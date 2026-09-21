@@ -1354,7 +1354,7 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         && input.collection_reference.is_collection_root();
     let can_jump_to_folder = (input.view.in_search || collection_root_grid)
         && !input.is_folder_context
-        && matches!(
+        && (matches!(
             input.kind,
             ContextMenuItemKind::Folder
                 | ContextMenuItemKind::Image
@@ -1364,7 +1364,7 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
                 | ContextMenuItemKind::PdfFile
                 | ContextMenuItemKind::ConvertibleArchive
                 | ContextMenuItemKind::SearchContainer
-        );
+        ) || collection_root_grid && input.kind == ContextMenuItemKind::CollectionPlaceholder);
     let can_jump_to_book = input.surface == ContextMenuSurface::Grid
         && input.view.reading_history
         && !input.is_folder_context
@@ -2526,6 +2526,38 @@ mod tests {
         assert!(
             command_state(&build_context_menu(&fullscreen), MenuCommand::JumpToFolder).is_none(),
             "fullscreen does not dispatch a collection location jump"
+        );
+    }
+
+    #[test]
+    fn collection_placeholder_exposes_only_the_collection_location_jump() {
+        let mut placeholder = input(
+            ContextMenuItemKind::CollectionPlaceholder,
+            ContextMenuSurface::Grid,
+        );
+        placeholder.collection_reference = CollectionReferenceAvailability::Ready;
+        let nodes = build_context_menu(&placeholder);
+        assert!(command_state(&nodes, MenuCommand::JumpToFolder).is_some());
+        for forbidden in [
+            MenuCommand::CutFiles,
+            MenuCommand::CopyFiles,
+            MenuCommand::Rename,
+            MenuCommand::MoveToRecycleBin,
+        ] {
+            assert!(
+                command_state(&nodes, forbidden.clone()).is_none(),
+                "placeholder unexpectedly enabled {forbidden:?}"
+            );
+        }
+        assert!(
+            !nodes
+                .iter()
+                .any(|node| matches!(node, MenuNode::Submenu { .. }))
+        );
+
+        placeholder.collection_reference = CollectionReferenceAvailability::NotCollectionRoot;
+        assert!(
+            command_state(&build_context_menu(&placeholder), MenuCommand::JumpToFolder).is_none()
         );
     }
 

@@ -51,7 +51,10 @@ mtime / size と画像認識 fingerprint を identity に catalog cache へ保�
 コレクションでは同名ファイルが異なる親に存在し得るため正規化した full path をキーにする。
 root の準備は worker が行い、source を開いて子へ入った後も root の戻り先と現在 entry を
 viewer context が保持する。別の実フォルダへの明示移動は読込成功時だけその owner を退役し、
-取消・失敗では元の root を保つ。
+取消・失敗では元の root を保つ。コレクションから開いた PDF / ZIP のページを Esc / Enter /
+右クリックで閉じる場合も、実ファイルの親フォルダではなく、collection ID・revision・entry ID・
+source key を持つ typed restore で同じ root へ戻る。ネストした ZIP 内の子から直接閉じる場合も
+同じ root entry を選択し、コレクションの順序とスクロール復元を維持する。
 
 サムネイルの full-path cache key を使うかどうかの正本は
 `App::use_full_path_cache_keys()`。検索結果（Ctrl+S / Ctrl+G）、タグ一覧、閲覧履歴、

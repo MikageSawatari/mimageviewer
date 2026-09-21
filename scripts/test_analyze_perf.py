@@ -15,11 +15,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 from analyze_perf import (
+    analyze_collection,
     analyze_page_turn,
     analyze_remote_page,
     analyze_test_script_input,
     analyze_idle_health,
     cmd_colorize,
+    cmd_collection,
     cmd_idle_health,
     cmd_metadata_search,
     cmd_page_turn,
@@ -63,6 +65,36 @@ def tail(t: float, n: int, reasons: list[str] | None = None) -> dict:
 
 def session(pid: int) -> dict:
     return {"t": 0.0, "cat": "session", "kind": "start", "pid": pid}
+
+
+def collection_lease(
+    t: float,
+    request_id: int,
+    outcome: str,
+    *,
+    owner: str = "grid",
+    phase: str = "snapshot",
+    active_ms: float = 0.0,
+    wall_ms: float = 0.0,
+    context: int | None = None,
+    surface_generation: int | None = None,
+) -> dict:
+    event = {
+        "t": t,
+        "cat": "collection",
+        "kind": "read_lease",
+        "request_id": request_id,
+        "owner": owner,
+        "phase": phase,
+        "active_ms": active_ms,
+        "wall_ms": wall_ms,
+        "outcome": outcome,
+    }
+    if context is not None:
+        event["context"] = context
+    if surface_generation is not None:
+        event["surface_generation"] = surface_generation
+    return event
 
 
 def thumb(t: float, kind: str, key: str) -> dict:
@@ -312,6 +344,166 @@ def remote_page_stage(
         "bytes": pixels * 4,
         "outcome": outcome,
     }
+
+
+class CollectionReportTests(unittest.TestCase):
+    def test_request_identity_is_scoped_to_session_and_late_viewer_binding(self) -> None:
+        events = [
+            session(101),
+            collection_lease(0.01, 7, "begin", phase="admission"),
+            collection_lease(
+                0.02,
+                7,
+                "phase",
+                context=11,
+                surface_generation=3,
+            ),
+            {
+                "t": 0.03,
+                "cat": "collection",
+                "kind": "navigation_begin",
+                "request_id": 7,
+                "surface_generation": 3,
+            },
+            collection_lease(
+                0.04,
+                7,
+                "ready",
+                active_ms=30.0,
+                wall_ms=30.0,
+                context=11,
+                surface_generation=3,
+            ),
+            session(202),
+            collection_lease(0.01, 7, "begin", owner="manager", phase="catalog"),
+            collection_lease(
+                0.05,
+                7,
+                "error",
+                owner="manager",
+                phase="catalog",
+                active_ms=40.0,
+                wall_ms=40.0,
+            ),
+        ]
+
+        report = analyze_collection(events)
+
+        self.assertEqual(report["sessions"], 2)
+        self.assertEqual(report["lease"]["completed"], 2)
+        self.assertEqual(report["lease"]["terminal_outcomes"], {"ready": 1, "error": 1})
+        self.assertEqual(report["lease"]["active"]["p50_ms"], 35.0)
+        self.assertEqual(report["legacy"]["matched_by_request_id"], 1)
+        self.assertEqual(report["legacy"]["unmatched"], 0)
+        self.assertEqual(
+            [row["session"] for row in report["lease"]["completed_requests"]],
+            [0, 1],
+            "the same request id in another process session is a different request",
+        )
+
+    def test_partial_stale_conflicting_and_unknown_records_never_become_success_or_hang(self) -> None:
+        missing_owner = collection_lease(0.11, 7, "phase")
+        missing_owner.pop("owner")
+        events = [
+            collection_lease(9.0, 1, "begin"),
+            collection_lease(9.1, 1, "ready", active_ms=100.0, wall_ms=100.0),
+            session(303),
+            collection_lease(0.01, 2, "ready", active_ms=10.0, wall_ms=10.0),
+            collection_lease(0.02, 3, "begin"),
+            collection_lease(0.03, 4, "begin"),
+            collection_lease(0.04, 4, "phase", context=1, surface_generation=8),
+            collection_lease(0.05, 4, "phase", context=2, surface_generation=8),
+            collection_lease(
+                0.06,
+                4,
+                "ready",
+                context=2,
+                surface_generation=8,
+            ),
+            collection_lease(0.07, 5, "begin"),
+            collection_lease(0.08, 5, "future_terminal"),
+            collection_lease(0.09, 6, "begin", owner="grid"),
+            collection_lease(0.10, 6, "phase", owner="manager"),
+            collection_lease(0.11, 6, "ready", owner="manager"),
+            collection_lease(0.10, 7, "begin", owner="grid"),
+            missing_owner,
+            collection_lease(0.12, 7, "ready", owner="grid"),
+        ]
+
+        report = analyze_collection(events)["lease"]
+
+        self.assertEqual(report["completed"], 0)
+        self.assertEqual(report["terminal_outcomes"], {})
+        self.assertEqual(report["partial_session"], 1)
+        self.assertEqual(report["unmatched"], 1)
+        self.assertEqual(report["incomplete"], 1)
+        self.assertEqual(report["scope_conflict"], 3)
+        self.assertEqual(report["unknown_terminal"], 1)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_collection(events)
+        rendered = output.getvalue()
+        self.assertIn("diagnostic only", rendered)
+        self.assertIn("does not infer success or a hang", rendered)
+
+    def test_legacy_stages_are_summarized_without_uuid_or_timestamp_joining(self) -> None:
+        events = [
+            session(404),
+            collection_lease(
+                0.01,
+                9,
+                "begin",
+                context=4,
+                surface_generation=12,
+            ),
+            {
+                "t": 0.02,
+                "cat": "collection",
+                "kind": "prepare",
+                "stage": "identity",
+                "request_id": 9,
+                "outcome": "ok",
+                "ms": 10.0,
+            },
+            {
+                "t": 0.03,
+                "cat": "collection",
+                "kind": "prepare",
+                "stage": "identity",
+                "collection_id": "same-uuid-is-not-a-join-key",
+                "outcome": "error",
+                "ms": 30.0,
+            },
+            {
+                "t": 0.04,
+                "cat": "collection",
+                "kind": "navigation_begin",
+                "request_id": 9,
+                "surface_generation": 99,
+            },
+            collection_lease(
+                0.05,
+                9,
+                "ready",
+                active_ms=40.0,
+                wall_ms=40.0,
+                context=4,
+                surface_generation=12,
+            ),
+        ]
+
+        report = analyze_collection(events)
+        identity = report["legacy"]["stages"]["prepare/identity"]
+
+        self.assertEqual(identity["count"], 2)
+        self.assertEqual(identity["outcomes"], {"ok": 1, "error": 1})
+        self.assertEqual(identity["duration"]["p50_ms"], 20.0)
+        self.assertEqual(identity["duration"]["p95_ms"], 29.0)
+        self.assertEqual(identity["duration"]["max_ms"], 30.0)
+        self.assertEqual(report["legacy"]["matched_by_request_id"], 1)
+        self.assertEqual(report["legacy"]["unmatched"], 2)
+        self.assertEqual(report["legacy"]["scope_conflict"], 1)
 
 
 class MetadataSearchReportTests(unittest.TestCase):

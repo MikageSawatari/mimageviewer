@@ -12,7 +12,8 @@ use super::{
     CollectionEntryId, CollectionId, CollectionMigrationOutcome, CollectionOrderMode,
     CollectionRegistration, CollectionResolvedKind, CollectionSourceMigration,
     CollectionSourceMigrationBatch, CollectionSourceNamespace, CollectionSourcePathKey,
-    CollectionStoreError, MAX_COLLECTION_ENTRIES,
+    CollectionStoreError, MAX_COLLECTION_ENTRIES, collection_sort_order_from_wire_name,
+    collection_sort_order_wire_name,
 };
 use crate::settings::SortOrder;
 
@@ -592,7 +593,7 @@ impl CollectionStoreDb {
                  WHERE id = ?5",
                 params![
                     prepared.mode.as_str(),
-                    sort_order_as_str(prepared.standard_sort),
+                    collection_sort_order_wire_name(prepared.standard_sort),
                     format!("{:016x}", prepared.shuffle_seed),
                     now_ms(),
                     prepared.id.to_string()
@@ -1343,7 +1344,7 @@ fn read_definition_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectionDe
                 format!("unknown collection order mode {order_mode}").into(),
             )
         })?,
-        standard_sort: sort_order_from_str(&sort_order).ok_or_else(|| {
+        standard_sort: collection_sort_order_from_wire_name(&sort_order).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
                 3,
                 rusqlite::types::Type::Text,
@@ -1555,33 +1556,6 @@ fn checked_u64_sql(value: i64, column: usize) -> rusqlite::Result<u64> {
             Box::new(error),
         )
     })
-}
-
-fn sort_order_as_str(sort: SortOrder) -> &'static str {
-    match sort {
-        SortOrder::FileName => "file_name",
-        SortOrder::FileNameDesc => "file_name_desc",
-        SortOrder::Numeric => "numeric",
-        SortOrder::NumericDesc => "numeric_desc",
-        SortOrder::DateAsc => "date_asc",
-        SortOrder::DateDesc => "date_desc",
-        SortOrder::SizeAsc => "size_asc",
-        SortOrder::SizeDesc => "size_desc",
-    }
-}
-
-fn sort_order_from_str(value: &str) -> Option<SortOrder> {
-    match value {
-        "file_name" => Some(SortOrder::FileName),
-        "file_name_desc" => Some(SortOrder::FileNameDesc),
-        "numeric" => Some(SortOrder::Numeric),
-        "numeric_desc" => Some(SortOrder::NumericDesc),
-        "date_asc" => Some(SortOrder::DateAsc),
-        "date_desc" => Some(SortOrder::DateDesc),
-        "size_asc" => Some(SortOrder::SizeAsc),
-        "size_desc" => Some(SortOrder::SizeDesc),
-        _ => None,
-    }
 }
 
 fn now_ms() -> i64 {

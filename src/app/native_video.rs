@@ -12212,6 +12212,15 @@ impl App {
                 self.add_current_video_frame_to_active_book(ctx, fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoAddToActiveBook)
             }
+            _ if self.fullscreen_idx == Some(fs_idx)
+                && !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoAddToCollectionTarget, &key) =>
+            {
+                self.add_media_shortcut_to_collection_target(fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoAddToCollectionTarget)
+            }
             // X / C: comparison view is static-image only. Consume as silent no-op.
             _ if !key.repeat
                 && (self
@@ -15269,6 +15278,36 @@ mod configurable_video_seek_dispatch_tests {
                 load_seq: 0,
             },
         );
+    }
+
+    #[test]
+    fn native_collection_shortcut_routes_video_and_audio_once_for_the_live_fs_index() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.keymap =
+            crate::keymap::Keymap::from_ini_str("[FsVideo]\nVideoAddToCollectionTarget = F13\n");
+        app.items = vec![
+            GridItem::Video(std::path::PathBuf::from(r"C:\clips\one.mp4")),
+            GridItem::Audio(std::path::PathBuf::from(r"C:\clips\two.mp3")),
+        ];
+        for idx in 0..2 {
+            app.fullscreen_idx = Some(idx);
+            assert!(matches!(
+                app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7C, false, false)),
+                NativeVideoKeyOutcome::Action(KeyAction::VideoAddToCollectionTarget)
+            ));
+            let mut repeat = native_key(0x7C, false, false);
+            repeat.repeat = true;
+            assert!(!matches!(
+                app.dispatch_native_video_key_event(&ctx, idx, repeat),
+                NativeVideoKeyOutcome::Action(KeyAction::VideoAddToCollectionTarget)
+            ));
+        }
+        app.fullscreen_idx = Some(1);
+        assert!(!matches!(
+            app.dispatch_native_video_key_event(&ctx, 0, native_key(0x7C, false, false)),
+            NativeVideoKeyOutcome::Action(KeyAction::VideoAddToCollectionTarget)
+        ));
     }
 
     fn player_position(app: &App, idx: usize) -> f64 {

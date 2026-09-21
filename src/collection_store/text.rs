@@ -43,10 +43,24 @@ pub struct CollectionImportLine {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CollectionImportPreview {
-    pub lines: Vec<CollectionImportLine>,
+    lines: Vec<CollectionImportLine>,
+    accepted_count: usize,
+    invalid_count: usize,
 }
 
 impl CollectionImportPreview {
+    pub fn lines(&self) -> &[CollectionImportLine] {
+        &self.lines
+    }
+
+    pub const fn accepted_count(&self) -> usize {
+        self.accepted_count
+    }
+
+    pub const fn invalid_count(&self) -> usize {
+        self.invalid_count
+    }
+
     pub fn accepted_paths(&self) -> impl Iterator<Item = (&Path, &CollectionSourcePathKey)> + '_ {
         self.lines.iter().filter_map(|line| {
             if line.status != CollectionImportLineStatus::Accepted {
@@ -69,6 +83,8 @@ pub fn parse_collection_text(
     let mut first_by_key: HashMap<CollectionSourcePathKey, usize> = HashMap::new();
     let base_dir = source_text_path.parent().unwrap_or(source_text_path);
     let mut nonempty_lines = 0;
+    let mut accepted_count = 0;
+    let mut invalid_count = 0;
 
     for (index, raw_line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
         let line_number = index + 1;
@@ -84,6 +100,7 @@ pub fn parse_collection_text(
         let value = match unquote_whole_line(trimmed) {
             Ok(value) => value,
             Err(reason) => {
+                invalid_count += 1;
                 lines.push(CollectionImportLine {
                     line_number,
                     original,
@@ -103,6 +120,7 @@ pub fn parse_collection_text(
                     }
                 } else {
                     first_by_key.insert(key.clone(), line_number);
+                    accepted_count += 1;
                     CollectionImportLineStatus::Accepted
                 };
                 lines.push(CollectionImportLine {
@@ -113,25 +131,32 @@ pub fn parse_collection_text(
                     status,
                 });
             }
-            Err(error) => lines.push(CollectionImportLine {
-                line_number,
-                original,
-                resolved_path: None,
-                source_key: None,
-                status: CollectionImportLineStatus::Invalid {
-                    reason: error.to_string(),
-                },
-            }),
+            Err(error) => {
+                invalid_count += 1;
+                lines.push(CollectionImportLine {
+                    line_number,
+                    original,
+                    resolved_path: None,
+                    source_key: None,
+                    status: CollectionImportLineStatus::Invalid {
+                        reason: error.to_string(),
+                    },
+                })
+            }
         }
     }
-    Ok(CollectionImportPreview { lines })
+    Ok(CollectionImportPreview {
+        lines,
+        accepted_count,
+        invalid_count,
+    })
 }
 
-/// 現在の有効順を UTF-8 text 本文へ直列化する純関数。
+/// 現在の有効順を UTF-8 BOM 付き text 本文へ直列化する純関数。
 ///
 /// Windows の path に `"` は使えないため、空白を含む行だけ whole-line quote を付ける。
 pub fn serialize_collection_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> String {
-    let mut output = String::new();
+    let mut output = String::from('\u{feff}');
     for path in paths {
         let value = path.to_string_lossy();
         if value.chars().any(char::is_whitespace) {

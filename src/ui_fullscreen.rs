@@ -27318,6 +27318,16 @@ impl App {
             self.handle_video_input(ctx, fs_idx, video_path.as_deref());
         }
 
+        // Audio and video in music view use the media file itself, never a displayed frame.
+        if fs_music_view_active
+            && self.fs_context_menu_idx.is_none()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::VideoAddToCollectionTarget)
+        {
+            self.add_media_shortcut_to_collection_target(fs_idx);
+        }
+
         // 音楽ビュー: 「動画フルスクリーンを閉じて一覧へ戻る」(VideoCloseFullscreen) を音声でも
         // 動画と同じ扱いで処理する (「映像なし動画」パリティ)。動画は native 経路
         // (native_video.rs) で VideoCloseFullscreen を VideoPlayPause より前に判定するので、
@@ -27946,6 +27956,12 @@ impl App {
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsAddToActiveBook);
+        let key_collection_add = !is_video_fs
+            && !fs_music_view_active
+            && self.fs_context_menu_idx.is_none()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::FsAddToCollectionTarget);
         let key_ctrl_e_export = !is_video_fs
             && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
@@ -28864,6 +28880,9 @@ impl App {
         }
         if key_ctrl_b_book {
             self.add_fullscreen_image_to_active_book(ctx, fs_idx);
+        }
+        if key_collection_add {
+            self.add_fs_shortcut_to_collection_target(fs_idx);
         }
         if key_ctrl_e_export
             && !self.show_continuous_reading_shortcut_noop(
@@ -45182,6 +45201,9 @@ impl App {
         let add_book_key = self
             .keymap
             .consume_action(ctx, KeyAction::VideoAddToActiveBook);
+        let add_collection_key = self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::VideoAddToCollectionTarget);
         #[cfg(windows)]
         let anime4k_remeasure_key = self
             .keymap
@@ -45267,6 +45289,10 @@ impl App {
         }
         if add_book_key {
             self.add_current_video_frame_to_active_book(ctx, fs_idx);
+            return;
+        }
+        if add_collection_key {
+            self.add_media_shortcut_to_collection_target(fs_idx);
             return;
         }
         if compare_x || compare_alt_c || compare_shift_c || compare_c {

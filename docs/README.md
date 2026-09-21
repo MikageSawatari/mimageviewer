@@ -34,7 +34,8 @@
 | [post-v3.10.0-development.md](post-v3.10.0-development.md) | v3.10.0後の修正・sort・コレクション開発順と、不在中の隔離検証 |
 | [folder-tree-sort-plan.md](folder-tree-sort-plan.md) | §2.25 ツリー専用の並び順と、展開・現在位置を保持するworker再列挙の設計。§2.24の一覧サイズ順に先行 |
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
-| [collection-implementation-plan.md](collection-implementation-plan.md) | 名前付き永続コレクションのactor、PC管理・一覧、最新順再生、Remote read-only統合、出荷前修正の実装・検収台帳 |
+| [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
+| [collection-rereview-fixes-20260921.md](collection-rereview-fixes-20260921.md) | v4.0.0再レビューの追加修正。指摘の妥当性、直列の実装範囲、バックアップ・復旧・待機要求の設計合意と検証記録 |
 | [collection-migration-journal-recovery.md](collection-migration-journal-recovery.md) | M-2/M-1 の復旧記録保護。読込失敗時の物理変更の事前停止、旧記録保持、再読込・終了と名前変更 scope の所有境界 |
 | [collection-playback-plan.md](collection-playback-plan.md) | Phase 4のPC向けCtrl+上下、通常next / prev、slideshow、三媒体EOFを最新prepared順へ接続した所有設計と検収記録 |
 | [collection-remote-plan.md](collection-remote-plan.md) | Phase 5の認証済みRemote一覧・閲覧、server-side latest navigation、session / route owner、path・budget・終了順の実装・検収記録 |
@@ -43,6 +44,7 @@
 | [msstore-startup-hang-vcrt-investigation-20260915.md](msstore-startup-hang-vcrt-investigation-20260915.md) | §1.241 VC++ ランタイムの無い Windows で起動が終わらない (Store 審査却下) の原因。onnxruntime.dll の依存、ort の失敗経路のデッドロック、Sandbox での陽性対照と修正候補 |
 | [section241-ort-vcrt-startup-fix-plan.md](section241-ort-vcrt-startup-fix-plan.md) | §1.241 の修正設計と検収記録。upstream ort backport、process 共通 AI runtime owner、app-local Microsoft VC runtime、TensorRT typed failure、全 PE 配布 gate |
 | [sidecar-first-visit-investigation-20260912.md](sidecar-first-visit-investigation-20260912.md) | §1.226 初訪問の旧XMPタグ読み取り待ちの調査と自動取り込み廃止。現在のタグDB・一般XMP・サイドカー復元を維持する境界 |
+| [sidecar-confirmation-reuse-plan.md](sidecar-confirmation-reuse-plan.md) | Ctrl+上下・再訪時の保存設定確認を高速化する設計と計測。外部変更・同期記録・書き込み完了の確認を維持した解析結果の再利用、メモリ上限と検証記録 |
 | [section115-revalidation-plan.md](section115-revalidation-plan.md) | §1.115最大化別窓の再確認。現backendの表示順、利用者の確認結果、完了判断と独立残件 |
 | [next-version-mouse-seek-plan.md](next-version-mouse-seek-plan.md) | 戻る・進むボタンの二重シークと長押し差異の入力元調査、限定診断、再導入条件 |
 | [next-version-background-color-plan.md](next-version-background-color-plan.md) | 画像・本の余白色と透過画像内背景を分離する設計、回転・別窓・連結の描画契約 |

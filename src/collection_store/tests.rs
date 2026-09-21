@@ -179,23 +179,25 @@ fn text_preview_is_pure_and_keeps_missing_paths_hash_and_first_duplicate() {
         Path::new(r"C:\NeverExists\list.txt"),
     )
     .unwrap();
-    assert_eq!(preview.lines.len(), 4);
+    assert_eq!(preview.lines().len(), 4);
     assert_eq!(
-        preview.lines[0].status,
+        preview.lines()[0].status,
         CollectionImportLineStatus::Accepted
     );
     assert_eq!(
-        preview.lines[1].status,
+        preview.lines()[1].status,
         CollectionImportLineStatus::Accepted
     );
     assert_eq!(
-        preview.lines[2].status,
+        preview.lines()[2].status,
         CollectionImportLineStatus::Duplicate { first_line: 2 }
     );
     assert!(matches!(
-        preview.lines[3].status,
+        preview.lines()[3].status,
         CollectionImportLineStatus::Invalid { .. }
     ));
+    assert_eq!(preview.accepted_count(), 2);
+    assert_eq!(preview.invalid_count(), 1);
     let accepted: Vec<_> = preview
         .accepted_paths()
         .map(|(path, _)| path.to_path_buf())
@@ -204,7 +206,7 @@ fn text_preview_is_pure_and_keeps_missing_paths_hash_and_first_duplicate() {
     assert!(accepted[0].to_string_lossy().contains("NeverExists"));
 
     let serialized = serialize_collection_paths(accepted.iter().map(PathBuf::as_path));
-    assert!(serialized.starts_with(r#""C:\NeverExists\missing folder\a.jpg""#));
+    assert!(serialized.starts_with("\u{feff}\"C:\\NeverExists\\missing folder\\a.jpg\""));
     assert!(serialized.ends_with("\r\n"));
     let reparsed =
         parse_collection_text(&serialized, Path::new(r"C:\Export\collection.txt")).unwrap();
@@ -218,13 +220,32 @@ fn text_preview_is_pure_and_keeps_missing_paths_hash_and_first_duplicate() {
 }
 
 #[test]
+fn collection_sort_order_wire_names_round_trip_without_debug_spelling() {
+    for sort in [
+        SortOrder::FileName,
+        SortOrder::FileNameDesc,
+        SortOrder::Numeric,
+        SortOrder::NumericDesc,
+        SortOrder::DateAsc,
+        SortOrder::DateDesc,
+        SortOrder::SizeAsc,
+        SortOrder::SizeDesc,
+    ] {
+        let wire = collection_sort_order_wire_name(sort);
+        assert_eq!(collection_sort_order_from_wire_name(wire), Some(sort));
+        assert_eq!(wire, wire.to_ascii_lowercase());
+    }
+    assert_eq!(collection_sort_order_from_wire_name("FileName"), None);
+}
+
+#[test]
 fn text_preview_rejects_byte_and_nonempty_line_resource_limits_without_partial_preview() {
     let source = Path::new(r"C:\Imports\list.txt");
     let at_byte_limit = " ".repeat(MAX_COLLECTION_IMPORT_BYTES);
     assert!(
         parse_collection_text(&at_byte_limit, source)
             .unwrap()
-            .lines
+            .lines()
             .is_empty()
     );
     let over_byte_limit = format!("{at_byte_limit} ");
@@ -235,9 +256,9 @@ fn text_preview_rejects_byte_and_nonempty_line_resource_limits_without_partial_p
 
     let at_line_limit = "C:\\Media\\same.jpg\r\n".repeat(MAX_COLLECTION_IMPORT_NONEMPTY_LINES);
     let preview = parse_collection_text(&at_line_limit, source).unwrap();
-    assert_eq!(preview.lines.len(), MAX_COLLECTION_IMPORT_NONEMPTY_LINES);
+    assert_eq!(preview.lines().len(), MAX_COLLECTION_IMPORT_NONEMPTY_LINES);
     assert_eq!(
-        preview.lines[1].status,
+        preview.lines()[1].status,
         CollectionImportLineStatus::Duplicate { first_line: 1 }
     );
     assert_eq!(

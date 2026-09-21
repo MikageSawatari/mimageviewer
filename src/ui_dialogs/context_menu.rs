@@ -406,6 +406,18 @@ struct NativeGridContextMenuTarget {
     collection_root_delete: crate::app::collection_grid::CollectionRootDeleteResolution,
 }
 
+#[derive(Debug)]
+enum CollectionJumpRequestResolution {
+    Ready(JumpToFolderRequest),
+    NoParent,
+    Unavailable(String),
+}
+
+const COLLECTION_JUMP_STALE_MESSAGE: &str =
+    "コレクション一覧が更新されたため、もう一度選択してください";
+const COLLECTION_JUMP_NO_PARENT_MESSAGE: &str =
+    "ドライブまたは共有ルートには親フォルダがありません";
+
 impl NativeGridContextMenuTarget {
     fn is_fullscreen_video(&self) -> bool {
         self.surface == ContextMenuSurface::Fullscreen && matches!(self.item, GridItem::Video(_))
@@ -1589,7 +1601,9 @@ impl crate::app::App {
                 if !target.is_folder_context
                     && let Some(path) = target.item.drag_source_path().map(Path::to_path_buf)
                 {
-                    self.request_rename_dialog(path);
+                    let target_is_file =
+                        !matches!(&target.item, crate::grid_item::GridItem::Folder(_));
+                    self.request_rename_dialog(path, target_is_file);
                 }
                 None
             }
@@ -1821,13 +1835,23 @@ impl crate::app::App {
         target: &NativeGridContextMenuTarget,
         book: bool,
     ) -> Option<ContextMenuAction> {
-        let request = self.context_jump_request(target, book);
-        if request.is_none() && target.collection_root_delete.is_collection_root() {
-            self.show_feedback_toast(
-                "コレクション一覧が更新されたため、もう一度選択してください".to_owned(),
-            );
+        if target.collection_root_delete.is_collection_root() {
+            return match self.collection_jump_request_resolution(target) {
+                CollectionJumpRequestResolution::Ready(request) => {
+                    Some(ContextMenuAction::JumpToFolder(request))
+                }
+                CollectionJumpRequestResolution::NoParent => {
+                    self.show_feedback_toast(COLLECTION_JUMP_NO_PARENT_MESSAGE.to_owned());
+                    None
+                }
+                CollectionJumpRequestResolution::Unavailable(reason) => {
+                    self.show_feedback_toast(reason);
+                    None
+                }
+            };
         }
-        request.map(ContextMenuAction::JumpToFolder)
+        self.context_jump_request(target, book)
+            .map(ContextMenuAction::JumpToFolder)
     }
 
     fn collection_jump_action_state(
@@ -1841,10 +1865,15 @@ impl crate::app::App {
         let disabled_reason = match &target.collection_root_delete {
             CollectionRootDeleteResolution::NotCollectionRoot => return None,
             CollectionRootDeleteResolution::Unavailable(reason) => Some((*reason).to_owned()),
-            CollectionRootDeleteResolution::Ready(_) => self
-                .context_jump_request(target, false)
-                .is_none()
-                .then(|| "コレクション一覧を更新中です".to_owned()),
+            CollectionRootDeleteResolution::Ready(_) => {
+                match self.collection_jump_request_resolution(target) {
+                    CollectionJumpRequestResolution::Ready(_) => None,
+                    CollectionJumpRequestResolution::NoParent => {
+                        Some(COLLECTION_JUMP_NO_PARENT_MESSAGE.to_owned())
+                    }
+                    CollectionJumpRequestResolution::Unavailable(reason) => Some(reason),
+                }
+            }
         };
         Some(ContextMenuActionState {
             label: "元の場所へ移動".to_owned(),
@@ -1858,36 +1887,73 @@ impl crate::app::App {
         target: &NativeGridContextMenuTarget,
         book: bool,
     ) -> Option<JumpToFolderRequest> {
-        let mut request = if book {
+        use crate::app::collection_grid::CollectionRootDeleteResolution;
+        if !matches!(
+            target.collection_root_delete,
+            CollectionRootDeleteResolution::NotCollectionRoot
+        ) {
+            return match self.collection_jump_request_resolution(target) {
+                CollectionJumpRequestResolution::Ready(request) => Some(request),
+                CollectionJumpRequestResolution::NoParent
+                | CollectionJumpRequestResolution::Unavailable(_) => None,
+            };
+        }
+        Some(if book {
             jump_to_book_folder_request(&target.item)?
         } else {
             jump_to_folder_request(&target.item)?
-        };
+        })
+    }
+
+    fn collection_jump_request_resolution(
+        &self,
+        target: &NativeGridContextMenuTarget,
+    ) -> CollectionJumpRequestResolution {
         use crate::app::collection_grid::CollectionRootDeleteResolution;
         match &target.collection_root_delete {
-            CollectionRootDeleteResolution::NotCollectionRoot => Some(request),
-            CollectionRootDeleteResolution::Unavailable(_) => None,
-            CollectionRootDeleteResolution::Ready(_) => {
-                let index = target.item_index?;
-                let source = target.item.drag_source_path()?;
-                let origin = self.collection_grid_physical_load_owner(index, source)?;
-                if !matches!(
-                    &origin.origin,
-                    crate::app::top_level_grid_view::CollectionGridPhysicalLoadOrigin::Root { .. }
-                ) || origin.accepted_revision != origin.wanted_revision
-                    || !self.collection_grid_physical_load_owner_is_current(&origin, source)
-                {
-                    return None;
-                }
-                // Even a Folder cell jumps to its parent so the original cell can be selected.
-                let source = native_nav_path(source);
-                request.destination =
-                    JumpToFolderDestination::PhysicalDirectory(parent_folder_for_nav(&source)?);
-                request.selection = JumpToFolderSelection::ExactPath(source);
-                request.origin = Some(origin);
-                Some(request)
+            CollectionRootDeleteResolution::Unavailable(reason) => {
+                return CollectionJumpRequestResolution::Unavailable((*reason).to_owned());
             }
+            CollectionRootDeleteResolution::NotCollectionRoot => {
+                return CollectionJumpRequestResolution::Unavailable(
+                    COLLECTION_JUMP_STALE_MESSAGE.to_owned(),
+                );
+            }
+            CollectionRootDeleteResolution::Ready(_) => {}
         }
+        let Some(source) = collection_jump_source_path(&target.item).map(native_nav_path) else {
+            return CollectionJumpRequestResolution::Unavailable(
+                COLLECTION_JUMP_STALE_MESSAGE.to_owned(),
+            );
+        };
+        let Some(parent) = parent_folder_for_nav(&source) else {
+            return CollectionJumpRequestResolution::NoParent;
+        };
+        let Some(index) = target.item_index else {
+            return CollectionJumpRequestResolution::Unavailable(
+                COLLECTION_JUMP_STALE_MESSAGE.to_owned(),
+            );
+        };
+        let Some(origin) = self.collection_grid_physical_load_owner(index, &source) else {
+            return CollectionJumpRequestResolution::Unavailable(
+                COLLECTION_JUMP_STALE_MESSAGE.to_owned(),
+            );
+        };
+        if !matches!(
+            &origin.origin,
+            crate::app::top_level_grid_view::CollectionGridPhysicalLoadOrigin::Root { .. }
+        ) || origin.accepted_revision != origin.wanted_revision
+            || !self.collection_grid_physical_load_owner_is_current(&origin, &source)
+        {
+            return CollectionJumpRequestResolution::Unavailable(
+                COLLECTION_JUMP_STALE_MESSAGE.to_owned(),
+            );
+        }
+        CollectionJumpRequestResolution::Ready(JumpToFolderRequest {
+            destination: JumpToFolderDestination::PhysicalDirectory(parent),
+            selection: JumpToFolderSelection::ExactPath(source),
+            origin: Some(origin),
+        })
     }
 
     /// `ContextMenuAction::JumpToFolder` の source surface 終了を適用する。検索終了
@@ -2700,6 +2766,16 @@ fn parent_folder_for_nav(path: &std::path::Path) -> Option<PathBuf> {
     Some(native_nav_path(path.parent()?))
 }
 
+/// The registered source may be consulted only by the Collection Grid location jump.
+/// Keeping this separate from `GridItem::drag_source_path` prevents a missing placeholder from
+/// becoming eligible for shell, delete, drag, or external-tool operations.
+fn collection_jump_source_path(item: &GridItem) -> Option<&Path> {
+    match item {
+        GridItem::CollectionPlaceholder { path, .. } => Some(path),
+        _ => item.drag_source_path(),
+    }
+}
+
 /// 右クリック対象に対して「このフォルダ」が指す実ディレクトリを返す。
 /// 単一フォルダはそのフォルダ自身、ファイルや仮想ページは元コンテナの親、複数選択と
 /// 背景メニューは現在表示中の実フォルダを使う。検索結果の複数選択のように単一の
@@ -2954,7 +3030,7 @@ mod delete_confirm_tests {
         let nodes = app.context_menu_nodes(&root, false);
         let jump = state(&nodes, MenuCommand::JumpToFolder).expect("grid location jump");
         assert!(!jump.0);
-        assert_eq!(jump.1.as_deref(), Some("コレクション一覧を更新中です"));
+        assert_eq!(jump.1.as_deref(), Some(COLLECTION_JUMP_STALE_MESSAGE));
         assert_eq!(
             state(&nodes, MenuCommand::RemoveFromCollection),
             Some((true, None))
@@ -2969,6 +3045,77 @@ mod delete_confirm_tests {
         root.surface = ContextMenuSurface::Fullscreen;
         let nodes = app.context_menu_nodes(&root, false);
         assert!(state(&nodes, MenuCommand::JumpToFolder).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placeholder_location_source_stays_jump_only_and_roots_report_no_parent() {
+        use crate::collection_store::CollectionResolvedKind;
+        use crate::grid_item::CollectionPlaceholderReason;
+
+        let missing = GridItem::CollectionPlaceholder {
+            path: PathBuf::from(r"C:\media\missing.jpg"),
+            last_known_kind: CollectionResolvedKind::Image,
+            reason: CollectionPlaceholderReason::Missing,
+        };
+        assert!(missing.drag_source_path().is_none());
+        assert_eq!(
+            collection_jump_source_path(&missing),
+            Some(Path::new(r"C:\media\missing.jpg"))
+        );
+        let missing_target = target(missing, ContextMenuSurface::Grid);
+        assert!(missing_target.shell_paths.is_none());
+        assert!(missing_target.real_paths.is_empty());
+        assert!(missing_target.delete_targets.is_empty());
+        assert!(
+            missing_target
+                .external_tool_targets
+                .iter()
+                .all(|target| target.real_file().is_err())
+        );
+
+        let mut app = crate::app::setup_app_for_test();
+        for root in [PathBuf::from(r"C:\"), PathBuf::from(r"\\server\share")] {
+            let mut target = target(
+                GridItem::CollectionPlaceholder {
+                    path: root,
+                    last_known_kind: CollectionResolvedKind::Image,
+                    reason: CollectionPlaceholderReason::Missing,
+                },
+                ContextMenuSurface::Grid,
+            );
+            target.collection_root_delete =
+                crate::app::collection_grid::CollectionRootDeleteResolution::Ready(
+                    crate::app::collection_grid::CollectionGridRemoveTarget {
+                        stamp: crate::app::top_level_grid_view::CollectionGridRequestStamp {
+                            context_id: crate::app::ViewerContextId::for_test(1),
+                            surface_generation: 2,
+                            collection_id: crate::collection_store::CollectionId::new(),
+                        },
+                        expected_revision: 3,
+                        entry_ids: vec![crate::collection_store::CollectionEntryId::new()],
+                    },
+                );
+            assert!(matches!(
+                app.collection_jump_request_resolution(&target),
+                CollectionJumpRequestResolution::NoParent
+            ));
+            let state = app
+                .collection_jump_action_state(&target)
+                .expect("collection jump state");
+            assert!(!state.enabled);
+            assert_eq!(
+                state.disabled_reason.as_deref(),
+                Some(COLLECTION_JUMP_NO_PARENT_MESSAGE)
+            );
+            assert!(app.dispatch_context_jump_request(&target, false).is_none());
+            assert!(!app.context_folder_jump_pending());
+            assert!(
+                app.fs_feedback_toast
+                    .as_ref()
+                    .is_some_and(|toast| { toast.0 == COLLECTION_JUMP_NO_PARENT_MESSAGE })
+            );
+        }
     }
 
     #[test]

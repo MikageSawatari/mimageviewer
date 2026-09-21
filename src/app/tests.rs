@@ -1409,6 +1409,118 @@ fn page_dims_cache_does_not_cross_equal_generation_viewer_bundles() {
     .expect("detached bundle remains parked");
 }
 
+#[cfg(windows)]
+#[test]
+fn collection_shortcut_from_mounted_detached_keeps_main_selection_and_scroll() {
+    let temp = tempfile::tempdir().unwrap();
+    let main_path = temp.path().join("main.png");
+    let detached_path = temp.path().join("detached.png");
+    std::fs::write(&main_path, b"main").unwrap();
+    std::fs::write(&detached_path, b"detached").unwrap();
+    let runtime = crate::collection_store::CollectionStoreRuntime::start_at(
+        temp.path().join("collection.db"),
+    )
+    .unwrap();
+    let client = runtime.client();
+    let mut app = phase_c_support::setup_app();
+    app.install_collection_runtime(runtime);
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !matches!(
+        app.collection_toolbar_catalog().2,
+        crate::ui_dialogs::collections::CollectionToolbarStatus::Ready
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "actor did not become ready"
+        );
+        app.poll_collection_ui(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let target = client
+        .create_collection("Detached add".into())
+        .unwrap()
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    while !app
+        .collection_toolbar_catalog()
+        .1
+        .iter()
+        .any(|(id, _)| *id == target.collection_id())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "catalog did not contain target"
+        );
+        app.poll_collection_ui(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    app.select_collection_toolbar_target(target.collection_id());
+    app.items = vec![GridItem::Image(main_path.clone())];
+    app.selected = Some(0);
+    app.checked.insert(0);
+    app.scroll_offset_y = 120.0;
+    app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+        detached.items = vec![GridItem::Image(detached_path.clone())];
+        detached.selected = Some(0);
+        detached.checked.clear();
+        detached.scroll_offset_y = 44.0;
+        detached.fullscreen_idx = Some(0);
+    });
+
+    app.with_active_viewer_context(|mounted| {
+        mounted.add_fs_shortcut_to_collection_target(0);
+        assert_eq!(
+            mounted.collection_toolbar_pending_target_paths_for_test(),
+            Some((target.collection_id(), vec![detached_path.clone()])),
+            "mounted action must capture the detached path and durable target"
+        );
+        assert_eq!(mounted.items, vec![GridItem::Image(detached_path.clone())]);
+        assert_eq!(mounted.selected, Some(0));
+        assert_eq!(mounted.scroll_offset_y, 44.0);
+    })
+    .expect("detached context remains mounted for its own action");
+    assert_eq!(app.items, vec![GridItem::Image(main_path.clone())]);
+    assert_eq!(app.selected, Some(0));
+    assert!(app.checked.contains(&0));
+    assert_eq!(app.scroll_offset_y, 120.0);
+    app.with_active_viewer_context(|mounted| {
+        assert_eq!(mounted.selected, Some(0));
+        assert_eq!(mounted.scroll_offset_y, 44.0);
+    })
+    .expect("detached context remains unchanged after its action");
+
+    while !app.collection_toolbar_add_settled_after_revision_for_test(
+        target.collection_id(),
+        target.revision(),
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached add did not settle"
+        );
+        app.poll_collection_ui(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let saved = client
+        .load_collection(target.collection_id())
+        .unwrap()
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.entries.len(), 1);
+    assert_eq!(saved.entries[0].source_path, detached_path);
+    assert_ne!(saved.entries[0].source_path, main_path);
+    assert_eq!(app.selected, Some(0));
+    assert_eq!(app.scroll_offset_y, 120.0);
+    app.with_active_viewer_context(|mounted| {
+        assert_eq!(mounted.selected, Some(0));
+        assert_eq!(mounted.scroll_offset_y, 44.0);
+    })
+    .expect("detached context remains unchanged after add completion");
+    app.shutdown_collection_runtime_for_exit();
+}
+
 #[test]
 #[cfg(windows)]
 fn spread_cache_does_not_cross_viewer_bundles() {
@@ -23866,6 +23978,510 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn dismissing_parse_recovery_keeps_exact_bytes_and_reopens_the_gate_prompt() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("rename-recovery-dismiss");
+        std::fs::create_dir(&data_dir).unwrap();
+        let journal = data_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        let invalid = b"invalid rename recovery bytes";
+        std::fs::write(&journal, invalid).unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir);
+
+        assert!(!app.ensure_rename_migration_journal_loaded());
+        assert!(app.rename_migration_recovery_dialog_visible());
+        app.dismiss_rename_migration_recovery();
+
+        assert!(!app.rename_migration_recovery_dialog_visible());
+        let RenameMigrationJournalAdmission::RecoveryFailed { error, prompt, .. } =
+            &app.rename_migration_journal_admission
+        else {
+            panic!("parse failure must remain the admission owner");
+        };
+        assert_eq!(error.parse_bytes().as_deref(), Some(invalid.as_slice()));
+        assert_eq!(*prompt, RenameMigrationRecoveryPrompt::Dismissed);
+        assert_eq!(std::fs::read(&journal).unwrap(), invalid);
+
+        assert!(!app.admit_rename_migration_source_change(&ctx));
+        assert!(app.rename_migration_recovery_dialog_visible());
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryFailed { .. }
+        ));
+        assert_eq!(std::fs::read(&journal).unwrap(), invalid);
+    }
+
+    fn run_rename_recovery_modal_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        background_clicks: &std::cell::Cell<u32>,
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 640.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::Area::new(egui::Id::new("rename_recovery_background_test"))
+                    .fixed_pos(egui::pos2(20.0, 20.0))
+                    .show(ctx, |ui| {
+                        if ui
+                            .add_sized(egui::vec2(160.0, 50.0), egui::Button::new("background"))
+                            .clicked()
+                        {
+                            background_clicks.set(background_clicks.get() + 1);
+                        }
+                    });
+                app.show_rename_migration_recovery_dialog(ctx);
+            },
+        );
+    }
+
+    fn recovery_pointer_event(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn recovery_modal_blocks_background_click_then_allows_it_after_dismissal() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("rename-recovery-modal-click");
+        std::fs::create_dir(&data_dir).unwrap();
+        let journal = data_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        let invalid = b"invalid modal click recovery";
+        std::fs::write(&journal, invalid).unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir);
+        assert!(!app.ensure_rename_migration_journal_loaded());
+        let background_clicks = std::cell::Cell::new(0);
+        let pos = egui::pos2(80.0, 40.0);
+
+        run_rename_recovery_modal_frame(&mut app, &ctx, Vec::new(), &background_clicks);
+        run_rename_recovery_modal_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                recovery_pointer_event(pos, true),
+            ],
+            &background_clicks,
+        );
+        run_rename_recovery_modal_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                recovery_pointer_event(pos, false),
+            ],
+            &background_clicks,
+        );
+        assert_eq!(background_clicks.get(), 0);
+        assert!(app.rename_migration_recovery_dialog_visible());
+        app.dismiss_rename_migration_recovery();
+        assert!(!app.rename_migration_recovery_dialog_visible());
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryFailed {
+                prompt: RenameMigrationRecoveryPrompt::Dismissed,
+                ..
+            }
+        ));
+        run_rename_recovery_modal_frame(&mut app, &ctx, Vec::new(), &background_clicks);
+
+        run_rename_recovery_modal_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                recovery_pointer_event(pos, true),
+            ],
+            &background_clicks,
+        );
+        run_rename_recovery_modal_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                recovery_pointer_event(pos, false),
+            ],
+            &background_clicks,
+        );
+        assert_eq!(background_clicks.get(), 1);
+        assert_eq!(std::fs::read(journal).unwrap(), invalid);
+    }
+
+    #[test]
+    fn recovery_modal_escape_keeps_failure_and_requests_quarantine_cancel() {
+        let escape = || egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let clicks = std::cell::Cell::new(0);
+
+        let failed_ctx = egui::Context::default();
+        let mut failed_app = setup_app();
+        let failed_dir = failed_app.tmp.path().join("rename-recovery-modal-escape");
+        std::fs::create_dir(&failed_dir).unwrap();
+        let failed_journal = failed_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        let invalid = b"invalid modal escape recovery";
+        std::fs::write(&failed_journal, invalid).unwrap();
+        failed_app.rename_migration_data_dir_override = Some(failed_dir);
+        assert!(!failed_app.ensure_rename_migration_journal_loaded());
+        run_rename_recovery_modal_frame(&mut failed_app, &failed_ctx, vec![escape()], &clicks);
+        let RenameMigrationJournalAdmission::RecoveryFailed { error, prompt, .. } =
+            &failed_app.rename_migration_journal_admission
+        else {
+            panic!("Escape must keep the parse-failure owner");
+        };
+        assert_eq!(error.parse_bytes().as_deref(), Some(invalid.as_slice()));
+        assert_eq!(*prompt, RenameMigrationRecoveryPrompt::Dismissed);
+        drop(failed_app);
+
+        let running_ctx = egui::Context::default();
+        let mut running_app = setup_app();
+        let running_dir = running_app
+            .tmp
+            .path()
+            .join("rename-recovery-running-escape");
+        std::fs::create_dir(&running_dir).unwrap();
+        std::fs::write(
+            running_dir.join(crate::rename_key_migration::JOURNAL_FILE),
+            invalid,
+        )
+        .unwrap();
+        running_app.rename_migration_data_dir_override = Some(running_dir);
+        assert!(!running_app.ensure_rename_migration_journal_loaded());
+        running_app.quarantine_rename_migration_recovery(&running_ctx);
+        assert!(running_app.rename_migration_recovery_quarantine_running());
+        run_rename_recovery_modal_frame(&mut running_app, &running_ctx, vec![escape()], &clicks);
+        assert!(matches!(
+            running_app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryQuarantining {
+                prompt: RenameMigrationRecoveryPrompt::Dismissed,
+                ..
+            }
+        ));
+        assert!(running_app.rename_migration_recovery_dialog_visible());
+        let pos = egui::pos2(80.0, 40.0);
+        run_rename_recovery_modal_frame(
+            &mut running_app,
+            &running_ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                recovery_pointer_event(pos, true),
+            ],
+            &clicks,
+        );
+        run_rename_recovery_modal_frame(
+            &mut running_app,
+            &running_ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                recovery_pointer_event(pos, false),
+            ],
+            &clicks,
+        );
+        assert_eq!(clicks.get(), 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while running_app.rename_migration_recovery_quarantine_running()
+            && std::time::Instant::now() < deadline
+        {
+            running_app.poll_rename_migration_quarantine();
+            std::thread::yield_now();
+        }
+        assert!(!running_app.rename_migration_recovery_quarantine_running());
+        assert!(!running_app.rename_migration_recovery_dialog_visible());
+    }
+
+    #[test]
+    fn explicit_quarantine_publishes_all_local_work_before_reopening_admission() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("rename-recovery-quarantine");
+        std::fs::create_dir(&data_dir).unwrap();
+        let journal = data_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        let invalid = b"invalid recovery record to quarantine";
+        std::fs::write(&journal, invalid).unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir.clone());
+        assert!(!app.ensure_rename_migration_journal_loaded());
+
+        let in_flight = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from("in-flight-old"),
+            PathBuf::from("in-flight-new"),
+            false,
+        );
+        let queued = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from("queued-old"),
+            PathBuf::from("queued-removed"),
+            false,
+        );
+        let boot_retry = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from("boot-old"),
+            PathBuf::from("boot-new"),
+            true,
+        );
+        let (_in_flight_tx, in_flight_rx) = std::sync::mpsc::channel();
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            job: in_flight.clone(),
+            rx: in_flight_rx,
+        });
+        app.rename_migration_queue.push_back(queued.clone());
+        app.rename_migration_boot_retry.push(boot_retry.clone());
+        app.invalidate_rename_migrations_for_removed_paths(&[PathBuf::from("queued-removed")]);
+
+        app.quarantine_rename_migration_recovery(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.rename_migration_recovery_quarantine_running()
+            && std::time::Instant::now() < deadline
+        {
+            app.poll_rename_migration_quarantine();
+            std::thread::yield_now();
+        }
+        assert!(!app.rename_migration_recovery_quarantine_running());
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Waiting { .. }
+        ));
+        assert!(!journal.exists());
+        let quarantined = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rename_migration_journal.json.invalid-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(std::fs::read(quarantined[0].path()).unwrap(), invalid);
+
+        app.flush_rename_migration_journal().unwrap();
+        let saved = crate::rename_key_migration::journal_load(&data_dir).unwrap();
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved[0], in_flight);
+        assert_eq!(saved[1].mappings, queued.mappings);
+        assert!(!saved[1].generic_pending);
+        assert_eq!(saved[2], boot_retry);
+        assert!(app.rename_migration_journal_allows_start());
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Durable
+        ));
+    }
+
+    #[test]
+    fn changed_valid_or_missing_source_requires_a_separate_explicit_reload() {
+        let ctx = egui::Context::default();
+
+        let mut valid_app = setup_app();
+        let valid_dir = valid_app.tmp.path().join("rename-recovery-became-valid");
+        std::fs::create_dir(&valid_dir).unwrap();
+        let valid_journal = valid_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        let original_invalid = b"invalid before valid replacement";
+        std::fs::write(&valid_journal, original_invalid).unwrap();
+        valid_app.rename_migration_data_dir_override = Some(valid_dir.clone());
+        assert!(!valid_app.ensure_rename_migration_journal_loaded());
+        let recovered = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            PathBuf::from("recovered-old"),
+            PathBuf::from("recovered-new"),
+            false,
+        );
+        crate::rename_key_migration::journal_save(&valid_dir, std::slice::from_ref(&recovered))
+            .unwrap();
+
+        valid_app.quarantine_rename_migration_recovery(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while valid_app.rename_migration_recovery_quarantine_running()
+            && std::time::Instant::now() < deadline
+        {
+            valid_app.poll_rename_migration_quarantine();
+            std::thread::yield_now();
+        }
+        let RenameMigrationJournalAdmission::RecoveryFailed { error, prompt, .. } =
+            &valid_app.rename_migration_journal_admission
+        else {
+            panic!("the quarantine action must not adopt a changed valid journal");
+        };
+        assert_eq!(
+            error.parse_bytes().as_deref(),
+            Some(original_invalid.as_slice())
+        );
+        assert_eq!(*prompt, RenameMigrationRecoveryPrompt::Shown);
+        assert!(valid_app.rename_migration_queue.is_empty());
+
+        valid_app.retry_rename_migration_recovery(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !valid_app.ensure_rename_migration_journal_loaded()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            valid_app.rename_migration_queue,
+            std::collections::VecDeque::from([recovered])
+        );
+        drop(valid_app);
+
+        let mut missing_app = setup_app();
+        let missing_dir = missing_app
+            .tmp
+            .path()
+            .join("rename-recovery-became-missing");
+        std::fs::create_dir(&missing_dir).unwrap();
+        let missing_journal = missing_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        std::fs::write(&missing_journal, original_invalid).unwrap();
+        missing_app.rename_migration_data_dir_override = Some(missing_dir);
+        assert!(!missing_app.ensure_rename_migration_journal_loaded());
+        std::fs::remove_file(&missing_journal).unwrap();
+
+        missing_app.quarantine_rename_migration_recovery(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while missing_app.rename_migration_recovery_quarantine_running()
+            && std::time::Instant::now() < deadline
+        {
+            missing_app.poll_rename_migration_quarantine();
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            missing_app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryFailed {
+                prompt: RenameMigrationRecoveryPrompt::Shown,
+                ..
+            }
+        ));
+        missing_app.retry_rename_migration_recovery(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !missing_app.ensure_rename_migration_journal_loaded()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            missing_app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Durable
+        ));
+        assert!(missing_app.rename_migration_queue.is_empty());
+    }
+
+    #[test]
+    fn quarantine_does_not_replay_the_blocked_physical_rename() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("rename-recovery-no-replay");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join(crate::rename_key_migration::JOURNAL_FILE),
+            b"bad",
+        )
+        .unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir);
+        let old = app.tmp.path().join("old.jpg");
+        let renamed = app.tmp.path().join("renamed.jpg");
+        std::fs::write(&old, b"image").unwrap();
+
+        app.start_rename_item_after_confirmation(
+            &ctx,
+            None,
+            old.clone(),
+            "renamed.jpg".into(),
+            true,
+        );
+        assert!(app.rename_pending.is_none());
+        app.quarantine_rename_migration_recovery(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while app.rename_migration_recovery_quarantine_running()
+            && std::time::Instant::now() < deadline
+        {
+            app.poll_rename_migration_quarantine();
+            std::thread::yield_now();
+        }
+
+        assert!(old.exists());
+        assert!(!renamed.exists());
+        assert!(app.rename_pending.is_none());
+    }
+
+    #[test]
+    fn exit_collects_an_active_quarantine_worker_into_a_terminal_state() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("rename-recovery-exit");
+        std::fs::create_dir(&data_dir).unwrap();
+        let journal = data_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        let invalid = b"invalid recovery during exit";
+        std::fs::write(&journal, invalid).unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir.clone());
+        assert!(!app.ensure_rename_migration_journal_loaded());
+        app.quarantine_rename_migration_recovery(&ctx);
+        assert!(app.rename_migration_recovery_quarantine_running());
+
+        app.resolve_collection_migration_for_exit();
+
+        assert!(!app.rename_migration_recovery_quarantine_running());
+        if journal.exists() {
+            assert_eq!(std::fs::read(&journal).unwrap(), invalid);
+            assert!(matches!(
+                app.rename_migration_journal_admission,
+                RenameMigrationJournalAdmission::RecoveryFailed { .. }
+            ));
+        } else {
+            let quarantined = std::fs::read_dir(&data_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("rename_migration_journal.json.invalid-")
+                })
+                .expect("a rename that won the exit race must leave the invalid bytes quarantined");
+            assert_eq!(std::fs::read(quarantined.path()).unwrap(), invalid);
+        }
+    }
+
+    #[test]
+    fn read_failure_cannot_enter_parse_quarantine() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let data_dir = app.tmp.path().join("rename-recovery-read-failure");
+        let journal = data_dir.join(crate::rename_key_migration::JOURNAL_FILE);
+        std::fs::create_dir_all(&journal).unwrap();
+        app.rename_migration_data_dir_override = Some(data_dir);
+
+        assert!(!app.ensure_rename_migration_journal_loaded());
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryFailed {
+                error: crate::rename_key_migration::JournalLoadError::Read(_),
+                ..
+            }
+        ));
+        assert!(!app.rename_migration_recovery_dialog_visible());
+        app.quarantine_rename_migration_recovery(&ctx);
+        assert!(matches!(
+            app.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryFailed {
+                error: crate::rename_key_migration::JournalLoadError::Read(_),
+                ..
+            }
+        ));
+        assert!(journal.is_dir());
+    }
+
+    #[test]
     fn explicit_retry_merges_old_jobs_and_deferred_delete_before_save_ack() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -23891,7 +24507,7 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(std::fs::read(&journal).unwrap(), b"bad");
         crate::rename_key_migration::journal_save(&data_dir, std::slice::from_ref(&old)).unwrap();
 
-        assert!(!app.admit_rename_migration_source_change(&ctx));
+        app.retry_rename_migration_recovery(&ctx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while !app.ensure_rename_migration_journal_loaded() && std::time::Instant::now() < deadline
         {
@@ -23925,7 +24541,7 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.ensure_rename_migration_journal_loaded());
         std::fs::write(&journal, b"[]").unwrap();
 
-        assert!(!app.admit_rename_migration_source_change(&ctx));
+        app.retry_rename_migration_recovery(&ctx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while matches!(
             app.rename_migration_journal_admission,
@@ -24006,6 +24622,29 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.rename_pending.is_none());
         assert_eq!(app.rename_migration_queue.len(), 1);
         assert!(!app.rename_migration_queue[0].mappings[0].tree);
+    }
+
+    #[test]
+    fn grid_rename_uses_item_kind_when_the_physical_path_is_missing() {
+        let mut app = setup_app();
+        let missing_image = app.tmp.path().join("missing.jpg");
+        let missing_folder = app.tmp.path().join("missing-folder");
+        assert!(!missing_image.exists());
+        assert!(!missing_folder.exists());
+
+        app.items = vec![GridItem::Image(missing_image.clone())];
+        app.selected = Some(0);
+        app.request_grid_rename_dialog();
+        assert_eq!(app.rename_target.as_ref(), Some(&missing_image));
+        assert!(app.rename_target_is_file);
+
+        app.show_rename_dialog = false;
+        app.rename_target = None;
+        app.rename_target_is_file = false;
+        app.items = vec![GridItem::Folder(missing_folder.clone())];
+        app.request_grid_rename_dialog();
+        assert_eq!(app.rename_target.as_ref(), Some(&missing_folder));
+        assert!(!app.rename_target_is_file);
     }
 
     #[test]
@@ -72787,6 +73426,57 @@ fn setup_fullscreen_fixed_key_test() -> (phase_c_support::AppTestEnv, usize, egu
     let ctx = egui::Context::default();
     crate::ime_focus::install_ime_input_policy(&ctx);
     (app, idx, ctx)
+}
+
+#[test]
+fn configured_fs_collection_key_reaches_current_image_handler_once() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsAddToCollectionTarget = F13\n");
+    ctx.begin_pass(viewport_raw_input(
+        egui::ViewportId::ROOT,
+        vec![fullscreen_fixed_key_event(egui::Key::F13)],
+    ));
+    let _ = app.handle_fs_key_input(&ctx, fs_idx, false);
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|(text, _, _)| text.contains("追加先"))
+    );
+    app.fs_feedback_toast = None;
+    let _ = app.handle_fs_key_input(&ctx, fs_idx, false);
+    assert!(
+        app.fs_feedback_toast.is_none(),
+        "same FS press must not be reused"
+    );
+    let _ = ctx.end_pass();
+}
+
+#[test]
+fn configured_media_collection_key_reaches_egui_video_and_music_handlers() {
+    let _input_guard = crate::key_input::lock_test_input();
+    for item in [
+        GridItem::Video(PathBuf::from("C:/clips/one.mp4")),
+        GridItem::Audio(PathBuf::from("C:/clips/two.mp3")),
+    ] {
+        let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+        let music_view = matches!(item, GridItem::Audio(_));
+        app.items[fs_idx] = item;
+        app.keymap =
+            crate::keymap::Keymap::from_ini_str("[FsVideo]\nVideoAddToCollectionTarget = F13\n");
+        ctx.begin_pass(viewport_raw_input(
+            egui::ViewportId::ROOT,
+            vec![fullscreen_fixed_key_event(egui::Key::F13)],
+        ));
+        assert_eq!(app.fs_music_view_active(fs_idx), music_view);
+        let _ = app.handle_fs_key_input(&ctx, fs_idx, false);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| text.contains("追加先"))
+        );
+        let _ = ctx.end_pass();
+    }
 }
 
 #[track_caller]

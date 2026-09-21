@@ -1454,6 +1454,15 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-20 §23.9 Collection追加ショートカット（親Codex／独立Sol構造合意）**
+
+Grid / 静止画FS / 動画・音声のキー入力から、現在mount済みviewer bundleの選択または表示中の
+実項目パスと追加先Collection IDを押下時に捕捉し、既存の非同期`ToolbarAddSnapshot`へ渡す。
+detachedとmainで同じApp入力関数を使用し、別bundleのitems / selection / scroll / workerを
+読み替えたり変更したりしない。viewport、host identity、focus、geometry、window lifecycle、
+detached専用predicate / bool / 時間guardは追加しない。これは既存context ownerへ入力入口を
+接続する機能で、§2が禁じるdetached症状パッチには該当しない。
+
 **2026-09-16 collection root再生navigationの表示binding再利用（親Codex／独立Sol構造合意）**
 
 linked別窓のnext / prev / EOFが同一collection rootを解決するたびにGridを再installし、main一覧の

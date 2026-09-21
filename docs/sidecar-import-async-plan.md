@@ -415,6 +415,23 @@ revalidation の `SourceChanged` は stale completion を install せず一度�
 `Current` / disabled placeholder / cache refresh のいずれでも置換しない。新snapshotはcacheへinstallせず、
 原本保護中の未保存変更を維持した旨をwarningとして残す。clean ownerだけを新snapshotへ置換できる。
 
+変更なし再訪では、前回の clean・semantic-valid な disk parse を App-global の bounded proof cache で
+再利用できる。ただし省略できるのは JSON decode と決定的な `prepare` だけであり、strict writer fence、
+pending/failed writer の優先、全 bytes SHA-256、要求 family の marker 再読、最後の source revalidation は
+毎回 worker で行う。marker の正規化 folder key と writable owner の identity を混同せず、proof hit は
+要求 raw `PathBuf`、data directory、family の完全一致を必要とする。大文字小文字や別表記の alias は strict
+probe へ戻し、返す `SidecarFile` は要求 raw path を所有する。worker 判定の hit/miss と App の exact request
+採用・proof publish は別に記録し、遅着 hit を採用済みとして扱わない。cache は正規化 folder slot の候補を
+渡すだけで、exact mismatch を LRU hit として昇格させない。`nav/sli_sidecar_reuse_check` は理由と
+probe/load/prepare 時間、`nav/sli_sidecar_reuse_apply` は request 採用と publish の成否を持つ。proof の
+admission、失効、退役、固定予算の正本は
+[sidecar-confirmation-reuse-plan.md](sidecar-confirmation-reuse-plan.md) とする。
+worker revalidation は pending／failed writer を最初に判定し、長さまたは mtime の不一致だけを
+full hash 前の miss にする。metadata 一致時は全 bytes hash と metadata 前後の再検証を省略しない。
+warm hit が late cancel 等で App に採用されなかった場合は既存 proof を LRU 昇格なしで保持し、
+候補 Arc だけを worker 退役する。cold 未採用候補は publish せず、dirty／warning／failed は既存 proof も
+失効する。
+
 import worker の cancel/disconnect/prepare error、preview clear の enqueue/ACK/DB error、target 消失後の
 non-Current terminal では DB import を再試行しない。typed `CacheRefreshing` worker が strict
 `load_for_import`、全content validation、source revalidation を一度行い、stable Loaded/Missing を

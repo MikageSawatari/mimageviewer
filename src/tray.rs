@@ -329,6 +329,11 @@ impl TrayController {
         };
         (ctrl, cmd_rx, event_tx)
     }
+
+    pub(crate) fn controller_for_test() -> Self {
+        let (controller, _commands, _events) = Self::new_for_test();
+        controller
+    }
 }
 
 /// 埋め込みアイコン (`assets/icon.png`) を RGBA ピクセル列にデコードして返す。

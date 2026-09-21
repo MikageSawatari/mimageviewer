@@ -510,6 +510,7 @@ $Perf = "$env:APPDATA\mimageviewer\logs\perf_events.jsonl"
 python scripts\analyze_perf.py $Perf startup   # 起動時間ブレークダウン
 python scripts\analyze_perf.py $Perf nav       # Ctrl+↑↓ 区間別統計
 python scripts\analyze_perf.py $Perf pre-grid  # グリッド直前のバー/ペイン/scroll 内訳
+python scripts\analyze_perf.py $Perf collection # collection read lease の相関・時間分布
 python scripts\analyze_perf.py $Perf hitches --ms 100  # 100ms 超フレームギャップ
 python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベント列
 ```

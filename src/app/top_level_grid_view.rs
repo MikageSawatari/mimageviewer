@@ -494,12 +494,12 @@ impl Eq for CollectionGridSourceOpenOwner {}
 pub(crate) enum CollectionGridLoadState {
     RequestNeeded {
         installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
-        /// Busy/Starting admission is retried only after this deadline.
-        not_before: Option<std::time::Instant>,
+        lease: crate::collection_store::CollectionReadLease,
     },
     Snapshot {
         stamp: CollectionGridRequestStamp,
         minimum_revision: u64,
+        lease: crate::collection_store::CollectionReadLease,
         /// Perf-only enqueue time; no effect on request ownership or scheduling.
         queued_at: Option<std::time::Instant>,
         installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
@@ -513,6 +513,7 @@ pub(crate) enum CollectionGridLoadState {
     Preparing {
         stamp: CollectionGridRequestStamp,
         exact_revision: u64,
+        lease: crate::collection_store::CollectionReadLease,
         installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         receiver: std::sync::mpsc::Receiver<
@@ -530,7 +531,7 @@ pub(crate) enum CollectionGridLoadState {
 
 pub(crate) struct CollectionGridPreparedInstall {
     pub(crate) prepared: crate::collection_store::CollectionPreparedSnapshot,
-    pub(crate) thumbnail_sources: CollectionGridPreparedThumbnailSources,
+    pub(crate) thumbnail_sources: CollectionGridPreparedThumbnailDelivery,
     pub(crate) auto_aspect_lookup: Option<crate::auto_aspect_cache::CollectionAutoAspectLookup>,
     pub(crate) reuse_key: CollectionGridPrepareReuseKey,
 }
@@ -548,6 +549,12 @@ pub(crate) struct CollectionGridThumbnailSourceIdentity(pub(crate) [u8; 32]);
 pub(crate) struct CollectionGridPreparedThumbnailSources {
     pub(crate) identity: CollectionGridThumbnailSourceIdentity,
     pub(crate) payload: CollectionGridThumbnailSources,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridPreparedThumbnailDelivery {
+    pub(crate) presentation: CollectionGridPresentationSources,
+    pub(crate) live: CollectionGridThumbnailSources,
 }
 
 pub(crate) const MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -568,6 +575,7 @@ pub(crate) struct CollectionGridPrepareReuseKey {
     pub(crate) skip_image_if_video_exists: bool,
     pub(crate) video_thumb_use_sidecar_image: bool,
     pub(crate) pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+    pub(crate) thumbnail_source_epoch: u64,
 }
 
 impl CollectionGridPrepareReuseKey {
@@ -576,6 +584,7 @@ impl CollectionGridPrepareReuseKey {
         revision: u64,
         settings: &crate::settings::Settings,
         pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+        thumbnail_source_epoch: u64,
     ) -> Self {
         Self {
             order: crate::collection_store::CollectionPrepareReuseKey::new(
@@ -589,6 +598,7 @@ impl CollectionGridPrepareReuseKey {
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
             pin_stamp,
+            thumbnail_source_epoch,
         }
     }
 }
@@ -599,11 +609,68 @@ pub(crate) enum CollectionGridPresentationSources {
     Oversized(CollectionGridThumbnailSourceIdentity),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct CollectionGridNavigationSources {
     pub(crate) reuse_key: CollectionGridPrepareReuseKey,
-    pub(crate) sources: std::sync::Arc<CollectionGridPreparedThumbnailSources>,
+    pub(crate) presentation: CollectionGridPresentationSources,
+    live: std::sync::Arc<std::sync::Mutex<Option<CollectionGridThumbnailSources>>>,
 }
+
+impl CollectionGridNavigationSources {
+    pub(crate) fn new(
+        reuse_key: CollectionGridPrepareReuseKey,
+        presentation: CollectionGridPresentationSources,
+        live: Option<CollectionGridThumbnailSources>,
+    ) -> Self {
+        Self {
+            reuse_key,
+            presentation,
+            live: std::sync::Arc::new(std::sync::Mutex::new(live)),
+        }
+    }
+
+    pub(crate) fn identity(&self) -> CollectionGridThumbnailSourceIdentity {
+        self.presentation.identity()
+    }
+
+    pub(crate) fn retained(
+        &self,
+    ) -> Option<&std::sync::Arc<CollectionGridPreparedThumbnailSources>> {
+        self.presentation.retained()
+    }
+
+    pub(crate) fn needs_live_delivery(&self) -> bool {
+        self.live.lock().is_ok_and(|live| live.is_none())
+    }
+
+    pub(crate) fn publish_live(&self, sources: CollectionGridThumbnailSources) {
+        if let Ok(mut live) = self.live.lock()
+            && live.is_none()
+        {
+            *live = Some(sources);
+        }
+    }
+
+    pub(crate) fn take_delivery(&self) -> CollectionGridPreparedThumbnailDelivery {
+        CollectionGridPreparedThumbnailDelivery {
+            presentation: self.presentation.clone(),
+            live: self
+                .live
+                .lock()
+                .ok()
+                .and_then(|mut live| live.take())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl PartialEq for CollectionGridNavigationSources {
+    fn eq(&self, other: &Self) -> bool {
+        self.reuse_key == other.reuse_key && self.presentation == other.presentation
+    }
+}
+
+impl Eq for CollectionGridNavigationSources {}
 
 impl CollectionGridPresentationSources {
     pub(crate) fn identity(&self) -> CollectionGridThumbnailSourceIdentity {
@@ -640,6 +707,16 @@ impl Default for CollectionGridPreparedThumbnailSources {
     }
 }
 
+impl Default for CollectionGridPreparedThumbnailDelivery {
+    fn default() -> Self {
+        let retained = std::sync::Arc::new(CollectionGridPreparedThumbnailSources::default());
+        Self {
+            presentation: CollectionGridPresentationSources::Retained(retained),
+            live: CollectionGridThumbnailSources::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CollectionGridInstalledPresentation {
     pub(crate) prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
@@ -648,20 +725,6 @@ pub(crate) struct CollectionGridInstalledPresentation {
 }
 
 impl CollectionGridInstalledPresentation {
-    pub(crate) fn from_prepared_sources(
-        prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
-        sources: std::sync::Arc<CollectionGridPreparedThumbnailSources>,
-        reuse_key: CollectionGridPrepareReuseKey,
-    ) -> Self {
-        let retained = if collection_pin_blob_sizes_fit_retention_budget(
-            sources.payload.video_pin_blobs.values().map(Vec::len),
-        ) {
-            CollectionGridPresentationSources::Retained(sources)
-        } else {
-            CollectionGridPresentationSources::Oversized(sources.identity)
-        };
-        Self::new(prepared, retained, reuse_key)
-    }
     pub(crate) fn new(
         prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
         sources: CollectionGridPresentationSources,
@@ -689,6 +752,7 @@ impl CollectionGridInstalledPresentation {
                 prepared.collection_revision,
                 &settings,
                 None,
+                0,
             ),
         ))
     }
@@ -744,7 +808,9 @@ impl CollectionGridSession {
             observed_catalog_revision: 0,
             load: CollectionGridLoadState::RequestNeeded {
                 installed: None,
-                not_before: None,
+                lease: crate::collection_store::CollectionReadLease::dormant(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                ),
             },
             watch: None,
             restore_anchor: None,
@@ -758,30 +824,96 @@ impl CollectionGridSession {
             &mut self.load,
             CollectionGridLoadState::RequestNeeded {
                 installed: None,
-                not_before: None,
+                lease: crate::collection_store::CollectionReadLease::dormant(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                ),
             },
         );
         log_collection_grid_pending_cancel(&previous);
-        let installed = match previous {
-            CollectionGridLoadState::RequestNeeded { installed, .. }
-            | CollectionGridLoadState::Failed { installed, .. } => installed,
-            CollectionGridLoadState::Snapshot { installed, .. } => installed,
+        let (installed, lease) = match previous {
+            CollectionGridLoadState::RequestNeeded {
+                installed, lease, ..
+            }
+            | CollectionGridLoadState::Snapshot {
+                installed, lease, ..
+            } => (installed, lease),
             CollectionGridLoadState::Preparing {
-                installed, cancel, ..
+                installed,
+                lease,
+                cancel,
+                ..
             } => {
                 cancel.store(true, std::sync::atomic::Ordering::Release);
-                installed
+                (installed, lease)
             }
             CollectionGridLoadState::Ready(presentation)
+            | CollectionGridLoadState::Empty(presentation) => (
+                Some(std::sync::Arc::clone(&presentation.prepared)),
+                crate::collection_store::CollectionReadLease::new(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                    std::time::Instant::now(),
+                    "revision",
+                ),
+            ),
+            CollectionGridLoadState::Failed { installed, .. } => (
+                installed,
+                crate::collection_store::CollectionReadLease::new(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                    std::time::Instant::now(),
+                    "retry",
+                ),
+            ),
+            CollectionGridLoadState::Deleted => (
+                None,
+                crate::collection_store::CollectionReadLease::new(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                    std::time::Instant::now(),
+                    "retry",
+                ),
+            ),
+        };
+        self.load = CollectionGridLoadState::RequestNeeded { installed, lease };
+    }
+
+    /// Invalidates only work that captured the old thumbnail-source epoch.  A
+    /// pending actor snapshot has not captured that epoch yet and keeps its
+    /// receiver/lease; terminal read states remain terminal until a real demand.
+    pub(crate) fn invalidate_thumbnail_presentation(
+        &mut self,
+    ) -> Option<std::sync::Arc<CollectionGridInstalledPresentation>> {
+        if let Some(cancel) = self.video_worker_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+        let previous = std::mem::replace(&mut self.load, CollectionGridLoadState::Deleted);
+        match previous {
+            CollectionGridLoadState::Ready(presentation)
             | CollectionGridLoadState::Empty(presentation) => {
-                Some(std::sync::Arc::clone(&presentation.prepared))
+                let installed = Some(std::sync::Arc::clone(&presentation.prepared));
+                self.load = CollectionGridLoadState::RequestNeeded {
+                    installed,
+                    lease: crate::collection_store::CollectionReadLease::new(
+                        crate::collection_store::CollectionReadScope::app_global("grid"),
+                        std::time::Instant::now(),
+                        "metadata_import",
+                    ),
+                };
+                Some(presentation)
             }
-            CollectionGridLoadState::Deleted => None,
-        };
-        self.load = CollectionGridLoadState::RequestNeeded {
-            installed,
-            not_before: None,
-        };
+            CollectionGridLoadState::Preparing {
+                installed,
+                lease,
+                cancel,
+                ..
+            } => {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                self.load = CollectionGridLoadState::RequestNeeded { installed, lease };
+                None
+            }
+            other => {
+                self.load = other;
+                None
+            }
+        }
     }
 
     pub(crate) fn prepared(
@@ -880,7 +1012,11 @@ impl Clone for CollectionGridSession {
             observed_catalog_revision: self.observed_catalog_revision,
             load: CollectionGridLoadState::RequestNeeded {
                 installed: self.load.installed().cloned(),
-                not_before: None,
+                lease: crate::collection_store::CollectionReadLease::new(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                    std::time::Instant::now(),
+                    "context_clone",
+                ),
             },
             watch: None,
             restore_anchor: self.restore_anchor.clone(),
@@ -1240,7 +1376,7 @@ impl TopLevelGridView {
     pub(in crate::app) fn collection_navigation_poll_delay(&self) -> Option<std::time::Duration> {
         self.collection_navigation_pending
             .as_ref()
-            .map(|pending| pending.poll_delay())
+            .and_then(|pending| pending.poll_delay())
     }
 
     pub(in crate::app) fn take_collection_navigation_retired_fs_lock(&mut self) -> bool {
@@ -1534,6 +1670,11 @@ mod tests {
         first.collection_session_mut().unwrap().load = CollectionGridLoadState::Preparing {
             stamp: stamp(first_id),
             exact_revision: 1,
+            lease: crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("grid-test"),
+                std::time::Instant::now(),
+                "prepare",
+            ),
             installed: None,
             cancel: Arc::clone(&first_cancel),
             receiver: first_rx,
@@ -1549,6 +1690,11 @@ mod tests {
         sibling.collection_session_mut().unwrap().load = CollectionGridLoadState::Preparing {
             stamp: stamp(sibling_id),
             exact_revision: 1,
+            lease: crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("grid-test"),
+                std::time::Instant::now(),
+                "prepare",
+            ),
             installed: None,
             cancel: Arc::clone(&sibling_cancel),
             receiver: sibling_rx,
@@ -1557,6 +1703,108 @@ mod tests {
         first.replace_surface(TopLevelGridSurface::Folder);
         assert!(first_cancel.load(std::sync::atomic::Ordering::Acquire));
         assert!(!sibling_cancel.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn thumbnail_epoch_invalidation_preserves_unstarted_reads_and_terminal_states() {
+        let collection_id = crate::collection_store::CollectionId::new();
+        let identity = CollectionGridIdentity { collection_id };
+        let mut session = CollectionGridSession::new(identity);
+        let request_lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("grid-test"),
+            std::time::Instant::now(),
+            "snapshot",
+        );
+        let request_id = request_lease.request_id();
+        session.load = CollectionGridLoadState::RequestNeeded {
+            installed: None,
+            lease: request_lease,
+        };
+        assert!(session.invalidate_thumbnail_presentation().is_none());
+        assert!(matches!(
+            &session.load,
+            CollectionGridLoadState::RequestNeeded { lease, .. }
+                if lease.request_id() == request_id
+        ));
+
+        let snapshot_lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("grid-test"),
+            std::time::Instant::now(),
+            "snapshot",
+        );
+        let snapshot_request_id = snapshot_lease.request_id();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        session.load = CollectionGridLoadState::Snapshot {
+            stamp: CollectionGridRequestStamp {
+                context_id: super::super::viewer_context_registry::ViewerContextId::for_test(1),
+                surface_generation: 1,
+                collection_id,
+            },
+            minimum_revision: 1,
+            lease: snapshot_lease,
+            queued_at: None,
+            installed: None,
+            receiver,
+        };
+        assert!(session.invalidate_thumbnail_presentation().is_none());
+        sender
+            .send(Err(crate::collection_store::CollectionStoreError::Busy))
+            .unwrap();
+        assert!(matches!(
+            &session.load,
+            CollectionGridLoadState::Snapshot {
+                lease, receiver, ..
+            } if lease.request_id() == snapshot_request_id
+                && matches!(receiver.try_recv(), Ok(Err(crate::collection_store::CollectionStoreError::Busy)))
+        ));
+
+        session.load = CollectionGridLoadState::Failed {
+            message: "terminal".into(),
+            installed: None,
+        };
+        assert!(session.invalidate_thumbnail_presentation().is_none());
+        assert!(matches!(
+            &session.load,
+            CollectionGridLoadState::Failed { message, .. } if message == "terminal"
+        ));
+        session.load = CollectionGridLoadState::Deleted;
+        assert!(session.invalidate_thumbnail_presentation().is_none());
+        assert!(matches!(session.load, CollectionGridLoadState::Deleted));
+    }
+
+    #[test]
+    fn thumbnail_epoch_invalidation_cancels_only_an_already_preparing_payload() {
+        let collection_id = crate::collection_store::CollectionId::new();
+        let mut session = CollectionGridSession::new(CollectionGridIdentity { collection_id });
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("grid-test"),
+            std::time::Instant::now(),
+            "prepare",
+        );
+        let request_id = lease.request_id();
+        session.load = CollectionGridLoadState::Preparing {
+            stamp: CollectionGridRequestStamp {
+                context_id: super::super::viewer_context_registry::ViewerContextId::for_test(1),
+                surface_generation: 1,
+                collection_id,
+            },
+            exact_revision: 1,
+            lease,
+            installed: None,
+            cancel: Arc::clone(&cancel),
+            receiver,
+        };
+
+        assert!(session.invalidate_thumbnail_presentation().is_none());
+
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(matches!(
+            &session.load,
+            CollectionGridLoadState::RequestNeeded { lease, .. }
+                if lease.request_id() == request_id
+        ));
     }
 
     #[test]

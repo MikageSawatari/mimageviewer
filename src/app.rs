@@ -14,7 +14,8 @@ use crate::final_composite::{
     final_composite_colorize_applies, resolve_effective_params,
 };
 use crate::keymap::{
-    CommandScope, EXTERNAL_TOOL_ACTIONS, KeyAction, LOCATION_NAVIGATION_ACTIONS, PINNED_TAG_ACTIONS,
+    CommandScope, EXTERNAL_TOOL_ACTIONS, KeyAction, LOCATION_NAVIGATION_ACTIONS,
+    PINNED_TAG_ACTIONS, SAVED_GROUP_ACTIONS,
 };
 
 /// ZIP/対応アーカイブ、および本扱いの画像のみフォルダを読むときのページ順。
@@ -174,6 +175,7 @@ pub(crate) mod normalize;
 mod prefetch_policy;
 mod recursive_snapshot_scan;
 mod runtime_ops;
+mod saved_group_actions;
 mod sidecar_restore;
 pub(crate) use sidecar_restore::SidecarRestorePresentation;
 pub(crate) mod collection_grid;
@@ -10223,6 +10225,10 @@ pub(crate) enum GridSortLockReason {
     PageOrderFixed,
     /// 詳細一覧の列ヘッダが並びを所有している。
     DetailsHeaderSort,
+    /// 手動順のコレクションでは列ヘッダが順序を上書きできない。
+    CollectionManualOrder,
+    /// シャッフル中のコレクションでは列ヘッダが順序を上書きできない。
+    CollectionShuffleOrder,
     CollectionLoading,
     CollectionViewerDeferred,
     CollectionStale,
@@ -10243,6 +10249,8 @@ impl GridSortLockReason {
         match self {
             Self::PageOrderFixed => "固定",
             Self::DetailsHeaderSort => "列ヘッダ",
+            Self::CollectionManualOrder => "手動順",
+            Self::CollectionShuffleOrder => "シャッフル",
             Self::CollectionLoading => "更新中",
             Self::CollectionViewerDeferred => "反映待ち",
             Self::CollectionStale => "更新待ち",
@@ -10260,6 +10268,12 @@ impl GridSortLockReason {
             }
             Self::DetailsHeaderSort => {
                 "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。"
+            }
+            Self::CollectionManualOrder => {
+                "手動順のコレクションでは列ヘッダの並べ替えを使えません。並べ替え画面で順序を変更できます。"
+            }
+            Self::CollectionShuffleOrder => {
+                "シャッフル中のコレクションでは列ヘッダの並べ替えを使えません。"
             }
             Self::CollectionLoading => "コレクション一覧の更新が完了すると並び順を選べます。",
             Self::CollectionViewerDeferred => {
@@ -11440,6 +11454,12 @@ pub(crate) enum RenameMigrationInFlight {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenameMigrationRecoveryPrompt {
+    Shown,
+    Dismissed,
+}
+
 #[derive(Debug)]
 pub(crate) enum RenameMigrationJournalAdmission {
     /// The one-time recovery read has not run yet.
@@ -11456,7 +11476,16 @@ pub(crate) enum RenameMigrationJournalAdmission {
     },
     /// Existing bytes could not be read or parsed. No snapshot may replace them.
     RecoveryFailed {
-        message: String,
+        error: crate::rename_key_migration::JournalLoadError,
+        prompt: RenameMigrationRecoveryPrompt,
+        deferred_removed: Vec<std::path::PathBuf>,
+    },
+    /// A worker owns the exact parse-failure bytes and the exclusive source handle. Closing the
+    /// prompt requests cancellation but keeps this gate until the worker reports a terminal result.
+    RecoveryQuarantining {
+        task: crate::rename_key_migration::JournalQuarantineTask,
+        failure: crate::rename_key_migration::JournalLoadError,
+        prompt: RenameMigrationRecoveryPrompt,
         deferred_removed: Vec<std::path::PathBuf>,
     },
     /// Boot-recovered entries are already represented by the journal on disk.
@@ -13007,6 +13036,8 @@ pub struct App {
     pub(crate) book_manager_rename_inputs: std::collections::BTreeMap<String, String>,
     pub(crate) book_manager_delete_confirm: Option<String>,
     pub(crate) book_list_cache: Option<Vec<crate::books::BookInfo>>,
+    saved_group_open_sequence: u64,
+    saved_group_open: Option<saved_group_actions::SavedGroupOpenTransition>,
     /// タグセクションがプルダウン表示のときに、コンボで選択中のタグ名 (非永続)。
     /// `None` のときは先頭のピン留めタグを使う。v2.0.0。
     pub(crate) toolbar_tag_dropdown_pick: Option<String>,
@@ -13455,6 +13486,10 @@ pub struct App {
     /// 動画フレーム ピン留め DB (= ユーザーが固定したフレーム = 動画グリッドサムネ
     /// 最優先)。Phase 7 で左パネル上部の 📌 ボタンから set_pin / remove する。
     pub(crate) video_pin_db: Option<crate::video_pins::VideoPinDb>,
+    /// Metadata import uses an independent ATTACH transaction, outside `video_pin_db`'s
+    /// mutation-stamp owner.  This app-global epoch binds Collection thumbnail preparation to
+    /// those committed writes across every viewer context.
+    pub(crate) collection_thumbnail_source_epoch: u64,
     /// ユーザーが任意位置に付けた付箋。フルスクリーン左パネルにジャンプサムネとして
     /// 表示される。B キー / 🔖 ボタンで追加。
     pub(crate) video_bookmark_db: Option<crate::video_bookmarks::VideoBookmarkDb>,
@@ -14153,6 +14188,7 @@ pub struct App {
     /// 初回 sidecar 復旧の全ライフサイクルと load continuation を所有する。
     /// `Some` 自体が全入力を止める共通 modal の根拠になる。
     pub(crate) sidecar_restore: Option<sidecar_restore::SidecarRestoreState>,
+    pub(crate) sidecar_probe_reuse: sidecar_restore::SidecarProbeReuseCache,
     /// サブ展開 worker の進行中状態。
     pub(crate) subfolder_expansion_pending: Option<subfolder_expansion::SubfolderExpansionPending>,
     /// サブ展開 worker 完了後、ソート・一覧構築・メタ DB 読み込みを行う非同期準備。
@@ -16504,6 +16540,8 @@ impl App {
             book_manager_rename_inputs: std::collections::BTreeMap::new(),
             book_manager_delete_confirm: None,
             book_list_cache: None,
+            saved_group_open_sequence: 0,
+            saved_group_open: None,
             toolbar_tag_dropdown_pick: None,
             toolbar_content_rect: None,
             toolbar_section_anchors: Vec::new(),
@@ -16669,6 +16707,7 @@ impl App {
             normalize_ui_states: std::collections::HashMap::new(),
             normalize_auto_scan_suppressed: std::collections::HashSet::new(),
             video_pin_db,
+            collection_thumbnail_source_epoch: 0,
             video_bookmark_db,
             book_bookmark_service,
             video_chapter_thumb_db,
@@ -16918,6 +16957,7 @@ impl App {
             show_subfolder_expansion_dialog: false,
             modal_block_reason_logged: None,
             sidecar_restore: None,
+            sidecar_probe_reuse: Default::default(),
             subfolder_expansion_pending: None,
             subfolder_expansion_install_pending: None,
             subfolder_expansion_confirm_pending: None,
@@ -17849,28 +17889,26 @@ impl App {
     /// Image / Video / ZipImage / PdfPage / Folder / ZipFile / PdfFile は代表サムネ経由で
     /// `source_dims` がいずれ来る可能性があるので分母に入れる。
     pub(crate) fn auto_aspect_eligible_total(&self) -> usize {
-        if self
-            .top_level_grid_view
-            .collection_session()
-            .is_some_and(|session| {
-                matches!(
-                    session.position,
-                    top_level_grid_view::CollectionGridPosition::Root
-                )
-            })
+        if let Some(session) = self.top_level_grid_view.collection_session()
+            && matches!(
+                session.position,
+                top_level_grid_view::CollectionGridPosition::Root
+            )
         {
-            self.items
-                .iter()
-                .filter(|item| {
-                    !matches!(
-                        item,
-                        GridItem::CollectionPlaceholder { .. } | GridItem::Audio(_)
-                    )
-                })
-                .count()
-        } else {
-            self.items.len()
+            let Some(presentation) = session.installed_presentation() else {
+                return 0;
+            };
+            let prepared = &presentation.prepared;
+            if prepared.collection_id != session.identity.collection_id
+                || prepared.collection_revision != session.accepted_revision
+                || session.installed_items_generation != Some(self.items_generation)
+                || prepared.entries.len() != self.items.len()
+            {
+                return 0;
+            }
+            return prepared.auto_aspect_eligible_total;
         }
+        self.items.len()
     }
 
     /// `auto_aspect` を新フォルダ用にリセットし、catalog の既存比率を一括投入する。
@@ -17887,7 +17925,7 @@ impl App {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
     ) {
-        self.reset_and_seed_auto_aspect_with_collection_seed(cache_map, None);
+        self.reset_and_seed_auto_aspect_with_collection_seed(cache_map, None, None);
     }
 
     pub(crate) fn reset_and_seed_auto_aspect_with_collection_seed(
@@ -17896,6 +17934,7 @@ impl App {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
         collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+        prepared_eligible_total: Option<usize>,
     ) {
         let generation = self.items_generation;
         self.auto_aspect.reset_for_new_generation(generation);
@@ -17912,7 +17951,8 @@ impl App {
         self.restore_cached_auto_aspect(collection_seed);
 
         // 集計対象母数は items ベース (動画含む)。
-        let eligible_total: usize = self.auto_aspect_eligible_total();
+        let eligible_total =
+            prepared_eligible_total.unwrap_or_else(|| self.auto_aspect_eligible_total());
         if eligible_total == 0 {
             return;
         }
@@ -18708,6 +18748,7 @@ impl App {
             // (2026-09-02)。
             self.external_tool_materialize_progress_visible() => "external_tool_materialize_progress",
             self.show_settings_restore => "settings_restore",
+            self.rename_migration_recovery_dialog_visible() => "rename_migration_recovery",
             self.collection_operation_modal_visible() => "collection_operation_modal",
             self.collection_manager_open() => "collection_manager",
             self.collection_reorder_open() => "collection_reorder",
@@ -18754,6 +18795,7 @@ impl App {
             self.subfolder_expansion_confirm_pending.is_some()
                 => "subfolder_expansion_confirm_pending",
             self.staged_smart_root_modal_visible() => "smart_folder_transition",
+            self.saved_group_open_modal_visible() => "saved_group_open",
             self.smart_folder_pending.is_some() => "smart_folder_pending",
             self.smart_folder_prepare_pending.is_some() => "smart_folder_prepare_pending",
             self.smart_folder_confirm_pending.is_some() => "smart_folder_confirm_pending",
@@ -19426,6 +19468,9 @@ impl App {
     /// では `effective_folder() == current_folder` なので挙動不変)。親が取れない
     /// (ドライブ root 等) ときは `None` を返し、呼び出し側が close にフォールバックする。
     pub(crate) fn resolve_return_to_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
+        if let Some(nav) = self.collection_grid_parent_nav() {
+            return Some(nav);
+        }
         if let Some(nav) = self.bookmark_view_back_nav() {
             return Some(nav);
         }
@@ -19477,6 +19522,17 @@ impl App {
         None
     }
 
+    fn apply_collection_input_nav(
+        &mut self,
+        restore: top_level_grid_view::CollectionGridRestore,
+        fullscreen_close_origin: bool,
+    ) {
+        if fullscreen_close_origin {
+            self.close_fullscreen();
+        }
+        self.open_collection_grid(restore.identity.collection_id, Some(restore));
+    }
+
     /// Early-return 経路で `pending_return_to_parent` 由来のナビを消化する。
     ///
     /// 通常は App::update 後段の input_nav 合流点で処理するが、Windows の
@@ -19525,9 +19581,14 @@ impl App {
                 true
             }
             crate::ui_main::AddressBarNav::Collection(restore) => {
-                self.open_collection_grid(restore.identity.collection_id, Some(restore));
+                self.apply_collection_input_nav(restore, true);
                 true
             }
+            crate::ui_main::AddressBarNav::CollectionOpen(id) => {
+                self.open_collection_grid_from_navigation(id);
+                true
+            }
+            crate::ui_main::AddressBarNav::SavedGroupReady(_) => false,
             crate::ui_main::AddressBarNav::HistoryBack
             | crate::ui_main::AddressBarNav::HistoryForward => false,
         }
@@ -20803,6 +20864,14 @@ impl App {
             "auto-refresh: folder content changed ({}), reloading",
             folder.display()
         ));
+        // A menu owns the visible item generation. Retire only the menu of this mounted context;
+        // an identical-content scan returned above and a sibling viewer keep their owners.
+        if self
+            .context_menu_idx
+            .is_some_and(|owner| self.grid_context_menu_owner_is_current(owner))
+        {
+            self.context_menu_idx = None;
+        }
         // 既に走らせた scan を pre_scan として渡し、UI スレッドで再 read_dir しない。
         self.load_folder_with_scan(folder, Some(scan));
         // 再ロード後に選択パスを探し、見つかればそこにカーソルを戻してスクロール依頼。
@@ -32189,16 +32258,14 @@ impl App {
     /// filesystem workers and retryable/unavailable stages remain in the durable journal for the
     /// next boot; only the short actor command is drained before actor shutdown.
     fn resolve_collection_migration_for_exit(&mut self) {
+        // Final exit cancels and collects the quarantine worker. If the handle rename already
+        // linearized, the terminal success is integrated before the final journal flush.
+        self.finish_rename_migration_quarantine_for_exit();
         // Startup recovery is lazy, but exit is also a journal writer. Merge the prior durable
         // snapshot before publishing the current one so an immediate close cannot erase it.
         if !self.ensure_rename_migration_journal_loaded() {
-            let warning = "名前変更の復旧記録を読み取れません。旧記録を保護したまま終了します。次回起動後に読み取れる状態へ戻してください";
-            crate::logger::log(format!("[RENAME-MIG] final recovery warning: {warning}"));
-            #[cfg(not(test))]
-            crate::native_name_dialog::show_warning(
-                self.main_hwnd,
-                "復旧記録を読み取れません",
-                warning,
+            crate::logger::log(
+                "[RENAME-MIG] final recovery remained blocked; original journal kept unchanged",
             );
             return;
         }
@@ -32248,20 +32315,53 @@ impl App {
                 Ok(entries) => self.adopt_rename_migration_recovery(entries, false),
                 Err(error) => {
                     crate::logger::log(format!("[RENAME-MIG] recovery read failed: {error}"));
+                    let prompt = Self::rename_migration_recovery_prompt_for(&error);
                     self.rename_migration_journal_admission =
                         RenameMigrationJournalAdmission::RecoveryFailed {
-                            message: error.to_string(),
+                            error,
+                            prompt,
                             deferred_removed: Vec::new(),
                         };
                 }
             }
         }
         self.poll_rename_migration_recovery_retry();
+        self.poll_rename_migration_quarantine();
         !matches!(
             self.rename_migration_journal_admission,
             RenameMigrationJournalAdmission::Unloaded
                 | RenameMigrationJournalAdmission::RecoveryRetrying { .. }
                 | RenameMigrationJournalAdmission::RecoveryFailed { .. }
+                | RenameMigrationJournalAdmission::RecoveryQuarantining { .. }
+        )
+    }
+
+    fn rename_migration_recovery_prompt_for(
+        error: &crate::rename_key_migration::JournalLoadError,
+    ) -> RenameMigrationRecoveryPrompt {
+        if error.parse_bytes().is_some() {
+            RenameMigrationRecoveryPrompt::Shown
+        } else {
+            RenameMigrationRecoveryPrompt::Dismissed
+        }
+    }
+
+    pub(crate) fn rename_migration_recovery_dialog_visible(&self) -> bool {
+        match &self.rename_migration_journal_admission {
+            RenameMigrationJournalAdmission::RecoveryFailed { error, prompt, .. } => {
+                error.parse_bytes().is_some() && *prompt == RenameMigrationRecoveryPrompt::Shown
+            }
+            // The modal remains present after close/Escape/cancel until the worker has
+            // reached a terminal result. This keeps pointer input blocked during the CAS race.
+            RenameMigrationJournalAdmission::RecoveryQuarantining { .. } => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn rename_migration_recovery_quarantine_running(&self) -> bool {
+        matches!(
+            self.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryQuarantining { .. }
         )
     }
 
@@ -32322,14 +32422,15 @@ impl App {
                     } => std::mem::take(deferred_removed),
                     _ => unreachable!("retry result has its owner"),
                 };
+                let prompt = Self::rename_migration_recovery_prompt_for(&error);
                 self.rename_migration_journal_admission =
                     RenameMigrationJournalAdmission::RecoveryFailed {
-                        message: error.to_string(),
+                        error,
+                        prompt,
                         deferred_removed,
                     };
                 self.show_feedback_toast(
-                    "復旧記録をまだ読み取れません。元の記録を保護し、変更は実行していません。次の操作で再確認できます"
-                        .into(),
+                    "復旧記録をまだ読み取れません。元の記録を保護し、変更は実行していません".into(),
                 );
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -32339,13 +32440,17 @@ impl App {
                     } => std::mem::take(deferred_removed),
                     _ => unreachable!("retry result has its owner"),
                 };
+                let error = crate::rename_key_migration::JournalLoadError::Read(
+                    std::io::Error::other("recovery reader worker disconnected"),
+                );
                 self.rename_migration_journal_admission =
                     RenameMigrationJournalAdmission::RecoveryFailed {
-                        message: "復旧記録の読み取り worker が終了しました".into(),
+                        error,
+                        prompt: RenameMigrationRecoveryPrompt::Dismissed,
                         deferred_removed,
                     };
                 self.show_feedback_toast(
-                    "復旧記録の再確認が中断されました。元の記録を保護し、変更は実行していません。次の操作で再確認できます"
+                    "復旧記録の再確認が中断されました。元の記録を保護し、変更は実行していません"
                         .into(),
                 );
             }
@@ -32353,49 +32458,258 @@ impl App {
         }
     }
 
+    pub(crate) fn retry_rename_migration_recovery(&mut self, ctx: &egui::Context) {
+        let state = std::mem::replace(
+            &mut self.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Unloaded,
+        );
+        let RenameMigrationJournalAdmission::RecoveryFailed {
+            error,
+            prompt,
+            deferred_removed,
+        } = state
+        else {
+            self.rename_migration_journal_admission = state;
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let data_dir = self.rename_migration_data_dir();
+        match std::thread::Builder::new()
+            .name("rename-migration-recovery".into())
+            .spawn(move || {
+                let _ = tx.send(crate::rename_key_migration::journal_load(&data_dir));
+            }) {
+            Ok(_) => {
+                self.rename_migration_journal_admission =
+                    RenameMigrationJournalAdmission::RecoveryRetrying {
+                        rx,
+                        deferred_removed,
+                    };
+                self.show_feedback_toast("復旧記録を再確認しています".into());
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(spawn_error) => {
+                crate::logger::log(format!(
+                    "[RENAME-MIG] recovery retry spawn failed: {spawn_error}"
+                ));
+                self.rename_migration_journal_admission =
+                    RenameMigrationJournalAdmission::RecoveryFailed {
+                        error,
+                        prompt,
+                        deferred_removed,
+                    };
+                self.show_feedback_toast("復旧記録の再確認を開始できませんでした".into());
+            }
+        }
+    }
+
+    pub(crate) fn quarantine_rename_migration_recovery(&mut self, ctx: &egui::Context) {
+        let state = std::mem::replace(
+            &mut self.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Unloaded,
+        );
+        let RenameMigrationJournalAdmission::RecoveryFailed {
+            error,
+            prompt,
+            deferred_removed,
+        } = state
+        else {
+            self.rename_migration_journal_admission = state;
+            return;
+        };
+        let Some(expected) = error.parse_bytes() else {
+            self.rename_migration_journal_admission =
+                RenameMigrationJournalAdmission::RecoveryFailed {
+                    error,
+                    prompt,
+                    deferred_removed,
+                };
+            return;
+        };
+        match crate::rename_key_migration::JournalQuarantineTask::spawn(
+            self.rename_migration_data_dir(),
+            expected,
+        ) {
+            Ok(task) => {
+                self.rename_migration_journal_admission =
+                    RenameMigrationJournalAdmission::RecoveryQuarantining {
+                        task,
+                        failure: error,
+                        prompt: RenameMigrationRecoveryPrompt::Shown,
+                        deferred_removed,
+                    };
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(spawn_error) => {
+                crate::logger::log(format!(
+                    "[RENAME-MIG] quarantine worker spawn failed: {spawn_error}"
+                ));
+                self.rename_migration_journal_admission =
+                    RenameMigrationJournalAdmission::RecoveryFailed {
+                        error,
+                        prompt,
+                        deferred_removed,
+                    };
+                self.show_feedback_toast("壊れた復旧記録の退避を開始できませんでした".into());
+            }
+        }
+    }
+
+    pub(crate) fn dismiss_rename_migration_recovery(&mut self) {
+        match &mut self.rename_migration_journal_admission {
+            RenameMigrationJournalAdmission::RecoveryFailed { prompt, .. } => {
+                *prompt = RenameMigrationRecoveryPrompt::Dismissed;
+            }
+            RenameMigrationJournalAdmission::RecoveryQuarantining { task, prompt, .. } => {
+                *prompt = RenameMigrationRecoveryPrompt::Dismissed;
+                task.cancel();
+            }
+            _ => {}
+        }
+    }
+
+    fn poll_rename_migration_quarantine(&mut self) {
+        let terminal = match &mut self.rename_migration_journal_admission {
+            RenameMigrationJournalAdmission::RecoveryQuarantining { task, .. } => {
+                match task.try_recv() {
+                    Ok(outcome) => Some(outcome),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(
+                        crate::rename_key_migration::JournalQuarantineOutcome::Failed(
+                            "quarantine worker disconnected".into(),
+                        ),
+                    ),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                }
+            }
+            _ => return,
+        };
+        let Some(outcome) = terminal else { return };
+        let state = std::mem::replace(
+            &mut self.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Unloaded,
+        );
+        let RenameMigrationJournalAdmission::RecoveryQuarantining {
+            mut task,
+            failure,
+            prompt,
+            deferred_removed,
+        } = state
+        else {
+            unreachable!("quarantine terminal has its typed owner");
+        };
+        task.join_terminal();
+        self.complete_rename_migration_quarantine(failure, prompt, deferred_removed, outcome);
+    }
+
+    fn complete_rename_migration_quarantine(
+        &mut self,
+        failure: crate::rename_key_migration::JournalLoadError,
+        prompt: RenameMigrationRecoveryPrompt,
+        deferred_removed: Vec<std::path::PathBuf>,
+        outcome: crate::rename_key_migration::JournalQuarantineOutcome,
+    ) {
+        match outcome {
+            crate::rename_key_migration::JournalQuarantineOutcome::Quarantined { path } => {
+                crate::logger::log(format!(
+                    "[RENAME-MIG] invalid recovery journal quarantined: {}",
+                    path.display()
+                ));
+                // The unreadable prior is now an empty prior. Merge every locally owned source of
+                // work and publish that complete snapshot; Waiting holds admission until save ACK.
+                self.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+                if !deferred_removed.is_empty() {
+                    self.invalidate_rename_migrations_for_removed_paths(&deferred_removed);
+                }
+                self.persist_rename_migration_journal();
+                self.show_feedback_toast(
+                    "壊れた復旧記録を退避しました。名前変更などの操作をもう一度実行してください"
+                        .into(),
+                );
+            }
+            crate::rename_key_migration::JournalQuarantineOutcome::Changed(change) => {
+                crate::logger::log(format!(
+                    "[RENAME-MIG] quarantine refused because recovery source changed: {change:?}"
+                ));
+                self.rename_migration_journal_admission =
+                    RenameMigrationJournalAdmission::RecoveryFailed {
+                        error: failure,
+                        prompt: RenameMigrationRecoveryPrompt::Shown,
+                        deferred_removed,
+                    };
+                self.show_feedback_toast(
+                    "復旧記録が変わったため退避しませんでした。「再読み込み」で内容を確認してください"
+                        .into(),
+                );
+            }
+            crate::rename_key_migration::JournalQuarantineOutcome::Cancelled => {
+                self.rename_migration_journal_admission =
+                    RenameMigrationJournalAdmission::RecoveryFailed {
+                        error: failure,
+                        prompt,
+                        deferred_removed,
+                    };
+            }
+            crate::rename_key_migration::JournalQuarantineOutcome::Failed(error) => {
+                crate::logger::log(format!("[RENAME-MIG] quarantine failed: {error}"));
+                self.rename_migration_journal_admission =
+                    RenameMigrationJournalAdmission::RecoveryFailed {
+                        error: failure,
+                        prompt,
+                        deferred_removed,
+                    };
+                self.show_feedback_toast(
+                    "壊れた復旧記録を退避できませんでした。元の記録は変更していません".into(),
+                );
+            }
+        }
+    }
+
+    fn finish_rename_migration_quarantine_for_exit(&mut self) {
+        let state = std::mem::replace(
+            &mut self.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::Unloaded,
+        );
+        let RenameMigrationJournalAdmission::RecoveryQuarantining {
+            task,
+            failure,
+            prompt,
+            deferred_removed,
+        } = state
+        else {
+            self.rename_migration_journal_admission = state;
+            return;
+        };
+        let outcome = task.cancel_and_wait();
+        self.complete_rename_migration_quarantine(failure, prompt, deferred_removed, outcome);
+    }
+
     /// Called only at mIV-owned filesystem mutation producers, before a worker or viewer release.
     pub(crate) fn admit_rename_migration_source_change(&mut self, ctx: &egui::Context) -> bool {
         if self.ensure_rename_migration_journal_loaded() {
             return true;
         }
-        if let RenameMigrationJournalAdmission::RecoveryFailed { message, .. } =
-            &self.rename_migration_journal_admission
-        {
-            let failure = message.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let data_dir = self.rename_migration_data_dir();
-            match std::thread::Builder::new()
-                .name("rename-migration-recovery".into())
-                .spawn(move || {
-                    let _ = tx.send(crate::rename_key_migration::journal_load(&data_dir));
-                }) {
-                Ok(_) => {
-                    let deferred_removed = match &mut self.rename_migration_journal_admission {
-                        RenameMigrationJournalAdmission::RecoveryFailed {
-                            deferred_removed,
-                            ..
-                        } => std::mem::take(deferred_removed),
-                        _ => unreachable!("failed recovery owns deferred paths"),
-                    };
-                    self.rename_migration_journal_admission =
-                        RenameMigrationJournalAdmission::RecoveryRetrying {
-                            rx,
-                            deferred_removed,
-                        };
-                    self.show_feedback_toast(format!(
-                        "復旧記録を読み取れないため変更を保留しました ({failure})。再確認中です"
-                    ));
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                }
-                Err(error) => {
-                    self.show_feedback_toast(format!(
-                        "復旧記録を読み取れないため変更を保留しました ({failure})。再確認を開始できません: {error}"
-                    ));
-                }
+        let parse_failure = matches!(
+            &self.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryFailed { error, .. }
+                if error.parse_bytes().is_some()
+        );
+        if parse_failure {
+            if let RenameMigrationJournalAdmission::RecoveryFailed { prompt, .. } =
+                &mut self.rename_migration_journal_admission
+            {
+                *prompt = RenameMigrationRecoveryPrompt::Shown;
             }
+            self.show_feedback_toast(
+                "名前変更の復旧記録を確認してから、操作をもう一度実行してください".into(),
+            );
+        } else if matches!(
+            self.rename_migration_journal_admission,
+            RenameMigrationJournalAdmission::RecoveryFailed { .. }
+        ) {
+            self.retry_rename_migration_recovery(ctx);
         } else {
             self.show_feedback_toast(
-                "復旧記録を再確認中です。完了後に操作をもう一度実行してください".into(),
+                "復旧記録を処理中です。完了後に操作をもう一度実行してください".into(),
             );
         }
         false
@@ -32421,6 +32735,9 @@ impl App {
                     deferred_removed, ..
                 }
                 | RenameMigrationJournalAdmission::RecoveryRetrying {
+                    deferred_removed, ..
+                }
+                | RenameMigrationJournalAdmission::RecoveryQuarantining {
                     deferred_removed, ..
                 } => deferred_removed.extend_from_slice(removed),
                 _ => {}
@@ -32860,6 +33177,7 @@ impl App {
             || matches!(
                 self.rename_migration_journal_admission,
                 RenameMigrationJournalAdmission::RecoveryRetrying { .. }
+                    | RenameMigrationJournalAdmission::RecoveryQuarantining { .. }
             )
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -35294,7 +35612,7 @@ impl App {
             Ok(_) => {
                 self.book_op_pending = Some(crate::books::BookOpPending {
                     rx,
-                    intent: crate::books::BookOpIntent::Unrelated,
+                    intent: crate::books::BookOpIntent::List { navigation: None },
                 });
             }
             Err(err) => {
@@ -38834,6 +39152,16 @@ impl App {
             return None;
         }
 
+        // Opening a saved group or manager is a one-shot command. Claim a physical
+        // repeat without reissuing the async request or reopening the dialog.
+        if let Some(action) = SAVED_GROUP_ACTIONS
+            .iter()
+            .copied()
+            .find(|action| self.keymap.consume_action_no_repeat(ctx, *action))
+        {
+            return self.apply_saved_group_key_action(ctx, action);
+        }
+
         if let Some(action) =
             self.keymap
                 .consume_first_action(ctx, &[CommandScope::Grid], PINNED_TAG_ACTIONS)
@@ -40152,6 +40480,11 @@ impl App {
                 return None;
             }
             if self.sidecar_restore_active() {
+                self.show_collection_jump_feedback_in_origin(
+                    origin,
+                    "サイドカー復元中のため、元の場所へ移動できませんでした。復元完了後にもう一度選択してください"
+                        .to_owned(),
+                );
                 return None;
             }
             if !self.snapshot_scope_allows_open(path, &OpenRequestOwner::Navigation) {
@@ -40254,6 +40587,11 @@ impl App {
                 return;
             }
             if self.sidecar_restore_active() {
+                self.show_collection_jump_feedback_in_origin(
+                    origin,
+                    "サイドカー復元中のため、元の場所へ移動できませんでした。復元完了後にもう一度選択してください"
+                        .to_owned(),
+                );
                 return;
             }
             if !self.snapshot_scope_allows_open(&path, &OpenRequestOwner::Navigation) {
@@ -52623,18 +52961,33 @@ impl App {
         self.settings.grid_view_mode == crate::settings::GridViewMode::Details
             && !self.current_folder_is_book_folder()
             && !self.items_are_reading_history_view
-            && !self.page_order_locked_for_current_view()
-            && !self.collection_grid_root_order().is_some_and(|order| {
-                !matches!(order, Ok(target) if target.mode == crate::collection_store::CollectionOrderMode::Standard)
-            })
+            && self.details_header_sort_lock_reason().is_none()
             && self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar
     }
 
+    /// 詳細一覧の列ヘッダを固定する理由。通常ソートの選択 UI とは別に、Manual /
+    /// Shuffle も列順を上書きできない理由として型で保持する。
+    pub(crate) fn details_header_sort_lock_reason(&self) -> Option<GridSortLockReason> {
+        if self.page_order_locked_for_current_view() {
+            return Some(GridSortLockReason::PageOrderFixed);
+        }
+        match self.collection_grid_root_order() {
+            Some(Err(reason)) => Some(reason),
+            Some(Ok(target)) => match target.mode {
+                crate::collection_store::CollectionOrderMode::Manual => {
+                    Some(GridSortLockReason::CollectionManualOrder)
+                }
+                crate::collection_store::CollectionOrderMode::Shuffle => {
+                    Some(GridSortLockReason::CollectionShuffleOrder)
+                }
+                crate::collection_store::CollectionOrderMode::Standard => None,
+            },
+            None => None,
+        }
+    }
+
     pub(crate) fn details_header_sort_locked(&self) -> bool {
-        self.page_order_locked_for_current_view()
-            || self.collection_grid_root_order().is_some_and(|order| {
-                !matches!(order, Ok(target) if target.mode == crate::collection_store::CollectionOrderMode::Standard)
-            })
+        self.details_header_sort_lock_reason().is_some()
     }
 
     /// 一覧のソート選択 UI を無効化する理由。無ければ選べる。
@@ -52645,28 +52998,7 @@ impl App {
     pub(crate) fn grid_sort_lock_reason(&self) -> Option<GridSortLockReason> {
         if let Some(order) = self.collection_grid_root_order() {
             return match order {
-                Err(_) => Some(
-                    match self
-                        .top_level_grid_view
-                        .collection_session()
-                        .map(|session| &session.load)
-                    {
-                        Some(top_level_grid_view::CollectionGridLoadState::Deleted) => {
-                            GridSortLockReason::CollectionDeleted
-                        }
-                        Some(top_level_grid_view::CollectionGridLoadState::Failed { .. }) => {
-                            GridSortLockReason::CollectionFailed
-                        }
-                        _ if self.collection_grid_refresh_waits_for_viewer() => {
-                            GridSortLockReason::CollectionViewerDeferred
-                        }
-                        Some(
-                            top_level_grid_view::CollectionGridLoadState::Ready(_)
-                            | top_level_grid_view::CollectionGridLoadState::Empty(_),
-                        ) => GridSortLockReason::CollectionStale,
-                        _ => GridSortLockReason::CollectionLoading,
-                    },
-                ),
+                Err(reason) => Some(reason),
                 Ok(_) if self.details_header_sort_active() => {
                     Some(GridSortLockReason::DetailsHeaderSort)
                 }
@@ -73260,11 +73592,7 @@ impl App {
             // viewports are registered below; returning here omits them from egui's frame and
             // destroys their host HWNDs (and any WS_CHILD native presenter). hide_to_tray has
             // already made each retained viewport explicit Hidden, so normal registration is safe.
-            let _tray_hide_started = if self.sidecar_restore_blocks_root_tray_hide() {
-                false
-            } else {
-                self.maybe_intercept_close(ctx)
-            };
+            let _tray_hide_started = self.maybe_intercept_close(ctx);
         }
         // request_repaint cannot wake a hidden Win32 root window. Publish the current media
         // ownership projection near the top of every pass so the tray thread can continue (or
@@ -73765,6 +74093,7 @@ impl App {
         self.poll_delete_purge_retry(ctx);
         self.poll_capture_pending(ctx);
         self.poll_book_op_pending(ctx);
+        self.poll_saved_group_open(ctx);
         self.poll_pipeline_debug_export_pending(ctx);
         self.poll_export_pending(ctx);
         self.poll_compare_pin_load_pending(ctx);
@@ -73993,11 +74322,15 @@ impl App {
             self.handle_clipboard_shortcuts(ctx);
         }
 
+        let keyboard_nav_from_fullscreen_close =
+            !fullscreen_root_key_handled && self.pending_return_to_parent;
         let keyboard_nav = if fullscreen_root_key_handled {
             None
         } else {
             self.handle_keyboard(ctx)
         };
+        let keyboard_nav_from_fullscreen_close =
+            keyboard_nav_from_fullscreen_close && keyboard_nav.is_some();
         // 物理デバイスはここで読む。**配り先は前面の viewer なので、まだ決めない。**
         // AtRest の active context が前面なら、その context を mount した中で配る
         // (root projection で配ると、別ウィンドウを見ているのにメイングリッドが動く。
@@ -74421,6 +74754,7 @@ impl App {
         self.render_progress_overlay(ctx);
         self.render_subfolder_expansion_install_overlay(ctx);
         self.render_smart_folder_overlay(ctx);
+        self.render_saved_group_open_modal(ctx);
 
         // ── PDF / ZIP コンテナ列挙待ちバッジ (左下、進捗バーの上に積む) ──
         // PDFium 開封 + 列挙の 100ms〜1.3 秒の間「親フォルダのまま動かない」状態に
@@ -74450,6 +74784,7 @@ impl App {
         self.show_subfolder_expansion_dialog_window(ctx);
         self.show_new_folder_dialog_window(ctx);
         self.show_rename_dialog_window(ctx);
+        self.show_rename_migration_recovery_dialog(ctx);
         self.draw_book_manager(ctx);
         self.draw_book_reorder(ctx);
         self.draw_collection_reorder(ctx);
@@ -74681,6 +75016,7 @@ impl App {
             {
                 self.add_grid_selection_to_active_book(ctx);
             }
+            self.handle_grid_collection_add_shortcut(ctx);
             // グリッドの Ctrl+E = 選択の一括エクスポート。既定キーはフルスクリーンの
             // `FsExport` と同じだが action は別で、割り当ても別々に変えられる。
             //
@@ -74943,10 +75279,35 @@ impl App {
         //                     > folder_pane_open > grid_nav
         // folder_nav は fav/toolbar/keyboard/gamepad より後、address 以下より先。
         let mouse_ring_nav = self.mouse_ring_nav.take();
-        let input_nav = fullscreen_close_nav
-            .or(keyboard_nav)
-            .or(gamepad_nav)
-            .or(mouse_ring_nav);
+        // A prepared saved-group open is a candidate, not a poll-time side effect. A
+        // different requested navigation wins without consuming its payload or history.
+        if fav_nav.is_some()
+            || toolbar_fav_nav.is_some()
+            || fullscreen_close_nav.is_some()
+            || keyboard_nav.is_some()
+            || gamepad_nav.is_some()
+            || mouse_ring_nav.is_some()
+            || address_nav.is_some()
+            || open_folder_nav.is_some()
+            || context_nav.is_some()
+            || folder_pane_nav.is_some()
+            || grid_nav.is_some()
+        {
+            self.cancel_saved_group_open_for_other_nav();
+        }
+        self.retire_saved_group_open_if_replaced();
+        let (input_nav, input_nav_from_fullscreen_close) = if fullscreen_close_nav.is_some() {
+            (fullscreen_close_nav, true)
+        } else if keyboard_nav.is_some() {
+            (keyboard_nav, keyboard_nav_from_fullscreen_close)
+        } else {
+            (
+                gamepad_nav
+                    .or(mouse_ring_nav)
+                    .or_else(|| self.saved_group_ready_nav()),
+                false,
+            )
+        };
         let folder_nav_result = self.poll_folder_nav();
         let folder_nav_wins = folder_nav_result.is_some()
             && fav_nav.is_none()
@@ -75012,7 +75373,16 @@ impl App {
                         None
                     }
                     crate::ui_main::AddressBarNav::Collection(restore) => {
-                        self.open_collection_grid(restore.identity.collection_id, Some(restore));
+                        self.apply_collection_input_nav(restore, input_nav_from_fullscreen_close);
+                        None
+                    }
+                    crate::ui_main::AddressBarNav::CollectionOpen(id) => {
+                        self.bump_input_seq("grid-collection-key", Some(&format!("{id:?}")));
+                        self.open_collection_grid_from_navigation(id);
+                        None
+                    }
+                    crate::ui_main::AddressBarNav::SavedGroupReady(id) => {
+                        self.adopt_saved_group_ready(id);
                         None
                     }
                     crate::ui_main::AddressBarNav::HistoryBack => {
@@ -75150,8 +75520,17 @@ impl App {
                                 );
                                 None
                             }
+                            crate::ui_main::AddressBarNav::CollectionOpen(id) => {
+                                self.bump_input_seq(
+                                    "grid-collection-key",
+                                    Some(&format!("{id:?}")),
+                                );
+                                self.open_collection_grid_from_navigation(id);
+                                None
+                            }
                             crate::ui_main::AddressBarNav::HistoryBack
-                            | crate::ui_main::AddressBarNav::HistoryForward => None,
+                            | crate::ui_main::AddressBarNav::HistoryForward
+                            | crate::ui_main::AddressBarNav::SavedGroupReady(_) => None,
                         }),
                 }
             } else if let Some(p) = folder_pane_nav {
@@ -75240,6 +75619,12 @@ impl App {
                         self.open_collection_grid(restore.identity.collection_id, Some(restore));
                         None
                     }
+                    Some(crate::ui_main::AddressBarNav::CollectionOpen(id)) => {
+                        self.bump_input_seq("grid-collection-key", Some(&format!("{id:?}")));
+                        self.open_collection_grid_from_navigation(id);
+                        None
+                    }
+                    Some(crate::ui_main::AddressBarNav::SavedGroupReady(_)) => None,
                     Some(
                         crate::ui_main::AddressBarNav::HistoryBack
                         | crate::ui_main::AddressBarNav::HistoryForward,

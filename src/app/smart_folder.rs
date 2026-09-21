@@ -712,7 +712,7 @@ enum SmartFolderSourceIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SmartFolderSourceLease {
+pub(super) struct SmartFolderSourceLease {
     context_id: super::viewer_context_registry::ViewerContextId,
     /// Stable for a single top-level owner even when its rows/revision finish loading.
     surface_generation: u64,
@@ -1493,7 +1493,7 @@ impl App {
         replaced
     }
 
-    fn smart_folder_source_lease(&self) -> Option<SmartFolderSourceLease> {
+    pub(super) fn smart_folder_source_lease(&self) -> Option<SmartFolderSourceLease> {
         let context_id = self.viewer_context_main();
         if self.projected_viewer_context_id() != context_id {
             return None;

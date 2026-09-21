@@ -537,6 +537,7 @@ impl RingDirection {
 pub enum RingActionId {
     None,
     AddToBook,
+    AddToCollection,
     PinRepresentativeThumb,
     ToggleDetachedViewer,
     ToggleWindowMode,
@@ -937,6 +938,7 @@ impl RingActionId {
         match self {
             Self::None => "none",
             Self::AddToBook => "add_to_book",
+            Self::AddToCollection => "add_to_collection",
             Self::PinRepresentativeThumb => "pin_representative_thumb",
             Self::ToggleDetachedViewer => "toggle_detached_viewer",
             Self::ToggleWindowMode => "toggle_window_mode",
@@ -1086,6 +1088,7 @@ impl RingActionId {
         Some(match key.as_str() {
             "none" | "" => Self::None,
             "add_to_book" => Self::AddToBook,
+            "add_to_collection" => Self::AddToCollection,
             "pin_representative_thumb" => Self::PinRepresentativeThumb,
             "toggle_detached_viewer" => Self::ToggleDetachedViewer,
             "toggle_window_mode" => Self::ToggleWindowMode,
@@ -1197,6 +1200,7 @@ impl RingActionId {
                 RingShortcutContext::VideoFullscreen => "本棚に追加 (フレーム)",
                 _ => "本棚に追加",
             },
+            Self::AddToCollection => "追加先のコレクションに追加",
             Self::PinRepresentativeThumb => match context {
                 RingShortcutContext::VideoFullscreen => "代表フレームにピン留め",
                 _ => "代表サムネにピン留め",
@@ -1353,6 +1357,7 @@ impl RingActionId {
                     | Self::ClearRecentFolders
                     | Self::ClearQuickFolderSlots
                     | Self::AddToBook
+                    | Self::AddToCollection
                     | Self::PinRepresentativeThumb
                     | Self::CycleFavorite
                     | Self::GridToggleDetails
@@ -1387,6 +1392,7 @@ impl RingActionId {
                 self,
                 Self::None
                     | Self::AddToBook
+                    | Self::AddToCollection
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
                     | Self::ToggleWindowMode
@@ -1424,6 +1430,7 @@ impl RingActionId {
                 self,
                 Self::None
                     | Self::AddToBook
+                    | Self::AddToCollection
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
                     | Self::ToggleWindowMode
@@ -1488,6 +1495,7 @@ impl RingActionId {
                 Self::ClearRecentFolders,
                 Self::ClearQuickFolderSlots,
                 Self::AddToBook,
+                Self::AddToCollection,
                 Self::PinRepresentativeThumb,
                 Self::CycleFavorite,
                 Self::GridToggleDetails,
@@ -1521,6 +1529,7 @@ impl RingActionId {
             RingShortcutContext::ImageFullscreen => vec![
                 Self::None,
                 Self::AddToBook,
+                Self::AddToCollection,
                 Self::PinRepresentativeThumb,
                 Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
@@ -1557,6 +1566,7 @@ impl RingActionId {
             RingShortcutContext::VideoFullscreen => vec![
                 Self::None,
                 Self::AddToBook,
+                Self::AddToCollection,
                 Self::PinRepresentativeThumb,
                 Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
@@ -2522,6 +2532,14 @@ pub struct RingPickerOriginalState {
     pub video_continuous_mode: crate::video::VideoContinuousMode,
 }
 
+/// リングを開いた時点で固定する一覧ソートの所有先。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RingPickerGridSortTarget {
+    Global,
+    Collection(crate::app::collection_grid::CollectionGridOrderTarget),
+    Locked(crate::app::GridSortLockReason),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RingPickerState {
     pub context: RingShortcutContext,
@@ -2533,6 +2551,7 @@ pub struct RingPickerState {
     /// 保存先を識別子で持つのは評価行 ([`RingPickerContainerTarget`]) と同じ理由。
     pub owner: crate::app::ViewerContextId,
     pub anchor: RingPickerAnchor,
+    pub(crate) grid_sort_target: RingPickerGridSortTarget,
     pub original: RingPickerOriginalState,
     pub row: usize,
     pub dirty_rows: Vec<RingPickerRowId>,
@@ -3169,6 +3188,25 @@ mod tests {
                 assert!(!action.is_valid_for_context(context));
                 assert!(!RingActionId::available_for_context(context).contains(&action));
             }
+        }
+    }
+
+    #[test]
+    fn collection_add_round_trips_in_all_ring_contexts() {
+        let action = RingActionId::AddToCollection;
+        assert_eq!(action.as_str(), "add_to_collection");
+        assert_eq!(
+            RingActionId::from_str("add_to_collection"),
+            Some(action.clone())
+        );
+        for context in [
+            RingShortcutContext::Grid,
+            RingShortcutContext::ImageFullscreen,
+            RingShortcutContext::VideoFullscreen,
+        ] {
+            assert!(action.is_valid_for_context(context));
+            assert!(RingActionId::available_for_context(context).contains(&action));
+            assert!(RingActionId::available_for_mouse_button_context(context).contains(&action));
         }
     }
 

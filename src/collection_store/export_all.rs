@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::settings::GridDisplayOrder;
 
 use super::{
-    CollectionAllExportSnapshot, CollectionPrepareError, prepare_collection_export,
-    serialize_collection_paths,
+    CollectionAllExportSnapshot, CollectionPrepareError, collection_sort_order_wire_name,
+    prepare_collection_export, serialize_collection_paths,
 };
 
 const INDEX_NAME: &str = "collections-index.txt";
@@ -89,7 +89,7 @@ fn write_all_collections_export_with(
     progress.1.store(bundle.snapshots.len(), Ordering::Release);
     let mut used_names = HashSet::from([INDEX_NAME.to_lowercase()]);
     let mut index = String::from(
-        "# mImageViewer collections export\r\n# position\tuuid\tname\torder_mode\tstandard_sort\tentries\tfile\r\n",
+        "\u{feff}# mImageViewer collections export\r\n# position\tuuid\tname\torder_mode\tstandard_sort\tentries\tfile\r\n",
     );
     for (position, snapshot) in bundle.snapshots.iter().enumerate() {
         if cancel.load(Ordering::Acquire) {
@@ -119,12 +119,12 @@ fn write_all_collections_export_with(
         write_new_file(&path, contents.as_bytes())
             .map_err(|error| fail(error.to_string(), incomplete()))?;
         index.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{:?}\t{}\t{}\r\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\r\n",
             position + 1,
             snapshot.collection_id(),
             escape_index_field(&snapshot.definition.name),
             snapshot.definition.order_mode.as_str(),
-            snapshot.definition.standard_sort,
+            collection_sort_order_wire_name(snapshot.definition.standard_sort),
             prepared.ordered_paths.len(),
             filename,
         ));
@@ -346,6 +346,17 @@ mod tests {
                     resolved_kind: CollectionResolvedKind::Image,
                     manual_position: 0,
                 }]
+            } else if *name == "空" {
+                let path = PathBuf::from(r"C:\画像\日本語.png");
+                let source = CollectionSourcePath::from_trusted(&path).unwrap();
+                vec![CollectionEntry {
+                    id: CollectionEntryId::new(),
+                    collection_id: definition.id,
+                    source_path: path,
+                    source_key: source.key().clone(),
+                    resolved_kind: CollectionResolvedKind::Image,
+                    manual_position: 0,
+                }]
             } else {
                 Vec::new()
             };
@@ -398,9 +409,11 @@ mod tests {
         assert!(files.iter().any(|name| name == "SAME-1.txt"));
         assert!(files.iter().any(|name| name == "collections-index-1.txt"));
         assert!(files.iter().any(|name| name == INDEX_NAME));
-        let index = fs::read_to_string(folder.join(INDEX_NAME)).unwrap();
+        let index_bytes = fs::read(folder.join(INDEX_NAME)).unwrap();
+        assert!(index_bytes.starts_with(&[0xef, 0xbb, 0xbf]));
+        let index = String::from_utf8(index_bytes).unwrap();
         assert!(index.contains("line\\tbreak"));
-        assert!(index.contains("\tmanual\tFileName\t1\t"));
+        assert!(index.contains("\tmanual\tfile_name\t1\t"));
         assert_eq!(index.lines().count(), bundle.snapshots.len() + 3);
         assert!(index.ends_with("# complete\r\n"));
         assert_eq!(progress.0.load(Ordering::Acquire), bundle.snapshots.len());
@@ -409,10 +422,18 @@ mod tests {
                 .unwrap()
                 .contains("missing image.png")
         );
-        assert!(
-            fs::read_to_string(folder.join("same.txt"))
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            fs::read_to_string(folder.join("same.txt")).unwrap(),
+            "\u{feff}"
+        );
+        let japanese = fs::read_to_string(folder.join("空.txt")).unwrap();
+        assert!(japanese.starts_with('\u{feff}'));
+        let reparsed =
+            super::super::parse_collection_text(&japanese, &folder.join("空.txt")).unwrap();
+        assert_eq!(reparsed.accepted_count(), 1);
+        assert_eq!(
+            reparsed.accepted_paths().next().unwrap().0,
+            Path::new(r"C:\画像\日本語.png")
         );
     }
 

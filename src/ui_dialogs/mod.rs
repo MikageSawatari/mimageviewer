@@ -31,6 +31,7 @@ mod pdf_password;
 mod pdf_worker_notice;
 pub(crate) mod preferences;
 pub(crate) mod rename_item;
+mod rename_migration_recovery;
 mod rotation_reset;
 mod settings_incompatible;
 pub(crate) mod settings_restore;

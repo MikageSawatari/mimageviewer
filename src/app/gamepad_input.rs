@@ -20,8 +20,8 @@ use crate::ring_shortcut::{
     MouseButtonSlot, MouseFlickOutcome, MouseFlickState, MouseGestureDirection, MouseGestureState,
     PickerListMode, PickerListState, RightDragCommand, RightDragContext, RightDragMode,
     RightDragOwner, RightDragRecognition, RingActionId, RingDirection, RingPickerAnchor,
-    RingPickerOriginalState, RingPickerRatingTarget, RingPickerRowId, RingPickerState,
-    RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
+    RingPickerGridSortTarget, RingPickerOriginalState, RingPickerRatingTarget, RingPickerRowId,
+    RingPickerState, RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
     mouse_flick_menu_delay, mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
@@ -2270,7 +2270,12 @@ impl App {
     fn picker_value_text(&self, picker: &RingPickerState, row: RingPickerRowId) -> String {
         match row {
             RingPickerRowId::GridColumns => format!("{} 列", picker.grid_cols),
-            RingPickerRowId::GridSortOrder => picker.sort_order.label().to_string(),
+            RingPickerRowId::GridSortOrder => match picker.grid_sort_target {
+                RingPickerGridSortTarget::Locked(reason) => reason.short_label().to_string(),
+                RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Collection(_) => {
+                    picker.sort_order.label().to_string()
+                }
+            },
             RingPickerRowId::GridThumbAspect => {
                 if picker.thumb_aspect_auto {
                     if let Some(current) = self.auto_aspect.current {
@@ -2988,7 +2993,27 @@ impl App {
             crate::settings::MIN_GRID_COLS,
             crate::settings::MAX_GRID_COLS,
         );
-        let sort_order = self.settings.sort_order;
+        let grid_sort_target = if context == RingShortcutContext::Grid {
+            match self.collection_grid_root_order() {
+                Some(Ok(target)) => self
+                    .grid_sort_lock_reason()
+                    .map(RingPickerGridSortTarget::Locked)
+                    .unwrap_or(RingPickerGridSortTarget::Collection(target)),
+                Some(Err(reason)) => RingPickerGridSortTarget::Locked(reason),
+                None => self
+                    .grid_sort_lock_reason()
+                    .map(RingPickerGridSortTarget::Locked)
+                    .unwrap_or(RingPickerGridSortTarget::Global),
+            }
+        } else {
+            RingPickerGridSortTarget::Global
+        };
+        let sort_order = match grid_sort_target {
+            RingPickerGridSortTarget::Collection(target) => target.standard_sort,
+            RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Locked(_) => {
+                self.settings.sort_order
+            }
+        };
         let thumb_aspect_auto = self.settings.thumb_aspect_auto;
         let thumb_aspect = self.settings.thumb_aspect;
         let spread_mode = self.spread_mode;
@@ -3055,6 +3080,7 @@ impl App {
             // 開いたまま前面の窓が変わったときに別ウィンドウのページへ書く (レビュー S01)。
             owner: self.edit_request_owner_context(),
             anchor: self.current_ring_picker_anchor(context),
+            grid_sort_target,
             original,
             row: 0,
             dirty_rows: Vec::new(),
@@ -3692,6 +3718,9 @@ impl App {
                 mark_picker_dirty(picker, row);
             }
             RingPickerRowId::GridSortOrder => {
+                if matches!(picker.grid_sort_target, RingPickerGridSortTarget::Locked(_)) {
+                    return;
+                }
                 picker.sort_order = cycle_value(SortOrder::all(), picker.sort_order, delta);
                 mark_picker_dirty(picker, row);
             }
@@ -3814,7 +3843,10 @@ impl App {
                 self.scroll_to_selected = true;
                 self.settings.save();
             }
-            RingPickerRowId::GridSortOrder if self.settings.sort_order != picker.sort_order => {
+            RingPickerRowId::GridSortOrder
+                if matches!(picker.grid_sort_target, RingPickerGridSortTarget::Global)
+                    && self.settings.sort_order != picker.sort_order =>
+            {
                 self.apply_grid_picker_sort_order(picker.sort_order);
             }
             RingPickerRowId::GridThumbAspect
@@ -4848,7 +4880,12 @@ impl App {
             .then(|| self.clear_native_video_picker_overlay(ctx))
             .flatten();
         match picker.context {
-            RingShortcutContext::Grid => self.apply_grid_picker_state(picker),
+            RingShortcutContext::Grid
+                if self.current_ring_picker_anchor(RingShortcutContext::Grid) == picker.anchor =>
+            {
+                self.apply_grid_picker_state(picker)
+            }
+            RingShortcutContext::Grid => {}
             RingShortcutContext::ImageFullscreen => {
                 if let Some(fs_idx) = self.picker_owner_fullscreen_idx(&picker) {
                     self.apply_image_picker_state(ctx, fs_idx, picker);
@@ -4886,10 +4923,23 @@ impl App {
             );
             settings_changed = true;
         }
-        if picker.dirty_rows.contains(&RingPickerRowId::GridSortOrder)
-            && self.settings.sort_order != picker.sort_order
-        {
-            self.apply_grid_picker_sort_order(picker.sort_order);
+        if picker.dirty_rows.contains(&RingPickerRowId::GridSortOrder) {
+            match picker.grid_sort_target {
+                RingPickerGridSortTarget::Global
+                    if self.settings.sort_order != picker.sort_order =>
+                {
+                    self.apply_grid_picker_sort_order(picker.sort_order);
+                }
+                RingPickerGridSortTarget::Collection(target) => {
+                    self.request_collection_grid_set_order(
+                        target,
+                        crate::collection_store::CollectionOrderMode::Standard,
+                        picker.sort_order,
+                        crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                    );
+                }
+                RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Locked(_) => {}
+            }
         }
         if picker
             .dirty_rows
@@ -5783,6 +5833,10 @@ impl App {
                 self.apply_ring_add_to_book(ctx, context);
                 None
             }
+            RingActionId::AddToCollection => {
+                self.apply_ring_add_to_collection(context);
+                None
+            }
             RingActionId::PinRepresentativeThumb => {
                 self.apply_ring_pin_representative_thumb(ctx, context);
                 None
@@ -6378,6 +6432,32 @@ impl App {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     self.add_current_video_frame_to_active_book(ctx, fs_idx);
                 }
+            }
+        }
+    }
+
+    fn apply_ring_add_to_collection(&mut self, context: RingShortcutContext) {
+        match context {
+            RingShortcutContext::Grid if self.fullscreen_idx.is_none() => {
+                self.add_grid_shortcut_to_collection_target();
+            }
+            RingShortcutContext::ImageFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.add_fs_shortcut_to_collection_target(fs_idx);
+                }
+            }
+            RingShortcutContext::VideoFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.add_media_shortcut_to_collection_target(fs_idx);
+                }
+            }
+            RingShortcutContext::Grid => {
+                // A stale/misrouted Grid ring action must never reinterpret the fullscreen
+                // item as a grid selection or silently register a different source.
+                self.show_feedback_toast(
+                    "フルスクリーン表示中はグリッドの項目をコレクションに追加できません"
+                        .to_string(),
+                );
             }
         }
     }
@@ -8039,12 +8119,13 @@ mod tests {
         GamepadFrameBatch, Instant, MouseMiddleInputSample, POST_FILTER_GROUPS, PadDir,
         RingPickerRatingTarget, RingPickerRowId, continuous_reading_stick_axis, cycle_rating,
         cycle_video_playback_speed, gamepad_grid_nav_target_pos, gamepad_text_input_active,
-        initial_gamepad_favorite_picker_tab, mouse_button_action_blocked_by_edit_mode,
-        mouse_flick_direction, picker_rows_for_context, post_filter_group_index,
-        post_filter_item_index_in_group, rating_label, right_drag_press_suppresses_context_menu,
-        ring_direction_from_dpad_buttons, ring_direction_from_stick,
-        ring_direction_from_stick_with_hysteresis, ring_shortcut_context_for_surface_state,
-        set_gamepad_favorite_picker_tab, update_mouse_middle_click_state, video_seek_ring_action,
+        initial_gamepad_favorite_picker_tab, mark_picker_dirty,
+        mouse_button_action_blocked_by_edit_mode, mouse_flick_direction, picker_rows_for_context,
+        post_filter_group_index, post_filter_item_index_in_group, rating_label,
+        right_drag_press_suppresses_context_menu, ring_direction_from_dpad_buttons,
+        ring_direction_from_stick, ring_direction_from_stick_with_hysteresis,
+        ring_shortcut_context_for_surface_state, set_gamepad_favorite_picker_tab,
+        update_mouse_middle_click_state, video_seek_ring_action,
     };
     use crate::adjustment::PostFilter;
 
@@ -8073,6 +8154,26 @@ mod tests {
             .push_for_test(PadEvent::ButtonPressed(PadButton::South));
         let batch = app.sample_gamepad_input(&ctx);
         assert!(!batch.actions.is_empty(), "有効に戻したら届く");
+    }
+
+    #[test]
+    fn grid_collection_ring_action_rejects_a_fullscreen_route_with_a_reason() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+
+        let navigation = app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::AddToCollection,
+            "test-grid-ring",
+        );
+
+        assert!(navigation.is_none());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text == "フルスクリーン表示中はグリッドの項目をコレクションに追加できません"
+        }));
+        assert_eq!(app.fullscreen_idx, Some(0));
     }
 
     /// 保持したまま OFF にしたら、**保持もそこで終わる**。
@@ -8206,6 +8307,211 @@ mod tests {
         let resumed = app.dispatch_gamepad_batch(&ctx, GamepadFrameBatch::empty_for_test());
         assert!(resumed.nav.is_none());
         assert!(!resumed.dispatched, "no pre-modal action may replay");
+    }
+
+    #[test]
+    fn collection_ring_sort_is_local_until_commit_and_discards_its_captured_target() {
+        use crate::collection_store::{
+            CollectionOrderMode, CollectionRegistration, CollectionResolvedKind,
+            CollectionStoreRuntime,
+        };
+        use crate::ring_shortcut::RingPickerGridSortTarget;
+        use crate::settings::{DetailsSortKey, GridViewMode, SortOrder};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("page.png");
+        std::fs::write(&source, b"page").unwrap();
+        let runtime = CollectionStoreRuntime::start_at(temp.path().join("collection.db")).unwrap();
+        let client = runtime.client();
+        let mut app = crate::app::setup_app_for_test();
+        app.install_collection_runtime(runtime);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !matches!(app.collection_store_client_for_read(), Ok(Some(_))) {
+            assert!(
+                Instant::now() < deadline,
+                "collection runtime did not start"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let created = client
+            .create_collection("Ring target".into())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let added = client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                vec![
+                    CollectionRegistration::from_trusted_path(
+                        &source,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        app.settings.sort_order = SortOrder::DateDesc;
+        app.open_collection_grid(added.collection_id(), None);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app
+            .collection_grid_root_order()
+            .is_none_or(|order| order.is_err())
+        {
+            assert!(Instant::now() < deadline, "collection grid did not settle");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        let captured = match picker.grid_sort_target {
+            RingPickerGridSortTarget::Collection(target) => target,
+            target => panic!("collection target was not captured: {target:?}"),
+        };
+        assert_eq!(picker.sort_order, captured.standard_sort);
+        picker.sort_order = SortOrder::SizeDesc;
+        mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
+        app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+        let preview_snapshot = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preview_snapshot.revision(),
+            captured.content.expected_revision
+        );
+
+        app.ring_picker = Some(picker);
+        app.commit_ring_picker(&ctx);
+        assert!(app.ring_picker.is_none());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !matches!(app.collection_grid_root_order(), Some(Ok(order))
+            if order.mode == CollectionOrderMode::Standard
+                && order.standard_sort == SortOrder::SizeDesc
+                && order.content.expected_revision == captured.content.expected_revision + 1)
+        {
+            assert!(Instant::now() < deadline, "ring sort did not install");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_sort_key = DetailsSortKey::Name;
+        app.rebuild_details_order();
+        let locked = app.build_ring_picker_state(RingShortcutContext::Grid);
+        assert_eq!(
+            locked.grid_sort_target,
+            RingPickerGridSortTarget::Locked(crate::app::GridSortLockReason::DetailsHeaderSort)
+        );
+        let locked_sort = locked.sort_order;
+        app.ring_picker = Some(locked);
+        app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, 1);
+        let locked = app.ring_picker.as_ref().unwrap();
+        assert_eq!(locked.sort_order, locked_sort);
+        assert!(!locked.dirty_rows.contains(&RingPickerRowId::GridSortOrder));
+        app.finish_gamepad_input_for_sidecar_restore(&ctx);
+        assert!(app.ring_picker.is_none());
+
+        app.settings.details_sort_key = DetailsSortKey::Toolbar;
+        let mut stale = app.build_ring_picker_state(RingShortcutContext::Grid);
+        stale.sort_order = SortOrder::FileName;
+        mark_picker_dirty(&mut stale, RingPickerRowId::GridSortOrder);
+        let external = client
+            .set_order(
+                added.collection_id(),
+                captured.content.expected_revision + 1,
+                CollectionOrderMode::Standard,
+                SortOrder::DateAsc,
+            )
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        app.ring_picker = Some(stale);
+        app.commit_ring_picker(&ctx);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !app.collection_export_all_available() {
+            assert!(
+                Instant::now() < deadline,
+                "stale ring request did not settle"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let latest = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest, external);
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !matches!(app.collection_grid_root_order(), Some(Ok(order))
+            if order.content.expected_revision == external.revision())
+        {
+            assert!(Instant::now() < deadline, "external order did not install");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut stale = app.build_ring_picker_state(RingShortcutContext::Grid);
+        stale.sort_order = SortOrder::FileName;
+        mark_picker_dirty(&mut stale, RingPickerRowId::GridSortOrder);
+        app.ring_picker = Some(stale);
+        let session = app.top_level_grid_view.collection_session_mut().unwrap();
+        let prepared = session.prepared().unwrap();
+        let first = prepared.entries[0].clone();
+        session.position =
+            crate::app::top_level_grid_view::CollectionGridPosition::PhysicalSource {
+                entry_id: first.entry_id,
+                source_key: first.source_key,
+                path: temp.path().join("physical-child"),
+            };
+        app.current_folder = Some(temp.path().join("physical-child"));
+        app.commit_ring_picker(&ctx);
+        assert!(app.ring_picker.is_none());
+        assert!(app.collection_export_all_available());
+        let unchanged = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.revision(), external.revision());
+        assert_eq!(unchanged.definition.standard_sort, SortOrder::DateAsc);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn global_ring_sort_keeps_live_preview() {
+        use crate::ring_shortcut::RingPickerGridSortTarget;
+        use crate::settings::SortOrder;
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sort_order = SortOrder::FileName;
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        assert_eq!(picker.grid_sort_target, RingPickerGridSortTarget::Global);
+        picker.sort_order = SortOrder::DateDesc;
+        mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
+
+        app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
+
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
     }
 
     use crate::app::ActionSurface;

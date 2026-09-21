@@ -1,110 +1,131 @@
-# Rename migration journal recovery (M-2)
+# Rename migration journal recovery (M-2 / RB-1, RB-8, RB-9)
 
-Status: implemented and independently reviewed 2026-09-20; automated verification and dev-runtime build passed. Interactive verification remains pending.
+Status: the unreadable-journal gate and explicit quarantine recovery are implemented. The 2026-09-21 focused automated checks passed; the final repository-wide gate is owned by the integrating task.
 
 ## Failure and invariant
 
-`rename_migration_journal.json` is the recovery record for unfinished path-key and
-collection source migrations. Previously `journal_load` returned an empty list for
-every read or parse failure. The next empty snapshot could delete the unreadable
-file, while a nonempty snapshot could replace it. Only a genuine `NotFound` may
-mean an empty journal. Any other read error and a document that parses as neither
-the current nor the legacy format are recovery failures. The original bytes must
-remain untouched until a later successful read merges the record into App-owned
-state. The legacy pair list remains readable and becomes Tree-scoped jobs.
+`rename_migration_journal.json` records unfinished path-key and collection source
+migrations. Only a genuine `NotFound` means an empty journal. Other read errors
+remain `JournalLoadError::Read`; bytes that parse as neither the current nor the
+legacy format remain `JournalLoadError::Parse` together with the exact bytes that
+failed. A read or parse failure must never be converted to an empty snapshot.
 
-`RenameMigrationJournalAdmission` owns the single recovery and persistence gate:
-unloaded, recovery-read failure, explicit retry in progress, durable, write
-pending, and write failure. The separate `rename_migration_journal_loaded` bool
-is removed. The first lazy read remains the existing one-time UI read; ordinary
-operations add no filesystem probe, read, or wait. A user action after a read
-failure explicitly retries the read on a worker. While that retry is pending,
-the action is held before physical change with a visible reason; the user may
-repeat it after completion. A failed retry retains the failure state and old
-bytes. Successful retry prepends recovered jobs to any locally retained work,
-publishes a complete snapshot if needed, and awaits its save ACK before starting
-any migration. No periodic retry is added. The successful retry-worker spawn reserves the next repaint, and the retry poll keeps a bounded 100 ms wakeup until its result is consumed; an idle window cannot strand the visible “rechecking” state.
+`RenameMigrationJournalAdmission` is the single owner of recovery and
+persistence admission. Its states cover unloaded, failed read/parse, retrying,
+quarantining, durable, save-waiting, and save-failed. While recovery is failed or
+running, the App refuses snapshot replacement, empty deletion, migration start,
+and every mIV-owned physical operation that could require a path-key migration.
+Late worker results and successful delete invalidations remain in the typed owner
+for later reconciliation.
 
-The App owner refuses every snapshot write, empty deletion, migration start, and
-immediate delete invalidation while the prior journal is unloaded or unreadable.
-Successful delete paths arriving from an already-running worker are retained in
-the same typed recovery admission state, then applied to the merged queue after
-a successful retry. In-flight migration completion likewise remains in memory
-for reconciliation; it does not rewrite the unreadable file. Exit does not
-publish an empty/new snapshot in this state and warns that recovery is still
-needed. Existing bounded retries for a
-**write** failure stay separate from recovery-read failure.
+Read errors are retried by rereading on a worker. Parse errors show the Japanese
+「名前変更の復旧記録」 dialog with these explicit choices:
+
+- 「再読み込み」 rereads the journal on a worker. A current or legacy journal is
+  merged ahead of locally retained work.
+- 「壊れた記録を退避して再開」 verifies and moves aside only the exact invalid
+  record described below.
+- 「閉じる」 and Escape close an idle failure dialog while retaining the exact
+  bytes and admission gate. During quarantine they request cancellation, but the
+  modal and its pointer-input block remain until the worker reports a terminal
+  result.
+
+The dialog explains that a corrupt record can prevent automatic continuation of
+settings and collection-reference migration for an unfinished rename. A
+successful quarantine does not replay the blocked rename or any other physical
+operation; the user repeats the desired operation after recovery completes.
+
+## Secure quarantine boundary on Windows
+
+Quarantine runs outside the UI thread. The worker opens the journal once with
+read and delete access, sharing disabled, `FILE_FLAG_WRITE_THROUGH`, and
+`FILE_FLAG_OPEN_REPARSE_POINT`. It then uses that same handle to:
+
+1. read the current bytes and compare them byte-for-byte with the confirmed parse
+   failure;
+2. recheck both current and legacy formats;
+3. rename the still-open file with `SetFileInformationByHandle(FileRenameInfo)`.
+
+The destination is an absolute UTF-16 name in the same directory, with an
+`.invalid-<unique>` suffix. `ReplaceIfExists` is false. A collision selects a new
+name and never overwrites an existing file. A path-based verify-then-rename is
+not used, so another process cannot swap the source between verification and the
+namespace change.
+
+If the source disappeared, became a valid current/legacy journal, or changed to
+different invalid bytes, the quarantine action adopts none of it. The App keeps
+the originally confirmed parse failure and gate, asks the user to choose
+「再読み込み」, and only that separate action reads and adopts the latest missing,
+valid, or invalid state. Open, read, comparison, and rename failures keep the
+original pathname protected.
+
+Cancellation and rename commitment share one atomic `Running -> Cancelled` or
+`Running -> Renaming` transition. If cancellation wins, the handle rename is
+never called and the original file remains. If the worker claims `Renaming`, the
+UI keeps the modal open until the Win32 call completes. A failed call leaves the
+source protected; successful `SetFileInformationByHandle` is the namespace
+linearization point and remains success even if cancellation is requested later.
+
+After a successful quarantine, the old prior is treated as empty. The App merges
+its in-flight job, queued jobs, boot-retry jobs, and deferred successful-delete
+invalidations into one complete snapshot. Admission remains closed in the
+save-waiting state until the journal writer acknowledges that snapshot. This is
+also true when the complete snapshot is empty. At shutdown, an active quarantine
+worker is cancelled and joined; a rename that already linearized is integrated
+as success before the final journal flush. Remaining recovery failure is written
+to the log while the original journal remains in place; shutdown does not show a
+new blocking warning dialog.
 
 ## Physical operation boundary
 
-The admission check sits before starting a Shell rename or delete worker and
-before releasing a viewer for deletion. It also sits in the shared worker
-entrypoints for book rename, book delete, reorder flush, and transfer **Move and
-Copy**. Copy may first commit the source page numbering via a physical rename.
-Book append/create/list and viewing remain available. A rejected request shows
-the recovery reason. This is limited to mIV-owned operations; external file
-managers and a full durable-before-filesystem transaction are outside M-2.
+The admission check runs before a Shell rename/delete worker and before releasing
+a viewer for deletion. The same boundary covers book rename, book delete,
+reorder flush, and transfer Move and Copy. Copy is included because it may first
+commit source page numbering through a physical rename. Book append/create/list
+and viewing remain available.
 
-Delete completion must invalidate queued generic migration stages by the exact
-successful paths, not by a reconstructed UI setting. The book delete result
-therefore carries its successful folder path back to App. The same guarded
-invalidation is used for ordinary delete and book delete. A Shell delete
-pending request and a book rename/delete/reorder/transfer pending request hold
-the **generic** migration queue head until App consumes the worker result.
-The book pending owner distinguishes unrelated list/create/append work from
-path mutations and captures the exact requested delete folder. This closes the
-physical-success-to-result-consumption gap: success invalidates by its actual
-path before releasing the gate, while failure/cancel leaves the job intact.
-A generic migration already running before the delete request remains subject
-to the existing non-cancellable-worker limitation; M-2 prevents new starts
-while a deletion is pending. A prior in-flight completion cannot bypass the
-recovery gate to overwrite the old journal.
+Delete completion invalidates queued generic migration stages by the exact paths
+that were successfully removed. The collection stage remains because it carries
+the renamed source reference. A pending Shell or book path mutation holds the
+generic queue head until App consumes the worker result. An already-running
+generic worker remains subject to its existing non-cancellable limitation.
 
-Book delete invalidates by its exact folder path only when `remove_dir_all`
-fully succeeds. A partial removal followed by `Err` does not report individual
-successful paths today; after that failure, a queued generic migration could
-still recreate metadata for a removed page. This pre-existing partial-delete
-case needs a separate typed result design and is outside M-2.
-
-The Shell rename pending request also owns its captured `Exact`/`Tree` scope
-beside the receiver (M-1). Clearing the dialog and polling an empty receiver
-cannot change that scope. Cancel, error, and success each consume the same typed
-request.
+The Shell rename request captures its `Exact`/`Tree` scope from the typed
+`GridItem` producer. The UI no longer calls `Path::is_file`: a missing image is
+still `Exact`, and a folder is `Tree`. Clearing the dialog or polling an empty
+receiver cannot change the captured scope.
 
 ## Verification matrix
 
-- Current and legacy journal files load and merge in FIFO order; genuine
-  `NotFound` loads an empty queue.
-- Inject read and parse failures and compare the old bytes after empty and
-  nonempty persistence attempts, delete invalidation, operation admission,
-  migration poll, and exit.
-- Retry performs no UI-thread read, merges prior jobs and locally retained
-  completions, waits for the complete-snapshot ACK, and starts only the durable
-  queue head. Retry failure leaves original bytes unchanged.
-- Shell rename/delete and book rename/delete/reorder/Move/Copy reject before
-  filesystem worker spawn when recovery fails. Book delete uses the exact
-  successful path for invalidation; ordinary delete keeps its existing path
-  scope. Book append/create and viewing remain unaffected.
-- Rename pending retains captured scope through dialog clear and Empty poll;
-  success, cancellation, and failure clear it exactly once.
+- Exact invalid bytes move once; a restart sees no source journal. Changed bytes
+  are detected even when length and modification time are unchanged.
+- Missing, current, legacy, and differently invalid source changes remain blocked
+  until a separate explicit reload. Destination collision never overwrites;
+  read/open/rename failure and cancellation before the atomic rename claim
+  preserve the source. Cancellation after that claim cannot demote the terminal
+  rename result.
+- Closing the parse dialog retains exact bytes and the gate. Read failures cannot
+  enter the parse-quarantine action. The real modal blocks background pointer
+  actions; Escape and close during quarantine retain that block until terminal.
+- Quarantine success publishes in-flight, queued, boot-retry, and deferred-delete
+  state, then waits for the full-snapshot save ACK before reopening admission.
+- A physical rename rejected by the recovery gate is not replayed after
+  quarantine.
+- Grid rename derives scope from `GridItem`, including missing image and folder
+  paths, without UI-thread filesystem I/O.
 
-Automated verification on 2026-09-20:
+Focused verification on 2026-09-21:
 
-- `cargo test -p mimageviewer --lib journal -- --nocapture`: 32 passed.
-- `cargo test -p mimageviewer --lib rename_migration -- --nocapture`: 8 passed.
-- `scripts/test-full.ps1`: passed, including 8,686 mimageviewer library tests, workspace integration tests, and vendored egui/eframe tests.
-- After the final retry-wakeup change, `cargo test -p mimageviewer --lib recovery -- --nocapture`: 17 passed; `cargo test -p mimageviewer --lib`: 8,686 passed, 45 ignored. Unchanged workspace/vendor checks use the preceding full-gate result.
-- `cargo fmt --all -- --check`, `python scripts/check_ui_glyphs.py`, and `git diff --check`: passed.
-- `scripts/build-dev.ps1 -PreserveRuntime`: passed; core and remote service built in `target/dev-runtime`.
+- `cargo test --lib rename_key_migration::tests -- --nocapture`: 39 passed.
+- `cargo test --lib recovery -- --nocapture`: 18 passed.
+- `cargo test --lib quarantine_ -- --nocapture`: 12 passed.
+- Direct read-failure and missing-grid-item producer regressions: passed.
 
 No normal-profile application launch, real-data edit, or interactive input was
-part of automated verification. On 2026-09-20 the user reported that rename
-tracking worked in the verification build. This confirms the ordinary rename
-path; unreadable-journal and retry behavior are covered by the automated checks
-above, not by a user-reported corrupt-journal exercise.
+part of this verification.
 
-The existing persistence-**write** failure path still accepts a new filesystem
-operation before its resulting migration intent has a durable ACK, then holds
-the migration and performs bounded save retries. M-2 only closes the distinct
-unreadable-prior-record hazard; a durable-before-filesystem transaction for
-write failure remains outside this change.
+The existing persistence-write failure path still accepts a new filesystem
+operation before its resulting migration intent has a durable ACK, then holds the
+migration and performs bounded save retries. This document covers the distinct
+unreadable-prior-record hazard; a durable-before-filesystem transaction for an
+ordinary write failure remains separate work.

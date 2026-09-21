@@ -7,19 +7,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const COLLECTION_GRID_READ_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-
 use super::top_level_grid_view::{
     CollectionGridIdentity, CollectionGridInstalledPresentation, CollectionGridLoadState,
     CollectionGridPhysicalLoadOrigin, CollectionGridPhysicalLoadOwner, CollectionGridPosition,
     CollectionGridPrepareReuseKey, CollectionGridPreparedInstall,
-    CollectionGridPreparedThumbnailSources, CollectionGridPresentationSources,
-    CollectionGridRequestStamp, CollectionGridRestore, CollectionGridSession,
-    CollectionGridSourceOpenOwner, CollectionGridThumbnailSourceIdentity,
+    CollectionGridPreparedThumbnailDelivery, CollectionGridPreparedThumbnailSources,
+    CollectionGridPresentationSources, CollectionGridRequestStamp, CollectionGridRestore,
+    CollectionGridSession, CollectionGridSourceOpenOwner, CollectionGridThumbnailSourceIdentity,
     CollectionGridThumbnailSources, CollectionGridViewportAnchor, TopLevelGridRestore,
     TopLevelGridSurface,
 };
-use super::{App, GridItem, ViewerContextId};
+use super::{App, GridItem, GridSortLockReason, ViewerContextId};
 use crate::collection_store::{
     CollectionEntryId, CollectionId, CollectionOrderMode, CollectionPrepareError,
     CollectionPreparedSnapshot, CollectionStoreError, prepare_collection_snapshot,
@@ -46,6 +44,28 @@ pub(crate) struct CollectionGridOrderTarget {
     pub(crate) content: CollectionGridContentTarget,
     pub(crate) mode: CollectionOrderMode,
     pub(crate) standard_sort: crate::settings::SortOrder,
+}
+
+/// コレクション順の変更要求。要求時点の表示 owner と revision を mode / sort と一体で持つ。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridSetOrderIntent {
+    pub(crate) content: CollectionGridContentTarget,
+    pub(crate) mode: CollectionOrderMode,
+    pub(crate) sort: crate::settings::SortOrder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionGridSetOrderResolution {
+    NoOp,
+    LocalHeaderReset,
+    Mutation(CollectionGridSetOrderIntent),
+}
+
+/// 上部 Collection メニューだけが、列ヘッダ所有中の同値 Standard を解除要求にできる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionGridSetOrderRoute {
+    StandardControl,
+    CollectionMenu,
 }
 
 /// Delete-key/context-menu resolution for the mounted collection surface. Root is fail-closed:
@@ -80,11 +100,11 @@ fn hash_collection_thumbnail_identity_part(digest: &mut sha2::Sha256, bytes: &[u
 pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
     sources: CollectionGridThumbnailSources,
     cancel: &AtomicBool,
-) -> Result<CollectionGridPreparedThumbnailSources, CollectionPrepareError> {
+) -> Result<CollectionGridPreparedThumbnailDelivery, CollectionPrepareError> {
     use sha2::Digest as _;
 
     if sources.video_sidecars.is_empty() && sources.video_pin_blobs.is_empty() {
-        return Ok(CollectionGridPreparedThumbnailSources::default());
+        return Ok(CollectionGridPreparedThumbnailDelivery::default());
     }
     let mut digest = sha2::Sha256::new();
     digest.update(b"miv.collection-thumbnail-sources.v1\0");
@@ -134,9 +154,22 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
         digest.update(sha2::Sha256::digest(webp));
     }
 
-    Ok(CollectionGridPreparedThumbnailSources {
-        identity: CollectionGridThumbnailSourceIdentity(digest.finalize().into()),
-        payload: sources,
+    let identity = CollectionGridThumbnailSourceIdentity(digest.finalize().into());
+    let presentation = if super::top_level_grid_view::collection_pin_blob_sizes_fit_retention_budget(
+        sources.video_pin_blobs.values().map(Vec::len),
+    ) {
+        CollectionGridPresentationSources::Retained(Arc::new(
+            CollectionGridPreparedThumbnailSources {
+                identity,
+                payload: sources.clone(),
+            },
+        ))
+    } else {
+        CollectionGridPresentationSources::Oversized(identity)
+    };
+    Ok(CollectionGridPreparedThumbnailDelivery {
+        presentation,
+        live: sources,
     })
 }
 
@@ -147,6 +180,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
     cancel: &AtomicBool,
     auto_aspect_client: Option<&crate::auto_aspect_cache::CollectionAutoAspectCacheClient>,
     pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+    thumbnail_source_epoch: u64,
 ) -> Result<CollectionGridPreparedInstall, CollectionPrepareError> {
     let perf_start = crate::perf::is_enabled().then(Instant::now);
     let classify_start = crate::perf::is_enabled().then(Instant::now);
@@ -295,6 +329,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
             snapshot.revision(),
             settings,
             pin_stamp,
+            thumbnail_source_epoch,
         ),
     })
 }
@@ -347,6 +382,27 @@ impl App {
         #[cfg(not(windows))]
         {
             ViewerContextId::single_context()
+        }
+    }
+
+    pub(crate) fn show_collection_jump_feedback_in_origin(
+        &mut self,
+        origin: &CollectionGridPhysicalLoadOwner,
+        message: String,
+    ) {
+        let origin_context = origin.stamp.context_id;
+        if self.collection_grid_context_id() == origin_context {
+            self.show_feedback_toast(message);
+            return;
+        }
+        if self
+            .with_viewer_context(origin_context, |app| app.show_feedback_toast(message))
+            .is_err()
+        {
+            crate::logger::log(format!(
+                "collection physical jump feedback dropped because origin context is gone context_id={}",
+                origin_context.serial()
+            ));
         }
     }
 
@@ -414,37 +470,112 @@ impl App {
 
     pub(crate) fn collection_grid_root_order(
         &self,
-    ) -> Option<Result<CollectionGridOrderTarget, &'static str>> {
+    ) -> Option<Result<CollectionGridOrderTarget, GridSortLockReason>> {
         let session = self.top_level_grid_view.collection_session()?;
         if !matches!(session.position, CollectionGridPosition::Root) {
             return None;
         }
         match session.load {
-            CollectionGridLoadState::Deleted => return Some(Err("コレクションは削除されました")),
-            CollectionGridLoadState::Failed { .. } => {
-                return Some(Err("コレクション一覧を読み込めませんでした"));
+            CollectionGridLoadState::Deleted => {
+                return Some(Err(GridSortLockReason::CollectionDeleted));
             }
-            CollectionGridLoadState::Ready(_) | CollectionGridLoadState::Empty(_) => {}
-            _ => return Some(Err("コレクション一覧を読み込み中です")),
+            CollectionGridLoadState::Failed { .. } => {
+                return Some(Err(GridSortLockReason::CollectionFailed));
+            }
+            _ => {}
+        }
+        if self.collection_grid_refresh_waits_for_viewer() {
+            return Some(Err(GridSortLockReason::CollectionViewerDeferred));
+        }
+        if !matches!(
+            session.load,
+            CollectionGridLoadState::Ready(_) | CollectionGridLoadState::Empty(_)
+        ) {
+            return Some(Err(GridSortLockReason::CollectionLoading));
         }
         if session.wanted_revision > session.accepted_revision {
-            return Some(Err("コレクション一覧の更新を待っています"));
+            return Some(Err(GridSortLockReason::CollectionStale));
         }
         let content = match self.collection_grid_content_target() {
             Ok(target) => target,
-            Err(reason) => return Some(Err(reason)),
+            Err(_) => return Some(Err(GridSortLockReason::CollectionStale)),
         };
         let Some(prepared) = session.prepared() else {
-            return Some(Err("コレクション一覧を更新中です"));
+            return Some(Err(GridSortLockReason::CollectionStale));
         };
         if prepared.collection_id != content.stamp.collection_id {
-            return Some(Err("コレクション一覧を更新中です"));
+            return Some(Err(GridSortLockReason::CollectionStale));
         }
         Some(Ok(CollectionGridOrderTarget {
             content,
             mode: prepared.order_mode,
             standard_sort: prepared.standard_sort,
         }))
+    }
+
+    /// すべての UI / ring のコレクション順要求を同じ no-op・lock 規則へ通す。
+    pub(crate) fn request_collection_grid_set_order(
+        &mut self,
+        captured: CollectionGridOrderTarget,
+        mode: CollectionOrderMode,
+        sort: crate::settings::SortOrder,
+        route: CollectionGridSetOrderRoute,
+    ) -> bool {
+        match self.resolve_collection_grid_set_order(captured, mode, sort, route) {
+            CollectionGridSetOrderResolution::NoOp => false,
+            CollectionGridSetOrderResolution::LocalHeaderReset => {
+                self.reset_details_sort_to_toolbar();
+                true
+            }
+            CollectionGridSetOrderResolution::Mutation(intent) => {
+                self.start_collection_grid_content_action(
+                    intent.content,
+                    crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder(intent),
+                );
+                true
+            }
+        }
+    }
+
+    fn resolve_collection_grid_set_order(
+        &self,
+        captured: CollectionGridOrderTarget,
+        mode: CollectionOrderMode,
+        sort: crate::settings::SortOrder,
+        route: CollectionGridSetOrderRoute,
+    ) -> CollectionGridSetOrderResolution {
+        let Some(Ok(current)) = self.collection_grid_root_order() else {
+            return CollectionGridSetOrderResolution::NoOp;
+        };
+        if current.content.stamp != captured.content.stamp
+            || current.content.expected_revision != captured.content.expected_revision
+        {
+            return CollectionGridSetOrderResolution::NoOp;
+        }
+        if matches!(route, CollectionGridSetOrderRoute::StandardControl)
+            && self.grid_sort_lock_reason().is_some()
+        {
+            return CollectionGridSetOrderResolution::NoOp;
+        }
+
+        let same_order = current.mode == mode
+            && (mode != CollectionOrderMode::Standard || current.standard_sort == sort);
+        if same_order
+            && mode == CollectionOrderMode::Standard
+            && matches!(route, CollectionGridSetOrderRoute::CollectionMenu)
+            && self.details_header_sort_active()
+        {
+            return CollectionGridSetOrderResolution::LocalHeaderReset;
+        }
+        if same_order && mode != CollectionOrderMode::Shuffle {
+            return CollectionGridSetOrderResolution::NoOp;
+        }
+
+        CollectionGridSetOrderResolution::Mutation(CollectionGridSetOrderIntent {
+            content: captured.content,
+            mode,
+            sort,
+        })
     }
 
     pub(crate) fn apply_collection_grid_remove_success(
@@ -537,6 +668,75 @@ impl App {
         }
         #[cfg(not(windows))]
         self.invalidate_current_collection_grid_sources(scopes);
+    }
+
+    fn invalidate_current_collection_thumbnail_presentation(
+        &mut self,
+    ) -> Option<Arc<CollectionGridInstalledPresentation>> {
+        self.top_level_grid_view
+            .collection_session_mut()?
+            .invalidate_thumbnail_presentation()
+    }
+
+    /// A metadata import writes through its own attached SQLite connection, so
+    /// the UI-owned `VideoPinDb` mutation stamp cannot observe the commit.  Move
+    /// every context to a presentation-only retry and bind future preparation to
+    /// this app-global epoch.  Item bindings, root/child position and navigation
+    /// ownership stay intact.
+    pub(crate) fn advance_collection_thumbnail_source_epoch_for_metadata_import(
+        &mut self,
+        committed_video_pin_changes: usize,
+    ) {
+        if committed_video_pin_changes == 0 {
+            return;
+        }
+        self.collection_thumbnail_source_epoch =
+            self.collection_thumbnail_source_epoch.wrapping_add(1);
+        let mut retired = Vec::<super::smart_folder::RetiredSmartFolderPayload>::new();
+        let mut invalidated_contexts = 0usize;
+        #[cfg(windows)]
+        {
+            for id in self.viewer_context_ids() {
+                if let Ok(Some(presentation)) = self.with_viewer_context(id, |app| {
+                    app.invalidate_current_collection_thumbnail_presentation()
+                }) {
+                    invalidated_contexts = invalidated_contexts.saturating_add(1);
+                    retired.push(Box::new(presentation));
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        if let Some(presentation) = self.invalidate_current_collection_thumbnail_presentation() {
+            invalidated_contexts = 1;
+            retired.push(Box::new(presentation));
+        }
+        self.retire_smart_folder_payloads(retired);
+        crate::logger::log(format!(
+            "metadata import: collection thumbnail sources invalidated changes={} epoch={} contexts={invalidated_contexts}",
+            committed_video_pin_changes, self.collection_thumbnail_source_epoch,
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "metadata_import",
+                "collection_thumbnail_sources_invalidated",
+                None,
+                0,
+                &[
+                    (
+                        "changes",
+                        serde_json::Value::from(committed_video_pin_changes as u64),
+                    ),
+                    (
+                        "epoch",
+                        serde_json::Value::from(self.collection_thumbnail_source_epoch),
+                    ),
+                    (
+                        "contexts",
+                        serde_json::Value::from(invalidated_contexts as u64),
+                    ),
+                ],
+            );
+        }
     }
 
     /// Resolves a context-menu cell/checked selection through the currently installed immutable
@@ -944,9 +1144,9 @@ impl App {
                 .as_ref()
                 .and_then(|request| request.root_thumbnail_sources.as_ref())
                 .map(|source_owner| {
-                    Arc::new(CollectionGridInstalledPresentation::from_prepared_sources(
+                    Arc::new(CollectionGridInstalledPresentation::new(
                         Arc::clone(&prepared),
-                        Arc::clone(&source_owner.sources),
+                        source_owner.presentation.clone(),
                         source_owner.reuse_key.clone(),
                     ))
                 })
@@ -1157,27 +1357,40 @@ impl App {
         let Some(session) = self.top_level_grid_view.collection_session() else {
             return;
         };
-        let CollectionGridLoadState::RequestNeeded { not_before, .. } = &session.load else {
+        let CollectionGridLoadState::RequestNeeded { .. } = &session.load else {
             return;
         };
-        if not_before.is_some_and(|deadline| Instant::now() < deadline) {
-            return;
-        }
+        let now = Instant::now();
         let minimum_revision = session.wanted_revision.max(session.accepted_revision);
         let installed = session.load.installed().cloned();
+        let deferred = if let Some(session) = self.top_level_grid_view.collection_session_mut()
+            && let CollectionGridLoadState::RequestNeeded { lease, .. } = &mut session.load
+        {
+            lease.bind_viewer(stamp.context_id.serial(), stamp.surface_generation);
+            lease.activate(now, "admission");
+            !lease.is_due(now)
+        } else {
+            true
+        };
+        if deferred {
+            return;
+        }
         let client = match self.collection_store_client_for_read() {
             Ok(Some(client)) => client,
             Err(error) if error.is_read_retryable() => {
-                if let Some(session) = self.top_level_grid_view.collection_session_mut() {
-                    session.load = CollectionGridLoadState::RequestNeeded {
-                        installed,
-                        not_before: Some(Instant::now() + COLLECTION_GRID_READ_RETRY_INTERVAL),
-                    };
+                if let Some(session) = self.top_level_grid_view.collection_session_mut()
+                    && let CollectionGridLoadState::RequestNeeded { lease, .. } = &mut session.load
+                {
+                    lease.defer(now, "admission");
                 }
                 return;
             }
             Ok(None) | Err(_) => {
                 if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                    if let CollectionGridLoadState::RequestNeeded { lease, .. } = &mut session.load
+                    {
+                        lease.finish(now, "unavailable");
+                    }
                     session.load = CollectionGridLoadState::Failed {
                         message: "コレクションを利用できません".into(),
                         installed,
@@ -1190,9 +1403,21 @@ impl App {
         match client.load_collection(stamp.collection_id) {
             Ok(receiver) => {
                 if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                    let previous =
+                        std::mem::replace(&mut session.load, CollectionGridLoadState::Deleted);
+                    let CollectionGridLoadState::RequestNeeded {
+                        installed,
+                        mut lease,
+                    } = previous
+                    else {
+                        session.load = previous;
+                        return;
+                    };
+                    lease.phase_progress(now, "snapshot");
                     session.load = CollectionGridLoadState::Snapshot {
                         stamp,
                         minimum_revision,
+                        lease,
                         queued_at,
                         installed,
                         receiver,
@@ -1200,15 +1425,18 @@ impl App {
                 }
             }
             Err(error) if error.is_read_retryable() => {
-                if let Some(session) = self.top_level_grid_view.collection_session_mut() {
-                    session.load = CollectionGridLoadState::RequestNeeded {
-                        installed,
-                        not_before: Some(Instant::now() + COLLECTION_GRID_READ_RETRY_INTERVAL),
-                    };
+                if let Some(session) = self.top_level_grid_view.collection_session_mut()
+                    && let CollectionGridLoadState::RequestNeeded { lease, .. } = &mut session.load
+                {
+                    lease.defer(now, "admission");
                 }
             }
             Err(error) => {
                 if let Some(session) = self.top_level_grid_view.collection_session_mut() {
+                    if let CollectionGridLoadState::RequestNeeded { lease, .. } = &mut session.load
+                    {
+                        lease.finish(now, "error");
+                    }
                     session.load = CollectionGridLoadState::Failed {
                         message: collection_grid_error(&error),
                         installed,
@@ -1223,11 +1451,13 @@ impl App {
         stamp: CollectionGridRequestStamp,
         snapshot: crate::collection_store::CollectionSnapshot,
         installed: Option<Arc<CollectionPreparedSnapshot>>,
+        mut lease: crate::collection_store::CollectionReadLease,
     ) {
         let exact_revision = snapshot.revision();
         let display_order = self.settings.grid_display_order.clone();
         let settings = self.settings.clone();
         let pin_stamp = self.video_pin_db.as_ref().map(|db| db.mutation_stamp());
+        let thumbnail_source_epoch = self.collection_thumbnail_source_epoch;
         let auto_aspect_client = self
             .collection_auto_aspect_cache
             .as_ref()
@@ -1245,15 +1475,18 @@ impl App {
                     &worker_cancel,
                     auto_aspect_client.as_ref(),
                     pin_stamp,
+                    thumbnail_source_epoch,
                 );
                 let _ = sender.send(result);
             });
         match spawn {
             Ok(_) => {
+                lease.phase_progress(Instant::now(), "prepare");
                 if let Some(session) = self.top_level_grid_view.collection_session_mut() {
                     session.load = CollectionGridLoadState::Preparing {
                         stamp,
                         exact_revision,
+                        lease,
                         installed,
                         cancel,
                         receiver,
@@ -1261,6 +1494,7 @@ impl App {
                 }
             }
             Err(error) => {
+                lease.finish(Instant::now(), "worker_spawn_error");
                 if let Some(session) = self.top_level_grid_view.collection_session_mut() {
                     session.load = CollectionGridLoadState::Failed {
                         message: format!("コレクション一覧を準備できません: {error}"),
@@ -1288,17 +1522,11 @@ impl App {
         }
         let session = self.top_level_grid_view.collection_session()?;
         match &session.load {
-            CollectionGridLoadState::RequestNeeded {
-                not_before: Some(deadline),
-                ..
-            } => Some(deadline.saturating_duration_since(Instant::now())),
-            CollectionGridLoadState::RequestNeeded {
-                not_before: None, ..
-            } => Some(Duration::ZERO),
-            CollectionGridLoadState::Snapshot { .. }
-            | CollectionGridLoadState::Preparing { .. } => {
-                Some(COLLECTION_GRID_READ_RETRY_INTERVAL)
+            CollectionGridLoadState::RequestNeeded { lease, .. } => {
+                lease.poll_delay(Instant::now())
             }
+            CollectionGridLoadState::Snapshot { lease, .. }
+            | CollectionGridLoadState::Preparing { lease, .. } => lease.completion_poll_delay(),
             _ => None,
         }
     }
@@ -1465,7 +1693,9 @@ impl App {
                         &mut session.load,
                         CollectionGridLoadState::RequestNeeded {
                             installed: None,
-                            not_before: None,
+                            lease: crate::collection_store::CollectionReadLease::dormant(
+                                crate::collection_store::CollectionReadScope::app_global("grid"),
+                            ),
                         },
                     ))
                 } else {
@@ -1476,6 +1706,7 @@ impl App {
             Some(CollectionGridLoadState::Snapshot {
                 stamp,
                 minimum_revision,
+                mut lease,
                 queued_at,
                 installed,
                 receiver,
@@ -1545,14 +1776,15 @@ impl App {
                                         .observed_catalog_revision
                                         .max(snapshot.catalog_revision);
                                 }
-                                self.spawn_collection_grid_prepare(stamp, snapshot, installed);
+                                self.spawn_collection_grid_prepare(
+                                    stamp, snapshot, installed, lease,
+                                );
                             } else if let Some(session) =
                                 self.top_level_grid_view.collection_session_mut()
                             {
-                                session.load = CollectionGridLoadState::RequestNeeded {
-                                    installed,
-                                    not_before: None,
-                                };
+                                lease.defer(Instant::now(), "revision");
+                                session.load =
+                                    CollectionGridLoadState::RequestNeeded { installed, lease };
                             }
                         }
                     }
@@ -1560,18 +1792,16 @@ impl App {
                         if self.collection_grid_stamp_is_current(stamp)
                             && let Some(session) = self.top_level_grid_view.collection_session_mut()
                         {
-                            session.load = CollectionGridLoadState::RequestNeeded {
-                                installed,
-                                not_before: Some(
-                                    Instant::now() + COLLECTION_GRID_READ_RETRY_INTERVAL,
-                                ),
-                            };
+                            lease.defer(Instant::now(), "actor_retry");
+                            session.load =
+                                CollectionGridLoadState::RequestNeeded { installed, lease };
                         }
                     }
                     Ok(Err(error)) => {
                         if self.collection_grid_stamp_is_current(stamp)
                             && let Some(session) = self.top_level_grid_view.collection_session_mut()
                         {
+                            lease.finish(Instant::now(), "error");
                             session.load = if matches!(error, CollectionStoreError::NotFound) {
                                 CollectionGridLoadState::Deleted
                             } else {
@@ -1589,6 +1819,7 @@ impl App {
                             session.load = CollectionGridLoadState::Snapshot {
                                 stamp,
                                 minimum_revision,
+                                lease,
                                 queued_at,
                                 installed,
                                 receiver,
@@ -1599,6 +1830,7 @@ impl App {
                         if self.collection_grid_stamp_is_current(stamp)
                             && let Some(session) = self.top_level_grid_view.collection_session_mut()
                         {
+                            lease.finish(Instant::now(), "disconnected");
                             session.load = CollectionGridLoadState::Failed {
                                 message: "コレクション一覧の応答が失われました".into(),
                                 installed,
@@ -1610,6 +1842,7 @@ impl App {
             Some(CollectionGridLoadState::Preparing {
                 stamp,
                 exact_revision,
+                mut lease,
                 installed,
                 cancel,
                 receiver,
@@ -1654,15 +1887,14 @@ impl App {
                         );
                     }
                     if accepts {
+                        lease.finish(Instant::now(), "ready");
                         self.apply_collection_grid_prepared_install(prepared, installed);
                         ctx.request_repaint();
                     } else if self.collection_grid_stamp_is_current(stamp)
                         && let Some(session) = self.top_level_grid_view.collection_session_mut()
                     {
-                        session.load = CollectionGridLoadState::RequestNeeded {
-                            installed,
-                            not_before: None,
-                        };
+                        lease.defer(Instant::now(), "reprepare");
+                        session.load = CollectionGridLoadState::RequestNeeded { installed, lease };
                     }
                 }
                 Ok(Err(CollectionPrepareError::Cancelled)) => {
@@ -1670,10 +1902,8 @@ impl App {
                     if self.collection_grid_stamp_is_current(stamp)
                         && let Some(session) = self.top_level_grid_view.collection_session_mut()
                     {
-                        session.load = CollectionGridLoadState::RequestNeeded {
-                            installed,
-                            not_before: None,
-                        };
+                        lease.defer(Instant::now(), "cancelled_reprepare");
+                        session.load = CollectionGridLoadState::RequestNeeded { installed, lease };
                     }
                 }
                 Ok(Err(error)) => {
@@ -1681,6 +1911,7 @@ impl App {
                     if self.collection_grid_stamp_is_current(stamp)
                         && let Some(session) = self.top_level_grid_view.collection_session_mut()
                     {
+                        lease.finish(Instant::now(), "prepare_error");
                         session.load = CollectionGridLoadState::Failed {
                             message: error.to_string(),
                             installed,
@@ -1693,6 +1924,7 @@ impl App {
                             session.load = CollectionGridLoadState::Preparing {
                                 stamp,
                                 exact_revision,
+                                lease,
                                 installed,
                                 cancel,
                                 receiver,
@@ -1707,6 +1939,7 @@ impl App {
                     if self.collection_grid_stamp_is_current(stamp)
                         && let Some(session) = self.top_level_grid_view.collection_session_mut()
                     {
+                        lease.finish(Instant::now(), "disconnected");
                         session.load = CollectionGridLoadState::Failed {
                             message: "コレクション準備workerが終了しました".into(),
                             installed,
@@ -1739,6 +1972,7 @@ impl App {
             revision,
             &self.settings,
             self.video_pin_db.as_ref().map(|db| db.mutation_stamp()),
+            self.collection_thumbnail_source_epoch,
         )
     }
 
@@ -1754,21 +1988,9 @@ impl App {
             auto_aspect_lookup,
             reuse_key,
         } = install;
-        let presentation_sources =
-            if super::top_level_grid_view::collection_pin_blob_sizes_fit_retention_budget(
-                thumbnail_sources
-                    .payload
-                    .video_pin_blobs
-                    .values()
-                    .map(Vec::len),
-            ) {
-                CollectionGridPresentationSources::Retained(Arc::new(thumbnail_sources.clone()))
-            } else {
-                CollectionGridPresentationSources::Oversized(thumbnail_sources.identity)
-            };
-        let CollectionGridPreparedThumbnailSources {
-            identity: _,
-            payload:
+        let CollectionGridPreparedThumbnailDelivery {
+            presentation: presentation_sources,
+            live:
                 CollectionGridThumbnailSources {
                     video_sidecars,
                     video_pin_blobs,
@@ -1876,6 +2098,7 @@ impl App {
             video_sidecars,
             video_pin_blobs,
             collection_seed,
+            prepared.auto_aspect_eligible_total,
         );
         self.checked = checked;
         if let Some(query) = old_search_query {
@@ -1971,7 +2194,7 @@ impl App {
         self.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
-                thumbnail_sources: CollectionGridPreparedThumbnailSources::default(),
+                thumbnail_sources: CollectionGridPreparedThumbnailDelivery::default(),
                 auto_aspect_lookup: None,
                 reuse_key,
             },
@@ -1986,6 +2209,15 @@ impl App {
         selected: Option<usize>,
         collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
     ) {
+        let auto_aspect_eligible_total = items
+            .iter()
+            .filter(|item| {
+                !matches!(
+                    item,
+                    GridItem::CollectionPlaceholder { .. } | GridItem::Audio(_)
+                )
+            })
+            .count();
         self.install_collection_grid_items_with_thumbnail_sources(
             items,
             image_metas,
@@ -1993,6 +2225,7 @@ impl App {
             std::collections::HashMap::new(),
             Arc::new(std::collections::HashMap::new()),
             collection_seed,
+            auto_aspect_eligible_total,
         );
     }
 
@@ -2004,6 +2237,7 @@ impl App {
         video_sidecars: std::collections::HashMap<String, std::path::PathBuf>,
         video_pin_blobs: Arc<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
         collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+        auto_aspect_eligible_total: usize,
     ) {
         // A grid menu owns the old item generation. Do not let its saved row index operate on
         // the newly installed collection; a menu owned by another viewer context is untouched.
@@ -2056,7 +2290,11 @@ impl App {
         let cache_map = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         self.current_color_cache_map = Some(Arc::clone(&cache_map));
         self.current_color_catalog = None;
-        self.reset_and_seed_auto_aspect_with_collection_seed(&cache_map, collection_seed);
+        self.reset_and_seed_auto_aspect_with_collection_seed(
+            &cache_map,
+            collection_seed,
+            Some(auto_aspect_eligible_total),
+        );
         self.cache_gen_total = 0;
         self.cache_gen_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let initial_display_px = super::compute_display_px(
@@ -2170,13 +2408,7 @@ fn collection_grid_prepare_result_event(
 }
 
 fn collection_grid_error(error: &CollectionStoreError) -> String {
-    match error {
-        CollectionStoreError::Starting => "コレクションを準備しています".into(),
-        CollectionStoreError::Busy => "コレクション処理が混み合っています".into(),
-        CollectionStoreError::Unavailable => "コレクションを利用できません".into(),
-        CollectionStoreError::NotFound => "コレクションが見つかりません".into(),
-        _ => format!("コレクションを読み込めません: {error}"),
-    }
+    error.user_message()
 }
 
 #[cfg(test)]
@@ -2188,6 +2420,7 @@ mod tests {
     use crate::collection_store::{
         CollectionRegistration, CollectionResolvedKind, CollectionStoreRuntime,
     };
+    use crate::grid_item::ThumbnailState;
 
     fn recv<T>(receiver: crossbeam_channel::Receiver<Result<T, CollectionStoreError>>) -> T {
         receiver
@@ -2315,6 +2548,66 @@ mod tests {
         wait_for_grid(&mut app, created.collection_id());
         assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Landscape16x9));
         assert_eq!(app.auto_aspect_eligible_total(), 1);
+        let installed = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::installed_presentation)
+            .unwrap()
+            .clone();
+        assert_eq!(installed.prepared.auto_aspect_eligible_total, 1);
+        let original_generation = app.items_generation;
+        app.items_generation = app.items_generation.wrapping_add(1);
+        assert_eq!(
+            app.auto_aspect_eligible_total(),
+            0,
+            "a stale items-generation binding must not expose the prepared denominator"
+        );
+        app.items_generation = original_generation;
+        let mut wrong_context = (*installed.prepared).clone();
+        wrong_context.collection_id = CollectionId::new();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load =
+            CollectionGridLoadState::Ready(Arc::new(CollectionGridInstalledPresentation::new(
+                Arc::new(wrong_context),
+                installed.sources.clone(),
+                installed.reuse_key.clone(),
+            )));
+        assert_eq!(
+            app.auto_aspect_eligible_total(),
+            0,
+            "a prepared snapshot from another Collection context must fail closed"
+        );
+        let mut wrong_revision = (*installed.prepared).clone();
+        wrong_revision.collection_revision = wrong_revision.collection_revision.wrapping_add(1);
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load =
+            CollectionGridLoadState::Ready(Arc::new(CollectionGridInstalledPresentation::new(
+                Arc::new(wrong_revision),
+                installed.sources.clone(),
+                installed.reuse_key.clone(),
+            )));
+        assert_eq!(app.auto_aspect_eligible_total(), 0);
+        let mut wrong_length = (*installed.prepared).clone();
+        wrong_length.entries = Arc::from(Vec::new());
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load =
+            CollectionGridLoadState::Ready(Arc::new(CollectionGridInstalledPresentation::new(
+                Arc::new(wrong_length),
+                installed.sources.clone(),
+                installed.reuse_key.clone(),
+            )));
+        assert_eq!(app.auto_aspect_eligible_total(), 0);
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Ready(installed);
+        assert_eq!(app.auto_aspect_eligible_total(), 1);
         assert!(matches!(app.auto_aspect_cache_target(),
             Some(super::super::AutoAspectCacheTarget::CollectionRoot(id)) if id == created.collection_id()));
 
@@ -2373,7 +2666,6 @@ mod tests {
     fn root_order_controls_use_installed_revision_and_preserve_global_sort_and_header_contract() {
         use crate::collection_store::CollectionOrderMode;
         use crate::settings::{DetailsSortKey, GridViewMode, SortOrder};
-        use crate::ui_dialogs::collections::CollectionGridSnapshotAction;
 
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source.png");
@@ -2396,13 +2688,12 @@ mod tests {
         assert!(app.details_header_sort_locked());
         assert_eq!(app.grid_sort_lock_reason(), None);
 
-        app.start_collection_grid_content_action(
-            manual.content,
-            CollectionGridSnapshotAction::SetOrder {
-                mode: CollectionOrderMode::Standard,
-                sort: SortOrder::FileName,
-            },
-        );
+        assert!(app.request_collection_grid_set_order(
+            manual,
+            CollectionOrderMode::Standard,
+            SortOrder::FileName,
+            CollectionGridSetOrderRoute::StandardControl,
+        ));
         poll_until(
             &mut app,
             "Standard order did not install",
@@ -2419,13 +2710,56 @@ mod tests {
         );
 
         let standard = app.collection_grid_root_order().unwrap().unwrap();
-        app.start_collection_grid_content_action(
-            standard.content,
-            CollectionGridSnapshotAction::SetOrder {
-                mode: CollectionOrderMode::Shuffle,
-                sort: standard.standard_sort,
-            },
+        assert!(!app.request_collection_grid_set_order(
+            standard,
+            CollectionOrderMode::Standard,
+            standard.standard_sort,
+            CollectionGridSetOrderRoute::StandardControl,
+        ));
+        assert_eq!(app.settings.details_sort_key, DetailsSortKey::Name);
+        assert!(app.request_collection_grid_set_order(
+            standard,
+            CollectionOrderMode::Standard,
+            standard.standard_sort,
+            CollectionGridSetOrderRoute::CollectionMenu,
+        ));
+        assert_eq!(app.settings.details_sort_key, DetailsSortKey::Toolbar);
+        assert!(
+            app.collection_export_all_available(),
+            "local header reset must not enqueue an actor operation"
         );
+        app.set_details_sort_key(DetailsSortKey::Modified);
+        app.set_details_sort_key(DetailsSortKey::Name);
+        assert_eq!(app.settings.details_sort_key, DetailsSortKey::Name);
+        assert!(app.settings.details_sort_ascending);
+        assert_eq!(
+            app.settings.details_sort_key,
+            DetailsSortKey::Name,
+            "a later header selection must have no pending no-op reply to overwrite it"
+        );
+        assert!(app.request_collection_grid_set_order(
+            standard,
+            CollectionOrderMode::Standard,
+            standard.standard_sort,
+            CollectionGridSetOrderRoute::CollectionMenu,
+        ));
+        assert_eq!(app.settings.details_sort_key, DetailsSortKey::Toolbar);
+        let unchanged_standard = app.collection_grid_root_order().unwrap().unwrap();
+        assert_eq!(
+            unchanged_standard.content.expected_revision,
+            standard.content.expected_revision
+        );
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+
+        app.settings.details_sort_key = DetailsSortKey::Name;
+        app.rebuild_details_order();
+        let standard = app.collection_grid_root_order().unwrap().unwrap();
+        assert!(app.request_collection_grid_set_order(
+            standard,
+            CollectionOrderMode::Shuffle,
+            standard.standard_sort,
+            CollectionGridSetOrderRoute::CollectionMenu,
+        ));
         poll_until(
             &mut app,
             "Shuffle order did not install",
@@ -2437,19 +2771,33 @@ mod tests {
         assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
 
         let shuffle = app.collection_grid_root_order().unwrap().unwrap();
-        app.start_collection_grid_content_action(
-            shuffle.content,
-            CollectionGridSnapshotAction::SetOrder {
-                mode: CollectionOrderMode::Shuffle,
-                sort: shuffle.standard_sort,
-            },
-        );
+        let first_shuffle_seed = recv(
+            client
+                .load_collection(created.collection_id())
+                .expect("load first shuffle"),
+        )
+        .definition
+        .shuffle_seed;
+        assert!(app.request_collection_grid_set_order(
+            shuffle,
+            CollectionOrderMode::Shuffle,
+            shuffle.standard_sort,
+            CollectionGridSetOrderRoute::StandardControl,
+        ));
         poll_until(
             &mut app,
             "Shuffle reselection did not install",
             |app| matches!(app.collection_grid_root_order(), Some(Ok(order)) if order.mode == CollectionOrderMode::Shuffle && order.content.expected_revision > shuffle.content.expected_revision),
         );
         assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+        let second_shuffle_seed = recv(
+            client
+                .load_collection(created.collection_id())
+                .expect("load second shuffle"),
+        )
+        .definition
+        .shuffle_seed;
+        assert_ne!(first_shuffle_seed, second_shuffle_seed);
 
         let anchor = app
             .top_level_grid_view
@@ -2487,7 +2835,6 @@ mod tests {
     fn standard_root_header_sort_only_reorders_rows_not_reader_or_spread() {
         use crate::collection_store::CollectionOrderMode;
         use crate::settings::{DetailsSortKey, GridViewMode, SortOrder, SpreadMode};
-        use crate::ui_dialogs::collections::CollectionGridSnapshotAction;
         use crate::ui_fullscreen::SpreadPair;
 
         let temp = tempfile::tempdir().unwrap();
@@ -2506,13 +2853,12 @@ mod tests {
         wait_for_grid(&mut app, created.collection_id());
 
         let manual = app.collection_grid_root_order().unwrap().unwrap();
-        app.start_collection_grid_content_action(
-            manual.content,
-            CollectionGridSnapshotAction::SetOrder {
-                mode: CollectionOrderMode::Standard,
-                sort: SortOrder::FileName,
-            },
-        );
+        assert!(app.request_collection_grid_set_order(
+            manual,
+            CollectionOrderMode::Standard,
+            SortOrder::FileName,
+            CollectionGridSetOrderRoute::StandardControl,
+        ));
         poll_until(&mut app, "Standard order did not install", |app| {
             matches!(
                 app.collection_grid_root_order(),
@@ -2886,6 +3232,7 @@ mod tests {
             collection_name: previous.collection_name.clone(),
             order_mode: previous.order_mode,
             standard_sort: previous.standard_sort,
+            auto_aspect_eligible_total: previous.auto_aspect_eligible_total,
             entries: Arc::from(entries.into_boxed_slice()),
         });
         app.apply_collection_grid_prepared(Arc::clone(&reordered), Some(previous));
@@ -3188,6 +3535,207 @@ mod tests {
             .unwrap();
         assert_eq!(prepared.entries[selected].entry_id, anchor.entry_id);
         assert_eq!(app.address, "コレクション: Renamed while in child");
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn direct_page_close_from_collection_pdf_and_zip_restores_root_anchor() {
+        let temp = tempfile::tempdir().unwrap();
+        let pdf = temp.path().join("book.pdf");
+        let zip = temp.path().join("book.zip");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        std::fs::write(&zip, b"collection return fixture").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (pdf.clone(), CollectionResolvedKind::Pdf),
+                (zip.clone(), CollectionResolvedKind::Zip),
+            ],
+        );
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let expected_order: Vec<_> = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.entry_id)
+            .collect();
+
+        for source in [&pdf, &zip] {
+            let source_index = app
+                .items
+                .iter()
+                .position(|item| item.drag_source_path() == Some(source.as_path()))
+                .expect("collection container row");
+            app.selected = Some(source_index);
+            app.scroll_offset_y = 360.0;
+            app.scroll_to_selected = false;
+            let anchor = app
+                .collection_grid_source_anchor(source_index, source)
+                .expect("stable collection source anchor");
+            app.commit_collection_grid_source_open(anchor.clone(), source.clone());
+            app.current_folder = Some(source.clone());
+            app.items = if source == &pdf {
+                vec![GridItem::PdfPage {
+                    pdf_path: source.clone(),
+                    page_num: 0,
+                    content_type: None,
+                }]
+            } else {
+                vec![GridItem::ZipImage {
+                    zip_path: source.clone(),
+                    entry_name: "page.jpg".into(),
+                }]
+            };
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.items_generation = app.items_generation.wrapping_add(1);
+            app.fullscreen_idx = Some(0);
+            app.pending_return_to_parent = false;
+
+            app.handle_fullscreen_close_request();
+            assert!(app.pending_return_to_parent);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            let close_consumed_before_render = source == &pdf;
+            let nav = if close_consumed_before_render {
+                let ctx = egui::Context::default();
+                ctx.begin_pass(egui::RawInput::default());
+                let nav = app.handle_keyboard(&ctx);
+                let _ = ctx.end_pass();
+                nav.expect("frame-start keyboard handling must consume the close request")
+            } else {
+                app.take_pending_return_to_parent_nav()
+                    .expect("post-render close handling must consume the close request")
+            };
+            let crate::ui_main::AddressBarNav::Collection(restore) = &nav else {
+                panic!("collection-owned book must not fall through to its physical parent")
+            };
+            assert_eq!(restore.identity.collection_id, snapshot.collection_id());
+            assert_eq!(restore.revision_at_open, snapshot.revision());
+            assert_eq!(restore.viewport_anchor.as_ref(), Some(&anchor));
+            assert!(app.select_after_load.is_none());
+
+            if close_consumed_before_render {
+                let crate::ui_main::AddressBarNav::Collection(restore) = nav else {
+                    unreachable!("the collection route was checked above")
+                };
+                app.apply_collection_input_nav(restore, true);
+            } else {
+                assert!(app.apply_fullscreen_close_nav_immediate(nav));
+            }
+            wait_for_grid(&mut app, snapshot.collection_id());
+            assert_eq!(app.fullscreen_idx, None);
+            assert!(matches!(
+                app.top_level_grid_view
+                    .collection_session()
+                    .unwrap()
+                    .position,
+                CollectionGridPosition::Root
+            ));
+            let prepared = app
+                .top_level_grid_view
+                .collection_session()
+                .and_then(CollectionGridSession::prepared)
+                .unwrap();
+            assert_eq!(
+                prepared
+                    .entries
+                    .iter()
+                    .map(|entry| entry.entry_id)
+                    .collect::<Vec<_>>(),
+                expected_order,
+                "return must preserve collection order"
+            );
+            assert_eq!(
+                prepared.entries[app.selected.expect("restored selection")].entry_id,
+                anchor.entry_id
+            );
+            assert!(app.scroll_to_selected);
+        }
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn ordinary_collection_navigation_does_not_close_fullscreen() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("page.png");
+        std::fs::write(&source, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[(source, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let TopLevelGridRestore::Collection(restore) = app
+            .collection_grid_restore_snapshot()
+            .expect("mounted collection restore")
+        else {
+            panic!("mounted collection must expose its typed restore")
+        };
+
+        app.fullscreen_idx = Some(0);
+        app.apply_collection_input_nav(restore, false);
+
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "ordinary collection navigation must not inherit direct-page close semantics"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_parent_resolution_is_owned_by_the_mounted_viewer_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("book");
+        let nested = folder.join("chapter");
+        std::fs::create_dir_all(&nested).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let anchor = app
+            .collection_grid_source_anchor(0, &folder)
+            .expect("collection source anchor");
+        app.commit_collection_grid_source_open(anchor.clone(), folder);
+        app.current_folder = Some(nested);
+
+        let crate::ui_main::AddressBarNav::Collection(descendant_restore) = app
+            .resolve_return_to_parent_nav()
+            .expect("collection descendant keeps its root parent")
+        else {
+            panic!("collection descendant must not fall through to its physical parent")
+        };
+        assert_eq!(descendant_restore.viewport_anchor.as_ref(), Some(&anchor));
+
+        let sibling_book = temp.path().join("sibling").join("other.pdf");
+        let sibling_parent = sibling_book.parent().unwrap().to_path_buf();
+        let sibling = app.build_window_context_for_test(9_901, |sibling| {
+            sibling.current_folder = Some(sibling_book.clone());
+            sibling.select_after_load = None;
+        });
+        app.with_viewer_context(sibling, |sibling| {
+            assert!(matches!(
+                sibling.resolve_return_to_parent_nav(),
+                Some(crate::ui_main::AddressBarNav::Direct(path)) if path == sibling_parent
+            ));
+            assert_eq!(sibling.select_after_load.as_deref(), Some("other.pdf"));
+        })
+        .expect("mount sibling context");
+
+        let crate::ui_main::AddressBarNav::Collection(restore) = app
+            .resolve_return_to_parent_nav()
+            .expect("mounted collection context owns its parent")
+        else {
+            panic!("mounted collection context must resolve independently of its sibling")
+        };
+        assert_eq!(restore.identity.collection_id, snapshot.collection_id());
+        assert_eq!(restore.viewport_anchor.as_ref(), Some(&anchor));
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -3547,6 +4095,129 @@ mod tests {
                 .is_some_and(|path| crate::folder_tree::path_eq(path, &source))
         }));
         app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn missing_placeholder_location_jump_uses_registered_exact_path_without_physical_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("source-folder");
+        std::fs::create_dir(&parent).unwrap();
+        let missing = parent.join("missing.png");
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(missing.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert!(matches!(
+            &app.items[0],
+            GridItem::CollectionPlaceholder { path, .. }
+                if crate::folder_tree::path_eq(path, &missing)
+        ));
+        assert!(app.items[0].drag_source_path().is_none());
+
+        let request = collection_jump_request(&app, &missing);
+        assert!(app.begin_context_jump_to_folder(request.clone()).is_none());
+        assert!(app.context_folder_jump_pending());
+        let pending = app.folder_pane_open_pending.take().unwrap();
+        pending.cancel.store(true, Ordering::Relaxed);
+        let scan = super::super::folder_scan::scan_directory_with_settings(&parent, &app.settings)
+            .unwrap();
+        app.apply_jump_to_physical_folder_ready(
+            parent.clone(),
+            scan,
+            request.selection,
+            request.origin,
+        );
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Folder
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(parent.as_path()));
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("移動先の項目が見つかりません")
+        }));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_location_jump_rejected_by_restore_keeps_root_and_notifies_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("source-folder");
+        std::fs::create_dir(&parent).unwrap();
+        let source = parent.join("image.png");
+        std::fs::write(&source, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(source.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let held_generation = app.items_generation;
+        let held_address = app.address.clone();
+        let request = collection_jump_request(&app, &source);
+        assert!(app.begin_context_jump_to_folder(request.clone()).is_none());
+        let pending = app.folder_pane_open_pending.take().unwrap();
+        pending.cancel.store(true, Ordering::Relaxed);
+        let scan = super::super::folder_scan::scan_directory_with_settings(&parent, &app.settings)
+            .unwrap();
+
+        // The restore began after the parent scan. The completed scan must be discarded without
+        // replacing the source Collection root, and the reason belongs to that origin context.
+        app.activate_sidecar_restore_modal_for_test(parent.clone());
+        app.apply_jump_to_physical_folder_ready(
+            parent.clone(),
+            scan,
+            request.selection.clone(),
+            request.origin.clone(),
+        );
+        assert_eq!(app.items_generation, held_generation);
+        assert_eq!(app.address, held_address);
+        assert!(app.current_folder.is_none());
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(_)
+        ));
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+            toast.0.contains("サイドカー復元中") && toast.0.contains("もう一度選択")
+        }));
+
+        // The same rejection at admission also leaves no hidden scan to replay later.
+        assert!(app.begin_context_jump_to_folder(request).is_none());
+        assert!(app.folder_pane_open_pending.is_none());
+        app.sidecar_restore = None;
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn normal_folder_rescan_preserves_menu_on_identical_content_and_retires_it_on_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("a.png"), b"a").unwrap();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        let initial =
+            super::super::folder_scan::scan_directory_with_settings(&folder, &app.settings)
+                .unwrap();
+        app.load_folder_with_scan(folder.clone(), Some(initial));
+        let generation = app.items_generation;
+        let menu_owner = app.capture_grid_context_menu_owner(0);
+        app.context_menu_idx = Some(menu_owner);
+
+        let unchanged =
+            super::super::folder_scan::scan_directory_with_settings(&folder, &app.settings)
+                .unwrap();
+        app.apply_external_rescan(folder.clone(), std::time::SystemTime::now(), unchanged);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.context_menu_idx, Some(menu_owner));
+
+        std::fs::write(folder.join("b.png"), b"b").unwrap();
+        let changed =
+            super::super::folder_scan::scan_directory_with_settings(&folder, &app.settings)
+                .unwrap();
+        app.apply_external_rescan(folder, std::time::SystemTime::now(), changed);
+        assert_ne!(app.items_generation, generation);
+        assert!(app.context_menu_idx.is_none());
     }
 
     #[test]
@@ -4138,6 +4809,11 @@ mod tests {
             .load = CollectionGridLoadState::Preparing {
             stamp,
             exact_revision: snapshot.revision(),
+            lease: crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("grid-test"),
+                Instant::now(),
+                "prepare",
+            ),
             installed: Some(Arc::clone(&installed)),
             cancel: Arc::clone(&cancel),
             receiver: rx,
@@ -4159,6 +4835,247 @@ mod tests {
             session.prepared().unwrap().collection_revision,
             snapshot.revision()
         );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn metadata_import_pin_epoch_refreshes_all_context_presentations_without_rebinding_items() {
+        let temp = tempfile::tempdir().unwrap();
+        let video = temp.path().join("clip.mp4");
+        std::fs::write(&video, b"video").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let pin_path = crate::video_pins::VideoPinDb::db_path();
+        app.video_pin_db = Some(crate::video_pins::VideoPinDb::open_at(&pin_path).unwrap());
+        app.video_pin_db
+            .as_ref()
+            .unwrap()
+            .set_pin(&video, 1.0, b"old-webp")
+            .unwrap();
+        let snapshot =
+            collection_with_sources(&client, &[(video.clone(), CollectionResolvedKind::Video)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let installed = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::installed_presentation)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            installed
+                .sources
+                .retained()
+                .unwrap()
+                .payload
+                .video_pin_blobs
+                .get(&video)
+                .map(Vec::as_slice),
+            Some(b"old-webp".as_slice())
+        );
+        let prepared = Arc::clone(&installed.prepared);
+        let entry = prepared.entries[0].clone();
+        let parked_items = app.items.clone();
+        let parked_metas = app.image_metas.clone();
+        let parked_video = video.clone();
+        let parked = app.build_window_context_for_test(709, move |context| {
+            context.top_level_grid_view.begin(
+                TopLevelGridSurface::Collection(CollectionGridIdentity {
+                    collection_id: prepared.collection_id,
+                }),
+                None,
+            );
+            context.items = parked_items;
+            context.image_metas = parked_metas;
+            context.fullscreen_idx = Some(0);
+            let generation = context.items_generation;
+            let session = context
+                .top_level_grid_view
+                .collection_session_mut()
+                .unwrap();
+            session.accepted_revision = prepared.collection_revision;
+            session.wanted_revision = prepared.collection_revision;
+            session.position = CollectionGridPosition::PhysicalSource {
+                entry_id: entry.entry_id,
+                source_key: entry.source_key,
+                path: parked_video,
+            };
+            session.load = CollectionGridLoadState::Ready(Arc::clone(&installed));
+            session.installed_items_generation = Some(generation);
+            context.top_level_grid_view.set_collection_navigation_pending(Some(
+                super::super::collection_navigation::CollectionNavigationPending::AwaitingOuterContinuation {
+                    steps: 1,
+                    fullscreen: true,
+                    resume_slideshow: false,
+                    native_toast: false,
+                },
+            ));
+        });
+
+        // The import writer is an independent connection.  Drop the App handle to
+        // prove that committed-change observation does not depend on its stamp.
+        app.video_pin_db = None;
+        let conn = rusqlite::Connection::open(&pin_path).unwrap();
+        conn.execute(
+            "UPDATE video_pins SET thumb_webp = ?2, thumb_pts_secs = 2.0 WHERE path = ?1",
+            rusqlite::params![
+                crate::path_key::normalize_keep_drive(&video),
+                b"new-webp".as_slice()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let root_generation = app.items_generation;
+        let root_items = app.items.clone();
+        app.fullscreen_idx = Some(0);
+        let old_epoch = app.collection_thumbnail_source_epoch;
+        let video_worker_cancel = Arc::new(AtomicBool::new(false));
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .video_worker_cancel = Some(Arc::clone(&video_worker_cancel));
+
+        app.advance_collection_thumbnail_source_epoch_for_metadata_import(0);
+        assert_eq!(app.collection_thumbnail_source_epoch, old_epoch);
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Ready(_)
+        ));
+        assert!(!video_worker_cancel.load(Ordering::Acquire));
+
+        app.advance_collection_thumbnail_source_epoch_for_metadata_import(1);
+
+        assert_eq!(
+            app.collection_thumbnail_source_epoch,
+            old_epoch.wrapping_add(1)
+        );
+        let root_session = app.top_level_grid_view.collection_session().unwrap();
+        assert!(matches!(
+            root_session.load,
+            CollectionGridLoadState::RequestNeeded {
+                installed: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            root_session.installed_items_generation,
+            Some(root_generation)
+        );
+        assert_eq!(app.items, root_items);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(video_worker_cancel.load(Ordering::Acquire));
+        app.with_viewer_context(parked, |context| {
+            let session = context.top_level_grid_view.collection_session().unwrap();
+            assert!(matches!(
+                session.position,
+                CollectionGridPosition::PhysicalSource { .. }
+            ));
+            assert!(matches!(
+                session.load,
+                CollectionGridLoadState::RequestNeeded {
+                    installed: Some(_),
+                    ..
+                }
+            ));
+            assert_eq!(
+                session.installed_items_generation,
+                Some(context.items_generation)
+            );
+            assert_eq!(context.fullscreen_idx, Some(0));
+            assert!(context.top_level_grid_view.collection_navigation_pending());
+            assert!(
+                context
+                    .top_level_grid_view
+                    .collection_navigation_owns_fs_lock()
+            );
+        })
+        .unwrap();
+
+        app.fullscreen_idx = None;
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let refreshed = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::installed_presentation)
+            .unwrap();
+        assert_eq!(refreshed.reuse_key.thumbnail_source_epoch, old_epoch + 1);
+        assert_eq!(
+            refreshed
+                .sources
+                .retained()
+                .unwrap()
+                .payload
+                .video_pin_blobs
+                .get(&video)
+                .map(Vec::as_slice),
+            Some(b"new-webp".as_slice())
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn prepare_result_from_a_previous_thumbnail_source_epoch_is_not_installed() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("image.png");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[(image, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let installed = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(|session| session.prepared().cloned())
+            .unwrap();
+        let old_reuse_key = app.collection_grid_prepare_reuse_key(
+            installed.collection_id,
+            installed.collection_revision,
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(CollectionGridPreparedInstall {
+                prepared: (*installed).clone(),
+                thumbnail_sources: prepare_collection_grid_thumbnail_sources(
+                    CollectionGridThumbnailSources::default(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap(),
+                auto_aspect_lookup: None,
+                reuse_key: old_reuse_key,
+            }))
+            .unwrap();
+        app.collection_thumbnail_source_epoch =
+            app.collection_thumbnail_source_epoch.wrapping_add(1);
+        let stamp = app.collection_grid_stamp().unwrap();
+        let generation = app.items_generation;
+        let items = app.items.clone();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Preparing {
+            stamp,
+            exact_revision: installed.collection_revision,
+            lease: crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("grid-test"),
+                Instant::now(),
+                "prepare",
+            ),
+            installed: Some(Arc::clone(&installed)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            receiver,
+        };
+
+        app.poll_collection_grid(&egui::Context::default());
+
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::RequestNeeded {
+                installed: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.items, items);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -4437,10 +5354,9 @@ mod tests {
         app.collection_ui.set_read_phase_for_test(true);
         app.open_collection_grid(snapshot.collection_id(), None);
         let first_deadline = match &app.top_level_grid_view.collection_session().unwrap().load {
-            CollectionGridLoadState::RequestNeeded {
-                not_before: Some(deadline),
-                ..
-            } => *deadline,
+            CollectionGridLoadState::RequestNeeded { lease, .. } => {
+                lease.next_poll_at_for_test().unwrap()
+            }
             _ => panic!("Starting must retain read demand"),
         };
         assert!(
@@ -4454,9 +5370,8 @@ mod tests {
         app.poll_collection_grid(&ctx);
         assert!(matches!(
             app.top_level_grid_view.collection_session().unwrap().load,
-            CollectionGridLoadState::RequestNeeded {
-                not_before: Some(deadline), ..
-            } if deadline == first_deadline
+            CollectionGridLoadState::RequestNeeded { ref lease, .. }
+                if lease.next_poll_at_for_test() == Some(first_deadline)
         ));
 
         app.collection_ui.set_read_phase_for_test(false);
@@ -4470,13 +5385,13 @@ mod tests {
                 other => panic!("unexpected actor admission: {other:?}"),
             }
         }
-        if let CollectionGridLoadState::RequestNeeded { not_before, .. } = &mut app
+        if let CollectionGridLoadState::RequestNeeded { lease, .. } = &mut app
             .top_level_grid_view
             .collection_session_mut()
             .unwrap()
             .load
         {
-            *not_before = Some(Instant::now());
+            lease.force_due_for_test(Instant::now());
         }
         app.poll_collection_grid(&ctx);
         assert!(
@@ -4487,18 +5402,16 @@ mod tests {
                 .is_some()
         );
         let busy_deadline = match &app.top_level_grid_view.collection_session().unwrap().load {
-            CollectionGridLoadState::RequestNeeded {
-                not_before: Some(deadline),
-                ..
-            } => *deadline,
+            CollectionGridLoadState::RequestNeeded { lease, .. } => {
+                lease.next_poll_at_for_test().unwrap()
+            }
             _ => panic!("Busy must retain read demand"),
         };
         app.poll_collection_grid(&ctx);
         assert!(matches!(
             app.top_level_grid_view.collection_session().unwrap().load,
-            CollectionGridLoadState::RequestNeeded {
-                not_before: Some(deadline), ..
-            } if deadline == busy_deadline
+            CollectionGridLoadState::RequestNeeded { ref lease, .. }
+                if lease.next_poll_at_for_test() == Some(busy_deadline)
         ));
         release.send(()).unwrap();
         barrier_reply
@@ -4506,16 +5419,280 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(queued);
-        if let CollectionGridLoadState::RequestNeeded { not_before, .. } = &mut app
+        if let CollectionGridLoadState::RequestNeeded { lease, .. } = &mut app
             .top_level_grid_view
             .collection_session_mut()
             .unwrap()
             .load
         {
-            *not_before = Some(Instant::now());
+            lease.force_due_for_test(Instant::now());
         }
         wait_for_grid(&mut app, snapshot.collection_id());
         assert_eq!(app.collection_grid_poll_delay(), None);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn long_running_grid_reads_keep_installed_content_adopt_exact_replies_and_honor_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("page.png");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[(image, CollectionResolvedKind::Image)]);
+        let collection_id = snapshot.collection_id();
+        app.open_collection_grid(collection_id, None);
+        wait_for_grid(&mut app, collection_id);
+        let installed_prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .unwrap()
+            .clone();
+        let installed_generation = app.items_generation;
+        let stamp = app.collection_grid_stamp().unwrap();
+        let now = Instant::now();
+        let started = now.checked_sub(Duration::from_secs(24 * 60 * 60)).unwrap();
+
+        let (snapshot_sender, snapshot_receiver) = crossbeam_channel::bounded(1);
+        let snapshot_lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("grid"),
+            started,
+            "snapshot",
+        );
+        let snapshot_request_id = snapshot_lease.request_id();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Snapshot {
+            stamp,
+            minimum_revision: installed_prepared.collection_revision,
+            lease: snapshot_lease,
+            queued_at: None,
+            installed: Some(Arc::clone(&installed_prepared)),
+            receiver: snapshot_receiver,
+        };
+        app.poll_collection_grid(&egui::Context::default());
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Snapshot { ref lease, ref installed, .. }
+                if lease.request_id() == snapshot_request_id
+                    && installed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &installed_prepared))
+        ));
+        assert_eq!(app.items_generation, installed_generation);
+        snapshot_sender.send(Ok(snapshot.clone())).unwrap();
+        wait_for_grid(&mut app, collection_id);
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Ready(_) | CollectionGridLoadState::Empty(_)
+        ));
+        let generation_before_prepare = app.items_generation;
+
+        let (prepare_sender, prepare_receiver) = std::sync::mpsc::channel();
+        let prepared_sources = prepare_collection_grid_thumbnail_sources(
+            CollectionGridThumbnailSources::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let prepare_lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("grid"),
+            started,
+            "prepare",
+        );
+        let prepare_request_id = prepare_lease.request_id();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Preparing {
+            stamp,
+            exact_revision: installed_prepared.collection_revision,
+            lease: prepare_lease,
+            installed: Some(Arc::clone(&installed_prepared)),
+            cancel: Arc::clone(&cancel),
+            receiver: prepare_receiver,
+        };
+        app.poll_collection_grid(&egui::Context::default());
+        assert!(!cancel.load(Ordering::Acquire));
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Preparing { ref lease, ref installed, .. }
+                if lease.request_id() == prepare_request_id
+                    && installed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &installed_prepared))
+        ));
+        assert_eq!(app.items_generation, generation_before_prepare);
+
+        prepare_sender
+            .send(Ok(CollectionGridPreparedInstall {
+                prepared: (*installed_prepared).clone(),
+                thumbnail_sources: prepared_sources,
+                auto_aspect_lookup: None,
+                reuse_key: app.collection_grid_prepare_reuse_key(
+                    installed_prepared.collection_id,
+                    installed_prepared.collection_revision,
+                ),
+            }))
+            .unwrap();
+        app.poll_collection_grid(&egui::Context::default());
+        assert!(!cancel.load(Ordering::Acquire));
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Ready(_) | CollectionGridLoadState::Empty(_)
+        ));
+
+        let (late_sender, late_receiver) = std::sync::mpsc::channel();
+        let late_cancel = Arc::new(AtomicBool::new(false));
+        let late_lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("grid"),
+            started,
+            "prepare",
+        );
+        let generation_before_cancel = app.items_generation;
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Preparing {
+            stamp,
+            exact_revision: installed_prepared.collection_revision,
+            lease: late_lease,
+            installed: Some(Arc::clone(&installed_prepared)),
+            cancel: Arc::clone(&late_cancel),
+            receiver: late_receiver,
+        };
+        late_sender
+            .send(Ok(CollectionGridPreparedInstall {
+                prepared: (*installed_prepared).clone(),
+                thumbnail_sources: prepare_collection_grid_thumbnail_sources(
+                    CollectionGridThumbnailSources::default(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap(),
+                auto_aspect_lookup: None,
+                reuse_key: app.collection_grid_prepare_reuse_key(
+                    installed_prepared.collection_id,
+                    installed_prepared.collection_revision,
+                ),
+            }))
+            .unwrap();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .cancel_pending();
+        assert!(late_cancel.load(Ordering::Acquire));
+        app.collection_ui.set_read_phase_for_test(true);
+        app.poll_collection_grid(&egui::Context::default());
+        assert_eq!(app.items_generation, generation_before_cancel);
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::RequestNeeded { .. }
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[ignore = "optimized 10,000-entry collection read pipeline benchmark"]
+    fn benchmark_collection_actor_and_root_prepare_with_10000_entries() {
+        const COUNT: usize = crate::collection_store::MAX_COLLECTION_ENTRIES;
+        let temp = tempfile::tempdir().unwrap();
+        let present_root = temp.path().join("present");
+        let missing_root = temp.path().join("missing");
+        std::fs::create_dir(&present_root).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+
+        let mut present = Vec::with_capacity(COUNT);
+        let file_creation_started = Instant::now();
+        for index in 0..COUNT {
+            let path = present_root.join(format!("image-{index:05}.png"));
+            std::fs::write(&path, []).unwrap();
+            present.push(
+                CollectionRegistration::from_trusted_path(&path, CollectionResolvedKind::Image)
+                    .unwrap(),
+            );
+        }
+        let file_creation_elapsed = file_creation_started.elapsed();
+
+        let present_created = recv(client.create_collection("10k present".into()).unwrap());
+        let actor_write_started = Instant::now();
+        let present_snapshot = client
+            .add_batch(
+                present_created.collection_id(),
+                present_created.revision(),
+                present,
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(120))
+            .expect("10k actor reply")
+            .expect("10k actor write")
+            .snapshot;
+        let actor_write_elapsed = actor_write_started.elapsed();
+
+        let catalog_started = Instant::now();
+        let catalog = client
+            .list_catalog()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(120))
+            .expect("catalog reply")
+            .expect("catalog read");
+        let catalog_elapsed = catalog_started.elapsed();
+        let snapshot_started = Instant::now();
+        let reloaded_present = client
+            .load_collection(present_snapshot.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(120))
+            .expect("snapshot reply")
+            .expect("snapshot read");
+        let snapshot_elapsed = snapshot_started.elapsed();
+        let prepare_present_started = Instant::now();
+        let prepared_present = crate::collection_store::prepare_collection_snapshot(
+            &reloaded_present,
+            &crate::settings::GridDisplayOrder::default(),
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .expect("prepare present roots");
+        let prepare_present_elapsed = prepare_present_started.elapsed();
+
+        let mut missing = Vec::with_capacity(COUNT);
+        for index in 0..COUNT {
+            let path = missing_root.join(format!("image-{index:05}.png"));
+            missing.push(
+                CollectionRegistration::from_trusted_path(&path, CollectionResolvedKind::Image)
+                    .unwrap(),
+            );
+        }
+        let missing_created = recv(client.create_collection("10k missing".into()).unwrap());
+        let missing_snapshot = client
+            .add_batch(
+                missing_created.collection_id(),
+                missing_created.revision(),
+                missing,
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(120))
+            .expect("10k missing actor reply")
+            .expect("10k missing actor write")
+            .snapshot;
+        let prepare_missing_started = Instant::now();
+        let prepared_missing = crate::collection_store::prepare_collection_snapshot(
+            &missing_snapshot,
+            &crate::settings::GridDisplayOrder::default(),
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .expect("prepare missing roots");
+        let prepare_missing_elapsed = prepare_missing_started.elapsed();
+
+        assert_eq!(catalog.definitions.len(), 1);
+        assert_eq!(prepared_present.entries.len(), COUNT);
+        assert_eq!(prepared_missing.entries.len(), COUNT);
+        println!(
+            "collection-10k file_create_ms={:.3} actor_write_ms={:.3} catalog_ms={:.3} snapshot_ms={:.3} prepare_present_ms={:.3} prepare_all_missing_ms={:.3}",
+            file_creation_elapsed.as_secs_f64() * 1000.0,
+            actor_write_elapsed.as_secs_f64() * 1000.0,
+            catalog_elapsed.as_secs_f64() * 1000.0,
+            snapshot_elapsed.as_secs_f64() * 1000.0,
+            prepare_present_elapsed.as_secs_f64() * 1000.0,
+            prepare_missing_elapsed.as_secs_f64() * 1000.0,
+        );
         app.shutdown_collection_runtime_for_exit();
     }
 

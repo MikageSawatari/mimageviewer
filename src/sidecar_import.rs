@@ -16,8 +16,14 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::sidecar::{
-    ImportStats, LoadedSidecarImport, RelKeyKind, SidecarFile, SidecarImportSource, SidecarMask,
-    classify_rel_key,
+    ImportStats, LoadedSidecarImport, RelKeyKind, SidecarDiskToken, SidecarFile,
+    SidecarImportSource, SidecarMask, classify_rel_key,
+};
+
+mod probe_reuse;
+pub(crate) use probe_reuse::{
+    MAX_PROOF_BYTES, SidecarProbeProof, SidecarProbeReuseMissReason, SidecarProbeReuseOutcome,
+    probe_for_restore,
 };
 
 const MAX_MASK_PIXELS: usize = 128 * 1024 * 1024;
@@ -63,10 +69,12 @@ pub struct SidecarProbeResult {
 /// Only `Current` exposes a `SidecarFile` that may be installed as a current
 /// cache value.  Write-required and source-changed variants deliberately expose
 /// no snapshot; the coordinator must drain writers and run a strict operation.
-pub enum SidecarImportProbe {
+pub(crate) enum SidecarImportProbe {
     Current {
         sidecar: SidecarFile,
         result: SidecarProbeResult,
+        /// Exact bytes parsed by this probe; Missing and pending-writer sources have no disk token.
+        source: Option<SidecarDiskToken>,
     },
     ImportRequired {
         result: SidecarProbeResult,
@@ -85,6 +93,19 @@ pub enum SidecarImportProbe {
         error: String,
         result: SidecarProbeResult,
     },
+}
+
+impl SidecarImportProbe {
+    pub(crate) fn result(&self) -> &SidecarProbeResult {
+        match self {
+            Self::Current { result, .. }
+            | Self::ImportRequired { result }
+            | Self::MarkerClearRequired { result }
+            | Self::SourceChanged { result, .. }
+            | Self::Cancelled { result }
+            | Self::Failed { result, .. } => result,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -422,7 +443,7 @@ pub(crate) fn validate_cache_snapshot(
 /// run on a worker.  A current snapshot is returned only when no requested
 /// family needs a write.  Stage 2 must still establish its writer barriers
 /// before installing the snapshot or resuming first-display hydration.
-pub fn probe(
+pub(crate) fn probe(
     folder: &Path,
     data_dir: &Path,
     families: ImportFamilies,
@@ -533,7 +554,14 @@ pub fn probe(
             if probe_requires_import(&result) {
                 SidecarImportProbe::ImportRequired { result }
             } else {
-                SidecarImportProbe::Current { sidecar, result }
+                SidecarImportProbe::Current {
+                    sidecar,
+                    result,
+                    source: match source {
+                        SidecarImportSource::Disk(token) => Some(token),
+                        SidecarImportSource::PendingWriter { .. } => None,
+                    },
+                }
             }
         }
         crate::sidecar::SidecarImportLoad::Missing { sidecar } => {
@@ -579,7 +607,11 @@ pub fn probe(
             if probe_requires_marker_clear(&result) {
                 SidecarImportProbe::MarkerClearRequired { result }
             } else {
-                SidecarImportProbe::Current { sidecar, result }
+                SidecarImportProbe::Current {
+                    sidecar,
+                    result,
+                    source: None,
+                }
             }
         }
         crate::sidecar::SidecarImportLoad::Unreadable { sidecar, error }
@@ -686,6 +718,7 @@ fn terminal_probe(
             requested_probe_failed(families.edits, &error),
             requested_probe_failed(families.tags, &error),
         ),
+        source: None,
     }
 }
 
@@ -2059,6 +2092,7 @@ mod tests {
         let SidecarImportProbe::Current {
             sidecar: mut probe_sidecar,
             result: probe_result,
+            ..
         } = probe(
             media.path(),
             data.path(),
@@ -2435,8 +2469,9 @@ mod tests {
         let cancel = AtomicBool::new(false);
         import_sample_sidecar(media.path(), data.path(), &cancel);
 
-        let SidecarImportProbe::Current { sidecar, result } =
-            probe(media.path(), data.path(), ImportFamilies::ALL, &cancel)
+        let SidecarImportProbe::Current {
+            sidecar, result, ..
+        } = probe(media.path(), data.path(), ImportFamilies::ALL, &cancel)
         else {
             panic!("committed sidecar must probe as synchronized");
         };
@@ -2707,5 +2742,510 @@ mod tests {
             ImportFamilyOutcome::SourceChanged(_)
         ));
         assert!(matches!(result.tags, ImportFamilyOutcome::SourceChanged(_)));
+    }
+
+    #[test]
+    fn reusable_probe_keeps_disk_and_marker_checks_on_each_visit() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(media.path(), data.path(), &cancel);
+
+        let first = probe_for_restore(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            None,
+            true,
+        );
+        assert!(!first.reuse.reused());
+        let SidecarImportProbe::Current {
+            sidecar: cold_owner,
+            ..
+        } = first.probe
+        else {
+            panic!("synchronized source must be Current");
+        };
+        assert!(cold_owner.outer_items_unique_for_test());
+        let proof = first
+            .proof_candidate
+            .expect("synchronized clean disk proof");
+        let second = probe_for_restore(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            Some(&proof),
+            true,
+        );
+        assert!(second.reuse.reused());
+        let SidecarImportProbe::Current {
+            sidecar: warm_owner,
+            ..
+        } = second.probe
+        else {
+            panic!("reused source must be Current");
+        };
+        assert!(warm_owner.outer_items_unique_for_test());
+
+        let folder_key = crate::adjustment_db::normalize_path(media.path());
+        let adjustment =
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap();
+        adjustment.sidecar_sync_upsert(&folder_key, 7).unwrap();
+        let marker_changed = probe_for_restore(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            Some(&proof),
+            true,
+        );
+        assert!(!marker_changed.reuse.reused());
+        assert_eq!(
+            marker_changed.reuse,
+            SidecarProbeReuseOutcome::Miss(SidecarProbeReuseMissReason::MarkerMismatch)
+        );
+        assert!(matches!(
+            marker_changed.probe,
+            SidecarImportProbe::ImportRequired { .. }
+        ));
+
+        let path = media.path().join(crate::sidecar::SIDECAR_FILENAME);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let changed = original
+            .windows(5)
+            .position(|bytes| bytes == b"a.jpg")
+            .expect("fixture key exists");
+        let mut replacement = original.clone();
+        replacement[changed] = b'b';
+        std::fs::write(&path, &replacement).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            original.len() as u64
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        let same_metadata_new_bytes = probe_for_restore(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            Some(&proof),
+            true,
+        );
+        assert!(!same_metadata_new_bytes.reuse.reused());
+        assert_eq!(
+            same_metadata_new_bytes.reuse,
+            SidecarProbeReuseOutcome::Miss(SidecarProbeReuseMissReason::TokenMismatch)
+        );
+        assert!(matches!(
+            same_metadata_new_bytes.probe,
+            SidecarImportProbe::ImportRequired { .. }
+        ));
+
+        std::fs::remove_file(&path).unwrap();
+        let missing = probe_for_restore(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            Some(&proof),
+            true,
+        );
+        assert!(!missing.reuse.reused());
+        assert!(missing.proof_candidate.is_none());
+        assert!(matches!(
+            missing.probe,
+            SidecarImportProbe::MarkerClearRequired { .. }
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reusable_probe_requires_the_exact_raw_folder_owner_path() {
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("ReuseCase");
+        std::fs::create_dir(&media).unwrap();
+        let alias = root.path().join("reusecase");
+        assert_ne!(media, alias);
+        assert_eq!(
+            crate::adjustment_db::normalize_path(&media),
+            crate::adjustment_db::normalize_path(&alias)
+        );
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(&media, data.path(), &cancel);
+        let first = probe_for_restore(
+            &media,
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            None,
+            true,
+        );
+        let proof = first.proof_candidate.expect("exact owner proof");
+
+        let aliased = probe_for_restore(
+            &alias,
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            Some(&proof),
+            true,
+        );
+        assert_eq!(
+            aliased.reuse,
+            SidecarProbeReuseOutcome::Miss(SidecarProbeReuseMissReason::KeyMismatch)
+        );
+        let SidecarImportProbe::Current { sidecar, .. } = aliased.probe else {
+            panic!("strict fallback must preserve the synchronized outcome");
+        };
+        assert_eq!(sidecar.folder(), alias);
+    }
+
+    #[test]
+    fn reusable_probe_rejects_data_dir_and_folder_key_changes() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(media.path(), data.path(), &cancel);
+        let first = probe_for_restore(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            None,
+            true,
+        );
+        let proof = first.proof_candidate.expect("synchronized proof");
+        let other_data = tempfile::tempdir().unwrap();
+        init_all_stores(other_data.path());
+        let data_miss = probe_for_restore(
+            media.path(),
+            other_data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            Some(&proof),
+            true,
+        );
+        assert_eq!(
+            data_miss.reuse,
+            SidecarProbeReuseOutcome::Miss(SidecarProbeReuseMissReason::KeyMismatch)
+        );
+
+        let other_media = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            media.path().join(crate::sidecar::SIDECAR_FILENAME),
+            other_media.path().join(crate::sidecar::SIDECAR_FILENAME),
+        )
+        .unwrap();
+        let folder_miss = probe_for_restore(
+            other_media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            Some(&proof),
+            true,
+        );
+        assert_eq!(
+            folder_miss.reuse,
+            SidecarProbeReuseOutcome::Miss(SidecarProbeReuseMissReason::KeyMismatch)
+        );
+    }
+
+    #[test]
+    fn invalid_unsupported_and_dirty_sources_never_create_a_reuse_proof() {
+        let invalid_media = tempfile::tempdir().unwrap();
+        let invalid_data = tempfile::tempdir().unwrap();
+        init_all_stores(invalid_data.path());
+        let mut invalid = SidecarFile::new(invalid_media.path().to_path_buf());
+        invalid.set_adjust("../escape.jpg", params(1.0));
+        assert!(invalid.flush_blocking());
+        let checked = probe_for_restore(
+            invalid_media.path(),
+            invalid_data.path(),
+            ImportFamilies {
+                edits: true,
+                tags: false,
+            },
+            &AtomicBool::new(false),
+            None,
+            true,
+        );
+        assert!(checked.proof_candidate.is_none());
+        let SidecarImportProbe::Current { result, .. } = checked.probe else {
+            panic!("semantic invalidity must retain a disabled Current owner");
+        };
+        assert!(result.source_validation_error.is_some());
+
+        let unsupported_media = tempfile::tempdir().unwrap();
+        let unsupported_data = tempfile::tempdir().unwrap();
+        init_all_stores(unsupported_data.path());
+        std::fs::write(
+            unsupported_media
+                .path()
+                .join(crate::sidecar::SIDECAR_FILENAME),
+            br#"{"version":999,"items":{}}"#,
+        )
+        .unwrap();
+        let unsupported = probe_for_restore(
+            unsupported_media.path(),
+            unsupported_data.path(),
+            ImportFamilies::ALL,
+            &AtomicBool::new(false),
+            None,
+            true,
+        );
+        assert!(unsupported.proof_candidate.is_none());
+
+        let dirty_media = tempfile::tempdir().unwrap();
+        let dirty_data = tempfile::tempdir().unwrap();
+        init_all_stores(dirty_data.path());
+        import_sample_sidecar(
+            dirty_media.path(),
+            dirty_data.path(),
+            &AtomicBool::new(false),
+        );
+        let mut strict = probe(
+            dirty_media.path(),
+            dirty_data.path(),
+            ImportFamilies::ALL,
+            &AtomicBool::new(false),
+        );
+        let SidecarImportProbe::Current { sidecar, .. } = &mut strict else {
+            panic!("fixture must be synchronized");
+        };
+        sidecar.set_tags("page.jpg", ["#dirty"]);
+        assert!(matches!(
+            probe_reuse::proof_candidate(
+                &strict,
+                dirty_media.path(),
+                dirty_data.path(),
+                ImportFamilies::ALL,
+            ),
+            Err(SidecarProbeReuseMissReason::Ineligible)
+        ));
+    }
+
+    #[test]
+    fn reusable_probe_rejects_family_change_marker_failure_and_cancel() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(media.path(), data.path(), &cancel);
+        let first = probe_for_restore(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            None,
+            true,
+        );
+        let proof = first.proof_candidate.unwrap();
+
+        let edits_only = probe_for_restore(
+            media.path(),
+            data.path(),
+            ImportFamilies {
+                edits: true,
+                tags: false,
+            },
+            &cancel,
+            Some(&proof),
+            true,
+        );
+        assert!(!edits_only.reuse.reused());
+        assert_eq!(
+            edits_only.reuse,
+            SidecarProbeReuseOutcome::Miss(SidecarProbeReuseMissReason::KeyMismatch)
+        );
+        assert!(matches!(
+            edits_only.probe,
+            SidecarImportProbe::Current { .. }
+        ));
+
+        std::fs::remove_file(data.path().join("tags.db")).unwrap();
+        let failed_marker = probe_for_restore(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            Some(&proof),
+            true,
+        );
+        assert!(!failed_marker.reuse.reused());
+        assert_eq!(
+            failed_marker.reuse,
+            SidecarProbeReuseOutcome::Miss(SidecarProbeReuseMissReason::MarkerReadFailed)
+        );
+        assert!(failed_marker.proof_candidate.is_none());
+        let SidecarImportProbe::Current { result, .. } = failed_marker.probe else {
+            panic!("marker failure preserves typed baseline Current outcome");
+        };
+        assert!(matches!(result.tags, SidecarProbeFamilyOutcome::Failed(_)));
+
+        cancel.store(true, Ordering::Relaxed);
+        let cancelled = probe_for_restore(
+            media.path(),
+            data.path(),
+            ImportFamilies::ALL,
+            &cancel,
+            Some(&proof),
+            true,
+        );
+        assert!(!cancelled.reuse.reused());
+        assert_eq!(
+            cancelled.reuse,
+            SidecarProbeReuseOutcome::Miss(SidecarProbeReuseMissReason::Cancelled)
+        );
+        assert!(cancelled.proof_candidate.is_none());
+        assert!(matches!(
+            cancelled.probe,
+            SidecarImportProbe::Cancelled { .. }
+        ));
+    }
+
+    /// Opt-in worker-only timing. The source is copied into a disposable folder;
+    /// marker stores are created there too, so this never writes the user profile.
+    #[test]
+    #[ignore]
+    fn benchmark_sidecar_probe_stages_from_fixture() {
+        let source = std::env::var_os("MIV_SIDECAR_BENCH_SOURCE")
+            .expect("set MIV_SIDECAR_BENCH_SOURCE to a read-only sidecar fixture");
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::copy(&source, media.path().join(crate::sidecar::SIDECAR_FILENAME)).unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        let families = ImportFamilies::ALL;
+        let folder_key = crate::adjustment_db::normalize_path(media.path());
+        let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
+            SidecarFile::load_for_import(media.path())
+        else {
+            panic!("fixture did not load as a supported sidecar");
+        };
+        let (_, source) = loaded.into_parts();
+        let crate::sidecar::SidecarImportSource::Disk(token) = source else {
+            panic!("disposable fixture must be a disk source");
+        };
+        let adjustment =
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap();
+        adjustment
+            .sidecar_sync_upsert(&folder_key, token.sync_marker())
+            .unwrap();
+        let tags = crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap();
+        tags.sidecar_sync_upsert(&folder_key, token.sync_marker())
+            .unwrap();
+        drop(tags);
+        drop(adjustment);
+        let mut load = Vec::new();
+        let mut prepare_time = Vec::new();
+        let mut marker = Vec::new();
+        let mut revalidate = Vec::new();
+        let mut whole_probe = Vec::new();
+        let mut warm_reuse = Vec::new();
+        for _ in 0..16 {
+            let start = Instant::now();
+            let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
+                SidecarFile::load_for_import(media.path())
+            else {
+                panic!("fixture did not load as a supported sidecar");
+            };
+            load.push(start.elapsed());
+            let start = Instant::now();
+            let prepared = prepare(loaded, families, &cancel).unwrap();
+            prepare_time.push(start.elapsed());
+            let start = Instant::now();
+            let _ = read_marker(data.path(), &folder_key, MarkerStore::Edits).unwrap();
+            let _ = read_marker(data.path(), &folder_key, MarkerStore::Tags).unwrap();
+            marker.push(start.elapsed());
+            let start = Instant::now();
+            crate::sidecar::revalidate_import_source(&prepared.sidecar, &prepared.source).unwrap();
+            revalidate.push(start.elapsed());
+            std::hint::black_box(prepared);
+            let start = Instant::now();
+            std::hint::black_box(probe(media.path(), data.path(), families, &cancel));
+            whole_probe.push(start.elapsed());
+        }
+        let started = Instant::now();
+        let first = probe_for_restore(media.path(), data.path(), families, &cancel, None, true);
+        let cold_with_proof = started.elapsed();
+        let SidecarImportProbe::Current {
+            sidecar: cold_owner,
+            ..
+        } = &first.probe
+        else {
+            panic!("fixture must have synchronized markers");
+        };
+        assert!(cold_owner.outer_items_unique_for_test());
+        let proof = first
+            .proof_candidate
+            .expect("fixture should admit a clean proof");
+        if let Some((key, entry)) = proof
+            .sidecar_for_test()
+            .items()
+            .iter()
+            .find(|(_, entry)| entry.local_adjust_layers.is_some())
+        {
+            let proof_layers = entry.local_adjust_layers.as_ref().unwrap();
+            let owner_layers = cold_owner.items()[key]
+                .local_adjust_layers
+                .as_ref()
+                .unwrap();
+            assert!(std::sync::Arc::ptr_eq(proof_layers, owner_layers));
+        }
+        for _ in 0..16 {
+            let start = Instant::now();
+            let warm = probe_for_restore(
+                media.path(),
+                data.path(),
+                families,
+                &cancel,
+                Some(&proof),
+                true,
+            );
+            assert!(warm.reuse.reused());
+            let SidecarImportProbe::Current {
+                sidecar: warm_owner,
+                ..
+            } = &warm.probe
+            else {
+                panic!("reused fixture must stay Current");
+            };
+            assert!(warm_owner.outer_items_unique_for_test());
+            std::hint::black_box(warm);
+            warm_reuse.push(start.elapsed());
+        }
+        let median_ms = |values: &mut Vec<Duration>| {
+            values.sort_unstable();
+            values[values.len() / 2].as_secs_f64() * 1000.0
+        };
+        eprintln!(
+            "sidecar fixture stage medians (ms, 16 warm iterations): load={:.3} prepare={:.3} two_markers={:.3} revalidate={:.3} whole_probe={:.3} cold_with_proof={:.3} proof_hit={:.3} proof_estimate_mib={:.1}",
+            median_ms(&mut load),
+            median_ms(&mut prepare_time),
+            median_ms(&mut marker),
+            median_ms(&mut revalidate),
+            median_ms(&mut whole_probe),
+            cold_with_proof.as_secs_f64() * 1000.0,
+            median_ms(&mut warm_reuse),
+            proof.estimated_heap_bytes() as f64 / (1024.0 * 1024.0),
+        );
     }
 }

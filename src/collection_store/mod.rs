@@ -9,6 +9,7 @@ mod export_all;
 mod model;
 mod path;
 mod prepare;
+mod read_lease;
 mod runtime;
 mod text;
 
@@ -26,6 +27,7 @@ pub(crate) use prepare::{
     prepare_collection_snapshot_while, resolve_prepared_collection_navigation,
     write_collection_export_atomic,
 };
+pub(crate) use read_lease::{CollectionReadLease, CollectionReadScope};
 pub(crate) use runtime::{
     CollectionRemoteProducerControl, CollectionRemoteRequestLease, CollectionRuntimeEventStream,
 };

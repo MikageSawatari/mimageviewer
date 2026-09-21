@@ -60,6 +60,9 @@ pub(crate) struct CollectionPreparedSnapshot {
     pub(crate) collection_name: String,
     pub(crate) order_mode: super::CollectionOrderMode,
     pub(crate) standard_sort: crate::settings::SortOrder,
+    /// UI-independent denominator for Collection-root automatic thumbnail aspect selection.
+    /// Classification owns this once; presentation adoption can then read it in O(1).
+    pub(crate) auto_aspect_eligible_total: usize,
     pub(crate) entries: Arc<[PreparedCollectionEntry]>,
 }
 
@@ -535,12 +538,23 @@ pub(crate) fn prepare_collection_snapshot_while(
     if !prepared_by_id.is_empty() {
         return Err(CollectionStoreError::InvalidOrder.into());
     }
+    let auto_aspect_eligible_total = entries
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                &entry.item,
+                crate::grid_item::GridItem::CollectionPlaceholder { .. }
+                    | crate::grid_item::GridItem::Audio(_)
+            )
+        })
+        .count();
     Ok(CollectionPreparedSnapshot {
         collection_id: snapshot.collection_id(),
         collection_revision: snapshot.revision(),
         collection_name: snapshot.definition.name.clone(),
         order_mode: snapshot.definition.order_mode,
         standard_sort: snapshot.definition.standard_sort,
+        auto_aspect_eligible_total,
         entries: Arc::from(entries),
     })
 }
@@ -820,6 +834,16 @@ mod tests {
             collection_name: "Navigation".into(),
             order_mode: CollectionOrderMode::Manual,
             standard_sort: SortOrder::FileName,
+            auto_aspect_eligible_total: entries
+                .iter()
+                .filter(|entry| {
+                    !matches!(
+                        &entry.item,
+                        crate::grid_item::GridItem::CollectionPlaceholder { .. }
+                            | crate::grid_item::GridItem::Audio(_)
+                    )
+                })
+                .count(),
             entries: Arc::from(entries),
         }
     }

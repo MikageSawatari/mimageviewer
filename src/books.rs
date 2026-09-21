@@ -209,13 +209,19 @@ pub struct BookOpPending {
 /// exact requested root until the success result supplies the removed path.
 pub enum BookOpIntent {
     Unrelated,
+    /// A manager refresh can also carry one read-only, cancelable grid-navigation request.
+    List {
+        navigation: Option<u64>,
+    },
     SourceMutation,
-    Delete { path: PathBuf },
+    Delete {
+        path: PathBuf,
+    },
 }
 
 impl BookOpIntent {
     pub fn blocks_rename_migration(&self) -> bool {
-        !matches!(self, Self::Unrelated)
+        matches!(self, Self::SourceMutation | Self::Delete { .. })
     }
 }
 

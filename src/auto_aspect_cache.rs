@@ -5,7 +5,7 @@
 //! image data and representative-folder thumbnail targets remain owned by the
 //! existing catalog / folder-thumb-pin paths.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -217,11 +217,13 @@ pub(crate) struct CollectionAutoAspectCacheClient {
     submission: Arc<Mutex<CollectionCacheSubmission>>,
 }
 
-// The short critical section linearizes Get with maintenance admission. No SQLite work or
-// receiver wait happens while held; a Get stamped with the new epoch is behind the clear.
+// The short critical section linearizes Get/Upsert/Forget with maintenance admission. No SQLite
+// work or receiver wait happens while held. Collection UUIDs are never reused, so a retired ID
+// remains rejected for the rest of this process and queued actor commands stay FIFO.
 struct CollectionCacheSubmission {
     tx: mpsc::Sender<CollectionCacheCommand>,
     epoch: u64,
+    retired: HashSet<CollectionId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -255,6 +257,9 @@ enum CollectionCacheCommand {
         id: CollectionId,
         entry: AutoAspectCacheEntry,
     },
+    Forget {
+        id: CollectionId,
+    },
     Maintenance {
         operation: CollectionAutoAspectMaintenance,
         reply: mpsc::Sender<Result<CollectionAutoAspectMaintenanceStats, String>>,
@@ -270,7 +275,11 @@ impl CollectionAutoAspectCache {
             .spawn(move || run_collection_cache_actor(path, rx))?;
         Ok(Self {
             client: CollectionAutoAspectCacheClient {
-                submission: Arc::new(Mutex::new(CollectionCacheSubmission { tx, epoch: 0 })),
+                submission: Arc::new(Mutex::new(CollectionCacheSubmission {
+                    tx,
+                    epoch: 0,
+                    retired: HashSet::new(),
+                })),
             },
             entries: HashMap::new(),
             handle: Some(handle),
@@ -282,6 +291,14 @@ impl CollectionAutoAspectCache {
     }
 
     pub(crate) fn cached(&self, id: CollectionId) -> Option<AutoAspectCacheEntry> {
+        if self
+            .client
+            .submission
+            .lock()
+            .is_ok_and(|submission| submission.retired.contains(&id))
+        {
+            return None;
+        }
         self.entries.get(&id).copied()
     }
 
@@ -290,15 +307,38 @@ impl CollectionAutoAspectCache {
         id: CollectionId,
         lookup: Option<CollectionAutoAspectLookup>,
     ) -> Option<AutoAspectCacheEntry> {
-        if let Some(entry) = self.cached(id) {
+        let submission = self.client.submission.lock().unwrap();
+        if submission.retired.contains(&id) {
+            return None;
+        }
+        if let Some(entry) = self.entries.get(&id).copied() {
             return Some(entry);
         }
         let lookup = lookup?;
-        if lookup.epoch != self.client.submission.lock().unwrap().epoch {
+        if lookup.epoch != submission.epoch {
             return None;
         }
+        drop(submission);
         self.entries.insert(id, lookup.entry);
         Some(lookup.entry)
+    }
+
+    /// Permanently retires one collection UUID for this process and removes its persisted row.
+    /// Holding the submission mutex across the enqueue establishes `Get/Upsert -> Forget` FIFO;
+    /// later lookups and records are rejected before they can reach the actor.
+    pub(crate) fn retire(&mut self, id: CollectionId) -> Result<(), String> {
+        let mut submission = self.client.submission.lock().unwrap();
+        let send_result = if submission.retired.insert(id) {
+            submission
+                .tx
+                .send(CollectionCacheCommand::Forget { id })
+                .map_err(|_| "Collection Auto 比率 cache worker を利用できません".to_owned())
+        } else {
+            Ok(())
+        };
+        drop(submission);
+        self.entries.remove(&id);
+        send_result
     }
 
     pub(crate) fn record(
@@ -314,13 +354,16 @@ impl CollectionAutoAspectCache {
             eligible_total,
             updated_at: now_unix_secs(),
         };
-        self.client
-            .submission
-            .lock()
-            .unwrap()
+        let submission = self.client.submission.lock().unwrap();
+        if submission.retired.contains(&id) {
+            self.entries.remove(&id);
+            return Ok(());
+        }
+        submission
             .tx
             .send(CollectionCacheCommand::Upsert { id, entry })
             .map_err(|_| "Collection Auto 比率 cache worker を利用できません".to_owned())?;
+        drop(submission);
         self.entries.insert(id, entry);
         Ok(())
     }
@@ -376,6 +419,9 @@ impl CollectionAutoAspectCacheClient {
         let (reply, receiver) = mpsc::channel();
         let epoch = {
             let submission = self.submission.lock().unwrap();
+            if submission.retired.contains(&id) {
+                return None;
+            }
             submission
                 .tx
                 .send(CollectionCacheCommand::Get { id, reply })
@@ -417,6 +463,13 @@ fn run_collection_cache_actor(path: PathBuf, rx: mpsc::Receiver<CollectionCacheC
                 if let Err(error) = db.upsert_collection(id, entry) {
                     crate::logger::log(format!(
                         "collection auto-aspect cache save failed: {error}"
+                    ));
+                }
+            }
+            CollectionCacheCommand::Forget { id } => {
+                if let Err(error) = db.delete_collection(id) {
+                    crate::logger::log(format!(
+                        "collection auto-aspect cache forget failed: {error}"
                     ));
                 }
             }
@@ -527,6 +580,13 @@ impl CollectionAutoAspectDb {
             "SELECT COUNT(*) FROM collection_auto_aspect_cache",
             [],
             |row| row.get(0),
+        )
+    }
+
+    fn delete_collection(&self, id: CollectionId) -> Result<usize, rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM collection_auto_aspect_cache WHERE collection_id = ?1",
+            [id.as_uuid().to_string()],
         )
     }
 
@@ -651,7 +711,11 @@ mod tests {
     fn collection_cache_get_is_optional_and_bounded() {
         let (tx, rx) = mpsc::channel();
         let client = CollectionAutoAspectCacheClient {
-            submission: Arc::new(Mutex::new(CollectionCacheSubmission { tx, epoch: 0 })),
+            submission: Arc::new(Mutex::new(CollectionCacheSubmission {
+                tx,
+                epoch: 0,
+                retired: HashSet::new(),
+            })),
         };
         let cancel = AtomicBool::new(false);
         let started = Instant::now();
@@ -669,6 +733,105 @@ mod tests {
                 .is_none()
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn retired_collection_rejects_late_lookup_and_record_without_affecting_other_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auto_aspect_cache.db");
+        let retired = CollectionId::new();
+        let survivor = CollectionId::new();
+        let mut cache = CollectionAutoAspectCache::spawn_at(path).unwrap();
+        cache
+            .record(retired, ThumbAspect::Portrait2x3, 4, 8)
+            .unwrap();
+        cache
+            .record(survivor, ThumbAspect::Landscape3x2, 5, 9)
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let late = cache
+            .client()
+            .get_bounded(retired, &cancel, Duration::from_secs(1))
+            .expect("lookup admitted before retirement");
+
+        cache.retire(retired).unwrap();
+        assert_eq!(cache.adopt_lookup(retired, Some(late)), None);
+        cache
+            .record(retired, ThumbAspect::Landscape16x9, 7, 10)
+            .unwrap();
+        cache.record(survivor, ThumbAspect::Square, 6, 11).unwrap();
+
+        let stats = maintenance(&mut cache, CollectionAutoAspectMaintenance::Count);
+        assert_eq!(stats.remaining, 1);
+        assert!(
+            cache
+                .client()
+                .get_bounded(retired, &cancel, Duration::from_secs(1))
+                .is_none()
+        );
+        let survivor_lookup = cache
+            .client()
+            .get_bounded(survivor, &cancel, Duration::from_secs(1))
+            .expect("unrelated collection remains cached");
+        assert_eq!(survivor_lookup.entry.aspect, ThumbAspect::Square);
+    }
+
+    #[test]
+    fn retirement_is_fifo_with_an_already_enqueued_lookup() {
+        let (tx, rx) = mpsc::channel();
+        let id = CollectionId::new();
+        let mut cache = CollectionAutoAspectCache {
+            client: CollectionAutoAspectCacheClient {
+                submission: Arc::new(Mutex::new(CollectionCacheSubmission {
+                    tx,
+                    epoch: 0,
+                    retired: HashSet::new(),
+                })),
+            },
+            entries: HashMap::new(),
+            handle: None,
+        };
+        let client = cache.client();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let lookup = std::thread::spawn(move || {
+            client.get_bounded(id, &worker_cancel, Duration::from_secs(1))
+        });
+        let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let CollectionCacheCommand::Get { reply, .. } = first else {
+            panic!("lookup must be first");
+        };
+        cache.retire(id).unwrap();
+        let second = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            matches!(second, CollectionCacheCommand::Forget { id: forgotten } if forgotten == id)
+        );
+        reply
+            .send(Ok(Some(AutoAspectCacheEntry {
+                aspect: ThumbAspect::Portrait3x4,
+                sample_count: 3,
+                eligible_total: 7,
+                updated_at: 1,
+            })))
+            .unwrap();
+        assert!(lookup.join().unwrap().is_some());
+        assert_eq!(
+            cache.adopt_lookup(
+                id,
+                Some(CollectionAutoAspectLookup {
+                    epoch: 0,
+                    entry: AutoAspectCacheEntry {
+                        aspect: ThumbAspect::Portrait3x4,
+                        sample_count: 3,
+                        eligible_total: 7,
+                        updated_at: 1,
+                    },
+                }),
+            ),
+            None
+        );
+        cache.record(id, ThumbAspect::Landscape16x9, 8, 12).unwrap();
+        assert!(rx.try_recv().is_err(), "late record must not be enqueued");
     }
 
     #[test]

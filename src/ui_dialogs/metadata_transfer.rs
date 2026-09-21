@@ -76,6 +76,22 @@ enum WorkerMessage {
     Refresh(crate::app::metadata_import_refresh::RefreshResult),
 }
 
+impl WorkerMessage {
+    fn committed_video_pin_changes(&self) -> usize {
+        match self {
+            Self::Import {
+                result: Ok(summary),
+                ..
+            } => summary.committed.video_pins,
+            Self::Progress(_)
+            | Self::Preview(_)
+            | Self::Export { .. }
+            | Self::Import { result: Err(_), .. }
+            | Self::Refresh(_) => 0,
+        }
+    }
+}
+
 struct ImportWorkerResources {
     sidecars: HashMap<PathBuf, crate::sidecar::SidecarFile>,
     tags_db: Option<crate::tags_db::TagsDb>,
@@ -495,6 +511,7 @@ impl App {
         let mut begin_terminal_refresh = false;
         let mut request_edit_preview_clear = false;
         let mut restart_terminal_refresh = false;
+        let mut committed_video_pin_changes = 0usize;
         let clear_status = self.metadata_transfer.as_ref().and_then(|state| {
             let Stage::WaitingForEditPreviewClear(completed) = &state.stage else {
                 return None;
@@ -517,6 +534,8 @@ impl App {
             begin_terminal_refresh = true;
         }
         for message in messages {
+            committed_video_pin_changes =
+                committed_video_pin_changes.saturating_add(message.committed_video_pin_changes());
             let Some(state) = self.metadata_transfer.as_mut() else {
                 break;
             };
@@ -587,6 +606,9 @@ impl App {
                 }
             }
         }
+        self.advance_collection_thumbnail_source_epoch_for_metadata_import(
+            committed_video_pin_changes,
+        );
         if disconnected
             && self.metadata_transfer.as_ref().is_some_and(|state| {
                 state.rx.is_some()
@@ -1469,6 +1491,34 @@ mod tests {
 
         assert!(import_cancel.load(Ordering::Relaxed));
         assert!(refresh_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn committed_video_pin_epoch_signal_belongs_only_to_the_import_result() {
+        let mut summary = ImportSummary::default();
+        summary.committed.video_pins = 3;
+        let import = WorkerMessage::Import {
+            result: Ok(summary),
+            resource_error: None,
+            view_trim_saved: true,
+        };
+        let refresh = WorkerMessage::Refresh(crate::app::metadata_import_refresh::RefreshResult {
+            contexts: Vec::new(),
+            page_snapshot: None,
+            errors: vec!["retryable refresh detail".into()],
+        });
+
+        assert_eq!(import.committed_video_pin_changes(), 3);
+        assert_eq!(refresh.committed_video_pin_changes(), 0);
+        assert_eq!(
+            WorkerMessage::Import {
+                result: Err("import failed".into()),
+                resource_error: None,
+                view_trim_saved: false,
+            }
+            .committed_video_pin_changes(),
+            0
+        );
     }
 
     #[test]

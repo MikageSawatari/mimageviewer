@@ -44,6 +44,11 @@ const BOOK_REORDER_MIN_WINDOW_H: f32 = 360.0;
 const BOOK_REORDER_SCROLLBAR_RESERVE_PX: f32 = 28.0;
 const BOOK_REORDER_AUTO_SCROLL_EDGE_PX: f32 = 64.0;
 const BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 34.0;
+pub(crate) const SAVED_GROUP_NUMBERED_SLOT_LIMIT: usize = 20;
+
+pub(crate) fn saved_group_slot_number(index: usize) -> Option<usize> {
+    (index < SAVED_GROUP_NUMBERED_SLOT_LIMIT).then_some(index + 1)
+}
 // 詳細ヘッダ + 詳細行 + パネル内の最小余白。下部情報バーはこの 2 行に加えて
 // solid 横スクロールバー専用レーンを CentralPanel より先に予約する。
 const SELECTION_INFO_BAR_CONTENT_HEIGHT: f32 = 58.0;
@@ -127,6 +132,10 @@ pub(crate) enum AddressBarNav {
     BooksRoot,
     HistoryBack,
     HistoryForward,
+    /// Explicit collection open; only the winning navigation candidate records history.
+    CollectionOpen(crate::collection_store::CollectionId),
+    /// Prepared book/collection open; its payload stays with the typed modal owner until winner.
+    SavedGroupReady(u64),
     Collection(crate::app::top_level_grid_view::CollectionGridRestore),
 }
 
@@ -5548,6 +5557,222 @@ mod details_column_context_menu_layout_tests {
     }
 }
 
+fn draw_collection_order_mode_menu_entries(
+    ui: &mut egui::Ui,
+    root: crate::app::collection_grid::CollectionGridOrderTarget,
+) -> Option<crate::collection_store::CollectionOrderMode> {
+    let mut requested = None;
+    let manual = root.mode == crate::collection_store::CollectionOrderMode::Manual;
+    if ui
+        .button(if manual {
+            "✓ 手動順"
+        } else {
+            "  手動順"
+        })
+        .on_hover_text("並べ替え画面で決めた順で表示します")
+        .clicked()
+    {
+        requested = Some(crate::collection_store::CollectionOrderMode::Manual);
+    }
+    let shuffle = root.mode == crate::collection_store::CollectionOrderMode::Shuffle;
+    if ui
+        .button(if shuffle {
+            "✓ シャッフル（再選択で並べ直す）"
+        } else {
+            "  シャッフル（再選択で並べ直す）"
+        })
+        .clicked()
+    {
+        requested = Some(crate::collection_store::CollectionOrderMode::Shuffle);
+    }
+    requested
+}
+
+fn collection_reorder_disabled_message(
+    order: Option<
+        Result<crate::collection_store::CollectionOrderMode, crate::app::GridSortLockReason>,
+    >,
+) -> Option<&'static str> {
+    match order {
+        Some(Ok(crate::collection_store::CollectionOrderMode::Manual)) => None,
+        Some(Ok(_)) => Some("手動順のコレクションだけを並べ替えられます"),
+        Some(Err(reason)) => Some(reason.tooltip()),
+        None => Some("コレクション直下を開くと使用できます"),
+    }
+}
+
+fn details_header_sort_hover_text(
+    collection_order: Option<
+        Result<crate::collection_store::CollectionOrderMode, crate::app::GridSortLockReason>,
+    >,
+    header_sort_active: bool,
+) -> &'static str {
+    if header_sort_active
+        && matches!(
+            collection_order,
+            Some(Ok(crate::collection_store::CollectionOrderMode::Standard))
+        )
+    {
+        "クリックで 昇順 → 降順 → ソートなし\n列ヘッダの順番は一覧の表示と選択だけに使います。ページ送りや連続再生は、保存されたコレクション順のままです。"
+    } else {
+        "クリックで 昇順 → 降順 → ソートなし"
+    }
+}
+
+#[cfg(test)]
+mod collection_order_mode_menu_tests {
+    use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    #[test]
+    fn reorder_disabled_message_matches_root_mode_and_admission_state() {
+        use crate::app::GridSortLockReason;
+        use crate::collection_store::CollectionOrderMode;
+
+        assert_eq!(
+            collection_reorder_disabled_message(Some(Ok(CollectionOrderMode::Standard))),
+            Some("手動順のコレクションだけを並べ替えられます")
+        );
+        assert_eq!(
+            collection_reorder_disabled_message(Some(Err(GridSortLockReason::CollectionStale))),
+            Some(GridSortLockReason::CollectionStale.tooltip())
+        );
+        assert_eq!(
+            collection_reorder_disabled_message(None),
+            Some("コレクション直下を開くと使用できます")
+        );
+        assert_eq!(
+            collection_reorder_disabled_message(Some(Ok(CollectionOrderMode::Manual))),
+            None
+        );
+    }
+
+    #[test]
+    fn details_header_sort_hover_explains_collection_reader_order_only_when_applicable() {
+        use crate::app::GridSortLockReason;
+        use crate::collection_store::CollectionOrderMode;
+
+        let explained =
+            details_header_sort_hover_text(Some(Ok(CollectionOrderMode::Standard)), true);
+        assert!(explained.contains("一覧の表示と選択だけ"));
+        assert!(explained.contains("保存されたコレクション順"));
+
+        for (order, active) in [
+            (None, true),
+            (Some(Ok(CollectionOrderMode::Manual)), true),
+            (Some(Ok(CollectionOrderMode::Shuffle)), true),
+            (Some(Err(GridSortLockReason::CollectionLoading)), true),
+            (Some(Ok(CollectionOrderMode::Standard)), false),
+        ] {
+            assert_eq!(
+                details_header_sort_hover_text(order, active),
+                "クリックで 昇順 → 降順 → ソートなし"
+            );
+        }
+    }
+
+    #[test]
+    fn display_menu_collection_modes_use_the_common_handler_without_changing_global_sort() {
+        use crate::collection_store::{CollectionOrderMode, CollectionStoreRuntime};
+        use crate::settings::SortOrder;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = CollectionStoreRuntime::start_at(temp.path().join("collection.db")).unwrap();
+        let client = runtime.client();
+        let mut app = crate::app::setup_app_for_test();
+        app.install_collection_runtime(runtime);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(app.collection_store_client_for_read(), Ok(Some(_))) {
+            assert!(
+                Instant::now() < deadline,
+                "collection runtime did not start"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let created = client
+            .create_collection("Display menu".into())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        app.settings.sort_order = SortOrder::DateDesc;
+        app.open_collection_grid(created.collection_id(), None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .collection_grid_root_order()
+            .is_none_or(|order| order.is_err())
+        {
+            assert!(Instant::now() < deadline, "collection grid did not settle");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let app = std::rc::Rc::new(std::cell::RefCell::new(app));
+        let render_app = std::rc::Rc::clone(&app);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(520.0, 240.0))
+            .build(move |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let root = render_app
+                        .borrow()
+                        .collection_grid_root_order()
+                        .and_then(Result::ok)
+                        .expect("installed collection root");
+                    if let Some(mode) = draw_collection_order_mode_menu_entries(ui, root) {
+                        render_app.borrow_mut().request_collection_grid_set_order(
+                            root,
+                            mode,
+                            root.standard_sort,
+                            crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                        );
+                    }
+                });
+            });
+        harness.run();
+        harness.get_by_label("✓ 手動順").click();
+        harness.run();
+        assert!(app.borrow().collection_export_all_available());
+        let unchanged = client
+            .load_collection(created.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.revision(), created.revision());
+        assert_eq!(app.borrow().settings.sort_order, SortOrder::DateDesc);
+
+        harness
+            .get_by_label("  シャッフル（再選択で並べ直す）")
+            .click();
+        harness.run();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let mut app = app.borrow_mut();
+                app.poll_collection_ui(&ctx);
+                app.poll_collection_grid(&ctx);
+                if matches!(app.collection_grid_root_order(), Some(Ok(order))
+                    if order.mode == CollectionOrderMode::Shuffle)
+                {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "display menu shuffle did not install"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.borrow().settings.sort_order, SortOrder::DateDesc);
+        drop(harness);
+        app.borrow_mut().shutdown_collection_runtime_for_exit();
+    }
+}
+
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────
 
@@ -6031,7 +6256,7 @@ impl App {
                                         }
                                         MenuCommandId::BooksOpenActiveBook => {
                                             if ui.button(&book_open_active_menu_label).clicked() {
-                                                fav_nav = Some(self.active_book_folder_path());
+                                                self.open_active_book_from_action(ctx);
                                                 ui.close();
                                             }
                                         }
@@ -6055,9 +6280,7 @@ impl App {
                                         MenuCommandId::BooksManage => {
                                             ui.separator();
                                             if ui.button(&book_manage_menu_label).clicked() {
-                                                self.show_book_manager = true;
-                                                self.book_manager_rename_name = active_name.clone();
-                                                self.book_list_cache = None;
+                                                self.open_book_manager_from_action();
                                                 ui.close();
                                             }
                                         }
@@ -6194,16 +6417,15 @@ impl App {
                                                     let current = current_order;
                                                     if ui
                                                         .button(if current.is_some_and(|d| d.mode == crate::collection_store::CollectionOrderMode::Manual) { "✓ 手動順" } else { "  手動順" })
+                                                        .on_hover_text("並べ替え画面で決めた順で表示します")
                                                         .clicked()
                                                     {
-                                                        let target = current.unwrap().content;
-                                                        let sort = current.unwrap().standard_sort;
-                                                        self.start_collection_grid_content_action(
-                                                            target,
-                                                            crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
-                                                                mode: crate::collection_store::CollectionOrderMode::Manual,
-                                                                sort,
-                                                            },
+                                                        let current = current.unwrap();
+                                                        self.request_collection_grid_set_order(
+                                                            current,
+                                                            crate::collection_store::CollectionOrderMode::Manual,
+                                                            current.standard_sort,
+                                                            crate::app::collection_grid::CollectionGridSetOrderRoute::CollectionMenu,
                                                         );
                                                         ui.close();
                                                     }
@@ -6212,12 +6434,11 @@ impl App {
                                                         .clicked()
                                                     {
                                                         let current = current.unwrap();
-                                                        self.start_collection_grid_content_action(
-                                                            current.content,
-                                                            crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
-                                                                mode: crate::collection_store::CollectionOrderMode::Shuffle,
-                                                                sort: current.standard_sort,
-                                                            },
+                                                        self.request_collection_grid_set_order(
+                                                            current,
+                                                            crate::collection_store::CollectionOrderMode::Shuffle,
+                                                            current.standard_sort,
+                                                            crate::app::collection_grid::CollectionGridSetOrderRoute::CollectionMenu,
                                                         );
                                                         ui.close();
                                                     }
@@ -6228,12 +6449,11 @@ impl App {
                                                                 .button(format!("{}{}", if checked { "✓ " } else { "  " }, sort.label()))
                                                                 .clicked()
                                                             {
-                                                                self.start_collection_grid_content_action(
-                                                                    current.unwrap().content,
-                                                                    crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
-                                                                        mode: crate::collection_store::CollectionOrderMode::Standard,
-                                                                        sort,
-                                                                    },
+                                                                self.request_collection_grid_set_order(
+                                                                    current.unwrap(),
+                                                                    crate::collection_store::CollectionOrderMode::Standard,
+                                                                    sort,
+                                                                    crate::app::collection_grid::CollectionGridSetOrderRoute::CollectionMenu,
                                                                 );
                                                                 ui.close();
                                                             }
@@ -6243,7 +6463,10 @@ impl App {
                                             });
                                             if current_order.is_none() {
                                                 order_menu.response.on_disabled_hover_text(
-                                                    current_order_state.and_then(Result::err).unwrap_or("コレクション直下を開くと使用できます"),
+                                                    current_order_state
+                                                        .and_then(Result::err)
+                                                        .map(crate::app::GridSortLockReason::tooltip)
+                                                        .unwrap_or("コレクション直下を開くと使用できます"),
                                                 );
                                             }
                                         }
@@ -6253,19 +6476,16 @@ impl App {
                                         }
                                         MenuCommandId::CollectionsReorderCurrent => {
                                             let manual = current_order.is_some_and(|order| order.mode == crate::collection_store::CollectionOrderMode::Manual);
+                                            let disabled_message = collection_reorder_disabled_message(
+                                                current_order_state.map(|order| order.map(|order| order.mode)),
+                                            );
                                             let response = ui
                                                 .add_enabled(
                                                     manual,
                                                     egui::Button::new(&collection_reorder_menu_label),
                                                 )
                                                 .on_disabled_hover_text(
-                                                    current_order_state.and_then(Result::err).unwrap_or_else(|| {
-                                                        if current_order.is_none() {
-                                                            "コレクション直下を開くと使用できます"
-                                                        } else {
-                                                            "手動順のコレクションだけを並べ替えられます"
-                                                        }
-                                                    }),
+                                                    disabled_message.unwrap_or_default(),
                                                 );
                                             if response.clicked() {
                                                 self.start_collection_grid_content_action(
@@ -6549,18 +6769,15 @@ impl App {
                                 } else {
                                     ui.menu_button("ソート順", |ui| {
                                         if let Some(root) = root_order {
-                                            if ui.selectable_label(root.mode == crate::collection_store::CollectionOrderMode::Manual, "手動順").clicked() {
-                                                self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
-                                                    mode: crate::collection_store::CollectionOrderMode::Manual,
-                                                    sort: root.standard_sort,
-                                                });
-                                                ui.close();
-                                            }
-                                            if ui.selectable_label(root.mode == crate::collection_store::CollectionOrderMode::Shuffle, "シャッフル（再選択で並べ直す）").clicked() {
-                                                self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
-                                                    mode: crate::collection_store::CollectionOrderMode::Shuffle,
-                                                    sort: root.standard_sort,
-                                                });
+                                            if let Some(mode) =
+                                                draw_collection_order_mode_menu_entries(ui, root)
+                                            {
+                                                self.request_collection_grid_set_order(
+                                                    root,
+                                                    mode,
+                                                    root.standard_sort,
+                                                    crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                                                );
                                                 ui.close();
                                             }
                                             ui.separator();
@@ -6580,10 +6797,12 @@ impl App {
                                                 .on_hover_text(order.description());
                                             if resp.clicked() {
                                                 if let Some(root) = root_order {
-                                                    self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
-                                                        mode: crate::collection_store::CollectionOrderMode::Standard,
-                                                        sort: order,
-                                                    });
+                                                    self.request_collection_grid_set_order(
+                                                        root,
+                                                        crate::collection_store::CollectionOrderMode::Standard,
+                                                        order,
+                                                        crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                                                    );
                                                 } else if self.items_are_rating_view {
                                                     self.settings.sort_order = order;
                                                     self.set_rating_view_sort(
@@ -7034,6 +7253,10 @@ impl App {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("本一覧");
+                    ui.label(egui::RichText::new("番号").weak())
+                        .on_hover_text(
+                            "操作カスタマイズの「本1〜20を開く」で使う番号です。\n名前順のため、追加・名前変更・削除で番号が変わります。",
+                        );
                     if ui
                         .add_enabled(self.book_op_pending.is_none(), egui::Button::new("更新"))
                         .clicked()
@@ -7058,9 +7281,32 @@ impl App {
                             .max_height(360.0)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                                for row in rows {
+                                for (index, row) in rows.into_iter().enumerate() {
                                     let active = row.name == active_name;
                                     ui.horizontal(|ui| {
+                                        let (number, hover) = saved_group_slot_number(index)
+                                            .map_or_else(
+                                                || {
+                                                    (
+                                                        "—".to_owned(),
+                                                        "番号操作の対象外です（1〜20のみ）"
+                                                            .to_owned(),
+                                                    )
+                                                },
+                                                |number| {
+                                                    (
+                                                        number.to_string(),
+                                                        format!(
+                                                            "操作カスタマイズの「本{number}を開く」で開きます"
+                                                        ),
+                                                    )
+                                                },
+                                            );
+                                        ui.add_sized(
+                                            [28.0, ui.spacing().interact_size.y],
+                                            egui::Label::new(number),
+                                        )
+                                        .on_hover_text(hover);
                                         if active {
                                             ui.strong("●");
                                         } else {
@@ -8926,14 +9172,16 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                         None => resp.on_hover_text(if mode == crate::collection_store::CollectionOrderMode::Shuffle {
                                             "再選択すると新しい順に並べ直します"
                                         } else {
-                                            "登録順で表示します"
+                                            "並べ替え画面で決めた順で表示します"
                                         }),
                                     };
                                     if resp.clicked() && (!selected || mode == crate::collection_store::CollectionOrderMode::Shuffle) {
-                                        self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                        self.request_collection_grid_set_order(
+                                            root,
                                             mode,
-                                            sort: root.standard_sort,
-                                        });
+                                            root.standard_sort,
+                                            crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                                        );
                                     }
                                 }
                             }
@@ -8963,10 +9211,12 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 };
                                 if resp.clicked() && !selected {
                                     if let Some(root) = root_order {
-                                        self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
-                                            mode: crate::collection_store::CollectionOrderMode::Standard,
-                                            sort: order,
-                                        });
+                                        self.request_collection_grid_set_order(
+                                            root,
+                                            crate::collection_store::CollectionOrderMode::Standard,
+                                            order,
+                                            crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                                        );
                                     } else if self.items_are_bookmark_view {
                                         self.settings.sort_order = order;
                                         self.settings.save();
@@ -9057,10 +9307,12 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                                 if ui.selectable_label(selected, label).clicked()
                                                     && (!selected || mode == crate::collection_store::CollectionOrderMode::Shuffle)
                                                 {
-                                                    self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
+                                                    self.request_collection_grid_set_order(
+                                                        root,
                                                         mode,
-                                                        sort: root.standard_sort,
-                                                    });
+                                                        root.standard_sort,
+                                                        crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                                                    );
                                                 }
                                             }
                                             ui.separator();
@@ -9083,10 +9335,12 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                             if resp.clicked() && !selected
                                             {
                                                 if let Some(root) = root_order {
-                                                    self.start_collection_grid_content_action(root.content, crate::ui_dialogs::collections::CollectionGridSnapshotAction::SetOrder {
-                                                        mode: crate::collection_store::CollectionOrderMode::Standard,
-                                                        sort: order,
-                                                    });
+                                                    self.request_collection_grid_set_order(
+                                                        root,
+                                                        crate::collection_store::CollectionOrderMode::Standard,
+                                                        order,
+                                                        crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                                                    );
                                                 } else if self.items_are_bookmark_view {
                                                     self.settings.sort_order = order;
                                                     self.settings.save();
@@ -9625,7 +9879,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.add_grid_selection_to_active_book(ctx);
         }
         if toolbar_book_open_active {
-            toolbar_fav_nav = Some(self.active_book_folder_path());
+            self.open_active_book_from_action(ctx);
         }
         // ピン留め本: 左クリック=開く / 右クリック=選択を追加。
         if let Some(name) = toolbar_book_pin_open {
@@ -9979,7 +10233,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 );
                 ui.separator();
                 if ui.button("本の管理…").clicked() {
-                    self.show_book_manager = true;
+                    self.open_book_manager_from_action();
                     ui.close();
                 }
             }
@@ -12578,8 +12832,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     Some(AddressBarNav::Collection(_)) => {
                                         "コレクションへ戻る [BS]".to_string()
                                     }
+                                    Some(AddressBarNav::CollectionOpen(_)) => {
+                                        "コレクションを開く".to_string()
+                                    }
                                     Some(
-                                        AddressBarNav::HistoryBack | AddressBarNav::HistoryForward,
+                                        AddressBarNav::HistoryBack
+                                            | AddressBarNav::HistoryForward
+                                            | AddressBarNav::SavedGroupReady(_),
                                     )
                                     | None => "親フォルダへ [BS]".to_string(),
                                 }
@@ -15318,7 +15577,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let bg = ui.visuals().extreme_bg_color;
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
-        let book_sort_locked = self.details_header_sort_locked();
+        let book_sort_locked = self.details_header_sort_lock_reason().is_some();
         self.advance_details_best_fit_job(ui, book_sort_locked);
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(
@@ -15767,7 +16026,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
         let hover_bg = ui.visuals().widgets.hovered.bg_fill;
-        let book_sort_locked = self.details_header_sort_locked();
+        let details_sort_lock = self.details_header_sort_lock_reason();
+        let book_sort_locked = details_sort_lock.is_some();
+        let sort_hover_text = details_header_sort_hover_text(
+            self.collection_grid_root_order()
+                .map(|order| order.map(|target| target.mode)),
+            self.details_header_sort_active(),
+        );
         self.advance_details_best_fit_job(ui, book_sort_locked);
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(
@@ -15831,11 +16096,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 book_sort_locked,
             );
             let response = if sort_enabled {
-                response.hover_tip("クリックで 昇順 → 降順 → ソートなし")
+                response.hover_tip(sort_hover_text)
             } else if book_sort_locked && sort_key.is_some() {
-                response.hover_tip(
-                    "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。",
-                )
+                response.hover_tip(details_sort_lock.expect("locked reason").tooltip())
             } else if sort_key.is_none() {
                 response.hover_tip("サムネイルプレビュー")
             } else {
@@ -23127,6 +23390,62 @@ mod grid_click_selection_tests {
 }
 
 #[cfg(test)]
+mod saved_group_number_ui_tests {
+    use super::*;
+
+    #[test]
+    fn management_number_column_assigns_only_slots_one_through_twenty() {
+        assert_eq!(saved_group_slot_number(0), Some(1));
+        assert_eq!(saved_group_slot_number(19), Some(20));
+        assert_eq!(saved_group_slot_number(20), None);
+        assert_eq!(saved_group_slot_number(99), None);
+    }
+
+    #[test]
+    fn book_manager_numbered_dark_snapshot() {
+        use egui_kittest::Harness;
+
+        let mut app = crate::app::setup_app_for_test();
+        app.show_book_manager = true;
+        app.settings.active_book_name = "Alpha".into();
+        app.settings.book_root = Some(PathBuf::from(r"C:\Users\example\Pictures\mIV Books"));
+        let book_root = app.settings.book_root.clone().unwrap();
+        app.book_list_cache = Some(vec![
+            crate::books::BookInfo {
+                name: "Alpha".into(),
+                path: book_root.join("Alpha"),
+                page_count: 16,
+            },
+            crate::books::BookInfo {
+                name: "Reference".into(),
+                path: book_root.join("Reference"),
+                page_count: 2,
+            },
+        ]);
+        let app = std::rc::Rc::new(std::cell::RefCell::new(app));
+        let ui_app = std::rc::Rc::clone(&app);
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 600.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.heading("画像一覧");
+                });
+                ui_app.borrow_mut().draw_book_manager(ctx);
+            });
+        harness.run();
+        harness.snapshot("book_manager_numbered_dark");
+    }
+}
+
+#[cfg(test)]
 mod grid_reclick_open_tests {
     use super::*;
     use crate::app::{AppTestEnvForTest, setup_app_for_test};
@@ -23617,6 +23936,66 @@ mod grid_reclick_open_tests {
             !harness.state().app.staged_smart_root_modal_visible(),
             "the cancelled scan must not replace the newly opened image"
         );
+    }
+
+    #[test]
+    fn saved_group_modal_blocks_real_image_cell_loading_and_ready_until_exact_cancel() {
+        let mut harness = handler_harness(
+            GridClickSelectionMode::Explorer,
+            true,
+            Some(0),
+            false,
+            false,
+        );
+        let book_root = harness.state().app.tmp.path().join("books");
+        std::fs::create_dir_all(book_root.join("Current")).unwrap();
+        let image = harness.state().app.tmp.path().join("saved-group-other.jpg");
+        std::fs::write(&image, []).unwrap();
+        {
+            let app = &mut harness.state_mut().app;
+            app.items[0] = GridItem::Image(image);
+            app.settings.book_root = Some(book_root);
+            app.settings.active_book_name = "Current".into();
+            app.apply_saved_group_key_action(
+                &egui::Context::default(),
+                crate::keymap::KeyAction::GridOpenActiveBook,
+            );
+            assert!(app.saved_group_open_modal_visible());
+            assert_eq!(app.modal_dialog_block_reason(), Some("saved_group_open"));
+        }
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().app.fullscreen_idx, None);
+
+        for _ in 0..100 {
+            let app = &mut harness.state_mut().app;
+            app.poll_saved_group_open(&egui::Context::default());
+            if app.saved_group_ready_nav().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(harness.state().app.saved_group_ready_nav().is_some());
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().app.fullscreen_idx, None);
+
+        let request_id = harness
+            .state()
+            .app
+            .saved_group_open_request_id_for_test()
+            .unwrap();
+        assert!(
+            harness
+                .state_mut()
+                .app
+                .cancel_saved_group_open_request(request_id)
+        );
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().app.fullscreen_idx, Some(0));
+        harness
+            .state_mut()
+            .app
+            .poll_saved_group_open(&egui::Context::default());
+        assert!(!harness.state().app.saved_group_open_modal_visible());
     }
 
     #[test]

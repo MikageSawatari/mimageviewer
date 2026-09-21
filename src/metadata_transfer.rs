@@ -113,8 +113,16 @@ pub struct ImportSummary {
     /// それ以前にcommitしたbatchは保持される。
     pub incomplete_error: Option<String>,
     pub changed: ImportChangedSections,
+    /// Changes that were durably committed by the import writer.  This is kept
+    /// separate from `changed`, which describes sections present in the bundle.
+    pub committed: ImportCommittedChanges,
     #[cfg(test)]
     pub transaction_batches: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportCommittedChanges {
+    pub video_pins: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -770,6 +778,7 @@ where
     let mut batch_entries = 0usize;
     let mut batch_bytes = 0usize;
     let mut batch_applied = 0usize;
+    let mut batch_video_pin_changes = 0usize;
     let mut batch_started = std::time::Instant::now();
     let mut batch_active = false;
     let apply_started = std::time::Instant::now();
@@ -857,6 +866,7 @@ where
                         Ok(outcome) => {
                             conn.execute_batch("RELEASE metadata_import_item")
                                 .map_err(db_error)?;
+                            let video_pin_changed = outcome.video_pin_changed;
                             for failure in outcome.skipped_folder_pins {
                                 crate::logger::log(format!(
                                     "metadata import: partially applied {}: {}",
@@ -879,6 +889,8 @@ where
                                 }
                             }
                             batch_applied = batch_applied.saturating_add(1);
+                            batch_video_pin_changes = batch_video_pin_changes
+                                .saturating_add(usize::from(video_pin_changed));
                         }
                         Err(error) => {
                             conn.execute_batch(
@@ -933,6 +945,10 @@ where
                     );
                 }
                 summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
+                summary.committed.video_pins = summary
+                    .committed
+                    .video_pins
+                    .saturating_add(batch_video_pin_changes);
                 #[cfg(test)]
                 {
                     summary.transaction_batches += 1;
@@ -941,6 +957,7 @@ where
                 batch_entries = 0;
                 batch_bytes = 0;
                 batch_applied = 0;
+                batch_video_pin_changes = 0;
                 batch_started = std::time::Instant::now();
             }
             progress(TransferProgress {
@@ -984,6 +1001,10 @@ where
     };
     if commit_result.is_ok() {
         summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
+        summary.committed.video_pins = summary
+            .committed
+            .video_pins
+            .saturating_add(batch_video_pin_changes);
         #[cfg(test)]
         if batch_active {
             summary.transaction_batches += 1;
@@ -1007,8 +1028,13 @@ where
         "metadata import: outcome={outcome} entries={} applied={} virtual={} bytes={} \
          manifest_ms={manifest_ms:.1} preflight_ms={preflight_ms:.1} db_open_ms={database_open_ms:.1} \
          apply_ms={apply_ms:.1} target_verify_ms={target_verify_ms:.1} sql_apply_ms={sql_apply_ms:.1} \
-         commits={transaction_batches} commit_ms={commit_ms:.1} max_commit_ms={max_commit_ms:.1}",
-        summary.total_entries, summary.applied_entries, applied_virtual_items, applied_record_bytes,
+         video_pin_changes={} commits={transaction_batches} commit_ms={commit_ms:.1} \
+         max_commit_ms={max_commit_ms:.1}",
+        summary.total_entries,
+        summary.applied_entries,
+        applied_virtual_items,
+        applied_record_bytes,
+        summary.committed.video_pins,
     ));
     if crate::perf::is_enabled() {
         crate::perf::event(
@@ -4132,6 +4158,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
 #[derive(Default)]
 struct ApplyEntryOutcome {
     skipped_folder_pins: Vec<ImportFailure>,
+    video_pin_changed: bool,
 }
 
 fn apply_entry(
@@ -4519,10 +4546,12 @@ fn apply_entry(
             }
         }
         if entry.media_kind == PortableMediaKind::Video {
-            tx.prepare_cached("DELETE FROM video_pin.video_pins WHERE path = ?1")
+            let deleted = tx
+                .prepare_cached("DELETE FROM video_pin.video_pins WHERE path = ?1")
                 .map_err(db_error)?
                 .execute([&base_key])
                 .map_err(db_error)?;
+            outcome.video_pin_changed |= deleted > 0;
         }
         if let Some(pin) = &entry.video_pin {
             let webp = pin
@@ -4544,6 +4573,7 @@ fn apply_entry(
                 pin.thumb_pts_secs
             ])
             .map_err(db_error)?;
+            outcome.video_pin_changed = true;
         }
     }
     Ok(outcome)
@@ -7768,6 +7798,7 @@ mod tests {
         // fault-injected and must remain wholly at its previous state.
         assert_eq!(imported.applied_entries, 1);
         assert_eq!(imported.failed_entries, 1);
+        assert_eq!(imported.committed.video_pins, 0);
         assert_eq!(imported.failed_items.len(), 1);
         assert_eq!(imported.failed_items[0].path, "clip.mp4");
         assert!(
@@ -8151,6 +8182,7 @@ mod tests {
         copy_sidecar_bundle(&source, &destination);
         let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
         assert_eq!(imported.failed_entries, 0);
+        assert_eq!(imported.committed.video_pins, 1);
 
         let destination_root = crate::path_key::normalize(&destination);
         let destination_root_keep = crate::path_key::normalize_keep_drive(&destination);
@@ -9210,6 +9242,81 @@ mod tests {
             rating(&destination_data, &destination.join(untouched)),
             Some(untouched_rating)
         );
+    }
+
+    #[test]
+    fn committed_video_pin_changes_survive_a_later_cancelled_batch_only_after_commit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for index in 0..IMPORT_TRANSACTION_BATCH_ENTRIES {
+            let name = format!("{index:04}.mp4");
+            fs::write(source.join(&name), b"video").unwrap();
+            fs::write(destination.join(&name), b"video").unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let first = source.join("0000.mp4");
+        Connection::open(source_data.join("video_pins.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO video_pins (path, pin_pts_secs, thumb_webp, thumb_pts_secs)
+                 VALUES (?1, 1.0, ?2, 1.0)",
+                params![
+                    crate::path_key::normalize_keep_drive(&first),
+                    b"committed-thumb".as_slice()
+                ],
+            )
+            .unwrap();
+
+        let export_cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &export_cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let import_cancel = AtomicBool::new(false);
+        let summary = import_at(
+            &destination_data,
+            &destination,
+            &import_cancel,
+            |progress| {
+                if progress.phase == TransferPhase::Importing
+                    && progress.processed == IMPORT_TRANSACTION_BATCH_ENTRIES
+                {
+                    import_cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(summary.cancelled);
+        assert_eq!(summary.transaction_batches, 1);
+        assert_eq!(summary.committed.video_pins, 1);
+    }
+
+    #[test]
+    fn import_without_an_existing_or_exported_video_pin_reports_no_committed_pin_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("clip.mp4"), b"video").unwrap();
+        fs::write(destination.join("clip.mp4"), b"video").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+
+        assert!(summary.applied_entries > 0);
+        assert_eq!(summary.committed.video_pins, 0);
     }
 
     #[test]

@@ -26,6 +26,8 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     nav                 Ctrl+↑↓ ナビの区間別 wall time (DFS / apply / load_folder /
                         start_loading_items / close_fullscreen) を集計
     pre-grid            App::update のグリッド直前区間を要素別に集計
+    collection          コレクション読取 lease を session + request_id で相関し、
+                        旧イベントは段別時間・outcome・未相関件数だけを集計
     hitches [--ms N]    フレーム間隔 N ms 超のヒッチを検出し、直前の nav.* 区間を
                         表示 (デフォルト 33ms = 30fps 閾値)
     idle-health         静止区間の update 頻度、repaint 理由の継続、同一 work の
@@ -2948,6 +2950,351 @@ def cmd_display_integrity(events: list[dict], check: bool) -> int:
     return 0
 
 
+# -----------------------------------------------------------------------
+# collection — bounded read lease correlation and legacy stage summaries
+# -----------------------------------------------------------------------
+
+COLLECTION_LEASE_PROGRESS_OUTCOMES = {
+    "begin",
+    "phase",
+    "wait",
+    "pause",
+    "resume",
+    "deadline_elapsed",
+}
+
+COLLECTION_LEASE_TERMINAL_OUTCOMES = {
+    "adopted",
+    "cancelled",
+    "closed",
+    "disconnected",
+    "error",
+    "failed",
+    "not_found",
+    "prepare_error",
+    "ready",
+    "rejected",
+    "replaced",
+    "retired",
+    "shutdown",
+    "timeout",
+    "unavailable",
+    "worker_spawn_error",
+}
+
+
+def _collection_duration_stats(values: list[float]) -> dict:
+    return {
+        "n": len(values),
+        "p50_ms": percentile(values, 0.50),
+        "p95_ms": percentile(values, 0.95),
+        "max_ms": max(values) if values else None,
+    }
+
+
+def _positive_request_id(event: dict) -> int | None:
+    value = event.get("request_id")
+    if isinstance(value, bool):
+        return None
+    try:
+        request_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return request_id if request_id > 0 else None
+
+
+def analyze_collection(events: list[dict]) -> dict:
+    """Analyze collection events without guessing joins from UUIDs or timestamps.
+
+    A request identity is valid only inside one explicit `session.start` segment. The
+    read-lease begin may precede viewer binding, so an absent context/surface may become
+    assigned later; once assigned, contradictory values exclude the request. Missing,
+    partial, future, and unterminated records remain diagnostic counts and are never
+    classified as success or as a hang.
+    """
+    session_index: int | None = None
+    session_count = 0
+    annotated: list[tuple[tuple[str, int], bool, int, dict]] = []
+    for order, event in enumerate(events):
+        if event.get("cat") == "session" and event.get("kind") == "start":
+            session_index = session_count
+            session_count += 1
+            continue
+        if session_index is None:
+            session_key = ("partial", 0)
+            marked = False
+        else:
+            session_key = ("session", session_index)
+            marked = True
+        annotated.append((session_key, marked, order, event))
+
+    groups: dict[tuple[tuple[str, int], int], list[tuple[int, dict]]] = defaultdict(list)
+    malformed_lease_events = 0
+    for session_key, _marked, order, event in annotated:
+        if event.get("cat") != "collection" or event.get("kind") != "read_lease":
+            continue
+        request_id = _positive_request_id(event)
+        if request_id is None:
+            malformed_lease_events += 1
+            continue
+        groups[(session_key, request_id)].append((order, event))
+
+    completed_requests: list[dict] = []
+    correlated_keys: dict[
+        tuple[tuple[str, int], int], tuple[str, object | None, object | None]
+    ] = {}
+    terminal_outcomes: Counter[str] = Counter()
+    phase_outcomes: Counter[tuple[str, str, str]] = Counter()
+    incomplete_requests = 0
+    partial_session_requests = 0
+    unknown_terminal_requests = 0
+    conflicting_scope_requests = 0
+    unmatched_requests = 0
+
+    for key, rows in groups.items():
+        session_key, request_id = key
+        rows.sort(key=lambda row: row[0])
+        owner: str | None = None
+        context: object | None = None
+        surface: object | None = None
+        scope_conflict = False
+        begins: list[tuple[int, dict]] = []
+        terminals: list[tuple[int, dict]] = []
+        unknown: list[tuple[int, dict]] = []
+
+        for order, event in rows:
+            outcome = str(event.get("outcome", ""))
+            if outcome == "begin":
+                begins.append((order, event))
+            elif outcome in COLLECTION_LEASE_TERMINAL_OUTCOMES:
+                terminals.append((order, event))
+            elif outcome not in COLLECTION_LEASE_PROGRESS_OUTCOMES:
+                unknown.append((order, event))
+
+            if "owner" in event:
+                candidate_owner = str(event.get("owner", ""))
+                if not candidate_owner:
+                    scope_conflict = True
+                elif owner is None:
+                    owner = candidate_owner
+                elif owner != candidate_owner:
+                    scope_conflict = True
+            elif owner is not None:
+                # Production lease events always carry owner. Once observed, its
+                # disappearance is a malformed identity record, not a new request.
+                scope_conflict = True
+
+            has_context = "context" in event
+            has_surface = "surface_generation" in event
+            if has_context != has_surface:
+                scope_conflict = True
+                continue
+            if has_context:
+                candidate_context = event.get("context")
+                candidate_surface = event.get("surface_generation")
+                if context is None and surface is None:
+                    context = candidate_context
+                    surface = candidate_surface
+                elif context != candidate_context or surface != candidate_surface:
+                    scope_conflict = True
+
+        if owner is None:
+            scope_conflict = True
+            owner = "?"
+        for _order, event in rows:
+            phase_outcomes[
+                (owner, str(event.get("phase", "?")), str(event.get("outcome", "?")))
+            ] += 1
+
+        marked = session_key[0] == "session"
+        if not marked:
+            partial_session_requests += 1
+            continue
+        if scope_conflict:
+            conflicting_scope_requests += 1
+            continue
+        if unknown:
+            unknown_terminal_requests += 1
+            continue
+        if len(begins) != 1:
+            unmatched_requests += 1
+            continue
+        if not terminals:
+            incomplete_requests += 1
+            correlated_keys[key] = (owner, context, surface)
+            continue
+        if len(terminals) != 1 or terminals[0][0] < begins[0][0]:
+            unmatched_requests += 1
+            continue
+        terminal_order, terminal = terminals[0]
+        if any(order > terminal_order for order, _event in rows):
+            unmatched_requests += 1
+            continue
+
+        outcome = str(terminal.get("outcome"))
+        active_ms = terminal.get("active_ms")
+        wall_ms = terminal.get("wall_ms")
+        active_value = float(active_ms) if isinstance(active_ms, (int, float)) else None
+        wall_value = float(wall_ms) if isinstance(wall_ms, (int, float)) else None
+        request = {
+            "session": session_key[1],
+            "request_id": request_id,
+            "owner": owner,
+            "context": context,
+            "surface_generation": surface,
+            "outcome": outcome,
+            "active_ms": active_value,
+            "wall_ms": wall_value,
+        }
+        completed_requests.append(request)
+        terminal_outcomes[outcome] += 1
+        correlated_keys[key] = (owner, context, surface)
+
+    active_values = [
+        request["active_ms"]
+        for request in completed_requests
+        if request["active_ms"] is not None
+    ]
+    wall_values = [
+        request["wall_ms"]
+        for request in completed_requests
+        if request["wall_ms"] is not None
+    ]
+    by_owner: dict[str, dict] = {}
+    for owner in sorted({request["owner"] for request in completed_requests}):
+        owner_rows = [request for request in completed_requests if request["owner"] == owner]
+        by_owner[owner] = {
+            "count": len(owner_rows),
+            "outcomes": dict(Counter(request["outcome"] for request in owner_rows)),
+            "active": _collection_duration_stats(
+                [request["active_ms"] for request in owner_rows if request["active_ms"] is not None]
+            ),
+            "wall": _collection_duration_stats(
+                [request["wall_ms"] for request in owner_rows if request["wall_ms"] is not None]
+            ),
+        }
+
+    legacy_stages: dict[str, dict] = {}
+    legacy_matched = 0
+    legacy_unmatched = 0
+    legacy_scope_conflicts = 0
+    for session_key, marked, _order, event in annotated:
+        if event.get("cat") != "collection" or event.get("kind") == "read_lease":
+            continue
+        kind = str(event.get("kind", "?"))
+        detail = event.get("stage", event.get("operation"))
+        label = f"{kind}/{detail}" if detail not in (None, "", kind) else kind
+        stage = legacy_stages.setdefault(label, {"count": 0, "outcomes": Counter(), "ms": []})
+        stage["count"] += 1
+        if "outcome" in event:
+            stage["outcomes"][str(event.get("outcome"))] += 1
+        if isinstance(event.get("ms"), (int, float)):
+            stage["ms"].append(float(event["ms"]))
+
+        request_id = _positive_request_id(event)
+        key = (session_key, request_id) if request_id is not None else None
+        if not marked or key not in correlated_keys:
+            legacy_unmatched += 1
+            continue
+        owner, context, surface = correlated_keys[key]
+        if (
+            ("owner" in event and str(event.get("owner")) != owner)
+            or (context is not None and "context" in event and event.get("context") != context)
+            or (
+                surface is not None
+                and "surface_generation" in event
+                and event.get("surface_generation") != surface
+            )
+        ):
+            legacy_scope_conflicts += 1
+            legacy_unmatched += 1
+            continue
+        legacy_matched += 1
+
+    rendered_legacy: dict[str, dict] = {}
+    for label, stage in sorted(legacy_stages.items()):
+        rendered_legacy[label] = {
+            "count": stage["count"],
+            "outcomes": dict(stage["outcomes"]),
+            "duration": _collection_duration_stats(stage["ms"]),
+        }
+
+    return {
+        "sessions": session_count,
+        "lease": {
+            "completed": len(completed_requests),
+            "completed_requests": completed_requests,
+            "terminal_outcomes": dict(terminal_outcomes),
+            "active": _collection_duration_stats(active_values),
+            "wall": _collection_duration_stats(wall_values),
+            "by_owner": by_owner,
+            "phase_outcomes": {
+                f"{owner}/{phase}/{outcome}": count
+                for (owner, phase, outcome), count in sorted(phase_outcomes.items())
+            },
+            "incomplete": incomplete_requests,
+            "partial_session": partial_session_requests,
+            "unknown_terminal": unknown_terminal_requests,
+            "scope_conflict": conflicting_scope_requests,
+            "unmatched": unmatched_requests,
+            "malformed_events": malformed_lease_events,
+        },
+        "legacy": {
+            "stages": rendered_legacy,
+            "matched_by_request_id": legacy_matched,
+            "unmatched": legacy_unmatched,
+            "scope_conflict": legacy_scope_conflicts,
+        },
+    }
+
+
+def _format_collection_stats(stats: dict) -> str:
+    if not stats["n"]:
+        return "n=0"
+    return (
+        f"n={stats['n']} p50={stats['p50_ms']:.2f}ms "
+        f"p95={stats['p95_ms']:.2f}ms max={stats['max_ms']:.2f}ms"
+    )
+
+
+def cmd_collection(events: list[dict]) -> None:
+    report = analyze_collection(events)
+    lease = report["lease"]
+    legacy = report["legacy"]
+    print(f"collection sessions: {report['sessions']}")
+    print(
+        "read lease: "
+        f"completed={lease['completed']} incomplete={lease['incomplete']} "
+        f"partial={lease['partial_session']} unknown_terminal={lease['unknown_terminal']} "
+        f"scope_conflict={lease['scope_conflict']} unmatched={lease['unmatched']} "
+        f"malformed_events={lease['malformed_events']}"
+    )
+    print(f"  terminal outcomes: {lease['terminal_outcomes']}")
+    print(f"  active: {_format_collection_stats(lease['active'])}")
+    print(f"  wall  : {_format_collection_stats(lease['wall'])}")
+    for owner, owner_report in lease["by_owner"].items():
+        print(
+            f"  owner={owner} count={owner_report['count']} "
+            f"outcomes={owner_report['outcomes']} "
+            f"active[{_format_collection_stats(owner_report['active'])}] "
+            f"wall[{_format_collection_stats(owner_report['wall'])}]"
+        )
+    print(
+        "legacy collection events (explicit request_id only): "
+        f"matched={legacy['matched_by_request_id']} unmatched={legacy['unmatched']} "
+        f"scope_conflict={legacy['scope_conflict']}"
+    )
+    for label, stage in legacy["stages"].items():
+        print(
+            f"  {label}: count={stage['count']} outcomes={stage['outcomes']} "
+            f"ms[{_format_collection_stats(stage['duration'])}]"
+        )
+    print(
+        "note: incomplete/partial/unknown records are diagnostic only; this command does not "
+        "infer success or a hang from missing events, UUIDs, or nearby timestamps."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="mimageviewer perf_events.jsonl analyzer"
@@ -2975,6 +3322,7 @@ def main() -> None:
     subs.add_parser("colorize")
     subs.add_parser("nav")
     subs.add_parser("startup")
+    subs.add_parser("collection")
     p_pre_grid = subs.add_parser("pre-grid")
     p_pre_grid.add_argument(
         "--min-ms",
@@ -3069,6 +3417,8 @@ def main() -> None:
         cmd_nav(events)
     elif args.cmd == "startup":
         cmd_startup(events)
+    elif args.cmd == "collection":
+        cmd_collection(events)
     elif args.cmd == "pre-grid":
         cmd_pre_grid(events, args.min_ms)
     elif args.cmd == "hitches":

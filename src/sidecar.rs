@@ -192,6 +192,10 @@ pub(crate) struct SidecarDiskToken {
 }
 
 impl SidecarDiskToken {
+    pub(crate) fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
     /// Stable identity stored in the existing INTEGER sync column.  It mixes
     /// byte length, nanosecond timestamp, and the digest so changed bytes do not
     /// look synchronized solely because their timestamps are equal. Old releases
@@ -311,6 +315,81 @@ pub(crate) fn revalidate_import_source(
     source: &SidecarImportSource,
 ) -> Result<(), String> {
     revalidate_import_source_from(sidecar, source, &writer().state)
+}
+
+/// Why a retained disk parse cannot be reused for this restore check.
+///
+/// The reuse path keeps writer precedence observable instead of collapsing every
+/// failure into a generic source mismatch. The ordinary strict probe still runs
+/// after every rejection and remains the owner of the user-visible outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidecarDiskReuseRevalidationError {
+    PendingWriter,
+    WriterFailed,
+    WriterStateUnavailable,
+    TokenMismatch,
+}
+
+pub(crate) fn revalidate_disk_import_source_for_reuse(
+    folder: &Path,
+    token: &SidecarDiskToken,
+) -> Result<(), SidecarDiskReuseRevalidationError> {
+    revalidate_disk_import_source_for_reuse_from(folder, token, &writer().state)
+}
+
+fn revalidate_disk_import_source_for_reuse_from(
+    folder: &Path,
+    token: &SidecarDiskToken,
+    writer_state: &WriterState,
+) -> Result<(), SidecarDiskReuseRevalidationError> {
+    revalidate_disk_import_source_for_reuse_from_with(
+        folder,
+        token,
+        writer_state,
+        |path| {
+            std::fs::metadata(path)
+                .map_err(|error| format!("cannot revalidate sidecar metadata: {error}"))
+                .and_then(|metadata| disk_metadata_identity(&metadata))
+        },
+        |folder, token| token.revalidate(folder),
+    )
+}
+
+fn revalidate_disk_import_source_for_reuse_from_with(
+    folder: &Path,
+    token: &SidecarDiskToken,
+    writer_state: &WriterState,
+    read_metadata: impl FnOnce(&Path) -> Result<DiskMetadataIdentity, String>,
+    revalidate_bytes: impl FnOnce(&Path, &SidecarDiskToken) -> Result<(), String>,
+) -> Result<(), SidecarDiskReuseRevalidationError> {
+    if writer_state
+        .pending_import_snapshot(folder)
+        .map_err(|_| SidecarDiskReuseRevalidationError::WriterStateUnavailable)?
+        .is_some()
+    {
+        return Err(SidecarDiskReuseRevalidationError::PendingWriter);
+    }
+    if writer_state
+        .is_failed_for_import(folder)
+        .map_err(|_| SidecarDiskReuseRevalidationError::WriterStateUnavailable)?
+    {
+        return Err(SidecarDiskReuseRevalidationError::WriterFailed);
+    }
+    if crate::adjustment_db::normalize_path(folder) != token.folder_key {
+        return Err(SidecarDiskReuseRevalidationError::TokenMismatch);
+    }
+    let current = read_metadata(&folder.join(SIDECAR_FILENAME))
+        .map_err(|_| SidecarDiskReuseRevalidationError::TokenMismatch)?;
+    let expected = DiskMetadataIdentity {
+        byte_len: token.byte_len,
+        modified_unix_nanos: token.modified_unix_nanos,
+    };
+    if current != expected {
+        return Err(SidecarDiskReuseRevalidationError::TokenMismatch);
+    }
+    // Equal len/mtime is only a cheap admission check. The full bytes digest and
+    // metadata-before/after linearization remain mandatory for a reuse hit.
+    revalidate_bytes(folder, token).map_err(|_| SidecarDiskReuseRevalidationError::TokenMismatch)
 }
 
 /// Confirm that the strict import source is still absent.
@@ -678,6 +757,32 @@ impl SidecarFile {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// A read-only import proof may share the parsed tree, never a writable owner state.
+    pub(crate) fn clone_clean_import_snapshot(&self) -> Option<Self> {
+        if self.dirty || self.disabled {
+            return None;
+        }
+        Some(Self {
+            folder: self.folder.clone(),
+            items: Arc::clone(&self.items),
+            dirty: false,
+            disabled: false,
+            dirty_since: None,
+        })
+    }
+
+    /// Build a writable outer owner beside a retained read-only proof on a worker.
+    /// `SidecarEntry::Clone` keeps the large local-mask raster Arcs shared, while
+    /// the BTreeMap itself is unique before any later UI `items_mut` call.
+    pub(crate) fn detach_outer_items_for_writable_owner(&mut self) {
+        self.items = Arc::new((*self.items).clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outer_items_unique_for_test(&self) -> bool {
+        Arc::strong_count(&self.items) == 1
     }
 
     /// clean → dirty になった時刻。定期フラッシュの判定に使う。
@@ -2354,6 +2459,125 @@ mod tests {
         state.queue(dir.path().to_path_buf(), WriteRequest::Remove);
         let error = revalidate_missing_import_source_from(dir.path(), &state).unwrap_err();
         assert!(error.contains("pending write"));
+    }
+
+    #[test]
+    fn reusable_disk_revalidation_distinguishes_pending_and_failed_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(dir.path().to_path_buf());
+        sidecar.set_tags("page.jpg", ["#saved"]);
+        assert!(sidecar.flush_blocking());
+        let SidecarImportLoad::Loaded(loaded) = SidecarFile::load_for_import(dir.path()) else {
+            panic!("fixture sidecar must load");
+        };
+        let (_, SidecarImportSource::Disk(token)) = loaded.into_parts() else {
+            panic!("fixture must have a disk token");
+        };
+
+        let pending = WriterState::default();
+        pending.queue(
+            dir.path().to_path_buf(),
+            WriteRequest::Write(Arc::new(BTreeMap::from([(
+                "new.jpg".to_string(),
+                SidecarEntry::default(),
+            )]))),
+        );
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from(dir.path(), &token, &pending),
+            Err(SidecarDiskReuseRevalidationError::PendingWriter)
+        );
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from_with(
+                dir.path(),
+                &token,
+                &pending,
+                |_| panic!("metadata must not outrank a pending writer"),
+                |_, _| panic!("bytes must not be read while a writer is pending"),
+            ),
+            Err(SidecarDiskReuseRevalidationError::PendingWriter)
+        );
+
+        let failed = WriterState::default();
+        failed
+            .failed
+            .lock()
+            .unwrap()
+            .insert(dir.path().to_path_buf());
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from(dir.path(), &token, &failed),
+            Err(SidecarDiskReuseRevalidationError::WriterFailed)
+        );
+
+        let clean = WriterState::default();
+        let bytes_called = std::cell::Cell::new(false);
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from_with(
+                dir.path(),
+                &token,
+                &clean,
+                |_| {
+                    Ok(DiskMetadataIdentity {
+                        byte_len: token.byte_len + 1,
+                        modified_unix_nanos: token.modified_unix_nanos,
+                    })
+                },
+                |_, _| {
+                    bytes_called.set(true);
+                    Ok(())
+                },
+            ),
+            Err(SidecarDiskReuseRevalidationError::TokenMismatch)
+        );
+        assert!(
+            !bytes_called.get(),
+            "len mismatch must avoid the full-byte hash"
+        );
+
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from_with(
+                dir.path(),
+                &token,
+                &clean,
+                |_| {
+                    Ok(DiskMetadataIdentity {
+                        byte_len: token.byte_len,
+                        modified_unix_nanos: token.modified_unix_nanos.saturating_add(1),
+                    })
+                },
+                |_, _| {
+                    bytes_called.set(true);
+                    Ok(())
+                },
+            ),
+            Err(SidecarDiskReuseRevalidationError::TokenMismatch)
+        );
+        assert!(
+            !bytes_called.get(),
+            "mtime mismatch must avoid the full-byte hash"
+        );
+
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from_with(
+                dir.path(),
+                &token,
+                &clean,
+                |_| {
+                    Ok(DiskMetadataIdentity {
+                        byte_len: token.byte_len,
+                        modified_unix_nanos: token.modified_unix_nanos,
+                    })
+                },
+                |_, _| {
+                    bytes_called.set(true);
+                    Ok(())
+                },
+            ),
+            Ok(())
+        );
+        assert!(
+            bytes_called.get(),
+            "equal metadata must still hash all bytes"
+        );
     }
 
     #[test]

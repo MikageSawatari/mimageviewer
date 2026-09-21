@@ -21,7 +21,7 @@ use crate::collection_store::{
     CollectionImportLineStatus, CollectionImportPreview, CollectionOrderMode,
     CollectionPrepareError, CollectionPreparedRegistration, CollectionRevisionWatch,
     CollectionRuntimeEvent, CollectionRuntimeEventStream, CollectionSnapshot,
-    CollectionStoreClient, CollectionStoreError, CollectionStoreRuntime,
+    CollectionStoreClient, CollectionStoreError, CollectionStoreRuntime, MAX_COLLECTION_ENTRIES,
     MAX_COLLECTION_IMPORT_BYTES, parse_collection_text, prepare_collection_export,
     prepare_collection_registrations, serialize_collection_paths, write_all_collections_export,
     write_collection_export_atomic,
@@ -37,8 +37,6 @@ const COLLECTION_REORDER_MAX_TILE_PX: f32 = 240.0;
 const COLLECTION_REORDER_AUTO_SCROLL_EDGE_PX: f32 = 48.0;
 const COLLECTION_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 18.0;
 const COLLECTION_REORDER_SCROLLBAR_RESERVE_PX: f32 = 24.0;
-const COLLECTION_READ_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CollectionRuntimePhase {
     Inert,
@@ -96,22 +94,63 @@ struct SnapshotRequest {
 /// demand. A revision already displayed does not erase a same-revision explicit refresh.
 enum CollectionReadSlot<R, D> {
     Idle,
-    RequestNeeded { demand: D, not_before: Instant },
-    InFlight { request: R, next: Option<D> },
+    RequestNeeded {
+        demand: D,
+        lease: crate::collection_store::CollectionReadLease,
+    },
+    InFlight {
+        request: R,
+        lease: crate::collection_store::CollectionReadLease,
+        next: Option<CollectionReadDemand<D>>,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+struct CollectionReadDemand<D> {
+    value: D,
+    lease: crate::collection_store::CollectionReadLease,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionReadDemandOrigin {
+    Explicit,
+    ObservedRevision,
 }
 
 impl<R, D> CollectionReadSlot<R, D> {
     fn is_some(&self) -> bool {
-        !matches!(self, Self::Idle)
+        matches!(self, Self::RequestNeeded { .. } | Self::InFlight { .. })
     }
 
     fn is_none(&self) -> bool {
         !self.is_some()
     }
 
-    fn take_in_flight(&mut self) -> Option<(R, Option<D>)> {
+    fn take_in_flight(
+        &mut self,
+    ) -> Option<(
+        R,
+        crate::collection_store::CollectionReadLease,
+        Option<CollectionReadDemand<D>>,
+    )> {
         match std::mem::replace(self, Self::Idle) {
-            Self::InFlight { request, next } => Some((request, next)),
+            Self::InFlight {
+                request,
+                lease,
+                next,
+            } => Some((request, lease, next)),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    fn take_request_needed(&mut self) -> Option<(D, crate::collection_store::CollectionReadLease)> {
+        match std::mem::replace(self, Self::Idle) {
+            Self::RequestNeeded { demand, lease } => Some((demand, lease)),
             other => {
                 *self = other;
                 None
@@ -121,11 +160,9 @@ impl<R, D> CollectionReadSlot<R, D> {
 
     fn retry_delay(&self, now: Instant) -> Option<Duration> {
         match self {
-            Self::Idle => None,
-            Self::RequestNeeded { not_before, .. } => {
-                Some(not_before.saturating_duration_since(now))
-            }
-            Self::InFlight { .. } => Some(COLLECTION_READ_RETRY_INTERVAL),
+            Self::Idle | Self::Failed { .. } => None,
+            Self::RequestNeeded { lease, .. } => lease.poll_delay(now),
+            Self::InFlight { lease, .. } => lease.completion_poll_delay(),
         }
     }
 }
@@ -353,6 +390,10 @@ enum ActorTask {
         origin: CollectionOperationOrigin,
         receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
     },
+    SetOrder {
+        intent: crate::app::collection_grid::CollectionGridSetOrderIntent,
+        receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
+    },
     ContextRemove {
         origin: crate::app::top_level_grid_view::CollectionGridRequestStamp,
         collection_id: CollectionId,
@@ -382,16 +423,17 @@ struct ToolbarAddSnapshotRequest {
 pub(crate) enum CollectionGridSnapshotAction {
     Import(PathBuf),
     Export(PathBuf),
-    SetOrder {
-        mode: CollectionOrderMode,
-        sort: crate::settings::SortOrder,
-    },
+    SetOrder(crate::app::collection_grid::CollectionGridSetOrderIntent),
     OpenReorder,
 }
 
 impl CollectionGridSnapshotAction {
     fn requires_exact_root_revision(&self) -> bool {
-        matches!(self, Self::OpenReorder | Self::SetOrder { .. })
+        matches!(self, Self::OpenReorder | Self::SetOrder(_))
+    }
+
+    fn requires_edit_admission(&self) -> bool {
+        !matches!(self, Self::Export(_))
     }
 }
 
@@ -464,6 +506,7 @@ enum CollectionDialogOperation {
     ReadingImport {
         collection_id: CollectionId,
         expected_revision: u64,
+        known_entry_count: Option<usize>,
         source_path: PathBuf,
         origin: CollectionAddOrigin,
         task: WorkerTask<Result<CollectionImportPreview, String>>,
@@ -471,6 +514,7 @@ enum CollectionDialogOperation {
     PreviewImport {
         collection_id: CollectionId,
         expected_revision: u64,
+        known_entry_count: Option<usize>,
         source_path: PathBuf,
         preview: CollectionImportPreview,
         origin: CollectionAddOrigin,
@@ -564,7 +608,8 @@ impl CollectionDialogOperation {
             Self::Submitting(ActorTask::SnapshotMutation { origin, .. }) => {
                 matches!(origin, CollectionOperationOrigin::Grid(_))
             }
-            Self::Submitting(ActorTask::ContextRemove { .. })
+            Self::Submitting(ActorTask::SetOrder { .. })
+            | Self::Submitting(ActorTask::ContextRemove { .. })
             | Self::Submitting(ActorTask::Add {
                 origin: CollectionAddOrigin::Grid(_),
                 ..
@@ -611,12 +656,21 @@ enum CollectionManagerCloseBehavior {
     Detach,
 }
 
+const fn collection_add_result_is_error(
+    added: usize,
+    capacity_rejected: usize,
+    has_validation_errors: bool,
+) -> bool {
+    has_validation_errors || (added == 0 && capacity_rejected > 0)
+}
+
 pub(crate) struct CollectionUiState {
     runtime: Option<CollectionStoreRuntime>,
     events: Option<CollectionRuntimeEventStream>,
     client: Option<CollectionStoreClient>,
     watch: Option<CollectionRevisionWatch>,
     phase: CollectionRuntimePhase,
+    runtime_observation: Option<crate::collection_store::CollectionReadLease>,
     catalog: Option<CollectionCatalogSnapshot>,
     catalog_request: CollectionReadSlot<CatalogRequest, u64>,
     wanted_catalog_revision: u64,
@@ -642,6 +696,7 @@ impl Default for CollectionUiState {
             client: None,
             watch: None,
             phase: CollectionRuntimePhase::Inert,
+            runtime_observation: None,
             catalog: None,
             catalog_request: CollectionReadSlot::Idle,
             wanted_catalog_revision: 0,
@@ -684,6 +739,11 @@ impl CollectionUiState {
         self.events = Some(runtime.event_stream());
         self.runtime = Some(runtime);
         self.phase = CollectionRuntimePhase::Starting;
+        self.runtime_observation = Some(crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("runtime"),
+            Instant::now(),
+            "starting",
+        ));
         self.message = None;
     }
 
@@ -696,6 +756,11 @@ impl CollectionUiState {
         self.client = Some(client);
         self.events = Some(events);
         self.phase = CollectionRuntimePhase::Starting;
+        self.runtime_observation = Some(crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("runtime"),
+            Instant::now(),
+            "starting",
+        ));
         self.message = None;
     }
 
@@ -709,6 +774,9 @@ impl CollectionUiState {
         self.operation = CollectionDialogOperation::Idle;
         self.catalog_request = CollectionReadSlot::Idle;
         self.snapshot_request = CollectionReadSlot::Idle;
+        if let Some(mut observation) = self.runtime_observation.take() {
+            observation.finish(Instant::now(), "shutdown");
+        }
         self.watch = None;
         self.events = None;
         self.client = None;
@@ -721,71 +789,133 @@ impl CollectionUiState {
     }
 
     fn request_catalog(&mut self, minimum_revision: u64) {
+        self.request_catalog_from(minimum_revision, CollectionReadDemandOrigin::Explicit);
+    }
+
+    fn observe_catalog_revision(&mut self, minimum_revision: u64) {
+        self.request_catalog_from(
+            minimum_revision,
+            CollectionReadDemandOrigin::ObservedRevision,
+        );
+    }
+
+    fn request_catalog_from(&mut self, minimum_revision: u64, origin: CollectionReadDemandOrigin) {
+        let now = Instant::now();
+        let previous_wanted = self.wanted_catalog_revision;
+        if origin == CollectionReadDemandOrigin::ObservedRevision
+            && minimum_revision <= previous_wanted
+        {
+            return;
+        }
         self.wanted_catalog_revision = self.wanted_catalog_revision.max(minimum_revision);
         let demand = self.wanted_catalog_revision;
         match &mut self.catalog_request {
-            CollectionReadSlot::Idle => {
+            CollectionReadSlot::Idle | CollectionReadSlot::Failed { .. } => {
                 self.catalog_request = CollectionReadSlot::RequestNeeded {
                     demand,
-                    not_before: Instant::now(),
+                    lease: crate::collection_store::CollectionReadLease::new(
+                        crate::collection_store::CollectionReadScope::app_global("manager_catalog"),
+                        now,
+                        "admission",
+                    ),
                 };
             }
             CollectionReadSlot::RequestNeeded {
                 demand: existing, ..
             } => *existing = (*existing).max(demand),
             CollectionReadSlot::InFlight { next, .. } => {
-                *next = Some(next.unwrap_or(0).max(demand));
+                if origin == CollectionReadDemandOrigin::Explicit {
+                    if let Some(next) = next {
+                        next.value = next.value.max(demand);
+                    } else {
+                        *next = Some(CollectionReadDemand {
+                            value: demand,
+                            lease: crate::collection_store::CollectionReadLease::new(
+                                crate::collection_store::CollectionReadScope::app_global(
+                                    "manager_catalog",
+                                ),
+                                now,
+                                "coalesced",
+                            ),
+                        });
+                    }
+                }
             }
         }
+        self.drive_catalog_request(now);
+    }
+
+    fn queue_catalog_demand(&mut self, demand: CollectionReadDemand<u64>) {
+        self.wanted_catalog_revision = self.wanted_catalog_revision.max(demand.value);
+        self.catalog_request = CollectionReadSlot::RequestNeeded {
+            demand: self.wanted_catalog_revision,
+            lease: demand.lease,
+        };
         self.drive_catalog_request(Instant::now());
     }
 
     fn drive_catalog_request(&mut self, now: Instant) {
-        let CollectionReadSlot::RequestNeeded { demand, not_before } = &self.catalog_request else {
+        let CollectionReadSlot::RequestNeeded { lease, .. } = &self.catalog_request else {
             return;
         };
-        if now < *not_before {
+        if !lease.is_due(now) {
             return;
         }
-        let minimum_revision = *demand;
+        let Some((minimum_revision, mut lease)) = self.catalog_request.take_request_needed() else {
+            return;
+        };
         if !matches!(self.phase, CollectionRuntimePhase::Ready) {
             if matches!(self.phase, CollectionRuntimePhase::Starting) {
+                lease.defer(now, "starting");
                 self.catalog_request = CollectionReadSlot::RequestNeeded {
                     demand: minimum_revision,
-                    not_before: now + COLLECTION_READ_RETRY_INTERVAL,
+                    lease,
                 };
             } else {
-                self.catalog_request = CollectionReadSlot::Idle;
+                lease.finish(now, "unavailable");
+                self.catalog_request = CollectionReadSlot::Failed {
+                    message: "コレクションを利用できません。".into(),
+                };
                 self.message = Some((true, "コレクションを利用できません。".into()));
             }
             return;
         }
         let Some(client) = &self.client else {
-            self.catalog_request = CollectionReadSlot::Idle;
+            lease.finish(now, "unavailable");
+            self.catalog_request = CollectionReadSlot::Failed {
+                message: "コレクションを利用できません。".into(),
+            };
             self.message = Some((true, "コレクションを利用できません。".into()));
             return;
         };
         let queued_at = crate::perf::is_enabled().then(Instant::now);
         match client.list_catalog() {
             Ok(receiver) => {
+                lease.phase_progress(now, "actor");
                 self.catalog_request = CollectionReadSlot::InFlight {
                     request: CatalogRequest {
                         minimum_revision,
                         queued_at,
                         receiver,
                     },
+                    lease,
                     next: None,
                 };
             }
             Err(error) if error.is_read_retryable() => {
+                lease.defer(now, "actor_admission");
                 self.catalog_request = CollectionReadSlot::RequestNeeded {
                     demand: minimum_revision,
-                    not_before: now + COLLECTION_READ_RETRY_INTERVAL,
+                    lease,
                 };
             }
             Err(error) => {
-                self.catalog_request = CollectionReadSlot::Idle;
-                self.message = Some((true, collection_error_message(&error)));
+                lease.finish(now, "error");
+                let message = collection_error_message(&error);
+                self.catalog_request = CollectionReadSlot::Failed {
+                    message: message.clone(),
+                };
+                self.message = Some((true, message));
             }
         }
     }
@@ -810,7 +940,34 @@ impl CollectionUiState {
     }
 
     fn request_snapshot(&mut self, collection_id: CollectionId, minimum_revision: u64) {
+        self.request_snapshot_from(
+            collection_id,
+            minimum_revision,
+            CollectionReadDemandOrigin::Explicit,
+        );
+    }
+
+    fn observe_snapshot_revision(&mut self, collection_id: CollectionId, minimum_revision: u64) {
+        self.request_snapshot_from(
+            collection_id,
+            minimum_revision,
+            CollectionReadDemandOrigin::ObservedRevision,
+        );
+    }
+
+    fn request_snapshot_from(
+        &mut self,
+        collection_id: CollectionId,
+        minimum_revision: u64,
+        origin: CollectionReadDemandOrigin,
+    ) {
         if self.selected_id != Some(collection_id) {
+            return;
+        }
+        let previous_wanted = self.wanted_collection_revision;
+        if origin == CollectionReadDemandOrigin::ObservedRevision
+            && minimum_revision <= previous_wanted
+        {
             return;
         }
         self.wanted_collection_revision = self.wanted_collection_revision.max(minimum_revision);
@@ -818,11 +975,18 @@ impl CollectionUiState {
             collection_id,
             minimum_revision: self.wanted_collection_revision,
         };
+        let now = Instant::now();
         match &mut self.snapshot_request {
-            CollectionReadSlot::Idle => {
+            CollectionReadSlot::Idle | CollectionReadSlot::Failed { .. } => {
                 self.snapshot_request = CollectionReadSlot::RequestNeeded {
                     demand,
-                    not_before: Instant::now(),
+                    lease: crate::collection_store::CollectionReadLease::new(
+                        crate::collection_store::CollectionReadScope::app_global(
+                            "manager_snapshot",
+                        ),
+                        now,
+                        "admission",
+                    ),
                 };
             }
             CollectionReadSlot::RequestNeeded {
@@ -831,53 +995,95 @@ impl CollectionUiState {
                 existing.minimum_revision = existing.minimum_revision.max(demand.minimum_revision);
             }
             CollectionReadSlot::InFlight { next, .. } => {
-                let minimum_revision = next
-                    .as_ref()
-                    .filter(|existing| existing.collection_id == collection_id)
-                    .map_or(demand.minimum_revision, |existing| {
-                        existing.minimum_revision.max(demand.minimum_revision)
-                    });
-                *next = Some(SnapshotReadDemand {
-                    collection_id,
-                    minimum_revision,
-                });
+                if origin == CollectionReadDemandOrigin::Explicit {
+                    let minimum_revision = next
+                        .as_ref()
+                        .filter(|existing| existing.value.collection_id == collection_id)
+                        .map_or(demand.minimum_revision, |existing| {
+                            existing.value.minimum_revision.max(demand.minimum_revision)
+                        });
+                    if let Some(next) = next {
+                        next.value = SnapshotReadDemand {
+                            collection_id,
+                            minimum_revision,
+                        };
+                    } else {
+                        *next = Some(CollectionReadDemand {
+                            value: SnapshotReadDemand {
+                                collection_id,
+                                minimum_revision,
+                            },
+                            lease: crate::collection_store::CollectionReadLease::new(
+                                crate::collection_store::CollectionReadScope::app_global(
+                                    "manager_snapshot",
+                                ),
+                                now,
+                                "coalesced",
+                            ),
+                        });
+                    }
+                }
             }
             CollectionReadSlot::RequestNeeded { .. } => {
                 self.snapshot_request = CollectionReadSlot::RequestNeeded {
                     demand,
-                    not_before: Instant::now(),
+                    lease: crate::collection_store::CollectionReadLease::new(
+                        crate::collection_store::CollectionReadScope::app_global(
+                            "manager_snapshot",
+                        ),
+                        now,
+                        "replacement",
+                    ),
                 };
             }
         }
+        self.drive_snapshot_request(now);
+    }
+
+    fn queue_snapshot_demand(&mut self, demand: CollectionReadDemand<SnapshotReadDemand>) {
+        if self.selected_id != Some(demand.value.collection_id) {
+            return;
+        }
+        self.wanted_collection_revision = self
+            .wanted_collection_revision
+            .max(demand.value.minimum_revision);
+        self.snapshot_request = CollectionReadSlot::RequestNeeded {
+            demand: SnapshotReadDemand {
+                collection_id: demand.value.collection_id,
+                minimum_revision: self.wanted_collection_revision,
+            },
+            lease: demand.lease,
+        };
         self.drive_snapshot_request(Instant::now());
     }
 
     fn drive_snapshot_request(&mut self, now: Instant) {
-        let CollectionReadSlot::RequestNeeded { demand, not_before } = &self.snapshot_request
-        else {
+        let CollectionReadSlot::RequestNeeded { lease, .. } = &self.snapshot_request else {
             return;
         };
-        if now < *not_before {
+        if !lease.is_due(now) {
             return;
         }
-        let demand = *demand;
+        let Some((demand, mut lease)) = self.snapshot_request.take_request_needed() else {
+            return;
+        };
         if self.selected_id != Some(demand.collection_id) {
             self.snapshot_request = CollectionReadSlot::Idle;
             return;
         }
         if !matches!(self.phase, CollectionRuntimePhase::Ready) {
             if matches!(self.phase, CollectionRuntimePhase::Starting) {
-                self.snapshot_request = CollectionReadSlot::RequestNeeded {
-                    demand,
-                    not_before: now + COLLECTION_READ_RETRY_INTERVAL,
-                };
+                lease.defer(now, "starting");
+                self.snapshot_request = CollectionReadSlot::RequestNeeded { demand, lease };
             } else {
+                lease.finish(now, "unavailable");
                 self.snapshot_request = CollectionReadSlot::Idle;
                 self.message = Some((true, "コレクションを利用できません。".into()));
             }
             return;
         }
         let Some(client) = &self.client else {
+            lease.finish(now, "unavailable");
             self.snapshot_request = CollectionReadSlot::Idle;
             self.message = Some((true, "コレクションを利用できません。".into()));
             return;
@@ -885,6 +1091,7 @@ impl CollectionUiState {
         let queued_at = crate::perf::is_enabled().then(Instant::now);
         match client.load_collection(demand.collection_id) {
             Ok(receiver) => {
+                lease.phase_progress(now, "actor");
                 self.snapshot_request = CollectionReadSlot::InFlight {
                     request: SnapshotRequest {
                         collection_id: demand.collection_id,
@@ -892,27 +1099,39 @@ impl CollectionUiState {
                         queued_at,
                         receiver,
                     },
+                    lease,
                     next: None,
                 };
             }
             Err(error) if error.is_read_retryable() => {
-                self.snapshot_request = CollectionReadSlot::RequestNeeded {
-                    demand,
-                    not_before: now + COLLECTION_READ_RETRY_INTERVAL,
-                };
+                lease.defer(now, "actor_admission");
+                self.snapshot_request = CollectionReadSlot::RequestNeeded { demand, lease };
             }
             Err(error) => {
+                lease.finish(now, "error");
                 self.snapshot_request = CollectionReadSlot::Idle;
                 self.message = Some((true, collection_error_message(&error)));
             }
         }
     }
 
-    fn install_catalog(&mut self, catalog: CollectionCatalogSnapshot) {
+    fn install_catalog(&mut self, catalog: CollectionCatalogSnapshot) -> Vec<CollectionId> {
         if catalog.catalog_revision < self.wanted_catalog_revision {
-            self.request_catalog(self.wanted_catalog_revision);
-            return;
+            self.observe_catalog_revision(self.wanted_catalog_revision);
+            return Vec::new();
         }
+        let incoming = catalog
+            .definitions
+            .iter()
+            .map(|definition| definition.id)
+            .collect::<HashSet<_>>();
+        let retired = self
+            .catalog
+            .as_ref()
+            .into_iter()
+            .flat_map(|previous| previous.definitions.iter())
+            .filter_map(|definition| (!incoming.contains(&definition.id)).then_some(definition.id))
+            .collect::<Vec<_>>();
         self.wanted_catalog_revision = catalog.catalog_revision;
         let selected_still_exists = self.selected_id.is_some_and(|id| {
             catalog
@@ -940,9 +1159,10 @@ impl CollectionUiState {
                 .map_or(0, CollectionSnapshot::revision)
                 < revision
             {
-                self.request_snapshot(id, revision);
+                self.observe_snapshot_revision(id, revision);
             }
         }
+        retired
     }
 
     fn install_snapshot(&mut self, snapshot: CollectionSnapshot) {
@@ -950,7 +1170,7 @@ impl CollectionUiState {
             || snapshot.revision() < self.wanted_collection_revision
         {
             if let Some(id) = self.selected_id {
-                self.request_snapshot(id, self.wanted_collection_revision);
+                self.observe_snapshot_revision(id, self.wanted_collection_revision);
             }
             return;
         }
@@ -968,29 +1188,7 @@ impl CollectionUiState {
 }
 
 fn collection_error_message(error: &CollectionStoreError) -> String {
-    match error {
-        CollectionStoreError::Cancelled => "コレクション処理を取り消しました。".into(),
-        CollectionStoreError::Busy => {
-            "コレクション処理が混み合っています。もう一度お試しください。".into()
-        }
-        CollectionStoreError::Starting => "コレクションを準備しています。".into(),
-        CollectionStoreError::Unavailable => "コレクションを利用できません。".into(),
-        CollectionStoreError::NotFound => "コレクションまたは項目が見つかりません。".into(),
-        CollectionStoreError::Conflict { .. } => {
-            "別の操作でコレクションが更新されました。最新の内容を読み直しました。".into()
-        }
-        CollectionStoreError::DuplicateSource(_) => "同じ参照は既に登録されています。".into(),
-        CollectionStoreError::InvalidName => "コレクション名を入力してください。".into(),
-        CollectionStoreError::InvalidPath(_) => "登録できないパスです。".into(),
-        CollectionStoreError::InvalidOrder => "並び順を更新できませんでした。".into(),
-        CollectionStoreError::ManualOrderInactive => "手動順のときだけ並べ替えられます。".into(),
-        CollectionStoreError::IncompatibleSchema(_) => {
-            "この版では新しいコレクションデータを開けません。".into()
-        }
-        CollectionStoreError::Persistence(message) => {
-            format!("コレクションを保存できませんでした: {message}")
-        }
-    }
+    error.user_message()
 }
 
 fn collection_reorder_select_single(state: &mut CollectionReorderState, index: usize) {
@@ -1541,7 +1739,7 @@ impl App {
     }
 
     pub(crate) fn collection_catalog_contains(&self, collection_id: CollectionId) -> bool {
-        match self.collection_ui.phase {
+        match &self.collection_ui.phase {
             CollectionRuntimePhase::Ready => {
                 self.collection_ui.catalog.as_ref().is_some_and(|catalog| {
                     catalog
@@ -1642,6 +1840,7 @@ impl App {
     }
 
     pub(crate) fn shutdown_collection_runtime_for_exit(&mut self) {
+        self.cancel_saved_group_open_for_other_nav();
         self.collection_ui.shutdown_for_exit();
     }
 
@@ -1717,6 +1916,107 @@ impl App {
                 | CollectionRuntimePhase::Closed => CollectionToolbarStatus::Unavailable,
             },
         )
+    }
+
+    /// Numbered navigation uses the installed management order, never toolbar pins. A pending
+    /// catalog read can carry a newer order, so callers must wait for its revision to land.
+    pub(crate) fn collection_action_catalog(
+        &self,
+    ) -> Result<(Vec<CollectionId>, Option<CollectionId>), &'static str> {
+        if self.collection_ui.phase != CollectionRuntimePhase::Ready {
+            return Err("コレクションを利用できません。");
+        }
+        let Some(catalog) = self.collection_ui.catalog.as_ref() else {
+            return Err("コレクション一覧を読み込み中です。");
+        };
+        if matches!(
+            &self.collection_ui.catalog_request,
+            CollectionReadSlot::Failed { .. }
+        ) {
+            return Err("コレクション一覧を読み込めませんでした。");
+        }
+        if catalog.catalog_revision < self.collection_ui.wanted_catalog_revision
+            || !matches!(
+                &self.collection_ui.catalog_request,
+                CollectionReadSlot::Idle
+            )
+        {
+            return Err("コレクション一覧を更新中です。");
+        }
+        let ids = catalog
+            .definitions
+            .iter()
+            .map(|definition| definition.id)
+            .collect::<Vec<_>>();
+        let target = self
+            .settings
+            .toolbar_collection_target_id
+            .map(CollectionId::from_uuid)
+            .filter(|id| ids.contains(id));
+        Ok((ids, target))
+    }
+
+    pub(crate) fn collection_action_catalog_read_pending(&self) -> bool {
+        self.collection_ui.catalog_request.is_some()
+    }
+
+    /// Resolve one modal navigation against the latest installed management catalog. The
+    /// request itself remains owned by the shared catalog read slot; `requested` belongs to the
+    /// navigation phase so a terminal read error does not silently restart forever.
+    pub(crate) fn poll_collection_action_catalog(
+        &mut self,
+        requested: &mut bool,
+    ) -> Result<Option<(Vec<CollectionId>, Option<CollectionId>)>, String> {
+        if let CollectionReadSlot::Failed { message } = &self.collection_ui.catalog_request {
+            if *requested {
+                return Err(message.clone());
+            }
+            *requested = true;
+            let prior_message = message.clone();
+            self.collection_ui
+                .request_catalog(self.collection_ui.wanted_catalog_revision);
+            return if self.collection_ui.catalog_request.is_some() {
+                Ok(None)
+            } else {
+                Err(prior_message)
+            };
+        }
+        match self.collection_ui.phase {
+            CollectionRuntimePhase::Starting => return Ok(None),
+            CollectionRuntimePhase::Ready => {}
+            CollectionRuntimePhase::Inert
+            | CollectionRuntimePhase::Failed(_)
+            | CollectionRuntimePhase::Closed => return Err("コレクションを利用できません。".into()),
+        }
+        if let Ok(catalog) = self.collection_action_catalog() {
+            return Ok(Some(catalog));
+        }
+        if self.collection_ui.catalog_request.is_some() {
+            *requested = true;
+            return Ok(None);
+        }
+        if *requested {
+            return Err("コレクション一覧を読み込めませんでした。".into());
+        }
+        *requested = true;
+        self.collection_ui
+            .request_catalog(self.collection_ui.wanted_catalog_revision);
+        if self.collection_ui.catalog_request.is_some() {
+            Ok(None)
+        } else {
+            Err("コレクション一覧を読み込めませんでした。".into())
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn collection_toolbar_pending_target_paths_for_test(
+        &self,
+    ) -> Option<(CollectionId, Vec<PathBuf>)> {
+        let CollectionDialogOperation::ToolbarAddSnapshot(request) = &self.collection_ui.operation
+        else {
+            return None;
+        };
+        Some((request.collection_id, request.paths.clone()))
     }
 
     #[cfg(test)]
@@ -1838,24 +2138,6 @@ impl App {
             self.show_feedback_toast("別のコレクション処理が進行中です。".into());
             return;
         }
-        let Some(collection_name) = self
-            .collection_ui
-            .catalog
-            .as_ref()
-            .and_then(|catalog| {
-                catalog
-                    .definitions
-                    .iter()
-                    .find(|definition| definition.id == collection_id)
-            })
-            .map(|definition| definition.name.clone())
-        else {
-            self.collection_ui
-                .request_catalog(self.collection_ui.wanted_catalog_revision);
-            self.show_feedback_toast("追加先のコレクションが見つかりません。".into());
-            return;
-        };
-
         let indices = self.grid_selection_indices();
         if indices.is_empty() {
             self.show_feedback_toast("コレクションに追加する項目を選択してください。".into());
@@ -1879,6 +2161,115 @@ impl App {
             };
             paths.push(path.to_path_buf());
         }
+        self.add_captured_paths_to_collection(collection_id, paths);
+    }
+
+    pub(crate) fn add_grid_shortcut_to_collection_target(&mut self) {
+        let Some(collection_id) = self.collection_shortcut_target() else {
+            return;
+        };
+        self.add_grid_selection_to_collection(collection_id);
+    }
+
+    pub(crate) fn handle_grid_collection_add_shortcut(&mut self, ctx: &egui::Context) {
+        // Keymap consumption alone does not enforce the action's Grid context.
+        if self.fullscreen_idx.is_none()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, crate::keymap::KeyAction::GridAddToCollectionTarget)
+        {
+            self.add_grid_shortcut_to_collection_target();
+        }
+    }
+
+    pub(crate) fn add_fs_shortcut_to_collection_target(&mut self, fs_idx: usize) {
+        let Some(collection_id) = self.collection_shortcut_target() else {
+            return;
+        };
+        if self.fullscreen_idx != Some(fs_idx) {
+            self.show_feedback_toast("表示中の項目が変わったため、追加できません。".into());
+            return;
+        }
+        let Some(item) = self.items.get(fs_idx) else {
+            self.show_feedback_toast("表示中の項目が変わったため、追加できません。".into());
+            return;
+        };
+        let path = match item {
+            crate::grid_item::GridItem::Image(path) => path.clone(),
+            other => {
+                let reason = other.file_operation_refusal().map_or_else(
+                    || "現在の実画像だけをコレクションに追加できます。".to_owned(),
+                    |refusal| refusal.message("コレクションに追加"),
+                );
+                self.show_feedback_toast(reason);
+                return;
+            }
+        };
+        self.add_captured_paths_to_collection(collection_id, vec![path]);
+    }
+
+    pub(crate) fn add_media_shortcut_to_collection_target(&mut self, fs_idx: usize) {
+        let Some(collection_id) = self.collection_shortcut_target() else {
+            return;
+        };
+        if self.fullscreen_idx != Some(fs_idx) {
+            self.show_feedback_toast("表示中の項目が変わったため、追加できません。".into());
+            return;
+        }
+        let path = match self.items.get(fs_idx) {
+            Some(
+                crate::grid_item::GridItem::Video(path) | crate::grid_item::GridItem::Audio(path),
+            ) => path.clone(),
+            _ => {
+                self.show_feedback_toast("現在の動画・音声ファイルを追加できません。".into());
+                return;
+            }
+        };
+        self.add_captured_paths_to_collection(collection_id, vec![path]);
+    }
+
+    fn collection_shortcut_target(&mut self) -> Option<CollectionId> {
+        let target = self
+            .settings
+            .toolbar_collection_target_id
+            .map(CollectionId::from_uuid);
+        if target.is_none() {
+            self.show_feedback_toast("追加先のコレクションを選択してください。".into());
+        }
+        target
+    }
+
+    /// The target ID and physical paths are captured before any actor reply or view change.
+    fn add_captured_paths_to_collection(
+        &mut self,
+        collection_id: CollectionId,
+        paths: Vec<std::path::PathBuf>,
+    ) {
+        if !self.collection_ui.can_edit() {
+            self.show_feedback_toast("コレクションを現在編集できません。".into());
+            return;
+        }
+        if !self.collection_ui.operation.is_idle() {
+            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            return;
+        }
+        let Some(collection_name) = self
+            .collection_ui
+            .catalog
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .definitions
+                    .iter()
+                    .find(|definition| definition.id == collection_id)
+            })
+            .map(|definition| definition.name.clone())
+        else {
+            self.collection_ui
+                .request_catalog(self.collection_ui.wanted_catalog_revision);
+            self.show_feedback_toast("追加先のコレクションが見つかりません。".into());
+            return;
+        };
 
         let Some(client) = self.collection_ui.client.clone() else {
             self.show_feedback_toast("コレクションを利用できません。".into());
@@ -1944,6 +2335,30 @@ impl App {
     }
 
     /// Runtime/worker結果はviewport/fullscreen早期returnより前で回収する。
+    fn install_collection_catalog(&mut self, catalog: CollectionCatalogSnapshot) {
+        let retired = self.collection_ui.install_catalog(catalog);
+        let Some(cache) = self.collection_auto_aspect_cache.as_mut() else {
+            return;
+        };
+        for collection_id in retired {
+            if let Err(error) = cache.retire(collection_id) {
+                crate::logger::log(format!(
+                    "collection auto-aspect cache retirement failed: {error}"
+                ));
+            }
+        }
+    }
+
+    fn retire_collection_auto_aspect_cache(&mut self, collection_id: CollectionId) {
+        if let Some(cache) = self.collection_auto_aspect_cache.as_mut()
+            && let Err(error) = cache.retire(collection_id)
+        {
+            crate::logger::log(format!(
+                "collection auto-aspect cache retirement failed: {error}"
+            ));
+        }
+    }
+
     pub(crate) fn poll_collection_ui(&mut self, ctx: &egui::Context) {
         let events = self
             .collection_ui
@@ -1954,16 +2369,22 @@ impl App {
         for event in events {
             match event {
                 CollectionRuntimeEvent::Ready(catalog) => {
+                    if let Some(mut observation) = self.collection_ui.runtime_observation.take() {
+                        observation.finish(Instant::now(), "ready");
+                    }
                     self.collection_ui.phase = CollectionRuntimePhase::Ready;
                     self.collection_ui.watch = self
                         .collection_ui
                         .client
                         .as_ref()
                         .and_then(|client| client.subscribe().ok());
-                    self.collection_ui.install_catalog(catalog);
+                    self.install_collection_catalog(catalog);
                     self.prune_collection_folder_history_from_ready_catalog();
                 }
                 CollectionRuntimeEvent::Failed(error) => {
+                    if let Some(mut observation) = self.collection_ui.runtime_observation.take() {
+                        observation.finish(Instant::now(), "failed");
+                    }
                     self.collection_ui.phase =
                         CollectionRuntimePhase::Failed(collection_error_message(&error));
                     self.collection_ui.watch = None;
@@ -1974,6 +2395,9 @@ impl App {
                     self.collection_ui.message = Some((true, collection_error_message(&error)));
                 }
                 CollectionRuntimeEvent::Closed => {
+                    if let Some(mut observation) = self.collection_ui.runtime_observation.take() {
+                        observation.finish(Instant::now(), "closed");
+                    }
                     self.collection_ui.phase = CollectionRuntimePhase::Closed;
                     self.collection_ui.watch = None;
                     self.collection_ui.catalog_request = CollectionReadSlot::Idle;
@@ -1983,25 +2407,27 @@ impl App {
                 }
             }
         }
-
         if let Some(notice) = self
             .collection_ui
             .watch
             .as_ref()
             .and_then(CollectionRevisionWatch::take_latest)
         {
-            self.collection_ui.request_catalog(notice.catalog_revision);
+            self.collection_ui
+                .observe_catalog_revision(notice.catalog_revision);
             if let Some(id) = self.collection_ui.selected_id
                 && let Some((_, revision)) = notice
                     .collection_revisions
                     .iter()
                     .find(|(candidate, _)| *candidate == id)
             {
-                self.collection_ui.request_snapshot(id, *revision);
+                self.collection_ui.observe_snapshot_revision(id, *revision);
             }
         }
 
-        if let Some((mut request, mut next)) = self.collection_ui.catalog_request.take_in_flight() {
+        if let Some((mut request, mut lease, mut next)) =
+            self.collection_ui.catalog_request.take_in_flight()
+        {
             let minimum_revision = request.minimum_revision;
             let reply = request.receiver.try_recv();
             if !matches!(&reply, Err(crossbeam_channel::TryRecvError::Empty))
@@ -2032,30 +2458,56 @@ impl App {
             }
             match reply {
                 Ok(Ok(catalog)) => {
-                    self.collection_ui.install_catalog(catalog);
-                    self.prune_collection_folder_history_from_ready_catalog();
+                    if catalog.catalog_revision
+                        < self
+                            .collection_ui
+                            .wanted_catalog_revision
+                            .max(minimum_revision)
+                    {
+                        lease.defer(Instant::now(), "revision");
+                        self.collection_ui.catalog_request = CollectionReadSlot::RequestNeeded {
+                            demand: self
+                                .collection_ui
+                                .wanted_catalog_revision
+                                .max(minimum_revision),
+                            lease,
+                        };
+                    } else {
+                        lease.finish(Instant::now(), "ready");
+                        self.install_collection_catalog(catalog);
+                        self.prune_collection_folder_history_from_ready_catalog();
+                    }
                 }
                 Ok(Err(error)) if error.is_read_retryable() => {
+                    lease.defer(Instant::now(), "actor_retry");
                     self.collection_ui.catalog_request = CollectionReadSlot::RequestNeeded {
                         demand: minimum_revision,
-                        not_before: Instant::now() + COLLECTION_READ_RETRY_INTERVAL,
+                        lease,
                     };
                 }
                 Ok(Err(error)) => {
-                    next = None;
-                    self.collection_ui.message = Some((true, collection_error_message(&error)))
+                    lease.finish(Instant::now(), "error");
+                    let message = collection_error_message(&error);
+                    self.collection_ui.catalog_request = CollectionReadSlot::Failed {
+                        message: message.clone(),
+                    };
+                    self.collection_ui.message = Some((true, message));
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     self.collection_ui.catalog_request = CollectionReadSlot::InFlight {
                         request,
+                        lease,
                         next: next.take(),
                     };
                     // In-flight demand owns the coalesced follow-up until this reply arrives.
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    next = None;
-                    self.collection_ui.message =
-                        Some((true, "コレクション一覧の応答が失われました。".into()))
+                    lease.finish(Instant::now(), "disconnected");
+                    let message = "コレクション一覧の応答が失われました。".to_string();
+                    self.collection_ui.catalog_request = CollectionReadSlot::Failed {
+                        message: message.clone(),
+                    };
+                    self.collection_ui.message = Some((true, message));
                 }
             }
             if !matches!(
@@ -2063,11 +2515,12 @@ impl App {
                 CollectionRuntimePhase::Failed(_) | CollectionRuntimePhase::Closed
             ) && let Some(next) = next
             {
-                self.collection_ui.request_catalog(next);
+                self.collection_ui.queue_catalog_demand(next);
             }
         }
 
-        if let Some((mut request, mut next)) = self.collection_ui.snapshot_request.take_in_flight()
+        if let Some((mut request, mut lease, mut next)) =
+            self.collection_ui.snapshot_request.take_in_flight()
         {
             let collection_id = request.collection_id;
             let minimum_revision = request.minimum_revision;
@@ -2101,33 +2554,60 @@ impl App {
                 );
             }
             match reply {
-                Ok(Ok(snapshot)) => self.collection_ui.install_snapshot(snapshot),
+                Ok(Ok(snapshot)) => {
+                    if self.collection_ui.selected_id != Some(collection_id)
+                        || snapshot.collection_id() != collection_id
+                        || snapshot.revision()
+                            < self
+                                .collection_ui
+                                .wanted_collection_revision
+                                .max(minimum_revision)
+                    {
+                        lease.defer(Instant::now(), "revision");
+                        self.collection_ui.snapshot_request = CollectionReadSlot::RequestNeeded {
+                            demand: SnapshotReadDemand {
+                                collection_id,
+                                minimum_revision: self
+                                    .collection_ui
+                                    .wanted_collection_revision
+                                    .max(minimum_revision),
+                            },
+                            lease,
+                        };
+                    } else {
+                        lease.finish(Instant::now(), "ready");
+                        self.collection_ui.install_snapshot(snapshot);
+                    }
+                }
                 Ok(Err(CollectionStoreError::NotFound)) => {
+                    lease.finish(Instant::now(), "not_found");
                     next = None;
                     self.collection_ui
                         .request_catalog(self.collection_ui.wanted_catalog_revision);
                 }
                 Ok(Err(error)) if error.is_read_retryable() => {
+                    lease.defer(Instant::now(), "actor_retry");
                     self.collection_ui.snapshot_request = CollectionReadSlot::RequestNeeded {
                         demand: SnapshotReadDemand {
                             collection_id,
                             minimum_revision,
                         },
-                        not_before: Instant::now() + COLLECTION_READ_RETRY_INTERVAL,
+                        lease,
                     };
                 }
                 Ok(Err(error)) => {
-                    next = None;
+                    lease.finish(Instant::now(), "error");
                     self.collection_ui.message = Some((true, collection_error_message(&error)))
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     self.collection_ui.snapshot_request = CollectionReadSlot::InFlight {
                         request,
+                        lease,
                         next: next.take(),
                     };
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    next = None;
+                    lease.finish(Instant::now(), "disconnected");
                     self.collection_ui.message =
                         Some((true, "コレクション内容の応答が失われました。".into()))
                 }
@@ -2138,8 +2618,7 @@ impl App {
             ) && self.collection_ui.selected_id == Some(collection_id)
                 && let Some(next) = next
             {
-                self.collection_ui
-                    .request_snapshot(next.collection_id, next.minimum_revision);
+                self.collection_ui.queue_snapshot_demand(next);
             }
         }
 
@@ -2169,10 +2648,18 @@ impl App {
         .into_iter()
         .flatten()
         .min();
-        let runtime_delay = (matches!(self.collection_ui.phase, CollectionRuntimePhase::Starting)
-            || !self.collection_ui.operation.is_idle())
-        .then_some(COLLECTION_READ_RETRY_INTERVAL);
-        read_delay.into_iter().chain(runtime_delay).min()
+        let runtime_delay = self
+            .collection_ui
+            .runtime_observation
+            .as_ref()
+            .and_then(|observation| observation.completion_poll_delay());
+        let operation_delay =
+            (!self.collection_ui.operation.is_idle()).then_some(Duration::from_millis(50));
+        read_delay
+            .into_iter()
+            .chain(runtime_delay)
+            .chain(operation_delay)
+            .min()
     }
 
     fn poll_collection_operation(&mut self, _ctx: &egui::Context) {
@@ -2184,6 +2671,7 @@ impl App {
             CollectionDialogOperation::ReadingImport {
                 collection_id,
                 expected_revision,
+                known_entry_count,
                 source_path,
                 origin,
                 mut task,
@@ -2191,6 +2679,7 @@ impl App {
                 None => CollectionDialogOperation::ReadingImport {
                     collection_id,
                     expected_revision,
+                    known_entry_count,
                     source_path,
                     origin,
                     task,
@@ -2198,6 +2687,7 @@ impl App {
                 Some(Ok(Ok(preview))) => CollectionDialogOperation::PreviewImport {
                     collection_id,
                     expected_revision,
+                    known_entry_count,
                     source_path,
                     preview,
                     origin,
@@ -2493,8 +2983,12 @@ impl App {
         target: crate::app::collection_grid::CollectionGridContentTarget,
         action: CollectionGridSnapshotAction,
     ) {
-        if !self.collection_ui.can_edit() || !self.collection_ui.operation.is_idle() {
+        if !self.collection_ui.operation.is_idle() {
             self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            return;
+        }
+        if action.requires_edit_admission() && !self.collection_ui.can_edit() {
+            self.show_feedback_toast("コレクションを現在編集できません。".into());
             return;
         }
         if !self.collection_grid_request_stamp_is_current(target.stamp) {
@@ -2503,9 +2997,16 @@ impl App {
             );
             return;
         }
-        let Some(client) = self.collection_ui.client.clone() else {
-            self.show_feedback_toast("コレクションを利用できません。".into());
-            return;
+        let client = match self.collection_store_client_for_read() {
+            Ok(Some(client)) => client,
+            Ok(None) => {
+                self.show_feedback_toast("コレクションを利用できません。".into());
+                return;
+            }
+            Err(error) => {
+                self.show_feedback_toast(collection_error_message(&error));
+                return;
+            }
         };
         match client.load_collection(target.stamp.collection_id) {
             Ok(receiver) => {
@@ -2532,24 +3033,33 @@ impl App {
             CollectionGridSnapshotAction::Import(path) => self.collection_import_read_operation(
                 snapshot.collection_id(),
                 snapshot.revision(),
+                Some(snapshot.entries.len()),
                 path,
                 CollectionAddOrigin::Grid(stamp),
             ),
             CollectionGridSnapshotAction::Export(path) => {
                 self.start_collection_export_worker(snapshot, path, origin)
             }
-            CollectionGridSnapshotAction::SetOrder { mode, sort } => {
+            CollectionGridSnapshotAction::SetOrder(intent) => {
+                if intent.content != target {
+                    self.show_feedback_toast(
+                        "表示が切り替わったため、並び順の変更を取り消しました。".into(),
+                    );
+                    return CollectionDialogOperation::Idle;
+                }
                 let Some(client) = &self.collection_ui.client else {
                     return CollectionDialogOperation::Idle;
                 };
-                match client.set_order(snapshot.collection_id(), snapshot.revision(), mode, sort) {
-                    Ok(receiver) => {
-                        CollectionDialogOperation::Submitting(ActorTask::SnapshotMutation {
-                            collection_id: snapshot.collection_id(),
-                            origin,
-                            receiver,
-                        })
-                    }
+                match client.set_order(
+                    snapshot.collection_id(),
+                    snapshot.revision(),
+                    intent.mode,
+                    intent.sort,
+                ) {
+                    Ok(receiver) => CollectionDialogOperation::Submitting(ActorTask::SetOrder {
+                        intent,
+                        receiver,
+                    }),
                     Err(error) => {
                         self.show_feedback_toast(collection_error_message(&error));
                         CollectionDialogOperation::Idle
@@ -2756,6 +3266,31 @@ impl App {
                     self.finish_actor_disconnect()
                 }
             },
+            ActorTask::SetOrder { intent, receiver } => match receiver.try_recv() {
+                Ok(Ok(snapshot)) => {
+                    let collection_id = snapshot.collection_id();
+                    if self.collection_ui.selected_id == Some(collection_id) {
+                        self.collection_ui.install_snapshot(snapshot);
+                    }
+                    self.collection_ui
+                        .request_catalog(self.collection_ui.wanted_catalog_revision);
+                    self.collection_ui.message =
+                        Some((false, "コレクションを更新しました。".into()));
+                    self.show_feedback_toast("コレクションを更新しました。".into());
+                    CollectionDialogOperation::Idle
+                }
+                Ok(Err(error)) => {
+                    self.show_feedback_toast(collection_error_message(&error));
+                    self.finish_actor_error(error)
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    CollectionDialogOperation::Submitting(ActorTask::SetOrder { intent, receiver })
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.show_feedback_toast("コレクション保存の応答が失われました。".into());
+                    self.finish_actor_disconnect()
+                }
+            },
             ActorTask::ContextRemove {
                 origin,
                 collection_id,
@@ -2808,7 +3343,8 @@ impl App {
                         self.collection_ui.selected_id = None;
                         self.collection_ui.snapshot = None;
                     }
-                    self.collection_ui.install_catalog(catalog);
+                    self.install_collection_catalog(catalog);
+                    self.retire_collection_auto_aspect_cache(deleted);
                     self.prune_collection_folder_history_from_ready_catalog();
                     self.collection_ui.message = Some((
                         false,
@@ -2843,13 +3379,21 @@ impl App {
                         outcome.capacity_rejected.len()
                     );
                     if !outcome.capacity_rejected.is_empty() {
-                        message.push_str(" 1コレクションの登録上限は10,000件です。");
+                        message.push_str(&format!(
+                            " 1コレクションの登録上限は{}件です。",
+                            crate::ui_helpers::format_count(MAX_COLLECTION_ENTRIES as u64)
+                        ));
                     }
                     if !errors.is_empty() {
                         message.push_str("\n");
                         message.push_str(&errors.join("\n"));
                     }
-                    self.report_collection_add_result(&origin, !errors.is_empty(), message);
+                    let is_error = collection_add_result_is_error(
+                        outcome.added.len(),
+                        outcome.capacity_rejected.len(),
+                        !errors.is_empty(),
+                    );
+                    self.report_collection_add_result(&origin, is_error, message);
                     CollectionDialogOperation::Idle
                 }
                 Ok(Err(error)) => {
@@ -3014,13 +3558,20 @@ impl App {
         collection_id: CollectionId,
         destination: PathBuf,
     ) {
-        if !self.collection_ui.can_edit() {
-            self.collection_ui.message = Some((true, "コレクションを現在編集できません。".into()));
+        if !self.collection_ui.operation.is_idle() {
+            self.collection_ui.message = Some((true, "別のコレクション処理が進行中です。".into()));
             return;
         }
-        let Some(client) = &self.collection_ui.client else {
-            self.collection_ui.message = Some((true, "コレクションを利用できません。".into()));
-            return;
+        let client = match self.collection_store_client_for_read() {
+            Ok(Some(client)) => client,
+            Ok(None) => {
+                self.collection_ui.message = Some((true, "コレクションを利用できません。".into()));
+                return;
+            }
+            Err(error) => {
+                self.collection_ui.message = Some((true, collection_error_message(&error)));
+                return;
+            }
         };
         match client.load_collection(collection_id) {
             Ok(receiver) => {
@@ -3038,7 +3589,8 @@ impl App {
     }
 
     pub(crate) fn collection_export_all_available(&self) -> bool {
-        self.collection_ui.can_edit() && self.collection_ui.operation.is_idle()
+        self.collection_ui.operation.is_idle()
+            && matches!(self.collection_store_client_for_read(), Ok(Some(_)))
     }
 
     pub(crate) fn start_collection_export_all(&mut self, parent: PathBuf) {
@@ -3046,9 +3598,16 @@ impl App {
             self.show_feedback_toast("別のコレクション処理が進行中です。".into());
             return;
         }
-        let Some(client) = self.collection_ui.client.clone() else {
-            self.show_feedback_toast("コレクションを利用できません。".into());
-            return;
+        let client = match self.collection_store_client_for_read() {
+            Ok(Some(client)) => client,
+            Ok(None) => {
+                self.show_feedback_toast("コレクションを利用できません。".into());
+                return;
+            }
+            Err(error) => {
+                self.show_feedback_toast(collection_error_message(&error));
+                return;
+            }
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
@@ -3153,6 +3712,10 @@ impl App {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("コレクション一覧");
+                    ui.label(egui::RichText::new("番号").weak())
+                        .on_hover_text(
+                            "操作カスタマイズの「コレクション1〜20を開く」で使う番号です。\n作成順で、削除すると後ろの番号が繰り上がります。",
+                        );
                     if busy {
                         ui.label(egui::RichText::new("処理中…").weak());
                     }
@@ -3174,13 +3737,36 @@ impl App {
                             self.collection_ui
                                 .manager_rename_inputs
                                 .retain(|id, _| definition_ids.contains(id));
-                            for definition in catalog.definitions.iter() {
+                            for (index, definition) in catalog.definitions.iter().enumerate() {
                                 let is_target = toolbar_target_id == Some(definition.id);
                                 let mut pinned = self
                                     .settings
                                     .pinned_collections
                                     .contains(&definition.id.as_uuid());
                                 ui.horizontal(|ui| {
+                                    let (number, hover) =
+                                        crate::ui_main::saved_group_slot_number(index).map_or_else(
+                                            || {
+                                                (
+                                                    "—".to_owned(),
+                                                    "番号操作の対象外です（1〜20のみ）"
+                                                        .to_owned(),
+                                                )
+                                            },
+                                            |number| {
+                                                (
+                                                    number.to_string(),
+                                                    format!(
+                                                        "操作カスタマイズの「コレクション{number}を開く」で開きます"
+                                                    ),
+                                                )
+                                            },
+                                        );
+                                    ui.add_sized(
+                                        [28.0, ui.spacing().interact_size.y],
+                                        egui::Label::new(number),
+                                    )
+                                    .on_hover_text(hover);
                                     if is_target {
                                         ui.strong("●");
                                     } else {
@@ -3399,9 +3985,19 @@ impl App {
         expected_revision: u64,
         source_path: PathBuf,
     ) {
+        let known_entry_count = self
+            .collection_ui
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| {
+                snapshot.collection_id() == collection_id
+                    && snapshot.revision() == expected_revision
+            })
+            .map(|snapshot| snapshot.entries.len());
         self.collection_ui.operation = self.collection_import_read_operation(
             collection_id,
             expected_revision,
+            known_entry_count,
             source_path,
             CollectionAddOrigin::Manager,
         );
@@ -3411,6 +4007,7 @@ impl App {
         &mut self,
         collection_id: CollectionId,
         expected_revision: u64,
+        known_entry_count: Option<usize>,
         source_path: PathBuf,
         origin: CollectionAddOrigin,
     ) -> CollectionDialogOperation {
@@ -3450,7 +4047,7 @@ impl App {
                         (
                             "lines",
                             serde_json::Value::from(
-                                result.as_ref().map_or(0, |preview| preview.lines.len()),
+                                result.as_ref().map_or(0, |preview| preview.lines().len()),
                             ),
                         ),
                         (
@@ -3475,6 +4072,7 @@ impl App {
             Ok(task) => CollectionDialogOperation::ReadingImport {
                 collection_id,
                 expected_revision,
+                known_entry_count,
                 source_path,
                 origin,
                 task,
@@ -3581,7 +4179,7 @@ impl App {
             .map(|(path, _)| path.to_path_buf())
             .collect();
         let errors = preview
-            .lines
+            .lines()
             .iter()
             .filter_map(|line| match &line.status {
                 CollectionImportLineStatus::Invalid { reason } => {
@@ -3709,6 +4307,7 @@ impl App {
             CollectionDialogOperation::PreviewImport {
                 collection_id,
                 expected_revision,
+                known_entry_count,
                 source_path,
                 preview,
                 origin,
@@ -3729,9 +4328,16 @@ impl App {
                     ui.heading("インポート内容の確認");
                     ui.label(format!("追加先: {}", self.collection_ui.catalog.as_ref().and_then(|catalog| catalog.definitions.iter().find(|item| item.id == collection_id)).map(|item| item.name.as_str()).unwrap_or("不明")));
                     ui.weak("この確認までは対象ファイルやフォルダへアクセスしていません。確認後に存在と種類を調べます。");
+                    if let Some(entry_count) = known_entry_count {
+                        let remaining = MAX_COLLECTION_ENTRIES.saturating_sub(entry_count);
+                        ui.weak(format!(
+                            "現在の残り登録枠の目安: {} 件。重複・無効項目と保存までの変更を反映した最終判定は保存時に行います。",
+                            crate::ui_helpers::format_count(remaining as u64)
+                        ));
+                    }
                     let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-                    egui::ScrollArea::vertical().max_height(320.0).show_rows(ui, row_height, preview.lines.len(), |ui, row_range| {
-                        for line in &preview.lines[row_range] {
+                    egui::ScrollArea::vertical().max_height(320.0).show_rows(ui, row_height, preview.lines().len(), |ui, row_range| {
+                        for line in &preview.lines()[row_range] {
                             let is_network = line.source_key.as_ref().is_some_and(|key| {
                                 key.normalized_path().starts_with("//")
                             });
@@ -3751,12 +4357,8 @@ impl App {
                         }
                     });
                     ui.horizontal(|ui| {
-                        let accepted = preview.accepted_paths().count();
-                        let invalid = preview
-                            .lines
-                            .iter()
-                            .filter(|line| matches!(line.status, CollectionImportLineStatus::Invalid { .. }))
-                            .count();
+                        let accepted = preview.accepted_count();
+                        let invalid = preview.invalid_count();
                         if ui
                             .add_enabled(
                                 accepted > 0 && invalid == 0,
@@ -3781,6 +4383,7 @@ impl App {
                     None => CollectionDialogOperation::PreviewImport {
                         collection_id,
                         expected_revision,
+                        known_entry_count,
                         source_path,
                         preview,
                         origin,
@@ -4460,7 +5063,7 @@ mod tests {
         CollectionDefinition, CollectionEntry, CollectionRegistration, CollectionResolvedKind,
         CollectionSourcePath,
     };
-    use crate::settings::SortOrder;
+    use crate::settings::{DetailsSortKey, GridViewMode, SortOrder};
 
     fn wait_for(app: &mut App, mut predicate: impl FnMut(&App) -> bool) {
         let ctx = egui::Context::default();
@@ -4492,7 +5095,81 @@ mod tests {
         wait_for(app, |app| {
             app.collection_ui.operation.is_idle() && app.collection_ui.snapshot.is_some()
         });
-        app.collection_ui.snapshot.clone().unwrap()
+        let created = app.collection_ui.snapshot.clone().unwrap();
+        let collection_id = created.collection_id();
+        let revision = created.revision();
+        wait_for(app, |app| {
+            app.collection_ui.operation.is_idle()
+                && app.collection_ui.selected_id == Some(collection_id)
+                && app.collection_ui.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.collection_id() == collection_id && snapshot.revision() >= revision
+                })
+                && app.collection_ui.catalog.as_ref().is_some_and(|catalog| {
+                    catalog.definitions.iter().any(|definition| {
+                        definition.id == collection_id && definition.revision >= revision
+                    })
+                })
+        });
+        created
+    }
+
+    fn test_read_lease(owner: &'static str) -> crate::collection_store::CollectionReadLease {
+        crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global(owner),
+            Instant::now(),
+            "test",
+        )
+    }
+
+    fn catalog_definition(id: CollectionId, name: &str, revision: u64) -> CollectionDefinition {
+        CollectionDefinition {
+            id,
+            name: name.into(),
+            order_mode: CollectionOrderMode::Manual,
+            standard_sort: SortOrder::FileName,
+            shuffle_seed: 0,
+            revision,
+        }
+    }
+
+    #[test]
+    fn authoritative_catalog_adoption_reports_only_newly_retired_collection_ids() {
+        let retired = CollectionId::new();
+        let survivor = CollectionId::new();
+        let newcomer = CollectionId::new();
+        let mut state = CollectionUiState::default();
+        state.catalog = Some(CollectionCatalogSnapshot {
+            catalog_revision: 4,
+            definitions: Arc::from(vec![
+                catalog_definition(retired, "retired", 1),
+                catalog_definition(survivor, "survivor", 1),
+            ]),
+        });
+        state.wanted_catalog_revision = 4;
+
+        let removed = state.install_catalog(CollectionCatalogSnapshot {
+            catalog_revision: 5,
+            definitions: Arc::from(vec![
+                catalog_definition(survivor, "survivor", 1),
+                catalog_definition(newcomer, "new", 1),
+            ]),
+        });
+        assert_eq!(removed, vec![retired]);
+
+        let stale = state.install_catalog(CollectionCatalogSnapshot {
+            catalog_revision: 4,
+            definitions: Arc::from(vec![catalog_definition(retired, "stale", 1)]),
+        });
+        assert!(stale.is_empty());
+        assert!(
+            state
+                .catalog
+                .as_ref()
+                .unwrap()
+                .definitions
+                .iter()
+                .all(|definition| definition.id != retired)
+        );
     }
 
     #[test]
@@ -4565,25 +5242,26 @@ mod tests {
             &app.collection_ui.snapshot_request,
         ) {
             (
+                CollectionReadSlot::RequestNeeded { lease: catalog, .. },
                 CollectionReadSlot::RequestNeeded {
-                    not_before: catalog,
-                    ..
+                    lease: snapshot, ..
                 },
-                CollectionReadSlot::RequestNeeded {
-                    not_before: snapshot,
-                    ..
-                },
-            ) => (*catalog, *snapshot),
+            ) => (
+                catalog.next_poll_at_for_test().unwrap(),
+                snapshot.next_poll_at_for_test().unwrap(),
+            ),
             _ => panic!("Starting must keep both explicit read demands"),
         };
         app.poll_collection_ui(&ctx);
         assert!(matches!(
             app.collection_ui.catalog_request,
-            CollectionReadSlot::RequestNeeded { not_before, .. } if not_before == catalog_deadline
+            CollectionReadSlot::RequestNeeded { ref lease, .. }
+                if lease.next_poll_at_for_test() == Some(catalog_deadline)
         ));
         assert!(matches!(
             app.collection_ui.snapshot_request,
-            CollectionReadSlot::RequestNeeded { not_before, .. } if not_before == snapshot_deadline
+            CollectionReadSlot::RequestNeeded { ref lease, .. }
+                if lease.next_poll_at_for_test() == Some(snapshot_deadline)
         ));
 
         app.collection_ui.phase = CollectionRuntimePhase::Ready;
@@ -4597,15 +5275,15 @@ mod tests {
                 other => panic!("unexpected actor admission: {other:?}"),
             }
         }
-        if let CollectionReadSlot::RequestNeeded { not_before, .. } =
+        if let CollectionReadSlot::RequestNeeded { lease, .. } =
             &mut app.collection_ui.catalog_request
         {
-            *not_before = Instant::now();
+            lease.force_due_for_test(Instant::now());
         }
-        if let CollectionReadSlot::RequestNeeded { not_before, .. } =
+        if let CollectionReadSlot::RequestNeeded { lease, .. } =
             &mut app.collection_ui.snapshot_request
         {
-            *not_before = Instant::now();
+            lease.force_due_for_test(Instant::now());
         }
         app.poll_collection_ui(&ctx);
         assert!(matches!(
@@ -4622,15 +5300,15 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(queued);
-        if let CollectionReadSlot::RequestNeeded { not_before, .. } =
+        if let CollectionReadSlot::RequestNeeded { lease, .. } =
             &mut app.collection_ui.catalog_request
         {
-            *not_before = Instant::now();
+            lease.force_due_for_test(Instant::now());
         }
-        if let CollectionReadSlot::RequestNeeded { not_before, .. } =
+        if let CollectionReadSlot::RequestNeeded { lease, .. } =
             &mut app.collection_ui.snapshot_request
         {
-            *not_before = Instant::now();
+            lease.force_due_for_test(Instant::now());
         }
         wait_for(&mut app, |app| {
             app.collection_ui.catalog_request.is_none()
@@ -4643,6 +5321,338 @@ mod tests {
         });
         assert_eq!(app.collection_ui_poll_delay(), None);
         app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn runtime_starting_remains_one_owner_after_a_long_observation() {
+        let mut app = crate::app::setup_app_for_test();
+        let now = Instant::now();
+        let started = now.checked_sub(Duration::from_secs(24 * 60 * 60)).unwrap();
+        app.collection_ui.phase = CollectionRuntimePhase::Starting;
+        app.collection_ui.runtime_observation =
+            Some(crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("runtime"),
+                started,
+                "starting",
+            ));
+        let request_id = app
+            .collection_ui
+            .runtime_observation
+            .as_ref()
+            .unwrap()
+            .request_id();
+        let ctx = egui::Context::default();
+
+        app.poll_collection_ui(&ctx);
+        app.poll_collection_ui(&ctx);
+
+        assert!(matches!(
+            app.collection_ui.phase,
+            CollectionRuntimePhase::Starting
+        ));
+        assert!(app.collection_ui.runtime.is_none());
+        assert!(app.collection_ui.client.is_none());
+        assert_eq!(
+            app.collection_ui
+                .runtime_observation
+                .as_ref()
+                .unwrap()
+                .request_id(),
+            request_id,
+            "observing a slow startup must not create a replacement actor/request",
+        );
+        assert_eq!(
+            app.collection_ui_poll_delay(),
+            Some(Duration::from_millis(50)),
+            "runtime completion observation stays bounded without replacing its owner",
+        );
+    }
+
+    #[test]
+    fn in_flight_completion_cadence_does_not_bypass_slow_admission_backoff() {
+        let start = Instant::now();
+        let mut lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("manager_catalog"),
+            start,
+            "admission",
+        );
+        lease.defer(start, "admission");
+        lease.defer(start + Duration::from_millis(50), "admission");
+        let slow_at = start + Duration::from_millis(250);
+        lease.defer(slow_at, "admission");
+        assert!(!lease.is_due(slow_at));
+        let slot: CollectionReadSlot<(), ()> = CollectionReadSlot::InFlight {
+            request: (),
+            lease,
+            next: None,
+        };
+        assert_eq!(slot.retry_delay(slow_at), Some(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn long_running_manager_reads_preserve_installed_state_and_eventually_adopt_replies() {
+        let mut app = snapshot_app(false);
+        let installed = app.collection_ui.catalog.clone().unwrap();
+        let installed_snapshot = app.collection_ui.snapshot.clone().unwrap();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let now = Instant::now();
+        let started = now.checked_sub(Duration::from_secs(24 * 60 * 60)).unwrap();
+        let current = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("manager_catalog"),
+            started,
+            "actor",
+        );
+        let current_id = current.request_id();
+        let mut next = test_read_lease("manager_catalog");
+        let next_id = next.request_id();
+        next.set_next_poll_at_for_test(now + Duration::from_secs(60));
+        app.collection_ui.catalog_request = CollectionReadSlot::InFlight {
+            request: CatalogRequest {
+                minimum_revision: installed.catalog_revision,
+                queued_at: None,
+                receiver,
+            },
+            lease: current,
+            next: Some(CollectionReadDemand {
+                value: installed.catalog_revision,
+                lease: next,
+            }),
+        };
+
+        app.poll_collection_ui(&egui::Context::default());
+
+        assert_eq!(
+            app.collection_ui.catalog.as_ref().unwrap().catalog_revision,
+            installed.catalog_revision,
+            "a long-running read must not clear the last installed catalog",
+        );
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::InFlight { ref lease, next: Some(ref next), .. }
+                if lease.request_id() == current_id && next.lease.request_id() == next_id
+        ));
+
+        app.collection_ui.phase = CollectionRuntimePhase::Starting;
+        sender.send(Ok(installed.clone())).unwrap();
+        app.poll_collection_ui(&egui::Context::default());
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::RequestNeeded { ref lease, .. }
+                if lease.request_id() == next_id && lease.request_id() != current_id
+        ));
+
+        let (snapshot_sender, snapshot_receiver) = crossbeam_channel::bounded(1);
+        let snapshot_lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("manager_snapshot"),
+            started,
+            "actor",
+        );
+        let snapshot_request_id = snapshot_lease.request_id();
+        app.collection_ui.snapshot_request = CollectionReadSlot::InFlight {
+            request: SnapshotRequest {
+                collection_id: installed_snapshot.collection_id(),
+                minimum_revision: installed_snapshot.revision(),
+                queued_at: None,
+                receiver: snapshot_receiver,
+            },
+            lease: snapshot_lease,
+            next: None,
+        };
+        app.poll_collection_ui(&egui::Context::default());
+        assert!(matches!(
+            app.collection_ui.snapshot_request,
+            CollectionReadSlot::InFlight { ref lease, .. }
+                if lease.request_id() == snapshot_request_id
+        ));
+        snapshot_sender
+            .send(Ok(installed_snapshot.clone()))
+            .unwrap();
+        app.poll_collection_ui(&egui::Context::default());
+        assert!(app.collection_ui.snapshot_request.is_none());
+        assert_eq!(
+            app.collection_ui.snapshot.as_ref().unwrap().revision(),
+            installed_snapshot.revision()
+        );
+    }
+
+    #[test]
+    fn observed_revisions_share_pending_owner_and_only_newer_terminal_notice_revives_it() {
+        let mut app = snapshot_app(false);
+        let installed = app.collection_ui.catalog.clone().unwrap();
+        let (catalog_sender, catalog_receiver) = crossbeam_channel::bounded(1);
+        let catalog_lease = test_read_lease("manager_catalog");
+        let catalog_lease_id = catalog_lease.request_id();
+        app.collection_ui.catalog_request = CollectionReadSlot::InFlight {
+            request: CatalogRequest {
+                minimum_revision: installed.catalog_revision,
+                queued_at: None,
+                receiver: catalog_receiver,
+            },
+            lease: catalog_lease,
+            next: None,
+        };
+
+        app.collection_ui
+            .observe_catalog_revision(installed.catalog_revision);
+        app.collection_ui
+            .observe_catalog_revision(installed.catalog_revision + 1);
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::InFlight { ref lease, next: None, .. }
+                if lease.request_id() == catalog_lease_id
+        ));
+        let mut stale_catalog = installed.clone();
+        stale_catalog.catalog_revision = installed.catalog_revision;
+        catalog_sender.send(Ok(stale_catalog)).unwrap();
+        app.poll_collection_ui(&egui::Context::default());
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::RequestNeeded { demand, ref lease }
+                if demand == installed.catalog_revision + 1
+                    && lease.request_id() == catalog_lease_id
+        ));
+
+        let (terminal_sender, terminal_receiver) = crossbeam_channel::bounded(1);
+        let (minimum_revision, lease) = app
+            .collection_ui
+            .catalog_request
+            .take_request_needed()
+            .expect("stale reply keeps the same catalog demand");
+        app.collection_ui.catalog_request = CollectionReadSlot::InFlight {
+            request: CatalogRequest {
+                minimum_revision,
+                queued_at: None,
+                receiver: terminal_receiver,
+            },
+            lease,
+            next: None,
+        };
+        terminal_sender
+            .send(Err(CollectionStoreError::Persistence(
+                "terminal read failure".into(),
+            )))
+            .unwrap();
+        app.poll_collection_ui(&egui::Context::default());
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::Failed { .. }
+        ));
+        app.collection_ui
+            .observe_catalog_revision(installed.catalog_revision + 1);
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::Failed { .. }
+        ));
+
+        app.collection_ui.phase = CollectionRuntimePhase::Starting;
+        app.collection_ui
+            .observe_catalog_revision(installed.catalog_revision + 2);
+        let newer_id = match &app.collection_ui.catalog_request {
+            CollectionReadSlot::RequestNeeded { lease, .. } => lease.request_id(),
+            _ => panic!("a strictly newer terminal notice must create one new demand"),
+        };
+        assert_ne!(newer_id, catalog_lease_id);
+        app.collection_ui.catalog_request = CollectionReadSlot::Failed {
+            message: "error".into(),
+        };
+        app.collection_ui
+            .request_catalog(installed.catalog_revision + 2);
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::RequestNeeded { ref lease, .. }
+                if lease.request_id() != newer_id
+        ));
+
+        let selected_id = app.collection_ui.selected_id.unwrap();
+        let snapshot_revision = app.collection_ui.snapshot.as_ref().unwrap().revision();
+        let (_snapshot_sender, snapshot_receiver) = crossbeam_channel::bounded(1);
+        let snapshot_lease = test_read_lease("manager_snapshot");
+        let snapshot_lease_id = snapshot_lease.request_id();
+        app.collection_ui.wanted_collection_revision = snapshot_revision;
+        app.collection_ui.snapshot_request = CollectionReadSlot::InFlight {
+            request: SnapshotRequest {
+                collection_id: selected_id,
+                minimum_revision: snapshot_revision,
+                queued_at: None,
+                receiver: snapshot_receiver,
+            },
+            lease: snapshot_lease,
+            next: None,
+        };
+        app.collection_ui
+            .observe_snapshot_revision(selected_id, snapshot_revision);
+        app.collection_ui
+            .observe_snapshot_revision(selected_id, snapshot_revision + 1);
+        assert!(matches!(
+            app.collection_ui.snapshot_request,
+            CollectionReadSlot::InFlight { ref lease, next: None, .. }
+                if lease.request_id() == snapshot_lease_id
+        ));
+    }
+
+    #[test]
+    fn older_terminal_manager_reply_preserves_later_explicit_refresh_owner() {
+        let mut app = snapshot_app(false);
+        let catalog_revision = app.collection_ui.catalog.as_ref().unwrap().catalog_revision;
+        let selected_id = app.collection_ui.selected_id.unwrap();
+        let snapshot_revision = app.collection_ui.snapshot.as_ref().unwrap().revision();
+        let (catalog_sender, catalog_receiver) = crossbeam_channel::bounded(1);
+        app.collection_ui.catalog_request = CollectionReadSlot::InFlight {
+            request: CatalogRequest {
+                minimum_revision: catalog_revision,
+                queued_at: None,
+                receiver: catalog_receiver,
+            },
+            lease: test_read_lease("manager_catalog"),
+            next: None,
+        };
+        app.collection_ui.request_catalog(catalog_revision);
+        let later_catalog_id = match &app.collection_ui.catalog_request {
+            CollectionReadSlot::InFlight {
+                next: Some(next), ..
+            } => next.lease.request_id(),
+            _ => panic!("explicit catalog refresh must own a coalesced demand"),
+        };
+        catalog_sender
+            .send(Err(CollectionStoreError::Persistence("old failure".into())))
+            .unwrap();
+        app.collection_ui.phase = CollectionRuntimePhase::Starting;
+        app.poll_collection_ui(&egui::Context::default());
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::RequestNeeded { ref lease, .. }
+                if lease.request_id() == later_catalog_id
+        ));
+
+        app.collection_ui.phase = CollectionRuntimePhase::Ready;
+        let (snapshot_sender, snapshot_receiver) =
+            crossbeam_channel::bounded::<Result<CollectionSnapshot, CollectionStoreError>>(1);
+        app.collection_ui.snapshot_request = CollectionReadSlot::InFlight {
+            request: SnapshotRequest {
+                collection_id: selected_id,
+                minimum_revision: snapshot_revision,
+                queued_at: None,
+                receiver: snapshot_receiver,
+            },
+            lease: test_read_lease("manager_snapshot"),
+            next: None,
+        };
+        app.collection_ui
+            .request_snapshot(selected_id, snapshot_revision);
+        let later_snapshot_id = match &app.collection_ui.snapshot_request {
+            CollectionReadSlot::InFlight {
+                next: Some(next), ..
+            } => next.lease.request_id(),
+            _ => panic!("explicit snapshot refresh must own a coalesced demand"),
+        };
+        drop(snapshot_sender);
+        app.collection_ui.phase = CollectionRuntimePhase::Starting;
+        app.poll_collection_ui(&egui::Context::default());
+        assert!(matches!(
+            app.collection_ui.snapshot_request,
+            CollectionReadSlot::RequestNeeded { ref lease, .. }
+                if lease.request_id() == later_snapshot_id
+        ));
     }
 
     #[test]
@@ -4670,7 +5680,8 @@ mod tests {
         app.collection_ui.request_catalog(catalog_revision);
         assert!(matches!(
             app.collection_ui.catalog_request,
-            CollectionReadSlot::InFlight { next: Some(revision), .. } if revision == catalog_revision
+            CollectionReadSlot::InFlight { next: Some(ref demand), .. }
+                if demand.value == catalog_revision
         ));
         app.collection_ui
             .request_snapshot(first_id, first.revision());
@@ -4678,8 +5689,8 @@ mod tests {
             .request_snapshot(first_id, first.revision());
         assert!(matches!(
             app.collection_ui.snapshot_request,
-            CollectionReadSlot::InFlight { next: Some(SnapshotReadDemand { collection_id, .. }), .. }
-                if collection_id == first_id
+            CollectionReadSlot::InFlight { next: Some(ref demand), .. }
+                if demand.value.collection_id == first_id
         ));
         // Closing the manager is presentation only. The toolbar/catalog request still belongs
         // to the runtime, while switching the selected target retires old snapshot follow-ups.
@@ -4687,7 +5698,7 @@ mod tests {
         app.collection_ui.select_collection(Some(second_id));
         assert!(matches!(
             app.collection_ui.snapshot_request,
-            CollectionReadSlot::InFlight { ref request, next: None }
+            CollectionReadSlot::InFlight { ref request, next: None, .. }
                 if request.collection_id == second_id
         ));
         release.send(()).unwrap();
@@ -5220,6 +6231,7 @@ mod tests {
             app.collection_ui.operation = CollectionDialogOperation::PreviewImport {
                 collection_id,
                 expected_revision: 7,
+                known_entry_count: Some(2),
                 source_path: PathBuf::from(r"D:\Import\collection.txt"),
                 preview,
                 origin: CollectionAddOrigin::Grid(
@@ -5731,6 +6743,22 @@ mod tests {
         let created = create_collection(&mut app, "Exact order");
         app.open_collection_grid(created.collection_id(), None);
         wait_for_collection_grid(&mut app, created.collection_id());
+        let manual = app.collection_grid_root_order().unwrap().unwrap();
+        assert!(app.request_collection_grid_set_order(
+            manual,
+            CollectionOrderMode::Standard,
+            SortOrder::FileName,
+            crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+        ));
+        wait_for_collection_grid_revision(
+            &mut app,
+            created.collection_id(),
+            manual.content.expected_revision + 1,
+        );
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_sort_key = DetailsSortKey::Name;
+        app.rebuild_details_order();
+        assert!(app.details_header_sort_active());
         let clicked = app.collection_grid_root_order().unwrap().unwrap();
 
         // The mounted root still displays N, while another owner commits N+1. The UI's
@@ -5746,13 +6774,12 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
-        app.start_collection_grid_content_action(
-            clicked.content,
-            CollectionGridSnapshotAction::SetOrder {
-                mode: CollectionOrderMode::Shuffle,
-                sort: SortOrder::FileName,
-            },
-        );
+        assert!(app.request_collection_grid_set_order(
+            clicked,
+            CollectionOrderMode::Shuffle,
+            SortOrder::FileName,
+            crate::app::collection_grid::CollectionGridSetOrderRoute::CollectionMenu,
+        ));
         wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
         let latest = client
             .load_collection(created.collection_id())
@@ -5769,6 +6796,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|(message, _, _)| message.contains("切り替わった"))
         );
+        assert_eq!(app.settings.details_sort_key, DetailsSortKey::Name);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -6486,6 +7514,7 @@ mod tests {
         app.collection_ui.operation = CollectionDialogOperation::PreviewImport {
             collection_id: target.collection_id(),
             expected_revision: target.revision(),
+            known_entry_count: Some(target.entries.len()),
             source_path: temp.path().join("import.txt"),
             preview,
             origin: CollectionAddOrigin::Manager,
@@ -6557,6 +7586,433 @@ mod tests {
             std::thread::yield_now();
         }
 
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_shortcut_freezes_grid_target_and_checked_paths_before_actor_reply() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected = temp.path().join("selected.png");
+        let checked = temp.path().join("checked.png");
+        std::fs::write(&selected, b"selected").unwrap();
+        std::fs::write(&checked, b"checked").unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let first = create_collection(&mut app, "First");
+        let second = create_collection(&mut app, "Second");
+        app.select_collection_toolbar_target(first.collection_id());
+        app.items = vec![
+            crate::grid_item::GridItem::Image(selected.clone()),
+            crate::grid_item::GridItem::Image(checked.clone()),
+        ];
+        app.selected = Some(0);
+        app.checked.insert(1);
+        app.scroll_offset_y = 93.0;
+
+        app.add_grid_shortcut_to_collection_target();
+        let CollectionDialogOperation::ToolbarAddSnapshot(request) = &app.collection_ui.operation
+        else {
+            panic!("shortcut must use the existing typed actor operation");
+        };
+        assert_eq!(request.collection_id, first.collection_id());
+        assert_eq!(request.paths, vec![checked.clone()]);
+
+        app.items = vec![crate::grid_item::GridItem::Image(selected.clone())];
+        app.selected = Some(0);
+        app.checked.clear();
+        app.settings.toolbar_collection_target_id = Some(second.collection_id().as_uuid());
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        let added = client
+            .load_collection(first.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(added.entries.len(), 1);
+        assert_eq!(added.entries[0].source_path, checked);
+        let untouched = client
+            .load_collection(second.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(untouched.entries.is_empty());
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 93.0);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_number_actions_follow_management_order_and_wait_for_current_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let first = create_collection(&mut app, "First");
+        let second = create_collection(&mut app, "Second");
+        let third = create_collection(&mut app, "Third");
+        wait_for(&mut app, |app| {
+            app.collection_action_catalog()
+                .is_ok_and(|(ids, _)| ids.len() == 3)
+        });
+        app.settings.pinned_collections = vec![
+            third.collection_id().as_uuid(),
+            first.collection_id().as_uuid(),
+        ];
+        app.collection_ui.selected_id = Some(third.collection_id());
+        let ctx = egui::Context::default();
+        for (action, expected) in [
+            (
+                crate::keymap::KeyAction::GridOpenCollection1,
+                first.collection_id(),
+            ),
+            (
+                crate::keymap::KeyAction::GridCollectionNext,
+                second.collection_id(),
+            ),
+        ] {
+            let before_session = app
+                .top_level_grid_view
+                .collection_session()
+                .map(|session| session.identity.collection_id);
+            let before_history_len = app.folder_nav_back_stack.len();
+            let nav = app.apply_saved_group_key_action(&ctx, action);
+            let Some(crate::ui_main::AddressBarNav::CollectionOpen(target)) = nav else {
+                panic!("collection key must return an explicit navigation candidate");
+            };
+            assert_eq!(target, expected);
+            assert_eq!(
+                app.top_level_grid_view
+                    .collection_session()
+                    .map(|session| session.identity.collection_id),
+                before_session,
+                "unadopted navigation must leave the visible surface unchanged",
+            );
+            assert_eq!(app.folder_nav_back_stack.len(), before_history_len);
+            app.open_collection_grid_from_navigation(target);
+            assert_eq!(
+                app.top_level_grid_view
+                    .collection_session()
+                    .map(|session| session.identity.collection_id),
+                Some(expected),
+            );
+        }
+        let installed = app.collection_ui.catalog.as_ref().unwrap().catalog_revision;
+        app.collection_ui.wanted_catalog_revision = installed + 1;
+        assert!(
+            app.apply_saved_group_key_action(&ctx, crate::keymap::KeyAction::GridOpenCollection1)
+                .is_none()
+        );
+        assert!(app.saved_group_open_modal_visible());
+        assert_eq!(
+            app.top_level_grid_view
+                .collection_session()
+                .map(|session| session.identity.collection_id),
+            Some(second.collection_id()),
+            "stale catalog must not replace the displayed collection",
+        );
+        app.cancel_saved_group_open_for_other_nav();
+        assert!(!app.saved_group_open_modal_visible());
+
+        let compacted = client
+            .delete_collection(first.collection_id(), first.revision())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        app.collection_ui.wanted_catalog_revision = compacted.catalog_revision;
+        app.collection_ui.catalog = Some(compacted);
+        app.collection_ui.catalog_request = CollectionReadSlot::Idle;
+        let (ids, _) = app.collection_action_catalog().unwrap();
+        assert_eq!(
+            ids,
+            vec![second.collection_id(), third.collection_id()],
+            "deleting the first collection compacts the visible numbered order"
+        );
+        assert!(matches!(
+            app.apply_saved_group_key_action(
+                &ctx,
+                crate::keymap::KeyAction::GridOpenCollection1
+            ),
+            Some(crate::ui_main::AddressBarNav::CollectionOpen(id))
+                if id == second.collection_id()
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_target_is_captured_before_catalog_wait_and_ready_is_winner_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, _client) = start_ready_app(&temp);
+        let first = create_collection(&mut app, "First");
+        let second = create_collection(&mut app, "Second");
+        wait_for(&mut app, |app| app.collection_action_catalog().is_ok());
+        let first_id = first.collection_id();
+        app.settings.toolbar_collection_target_id = Some(first_id.as_uuid());
+        let revision = app.collection_ui.catalog.as_ref().unwrap().catalog_revision;
+        let mut delayed_lease = test_read_lease("catalog-test");
+        delayed_lease.set_next_poll_at_for_test(Instant::now() + Duration::from_secs(60));
+        app.collection_ui.catalog_request = CollectionReadSlot::RequestNeeded {
+            demand: revision,
+            lease: delayed_lease,
+        };
+        let ctx = egui::Context::default();
+        let history = app.folder_nav_back_stack.len();
+        let before = app.top_level_grid_view.generation();
+        assert!(
+            app.apply_saved_group_key_action(
+                &ctx,
+                crate::keymap::KeyAction::GridOpenCollectionTarget
+            )
+            .is_none()
+        );
+        app.settings.toolbar_collection_target_id = Some(second.collection_id().as_uuid());
+        app.collection_ui.catalog_request = CollectionReadSlot::Idle;
+        app.poll_saved_group_open(&ctx);
+        let Some(crate::ui_main::AddressBarNav::SavedGroupReady(owner)) =
+            app.saved_group_ready_nav()
+        else {
+            panic!("fresh catalog must make the request ready");
+        };
+        assert_eq!(app.top_level_grid_view.generation(), before);
+        assert_eq!(app.folder_nav_back_stack.len(), history);
+        app.adopt_saved_group_ready(owner);
+        assert_eq!(
+            app.top_level_grid_view
+                .collection_session()
+                .map(|session| session.identity.collection_id),
+            Some(first_id),
+        );
+        assert!(!app.saved_group_open_modal_visible());
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn failed_same_revision_catalog_refresh_does_not_use_old_management_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, _client) = start_ready_app(&temp);
+        create_collection(&mut app, "First");
+        wait_for(&mut app, |app| app.collection_action_catalog().is_ok());
+        let revision = app.collection_ui.catalog.as_ref().unwrap().catalog_revision;
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        drop(sender);
+        app.collection_ui.catalog_request = CollectionReadSlot::InFlight {
+            request: CatalogRequest {
+                minimum_revision: revision,
+                queued_at: None,
+                receiver,
+            },
+            lease: test_read_lease("catalog-test"),
+            next: None,
+        };
+        let ctx = egui::Context::default();
+        app.apply_saved_group_key_action(&ctx, crate::keymap::KeyAction::GridOpenCollection1);
+        assert!(app.saved_group_open_modal_visible());
+        app.poll_collection_ui(&ctx);
+        assert!(matches!(
+            app.collection_ui.catalog_request,
+            CollectionReadSlot::Failed { .. }
+        ));
+        app.poll_saved_group_open(&ctx);
+        assert!(!app.saved_group_open_modal_visible());
+        assert!(app.saved_group_ready_nav().is_none());
+        assert!(app.top_level_grid_view.collection_session().is_none());
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn failed_catalog_read_is_not_reported_as_an_update_in_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, _client) = start_ready_app(&temp);
+        create_collection(&mut app, "First");
+        wait_for(&mut app, |app| app.collection_action_catalog().is_ok());
+        app.collection_ui.catalog_request = CollectionReadSlot::Failed {
+            message: "読み取りに失敗しました。".into(),
+        };
+
+        assert_eq!(
+            app.collection_action_catalog().unwrap_err(),
+            "コレクション一覧を読み込めませんでした。"
+        );
+
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn ring_add_to_collection_uses_real_sources_without_switching_grid() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ["grid.png", "viewer.png", "video.mp4"].map(|name| temp.path().join(name));
+        for path in &paths {
+            std::fs::write(path, b"source").unwrap();
+        }
+        let (mut app, client) = start_ready_app(&temp);
+        let collection = create_collection(&mut app, "Ring target");
+        app.select_collection_toolbar_target(collection.collection_id());
+        app.items = vec![
+            crate::grid_item::GridItem::Image(paths[0].clone()),
+            crate::grid_item::GridItem::Image(paths[1].clone()),
+            crate::grid_item::GridItem::Video(paths[2].clone()),
+        ];
+        app.selected = Some(0);
+        app.scroll_offset_y = 81.0;
+        let ctx = egui::Context::default();
+        for (context, fullscreen_idx) in [
+            (crate::ring_shortcut::RingShortcutContext::Grid, None),
+            (
+                crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+                Some(1),
+            ),
+            (
+                crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+                Some(2),
+            ),
+        ] {
+            app.fullscreen_idx = fullscreen_idx;
+            assert!(
+                app.apply_ring_action(
+                    &ctx,
+                    context,
+                    crate::ring_shortcut::RingActionId::AddToCollection,
+                    "collection-ring-test",
+                )
+                .is_none()
+            );
+            wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+            assert!(app.top_level_grid_view.collection_session().is_none());
+            assert_eq!(app.scroll_offset_y, 81.0);
+        }
+        let snapshot = client
+            .load_collection(collection.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let actual = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.source_path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, paths.to_vec());
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn configured_grid_collection_key_is_single_press_and_grid_only() {
+        let mut app = crate::app::setup_app_for_test();
+        app.keymap =
+            crate::keymap::Keymap::from_ini_str("[Grid]\nGridAddToCollectionTarget = F13\n");
+        let ctx = egui::Context::default();
+        let press = egui::Event::Key {
+            key: egui::Key::F13,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        ctx.begin_pass(egui::RawInput {
+            events: vec![press.clone()],
+            ..Default::default()
+        });
+        let _ = app.keyboard_owner_for_pass(&ctx);
+        app.handle_grid_collection_add_shortcut(&ctx);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| text.contains("追加先"))
+        );
+        app.fs_feedback_toast = None;
+        app.handle_grid_collection_add_shortcut(&ctx);
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "same key press must not be reused"
+        );
+        let _ = ctx.end_pass();
+
+        app.fullscreen_idx = Some(0);
+        ctx.begin_pass(egui::RawInput {
+            events: vec![press],
+            ..Default::default()
+        });
+        let _ = app.keyboard_owner_for_pass(&ctx);
+        app.handle_grid_collection_add_shortcut(&ctx);
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "Grid action must not run in FS"
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn collection_shortcuts_use_only_current_physical_fs_anchor_and_media_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.png");
+        let anchor = temp.path().join("anchor.png");
+        let video = temp.path().join("video.mp4");
+        let audio = temp.path().join("audio.mp3");
+        let pdf = temp.path().join("book.pdf");
+        for path in [&first, &anchor, &video, &audio, &pdf] {
+            std::fs::write(path, b"source").unwrap();
+        }
+        let (mut app, client) = start_ready_app(&temp);
+        let target = create_collection(&mut app, "Fullscreen shortcuts");
+        app.select_collection_toolbar_target(target.collection_id());
+        app.items = vec![
+            crate::grid_item::GridItem::Image(first.clone()),
+            crate::grid_item::GridItem::Image(anchor.clone()),
+            crate::grid_item::GridItem::Video(video.clone()),
+            crate::grid_item::GridItem::Audio(audio.clone()),
+            crate::grid_item::GridItem::PdfPage {
+                pdf_path: pdf,
+                page_num: 0,
+                content_type: None,
+            },
+        ];
+        app.selected = Some(0);
+        app.checked.extend([0, 2]);
+        app.fullscreen_idx = Some(1);
+        app.add_fs_shortcut_to_collection_target(1);
+        let CollectionDialogOperation::ToolbarAddSnapshot(request) = &app.collection_ui.operation
+        else {
+            panic!("FS add must capture one physical anchor");
+        };
+        assert_eq!(request.paths, vec![anchor.clone()]);
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+
+        app.fullscreen_idx = Some(4);
+        app.add_fs_shortcut_to_collection_target(4);
+        assert!(app.collection_ui.operation.is_idle());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| text.contains("PDF 内のページ"))
+        );
+        app.add_fs_shortcut_to_collection_target(1);
+        assert!(app.collection_ui.operation.is_idle());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| text.contains("変わった"))
+        );
+
+        app.fullscreen_idx = Some(2);
+        app.add_media_shortcut_to_collection_target(2);
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        app.fullscreen_idx = Some(3);
+        app.add_media_shortcut_to_collection_target(3);
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        let added = client
+            .load_collection(target.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            added
+                .entries
+                .iter()
+                .map(|entry| entry.source_path.clone())
+                .collect::<Vec<_>>(),
+            vec![anchor, video, audio],
+        );
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.checked.len(), 2);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -6802,6 +8258,173 @@ mod tests {
     }
 
     #[test]
+    fn capacity_only_rejection_is_an_error_but_partial_add_remains_a_result() {
+        assert!(collection_add_result_is_error(0, 1, false));
+        assert!(!collection_add_result_is_error(1, 1, false));
+        assert!(collection_add_result_is_error(1, 0, true));
+
+        let mut app = crate::app::setup_app_for_test();
+        let collection_id = CollectionId::new();
+        let snapshot = CollectionSnapshot {
+            catalog_revision: 1,
+            definition: CollectionDefinition {
+                id: collection_id,
+                name: "Capacity result".into(),
+                order_mode: CollectionOrderMode::Manual,
+                standard_sort: SortOrder::FileName,
+                shuffle_seed: 0,
+                revision: 1,
+            },
+            entries: Arc::from([]),
+        };
+        let rejected_key =
+            CollectionSourcePath::from_trusted(std::path::Path::new(r"C:\capacity\rejected.png"))
+                .unwrap()
+                .key()
+                .clone();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        sender
+            .send(Ok(CollectionBatchAddOutcome {
+                snapshot: snapshot.clone(),
+                added: Arc::from([]),
+                duplicates: Arc::from([]),
+                capacity_rejected: Arc::from([rejected_key]),
+            }))
+            .unwrap();
+        app.collection_ui.operation = CollectionDialogOperation::Submitting(ActorTask::Add {
+            collection_id: snapshot.collection_id(),
+            errors: Vec::new(),
+            origin: CollectionAddOrigin::Manager,
+            receiver,
+        });
+        app.poll_collection_operation(&egui::Context::default());
+        assert!(app.collection_ui.operation.is_idle());
+        assert!(
+            app.collection_ui
+                .message
+                .as_ref()
+                .is_some_and(|(error, text)| {
+                    *error && text.contains("追加 0 件") && text.contains("上限による拒否 1 件")
+                })
+        );
+    }
+
+    #[test]
+    fn export_read_survives_reorder_busy_while_mutation_is_not_replayed_and_reload_failure_keeps_edits()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ["first.png", "second.png", "third.png"].map(|name| temp.path().join(name));
+        for path in &paths {
+            std::fs::write(path, b"source").unwrap();
+        }
+        let destination = temp.path().join("read-while-reordering.txt");
+        let (mut app, client) = start_ready_app(&temp);
+        let created = create_collection(&mut app, "Read while editing");
+        let added = client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                paths[..2]
+                    .iter()
+                    .map(|path| {
+                        CollectionRegistration::from_trusted_path(
+                            path,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        app.open_collection_grid(added.collection_id(), None);
+        wait_for_collection_grid_revision(&mut app, added.collection_id(), added.revision());
+        let target = app.collection_grid_content_target().unwrap();
+
+        app.open_collection_reorder(added.clone(), Some(added.entries[0].id));
+        {
+            let state = app.collection_ui.reorder.as_mut().unwrap();
+            state.entries.reverse();
+            state.dirty = true;
+        }
+        let edited_order = app
+            .collection_ui
+            .reorder
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.entry.id)
+            .collect::<Vec<_>>();
+        let (reload_sender, reload_receiver) = crossbeam_channel::bounded(1);
+        app.collection_ui.reorder.as_mut().unwrap().phase = CollectionReorderPhase::Refreshing {
+            receiver: reload_receiver,
+        };
+        assert!(!app.collection_ui.can_edit());
+
+        app.start_collection_grid_content_action(
+            target,
+            CollectionGridSnapshotAction::Export(destination.clone()),
+        );
+        wait_for(&mut app, |app| {
+            app.collection_ui.operation.is_idle() && destination.exists()
+        });
+        let exported = std::fs::read(&destination).unwrap();
+        assert!(exported.starts_with(&[0xef, 0xbb, 0xbf]));
+        assert!(app.collection_export_all_available());
+        app.start_collection_export_all(temp.path().to_path_buf());
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        assert!(
+            temp.path()
+                .join("collections-export")
+                .join("collections-index.txt")
+                .exists()
+        );
+
+        app.items = vec![crate::grid_item::GridItem::Image(paths[2].clone())];
+        app.selected = Some(0);
+        app.checked.clear();
+        app.add_grid_selection_to_collection(added.collection_id());
+        assert!(app.collection_ui.operation.is_idle());
+        drop(reload_sender);
+        app.poll_collection_reorder(&egui::Context::default());
+        let reorder = app.collection_ui.reorder.as_ref().unwrap();
+        assert!(reorder.dirty);
+        assert!(matches!(
+            reorder.phase,
+            CollectionReorderPhase::Error {
+                conflict: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            reorder
+                .entries
+                .iter()
+                .map(|entry| entry.entry.id)
+                .collect::<Vec<_>>(),
+            edited_order
+        );
+        let unchanged = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.entries.len(), 2, "toolbar add was not queued");
+        assert!(
+            unchanged
+                .entries
+                .iter()
+                .all(|entry| entry.source_path != paths[2])
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn export_handler_loads_latest_actor_snapshot_instead_of_stale_dialog_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.png");
@@ -6960,6 +8583,7 @@ mod tests {
         app.borrow_mut().collection_ui.operation = CollectionDialogOperation::ReadingImport {
             collection_id,
             expected_revision: 7,
+            known_entry_count: Some(2),
             source_path: PathBuf::from(r"D:\Import\collection.txt"),
             origin: CollectionAddOrigin::Manager,
             task,

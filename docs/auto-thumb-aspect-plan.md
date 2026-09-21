@@ -783,13 +783,19 @@ helper メソッド (例: `record_aspect_sample`, `maybe_apply_auto_aspect`) を
   enqueue 成功時には App map を失効させ、prepare 中の
   Get 結果には cache epoch を添えて失効後の遅着採用を拒否する。clear admission の直後に
   始まる Get も actor queue では clear の後ろへ並び、処理前の DB 行を新 epoch として
-  採用しない。個別 folder 削除は
-  Collection ID に触れず、Collection 削除通知で新たな同期 DB write は行わない。
-  未参照 UUID 行は通常の age-prune に委ねる。cache manager の合算数は「件」と表示する。
+  採用しない。個別 folder 削除は Collection ID に触れない。Collection の authoritative
+  catalog 採用で旧一覧から消えた UUID と、Delete 成功応答の exact UUID は、同じ送信 lock 内で
+  process-lifetime の retired 集合へ入れて `Forget` を enqueue する。先行 Get / Upsert の後ろへ
+  FIFO で並ぶため、削除後の遅い lookup / record は map に戻らず、対象 UUID の disk row も削除する。
+  UUID は再利用しない契約なので retired 集合は session 中保持し、別 UUID の値は維持する。
+  これは非同期 actor write であり UI thread から SQLite を呼ばない。age-prune は期限整理として残す。
+  cache manager の合算数は「件」と表示する。
 - Collection root の sample 可能母数は `CollectionPlaceholder` と、固定音楽アイコンで
-  thumbnail sample を出さない `Audio` を除外する同一純述語から seed / decision の両方を
-  導く。通常 folder の母数とサンプル経路は変えない。cache の前回 sample gate は現在の
-  sample 可能母数で clip し、到達不能な待機を作らない。
+  thumbnail sample を出さない `Audio` を除外する同一純述語から prepare worker が一度だけ
+  immutable scalar を作る。install 途中の seed はこの新しい scalar を明示的に受け取り、公開後は
+  exact Collection ID / revision / items generation / item 件数が一致する root だけ O(1) で読む。
+  不一致は 0 とし、通常 folder / PhysicalSource 子は従来どおり `items.len()` を使う。cache の
+  前回 sample gate は現在の sample 可能母数で clip し、到達不能な待機を作らない。
 
 実装では `CollectionAutoAspectCache` が App 全体の UUID メモリ値を持ち、
 `CollectionAutoAspectDb` だけが専用 table に触れる。短い送信ロックで Get と
@@ -797,7 +803,8 @@ maintenance admission / epoch 更新を直列化し、DB 待ちを UI に持ち�
 prepare worker の Get は最大 100 ms、取消・期限切れ・DB 不調は cache miss とする。
 実 rows の accepted install 前に lookup の epoch を照合して復元し、同一プロセスの
 再訪はメモリ値を優先する。保存は root の exact Ready ID / generation / revision と
-item 件数が一致したときだけ行う。管理操作は Collection actor 応答と従来の
+item 件数が一致したときだけ行う。削除済み UUID は catalog / Delete 応答で retired にし、
+`Forget` と遅着拒否を同じ送信 mutex で直列化する。管理操作は Collection actor 応答と従来の
 folder table worker の結果を合算する。UUID 側が失敗しても従来の folder / catalog /
 tile 処理を続け、合算件数は不明、全件削除は部分失敗として明示する。個別 folder
 削除では UUID は件数照会だけなので、actor の不調で folder 削除を妨げない。

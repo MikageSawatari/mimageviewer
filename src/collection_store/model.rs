@@ -185,6 +185,34 @@ impl CollectionOrderMode {
     }
 }
 
+/// Stable wire spelling shared by the collection database and text export.
+pub(crate) const fn collection_sort_order_wire_name(sort: SortOrder) -> &'static str {
+    match sort {
+        SortOrder::FileName => "file_name",
+        SortOrder::FileNameDesc => "file_name_desc",
+        SortOrder::Numeric => "numeric",
+        SortOrder::NumericDesc => "numeric_desc",
+        SortOrder::DateAsc => "date_asc",
+        SortOrder::DateDesc => "date_desc",
+        SortOrder::SizeAsc => "size_asc",
+        SortOrder::SizeDesc => "size_desc",
+    }
+}
+
+pub(crate) fn collection_sort_order_from_wire_name(value: &str) -> Option<SortOrder> {
+    match value {
+        "file_name" => Some(SortOrder::FileName),
+        "file_name_desc" => Some(SortOrder::FileNameDesc),
+        "numeric" => Some(SortOrder::Numeric),
+        "numeric_desc" => Some(SortOrder::NumericDesc),
+        "date_asc" => Some(SortOrder::DateAsc),
+        "date_desc" => Some(SortOrder::DateDesc),
+        "size_asc" => Some(SortOrder::SizeAsc),
+        "size_desc" => Some(SortOrder::SizeDesc),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionDefinition {
     pub id: CollectionId,
@@ -335,6 +363,29 @@ pub enum CollectionStoreError {
 impl CollectionStoreError {
     pub fn is_read_retryable(&self) -> bool {
         matches!(self, Self::Busy | Self::Starting)
+    }
+
+    /// 利用者向け表示の正本文言。`Display` はログ・診断用の英語詳細を保持する。
+    pub(crate) fn user_message(&self) -> String {
+        match self {
+            Self::Cancelled => "コレクション処理を取り消しました。".into(),
+            Self::Busy => "コレクション処理が混み合っています。もう一度お試しください。".into(),
+            Self::Starting => "コレクションを準備しています。".into(),
+            Self::Unavailable => "コレクションを利用できません。".into(),
+            Self::NotFound => "コレクションまたは項目が見つかりません。".into(),
+            Self::Conflict { .. } => {
+                "別の操作でコレクションが更新されました。最新の内容を読み直しました。".into()
+            }
+            Self::DuplicateSource(_) => "同じ参照は既に登録されています。".into(),
+            Self::InvalidName => "コレクション名を入力してください。".into(),
+            Self::InvalidPath(_) => "登録できないパスです。".into(),
+            Self::InvalidOrder => "並び順を更新できませんでした。".into(),
+            Self::ManualOrderInactive => "手動順のときだけ並べ替えられます。".into(),
+            Self::IncompatibleSchema(_) => {
+                "この版では新しいコレクションデータを開けません。".into()
+            }
+            Self::Persistence(_) => "コレクションデータの読み書きに失敗しました。".into(),
+        }
     }
 }
 

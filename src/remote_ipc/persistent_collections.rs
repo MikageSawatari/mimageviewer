@@ -2154,6 +2154,16 @@ mod tests {
             collection_name: "test".to_owned(),
             order_mode: CollectionOrderMode::Manual,
             standard_sort: crate::settings::SortOrder::FileName,
+            auto_aspect_eligible_total: entries
+                .iter()
+                .filter(|entry| {
+                    !matches!(
+                        &entry.item,
+                        crate::grid_item::GridItem::CollectionPlaceholder { .. }
+                            | crate::grid_item::GridItem::Audio(_)
+                    )
+                })
+                .count(),
             entries: entries.into(),
         }
     }

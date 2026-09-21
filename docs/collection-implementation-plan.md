@@ -920,6 +920,8 @@ focused / full / staticの数値とログhash、build保留理由は
 container child open / return、latest next / prev / EOFを追加した。protocolは56で、既存aggregate collectionとは
 別message / route / browser ownerを使う。PCと同じactor snapshot / immutable prepared model / pure resolverを読み、
 Remoteからcreate / edit / sort writeを公開しない。
+この protocol 番号は当該変更時点の記録であり、現行 protocol は
+[`web-remote-plan.md`](web-remote-plan.md) を参照する。
 
 session / route / revision / deadline / cancel、Remote pathとactual kindの二重検証、64 MiB response budget、
 truncated sparse target、display-unit / ordinal、終了時App ACK→server→producer→actorの所有境界と独立review、
@@ -977,6 +979,10 @@ focused / full / static / verification build保留証跡は
   current pathを要求し、child閲覧中のwanted revision進行とcollection削除を許容する。独立したアドレス・履歴・
   お気に入り・pane navigationはvisible load採用時だけCollectionをFolderへ退役させる。scan失敗、stale async
   candidate、scope拒否、変換取消ではsurfaceと旧itemsを分裂させない。
+- `PhysicalSource` から直接表示した PDF / ZIP を Esc / Enter / 右クリックで閉じる要求は、通常の
+  collection open と区別して入力ナビの競合点まで由来を運ぶ。その要求が勝った場合だけ fullscreen を閉じてから
+  typed restore で root を開き、entry / source anchor、collection順、選択、scrollを復元する。通常の
+  collection navigationにはclose副作用を加えず、通常Folder、Smart、別viewer context、detached closeを維持する。
 - コレクションrootの動画がPendingのままだった原因は、aggregate items install後に通常thumbnail poolとvideo
   workerを起動していなかったことだった。exact revisionのprepare workerがfull-path動画sidecarとvideo pinを
   一括準備し、watch再表示とlatest再生root着地の両方へ同じsnapshotを渡す。root installはviewer bundleの
@@ -1101,7 +1107,7 @@ focused / full / static / verification build保留証跡は
 
 ## 23. v4.0.0 出荷前レビュー後の修正計画（2026-09-16）
 
-状態: §23.1〜23.4、§23.5（M-1）、§23.6、A-6、D-4、§23.7（登録上限・import資源上限・preview仮想化・PC/Remote prepare再利用）は実装・自動検証・Codex 独立レビュー完了。§23.4 / §23.6 / A-6 / D-4 / §23.7 は実機確認待ち。A-6 / D-4 の統合 full gate / build と、§23.7 前後半の統合 full gate / build は2026-09-20に通過した。§23.8 は移行前 DB 保護に続き、起動時バックアップと一括書き出しを実装・検証中。ほかの残件は未着手。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
+状態: §23.1〜23.9 の出荷前修正は実装・自動検証・Codex 独立レビューを完了した。§23.8 の世代バックアップ / 一括書き出しと §23.9 の追加キーは、2026-09-20 の統合 full gate と確認用 build を通過した。§23.10 の公開文書も整備・静的検証・Codex 独立レビューを完了した。§23.9 の Windows native 入力は利用者の実機確認待ちで、製品差分は未コミットのまま保持している。過去の §23.4 / §23.6 / A-6 / D-4 / §23.7 にも実機確認待ちの項目があり、リリース完了ではない。実装は Codex、出荷前の ClaudeCode レビュー指摘を修正中。2026-09-17 に仕様判断 2（シャッフル方式）・3（上限 10,000 件）・5（バックアップ 2 段）を利用者が確定。指摘 ID は
 [docs/review-v4.0.0/README.md](review-v4.0.0/README.md) と同フォルダの A〜E 報告書を指す。
 利用者の判断は [仕様案「利用者の判断（2026-09-16）」](collection-spec-proposal.md#利用者の判断2026-09-16v400-出荷前レビュー後)
 が正本。修正ごとに handler-level / 状態遷移テストを付け、着手前に §13 不変条件と review の
@@ -1150,6 +1156,9 @@ request ownership、worker の配置、deadline、取消、表示順は変更し
 - 上部「コレクション」メニューの「並び順」は残し、同じ installed root 述語から表示を導く。
   このメニューだけは Standard の列ヘッダ所有中も order を選べ、成功採用時に列ソートを解除する。
   loading / stale / failed / deleted で無効のときは理由を出す（A-9）。
+- Standard のコレクション直下で列ヘッダソートが有効な間は、列ヘッダの hover に、列順は一覧の表示と
+  選択だけへ適用し、ページ送りや連続再生は保存済みのコレクション順を保つことを表示する。通常Folder、
+  Manual / Shuffle、loading / stale / failed / deleted ではこの説明を出さない。
 - A-6「元の場所へ移動」はこのsort chunkから分離する。既存 `begin_context_jump_to_folder` は開始時にrootを
   破棄するため流用せず、後続の独立physical jump chunkで stamped scan owner を持ち、成功時だけrootを退役、
   失敗・取消・遅着では元rootと履歴を保つ。`ContextMenuViewFlags` / `can_jump_to_folder` の変更もそこで行う。
@@ -1184,12 +1193,29 @@ Remote IPCは56→57、WebはShuffleと表示する。Standardのfacts集合照�
 - focused collection 168/168、Remote IPC Shuffle wire、Web 123/123、
   `scripts/test-full.ps1 -SuppressCrashDialogs` の `[test-full] PASS` / exit 0、
   core check、viewer-context audit、fmt、UI glyph、diff check が成功した。
+
   `scripts/build-dev.ps1 -PreserveRuntime` は居残りプロセス不在を確認して成功し、core / Remote を
   `target/dev-runtime` に生成した。証跡は `target/collection-sort-verify-20260919/`。
   Codex独立 reviewer は §23.2/3 と §1.244 の差分・検証を確認し、重大な残件なしと判断した。
   GUI / 実データは操作していない。
 - A-6「元の場所へ移動」はこの chunk に含めず、root を成功前に破棄しない独立 physical jump として
   後続で設計・実装する。§23.8 の全件書き出しも未実装で、ここでは schema 移行前の DB 保護だけを先行した。
+
+#### §23.2 / §23.3 再レビュー補正（2026-09-21）
+
+- UI とリングの順変更は、要求時の collection ID・surface generation・revision・mode・sort を
+  `CollectionGridSetOrderIntent` にまとめ、同じ入口へ通す。Manual / Standard の同値要求は送らず、
+  Shuffle の再選択だけは毎回新しい seed を要求する。上部「コレクション」メニューだけは、詳細列
+  ソート中の同値 Standard を列ソート解除要求として受け付ける。これは exact context / stamp / revision
+  を確認した同じ UI 処理内でローカル解除し、DB の同値 command を送らない。mode / sort の変更と
+  Shuffle だけを actor へ送り、競合・失敗・別 root への遅着では列ヘッダ表示を変えない。
+- リングは開いた時点でソート先を Global / Collection / Locked のいずれかとして捕捉する。
+  Collection の途中操作はリング表示だけを変え、確定時に一度だけ上記 intent を送るため、通常一覧の
+  `settings.sort_order` を変更しない。Global は従来の live preview を維持し、Locked は共通の理由を表示する。
+- loading / viewer-deferred / stale / failed / deleted と、列ヘッダを固定する Manual / Shuffle の理由は
+  `GridSortLockReason` を正本にし、列ヘッダ・表示メニュー・ツールバー・コレクションメニューで同じ
+  説明を使う。コレクション actor の利用者向けエラーは日本語 helper を共有し、英語 `Display` は
+  診断ログだけに残す。
 
 #### §23.2 / §23.3 追加の利用者報告（2026-09-20）
 
@@ -1260,7 +1286,7 @@ Unavailable でも既存の明示削除契約を変更しない。model と menu
 read 経路の入口を `collection_store_client_for_migration` と同じ `Result<Option<_>, CollectionStoreError>` へ揃え、
 `Busy` / `Starting` は終端 `Failed` や無言 drop にせず `RequestNeeded` + `request_repaint_after`
 で再駆動する。並べ替え保存中も read は編集可否から独立し、actor が受け付ければ進む。
-Grid の `Snapshot` / `Preparing` と期限付き再受付は、表示中の root に限って
+Grid の `Snapshot` / `Preparing` と再受付は、表示中の root に限って
 遅延 poll とし、tail の即時 repaint reasons には入れない。即時 repaint によって遅延予約が
 失われ得るため、各 pass で残り時間を再予約する。
 
@@ -1270,7 +1296,7 @@ Grid の `Snapshot` / `Preparing` と期限付き再受付は、表示中の roo
 Busy/Starting 後に同じ revision の要求も落とさない。window を閉じても runtime/catalog の
 需要は消さず、選択・runtime の変更時に旧 snapshot 要求を退役する。navigation は既存 pending に
 `RequestNeeded` を加え、subscribe 済み watch と source/intent を保ったまま load Busy を待つ。
-繰り返し届く同一 slideshow / EOF 通知は既存要求の期限を伸ばさず、別 action/serial は別意図として
+繰り返し届く同一 slideshow / EOF 通知は既存要求を再生成せず、別 action/serial は別意図として
 扱う。terminal read error は真の末尾として表示しない。新規・関連焦点回帰 158 件、
 本体 lib 8,750 件（45 件除外）を含む `scripts/test-full.ps1 -SuppressCrashDialogs`、
 `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo run --locked -p viewer_context_audit`、
@@ -1295,11 +1321,21 @@ scroll、address、history、cache は走査中に保持し、失敗・断線・
 履歴を作る。元項目が走査後の一覧から消えた、または表示設定で除外されたときも親 Folder への移動は
 成功とし、既存の exact 不在通知を出して別項目を誤選択しない。
 
+2026-09-21 の再レビュー補正では、欠損・未対応・読取失敗の placeholder も、登録済み exact path を
+この操作だけへ渡す。`GridItem::drag_source_path()` は `None` のままとし、ドラッグ、削除、Windows
+メニュー、外部ツールへ実パス操作能力を広げない。ドライブ root と UNC 共有 root は `NoParent` として
+理由付きで無効化し、worker を起動しない。走査開始後にサイドカー復元が始まった場合も Collection root
+と履歴を維持して結果を破棄し、元 viewer context へ復元完了後の再操作を案内する。通常フォルダの
+外部変更再走査は、内容 signature が同じなら開いているメニューを維持し、内容が変わって一覧を
+差し替える場合だけ、その viewer context の古いメニュー owner を退役させる。
+
 grid メニューの保存対象は index 単独から context と items generation を持つ owner へ替えた。
 Collection の再 install は同じ context / generation の古いメニューだけを失効させ、別 viewer の
 メニューは保持する。A-6 のメニュー可否は元 source owner の実行前判定から導き、revision 更新待ち
 などは理由付きで無効化する。表示後に owner が失効した押下には再選択案内を出す。
 参照解除の可否は変更しない。Collection Fullscreen にはこの Grid 専用入口を出さない。
+これは Grid root の entry / source binding が可否の正本であり、Fullscreen の汎用 source 操作へ
+placeholder の登録パスを漏らさないための意図した制限である。
 Search / 閲覧履歴の既存 Jump は開始時に source を退役する従来契約を維持する。
 Windows の ready / scan error、共通 ready の成功・取消・revision / items / context stale、
 元項目不在、履歴、別 quick-folder 履歴、メニュー世代と既存 Search Jump の焦点回帰を通した。
@@ -1339,8 +1375,10 @@ bin check / fmt / UI glyph / viewer context audit / diff checkも通過。独立
 `Ready / Empty` が持つ実サムネイル情報と、sidecar 判定設定・動画 pin DB instance / 成功書込世代まで
 一致するときだけ navigation の全件 prepare を省く。可視 root の同一 binding は cursor だけを進め、
 child から root へ戻る場合は保持した sidecar と pin payload から再設置する。pin WebP は動画 worker と
-`Arc` で共有して複製しない。長期保持する pin BLOB の合計が 64 MiB を超える場合だけ保持せず、
+`Arc` で共有して複製しない。長期保持する pin BLOB の合計は installed presentation 単位で判定し、64 MiB を超える場合だけ保持せず、
 次の移動は従来の完全 prepare に戻す。表示する項目・ピン・並び順はこの予算で省略しない。
+この予算はprocess全体の上限ではない。異なるpresentationを持つ複数viewerでは合算される。
+同一prepared sourceのArcを共有する場合はpayloadを複製しない。
 アプリ内 pin 変更の成功、collection revision 前進、表示設定変更、明示更新 / 開き直し、source
 失効は再 prepare の契機とし、worker 開始・受信・着地直前に key と owner を再検証する。
 preflight は実際の移動先と見開き slot だけ再確認し、欠損候補は有限探索の次へ進める。
@@ -1366,11 +1404,20 @@ Remote service `9FBF80F94403CDF78E8698A0BD31271B1B874DAEB8D5C7063EA6F780BEEC45E5
 
 ### 23.8 バックアップと全件書き出し（仕様判断 5、K-1）
 
-- 新規 DB は世代を回さない。既存 v2 は read-only probe の `integrity_check(1)` と全 catalog / entry の
-  読み取りが成功した後、actor Ready 前に `db_backup::rotate_generation_backups` で WAL 込み snapshot を
-  起動ごとに 1 回作る。通常 v2 の backup 失敗はログに残して機能を維持する。v1 は旧 schema と FK の
-  read-only 検証後に既存の移行前 backup を必須とし、同じ起動で二重 rotate しない。将来版・破損 DB は
-  既存 backup chain を回さない。
+- 新規 DB は空の世代を回さない。既存 v2 は read-only probe の `integrity_check(1)` と全 catalog / entry の
+  読み取りが成功した後に Ready へ進むが、この時点では backup しない。actor は session backup state を持ち、
+  read-only prepare で `NoOp / Reject / Write` を確定し、**そのセッション最初の `Write` の transaction を開く前**に
+  `db_backup::rotate_generation_backups` で WAL 込み snapshot を 1 回だけ作る。backup 後は短い transaction で
+  catalog / collection revision と対象 identity を再検証して適用する。同名 rename、同じ非 Shuffle order、
+  追加 0 件、解除 0 件、同じ手動順 / relink、置換 0 件の source migration、および拒否は backup しない。
+  Shuffle の再選択と実際に置換する runtime source migration は `Write` とする。未編集の空 DB は再起動後も
+  `catalog_revision == 0` かつ空 catalog を確認して空 backup を省き、最初の成功変更後に arm する。
+  最初の成功変更後の次の実変更は、同じセッション内でも直前 backup を作る。
+- 通常 v2 の backup 失敗は永続ログへ成否・所要時間を残して変更を続け、同じセッションでは再試行しない。
+  v1 と既存 unversioned DB は read-only 検証後、schema 書込み前の backup を必須とし、失敗時は移行を停止する。
+  将来版・破損 DB は既存 backup chain を回さない。`collection/db_open` は path を含めず startup 種別と
+  open / validate / schema / 必須 backup 時間、`collection/startup_catalog` は初期 catalog 時間、
+  `collection/db_backup` は通常 backup の結果と時間を記録する。
   shared backup helper は変更しない。snapshot 作成段階の失敗では chain は不変だが、後段の世代 rename は
   全体として原子的ではなく、失敗時に一部世代が移動する可能性がある。settings-family reset 対象外。
 - 上部メニューの一括書き出しは、選択した親フォルダ内に一意の新規サブフォルダを作ることを UI に明示する。
@@ -1384,7 +1431,8 @@ Remote service `9FBF80F94403CDF78E8698A0BD31271B1B874DAEB8D5C7063EA6F780BEEC45E5
 2026-09-20 K-1 焦点検証: `collection_store::` 45 件、`ui_dialogs::collections::tests::` 33 件、
 `keymap::tests::` 142 件が PASS。`cargo check -p mimageviewer --bin mimageviewer-core`、fmt、
 UI glyph（危険 glyph 0）、`viewer_context_audit`、`git diff --check` は exit 0。
-独立 review 後の全体 gate / 確認用 build は §23.9 と統合するため、この chunk では未実行。
+独立 review 後の全体 gate / 確認用 build はこの chunk 単独では実行せず、§23.9 と統合した。
+K-1 / A-4 統合 checkpoint の全体 gate と確認用 build は §23.9 の記録どおり通過した。
 
 ### 23.9 キー操作（A-4）
 
@@ -1392,19 +1440,53 @@ UI glyph（危険 glyph 0）、`viewer_context_audit`、`git diff --check` は e
 `ini_name()` / `context()` / `trigger()` / `default_chords()`（空でよい）/ `ALL_ACTIONS` / helper /
 `docs/keymap.ini.default` を揃える。リングショートカットへの追加は任意。
 
+実装では3 Actionの既定割り当てを空にする。Gridはチェック済みを優先し、なければ選択中の
+実項目を追加する。静止画FSは現在の実画像1件のみ、動画・音声は現在の実メディアファイル1件のみを
+対象にする。ZIP/PDF内の仮想ページは元のコンテナへ暗黙に置換せず、理由を表示して拒否する。
+音声VSTプラグイン画面の入力は既存の隔離契約で処理されるため、ショートカット対象外とする。
+入力時に追加先UUIDと実パスを捕捉し、既存の`ToolbarAddSnapshot`操作でactor snapshot、分類、登録へ
+進める。開始後の選択・表示・追加先変更を再読込せず、managerやsource viewは切り替えない。
+main / detachedの現在mount済みbundleだけを読み、別contextのselection、scroll、workerは変更しない。
+
+2026-09-20、独立 reviewer は完成 source に blocking 所見なしと判断した。Grid / FS / egui 動画・音声 /
+native 動画・音声の設定キー到達、checked 優先、実パス捕捉、仮想ページ拒否、非リピートと別窓 owner の
+焦点回帰が通過した。別窓回帰は一時 actor の Ready catalog を使用し、`ToolbarAddSnapshot` が別窓の
+target UUID と実パスを捕捉して、登録結果が別窓画像1件となり、main / detached の選択とスクロールが
+不変なことまで確認した。K-1 / A-4 統合の `RUST_TEST_THREADS=1`、
+`scripts/test-full.ps1 -SuppressCrashDialogs` は `[test-full] PASS` / exit 0、process error mode は
+`0x00008001` へ復元した。別窓回帰の test-only 補強後も当該焦点 1/1、fmt、UI glyph、
+viewer context audit、diff check が通過した。補強前後で製品 source は同一である。
+常駐 mImageViewer 不在を確認して `scripts/build-dev.ps1 -PreserveRuntime` は `[build-dev] DONE`、
+VCRT / PE 検査 runtime 4 / PE 2 で成功した。core SHA-256 は
+`CA67D0E3CBA4D2D195D7B1F878440FEEA59430048FFE70D8A00ABCFC9F6DDEFD`、Remote service は
+`9FBF80F94403CDF78E8698A0BD31271B1B874DAEB8D5C7063EA6F780BEEC45E5`。
+GUI / 通常 profile / 実データは起動・操作していない。native 動画・音声入力の実機確認を利用者に渡し、
+A-4 の製品差分はその確認まで未コミットで保持する。
+
 ### 23.10 文書（E-1〜E-7、E-10 / E-11 / E-21、仕様判断 6）
 
-README v4.0.0 節（E 報告書 §A の下書きを Phase 0 の利用者承認へ）、`manual/collections.html` +
-`tut-collections.html` 新設とサイドバー 30 リンク同期、`shortcuts.html` の Delete 説明、`remote.html`、
-privacy.html / 製品ページの保存データ列挙、移行ガイドの「仮想フォルダ / プレイリスト → コレクション」、
-`version_highlights` 4.0.0 節、`architecture-overview` / `async-architecture` / `virtual-folders` /
-`keymap-spec` / `spec.md` の同時更新。
+`manual/collections.html` + `tut-collections.html` 新設、通常マニュアル全ページのサイドバーを 30 リンクへ
+同期する。導線、`shortcuts.html` の Delete と追加キー、`remote.html` の読み取り専用範囲、
+`settings.html` の保存先、known issues の上限・制限、privacy.html / 製品ページの保存データ、
+移行ガイドのコレクション / スマートフォルダ / 本棚の対応を最終実装に合わせる。
+`architecture-overview` / `async-architecture` / `virtual-folders` / `keymap-spec` / `spec.md` と
+初期仕様案の現在状態も整える。README のリリース節、`version_highlights`、版番号、配布・公開メタデータ、
+リリース changelog 本文は ClaudeCode のリリース担当へ引き渡す。
+
+2026-09-21、`manual/collections.html` / `manual/tut-collections.html` を新設し、サイドバーを持つ
+通常マニュアル 30 ページの同一 30 リンクと各 1 active を確認した。変更 HTML 36 ページの
+ローカルリンク / fragment / 重複 ID、新設 2 ページの canonical / description、関連 Markdown
+7 ファイルの相対リンク 251 件、UTF-8 読取、`git diff --check` は PASS。公開内容の独立レビューでも
+追加 blocking 所見なし。公開文書は `01e99b32c`、新設ページ 2 件を含む sitemap は `a5a1fc43b` でコミット済み（全 71 URL の生成一致検査 PASS）。製品コードの変更がないため
+製品 test / 確認用 build は §23.9 の結果を再利用した。
 
 ### 23.11 v4.0.x 以降へ送るもの
 
 B-2（revision 前進時の再 install 抑制）、B-5（migration の M×N）、D-1（Remote レーン分離）、D-3、
 A-8〜A-18 の P3、M3U 対応、登録順ソート、D&D 追加、件数表示、終了時の自動書き出し、通常フォルダの
 セッション限定シャッフル。前提件数（10,000）は known-issues と本書に明記する。
+取り込み後の古いサムネイルを残さない正しさ修正とは分け、無関係な動画 pin 更新でも
+Collection 全体を再 prepare する性能課題は後続版で扱う。
 
 D-4 は 2026-09-19 に利用者が出荷前修正へ戻すことを承認し、2026-09-20 に
 §23.2 / §23.3 とは別の後続 chunk として実装・焦点検証・独立レビューを完了した。
@@ -1448,3 +1530,95 @@ M-2 も 2026-09-20 に利用者が修正を承認し、出荷前対象へ戻し�
 fmt / UI glyph / diff check と `scripts/build-dev.ps1 -PreserveRuntime` はすべて exit 0。
 core SHA-256: `F64B64B514E638D7F23F1AA7CB9B52F7AD07D464A3B5B35B57F553FF189D2F28`。
 Remote SHA-256: `60F4EFD348C5AD5A1963BD61B7D8DD79855CA4C707B275C901324C9247793AA9`。
+
+### 23.12 お気に入り・製本・コレクションの割り当て操作を統一（2026-09-21）
+
+利用者が、管理画面の全件順（ピン留め順ではない）の本／コレクション1〜20番・前後移動、追加先を開く操作、3種の管理画面、コレクション追加のリング対応を承認した。新規キーの既定割り当ては空。
+利用者は一覧が未取得・更新中でも一度の操作で開く方式を確定した。本棚一覧とコレクション目録は既存の非同期読取へ要求を結び付け、対象を確定するまでモーダルで背面操作を遮断する。読取後、本は非同期走査済み内容を、コレクションは最新の管理全件順で確定したIDを、通常のナビゲーション裁定で勝った場合だけ採用する。中止・失敗・別のナビゲーション・表示元変更では旧要求を退役させ、遅着結果で開かない。コレクションは読み込み中のrootが可視採用された時点で既存の読込所有者へ引き継ぐ。
+本／コレクションの番号・前後、追加先を開く、3種の管理操作、コレクション追加のリング操作を接続した。独立レビューは所有境界・同一フレーム裁定・sidecar復元との引き継ぎを含めて受理した。焦点回帰 `cargo test -p mimageviewer --lib saved_group_actions -q` は 10 件成功。core check、`cargo fmt --all -- --check`、UI glyph、`git diff --check` も成功した。
+追加レビュー後、製本管理には名前順、コレクション管理には作成順の番号列を表示し、1〜20だけが番号操作の対象であることを画面上でも確認できるようにした。追加先の本を開くメニュー・ツールバー・キーは同じ待機要求へ統一し、IME変換中を除く `Esc` でその要求だけを取り消す。本管理を開いたときは表示済み一覧を消さず、新しい一覧の取得結果で置き換える。読み取り失敗は「更新中」と区別して表示する。
+全20枠について本／コレクションの番号対応を表形式の回帰で固定し、SavedGroup の全操作は Grid context、Press trigger、空の既定割り当て、INI 名の往復を同じ表から検証する。Grid 用のコレクション追加が誤って fullscreen 経路へ届いた場合は、別の表示項目を登録せず理由を表示して拒否する。走査中の件数を段階表示する拡張は後続版へ分離し、この段階では既存の進行表示を維持する。
+`master` の HEAD `a5a1fc43b` に未コミットの本件差分・既存 A4 差分・他作業の差分がある状態で `.\scripts\test-full.ps1` を実行した。`RUST_TEST_THREADS` は未設定、`-SuppressCrashDialogs` は指定せず、標準出力のみで保存ログはない。全体 gate は exit 0、主ライブラリ 8,808 件成功 / 45 件除外、workspace・統合・vendor egui / egui-wgpu / eframe も成功した。実行前に mImageViewer プロセスがないことを確認し、`.\scripts\build-dev.ps1 -PreserveRuntime` が exit 0 で通常 feature の core と remote service を生成した。core SHA-256: `5533B722F3B3738F9E187D4315B4BA8DC9E7C95B25DABBD5B74132FB2B81A2EE`。remote SHA-256: `9FBF80F94403CDF78E8698A0BD31271B1B874DAEB8D5C7063EA6F780BEEC45E5`。通常 profile のアプリは起動していない。コミットと利用者の実機確認は未実施。作業前差分と限定復元記録は `target/collection-actions-20260921/` に保存した。
+
+### 23.13 コレクション読取の共通 lease とトレイ格納境界（2026-09-21）
+
+Grid、管理画面、コレクション移動、番号・前後操作の目録待ちは、一つの typed read lease で
+要求識別子、phase、50 ms → 200 ms → 1 秒の再試行間隔を所有する。
+`Starting`、actor の `Busy`、revision 前進、再 prepare は同じ要求を引き継ぎ、
+高頻度の描画フレームが再 admission を早めない。進行中に観測した新しい revision は同じ lease を
+引き継ぎ、終端後にさらに新しい revision を観測した場合と利用者が明示的に再試行した場合だけ
+新しい要求を作る。同じ revision の通知だけでは終端済み要求を復活させない。
+
+経過時間だけでは UI 要求を終端しない。明示取消、別 navigation や context / surface の置換、
+世代・revision の不一致、実エラー・切断・削除、shutdown でのみ採用権を退役させ、表示済み一覧、
+履歴、共有 catalog、collection actor の稼働状態を維持する。50 ms → 200 ms → 1 秒の backoff は
+`RequestNeeded` の再 admission だけに適用し、受理済み actor/worker と runtime の完了観測は従来の
+50 ms 間隔を維持する。UI の待機を理由に `Starting` を `Failed` へ変えたり二つ目の actor を起動したりしない。
+PDF パスワード入力中だけ active-time 計測を一時停止し、同じ request ID で再開する。
+`AwaitingOuter` など DB 読取後の継続状態は actor/worker 完了観測とは別に所有する。
+
+通常の閉じる操作をトレイ格納へ変換するときは、sidecar 復元、Smart Folder の staged/旧形式確認、
+本・コレクションを開く待機、名前変更 journal 復旧の実表示モーダルを先に確認する。該当モーダルが
+あるフレームは `CancelClose` でメイン画面を維持し、同じフレーム後半で処理が終端しても格納しない。
+トレイメニューの「終了」とインストーラの終了要求は従来どおり終了経路を通る。
+
+`collection/read_lease` の perf event はパスを記録せず、owner、request ID、phase、active/wall 時間、
+terminal outcome と、viewer 固有要求では context/surface generation を記録する。10,000 件の上限では
+optimized ignored test で actor 書込、catalog/snapshot 読取、存在する全件と全件欠落の root prepare を
+限定計測する。
+`scripts/analyze_perf.py <log> collection` は明示的な session 内の request ID だけで lease を相関し、
+begin 後に付与される viewer context/surface は許容する一方、確定後の owner/context/surface 矛盾を
+除外する。旧 collection event は段別時間、outcome、未相関件数だけを集計し、UUID や近い時刻から
+結び付けない。途中ログ、未知の終端、未完了要求を成功または固着と推測せず、確定要求だけの
+active/wall 時間を owner 別に p50/p95/max で出力する。
+
+### 23.14 Collection Auto 比率 cache と prepared 表示資産（2026-09-21）
+
+Collection の catalog 採用時は、直前の authoritative catalog に存在し新しい catalog から消えた UUID を
+Auto 比率 cache から退役させる。Delete 成功時も応答の exact UUID を退役させる。同じ submission lock の
+下で退役集合への登録と `Forget` enqueue を行い、先行済みの lookup / record より後へ FIFO で置く。
+その後に届く同じ UUID の lookup / record は process lifetime の退役集合で拒否し、別 UUID の値は維持する。
+UUID は再利用しないため、退役解除は次回起動まで行わない。
+
+root prepare worker は placeholder と Audio を除く Auto 比率の eligible 件数を prepared snapshot に保持する。
+UI は公開中の Collection ID、revision、items generation、件数が snapshot と完全一致する場合だけこの scalar を
+O(1) で初期 seed に使い、一致しなければ 0 とする。物理 child と通常フォルダは従来どおり `items.len()` を使う。
+
+cold prepare worker は video sidecar / pin の live map と、再利用用の retained `Arc` または容量超過を表す
+`Oversized` marker を同時に構築し、UI は完成品を move して install する。warm navigation preflight も retained
+資産から live map を worker 上で構築する。Collection ID、revision、表示順、sidecar fingerprint、画像・動画設定、
+pin stamp のどれかが異なる場合と `Oversized` の場合は再利用せず full prepare へ戻す。
+
+### 23.15 Collection text入出力とread admissionの補正（2026-09-21）
+
+import parser worker はpreview行と同時にaccepted / invalid件数を確定し、確認modalは毎frame全行を走査しない。
+確認画面の残り登録枠は読取snapshotに基づく説明値だけとし、候補を先に切り詰めない。重複、path検証、並行変更と
+`MAX_COLLECTION_ENTRIES`の最終判定はactorが入力順で行う。追加0件かつ容量拒否が1件以上なら成功表示にせず、
+一部を追加できた場合は追加・重複・容量拒否の各件数をそのまま示す。
+
+Gridの単件書き出しと上部メニューの全件書き出しは、変更操作の`can_edit`とは分けたread admissionから最新actor
+snapshotを取得する。相互排他的operationが進行中なら開始せず、読み取りを後で自動再実行しない。toolbar追加は従来の
+mutation admissionを維持し、手動順再読込が失敗しても利用者の未保存順とdirty ownerを保持する。
+
+単件text、全件内の各text、`collections-index.txt`はすべてUTF-8 BOM付きで保存する。日本語pathを往復でき、
+書き出しはclipboardを変更しない。DBと索引の通常ソート名はmodelの共通snake_case helperを使用し、Rustの
+`Debug`表記やSettings全体のserde表現へ依存しない。
+
+### 23.16 メタ情報取り込み後のCollection動画サムネイル更新（2026-09-21）
+
+メタ情報取り込みはAppが保持する動画ピンDBとは別のATTACH transactionで書くため、通常のmutation stampでは
+Collectionの保持済み動画サムネイルが更新を検出できない。取り込みwriterは、各item SAVEPOINTで成功した
+動画ピン変更をbatch内だけに保持し、外側transactionのCOMMIT成功後にだけ`ImportSummary`の確定件数へ加える。
+項目rollback、batch COMMIT失敗、適用0件は変更として通知せず、後続batchが失敗した場合も先にCOMMIT済みの
+件数は保持する。
+
+UIは`WorkerMessage::Import`を最初に受理した境界で、確定件数が1件以上の場合だけApp-globalな
+thumbnail-source epochを1回進める。終端refreshの再試行では進めず、App側の動画ピンDB handleが無い場合も
+同じ通知を使う。epochはCollection prepareのreuse keyに含めるため、旧worker結果とnavigation用保持資産は
+再利用されない。全viewer contextは項目を走査せず、Ready / Emptyのpresentationだけをinstalled snapshot付き
+再準備へ移し、旧epochを捕捉済みのPreparingだけを取消す。RequestNeeded / Snapshotのread leaseとreceiver、
+Failed / Deleted終端、items generation、root / physical child位置、player、navigation intent / lockは保持する。
+retained thumbnail payloadの最終dropは既存のpayload退役workerへ移す。
+
+この正しさ修正は、無関係な動画ピン変更でCollection全体を再prepareしない性能拡張を含まない。その最適化は
+§23.11の後続版項目として維持する。

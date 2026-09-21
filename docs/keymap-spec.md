@@ -56,6 +56,13 @@ Enter / Backspace / Home / End / PageUp / PageDown などの閲覧操作は文�
 標準キーを持たないが割り当て可能な操作は `keymap.ini.default` に
 `# Action = none` として列挙される。コマンド設定または旧 `keymap.ini` 移行でキー名を指定すると割り当てられ、
 `Action = none` を明示した場合は無効化として扱う。
+コレクションへの追加は `GridAddToCollectionTarget` / `FsAddToCollectionTarget` /
+`VideoAddToCollectionTarget` の3つの文脈別Actionで、既定キーは空。Gridはチェック済み優先、
+静止画FSは現在の実画像、動画・音声は現在の実ファイルを追加先コレクションへ渡す。
+音声VSTプラグイン画面でのキー入力は既存のVST入力隔離が優先し、このActionを発火しない。
+ZIP/PDF内ページは実ファイルに置き換えず拒否し、入力時に対象パスと追加先を捕捉する。
+同じ追加操作は `RingActionId::AddToCollection` として、グリッド・画像フルスクリーン・
+動画/音声フルスクリーンのリング、ジェスチャ、マウスボタンにも割り当てられる。
 お気に入りの前後移動 / 1〜20 番を開く、現在位置のルートディレクトリを開く、
 「ドライブ `C:\` のルートを開く」〜「ドライブ `Z:\` のルートを開く」、
 「ドライブ `C:` の最後の場所へ切り替える」〜「ドライブ `Z:` の最後の場所へ切り替える」、場所▼の固定項目
@@ -64,6 +71,18 @@ Enter / Backspace / Home / End / PageUp / PageDown などの閲覧操作は文�
 `GridFavorite...` / `GridOpenFavorite...` / `GridOpenCurrentDriveRoot` / `GridOpenDrive...` /
 `GridSwitchDrive...` /
 `GridOpenLocation...` / `GridTogglePinnedTag...` とし、競合判定とヘルプ表示でも `Grid` 文脈として扱う。
+本とコレクションにも、1〜20 番を開く、前/次へ移動する、追加先を開く、管理画面を開く
+`GridOpenBook1..20` / `GridBookPrev・Next` / `GridOpenActiveBook` / `GridManageBooks`、
+`GridOpenCollection1..20` / `GridCollectionPrev・Next` / `GridOpenCollectionTarget` /
+`GridManageCollections` を設ける。お気に入りの管理は `GridManageFavorites`。
+いずれもグリッド文脈で既定キーは空。番号と前/次はツールバーの固定項目に限定せず、
+管理一覧の全件（本は名前順、コレクションは管理順）を対象にする。前/次は端で循環し、
+現在位置が一覧の項目でないときは次=先頭、前=末尾から始める。
+本棚一覧またはコレクション一覧が未読込・更新中なら、1 回の入力で専用の待機ダイアログを開き、
+一覧確定後に同じ要求を実行する。待機中は背面操作を止め、「中止」で要求だけを取り消す。
+本は対象フォルダの事前走査が済んでから移動し、コレクションは新しい一覧の読み込み画面を
+採用した時点で待機を終える。番号と前/次は読み込み後の管理順で決めるが、追加先を開く操作は
+押下時点の追加先を維持し、待機中に設定が変わっても別の追加先へ飛ばない。
 フォルダバーの「最近開いたフォルダ履歴をクリア」と
 「A/B の記憶した場所と一覧位置をクリア」も、
 `GridClearRecentFolders` / `GridClearQuickFolderSlots` として標準キーなしで割り当てられる。

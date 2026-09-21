@@ -1412,6 +1412,15 @@ pub enum KeyAction {
     HelpShowContextShortcuts,
     GridFavoritePrev,
     GridFavoriteNext,
+    GridManageFavorites,
+    GridBookPrev,
+    GridBookNext,
+    GridOpenActiveBook,
+    GridManageBooks,
+    GridCollectionPrev,
+    GridCollectionNext,
+    GridOpenCollectionTarget,
+    GridManageCollections,
     GridOpenFavorite1,
     GridOpenFavorite2,
     GridOpenFavorite3,
@@ -1432,6 +1441,46 @@ pub enum KeyAction {
     GridOpenFavorite18,
     GridOpenFavorite19,
     GridOpenFavorite20,
+    GridOpenBook1,
+    GridOpenBook2,
+    GridOpenBook3,
+    GridOpenBook4,
+    GridOpenBook5,
+    GridOpenBook6,
+    GridOpenBook7,
+    GridOpenBook8,
+    GridOpenBook9,
+    GridOpenBook10,
+    GridOpenBook11,
+    GridOpenBook12,
+    GridOpenBook13,
+    GridOpenBook14,
+    GridOpenBook15,
+    GridOpenBook16,
+    GridOpenBook17,
+    GridOpenBook18,
+    GridOpenBook19,
+    GridOpenBook20,
+    GridOpenCollection1,
+    GridOpenCollection2,
+    GridOpenCollection3,
+    GridOpenCollection4,
+    GridOpenCollection5,
+    GridOpenCollection6,
+    GridOpenCollection7,
+    GridOpenCollection8,
+    GridOpenCollection9,
+    GridOpenCollection10,
+    GridOpenCollection11,
+    GridOpenCollection12,
+    GridOpenCollection13,
+    GridOpenCollection14,
+    GridOpenCollection15,
+    GridOpenCollection16,
+    GridOpenCollection17,
+    GridOpenCollection18,
+    GridOpenCollection19,
+    GridOpenCollection20,
     GridOpenDriveC,
     GridOpenDriveD,
     GridOpenDriveE,
@@ -1559,6 +1608,7 @@ pub enum KeyAction {
     GridPin,
     GridComparePin,
     GridAddToActiveBook,
+    GridAddToCollectionTarget,
     GridExportSelection,
     GridColumnCount1,
     GridColumnCount2,
@@ -1631,6 +1681,7 @@ pub enum KeyAction {
     FsSpaceCheck,
     FsCapture,
     FsAddToActiveBook,
+    FsAddToCollectionTarget,
     FsExport,
     FsCompareToggle,
     FsCompareCycle,
@@ -1782,6 +1833,7 @@ pub enum KeyAction {
     VideoBookmark,
     VideoCapture,
     VideoAddToActiveBook,
+    VideoAddToCollectionTarget,
     VideoCompareToggle,
     VideoCompareCycle,
     VideoCompareWipe,
@@ -1905,6 +1957,15 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::HelpShowContextShortcuts,
     KeyAction::GridFavoritePrev,
     KeyAction::GridFavoriteNext,
+    KeyAction::GridManageFavorites,
+    KeyAction::GridBookPrev,
+    KeyAction::GridBookNext,
+    KeyAction::GridOpenActiveBook,
+    KeyAction::GridManageBooks,
+    KeyAction::GridCollectionPrev,
+    KeyAction::GridCollectionNext,
+    KeyAction::GridOpenCollectionTarget,
+    KeyAction::GridManageCollections,
     KeyAction::GridOpenFavorite1,
     KeyAction::GridOpenFavorite2,
     KeyAction::GridOpenFavorite3,
@@ -1925,6 +1986,46 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenFavorite18,
     KeyAction::GridOpenFavorite19,
     KeyAction::GridOpenFavorite20,
+    KeyAction::GridOpenBook1,
+    KeyAction::GridOpenBook2,
+    KeyAction::GridOpenBook3,
+    KeyAction::GridOpenBook4,
+    KeyAction::GridOpenBook5,
+    KeyAction::GridOpenBook6,
+    KeyAction::GridOpenBook7,
+    KeyAction::GridOpenBook8,
+    KeyAction::GridOpenBook9,
+    KeyAction::GridOpenBook10,
+    KeyAction::GridOpenBook11,
+    KeyAction::GridOpenBook12,
+    KeyAction::GridOpenBook13,
+    KeyAction::GridOpenBook14,
+    KeyAction::GridOpenBook15,
+    KeyAction::GridOpenBook16,
+    KeyAction::GridOpenBook17,
+    KeyAction::GridOpenBook18,
+    KeyAction::GridOpenBook19,
+    KeyAction::GridOpenBook20,
+    KeyAction::GridOpenCollection1,
+    KeyAction::GridOpenCollection2,
+    KeyAction::GridOpenCollection3,
+    KeyAction::GridOpenCollection4,
+    KeyAction::GridOpenCollection5,
+    KeyAction::GridOpenCollection6,
+    KeyAction::GridOpenCollection7,
+    KeyAction::GridOpenCollection8,
+    KeyAction::GridOpenCollection9,
+    KeyAction::GridOpenCollection10,
+    KeyAction::GridOpenCollection11,
+    KeyAction::GridOpenCollection12,
+    KeyAction::GridOpenCollection13,
+    KeyAction::GridOpenCollection14,
+    KeyAction::GridOpenCollection15,
+    KeyAction::GridOpenCollection16,
+    KeyAction::GridOpenCollection17,
+    KeyAction::GridOpenCollection18,
+    KeyAction::GridOpenCollection19,
+    KeyAction::GridOpenCollection20,
     KeyAction::GridOpenDriveC,
     KeyAction::GridOpenDriveD,
     KeyAction::GridOpenDriveE,
@@ -2052,6 +2153,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridPin,
     KeyAction::GridComparePin,
     KeyAction::GridAddToActiveBook,
+    KeyAction::GridAddToCollectionTarget,
     KeyAction::GridExportSelection,
     KeyAction::GridColumnCount1,
     KeyAction::GridColumnCount2,
@@ -2124,6 +2226,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsSpaceCheck,
     KeyAction::FsCapture,
     KeyAction::FsAddToActiveBook,
+    KeyAction::FsAddToCollectionTarget,
     KeyAction::FsExport,
     KeyAction::FsCompareToggle,
     KeyAction::FsCompareCycle,
@@ -2275,6 +2378,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoBookmark,
     KeyAction::VideoCapture,
     KeyAction::VideoAddToActiveBook,
+    KeyAction::VideoAddToCollectionTarget,
     KeyAction::VideoCompareToggle,
     KeyAction::VideoCompareCycle,
     KeyAction::VideoCompareWipe,
@@ -2724,7 +2828,7 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::FavoritesEdit,
         parent: TopMenuId::Favorites,
         label: "編集",
-        action: None,
+        action: Some(KeyAction::GridManageFavorites),
     },
     MenuCommandSpec {
         id: MenuCommandId::FavoritesFavSearch,
@@ -2778,7 +2882,7 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::BooksOpenActiveBook,
         parent: TopMenuId::Books,
         label: "追加先の本を開く",
-        action: None,
+        action: Some(KeyAction::GridOpenActiveBook),
     },
     MenuCommandSpec {
         id: MenuCommandId::BooksReorderCurrentBook,
@@ -2790,7 +2894,7 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::BooksManage,
         parent: TopMenuId::Books,
         label: "製本の管理…",
-        action: None,
+        action: Some(KeyAction::GridManageBooks),
     },
     MenuCommandSpec {
         id: MenuCommandId::CollectionsAddSelectionToTarget,
@@ -2802,7 +2906,7 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::CollectionsOpenTarget,
         parent: TopMenuId::Collections,
         label: "追加先のコレクションを開く",
-        action: None,
+        action: Some(KeyAction::GridOpenCollectionTarget),
     },
     MenuCommandSpec {
         id: MenuCommandId::CollectionsImportCurrent,
@@ -2844,7 +2948,7 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::CollectionsManage,
         parent: TopMenuId::Collections,
         label: "コレクションの管理…",
-        action: None,
+        action: Some(KeyAction::GridManageCollections),
     },
     MenuCommandSpec {
         id: MenuCommandId::ConvertToZip,
@@ -3170,6 +3274,104 @@ const FAVORITE_LOCATION_ACTIONS: [KeyAction; 20] = [
     KeyAction::GridOpenFavorite20,
 ];
 
+const BOOK_LOCATION_ACTIONS: [KeyAction; 20] = [
+    KeyAction::GridOpenBook1,
+    KeyAction::GridOpenBook2,
+    KeyAction::GridOpenBook3,
+    KeyAction::GridOpenBook4,
+    KeyAction::GridOpenBook5,
+    KeyAction::GridOpenBook6,
+    KeyAction::GridOpenBook7,
+    KeyAction::GridOpenBook8,
+    KeyAction::GridOpenBook9,
+    KeyAction::GridOpenBook10,
+    KeyAction::GridOpenBook11,
+    KeyAction::GridOpenBook12,
+    KeyAction::GridOpenBook13,
+    KeyAction::GridOpenBook14,
+    KeyAction::GridOpenBook15,
+    KeyAction::GridOpenBook16,
+    KeyAction::GridOpenBook17,
+    KeyAction::GridOpenBook18,
+    KeyAction::GridOpenBook19,
+    KeyAction::GridOpenBook20,
+];
+
+const COLLECTION_LOCATION_ACTIONS: [KeyAction; 20] = [
+    KeyAction::GridOpenCollection1,
+    KeyAction::GridOpenCollection2,
+    KeyAction::GridOpenCollection3,
+    KeyAction::GridOpenCollection4,
+    KeyAction::GridOpenCollection5,
+    KeyAction::GridOpenCollection6,
+    KeyAction::GridOpenCollection7,
+    KeyAction::GridOpenCollection8,
+    KeyAction::GridOpenCollection9,
+    KeyAction::GridOpenCollection10,
+    KeyAction::GridOpenCollection11,
+    KeyAction::GridOpenCollection12,
+    KeyAction::GridOpenCollection13,
+    KeyAction::GridOpenCollection14,
+    KeyAction::GridOpenCollection15,
+    KeyAction::GridOpenCollection16,
+    KeyAction::GridOpenCollection17,
+    KeyAction::GridOpenCollection18,
+    KeyAction::GridOpenCollection19,
+    KeyAction::GridOpenCollection20,
+];
+
+pub const SAVED_GROUP_ACTIONS: &[KeyAction] = &[
+    KeyAction::GridBookPrev,
+    KeyAction::GridBookNext,
+    KeyAction::GridOpenActiveBook,
+    KeyAction::GridManageFavorites,
+    KeyAction::GridManageBooks,
+    KeyAction::GridCollectionPrev,
+    KeyAction::GridCollectionNext,
+    KeyAction::GridOpenCollectionTarget,
+    KeyAction::GridManageCollections,
+    KeyAction::GridOpenBook1,
+    KeyAction::GridOpenBook2,
+    KeyAction::GridOpenBook3,
+    KeyAction::GridOpenBook4,
+    KeyAction::GridOpenBook5,
+    KeyAction::GridOpenBook6,
+    KeyAction::GridOpenBook7,
+    KeyAction::GridOpenBook8,
+    KeyAction::GridOpenBook9,
+    KeyAction::GridOpenBook10,
+    KeyAction::GridOpenBook11,
+    KeyAction::GridOpenBook12,
+    KeyAction::GridOpenBook13,
+    KeyAction::GridOpenBook14,
+    KeyAction::GridOpenBook15,
+    KeyAction::GridOpenBook16,
+    KeyAction::GridOpenBook17,
+    KeyAction::GridOpenBook18,
+    KeyAction::GridOpenBook19,
+    KeyAction::GridOpenBook20,
+    KeyAction::GridOpenCollection1,
+    KeyAction::GridOpenCollection2,
+    KeyAction::GridOpenCollection3,
+    KeyAction::GridOpenCollection4,
+    KeyAction::GridOpenCollection5,
+    KeyAction::GridOpenCollection6,
+    KeyAction::GridOpenCollection7,
+    KeyAction::GridOpenCollection8,
+    KeyAction::GridOpenCollection9,
+    KeyAction::GridOpenCollection10,
+    KeyAction::GridOpenCollection11,
+    KeyAction::GridOpenCollection12,
+    KeyAction::GridOpenCollection13,
+    KeyAction::GridOpenCollection14,
+    KeyAction::GridOpenCollection15,
+    KeyAction::GridOpenCollection16,
+    KeyAction::GridOpenCollection17,
+    KeyAction::GridOpenCollection18,
+    KeyAction::GridOpenCollection19,
+    KeyAction::GridOpenCollection20,
+];
+
 const DRIVE_LOCATION_ACTIONS: [KeyAction; 24] = [
     KeyAction::GridOpenDriveC,
     KeyAction::GridOpenDriveD,
@@ -3390,6 +3592,20 @@ impl KeyAction {
             .map(|idx| idx + 1)
     }
 
+    pub fn book_slot_number(self) -> Option<usize> {
+        BOOK_LOCATION_ACTIONS
+            .iter()
+            .position(|action| *action == self)
+            .map(|idx| idx + 1)
+    }
+
+    pub fn collection_slot_number(self) -> Option<usize> {
+        COLLECTION_LOCATION_ACTIONS
+            .iter()
+            .position(|action| *action == self)
+            .map(|idx| idx + 1)
+    }
+
     pub fn drive_action(letter: char) -> Option<Self> {
         let upper = letter.to_ascii_uppercase();
         if !('C'..='Z').contains(&upper) {
@@ -3488,6 +3704,56 @@ impl KeyAction {
                 19 => "GridOpenFavorite19",
                 20 => "GridOpenFavorite20",
                 _ => unreachable!("favorite slot is constrained to 1..=20"),
+            };
+        }
+        if let Some(slot) = self.book_slot_number() {
+            return match slot {
+                1 => "GridOpenBook1",
+                2 => "GridOpenBook2",
+                3 => "GridOpenBook3",
+                4 => "GridOpenBook4",
+                5 => "GridOpenBook5",
+                6 => "GridOpenBook6",
+                7 => "GridOpenBook7",
+                8 => "GridOpenBook8",
+                9 => "GridOpenBook9",
+                10 => "GridOpenBook10",
+                11 => "GridOpenBook11",
+                12 => "GridOpenBook12",
+                13 => "GridOpenBook13",
+                14 => "GridOpenBook14",
+                15 => "GridOpenBook15",
+                16 => "GridOpenBook16",
+                17 => "GridOpenBook17",
+                18 => "GridOpenBook18",
+                19 => "GridOpenBook19",
+                20 => "GridOpenBook20",
+                _ => unreachable!("book slot is constrained to 1..=20"),
+            };
+        }
+        if let Some(slot) = self.collection_slot_number() {
+            return match slot {
+                1 => "GridOpenCollection1",
+                2 => "GridOpenCollection2",
+                3 => "GridOpenCollection3",
+                4 => "GridOpenCollection4",
+                5 => "GridOpenCollection5",
+                6 => "GridOpenCollection6",
+                7 => "GridOpenCollection7",
+                8 => "GridOpenCollection8",
+                9 => "GridOpenCollection9",
+                10 => "GridOpenCollection10",
+                11 => "GridOpenCollection11",
+                12 => "GridOpenCollection12",
+                13 => "GridOpenCollection13",
+                14 => "GridOpenCollection14",
+                15 => "GridOpenCollection15",
+                16 => "GridOpenCollection16",
+                17 => "GridOpenCollection17",
+                18 => "GridOpenCollection18",
+                19 => "GridOpenCollection19",
+                20 => "GridOpenCollection20",
+                _ => unreachable!("collection slot is constrained to 1..=20"),
             };
         }
         if let Some(letter) = self.drive_letter() {
@@ -3598,6 +3864,15 @@ impl KeyAction {
             GridOpenCurrentDriveRoot => "GridOpenCurrentDriveRoot",
             GridFavoritePrev => "GridFavoritePrev",
             GridFavoriteNext => "GridFavoriteNext",
+            GridManageFavorites => "GridManageFavorites",
+            GridBookPrev => "GridBookPrev",
+            GridBookNext => "GridBookNext",
+            GridOpenActiveBook => "GridOpenActiveBook",
+            GridManageBooks => "GridManageBooks",
+            GridCollectionPrev => "GridCollectionPrev",
+            GridCollectionNext => "GridCollectionNext",
+            GridOpenCollectionTarget => "GridOpenCollectionTarget",
+            GridManageCollections => "GridManageCollections",
             GridOpenFavorite1
             | GridOpenFavorite2
             | GridOpenFavorite3
@@ -3618,6 +3893,46 @@ impl KeyAction {
             | GridOpenFavorite18
             | GridOpenFavorite19
             | GridOpenFavorite20
+            | GridOpenBook1
+            | GridOpenBook2
+            | GridOpenBook3
+            | GridOpenBook4
+            | GridOpenBook5
+            | GridOpenBook6
+            | GridOpenBook7
+            | GridOpenBook8
+            | GridOpenBook9
+            | GridOpenBook10
+            | GridOpenBook11
+            | GridOpenBook12
+            | GridOpenBook13
+            | GridOpenBook14
+            | GridOpenBook15
+            | GridOpenBook16
+            | GridOpenBook17
+            | GridOpenBook18
+            | GridOpenBook19
+            | GridOpenBook20
+            | GridOpenCollection1
+            | GridOpenCollection2
+            | GridOpenCollection3
+            | GridOpenCollection4
+            | GridOpenCollection5
+            | GridOpenCollection6
+            | GridOpenCollection7
+            | GridOpenCollection8
+            | GridOpenCollection9
+            | GridOpenCollection10
+            | GridOpenCollection11
+            | GridOpenCollection12
+            | GridOpenCollection13
+            | GridOpenCollection14
+            | GridOpenCollection15
+            | GridOpenCollection16
+            | GridOpenCollection17
+            | GridOpenCollection18
+            | GridOpenCollection19
+            | GridOpenCollection20
             | GridOpenDriveC
             | GridOpenDriveD
             | GridOpenDriveE
@@ -3746,6 +4061,7 @@ impl KeyAction {
             GridPin => "GridPin",
             GridComparePin => "GridComparePin",
             GridAddToActiveBook => "GridAddToActiveBook",
+            GridAddToCollectionTarget => "GridAddToCollectionTarget",
             GridExportSelection => "GridExportSelection",
             GridColumnCount1 => "GridColumnCount1",
             GridColumnCount2 => "GridColumnCount2",
@@ -3818,6 +4134,7 @@ impl KeyAction {
             FsSpaceCheck => "FsSpaceCheck",
             FsCapture => "FsCapture",
             FsAddToActiveBook => "FsAddToActiveBook",
+            FsAddToCollectionTarget => "FsAddToCollectionTarget",
             FsExport => "FsExport",
             FsCompareToggle => "FsCompareToggle",
             FsCompareCycle => "FsCompareCycle",
@@ -3969,6 +4286,7 @@ impl KeyAction {
             VideoBookmark => "VideoBookmark",
             VideoCapture => "VideoCapture",
             VideoAddToActiveBook => "VideoAddToActiveBook",
+            VideoAddToCollectionTarget => "VideoAddToCollectionTarget",
             VideoCompareToggle => "VideoCompareToggle",
             VideoCompareCycle => "VideoCompareCycle",
             VideoCompareWipe => "VideoCompareWipe",
@@ -4090,6 +4408,56 @@ impl KeyAction {
                 _ => unreachable!("favorite slot is constrained to 1..=20"),
             };
         }
+        if let Some(slot) = self.book_slot_number() {
+            return match slot {
+                1 => "本1を開く",
+                2 => "本2を開く",
+                3 => "本3を開く",
+                4 => "本4を開く",
+                5 => "本5を開く",
+                6 => "本6を開く",
+                7 => "本7を開く",
+                8 => "本8を開く",
+                9 => "本9を開く",
+                10 => "本10を開く",
+                11 => "本11を開く",
+                12 => "本12を開く",
+                13 => "本13を開く",
+                14 => "本14を開く",
+                15 => "本15を開く",
+                16 => "本16を開く",
+                17 => "本17を開く",
+                18 => "本18を開く",
+                19 => "本19を開く",
+                20 => "本20を開く",
+                _ => unreachable!("book slot is constrained to 1..=20"),
+            };
+        }
+        if let Some(slot) = self.collection_slot_number() {
+            return match slot {
+                1 => "コレクション1を開く",
+                2 => "コレクション2を開く",
+                3 => "コレクション3を開く",
+                4 => "コレクション4を開く",
+                5 => "コレクション5を開く",
+                6 => "コレクション6を開く",
+                7 => "コレクション7を開く",
+                8 => "コレクション8を開く",
+                9 => "コレクション9を開く",
+                10 => "コレクション10を開く",
+                11 => "コレクション11を開く",
+                12 => "コレクション12を開く",
+                13 => "コレクション13を開く",
+                14 => "コレクション14を開く",
+                15 => "コレクション15を開く",
+                16 => "コレクション16を開く",
+                17 => "コレクション17を開く",
+                18 => "コレクション18を開く",
+                19 => "コレクション19を開く",
+                20 => "コレクション20を開く",
+                _ => unreachable!("collection slot is constrained to 1..=20"),
+            };
+        }
         if let Some(letter) = self.drive_letter() {
             return match letter {
                 'C' => "ドライブ C:\\ のルートを開く",
@@ -4197,6 +4565,15 @@ impl KeyAction {
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
             GridFavoritePrev => "前のお気に入りへ移動する",
             GridFavoriteNext => "次のお気に入りへ移動する",
+            GridManageFavorites => "お気に入りの管理を開く",
+            GridBookPrev => "前の本を開く",
+            GridBookNext => "次の本を開く",
+            GridOpenActiveBook => "追加先の本を開く",
+            GridManageBooks => "製本の管理を開く",
+            GridCollectionPrev => "前のコレクションを開く",
+            GridCollectionNext => "次のコレクションを開く",
+            GridOpenCollectionTarget => "追加先のコレクションを開く",
+            GridManageCollections => "コレクションの管理を開く",
             GridOpenCurrentDriveRoot => "現在位置のルートディレクトリを開く",
             GridOpenFavorite1
             | GridOpenFavorite2
@@ -4218,6 +4595,46 @@ impl KeyAction {
             | GridOpenFavorite18
             | GridOpenFavorite19
             | GridOpenFavorite20
+            | GridOpenBook1
+            | GridOpenBook2
+            | GridOpenBook3
+            | GridOpenBook4
+            | GridOpenBook5
+            | GridOpenBook6
+            | GridOpenBook7
+            | GridOpenBook8
+            | GridOpenBook9
+            | GridOpenBook10
+            | GridOpenBook11
+            | GridOpenBook12
+            | GridOpenBook13
+            | GridOpenBook14
+            | GridOpenBook15
+            | GridOpenBook16
+            | GridOpenBook17
+            | GridOpenBook18
+            | GridOpenBook19
+            | GridOpenBook20
+            | GridOpenCollection1
+            | GridOpenCollection2
+            | GridOpenCollection3
+            | GridOpenCollection4
+            | GridOpenCollection5
+            | GridOpenCollection6
+            | GridOpenCollection7
+            | GridOpenCollection8
+            | GridOpenCollection9
+            | GridOpenCollection10
+            | GridOpenCollection11
+            | GridOpenCollection12
+            | GridOpenCollection13
+            | GridOpenCollection14
+            | GridOpenCollection15
+            | GridOpenCollection16
+            | GridOpenCollection17
+            | GridOpenCollection18
+            | GridOpenCollection19
+            | GridOpenCollection20
             | GridOpenDriveC
             | GridOpenDriveD
             | GridOpenDriveE
@@ -4352,6 +4769,9 @@ impl KeyAction {
             GridPin => "選択中の項目を代表サムネイルに固定または解除する",
             GridComparePin => "選択中の画像を比較スロットに固定または解除する",
             GridAddToActiveBook => "選択中またはチェック済みのページを追加先の本へ追加する",
+            GridAddToCollectionTarget => {
+                "選択中またはチェック済みの実項目を追加先のコレクションへ追加する"
+            }
             GridExportSelection => "選択中またはチェック済みの画像をまとめて書き出す",
             GridColumnCount1 => "サムネイル列数を1列にする",
             GridColumnCount2 => "サムネイル列数を2列にする",
@@ -4424,6 +4844,7 @@ impl KeyAction {
             FsSpaceCheck => "現在の画像のチェックを切り替える。スライドショー中は停止する",
             FsCapture => "現在の表示画像をキャプチャ保存する",
             FsAddToActiveBook => "現在のページを追加先の本へ追加する",
+            FsAddToCollectionTarget => "現在の実画像を追加先のコレクションへ追加する",
             FsExport => "現在の表示結果を別ファイルへ書き出す",
             FsCompareToggle => "現在の画像を比較スロットに固定または解除する",
             FsCompareCycle => "比較スロットのピン画像と現在画像を切り替えて表示する",
@@ -4579,6 +5000,9 @@ impl KeyAction {
             VideoBookmark => "現在の再生位置にブックマークを追加する",
             VideoCapture => "現在の動画フレームをキャプチャ保存する",
             VideoAddToActiveBook => "現在の動画フレームを追加先の本へ追加する",
+            VideoAddToCollectionTarget => {
+                "現在の動画・音声ファイルを追加先のコレクションへ追加する"
+            }
             VideoCompareToggle => "動画では比較表示キーを何もしない操作として消費する",
             VideoCompareCycle => "動画では比較切り替えキーを何もしない操作として消費する",
             VideoCompareWipe => "動画ではワイプ比較キーを何もしない操作として消費する",
@@ -4679,6 +5103,55 @@ impl KeyAction {
             | HelpShowContextShortcuts => KeyContext::Global,
             GridFavoritePrev
             | GridFavoriteNext
+            | GridManageFavorites
+            | GridBookPrev
+            | GridBookNext
+            | GridOpenActiveBook
+            | GridManageBooks
+            | GridCollectionPrev
+            | GridCollectionNext
+            | GridOpenCollectionTarget
+            | GridManageCollections
+            | GridOpenBook1
+            | GridOpenBook2
+            | GridOpenBook3
+            | GridOpenBook4
+            | GridOpenBook5
+            | GridOpenBook6
+            | GridOpenBook7
+            | GridOpenBook8
+            | GridOpenBook9
+            | GridOpenBook10
+            | GridOpenBook11
+            | GridOpenBook12
+            | GridOpenBook13
+            | GridOpenBook14
+            | GridOpenBook15
+            | GridOpenBook16
+            | GridOpenBook17
+            | GridOpenBook18
+            | GridOpenBook19
+            | GridOpenBook20
+            | GridOpenCollection1
+            | GridOpenCollection2
+            | GridOpenCollection3
+            | GridOpenCollection4
+            | GridOpenCollection5
+            | GridOpenCollection6
+            | GridOpenCollection7
+            | GridOpenCollection8
+            | GridOpenCollection9
+            | GridOpenCollection10
+            | GridOpenCollection11
+            | GridOpenCollection12
+            | GridOpenCollection13
+            | GridOpenCollection14
+            | GridOpenCollection15
+            | GridOpenCollection16
+            | GridOpenCollection17
+            | GridOpenCollection18
+            | GridOpenCollection19
+            | GridOpenCollection20
             | GridOpenFavorite1
             | GridOpenFavorite2
             | GridOpenFavorite3
@@ -4826,6 +5299,7 @@ impl KeyAction {
             | GridPin
             | GridComparePin
             | GridAddToActiveBook
+            | GridAddToCollectionTarget
             | GridExportSelection
             | GridColumnCount1
             | GridColumnCount2
@@ -4883,6 +5357,7 @@ impl KeyAction {
             | FsSpaceCheck
             | FsCapture
             | FsAddToActiveBook
+            | FsAddToCollectionTarget
             | FsExport
             | FsCompareToggle
             | FsCompareCycle
@@ -5032,6 +5507,7 @@ impl KeyAction {
             | VideoBookmark
             | VideoCapture
             | VideoAddToActiveBook
+            | VideoAddToCollectionTarget
             | VideoCompareToggle
             | VideoCompareCycle
             | VideoCompareWipe
@@ -5102,6 +5578,55 @@ impl KeyAction {
             | HelpShowContextShortcuts
             | GridFavoritePrev
             | GridFavoriteNext
+            | GridManageFavorites
+            | GridBookPrev
+            | GridBookNext
+            | GridOpenActiveBook
+            | GridManageBooks
+            | GridCollectionPrev
+            | GridCollectionNext
+            | GridOpenCollectionTarget
+            | GridManageCollections
+            | GridOpenBook1
+            | GridOpenBook2
+            | GridOpenBook3
+            | GridOpenBook4
+            | GridOpenBook5
+            | GridOpenBook6
+            | GridOpenBook7
+            | GridOpenBook8
+            | GridOpenBook9
+            | GridOpenBook10
+            | GridOpenBook11
+            | GridOpenBook12
+            | GridOpenBook13
+            | GridOpenBook14
+            | GridOpenBook15
+            | GridOpenBook16
+            | GridOpenBook17
+            | GridOpenBook18
+            | GridOpenBook19
+            | GridOpenBook20
+            | GridOpenCollection1
+            | GridOpenCollection2
+            | GridOpenCollection3
+            | GridOpenCollection4
+            | GridOpenCollection5
+            | GridOpenCollection6
+            | GridOpenCollection7
+            | GridOpenCollection8
+            | GridOpenCollection9
+            | GridOpenCollection10
+            | GridOpenCollection11
+            | GridOpenCollection12
+            | GridOpenCollection13
+            | GridOpenCollection14
+            | GridOpenCollection15
+            | GridOpenCollection16
+            | GridOpenCollection17
+            | GridOpenCollection18
+            | GridOpenCollection19
+            | GridOpenCollection20
             | GridOpenFavorite1
             | GridOpenFavorite2
             | GridOpenFavorite3
@@ -5249,6 +5774,7 @@ impl KeyAction {
             | GridPin
             | GridComparePin
             | GridAddToActiveBook
+            | GridAddToCollectionTarget
             | GridExportSelection
             | GridColumnCount1
             | GridColumnCount2
@@ -5321,6 +5847,7 @@ impl KeyAction {
             | FsSpaceCheck
             | FsCapture
             | FsAddToActiveBook
+            | FsAddToCollectionTarget
             | FsExport
             | FsCompareToggle
             | FsCompareCycle
@@ -5468,6 +5995,7 @@ impl KeyAction {
             | VideoBookmark
             | VideoCapture
             | VideoAddToActiveBook
+            | VideoAddToCollectionTarget
             | VideoCompareToggle
             | VideoCompareCycle
             | VideoCompareWipe
@@ -5574,6 +6102,55 @@ impl KeyAction {
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
             GridFavoritePrev
             | GridFavoriteNext
+            | GridManageFavorites
+            | GridBookPrev
+            | GridBookNext
+            | GridOpenActiveBook
+            | GridManageBooks
+            | GridCollectionPrev
+            | GridCollectionNext
+            | GridOpenCollectionTarget
+            | GridManageCollections
+            | GridOpenBook1
+            | GridOpenBook2
+            | GridOpenBook3
+            | GridOpenBook4
+            | GridOpenBook5
+            | GridOpenBook6
+            | GridOpenBook7
+            | GridOpenBook8
+            | GridOpenBook9
+            | GridOpenBook10
+            | GridOpenBook11
+            | GridOpenBook12
+            | GridOpenBook13
+            | GridOpenBook14
+            | GridOpenBook15
+            | GridOpenBook16
+            | GridOpenBook17
+            | GridOpenBook18
+            | GridOpenBook19
+            | GridOpenBook20
+            | GridOpenCollection1
+            | GridOpenCollection2
+            | GridOpenCollection3
+            | GridOpenCollection4
+            | GridOpenCollection5
+            | GridOpenCollection6
+            | GridOpenCollection7
+            | GridOpenCollection8
+            | GridOpenCollection9
+            | GridOpenCollection10
+            | GridOpenCollection11
+            | GridOpenCollection12
+            | GridOpenCollection13
+            | GridOpenCollection14
+            | GridOpenCollection15
+            | GridOpenCollection16
+            | GridOpenCollection17
+            | GridOpenCollection18
+            | GridOpenCollection19
+            | GridOpenCollection20
             | GridOpenFavorite1
             | GridOpenFavorite2
             | GridOpenFavorite3
@@ -5722,6 +6299,7 @@ impl KeyAction {
             GridPin => ChordList::one(Chord::key(P)),
             GridComparePin => ChordList::one(Chord::key(X)),
             GridAddToActiveBook => ChordList::one(Chord::ctrl(B)),
+            GridAddToCollectionTarget => ChordList::EMPTY,
             // フルスクリーンの `FsExport` と同じ既定キーだが、別 action として持つ。
             // 一方へまとめると、利用者が保存済みの上書き (action 名がキー) の意味が
             // 黙って変わる。
@@ -5794,6 +6372,7 @@ impl KeyAction {
             FsSpaceCheck => ChordList::one(Chord::key(Space)),
             FsCapture => ChordList::one(Chord::ctrl(S)),
             FsAddToActiveBook => ChordList::one(Chord::ctrl(B)),
+            FsAddToCollectionTarget => ChordList::EMPTY,
             FsExport => ChordList::one(Chord::ctrl(E)),
             FsCompareToggle => ChordList::one(Chord::key(X)),
             FsCompareCycle => ChordList::one(Chord::key(C)),
@@ -5949,6 +6528,7 @@ impl KeyAction {
             VideoBookmark => ChordList::one(Chord::key(B)),
             VideoCapture => ChordList::one(Chord::ctrl(S)),
             VideoAddToActiveBook => ChordList::one(Chord::ctrl(B)),
+            VideoAddToCollectionTarget => ChordList::EMPTY,
             VideoCompareToggle => ChordList::one(Chord::key(X)),
             VideoCompareCycle => ChordList::one(Chord::key(C)),
             VideoCompareWipe => ChordList::one(Chord::shift(C)),
@@ -9517,6 +10097,7 @@ mod tests {
     fn ring_actions_are_classified_for_key_action_parity() {
         let mut key_handled = std::collections::BTreeSet::from([
             "AddToBook".to_string(),
+            "AddToCollection".to_string(),
             "PinRepresentativeThumb".to_string(),
             "ToggleDetachedViewer".to_string(),
             "ToggleWindowMode".to_string(),
@@ -11021,6 +11602,47 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn saved_group_actions_are_grid_press_commands_with_round_trippable_empty_defaults() {
+        let defaults = Keymap::default();
+        for action in SAVED_GROUP_ACTIONS.iter().copied() {
+            assert!(ALL_ACTIONS.contains(&action), "{action:?}");
+            assert_eq!(action.context(), KeyContext::Grid, "{action:?}");
+            assert_eq!(action.trigger(), KeyTrigger::Press, "{action:?}");
+            assert!(action.default_chords().is_empty(), "{action:?}");
+            assert!(defaults.effective_chords(action).is_empty(), "{action:?}");
+            assert!(action.is_user_facing(), "{action:?}");
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+
+            let configured =
+                Keymap::from_ini_str(&format!("[Grid]\n{} = F13\n", action.ini_name()));
+            assert!(configured.warnings().is_empty(), "{action:?}");
+            assert_eq!(
+                configured.effective_chords(action),
+                vec![Chord::key(KeyName::F13)],
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_book_and_collection_location_slot_maps_exactly_one_through_twenty() {
+        for (index, action) in BOOK_LOCATION_ACTIONS.iter().copied().enumerate() {
+            assert_eq!(action.book_slot_number(), Some(index + 1), "{action:?}");
+            assert_eq!(action.collection_slot_number(), None, "{action:?}");
+        }
+        for (index, action) in COLLECTION_LOCATION_ACTIONS.iter().copied().enumerate() {
+            assert_eq!(
+                action.collection_slot_number(),
+                Some(index + 1),
+                "{action:?}"
+            );
+            assert_eq!(action.book_slot_number(), None, "{action:?}");
+        }
+        assert_eq!(BOOK_LOCATION_ACTIONS.len(), 20);
+        assert_eq!(COLLECTION_LOCATION_ACTIONS.len(), 20);
     }
 
     #[test]
@@ -13290,6 +13912,51 @@ mod tests {
             keymap.warnings()
         );
         assert!(keymap.overrides.is_empty());
+    }
+
+    #[test]
+    fn collection_add_actions_have_empty_defaults_and_distinct_contexts() {
+        let actions = [
+            (KeyAction::GridAddToCollectionTarget, KeyContext::Grid),
+            (KeyAction::FsAddToCollectionTarget, KeyContext::FsImage),
+            (KeyAction::VideoAddToCollectionTarget, KeyContext::FsVideo),
+        ];
+        let default = Keymap::default();
+        for (action, context) in actions {
+            assert_eq!(action.context(), context);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(default.effective_chords(action).is_empty());
+            let configured = Keymap::from_ini_str(&format!(
+                "[{}]\n{} = F13\n",
+                context.ini_name(),
+                action.ini_name()
+            ));
+            assert!(configured.warnings().is_empty());
+            assert_eq!(
+                configured.effective_chords(action),
+                vec![Chord::key(KeyName::F13)]
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_collection_add_actions_consume_one_egui_press() {
+        let _serial = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        for (section, action) in [
+            ("Grid", KeyAction::GridAddToCollectionTarget),
+            ("FsImage", KeyAction::FsAddToCollectionTarget),
+            ("FsVideo", KeyAction::VideoAddToCollectionTarget),
+        ] {
+            let keymap =
+                Keymap::from_ini_str(&format!("[{section}]\n{} = F13\n", action.ini_name()));
+            let ctx = egui::Context::default();
+            begin_key_pass(&ctx, egui::Key::F13, egui::Modifiers::NONE);
+            assert!(keymap.consume_action_no_repeat(&ctx, action));
+            assert!(!keymap.consume_action_no_repeat(&ctx, action));
+            let _ = ctx.end_pass();
+        }
     }
 
     #[test]

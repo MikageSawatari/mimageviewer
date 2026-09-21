@@ -8,15 +8,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const COLLECTION_NAV_READ_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-
 use super::folder_scan::ScannedDir;
 #[cfg(test)]
 use super::top_level_grid_view::CollectionGridThumbnailSources;
 use super::top_level_grid_view::{
     CollectionGridIdentity, CollectionGridLoadState, CollectionGridNavigationSources,
-    CollectionGridPosition, CollectionGridPreparedInstall, CollectionGridPreparedThumbnailSources,
-    CollectionGridSession, CollectionGridViewportAnchor, TopLevelGridRestore, TopLevelGridSurface,
+    CollectionGridPosition, CollectionGridPreparedInstall, CollectionGridPreparedThumbnailDelivery,
+    CollectionGridPresentationSources, CollectionGridSession, CollectionGridViewportAnchor,
+    TopLevelGridRestore, TopLevelGridSurface,
 };
 use super::{App, FolderOpenOutcome, HistoryTrigger, ManualMediaNavigationLanding};
 use crate::collection_store::{
@@ -183,6 +182,7 @@ pub(in crate::app) struct CollectionNavigationRequest {
     action: CollectionNavigationAction,
     pub(in crate::app) root_thumbnail_sources: Option<Arc<CollectionGridNavigationSources>>,
     perf_started_at: Option<std::time::Instant>,
+    lease: crate::collection_store::CollectionReadLease,
 }
 
 enum CollectionNavigationPreflightPayload {
@@ -212,6 +212,42 @@ struct CollectionNavigationRootLanding {
     transient_origin: bool,
 }
 
+/// Wakes the UI for revision notices while the navigation lease is paused for password input.
+/// The worker owns no collection state; dropping it cancels the wait promptly.
+pub(in crate::app) struct CollectionRevisionWake {
+    cancel: crossbeam_channel::Sender<()>,
+}
+
+impl CollectionRevisionWake {
+    fn spawn(ctx: &egui::Context, watch: &CollectionRevisionWatch) -> Self {
+        let wake = watch.wake_receiver();
+        let (cancel, cancelled) = crossbeam_channel::bounded(1);
+        let repaint = ctx.clone();
+        let _ = std::thread::Builder::new()
+            .name("collection-revision-wake".into())
+            .spawn(move || {
+                loop {
+                    crossbeam_channel::select! {
+                        recv(cancelled) -> _ => break,
+                        recv(wake) -> notice => {
+                            if notice.is_err() {
+                                break;
+                            }
+                            repaint.request_repaint();
+                        }
+                    }
+                }
+            });
+        Self { cancel }
+    }
+}
+
+impl Drop for CollectionRevisionWake {
+    fn drop(&mut self) {
+        let _ = self.cancel.try_send(());
+    }
+}
+
 /// Whether a prepared root is the exact Grid presentation already installed in this viewer
 /// context. The actor revision alone is not enough: filesystem classification and display facts
 /// may change without a collection mutation.
@@ -238,7 +274,6 @@ pub(in crate::app) enum CollectionNavigationPending {
         request: CollectionNavigationRequest,
         /// Keep the subscription if load admission was Busy.
         watch: Option<CollectionRevisionWatch>,
-        not_before: Instant,
     },
     Snapshot {
         request: CollectionNavigationRequest,
@@ -267,6 +302,7 @@ pub(in crate::app) enum CollectionNavigationPending {
     AwaitingPdfPassword {
         request: CollectionNavigationRequest,
         watch: CollectionRevisionWatch,
+        revision_wake: CollectionRevisionWake,
         prepared: Arc<CollectionPreparedSnapshot>,
         target: CollectionPreparedNavigationTarget,
     },
@@ -319,12 +355,19 @@ impl CollectionNavigationPending {
             .is_some_and(|request| &request.origin == origin && &request.action == action)
     }
 
-    pub(crate) fn poll_delay(&self) -> Duration {
+    pub(crate) fn poll_delay(&self) -> Option<Duration> {
         match self {
-            Self::RequestNeeded { not_before, .. } => {
-                not_before.saturating_duration_since(Instant::now())
+            Self::RequestNeeded { request, .. } => request.lease.poll_delay(Instant::now()),
+            Self::Snapshot { request, .. }
+            | Self::Preparing { request, .. }
+            | Self::Preflighting { request, .. }
+            | Self::PdfPasswordPreflighting { request, .. } => {
+                request.lease.completion_poll_delay()
             }
-            _ => Duration::from_millis(16),
+            Self::AwaitingPdfPassword { .. } => None,
+            Self::AwaitingOuterContinuation { .. } | Self::AwaitingManualContinuation { .. } => {
+                Some(Duration::from_millis(50))
+            }
         }
     }
 
@@ -941,11 +984,21 @@ impl App {
         origin: CollectionNavigationOrigin,
         action: CollectionNavigationAction,
     ) -> bool {
+        let scope = crate::collection_store::CollectionReadScope::viewer(
+            "navigation",
+            origin.context_id.serial(),
+            origin.surface_generation,
+        );
         let request = CollectionNavigationRequest {
             origin,
             action,
             root_thumbnail_sources: None,
             perf_started_at: crate::perf::is_enabled().then(std::time::Instant::now),
+            lease: crate::collection_store::CollectionReadLease::new(
+                scope,
+                Instant::now(),
+                "admission",
+            ),
         };
         self.top_level_grid_view
             .set_collection_navigation_pending(None);
@@ -956,11 +1009,24 @@ impl App {
     fn start_or_defer_collection_navigation(
         &mut self,
         ctx: &egui::Context,
-        request: CollectionNavigationRequest,
+        mut request: CollectionNavigationRequest,
         watch: Option<CollectionRevisionWatch>,
     ) {
+        let now = Instant::now();
+        request.lease.activate(now, "admission");
         if !self.collection_navigation_request_is_current(&request) {
+            request.lease.finish(now, "replaced");
             self.finish_collection_navigation_without_target_no_context(&request.action);
+            return;
+        }
+        if !request.lease.is_due(now) {
+            self.top_level_grid_view
+                .set_collection_navigation_pending(Some(
+                    CollectionNavigationPending::RequestNeeded { request, watch },
+                ));
+            if let Some(delay) = self.top_level_grid_view.collection_navigation_poll_delay() {
+                ctx.request_repaint_after(delay);
+            }
             return;
         }
         let client = match self.collection_store_client_for_read() {
@@ -978,11 +1044,7 @@ impl App {
                 return;
             }
             Err(error) => {
-                self.finish_collection_navigation_read_error(
-                    ctx,
-                    &request.action,
-                    &error.to_string(),
-                );
+                self.finish_collection_navigation_store_error(ctx, &request.action, &error);
                 return;
             }
         };
@@ -997,11 +1059,7 @@ impl App {
                     return;
                 }
                 Err(error) => {
-                    self.finish_collection_navigation_read_error(
-                        ctx,
-                        &request.action,
-                        &error.to_string(),
-                    );
+                    self.finish_collection_navigation_store_error(ctx, &request.action, &error);
                     return;
                 }
             },
@@ -1013,11 +1071,7 @@ impl App {
                 return;
             }
             Err(error) => {
-                self.finish_collection_navigation_read_error(
-                    ctx,
-                    &request.action,
-                    &error.to_string(),
-                );
+                self.finish_collection_navigation_store_error(ctx, &request.action, &error);
                 return;
             }
         };
@@ -1037,12 +1091,17 @@ impl App {
                         serde_json::Value::from(request.origin.intent_sequence),
                     ),
                     (
+                        "request_id",
+                        serde_json::Value::from(request.lease.request_id()),
+                    ),
+                    (
                         "surface_generation",
                         serde_json::Value::from(request.origin.surface_generation),
                     ),
                 ],
             );
         }
+        request.lease.phase_progress(now, "snapshot");
         self.top_level_grid_view
             .set_collection_navigation_pending(Some(CollectionNavigationPending::Snapshot {
                 request,
@@ -1055,16 +1114,19 @@ impl App {
     fn defer_collection_navigation_read(
         &mut self,
         ctx: &egui::Context,
-        request: CollectionNavigationRequest,
+        mut request: CollectionNavigationRequest,
         watch: Option<CollectionRevisionWatch>,
     ) {
+        let now = Instant::now();
+        request.lease.defer(now, "admission");
         self.top_level_grid_view
             .set_collection_navigation_pending(Some(CollectionNavigationPending::RequestNeeded {
                 request,
                 watch,
-                not_before: Instant::now() + COLLECTION_NAV_READ_RETRY_INTERVAL,
             }));
-        ctx.request_repaint_after(COLLECTION_NAV_READ_RETRY_INTERVAL);
+        if let Some(delay) = self.top_level_grid_view.collection_navigation_poll_delay() {
+            ctx.request_repaint_after(delay);
+        }
     }
 
     fn finish_collection_navigation_read_error(
@@ -1079,6 +1141,18 @@ impl App {
         }
         self.show_feedback_toast(format!("コレクションを読み込めませんでした: {reason}"));
         ctx.request_repaint();
+    }
+
+    fn finish_collection_navigation_store_error(
+        &mut self,
+        ctx: &egui::Context,
+        action: &CollectionNavigationAction,
+        error: &CollectionStoreError,
+    ) {
+        crate::logger::log(format!(
+            "[collection-nav] terminal store read failed: {error}"
+        ));
+        self.finish_collection_navigation_read_error(ctx, action, &error.user_message());
     }
 
     pub(crate) fn start_collection_manual_navigation(
@@ -1411,8 +1485,9 @@ impl App {
             return false;
         };
         let CollectionNavigationPending::AwaitingPdfPassword {
-            request,
+            mut request,
             watch,
+            revision_wake: _,
             prepared,
             target,
         } = pending
@@ -1443,9 +1518,13 @@ impl App {
                 let _ = sender.send(result);
             });
         if spawn.is_err() {
+            request.lease.finish(Instant::now(), "error");
             self.finish_collection_navigation_without_target_no_context(&request.action);
             return true;
         }
+        request
+            .lease
+            .resume(Instant::now(), "pdf_password_preflight");
         self.top_level_grid_view
             .set_collection_navigation_pending(Some(
                 CollectionNavigationPending::PdfPasswordPreflighting {
@@ -1471,8 +1550,9 @@ impl App {
         };
         pending.cancel();
         match pending {
-            CollectionNavigationPending::AwaitingPdfPassword { request, .. }
-            | CollectionNavigationPending::PdfPasswordPreflighting { request, .. } => {
+            CollectionNavigationPending::AwaitingPdfPassword { mut request, .. }
+            | CollectionNavigationPending::PdfPasswordPreflighting { mut request, .. } => {
+                request.lease.finish(Instant::now(), "cancelled");
                 self.finish_collection_navigation_without_target_no_context(&request.action);
                 true
             }
@@ -1492,18 +1572,18 @@ impl App {
         request.root_thumbnail_sources = None;
         request.origin.surface_generation = self.top_level_grid_view.generation();
         request.origin.items_generation = self.items_generation;
-        let origin = request.origin.clone();
-        let action = request.action.clone();
-        let _ = self.enqueue_collection_navigation(ctx, origin, action);
+        request.lease.defer(Instant::now(), "restart");
+        self.start_or_defer_collection_navigation(ctx, request, None);
     }
 
     fn spawn_collection_navigation_prepare(
         &mut self,
         ctx: &egui::Context,
-        request: CollectionNavigationRequest,
+        mut request: CollectionNavigationRequest,
         watch: CollectionRevisionWatch,
         snapshot: CollectionSnapshot,
     ) {
+        request.lease.phase_progress(Instant::now(), "prepare");
         let exact_revision = snapshot.revision();
         let reuse_key =
             self.collection_grid_prepare_reuse_key(request.origin.collection_id, exact_revision);
@@ -1523,11 +1603,11 @@ impl App {
                     .map(|sources| (Arc::clone(&presentation.prepared), Arc::clone(sources)))
             });
         if let Some((prepared, sources)) = retained {
-            let mut request = request;
-            request.root_thumbnail_sources = Some(Arc::new(CollectionGridNavigationSources {
+            request.root_thumbnail_sources = Some(Arc::new(CollectionGridNavigationSources::new(
                 reuse_key,
-                sources,
-            }));
+                CollectionGridPresentationSources::Retained(sources),
+                None,
+            )));
             let target_kind = request.action.target_kind();
             self.spawn_collection_navigation_preflight(ctx, request, watch, prepared, target_kind);
             return;
@@ -1535,6 +1615,7 @@ impl App {
         let display_order = self.settings.grid_display_order.clone();
         let settings = self.settings.clone();
         let pin_stamp = self.video_pin_db.as_ref().map(|db| db.mutation_stamp());
+        let thumbnail_source_epoch = self.collection_thumbnail_source_epoch;
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1551,6 +1632,7 @@ impl App {
                     &worker_cancel,
                     None,
                     pin_stamp,
+                    thumbnail_source_epoch,
                 );
                 if let Some(start) = perf_start {
                     crate::perf::event(
@@ -1608,6 +1690,7 @@ impl App {
         prepared: Arc<CollectionPreparedSnapshot>,
         target_kind: CollectionNavigationTargetKind,
     ) {
+        request.lease.phase_progress(Instant::now(), "preflight");
         let resolved = resolve_prepared_collection_navigation(
             &prepared,
             request.origin.anchor.as_ref(),
@@ -1666,11 +1749,25 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::channel();
+        let warm_live_delivery = request
+            .root_thumbnail_sources
+            .as_ref()
+            .filter(|owner| owner.needs_live_delivery())
+            .and_then(|owner| {
+                owner
+                    .retained()
+                    .map(|sources| (Arc::clone(owner), Arc::clone(sources)))
+            });
         let collection_id = request.origin.collection_id;
         let request_sequence = request.origin.intent_sequence;
         let spawn = std::thread::Builder::new()
             .name("collection-navigation-preflight".into())
             .spawn(move || {
+                if let Some((owner, retained)) = warm_live_delivery
+                    && !worker_cancel.load(Ordering::Acquire)
+                {
+                    owner.publish_live(retained.payload.clone());
+                }
                 let result = preflight_candidates(
                     candidates,
                     required_matches,
@@ -1725,21 +1822,13 @@ impl App {
             return;
         };
         match pending {
-            CollectionNavigationPending::RequestNeeded {
-                request,
-                watch,
-                not_before,
-            } => {
+            CollectionNavigationPending::RequestNeeded { request, watch } => {
                 if !self.collection_navigation_request_is_current(&request) {
                     self.finish_collection_navigation_without_target_no_context(&request.action);
-                } else if Instant::now() < not_before {
+                } else if !request.lease.is_due(Instant::now()) {
                     self.top_level_grid_view
                         .set_collection_navigation_pending(Some(
-                            CollectionNavigationPending::RequestNeeded {
-                                request,
-                                watch,
-                                not_before,
-                            },
+                            CollectionNavigationPending::RequestNeeded { request, watch },
                         ));
                 } else {
                     self.start_or_defer_collection_navigation(ctx, request, watch);
@@ -1769,11 +1858,9 @@ impl App {
                     Ok(Err(error)) if error.is_read_retryable() => {
                         self.defer_collection_navigation_read(ctx, request, Some(watch));
                     }
-                    Ok(Err(error)) => self.finish_collection_navigation_read_error(
-                        ctx,
-                        &request.action,
-                        &error.to_string(),
-                    ),
+                    Ok(Err(error)) => {
+                        self.finish_collection_navigation_store_error(ctx, &request.action, &error)
+                    }
                     Err(crossbeam_channel::TryRecvError::Disconnected) => self
                         .finish_collection_navigation_read_error(
                             ctx,
@@ -1823,10 +1910,11 @@ impl App {
                     {
                         let mut request = request;
                         request.root_thumbnail_sources =
-                            Some(Arc::new(CollectionGridNavigationSources {
-                                reuse_key: install.reuse_key,
-                                sources: Arc::new(install.thumbnail_sources),
-                            }));
+                            Some(Arc::new(CollectionGridNavigationSources::new(
+                                install.reuse_key,
+                                install.thumbnail_sources.presentation,
+                                Some(install.thumbnail_sources.live),
+                            )));
                         let target_kind = request.action.target_kind();
                         self.spawn_collection_navigation_preflight(
                             ctx,
@@ -1954,8 +2042,9 @@ impl App {
                 },
             },
             CollectionNavigationPending::AwaitingPdfPassword {
-                request,
+                mut request,
                 watch,
+                revision_wake,
                 prepared,
                 target,
             } => {
@@ -1966,6 +2055,7 @@ impl App {
                         if revision > prepared.collection_revision
                 ) {
                     self.pdf_password_request = None;
+                    request.lease.resume(Instant::now(), "revision_restart");
                     self.restart_collection_navigation(ctx, request);
                 } else if self
                     .collection_navigation_exact_target_is_current(&request, &prepared, &target)
@@ -1976,6 +2066,7 @@ impl App {
                             CollectionNavigationPending::AwaitingPdfPassword {
                                 request,
                                 watch,
+                                revision_wake,
                                 prepared,
                                 target,
                             },
@@ -2027,16 +2118,20 @@ impl App {
                             );
                         }
                         Ok(Err(error)) if crate::pdf_loader::is_password_required_error(&error) => {
+                            let mut request = request;
+                            request.lease.pause(Instant::now(), "pdf_password_input");
                             self.pdf_current_password = None;
                             self.pdf_password_pending_save = None;
                             self.pdf_password_request = Some(super::PdfPasswordRequest {
                                 path: target.source_path.clone(),
                             });
+                            let revision_wake = CollectionRevisionWake::spawn(ctx, &watch);
                             self.top_level_grid_view
                                 .set_collection_navigation_pending(Some(
                                     CollectionNavigationPending::AwaitingPdfPassword {
                                         request,
                                         watch,
+                                        revision_wake,
                                         prepared,
                                         target,
                                     },
@@ -2461,7 +2556,7 @@ impl App {
         let prepared_thumbnail_source_identity = request
             .root_thumbnail_sources
             .as_deref()
-            .map(|owner| owner.sources.identity)
+            .map(|owner| owner.identity())
             .unwrap_or_default();
         // A linked detached viewer and the visible main Grid may intentionally share the same
         // mounted collection context. Moving between entries in an unchanged immutable root must
@@ -2544,7 +2639,7 @@ impl App {
             });
             session.load = CollectionGridLoadState::RequestNeeded {
                 installed: previous.clone(),
-                not_before: None,
+                lease: request.lease.clone(),
             };
         }
         let remapped_origin_idx = request.origin.anchor.as_ref().and_then(|anchor| {
@@ -2584,9 +2679,9 @@ impl App {
                 .then_some(prepared.entries.len())
         });
         let (thumbnail_sources, reuse_key) = match request.root_thumbnail_sources.take() {
-            Some(owner) => (owner.sources.as_ref().clone(), owner.reuse_key.clone()),
+            Some(owner) => (owner.take_delivery(), owner.reuse_key.clone()),
             None => (
-                CollectionGridPreparedThumbnailSources::default(),
+                CollectionGridPreparedThumbnailDelivery::default(),
                 self.collection_grid_prepare_reuse_key(
                     request.origin.collection_id,
                     prepared.collection_revision,
@@ -2743,14 +2838,17 @@ impl App {
             ready.payload,
             CollectionNavigationPreflightPayload::PdfPasswordRequired
         ) {
+            request.lease.pause(Instant::now(), "pdf_password_input");
             self.pdf_password_request = Some(super::PdfPasswordRequest {
                 path: ready.target.source_path.clone(),
             });
+            let revision_wake = CollectionRevisionWake::spawn(ctx, &watch);
             self.top_level_grid_view
                 .set_collection_navigation_pending(Some(
                     CollectionNavigationPending::AwaitingPdfPassword {
                         request,
                         watch,
+                        revision_wake,
                         prepared,
                         target: ready.target,
                     },
@@ -3326,6 +3424,14 @@ mod tests {
             .expect("collection actor operation")
     }
 
+    fn navigation_test_lease() -> crate::collection_store::CollectionReadLease {
+        crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("navigation-test"),
+            Instant::now(),
+            "admission",
+        )
+    }
+
     fn start_ready_app(
         db_path: &std::path::Path,
     ) -> (
@@ -3365,7 +3471,7 @@ mod tests {
 
     fn prepared_thumbnail_sources(
         sources: CollectionGridThumbnailSources,
-    ) -> CollectionGridPreparedThumbnailSources {
+    ) -> CollectionGridPreparedThumbnailDelivery {
         super::super::collection_grid::prepare_collection_grid_thumbnail_sources(
             sources,
             &AtomicBool::new(false),
@@ -3376,15 +3482,16 @@ mod tests {
     fn navigation_sources(
         app: &App,
         prepared: &CollectionPreparedSnapshot,
-        sources: CollectionGridPreparedThumbnailSources,
+        sources: CollectionGridPreparedThumbnailDelivery,
     ) -> Arc<CollectionGridNavigationSources> {
-        Arc::new(CollectionGridNavigationSources {
-            reuse_key: app.collection_grid_prepare_reuse_key(
+        Arc::new(CollectionGridNavigationSources::new(
+            app.collection_grid_prepare_reuse_key(
                 prepared.collection_id,
                 prepared.collection_revision,
             ),
-            sources: Arc::new(sources),
-        })
+            sources.presentation,
+            Some(sources.live),
+        ))
     }
 
     #[test]
@@ -3458,7 +3565,128 @@ mod tests {
             Some(CollectionNavigationPending::Preflighting { prepared: reused, .. }) if Arc::ptr_eq(reused, &installed.prepared)),
             "same revision uses the already classified listing and thumbnail payload; no full stat/sidecar/pin pass is started"
         );
+        let delivery_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let delivered = matches!(
+                app.top_level_grid_view.collection_navigation_pending_for_test(),
+                Some(CollectionNavigationPending::Preflighting { request, .. })
+                    if request
+                        .root_thumbnail_sources
+                        .as_ref()
+                        .is_some_and(|owner| !owner.needs_live_delivery())
+            );
+            if delivered {
+                break;
+            }
+            assert!(
+                Instant::now() < delivery_deadline,
+                "warm preflight worker did not publish the live thumbnail map"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
         app.cancel_collection_navigation_intent();
+
+        let mut mismatches = Vec::new();
+        let mut collection_id = installed.reuse_key.clone();
+        collection_id.order.collection_id = CollectionId::new();
+        mismatches.push(("collection id", collection_id));
+        let mut revision = installed.reuse_key.clone();
+        revision.order.revision = revision.order.revision.wrapping_add(1);
+        mismatches.push(("revision", revision));
+        let mut display_order = installed.reuse_key.clone();
+        display_order.order.display_order = crate::settings::GridDisplayOrder::from_rows([
+            vec![
+                crate::settings::GridItemDisplayKind::Image,
+                crate::settings::GridItemDisplayKind::VideoAudio,
+                crate::settings::GridItemDisplayKind::Folder,
+                crate::settings::GridItemDisplayKind::Archive,
+            ],
+            vec![],
+            vec![],
+            vec![],
+        ]);
+        mismatches.push(("display order", display_order));
+        let mut sidecar = installed.reuse_key.clone();
+        sidecar.sidecar_scan_fingerprint ^= 1;
+        mismatches.push(("sidecar fingerprint", sidecar));
+        let mut skip_video = installed.reuse_key.clone();
+        skip_video.skip_image_if_video_exists = !skip_video.skip_image_if_video_exists;
+        mismatches.push(("skip-image policy", skip_video));
+        let mut sidecar_video = installed.reuse_key.clone();
+        sidecar_video.video_thumb_use_sidecar_image = !sidecar_video.video_thumb_use_sidecar_image;
+        mismatches.push(("video-sidecar policy", sidecar_video));
+        let mut pin_stamp = installed.reuse_key.clone();
+        pin_stamp.pin_stamp = None;
+        assert_ne!(
+            pin_stamp, installed.reuse_key,
+            "test requires a live pin DB stamp"
+        );
+        mismatches.push(("pin stamp", pin_stamp));
+        let mut thumbnail_source_epoch = installed.reuse_key.clone();
+        thumbnail_source_epoch.thumbnail_source_epoch = thumbnail_source_epoch
+            .thumbnail_source_epoch
+            .wrapping_add(1);
+        mismatches.push(("metadata-import thumbnail epoch", thumbnail_source_epoch));
+
+        for (label, reuse_key) in mismatches {
+            app.top_level_grid_view
+                .collection_session_mut()
+                .unwrap()
+                .load = CollectionGridLoadState::Ready(Arc::new(
+                super::super::top_level_grid_view::CollectionGridInstalledPresentation::new(
+                    Arc::clone(&installed.prepared),
+                    installed.sources.clone(),
+                    reuse_key,
+                ),
+            ));
+            let request = manual_navigation_request(&mut app, 0);
+            app.spawn_collection_navigation_prepare(
+                &egui::Context::default(),
+                request,
+                client.subscribe().unwrap(),
+                added.snapshot.clone(),
+            );
+            assert!(
+                matches!(
+                    app.top_level_grid_view
+                        .collection_navigation_pending_for_test(),
+                    Some(CollectionNavigationPending::Preparing { .. })
+                ),
+                "{label} mismatch must start a full prepare"
+            );
+            app.cancel_collection_navigation_intent();
+        }
+
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Ready(Arc::new(
+            super::super::top_level_grid_view::CollectionGridInstalledPresentation::new(
+                Arc::clone(&installed.prepared),
+                CollectionGridPresentationSources::Oversized(installed.sources.identity()),
+                installed.reuse_key.clone(),
+            ),
+        ));
+        let request = manual_navigation_request(&mut app, 0);
+        app.spawn_collection_navigation_prepare(
+            &egui::Context::default(),
+            request,
+            client.subscribe().unwrap(),
+            added.snapshot.clone(),
+        );
+        assert!(
+            matches!(
+                app.top_level_grid_view
+                    .collection_navigation_pending_for_test(),
+                Some(CollectionNavigationPending::Preparing { .. })
+            ),
+            "an oversized presentation retains identity only and must start a full prepare"
+        );
+        app.cancel_collection_navigation_intent();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Ready(Arc::clone(&installed));
 
         app.video_pin_db
             .as_ref()
@@ -3573,11 +3801,13 @@ mod tests {
                 forward: true,
                 queued_steps: 0,
             },
-            root_thumbnail_sources: Some(Arc::new(CollectionGridNavigationSources {
-                reuse_key: installed.reuse_key.clone(),
-                sources: retained,
-            })),
+            root_thumbnail_sources: Some(Arc::new(CollectionGridNavigationSources::new(
+                installed.reuse_key.clone(),
+                CollectionGridPresentationSources::Retained(retained),
+                None,
+            ))),
             perf_started_at: None,
+            lease: navigation_test_lease(),
         };
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Folder);
         let owner = app
@@ -3621,6 +3851,7 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
+            lease: navigation_test_lease(),
         };
         app.spawn_collection_navigation_prepare(
             &egui::Context::default(),
@@ -3635,10 +3866,20 @@ mod tests {
         ));
         app.cancel_collection_navigation_intent();
         let mut return_request = return_request;
-        return_request.root_thumbnail_sources = Some(Arc::new(CollectionGridNavigationSources {
-            reuse_key: child_presentation.reuse_key.clone(),
-            sources: child_presentation.sources.retained().unwrap().clone(),
-        }));
+        let returned_live_sources = child_presentation
+            .sources
+            .retained()
+            .unwrap()
+            .payload
+            .clone();
+        return_request.root_thumbnail_sources =
+            Some(Arc::new(CollectionGridNavigationSources::new(
+                child_presentation.reuse_key.clone(),
+                CollectionGridPresentationSources::Retained(
+                    child_presentation.sources.retained().unwrap().clone(),
+                ),
+                Some(returned_live_sources),
+            )));
         let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Folder);
         assert!(
             app.install_collection_navigation_root(
@@ -3683,6 +3924,28 @@ mod tests {
             usize::MAX,
             1
         ]));
+
+        let complete_blobs = Arc::new(std::collections::HashMap::from([(
+            PathBuf::from("oversized.mp4"),
+            vec![7; MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES + 1],
+        )]));
+        let delivery = prepared_thumbnail_sources(CollectionGridThumbnailSources {
+            video_sidecars: std::collections::HashMap::new(),
+            video_pin_blobs: Arc::clone(&complete_blobs),
+        });
+        assert!(matches!(
+            delivery.presentation,
+            CollectionGridPresentationSources::Oversized(_)
+        ));
+        assert!(Arc::ptr_eq(&delivery.live.video_pin_blobs, &complete_blobs));
+        assert_eq!(
+            delivery
+                .live
+                .video_pin_blobs
+                .get(&PathBuf::from("oversized.mp4"))
+                .map(Vec::len),
+            Some(MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES + 1)
+        );
     }
 
     fn manual_navigation_request(app: &mut App, origin_idx: usize) -> CollectionNavigationRequest {
@@ -3700,6 +3963,7 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
+            lease: navigation_test_lease(),
         }
     }
 
@@ -3754,11 +4018,9 @@ mod tests {
         let first_deadline = match app.top_level_grid_view.take_collection_navigation_pending() {
             Some(pending @ CollectionNavigationPending::RequestNeeded { .. }) => {
                 let deadline = match &pending {
-                    CollectionNavigationPending::RequestNeeded {
-                        not_before, watch, ..
-                    } => {
+                    CollectionNavigationPending::RequestNeeded { request, watch, .. } => {
                         assert!(watch.is_none());
-                        *not_before
+                        request.lease.next_poll_at_for_test().unwrap()
                     }
                     _ => unreachable!(),
                 };
@@ -3771,7 +4033,8 @@ mod tests {
         app.poll_collection_navigation(&ctx);
         assert!(matches!(
             app.top_level_grid_view.take_collection_navigation_pending(),
-            Some(CollectionNavigationPending::RequestNeeded { not_before, .. }) if not_before == first_deadline
+            Some(CollectionNavigationPending::RequestNeeded { request, .. })
+                if request.lease.next_poll_at_for_test() == Some(first_deadline)
         ));
         // Re-stage the request from the same owner to test Busy admission.
         let mut origin = app.collection_outer_navigation_origin(None).unwrap();
@@ -3784,6 +4047,7 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
+            lease: navigation_test_lease(),
         };
         app.collection_ui.set_read_phase_for_test(false);
         let (barrier_reply, entered, release) = client.test_barrier().unwrap();
@@ -3800,11 +4064,9 @@ mod tests {
         let busy_deadline = match app.top_level_grid_view.take_collection_navigation_pending() {
             Some(pending @ CollectionNavigationPending::RequestNeeded { .. }) => {
                 let deadline = match &pending {
-                    CollectionNavigationPending::RequestNeeded {
-                        not_before, watch, ..
-                    } => {
+                    CollectionNavigationPending::RequestNeeded { request, watch, .. } => {
                         assert!(watch.is_some(), "subscribe succeeded before load was Busy");
-                        *not_before
+                        request.lease.next_poll_at_for_test().unwrap()
                     }
                     _ => unreachable!(),
                 };
@@ -3821,8 +4083,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &pending,
-            CollectionNavigationPending::RequestNeeded { not_before, watch: Some(_), .. }
-                if *not_before == busy_deadline
+            CollectionNavigationPending::RequestNeeded { request, watch: Some(_), .. }
+                if request.lease.next_poll_at_for_test() == Some(busy_deadline)
         ));
         let last_queued = queued.pop().unwrap();
         release.send(()).unwrap();
@@ -3835,8 +4097,8 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(queued);
-        if let CollectionNavigationPending::RequestNeeded { not_before, .. } = &mut pending {
-            *not_before = Instant::now();
+        if let CollectionNavigationPending::RequestNeeded { request, .. } = &mut pending {
+            request.lease.force_due_for_test(Instant::now());
         }
         app.top_level_grid_view
             .set_collection_navigation_pending(Some(pending));
@@ -3886,7 +4148,9 @@ mod tests {
             .take_collection_navigation_pending()
             .unwrap();
         let first_deadline = match &pending {
-            CollectionNavigationPending::RequestNeeded { not_before, .. } => *not_before,
+            CollectionNavigationPending::RequestNeeded { request, .. } => {
+                request.lease.next_poll_at_for_test().unwrap()
+            }
             _ => panic!("Starting must defer automatic navigation"),
         };
         app.top_level_grid_view
@@ -3902,8 +4166,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &pending,
-            CollectionNavigationPending::RequestNeeded { not_before, request, .. }
-                if *not_before == first_deadline
+            CollectionNavigationPending::RequestNeeded { request, .. }
+                if request.lease.next_poll_at_for_test() == Some(first_deadline)
                     && request.origin.intent_sequence == origin_at_request.intent_sequence
         ));
         let video = CollectionNavigationAction::VideoContinuousEof {
@@ -3926,9 +4190,9 @@ mod tests {
                 action: video,
                 root_thumbnail_sources: None,
                 perf_started_at: None,
+                lease: navigation_test_lease(),
             },
             watch: None,
-            not_before: first_deadline,
         };
         assert!(video_request.matches_automatic_intent(
             &origin_at_request,
@@ -3980,8 +4244,8 @@ mod tests {
             .top_level_grid_view
             .take_collection_navigation_pending()
             .unwrap();
-        if let CollectionNavigationPending::RequestNeeded { not_before, .. } = &mut pending {
-            *not_before = Instant::now();
+        if let CollectionNavigationPending::RequestNeeded { request, .. } = &mut pending {
+            request.lease.force_due_for_test(Instant::now());
         } else {
             panic!("Starting must defer navigation");
         }
@@ -3996,7 +4260,28 @@ mod tests {
                 .is_none()
         );
         assert!(app.fs_boundary_hint.is_none());
-        assert!(app.fs_feedback_toast.is_some());
+        let terminal_error = app
+            .fs_feedback_toast
+            .as_ref()
+            .map(|(message, _, _)| message.as_str())
+            .expect("terminal error toast");
+        assert!(terminal_error.contains("コレクションを利用できません"));
+        assert!(!terminal_error.contains("collection store"));
+        assert!(!terminal_error.contains("次のコンテナはありません"));
+
+        app.finish_collection_navigation_without_target(
+            &ctx,
+            &CollectionNavigationAction::OuterGrid {
+                forward: true,
+                queued_steps: 0,
+            },
+        );
+        let boundary = app
+            .fs_feedback_toast
+            .as_ref()
+            .map(|(message, _, _)| message.as_str())
+            .expect("boundary toast");
+        assert_eq!(boundary, "コレクション内の次のコンテナはありません");
     }
 
     #[test]
@@ -4056,6 +4341,7 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
+            lease: navigation_test_lease(),
         };
         request.root_thumbnail_sources = Some(navigation_sources(
             &app,
@@ -4179,7 +4465,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_manual_navigation_poll_keeps_the_unchanged_root_generation_and_grid_state() {
+    fn manual_media_navigation_routes_collection_before_its_display_order_argument() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.jpg");
         let second = temp.path().join("second.jpg");
@@ -4232,12 +4518,15 @@ mod tests {
         let reload_queue = app.reload_queue.as_ref().map(Arc::clone).unwrap();
         let heavy_io_queue = app.heavy_io_queue.as_ref().map(Arc::clone).unwrap();
         let ctx = egui::Context::default();
-        assert!(app.start_collection_manual_navigation(
+        app.start_manual_media_navigation(
             &ctx,
+            &[], // Collection root owns reader order; a caller's list display order is irrelevant.
             0,
             1,
+            "collection_manual_route_test",
             ManualMediaNavigationLanding::Fullscreen,
-        ));
+        );
+        assert!(app.top_level_grid_view.collection_navigation_pending());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.fullscreen_idx != Some(1) {
             assert!(
@@ -4322,7 +4611,7 @@ mod tests {
             )])),
         };
         let prepared_sources_a = prepared_thumbnail_sources(sources_a.clone());
-        let identity_a = prepared_sources_a.identity;
+        let identity_a = prepared_sources_a.presentation.identity();
         app.top_level_grid_view.begin(
             TopLevelGridSurface::Collection(CollectionGridIdentity {
                 collection_id: prepared.collection_id,
@@ -4378,7 +4667,7 @@ mod tests {
             )])),
         };
         let prepared_sidecar_changed = prepared_thumbnail_sources(sidecar_changed);
-        let sidecar_changed_identity = prepared_sidecar_changed.identity;
+        let sidecar_changed_identity = prepared_sidecar_changed.presentation.identity();
         request.root_thumbnail_sources = Some(navigation_sources(
             &app,
             &prepared,
@@ -4406,7 +4695,7 @@ mod tests {
             video_pin_blobs: Arc::new(std::collections::HashMap::from([(first, vec![4, 5, 6])])),
         };
         let prepared_pin_changed = prepared_thumbnail_sources(pin_changed);
-        let pin_changed_identity = prepared_pin_changed.identity;
+        let pin_changed_identity = prepared_pin_changed.presentation.identity();
         request.root_thumbnail_sources =
             Some(navigation_sources(&app, &prepared, prepared_pin_changed));
         assert!(
@@ -4581,6 +4870,7 @@ mod tests {
             collection_name: prepared.collection_name.clone(),
             order_mode: prepared.order_mode,
             standard_sort: prepared.standard_sort,
+            auto_aspect_eligible_total: prepared.auto_aspect_eligible_total,
             entries: Arc::from(changed_entries),
         });
         let target = prepared_target(&changed.entries[0], CollectionResolvedKind::Image);
@@ -4676,6 +4966,342 @@ mod tests {
             1,
         );
         assert!(matches!(result, Err(CollectionPrepareError::Cancelled)));
+    }
+
+    #[test]
+    fn pdf_password_wait_pauses_the_same_lease_and_cancel_releases_navigation_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let pdf = temp.path().join("locked.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("password".into()).unwrap());
+        let snapshot = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &pdf,
+                            CollectionResolvedKind::Pdf,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        )
+        .snapshot;
+        let prepared = prepare_snapshot(&snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .unwrap()
+            .clone();
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        let request_sequence = app
+            .top_level_grid_view
+            .advance_collection_navigation_sequence();
+        let mut origin = app.collection_outer_navigation_origin(Some(0)).unwrap();
+        origin.intent_sequence = request_sequence;
+        let mut request = CollectionNavigationRequest {
+            origin,
+            action: CollectionNavigationAction::OuterFullscreen {
+                fs_idx: 0,
+                forward: true,
+                resume_slideshow: false,
+                native_toast: false,
+                queued_steps: 0,
+            },
+            root_thumbnail_sources: None,
+            perf_started_at: None,
+            lease: crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("navigation-test"),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(24 * 60 * 60))
+                    .unwrap(),
+                "preflight",
+            ),
+        };
+        let lease_id = request.lease.request_id();
+        request.lease.pause(Instant::now(), "pdf_password_input");
+        let watch = client.subscribe().unwrap();
+        let ctx = egui::Context::default();
+        let revision_wake = CollectionRevisionWake::spawn(&ctx, &watch);
+        let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Pdf);
+        app.pdf_password_request = Some(super::super::PdfPasswordRequest { path: pdf });
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(
+                CollectionNavigationPending::AwaitingPdfPassword {
+                    request,
+                    watch,
+                    revision_wake,
+                    prepared,
+                    target,
+                },
+            ));
+
+        app.poll_collection_navigation(&ctx);
+        assert_eq!(
+            app.top_level_grid_view.collection_navigation_poll_delay(),
+            None
+        );
+        assert!(matches!(
+            app.top_level_grid_view.collection_navigation_pending_for_test(),
+            Some(CollectionNavigationPending::AwaitingPdfPassword { request, .. })
+                if request.lease.request_id() == lease_id
+                    && request.lease.is_paused()
+                    && request.lease.phase() == "pdf_password_input"
+        ));
+        assert!(app.fs_nav_is_locked());
+
+        assert!(app.cancel_collection_pdf_password_request());
+        assert!(!app.top_level_grid_view.collection_navigation_pending());
+        assert!(!app.fs_nav_is_locked());
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn long_running_navigation_keeps_lock_and_history_then_adopts_exact_reply() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("page.png");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("long-running".into()).unwrap());
+        let snapshot = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &image,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        )
+        .snapshot;
+        let prepared = prepare_snapshot(&snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .unwrap()
+            .clone();
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        let request_sequence = app
+            .top_level_grid_view
+            .advance_collection_navigation_sequence();
+        let mut origin = app.collection_root_navigation_origin(0, false).unwrap();
+        origin.intent_sequence = request_sequence;
+        let request = CollectionNavigationRequest {
+            origin,
+            action: CollectionNavigationAction::OuterFullscreen {
+                fs_idx: 0,
+                forward: true,
+                resume_slideshow: false,
+                native_toast: false,
+                queued_steps: 0,
+            },
+            root_thumbnail_sources: None,
+            perf_started_at: None,
+            lease: crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("navigation-test"),
+                Instant::now()
+                    .checked_sub(Duration::from_secs(24 * 60 * 60))
+                    .unwrap(),
+                "preflight",
+            ),
+        };
+        let request_id = request.lease.request_id();
+        let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Image);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(CollectionNavigationPending::Preflighting {
+                request,
+                watch: client.subscribe().unwrap(),
+                prepared: Arc::clone(&prepared),
+                target_kind: CollectionNavigationTargetKind::OuterContainer,
+                cancel: Arc::clone(&cancel),
+                receiver,
+            }));
+        let items_generation = app.items_generation;
+        let history_len = app.folder_nav_back_stack.len();
+
+        app.poll_collection_navigation(&egui::Context::default());
+
+        assert!(!cancel.load(Ordering::Acquire));
+        assert!(matches!(
+            app.top_level_grid_view.collection_navigation_pending_for_test(),
+            Some(CollectionNavigationPending::Preflighting { request, .. })
+                if request.lease.request_id() == request_id
+        ));
+        assert!(app.fs_nav_is_locked());
+        assert_eq!(app.items_generation, items_generation);
+        assert_eq!(app.folder_nav_back_stack.len(), history_len);
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .and_then(CollectionGridSession::prepared)
+                .is_some_and(|current| Arc::ptr_eq(current, &prepared))
+        );
+
+        sender
+            .send(Ok(Some(CollectionNavigationPreflightReady {
+                target,
+                payload: CollectionNavigationPreflightPayload::Media,
+                rejected: Vec::new(),
+            })))
+            .unwrap();
+        app.poll_collection_navigation(&egui::Context::default());
+        assert!(!cancel.load(Ordering::Acquire));
+        assert!(!app.top_level_grid_view.collection_navigation_pending());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_none_or(|(text, _, _)| !text.contains("タイムアウト"))
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn password_revision_restart_resumes_same_lease_before_read_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let pdf = temp.path().join("locked.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(
+            client
+                .create_collection("password-revision".into())
+                .unwrap(),
+        );
+        let snapshot = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &pdf,
+                            CollectionResolvedKind::Pdf,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        )
+        .snapshot;
+        let prepared = prepare_snapshot(&snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        let sequence = app
+            .top_level_grid_view
+            .advance_collection_navigation_sequence();
+        let mut origin = app.collection_outer_navigation_origin(Some(0)).unwrap();
+        origin.intent_sequence = sequence;
+        let mut request = CollectionNavigationRequest {
+            origin,
+            action: CollectionNavigationAction::OuterFullscreen {
+                fs_idx: 0,
+                forward: true,
+                resume_slideshow: false,
+                native_toast: false,
+                queued_steps: 0,
+            },
+            root_thumbnail_sources: None,
+            perf_started_at: None,
+            lease: navigation_test_lease(),
+        };
+        let lease_id = request.lease.request_id();
+        request.lease.pause(Instant::now(), "pdf_password_input");
+        let watch = client.subscribe().unwrap();
+        let ctx = egui::Context::default();
+        let revision_wake = CollectionRevisionWake::spawn(&ctx, &watch);
+        let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Pdf);
+        app.pdf_password_request = Some(super::super::PdfPasswordRequest { path: pdf });
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(
+                CollectionNavigationPending::AwaitingPdfPassword {
+                    request,
+                    watch,
+                    revision_wake,
+                    prepared,
+                    target,
+                },
+            ));
+        let _updated = recv(
+            client
+                .rename_collection(
+                    snapshot.collection_id(),
+                    snapshot.revision(),
+                    "password-revision-updated".into(),
+                )
+                .unwrap(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.poll_collection_navigation(&ctx);
+            let resumed = app
+                .top_level_grid_view
+                .collection_navigation_pending_for_test()
+                .is_some_and(|pending| {
+                    !matches!(
+                        pending,
+                        CollectionNavigationPending::AwaitingPdfPassword { .. }
+                    ) && pending.request().is_some_and(|request| {
+                        request.lease.request_id() == lease_id && !request.lease.is_paused()
+                    })
+                });
+            if resumed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "revision notice did not resume the paused navigation lease"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            app.top_level_grid_view
+                .collection_navigation_poll_delay()
+                .is_some()
+        );
+        assert!(app.fs_nav_is_locked());
+        app.cancel_collection_navigation_intent();
+        app.poll_collection_navigation(&ctx);
+        assert!(!app.fs_nav_is_locked());
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]
@@ -4892,6 +5518,7 @@ mod tests {
         );
         app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
         app.fullscreen_idx = Some(0);
+        app.fs_nav_locked_gen = Some(app.items_generation);
         let sequence = app
             .top_level_grid_view
             .advance_collection_navigation_sequence();
@@ -4909,7 +5536,10 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
+            lease: navigation_test_lease(),
         };
+        let request_id = request.lease.request_id();
+        let expected_action = request.action.clone();
         let target_entry = prepared.entries[1].clone();
         let target = CollectionPreparedNavigationTarget {
             entry_id: target_entry.entry_id,
@@ -4949,6 +5579,13 @@ mod tests {
             std::thread::yield_now();
         }
         let installed_generation = app.items_generation;
+        let history_len = app.folder_nav_back_stack.len();
+        let installed_prepared = Arc::clone(
+            app.top_level_grid_view
+                .collection_session()
+                .and_then(CollectionGridSession::prepared)
+                .expect("the original collection presentation stays installed"),
+        );
 
         app.commit_collection_navigation(
             &egui::Context::default(),
@@ -4963,10 +5600,38 @@ mod tests {
         );
 
         assert_eq!(app.items_generation, installed_generation);
+        assert_eq!(app.folder_nav_back_stack.len(), history_len);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fs_nav_is_locked());
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .and_then(CollectionGridSession::prepared)
+                .is_some_and(|current| Arc::ptr_eq(current, &installed_prepared))
+        );
+        let mut pending = app
+            .top_level_grid_view
+            .take_collection_navigation_pending()
+            .expect("revision change keeps the navigation request pending");
+        assert!(matches!(
+            &pending,
+            CollectionNavigationPending::RequestNeeded { request, .. }
+                if request.lease.request_id() == request_id
+                    && request.origin.intent_sequence == sequence
+                    && request.action == expected_action
+        ));
+        if let CollectionNavigationPending::RequestNeeded { request, .. } = &mut pending {
+            request.lease.force_due_for_test(Instant::now());
+        }
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(pending));
+        app.poll_collection_navigation(&egui::Context::default());
         assert!(matches!(
             app.top_level_grid_view.take_collection_navigation_pending(),
-            Some(CollectionNavigationPending::Snapshot { .. })
+            Some(CollectionNavigationPending::Snapshot { request, .. })
+                if request.lease.request_id() == request_id
         ));
+        assert!(app.fs_nav_is_locked());
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -5004,6 +5669,7 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
+            lease: navigation_test_lease(),
         };
         assert!(app.collection_navigation_request_is_current(&request));
 
@@ -5066,6 +5732,7 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
+            lease: navigation_test_lease(),
         };
         assert!(app.collection_navigation_request_is_current(&request));
 
@@ -5146,6 +5813,7 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
+            lease: navigation_test_lease(),
         };
         let watch = client.subscribe().unwrap();
         let target_entry = &prepared.entries[1];
@@ -5227,6 +5895,7 @@ mod tests {
             },
             root_thumbnail_sources: None,
             perf_started_at: None,
+            lease: navigation_test_lease(),
         };
         let target_entry = &prepared.entries[1];
         let target = CollectionPreparedNavigationTarget {

@@ -240,8 +240,27 @@ impl App {
             return false;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if let Some(owner) = self.root_tray_hide_modal_owner() {
+            crate::logger::log(format!(
+                "[tray] kept main window visible for modal owner={owner}"
+            ));
+            return false;
+        }
         self.hide_to_tray(ctx);
         true
+    }
+
+    /// Modal state is sampled before polling terminal workers in this frame. A dialog that was
+    /// visible when CloseRequested arrived therefore keeps the main window visible for the whole
+    /// frame, even if its worker reaches a terminal result later in the pass.
+    fn root_tray_hide_modal_owner(&self) -> Option<&'static str> {
+        root_tray_hide_modal_owner(
+            self.sidecar_restore_active(),
+            self.staged_smart_root_modal_visible(),
+            self.smart_folder_confirm_pending.is_some(),
+            self.saved_group_open_modal_visible(),
+            self.rename_migration_recovery_dialog_visible(),
+        )
     }
 
     /// ウィンドウを非表示にしてタスクトレイ状態へ遷移する。
@@ -607,9 +626,31 @@ impl App {
     }
 }
 
+fn root_tray_hide_modal_owner(
+    sidecar_restore: bool,
+    staged_smart_root: bool,
+    legacy_smart_confirm: bool,
+    saved_group_open: bool,
+    rename_recovery: bool,
+) -> Option<&'static str> {
+    if sidecar_restore {
+        Some("sidecar_restore")
+    } else if staged_smart_root {
+        Some("smart_folder_transition")
+    } else if legacy_smart_confirm {
+        Some("smart_folder_legacy_confirm")
+    } else if saved_group_open {
+        Some("saved_group_open")
+    } else if rename_recovery {
+        Some("rename_migration_recovery")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_close_fullscreen_for_tray;
+    use super::{root_tray_hide_modal_owner, should_close_fullscreen_for_tray};
 
     #[test]
     fn tray_residency_closes_plain_still_fullscreen_sessions() {
@@ -636,5 +677,72 @@ mod tests {
         assert!(!should_close_fullscreen_for_tray(true, false, false, true));
         assert!(!should_close_fullscreen_for_tray(false, true, false, true));
         assert!(!should_close_fullscreen_for_tray(false, false, true, true));
+    }
+
+    #[test]
+    fn every_rendered_root_modal_owner_blocks_tray_hide() {
+        assert_eq!(
+            root_tray_hide_modal_owner(true, false, false, false, false),
+            Some("sidecar_restore")
+        );
+        assert_eq!(
+            root_tray_hide_modal_owner(false, true, false, false, false),
+            Some("smart_folder_transition")
+        );
+        assert_eq!(
+            root_tray_hide_modal_owner(false, false, true, false, false),
+            Some("smart_folder_legacy_confirm")
+        );
+        assert_eq!(
+            root_tray_hide_modal_owner(false, false, false, true, false),
+            Some("saved_group_open")
+        );
+        assert_eq!(
+            root_tray_hide_modal_owner(false, false, false, false, true),
+            Some("rename_migration_recovery")
+        );
+        assert_eq!(
+            root_tray_hide_modal_owner(false, false, false, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn close_to_tray_keeps_a_saved_group_modal_visible_for_the_whole_frame() {
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("books");
+        std::fs::create_dir_all(root.join("Current")).unwrap();
+        app.settings.book_root = Some(root);
+        app.settings.active_book_name = "Current".into();
+        app.settings.minimize_to_tray_on_close = true;
+        app.window_visible = true;
+        app.tray_controller = Some(crate::tray::TrayController::controller_for_test());
+        let ctx = egui::Context::default();
+        app.open_active_book_from_action(&ctx);
+        let request_id = app.saved_group_open_request_id_for_test().unwrap();
+        let mut raw = egui::RawInput::default();
+        raw.viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+
+        let output = ctx.run(raw, |ctx| {
+            assert!(!app.maybe_intercept_close(ctx));
+            // Simulate a terminal transition later in the same App::update pass. The close
+            // decision already sampled the visible modal and must not hide retroactively.
+            assert!(app.cancel_saved_group_open_request(request_id));
+        });
+
+        assert!(app.window_visible);
+        assert!(
+            output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|viewport| viewport
+                    .commands
+                    .iter()
+                    .any(|command| { matches!(command, egui::ViewportCommand::CancelClose) }))
+        );
     }
 }

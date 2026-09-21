@@ -9,6 +9,83 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 const SIDECAR_WRITER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const SIDECAR_RESTORE_MODAL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+const SIDECAR_REUSE_MAX_FOLDERS: usize = 4;
+const SIDECAR_REUSE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const _: () = assert!(SIDECAR_REUSE_MAX_FOLDERS > 0);
+const _: () = assert!(crate::sidecar_import::MAX_PROOF_BYTES <= SIDECAR_REUSE_TOTAL_BYTES);
+
+/// App-global immutable proofs, separate from writable `App.sidecars` owners.
+/// Old Arc payloads are returned to the caller for worker-side retirement.
+#[derive(Default)]
+pub(crate) struct SidecarProbeReuseCache {
+    entries: std::collections::VecDeque<Arc<crate::sidecar_import::SidecarProbeProof>>,
+    estimated_bytes: u64,
+}
+
+impl SidecarProbeReuseCache {
+    /// Return the normalized-folder slot without declaring a reuse hit or
+    /// updating LRU recency. The Checking worker owns the exact raw path,
+    /// data-directory, and family decision; only an adopted publish is a hit.
+    fn candidate(&self, folder: &Path) -> Option<Arc<crate::sidecar_import::SidecarProbeProof>> {
+        let folder_key = crate::adjustment_db::normalize_path(folder);
+        self.entries
+            .iter()
+            .find(|proof| proof.folder_key() == folder_key)
+            .map(Arc::clone)
+    }
+
+    fn publish(
+        &mut self,
+        proof: Arc<crate::sidecar_import::SidecarProbeProof>,
+    ) -> Vec<Arc<crate::sidecar_import::SidecarProbeProof>> {
+        let mut retired = Vec::new();
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|old| old.folder_key() == proof.folder_key())
+        {
+            let old = self.entries.remove(index).expect("matching proof exists");
+            self.estimated_bytes -= old.estimated_heap_bytes();
+            if !Arc::ptr_eq(&old, &proof) {
+                retired.push(old);
+            }
+        }
+        while self.entries.len() >= SIDECAR_REUSE_MAX_FOLDERS
+            || self
+                .estimated_bytes
+                .saturating_add(proof.estimated_heap_bytes())
+                > SIDECAR_REUSE_TOTAL_BYTES
+        {
+            let old = self
+                .entries
+                .pop_front()
+                .expect("proof itself fits the budget");
+            self.estimated_bytes -= old.estimated_heap_bytes();
+            retired.push(old);
+        }
+        self.estimated_bytes += proof.estimated_heap_bytes();
+        self.entries.push_back(proof);
+        retired
+    }
+
+    fn remove_folder(
+        &mut self,
+        folder: &Path,
+    ) -> Vec<Arc<crate::sidecar_import::SidecarProbeProof>> {
+        let folder_key = crate::adjustment_db::normalize_path(folder);
+        let mut retired = Vec::new();
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|proof| proof.folder_key() == folder_key)
+        {
+            let old = self.entries.remove(index).expect("matching proof exists");
+            self.estimated_bytes -= old.estimated_heap_bytes();
+            retired.push(old);
+        }
+        retired
+    }
+}
 
 pub(super) struct SidecarLoadContinuation {
     pub(super) source_path: PathBuf,
@@ -128,6 +205,8 @@ struct Checking {
 struct CheckingWorkerResult {
     flush: Result<crate::sidecar::SidecarFlushReport, String>,
     probe: Option<crate::sidecar_import::SidecarImportProbe>,
+    proof_candidate: Option<Arc<crate::sidecar_import::SidecarProbeProof>>,
+    reuse: crate::sidecar_import::SidecarProbeReuseOutcome,
 }
 
 struct Quiescing {
@@ -376,6 +455,34 @@ pub(crate) struct SidecarRestoreState {
     phase: Phase,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReuseProofApply {
+    PublishCandidate,
+    PreserveExisting,
+    EvictExisting,
+}
+
+fn reuse_proof_apply(
+    reuse: crate::sidecar_import::SidecarProbeReuseOutcome,
+    request_adopted: bool,
+    has_candidate: bool,
+    publish_admitted: bool,
+    invalidated: bool,
+) -> ReuseProofApply {
+    if invalidated {
+        return ReuseProofApply::EvictExisting;
+    }
+    if request_adopted && has_candidate && publish_admitted {
+        return ReuseProofApply::PublishCandidate;
+    }
+    if reuse.reused() {
+        // The cache still owns the exact validated Arc. A late cancel or stale owner
+        // retires only the worker candidate and must not promote its LRU position.
+        return ReuseProofApply::PreserveExisting;
+    }
+    ReuseProofApply::EvictExisting
+}
+
 impl SidecarRestoreState {
     pub(crate) fn target_context(&self) -> ViewerContextId {
         self.common.target_context
@@ -419,6 +526,22 @@ impl SidecarRestoreState {
 }
 
 impl App {
+    fn retire_sidecar_probe_proofs(
+        &mut self,
+        proofs: impl IntoIterator<Item = Arc<crate::sidecar_import::SidecarProbeProof>>,
+    ) {
+        self.retire_smart_folder_payloads(
+            proofs
+                .into_iter()
+                .map(|proof| Box::new(proof) as smart_folder::RetiredSmartFolderPayload),
+        );
+    }
+
+    fn clear_sidecar_probe_reuse(&mut self, folder: &Path) {
+        let retired = self.sidecar_probe_reuse.remove_folder(folder);
+        self.retire_sidecar_probe_proofs(retired);
+    }
+
     pub(crate) fn sidecar_restore_active(&self) -> bool {
         self.sidecar_restore.is_some()
     }
@@ -590,7 +713,10 @@ impl App {
                 .take()
                 .expect("checking owns flush reservations");
             let flush_result = match worker_result {
-                Ok(worker) => worker.flush,
+                Ok(worker) => {
+                    self.retire_sidecar_probe_proofs(worker.proof_candidate);
+                    worker.flush
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) =
@@ -799,15 +925,38 @@ impl App {
         let data_dir = state.common.data_dir.clone();
         let families = state.common.families;
         let cancel = Arc::clone(state.common.continuation.cancel());
+        let prior = self.sidecar_probe_reuse.candidate(&folder);
+        let allow_new_proof = self.smart_folder_retired_payloads.is_empty();
         let spawned = std::thread::Builder::new()
             .name("sidecar-restore-recheck".to_owned())
             .spawn(move || {
                 let flush = batch.run_on_worker(SIDECAR_WRITER_IDLE_TIMEOUT);
-                let probe = flush
-                    .as_ref()
-                    .ok()
-                    .map(|_| crate::sidecar_import::probe(&folder, &data_dir, families, &cancel));
-                let _ = tx.send(CheckingWorkerResult { flush, probe });
+                let checked = flush.as_ref().ok().map(|_| {
+                    crate::sidecar_import::probe_for_restore(
+                        &folder,
+                        &data_dir,
+                        families,
+                        &cancel,
+                        prior.as_ref(),
+                        allow_new_proof,
+                    )
+                });
+                let (probe, proof_candidate, reuse) = match checked {
+                    Some(checked) => (Some(checked.probe), checked.proof_candidate, checked.reuse),
+                    None => (
+                        None,
+                        None,
+                        crate::sidecar_import::SidecarProbeReuseOutcome::Miss(
+                            crate::sidecar_import::SidecarProbeReuseMissReason::Ineligible,
+                        ),
+                    ),
+                };
+                let _ = tx.send(CheckingWorkerResult {
+                    flush,
+                    probe,
+                    proof_candidate,
+                    reuse,
+                });
             });
         match spawned {
             Err(error) => {
@@ -1100,6 +1249,7 @@ impl App {
             Phase::Checking(mut checking) => match poll_checking_worker(&mut checking) {
                 CheckingPoll::Pending => Phase::Checking(checking),
                 CheckingPoll::Complete(Err(error)) => {
+                    self.clear_sidecar_probe_reuse(&state.common.folder);
                     let reservations = checking
                         .reservations
                         .take()
@@ -1116,6 +1266,7 @@ impl App {
                         .reservations
                         .take()
                         .expect("checking owns flush reservations");
+                    let mut proof_candidate = worker.proof_candidate;
                     if let Err(error) = reservations.resolve_in_place(
                         &mut self.sidecars,
                         worker.flush,
@@ -1126,39 +1277,152 @@ impl App {
                             "サイドカー保存が完了しなかったため、中央DBから表示を続けます"
                                 .to_string(),
                         );
+                        self.clear_sidecar_probe_reuse(&state.common.folder);
+                        self.retire_sidecar_probe_proofs(proof_candidate);
                         Phase::Resuming
                     } else {
+                        if crate::perf::is_enabled() {
+                            let result = worker
+                                .probe
+                                .as_ref()
+                                .map(crate::sidecar_import::SidecarImportProbe::result);
+                            crate::perf::event(
+                                "nav",
+                                "sli_sidecar_reuse_check",
+                                None,
+                                state.common.request_id,
+                                &[
+                                    (
+                                        "worker_reused",
+                                        serde_json::Value::from(worker.reuse.reused()),
+                                    ),
+                                    ("reason", serde_json::Value::from(worker.reuse.label())),
+                                    (
+                                        "probe_ms",
+                                        serde_json::Value::from(result.map_or(0.0, |result| {
+                                            result.probe_elapsed.as_secs_f64() * 1000.0
+                                        })),
+                                    ),
+                                    (
+                                        "load_ms",
+                                        serde_json::Value::from(result.map_or(0.0, |result| {
+                                            result.load_elapsed.as_secs_f64() * 1000.0
+                                        })),
+                                    ),
+                                    (
+                                        "prepare_ms",
+                                        serde_json::Value::from(result.map_or(0.0, |result| {
+                                            result.prepare_elapsed.as_secs_f64() * 1000.0
+                                        })),
+                                    ),
+                                ],
+                            );
+                        }
                         let probe = worker.probe.expect("successful flush includes a probe");
                         let action = match probe {
                             crate::sidecar_import::SidecarImportProbe::Current {
                                 sidecar,
                                 result,
+                                ..
                             } => {
-                                if let Some(warning) =
-                                    self.install_sidecar_restore_cache_owner(sidecar)
-                                {
+                                let install_warning =
+                                    self.install_sidecar_restore_cache_owner(sidecar);
+                                let owner_installed = install_warning.is_none();
+                                let request_adopted = owner_installed
+                                    && !state.common.continuation.cancel().load(Ordering::Relaxed)
+                                    && matches!(
+                                        &state.common.continuation,
+                                        ContinuationOwner::Live(_)
+                                    );
+                                let result_failed = probe_result_has_failure(&result);
+                                let proof_apply = reuse_proof_apply(
+                                    worker.reuse,
+                                    request_adopted,
+                                    proof_candidate.is_some(),
+                                    self.smart_folder_retired_payloads.is_empty(),
+                                    install_warning.is_some() || result_failed,
+                                );
+                                let mut proof_published = false;
+                                if let Some(warning) = install_warning {
                                     append_warning(&mut state.common.warning, warning);
                                 }
-                                if probe_result_has_failure(&result) {
+                                if result_failed {
                                     append_warning(
                                         &mut state.common.warning,
                                         probe_result_warning(&result),
                                     );
                                 }
+                                match proof_apply {
+                                    ReuseProofApply::PublishCandidate => {
+                                        let proof =
+                                            proof_candidate.take().expect("checked candidate");
+                                        let retired = self.sidecar_probe_reuse.publish(proof);
+                                        self.retire_sidecar_probe_proofs(retired);
+                                        proof_published = true;
+                                    }
+                                    ReuseProofApply::PreserveExisting => {
+                                        // Do not call `publish`: an unadopted warm result must not
+                                        // become the most-recently-used cache entry.
+                                        self.retire_sidecar_probe_proofs(proof_candidate.take());
+                                    }
+                                    ReuseProofApply::EvictExisting => {
+                                        self.clear_sidecar_probe_reuse(&state.common.folder);
+                                        // The writable owner has a separate outer map. Retire the
+                                        // unused proof on a worker so its last map drop stays off UI.
+                                        self.retire_sidecar_probe_proofs(proof_candidate.take());
+                                    }
+                                }
+                                if crate::perf::is_enabled() {
+                                    crate::perf::event(
+                                        "nav",
+                                        "sli_sidecar_reuse_apply",
+                                        None,
+                                        state.common.request_id,
+                                        &[
+                                            (
+                                                "worker_reused",
+                                                serde_json::Value::from(worker.reuse.reused()),
+                                            ),
+                                            (
+                                                "request_adopted",
+                                                serde_json::Value::from(request_adopted),
+                                            ),
+                                            (
+                                                "proof_published",
+                                                serde_json::Value::from(proof_published),
+                                            ),
+                                        ],
+                                    );
+                                }
+                                if worker.reuse.reused() && request_adopted {
+                                    crate::logger::log(format!(
+                                        "sidecar restore adopted reused parse request={} proof_published={} folder={}",
+                                        state.common.request_id,
+                                        proof_published,
+                                        state.common.folder.display()
+                                    ));
+                                }
                                 RequiredAction::Resume
                             }
                             crate::sidecar_import::SidecarImportProbe::ImportRequired {
                                 result,
-                            } => RequiredAction::Import {
-                                clear_preview: probe_requires_preview_clear(&result),
-                            },
+                            } => {
+                                self.clear_sidecar_probe_reuse(&state.common.folder);
+                                RequiredAction::Import {
+                                    clear_preview: probe_requires_preview_clear(&result),
+                                }
+                            }
                             crate::sidecar_import::SidecarImportProbe::MarkerClearRequired {
                                 ..
-                            } => RequiredAction::ClearMissingMarkers,
+                            } => {
+                                self.clear_sidecar_probe_reuse(&state.common.folder);
+                                RequiredAction::ClearMissingMarkers
+                            }
                             crate::sidecar_import::SidecarImportProbe::SourceChanged {
                                 error,
                                 ..
                             } => {
+                                self.clear_sidecar_probe_reuse(&state.common.folder);
                                 state.common.warning = Some(error);
                                 if state.common.source_change_reprobe {
                                     if let Some(warning) = self
@@ -1173,15 +1437,18 @@ impl App {
                                 }
                             }
                             crate::sidecar_import::SidecarImportProbe::Cancelled { .. } => {
+                                self.clear_sidecar_probe_reuse(&state.common.folder);
                                 state.common.warning =
                                     Some("サイドカー復元が取り消されました".into());
                                 RequiredAction::RefreshCache
                             }
                             crate::sidecar_import::SidecarImportProbe::Failed { error, .. } => {
+                                self.clear_sidecar_probe_reuse(&state.common.folder);
                                 state.common.warning = Some(error);
                                 RequiredAction::RefreshCache
                             }
                         };
+                        self.retire_sidecar_probe_proofs(proof_candidate);
                         match action {
                             RequiredAction::Resume => Phase::Resuming,
                             RequiredAction::Import {
@@ -1456,6 +1723,7 @@ impl App {
                         .reservations
                         .take()
                         .expect("checking owns flush reservations");
+                    self.retire_sidecar_probe_proofs(worker.proof_candidate);
                     if let Err(error) = reservations.resolve_in_place(
                         &mut self.sidecars,
                         worker.flush,
@@ -2233,6 +2501,231 @@ mod tests {
     }
 
     #[test]
+    fn checking_publishes_a_proof_only_after_matching_owner_install() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sidecar_backup_enabled = true;
+        app.settings.tag_sidecar_backup_enabled = true;
+        let folder = app.tmp.path().join("reuse-book");
+        let data = app.tmp.path().join("reuse-data");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        drop(crate::adjustment_db::AdjustmentDb::open_at(&data.join("adjustment.db")).unwrap());
+        drop(crate::tags_db::TagsDb::open_at(&data.join("tags.db")).unwrap());
+        let mut sidecar = crate::sidecar::SidecarFile::new(folder.clone());
+        sidecar.set_tags("page.jpg", ["#saved"]);
+        assert!(sidecar.flush_blocking());
+        let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
+            crate::sidecar::SidecarFile::load_for_import(&folder)
+        else {
+            panic!("fixture sidecar must load");
+        };
+        let (_, source) = loaded.into_parts();
+        let crate::sidecar::SidecarImportSource::Disk(token) = source else {
+            panic!("fixture is a disk source");
+        };
+        let folder_key = crate::adjustment_db::normalize_path(&folder);
+        crate::adjustment_db::AdjustmentDb::open_at(&data.join("adjustment.db"))
+            .unwrap()
+            .sidecar_sync_upsert(&folder_key, token.sync_marker())
+            .unwrap();
+        crate::tags_db::TagsDb::open_at(&data.join("tags.db"))
+            .unwrap()
+            .sidecar_sync_upsert(&folder_key, token.sync_marker())
+            .unwrap();
+
+        app.current_folder = Some(folder.clone());
+        let (tx, _rx) = mpsc::channel::<ThumbMsg>();
+        let now = std::time::Instant::now();
+        assert!(
+            app.begin_sidecar_restore(
+                SidecarLoadContinuation {
+                    source_path: folder.clone(),
+                    source_is_directory: true,
+                    prepared_subfolder: None,
+                    prepared_aggregate: None,
+                    catalog_existing_keys: HashSet::new(),
+                    video_items: Vec::new(),
+                    sli_seq: 0,
+                    sli_t0: now,
+                    items_len: 0,
+                    detached_physical: false,
+                    tx,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    restore_started_at: now,
+                },
+                false
+            )
+            .is_ok()
+        );
+        let mut state = app.sidecar_restore.take().unwrap();
+        state.common.data_dir = data.clone();
+        state.phase = app.sidecar_restore_start_checking(&mut state);
+        app.sidecar_restore = Some(state);
+        let ctx = egui::Context::default();
+        for _ in 0..10_000 {
+            app.poll_sidecar_restore(&ctx);
+            if app.sidecar_probe_reuse.candidate(&folder).is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(app.sidecars.contains_key(&folder));
+        let proof = app
+            .sidecar_probe_reuse
+            .candidate(&folder)
+            .expect("matching owner install publishes the proof");
+        let warm = crate::sidecar_import::probe_for_restore(
+            &folder,
+            &data,
+            crate::sidecar_import::ImportFamilies::ALL,
+            &AtomicBool::new(false),
+            Some(&proof),
+            true,
+        );
+        assert!(warm.reuse.reused());
+    }
+
+    #[test]
+    fn proof_cache_evicts_least_recent_folder_and_keeps_budget_accounting() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        drop(
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap(),
+        );
+        drop(crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap());
+        let mut cache = SidecarProbeReuseCache::default();
+        let mut folders = Vec::new();
+        for index in 0..5 {
+            let folder = root.path().join(format!("book-{index}"));
+            std::fs::create_dir(&folder).unwrap();
+            let mut sidecar = crate::sidecar::SidecarFile::new(folder.clone());
+            sidecar.set_tags("page.jpg", ["#saved"]);
+            assert!(sidecar.flush_blocking());
+            let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
+                crate::sidecar::SidecarFile::load_for_import(&folder)
+            else {
+                panic!("fixture sidecar must load");
+            };
+            let (_, source) = loaded.into_parts();
+            let crate::sidecar::SidecarImportSource::Disk(token) = source else {
+                panic!("fixture is a disk source");
+            };
+            let key = crate::adjustment_db::normalize_path(&folder);
+            crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+                .unwrap()
+                .sidecar_sync_upsert(&key, token.sync_marker())
+                .unwrap();
+            crate::tags_db::TagsDb::open_at(&data.path().join("tags.db"))
+                .unwrap()
+                .sidecar_sync_upsert(&key, token.sync_marker())
+                .unwrap();
+            let checked = crate::sidecar_import::probe_for_restore(
+                &folder,
+                data.path(),
+                crate::sidecar_import::ImportFamilies::ALL,
+                &AtomicBool::new(false),
+                None,
+                true,
+            );
+            let proof = checked.proof_candidate.expect("small synchronized proof");
+            folders.push(folder);
+            if index == 4 {
+                assert!(cache.candidate(&folders[0]).is_some());
+                let touched = cache.candidate(&folders[0]).unwrap();
+                assert!(cache.publish(touched).is_empty());
+            }
+            let retired = cache.publish(proof);
+            assert_eq!(retired.len(), usize::from(index == 4));
+            assert!(cache.estimated_bytes <= SIDECAR_REUSE_TOTAL_BYTES);
+            assert!(cache.entries.len() <= SIDECAR_REUSE_MAX_FOLDERS);
+        }
+        assert!(cache.candidate(&folders[0]).is_some());
+        assert!(cache.candidate(&folders[1]).is_none());
+
+        let order_before_miss: Vec<String> = cache
+            .entries
+            .iter()
+            .map(|proof| proof.folder_key().to_string())
+            .collect();
+        let other_data = tempfile::tempdir().unwrap();
+        drop(
+            crate::adjustment_db::AdjustmentDb::open_at(&other_data.path().join("adjustment.db"))
+                .unwrap(),
+        );
+        drop(crate::tags_db::TagsDb::open_at(&other_data.path().join("tags.db")).unwrap());
+        let prior = cache
+            .candidate(&folders[0])
+            .expect("normalized folder slot supplies a worker candidate");
+        let mismatched = crate::sidecar_import::probe_for_restore(
+            &folders[0],
+            other_data.path(),
+            crate::sidecar_import::ImportFamilies::ALL,
+            &AtomicBool::new(false),
+            Some(&prior),
+            true,
+        );
+        assert_eq!(
+            mismatched.reuse,
+            crate::sidecar_import::SidecarProbeReuseOutcome::Miss(
+                crate::sidecar_import::SidecarProbeReuseMissReason::KeyMismatch,
+            )
+        );
+        assert!(matches!(
+            mismatched.probe,
+            crate::sidecar_import::SidecarImportProbe::ImportRequired { .. }
+        ));
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|proof| proof.folder_key().to_string())
+                .collect::<Vec<_>>(),
+            order_before_miss,
+            "a rejected candidate must not be promoted as an LRU hit"
+        );
+        assert_eq!(cache.remove_folder(&folders[0]).len(), 1);
+        assert_eq!(cache.entries.len(), 3);
+    }
+
+    #[test]
+    fn unadopted_warm_proof_is_preserved_without_lru_publish() {
+        use crate::sidecar_import::{SidecarProbeReuseMissReason, SidecarProbeReuseOutcome};
+
+        assert_eq!(
+            reuse_proof_apply(SidecarProbeReuseOutcome::Hit, false, true, true, false),
+            ReuseProofApply::PreserveExisting,
+            "a late cancel keeps the cache-owned proof"
+        );
+        assert_eq!(
+            reuse_proof_apply(SidecarProbeReuseOutcome::Hit, true, true, false, false),
+            ReuseProofApply::PreserveExisting,
+            "a warm proof stays in place while new proof admission is paused"
+        );
+        assert_eq!(
+            reuse_proof_apply(SidecarProbeReuseOutcome::Hit, true, true, true, false),
+            ReuseProofApply::PublishCandidate,
+            "only an adopted warm result may publish and promote its proof"
+        );
+        assert_eq!(
+            reuse_proof_apply(
+                SidecarProbeReuseOutcome::Miss(SidecarProbeReuseMissReason::NoPriorProof),
+                false,
+                true,
+                true,
+                false,
+            ),
+            ReuseProofApply::EvictExisting,
+            "a cold unadopted candidate is never published"
+        );
+        assert_eq!(
+            reuse_proof_apply(SidecarProbeReuseOutcome::Hit, false, true, true, true),
+            ReuseProofApply::EvictExisting,
+            "warnings or semantic failures evict even a warm proof"
+        );
+    }
+
+    #[test]
     fn preview_clear_is_required_only_before_an_edit_import() {
         use crate::sidecar_import::SidecarProbeFamilyOutcome as Outcome;
 
@@ -2305,6 +2798,10 @@ mod tests {
                 .send(CheckingWorkerResult {
                     flush: Err("synthetic flush result".to_string()),
                     probe: None,
+                    proof_candidate: None,
+                    reuse: crate::sidecar_import::SidecarProbeReuseOutcome::Miss(
+                        crate::sidecar_import::SidecarProbeReuseMissReason::Ineligible,
+                    ),
                 })
                 .unwrap();
             sent_tx.send(()).unwrap();
@@ -3102,6 +3599,66 @@ mod tests {
             warning.contains("未保存変更を保持") && warning.contains("invalid source")
         }));
         assert_unsaved_owner_is_retained(&app, &folder);
+    }
+
+    #[test]
+    fn dirty_write_disabled_owner_rejects_and_evicts_a_reuse_proof() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("proof-conflict");
+        let data = app.tmp.path().join("proof-conflict-data");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        drop(crate::adjustment_db::AdjustmentDb::open_at(&data.join("adjustment.db")).unwrap());
+        drop(crate::tags_db::TagsDb::open_at(&data.join("tags.db")).unwrap());
+        let mut disk = crate::sidecar::SidecarFile::new(folder.clone());
+        disk.set_tags("page.jpg", ["#disk"]);
+        assert!(disk.flush_blocking());
+        let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
+            crate::sidecar::SidecarFile::load_for_import(&folder)
+        else {
+            panic!("fixture sidecar must load");
+        };
+        let (_, crate::sidecar::SidecarImportSource::Disk(token)) = loaded.into_parts() else {
+            panic!("fixture must have a disk token");
+        };
+        let folder_key = crate::adjustment_db::normalize_path(&folder);
+        crate::adjustment_db::AdjustmentDb::open_at(&data.join("adjustment.db"))
+            .unwrap()
+            .sidecar_sync_upsert(&folder_key, token.sync_marker())
+            .unwrap();
+        crate::tags_db::TagsDb::open_at(&data.join("tags.db"))
+            .unwrap()
+            .sidecar_sync_upsert(&folder_key, token.sync_marker())
+            .unwrap();
+        let checked = crate::sidecar_import::probe_for_restore(
+            &folder,
+            &data,
+            crate::sidecar_import::ImportFamilies::ALL,
+            &AtomicBool::new(false),
+            None,
+            true,
+        );
+        let proof = checked.proof_candidate.expect("synchronized proof");
+        assert!(app.sidecar_probe_reuse.publish(proof).is_empty());
+
+        let mut dirty = crate::sidecar::SidecarFile::disabled_placeholder(folder.clone());
+        dirty.set_tags("page.jpg", ["#unsaved"]);
+        app.sidecars.insert(folder.clone(), dirty);
+        let warning = app
+            .install_sidecar_restore_cache_owner(crate::sidecar::SidecarFile::new(folder.clone()));
+        assert!(warning.is_some());
+        app.clear_sidecar_probe_reuse(&folder);
+
+        assert!(app.sidecar_probe_reuse.candidate(&folder).is_none());
+        let retained = app.sidecars.get(&folder).expect("dirty owner retained");
+        assert!(retained.is_dirty());
+        assert_eq!(
+            retained
+                .items()
+                .get("page.jpg")
+                .and_then(|entry| entry.tags.as_ref()),
+            Some(&vec!["#unsaved".to_string()])
+        );
     }
 
     fn create_recovery_edit_stores(data_dir: &Path) {

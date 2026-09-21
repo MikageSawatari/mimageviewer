@@ -38,7 +38,9 @@
 //!   成功ハンドラからしか呼ばれない (外部リネームの検知は将来課題)。
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -233,16 +235,44 @@ pub const JOURNAL_FILE: &str = "rename_migration_journal.json";
 #[derive(Debug)]
 pub(crate) enum JournalLoadError {
     Read(std::io::Error),
-    Parse(serde_json::Error),
+    Parse {
+        error: serde_json::Error,
+        /// Exact bytes that failed both the current and legacy parsers. The explicit quarantine
+        /// action must prove that the same file object still contains these bytes before moving it.
+        bytes: Arc<[u8]>,
+    },
 }
 
 impl std::fmt::Display for JournalLoadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Read(error) => write!(formatter, "read failed: {error}"),
-            Self::Parse(error) => write!(formatter, "parse failed: {error}"),
+            Self::Parse { error, .. } => write!(formatter, "parse failed: {error}"),
         }
     }
+}
+
+impl JournalLoadError {
+    pub(crate) fn parse_bytes(&self) -> Option<Arc<[u8]>> {
+        match self {
+            Self::Parse { bytes, .. } => Some(Arc::clone(bytes)),
+            Self::Read(_) => None,
+        }
+    }
+}
+
+fn parse_journal_bytes(bytes: &[u8]) -> Result<Vec<PathMigrationJob>, serde_json::Error> {
+    if let Ok(entries) = serde_json::from_slice::<Vec<PathMigrationJob>>(bytes) {
+        return Ok(entries);
+    }
+    // v3.10 and earlier stored a bare list of pairs. A recovered legacy entry is treated as Tree:
+    // exact sources still match, while a folder rename cannot strand collection descendants.
+    serde_json::from_slice::<Vec<(PathBuf, PathBuf)>>(bytes).map(|entries| {
+        entries
+            .into_iter()
+            .map(|(old_path, new_path)| PathMigrationJob::shell_rename(old_path, new_path, true))
+            .collect()
+    })
 }
 
 /// A missing file means no recovery work. Any other read or format error must
@@ -254,18 +284,357 @@ pub(crate) fn journal_load(data_dir: &Path) -> Result<Vec<PathMigrationJob>, Jou
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(JournalLoadError::Read(error)),
     };
-    if let Ok(entries) = serde_json::from_slice::<Vec<PathMigrationJob>>(&bytes) {
-        return Ok(entries);
+    let bytes: Arc<[u8]> = bytes.into();
+    parse_journal_bytes(&bytes).map_err(|error| JournalLoadError::Parse { error, bytes })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JournalQuarantineOutcome {
+    /// The exact invalid source object was moved aside. `path` is the non-overwriting destination.
+    Quarantined { path: PathBuf },
+    /// The source no longer matches the exact invalid bytes that the user confirmed. Only a
+    /// separate explicit reload may adopt missing, newly valid, or differently invalid content.
+    Changed(JournalQuarantineChange),
+    /// Cancellation won before the handle-based rename linearized.
+    Cancelled,
+    /// Opening, reading, or renaming failed. The original pathname remains protected.
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JournalQuarantineChange {
+    Missing,
+    ValidCurrentOrLegacy,
+    DifferentInvalidBytes,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalQuarantinePhase {
+    Running = 0,
+    Cancelled = 1,
+    Renaming = 2,
+}
+
+#[derive(Debug)]
+struct JournalQuarantineControl {
+    phase: AtomicU8,
+}
+
+impl JournalQuarantineControl {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(JournalQuarantinePhase::Running as u8),
+        }
     }
-    // v3.10 and earlier stored a bare list of pairs. A recovered legacy entry is treated as Tree:
-    // exact sources still match, while a folder rename cannot strand collection descendants.
-    match serde_json::from_slice::<Vec<(PathBuf, PathBuf)>>(&bytes) {
-        Ok(entries) => Ok(entries
-            .into_iter()
-            .map(|(old_path, new_path)| PathMigrationJob::shell_rename(old_path, new_path, true))
-            .collect()),
-        Err(error) => Err(JournalLoadError::Parse(error)),
+
+    fn cancel(&self) {
+        let _ = self.phase.compare_exchange(
+            JournalQuarantinePhase::Running as u8,
+            JournalQuarantinePhase::Cancelled as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
+
+    fn cancelled(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == JournalQuarantinePhase::Cancelled as u8
+    }
+
+    /// Claims the irreversible namespace-operation phase. Cancellation and this transition race
+    /// through one CAS, so a cancellation that wins guarantees the handle rename is never called.
+    fn begin_rename(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                JournalQuarantinePhase::Running as u8,
+                JournalQuarantinePhase::Renaming as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+pub(crate) struct JournalQuarantineTask {
+    control: Arc<JournalQuarantineControl>,
+    rx: std::sync::mpsc::Receiver<JournalQuarantineOutcome>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for JournalQuarantineTask {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JournalQuarantineTask")
+            .field("phase", &self.control.phase.load(Ordering::Acquire))
+            .field("worker_running", &self.handle.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl JournalQuarantineTask {
+    pub(crate) fn spawn(data_dir: PathBuf, expected: Arc<[u8]>) -> Result<Self, String> {
+        let control = Arc::new(JournalQuarantineControl::new());
+        let worker_control = Arc::clone(&control);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("rename-migration-quarantine".into())
+            .spawn(move || {
+                let outcome = quarantine_invalid_journal(&data_dir, &expected, &worker_control);
+                let _ = tx.send(outcome);
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            control,
+            rx,
+            handle: Some(handle),
+        })
+    }
+
+    pub(crate) fn try_recv(
+        &mut self,
+    ) -> Result<JournalQuarantineOutcome, std::sync::mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.control.cancel();
+    }
+
+    /// The worker sends only after all filesystem work has ended, so joining a terminal task does
+    /// not put filesystem latency on an ordinary UI frame.
+    pub(crate) fn join_terminal(&mut self) {
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            crate::logger::log("[RENAME-MIG] quarantine worker panicked after terminal result");
+        }
+    }
+
+    /// Final-exit fence. Cancellation is observed before rename; if the handle rename already
+    /// succeeded, that success remains the linearization point and is returned as such.
+    pub(crate) fn cancel_and_wait(mut self) -> JournalQuarantineOutcome {
+        self.cancel();
+        let outcome = self.rx.recv().unwrap_or_else(|_| {
+            JournalQuarantineOutcome::Failed("quarantine worker disconnected".into())
+        });
+        self.join_terminal();
+        outcome
+    }
+}
+
+static QUARANTINE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn quarantine_token() -> u128 {
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    (time << 32)
+        ^ u128::from(std::process::id())
+        ^ u128::from(QUARANTINE_NONCE.fetch_add(1, Ordering::Relaxed))
+}
+
+fn quarantine_destination(source: &Path, token: u128, attempt: u32) -> PathBuf {
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(JOURNAL_FILE);
+    source.with_file_name(format!("{file_name}.invalid-{token:032x}-{attempt:02}"))
+}
+
+enum HandleRenameError {
+    Collision,
+    Failed(String),
+}
+
+fn quarantine_invalid_journal(
+    data_dir: &Path,
+    expected: &[u8],
+    control: &JournalQuarantineControl,
+) -> JournalQuarantineOutcome {
+    quarantine_invalid_journal_with(
+        data_dir,
+        expected,
+        control,
+        quarantine_token(),
+        rename_open_journal_handle,
+        || {},
+        || {},
+    )
+}
+
+fn quarantine_invalid_journal_with(
+    data_dir: &Path,
+    expected: &[u8],
+    control: &JournalQuarantineControl,
+    token: u128,
+    mut rename_handle: impl FnMut(&std::fs::File, &Path) -> Result<(), HandleRenameError>,
+    before_rename_claim: impl FnOnce(),
+    after_rename: impl FnOnce(),
+) -> JournalQuarantineOutcome {
+    if control.cancelled() {
+        return JournalQuarantineOutcome::Cancelled;
+    }
+    let source = data_dir.join(JOURNAL_FILE);
+    let mut file = match open_journal_for_quarantine(&source) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return JournalQuarantineOutcome::Changed(JournalQuarantineChange::Missing);
+        }
+        Err(error) => {
+            return JournalQuarantineOutcome::Failed(format!(
+                "open failed for {}: {error}",
+                source.display()
+            ));
+        }
+    };
+    let mut actual = Vec::new();
+    if let Err(error) = file.read_to_end(&mut actual) {
+        return JournalQuarantineOutcome::Failed(format!(
+            "read failed for {}: {error}",
+            source.display()
+        ));
+    }
+    match parse_journal_bytes(&actual) {
+        Ok(_) => {
+            return JournalQuarantineOutcome::Changed(
+                JournalQuarantineChange::ValidCurrentOrLegacy,
+            );
+        }
+        Err(_) if actual.as_slice() != expected => {
+            return JournalQuarantineOutcome::Changed(
+                JournalQuarantineChange::DifferentInvalidBytes,
+            );
+        }
+        Err(_) => {}
+    }
+    before_rename_claim();
+    if !control.begin_rename() {
+        return JournalQuarantineOutcome::Cancelled;
+    }
+    for attempt in 0..100 {
+        let destination = quarantine_destination(&source, token, attempt);
+        match rename_handle(&file, &destination) {
+            Ok(()) => {
+                // SetFileInformationByHandle success is the namespace linearization point. A
+                // cancellation arriving here must not turn a completed quarantine into failure.
+                after_rename();
+                return JournalQuarantineOutcome::Quarantined { path: destination };
+            }
+            Err(HandleRenameError::Collision) => continue,
+            Err(HandleRenameError::Failed(error)) => {
+                return JournalQuarantineOutcome::Failed(error);
+            }
+        }
+    }
+    JournalQuarantineOutcome::Failed(
+        "could not choose a non-existing quarantine destination".into(),
+    )
+}
+
+#[cfg(windows)]
+fn open_journal_for_quarantine(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ,
+    };
+
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ.0 | DELETE.0)
+        .share_mode(0)
+        .custom_flags((FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_journal_for_quarantine(_path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure journal quarantine is available only on Windows",
+    ))
+}
+
+#[cfg(windows)]
+fn rename_open_journal_handle(
+    file: &std::fs::File,
+    destination: &Path,
+) -> Result<(), HandleRenameError> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GetLastError, HANDLE,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+
+    let absolute = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| HandleRenameError::Failed(error.to_string()))?
+            .join(destination)
+    };
+    let mut name: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        return Err(HandleRenameError::Failed(
+            "quarantine destination is not a valid absolute Windows path".into(),
+        ));
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| HandleRenameError::Failed("quarantine path is too long".into()))?;
+    name.push(0);
+    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let buffer_bytes = (offset + name.len() * std::mem::size_of::<u16>())
+        .max(std::mem::size_of::<FILE_RENAME_INFO>());
+    let words = buffer_bytes.div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0usize; words];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = HANDLE::default();
+        (*info).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+    }
+    let result = unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileRenameInfo,
+            info.cast(),
+            buffer_bytes as u32,
+        )
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let last = unsafe { GetLastError() };
+            if last == ERROR_ALREADY_EXISTS || last == ERROR_FILE_EXISTS {
+                Err(HandleRenameError::Collision)
+            } else {
+                Err(HandleRenameError::Failed(format!(
+                    "handle rename failed for {}: {error}",
+                    destination.display()
+                )))
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_open_journal_handle(
+    _file: &std::fs::File,
+    _destination: &Path,
+) -> Result<(), HandleRenameError> {
+    Err(HandleRenameError::Failed(
+        "secure journal quarantine is available only on Windows".into(),
+    ))
 }
 
 /// ジャーナルを書き出す (temp + rename の atomic 置換、空なら削除)。
@@ -2346,7 +2715,7 @@ mod tests {
         std::fs::write(dir.path().join(JOURNAL_FILE), b"broken json").unwrap();
         assert!(matches!(
             journal_load(dir.path()),
-            Err(JournalLoadError::Parse(_))
+            Err(JournalLoadError::Parse { .. })
         ));
         assert_eq!(
             std::fs::read(dir.path().join(JOURNAL_FILE)).unwrap(),
@@ -2374,6 +2743,294 @@ mod tests {
                 true,
             )]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_journal_quarantine_moves_exact_bytes_and_restart_sees_empty_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let original = b"invalid recovery bytes";
+        std::fs::write(&source, original).unwrap();
+        let control = JournalQuarantineControl::new();
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            original,
+            &control,
+            0x1111,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        let JournalQuarantineOutcome::Quarantined { path } = outcome else {
+            panic!("expected exact quarantine success");
+        };
+        let listing = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            std::fs::read(&path).unwrap_or_else(|error| panic!(
+                "returned destination missing: {} ({error}); source_exists={} listing={listing:?}",
+                path.display(),
+                source.exists()
+            )),
+            original
+        );
+        assert!(!source.exists());
+        assert!(
+            journal_load(dir.path()).unwrap().is_empty(),
+            "a restart sees no prior journal after the invalid object was moved aside"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quarantine_detects_changed_bytes_without_trusting_length_or_mtime() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{FILETIME, HANDLE};
+        use windows::Win32::Storage::FileSystem::{GetFileTime, SetFileTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let expected = b"bad-aaaa";
+        let changed = b"bad-bbbb";
+        std::fs::write(&source, expected).unwrap();
+        let input = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        let mut written = FILETIME::default();
+        unsafe {
+            GetFileTime(
+                HANDLE(input.as_raw_handle()),
+                None,
+                None,
+                Some(std::ptr::from_mut(&mut written)),
+            )
+        }
+        .unwrap();
+        std::fs::write(&source, changed).unwrap();
+        unsafe {
+            SetFileTime(
+                HANDLE(input.as_raw_handle()),
+                None,
+                None,
+                Some(std::ptr::from_ref(&written)),
+            )
+        }
+        .unwrap();
+        drop(input);
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            expected,
+            &JournalQuarantineControl::new(),
+            0x2222,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        assert_eq!(
+            outcome,
+            JournalQuarantineOutcome::Changed(JournalQuarantineChange::DifferentInvalidBytes)
+        );
+        assert_eq!(std::fs::read(source).unwrap(), changed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quarantine_requires_explicit_reload_for_missing_current_and_legacy_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let old_confirmation = b"old invalid bytes";
+        let current = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("old-current"),
+            PathBuf::from("new-current"),
+            false,
+        )];
+        std::fs::write(&source, serde_json::to_vec(&current).unwrap()).unwrap();
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            old_confirmation,
+            &JournalQuarantineControl::new(),
+            0x3333,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        assert_eq!(
+            outcome,
+            JournalQuarantineOutcome::Changed(JournalQuarantineChange::ValidCurrentOrLegacy)
+        );
+        assert!(source.exists());
+
+        let legacy = vec![(PathBuf::from("old-legacy"), PathBuf::from("new-legacy"))];
+        std::fs::write(&source, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            old_confirmation,
+            &JournalQuarantineControl::new(),
+            0x4444,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        assert_eq!(
+            outcome,
+            JournalQuarantineOutcome::Changed(JournalQuarantineChange::ValidCurrentOrLegacy)
+        );
+        assert!(source.exists());
+
+        std::fs::remove_file(&source).unwrap();
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            old_confirmation,
+            &JournalQuarantineControl::new(),
+            0x4545,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        assert_eq!(
+            outcome,
+            JournalQuarantineOutcome::Changed(JournalQuarantineChange::Missing)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quarantine_never_overwrites_collision_and_retries_same_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let original = b"broken";
+        std::fs::write(&source, original).unwrap();
+        let collision = quarantine_destination(&source, 0x5555, 0);
+        std::fs::write(&collision, b"keep collision").unwrap();
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            original,
+            &JournalQuarantineControl::new(),
+            0x5555,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        let JournalQuarantineOutcome::Quarantined { path } = outcome else {
+            panic!("second unique candidate should succeed");
+        };
+        assert_ne!(path, collision);
+        assert_eq!(std::fs::read(collision).unwrap(), b"keep collision");
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quarantine_read_rename_and_cancel_failures_preserve_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        std::fs::create_dir(&source).unwrap();
+        assert!(matches!(
+            quarantine_invalid_journal(dir.path(), b"broken", &JournalQuarantineControl::new()),
+            JournalQuarantineOutcome::Failed(_)
+        ));
+        std::fs::remove_dir(&source).unwrap();
+        std::fs::write(&source, b"broken").unwrap();
+
+        let cancelled = JournalQuarantineControl::new();
+        cancelled.cancel();
+        assert!(matches!(
+            quarantine_invalid_journal(dir.path(), b"broken", &cancelled),
+            JournalQuarantineOutcome::Cancelled
+        ));
+        assert_eq!(std::fs::read(&source).unwrap(), b"broken");
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            b"broken",
+            &JournalQuarantineControl::new(),
+            0x6666,
+            |_file, _destination| Err(HandleRenameError::Failed("injected rename failure".into())),
+            || {},
+            || {},
+        );
+        assert!(matches!(outcome, JournalQuarantineOutcome::Failed(_)));
+        assert_eq!(std::fs::read(&source).unwrap(), b"broken");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_before_rename_claim_prevents_the_handle_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let original = b"broken";
+        std::fs::write(&source, original).unwrap();
+        let control = JournalQuarantineControl::new();
+        let rename_called = std::cell::Cell::new(false);
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            original,
+            &control,
+            0x7777,
+            |_file, _destination| {
+                rename_called.set(true);
+                Err(HandleRenameError::Failed("must not run".into()))
+            },
+            || control.cancel(),
+            || {},
+        );
+        assert!(matches!(outcome, JournalQuarantineOutcome::Cancelled));
+        assert!(!rename_called.get());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_after_rename_claim_keeps_success_or_failure_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let original = b"broken";
+        std::fs::write(&source, original).unwrap();
+        let success_control = JournalQuarantineControl::new();
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            original,
+            &success_control,
+            0x8888,
+            |file, destination| {
+                success_control.cancel();
+                rename_open_journal_handle(file, destination)
+            },
+            || {},
+            || success_control.cancel(),
+        );
+        assert!(matches!(
+            outcome,
+            JournalQuarantineOutcome::Quarantined { .. }
+        ));
+        assert!(!source.exists());
+
+        std::fs::write(&source, original).unwrap();
+        let failure_control = JournalQuarantineControl::new();
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            original,
+            &failure_control,
+            0x9999,
+            |_file, _destination| {
+                failure_control.cancel();
+                Err(HandleRenameError::Failed("injected after claim".into()))
+            },
+            || {},
+            || {},
+        );
+        assert!(matches!(outcome, JournalQuarantineOutcome::Failed(_)));
+        assert_eq!(std::fs::read(source).unwrap(), original);
     }
 
     #[test]
