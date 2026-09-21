@@ -1,0 +1,170 @@
+# v4.0.0 コレクション 出荷前レビュー指摘の修正に対する再レビュー
+
+作成: 2026-09-21 / 統括: ClaudeCode Fable 5.1 / 監査: ClaudeCode Opus 5 ×5 (Codex 不使用)
+
+## 0. 対象と方法
+
+- **対象**: [初回レビュー](../README.md) の確定 (`bee2dbec2`) 以降に Codex が入れた修正のうち、コミット済みの
+  `e10669da2` (計装) / `540fdc216` `c12c84562` `53752314e` (ソート統一・シャッフル・比率 cache) /
+  `2a7167934` (journal 保護と rename scope) / `3d8f5d279` (一過性状態) / `8fbc4543d` (元の場所へ移動) /
+  `8dbad53e5` (Remote の媒体別位置) / `2814fb139` `1c0b470de` (上限・import 資源上限・prepare 再利用) /
+  `9a8a403af` (バックアップと一括書き出し) / `01e99b32c` `a5a1fc43b` (文書と sitemap)。HEAD は `a5a1fc43b`。
+- **対象外**: 作業ツリーの未コミット差分 (キー操作 `KeyAction` の追加 = 実装計画 §23.9。利用者の指示で Codex が
+  再調査中)。本レビューはこれらのファイルを読む際も `git show HEAD:<path>` のコミット済み状態を正とし、
+  未コミット差分には触れていない。スマートフォルダのナビゲーション修正 `6f720e42c` は初回レビューの指摘対象では
+  ないため、ソート周辺の hunk だけを見た。
+- **方法**: 読み取り専用のコード照合。**アプリは起動しておらず、cargo も実行していない。実行時観測はゼロ**で、
+  本書の「〜になる」はコード上の推定である。Fable は P1 / 主な P2 の根拠箇所を読み直し「再検証」欄に記した。
+- 個別報告書: [RA ソートとシャッフル](RA-sort-shuffle.md) / [RB メニュー・元の場所・journal](RB-menu-jump-journal.md) /
+  [RC 一過性状態と計装](RC-transient-instrumentation.md) / [RD 上限・再利用・Remote](RD-caps-reuse-remote.md) /
+  [RE バックアップ・一括書き出し・文書](RE-backup-export-docs.md)。監査エージェントの消費は合計約 171 万トークン。
+
+## 1. 総合判定
+
+**初回の出荷前必須 (P1 相当) は、文書の公開担当持ち越し分を除いてすべて解消または実質解消している。**
+修正の質は高く、Codex が初回指摘をそのまま実装せず設計を補正した箇所 (Manual で toolbar 全体をロックしない、
+未リリースでも試用 DB を保持する移行を入れる、明示的な元ファイル削除は参照解除の可否と独立に扱う、
+B-4 の fast path を利用者の仕様承認を得てから入れる) はいずれも妥当と判断した。
+
+一方、**修正によって新たに生じた出荷前必須が 2 件**ある。どちらも「保護を足した結果、別の失敗形が残った」型である。
+
+| ID | 件名 | Fable 再検証 |
+| --- | --- | --- |
+| **RE-1** | `collection.db` バックアップの成否が `eprintln!` のみで、GUI 起動ではどこにも残らない。spec とマニュアルの「失敗はログに記録」が偽になり、バックアップが一度も作られていない状態を検出できない | コード確定。`src/collection_store/db.rs:104, 128, 135`。`collection_store/` 全体で `logger::log` の呼び出しが 0 件 |
+| **RB-1** | `rename_migration_journal.json` が parse 不能だと、名前変更・**削除**・本棚のパス操作が毎セッション恒久的に拒否され、アプリ内に復旧手段が無い。コレクション未使用の利用者にも及ぶ | コード確定。`src/app.rs:32242-32258` で `Parse` も `RecoveryFailed` に入り、`admit_rename_migration_source_change` (`:32357-`) は再読込を繰り返すだけで退避経路が無い。表示は「復旧記録を読み取れないため変更を保留しました (parse failed: …英語…)。再確認中です」 |
+
+## 2. 元指摘の判定
+
+### 2.1 初回の出荷前必須
+
+| 元 ID | 内容 | 判定 | 補足 |
+| --- | --- | --- | --- |
+| A-1 | ソートが効かず global `settings.sort_order` を書き換える | **部分的** | ツールバー (ボタン / プルダウン)・表示メニュー・上部コレクションメニューは解消。**ゲームパッドのリングピッカー** (`src/app/gamepad_input.rs:4908-4915`) が同型のまま残る (RA-1、Fable 確定) |
+| A-2 | 列ヘッダソートが手動順を上書き | 解消 | Manual / Shuffle で列ヘッダ固定、open・履歴復帰・order 切替で解除。§1.244 (本の中の列ヘッダ) も同じ述語で解消 |
+| A-3 / C-11 | 更新中の右クリックで参照解除だけ消える | 解消 (C-11 は部分的) | 無効項目 + 理由で残る。「元ファイルをゴミ箱へ移動」を無効化しない Codex の判断は、メニュー owner を context + items generation に結び付けた変更と合わせて成立することを RB が確認 |
+| B-1 | import 確認画面の全行描画 | 部分的 | `show_rows` 仮想化、32 MiB / 50,000 行の資源上限は実装済み。件数の毎フレーム再計算だけ残る (RD-1、P3) |
+| M-1 | rename scope が常に Tree | 解消 | `RenamePending` が開始時の scope を所有 |
+| E-1〜E-7 | 文書・版表記 | 解消 / 公開担当へ持ち越し | 専用ページ 2 本新設、サイドバーは実測で 30 ページ × 30 リンク、sitemap up to date。README v4.0.0 節・版表記・`version_highlights` は公開担当 (ClaudeCode) の Phase 0〜1 作業として残る |
+
+### 2.2 初回の推奨 (P2) と利用者判断
+
+| 元 ID | 判定 | 補足 |
+| --- | --- | --- |
+| A-4 キー操作 | 対象外 (再調査中) | §5 参照 |
+| A-5 タイトル / A-9 無効理由 | 解消 | |
+| A-6 元の場所へ移動 | 解消 | root を成功まで退役しない、worker 走査、開始時と ready 時の二重 stamp 検証、履歴 1 本、失敗時保持を RB が確認 |
+| B-3 repaint 駆動 | 解消 | 各 pass で残り時間を再予約する形 |
+| B-4 / D-2 全件再 prepare | 解消 (仕様変更込み) | filesystem 側の O(N) は消えた。DB 側の全 entry 読みは残る (RD-5) |
+| B-6 計装 | 概ね解消 | 全 call site が `is_enabled()` ガード付き、path・名前は記録しない。起動時バックアップ区間だけ未計装 (RE-3) |
+| C-1 / C-2 / C-3 | 解消 (C-1 は部分的) | read 入口を編集可否から分離、`CollectionReadSlot` の単一 owner。再駆動に上限・backoff が無い (RC-2) |
+| M-2 journal | 部分的 | 旧 bytes の保護は成立。代わりに RB-1 の操作不能が生じた |
+| D-4 Remote 位置 | 解消 | protocol 58、媒体別 position、checked 補正 |
+| シャッフル / 上限 10,000 件 / バックアップ 2 段 | 解消 | シャッフルは単一 helper、移行は fail-closed、上限は actor transaction の `COUNT(*)` が正本。バックアップは RE-1 / RE-2 の指摘あり |
+| B-2 / B-5 / D-1 / D-3 / D-5 | 未対応 (延期済み) | 悪化なし |
+
+## 3. 出荷前に直すべき新規指摘
+
+### RE-1 (P1) バックアップの成否が GUI ではどこにも残らない
+
+- 根拠: `src/collection_store/db.rs:104, 128, 135` が `eprintln!`。本体は `windows_subsystem = "windows"` なので
+  標準エラーは捨てられる。tags.db は `logger::log`、settings.db は診断ログへ出している。
+- 影響: `docs/spec.md` と `manual/collections.html:161` の「失敗はログに記録して機能を維持」が公開時点で偽。
+  バックアップが一度も作られていない状態を利用者もサポートも検出できない。
+- 修正方向: tags.db と同じく `crate::logger::log` へ流す。成功時も世代数と所要時間を 1 行残すと RE-3 (計装) も兼ねられる。
+
+### RB-1 (P1) 壊れた journal による削除・名前変更の恒久拒否
+
+- 根拠: §1 の表のとおり。`JournalLoadError` は `Read` と `Parse` を型で区別している (`src/rename_key_migration.rs:234-267`) のに、
+  admission は両方を同じ `RecoveryFailed` に入れる。`start_delete_files` は全削除の単一入口なので影響はアプリ全体。
+  journal の temp ファイルは fsync されない (元 M-7) ため、切断された JSON は起こり得る。
+- 経緯: 利用者は 2026-09-20 に「読み取り失敗時に限り物理変更前に停止し理由を表示する」方針を承認している。
+  ただしその承認は一過性の読み取り失敗を想定した記述で、**決定的に読めないファイルで永久に止まる**場合の
+  出口は設計記録 (`docs/collection-migration-journal-recovery.md`) に無い。修正前は壊れた journal をログ 1 行で
+  破棄していたので、M-2 は「旧 bytes の保護」と「操作不能」を交換した形になっている。
+- 修正方向 (利用者判断が要る): `Read` (一過性。ロック・I/O) は現行どおり停止して再試行。`Parse` (決定的) は
+  settings.db の quarantine と同じく **別名へ退避** (bytes は保持) して空として続行し、退避した旨とファイル名を
+  日本語で 1 回通知する。あわせて表示文言から serde の英語を外す (RB-8)。
+
+## 4. 出荷前に直すことを推奨する新規指摘 (P2)
+
+| ID | 件名 | 根拠 | Fable 再検証 |
+| --- | --- | --- | --- |
+| RA-1 | ゲームパッドのリングピッカーのソート行が、コレクション直下でも global ソートを書き換えて保存し一覧は変わらない (A-1 の残り) | `src/app/gamepad_input.rs:4908-4915` | 確定 |
+| RA-2 | Manual / Shuffle で列ヘッダが無効なときの hover 理由が「本として表示中や閲覧履歴では…」と事実と違う。`details_header_sort_locked()` が bool で typed 理由を落としている | `src/ui_main.rs:15813-15818` | 未再検証 |
+| RA-3 | **表示順と読み順の乖離**。通常フォルダは列ヘッダ順に → / Home / End / 見開き / スライドショーも従うが、Standard のコレクション直下だけ一覧は列ヘッダ順・読みは installed 有効順になる。「1 行目を開いて → を押したのに 2 行目ではない項目が出る」 | `src/app.rs:52547-52581` | RA の引用を確認 |
+| RA-4 | RA-3 の切り替えを音楽ビュー HUD の前 / 次ファイルボタンだけ取りこぼし、キーボードと別の項目へ進む | `src/ui_music_panels.rs:344` | 確定 (`current_grid_order()` のまま) |
+| RC-1 | ナビゲーションの読み取りエラーが `CollectionStoreError` の英語表示をそのままトーストへ出す (`collection store is unavailable` 等)。日本語ヘルパーがあるのに未使用 | `src/app/collection_navigation.rs:984` ほか 3 箇所、`src/collection_store/model.rs:341-` | 確定 |
+| RC-2 | `Busy` / `Starting` の再駆動に上限・backoff・終端昇格が無く 20Hz で無期限。`collection_grid_root_materialize_active` は `window_visible` を見ないので背面・トレイでも続き得る。idle health の既定 `max_update_rate=10/s` とぶつかる。Remote 側だけが deadline + 再試行上限を持ち非対称 | `src/app/collection_grid.rs:10, 1274-1294` ほか | 未再検証 |
+| RD-5 | ページ送りごとに `load_collection` が全 entry 行を読み、Remote と共有する単一 actor を占有する。T3 の O(N) は filesystem から DB へ場所を変えて残る | `src/app/collection_navigation.rs:1009`、`src/collection_store/db.rs:148-153` | RD の引用を確認 |
+| RE-2 | バックアップ rotate の契機が settings / tags と違い**毎起動無条件**。誤って全削除した後に編集せず 10 回起動すると良い世代がすべて押し出される。`integrity_check` は構造破損しか見ない | `src/collection_store/db.rs` の起動経路 | 未再検証 |
+| RE-3 | 起動時の 3 パス (integrity_check / 全行読み / VACUUM INTO) に計装が無く、Ready の遅延を測れない。UI スレッドは止めない (actor 上) ことは確認済み | 同上 | 未再検証 |
+| RE-4 | バックアップの**戻し方**が未文書。WAL 運用なので `-wal` / `-shm` を残したまま bak1 を上書きする素朴な手順は危険 | `manual/collections.html` | 未再検証 |
+| RE-5 | コミット済みマニュアルが、未コミットのキー操作を実装済みとして説明している | `manual/collections.html:101-102`、`manual/shortcuts.html:180, 190-192` | 確定。§5 の再調査で操作の構成が変わるなら同時に直す |
+| RE-6 | `privacy.html` 英語版が未更新 (E-10 の半分) | `htdocs/mimageviewer/privacy.html:255-262` | 未再検証 |
+
+## 5. キー操作 (A-4) について (レビュー対象外・再調査への材料)
+
+- 利用者の指摘どおり、お気に入りには `GridOpenFavorite1`〜`20`、ドライブには `GridOpenDriveC`〜 があるのに、
+  コレクションには「固定したコレクション N を開く」に当たる操作が無い。未コミット差分が足しているのは
+  `GridAddToCollectionTarget` / `FsAddToCollectionTarget` / `VideoAddToCollectionTarget` の 3 つだけである。
+- **原因の一部は初回レビュー側にある**。元指摘 A-4 は「追加 / 開く / 管理の入口が無い」と書いたのに、
+  Fable が書いた実装計画 §23.9 は追加の 3 操作しか列挙しなかった。
+- 再調査時に突き合わせるとよい既存の型: お気に入りの番号付き open (`GridOpenFavorite1..20`)、本棚の
+  `GridOpenLocationBooksRoot`、リングショートカットの `AddToBook` / `OpenLocationBooksRoot`。コレクションで
+  同格にするなら「固定コレクション 1〜N を開く」「追加先のコレクションを開く」「管理画面を開く」
+  「現在のコレクションを並べ替える」が候補になる。固定列は stable UUID の順序付きリスト
+  (`settings.pinned_collections`) なので、番号は固定列の位置で解決できる。
+- 実装計画のファイルには Codex の未コミット差分があるため、本レビューでは §23.9 を編集していない。
+
+## 6. 利用者の判断が要る点
+
+| 論点 | 選択肢と推奨 |
+| --- | --- |
+| RB-1 壊れた journal | **推奨**: `Parse` は別名退避して空として続行 + 日本語で 1 回通知、`Read` は現行どおり停止。代案: 現行維持のうえ、表示に対処 (ファイルの場所と退避方法) を書く |
+| RE-2 バックアップの契機 | **推奨**: tags.db と同じく「そのセッション最初の書き込み前に 1 回」。編集しない起動では世代が動かない。代案: 毎起動のまま、前回と内容が同じなら回さない |
+| RA-3 表示順と読み順 | **推奨 (v4.0.0)**: 仕様は維持し、列ヘッダ所有中に「列の並びは一覧表示だけに使われます。送り・再生はコレクションの並び順に従います」を hover かヘッダ行に出し、マニュアルへ明記。代案: コレクション直下では列ヘッダソート自体を無効にする (列で眺める用途を失う) |
+| RC-2 再駆動の上限 | **推奨**: backoff (50ms → 200ms → 1s) と上限超過時の終端昇格を入れる。少なくとも出荷前に、コレクション root を開いた状態で idle health 4 シナリオを 1 回測る |
+| RD-5 DB 側の全件読み | **推奨**: v4.0.0 は計装済みの `actor_rtt` で 10,000 件時の実測を取り、許容なら v4.0.x で revision だけ返す軽量コマンドを足す |
+
+## 7. P3 (件名のみ。詳細は各報告書)
+
+- RA: 無効理由の二重導出 (RA-5)、コレクション削除時に残る比率 cache の UUID 行 (RA-6)、毎フレーム O(N) 走査 (RA-7)、
+  「手動」の hover 文言 (RA-8)、表示メニューの ✓ 表記混在 (RA-9)、経路ごとに違う選択済みガード (RA-10)、
+  列ヘッダ所有中に戻す導線が無い (RA-11)、`auto_fullscreen_image_folders` ON 時の列ソート喪失 (RA-12)、
+  `apply_sort_change_reload` の早期 return がバッチ変換の一覧再構築も飲む (RA-13)、**再 seed が実際に変わることの
+  テストが無い** (RA-14。`new_shuffle_seed` が定数でも全テストが通る)、Web の非網羅 default (RA-15)、計画の IPC 版記述 (RA-16)、
+  一括書き出しに seed が無い (RA-17)。
+- RB: 削除確認スキップ設定時に Unavailable 窓で無確認削除が成立し得る (RB-2)、メニュー編集で参照解除を隠せる (RB-3)、
+  「見つかりません」項目に「元の場所へ移動」が出ない (RB-4)、ドライブ直下・UNC 共有ルートで無効理由が誤り (RB-5)、
+  検索は全画面でも Jump が出るのにコレクションは一覧限定 (RB-6)、M-1 の capture 側に肯定テストが無い (RB-7)、
+  利用者向け文言に serde の英語 (RB-8)、終了時の blocking MessageBox と無期限 `recv()` (RB-9)、
+  `sidecar_restore_active` での無言 return (RB-10)、通常フォルダのメニュー世代回帰テストが無い (RB-11)。
+- RC: `AwaitingPdfPassword` が入力待ちなのに 60Hz (RC-3)、`can_edit` に残る read 経路 (RC-4)、同型が残る 6 箇所 (RC-5)、
+  `analyze_perf.py` に collection 集計が無い (RC-6)、terminal-error テストが真の末尾と区別できていない (RC-7〜9)。
+- RD: 全件容量拒否が成功通知になる (RD-2)、上限値のリテラル重複 (RD-3)、拒否される分まで分類 worker が stat (RD-4)、
+  pin stamp の過剰失効 (RD-6)、再利用キー不一致時の再駆動に上限なし (RD-7)、64 MiB 予算の単位が文書と違う (RD-8)、
+  再利用キー要素別テストの欠落 (RD-9)、install 時の HashMap clone (RD-10)。
+- RE: シャッフル書き出しで手動順が残らない点の注記、書き出しテキストの BOM (付ける方を推奨)、予約名 COM0 / LPT0、
+  index の綴り不統一、known-issues 掲載の判断、未リリースなのに「既存の上限超過一覧」を書いている、
+  tutorial の一般語衝突、計画 §23 の状態行。
+
+## 8. 公開担当 (ClaudeCode) へ引き継ぐもの
+
+[RE 報告書](RE-backup-export-docs.md) の「公開担当の作業リスト」9 項目と「README v4.0.0 下書きへの差分メモ」を参照。要点:
+
+- E 報告書 §A の下書き (6,859 バイト) にシャッフル / 上限 / バックアップと一括書き出し / 元の場所へ移動 /
+  Remote 位置修正 / Ctrl+G 進捗 / 索引再構築 / 類似本の上限 / スマートフォルダ移動修正を足すと 8,192 バイトを超える。
+  **`docs/release-body-4.0.0.md` の短縮版を作る前提**で Phase 0 を進める。
+- 全文索引の版が上がっている (`a73d18b48`) ため、初回起動時の再構築は更新履歴の「⚠️」対象になる可能性が高い。
+- `version_highlights` 4.0.0 節、版表記、製品ページのダウンロード欄は未着手のまま残っている (開発側が先走っていない)。
+
+## 9. 修正後に実機で確認してほしい追加シナリオ
+
+1. コレクション root を開いたままウィンドウを背面へ回す / トレイへ格納し、`check-idle-health.ps1` の
+   `static-background` と `tray-residency` を測る (RC-2)。
+2. 詳細表示の Standard コレクションで列ヘッダを押し、1 行目を開いて → を押す。進む先と表示の説明が一致する (RA-3)。
+   同じ状態で音声を開き、HUD の次ボタンとキーボードの送りが同じ項目へ進む (RA-4)。
+3. ゲームパッドのリングピッカーからコレクション直下でソートを変え、実フォルダへ戻ったとき global の並びが変わっていない (RA-1)。
+4. `%APPDATA%\mimageviewer\logs\mimageviewer.log` に、起動時のコレクションのバックアップ成否が 1 行残る (RE-1)。
+5. 使い捨ての data-dir で `rename_migration_journal.json` を壊れた JSON に置き換えて起動し、削除と名前変更が
+   どうなるか、表示が対処を示すかを確認する (RB-1。実データでは行わない)。

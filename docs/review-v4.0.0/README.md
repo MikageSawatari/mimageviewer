@@ -2,6 +2,8 @@
 
 作成: 2026-09-16 / 統括: ClaudeCode Fable 5.1 / 監査: ClaudeCode Opus 5 ×5 (Codex 不使用)
 
+> **2026-09-21 追記**: 本書の指摘に対する修正の再レビューは [re-review-20260921/README.md](re-review-20260921/README.md)。初回の出荷前必須は概ね解消、修正由来の新規 P1 が 2 件 (バックアップのログ欠落、壊れた journal による削除の恒久拒否)。
+
 ## 0. 体制と前提
 
 - **対象**: `master` HEAD `0a7139d27`。コレクション実装は `d8b61ff20` (Add persistent collection storage)
