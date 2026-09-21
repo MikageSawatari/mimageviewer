@@ -53,6 +53,12 @@ root の準備は worker が行い、source を開いて子へ入った後も ro
 viewer context が保持する。別の実フォルダへの明示移動は読込成功時だけその owner を退役し、
 取消・失敗では元の root を保つ。
 
+サムネイルの full-path cache key を使うかどうかの正本は
+`App::use_full_path_cache_keys()`。検索結果（Ctrl+S / Ctrl+G）、タグ一覧、閲覧履歴、
+レーティング一覧、コレクションに加え、synthetic view path の一覧（★固定等）と
+ドライブ/共有ルートを対象とする。要求生成・読出し・seed・欠損整理で同じ判定を共有し、
+一覧の種類ごとに basename/full-path の分岐を独自追加しない。
+
 通常グリッドの表示順は `Settings.grid_display_order` の 4 行割り当てで決まる。カテゴリは
 実フォルダ (`Folder`) / アーカイブ類 (`ZipFile` / `PdfFile` / `ConvertibleArchive`、ZIP 内では
 `ZipDir`) / 画像 (`Image` / `ZipImage` / `PdfPage` / `Stack`) / 動画・音声 (`Video` / `Audio`)。

@@ -2050,6 +2050,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `toolbar_section_new_row` | Vec\<ToolbarSectionId\> | [] | 「行頭に表示」(= その手前で改行) するセクションの集合 (v2.0.0) |
 | `toolbar_{cols,aspect,sort,favorites,smart_folders,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
 | `toolbar_collections_display` | ToolbarSectionDisplay | Buttons | コレクションの固定ショートカットの表示形式。追加先コンボと追加 / 開くは常時表示し、展開 / 折りたたみから選ぶ。旧Dropdown / UnknownはButtonsへ正規化する。管理は上部`コレクション`メニューから開く |
+| `pinned_collections` | Vec&lt;Uuid&gt; | 空 | ツールバーへ固定するコレクションのID。名前ではなく安定UUIDを保持し、コレクションの改名に追従する |
 | `toolbar_collection_target_id` | Option\<Uuid\> | None | コレクションツールバーの追加 / 開く対象。管理画面の選択と現在の Grid 表示先から独立して保存し、Ready catalog で削除済みと確定したときだけ先頭または None へ補正する |
 | `toolbar_{favorites,smart_folders,tags,bookshelf,collections}_collapsed` | bool | false | 折りたたみ表示時の畳み状態 (永続) |
 | `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するフィールド。固定 leaf 項目と空 top menu の表示 ON/OFF、top menu の表示順、固定 leaf 項目のメニュー内表示順を描画へ接続し、環境設定「表示 → 通常メニュー」から編集できる。登録済み一覧などの動的ブロックは既存位置を基準に表示する。「設定 → 環境設定…」は設定入口を失わないよう非表示指定を無視する。欠落時や空設定は既定メニュー構成として扱う |

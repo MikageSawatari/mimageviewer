@@ -155,6 +155,7 @@
       この全件書き出しでは既存ファイルを上書きしません。最後に <code>collections-index.txt</code> を作成して完了とします。
       途中で失敗・中止した場合は未完成のフォルダを案内し、成功として扱いません。
       書き出すのはパスの一覧で、元ファイルやタグ・評価などのバックアップではありません。
+      通常ソートやシャッフルで書き出した場合、その時の順番は残りますが、切り替える前の手動順やシャッフル設定まで復元するものではありません。
     </p>
     <p>
       名前と登録内容はアプリのデータフォルダ内の <code>collection.db</code> に自動保存されます。
@@ -169,14 +170,14 @@
     <ol>
       <li>タスクトレイの常駐分も含めて mImageViewer を完全に終了します。</li>
       <li>データフォルダにある <code>collection.db</code>、<code>collection.db-wal</code>、<code>collection.db-shm</code> を、別のフォルダへまとめて退避します。<code>-wal</code> や <code>-shm</code> が無い場合は、あるファイルだけを退避します。</li>
-      <li>戻したい <code>collection.db.bak1</code> 〜 <code>collection.db.bak10</code> の 1 つを<strong>コピー</strong>し、コピーの名前を <code>collection.db</code> に変えます。元のバックアップは残してください。</li>
+      <li>戻したい <code>collection.db.bak1</code> 〜 <code>collection.db.bak10</code> の 1 つを、元のデータフォルダへ <code>collection.db</code> という名前で<strong>コピー</strong>します。元のバックアップは残してください。</li>
       <li>mImageViewer を起動し、コレクションの内容を確認します。</li>
     </ol>
     <p class="note">通常版のデータフォルダは <code>%APPDATA%\mimageviewer\</code> です。ポータブル版や <code>--data-dir</code> を指定している場合は、そのデータフォルダで同じ手順を行います。アプリの動作中にファイルを入れ替えたり、古い <code>-wal</code> / <code>-shm</code> を残したままバックアップを上書きしたりしないでください。</p>
 
     <h2 id="limits">利用範囲</h2>
     <p>
-      1 コレクションには最大 10,000 件を新たに登録できます。すでに上限を超える古い一覧は読取・解除・並べ替えを続けられますが、追加はできません。
+      1 コレクションには最大 10,000 件を登録できます。
       コレクションの入れ子、ZIP・PDF 内の 1 ページだけの登録、参照先を付け替える画面はありません。
       <a href="remote.html">mIV Remote</a> からはコレクションを読み取り専用で閲覧できます。
       リモートで作成・編集・削除はできず、見える項目は公開が許された場所に限られます。
