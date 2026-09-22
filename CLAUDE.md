@@ -206,6 +206,12 @@ mimageviewer/
 │   ├── settings.rs          # 設定の読み書き API (Phase 3 で SQLite 経路に切替)
 │   ├── settings_db.rs       # 設定永続化 SQLite バックエンド (settings.db、bak1..bak10 世代、JSON migration、boot decision tree、quarantine)
 │   ├── catalog.rs           # SQLite サムネイルカタログ
+│   ├── collection_store/    # 名前付きコレクション（v4.0.0）の永続化。単一 actor + immutable snapshot。
+│   │                        # db/model/path/prepare/read_lease/runtime/text/export_all（collection.db、bak1..bak10）
+│   ├── app/collection_grid.rs      # コレクション直下の一覧（items 生成・並べ替え・右クリック）
+│   ├── app/collection_navigation.rs # コレクションの有効な順番でのページ送り・連続再生・親への復帰
+│   ├── ui_dialogs/collections.rs   # コレクション管理ウィンドウ（作成/固定/削除/並べ替え/取り込み/書き出し）
+│   ├── remote_ipc/persistent_collections.rs # mIV Remote への読み取り専用公開
 │   ├── folder_tree.rs       # フォルダツリー走査ヘルパー
 │   ├── folder_thumb_pins.rs # 親コンテナ（Folder/ZipFile/PdfFile）の代表サムネ手動ピン DB（v0.9.x、`#pin:` cache key suffix で identity を表現）
 │   ├── grid_item.rs         # GridItem（Folder/Image/Video/Audio/ZipFile/PdfFile/ZipImage/ZipDir/PdfPage/Stack）/ ThumbnailState 定義
@@ -1743,7 +1749,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    操作・既定の変更が無いリリースでは追記不要。追記したら
    `cargo test --lib version_highlights::` でテーブルがパースできることを確認。
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
-   - マニュアル左サイドバーを持つ通常ページ 29 ページでリンク一覧が揃っているか
+   - マニュアル左サイドバーを持つ通常ページ 30 ページでリンク一覧が揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
      ```bash
      cd htdocs/mimageviewer/manual && for f in *.html; do
@@ -1753,7 +1759,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
          | grep -E 'href="[a-z-]+\.html"' | wc -l
      done
      ```
-     各ページが 29 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
+     各ページが 30 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
      ページを増減したらこの数も更新する (数そのものより、**全ページが同じ数で揃っている**ことが要件)。
      `tut-*.html` など `sidebar-section` を持たないチュートリアルページは別レイアウトなので対象外。
      新規の通常ページを追加した際はサイドバーを持つ全ページを更新すること
