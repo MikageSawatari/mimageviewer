@@ -625,6 +625,7 @@ pub(crate) struct DetachedImageWindowFrozenPage {
     pub(crate) uv_rect: egui::Rect,
     pub(crate) clip_rect_norm: egui::Rect,
     pub(crate) rotation: crate::rotation_db::Rotation,
+    pub(crate) free_rotation: f32,
 }
 
 #[derive(Clone)]
@@ -8886,6 +8887,37 @@ impl FsHoldover {
             .find(|page| page.texture.source_texture_id() == texture_id)
     }
 
+    /// Display unit that still owns the pixels most recently painted over the live page.
+    /// Snapshot capture is read-only: it must not advance a Ready navigation target to
+    /// Presenting or clear a source-reload holdover merely because the window is being parked.
+    pub(crate) fn last_painted_display_unit_for_snapshot(
+        &self,
+        fs_idx: usize,
+    ) -> Option<&FsDisplayUnitHoldover> {
+        match self {
+            Self::FolderNavigation(previous) => previous.as_ref(),
+            Self::PresentationSwitch(unit) => Some(unit),
+            Self::NavigationSequence(sequence) => {
+                let previous_is_still_visible = sequence.displays_previous_unit()
+                    && !matches!(
+                        &sequence.target,
+                        FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                            phase: FsNavigationTargetPhase::Presenting { .. },
+                            ..
+                        })
+                    );
+                if previous_is_still_visible {
+                    sequence.previous.as_ref()
+                } else {
+                    None
+                }
+            }
+            Self::FinalEffectSourceReload(holdover) => {
+                (holdover.target_idx == fs_idx).then_some(&holdover.previous)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn primary_texture_id(&self) -> egui::TextureId {
         match self {
@@ -8936,6 +8968,26 @@ pub(crate) struct FsDisplayUnitHoldover {
     /// Capture-time layout projection. Folder/navigation changes must not
     /// re-derive this from the subsequently mounted context.
     pub(crate) singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement,
+    /// Exact typed placement of the painted layout when one was available at capture time.
+    pub(crate) layout_projection: FsDisplayUnitLayoutProjection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FsDisplayUnitLayoutProjection {
+    Canonical,
+    Painted(crate::displayed_image_transform::ResolvedDisplayPlacement),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CapturedPagedDisplayPresentation {
+    Live,
+    Holdover,
+}
+
+/// Ephemeral snapshot input joining the captured resources with their painted provenance.
+pub(crate) struct CapturedPagedDisplayUnit {
+    pub(crate) unit: FsDisplayUnitHoldover,
+    pub(crate) presentation: CapturedPagedDisplayPresentation,
 }
 
 #[derive(Clone)]
@@ -47772,7 +47824,42 @@ impl App {
             ));
             return None;
         }
-        let Some(texture) = self.resolve_fs_display_tex(idx, true) else {
+        // Select the actual last-painted paged presentation before looking up `items[idx]`.
+        // A navigation/source-reload holdover can still own the visible pixels after that index
+        // has been rebound (or while its replacement has no texture at all).
+        let paged_display_unit = self
+            .reading_flow
+            .is_paged()
+            .then(|| self.capture_paged_display_unit_for_snapshot(idx))
+            .flatten();
+        let last_painted_is_holdover = paged_display_unit.as_ref().is_some_and(|captured| {
+            matches!(
+                captured.presentation,
+                CapturedPagedDisplayPresentation::Holdover
+            )
+        });
+        let captured_primary = paged_display_unit
+            .as_ref()
+            .and_then(|captured| {
+                captured
+                    .unit
+                    .pages
+                    .iter()
+                    .find(|page| page.idx() == idx)
+                    .or_else(|| captured.unit.pages.first())
+            })
+            .map(|page| (page.texture.clone(), page.rotation));
+        let resolved_current = if captured_primary.is_none() {
+            self.resolve_fs_display_tex(idx, true).map(|texture| {
+                (
+                    self.fullscreen_paint_resource_for_texture(idx, texture),
+                    self.get_rotation(idx),
+                )
+            })
+        } else {
+            None
+        };
+        let Some((base_texture, rotation)) = captured_primary.or(resolved_current) else {
             self.log_detached_image_window_debug(format!(
                 "build_active_snapshot_failed reason=no_display_texture idx={idx} \
                  window_id={:?} current_pending={} pending={} \
@@ -47792,14 +47879,18 @@ impl App {
             ));
             return None;
         };
+        let texture = base_texture.source_texture().clone();
         #[cfg(feature = "test-script")]
-        let test_script_content_proof = self.test_script_content_proof(
-            idx,
-            &texture,
-            self.test_script_paint_source_kind(idx, &texture),
-        );
+        let test_script_content_proof = (!last_painted_is_holdover)
+            .then(|| {
+                self.test_script_content_proof(
+                    idx,
+                    &texture,
+                    self.test_script_paint_source_kind(idx, &texture),
+                )
+            })
+            .flatten();
         let texture_size = texture.size_vec2();
-        let rotation = self.get_rotation(idx);
         let zoom_pan = self.fs_zoom_pan();
         let free_rotation = self.fs_free_rotation;
         let id = self.ensure_detached_viewer_window_id();
@@ -47807,6 +47898,9 @@ impl App {
         let pixels_per_point = ctx
             .map(egui::Context::pixels_per_point)
             .unwrap_or(self.detached_viewer_last_pixels_per_point);
+        // Passive paged rendering consumes the same capture-time display unit as the live
+        // holdover paths. In particular, this retains canonical singleton/Z placement and the
+        // last-painted resource provenance instead of rebuilding either from current settings.
         // 貼り先と倍率は layout が対で返す。ここで `min(rect / tex)` を組み直すと、
         // **既に物理ピクセルへ寄せた矩形**からの逆算になり、軸ごとの floor の分だけ
         // 倍率が小さくなる。リサンプラの出力が子ウィンドウの貼り先より 1〜2 物理
@@ -47860,22 +47954,33 @@ impl App {
                 image_rect,
             )
             .and_then(|transform| transform.visible_region_request(snapshot_rect));
-        let texture = self.fullscreen_paint_resource_for_texture(idx, texture);
-        let texture = self.prepare_fullscreen_paint_resource(
-            &texture,
-            logical_scale,
-            pixels_per_point,
-            visible_region,
-        );
+        let texture = if last_painted_is_holdover {
+            // The visible held unit is baked below with its captured per-page filter and visible
+            // source region. Keep the snapshot backstop tied to the same old resource as well;
+            // resolving it through the replacement item's filter would forge provenance.
+            base_texture.clone()
+        } else {
+            self.prepare_fullscreen_paint_resource(
+                &base_texture,
+                logical_scale,
+                pixels_per_point,
+                visible_region,
+            )
+        };
         #[cfg(feature = "test-script")]
         let texture = match test_script_content_proof {
             Some(proof) => texture.with_test_script_content_proof(proof),
             None => texture,
         };
         let image_underlay = self.detached_image_underlay_for_snapshot(ctx);
-        let frozen_continuous_pages = ctx
-            .map(|ctx| self.detached_frozen_pages_for_snapshot(ctx, id, idx, placement))
-            .unwrap_or_default();
+        let frozen_continuous_pages = self.detached_frozen_pages_for_snapshot(
+            ctx,
+            id,
+            idx,
+            placement,
+            pixels_per_point,
+            paged_display_unit.as_ref(),
+        );
         let reopen_descriptor = self.parked_still_reopen_descriptor_for_idx(idx);
         let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
         self.log_detached_image_window_debug(format!(

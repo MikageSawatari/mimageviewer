@@ -764,11 +764,26 @@ viewer cache / AI / 先読み / スライドショーは単一 active session �
 detached bundle 間で保持・確定しない方針とし、always-new / ピン留めの連動なし窓では
 消しゴム・補正レイヤー・隠蔽加工・テキスト注釈・切り取り等の編集機能を起動できない。
 通常 F12 の linked detached viewer では従来どおり編集できるが、編集中はピン留めできない。
-passive snapshot は単ページでは 1 枚の texture を保持する。縦連結読みと見開き表示では、
-pause 時点で可視だった各ページの `TextureHandle` と正規化済み表示矩形を frozen page list に
-保持し、passive window 側で同じレイアウトを再描画する。見開きの片側がまだ未デコードで
-texture を取得できない場合は multi-page frozen を作らず、従来の現在ページ 1 枚 snapshot へ
-フォールバックする。
+passive snapshot の paged 経路は、pause 時点で最後に実際にpaintされたpresentationをtypedに選ぶ。
+navigation / source-reload holdoverがlive pageの後にoverlayされていれば、その旧resource unitをcloneし、
+index再利用後のcurrent itemを取り直さない。holdoverが無ければcurrent live unitをcaptureする。選択は
+read-onlyで、navigationの`Ready` phaseを進めずholdoverもclearしない。resource unitへ、painted
+`fullscreen_page_layout`（無ければcanonical composition）のexact `ResolvedDisplayPlacement`を合成した
+`CapturedPagedDisplayUnit`が唯一のbake入力である。
+
+unitはtexture、保存回転、canonical layout size、source size、trim/content bbox、post filter、page /
+occurrenceとtyped placementを一体で保持するため、passive側でcurrent item、設定、book preference、縦横を
+読み直さない。2 page見開きは2件、`Left / Right`のendpoint singleton、Z / ZipPla single、holdover singleは
+1件のfrozen pageとして、liveと同じ`DisplayedImageTransform`、fit / scale limit、物理pixel量子化済みgap、
+zoom / pan、自由回転、visible-source UV / clip規則で焼き込む。Zはactive / aimingとfactor / zoom-pan /
+singleton side/gapをcapture-time placementから取り、active doubleだけgapをzoom倍、fit scaleはzoom前のgap
+から求める。page / occurrence / requestはsingletonでも1件のままである。通常liveの`Center`（設定OFF、
+本別Center、横長 / 非pairable境界を含む）は従来のdirect-single snapshotを維持し、既定値のgeometryと
+丸めを変えない。paged bakeは既に確定したplacementと`pixels_per_point`だけを受ける純境界なので、parkの
+snapshot captureがegui `Context`を渡さない場合も同じ結果になる。縦連結読みはpause時点で可視だった
+各ページの`TextureHandle`と正規化済み表示矩形をfrozen page listに保持し、layout計算にegui `Context`が
+必要なため`Some(ctx)`のcapture時だけ従来どおり作る。必要なpage textureを取得できない場合はmulti-page
+frozenを作らず、従来の現在ページ1枚snapshotへフォールバックする。
 CUT 後、linked window は passive 化しない。設定 OFF の F12 linked window は最大 1 枚で
 メイン一覧に追従し、別の independent / ParkedLive window を Active 化する場合は閉じる。
 設定 `detached_viewer_open_images_in_window` が ON のときだけ、画像 / ZIP画像 / PDFページを

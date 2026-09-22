@@ -1634,6 +1634,7 @@ fn spread_cache_does_not_cross_viewer_bundles() {
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
     FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
         singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement::Center,
+        layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
         pages: vec![FsDisplayUnitHoldoverPage {
             occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(page_idx, page_idx),
             layout_size: texture.size_vec2(),
@@ -34207,6 +34208,7 @@ mod pipeline_cache_refactor_tests {
             previous: FsDisplayUnitHoldover {
                 singleton_placement:
                     crate::displayed_image_transform::SingletonSpreadPlacement::Center,
+                layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
                 pages: vec![FsDisplayUnitHoldoverPage {
                     occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(
                         page_idx, target_idx,
@@ -57533,6 +57535,888 @@ mod still_window_mode_key_tests {
                 != snapshot.frozen_continuous_pages[1].paint_rect_norm,
             "left/right spread pages must keep separate frozen layout rects"
         );
+    }
+
+    fn configure_detached_endpoint_singleton(
+        app: &mut App,
+        ctx: &egui::Context,
+        mode: crate::settings::SpreadMode,
+        window_id: u64,
+        label: &str,
+        size: [usize; 2],
+        preference: crate::settings::SingletonSpreadPlacementPreference,
+    ) {
+        app.current_folder = Some(PathBuf::from(r"C:\books\singleton"));
+        app.top_level_grid_view
+            .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+        app.items = vec![GridItem::Image(PathBuf::from(format!(
+            r"C:\books\singleton\{label}.png"
+        )))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.details_order = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.spread_mode = mode;
+        app.singleton_spread_placement_preference = preference;
+        app.record_page_dims_for_spread(0, (size[0] as u32, size[1] as u32));
+        let pixels = egui::ColorImage::filled(size, egui::Color32::LIGHT_BLUE);
+        let texture = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels: std::sync::Arc::new(pixels),
+                source_dims: Some(size),
+                load_seq: window_id,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+    }
+
+    /// The passive page is baked from the capture-time typed display unit. This exercises the
+    /// complete mount -> park -> deposit -> remount lifecycle which exposed the real-device bug:
+    /// the bundle preference survived, but the old Double-only frozen producer dropped the
+    /// endpoint singleton and the passive direct-single fallback centered it.
+    #[test]
+    fn endpoint_singleton_side_survives_mount_park_deposit_and_remount() {
+        for (case, mode, expected) in [
+            (
+                "left",
+                crate::settings::SpreadMode::Ltr,
+                crate::displayed_image_transform::SingletonSpreadPlacement::Left,
+            ),
+            (
+                "right",
+                crate::settings::SpreadMode::Rtl,
+                crate::displayed_image_transform::SingletonSpreadPlacement::Right,
+            ),
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            app.settings.detached_viewer_open_images_in_window = true;
+            app.settings.singleton_spread_placement_enabled = true;
+            app.settings.detached_viewer_window_placement =
+                Some(crate::settings::DetachedViewerWindowPlacement {
+                    x: 80.0,
+                    y: 80.0,
+                    w: 960.0,
+                    h: 720.0,
+                    maximized: false,
+                });
+
+            let sibling_id = app.build_window_context_for_test(200, |sibling| {
+                sibling.singleton_spread_placement_preference =
+                    crate::settings::SingletonSpreadPlacementPreference::Center;
+            });
+            let context_id =
+                app.build_active_context_for_test(Some(100), DetachedSource::Book, |active| {
+                    configure_detached_endpoint_singleton(
+                        active,
+                        &ctx,
+                        mode,
+                        100,
+                        case,
+                        [600, 900],
+                        crate::settings::SingletonSpreadPlacementPreference::Place,
+                    );
+                });
+
+            assert_eq!(
+                app.viewer_context_residence(context_id),
+                ContextResidence::AtRest,
+                "the active detached owner starts deposited and is mounted transactionally"
+            );
+            let (preference_before, placement_before, page_count_before, contextless_snapshot) =
+                app.with_active_viewer_context(|mounted| {
+                    let unit = mounted
+                        .capture_fs_display_unit(0)
+                        .expect("canonical endpoint singleton must be capturable after mount");
+                    let snapshot = mounted
+                        .build_active_detached_image_window_snapshot(None)
+                        .expect("paged snapshot must not require an egui Context");
+                    (
+                        mounted.singleton_spread_placement_preference,
+                        unit.singleton_placement,
+                        unit.pages.len(),
+                        snapshot,
+                    )
+                })
+                .expect("active context must mount");
+            assert_eq!(
+                preference_before,
+                crate::settings::SingletonSpreadPlacementPreference::Place
+            );
+            assert_eq!(placement_before, expected);
+            assert_eq!(page_count_before, 1);
+            assert_eq!(contextless_snapshot.frozen_continuous_pages.len(), 1);
+            let contextless_page = &contextless_snapshot.frozen_continuous_pages[0];
+            match expected {
+                crate::displayed_image_transform::SingletonSpreadPlacement::Left => assert!(
+                    contextless_page.paint_rect_norm.center().x < 0.5,
+                    "left singleton was centered in the Context-free paged bake: {:?}",
+                    contextless_page.paint_rect_norm
+                ),
+                crate::displayed_image_transform::SingletonSpreadPlacement::Right => assert!(
+                    contextless_page.paint_rect_norm.center().x > 0.5,
+                    "right singleton was centered in the Context-free paged bake: {:?}",
+                    contextless_page.paint_rect_norm
+                ),
+                crate::displayed_image_transform::SingletonSpreadPlacement::Center => {
+                    unreachable!()
+                }
+            }
+            assert_eq!(
+                app.viewer_context_residence(context_id),
+                ContextResidence::AtRest,
+                "mount completion must deposit the same bundle"
+            );
+
+            assert!(app.pause_current_active_viewer_context(&ctx));
+            assert_eq!(
+                app.detached_window_state(100),
+                Some(DetachedWindowState::Parked),
+                "pause commits the passive Parked state"
+            );
+            assert_eq!(
+                app.viewer_context_residence(context_id),
+                ContextResidence::AtRest,
+                "park snapshot creation must deposit the mounted bundle"
+            );
+            let passive = app
+                .detached_image_windows
+                .iter()
+                .find(|snapshot| snapshot.id == 100)
+                .expect("parked window publishes a passive snapshot");
+            assert_eq!(passive.frozen_continuous_pages.len(), 1);
+            let passive_page = &passive.frozen_continuous_pages[0];
+            match expected {
+                crate::displayed_image_transform::SingletonSpreadPlacement::Left => {
+                    assert!(passive_page.paint_rect_norm.center().x < 0.5)
+                }
+                crate::displayed_image_transform::SingletonSpreadPlacement::Right => {
+                    assert!(passive_page.paint_rect_norm.center().x > 0.5)
+                }
+                crate::displayed_image_transform::SingletonSpreadPlacement::Center => {
+                    unreachable!()
+                }
+            }
+            app.with_window_viewer_context(100, |parked| {
+                assert_eq!(
+                    parked.singleton_spread_placement_preference,
+                    crate::settings::SingletonSpreadPlacementPreference::Place
+                );
+            })
+            .expect("parked bundle stays addressable");
+            app.with_viewer_context(sibling_id, |sibling| {
+                assert_eq!(
+                    sibling.singleton_spread_placement_preference,
+                    crate::settings::SingletonSpreadPlacementPreference::Center,
+                    "mount/park/deposit of one window must not mutate its sibling"
+                );
+            })
+            .expect("sibling remains independently mountable");
+
+            assert!(app.activate_detached_image_window_snapshot(&ctx, 100));
+            let (preference_after, placement_after, page_count_after) = app
+                .with_active_viewer_context(|remounted| {
+                    let unit = remounted
+                        .capture_fs_display_unit(0)
+                        .expect("remounted endpoint singleton must remain canonical");
+                    (
+                        remounted.singleton_spread_placement_preference,
+                        unit.singleton_placement,
+                        unit.pages.len(),
+                    )
+                })
+                .expect("activated context must remount");
+            assert_eq!(preference_after, preference_before);
+            assert_eq!(placement_after, placement_before);
+            assert_eq!(page_count_after, page_count_before);
+            app.with_viewer_context(sibling_id, |sibling| {
+                assert_eq!(
+                    sibling.singleton_spread_placement_preference,
+                    crate::settings::SingletonSpreadPlacementPreference::Center,
+                    "activation/remount must leave the sibling preference untouched"
+                );
+            })
+            .expect("sibling remains independently mountable after remount");
+        }
+    }
+
+    #[test]
+    fn centered_singletons_keep_the_direct_passive_snapshot_path() {
+        for (case, global_enabled, preference, size) in [
+            (
+                "setting-off",
+                false,
+                crate::settings::SingletonSpreadPlacementPreference::FollowGlobal,
+                [600, 900],
+            ),
+            (
+                "book-center",
+                true,
+                crate::settings::SingletonSpreadPlacementPreference::Center,
+                [600, 900],
+            ),
+            (
+                "landscape",
+                true,
+                crate::settings::SingletonSpreadPlacementPreference::Place,
+                [900, 600],
+            ),
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            app.settings.detached_viewer_open_images_in_window = true;
+            app.settings.singleton_spread_placement_enabled = global_enabled;
+            app.settings.detached_viewer_window_placement =
+                Some(crate::settings::DetachedViewerWindowPlacement {
+                    x: 80.0,
+                    y: 80.0,
+                    w: 960.0,
+                    h: 720.0,
+                    maximized: false,
+                });
+            configure_detached_endpoint_singleton(
+                &mut app,
+                &ctx,
+                crate::settings::SpreadMode::Ltr,
+                300,
+                case,
+                size,
+                preference,
+            );
+            app.set_detached_window_binding_for_test(Some(300));
+            app.begin_mounted_detached_session_for_test(300, DetachedSource::Book);
+
+            let unit = app.capture_fs_display_unit(0).expect("single page capture");
+            assert_eq!(
+                unit.singleton_placement,
+                crate::displayed_image_transform::SingletonSpreadPlacement::Center,
+                "{case}"
+            );
+            let snapshot = app
+                .build_active_detached_image_window_snapshot(None)
+                .expect("centered singleton snapshot");
+            assert!(
+                snapshot.frozen_continuous_pages.is_empty(),
+                "{case}: Center must preserve the existing direct-single path"
+            );
+        }
+    }
+
+    #[test]
+    fn detached_singleton_snapshot_matches_live_two_slot_geometry() {
+        for (case, mode, expected) in [
+            (
+                "left",
+                crate::settings::SpreadMode::Ltr,
+                egui::Rect::from_min_max(egui::pos2(0.0, -1.0 / 6.0), egui::pos2(0.5, 7.0 / 6.0)),
+            ),
+            (
+                "right",
+                crate::settings::SpreadMode::Rtl,
+                egui::Rect::from_min_max(egui::pos2(0.5, -1.0 / 6.0), egui::pos2(1.0, 7.0 / 6.0)),
+            ),
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            app.settings.detached_viewer_open_images_in_window = true;
+            app.settings.singleton_spread_placement_enabled = true;
+            app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
+            app.settings.spread_page_gap_px = 0;
+            app.settings.detached_viewer_window_placement =
+                Some(crate::settings::DetachedViewerWindowPlacement {
+                    x: 80.0,
+                    y: 80.0,
+                    w: 960.0,
+                    h: 720.0,
+                    maximized: false,
+                });
+            configure_detached_endpoint_singleton(
+                &mut app,
+                &ctx,
+                mode,
+                301,
+                case,
+                [1, 2],
+                crate::settings::SingletonSpreadPlacementPreference::Place,
+            );
+            app.set_detached_window_binding_for_test(Some(301));
+            app.begin_mounted_detached_session_for_test(301, DetachedSource::Book);
+
+            let snapshot = app
+                .build_active_detached_image_window_snapshot(None)
+                .expect("context-free singleton snapshot");
+            assert_eq!(snapshot.frozen_continuous_pages.len(), 1, "{case}");
+            let page = &snapshot.frozen_continuous_pages[0];
+            assert_rect_close(page.paint_rect_norm, expected);
+            assert_rect_close(
+                page.clip_rect_norm,
+                expected.intersect(egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                )),
+            );
+        }
+    }
+
+    #[test]
+    fn zippla_singleton_projection_survives_mount_park_deposit_and_remount() {
+        use crate::displayed_image_transform::{
+            DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
+            FullscreenPageLayoutKind, RectPixelFit, ResolvedDisplayPlacement,
+            SingletonSpreadPlacement,
+        };
+
+        for (case, active, mode, side, zoom_pan) in [
+            (
+                "active-left",
+                true,
+                crate::settings::SpreadMode::Ltr,
+                SingletonSpreadPlacement::Left,
+                Some((1.8, egui::vec2(35.0, -20.0))),
+            ),
+            (
+                "aiming-right",
+                false,
+                crate::settings::SpreadMode::Rtl,
+                SingletonSpreadPlacement::Right,
+                None,
+            ),
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let window_id = if active { 311 } else { 312 };
+            let window_size = egui::vec2(960.0, 720.0);
+            app.settings.detached_viewer_open_images_in_window = true;
+            app.settings.singleton_spread_placement_enabled = true;
+            app.settings.spread_page_gap_px = 18;
+            app.settings.detached_viewer_window_placement =
+                Some(crate::settings::DetachedViewerWindowPlacement {
+                    x: 80.0,
+                    y: 80.0,
+                    w: window_size.x,
+                    h: window_size.y,
+                    maximized: false,
+                });
+
+            let placement = ResolvedDisplayPlacement::Z {
+                active,
+                factor: 2.0,
+                zoom_pan,
+                singleton_side: side,
+                singleton_gap: 18.0,
+            };
+            let expected = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
+                page_idx: 0,
+                viewport_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, window_size),
+                source_size: egui::vec2(600.0, 900.0),
+                texture_size: egui::vec2(600.0, 900.0),
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement,
+            })
+            .expect("Z singleton transform");
+            let context_id = app.build_active_context_for_test(
+                Some(window_id),
+                DetachedSource::Book,
+                |mounted| {
+                    configure_detached_endpoint_singleton(
+                        mounted,
+                        &ctx,
+                        mode,
+                        window_id,
+                        case,
+                        [600, 900],
+                        crate::settings::SingletonSpreadPlacementPreference::Place,
+                    );
+                    mounted.fs_zoom_active = active;
+                    mounted.fs_zoom_aiming = !active;
+                    mounted.fs_zoom_factor = 2.0;
+                    mounted
+                        .fullscreen_page_layout
+                        .begin(FullscreenPageLayoutKind::Single);
+                    mounted.fullscreen_page_layout.push_occurrence(
+                        expected,
+                        crate::ui_fullscreen::SpreadPageOccurrence::navigation(0, 0),
+                    );
+                },
+            );
+
+            let captured_before = app
+                .with_active_viewer_context(|mounted| {
+                    mounted.capture_paged_display_unit_for_snapshot(0)
+                })
+                .flatten()
+                .expect("mounted Z projection");
+            assert!(matches!(
+                captured_before.unit.layout_projection,
+                crate::app::FsDisplayUnitLayoutProjection::Painted(actual)
+                    if actual == placement
+            ));
+            assert_eq!(captured_before.unit.pages.len(), 1);
+
+            assert!(app.pause_current_active_viewer_context(&ctx), "{case}");
+            assert_eq!(
+                app.viewer_context_residence(context_id),
+                ContextResidence::AtRest,
+                "{case}: park must deposit the mounted bundle"
+            );
+            assert_eq!(
+                app.detached_window_state(window_id),
+                Some(DetachedWindowState::Parked),
+                "{case}"
+            );
+            let passive = app
+                .detached_image_windows
+                .iter()
+                .find(|snapshot| snapshot.id == window_id)
+                .expect("park publishes passive Z snapshot");
+            assert_eq!(passive.frozen_continuous_pages.len(), 1, "{case}");
+            let expected_norm = egui::Rect::from_min_max(
+                egui::pos2(
+                    expected.full_image_rect.min.x / window_size.x,
+                    expected.full_image_rect.min.y / window_size.y,
+                ),
+                egui::pos2(
+                    expected.full_image_rect.max.x / window_size.x,
+                    expected.full_image_rect.max.y / window_size.y,
+                ),
+            );
+            assert_rect_close(
+                passive.frozen_continuous_pages[0].paint_rect_norm,
+                expected_norm,
+            );
+
+            app.with_window_viewer_context(window_id, |parked| {
+                assert_eq!(
+                    parked.singleton_spread_placement_preference,
+                    crate::settings::SingletonSpreadPlacementPreference::Place
+                );
+                assert_eq!(parked.fs_zoom_active, active);
+                assert_eq!(parked.fs_zoom_aiming, !active);
+                assert_eq!(
+                    parked
+                        .fullscreen_page_layout
+                        .single_page()
+                        .expect("parked painted page")
+                        .transform
+                        .placement,
+                    placement
+                );
+            })
+            .expect("parked bundle");
+
+            assert!(app.activate_detached_image_window_snapshot(&ctx, window_id));
+            app.with_active_viewer_context(|remounted| {
+                assert_eq!(
+                    remounted.singleton_spread_placement_preference,
+                    crate::settings::SingletonSpreadPlacementPreference::Place
+                );
+                assert_eq!(remounted.fs_zoom_active, active);
+                assert_eq!(remounted.fs_zoom_aiming, !active);
+                let captured = remounted
+                    .capture_paged_display_unit_for_snapshot(0)
+                    .expect("remounted Z projection");
+                assert_eq!(captured.unit.pages.len(), 1);
+                assert!(matches!(
+                    captured.unit.layout_projection,
+                    crate::app::FsDisplayUnitLayoutProjection::Painted(actual)
+                        if actual == placement
+                ));
+            })
+            .expect("Z bundle remounted");
+        }
+    }
+
+    #[test]
+    fn zippla_spread_snapshot_matches_live_zoom_fit_and_scaled_gap() {
+        use crate::displayed_image_transform::{
+            DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
+            FullscreenPageLayoutKind, RectPixelFit, ResolvedDisplayPlacement,
+            SingletonSpreadPlacement,
+        };
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_size = egui::vec2(960.0, 720.0);
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
+        app.settings.spread_page_gap_px = 20;
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 80.0,
+                y: 80.0,
+                w: window_size.x,
+                h: window_size.y,
+                maximized: false,
+            });
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        app.set_detached_window_binding_for_test(Some(313));
+        app.begin_mounted_detached_session_for_test(313, DetachedSource::Book);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        let left = push_image(&mut app, r"C:\pics\z-spread-left.jpg");
+        let right = push_image(&mut app, r"C:\pics\z-spread-right.jpg");
+        for (idx, label) in [(left, "z_spread_left"), (right, "z_spread_right")] {
+            let pixels = egui::ColorImage::filled([100, 200], egui::Color32::LIGHT_BLUE);
+            let tex = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels: std::sync::Arc::new(pixels),
+                    source_dims: Some([100, 200]),
+                    load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+        }
+        app.fullscreen_idx = Some(left);
+        app.fs_zoom_active = true;
+        app.fs_zoom_factor = 1.5;
+        let placement = ResolvedDisplayPlacement::Z {
+            active: true,
+            factor: 1.5,
+            zoom_pan: Some((1.5, egui::vec2(30.0, -10.0))),
+            singleton_side: SingletonSpreadPlacement::Center,
+            singleton_gap: 0.0,
+        };
+        let left_rect =
+            egui::Rect::from_min_max(egui::pos2(-210.0, -355.0), egui::pos2(495.0, 1055.0));
+        let right_rect =
+            egui::Rect::from_min_max(egui::pos2(525.0, -355.0), egui::pos2(1230.0, 1055.0));
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Spread);
+        for (idx, rect) in [(left, left_rect), (right, right_rect)] {
+            let transform = DisplayedImageTransform::from_resolved_rect(
+                DisplayedImageTransformInput {
+                    pixel_fit: RectPixelFit::Texels,
+                    page_idx: idx,
+                    viewport_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, window_size),
+                    source_size: egui::vec2(100.0, 200.0),
+                    texture_size: egui::vec2(100.0, 200.0),
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox: None,
+                    fit_mode: crate::settings::FullscreenFitMode::Width,
+                    fit_scale_limits: FullscreenFitScaleLimits::default(),
+                    pixels_per_point: 1.0,
+                    placement,
+                },
+                rect,
+            )
+            .expect("live Z spread page");
+            app.fullscreen_page_layout.push_occurrence(
+                transform,
+                crate::ui_fullscreen::SpreadPageOccurrence::navigation(idx, left),
+            );
+        }
+
+        let captured = app
+            .capture_paged_display_unit_for_snapshot(left)
+            .expect("Z spread capture");
+        assert!(matches!(
+            captured.unit.layout_projection,
+            crate::app::FsDisplayUnitLayoutProjection::Painted(actual)
+                if actual == placement
+        ));
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(None)
+            .expect("context-free Z spread snapshot");
+        assert_eq!(snapshot.frozen_continuous_pages.len(), 2);
+        let denormalize = |rect: egui::Rect| {
+            egui::Rect::from_min_max(
+                egui::pos2(rect.min.x * window_size.x, rect.min.y * window_size.y),
+                egui::pos2(rect.max.x * window_size.x, rect.max.y * window_size.y),
+            )
+        };
+        let frozen_left = denormalize(snapshot.frozen_continuous_pages[0].paint_rect_norm);
+        let frozen_right = denormalize(snapshot.frozen_continuous_pages[1].paint_rect_norm);
+        assert_rect_close(frozen_left, left_rect);
+        assert_rect_close(frozen_right, right_rect);
+        assert!((frozen_left.width() / 1.5 - 470.0).abs() < 0.001);
+        assert!((frozen_right.left() - frozen_left.right() - 30.0).abs() < 0.001);
+        assert!((((frozen_left.left() + frozen_right.right()) * 0.5) - 510.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parked_snapshot_uses_last_painted_holdover_resource_after_index_reuse() {
+        use crate::displayed_image_transform::{
+            DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
+            FullscreenPageLayoutKind, RectPixelFit, ResolvedDisplayPlacement,
+            SingletonSpreadPlacement,
+        };
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 314;
+        let old_pixels = egui::ColorImage::filled([400, 800], egui::Color32::LIGHT_RED);
+        let old_texture = ctx.load_texture(
+            "detached_old_source_before_index_reuse",
+            old_pixels,
+            egui::TextureOptions::LINEAR,
+        );
+        let old_texture_id = old_texture.id();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 80.0,
+                y: 80.0,
+                w: 960.0,
+                h: 720.0,
+                maximized: false,
+            });
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Book, |mounted| {
+            configure_detached_endpoint_singleton(
+                mounted,
+                &ctx,
+                crate::settings::SpreadMode::Single,
+                window_id,
+                "replacement-current-source",
+                [900, 600],
+                crate::settings::SingletonSpreadPlacementPreference::FollowGlobal,
+            );
+            let placement = ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((1.25, egui::vec2(15.0, -8.0))),
+            };
+            let transform = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+                pixel_fit: RectPixelFit::Texels,
+                page_idx: 0,
+                viewport_rect: egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 720.0),
+                ),
+                source_size: egui::vec2(400.0, 800.0),
+                texture_size: egui::vec2(400.0, 800.0),
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement,
+            })
+            .expect("held page transform");
+            mounted
+                .fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Single);
+            mounted.fullscreen_page_layout.push_occurrence(
+                transform,
+                crate::ui_fullscreen::SpreadPageOccurrence::navigation(0, 0),
+            );
+            mounted.fs_holdover_tex = Some(FsHoldover::FinalEffectSourceReload(
+                crate::app::FinalEffectSourceReloadHoldover {
+                    target_idx: 0,
+                    previous: FsDisplayUnitHoldover {
+                        pages: vec![FsDisplayUnitHoldoverPage {
+                            occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(
+                                0, 0,
+                            ),
+                            texture: crate::gpu_lanczos::FullscreenPaintResource::resampleable(
+                                0,
+                                old_texture.clone(),
+                                crate::gpu_lanczos::FullscreenPaintSourceGeneration {
+                                    items: 41,
+                                    input: 7,
+                                },
+                            ),
+                            rotation: crate::rotation_db::Rotation::None,
+                            layout_size: egui::vec2(400.0, 800.0),
+                            post_filter: crate::adjustment::PostFilter::Sepia,
+                            trace_key: Some("old-source".to_string()),
+                            trace_load_seq: 44,
+                            source_size: Some(egui::vec2(400.0, 800.0)),
+                            content_bbox: None,
+                        }],
+                        singleton_placement: SingletonSpreadPlacement::Center,
+                        layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
+                    },
+                    started_at: std::time::Instant::now(),
+                },
+            ));
+        });
+        let current_texture_id = app
+            .with_active_viewer_context(|mounted| match mounted.fs_cache.get(&0) {
+                Some(FsCacheEntry::Static { tex, .. }) => tex.id(),
+                _ => panic!("replacement texture"),
+            })
+            .expect("mounted replacement");
+        assert_ne!(old_texture_id, current_texture_id);
+        app.with_active_viewer_context(|mounted| {
+            let captured = mounted
+                .capture_paged_display_unit_for_snapshot(0)
+                .expect("last-painted holdover capture");
+            assert!(matches!(
+                captured.presentation,
+                crate::app::CapturedPagedDisplayPresentation::Holdover
+            ));
+            assert_eq!(
+                captured.unit.pages[0].trace_key.as_deref(),
+                Some("old-source")
+            );
+            assert_eq!(captured.unit.pages[0].trace_load_seq, 44);
+            assert_eq!(
+                captured.unit.pages[0].post_filter,
+                crate::adjustment::PostFilter::Sepia
+            );
+            assert!(matches!(
+                captured.unit.layout_projection,
+                crate::app::FsDisplayUnitLayoutProjection::Painted(
+                    ResolvedDisplayPlacement::Normal { zoom_pan: Some(_) }
+                )
+            ));
+        });
+
+        assert!(app.pause_current_active_viewer_context(&ctx));
+        let passive = app
+            .detached_image_windows
+            .iter()
+            .find(|snapshot| snapshot.id == window_id)
+            .expect("old held frame was parked");
+        assert_eq!(passive.texture.source_texture_id(), old_texture_id);
+        assert_eq!(passive.frozen_continuous_pages.len(), 1);
+        assert_eq!(
+            passive.frozen_continuous_pages[0]
+                .texture
+                .source_texture_id(),
+            old_texture_id
+        );
+        assert_ne!(
+            passive.frozen_continuous_pages[0]
+                .texture
+                .source_texture_id(),
+            current_texture_id
+        );
+        app.with_window_viewer_context(window_id, |parked| {
+            assert!(
+                parked.fs_holdover_tex.is_none(),
+                "parking may retire transient work only after the old frame has been snapshotted"
+            );
+        })
+        .expect("parked owner bundle");
+    }
+
+    #[test]
+    fn singleton_snapshot_preserves_free_rotation_clip_visible_uv_and_post_filter() {
+        use crate::displayed_image_transform::{
+            DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
+            FullscreenPageLayoutKind, RectPixelFit, ResolvedDisplayPlacement,
+            SingletonSpreadPlacement,
+        };
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_size = egui::vec2(960.0, 720.0);
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.singleton_spread_placement_enabled = true;
+        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
+        app.settings.spread_page_gap_px = 20;
+        app.settings.global_preset.post_filter = crate::adjustment::PostFilter::Nearest;
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 80.0,
+                y: 80.0,
+                w: window_size.x,
+                h: window_size.y,
+                maximized: false,
+            });
+        configure_detached_endpoint_singleton(
+            &mut app,
+            &ctx,
+            crate::settings::SpreadMode::Ltr,
+            315,
+            "free-rotation-visible-source",
+            [600, 900],
+            crate::settings::SingletonSpreadPlacementPreference::Place,
+        );
+        app.set_detached_window_binding_for_test(Some(315));
+        app.begin_mounted_detached_session_for_test(315, DetachedSource::Book);
+        app.fs_zoom = 2.0;
+        app.fs_pan = egui::vec2(200.0, 0.0);
+        app.fs_free_rotation = 0.2;
+        let placement = ResolvedDisplayPlacement::SingletonSpread {
+            side: SingletonSpreadPlacement::Left,
+            gap: 20.0,
+            zoom_pan: Some((2.0, egui::vec2(200.0, 0.0))),
+        };
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, window_size);
+        let live = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            pixel_fit: RectPixelFit::Texels,
+            page_idx: 0,
+            viewport_rect: viewport,
+            source_size: egui::vec2(600.0, 900.0),
+            texture_size: egui::vec2(600.0, 900.0),
+            rotation: crate::rotation_db::Rotation::None,
+            free_rotation_rad: 0.2,
+            content_bbox: None,
+            fit_mode: crate::settings::FullscreenFitMode::Width,
+            fit_scale_limits: FullscreenFitScaleLimits::default(),
+            pixels_per_point: 1.0,
+            placement,
+        })
+        .expect("live rotated singleton");
+        let visible_request = live
+            .visible_region_request(viewport)
+            .expect("rotated, zoomed singleton must expose a visible source region");
+        assert!(
+            visible_request.source_uv_rect.width() < 0.999
+                || visible_request.source_uv_rect.height() < 0.999,
+            "the focused fixture must exercise partial-source UV preparation"
+        );
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Single);
+        app.fullscreen_page_layout.push_occurrence(
+            live,
+            crate::ui_fullscreen::SpreadPageOccurrence::navigation(0, 0),
+        );
+        let captured = app
+            .capture_paged_display_unit_for_snapshot(0)
+            .expect("rotated singleton capture");
+        assert_eq!(
+            captured.unit.pages[0].post_filter,
+            crate::adjustment::PostFilter::Nearest
+        );
+        assert!(matches!(
+            captured.unit.layout_projection,
+            crate::app::FsDisplayUnitLayoutProjection::Painted(actual)
+                if actual == placement
+        ));
+
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(None)
+            .expect("rotated singleton snapshot");
+        assert_eq!(snapshot.frozen_continuous_pages.len(), 1);
+        let frozen = &snapshot.frozen_continuous_pages[0];
+        assert!((frozen.free_rotation - 0.2).abs() < f32::EPSILON);
+        assert_rect_close(
+            frozen.clip_rect_norm,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        );
+        assert_rect_close(
+            frozen.uv_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        );
+        let expected_norm = egui::Rect::from_min_max(
+            egui::pos2(
+                live.full_image_rect.min.x / window_size.x,
+                live.full_image_rect.min.y / window_size.y,
+            ),
+            egui::pos2(
+                live.full_image_rect.max.x / window_size.x,
+                live.full_image_rect.max.y / window_size.y,
+            ),
+        );
+        assert_rect_close(frozen.paint_rect_norm, expected_norm);
     }
 
     #[test]

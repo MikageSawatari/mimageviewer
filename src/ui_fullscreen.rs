@@ -29,7 +29,8 @@ use crate::ai::ModelKind;
 #[cfg(windows)]
 use crate::app::DetachedSessionContentPhase;
 use crate::app::{
-    App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover,
+    App, CapturedPagedDisplayPresentation, CapturedPagedDisplayUnit, FsDisplayUnitHoldover,
+    FsDisplayUnitHoldoverPage, FsDisplayUnitLayoutProjection, FsHoldover,
     FsNavigationChromeContinuation, FsNavigationDisplayTarget, FsNavigationPresentation,
     FsNavigationPurpose, FsNavigationSequence, FsNavigationSequenceTarget,
     FsNavigationStillChromeInputs, FsNavigationTargetPhase, FsOpenMaterialization,
@@ -9685,6 +9686,37 @@ impl App {
         self.capture_fs_display_unit_with_rendition(None, idx)
     }
 
+    /// Capture the page resources that own the pixels visible at park time. A typed holdover is
+    /// an overlay painted after the current item, so it wins without advancing its Ready phase or
+    /// clearing it. Only when no holdover still owns the last paint do we capture the live unit.
+    #[cfg(windows)]
+    pub(crate) fn capture_paged_display_unit_for_snapshot(
+        &mut self,
+        idx: usize,
+    ) -> Option<CapturedPagedDisplayUnit> {
+        if let Some(mut unit) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(|holdover| holdover.last_painted_display_unit_for_snapshot(idx))
+            .cloned()
+        {
+            // The holdover owns the resources, while `fullscreen_page_layout` owns the exact
+            // placement produced by its most recent paint. Join those two halves here. In
+            // particular, an index may already name a replacement item, so recapturing the
+            // current item just to obtain its layout would lose the old texture provenance.
+            self.apply_painted_layout_projection(idx, &mut unit);
+            return Some(CapturedPagedDisplayUnit {
+                unit,
+                presentation: CapturedPagedDisplayPresentation::Holdover,
+            });
+        }
+        self.capture_fs_display_unit(idx)
+            .map(|unit| CapturedPagedDisplayUnit {
+                unit,
+                presentation: CapturedPagedDisplayPresentation::Live,
+            })
+    }
+
     /// Resolve the last unit painted by this mounted viewer context. Paged rendering clears and
     /// rebuilds `fullscreen_page_layout` before input arbitration, and the registry swaps that
     /// owner with its context, so an occurrence bound to the current navigation anchor is the
@@ -9693,8 +9725,8 @@ impl App {
     fn painted_spread_display_composition(
         &self,
         navigation_anchor_idx: usize,
-    ) -> Option<SpreadDisplayComposition> {
-        if !self.spread_mode.is_spread() || self.fullscreen_idx != Some(navigation_anchor_idx) {
+    ) -> Option<(SpreadDisplayComposition, ResolvedDisplayPlacement)> {
+        if self.fullscreen_idx != Some(navigation_anchor_idx) {
             return None;
         }
         match self.fullscreen_page_layout.kind() {
@@ -9716,17 +9748,58 @@ impl App {
                     } => side,
                     ResolvedDisplayPlacement::Normal { .. } => SingletonSpreadPlacement::Center,
                 };
-                Some(composition)
+                Some((composition, page.transform.placement))
             }
             FullscreenPageLayoutKind::Spread => {
-                let mut pages = self.fullscreen_page_layout.spread_occurrences()?.to_vec();
+                let screen_pages = self.fullscreen_page_layout.spread_occurrences()?;
+                let placement = self
+                    .fullscreen_page_layout
+                    .page_by_occurrence(screen_pages[0])?
+                    .transform
+                    .placement;
+                if screen_pages.iter().any(|occurrence| {
+                    self.fullscreen_page_layout
+                        .page_by_occurrence(*occurrence)
+                        .is_none_or(|page| page.transform.placement != placement)
+                }) {
+                    return None;
+                }
+                let mut pages = screen_pages.to_vec();
                 if self.spread_mode.is_rtl() {
                     pages.reverse();
                 }
                 SpreadDisplayComposition::from_presentation_pages(navigation_anchor_idx, pages)
+                    .map(|composition| (composition, placement))
             }
             FullscreenPageLayoutKind::Empty | FullscreenPageLayoutKind::Continuous => None,
         }
+    }
+
+    fn apply_painted_layout_projection(
+        &self,
+        navigation_anchor_idx: usize,
+        unit: &mut FsDisplayUnitHoldover,
+    ) {
+        let Some((composition, placement)) =
+            self.painted_spread_display_composition(navigation_anchor_idx)
+        else {
+            return;
+        };
+        let occurrences = composition.pages_in_screen_order(self.spread_mode);
+        if unit.pages.len() != occurrences.len()
+            || unit
+                .pages
+                .iter()
+                .zip(&occurrences)
+                .any(|(page, occurrence)| page.idx() != occurrence.idx)
+        {
+            return;
+        }
+        for (page, occurrence) in unit.pages.iter_mut().zip(occurrences) {
+            page.occurrence = occurrence;
+        }
+        unit.singleton_placement = composition.singleton_placement();
+        unit.layout_projection = FsDisplayUnitLayoutProjection::Painted(placement);
     }
 
     fn capture_fs_navigation_display_unit(
@@ -9743,9 +9816,15 @@ impl App {
         idx: usize,
     ) -> Option<FsDisplayUnitHoldover> {
         let canonical = self.spread_display_composition_for_anchor(idx);
-        let composition = self
-            .painted_spread_display_composition(idx)
-            .unwrap_or(canonical);
+        let (composition, layout_projection) = self.painted_spread_display_composition(idx).map_or(
+            (canonical, FsDisplayUnitLayoutProjection::Canonical),
+            |(composition, placement)| {
+                (
+                    composition,
+                    FsDisplayUnitLayoutProjection::Painted(placement),
+                )
+            },
+        );
         let pair = composition.spread_pair(self.spread_mode);
         let mut unit =
             self.capture_fs_display_unit_with_rendition_for_pair(rendition_ctx, idx, pair)?;
@@ -9763,6 +9842,7 @@ impl App {
             page.occurrence = occurrence;
         }
         unit.singleton_placement = composition.singleton_placement();
+        unit.layout_projection = layout_projection;
         Some(unit)
     }
 
@@ -9793,6 +9873,7 @@ impl App {
                 Some(FsDisplayUnitHoldover {
                     pages: vec![page],
                     singleton_placement: SingletonSpreadPlacement::Center,
+                    layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                 })
             }
             SpreadPair::Double { left, right } => {
@@ -9844,6 +9925,7 @@ impl App {
                 Some(FsDisplayUnitHoldover {
                     pages: vec![left_page, right_page],
                     singleton_placement: SingletonSpreadPlacement::Center,
+                    layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                 })
             }
         }
@@ -16978,6 +17060,7 @@ impl App {
                     uv_rect,
                     clip_rect_norm,
                     rotation,
+                    free_rotation: 0.0,
                 })
             })
             .collect()
@@ -16986,17 +17069,30 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn detached_frozen_pages_for_snapshot(
         &mut self,
-        ctx: &egui::Context,
+        ctx: Option<&egui::Context>,
         window_id: u64,
         idx: usize,
         placement: crate::settings::DetachedViewerWindowPlacement,
+        pixels_per_point: f32,
+        paged_display_unit: Option<&CapturedPagedDisplayUnit>,
     ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
-        let continuous =
-            self.detached_continuous_frozen_pages_for_snapshot(ctx, window_id, idx, placement);
-        if !continuous.is_empty() {
-            return continuous;
+        if self.reading_flow.is_paged() {
+            return paged_display_unit
+                .map(|unit| {
+                    self.detached_paged_frozen_pages_for_snapshot(
+                        window_id,
+                        idx,
+                        placement,
+                        pixels_per_point,
+                        unit,
+                    )
+                })
+                .unwrap_or_default();
         }
-        self.detached_spread_frozen_pages_for_snapshot(ctx, window_id, idx, placement)
+        ctx.map(|ctx| {
+            self.detached_continuous_frozen_pages_for_snapshot(ctx, window_id, idx, placement)
+        })
+        .unwrap_or_default()
     }
 
     #[cfg(windows)]
@@ -17048,41 +17144,158 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_spread_frozen_pages_for_snapshot(
+    fn detached_paged_frozen_pages_for_snapshot(
         &mut self,
-        ctx: &egui::Context,
         window_id: u64,
         idx: usize,
         placement: crate::settings::DetachedViewerWindowPlacement,
+        pixels_per_point: f32,
+        captured: &CapturedPagedDisplayUnit,
     ) -> Vec<crate::app::DetachedImageWindowFrozenPage> {
-        let pixels_per_point = ctx.pixels_per_point();
-        let SpreadPair::Double { left, right } = self.resolve_visible_spread_pair(idx) else {
-            return Vec::new();
-        };
-        let Some(left_texture) = self.resolve_fs_display_tex(left, true) else {
-            self.log_detached_image_window_debug(format!(
-                "detached_spread_frozen_fallback reason=missing_left idx={idx} left={left} \
-                 right={right}"
-            ));
-            return Vec::new();
-        };
-        let Some(right_texture) = self.resolve_fs_display_tex(right, true) else {
-            self.log_detached_image_window_debug(format!(
-                "detached_spread_frozen_fallback reason=missing_right idx={idx} left={left} \
-                 right={right}"
-            ));
-            return Vec::new();
-        };
-
+        let unit = &captured.unit;
         let full_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
         );
         let image_rect = self.fullscreen_media_rect(full_rect, idx, false);
-        let left_rot = self.get_rotation(left);
-        let right_rot = self.get_rotation(right);
-        let left_size = rotated_display_size(left_texture.size_vec2(), left_rot);
-        let right_size = rotated_display_size(right_texture.size_vec2(), right_rot);
+        let spread_gap = quantize_points_to_physical_pixels(
+            self.settings.spread_page_gap_px.min(200) as f32,
+            pixels_per_point,
+        );
+        let resolved_placement = match unit.layout_projection {
+            FsDisplayUnitLayoutProjection::Painted(placement) => placement,
+            FsDisplayUnitLayoutProjection::Canonical
+                if unit.singleton_placement != SingletonSpreadPlacement::Center =>
+            {
+                ResolvedDisplayPlacement::SingletonSpread {
+                    side: unit.singleton_placement,
+                    gap: spread_gap,
+                    zoom_pan: self.fs_zoom_pan(),
+                }
+            }
+            FsDisplayUnitLayoutProjection::Canonical => ResolvedDisplayPlacement::Normal {
+                zoom_pan: self.fs_zoom_pan(),
+            },
+        };
+
+        if let [page] = unit.pages.as_slice() {
+            let frozen_geometry_required =
+                matches!(
+                    captured.presentation,
+                    CapturedPagedDisplayPresentation::Holdover
+                ) || matches!(resolved_placement, ResolvedDisplayPlacement::Z { .. })
+                    || matches!(
+                        resolved_placement,
+                        ResolvedDisplayPlacement::SingletonSpread { side, .. }
+                            if side != SingletonSpreadPlacement::Center
+                    );
+            if !frozen_geometry_required {
+                // Setting OFF, explicit Center, landscape and non-pairable singleton units keep
+                // the existing live direct-single path and its exact geometry. A held Center unit
+                // still uses frozen geometry because its texture may no longer be `items[idx]`.
+                return Vec::new();
+            }
+            let resource = &page.texture;
+            let texture_size = resource.size_vec2();
+            let z_projection = matches!(resolved_placement, ResolvedDisplayPlacement::Z { .. });
+            let (fit_mode, fit_scale_limits, free_rotation) = if z_projection {
+                (
+                    FullscreenFitMode::Page,
+                    FullscreenFitScaleLimits {
+                        pixels_per_point,
+                        ..FullscreenFitScaleLimits::default()
+                    },
+                    0.0,
+                )
+            } else {
+                (
+                    self.effective_fullscreen_fit_mode(),
+                    self.fullscreen_fit_scale_limits(pixels_per_point),
+                    self.fs_free_rotation,
+                )
+            };
+            let transform = resolve_fs_image_transform(
+                DisplayedImageTransformInput {
+                    pixel_fit: RectPixelFit::Texels,
+                    page_idx: page.idx(),
+                    viewport_rect: image_rect,
+                    source_size: page.source_size.unwrap_or(texture_size),
+                    texture_size,
+                    rotation: page.rotation,
+                    free_rotation_rad: free_rotation,
+                    content_bbox: page.content_bbox,
+                    fit_mode,
+                    fit_scale_limits,
+                    pixels_per_point,
+                    placement: resolved_placement,
+                },
+                Some(page.layout_size),
+            );
+            let Some(transform) = transform else {
+                self.log_detached_image_window_debug(format!(
+                    "detached_paged_frozen_fallback reason=no_singleton_transform idx={idx} \
+                     page={} side={:?}",
+                    page.idx(),
+                    unit.singleton_placement
+                ));
+                return Vec::new();
+            };
+            // Free rotation paints a quad whose corners can extend beyond the unrotated
+            // `paint_rect`; live single-page rendering clips that quad to the viewport. Trim is
+            // intentionally inactive during free rotation, so the viewport is the sole scissor.
+            let clip_rect = if free_rotation.abs() > TRANSFORM_EPSILON {
+                image_rect
+            } else {
+                transform.paint_rect.intersect(image_rect)
+            };
+            let (bake_rect, bake_scale) = transform.paint_geometry();
+            let texture = self.prepare_fullscreen_paint_resource_with_filter(
+                resource,
+                bake_scale,
+                pixels_per_point,
+                transform.visible_region_request(clip_rect),
+                page.post_filter,
+                false,
+            );
+            let paint_rect_norm = Self::normalize_rect_to_full_rect(bake_rect, full_rect);
+            let clip_rect_norm = Self::normalize_rect_to_full_rect(clip_rect, full_rect);
+            let uv_rect = Self::full_uv_rect();
+            self.log_detached_frozen_page_bake_debug(
+                "singleton",
+                window_id,
+                page.idx(),
+                0,
+                bake_rect,
+                uv_rect,
+                clip_rect,
+                full_rect,
+                image_rect,
+                paint_rect_norm,
+                clip_rect_norm,
+                pixels_per_point,
+                page.content_bbox,
+                placement,
+            );
+            return vec![crate::app::DetachedImageWindowFrozenPage {
+                texture,
+                paint_rect_norm,
+                uv_rect,
+                clip_rect_norm,
+                rotation: page.rotation,
+                free_rotation,
+            }];
+        }
+
+        let [left_page, right_page] = unit.pages.as_slice() else {
+            debug_assert!(false, "paged display unit must contain one or two pages");
+            return Vec::new();
+        };
+        let left = left_page.idx();
+        let right = right_page.idx();
+        let left_rot = left_page.rotation;
+        let right_rot = right_page.rotation;
+        let left_size = rotated_display_size(left_page.layout_size, left_rot);
+        let right_size = rotated_display_size(right_page.layout_size, right_rot);
         if left_size.x <= 0.0 || left_size.y <= 0.0 || right_size.x <= 0.0 || right_size.y <= 0.0 {
             self.log_detached_image_window_debug(format!(
                 "detached_spread_frozen_fallback reason=invalid_size idx={idx} left={left} \
@@ -17091,24 +17304,12 @@ impl App {
             return Vec::new();
         }
 
-        let content_left = if left_rot.is_none() {
-            self.view_trim_spread_content_bbox(left, crate::view_trim::ViewTrimSpreadSide::Left)
-        } else {
-            None
-        };
-        let content_right = if right_rot.is_none() {
-            self.view_trim_spread_content_bbox(right, crate::view_trim::ViewTrimSpreadSide::Right)
-        } else {
-            None
-        };
+        let content_left = left_page.content_bbox;
+        let content_right = right_page.content_bbox;
         let full_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let left_bbox = content_left.unwrap_or(full_bbox);
         let right_bbox = content_right.unwrap_or(full_bbox);
         let content_active = content_left.is_some() || content_right.is_some();
-        let spread_gap = quantize_points_to_physical_pixels(
-            self.settings.spread_page_gap_px.min(200) as f32,
-            pixels_per_point,
-        );
         let fit_mode = self.effective_fullscreen_fit_mode();
         let geometry = spread_layout_geometry(
             left_size,
@@ -17118,7 +17319,21 @@ impl App {
             spread_should_match_page_heights(fit_mode),
         );
         let fit_scale_limits = self.fullscreen_fit_scale_limits(pixels_per_point);
-        let zoom_pan = self.fs_zoom_pan();
+        let zoom_pan = match resolved_placement {
+            ResolvedDisplayPlacement::Normal { zoom_pan }
+            | ResolvedDisplayPlacement::Z { zoom_pan, .. }
+            | ResolvedDisplayPlacement::SingletonSpread { zoom_pan, .. } => zoom_pan,
+        };
+        let effective_gap = match resolved_placement {
+            ResolvedDisplayPlacement::Z {
+                active: true,
+                zoom_pan: Some((zoom, _)),
+                ..
+            } => spread_gap * zoom,
+            ResolvedDisplayPlacement::Normal { .. }
+            | ResolvedDisplayPlacement::Z { .. }
+            | ResolvedDisplayPlacement::SingletonSpread { .. } => spread_gap,
+        };
         let page_fit = || {
             ((image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x)
                 .min(image_rect.height() / geometry.fit_size.y)
@@ -17141,7 +17356,7 @@ impl App {
             center,
             geometry,
             total_scale,
-            spread_gap,
+            effective_gap,
             pixels_per_point,
             left_bbox,
             right_bbox,
@@ -17154,39 +17369,39 @@ impl App {
         // transform が決めるので所有者が 2 人に割れ、live で直した二段丸めが凍結側にだけ
         // 残っていた。トリムを transform へ渡せば `paint_rect` がそのまま量子化済みの
         // 可視帯になり、live と同じ helper で間隔を合わせられる。
-        let left_resource = self.fullscreen_paint_resource_for_texture(left, left_texture);
-        let right_resource = self.fullscreen_paint_resource_for_texture(right, right_texture);
-        let left_source_size = self
-            .source_dims_for_idx(left)
-            .map(|(w, h)| egui::vec2(w, h));
-        let right_source_size = self
-            .source_dims_for_idx(right)
-            .map(|(w, h)| egui::vec2(w, h));
+        let left_resource = &left_page.texture;
+        let right_resource = &right_page.texture;
         // 解決は live と同じ入口を通す。レイアウト寸法とテクスチャの縦横比が違う経路
         // (PDF / passthrough) をここだけ別式で解かないため。
         let left_transform = self.resolve_fs_spread_page_transform(
-            &left_resource,
+            left_resource,
             image_rect,
             rects.left_rect,
             left,
-            left_source_size,
-            FsPageLayoutSource::CurrentItem,
+            left_page.source_size,
+            FsPageLayoutSource::Captured {
+                layout_size: left_page.layout_size,
+                post_filter: left_page.post_filter,
+            },
             left_rot,
             content_left,
             pixels_per_point,
-            ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            resolved_placement,
         );
         let right_transform = self.resolve_fs_spread_page_transform(
-            &right_resource,
+            right_resource,
             image_rect,
             rects.right_rect,
             right,
-            right_source_size,
-            FsPageLayoutSource::CurrentItem,
+            right_page.source_size,
+            FsPageLayoutSource::Captured {
+                layout_size: right_page.layout_size,
+                post_filter: right_page.post_filter,
+            },
             right_rot,
             content_right,
             pixels_per_point,
-            ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            resolved_placement,
         );
         // **片側だけ別由来にしない。** 以前はここでレイアウト矩形と自前の倍率へ落ちていたが、
         // それは transform 以外の geometry 所有者を 1 つ残すことになる。組めないなら凍結
@@ -17199,7 +17414,7 @@ impl App {
             ));
             return Vec::new();
         };
-        let gap_px = (spread_gap.max(0.0) * pixels_per_point).round();
+        let gap_px = (effective_gap.max(0.0) * pixels_per_point).round();
         let (left_offset, right_offset) =
             align_spread_pages_for_gap(&left_transform, &right_transform, gap_px, pixels_per_point);
         let left_transform = left_transform.translated_by(left_offset);
@@ -17209,17 +17424,21 @@ impl App {
         let right_clip_rect = right_transform.paint_rect.intersect(image_rect);
         let (left_bake_rect, left_bake_scale) = left_transform.paint_geometry();
         let (right_bake_rect, right_bake_scale) = right_transform.paint_geometry();
-        let left_texture = self.prepare_fullscreen_paint_resource(
-            &left_resource,
+        let left_texture = self.prepare_fullscreen_paint_resource_with_filter(
+            left_resource,
             left_bake_scale,
             pixels_per_point,
             left_transform.visible_region_request(left_clip_rect),
+            left_page.post_filter,
+            false,
         );
-        let right_texture = self.prepare_fullscreen_paint_resource(
-            &right_resource,
+        let right_texture = self.prepare_fullscreen_paint_resource_with_filter(
+            right_resource,
             right_bake_scale,
             pixels_per_point,
             right_transform.visible_region_request(right_clip_rect),
+            right_page.post_filter,
+            false,
         );
         let left_rect_norm = Self::normalize_rect_to_full_rect(left_bake_rect, full_rect);
         let right_rect_norm = Self::normalize_rect_to_full_rect(right_bake_rect, full_rect);
@@ -17267,6 +17486,7 @@ impl App {
                 uv_rect: left_uv_rect,
                 clip_rect_norm: left_clip_rect_norm,
                 rotation: left_rot,
+                free_rotation: 0.0,
             },
             crate::app::DetachedImageWindowFrozenPage {
                 texture: right_texture,
@@ -17274,6 +17494,7 @@ impl App {
                 uv_rect: right_uv_rect,
                 clip_rect_norm: right_clip_rect_norm,
                 rotation: right_rot,
+                free_rotation: 0.0,
             },
         ]
     }
@@ -17378,7 +17599,7 @@ impl App {
                 let painter = painter.with_clip_rect(clip_rect);
                 paint_image_underlay(
                     &painter,
-                    ImagePaintQuad::from_rect(paint_rect, paint_rect.center(), 0.0),
+                    ImagePaintQuad::from_rect(paint_rect, paint_rect.center(), page.free_rotation),
                     &bg_style,
                 );
                 if let Some(source_uv_rect) = page.texture.visible_source_uv_rect() {
@@ -17387,17 +17608,21 @@ impl App {
                         page.texture.id(),
                         paint_rect,
                         page.rotation,
-                        0.0,
+                        page.free_rotation,
                         source_uv_rect,
                         Self::full_uv_rect(),
                         egui::Color32::WHITE,
                     );
                 } else {
-                    crate::app::draw_rotated_image(
+                    crate::displayed_image_transform::paint_source_region_texture(
                         &painter,
                         page.texture.id(),
                         paint_rect,
                         page.rotation,
+                        page.free_rotation,
+                        Self::full_uv_rect(),
+                        Self::full_uv_rect(),
+                        egui::Color32::WHITE,
                     );
                 }
                 page.texture.retain_native_output_for_paint(&painter);
@@ -51604,6 +51829,102 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_last_painted_holdover_selection_is_read_only_and_phase_exact() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "snapshot_last_painted_holdover",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let unit = FsDisplayUnitHoldover {
+            pages: vec![navigation_holdover_page(7, texture)],
+            singleton_placement: SingletonSpreadPlacement::Center,
+            layout_projection: FsDisplayUnitLayoutProjection::Canonical,
+        };
+        let started_at = std::time::Instant::now();
+
+        for (case, phase, expected_previous) in [
+            ("awaiting", navigation_awaiting(vec![7]), true),
+            (
+                "ready",
+                navigation_ready(vec![7], FsNavigationPresentation::Materialized),
+                true,
+            ),
+            (
+                "presenting",
+                navigation_presenting(vec![7], FsNavigationPresentation::Materialized),
+                false,
+            ),
+        ] {
+            let mut holdover = page_wait_navigation_sequence(started_at, 5, vec![7], phase.clone());
+            let FsHoldover::NavigationSequence(sequence) = &mut holdover else {
+                unreachable!();
+            };
+            sequence.previous = Some(unit.clone());
+            assert_eq!(
+                holdover.last_painted_display_unit_for_snapshot(7).is_some(),
+                expected_previous,
+                "{case}"
+            );
+            let FsHoldover::NavigationSequence(sequence) = &holdover else {
+                unreachable!();
+            };
+            assert_eq!(
+                sequence.target,
+                FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                    items_generation: 5,
+                    anchor_idx: 7,
+                    accept_rendition: false,
+                    phase,
+                }),
+                "snapshot selection must not latch Ready or otherwise mutate {case}"
+            );
+        }
+
+        let awaiting_password = FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: Some(unit.clone()),
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: started_at,
+            target: FsNavigationSequenceTarget::AwaitingPassword {
+                accepted_generation: 5,
+            },
+        });
+        assert!(
+            awaiting_password
+                .last_painted_display_unit_for_snapshot(7)
+                .is_none(),
+            "the password surface replaces the previous page"
+        );
+        assert!(
+            FsHoldover::FolderNavigation(Some(unit.clone()))
+                .last_painted_display_unit_for_snapshot(7)
+                .is_some()
+        );
+        assert!(
+            FsHoldover::PresentationSwitch(unit.clone())
+                .last_painted_display_unit_for_snapshot(7)
+                .is_some()
+        );
+        let source_reload =
+            FsHoldover::FinalEffectSourceReload(crate::app::FinalEffectSourceReloadHoldover {
+                target_idx: 7,
+                previous: unit,
+                started_at,
+            });
+        assert!(
+            source_reload
+                .last_painted_display_unit_for_snapshot(7)
+                .is_some()
+        );
+        assert!(
+            source_reload
+                .last_painted_display_unit_for_snapshot(8)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn shared_previous_texture_drawn_live_retires_spread_shift_sequence() {
         let ctx = egui::Context::default();
         let page_2 = ctx.load_texture(
@@ -51628,6 +51949,7 @@ mod tests {
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: Some(FsDisplayUnitHoldover {
                 singleton_placement: SingletonSpreadPlacement::Center,
+                layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                 pages: vec![
                     navigation_holdover_page(2, page_2),
                     navigation_holdover_page(3, shared_page_3.clone()),
@@ -51690,6 +52012,7 @@ mod tests {
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: Some(FsDisplayUnitHoldover {
                 singleton_placement: SingletonSpreadPlacement::Center,
+                layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                 pages: vec![
                     navigation_holdover_page(2, page_2),
                     navigation_holdover_page(3, shared_page_3.clone()),
@@ -52618,6 +52941,7 @@ mod tests {
             app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
                 previous: Some(FsDisplayUnitHoldover {
                     singleton_placement: SingletonSpreadPlacement::Center,
+                    layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                     pages: vec![navigation_holdover_page(0, held_texture.clone())],
                 }),
                 chrome: FsNavigationChromeContinuation::None,
@@ -52727,6 +53051,7 @@ mod tests {
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: Some(FsDisplayUnitHoldover {
                 singleton_placement: SingletonSpreadPlacement::Center,
+                layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                 pages: vec![navigation_holdover_page(0, held_texture)],
             }),
             chrome: FsNavigationChromeContinuation::None,
@@ -53335,6 +53660,7 @@ mod tests {
                 pages: vec![navigation_holdover_page(0, old_texture.clone())],
                 singleton_placement:
                     crate::displayed_image_transform::SingletonSpreadPlacement::Center,
+                layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             }),
             chrome: FsNavigationChromeContinuation::None,
             purpose: FsNavigationPurpose::Ordinary,
@@ -53625,6 +53951,7 @@ mod tests {
         );
         let previous = FsDisplayUnitHoldover {
             singleton_placement: SingletonSpreadPlacement::Center,
+            layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
                 texture: FullscreenPaintResource::direct(old.clone()),
@@ -54220,6 +54547,7 @@ mod tests {
         );
         let holdover = FsDisplayUnitHoldover {
             singleton_placement: SingletonSpreadPlacement::Center,
+            layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
                 occurrence: SpreadPageOccurrence::navigation(4, 4),
                 layout_size: held.size_vec2(),
@@ -58879,6 +59207,7 @@ mod tests {
                 target_idx: 0,
                 previous: FsDisplayUnitHoldover {
                     singleton_placement: SingletonSpreadPlacement::Center,
+                    layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                     pages: vec![FsDisplayUnitHoldoverPage {
                         occurrence: SpreadPageOccurrence::navigation(0, 0),
                         layout_size: texture.size_vec2(),
@@ -58907,6 +59236,7 @@ mod tests {
 
         let folder_navigation = FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
             singleton_placement: SingletonSpreadPlacement::Center,
+            layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
                 layout_size: texture.size_vec2(),
@@ -67254,6 +67584,7 @@ mod tests {
                 target_idx: 3,
                 previous: FsDisplayUnitHoldover {
                     singleton_placement: SingletonSpreadPlacement::Center,
+                    layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                     pages: vec![navigation_holdover_page(3, texture)],
                 },
                 started_at: std::time::Instant::now(),

@@ -400,3 +400,113 @@ verification build の証拠は、この文書の最終検証節へ追記する�
   `mimageviewer-remote.exe`（SHA-256
   `8ABADDA66BC570D269ABB22439C2A6CA90964A5C2DF2239124CD81B01AEED0AD`）。agent はresidentを停止せず、
   アプリも起動していない。
+
+## 2026-09-23 detached passive と ViewerContextBundle 横断監査
+
+### 実機症状の経路と修正境界
+
+active detached window を pause すると、AtRest の `ViewerContextBundle` を一時 mount し、
+`build_active_detached_image_window_snapshot` で表示 snapshot を作った後に同じ bundle を deposit する。
+`singleton_spread_placement_preference` 自体はこの transaction で失われていなかった。一方、従来の
+paged frozen producer は `SpreadPair::Double` だけを再解決し、canonical display unit が 1 page の
+endpoint singleton では空を返していた。そのため passive snapshot は direct-single の既定 `Center`
+へ落ち、再 activate / remount すると同じ bundle の preference から canonical `Left / Right` が戻って
+いた。観測された「非アクティブ時だけ中央、再アクティブ時に片側」はこの経路と一致する。
+
+修正後は、snapshot owner がまず「最後に実際に描いた presentation」を typed に選ぶ。navigation / source
+reload の `FsHoldover` が live page の後に overlay された状態なら、その旧 resource unit を clone し、
+current `items[idx]` を取り直さない。holdover が無ければ current live unit を capture する。この選択は
+`Ready` を `Presenting` に進めず、source-reload holdover も clear しない read-only query である。選ばれた
+resource unit へ、直近の `fullscreen_page_layout` が持つ exact `ResolvedDisplayPlacement` を合成し、
+`CapturedPagedDisplayUnit { unit, presentation }` を paged snapshot bake の唯一の入力にする。
+
+1 page + `Left / Right` は `ResolvedDisplayPlacement::SingletonSpread`、Z / ZipPla は
+`ResolvedDisplayPlacement::Z { active, factor, zoom_pan, singleton_side, singleton_gap }`、2 page は同じ
+capture-time page 群と resolved placement を live と同じ `DisplayedImageTransform` へ渡す。active Z の
+見開き gap は live と同じく zoom 倍し、fit scale は zoom 前の gap から求める。holdover と Z は1 pageでも
+frozen pageへbakeする一方、通常 live の `Center` は空の frozen listを返して従来のdirect-single pathを
+保つ。paged producer は egui `Context` ではなく確定済み `pixels_per_point` を受けるので、
+`build_active_detached_image_window_snapshot(None)` でも同じ結果になる。passive 側で setting / preference /
+endpoint / 縦横を読み直す分岐、新しい lifecycle state は追加していない。
+
+### 245 field の ordinary lifecycle 監査
+
+`ViewerContextBundle` の named field は **245**。ordinary mount / deposit / remount の transaction 自体は
+`swap_viewer_context_bundle` の **244 `swap_field!` + `viewer_session.swap_with_mounted` 1 件**で全 field を
+交換する。従って **ordinary swap coverage は M / D / R とも245 / 245**であり、そこに field copy の欠落は
+無い。ただし active → park は単なるswapではない。snapshot前にforeground-only interactionを終了し、
+snapshot後にbackground workをcancel / drainしてからdepositする。この semantic terminal で意図的に変わる
+fieldまで「同じ値のままP/R」とは数えない。下表の「swap ✓」はordinary transactionの網羅性、右列は
+park terminal と passive可視投影を分けて示す。
+
+| # / 件数 | 意味グループと field（ordinary M/D/R swap ✓） | park terminal / passive の扱い |
+|---|---|---|
+| 1–12 / 12 | `address`, `current_folder`, `favorite_view_context`, `navigation_scope`, `archive_source_override`, `zip_nav`, `stack_mode_requested`, `stack_view`, `stack_showing_flat`, `stack_active_rule`, `stack_script_error`, `stack_toggle_select_path` | bundle 保持。title / reopen identity に必要な範囲だけ snapshot 化 |
+| 13–28 / 16 | `items`, `items_generation`, `visible_indices`, `facet_name_cache`, `facet_name_cache_generation`, `facet_name_cache_pending`, `facet_name_cache_failed_generation`, `thumbnails`, `image_metas`, `video_thumb_overrides`, `auto_aspect`, `selected`, `grid_click_selection_anchor`, `scroll_offset_y`, `scroll_to_selected`, `pending_grid_scroll` | bundle 保持。passive still は固定 snapshot なので一覧 UI を再投影しない |
+| 29–47 / 19 | `requested`, `idle_upgrade_cache_bypass_ineligible`, `keep_range`, `keep_set`, `still_seek_thumbnail_pages`, `still_seek_thumbnail_pages_shared`, `thumbnail_eviction_generation`, `details_thumb_suppression_applied`, `details_hover_thumb_idx`, `details_hover_thumb_viewport_open`, `texture_backlog`, `details_order`, `details_order_revision`, `details_cell_content_revisions`, `details_tag_prewarm_indices`, `details_lazy_meta`, `details_meta_pending`, `details_lazy_visible_revision`, `details_image_dims_state` | `texture_backlog` はsnapshot完成後にclear。残りはbundle保持し、worker / details projection は passive still では駆動しない |
+| 48–56 / 9 | `metadata_cache`, `exif_cache`, `xmp_cache`, `xmp_panorama_info`, `metadata_pending`, `tags_cache`, `tag_prewarm_pending`, `tag_prewarm_queued`, `pending_finalize` | bundle 保持。passive still DTO の対象外 |
+| 57–76 / 20 | `tx`, `rx`, `cancel_token`, `reload_queue`, `heavy_io_queue`, `scroll_hint`, `visible_end_shared`, `keep_start_shared`, `keep_end_shared`, `last_vis_range`, `vis_settle_at`, `vis_first_logged`, `vis_all_logged`, `folder_nav_pending`, `folder_pane_open_pending`, `pending_folder_nav_steps`, `pending_folder_nav_mode`, `search_filter`, `search_filter_origin_folder`, `checked` | worker基盤はbundle所有。park後に`folder_nav_pending` / `folder_pane_open_pending`をcancelしてtake、stepを0、modeをGridへ戻す。passive stillは固定表示 |
+| 77–92 / 16 | `rotation_cache`, `page_dims_cache`, `spread_display_units_cache`, `rating_cache`, `rating_filter_suppressed_at`, `rating_session_write_seen_generation`, `metadata_import_refresh_index`, `current_folder_rating_cache`, `current_folder_last_mtime`, `current_folder_signature`, `folder_pin_map`, `converted_archive_cache_paths`, `converted_archive_pin_root_states`, `converted_archive_cache_paths_pending`, `current_color_cache_map`, `current_color_catalog` | bundle 保持。回転・寸法・canonical unit の capture 結果は passive DTO に bake |
+| 93–110 / 18 | `vst3_deferred_media_open`, `fullscreen_idx`, `fullscreen_page_slice`, `fs_secondary_press`, `viewer_session`, `native_video_in_window_active`, `video_audio_mode`, `video_audio_vst`, `video_audio_mode_runtime`, `video_seek_strip_runtime`, `video_seek_strip_wave_holdover`, `video_seek_strip_next_session_id`, `panorama_state`, `video_zoom_state`, `native_video_mouse_seek_holds`, `panorama_intent`, `fs_info_panel`, `similar_panel` | `viewer_session`の内包4値は専用swap。park前に`fs_secondary_press`、pointer gesture、`fs_info_panel.hover_active`を終了し、panorama live state / video zoomを既存intentへ畳む。`fullscreen_idx/page_slice`とintentは保持し、still passiveはcapture済みidxだけ表示 |
+| 111–126 / 16 | `pano_toast_shown_for_current_fs`, `analysis_mode`, `analysis_hover_color`, `analysis_pinned_color`, `analysis_grayscale`, `analysis_mosaic_grid`, `analysis_filter_mag`, `analysis_guide_drag`, `view_trim_mode`, `view_trim_apply_mode`, `view_trim_page_apply_root_idx`, `view_trim_page_spread_separate`, `view_trim_book_settings`, `view_trim_page_overrides`, `view_trim_dirty_page_overrides`, `view_trim_save_pending` | park前にanalysis live modeとview-trim edit modeを終了し、dirty trimを保存する。book/page trim設定は保持し、capture結果をbbox / UV / clipへbake |
+| 127–154 / 28 | `fs_cache`, `fs_lanczos_cache`, `fullscreen_navigator_interaction`, `fullscreen_page_layout`, `fs_margin_bbox_cache`, `input_generation`, `fs_pending`, `fullscreen_pdf_promotion`, `fs_pdf_display_target`, `fs_early_dims`, `fs_upload_backlog`, `top_level_grid_view`, `snapshot`, `global_search_subfolder_restore`, `favsearch_subfolder_restore`, `items_are_global_search_view`, `items_are_tag_view`, `items_are_reading_history_view`, `items_are_bookmark_view`, `items_are_rating_view`, `items_are_subfolder_expansion_view`, `items_are_smart_folder_view`, `items_are_drive_list`, `reading_history_return_from`, `bookmark_view_state`, `bookmark_open_pending`, `fs_open_intent_from_grid`, `video_presentation_transition` | painted `fullscreen_page_layout`をsnapshotへ先にcapture。その後`fs_pending`をcancel/drainし、`texture_backlog`（#29–47）等のbackground queueをclearする。cache/layout/current frameはbundleに残る |
+| 155–176 / 22 | `fs_zoom`, `fs_pan`, `fs_zoom_active`, `fs_zoom_aiming`, `fs_zoom_factor`, `fs_zoom_pdf_rerender_idx`, `fs_zoom_pdf_rerender_zoom`, `fs_pan_drag_start`, `fs_vertical_scroll`, `fs_seek_drag_active`, `fs_seek_gesture`, `fs_seek_overlay_visible`, `fs_vertical_cache_keep_set`, `continuous_page_transitions`, `fs_free_rotation`, `fs_rotation_drag_start`, `analysis_zoom`, `analysis_pan`, `analysis_pan_drag_start`, `analysis_overlay_cache`, `analysis_hist_cache`, `analysis_sv_cache` | zoom / pan / Z active/aiming/factor、scroll、free rotationは保持し、exact resolved placement / geometryへbake。park後にseek drag/gesture/overlayを終了し、continuous transitionをclearする |
+| 177–205 / 29 | `spread_mode`, `final_cover_spread_preference`, `singleton_spread_placement_preference`, `spread_shift_anchor_idx`, `reading_flow`, `reading_direction`, `slideshow_playing`, `slideshow_next_at`, `slideshow_anchor_idx`, `continuous_reading_scroll_transition`, `slideshow_scroll_range_cache`, `pdf_password_request`, `pdf_current_password`, `pdf_password_pending_save`, `pdf_enumerate_pending`, `zip_enumerate_pending`, `fs_nav_after_pdf_enumerate`, `pending_auto_fs_open`, `pending_return_to_parent`, `pdf_placeholder_count`, `viewer_navigation_caches`, `fs_nav_locked_gen`, `fs_nav_dropped_block_signature`, `fs_nav_dropped_block_count`, `fs_load_skip_signature`, `fs_holdover_tex`, `fs_boundary_hint`, `virtual_folder_writeback`, `pdf_prefetch_grace_until` | spread/layout/preferences/directionは保持するがpassiveから再読しない。snapshot後にslideshow/scroll transition、enumerate/deferred-open、nav lock/signature、`fs_holdover_tex`を意図的terminalにする。holdover resource/projectionはclear前にDTOへcapture済み |
+| 206–240 / 35 | `thumb_pixels`, `thumb_edit_preview_layers`, `thumb_edit_preview_keys`, `thumb_adjust_tex`, `passthrough_rendition_cache`, `adjustment_page_params`, `local_adjust_page_layers`, `local_adjust_pages`, `local_adjust_selected_layers`, `local_adjust_generation`, `local_adjust_cache`, `local_adjust_pending`, `export_crop_page_settings`, `export_crop_pages`, `mask_pages`, `comic_pages`, `conceal_pages`, `erase_mask_generation`, `conceal_mask_generation`, `edit_result_cache`, `final_ai_cache`, `final_ai_pending`, `final_ai_failed`, `final_composite_cache`, `final_effect_pending`, `adjustment_cache`, `erase_result_cache`, `erase_preview_cache`, `erase_base_cache`, `conceal_base_cache`, `conceal_cache`, `comic_cache`, `comic_bake_pending`, `erase_inpaint_pending`, `ai_classify_cache` | capture時に選ばれたrendition/post-filterをtextureと一体でbake。park後は`final_ai_pending`, `local_adjust_pending`, `comic_bake_pending`, `erase_inpaint_pending`をcancel/clearし、確定cache/edit設定は保持。編集foreground UIはpause前に終了 |
+| 241–245 / 5 | `normalize_ui_states`, `normalize_auto_scan_suppressed`, `music_bookmarks`, `music_bookmarks_loaded_for`, `last_loop_pos` | bundle 保持。still passive DTO の対象外 |
+
+既定値へ落ちても発見しにくい属性として、`fullscreen_page_slice`、`fs_zoom` / `fs_pan`、
+`fs_vertical_scroll`、`fs_free_rotation`、`panorama_state` / `panorama_intent`、analysis一式、
+`spread_mode` / 両 spread preference / `spread_shift_anchor_idx`、`reading_flow` /
+`reading_direction`、`fullscreen_page_layout` を優先照合した。いずれも ordinary transaction のswap対象
+であり、park terminal対象か否かを上表で分離した。必要なstill passiveの見た目はterminal前にsnapshotへ
+bakeされる。監査で見つかった欠落はbundle fieldのcopyではなく、passive paged capture/bake境界の同じ
+構造族だった。具体的には (1) canonical endpoint singletonのtyped side、(2) Z / ZipPlaのpainted
+`ResolvedDisplayPlacement`、(3) navigation/source-reload中のlast-painted holdover resource / post-filter
+provenance の3点で、いずれも今回の単一typed capture入力へ統合した。
+
+### fork と foreground terminal の区別
+
+- `split_current_context_preserving_main_grid` は245 fieldを全 destructureし、
+  `duplicate_for_parked!` / `move_to_parked!` / `keep_in_main!` のいずれかへ明示分類する。field追加時は
+  non-exhaustive destructureでコンパイルエラーになる。これは ordinary mount / deposit ではなく、
+  main grid と新しい `LiveMedia` ownerを分ける fork である。media/fullscreen transient、render cache、
+  zoom / pan / free rotation、analysis、slideshow、navigation holdover、music stateは parkedへmoveし、
+  item identity/cacheの必要部分はduplicateする。grid worker、details/tag、edit/view-trim、spread preference、
+  direction/layout等はmedia parked windowが駆動しないためmainに残す。`viewer_session` はmedia owner側へmove、
+  physical mouse holdはowner変更をterminalとしてclearする。いずれも意図した fork policy であり、
+  ordinary lifecycleの属性欠落ではない。
+- materialized still fork はその exhaustive splitの後、`split_materialized_physical_context_for_detached_scope`
+  が view-trim一式、`spread_mode`、両spread preference（今回のsingletonを含む）、shift anchor、
+  reading flow/direction、thumbnail/edit/adjustment stateを明示copyする。新しい物理scopeに合わせて
+  navigation scope / surface / selectionを作り、snapshot restore、rating suppression、details order、
+  navigation cacheは意図的にresetする。表示属性のcopy漏れは無かった。
+- `reset_detached_pause_foreground_modes` は passive still を作る前に panoramaのlive state、analysis mode、
+  pointer gesture、panel hover、edit mode等のforeground-only interactionを終了する。panorama **intent**、
+  book preference、zoom/scroll/layout等を落とす処理ではなく、ordinary bundle swapの欠落とは区別する。
+- `pause_mounted_background_work_keep_current_frame` はsnapshot完成後にslideshow/seek/navigation holdover、
+  enumerate/deferred-open、各pending workerを停止する。従ってこれらは245-field swapには含まれていても
+  park後に値が同一であるべき属性ではない。今回のlast-painted holdoverはこのterminalより先にtexture、
+  occurrence、post-filter、resolved placementをsnapshotへ移し、capture自体ではphaseを進めない。
+
+### passive snapshot DTO の可視属性対応
+
+| 可視属性 | snapshot / deferred view の所有方法 | 結果 |
+|---|---|---|
+| texture / rendition / post-filter / provenance | snapshot ownerがlast-painted `Holdover` / `Live`をtyped選択。holdoverなら旧resource + capture-time post-filterを使い、index再利用後のcurrent itemを再取得しない | **今回補完**。capture後のterminal clearより先に保持 |
+| 保存回転 / 自由回転 | snapshotの `rotation` / `free_rotation`、frozen pageの `rotation` / `free_rotation`。continuous/spreadの自由回転は仕様どおり0 | 保持 |
+| fit / scale limit / zoom / pan / Z | `image_rect_norm` または frozen `paint_rect_norm` に、capture-time exact `ResolvedDisplayPlacement`とlive同値transformからbake | **Z projectionを今回補完**。active/aiming、single/doubleを保持 |
+| trim / content bbox / source region | directは `image_content_bbox`、frozenはcapture bboxをtransformへ渡し、texture visible-source UV + `uv_rect` + `clip_rect_norm`でpaint | 保持 |
+| spread pages / gap / typed singleton side | capture-time `FsDisplayUnitHoldover` の1/2 page、exact placement、量子化gapをpaged producerが消費。active Z doubleだけgapをzoom倍 | **今回補完**。Left/Rightは1件のfrozen page、通常live Centerはdirect path |
+| continuous layout / scroll | capture時のvisible page rectとgap alignmentをfrozen listへbake | 保持（`Some(ctx)` capture） |
+| page / occurrence / request identity | snapshotはtexture/geometryだけを凍結し、canonical unit自体の1/2 page数を増やさない | singletonは1件のまま |
+| underlay | `DetachedImageWindowUnderlay` にsolid/checkerをcapture。frozen pageも同じquadへ描画 | 保持 |
+| detached client size / DPI | placementの `w/h` とcapture時 `pixels_per_point`をbake入力に使用 | 保持。DTOへ新規placement ownerは作らない |
+| runtime window placement / activation | registry runtime/hostの既存ownerが保持し、deferred viewは既存runtime placementを投影 | 既存契約のまま。今回変更なし |
+| margin color | App-global `fullscreen_image_margin_color` をpassive deferred描画時に投影 | 意図したglobal値。bundle fieldではない |
+| title / location / reopen identity | snapshotのtitle/location/reopen descriptor/sync stamp | 保持 |
+
+横断監査の結論は、ordinary transactionの**245 / 245 field swap coverage合格**（park semantic terminalは
+別表）、materialized still forkの必要表示属性copy合格、LiveMedia forkの差分は全て明示policyである。
+passive可視投影では、同じcapture/bake ownership境界にあった **singleton side / Z resolved placement /
+last-painted holdover provenanceの3点**を今回補完した。他に同じ構造修正へ含める未保持属性は無い。
