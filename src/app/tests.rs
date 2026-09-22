@@ -475,6 +475,7 @@ fn stale_terminal_h_cleanup_cannot_close_current_j_and_current_j_close_remains_e
     );
     app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
     app.fs_viewport_shown = true;
+    app.mark_active_detached_viewport_rendered();
 
     // A late terminal effect for retired H must be exact-by-lease and leave J untouched.
     app.retire_terminal_detached_viewport_identity(OLD_WINDOW_H, "test_stale_h_cleanup");
@@ -574,6 +575,59 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
 
     let current_window_j = app.ensure_detached_viewer_window_id();
     assert_ne!(current_window_j, OLD_WINDOW_H);
+}
+
+#[test]
+#[cfg(windows)]
+fn hwnd_registration_preserves_previewport_lifecycle_until_render_marker() {
+    const WINDOW_ID: u64 = 53;
+
+    let mut app = phase_c_support::setup_app();
+    app.set_detached_window_binding_for_test(Some(WINDOW_ID));
+    app.begin_active_detached_session(WINDOW_ID, DetachedSource::Book);
+    assert_eq!(
+        app.detached_window_state(WINDOW_ID),
+        Some(DetachedWindowState::Opening)
+    );
+
+    assert!(app.begin_detached_window_hwnd_registration(WINDOW_ID, "test_opening_register"));
+    assert_eq!(
+        app.detached_window_state(WINDOW_ID),
+        Some(DetachedWindowState::Opening),
+        "pre-show registration must not claim that content has rendered"
+    );
+    let registered = app.detached_window_state_for_show_label(WINDOW_ID, "active_render");
+    app.transition_detached_window_state(WINDOW_ID, registered, "test_opening_registered");
+    assert_eq!(
+        app.detached_window_state(WINDOW_ID),
+        Some(DetachedWindowState::Opening),
+        "post-show HWND adoption is not the viewport-rendered marker"
+    );
+    app.mark_active_detached_viewport_rendered();
+    assert_eq!(
+        app.detached_window_state(WINDOW_ID),
+        Some(DetachedWindowState::Active)
+    );
+
+    app.transition_detached_window_state(
+        WINDOW_ID,
+        DetachedWindowState::Resuming,
+        "test_resume_begin",
+    );
+    assert!(app.begin_detached_window_hwnd_registration(WINDOW_ID, "test_resuming_register"));
+    let registered = app.detached_window_state_for_show_label(WINDOW_ID, "active_render");
+    app.transition_detached_window_state(WINDOW_ID, registered, "test_resuming_registered");
+    assert_eq!(
+        app.detached_window_state(WINDOW_ID),
+        Some(DetachedWindowState::Resuming),
+        "registration must preserve the typed resume lifecycle"
+    );
+    app.mark_active_detached_viewport_rendered();
+    assert_eq!(
+        app.detached_window_state(WINDOW_ID),
+        Some(DetachedWindowState::Active),
+        "only the actual viewport marker completes resume"
+    );
 }
 
 #[test]
@@ -45583,7 +45637,8 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(
             app.detached_window_state(7),
-            Some(DetachedWindowState::Active)
+            Some(DetachedWindowState::Opening),
+            "HWND adoption alone must not complete the content lifecycle"
         );
     }
 
@@ -46553,8 +46608,9 @@ mod still_window_mode_key_tests {
         assert_eq!(session.source, DetachedSource::Video);
         assert_eq!(
             app.detached_window_state(session.window_id),
-            Some(DetachedWindowState::Active)
+            Some(DetachedWindowState::Opening)
         );
+        app.mark_active_detached_viewport_rendered();
         app.bind_mounted_context_for_test(session.window_id);
 
         let request_id = begin_test_video_presentation_transition(
@@ -46666,6 +46722,7 @@ mod still_window_mode_key_tests {
         app.set_detached_window_binding_for_test(Some(window_id));
         app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
         app.detached_window_hwnd_set(window_id, 0x1000 + window_id);
+        app.mark_active_detached_viewport_rendered();
 
         assert_eq!(
             app.detached_window_state(window_id),
@@ -48665,6 +48722,12 @@ mod still_window_mode_key_tests {
             context.detached_viewer_independent_active = true;
             context.detached_viewer_open_next_still_detached_once = false;
         });
+        app.with_active_viewer_context(|context| {
+            assert!(
+                context.terminate_active_detached_open_before_viewport("test_empty_open_terminal")
+            );
+        })
+        .expect("the terminal producer must be mounted in its owning context");
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.update_active_viewer_context(ctx, None).updated;
@@ -48683,6 +48746,221 @@ mod still_window_mode_key_tests {
             None,
             "terminal close before viewport creation must remove the window runtime"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_bookmark_page_terminals_close_the_opening_context() {
+        for page_timeout in [false, true] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let window_id = if page_timeout { 506 } else { 505 };
+            let main_folder = app.tmp.path().join("main-bookmark-grid");
+            let main_item = main_folder.join("bookmark-row.jpg");
+            app.current_folder = Some(main_folder.clone());
+            app.items = vec![GridItem::Image(main_item.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.items_are_bookmark_view = true;
+
+            let container = app.tmp.path().join(if page_timeout {
+                "timed-out-book.pdf"
+            } else {
+                "missing-page-book.pdf"
+            });
+            let request_id = crate::bookmark_browser::BookmarkOpenRequestId(window_id);
+            let pending_container = container.clone();
+            app.build_active_context_for_test(
+                Some(window_id),
+                DetachedSource::Book,
+                move |context| {
+                    context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+                    context.current_folder = Some(pending_container.clone());
+                    context.viewer_presentation = ViewerPresentation::DetachedWindow;
+                    context.detached_viewer_independent_active = true;
+                    context.bookmark_view_state = Some(BookmarkViewState::Detached {
+                        target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+                            pending_container.clone(),
+                        ),
+                    });
+                    context.bookmark_open_pending =
+                        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
+                            crate::bookmark_browser::PendingBookOpen {
+                                request_id,
+                                bookmark: crate::book_bookmarks::BookBookmark {
+                                    id: window_id as i64,
+                                    container_key: crate::adjustment_db::normalize_path(
+                                        &pending_container,
+                                    ),
+                                    container_path: pending_container,
+                                    container_kind: crate::book_bookmarks::BookContainerKind::Pdf,
+                                    page_identity: crate::book_bookmarks::PageIdentity::PdfPage(7),
+                                    page_index_hint: 7,
+                                    created_at_ms: 1,
+                                    title: None,
+                                },
+                                relative_page_provenance: None,
+                                started_at: std::time::Instant::now(),
+                                stage:
+                                    crate::bookmark_browser::PendingBookOpenStage::AwaitingPage {
+                                        started_at: std::time::Instant::now()
+                                            - if page_timeout {
+                                                std::time::Duration::from_secs(46)
+                                            } else {
+                                                std::time::Duration::ZERO
+                                            },
+                                        entered_archive_prefix: false,
+                                    },
+                            },
+                        ));
+                },
+            );
+
+            app.with_active_viewer_context(|context| {
+                context.poll_bookmark_book_open(&ctx);
+                assert!(context.bookmark_open_pending.is_none());
+            })
+            .expect("bookmark terminal must run in its detached owner context");
+            assert_eq!(
+                app.detached_window_state(window_id),
+                Some(DetachedWindowState::Closing),
+                "page timeout/missing must explicitly terminate the pre-viewport lifecycle"
+            );
+
+            run_active_detached_frame_for_test(&mut app, &ctx);
+            assert!(app.active_viewer_context_id().is_none());
+            assert!(app.active_detached_session.is_none());
+            assert_eq!(app.detached_window_state(window_id), None);
+            assert_eq!(app.current_folder, Some(main_folder));
+            assert!(matches!(
+                app.items.as_slice(),
+                [GridItem::Image(path)] if path == &main_item
+            ));
+            assert!(app.items_are_bookmark_view);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_open_survives_sidecar_restore_until_first_viewport_render() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+        let window_id = 503;
+        let folder = app.tmp.path().join("detached-sidecar-book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let page = folder.join("page-001.jpg");
+        let mut thumb_rx = None;
+
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Book, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.current_folder = Some(folder.clone());
+            context.items = vec![GridItem::Image(page)];
+            context.thumbnails = vec![ThumbnailState::Pending];
+            context.image_metas = vec![None];
+            context.visible_indices = vec![0];
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            thumb_rx = Some(context.activate_live_sidecar_restore_for_test(folder.clone()));
+            assert!(context.defer_sidecar_restore_fullscreen(
+                0,
+                HistoryTrigger::UserChosen,
+                FsOpenMaterialization::Eager,
+                FsPageLoadContract::Sequential,
+            ));
+        });
+        let _thumb_rx = thumb_rx.expect("live restore must own a thumbnail continuation");
+
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Opening)
+        );
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Opening),
+            "session_begin -> restore wait must preserve the context-owned open lifecycle"
+        );
+        assert!(app.active_viewer_context_id().is_some());
+        assert!(app.active_detached_session.is_some());
+        assert!(!app.fs_viewport_shown);
+
+        app.poll_sidecar_restore(&ctx);
+        assert!(app.sidecar_restore.is_none());
+        app.with_active_viewer_context(|context| {
+            assert_eq!(context.fullscreen_idx, Some(0));
+        })
+        .expect("restore completion must retain the opening context");
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active),
+            "the first real viewport render is the Opening -> Active boundary"
+        );
+        assert!(app.active_viewer_context_id().is_some());
+        assert!(app.active_detached_session.is_some());
+        assert!(app.fs_viewport_shown);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_sidecar_identity_mismatch_closes_only_the_opening_context() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 504;
+        let main_folder = app.tmp.path().join("main-owner");
+        let main_page = main_folder.join("main.jpg");
+        app.current_folder = Some(main_folder.clone());
+        app.items = vec![GridItem::Image(main_page.clone())];
+        let folder = app.tmp.path().join("detached-mismatch-book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let page = folder.join("page-001.jpg");
+        let replacement = folder.join("replacement.jpg");
+        let mut thumb_rx = None;
+
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Image, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.current_folder = Some(folder.clone());
+            context.items = vec![GridItem::Image(page)];
+            context.thumbnails = vec![ThumbnailState::Pending];
+            context.image_metas = vec![None];
+            context.visible_indices = vec![0];
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            thumb_rx = Some(context.activate_live_sidecar_restore_for_test(folder.clone()));
+            assert!(context.defer_sidecar_restore_fullscreen(
+                0,
+                HistoryTrigger::UserChosen,
+                FsOpenMaterialization::Eager,
+                FsPageLoadContract::Sequential,
+            ));
+            context.items[0] = GridItem::Image(replacement);
+        });
+        let _thumb_rx = thumb_rx.expect("live restore must own a thumbnail continuation");
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Opening)
+        );
+        app.poll_sidecar_restore(&ctx);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Closing),
+            "an exact deferred target mismatch is a pre-viewport terminal event"
+        );
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert!(app.active_viewer_context_id().is_none());
+        assert!(app.active_detached_session.is_none());
+        assert_eq!(app.detached_window_state(window_id), None);
+        assert_eq!(app.current_folder.as_deref(), Some(main_folder.as_path()));
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::Image(path)] if path == &main_page
+        ));
     }
 
     fn install_convertible_archive_main_grid(
@@ -52303,6 +52581,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_active_detached_session(121, DetachedSource::Video);
+        app.mark_active_detached_viewport_rendered();
         app.fs_focus_grace_elapsed = true;
         app.window_visible = false;
 
@@ -52348,6 +52627,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_active_detached_session(122, DetachedSource::Video);
+        app.mark_active_detached_viewport_rendered();
         app.fs_focus_grace_elapsed = true;
         app.window_visible = false;
 
@@ -56440,6 +56720,7 @@ mod still_window_mode_key_tests {
             bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
             bundle.detached_viewer_independent_active = true;
         });
+        app.mark_active_detached_viewport_rendered();
 
         app.open_fullscreen(second_main, crate::app::HistoryTrigger::UserChosen);
 
@@ -58383,6 +58664,12 @@ mod still_window_mode_key_tests {
         assert!(app.detached_active_window_alive_wanted());
         assert_eq!(
             app.detached_window_state(window_id),
+            Some(DetachedWindowState::Opening),
+            "publishing the session must not erase the pre-viewport lifecycle"
+        );
+        app.mark_active_detached_viewport_rendered();
+        assert_eq!(
+            app.detached_window_state(window_id),
             Some(DetachedWindowState::Active)
         );
 
@@ -58403,6 +58690,12 @@ mod still_window_mode_key_tests {
         );
 
         app.begin_active_detached_session(window_id, DetachedSource::Image);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Resuming),
+            "resumption remains nonterminal until its viewport is rendered"
+        );
+        app.mark_active_detached_viewport_rendered();
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::Active)
@@ -59229,7 +59522,8 @@ mod still_window_mode_key_tests {
         assert_eq!(session.source, DetachedSource::Video);
         assert_eq!(
             app.detached_window_state(61),
-            Some(DetachedWindowState::Active)
+            Some(DetachedWindowState::Resuming),
+            "ParkedLive activation remains Resuming until the active viewport renders"
         );
         assert!(app.other_active_viewer_context_contains_video());
         assert!(
@@ -59531,7 +59825,8 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_window_state(71), None);
         assert_eq!(
             app.detached_window_state(72),
-            Some(DetachedWindowState::Active)
+            Some(DetachedWindowState::Resuming),
+            "ParkedLive activation remains Resuming until the active viewport renders"
         );
     }
 
@@ -60559,8 +60854,8 @@ mod still_window_mode_key_tests {
         assert!(app.detached_image_windows.is_empty());
         assert_eq!(
             app.detached_window_state(72),
-            Some(DetachedWindowState::Active),
-            "same-media activation keeps the existing viewport lease"
+            Some(DetachedWindowState::Resuming),
+            "same-media activation keeps the lease in Resuming until its viewport renders"
         );
         app.with_active_viewer_context(|active| {
             assert!(viewer_context_bundle_displays_media_path(
@@ -60609,7 +60904,8 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(
             app.detached_window_state(82),
-            Some(DetachedWindowState::Active)
+            Some(DetachedWindowState::Resuming),
+            "same-media ParkedLive activation remains Resuming until render"
         );
         assert_eq!(app.detached_viewer_window_id(), None);
         assert_eq!(
@@ -60704,8 +61000,8 @@ mod still_window_mode_key_tests {
         assert!(app.detached_image_windows.is_empty());
         assert_eq!(
             app.detached_window_state(74),
-            Some(DetachedWindowState::Active),
-            "same-media grid routing must promote the existing lease without retiring it"
+            Some(DetachedWindowState::Resuming),
+            "same-media grid routing must resume the existing lease without retiring it"
         );
         assert_eq!(app.input_seq, input_seq_before, "open path did not run");
     }
@@ -62871,6 +63167,7 @@ mod still_window_mode_key_tests {
                 .active_viewer_context_id()
                 .expect("partial spread backstop keeps a mounted owner");
             let state_before = app.detached_window_state(208);
+            assert_eq!(state_before, Some(DetachedWindowState::Opening));
 
             let rendered = render_backstop_with_captured_viewport(&mut app, &ctx).unwrap();
 
@@ -62881,7 +63178,11 @@ mod still_window_mode_key_tests {
                 app.viewer_context_residence(owner),
                 ContextResidence::Mounted
             );
-            assert_eq!(app.detached_window_state(208), state_before);
+            assert_eq!(
+                app.detached_window_state(208),
+                Some(DetachedWindowState::Active),
+                "the first active backstop render completes Opening"
+            );
             assert!(app.active_detached_viewport_rendered_this_frame());
         })
         .join()
@@ -62918,6 +63219,7 @@ mod still_window_mode_key_tests {
                 .active_viewer_context_id()
                 .expect("continuous backstop keeps a mounted owner");
             let state_before = app.detached_window_state(209);
+            assert_eq!(state_before, Some(DetachedWindowState::Opening));
 
             let rendered = render_backstop_with_captured_viewport(&mut app, &ctx).unwrap();
 
@@ -62928,7 +63230,11 @@ mod still_window_mode_key_tests {
                 app.viewer_context_residence(owner),
                 ContextResidence::Mounted
             );
-            assert_eq!(app.detached_window_state(209), state_before);
+            assert_eq!(
+                app.detached_window_state(209),
+                Some(DetachedWindowState::Active),
+                "the first active backstop render completes Opening"
+            );
             assert!(app.active_detached_viewport_rendered_this_frame());
         })
         .join()
@@ -62979,8 +63285,8 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(
             app.detached_window_state(5),
-            Some(crate::app::DetachedWindowState::Active),
-            "skipped backstop must not move the runtime into Opening"
+            Some(crate::app::DetachedWindowState::Opening),
+            "skipped backstop must leave first-host ownership in Opening"
         );
 
         set_detached_host_for_test(&mut app, 5, 0x5000, true);
@@ -64487,7 +64793,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn parked_hwnd_liveness_clears_dead_registry_entry() {
+    fn parked_hwnd_liveness_recreation_returns_to_activatable_parked() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let texture = ctx.load_texture(
@@ -64520,6 +64826,9 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
+        app.detached_image_windows[0].reopen_descriptor = Some(ViewerContextDescriptor::Image {
+            path: PathBuf::from(r"C:\pics\a.jpg"),
+        });
         app.transition_detached_window_state(7, DetachedWindowState::Parked, "test_liveness");
         app.set_detached_window_runtime_placement(7, placement, "test_liveness");
         set_detached_host_for_test(&mut app, 7, 0x7000, false);
@@ -64535,6 +64844,22 @@ mod still_window_mode_key_tests {
             app.detached_window_state(7),
             Some(DetachedWindowState::Opening),
             "dead parked HWNDs should re-enter Opening so the deferred callback can re-adopt"
+        );
+
+        assert!(app.begin_detached_window_hwnd_registration(7, "passive"));
+        set_detached_host_for_test(&mut app, 7, 0x7001, true);
+        let registered = app.detached_window_state_for_show_label(7, "passive");
+        app.transition_detached_window_state(7, registered, "test_passive_recreated");
+        assert_eq!(
+            app.detached_window_state(7),
+            Some(DetachedWindowState::Parked),
+            "passive post-show registration must return a recreated host to Parked"
+        );
+        assert!(
+            app.deferred_detached_activation_watch_targets()
+                .iter()
+                .any(|target| target.window_id == 7),
+            "the recreated passive window must re-enter activation watcher ownership"
         );
     }
 
@@ -77810,6 +78135,7 @@ fn exact_old_cleanup_keeps_current_sibling_session_binding_runtime_and_viewport(
     app.detached_window_hwnd_set(SIBLING_WINDOW, SIBLING_HOST);
     app.set_detached_window_live_hwnds_for_test([OLD_HOST, SIBLING_HOST]);
     app.begin_mounted_detached_session_for_test(SIBLING_WINDOW, DetachedSource::Video);
+    app.mark_active_detached_viewport_rendered();
     let sibling_context = app
         .locate_window_context(SIBLING_WINDOW)
         .expect("sibling binding before stale cleanup")

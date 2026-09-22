@@ -1247,9 +1247,17 @@ impl App {
         {
             return false;
         }
-        // HWND の欠落は OS host の生成状態であって、メディア session の意味状態ではない。
-        // ParkedLive を Opening に落とすと live poll / 新メディア close routing から外れる。
-        if self.detached_window_state(window_id) != Some(DetachedWindowState::ParkedLive) {
+        // HWND の欠落は OS host の生成状態であって、初回/再開 content lifecycle の完了では
+        // ない。Opening/Resuming は render marker まで保持する。Active/Parked の host 再登録は
+        // 従来どおり Opening を経由し、ParkedLive は live poll ownership を維持する。
+        if !matches!(
+            self.detached_window_state(window_id),
+            Some(
+                DetachedWindowState::Opening
+                    | DetachedWindowState::Resuming
+                    | DetachedWindowState::ParkedLive
+            )
+        ) {
             self.transition_detached_window_state(window_id, DetachedWindowState::Opening, reason);
         }
         true
@@ -1265,6 +1273,8 @@ impl App {
             Some(DetachedWindowState::ParkedLive) => DetachedWindowState::ParkedLive,
             Some(DetachedWindowState::Closing) => DetachedWindowState::Closing,
             _ if label == "passive" => DetachedWindowState::Parked,
+            Some(DetachedWindowState::Opening) => DetachedWindowState::Opening,
+            Some(DetachedWindowState::Resuming) => DetachedWindowState::Resuming,
             _ => DetachedWindowState::Active,
         }
     }
@@ -1412,8 +1422,12 @@ impl App {
                 transition.hwnd
             ));
         }
-        let entering_active = transition.from != DetachedWindowState::Active
-            && transition.to == DetachedWindowState::Active;
+        let entering_active = (transition.from != DetachedWindowState::Active
+            && transition.to == DetachedWindowState::Active)
+            || (matches!(
+                transition.from,
+                DetachedWindowState::Parked | DetachedWindowState::ParkedLive
+            ) && transition.to == DetachedWindowState::Resuming);
         self.log_detached_image_window_debug(format!(
             "state_transition window_id={} from={:?} to={:?} \
              reason={reason} hwnd=0x{:x} linked={}",
@@ -25273,6 +25287,8 @@ impl App {
             // (PDF 側 cancel ガードと対称)。
             self.fs_nav_after_pdf_enumerate = None;
             self.finish_visible_container_fs_nav_failed();
+            #[cfg(windows)]
+            self.terminate_active_detached_open_before_viewport("zip_enumerate_cancelled");
             return;
         }
         let result = match pending.rx.try_recv() {
@@ -25295,6 +25311,8 @@ impl App {
                 self.set_empty_items_reason(
                     crate::empty_items_reason::EmptyItemsReason::ZipWorkerLost,
                 );
+                #[cfg(windows)]
+                self.terminate_active_detached_open_before_viewport("zip_enumerate_disconnected");
                 return;
             }
         };
@@ -25487,6 +25505,8 @@ impl App {
                 self.set_empty_items_reason(
                     crate::empty_items_reason::EmptyItemsReason::ZipEnumerateFailed { detail: e },
                 );
+                #[cfg(windows)]
+                self.terminate_active_detached_open_before_viewport("zip_enumerate_failed");
                 return;
             }
         };
@@ -26331,10 +26351,18 @@ impl App {
             DeferredFsOpenOutcome::Opened => {}
             DeferredFsOpenOutcome::NoPlayableItem => {
                 self.finish_visible_container_fs_nav_failed();
+                #[cfg(windows)]
+                self.terminate_active_detached_open_before_viewport(
+                    "deferred_open_no_playable_item",
+                );
             }
             DeferredFsOpenOutcome::RequiredTargetMissing => {
                 self.finish_visible_container_fs_nav_failed();
                 self.show_feedback_toast("移動先の画像が見つかりません".to_string());
+                #[cfg(windows)]
+                self.terminate_active_detached_open_before_viewport(
+                    "deferred_open_required_target_missing",
+                );
             }
         }
     }
@@ -26498,6 +26526,8 @@ impl App {
             // (= UI フリーズに見える)。明示的に破棄する。
             self.fs_nav_after_pdf_enumerate = None;
             self.finish_visible_container_fs_nav_failed();
+            #[cfg(windows)]
+            self.terminate_active_detached_open_before_viewport("pdf_enumerate_cancelled");
             return;
         }
 
@@ -26522,6 +26552,8 @@ impl App {
                 self.set_empty_items_reason(
                     crate::empty_items_reason::EmptyItemsReason::PdfWorkerLost,
                 );
+                #[cfg(windows)]
+                self.terminate_active_detached_open_before_viewport("pdf_enumerate_disconnected");
                 return;
             }
         };
@@ -26540,6 +26572,8 @@ impl App {
                 // 残すと grid 抑止 / holdover 維持が永続化して UI フリーズに見える。
                 self.fs_nav_after_pdf_enumerate = None;
                 self.finish_visible_container_fs_nav_failed();
+                #[cfg(windows)]
+                self.terminate_active_detached_open_before_viewport("pdf_enumerate_interrupted");
                 return;
             }
         }
@@ -26721,6 +26755,8 @@ impl App {
                         detail: err_msg,
                     },
                 );
+                #[cfg(windows)]
+                self.terminate_active_detached_open_before_viewport("pdf_enumerate_failed");
             }
         }
     }
@@ -26833,6 +26869,8 @@ impl App {
         self.fs_nav_after_pdf_enumerate = None;
         self.finish_visible_container_fs_nav_failed();
         self.restore_rating_filter_suppression();
+        #[cfg(windows)]
+        self.terminate_active_detached_open_before_viewport("pdf_password_cancelled");
         true
     }
 
@@ -35374,7 +35412,11 @@ impl App {
                 self.fullscreen_idx,
                 current_item
             ));
-            self.cancel_bookmark_open_request(pending.request_id, "media_timeout");
+            let cancelled = self.cancel_bookmark_open_request(pending.request_id, "media_timeout");
+            #[cfg(windows)]
+            if cancelled {
+                self.terminate_active_detached_open_before_viewport("media_timeout");
+            }
             self.show_feedback_toast("ブックマーク位置を開けませんでした".to_string());
             return;
         }
@@ -35474,14 +35516,24 @@ impl App {
                     return;
                 }
                 if pending.started_at.elapsed() > std::time::Duration::from_secs(45) {
-                    self.cancel_bookmark_open_request(pending.request_id, "book_resolve_timeout");
+                    let cancelled = self
+                        .cancel_bookmark_open_request(pending.request_id, "book_resolve_timeout");
+                    #[cfg(windows)]
+                    if cancelled {
+                        self.terminate_active_detached_open_before_viewport("book_resolve_timeout");
+                    }
                     self.show_feedback_toast("ブックマーク先の本を開けませんでした".to_string());
                 }
                 return;
             }
         };
         if started_at.elapsed() > std::time::Duration::from_secs(45) {
-            self.cancel_bookmark_open_request(pending.request_id, "book_page_timeout");
+            let cancelled =
+                self.cancel_bookmark_open_request(pending.request_id, "book_page_timeout");
+            #[cfg(windows)]
+            if cancelled {
+                self.terminate_active_detached_open_before_viewport("book_page_timeout");
+            }
             self.show_feedback_toast("ブックマーク先の本を開けませんでした".to_string());
             return;
         }
@@ -35530,7 +35582,12 @@ impl App {
             || self.folder_pane_open_pending.is_some()
             || self.pdf_password_request.is_some();
         if !enumeration_pending {
-            self.cancel_bookmark_open_request(pending.request_id, "book_page_missing");
+            let cancelled =
+                self.cancel_bookmark_open_request(pending.request_id, "book_page_missing");
+            #[cfg(windows)]
+            if cancelled {
+                self.terminate_active_detached_open_before_viewport("book_page_missing");
+            }
             self.show_feedback_toast(
                 "ブックマーク先のページが見つかりません（記録は保持されます）".to_string(),
             );
@@ -40804,6 +40861,11 @@ impl App {
                 // A still-owned disconnected channel is therefore an abnormal worker exit and
                 // must complete an exact fullscreen request through its normal failure boundary.
                 let mut pending = self.folder_pane_open_pending.take().unwrap();
+                let detached_open = matches!(
+                    pending.purpose,
+                    FolderOpenScanPurpose::DetachedImage { .. }
+                        | FolderOpenScanPurpose::DetachedFolder
+                );
                 if matches!(
                     pending.purpose,
                     FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
@@ -40812,6 +40874,12 @@ impl App {
                         trace.terminal("scan_disconnected");
                     }
                     self.finish_required_fullscreen_folder_scan_failure();
+                }
+                #[cfg(windows)]
+                if detached_open {
+                    self.terminate_active_detached_open_before_viewport(
+                        "detached_folder_scan_disconnected",
+                    );
                 }
                 None
             }
@@ -41106,7 +41174,17 @@ impl App {
                 self.with_detached_viewer_main_history_suppressed(|app| {
                     app.load_folder_with_scan(ready.path, Some(scan));
                 });
-                DetachedPhysicalFolderOpenPoll::Applied
+                if self.fullscreen_idx.is_some()
+                    || self.sidecar_restore_deferred_fullscreen_wait_active()
+                    || matches!(
+                        self.bookmark_open_pending,
+                        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
+                    )
+                {
+                    DetachedPhysicalFolderOpenPoll::Applied
+                } else {
+                    DetachedPhysicalFolderOpenPoll::Failed
+                }
             }
             FolderOpenScanPurpose::PaneNavigation => {
                 // active detached viewport はフォルダペインを持たないため通常は到達しない。
@@ -43262,8 +43340,11 @@ impl App {
         ));
     }
 
-    /// アクティブ detached セッションを開始 / 更新する (set)。既に同じ window_id の
-    /// セッションがあれば runtime state を Active に戻して据え置く (passive→active 再開や F12 再 ON)。
+    /// アクティブ detached セッションを開始 / 更新する (set)。
+    ///
+    /// セッション publish は OS viewport の生成完了ではない。新規 open の `Opening` と
+    /// passive→active 再開の `Resuming` は、実際の viewport render が観測されるまで保持する。
+    /// `Active` への唯一の昇格点は `mark_active_detached_viewport_rendered`。
     #[cfg(windows)]
     #[track_caller]
     pub(crate) fn begin_active_detached_session(&mut self, window_id: u64, source: DetachedSource) {
@@ -43299,12 +43380,21 @@ impl App {
             self.active_detached_session,
             std::panic::Location::caller(),
         );
-        if changed || current_state != Some(DetachedWindowState::Active) {
-            self.transition_detached_window_state(
-                window_id,
-                DetachedWindowState::Active,
-                "session_begin",
-            );
+        let begin_state = match current_state {
+            Some(DetachedWindowState::Active) => DetachedWindowState::Active,
+            Some(DetachedWindowState::Resuming) => DetachedWindowState::Resuming,
+            Some(DetachedWindowState::Opening) => DetachedWindowState::Opening,
+            Some(DetachedWindowState::Parked | DetachedWindowState::ParkedLive) => {
+                DetachedWindowState::Resuming
+            }
+            Some(DetachedWindowState::Closing) => DetachedWindowState::Closing,
+            None => DetachedWindowState::Opening,
+        };
+        let lifecycle_changed = current_state != Some(begin_state);
+        if lifecycle_changed {
+            self.transition_detached_window_state(window_id, begin_state, "session_begin");
+        }
+        if changed || lifecycle_changed {
             self.ensure_detached_window_runtime_placement(window_id, "session_begin_seed");
         }
         if changed {
@@ -43326,6 +43416,37 @@ impl App {
                 "session_closing window_id={window_id} reason={reason}"
             ));
         }
+    }
+
+    /// A producer that owns an initial detached open has reached a terminal result before the
+    /// first viewport was rendered. Active navigation deliberately ignores this event: only the
+    /// typed `Opening` / `Resuming` lifecycle may be completed here.
+    #[cfg(windows)]
+    pub(crate) fn terminate_active_detached_open_before_viewport(
+        &mut self,
+        reason: &'static str,
+    ) -> bool {
+        // Use the projected context binding, not the App-global active selection. This helper is
+        // also called while a detached context is still Building, and a main-context producer
+        // must never terminate a sibling detached open.
+        let Some(window_id) = self.detached_viewer_window_id() else {
+            return false;
+        };
+        if !matches!(
+            self.detached_window_state(window_id),
+            Some(DetachedWindowState::Opening | DetachedWindowState::Resuming)
+        ) {
+            return false;
+        }
+        if self.active_detached_window_id() == Some(window_id) {
+            self.begin_active_detached_session_close(reason);
+        } else {
+            self.transition_detached_window_state(window_id, DetachedWindowState::Closing, reason);
+            self.log_detached_image_window_debug(format!(
+                "open_terminal_before_session window_id={window_id} reason={reason}"
+            ));
+        }
+        true
     }
 
     /// terminal close を完了し、session と同じ window_id の runtime を一体で除去する。
@@ -43420,13 +43541,28 @@ impl App {
     }
 
     /// active detached bundle が「まだ内部遷移の途中」か。
-    /// このフレームで detached window を生かしておく理由が1つでもあれば true。
+    /// 初回 viewport までは runtime reducer (`Opening` / `Resuming`) が正本。その後の
+    /// `Active` navigation だけは、各 typed pending owner がこのフレームの継続を宣言する。
     ///
     /// 同じ条件列が repaint 要求 / should_drop / keep-alive の3箇所に複製されており、
     /// finalize だけが更新から取り残されて 2026-07 の「Ctrl+↓ で detached window が閉じる」
     /// 回帰を生んだ。以後 pending を増やすときはこの1箇所だけを更新すること。
     #[cfg(windows)]
     pub(crate) fn active_detached_transition_outstanding(&self) -> bool {
+        match self
+            .active_detached_window_id()
+            .and_then(|window_id| self.detached_window_state(window_id))
+        {
+            Some(DetachedWindowState::Opening | DetachedWindowState::Resuming) => return true,
+            Some(DetachedWindowState::Closing) => return false,
+            Some(
+                DetachedWindowState::Active
+                | DetachedWindowState::Parked
+                | DetachedWindowState::ParkedLive,
+            )
+            | None => {}
+        }
+
         self.folder_nav_pending.is_some()
             || self.folder_pane_open_pending.is_some()
             || self.pdf_enumerate_pending.is_some()
@@ -43453,6 +43589,16 @@ impl App {
     pub(crate) fn mark_active_detached_viewport_rendered(&mut self) {
         self.detached_active_viewport_rendered_frame = self.frame_counter;
         if let Some(session) = self.active_detached_session {
+            if matches!(
+                self.detached_window_state(session.window_id),
+                Some(DetachedWindowState::Opening | DetachedWindowState::Resuming)
+            ) {
+                self.transition_detached_window_state(
+                    session.window_id,
+                    DetachedWindowState::Active,
+                    "active_viewport_rendered",
+                );
+            }
             self.log_detached_image_window_debug(format!(
                 "active_detached_immediate_rendered frame={} window_id={} viewport={:?}",
                 self.frame_counter,
@@ -45974,6 +46120,9 @@ impl App {
                                     "image_reopen_no_parent_for_async_folder_scan path={}",
                                     path.display()
                                 ));
+                                app.terminate_active_detached_open_before_viewport(
+                                    "detached_image_open_no_parent",
+                                );
                             }
                         }
                     },
@@ -46747,7 +46896,14 @@ impl App {
                 if let Some(result) = app.poll_folder_nav() {
                     app.apply_folder_nav_result(ctx, result);
                 }
-                let _ = app.poll_detached_physical_folder_open(ctx);
+                if matches!(
+                    app.poll_detached_physical_folder_open(ctx),
+                    DetachedPhysicalFolderOpenPoll::Failed
+                ) {
+                    app.terminate_active_detached_open_before_viewport(
+                        "detached_physical_open_failed",
+                    );
+                }
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
                 app.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel);

@@ -618,6 +618,55 @@ impl App {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn activate_live_sidecar_restore_for_test(
+        &mut self,
+        folder: PathBuf,
+    ) -> Receiver<ThumbMsg> {
+        let target_context = self.sidecar_restore_projected_context();
+        let (tx, rx) = mpsc::channel();
+        let started_at = std::time::Instant::now();
+        self.sidecar_restore = Some(SidecarRestoreState {
+            common: Common {
+                request_id: 1,
+                started_at,
+                target_context,
+                items_generation: self.items_generation,
+                folder: folder.clone(),
+                data_dir: folder.clone(),
+                families: crate::sidecar_import::ImportFamilies {
+                    edits: true,
+                    tags: true,
+                },
+                tag_item_keys: Vec::new(),
+                source_path: folder.clone(),
+                continuation: ContinuationOwner::Live(SidecarLoadContinuation {
+                    source_path: folder.clone(),
+                    source_is_directory: true,
+                    prepared_subfolder: None,
+                    prepared_aggregate: None,
+                    catalog_existing_keys: HashSet::new(),
+                    video_items: Vec::new(),
+                    sli_seq: 0,
+                    sli_t0: started_at,
+                    items_len: self.items.len(),
+                    detached_physical: true,
+                    tx,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    restore_started_at: started_at,
+                }),
+                deferred_fullscreen: None,
+                favorite_failures: Vec::new(),
+                warning: None,
+                source_change_reprobe: false,
+                clear_sidecar_cache_after_flush: false,
+                effects: RestoreEffects::default(),
+            },
+            phase: Phase::Resuming,
+        });
+        rx
+    }
+
     /// Discard semantic input while keeping release edges available to the
     /// existing hold owners. Nothing retained here is queued for replay after
     /// the restore terminal.
@@ -1232,6 +1281,10 @@ impl App {
             return;
         };
         if !self.sidecar_restore_context_current(&state.common) {
+            #[cfg(windows)]
+            self.terminate_active_detached_open_before_viewport(
+                "sidecar_restore_target_identity_changed",
+            );
             if state.common.discard_target() {
                 crate::logger::log(format!(
                     "sidecar restore target changed request={} context={:?} generation={}",
@@ -1661,6 +1714,7 @@ impl App {
         let deferred = state.common.deferred_fullscreen.take();
         let favorite_failures = std::mem::take(&mut state.common.favorite_failures);
         let continuation = state.common.continuation.take_live();
+        let continuation_discarded = continuation.is_none();
         self.resume_metadata_transfer_context_readers();
         if let Some(continuation) = continuation {
             self.resume_loading_items_after_sidecar(continuation);
@@ -1668,19 +1722,31 @@ impl App {
         for command in favorite_failures {
             self.restore_failed_favorite_command(command);
         }
-        if let Some(deferred) = deferred
-            && self
+        let mut deferred_identity_mismatch = false;
+        if let Some(deferred) = deferred {
+            if self
                 .items
                 .get(deferred.idx)
                 .is_some_and(|item| item.perf_key() == deferred.item_key)
-        {
-            self.open_fullscreen_with_materialization_and_contract(
-                deferred.idx,
-                deferred.trigger,
-                deferred.requested_materialization,
-                deferred.load_contract,
-                None,
-            );
+            {
+                self.open_fullscreen_with_materialization_and_contract(
+                    deferred.idx,
+                    deferred.trigger,
+                    deferred.requested_materialization,
+                    deferred.load_contract,
+                    None,
+                );
+            } else {
+                deferred_identity_mismatch = true;
+            }
+        }
+        #[cfg(windows)]
+        if continuation_discarded || deferred_identity_mismatch {
+            self.terminate_active_detached_open_before_viewport(if continuation_discarded {
+                "sidecar_restore_continuation_discarded"
+            } else {
+                "sidecar_restore_deferred_identity_mismatch"
+            });
         }
         ctx.request_repaint();
     }
