@@ -3585,6 +3585,7 @@ impl App {
         self.active_detached_session = Some(ActiveDetachedSession {
             window_id,
             source: DetachedSource::Image,
+            content_phase: DetachedSessionContentPhase::Ready,
         });
         self.record_active_detached_session_write(
             "set",

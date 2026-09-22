@@ -26,6 +26,8 @@ use std::sync::atomic::Ordering;
 
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
+#[cfg(windows)]
+use crate::app::DetachedSessionContentPhase;
 use crate::app::{
     App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover,
     FsNavigationChromeContinuation, FsNavigationDisplayTarget, FsNavigationPresentation,
@@ -3551,6 +3553,36 @@ fn paint_centered_dark_status_overlay(ui: &egui::Ui, full_rect: egui::Rect, text
         text,
         font,
         egui::Color32::WHITE,
+    );
+}
+
+/// Paint the canonical fresh fullscreen loading placeholder.
+///
+/// `draw_fs_image` uses this while the selected page has no usable texture yet.  Detached
+/// opening shells deliberately call the same helper so a slow container/path preflight does not
+/// invent a second loading presentation before the first page exists.
+fn paint_fullscreen_loading_placeholder(
+    ui: &egui::Ui,
+    full_rect: egui::Rect,
+    loading_label: &str,
+    location_display: &str,
+) {
+    let painter = ui.painter();
+    painter.text(
+        full_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        loading_label,
+        egui::FontId::proportional(24.0),
+        egui::Color32::from_gray(180),
+    );
+    crate::ui_helpers::draw_centered_elided_label(
+        painter,
+        full_rect,
+        location_display,
+        14.0,
+        egui::Color32::from_gray(170),
+        full_rect.center().y + 22.0,
+        20.0,
     );
 }
 
@@ -19407,6 +19439,8 @@ impl App {
         let layout = self.fs_navigation_gap_layout(full_rect, chrome);
         if let Some(unit) = unit {
             self.draw_fs_display_unit_holdover(ui, ctx, layout.media_rect, unit);
+        } else {
+            paint_fullscreen_loading_placeholder(ui, layout.media_rect, "読込中...", "");
         }
         if let Some((lock_effective, seek_height)) = layout.panel {
             self.draw_metadata_panel_navigation_shell(
@@ -20663,6 +20697,120 @@ impl App {
         #[cfg(not(windows))]
         let detached_transition_hold = false;
 
+        // A fresh detached request owns a stable viewport before its first item/index exists.
+        // Render that viewport now instead of waiting for enumeration, conversion, path
+        // resolution, or sidecar restore to manufacture `fullscreen_idx`.  This is the normal
+        // first-host producer (not the K0 backstop), so it uses the active detached builder,
+        // publishes visibility only after the loading canvas has been painted, and only then
+        // advances Opening/Resuming through the runtime reducer.
+        #[cfg(windows)]
+        if !self.fs_viewport_shown && detached_transition_hold {
+            let Some(window_id) = self.active_detached_window_id() else {
+                return;
+            };
+            self.detached_viewer_focus_requested = false;
+            let activate_on_show = if self.video_presentation_transition.is_transitioning()
+                && self.video_presentation_transition.target() == ViewerPresentation::DetachedWindow
+            {
+                let _ = self.take_detached_viewer_activate_on_show();
+                false
+            } else {
+                self.take_detached_viewer_activate_on_show()
+            };
+            let detached_host_needs_create = self.detached_viewer_should_seed_placement();
+            let apply_placement = detached_host_needs_create;
+            let builder_placement = apply_placement.then(|| {
+                self.active_detached_builder_placement_latch(true, "detached_loading_shell")
+            });
+            let builder = self.build_detached_viewer_viewport_builder(
+                0,
+                Some(activate_on_show),
+                if detached_host_needs_create || !self.window_visible {
+                    DetachedViewportBuilderVisibility::Hidden
+                } else {
+                    DetachedViewportBuilderVisibility::Preserve
+                },
+                apply_placement,
+                builder_placement,
+                "detached_loading_shell",
+            );
+            let hwnd_before = self.detached_window_hwnd_snapshot_before_show(
+                window_id,
+                "detached_loading_shell",
+                fs_id,
+            );
+            let loading_location = self.address.clone();
+            let mut cancel = false;
+            ctx.show_viewport_immediate(fs_id, builder, |vp_ctx, _class| {
+                if self.sidecar_restore_blocks_projected_context() {
+                    Self::consume_sidecar_restore_viewport_input(vp_ctx);
+                } else if vp_ctx.input(|input| {
+                    input.viewport().close_requested() || input.key_pressed(egui::Key::Escape)
+                }) {
+                    cancel = true;
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                    .show(vp_ctx, |ui| {
+                        paint_fullscreen_loading_placeholder(
+                            ui,
+                            ui.max_rect(),
+                            "読込中...",
+                            &loading_location,
+                        );
+                    });
+                self.show_sidecar_restore_dialog(vp_ctx);
+            });
+            self.register_detached_window_hwnd_after_show(
+                ctx,
+                window_id,
+                "detached_loading_shell",
+                fs_id,
+                hwnd_before.as_deref(),
+            );
+            self.fs_viewport_shown = true;
+            self.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+            if cancel {
+                self.cancel_detached_initial_open_for_lease(
+                    Self::detached_session_lease(window_id),
+                    "detached_loading_shell_cancel",
+                );
+            } else {
+                if detached_host_needs_create
+                    && self.window_visible
+                    && !self.video_presentation_transition.is_transitioning()
+                {
+                    let maximized = self.active_detached_viewport_maximized_on_visible_commit();
+                    Self::send_detached_viewport_visible_commit(ctx, fs_id, maximized);
+                    self.observe_viewport_presentation_command(
+                        fs_id,
+                        crate::presentation_observer::WindowAction::Visible,
+                        "ui_fullscreen::detached_loading_shell_visible_commit",
+                        if maximized {
+                            "maximized=true value=true"
+                        } else {
+                            "maximized=false value=true"
+                        },
+                    );
+                    if activate_on_show {
+                        ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
+                        self.observe_viewport_presentation_command(
+                            fs_id,
+                            crate::presentation_observer::WindowAction::Focus,
+                            "ui_fullscreen::detached_loading_shell_visible_commit",
+                            "viewport_command=Focus",
+                        );
+                        self.mark_video_audio_music_viewport_focus_requested(fs_id);
+                    }
+                }
+                // This is deliberately after `show_viewport_immediate`: the loading callback is
+                // a real active viewport render, so it is the valid Opening -> Active boundary.
+                self.mark_active_detached_viewport_rendered_if_matches(fs_id);
+            }
+            ctx.request_repaint();
+            return;
+        }
+
         // Ctrl+↑↓ の deferred reopen (PDF/ZIP列挙またはsidecar復元)、またはactive detachedの
         // scan・password
         // 待ちでは fullscreen_idx が None のまま内部遷移の完了を待つ。この間ビューポートを
@@ -20770,6 +20918,11 @@ impl App {
             #[cfg(windows)]
             self.mark_active_detached_viewport_rendered_if_matches(fs_id);
             if cancel {
+                #[cfg(windows)]
+                let preparing_lease = self.active_detached_session.and_then(|session| {
+                    (session.content_phase == DetachedSessionContentPhase::Preparing)
+                        .then_some(Self::detached_session_lease(session.window_id))
+                });
                 // 保留中の「列挙後にフルスクリーン復帰」意図を破棄。
                 // poll_pdf_enumerate 完了時のフルスクリーン再オープンが抑止され、
                 // 次フレーム以降はこの関数の非アクティブ経路でビューポートが
@@ -20778,12 +20931,22 @@ impl App {
                 // `poll_fs_nav_lock` の解放経路に乗らず lock/holdover が居座る。
                 // 明示 release で確実に状態をクリーンにする (embedded 用ヘルパと対称、
                 // Codex 第 3 ラウンド P2)。
+                #[cfg(windows)]
+                if let Some(lease) = preparing_lease {
+                    self.cancel_detached_initial_open_for_lease(
+                        lease,
+                        "deferred_loading_shell_cancel",
+                    );
+                } else {
+                    self.finish_fullscreen_navigation_for_true_close();
+                }
+                #[cfg(not(windows))]
                 self.finish_fullscreen_navigation_for_true_close();
                 // deferred holdover 中の Esc / × は detached viewer を閉じる明示操作。
                 // 同フレームの backstop より前に session を畳んで空窓の再描画を防ぐ
                 // (Codex レビュー #3 site 3)。(detached session は cfg(windows))
                 #[cfg(windows)]
-                {
+                if preparing_lease.is_none() {
                     self.begin_active_detached_session_close("deferred_holdover_cancel");
                     self.finish_active_detached_session_close("deferred_holdover_cancel");
                 }
@@ -34633,28 +34796,12 @@ impl App {
             // 文言だったが、動画サムネ自体を廃止したので出さない (VST3 初期化待ちだけは下の
             // 分岐で専用表示する)。
         } else {
-            let painter = ui.painter();
             let loading_label = if vst3_waiting_for_video {
                 "VST3 プラグインを初期化中..."
             } else {
                 "読込中..."
             };
-            painter.text(
-                full_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                loading_label,
-                egui::FontId::proportional(24.0),
-                egui::Color32::from_gray(180),
-            );
-            crate::ui_helpers::draw_centered_elided_label(
-                painter,
-                full_rect,
-                location_display,
-                14.0,
-                egui::Color32::from_gray(170),
-                full_rect.center().y + 22.0,
-                20.0,
-            );
+            paint_fullscreen_loading_placeholder(ui, full_rect, loading_label, location_display);
         }
         None
     }

@@ -468,6 +468,9 @@ fn item_belongs_to_detached_physical_scope(item: &GridItem, scope: &Path) -> boo
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DetachedGridArchiveOpenRequestOwner {
     pub(crate) request_id: u64,
+    /// Stable loading-window lease created when the user invokes the open.
+    #[cfg(windows)]
+    pub(crate) lease: DetachedSessionLease,
     /// The path selected in the main grid. A multi-volume RAR probe may resolve a different
     /// backing volume, but the detached reader must retain this user-facing identity.
     pub(crate) source_path: PathBuf,
@@ -2679,10 +2682,27 @@ pub(crate) enum DetachedSource {
 /// - folder-nav reopen / PDF/ZIP 列挙待ち / context swap では据え置き (close_fullscreen で
 ///   推測クリアしない)。
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedSessionContentPhase {
+    /// The stable window exists, but no normal fullscreen item has rendered in it yet.
+    Preparing,
+    /// At least one normal fullscreen item has rendered. Later `fullscreen_idx=None` gaps are
+    /// navigation transitions and must not be mistaken for an initial-open terminal.
+    Ready,
+}
+
+#[cfg(windows)]
+enum DetachedLoadingContextInit {
+    Continue,
+    Abort(&'static str),
+}
+
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ActiveDetachedSession {
     pub(crate) window_id: u64,
     pub(crate) source: DetachedSource,
+    pub(crate) content_phase: DetachedSessionContentPhase,
 }
 
 #[cfg(windows)]
@@ -4705,6 +4725,8 @@ pub(crate) enum FolderOpenScanPurpose {
     /// book (detached) or an ordinary mixed folder (main navigation).
     GridFolderCandidate {
         collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
+        #[cfg(windows)]
+        detached_lease: DetachedSessionLease,
     },
     DetachedFolder,
     DetachedImage {
@@ -4734,6 +4756,14 @@ pub(crate) enum FolderOpenScanPurpose {
 }
 
 impl FolderOpenScanPurpose {
+    #[cfg(windows)]
+    fn detached_loading_lease(&self) -> Option<DetachedSessionLease> {
+        match self {
+            Self::GridFolderCandidate { detached_lease, .. } => Some(*detached_lease),
+            _ => None,
+        }
+    }
+
     fn diagnostic_trace(&self) -> Option<&SimilarMoveTrace> {
         match self {
             Self::RequiredFullscreenTarget {
@@ -35121,6 +35151,56 @@ impl App {
         self.scroll_to_selected = rows_changed && self.selected.is_some();
     }
 
+    #[cfg(windows)]
+    fn start_detached_bookmark_loading_context(
+        &mut self,
+        ctx: &egui::Context,
+        pending: crate::bookmark_browser::PendingBookmarkOpen,
+        target: crate::bookmark_browser::BookmarkViewReturnTarget,
+        source: DetachedSource,
+        requested: PathBuf,
+    ) -> bool {
+        let base_placement = self.active_detached_viewer_current_placement();
+        let had_active_detached = self.active_detached_context_exists();
+        let parked = if matches!(source, DetachedSource::Video | DetachedSource::Audio) {
+            self.park_and_close_current_active_detached_viewer_for_media_handoff(ctx)
+        } else {
+            self.park_and_close_current_active_detached_viewer(ctx)
+        };
+        if !parked {
+            return false;
+        }
+        let placement_seed = had_active_detached
+            .then(|| self.offset_detached_image_window_placement(base_placement));
+        let resolve_path = requested.clone();
+        self.start_active_detached_loading_context(
+            ctx,
+            placement_seed,
+            source,
+            requested,
+            move |app, _window_id| {
+                app.bookmark_open_pending = Some(pending);
+                app.bookmark_view_state = Some(BookmarkViewState::Detached { target });
+                app.start_startup_open_path_resolve(
+                    resolve_path,
+                    StartupOpenPathSource::Bookmark,
+                    ctx,
+                );
+                if app.bookmark_open_pending.is_some()
+                    && matches!(
+                        app.bookmark_view_state,
+                        Some(BookmarkViewState::Detached { .. })
+                    )
+                {
+                    DetachedLoadingContextInit::Continue
+                } else {
+                    DetachedLoadingContextInit::Abort("bookmark_resolve_sync_terminal")
+                }
+            },
+        )
+        .is_some()
+    }
+
     pub(crate) fn open_bookmark_browser_row(
         &mut self,
         ctx: &egui::Context,
@@ -35152,10 +35232,15 @@ impl App {
         let request_id =
             crate::bookmark_browser::BookmarkOpenRequestId(self.bookmark_open_request_seq);
         match &row.source {
-            crate::bookmark_browser::BookmarkRowSource::Media { path, pts_secs, .. } => {
+            crate::bookmark_browser::BookmarkRowSource::Media {
+                path,
+                pts_secs,
+                is_audio,
+                ..
+            } => {
                 let target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(path.clone());
                 self.bookmark_view_state = Some(BookmarkViewState::Opening {
-                    target,
+                    target: target.clone(),
                     grid: return_grid,
                 });
                 crate::logger::log(format!(
@@ -35164,16 +35249,34 @@ impl App {
                     pts_secs,
                     self.viewer_presentation
                 ));
-                self.bookmark_open_pending =
-                    Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
-                        crate::bookmark_browser::PendingMediaOpen {
-                            request_id,
-                            path: path.clone(),
-                            pts_secs: *pts_secs,
-                            started_at: std::time::Instant::now(),
-                            last_wait: None,
-                        },
-                    ));
+                let pending = crate::bookmark_browser::PendingBookmarkOpen::Media(
+                    crate::bookmark_browser::PendingMediaOpen {
+                        request_id,
+                        path: path.clone(),
+                        pts_secs: *pts_secs,
+                        started_at: std::time::Instant::now(),
+                        last_wait: None,
+                    },
+                );
+                #[cfg(windows)]
+                if self.settings.effective_media_in_media_window() {
+                    let source = if *is_audio {
+                        DetachedSource::Audio
+                    } else {
+                        DetachedSource::Video
+                    };
+                    if !self.start_detached_bookmark_loading_context(
+                        ctx,
+                        pending,
+                        target,
+                        source,
+                        path.clone(),
+                    ) {
+                        self.clear_bookmark_view_return_state();
+                    }
+                    return;
+                }
+                self.bookmark_open_pending = Some(pending);
                 self.start_startup_open_path_resolve(
                     path.clone(),
                     StartupOpenPathSource::Bookmark,
@@ -35185,7 +35288,7 @@ impl App {
                     bookmark.container_path.clone(),
                 );
                 self.bookmark_view_state = Some(BookmarkViewState::Opening {
-                    target,
+                    target: target.clone(),
                     grid: return_grid,
                 });
                 crate::logger::log(format!(
@@ -35194,16 +35297,29 @@ impl App {
                     bookmark.page_identity.display_name(),
                     self.viewer_presentation
                 ));
-                self.bookmark_open_pending =
-                    Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
-                        crate::bookmark_browser::PendingBookOpen {
-                            request_id,
-                            bookmark: bookmark.clone(),
-                            relative_page_provenance: row.relative_page_provenance.clone(),
-                            started_at: std::time::Instant::now(),
-                            stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
-                        },
-                    ));
+                let pending = crate::bookmark_browser::PendingBookmarkOpen::Book(
+                    crate::bookmark_browser::PendingBookOpen {
+                        request_id,
+                        bookmark: bookmark.clone(),
+                        relative_page_provenance: row.relative_page_provenance.clone(),
+                        started_at: std::time::Instant::now(),
+                        stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
+                    },
+                );
+                #[cfg(windows)]
+                if self.settings.detached_viewer_open_images_in_window {
+                    if !self.start_detached_bookmark_loading_context(
+                        ctx,
+                        pending,
+                        target,
+                        DetachedSource::Book,
+                        bookmark.container_path.clone(),
+                    ) {
+                        self.clear_bookmark_view_return_state();
+                    }
+                    return;
+                }
+                self.bookmark_open_pending = Some(pending);
                 self.start_startup_open_path_resolve(
                     bookmark.container_path.clone(),
                     StartupOpenPathSource::Bookmark,
@@ -40702,10 +40818,14 @@ impl App {
         &mut self,
         path: PathBuf,
         collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
+        detached_lease: DetachedSessionLease,
     ) {
         self.start_folder_open_scan(
             path,
-            FolderOpenScanPurpose::GridFolderCandidate { collection_owner },
+            FolderOpenScanPurpose::GridFolderCandidate {
+                collection_owner,
+                detached_lease,
+            },
         );
     }
 
@@ -40747,7 +40867,13 @@ impl App {
         }
         // 旧 pending を破棄 (連打で最後のクリックだけ生かす)。
         if let Some(mut prev) = self.folder_pane_open_pending.take() {
+            #[cfg(windows)]
+            let detached_lease = prev.purpose.detached_loading_lease();
             prev.cancel_with_diagnostic("scan_replaced");
+            #[cfg(windows)]
+            if let Some(lease) = detached_lease {
+                self.cancel_detached_loading_shell_from_main(lease, "folder_scan_replaced");
+            }
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -40791,7 +40917,13 @@ impl App {
     /// 別の nav 源 (アドレスバー / Ctrl+↑↓ / グリッド) が勝ったときに呼ぶ。
     fn cancel_folder_pane_open(&mut self) {
         if let Some(mut prev) = self.folder_pane_open_pending.take() {
+            #[cfg(windows)]
+            let detached_lease = prev.purpose.detached_loading_lease();
             prev.cancel_with_diagnostic("scan_cancelled");
+            #[cfg(windows)]
+            if let Some(lease) = detached_lease {
+                self.cancel_detached_loading_shell_from_main(lease, "folder_scan_cancelled");
+            }
         }
     }
 
@@ -40843,6 +40975,14 @@ impl App {
         let Some(pending) = self.folder_pane_open_pending.as_ref() else {
             return None;
         };
+        #[cfg(windows)]
+        if let Some(lease) = pending.purpose.detached_loading_lease()
+            && !self.detached_loading_lease_is_preparing(lease)
+        {
+            let mut stale = self.folder_pane_open_pending.take().unwrap();
+            stale.cancel_with_diagnostic("detached_loading_lease_stale");
+            return None;
+        }
         match pending.rx.try_recv() {
             Ok(scan) => {
                 let pending = self.folder_pane_open_pending.take().unwrap();
@@ -40861,7 +41001,9 @@ impl App {
                 // A still-owned disconnected channel is therefore an abnormal worker exit and
                 // must complete an exact fullscreen request through its normal failure boundary.
                 let mut pending = self.folder_pane_open_pending.take().unwrap();
-                let detached_open = matches!(
+                #[cfg(windows)]
+                let detached_lease = pending.purpose.detached_loading_lease();
+                let detached_context_open = matches!(
                     pending.purpose,
                     FolderOpenScanPurpose::DetachedImage { .. }
                         | FolderOpenScanPurpose::DetachedFolder
@@ -40876,7 +41018,12 @@ impl App {
                     self.finish_required_fullscreen_folder_scan_failure();
                 }
                 #[cfg(windows)]
-                if detached_open {
+                if let Some(lease) = detached_lease {
+                    self.cancel_detached_loading_shell_from_main(
+                        lease,
+                        "detached_folder_scan_disconnected",
+                    );
+                } else if detached_context_open {
                     self.terminate_active_detached_open_before_viewport(
                         "detached_folder_scan_disconnected",
                     );
@@ -40919,6 +41066,7 @@ impl App {
         ctx: &egui::Context,
         ready: FolderPaneOpenReady,
     ) -> Option<ResolvedMainFolderOpen> {
+        let detached_lease = ready.purpose.detached_loading_lease();
         let scan = match ready.scan {
             Ok(scan) => scan,
             Err(error) => {
@@ -40953,6 +41101,12 @@ impl App {
                     }
                     self.finish_required_fullscreen_folder_scan_failure();
                 }
+                if let Some(lease) = detached_lease {
+                    self.cancel_detached_loading_shell_from_main(
+                        lease,
+                        "grid_folder_candidate_scan_failed",
+                    );
+                }
                 return None;
             }
         };
@@ -40963,7 +41117,10 @@ impl App {
                 scan,
                 collection_owner: None,
             }),
-            FolderOpenScanPurpose::GridFolderCandidate { collection_owner } => {
+            FolderOpenScanPurpose::GridFolderCandidate {
+                collection_owner,
+                detached_lease,
+            } => {
                 if let Some(owner) = collection_owner.as_ref()
                     && !self.collection_grid_physical_load_owner_is_current(owner, &ready.path)
                 {
@@ -40971,6 +41128,10 @@ impl App {
                         "grid folder candidate discarded after collection owner became stale path={}",
                         ready.path.display()
                     ));
+                    self.cancel_detached_loading_shell_from_main(
+                        detached_lease,
+                        "grid_folder_candidate_collection_owner_stale",
+                    );
                     return None;
                 }
                 let image_book = self.settings.auto_fullscreen_image_folders_enabled()
@@ -40978,6 +41139,10 @@ impl App {
                 let should_detach =
                     self.settings.detached_viewer_open_images_in_window && image_book;
                 if !should_detach {
+                    self.cancel_detached_loading_shell_from_main(
+                        detached_lease,
+                        "grid_folder_candidate_main_fallback",
+                    );
                     let scan = if self.top_level_grid_view.smart_folder_session().is_some() {
                         let source_index = self.items.iter().position(|item| {
                             matches!(item, GridItem::Folder(folder)
@@ -41021,27 +41186,33 @@ impl App {
                     });
                 }
 
-                let base_placement = self.active_detached_viewer_current_placement();
-                let had_active_detached = self.active_detached_context_exists();
-                if !self.park_and_close_current_active_detached_viewer(ctx) {
-                    return None;
+                let opened = self
+                    .with_window_viewer_context(detached_lease.window_id, |app| {
+                        if app.detached_viewer_window_id() != Some(detached_lease.window_id)
+                            || app.active_detached_session.is_none_or(|session| {
+                                session.window_id != detached_lease.window_id
+                                    || session.content_phase
+                                        != DetachedSessionContentPhase::Preparing
+                            })
+                        {
+                            return false;
+                        }
+                        app.pending_auto_fs_open = true;
+                        app.fs_open_intent_from_grid = true;
+                        app.with_detached_viewer_main_history_suppressed(|app| {
+                            app.load_folder_with_scan(ready.path, Some(scan));
+                        });
+                        app.fullscreen_idx.is_some()
+                            || app.sidecar_restore_deferred_fullscreen_wait_active()
+                    })
+                    .unwrap_or(false);
+                if !opened {
+                    self.cancel_detached_loading_shell_from_main(
+                        detached_lease,
+                        "grid_folder_candidate_detached_materialize_failed",
+                    );
                 }
-                let placement_seed = had_active_detached
-                    .then(|| self.offset_detached_image_window_placement(base_placement));
-                let collection_restore = collection_owner.as_ref().map(|owner| {
-                    let wanted_revision = self
-                        .top_level_grid_view
-                        .collection_session()
-                        .map_or(owner.accepted_revision, |session| session.wanted_revision);
-                    owner.restore(wanted_revision)
-                });
-                self.start_active_detached_book_context_from_scanned_folder_with_restore(
-                    ready.path,
-                    scan,
-                    ctx,
-                    placement_seed,
-                    collection_restore,
-                );
+                ctx.request_repaint();
                 None
             }
             FolderOpenScanPurpose::DetachedFolder | FolderOpenScanPurpose::DetachedImage { .. } => {
@@ -41193,8 +41364,6 @@ impl App {
                 DetachedPhysicalFolderOpenPoll::Applied
             }
             FolderOpenScanPurpose::GridFolderCandidate { .. } => {
-                // Candidate classification is owned by main. Reaching a detached bundle would
-                // cross the ownership boundary, so never materialize it here.
                 crate::logger::log(format!(
                     "detached folder scan rejected main-owned grid candidate path={}",
                     ready.path.display()
@@ -43371,7 +43540,15 @@ impl App {
                     || s.source != source
             })
             .unwrap_or(true);
-        self.active_detached_session = Some(ActiveDetachedSession { window_id, source });
+        let content_phase = previous
+            .filter(|session| session.window_id == window_id)
+            .map(|session| session.content_phase)
+            .unwrap_or(DetachedSessionContentPhase::Preparing);
+        self.active_detached_session = Some(ActiveDetachedSession {
+            window_id,
+            source,
+            content_phase,
+        });
         self.record_active_detached_session_write(
             "set",
             "session_begin",
@@ -43419,8 +43596,9 @@ impl App {
     }
 
     /// A producer that owns an initial detached open has reached a terminal result before the
-    /// first viewport was rendered. Active navigation deliberately ignores this event: only the
-    /// typed `Opening` / `Resuming` lifecycle may be completed here.
+    /// first normal content render.  The loading shell itself may already have promoted the
+    /// runtime to `Active`; `content_phase` keeps that initial request distinct from a later
+    /// navigation gap without reconstructing ownership from pending-field presence.
     #[cfg(windows)]
     pub(crate) fn terminate_active_detached_open_before_viewport(
         &mut self,
@@ -43432,13 +43610,19 @@ impl App {
         let Some(window_id) = self.detached_viewer_window_id() else {
             return false;
         };
-        if !matches!(
-            self.detached_window_state(window_id),
-            Some(DetachedWindowState::Opening | DetachedWindowState::Resuming)
-        ) {
+        let preparing_session = self.active_detached_session.is_some_and(|session| {
+            session.window_id == window_id
+                && session.content_phase == DetachedSessionContentPhase::Preparing
+        });
+        let building_open = self.active_detached_session.is_none()
+            && matches!(
+                self.detached_window_state(window_id),
+                Some(DetachedWindowState::Opening | DetachedWindowState::Resuming)
+            );
+        if !preparing_session && !building_open {
             return false;
         }
-        if self.active_detached_window_id() == Some(window_id) {
+        if preparing_session && self.active_detached_window_id() == Some(window_id) {
             self.begin_active_detached_session_close(reason);
         } else {
             self.transition_detached_window_state(window_id, DetachedWindowState::Closing, reason);
@@ -43447,6 +43631,121 @@ impl App {
             ));
         }
         true
+    }
+
+    /// Cancel the initial content producer for exactly one visible detached loading session.
+    ///
+    /// Rendering the placeholder legitimately promotes the runtime to `Active`; the typed
+    /// `Preparing` phase and lease therefore remain the authority for X/Escape and producer
+    /// failures. Dropping each context-local receiver makes late worker results inert, while the
+    /// App-global archive/bookmark owners are cancelled only when they carry the same lease.
+    #[cfg(windows)]
+    pub(crate) fn cancel_detached_initial_open_for_lease(
+        &mut self,
+        lease: DetachedSessionLease,
+        reason: &'static str,
+    ) -> bool {
+        if self.detached_viewer_window_id() != Some(lease.window_id)
+            || self.active_detached_session.is_none_or(|session| {
+                session.window_id != lease.window_id
+                    || session.content_phase != DetachedSessionContentPhase::Preparing
+            })
+        {
+            return false;
+        }
+
+        self.cancel_main_grid_folder_candidate_for_lease(lease, reason);
+        if let Some(mut pending) = self.folder_pane_open_pending.take() {
+            pending.cancel_with_diagnostic(reason);
+        }
+        self.pdf_enumerate_pending = None;
+        self.zip_enumerate_pending = None;
+        self.fs_nav_after_pdf_enumerate = None;
+        self.archive_auto_fs_paint_trace = None;
+
+        let bookmark_request = self
+            .bookmark_open_pending
+            .as_ref()
+            .map(crate::bookmark_browser::PendingBookmarkOpen::request_id);
+        if let Some(request_id) = bookmark_request {
+            self.cancel_bookmark_open_request(request_id, reason);
+        }
+        self.cancel_archive_convert_for_detached_loading_lease(lease, reason);
+
+        if self.active_detached_session.is_some_and(|session| {
+            session.window_id == lease.window_id
+                && session.content_phase == DetachedSessionContentPhase::Preparing
+        }) {
+            self.begin_active_detached_session_close(reason);
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    fn cancel_main_grid_folder_candidate_for_lease(
+        &mut self,
+        lease: DetachedSessionLease,
+        reason: &'static str,
+    ) -> bool {
+        fn cancel_mounted(
+            app: &mut App,
+            lease: DetachedSessionLease,
+            reason: &'static str,
+        ) -> bool {
+            let matches = app
+                .folder_pane_open_pending
+                .as_ref()
+                .and_then(|pending| pending.purpose.detached_loading_lease())
+                == Some(lease);
+            if !matches {
+                return false;
+            }
+            if let Some(mut pending) = app.folder_pane_open_pending.take() {
+                pending.cancel_with_diagnostic(reason);
+            }
+            true
+        }
+
+        if self.detached_viewer_window_id().is_none() {
+            return cancel_mounted(self, lease, reason);
+        }
+        let main = self.viewer_context_main();
+        self.with_viewer_context(main, |app| cancel_mounted(app, lease, reason))
+            .unwrap_or(false)
+    }
+
+    /// Cancel a loading shell whose producer is owned by the mounted main bundle.
+    ///
+    /// Folder-candidate enumeration participates in the ordinary main-navigation arbitration,
+    /// while the visible placeholder lives in its detached bundle. Route the terminal event by
+    /// the typed lease instead of inferring an owner from whichever context happens to be mounted.
+    #[cfg(windows)]
+    fn cancel_detached_loading_shell_from_main(
+        &mut self,
+        lease: DetachedSessionLease,
+        reason: &'static str,
+    ) -> bool {
+        if self.detached_viewer_window_id() == Some(lease.window_id) {
+            return self.cancel_detached_initial_open_for_lease(lease, reason);
+        }
+        if self.locate_window_context(lease.window_id).is_none() {
+            return false;
+        }
+        self.with_window_viewer_context(lease.window_id, |app| {
+            app.cancel_detached_initial_open_for_lease(lease, reason)
+        })
+        .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    fn detached_loading_lease_is_preparing(&self, lease: DetachedSessionLease) -> bool {
+        self.active_detached_session.is_some_and(|session| {
+            session.window_id == lease.window_id
+                && session.content_phase == DetachedSessionContentPhase::Preparing
+        }) && !matches!(
+            self.detached_window_state(lease.window_id),
+            None | Some(DetachedWindowState::Closing)
+        ) && self.locate_window_context(lease.window_id).is_some()
     }
 
     /// terminal close を完了し、session と同じ window_id の runtime を一体で除去する。
@@ -43541,18 +43840,19 @@ impl App {
     }
 
     /// active detached bundle が「まだ内部遷移の途中」か。
-    /// 初回 viewport までは runtime reducer (`Opening` / `Resuming`) が正本。その後の
-    /// `Active` navigation だけは、各 typed pending owner がこのフレームの継続を宣言する。
+    /// 初回 loading viewport までは runtime reducer (`Opening` / `Resuming`) が正本。
+    /// loading render 後、最初の通常 content render までは typed `Preparing` phase が所有し、
+    /// その後の `Active` navigation だけは各 typed pending owner が継続を宣言する。
     ///
     /// 同じ条件列が repaint 要求 / should_drop / keep-alive の3箇所に複製されており、
     /// finalize だけが更新から取り残されて 2026-07 の「Ctrl+↓ で detached window が閉じる」
     /// 回帰を生んだ。以後 pending を増やすときはこの1箇所だけを更新すること。
     #[cfg(windows)]
     pub(crate) fn active_detached_transition_outstanding(&self) -> bool {
-        match self
+        let runtime_state = self
             .active_detached_window_id()
-            .and_then(|window_id| self.detached_window_state(window_id))
-        {
+            .and_then(|window_id| self.detached_window_state(window_id));
+        match runtime_state {
             Some(DetachedWindowState::Opening | DetachedWindowState::Resuming) => return true,
             Some(DetachedWindowState::Closing) => return false,
             Some(
@@ -43561,6 +43861,12 @@ impl App {
                 | DetachedWindowState::ParkedLive,
             )
             | None => {}
+        }
+        if self
+            .active_detached_session
+            .is_some_and(|session| session.content_phase == DetachedSessionContentPhase::Preparing)
+        {
+            return true;
         }
 
         self.folder_nav_pending.is_some()
@@ -43588,7 +43894,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn mark_active_detached_viewport_rendered(&mut self) {
         self.detached_active_viewport_rendered_frame = self.frame_counter;
-        if let Some(session) = self.active_detached_session {
+        if let Some(mut session) = self.active_detached_session {
             if matches!(
                 self.detached_window_state(session.window_id),
                 Some(DetachedWindowState::Opening | DetachedWindowState::Resuming)
@@ -43598,6 +43904,10 @@ impl App {
                     DetachedWindowState::Active,
                     "active_viewport_rendered",
                 );
+            }
+            if self.fullscreen_idx.is_some() {
+                session.content_phase = DetachedSessionContentPhase::Ready;
+                self.active_detached_session = Some(session);
             }
             self.log_detached_image_window_debug(format!(
                 "active_detached_immediate_rendered frame={} window_id={} viewport={:?}",
@@ -45927,6 +46237,80 @@ impl App {
         !self.active_detached_context_is_at_rest()
     }
 
+    /// Publish an empty, renderable detached context before a slow producer knows its contents.
+    ///
+    /// The returned window identity is the handle carried by the producer through completion.
+    /// The context bundle owns any context-local pending state installed by `initialize`; the
+    /// App-global runtime owns only the already-existing window/session lifecycle.  Completion
+    /// fills this same context and therefore never replaces the loading HWND with another one.
+    #[cfg(windows)]
+    fn start_active_detached_loading_context(
+        &mut self,
+        ctx: &egui::Context,
+        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        source: DetachedSource,
+        address: PathBuf,
+        initialize: impl FnOnce(&mut Self, u64) -> DetachedLoadingContextInit,
+    ) -> Option<u64> {
+        let mut initialize = Some(initialize);
+        let mut allocated_window_id = None;
+        let built =
+            self.build_viewer_context("start_active_detached_loading_context", |app, reserved| {
+                app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+                app.reset_active_detached_viewport_runtime_for_new_window(
+                    reserved.serial(),
+                    "start_active_detached_loading_context",
+                );
+                let window_id = app.allocate_detached_viewer_window_id();
+                allocated_window_id = Some(window_id);
+                app.reserve_window_binding_for_build(window_id);
+                app.last_active_detached_window_id = Some(window_id);
+                let seed = placement_seed.unwrap_or_else(|| app.detached_viewer_window_placement());
+                app.set_detached_window_runtime_placement(
+                    window_id,
+                    seed,
+                    "start_active_detached_loading_context",
+                );
+                app.transition_detached_window_state(
+                    window_id,
+                    DetachedWindowState::Opening,
+                    "start_active_detached_loading_context",
+                );
+                app.viewer_presentation = ViewerPresentation::DetachedWindow;
+                app.detached_viewer_independent_active = true;
+                app.address = address.to_string_lossy().to_string();
+                let outcome = initialize
+                    .take()
+                    .expect("detached loading initializer runs once")(
+                    app, window_id
+                );
+                match outcome {
+                    DetachedLoadingContextInit::Continue => BuildOutcome::Commit,
+                    DetachedLoadingContextInit::Abort(reason) => {
+                        app.transition_detached_window_state(
+                            window_id,
+                            DetachedWindowState::Closing,
+                            reason,
+                        );
+                        app.remove_detached_window_runtime(window_id, reason);
+                        BuildOutcome::Abort(reason)
+                    }
+                }
+            });
+        let Some(built) = built else {
+            if let Some(window_id) = allocated_window_id {
+                self.remove_detached_window_runtime(window_id, "detached_loading_build_aborted");
+            }
+            return None;
+        };
+        let window_id = self
+            .viewer_context_window(built)
+            .expect("committed detached loading context publishes its window identity");
+        self.begin_active_detached_session(window_id, source);
+        ctx.request_repaint();
+        Some(window_id)
+    }
+
     #[cfg(windows)]
     fn start_active_detached_book_context_from_descriptor_with_restore(
         &mut self,
@@ -46016,6 +46400,69 @@ impl App {
         )
     }
 
+    /// Continue a descriptor-backed open in the already-published detached loading context.
+    /// The caller must have mounted the context named by the request's window lease.
+    #[cfg(windows)]
+    fn continue_active_detached_book_context_from_descriptor(
+        &mut self,
+        descriptor: ViewerContextDescriptor,
+    ) -> bool {
+        let target = Self::detached_book_context_target(&descriptor);
+        if let Some(pending) = self
+            .bookmark_open_pending
+            .as_mut()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book_mut)
+        {
+            pending.begin_page_wait();
+        }
+        let bookmark_open = self.bookmark_open_pending.is_some();
+        let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
+        self.pending_auto_fs_open = !is_image_reopen && !bookmark_open;
+        self.fs_open_intent_from_grid = !is_image_reopen && !bookmark_open;
+
+        self.with_detached_viewer_main_history_suppressed(|app| match descriptor.clone() {
+            ViewerContextDescriptor::Zip {
+                path,
+                archive_source_override,
+                ..
+            } => {
+                app.load_zip_as_folder(path);
+                if let Some(source) = archive_source_override {
+                    app.archive_source_override = Some(source.clone());
+                    app.address = source.to_string_lossy().to_string();
+                }
+            }
+            ViewerContextDescriptor::Pdf { path, .. } => app.load_pdf_as_folder(path),
+            ViewerContextDescriptor::BookFolder { path } => app.start_detached_folder_open(path),
+            ViewerContextDescriptor::Image { path } => {
+                if !app.start_detached_image_folder_open(path.clone()) {
+                    app.log_detached_image_window_debug(format!(
+                        "image_reopen_no_parent_for_async_folder_scan path={}",
+                        path.display()
+                    ));
+                    app.terminate_active_detached_open_before_viewport(
+                        "detached_image_open_no_parent",
+                    );
+                }
+            }
+        });
+
+        if !bookmark_open
+            && !is_image_reopen
+            && let Some(target) = target
+        {
+            self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                history_trigger: crate::app::HistoryTrigger::UserChosen,
+                resume_slideshow: false,
+                target: DeferredFsTarget::Required(target),
+                resume_to_last_page: false,
+                from_explicit_open: true,
+                preserve_after_password_prompt: true,
+            });
+        }
+        !self.active_detached_window_is_closing()
+    }
+
     #[cfg(windows)]
     fn start_active_detached_book_context_with_start(
         &mut self,
@@ -46032,7 +46479,17 @@ impl App {
                 ViewerContextDescriptor::BookFolder { path: path.clone() }
             }
         };
+        if matches!(
+            &descriptor,
+            ViewerContextDescriptor::Image { path } if path.parent().is_none()
+        ) {
+            self.log_detached_image_window_debug(
+                "image_reopen_no_parent_before_detached_build".to_string(),
+            );
+            return false;
+        }
         let target = Self::detached_book_context_target(&descriptor);
+        let mut initializer_failed = false;
         let built =
             self.build_viewer_context("start_active_detached_book_context", |app, reserved| {
                 // From this point until the bundle is captured, all loads belong to the
@@ -46120,9 +46577,10 @@ impl App {
                                     "image_reopen_no_parent_for_async_folder_scan path={}",
                                     path.display()
                                 ));
-                                app.terminate_active_detached_open_before_viewport(
-                                    "detached_image_open_no_parent",
-                                );
+                                // The session lease is intentionally published only after this
+                                // build commits, so a synchronous initializer failure must abort
+                                // the typed build instead of attempting a pre-session close.
+                                initializer_failed = true;
                             }
                         }
                     },
@@ -46133,6 +46591,10 @@ impl App {
                         app.load_folder_with_scan(path, Some(scan));
                     }
                 });
+
+                if initializer_failed {
+                    return BuildOutcome::Abort("detached_image_open_no_parent");
+                }
 
                 if let Some(restore) = collection_restore {
                     app.top_level_grid_view.install_return_to(
@@ -46227,8 +46689,10 @@ impl App {
             })
     }
 
+    #[cfg(windows)]
     fn next_detached_grid_archive_open_owner(
         &mut self,
+        lease: DetachedSessionLease,
         source_path: PathBuf,
         collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
     ) -> DetachedGridArchiveOpenRequestOwner {
@@ -46238,6 +46702,7 @@ impl App {
             .expect("detached grid archive open request sequence exhausted");
         DetachedGridArchiveOpenRequestOwner {
             request_id: self.detached_grid_archive_open_request_seq,
+            lease,
             source_path,
             collection_restore,
         }
@@ -46268,6 +46733,14 @@ impl App {
         reason: &'static str,
     ) {
         self.invalidate_detached_grid_archive_open_owner(owner);
+        #[cfg(windows)]
+        if self.active_detached_window_id() == Some(owner.lease.window_id)
+            && self.active_detached_session.is_some_and(|session| {
+                session.content_phase == DetachedSessionContentPhase::Preparing
+            })
+        {
+            self.begin_active_detached_session_close(reason);
+        }
         crate::logger::log(format!(
             "[detached-grid-archive] request cancelled id={} reason={reason} source={}",
             owner.request_id,
@@ -46356,19 +46829,73 @@ impl App {
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_folder_candidate",
                 );
-                // Classification is main-owned. No session/runtime or detached bundle exists
-                // until the completed scan proves this is an image book; mixed folders fall
-                // back through the normal main navigation arbitration.
-                self.start_grid_folder_candidate_open(path, collection_owner);
-                ctx.request_repaint();
+                let base_placement = self.active_detached_viewer_current_placement();
+                let had_active_detached = self.active_detached_context_exists();
+                if !self.park_and_close_current_active_detached_viewer(ctx) {
+                    return false;
+                }
+                let placement_seed = had_active_detached
+                    .then(|| self.offset_detached_image_window_placement(base_placement));
+                let collection_restore = collection_owner
+                    .as_ref()
+                    .map(|owner| owner.restore(owner.wanted_revision));
+                let address = path.clone();
+                let Some(window_id) = self.start_active_detached_loading_context(
+                    ctx,
+                    placement_seed,
+                    DetachedSource::Book,
+                    address,
+                    move |app, _window_id| {
+                        if let Some(restore) = collection_restore {
+                            app.top_level_grid_view.install_return_to(
+                                top_level_grid_view::TopLevelGridRestore::Collection(restore),
+                            );
+                        }
+                        DetachedLoadingContextInit::Continue
+                    },
+                ) else {
+                    return false;
+                };
+                self.start_grid_folder_candidate_open(
+                    path,
+                    collection_owner,
+                    Self::detached_session_lease(window_id),
+                );
                 return true;
             }
             DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
                 path,
                 collection_restore,
             } => {
-                let owner =
-                    self.next_detached_grid_archive_open_owner(path.clone(), collection_restore);
+                let base_placement = self.active_detached_viewer_current_placement();
+                let had_active_detached = self.active_detached_context_exists();
+                if !self.park_and_close_current_active_detached_viewer(ctx) {
+                    return false;
+                }
+                let placement_seed = had_active_detached
+                    .then(|| self.offset_detached_image_window_placement(base_placement));
+                let restore_for_shell = collection_restore.clone();
+                let Some(window_id) = self.start_active_detached_loading_context(
+                    ctx,
+                    placement_seed,
+                    DetachedSource::Book,
+                    path.clone(),
+                    move |app, _window_id| {
+                        if let Some(restore) = restore_for_shell {
+                            app.top_level_grid_view.install_return_to(
+                                top_level_grid_view::TopLevelGridRestore::Collection(restore),
+                            );
+                        }
+                        DetachedLoadingContextInit::Continue
+                    },
+                ) else {
+                    return false;
+                };
+                let owner = self.next_detached_grid_archive_open_owner(
+                    Self::detached_session_lease(window_id),
+                    path.clone(),
+                    collection_restore,
+                );
                 let open_owner = OpenRequestOwner::DetachedGridArchive(owner.clone());
                 let auto_fullscreen = self.settings.effective_auto_fullscreen_zip_pdf();
                 let format = path
@@ -46377,11 +46904,13 @@ impl App {
                     .and_then(crate::archive_converter::ArchiveFormat::from_extension);
 
                 if self.settings.archive_file_handling_ignores_convertible() {
-                    let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                        path,
-                        auto_fullscreen,
-                        open_owner,
-                    );
+                    let _ = self.with_window_viewer_context(window_id, |app| {
+                        app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                            path,
+                            auto_fullscreen,
+                            open_owner,
+                        )
+                    });
                     self.cancel_detached_grid_archive_open_owner(
                         &owner,
                         "archive_handling_ignored",
@@ -46393,9 +46922,16 @@ impl App {
                 // Non-RAR cache hits are already classified, so they can create the detached
                 // context synchronously. RAR still probes first because a valid direct-read path
                 // takes precedence over its conversion cache.
-                if format != Some(crate::archive_converter::ArchiveFormat::Rar)
-                    && let Some(cached_zip) = self.try_archive_cache_lookup(&path)
-                {
+                let cached_zip = if format != Some(crate::archive_converter::ArchiveFormat::Rar) {
+                    self.with_window_viewer_context(window_id, |app| {
+                        app.try_archive_cache_lookup(&path)
+                    })
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
+                if let Some(cached_zip) = cached_zip {
                     if !self.claim_open_request_owner(&path, &open_owner) {
                         self.fail_detached_grid_archive_open(
                             &owner,
@@ -46413,11 +46949,15 @@ impl App {
                     return true;
                 }
 
-                let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                    path,
-                    auto_fullscreen,
-                    open_owner,
-                );
+                let outcome = self
+                    .with_window_viewer_context(window_id, |app| {
+                        app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                            path,
+                            auto_fullscreen,
+                            open_owner,
+                        )
+                    })
+                    .unwrap_or(FolderOpenOutcome::Ignored);
                 if matches!(outcome, FolderOpenOutcome::Ignored) {
                     self.fail_detached_grid_archive_open(
                         &owner,
@@ -46461,26 +47001,28 @@ impl App {
         if !self.detached_grid_archive_open_owner_is_current(owner) {
             return DetachedGridArchiveOpenOutcome::Cancelled("archive_detached_completion_stale");
         }
-        let base_placement = self.active_detached_viewer_current_placement();
-        let had_active_detached = self.active_detached_context_exists();
-        if !self.park_and_close_current_active_detached_viewer(ctx) {
-            return DetachedGridArchiveOpenOutcome::Failed;
+        if self.active_detached_window_id() != Some(owner.lease.window_id)
+            || self.active_detached_session.is_none_or(|session| {
+                session.content_phase != DetachedSessionContentPhase::Preparing
+            })
+        {
+            return DetachedGridArchiveOpenOutcome::Cancelled(
+                "archive_detached_loading_owner_stale",
+            );
         }
-        let placement_seed = had_active_detached
-            .then(|| self.offset_detached_image_window_placement(base_placement));
         let descriptor = ViewerContextDescriptor::Zip {
             path: backing_archive,
             entry_name: None,
             archive_source_override: Some(owner.source_path.clone()),
         };
-        let opened = self.start_active_detached_book_context_from_descriptor_with_restore(
-            descriptor,
-            ctx,
-            placement_seed,
-            owner.collection_restore.clone(),
-        );
+        let opened = self
+            .with_window_viewer_context(owner.lease.window_id, |app| {
+                app.continue_active_detached_book_context_from_descriptor(descriptor)
+            })
+            .unwrap_or(false);
         if opened {
             self.invalidate_detached_grid_archive_open_owner(owner);
+            ctx.request_repaint();
             DetachedGridArchiveOpenOutcome::Opened
         } else {
             DetachedGridArchiveOpenOutcome::Failed
@@ -46503,6 +47045,22 @@ impl App {
         if !self.bookmark_open_owner_is_current(owner) {
             return Some(false);
         }
+        if let Some(lease) = owner.detached_lease
+            && self.detached_viewer_window_id() != Some(lease.window_id)
+        {
+            let backing_archive_for_owner = backing_archive.clone();
+            return self
+                .with_window_viewer_context(lease.window_id, |app| {
+                    app.open_converted_bookmark_in_detached_context(
+                        ctx,
+                        backing_archive_for_owner,
+                        owner,
+                    )
+                })
+                .ok()
+                .flatten()
+                .or(Some(false));
+        }
         let pending = self
             .bookmark_open_pending
             .as_ref()
@@ -46516,12 +47074,26 @@ impl App {
                 Some(BookmarkViewState::Opening {
                     target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(path),
                     ..
+                } | BookmarkViewState::Detached {
+                    target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(path),
                 }) if crate::path_key::eq_keep_drive(path, &pending.bookmark.container_path)
             )
         {
             return None;
         }
         let bookmark_container = pending.bookmark.container_path.clone();
+        if owner.detached_lease.is_some() {
+            let descriptor = ViewerContextDescriptor::Zip {
+                path: backing_archive,
+                entry_name: None,
+                archive_source_override: Some(bookmark_container),
+            };
+            let opened = self.continue_active_detached_book_context_from_descriptor(descriptor);
+            if opened {
+                ctx.request_repaint();
+            }
+            return Some(opened);
+        }
         let pending = match self.bookmark_open_pending.take() {
             Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending)) => pending,
             other => {
@@ -46896,13 +47468,14 @@ impl App {
                 if let Some(result) = app.poll_folder_nav() {
                     app.apply_folder_nav_result(ctx, result);
                 }
-                if matches!(
-                    app.poll_detached_physical_folder_open(ctx),
-                    DetachedPhysicalFolderOpenPoll::Failed
-                ) {
-                    app.terminate_active_detached_open_before_viewport(
-                        "detached_physical_open_failed",
-                    );
+                match app.poll_detached_physical_folder_open(ctx) {
+                    DetachedPhysicalFolderOpenPoll::Failed => {
+                        app.terminate_active_detached_open_before_viewport(
+                            "detached_physical_open_failed",
+                        );
+                    }
+                    DetachedPhysicalFolderOpenPoll::Waiting
+                    | DetachedPhysicalFolderOpenPoll::Applied => {}
                 }
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();

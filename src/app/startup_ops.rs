@@ -3,6 +3,18 @@ use super::*;
 const STARTUP_OPEN_PATH_RESOLVE_TOAST_DELAY: std::time::Duration =
     std::time::Duration::from_millis(400);
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILURE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn force_startup_open_resolve_spawn_failure_for_test(force: bool) {
+    FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILURE.with(|slot| slot.set(force));
+}
+
 impl App {
     pub(crate) fn set_startup_open_path(&mut self, path: PathBuf) {
         self.startup_open_path = Some(path);
@@ -106,20 +118,32 @@ impl App {
             .flatten();
         let worker_bookmark = bookmark.clone();
         let repaint_ctx = ctx.clone();
-        let spawn_result = std::thread::Builder::new()
-            .name("startup-open-resolve".to_string())
-            .spawn(move || {
-                if cancel_w.load(Ordering::Relaxed) {
-                    return;
-                }
-                let result =
-                    resolve_startup_open_path(worker_requested, source, worker_bookmark.as_ref());
-                if cancel_w.load(Ordering::Relaxed) {
-                    return;
-                }
-                let _ = tx.send(result);
-                repaint_ctx.request_repaint();
-            });
+        let worker = move || {
+            if cancel_w.load(Ordering::Relaxed) {
+                return;
+            }
+            let result =
+                resolve_startup_open_path(worker_requested, source, worker_bookmark.as_ref());
+            if cancel_w.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = tx.send(result);
+            repaint_ctx.request_repaint();
+        };
+        #[cfg(test)]
+        let force_spawn_failure =
+            FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILURE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let force_spawn_failure = false;
+        let spawn_result = if force_spawn_failure {
+            Err(std::io::Error::other(
+                "forced startup path resolver spawn failure",
+            ))
+        } else {
+            std::thread::Builder::new()
+                .name("startup-open-resolve".to_string())
+                .spawn(worker)
+        };
 
         match spawn_result {
             Ok(_) => {
@@ -256,6 +280,34 @@ impl App {
             ));
             return;
         }
+        #[cfg(windows)]
+        let detached_route = match &owner {
+            StartupOpenPathOwner::Bookmark(bookmark_owner) => bookmark_owner
+                .detached_lease
+                .map(|lease| (lease.window_id, bookmark_owner.request_id)),
+            _ => None,
+        };
+        #[cfg(windows)]
+        if let Some((window_id, request_id)) = detached_route
+            && self.detached_viewer_window_id() != Some(window_id)
+        {
+            let routed = self.with_window_viewer_context(window_id, |app| {
+                app.finish_startup_open_path_resolve_with_held(
+                    owner,
+                    result,
+                    held,
+                    held_duration,
+                    ctx,
+                );
+            });
+            if let Err(error) = routed {
+                crate::logger::log(format!(
+                    "startup open: detached owner mount failed window_id={window_id} error={error:?}"
+                ));
+                self.cancel_bookmark_open_request(request_id, "detached_resolve_owner_missing");
+            }
+            return;
+        }
         let source = owner.source();
         if matches!(source, StartupOpenPathSource::Activation) {
             match result.resolved.as_ref() {
@@ -374,7 +426,14 @@ impl App {
                 let request_id = self.bookmark_open_pending.as_ref()?.request_id();
                 let target = self.bookmark_view_target()?.clone();
                 Some(StartupOpenPathOwner::Bookmark(
-                    crate::bookmark_browser::BookmarkOpenRequestOwner { request_id, target },
+                    crate::bookmark_browser::BookmarkOpenRequestOwner {
+                        request_id,
+                        target,
+                        #[cfg(windows)]
+                        detached_lease: self
+                            .detached_viewer_window_id()
+                            .map(Self::detached_session_lease),
+                    },
                 ))
             }
         }
@@ -391,10 +450,30 @@ impl App {
         &self,
         owner: &crate::bookmark_browser::BookmarkOpenRequestOwner,
     ) -> bool {
-        self.bookmark_open_pending
+        let projected_owner_matches = self
+            .bookmark_open_pending
             .as_ref()
             .is_some_and(|pending| pending.request_id() == owner.request_id)
-            && self.bookmark_view_target() == Some(&owner.target)
+            && self.bookmark_view_target() == Some(&owner.target);
+        if projected_owner_matches {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            owner.detached_lease.is_some_and(|lease| {
+                self.bookmark_open_request_seq == owner.request_id.0
+                    && self.active_detached_window_id() == Some(lease.window_id)
+                    && self.active_detached_session.is_some_and(|session| {
+                        session.window_id == lease.window_id
+                            && session.content_phase == DetachedSessionContentPhase::Preparing
+                    })
+                    && self.bookmark_view_target() == Some(&owner.target)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 
     pub(crate) fn begin_bookmark_page_wait(
@@ -479,6 +558,50 @@ impl App {
         request_id: crate::bookmark_browser::BookmarkOpenRequestId,
         reason: &'static str,
     ) -> bool {
+        #[cfg(windows)]
+        let detached_lease = self
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .and_then(|pending| match &pending.owner {
+                StartupOpenPathOwner::Bookmark(owner) if owner.request_id == request_id => {
+                    owner.detached_lease
+                }
+                _ => pending
+                    .held_resolve_for_activation_admission
+                    .as_deref()
+                    .and_then(|held| match &held.owner {
+                        StartupOpenPathOwner::Bookmark(owner) if owner.request_id == request_id => {
+                            owner.detached_lease
+                        }
+                        _ => None,
+                    }),
+            })
+            .or_else(|| {
+                self.archive_convert
+                    .as_ref()
+                    .and_then(|state| state.completion.bookmark_owner())
+                    .filter(|owner| owner.request_id == request_id)
+                    .and_then(|owner| owner.detached_lease)
+            })
+            .or_else(|| {
+                (self.bookmark_open_request_seq == request_id.0)
+                    .then_some(self.active_detached_session)
+                    .flatten()
+                    .filter(|session| {
+                        session.content_phase == DetachedSessionContentPhase::Preparing
+                    })
+                    .map(|session| Self::detached_session_lease(session.window_id))
+            });
+        #[cfg(windows)]
+        if let Some(lease) = detached_lease
+            && self.detached_viewer_window_id() != Some(lease.window_id)
+        {
+            return self
+                .with_window_viewer_context(lease.window_id, |app| {
+                    app.cancel_bookmark_open_request(request_id, reason)
+                })
+                .unwrap_or(false);
+        }
         let resolver_matches =
             self.startup_open_path_resolve_pending
                 .as_ref()
@@ -522,16 +645,40 @@ impl App {
             .bookmark_open_pending
             .as_ref()
             .is_some_and(|pending| pending.request_id() == request_id);
-        if !pending_matches {
-            return resolver_matches || held_resolver_matches || archive_matches;
+        let owned = resolver_matches || held_resolver_matches || archive_matches || pending_matches;
+        if pending_matches {
+            crate::logger::log(format!(
+                "[bookmark-open] finish request id={} reason={reason}",
+                request_id.0
+            ));
+            self.bookmark_open_pending = None;
+            #[cfg(windows)]
+            let retain_detached_target_for_close = detached_lease.is_some_and(|lease| {
+                self.detached_viewer_window_id() == Some(lease.window_id)
+                    && matches!(
+                        self.bookmark_view_state,
+                        Some(BookmarkViewState::Detached { .. })
+                    )
+            });
+            #[cfg(not(windows))]
+            let retain_detached_target_for_close = false;
+            if !retain_detached_target_for_close {
+                self.clear_bookmark_view_return_state();
+            }
         }
-        crate::logger::log(format!(
-            "[bookmark-open] finish request id={} reason={reason}",
-            request_id.0
-        ));
-        self.bookmark_open_pending = None;
-        self.clear_bookmark_view_return_state();
-        true
+        #[cfg(windows)]
+        if owned
+            && detached_lease.is_some_and(|lease| {
+                self.detached_viewer_window_id() == Some(lease.window_id)
+                    && self.active_detached_session.is_some_and(|session| {
+                        session.window_id == lease.window_id
+                            && session.content_phase == DetachedSessionContentPhase::Preparing
+                    })
+            })
+        {
+            self.begin_active_detached_session_close(reason);
+        }
+        owned
     }
 
     fn apply_startup_open_path_resolve_result(
@@ -562,6 +709,37 @@ impl App {
                 resolution.kind,
                 crate::folder_tree::OpenablePathKind::Directory
             );
+        #[cfg(windows)]
+        if matches!(source, StartupOpenPathSource::Bookmark)
+            && self.navigation_scope.is_detached_physical()
+            && self.active_detached_session.is_some_and(|session| {
+                session.content_phase == DetachedSessionContentPhase::Preparing
+            })
+        {
+            if self
+                .bookmark_open_pending
+                .as_ref()
+                .and_then(crate::bookmark_browser::PendingBookmarkOpen::media)
+                .is_some()
+            {
+                let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    openable,
+                    true,
+                    owner.open_request_owner(),
+                );
+                if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
+                    self.open_startup_file_if_visible(&result.requested);
+                }
+                return !matches!(outcome, FolderOpenOutcome::Ignored);
+            }
+            if let Some(descriptor) = self.bookmark_detached_descriptor(&openable, resolution.kind)
+            {
+                return self.continue_active_detached_book_context_from_descriptor(descriptor);
+            }
+            // OtherArchive without a cache remains in this same loading context.  The ordinary
+            // owned loader below starts probe/conversion and carries the bookmark's window lease
+            // through its completion policy.
+        }
         #[cfg(windows)]
         if matches!(source, StartupOpenPathSource::Bookmark)
             && self.settings.effective_media_in_media_window()
@@ -631,6 +809,55 @@ impl App {
     /// PDF/ZIP grid opens. `None` means the container still needs the archive-conversion flow;
     /// `Some` means this method owns the request and main must not load the container.
     #[cfg(windows)]
+    fn bookmark_detached_descriptor(
+        &mut self,
+        openable: &Path,
+        kind: crate::folder_tree::OpenablePathKind,
+    ) -> Option<ViewerContextDescriptor> {
+        let pending = self
+            .bookmark_open_pending
+            .as_ref()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)?;
+        match pending.bookmark.container_kind {
+            crate::book_bookmarks::BookContainerKind::Pdf
+                if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
+            {
+                Some(ViewerContextDescriptor::Pdf {
+                    path: openable.to_path_buf(),
+                    page_num: None,
+                })
+            }
+            crate::book_bookmarks::BookContainerKind::Zip
+                if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
+            {
+                Some(ViewerContextDescriptor::Zip {
+                    path: openable.to_path_buf(),
+                    entry_name: None,
+                    archive_source_override: None,
+                })
+            }
+            crate::book_bookmarks::BookContainerKind::CompiledBook
+            | crate::book_bookmarks::BookContainerKind::ImageFolder
+                if matches!(kind, crate::folder_tree::OpenablePathKind::Directory) =>
+            {
+                Some(ViewerContextDescriptor::BookFolder {
+                    path: openable.to_path_buf(),
+                })
+            }
+            crate::book_bookmarks::BookContainerKind::OtherArchive => {
+                let source = pending.bookmark.container_path.clone();
+                let cached = self.try_archive_cache_lookup(&source)?;
+                Some(ViewerContextDescriptor::Zip {
+                    path: cached,
+                    entry_name: None,
+                    archive_source_override: Some(source),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
     pub(super) fn open_bookmark_book_in_detached_context(
         &mut self,
         ctx: &egui::Context,
@@ -652,41 +879,7 @@ impl App {
             return None;
         }
 
-        let descriptor = match pending.bookmark.container_kind {
-            crate::book_bookmarks::BookContainerKind::Pdf
-                if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
-            {
-                ViewerContextDescriptor::Pdf {
-                    path: openable,
-                    page_num: None,
-                }
-            }
-            crate::book_bookmarks::BookContainerKind::Zip
-                if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
-            {
-                ViewerContextDescriptor::Zip {
-                    path: openable,
-                    entry_name: None,
-                    archive_source_override: None,
-                }
-            }
-            crate::book_bookmarks::BookContainerKind::CompiledBook
-            | crate::book_bookmarks::BookContainerKind::ImageFolder
-                if matches!(kind, crate::folder_tree::OpenablePathKind::Directory) =>
-            {
-                ViewerContextDescriptor::BookFolder { path: openable }
-            }
-            crate::book_bookmarks::BookContainerKind::OtherArchive => {
-                let source = pending.bookmark.container_path.clone();
-                let cached = self.try_archive_cache_lookup(&source)?;
-                ViewerContextDescriptor::Zip {
-                    path: cached,
-                    entry_name: None,
-                    archive_source_override: Some(source),
-                }
-            }
-            _ => return None,
-        };
+        let descriptor = self.bookmark_detached_descriptor(&openable, kind)?;
 
         let pending = match self.bookmark_open_pending.take() {
             Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending)) => pending,

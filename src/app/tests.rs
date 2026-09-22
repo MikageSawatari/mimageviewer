@@ -7382,7 +7382,12 @@ mod startup_open_path_resolve_tests {
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
             requested,
             owner: StartupOpenPathOwner::Bookmark(
-                crate::bookmark_browser::BookmarkOpenRequestOwner { request_id, target },
+                crate::bookmark_browser::BookmarkOpenRequestOwner {
+                    request_id,
+                    target,
+                    #[cfg(windows)]
+                    detached_lease: None,
+                },
             ),
             cancel: Arc::clone(&cancel),
             rx,
@@ -7411,6 +7416,8 @@ mod startup_open_path_resolve_tests {
         crate::bookmark_browser::BookmarkOpenRequestOwner {
             request_id,
             target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(path),
+            #[cfg(windows)]
+            detached_lease: None,
         }
     }
 
@@ -8439,6 +8446,8 @@ mod startup_open_path_resolve_tests {
         let owner_a = crate::bookmark_browser::BookmarkOpenRequestOwner {
             request_id: request_a,
             target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(source_a.clone()),
+            #[cfg(windows)]
+            detached_lease: None,
         };
         arm_archive_bookmark(&mut app, request_b, source_b, std::time::Instant::now());
         let (tx, cancel) = install_bookmark_archive_transition(
@@ -8588,6 +8597,8 @@ mod startup_open_path_resolve_tests {
         app.detached_grid_archive_open_request_seq += 1;
         let detached_owner = crate::app::DetachedGridArchiveOpenRequestOwner {
             request_id: app.detached_grid_archive_open_request_seq,
+            #[cfg(windows)]
+            lease: crate::app::DetachedSessionLease { window_id: 8_589 },
             source_path: source.clone(),
             collection_restore: None,
         };
@@ -8711,6 +8722,8 @@ mod startup_open_path_resolve_tests {
             StartupOpenPathOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
                 request_id: request_a,
                 target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(target_a.clone()),
+                #[cfg(windows)]
+                detached_lease: None,
             }),
             StartupOpenPathResolveResult {
                 requested: target_a,
@@ -15296,7 +15309,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     #[cfg(windows)]
     fn main_folder_candidate_fallback_updates_reading_history_at_adoption() {
-        use crate::app::{FolderOpenScanPurpose, FolderPaneOpenPending, scan_directory};
+        use crate::app::{FolderPaneOpenPending, scan_directory};
         use crate::grid_item::{GridItem, ThumbnailState};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, mpsc};
@@ -15346,9 +15359,7 @@ mod phase_c_drill_nav_tests {
                 path: folder.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: scan_rx,
-                purpose: FolderOpenScanPurpose::GridFolderCandidate {
-                    collection_owner: None,
-                },
+                purpose: real_pending.purpose,
             });
             let ready = app
                 .poll_folder_pane_open(&egui::Context::default())
@@ -16492,6 +16503,8 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
             &crate::bookmark_browser::BookmarkOpenRequestOwner {
                 request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
                 target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(source.clone()),
+                #[cfg(windows)]
+                detached_lease: None,
             },
         ),
         Some(true)
@@ -16510,6 +16523,78 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
         );
     })
     .expect("converted archive bookmark must own a detached reader context");
+}
+
+#[cfg(windows)]
+#[test]
+fn converted_bookmark_archive_continues_the_existing_loading_session_lease() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let source = app.tmp.path().join("slow-bookmark.rar");
+    let backing = app.tmp.path().join("slow-bookmark-cache.zip");
+    std::fs::write(&source, []).expect("create source archive");
+    std::fs::write(&backing, []).expect("create cache archive");
+    arm_detached_bookmark_book_open(
+        &mut app,
+        source.clone(),
+        crate::book_bookmarks::BookContainerKind::OtherArchive,
+        crate::book_bookmarks::PageIdentity::ArchiveEntry("page-001.jpg".to_string()),
+    );
+    app.bookmark_open_request_seq = 1;
+    let pending = app
+        .bookmark_open_pending
+        .take()
+        .expect("bookmark request must be armed");
+    let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(source.clone());
+    assert!(app.start_detached_bookmark_loading_context(
+        &ctx,
+        pending,
+        target.clone(),
+        DetachedSource::Book,
+        source.clone(),
+    ));
+    let context_id = app
+        .active_viewer_context_id()
+        .expect("loading shell must publish one active context");
+    let window_id = app
+        .active_detached_window_id()
+        .expect("loading shell must publish one stable session lease");
+    let owner = crate::bookmark_browser::BookmarkOpenRequestOwner {
+        request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
+        target,
+        detached_lease: Some(DetachedSessionLease { window_id }),
+    };
+
+    assert_eq!(
+        app.open_converted_bookmark_in_detached_context(&ctx, backing.clone(), &owner),
+        Some(true)
+    );
+    assert_eq!(app.active_viewer_context_id(), Some(context_id));
+    assert_eq!(app.active_detached_window_id(), Some(window_id));
+    assert_eq!(
+        app.active_detached_session
+            .map(|session| session.content_phase),
+        Some(DetachedSessionContentPhase::Preparing)
+    );
+    app.with_active_viewer_context(|active| {
+        assert_eq!(
+            active.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert!(
+            active
+                .zip_enumerate_pending
+                .as_ref()
+                .is_some_and(|pending| crate::path_key::eq_keep_drive(&pending.zip_path, &backing))
+        );
+        assert!(matches!(
+            active.bookmark_view_state,
+            Some(super::BookmarkViewState::Detached {
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(_)
+            })
+        ));
+    })
+    .expect("conversion completion must continue inside the existing loading shell");
 }
 
 #[cfg(windows)]
@@ -48614,7 +48699,7 @@ mod still_window_mode_key_tests {
         assert!(
             app.with_active_viewer_context(|active| active.pdf_password_request.is_some())
                 .unwrap_or(false),
-            "a password request must keep the pre-viewport detached context alive"
+            "a password request must keep the detached context alive before normal content renders"
         );
         assert_eq!(
             app.active_detached_session.map(|session| session.window_id),
@@ -48739,12 +48824,12 @@ mod still_window_mode_key_tests {
         );
         assert!(
             app.active_detached_session.is_none(),
-            "terminal close before viewport creation must finish the detached session"
+            "terminal close before the first normal content render must finish the detached session"
         );
         assert_eq!(
             app.detached_window_state(window_id),
             None,
-            "terminal close before viewport creation must remove the window runtime"
+            "terminal close before the first normal content render must remove the window runtime"
         );
     }
 
@@ -48757,19 +48842,28 @@ mod still_window_mode_key_tests {
             let window_id = if page_timeout { 506 } else { 505 };
             let main_folder = app.tmp.path().join("main-bookmark-grid");
             let main_item = main_folder.join("bookmark-row.jpg");
+            let container = app.tmp.path().join(if page_timeout {
+                "timed-out-book.pdf"
+            } else {
+                "missing-page-book.pdf"
+            });
             app.current_folder = Some(main_folder.clone());
             app.items = vec![GridItem::Image(main_item.clone())];
             app.thumbnails = vec![ThumbnailState::Pending];
             app.image_metas = vec![None];
             app.visible_indices = vec![0];
             app.items_are_bookmark_view = true;
-
-            let container = app.tmp.path().join(if page_timeout {
-                "timed-out-book.pdf"
-            } else {
-                "missing-page-book.pdf"
+            app.bookmark_view_state = Some(BookmarkViewState::Opening {
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(container.clone()),
+                grid: BookmarkViewReturnGridState {
+                    row_keys: vec![(1, 1)],
+                    selected_key: Some((1, 1)),
+                    opened_key: (1, 1),
+                    scroll_offset_y: 0.0,
+                },
             });
             let request_id = crate::bookmark_browser::BookmarkOpenRequestId(window_id);
+            app.bookmark_open_request_seq = request_id.0;
             let pending_container = container.clone();
             app.build_active_context_for_test(
                 Some(window_id),
@@ -48820,12 +48914,18 @@ mod still_window_mode_key_tests {
             app.with_active_viewer_context(|context| {
                 context.poll_bookmark_book_open(&ctx);
                 assert!(context.bookmark_open_pending.is_none());
+                assert!(matches!(
+                    context.bookmark_view_state.as_ref(),
+                    Some(BookmarkViewState::Detached {
+                        target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(path),
+                    }) if crate::path_key::eq_keep_drive(path, &container)
+                ));
             })
             .expect("bookmark terminal must run in its detached owner context");
             assert_eq!(
                 app.detached_window_state(window_id),
                 Some(DetachedWindowState::Closing),
-                "page timeout/missing must explicitly terminate the pre-viewport lifecycle"
+                "page timeout/missing must explicitly terminate before the first normal content render"
             );
 
             run_active_detached_frame_for_test(&mut app, &ctx);
@@ -48838,7 +48938,102 @@ mod still_window_mode_key_tests {
                 [GridItem::Image(path)] if path == &main_item
             ));
             assert!(app.items_are_bookmark_view);
+            assert!(matches!(
+                app.bookmark_view_state,
+                Some(BookmarkViewState::Restoring { .. })
+            ));
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_media_bookmark_resolve_cancel_preserves_target_until_exact_retirement() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 507;
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(507);
+        let media = app.tmp.path().join("slow-media.mp4");
+        let target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(media.clone());
+        app.bookmark_open_request_seq = request_id.0;
+        app.items_are_bookmark_view = true;
+        app.bookmark_view_state = Some(BookmarkViewState::Opening {
+            target: target.clone(),
+            grid: BookmarkViewReturnGridState {
+                row_keys: vec![(2, 2)],
+                selected_key: Some((2, 2)),
+                opened_key: (2, 2),
+                scroll_offset_y: 0.0,
+            },
+        });
+        let pending_media = media.clone();
+        let detached_target = target.clone();
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Video, move |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            context.bookmark_open_pending =
+                Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+                    crate::bookmark_browser::PendingMediaOpen {
+                        request_id,
+                        path: pending_media,
+                        pts_secs: 3.0,
+                        started_at: std::time::Instant::now(),
+                        last_wait: None,
+                    },
+                ));
+            context.bookmark_view_state = Some(BookmarkViewState::Detached {
+                target: detached_target,
+            });
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let resolver_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            requested: media.clone(),
+            owner: StartupOpenPathOwner::Bookmark(
+                crate::bookmark_browser::BookmarkOpenRequestOwner {
+                    request_id,
+                    target: target.clone(),
+                    detached_lease: Some(DetachedSessionLease { window_id }),
+                },
+            ),
+            cancel: std::sync::Arc::clone(&resolver_cancel),
+            rx,
+            started_at: std::time::Instant::now(),
+            toast_shown: false,
+            held_resolve_for_activation_admission: None,
+        });
+
+        assert!(app.cancel_bookmark_open_request(request_id, "test_resolve_cancel"));
+        assert!(resolver_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        app.with_active_viewer_context(|context| {
+            assert!(context.bookmark_open_pending.is_none());
+            assert!(matches!(
+                context.bookmark_view_state.as_ref(),
+                Some(BookmarkViewState::Detached {
+                    target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(path),
+                }) if crate::path_key::eq_keep_drive(path, &media)
+            ));
+        })
+        .expect("cancel must retire the exact detached owner, not the main bundle");
+        assert!(
+            tx.send(StartupOpenPathResolveResult {
+                requested: media,
+                resolved: None,
+                bookmark_relative_page_openable: None,
+                elapsed_ms: 1.0,
+            })
+            .is_err(),
+            "late resolver completion must not resurrect the retired shell"
+        );
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert!(app.active_viewer_context_id().is_none());
+        assert!(app.active_detached_session.is_none());
+        assert!(matches!(
+            app.bookmark_view_state,
+            Some(BookmarkViewState::Restoring { .. })
+        ));
     }
 
     #[test]
@@ -48879,12 +49074,30 @@ mod still_window_mode_key_tests {
         run_active_detached_frame_for_test(&mut app, &ctx);
         assert_eq!(
             app.detached_window_state(window_id),
-            Some(DetachedWindowState::Opening),
-            "session_begin -> restore wait must preserve the context-owned open lifecycle"
+            Some(DetachedWindowState::Active),
+            "the visible loading viewport is the actual Opening -> Active render boundary"
         );
         assert!(app.active_viewer_context_id().is_some());
-        assert!(app.active_detached_session.is_some());
-        assert!(!app.fs_viewport_shown);
+        assert_eq!(
+            app.active_detached_session
+                .map(|session| session.content_phase),
+            Some(DetachedSessionContentPhase::Preparing)
+        );
+        assert!(app.fs_viewport_shown);
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active),
+            "multiple unfinished frames must keep the already-visible loading window alive"
+        );
+        assert_eq!(
+            app.active_detached_session
+                .map(|session| session.content_phase),
+            Some(DetachedSessionContentPhase::Preparing)
+        );
+        assert!(app.active_viewer_context_id().is_some());
+        assert!(app.fs_viewport_shown);
 
         app.poll_sidecar_restore(&ctx);
         assert!(app.sidecar_restore.is_none());
@@ -48897,11 +49110,149 @@ mod still_window_mode_key_tests {
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::Active),
-            "the first real viewport render is the Opening -> Active boundary"
+            "content rendering must retain the loading shell's active session and window"
         );
         assert!(app.active_viewer_context_id().is_some());
-        assert!(app.active_detached_session.is_some());
+        assert_eq!(
+            app.active_detached_session
+                .map(|session| session.content_phase),
+            Some(DetachedSessionContentPhase::Ready),
+            "normal fullscreen content replaces the loading surface in the same session"
+        );
         assert!(app.fs_viewport_shown);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_sync_descriptor_failure_does_not_publish_loading_session() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+
+        assert!(!app.start_active_detached_book_context(
+            ViewerContextDescriptor::Image {
+                path: PathBuf::from(r"C:\"),
+            },
+            &ctx,
+            None,
+            None,
+        ));
+        assert!(app.active_viewer_context_id().is_none());
+        assert!(app.active_detached_session.is_none());
+        assert!(app.detached_window_manager.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_bookmark_sync_resolver_terminal_aborts_build_without_runtime_leak() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(508);
+        let missing = PathBuf::from(r"?:\miv-invalid-root\missing-book.pdf");
+        let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(missing.clone());
+        app.bookmark_open_request_seq = request_id.0;
+        app.bookmark_view_state = Some(BookmarkViewState::Opening {
+            target: target.clone(),
+            grid: BookmarkViewReturnGridState {
+                row_keys: vec![(3, 3)],
+                selected_key: Some((3, 3)),
+                opened_key: (3, 3),
+                scroll_offset_y: 0.0,
+            },
+        });
+        let pending = crate::bookmark_browser::PendingBookmarkOpen::Book(
+            crate::bookmark_browser::PendingBookOpen {
+                request_id,
+                bookmark: crate::book_bookmarks::BookBookmark {
+                    id: 508,
+                    container_key: crate::adjustment_db::normalize_path(&missing),
+                    container_path: missing.clone(),
+                    container_kind: crate::book_bookmarks::BookContainerKind::Pdf,
+                    page_identity: crate::book_bookmarks::PageIdentity::PdfPage(0),
+                    page_index_hint: 0,
+                    created_at_ms: 1,
+                    title: None,
+                },
+                relative_page_provenance: None,
+                started_at: std::time::Instant::now(),
+                stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
+            },
+        );
+
+        super::super::startup_ops::force_startup_open_resolve_spawn_failure_for_test(true);
+        let opened = app.start_detached_bookmark_loading_context(
+            &ctx,
+            pending,
+            target,
+            DetachedSource::Book,
+            missing,
+        );
+        super::super::startup_ops::force_startup_open_resolve_spawn_failure_for_test(false);
+
+        assert!(!opened);
+        assert!(app.active_viewer_context_id().is_none());
+        assert!(app.active_detached_session.is_none());
+        assert!(app.detached_window_manager.is_empty());
+        assert!(app.startup_open_path_resolve_pending.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_loading_cancel_retires_exact_scan_and_preserves_pdf_password_digest() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+        let window_id = 505;
+        let folder = app.tmp.path().join("slow-folder");
+        let password_pdf = app.tmp.path().join("password.pdf");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_probe = std::sync::Arc::clone(&cancel);
+
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Book, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            context.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                path: folder,
+                cancel,
+                rx,
+                purpose: FolderOpenScanPurpose::DetachedFolder,
+            });
+            context.pdf_password_request = Some(PdfPasswordRequest { path: password_pdf });
+        });
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert_eq!(
+            app.active_detached_session
+                .map(|session| session.content_phase),
+            Some(DetachedSessionContentPhase::Preparing)
+        );
+        assert!(app.fs_viewport_shown);
+
+        app.with_active_viewer_context(|context| {
+            assert!(context.cancel_detached_initial_open_for_lease(
+                DetachedSessionLease { window_id },
+                "test_loading_cancel",
+            ));
+            assert!(context.folder_pane_open_pending.is_none());
+            assert!(context.pdf_password_request.is_some());
+        })
+        .expect("loading owner must remain mountable until retirement");
+        assert!(cancel_probe.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            tx.send(Err(std::io::Error::other("late detached scan")))
+                .is_err()
+        );
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Closing)
+        );
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert!(app.active_viewer_context_id().is_none());
+        assert!(app.active_detached_session.is_none());
+        assert_eq!(app.detached_window_state(window_id), None);
+        assert!(app.pdf_password_request.is_none());
     }
 
     #[test]
@@ -48943,13 +49294,18 @@ mod still_window_mode_key_tests {
         run_active_detached_frame_for_test(&mut app, &ctx);
         assert_eq!(
             app.detached_window_state(window_id),
-            Some(DetachedWindowState::Opening)
+            Some(DetachedWindowState::Active)
+        );
+        assert_eq!(
+            app.active_detached_session
+                .map(|session| session.content_phase),
+            Some(DetachedSessionContentPhase::Preparing)
         );
         app.poll_sidecar_restore(&ctx);
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::Closing),
-            "an exact deferred target mismatch is a pre-viewport terminal event"
+            "an exact deferred target mismatch is terminal before the first normal content render"
         );
 
         run_active_detached_frame_for_test(&mut app, &ctx);
@@ -49022,12 +49378,24 @@ mod still_window_mode_key_tests {
         mpsc::Sender<crate::ui_dialogs::archive_convert::ArchiveConvertMsg>,
         Arc<AtomicBool>,
     ) {
+        let ctx = egui::Context::default();
+        let window_id = app
+            .start_active_detached_loading_context(
+                &ctx,
+                None,
+                DetachedSource::Book,
+                source.clone(),
+                |_app, _window_id| DetachedLoadingContextInit::Continue,
+            )
+            .expect("test conversion owner must publish its loading shell first");
         app.detached_grid_archive_open_request_seq = app
             .detached_grid_archive_open_request_seq
             .checked_add(1)
             .unwrap();
         let owner = crate::app::DetachedGridArchiveOpenRequestOwner {
             request_id: app.detached_grid_archive_open_request_seq,
+            #[cfg(windows)]
+            lease: crate::app::DetachedSessionLease { window_id },
             source_path: source.clone(),
             collection_restore: None,
         };
@@ -49218,7 +49586,14 @@ mod still_window_mode_key_tests {
             state.auto_fullscreen,
             app.settings.effective_auto_fullscreen_zip_pdf()
         );
-        assert!(app.active_viewer_context_id().is_none());
+        assert!(app.active_viewer_context_id().is_some());
+        assert_eq!(
+            state
+                .completion
+                .detached_grid_archive_owner()
+                .map(|owner| owner.lease.window_id),
+            app.active_detached_window_id()
+        );
         state.cancel.store(true, Ordering::Relaxed);
     }
 
@@ -49328,6 +49703,7 @@ mod still_window_mode_key_tests {
             &source,
             items_generation,
         );
+        run_active_detached_frame_for_test(&mut app, &ctx);
         assert!(app.active_viewer_context_id().is_none());
         assert!(
             app.fs_feedback_toast.is_none(),
@@ -49367,6 +49743,7 @@ mod still_window_mode_key_tests {
             &source,
             items_generation,
         );
+        run_active_detached_frame_for_test(&mut app, &ctx);
         assert!(app.active_viewer_context_id().is_none());
         assert!(
             app.fs_feedback_toast.is_none(),
@@ -49525,6 +49902,7 @@ mod still_window_mode_key_tests {
         assert!(app.archive_convert.is_none());
         assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
         assert_eq!(app.current_folder, Some(destination));
+        run_active_detached_frame_for_test(&mut app, &egui::Context::default());
         assert!(app.active_viewer_context_id().is_none());
     }
 
@@ -49563,6 +49941,7 @@ mod still_window_mode_key_tests {
             &source,
             items_generation,
         );
+        run_active_detached_frame_for_test(&mut app, &ctx);
         assert!(app.active_viewer_context_id().is_none());
     }
 
@@ -49754,19 +50133,21 @@ mod still_window_mode_key_tests {
             &folder,
             crate::collection_store::CollectionResolvedKind::Folder,
         );
-        let owner = app
-            .collection_grid_physical_load_owner(0, &folder)
-            .expect("collection load owner");
+        let ctx = egui::Context::default();
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
+        let pending = app
+            .folder_pane_open_pending
+            .take()
+            .expect("the collection candidate scan remains main-owned");
+        pending.cancel.store(true, Ordering::Relaxed);
         app.selected = None;
         let ready = FolderPaneOpenReady {
             path: folder.clone(),
             scan: Ok(scan_directory(&folder)),
-            purpose: FolderOpenScanPurpose::GridFolderCandidate {
-                collection_owner: Some(owner.clone()),
-            },
+            purpose: pending.purpose,
         };
         let resolved = app
-            .resolve_main_folder_open_ready(&egui::Context::default(), ready)
+            .resolve_main_folder_open_ready(&ctx, ready)
             .expect("mixed folder returns to main navigation");
         assert_eq!(
             resolved
@@ -49792,9 +50173,10 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn image_folder_container_open_classifies_before_creating_detached_context() {
+    fn image_folder_container_open_shows_preparing_shell_then_reuses_it_for_content() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let temp = tempfile::TempDir::new().unwrap();
         let parent = temp.path().join("library");
         let child = parent.join("book");
@@ -49830,11 +50212,17 @@ mod still_window_mode_key_tests {
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.scroll_offset_y, 246.0);
         assert_eq!(app.fullscreen_idx, None);
-        assert!(
-            app.active_viewer_context_id().is_none(),
-            "an unclassified Folder candidate must not allocate a detached context"
+        let context_id = app
+            .active_viewer_context_id()
+            .expect("the user operation must publish its detached loading shell immediately");
+        let session = app
+            .active_detached_session
+            .expect("the loading shell must own a detached session");
+        let window_id = session.window_id;
+        assert_eq!(
+            session.content_phase,
+            DetachedSessionContentPhase::Preparing
         );
-        assert!(app.active_detached_session.is_none());
         assert!(matches!(
             app.folder_pane_open_pending
                 .as_ref()
@@ -49843,29 +50231,54 @@ mod still_window_mode_key_tests {
         ));
 
         let (scan_tx, scan_rx) = mpsc::channel();
-        scan_tx.send(Ok(physical_scan)).unwrap();
         let real_pending = app
             .folder_pane_open_pending
             .take()
-            .expect("main-owned Folder candidate scan must have started");
+            .expect("the main bundle must own the Folder candidate scan");
         real_pending.cancel.store(true, Ordering::Relaxed);
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
             path: child.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             rx: scan_rx,
-            purpose: FolderOpenScanPurpose::GridFolderCandidate {
-                collection_owner: None,
-            },
+            purpose: real_pending.purpose,
         });
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        let session = app.active_detached_session.unwrap();
+        assert_eq!(session.window_id, window_id);
+        assert_eq!(
+            session.content_phase,
+            DetachedSessionContentPhase::Preparing
+        );
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active),
+            "only the actual loading viewport callback may activate the runtime"
+        );
+        app.with_active_viewer_context(|mounted| {
+            assert!(mounted.fs_viewport_shown);
+            assert_eq!(
+                mounted.fs_viewport_presentation,
+                Some(ViewerPresentation::DetachedWindow)
+            );
+            assert!(mounted.folder_pane_open_pending.is_none());
+        })
+        .unwrap();
+        assert!(app.folder_pane_open_pending.is_some());
+
+        scan_tx.send(Ok(physical_scan)).unwrap();
         let ready = app
             .poll_folder_pane_open(&ctx)
-            .expect("completed Folder candidate scan");
-        assert!(
-            app.resolve_main_folder_open_ready(&ctx, ready).is_none(),
-            "an image-only result must be consumed by the detached transition"
-        );
+            .expect("the completed main-owned candidate scan");
+        assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+        assert_eq!(app.active_viewer_context_id(), Some(context_id));
+        assert_eq!(app.active_detached_session.unwrap().window_id, window_id);
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        let session = app.active_detached_session.unwrap();
+        assert_eq!(session.window_id, window_id);
+        assert_eq!(session.content_phase, DetachedSessionContentPhase::Ready);
 
-        assert_eq!(app.current_folder, Some(parent));
+        assert_eq!(app.current_folder, Some(parent.clone()));
         assert!(matches!(
             app.items.as_slice(),
             [GridItem::Folder(path)] if path == &child
@@ -49898,7 +50311,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn mixed_folder_candidate_falls_back_to_main_navigation_without_detached_session() {
+    fn mixed_folder_candidate_retires_exact_loading_shell_and_adopts_completed_scan() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let temp = tempfile::TempDir::new().unwrap();
@@ -49922,37 +50335,55 @@ mod still_window_mode_key_tests {
         app.settings.auto_fullscreen_image_folders = true;
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
-        assert!(
-            app.active_viewer_context_id().is_none(),
-            "classification must precede detached context creation"
+        let shell_context_id = app.active_viewer_context_id().unwrap();
+        let window_id = app.active_detached_session.unwrap().window_id;
+        assert_eq!(app.current_folder, Some(parent.clone()));
+
+        let (scan_tx, scan_rx) = mpsc::channel();
+        let real_pending = app.folder_pane_open_pending.take().unwrap();
+        real_pending.cancel.store(true, Ordering::Relaxed);
+        app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            path: child.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: scan_rx,
+            purpose: real_pending.purpose,
+        });
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active)
         );
-        assert!(app.active_detached_session.is_none());
+        assert_eq!(
+            app.active_detached_session.unwrap().content_phase,
+            DetachedSessionContentPhase::Preparing
+        );
         assert_eq!(app.current_folder, Some(parent));
 
-        let ready = FolderPaneOpenReady {
-            path: child.clone(),
-            scan: Ok(scan_directory(&child)),
-            purpose: FolderOpenScanPurpose::GridFolderCandidate {
-                collection_owner: None,
-            },
-        };
-        let crate::app::ResolvedMainFolderOpen {
-            path: navigate_path,
-            scan,
-            ..
-        } = app
+        scan_tx.send(Ok(scan_directory(&child))).unwrap();
+        let ready = app
+            .poll_folder_pane_open(&ctx)
+            .expect("the completed main-owned candidate scan");
+        let resolved = app
             .resolve_main_folder_open_ready(&ctx, ready)
-            .expect("mixed folders must return to ordinary main navigation");
-        assert_eq!(navigate_path, child);
-        assert!(matches!(
-            app.load_folder_nav_target(navigate_path, Some(scan)),
-            FolderOpenOutcome::Loaded
-        ));
+            .expect("mixed folders rejoin ordinary main navigation");
+        let owner = resolved
+            .collection_owner
+            .map(OpenRequestOwner::CollectionGridPhysical)
+            .unwrap_or(OpenRequestOwner::Navigation);
+        assert!(app.load_folder_with_scan_owned(resolved.path, Some(resolved.scan), owner));
+        run_active_detached_frame_for_test(&mut app, &ctx);
 
         assert_eq!(app.current_folder, Some(child));
         assert_eq!(app.fullscreen_idx, None);
         assert!(app.active_viewer_context_id().is_none());
         assert!(app.active_detached_session.is_none());
+        assert_eq!(app.detached_window_state(window_id), None);
+        assert_ne!(app.active_viewer_context_id(), Some(shell_context_id));
+        assert!(
+            app.folder_pane_open_pending.is_none(),
+            "the completed detached scan must be adopted without starting a second main scan"
+        );
         assert!(
             app.items
                 .iter()
@@ -49967,7 +50398,135 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn folder_candidate_mode_matrix_has_one_classification_entrypoint() {
+    fn newer_main_navigation_cancels_folder_candidate_shell_without_late_rewind() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let candidate = app.tmp.path().join("slow-candidate");
+        let destination = app.tmp.path().join("newer-main-destination");
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(candidate.join("page.jpg"), b"fixture").unwrap();
+        std::fs::write(destination.join("winner.jpg"), b"fixture").unwrap();
+        app.items = vec![GridItem::Folder(candidate.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
+        let window_id = app.active_detached_session.unwrap().window_id;
+        let cancel = app
+            .folder_pane_open_pending
+            .as_ref()
+            .map(|pending| Arc::clone(&pending.cancel))
+            .unwrap();
+
+        app.load_folder(destination.clone());
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.folder_pane_open_pending.is_none());
+        assert_eq!(app.current_folder, Some(destination.clone()));
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Closing)
+        );
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert!(app.active_viewer_context_id().is_none());
+        assert_eq!(app.detached_window_state(window_id), None);
+        assert_eq!(app.current_folder, Some(destination));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn loading_shell_cancel_reaches_main_owned_folder_candidate_by_exact_lease() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let candidate = app.tmp.path().join("cancelled-slow-candidate");
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(candidate.join("page.jpg"), b"fixture").unwrap();
+        app.items = vec![GridItem::Folder(candidate)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
+        let window_id = app.active_detached_session.unwrap().window_id;
+        let lease = DetachedSessionLease { window_id };
+        let cancel = app
+            .folder_pane_open_pending
+            .as_ref()
+            .map(|pending| Arc::clone(&pending.cancel))
+            .unwrap();
+
+        assert!(
+            app.with_active_viewer_context(|shell| {
+                shell.cancel_detached_initial_open_for_lease(lease, "test_loading_shell_cancel")
+            })
+            .unwrap_or(false)
+        );
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.folder_pane_open_pending.is_none());
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Closing)
+        );
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert!(app.active_viewer_context_id().is_none());
+        assert_eq!(app.detached_window_state(window_id), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn stale_collection_folder_candidate_closes_only_its_loading_shell() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        let folder = app.tmp.path().join("stale-collection-candidate");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("page.jpg"), b"fixture").unwrap();
+        let restore = install_collection_item_for_detached_plan(
+            &mut app,
+            &folder,
+            crate::collection_store::CollectionResolvedKind::Folder,
+        );
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
+        let window_id = app.active_detached_session.unwrap().window_id;
+        let pending = app.folder_pane_open_pending.take().unwrap();
+        pending.cancel.store(true, Ordering::Relaxed);
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .wanted_revision = restore.revision_at_open + 1;
+
+        let ready = FolderPaneOpenReady {
+            path: folder.clone(),
+            scan: Ok(scan_directory(&folder)),
+            purpose: pending.purpose,
+        };
+        assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Closing)
+        );
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::Folder(path)] if path == &folder
+        ));
+        assert_eq!(app.selected, Some(0));
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        assert!(app.active_viewer_context_id().is_none());
+        assert!(app.top_level_grid_view.collection_session().is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn folder_candidate_mode_matrix_has_one_loading_shell_entrypoint() {
         let ctx = egui::Context::default();
 
         for always_new in [false, true] {
@@ -49998,14 +50557,32 @@ mod still_window_mode_key_tests {
                     always_new && image_folder_books,
                     "always_new={always_new} image_folder_books={image_folder_books}"
                 );
-                assert!(
-                    app.active_viewer_context_id().is_none(),
-                    "Folder classification must never allocate a detached context synchronously"
-                );
                 assert_eq!(
-                    app.folder_pane_open_pending.is_some(),
-                    always_new && image_folder_books
+                    app.active_viewer_context_id().is_some(),
+                    always_new && image_folder_books,
+                    "eligible Folder candidates publish a loading shell synchronously"
                 );
+                if always_new && image_folder_books {
+                    assert_eq!(
+                        app.active_detached_session.unwrap().content_phase,
+                        DetachedSessionContentPhase::Preparing
+                    );
+                    assert!(matches!(
+                        app.folder_pane_open_pending
+                            .as_ref()
+                            .map(|pending| &pending.purpose),
+                        Some(FolderOpenScanPurpose::GridFolderCandidate { .. })
+                    ));
+                    assert!(
+                        app.with_active_viewer_context(|mounted| {
+                            mounted.folder_pane_open_pending.is_none()
+                        })
+                        .unwrap_or(false)
+                    );
+                } else {
+                    assert!(app.active_detached_session.is_none());
+                    assert!(app.folder_pane_open_pending.is_none());
+                }
             }
         }
 
@@ -58644,6 +59221,42 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn materialized_detached_session_is_preparing_until_its_normal_render_callback() {
+        let mut app = setup_app();
+        let window_id = 8;
+        app.fullscreen_idx = Some(0);
+        app.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Opening,
+            "materialized_test_opening",
+        );
+
+        app.begin_active_detached_session(window_id, DetachedSource::Image);
+
+        assert_eq!(
+            app.active_detached_session.unwrap().content_phase,
+            DetachedSessionContentPhase::Preparing,
+            "cached descriptors and F12 must not become Ready merely because an index exists"
+        );
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Opening),
+            "publishing materialized content is not a viewport render"
+        );
+
+        app.mark_active_detached_viewport_rendered();
+        assert_eq!(
+            app.active_detached_session.unwrap().content_phase,
+            DetachedSessionContentPhase::Ready
+        );
+        assert_eq!(
+            app.detached_window_state(window_id),
+            Some(DetachedWindowState::Active)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_window_runtime_reducer_representative_sequence() {
         // R2b Part 1: active session の closing bool を廃止し、runtime.state を
         // reducer の正にした代表列を固定する。
@@ -58665,7 +59278,7 @@ mod still_window_mode_key_tests {
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::Opening),
-            "publishing the session must not erase the pre-viewport lifecycle"
+            "publishing the session must not erase the lifecycle before its first viewport render"
         );
         app.mark_active_detached_viewport_rendered();
         assert_eq!(
@@ -77707,6 +78320,19 @@ fn a_foreground_detached_viewer_receives_the_gamepad_batch_itself() {
         bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
     });
     app.begin_active_detached_session(window_id, DetachedSource::Image);
+    // This test exercises gamepad routing for an established detached viewer, not the initial
+    // loading shell.  Model the normal-content render that production performs before this
+    // update; leaving the new session in `Preparing` would legitimately try to paint its first
+    // viewport, which requires an active egui pass.
+    app.active_detached_session
+        .as_mut()
+        .expect("detached session")
+        .content_phase = DetachedSessionContentPhase::Ready;
+    app.transition_detached_window_state(
+        window_id,
+        DetachedWindowState::Active,
+        "gamepad_test_established_viewer",
+    );
     assert_eq!(app.active_viewer_context_id(), Some(context_id));
     assert!(
         app.active_detached_context_is_at_rest(),

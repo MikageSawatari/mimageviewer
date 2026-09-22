@@ -904,6 +904,10 @@ pub struct BookmarkOpenRequestId(pub(crate) u64);
 pub struct BookmarkOpenRequestOwner {
     pub request_id: BookmarkOpenRequestId,
     pub target: BookmarkViewReturnTarget,
+    /// Stable detached loading-window lease, when the request was launched into a shell before
+    /// path resolution. `None` retains the ordinary main/full-feature bookmark route.
+    #[cfg(windows)]
+    pub(crate) detached_lease: Option<crate::app::DetachedSessionLease>,
 }
 
 #[derive(Clone, Debug)]

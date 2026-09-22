@@ -716,6 +716,34 @@ impl App {
         true
     }
 
+    /// Cancel only the conversion/probe whose typed completion owns this detached loading
+    /// session.  A sibling detached reader (or a later request reusing neither lease nor owner)
+    /// is left untouched.
+    #[cfg(windows)]
+    pub(crate) fn cancel_archive_convert_for_detached_loading_lease(
+        &mut self,
+        lease: crate::app::DetachedSessionLease,
+        reason: &'static str,
+    ) -> bool {
+        let completion = self
+            .archive_convert
+            .as_ref()
+            .map(|state| state.completion.clone());
+        match completion {
+            Some(ArchiveConvertCompletionPolicy::Bookmark(owner))
+                if owner.detached_lease == Some(lease) =>
+            {
+                self.cancel_archive_convert_for_bookmark_request(owner.request_id)
+            }
+            Some(ArchiveConvertCompletionPolicy::DetachedGridArchive(owner))
+                if owner.lease == lease =>
+            {
+                self.cancel_archive_convert_for_navigation(reason)
+            }
+            _ => false,
+        }
+    }
+
     /// A new navigation owns the visible context and supersedes any archive dialog/worker.
     /// Same-folder refreshes are not navigation and intentionally keep the dialog alive.
     pub(crate) fn cancel_archive_convert_for_navigation_to(
@@ -751,7 +779,7 @@ impl App {
             self.abort_smart_archive_open_for_owner(owner);
         }
         if let Some(owner) = detached_owner.as_ref() {
-            self.invalidate_detached_grid_archive_open_owner(owner);
+            self.cancel_detached_grid_archive_open_owner(owner, reason);
         }
         if had_deferred {
             self.release_fs_nav_lock();
