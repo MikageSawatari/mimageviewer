@@ -3448,6 +3448,32 @@ impl App {
     }
 }
 
+#[cfg(not(windows))]
+impl App {
+    pub(in crate::app) fn viewer_context_main(&self) -> ViewerContextId {
+        ViewerContextId::single_context()
+    }
+
+    /// Non-Windows builds have one viewer payload and therefore one projected identity.
+    pub(in crate::app) fn projected_viewer_context_id(&self) -> ViewerContextId {
+        ViewerContextId::single_context()
+    }
+
+    pub(in crate::app) fn with_viewer_context<R>(
+        &mut self,
+        id: ViewerContextId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, MountError> {
+        if id != ViewerContextId::single_context() {
+            return Err(MountError {
+                id,
+                residence: ContextResidence::Unknown,
+            });
+        }
+        Ok(f(self))
+    }
+}
+
 #[cfg(all(test, windows))]
 impl App {
     pub(in crate::app) fn begin_mounted_detached_session_for_test(

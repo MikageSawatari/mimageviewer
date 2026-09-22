@@ -111,3 +111,25 @@ README v4.0.0 節は 8KB を超える見込みなので `docs/release-body-4.0.0
 
 **コード照合の範囲では、v4.0.0 の出荷を止める指摘は残っていない。** 残るのは実機確認 (§4 と上の別窓の 1 点) と、
 公開担当の Phase 0〜1 作業である。
+
+## 7. 追補: §4 の実機確認の結果 (2026-09-22、公開担当 ClaudeCode Opus 5 が記録)
+
+公開工程 (Phase 2) で実施した分だけを、観測者付きで残す。**エージェントは製品バイナリを起動していない。**
+下記はすべて利用者が自分の実機で `scripts/check-idle-health.ps1` を実行し、その端末出力を公開担当へ渡したもの。
+判定は script 自身の gate による。
+
+| §4 の項目 | 観測者 | 結果 |
+| --- | --- | --- |
+| 2. コレクション root を開いた状態の `static-background` | 利用者 (実機) | **PASS**。測定区間 15.03s で `events=0 frames=0 update_rate=0.00/s tail_repaint=0`、CPU one-core ratio 0.0156、perf log 増加 0 バイト。report `target/idle-health/20260922-121804-static-background-perf.json` |
+| 2. コレクション root を開いた状態の `tray-residency` | 利用者 (実機) | **PASS**。測定区間 15.03s で同じく `events=0`、CPU one-core ratio 0.0125。report `target/idle-health/20260922-121840-tray-residency-perf.json` |
+
+測定区間が完全に sleep しているため、`ui.tail_repaint.action` が
+`request_repaint_after_collection_grid` / `_collection_ui` で滞留していないかを見る必要は生じなかった
+(滞留していれば events が 0 にならない)。
+
+通常フォルダを開いた状態の `static-foreground` / `static-background` / `tray-residency` も同日に PASS
+(report は `target/idle-health/20260922-1201*`)。`video-pin-background` は該当フォルダの用意が要るため未実施で、
+本版はアイドル高画質化の経路を変更していないことを理由に waiver とする。
+
+§4 の 1 (U-1 の Esc)、3 (壊れた移行記録)、4 (バックアップのログ) と、§6「確認を勧める点」の別窓 Esc は
+この追補の時点では未実施。

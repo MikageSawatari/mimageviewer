@@ -375,14 +375,7 @@ fn collection_prepare_stage_event<T>(
 
 impl App {
     pub(crate) fn collection_grid_context_id(&self) -> ViewerContextId {
-        #[cfg(windows)]
-        {
-            self.projected_viewer_context_id()
-        }
-        #[cfg(not(windows))]
-        {
-            ViewerContextId::single_context()
-        }
+        self.projected_viewer_context_id()
     }
 
     pub(crate) fn show_collection_jump_feedback_in_origin(

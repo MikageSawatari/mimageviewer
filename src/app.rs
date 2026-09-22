@@ -56499,28 +56499,9 @@ impl App {
         (player, start_normalize_scan_before_play)
     }
 
-    /// ページ読み込みスケジューラへ渡す viewer context の識別子。
-    ///
-    /// **複数ウィンドウ (detached viewer) は Windows 専用**なので、
-    /// `viewer_contexts` レジストリと `projected_viewer_context_id` は
-    /// `#[cfg(windows)]` にある。非 Windows では context が常に 1 つしかないため、
-    /// 固定値で「同じ context」を表す。スケジューラは serial を等値比較にしか
-    /// 使わない (`supersede_waiting_for_latest_seek` の対象選別) ので、値が何かは
-    /// 問われない。
-    ///
-    /// **`projected_viewer_context_id()` を cfg なしで呼ぶと非 Windows ビルドが壊れる。**
-    /// 2026-09-06 に `scripts/check-non-windows-shadow.ps1` が実際に検出した
-    /// (CI の ubuntu ジョブと同じ種類の失敗)。呼び出しをここへ集約して、次に
-    /// スケジューラを使う人が同じ穴を掘らないようにする。
+    /// ページ読み込みスケジューラへ渡す projected viewer context の識別子。
     fn fs_page_load_context_serial(&self) -> u64 {
-        #[cfg(windows)]
-        {
-            self.projected_viewer_context_id().serial()
-        }
-        #[cfg(not(windows))]
-        {
-            0
-        }
+        self.projected_viewer_context_id().serial()
     }
 
     pub(crate) fn fs_pdf_render_context_epoch(_priority: crate::pdf_loader::JobPriority) -> u64 {
@@ -58883,15 +58864,7 @@ impl App {
     /// 開いたまま一覧側で貼り付けると、一覧側のキャッシュ・保持設定・undo が更新されない
     /// (v3.5.0 レビュー F08)。
     pub(crate) fn edit_request_owner_context(&self) -> ViewerContextId {
-        // 非 Windows は viewer context が 1 つしかない (registry の mount / swap も無い)。
-        #[cfg(windows)]
-        {
-            self.projected_viewer_context_id()
-        }
-        #[cfg(not(windows))]
-        {
-            ViewerContextId::single_context()
-        }
+        self.projected_viewer_context_id()
     }
 
     /// `owner` を mount した状態で `f` を実行する。context が既に無ければ `None`。
@@ -58900,15 +58873,7 @@ impl App {
         owner: ViewerContextId,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Option<R> {
-        #[cfg(windows)]
-        {
-            self.with_viewer_context(owner, f).ok()
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = owner;
-            Some(f(self))
-        }
+        self.with_viewer_context(owner, f).ok()
     }
 
     /// 焼き込みの AI 段に渡す材料。**設定と上限の解釈はここ 1 か所。**
@@ -75570,9 +75535,30 @@ impl App {
                             self.apply_jump_to_physical_folder_ready(path, scan, selection, origin);
                             None
                         }
-                        (FolderOpenScanPurpose::CurrentViewOrderRefresh { order }, Ok(scan)) => {
-                            self.apply_current_view_order_refresh(path, scan, order);
+                        (
+                            FolderOpenScanPurpose::CurrentViewOrderRefresh {
+                                order,
+                                collection_owner,
+                            },
+                            Ok(scan),
+                        ) => {
+                            self.apply_current_view_order_refresh(
+                                path,
+                                scan,
+                                order,
+                                collection_owner,
+                            );
                             None
+                        }
+                        (
+                            FolderOpenScanPurpose::GridFolderCandidate { collection_owner },
+                            Ok(scan),
+                        ) => {
+                            navigate_pre_scan = Some(scan);
+                            if let Some(owner) = collection_owner {
+                                navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
+                            }
+                            Some(path)
                         }
                         (_, Ok(scan)) => {
                             navigate_pre_scan = Some(scan);
@@ -78266,8 +78252,16 @@ mod favorite_view_state_tests {
                 {
                     let scan = ready.scan.unwrap();
                     match ready.purpose {
-                        FolderOpenScanPurpose::CurrentViewOrderRefresh { order } => {
-                            assert!(app.apply_current_view_order_refresh(ready.path, scan, order));
+                        FolderOpenScanPurpose::CurrentViewOrderRefresh {
+                            order,
+                            collection_owner,
+                        } => {
+                            assert!(app.apply_current_view_order_refresh(
+                                ready.path,
+                                scan,
+                                order,
+                                collection_owner,
+                            ));
                         }
                         _ => panic!("unexpected folder scan purpose"),
                     }
