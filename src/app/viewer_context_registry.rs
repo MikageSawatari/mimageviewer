@@ -3547,6 +3547,7 @@ impl App {
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: None,
+            reopen_collection_root: None,
             activation_ready_frame: 0,
             activation_armed: true,
             focused_last_frame: false,

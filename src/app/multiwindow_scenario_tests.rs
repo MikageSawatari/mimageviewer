@@ -125,14 +125,19 @@ impl ScenarioDriver {
     }
 
     fn root(&mut self, app: &mut App) -> ScenarioFrame {
+        self.root_with_events(app, Vec::new())
+    }
+
+    fn root_with_events(&mut self, app: &mut App, events: Vec<egui::Event>) -> ScenarioFrame {
         self.number += 1;
         self.child_outputs.borrow_mut().clear();
-        let input = Self::input(
+        let mut input = Self::input(
             egui::ViewportId::ROOT,
             *self.focused.borrow(),
             ROOT_SIZE,
             &self.known.borrow(),
         );
+        input.events = events;
         let output = with_capture(|| {
             self.ctx.run(input, |ctx| {
                 <App as eframe::App>::update(app, ctx, &mut self.frame);
@@ -860,6 +865,47 @@ fn collection_order_fixture(
     [a, b, c]
 }
 
+fn collection_order_add_folder(
+    app: &mut App,
+    driver: &mut ScenarioDriver,
+    temp: &std::path::Path,
+    name: &str,
+    expected_index: usize,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let folder = temp.join(name);
+    std::fs::create_dir(&folder).unwrap();
+    let page = folder.join("page.png");
+    save_portrait(&page, [140, 80, 30]);
+    let session = app.top_level_grid_view.collection_session().unwrap();
+    let prepared = session.prepared().unwrap();
+    let client = app.collection_store_client_for_read().unwrap().unwrap();
+    client
+        .add_batch(
+            prepared.collection_id,
+            prepared.collection_revision,
+            vec![
+                crate::collection_store::CollectionRegistration::from_trusted_path(
+                    &folder,
+                    crate::collection_store::CollectionResolvedKind::Folder,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    wait_until(
+        "collection folder entry",
+        std::time::Duration::from_secs(10),
+        || {
+            driver.root(app);
+            matches!(app.items.get(expected_index), Some(GridItem::Folder(path)) if path == &folder)
+        },
+    );
+    (folder, page)
+}
+
 fn collection_order_current_path(app: &mut App, detached: bool) -> Option<std::path::PathBuf> {
     let current = |owner: &App| {
         owner
@@ -905,8 +951,77 @@ fn collection_order_open(
 ) {
     app.selected = Some(index);
     let viewport = if detached {
-        assert!(app.open_grid_container_in_detached_book_context(&driver.ctx, index));
+        let main_items = app.items.clone();
+        let main_generation = app.items_generation;
+        let main_surface_generation = app.top_level_grid_view.generation();
+        let main_scroll = app.scroll_offset_y;
+        let main_prepared = std::sync::Arc::clone(
+            app.top_level_grid_view
+                .collection_session()
+                .and_then(|session| session.prepared())
+                .expect("installed collection root"),
+        );
+        driver.focus(egui::ViewportId::ROOT);
+        driver.root_with_events(
+            app,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
         let window_id = app.active_detached_window_id().expect("detached grid open");
+        assert_eq!(app.items, main_items, "opening must preserve the main list");
+        assert_eq!(app.items_generation, main_generation);
+        assert_eq!(app.selected, Some(index));
+        assert_eq!(app.scroll_offset_y, main_scroll);
+        assert_eq!(
+            app.top_level_grid_view.generation(),
+            main_surface_generation
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            app.top_level_grid_view
+                .collection_session()
+                .and_then(|session| session.prepared())
+                .expect("main presentation retained"),
+            &main_prepared,
+        ));
+        app.with_active_viewer_context(|owner| {
+            assert_eq!(
+                owner.items, main_items,
+                "new owner needs the complete root order"
+            );
+            assert_ne!(owner.items_generation, main_generation);
+            assert_eq!(
+                owner.visible_indices,
+                (0..main_items.len()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                owner.navigation_scope,
+                ViewerNavigationScope::CollectionRoot
+            );
+            assert!(owner.current_folder.is_none());
+            assert!(owner.folder_pane_open_pending.is_none(), "no physical scan");
+            let session = owner
+                .top_level_grid_view
+                .collection_session()
+                .expect("root session");
+            assert!(matches!(
+                session.position,
+                super::top_level_grid_view::CollectionGridPosition::Root
+            ));
+            assert_eq!(
+                session.installed_items_generation,
+                Some(owner.items_generation)
+            );
+            assert!(std::sync::Arc::ptr_eq(
+                session.prepared().expect("prepared"),
+                &main_prepared
+            ));
+        })
+        .expect("detached owner");
         let viewport = App::detached_image_window_viewport_id(window_id);
         driver.focus(viewport);
         Some(viewport)
@@ -1085,7 +1200,6 @@ fn run_detached_collection_order_case(open_index: usize, forward: Option<bool>) 
 }
 
 #[test]
-#[ignore = "known issue: backlog 1.267, collection order lost in a separate window; fix in v4.0.1"]
 fn multiwindow_scenario_collection_order_detached_next() {
     std::thread::spawn(|| run_detached_collection_order_case(0, Some(true)))
         .join()
@@ -1093,7 +1207,6 @@ fn multiwindow_scenario_collection_order_detached_next() {
 }
 
 #[test]
-#[ignore = "known issue: backlog 1.267, collection order lost in a separate window; fix in v4.0.1"]
 fn multiwindow_scenario_collection_order_detached_prev() {
     std::thread::spawn(|| run_detached_collection_order_case(1, Some(false)))
         .join()
@@ -1101,9 +1214,986 @@ fn multiwindow_scenario_collection_order_detached_prev() {
 }
 
 #[test]
-#[ignore = "known issue: backlog 1.267, collection order lost in a separate window; fix in v4.0.1"]
 fn multiwindow_scenario_collection_order_detached_slideshow() {
     std::thread::spawn(|| run_detached_collection_order_case(0, None))
         .join()
         .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_detached_boundaries_and_spread() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [a, b, c] = collection_order_fixture(&mut app, &mut driver, &temp);
+        collection_order_open(&mut app, &mut driver, true, 1, &b);
+        app.with_active_viewer_context(|owner| {
+            owner.handle_fullscreen_boundary_jump(&driver.ctx, 1, false, "test_home");
+        })
+        .expect("detached root");
+        collection_order_observe(&mut app, &mut driver, true, &a);
+        app.with_active_viewer_context(|owner| {
+            let from = owner.fullscreen_idx.expect("Home landed");
+            owner.handle_fullscreen_boundary_jump(&driver.ctx, from, true, "test_end");
+        })
+        .expect("detached root");
+        collection_order_observe(&mut app, &mut driver, true, &c);
+        app.with_active_viewer_context(|owner| {
+            owner.spread_mode = crate::settings::SpreadMode::Ltr;
+            let nav = owner.visible_indices.clone();
+            let units = owner.spread_display_unit_pages_for_test(&nav);
+            assert!(
+                units
+                    .iter()
+                    .any(|unit| unit.contains(&0) && unit.contains(&1)),
+                "spread must pair portraits across source folders: {units:?}"
+            );
+        })
+        .expect("detached root");
+        app.with_active_viewer_context(|owner| {
+            let from = owner.fullscreen_idx.unwrap();
+            owner.handle_fullscreen_boundary_jump(&driver.ctx, from, false, "test_spread_home");
+        })
+        .expect("detached root");
+        collection_order_observe(&mut app, &mut driver, true, &a);
+        collection_order_page_turn(&mut app, &mut driver, true, true);
+        collection_order_observe(&mut app, &mut driver, true, &c);
+        app.with_active_viewer_context(|owner| {
+            let from = owner.fullscreen_idx.unwrap();
+            owner.handle_fullscreen_boundary_jump(
+                &driver.ctx,
+                from,
+                false,
+                "test_spread_slideshow_home",
+            );
+        })
+        .expect("detached root");
+        collection_order_observe(&mut app, &mut driver, true, &a);
+        collection_order_slideshow_tick(&mut app, &mut driver, true);
+        collection_order_observe(&mut app, &mut driver, true, &c);
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_passive_reopen_without_bundle() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [a, b, _] = collection_order_fixture(&mut app, &mut driver, &temp);
+        collection_order_open(&mut app, &mut driver, true, 0, &a);
+        let window_id = app.active_detached_window_id().expect("detached window");
+        let viewport_id = App::detached_image_window_viewport_id(window_id);
+        let placement = app.active_detached_viewer_current_placement();
+        assert!(app.park_and_close_current_active_detached_viewer(&driver.ctx));
+        let snapshot = app
+            .detached_image_windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .expect("parked still snapshot");
+        assert_eq!(snapshot.title, "2.png - mimageviewer");
+        assert_eq!(snapshot.location_display, "2.png");
+        assert!(snapshot.reopen_collection_root.is_some());
+        assert!(snapshot.reopen_descriptor.is_none(), "no physical fallback");
+        let (old_context, residence) = app.locate_window_context(window_id).expect("parked bundle");
+        assert_eq!(residence, ContextResidence::AtRest);
+        app.retire_context(
+            old_context,
+            "test_force_absent_collection_root_bundle",
+            |_| (),
+        )
+        .expect("retire parked bundle");
+        assert!(app.locate_window_context(window_id).is_none());
+        assert!(matches!(
+            app.right_drag_viewer_identity_for_window_id(window_id),
+            Some(DetachedRightDragViewerIdentity::ReopenCollectionRoot { .. })
+        ));
+        assert!(app.activate_detached_image_window_snapshot(&driver.ctx, window_id));
+        assert_eq!(app.active_detached_window_id(), Some(window_id));
+        assert_eq!(
+            App::detached_image_window_viewport_id(window_id),
+            viewport_id
+        );
+        assert_eq!(app.active_detached_viewer_current_placement(), placement);
+        collection_order_observe(&mut app, &mut driver, true, &a);
+        collection_order_page_turn(&mut app, &mut driver, true, true);
+        collection_order_observe(&mut app, &mut driver, true, &b);
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_removed_source_reopen_current_behavior() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [a, _, _] = collection_order_fixture(&mut app, &mut driver, &temp);
+        collection_order_open(&mut app, &mut driver, true, 0, &a);
+        let window_id = app.active_detached_window_id().unwrap();
+        assert!(app.park_and_close_current_active_detached_viewer(&driver.ctx));
+        let (old_context, ContextResidence::AtRest) = app.locate_window_context(window_id).unwrap()
+        else {
+            panic!("parked still owns an AtRest bundle");
+        };
+        app.retire_context(old_context, "test_removed_source_reopen", |_| ())
+            .unwrap();
+        std::fs::remove_file(&a).unwrap();
+
+        // §1.269: both physical and collection reopen currently commit before async decode.
+        assert!(app.activate_detached_image_window_snapshot(&driver.ctx, window_id));
+        assert_eq!(app.active_detached_window_id(), Some(window_id));
+        assert!(
+            !app.detached_image_windows
+                .iter()
+                .any(|window| window.id == window_id)
+        );
+        app.with_window_viewer_context(window_id, |owner| {
+            assert_eq!(
+                owner.navigation_scope,
+                ViewerNavigationScope::CollectionRoot
+            );
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            assert_eq!(owner.items[0], GridItem::Image(a.clone()));
+            assert!(owner.folder_pane_open_pending.is_none());
+        })
+        .expect("reopened window has one complete owner");
+        wait_until(
+            "removed-source decode terminal",
+            std::time::Duration::from_secs(10),
+            || {
+                driver.root(&mut app);
+                app.with_active_viewer_context(|owner| {
+                    owner.fs_pending.is_empty() && owner.fs_upload_backlog.is_empty()
+                })
+                .unwrap_or(false)
+            },
+        );
+        assert_eq!(app.active_detached_window_id(), Some(window_id));
+        app.with_active_viewer_context(|owner| {
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            assert!(
+                matches!(owner.fs_cache.get(&0), Some(FsCacheEntry::Failed)),
+                "missing source terminates as a failed image in the committed owner"
+            );
+        })
+        .unwrap();
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_detached_edit_delete_and_reopen() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [a, _b, c] = collection_order_fixture(&mut app, &mut driver, &temp);
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(|session| session.prepared())
+            .expect("root prepared");
+        let collection_id = prepared.collection_id;
+        let revision = prepared.collection_revision;
+        let removed_entry = prepared.entries[1].entry_id;
+        let client = app.collection_store_client_for_read().unwrap().unwrap();
+        collection_order_open(&mut app, &mut driver, true, 0, &a);
+        let window_id = app.active_detached_window_id().unwrap();
+        let placement = app.active_detached_viewer_current_placement();
+        let removed = client
+            .remove_entries(collection_id, revision, vec![removed_entry])
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        wait_until(
+            "detached collection edit watch",
+            std::time::Duration::from_secs(10),
+            || {
+                driver.root(&mut app);
+                app.with_active_viewer_context(|owner| {
+                    let session = owner.top_level_grid_view.collection_session().unwrap();
+                    session.wanted_revision >= removed.revision()
+                        && owner.fullscreen_idx == Some(0)
+                        && owner.items.len() == 3
+                })
+                .unwrap_or(false)
+            },
+        );
+        collection_order_page_turn(&mut app, &mut driver, true, true);
+        collection_order_observe(&mut app, &mut driver, true, &c);
+        client
+            .delete_collection(collection_id, removed.revision())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        wait_until(
+            "detached collection delete watch",
+            std::time::Duration::from_secs(10),
+            || {
+                driver.root(&mut app);
+                app.with_active_viewer_context(|owner| {
+                    matches!(
+                        owner
+                            .top_level_grid_view
+                            .collection_session()
+                            .map(|session| &session.load),
+                        Some(super::top_level_grid_view::CollectionGridLoadState::Deleted { .. })
+                    ) && owner.fullscreen_idx.is_some()
+                })
+                .unwrap_or(false)
+            },
+        );
+        assert_eq!(
+            collection_order_current_path(&mut app, true).as_deref(),
+            Some(c.as_path())
+        );
+        assert!(app.park_and_close_current_active_detached_viewer(&driver.ctx));
+        let parked = app
+            .detached_image_windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .unwrap();
+        assert!(parked.reopen_collection_root.is_some());
+        assert!(super::detached_window_references_removed(
+            parked,
+            None,
+            &|key| key == crate::adjustment_db::normalize_path(&c),
+        ));
+        assert!(!super::detached_window_references_removed(
+            parked,
+            None,
+            &|key| key == collection_id.as_uuid().to_string(),
+        ));
+        let (old_context, _) = app.locate_window_context(window_id).unwrap();
+        app.retire_context(old_context, "test_deleted_collection_reopen", |_| ())
+            .unwrap();
+        assert!(app.activate_detached_image_window_snapshot(&driver.ctx, window_id));
+        assert_eq!(app.active_detached_viewer_current_placement(), placement);
+        collection_order_observe(&mut app, &mut driver, true, &c);
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_f12_modes() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [a, b, _] = collection_order_fixture(&mut app, &mut driver, &temp);
+        collection_order_open(&mut app, &mut driver, false, 0, &a);
+        app.toggle_detached_viewer_mode();
+        assert!(
+            app.settings.detached_viewer_enabled,
+            "F12 is enabled in full mode"
+        );
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            super::top_level_grid_view::TopLevelGridSurface::Collection(_)
+        ));
+        collection_order_page_turn(&mut app, &mut driver, false, true);
+        collection_order_observe(&mut app, &mut driver, false, &b);
+
+        // In always-new mode the same operation is intentionally disabled for still images.
+        app.settings.detached_viewer_open_images_in_window = true;
+        let before = app.settings.detached_viewer_enabled;
+        app.toggle_detached_viewer_mode();
+        assert_eq!(app.settings.detached_viewer_enabled, before);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            super::top_level_grid_view::TopLevelGridSurface::Collection(_)
+        ));
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_detached_bs_and_esc() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [a, _, _] = collection_order_fixture(&mut app, &mut driver, &temp);
+        collection_order_open(&mut app, &mut driver, true, 0, &a);
+        app.with_active_viewer_context(|owner| {
+            let from = owner.fullscreen_idx.unwrap();
+            owner.handle_fs_navigation(
+                &driver.ctx,
+                false,
+                true,
+                None,
+                None,
+                None,
+                crate::ui_fullscreen::FsPageNav::None,
+                None,
+                from,
+            );
+            assert!(owner.fullscreen_idx.is_none(), "BS closes the leaf");
+            assert!(matches!(
+                owner.top_level_grid_view.surface(),
+                super::top_level_grid_view::TopLevelGridSurface::Collection(_)
+            ));
+        })
+        .expect("detached owner");
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            super::top_level_grid_view::TopLevelGridSurface::Collection(_)
+        ));
+
+        collection_order_open(&mut app, &mut driver, true, 0, &a);
+        let closed_id = app.active_detached_window_id().unwrap();
+        app.with_active_viewer_context(|owner| {
+            let from = owner.fullscreen_idx.unwrap();
+            owner.handle_fs_navigation(
+                &driver.ctx,
+                true,
+                false,
+                None,
+                None,
+                None,
+                crate::ui_fullscreen::FsPageNav::None,
+                None,
+                from,
+            );
+        })
+        .expect("detached owner");
+        driver.root(&mut app);
+        assert_ne!(app.active_detached_window_id(), Some(closed_id));
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            super::top_level_grid_view::TopLevelGridSurface::Collection(_)
+        ));
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_sibling_watch_owners() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [a, b, _c] = collection_order_fixture(&mut app, &mut driver, &temp);
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .prepared()
+            .unwrap();
+        let collection_id = prepared.collection_id;
+        let revision = prepared.collection_revision;
+        let removed_entry = prepared.entries[2].entry_id;
+        let client = app.collection_store_client_for_read().unwrap().unwrap();
+        collection_order_open(&mut app, &mut driver, true, 0, &a);
+        let first_id = app.active_detached_window_id().unwrap();
+        let first_placement = app.active_detached_viewer_current_placement();
+        collection_order_open(&mut app, &mut driver, true, 1, &b);
+        let second_id = app.active_detached_window_id().unwrap();
+        assert_ne!(first_id, second_id);
+        let first_context = app.locate_window_context(first_id).unwrap().0;
+        let before = app
+            .with_viewer_context(first_context, |owner| {
+                owner
+                    .top_level_grid_view
+                    .collection_session()
+                    .unwrap()
+                    .wanted_revision
+            })
+            .unwrap();
+        let removed = client
+            .remove_entries(collection_id, revision, vec![removed_entry])
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        wait_until(
+            "active sibling watch",
+            std::time::Duration::from_secs(10),
+            || {
+                driver.root(&mut app);
+                app.with_active_viewer_context(|owner| {
+                    owner
+                        .top_level_grid_view
+                        .collection_session()
+                        .unwrap()
+                        .wanted_revision
+                        >= removed.revision()
+                })
+                .unwrap_or(false)
+            },
+        );
+        assert_eq!(
+            app.with_viewer_context(first_context, |owner| {
+                owner
+                    .top_level_grid_view
+                    .collection_session()
+                    .unwrap()
+                    .wanted_revision
+            })
+            .unwrap(),
+            before,
+            "active polling must not drain the parked sibling watch"
+        );
+        assert!(app.activate_detached_image_window_snapshot(&driver.ctx, first_id));
+        assert_eq!(app.active_detached_window_id(), Some(first_id));
+        assert_eq!(
+            app.active_detached_viewer_current_placement(),
+            first_placement
+        );
+        collection_order_observe(&mut app, &mut driver, true, &a);
+        wait_until(
+            "resumed sibling watch",
+            std::time::Duration::from_secs(10),
+            || {
+                driver.root(&mut app);
+                app.with_active_viewer_context(|owner| {
+                    owner
+                        .top_level_grid_view
+                        .collection_session()
+                        .unwrap()
+                        .wanted_revision
+                        >= removed.revision()
+                })
+                .unwrap_or(false)
+            },
+        );
+        assert!(
+            app.detached_image_windows
+                .iter()
+                .any(|window| window.id == second_id)
+        );
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_async_sibling_result_is_owner_scoped() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [a, b, c] = collection_order_fixture(&mut app, &mut driver, &temp);
+        collection_order_open(&mut app, &mut driver, true, 0, &a);
+        let first_id = app.active_detached_window_id().unwrap();
+        collection_order_page_turn(&mut app, &mut driver, true, true);
+        wait_until(
+            "first window async snapshot",
+            std::time::Duration::from_secs(5),
+            || {
+                app.with_active_viewer_context(|owner| {
+                owner.poll_collection_navigation(&driver.ctx);
+                matches!(
+                    owner.top_level_grid_view.collection_navigation_pending_for_test(),
+                    Some(super::collection_navigation::CollectionNavigationPending::Snapshot { .. })
+                )
+            })
+            .unwrap_or(false)
+            },
+        );
+        collection_order_open(&mut app, &mut driver, true, 2, &c);
+        let second_id = app.active_detached_window_id().unwrap();
+        assert_ne!(first_id, second_id);
+        for _ in 0..4 {
+            driver.root(&mut app);
+        }
+        let first_context = app
+            .locate_window_context(first_id)
+            .expect("parked first owner")
+            .0;
+        assert!(
+            app.with_viewer_context(first_context, |owner| {
+                matches!(
+                    owner
+                        .top_level_grid_view
+                        .collection_navigation_pending_for_test(),
+                    Some(
+                        super::collection_navigation::CollectionNavigationPending::Snapshot { .. }
+                    )
+                )
+            })
+            .unwrap(),
+            "the async reply remains with its parked request owner"
+        );
+        assert_eq!(
+            collection_order_current_path(&mut app, true).as_deref(),
+            Some(c.as_path()),
+            "the first window's async result must not land in the second"
+        );
+        assert!(app.activate_detached_image_window_snapshot(&driver.ctx, first_id));
+        assert_eq!(app.active_detached_window_id(), Some(first_id));
+        collection_order_observe(&mut app, &mut driver, true, &b);
+        assert!(
+            app.detached_image_windows
+                .iter()
+                .any(|window| window.id == second_id)
+        );
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_ctrl_outer_navigation() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [a, _, _] = collection_order_fixture(&mut app, &mut driver, &temp);
+        let (_, first_page) =
+            collection_order_add_folder(&mut app, &mut driver, &temp, "outer-first", 3);
+        let (_, second_page) =
+            collection_order_add_folder(&mut app, &mut driver, &temp, "outer-second", 4);
+        collection_order_open(&mut app, &mut driver, true, 0, &a);
+        let window_id = app.active_detached_window_id().unwrap();
+        app.with_active_viewer_context(|owner| {
+            owner.handle_fullscreen_ctrl_nav_context(&driver.ctx, 0, true, false);
+        })
+        .unwrap();
+        collection_order_observe(&mut app, &mut driver, true, &first_page);
+        app.with_active_viewer_context(|owner| {
+            let from = owner.fullscreen_idx.unwrap();
+            owner.handle_fullscreen_ctrl_nav_context(&driver.ctx, from, true, false);
+        })
+        .unwrap();
+        collection_order_observe(&mut app, &mut driver, true, &second_page);
+        app.with_active_viewer_context(|owner| {
+            let from = owner.fullscreen_idx.unwrap();
+            owner.handle_fullscreen_ctrl_nav_context(&driver.ctx, from, false, false);
+        })
+        .unwrap();
+        collection_order_observe(&mut app, &mut driver, true, &first_page);
+        assert_eq!(app.active_detached_window_id(), Some(window_id));
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_slideshow_next_folder() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [_, _, c] = collection_order_fixture(&mut app, &mut driver, &temp);
+        let (folder, page) = collection_order_add_folder(&mut app, &mut driver, &temp, "collection-registered-book", 3);
+        collection_order_open(&mut app, &mut driver, true, 2, &c);
+        app.with_active_viewer_context(|owner| {
+            owner.settings.slideshow_end_action =
+                crate::settings::SlideshowEndAction::NextFolder;
+        })
+        .unwrap();
+        collection_order_slideshow_tick(&mut app, &mut driver, true);
+        wait_until("detached NextFolder child landing", std::time::Duration::from_secs(10), || {
+            driver.root(&mut app);
+            app.with_active_viewer_context(|owner| {
+                owner.fullscreen_idx.and_then(|idx| owner.items.get(idx))
+                    == Some(&GridItem::Image(page.clone()))
+                    && matches!(owner.top_level_grid_view.collection_session().map(|session| &session.position),
+                        Some(super::top_level_grid_view::CollectionGridPosition::PhysicalSource { .. }))
+            })
+            .unwrap_or(false)
+        });
+        assert!(folder.is_dir());
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_detached_folder_child_restore() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let _ = collection_order_fixture(&mut app, &mut driver, &temp);
+        let (folder, page) = collection_order_add_folder(
+            &mut app,
+            &mut driver,
+            &temp,
+            "collection-registered-book",
+            3,
+        );
+        let collection_id = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .identity
+            .collection_id;
+        let main_items = app.items.clone();
+        app.selected = Some(3);
+        driver.focus(egui::ViewportId::ROOT);
+        driver.root_with_events(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        wait_until(
+            "detached folder child open",
+            std::time::Duration::from_secs(10),
+            || {
+                driver.root(&mut app);
+                app.with_active_viewer_context(|owner| {
+                    owner.fullscreen_idx.and_then(|idx| owner.items.get(idx))
+                        == Some(&GridItem::Image(page.clone()))
+                        && matches!(
+                            owner.top_level_grid_view.return_to(),
+                            Some(super::top_level_grid_view::TopLevelGridRestore::Collection(
+                                _
+                            ))
+                        )
+                })
+                .unwrap_or(false)
+            },
+        );
+        let window_id = app.active_detached_window_id().unwrap();
+        app.with_active_viewer_context(|owner| {
+            assert!(
+                owner
+                    .current_folder
+                    .as_deref()
+                    .is_some_and(|path| crate::folder_tree::path_eq(path, &folder))
+            );
+            let restore = match owner
+                .top_level_grid_view
+                .return_to()
+                .expect("collection return")
+            {
+                super::top_level_grid_view::TopLevelGridRestore::Collection(restore) => {
+                    restore.clone()
+                }
+                other => panic!("expected collection restore, got {other:?}"),
+            };
+            owner.close_fullscreen();
+            owner.open_collection_grid(collection_id, Some(restore));
+        })
+        .unwrap();
+        wait_until(
+            "detached child restored root",
+            std::time::Duration::from_secs(10),
+            || {
+                app.with_active_viewer_context(|owner| {
+                    owner.poll_collection_grid(&driver.ctx);
+                    owner.items == main_items
+                        && matches!(
+                            owner
+                                .top_level_grid_view
+                                .collection_session()
+                                .map(|session| &session.position),
+                            Some(super::top_level_grid_view::CollectionGridPosition::Root)
+                        )
+                })
+                .unwrap_or(false)
+            },
+        );
+        assert_eq!(app.active_detached_window_id(), Some(window_id));
+        assert_eq!(app.items, main_items);
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_scenario_noncollection_image_controls_remain_physical() {
+    use super::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+    for surface in [
+        TopLevelGridSurface::Search(TopLevelSearchView::Global),
+        TopLevelGridSurface::Rating { stars: 5 },
+        TopLevelGridSurface::ReadingHistory,
+    ] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.settings.detached_viewer_open_images_in_window = true;
+        let folder = app.tmp.path().join("physical-control");
+        std::fs::create_dir(&folder).unwrap();
+        let image = folder.join("page.png");
+        save_portrait(&image, [40, 70, 100]);
+        app.top_level_grid_view.begin(surface.clone(), None);
+        app.items = vec![GridItem::Image(image.clone())];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.items_are_global_search_view = matches!(surface, TopLevelGridSurface::Search(_));
+        app.items_are_rating_view = matches!(surface, TopLevelGridSurface::Rating { .. });
+        app.items_are_reading_history_view = matches!(surface, TopLevelGridSurface::ReadingHistory);
+        assert!(matches!(
+            app.detached_grid_item_open_plan(0, false),
+            Some(DetachedGridItemOpenPlan::Descriptor {
+                descriptor: ViewerContextDescriptor::Image { .. },
+                collection_restore: None,
+            })
+        ));
+        assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
+        app.with_active_viewer_context(|owner| {
+            assert_eq!(
+                owner.navigation_scope,
+                ViewerNavigationScope::DetachedPhysical
+            );
+            assert!(owner.folder_pane_open_pending.is_some());
+            assert!(owner.top_level_grid_view.collection_session().is_none());
+        })
+        .expect("physical image owner");
+    }
+}
+
+#[test]
+fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
+    use crate::collection_store::{
+        CollectionRegistration, CollectionResolvedKind, CollectionStoreRuntime,
+    };
+    for is_audio in [false, true] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        let temp = app.tmp.path().to_path_buf();
+        let first = temp.join(if is_audio { "first.flac" } else { "first.mp4" });
+        let second = temp.join(if is_audio {
+            "second.flac"
+        } else {
+            "second.mp4"
+        });
+        std::fs::write(&first, b"fixture").unwrap();
+        std::fs::write(&second, b"fixture").unwrap();
+        let runtime = CollectionStoreRuntime::start_at(temp.join("media-collection.db"))
+            .expect("collection actor");
+        let client = runtime.client();
+        app.install_collection_runtime(runtime);
+        wait_until(
+            "media collection actor ready",
+            std::time::Duration::from_secs(5),
+            || {
+                app.poll_collection_ui(&ctx);
+                matches!(app.collection_store_client_for_read(), Ok(Some(_)))
+            },
+        );
+        let created = client
+            .create_collection("Media EOF".into())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let kind = if is_audio {
+            CollectionResolvedKind::Audio
+        } else {
+            CollectionResolvedKind::Video
+        };
+        let registrations = [&first, &second]
+            .map(|path| CollectionRegistration::from_trusted_path(path, kind).unwrap())
+            .to_vec();
+        client
+            .add_batch(created.collection_id(), created.revision(), registrations)
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        app.open_collection_grid_from_navigation(created.collection_id());
+        wait_until(
+            "media collection root",
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_collection_ui(&ctx);
+                app.poll_collection_grid(&ctx);
+                app.items.len() == 2
+            },
+        );
+        let grid = app.top_level_grid_view.clone();
+        let items = app.items.clone();
+        let metas = app.image_metas.clone();
+        let window_id = if is_audio { 711 } else { 710 };
+        let source = first.clone();
+        app.push_window_context_for_test(&ctx, window_id, move |owner| {
+            owner.top_level_grid_view = grid;
+            owner.install_prepared_aggregate_items(items, metas);
+            owner
+                .top_level_grid_view
+                .collection_session_mut()
+                .unwrap()
+                .installed_items_generation = Some(owner.items_generation);
+            owner.fullscreen_idx = Some(0);
+            owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+            owner.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
+            owner.video_continuous_last_eof = Some((0, 1));
+            owner.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                        source, 3.0,
+                    )),
+                    load_seq: 0,
+                },
+            );
+            owner.set_detached_window_binding_for_test(Some(window_id));
+        });
+        app.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::ParkedLive,
+            "test_eof",
+        );
+        assert!(
+            app.with_window_viewer_context(window_id, |owner| {
+                if is_audio {
+                    owner.start_collection_music_eof_navigation(&ctx, 0, 1)
+                } else {
+                    owner.start_collection_video_eof_navigation(&ctx, 0, 1)
+                }
+            })
+            .unwrap()
+        );
+        assert!(
+            app.with_window_viewer_context(window_id, |owner| {
+                matches!(
+                    owner
+                        .top_level_grid_view
+                        .collection_navigation_pending_for_test(),
+                    Some(
+                        super::collection_navigation::CollectionNavigationPending::Snapshot { .. }
+                    )
+                )
+            })
+            .unwrap()
+        );
+        wait_until(
+            "ParkedLive EOF landing",
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_parked_live_detached_windows(&ctx);
+                app.with_window_viewer_context(window_id, |owner| {
+                    owner.fullscreen_idx == Some(1)
+                        && match owner.items.get(1) {
+                            Some(GridItem::Audio(path)) if is_audio => {
+                                crate::folder_tree::path_eq(path, &second)
+                            }
+                            Some(GridItem::Video(path)) if !is_audio => {
+                                crate::folder_tree::path_eq(path, &second)
+                            }
+                            _ => false,
+                        }
+                })
+                .unwrap_or(false)
+            },
+        );
+        assert_eq!(app.fullscreen_idx, None, "main must not consume parked EOF");
+    }
+}
+
+#[test]
+fn multiwindow_scenario_collection_root_stale_grid_open_is_terminal() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [first, _, _] = collection_order_fixture(&mut app, &mut driver, &temp);
+        let main_items = app.items.clone();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .installed_items_generation = None;
+        assert!(matches!(
+            app.detached_grid_item_open_plan(0, false),
+            Some(DetachedGridItemOpenPlan::CollectionRootUnavailable)
+        ));
+        assert!(app.open_grid_container_in_detached_book_context(&driver.ctx, 0));
+        assert_eq!(app.items, main_items);
+        assert!(app.active_detached_window_id().is_none());
+
+        let entry = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .prepared()
+            .unwrap()
+            .entries[0]
+            .clone();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .position = super::top_level_grid_view::CollectionGridPosition::PhysicalSource {
+            entry_id: entry.entry_id,
+            source_key: entry.source_key,
+            path: first.parent().unwrap().to_path_buf(),
+        };
+        assert!(matches!(
+            app.detached_grid_item_open_plan(0, false),
+            Some(DetachedGridItemOpenPlan::Descriptor { .. })
+        ));
+    })
+    .join()
+    .expect("scenario thread");
 }

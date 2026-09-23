@@ -33142,6 +33142,14 @@ impl App {
             }
             crate::settings::SlideshowEndAction::NextFolder => {
                 #[cfg(windows)]
+                if matches!(
+                    self.navigation_scope,
+                    crate::app::ViewerNavigationScope::CollectionRoot
+                ) && self.try_start_slideshow_next_folder(ctx, cur)
+                {
+                    return;
+                }
+                #[cfg(windows)]
                 if self.detached_independent_session_blocks_folder_nav() {
                     self.loop_slideshow_to_first(ctx);
                     return;
@@ -33857,6 +33865,20 @@ impl App {
                 self.capture_fs_nav_holdover(fs_idx);
                 self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
             }
+            return;
+        }
+
+        #[cfg(windows)]
+        if matches!(
+            self.navigation_scope,
+            crate::app::ViewerNavigationScope::CollectionRoot
+        ) && self.start_collection_outer_fullscreen_navigation(
+            ctx,
+            fs_idx,
+            forward,
+            false,
+            native_toast,
+        ) {
             return;
         }
 

@@ -429,7 +429,30 @@ actual `start_collection_manual_navigation`→snapshot→prepare→preflight→c
 cache owner / Auto比率を固定し、split bundleはdetached側だけを再installしてmainを変えないことを固定した。これは
 auto-aspect値の退避復元ではなく、viewer cursor移動とGrid presentation更新の所有を分ける変更である。
 
-## §1.267 別ウィンドウで開いたコレクション直下の画像（実装前設計、2026-09-23）
+## §1.267 別ウィンドウで開いたコレクション直下の画像（実装・対象自動検査済み、独立 reviewer が BA-7 と合意、2026-09-23）
+
+実装は Grid の Image 入口だけに typed collection-root open plan を追加し、fresh bundle へ
+prepared 全件と新しい items generation に bind した root session を install する。
+`CollectionRoot` navigation scope は跨フォルダの reader order を保ち、snapshot の typed
+reopen route は main-index stamp / 物理 descriptor より先に dispatch する。active と ParkedLive の
+collection watch / navigation poll は owner mount 内へ接続した。削除済み root の表示中 leaf は
+最後の prepared を保持して passive reopen の identity を失わない。
+修正前に ignored next シナリオが物理 sibling へ着地して失敗することを確認し、修正後は
+next / prev / slideshow と full-mode control、factory・Home/End・見開き・AtRest 不在 reopen・
+edit/delete・2 窓 watch・BS/Esc・F12 mode の headless scenario が pass した。
+補完検証では実際の GridOpenSelected 入力、兄弟窓の非同期 snapshot 結果、ParkedLive の
+動画 / 音声着地、見開きの手動 / slideshow 着地、root 別窓からの Ctrl+上下と
+slideshow NextFolder、別窓 folder child→root、Ctrl+G / rating / history の物理 image
+control を追加した。Ctrl+上下と NextFolder は別窓の独立ナビ block より先に root owner の
+outer request を起こす必要があり、修正前 failure を確認してから専用 dispatch を追加した。
+stale root binding は typed terminal とし、collection の物理 child 内 Image は従来の
+descriptor route を維持する。元ファイルが外部で消えた後の parked 表示保持は、
+collection root と従来の物理 Image fallback の双方に既存の gap がある。
+どちらも非同期 open の成否を commit 前に判定する owner がなく、backlog §1.269 に記録した。
+collection route の現行動作（source 消失後も async decode より先に完全な context を publish し、
+その context の `FsCacheEntry::Failed` で終端）を headless 回帰に固定した。
+独立 reviewer は BA-7 の構造修正に合意し、退行 finding はない。
+実機操作は未実施。
 
 ### 観測・所有モデル
 
@@ -449,7 +472,7 @@ auto-aspect値の退避復元ではなく、viewer cursor移動とGrid presentat
 ### lifecycle、gate、検収
 
 - `build_viewer_context`の予約→commit→window binding公開の後だけdetached sessionを開始する。mount / deposit / remountは同じbundleのroot session、`items`、fullscreen index、pendingを一体で運び、parked siblingを巻き込まない。retire / surface replace / Dropはそのcontextのrequest、worker、watchを終端する（`src/app.rs:46675-46688,19056-19069`; `src/app/viewer_context_registry.rs:908-909,1305-1315,3267-3337`; `src/app/top_level_grid_view.rs:1186-1216`）。
-- passive静止画の再活性化は、同期stampで元indexを解決できなければ保存済み`Image` descriptorから**物理親フォルダ**を再openする（`src/app.rs:43402-43406,47266-47280,47333-47391,47987-48015`）。collection root leafだけはそのfallbackでもoriginを失わないtyped reopen payload（collection ID、entry ID、source key、開いた時のimmutable prepared / source path）をsnapshotへ持たせ、同じroot factoryで再構築する。collectionが編集 / 削除されても現在画像は保持し、次要求だけがlatest / deletedを判定する。旧`usize`を新rootへ流用せず、元source自体が開けなければparked表示を保つterminal failureとする。物理`Image` descriptorへのsilent fallbackはしない。既存window ID / placement / viewport leaseは再活性化経路のまま維持する（`src/app.rs:47388-47391`）。
+- passive静止画の再活性化は、同期stampで元indexを解決できなければ保存済み`Image` descriptorから**物理親フォルダ**を再openする（`src/app.rs:43402-43406,47266-47280,47333-47391,47987-48015`）。collection root leafだけはそのfallbackでもoriginを失わないtyped reopen payload（collection ID、entry ID、source key、開いた時のimmutable prepared / source path）をsnapshotへ持たせ、同じroot factoryで再構築する。collectionが編集 / 削除されても現在画像は保持し、次要求だけがlatest / deletedを判定する。旧`usize`を新rootへ流用せず、物理`Image` descriptorへのsilent fallbackはしない。既存window ID / placement / viewport leaseは再活性化経路のまま維持する（`src/app.rs:47388-47391`）。外部で元sourceが失われた場合にparked表示を保つ契約は両reopen routeに未実装の既存gapであり、§1.269で非同期open結果とsnapshotのhandoffを設計する。
 - **poll境界を実装で確認・接続する**: 現在の`App::update`入口はmainだけで`poll_collection_grid/navigation`を呼ぶ一方、active detached updateは自身をmountして物理scan / video等をpollし、parked-liveはvideoだけをpollする（`src/app.rs:77044-77054,47487-47549,45595-45613`）。root leafを別窓へ載せるなら、そのbundleのcollection watch / navigation pendingをactiveでpollし、ParkedLiveで再生を続けるmediaのpendingもownerのもとで進める。mainからdetached pendingをdrainせず、parked静止画に不要な常時pollを設けない。read leaseの起床 / terminalとviewport lifecycleは既存の契約を使う（`src/app/collection_navigation.rs:1798-1835,2288-2335`）。
 - edit noticeはそのcollection IDのwanted revisionだけを進め、表示中のroot `items` / fullscreen index / player / slideshowを即時置換しない。次manual / tick / EOF / Ctrl要求はwatch→actor load→exact prepare→preflight→commitでlatestを採用し、同collectionの新noticeが来た旧resultは破棄・再準備する。削除時も表示中leafは維持し、次操作をtargetなしとして終える。rootへ戻った時だけ空/最新行をinstallする（`src/app/collection_grid.rs:1612-1669`; `src/app/collection_navigation.rs:2288-2335,2786-2820`; 本書`§6-8`）。context ID、surface generation、collection ID、revision、items generation、intent sequenceのcurrent gateとDrop cancelをmain / detached / siblingsそれぞれで検証する。
 - 検収: `src/app/multiwindow_scenario_tests.rs:1087-1109`の3本の`#[ignore]`を外してpass、`1042-1064`のfull-mode controlもpass。root別窓のHome / End、見開きmanual / slideshow、NextFolder、Ctrl+上下、video / audio EOF、BS / close、編集 / 削除、park→remount、複数collection窓のstale result隔離をfocused handler / lifecycle回帰に加える。container childとCtrl+G / rating / historyの物理順も保護する。detached predicate、HWND / viewport identity、placement、focus、mount / park / retireの**判定条件**は変えない。

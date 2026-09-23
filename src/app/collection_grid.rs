@@ -487,7 +487,7 @@ impl App {
             return None;
         }
         match session.load {
-            CollectionGridLoadState::Deleted => {
+            CollectionGridLoadState::Deleted { .. } => {
                 return Some(Err(GridSortLockReason::CollectionDeleted));
             }
             CollectionGridLoadState::Failed { .. } => {
@@ -1433,8 +1433,10 @@ impl App {
         match client.load_collection(stamp.collection_id) {
             Ok(receiver) => {
                 if let Some(session) = self.top_level_grid_view.collection_session_mut() {
-                    let previous =
-                        std::mem::replace(&mut session.load, CollectionGridLoadState::Deleted);
+                    let previous = std::mem::replace(
+                        &mut session.load,
+                        CollectionGridLoadState::Deleted { installed: None },
+                    );
                     let CollectionGridLoadState::RequestNeeded {
                         installed,
                         mut lease,
@@ -1612,7 +1614,7 @@ impl App {
             CollectionGridLoadState::Failed {
                 installed: Some(_), ..
             } => None,
-            CollectionGridLoadState::Deleted => Some("コレクションは削除されました".into()),
+            CollectionGridLoadState::Deleted { .. } => Some("コレクションは削除されました".into()),
             CollectionGridLoadState::Ready(_) => None,
         }
     }
@@ -1675,7 +1677,8 @@ impl App {
                 }
             } else {
                 session.cancel_pending();
-                session.load = CollectionGridLoadState::Deleted;
+                let installed = session.prepared().cloned();
+                session.load = CollectionGridLoadState::Deleted { installed };
                 deleted_current_root = matches!(session.position, CollectionGridPosition::Root)
                     && self.fullscreen_idx.is_none();
             }
@@ -1684,6 +1687,7 @@ impl App {
             self.install_collection_grid_items(Vec::new(), Vec::new(), None, None);
             if let Some(session) = self.top_level_grid_view.collection_session_mut() {
                 session.installed_items_generation = None;
+                session.load = CollectionGridLoadState::Deleted { installed: None };
             }
             self.address = "コレクションは削除されました".into();
             ctx.request_repaint();
@@ -1702,7 +1706,7 @@ impl App {
             self.top_level_grid_view
                 .collection_session()
                 .is_some_and(|session| {
-                    matches!(session.load, CollectionGridLoadState::Deleted)
+                    matches!(session.load, CollectionGridLoadState::Deleted { .. })
                         && session.installed_items_generation == Some(self.items_generation)
                 });
         if presents_deleted_rows {
@@ -1837,7 +1841,7 @@ impl App {
                         {
                             lease.finish(Instant::now(), "error");
                             session.load = if matches!(error, CollectionStoreError::NotFound) {
-                                CollectionGridLoadState::Deleted
+                                CollectionGridLoadState::Deleted { installed }
                             } else {
                                 CollectionGridLoadState::Failed {
                                     message: collection_grid_error(&error),
@@ -1987,7 +1991,7 @@ impl App {
                 | CollectionGridLoadState::Ready(_)
                 | CollectionGridLoadState::Empty(_)
                 | CollectionGridLoadState::Failed { .. }
-                | CollectionGridLoadState::Deleted,
+                | CollectionGridLoadState::Deleted { .. },
             )
             | None => {}
         }
@@ -2792,7 +2796,7 @@ mod tests {
         app.top_level_grid_view
             .collection_session_mut()
             .unwrap()
-            .load = CollectionGridLoadState::Deleted;
+            .load = CollectionGridLoadState::Deleted { installed: None };
         assert!(app.auto_aspect_cache_target().is_none());
         app.shutdown_collection_runtime_for_exit();
     }
@@ -3209,7 +3213,9 @@ mod tests {
                 && app
                     .top_level_grid_view
                     .collection_session()
-                    .is_some_and(|session| matches!(session.load, CollectionGridLoadState::Deleted))
+                    .is_some_and(|session| {
+                        matches!(session.load, CollectionGridLoadState::Deleted { .. })
+                    })
         });
 
         let back = app
@@ -4562,7 +4568,7 @@ mod tests {
                 .collection_session()
                 .is_some_and(|session| {
                     session.observed_catalog_revision >= deleted.catalog_revision
-                        && matches!(session.load, CollectionGridLoadState::Deleted)
+                        && matches!(session.load, CollectionGridLoadState::Deleted { .. })
                 })
         });
         let deeper_index = app
@@ -4857,7 +4863,7 @@ mod tests {
                     .collection_session()
                     .is_some_and(|session| {
                         session.observed_catalog_revision >= deleted.catalog_revision
-                            && matches!(session.load, CollectionGridLoadState::Deleted)
+                            && matches!(session.load, CollectionGridLoadState::Deleted { .. })
                     })
             },
         );

@@ -526,7 +526,10 @@ pub(crate) enum CollectionGridLoadState {
         message: String,
         installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
     },
-    Deleted,
+    Deleted {
+        /// Keep the displayed root identity while a fullscreen leaf still owns its indices.
+        installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+    },
 }
 
 pub(crate) struct CollectionGridPreparedInstall {
@@ -826,7 +829,7 @@ impl CollectionGridLoadState {
             | Self::Preparing { installed, .. }
             | Self::Failed { installed, .. } => installed.as_ref(),
             Self::Ready(presentation) | Self::Empty(presentation) => Some(&presentation.prepared),
-            Self::Deleted => None,
+            Self::Deleted { installed } => installed.as_ref(),
         }
     }
 
@@ -921,8 +924,8 @@ impl CollectionGridSession {
                     "retry",
                 ),
             ),
-            CollectionGridLoadState::Deleted => (
-                None,
+            CollectionGridLoadState::Deleted { installed } => (
+                installed,
                 crate::collection_store::CollectionReadLease::new(
                     crate::collection_store::CollectionReadScope::app_global("grid"),
                     std::time::Instant::now(),
@@ -942,7 +945,10 @@ impl CollectionGridSession {
         if let Some(cancel) = self.video_worker_cancel.take() {
             cancel.store(true, std::sync::atomic::Ordering::Release);
         }
-        let previous = std::mem::replace(&mut self.load, CollectionGridLoadState::Deleted);
+        let previous = std::mem::replace(
+            &mut self.load,
+            CollectionGridLoadState::Deleted { installed: None },
+        );
         match previous {
             CollectionGridLoadState::Ready(presentation)
             | CollectionGridLoadState::Empty(presentation) => {
@@ -1825,9 +1831,12 @@ mod tests {
             &session.load,
             CollectionGridLoadState::Failed { message, .. } if message == "terminal"
         ));
-        session.load = CollectionGridLoadState::Deleted;
+        session.load = CollectionGridLoadState::Deleted { installed: None };
         assert!(session.invalidate_thumbnail_presentation().is_none());
-        assert!(matches!(session.load, CollectionGridLoadState::Deleted));
+        assert!(matches!(
+            session.load,
+            CollectionGridLoadState::Deleted { .. }
+        ));
     }
 
     #[test]

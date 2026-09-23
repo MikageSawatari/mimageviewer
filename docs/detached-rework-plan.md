@@ -1454,6 +1454,24 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-23 §1.267 コレクション直下画像の別窓 root owner（Codex 実装、独立 reviewer 合意、BA-7）**
+
+Grid 入力時の immutable prepared と entry ID / source key を typed open plan に固定し、
+fresh `build_viewer_context` へ全 entry 順を install して、その context の新しい
+`items_generation` に root session を bind する。別窓の navigation scope は
+`CollectionRoot` とし、`visible_indices` を親物理フォルダへ狭めない。
+parked 静止画 snapshot は同じ typed route を保持し、AtRest bundle が不在でも
+main-index stamp / 物理 Image descriptor より先に collection root を再構築する。
+active / ParkedLive の collection watch と navigation pending は各 owner の mount 内で poll する。
+削除済み collection の表示中 leaf については、`Deleted` load state に最後の prepared を
+保持し、leaf が閉じるまで entry identity を失わない。main grid を空にした場合は保持を解放する。
+この変更は open producer と一覧 owner の分裂を直す BA-7 の構造修正であり、
+detached predicate、viewport / HWND lifecycle、placement、focus の判定は変更しない。
+補完シナリオで Ctrl+上下と slideshow NextFolder が独立窓 block へ先に入ることを確認した。
+`CollectionRoot` の outer request を block より前に dispatch し、既存 predicate と物理別窓の
+分岐は維持した。外部消失 source の parked 表示保持は物理 / collection 両 route に共通の
+既存 gap（backlog §1.269）として別扱いにする。
+
 **2026-09-23 仮想一覧のページ編集 snapshot を viewer context に帰属させる Phase A（Codex 実装、独立 Sol reviewer が構造的変更と合意）**
 
 `src/app/viewer_context_registry.rs:2194` の bundle swap に `page_edit_snapshot` を加え、

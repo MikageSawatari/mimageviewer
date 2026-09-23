@@ -424,6 +424,7 @@ pub(crate) enum ViewerNavigationScope {
     #[default]
     Main,
     DetachedPhysical,
+    CollectionRoot,
 }
 
 impl ViewerNavigationScope {
@@ -591,6 +592,10 @@ pub(crate) struct ViewerSyncStamp {
 pub(crate) enum DetachedRightDragViewerIdentity {
     ItemsGeneration(u64),
     ReopenSyncStamp(ViewerSyncStamp),
+    ReopenCollectionRoot {
+        identity: top_level_grid_view::CollectionGridIdentity,
+        anchor: top_level_grid_view::CollectionGridViewportAnchor,
+    },
 }
 
 // フィールド型 (ViewerContextDescriptor / ViewerContextBundle) が cfg(windows) の
@@ -613,6 +618,7 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
     pub(crate) reopen_descriptor: Option<ViewerContextDescriptor>,
     pub(crate) reopen_sync_stamp: Option<ViewerSyncStamp>,
+    reopen_collection_root: Option<DetachedCollectionRootImageOpenPlan>,
     pub(crate) activation_ready_frame: u64,
     pub(crate) activation_armed: bool,
     pub(crate) focused_last_frame: bool,
@@ -883,6 +889,7 @@ impl Clone for DetachedImageWindowSnapshot {
             frozen_continuous_pages: self.frozen_continuous_pages.clone(),
             reopen_descriptor: self.reopen_descriptor.clone(),
             reopen_sync_stamp: self.reopen_sync_stamp.clone(),
+            reopen_collection_root: self.reopen_collection_root.clone(),
             activation_ready_frame: self.activation_ready_frame,
             activation_armed: self.activation_armed,
             focused_last_frame: self.focused_last_frame,
@@ -894,7 +901,9 @@ impl Clone for DetachedImageWindowSnapshot {
 #[cfg(windows)]
 impl DetachedImageWindowSnapshot {
     fn has_reopen_identity(&self) -> bool {
-        self.reopen_descriptor.is_some() || self.reopen_sync_stamp.is_some()
+        self.reopen_collection_root.is_some()
+            || self.reopen_descriptor.is_some()
+            || self.reopen_sync_stamp.is_some()
     }
 }
 
@@ -1575,6 +1584,14 @@ impl App {
                 | ContextResidence::Retiring
                 | ContextResidence::Retired
                 | ContextResidence::Unknown => None,
+            })
+            .or_else(|| {
+                window.reopen_collection_root.as_ref().map(|plan| {
+                    DetachedRightDragViewerIdentity::ReopenCollectionRoot {
+                        identity: plan.identity,
+                        anchor: plan.anchor.clone(),
+                    }
+                })
             })
             .or_else(|| {
                 window
@@ -2465,6 +2482,15 @@ impl App {
             DetachedRightDragViewerIdentity::ReopenSyncStamp(expected) => {
                 self.resolve_viewer_sync_stamp_idx(expected) == Some(fs_idx)
             }
+            DetachedRightDragViewerIdentity::ReopenCollectionRoot { identity, anchor } => self
+                .top_level_grid_view
+                .collection_session()
+                .filter(|session| session.identity == *identity)
+                .and_then(|session| session.prepared())
+                .and_then(|prepared| prepared.entries.get(fs_idx))
+                .is_some_and(|entry| {
+                    entry.entry_id == anchor.entry_id && entry.source_key == anchor.source_key
+                }),
         };
         if !identity_matches {
             self.log_detached_image_window_debug(format!(
@@ -2623,6 +2649,10 @@ enum DetachedBookContextStart {
 #[cfg(windows)]
 #[derive(Debug, PartialEq, Eq)]
 enum DetachedGridItemOpenPlan {
+    CollectionRootImage(DetachedCollectionRootImageOpenPlan),
+    /// A root Image cell whose installed generation/entry no longer matches the Grid input.
+    /// Consume this input as a terminal failure; never reroute it through a physical descriptor.
+    CollectionRootUnavailable,
     /// The directory has not been enumerated yet, so it must remain main-owned until
     /// the worker proves that it is an image book.
     FolderCandidate {
@@ -2641,6 +2671,18 @@ enum DetachedGridItemOpenPlan {
         descriptor: ViewerContextDescriptor,
         collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
     },
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DetachedCollectionRootImageOpenPlan {
+    prepared: Arc<crate::collection_store::CollectionPreparedSnapshot>,
+    presentation: Option<Arc<top_level_grid_view::CollectionGridInstalledPresentation>>,
+    identity: top_level_grid_view::CollectionGridIdentity,
+    anchor: top_level_grid_view::CollectionGridViewportAnchor,
+    source_path: PathBuf,
+    wanted_revision: u64,
+    observed_catalog_revision: u64,
 }
 
 /// アクティブ detached viewer セッションの再オープン経路の種別 (将来拡張用)。
@@ -11946,6 +11988,13 @@ fn detached_window_references_removed(
     context: Option<ContextRef<'_>>,
     matches_key: &dyn Fn(&str) -> bool,
 ) -> bool {
+    if window
+        .reopen_collection_root
+        .as_ref()
+        .is_some_and(|plan| matches_key(&crate::adjustment_db::normalize_path(&plan.source_path)))
+    {
+        return true;
+    }
     if window
         .reopen_sync_stamp
         .as_ref()
@@ -45652,6 +45701,8 @@ impl App {
                 app.native_video_parked_live_input_window_id = Some(id);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     app.poll_video(ctx);
+                    app.poll_collection_grid(ctx);
+                    app.poll_collection_navigation(ctx);
                     app.poll_bookmark_media_open(ctx);
                     app.update_parked_live_audio_music_view_state(ctx);
                     app.sync_parked_live_native_video_right_drag_overlays(ctx, id);
@@ -46447,6 +46498,151 @@ impl App {
         )
     }
 
+    /// Build a new owner for a directly registered collection image. The captured prepared
+    /// order is installed as one root session; no parent-folder enumeration participates.
+    #[cfg(windows)]
+    fn start_active_detached_collection_root_image(
+        &mut self,
+        plan: DetachedCollectionRootImageOpenPlan,
+        ctx: &egui::Context,
+        placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
+        resume_window_id: Option<u64>,
+    ) -> bool {
+        let mut start_idx = None;
+        let mut allocated_window_id = None;
+        let built = self.build_viewer_context(
+            "start_active_detached_collection_root_image",
+            |app, reserved| {
+                app.navigation_scope = ViewerNavigationScope::CollectionRoot;
+                let window_id =
+                    resume_window_id.unwrap_or_else(|| app.allocate_detached_viewer_window_id());
+                allocated_window_id = Some(window_id);
+                if resume_window_id.is_none() {
+                    app.reset_active_detached_viewport_runtime_for_new_window(
+                        reserved.serial(),
+                        "start_active_detached_collection_root_image",
+                    );
+                }
+                app.reserve_window_binding_for_build(window_id);
+                app.last_active_detached_window_id = Some(window_id);
+                if resume_window_id.is_some() {
+                    app.adopt_active_detached_viewport_runtime_from_passive(
+                        "resume_detached_collection_root_image",
+                    );
+                } else {
+                    let seed =
+                        placement_seed.unwrap_or_else(|| app.detached_viewer_window_placement());
+                    app.set_detached_window_runtime_placement(
+                        window_id,
+                        seed,
+                        "start_active_detached_collection_root_image",
+                    );
+                }
+                app.transition_detached_window_state(
+                    window_id,
+                    if resume_window_id.is_some() {
+                        DetachedWindowState::Resuming
+                    } else {
+                        DetachedWindowState::Opening
+                    },
+                    "start_active_detached_collection_root_image",
+                );
+                app.detached_viewer_independent_active = true;
+                app.viewer_presentation = ViewerPresentation::DetachedWindow;
+                app.fs_open_intent_from_grid = false;
+                app.top_level_grid_view.begin(
+                    top_level_grid_view::TopLevelGridSurface::Collection(plan.identity),
+                    None,
+                );
+                let items = plan
+                    .prepared
+                    .entries
+                    .iter()
+                    .map(|entry| entry.item.clone())
+                    .collect();
+                let image_metas = plan
+                    .prepared
+                    .entries
+                    .iter()
+                    .map(|entry| entry.display_meta)
+                    .collect();
+                app.install_prepared_aggregate_items(items, image_metas);
+                app.rebuild_visible_indices();
+                let idx = plan
+                    .prepared
+                    .entries
+                    .iter()
+                    .position(|entry| entry.entry_id == plan.anchor.entry_id)
+                    .or_else(|| {
+                        plan.prepared
+                            .entries
+                            .iter()
+                            .position(|entry| entry.source_key == plan.anchor.source_key)
+                    });
+                let Some(idx) = idx.filter(|idx| {
+                    matches!(app.items.get(*idx), Some(GridItem::Image(path)) if
+                        crate::folder_tree::path_eq(path, &plan.source_path))
+                }) else {
+                    return BuildOutcome::Abort("collection_root_anchor_missing");
+                };
+                app.selected = Some(idx);
+                app.address = format!("コレクション: {}", plan.prepared.collection_name);
+                if let Some(session) = app.top_level_grid_view.collection_session_mut() {
+                    session.accepted_revision = plan.prepared.collection_revision;
+                    session.wanted_revision = plan.wanted_revision.max(session.accepted_revision);
+                    session.observed_catalog_revision = plan.observed_catalog_revision;
+                    session.installed_items_generation = Some(app.items_generation);
+                    session.load = if session.wanted_revision > session.accepted_revision
+                        || plan.presentation.is_none()
+                    {
+                        top_level_grid_view::CollectionGridLoadState::RequestNeeded {
+                            installed: Some(Arc::clone(&plan.prepared)),
+                            lease: crate::collection_store::CollectionReadLease::new(
+                                crate::collection_store::CollectionReadScope::app_global("grid"),
+                                std::time::Instant::now(),
+                                "detached_collection_root",
+                            ),
+                        }
+                    } else {
+                        top_level_grid_view::CollectionGridLoadState::Ready(Arc::clone(
+                            plan.presentation.as_ref().expect("checked above"),
+                        ))
+                    };
+                }
+                start_idx = Some(idx);
+                BuildOutcome::Commit
+            },
+        );
+        let Some(built) = built else {
+            if let Some(window_id) = allocated_window_id {
+                if resume_window_id.is_some() {
+                    self.transition_detached_window_state(
+                        window_id,
+                        DetachedWindowState::Parked,
+                        "collection_root_build_aborted",
+                    );
+                } else {
+                    self.remove_detached_window_runtime(window_id, "collection_root_build_aborted");
+                }
+            }
+            return false;
+        };
+        let window_id = self
+            .viewer_context_window(built)
+            .expect("committed collection root must publish its window binding");
+        self.begin_active_detached_session(window_id, DetachedSource::Image);
+        self.with_window_viewer_context(window_id, |app| {
+            app.detached_viewer_open_next_still_detached_once = true;
+            app.open_fullscreen(
+                start_idx.expect("collection root anchor resolved"),
+                crate::app::HistoryTrigger::UserChosen,
+            );
+        })
+        .expect("committed collection root must mount for open");
+        ctx.request_repaint();
+        true
+    }
+
     #[cfg(all(windows, test))]
     fn start_active_detached_book_context_from_scanned_folder(
         &mut self,
@@ -46760,6 +46956,22 @@ impl App {
         if !self.settings.detached_viewer_open_images_in_window {
             return None;
         }
+        if matches!(self.items.get(idx), Some(GridItem::Image(_)))
+            && self
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    matches!(
+                        session.position,
+                        top_level_grid_view::CollectionGridPosition::Root
+                    )
+                })
+        {
+            return Some(self.detached_collection_root_image_open_plan(idx).map_or(
+                DetachedGridItemOpenPlan::CollectionRootUnavailable,
+                DetachedGridItemOpenPlan::CollectionRootImage,
+            ));
+        }
         if auto_fullscreen && let Some(GridItem::Folder(path)) = self.items.get(idx) {
             // Ctrl+G drill folders are navigation nodes, not physical book containers.
             if self.global_search.active && self.global_search.drill.is_some() {
@@ -46788,6 +47000,44 @@ impl App {
                     collection_restore,
                 }
             })
+    }
+
+    #[cfg(windows)]
+    fn detached_collection_root_image_open_plan(
+        &self,
+        idx: usize,
+    ) -> Option<DetachedCollectionRootImageOpenPlan> {
+        let session = self.top_level_grid_view.collection_session()?;
+        if !matches!(
+            session.position,
+            top_level_grid_view::CollectionGridPosition::Root
+        ) || session.installed_items_generation != Some(self.items_generation)
+        {
+            return None;
+        }
+        let prepared = Arc::clone(session.prepared()?);
+        let entry = prepared.entries.get(idx)?;
+        if prepared.collection_id != session.identity.collection_id
+            || prepared.entries.len() != self.items.len()
+            || self.items.get(idx) != Some(&entry.item)
+            || !matches!(entry.item, GridItem::Image(_))
+        {
+            return None;
+        }
+        let anchor = top_level_grid_view::CollectionGridViewportAnchor {
+            entry_id: entry.entry_id,
+            source_key: entry.source_key.clone(),
+        };
+        let source_path = entry.source_path.clone();
+        Some(DetachedCollectionRootImageOpenPlan {
+            prepared,
+            presentation: session.installed_presentation().cloned(),
+            identity: session.identity,
+            anchor,
+            source_path,
+            wanted_revision: session.wanted_revision,
+            observed_catalog_revision: session.observed_catalog_revision,
+        })
     }
 
     #[cfg(windows)]
@@ -46912,6 +47162,38 @@ impl App {
         };
 
         let descriptor = match plan {
+            DetachedGridItemOpenPlan::CollectionRootUnavailable => {
+                self.show_feedback_toast(
+                    "コレクションの画像を開けませんでした。一覧を更新してください".to_string(),
+                );
+                return true;
+            }
+            DetachedGridItemOpenPlan::CollectionRootImage(plan) => {
+                self.cancel_detached_grid_archive_open_for_replacement(
+                    "detached_grid_archive_replaced_by_collection_image",
+                );
+                let base_placement = self.active_detached_viewer_current_placement();
+                let had_active_detached = self.active_detached_context_exists();
+                if !self.park_and_close_current_active_detached_viewer(ctx) {
+                    self.show_feedback_toast(
+                        "別ウィンドウの切り替えを完了できませんでした".to_string(),
+                    );
+                    return true;
+                }
+                let placement_seed = had_active_detached
+                    .then(|| self.offset_detached_image_window_placement(base_placement));
+                if !self.start_active_detached_collection_root_image(
+                    plan,
+                    ctx,
+                    placement_seed,
+                    None,
+                ) {
+                    self.show_feedback_toast(
+                        "コレクションの画像を別ウィンドウで開けませんでした".to_string(),
+                    );
+                }
+                return true;
+            }
             DetachedGridItemOpenPlan::Descriptor {
                 descriptor,
                 collection_restore,
@@ -47299,6 +47581,40 @@ impl App {
             return true;
         }
 
+        if let Some(plan) = snapshot.reopen_collection_root.clone() {
+            self.ensure_detached_window_runtime_placement(
+                snapshot.id,
+                "resume_collection_root_image",
+            );
+            if !self.park_and_close_current_active_detached_viewer(ctx)
+                || !self.start_active_detached_collection_root_image(
+                    plan,
+                    ctx,
+                    None,
+                    Some(snapshot.id),
+                )
+            {
+                self.transition_detached_window_state(
+                    snapshot.id,
+                    DetachedWindowState::Parked,
+                    "resume_collection_root_image_aborted",
+                );
+                self.detached_image_windows.insert(pos, snapshot);
+                return false;
+            }
+            let zoom_pan = snapshot.zoom_pan;
+            let free_rotation = snapshot.free_rotation;
+            self.with_window_viewer_context(snapshot.id, |app| {
+                if let Some((zoom, pan)) = zoom_pan {
+                    app.fs_zoom = zoom;
+                    app.fs_pan = pan;
+                }
+                app.fs_free_rotation = free_rotation;
+            })
+            .expect("resumed collection root context must remain bound");
+            return true;
+        }
+
         // 通常画像の parked still はまず同期スタンプ (main の現行 items) で解決する。
         // `Image` descriptor はスタンプが解決できないときのフォールバック専用
         // (親フォルダを窓内コンテキストとして開き直す)。Pdf/Zip descriptor は
@@ -47580,6 +47896,8 @@ impl App {
                 }
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
+                app.poll_collection_grid(ctx);
+                app.poll_collection_navigation(ctx);
                 app.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel);
                 // Thumbnail results belong to the context whose worker generation and rx
                 // produced them. Consume them while that detached owner is mounted so image
@@ -48030,7 +48348,11 @@ impl App {
             pixels_per_point,
             paged_display_unit.as_ref(),
         );
-        let reopen_descriptor = self.parked_still_reopen_descriptor_for_idx(idx);
+        let reopen_collection_root = self.detached_collection_root_image_open_plan(idx);
+        let reopen_descriptor = reopen_collection_root
+            .is_none()
+            .then(|| self.parked_still_reopen_descriptor_for_idx(idx))
+            .flatten();
         let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
         self.log_detached_image_window_debug(format!(
             "build_active_snapshot_ok id={id} idx={idx} \
@@ -48060,6 +48382,7 @@ impl App {
             frozen_continuous_pages,
             reopen_descriptor,
             reopen_sync_stamp,
+            reopen_collection_root,
             activation_ready_frame: self.frame_counter.saturating_add(1),
             activation_armed: false,
             focused_last_frame: false,
@@ -48105,6 +48428,7 @@ impl App {
             frozen_continuous_pages: Vec::new(),
             reopen_descriptor: None,
             reopen_sync_stamp: None,
+            reopen_collection_root: None,
             activation_ready_frame: self.frame_counter.saturating_add(1),
             activation_armed: false,
             focused_last_frame: false,
@@ -52742,6 +53066,16 @@ impl App {
     }
 
     fn rebuild_visible_indices_impl(&mut self, sync_facet_scope: bool) {
+        if matches!(self.navigation_scope, ViewerNavigationScope::CollectionRoot) {
+            // The root's installed prepared order is the navigation domain. App-global search,
+            // rating, and facet filters belong to the main grid and must not trim this owner.
+            self.visible_indices = (0..self.items.len()).collect();
+            self.details_thumb_suppression_applied = false;
+            self.details_order.clear();
+            self.viewer_navigation_caches.invalidate();
+            self.ensure_selected_visible_or_first();
+            return;
+        }
         if self.navigation_scope.is_detached_physical() {
             // Detached physical viewers intentionally ignore every App-global
             // display filter. Their raw order is still constrained to the

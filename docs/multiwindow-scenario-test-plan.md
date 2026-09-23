@@ -198,7 +198,7 @@ texture id 自体は正当に変わり得るので比較しない。
 | --- | --- | --- |
 | T0 | 本計画の独立レビュー | 済 (§8) |
 | T1 | H1 + H2 (画像 mesh) + I1/I2 + H5 (sidecar の受信継ぎ目) + 不具合 A・B の変異確認。指向シナリオ 2 本、pairwise 展開は T2 | 実装・対象検査済み。S-A folder/ZIPとS-Bは現行ソースで成功、A変異はI1、B変異はI2で失敗。独立レビュー待ち |
-| T2 | 操作語彙と組み合わせの拡張、単窓設定での一覧→フルスクリーン→一覧、I3/I4/I6。安定化判定を指向fixture依存から共通化する（T1独立レビューP3）。Ctrl+G の double-click dispatch と検索 index の統合検証 | 未 |
+| T2 | 操作語彙と組み合わせの拡張、単窓設定での一覧→フルスクリーン→一覧、I3/I4/I6。安定化判定を指向fixture依存から共通化する（T1独立レビューP3）。Ctrl+G の double-click dispatch と検索 index の統合検証。別窓 child→root の復帰を handler 経由で通すテスト（§1.267 独立レビュー P3、現状は `close_fullscreen` / `open_collection_grid` を直接呼ぶ） | 未 |
 | T3 | 第 2 層 (test-script 観測の追加、シナリオ、1 コマンドのスイート。出荷前手順の項目は増やさない) | 実装・非対話検査済み。独立レビューと公開担当のlive実行待ち。窓切替はtest-script activation要求を使い、OSクリック配送は対象外 (§4) |
 
 ## 7. レビューで確認したい点
@@ -297,9 +297,7 @@ production advance を ROOT/child frame driver で検査する。キー割り当
 入力配送そのものはこのシナリオの対象外。
 
 複数ウィンドウ OFF の control は A→次 B→前 A→slideshow B で成功。
-ON の 3 テストは現行 v4.0.0 でそれぞれ失敗し、通常 gate では
-`#[ignore = "known issue: backlog 1.267, collection order lost in a separate window; fix in v4.0.1"]`
-としている。`--ignored` の確認結果は、A→次が `one/3.png`、B→前が `two/0.png`、
+ON の 3 テストは修正前の v4.0.0 でそれぞれ失敗した。`--ignored` の確認結果は、A→次が `one/3.png`、B→前が `two/0.png`、
 A→slideshow が `one/3.png`。いずれも collection 順ではなく画像の親フォルダ順。
 
 入口は `app.rs::detached_grid_item_open_plan` の Image descriptor と collection return owner。
@@ -307,7 +305,22 @@ A→slideshow が `one/3.png`。いずれも collection 順ではなく画像の
 Image descriptor から親フォルダの scan を開始する。`poll_detached_physical_folder_open` は
 その scan を `load_folder_with_scan` して物理一覧の index で `open_fullscreen` する。
 collection restore は一覧への復帰先として保持されるが、現在の直接登録 media root binding にはならない。
-製品修正はこのテスト追加に含めない。
+§1.267 の構造修正で 3 本の ignore を解除し、full-mode control と合わせて pass。
+同じ fixture で factory の全 entry / 新 generation / main 不変 / scan 不在、Home/End と
+跨フォルダ見開き、AtRest bundle 不在の passive reopen、edit/delete 後の owner watch、
+2 窓の watch 分離、BS/Esc、F12 の mode 別挙動を追加した。描画確認は実 PNG の
+ROOT/child frame と viewport ごとの PaintRecord を使う。実 OS focus/HWND は第 2 層で確認する。
+stale root binding の Grid 入力は物理 image fallback へ落とさず終端し、
+collection の物理 child 内 Image は既存 descriptor route を維持する。
+ParkedLive の動画・音声 EOF は disconnected test player を持つ owner bundle で intent を作り、
+`poll_video` 後の owner-mounted collection navigation が次の動画 / 音声 item に着地することを検査する。
+GridOpenSelected の Enter 入力から root image を開き、兄弟窓の async snapshot reply は元 owner に
+残して再活性化後だけ着地させる。見開きは pair 構築に加えて手動 / slideshow の実着地を確認。
+別窓 root から Ctrl+上下で登録 folder 間を移動し、slideshow NextFolder で child に着地、
+folder child から collection root へ戻る。Ctrl+G / rating / history Image は物理 descriptor / scan
+を維持する control を置く。source 外部削除後の passive reopen は現行どおり context を publish し、
+async decode が `FsCacheEntry::Failed` で終端し、crash / 半端な owner がないことを固定する
+（parked 表示保持は §1.269）。
 
 ## 9. 実行記録
 
