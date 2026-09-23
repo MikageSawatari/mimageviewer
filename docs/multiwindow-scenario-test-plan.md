@@ -123,7 +123,7 @@ texture id 自体は正当に変わり得るので比較しない。
 
 シナリオ = 「fixture × 設定 × 操作列」。操作列は小さな語彙から作る:
 
-`開く(一覧から / パスで)`、`検索・一覧ビューから開く`、`フルスクリーンへ`、`フルスクリーンを閉じる`、`別窓で開く`、
+`開く(一覧から / パスで)`、`検索・一覧ビューから開く`、`コレクションから開く`、`フルスクリーンへ`、`フルスクリーンを閉じる`、`別窓で開く`、
 `focus(X)`、`次ページ(X)`、`前ページ(X)`、`拡大(X)`、`閉じる(X)`、`一覧へ戻る`。
 
 設定の軸: 見開き (単/見開き)、端の単ページを片側へ寄せる (ON/OFF)、表紙の扱い、
@@ -286,6 +286,28 @@ double-click dispatch と検索 index の統合検証は T2 に残す。
 `read_dir` の `\` を別パスと扱い、対象不在として新規窓を最初の ROOT frame で退役させた。
 テストは `frame=0 -> 1 window=1 vanished without an explicit error` で失敗し、
 drive を保持した区切り文字正規化の照合へ変更後に成功した。
+
+### 8.5 コレクションから別窓で開いた画像の順序 (2026-09-23、backlog §1.267)
+
+第 1 層に「コレクションから開く」を追加。TempDir の異なる 2 フォルダに実 PNG を置き、
+直接登録順を A=`one/2.png`、B=`two/1.png`、C=`one/1.png` とし、両フォルダに未登録画像も置く。
+production actor で作成・登録したコレクションの Grid を開き、画像 A または B を Grid open
+経路から開く。`FsPageNext` / `FsPagePrev` の page navigation handler と、slideshow timer の
+production advance を ROOT/child frame driver で検査する。キー割り当てから handler までの
+入力配送そのものはこのシナリオの対象外。
+
+複数ウィンドウ OFF の control は A→次 B→前 A→slideshow B で成功。
+ON の 3 テストは現行 v4.0.0 でそれぞれ失敗し、通常 gate では
+`#[ignore = "known issue: backlog 1.267, collection order lost in a separate window; fix in v4.0.1"]`
+としている。`--ignored` の確認結果は、A→次が `one/3.png`、B→前が `two/0.png`、
+A→slideshow が `one/3.png`。いずれも collection 順ではなく画像の親フォルダ順。
+
+入口は `app.rs::detached_grid_item_open_plan` の Image descriptor と collection return owner。
+`start_active_detached_book_context_with_start` は別 context を `DetachedPhysical` として作り、
+Image descriptor から親フォルダの scan を開始する。`poll_detached_physical_folder_open` は
+その scan を `load_folder_with_scan` して物理一覧の index で `open_fullscreen` する。
+collection restore は一覧への復帰先として保持されるが、現在の直接登録 media root binding にはならない。
+製品修正はこのテスト追加に含めない。
 
 ## 9. 実行記録
 

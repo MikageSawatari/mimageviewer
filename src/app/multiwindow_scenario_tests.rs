@@ -782,3 +782,328 @@ fn multiwindow_scenario_a_zip_sidecar_restore_reaches_paint() {
         .join()
         .expect("scenario thread");
 }
+
+/// The collection order is A (folder one/2), B (folder two/1), C (folder
+/// one/1). Each physical folder also has unregistered neighbours.
+fn collection_order_fixture(
+    app: &mut App,
+    driver: &mut ScenarioDriver,
+    temp: &std::path::Path,
+) -> [std::path::PathBuf; 3] {
+    use crate::collection_store::{
+        CollectionRegistration, CollectionResolvedKind, CollectionStoreRuntime,
+    };
+    let first_folder = temp.join("collection-order-one");
+    let second_folder = temp.join("collection-order-two");
+    std::fs::create_dir(&first_folder).unwrap();
+    std::fs::create_dir(&second_folder).unwrap();
+    let a = first_folder.join("2.png");
+    let b = second_folder.join("1.png");
+    let c = first_folder.join("1.png");
+    for (path, color) in [
+        (first_folder.join("0.png"), [10, 20, 30]),
+        (c.clone(), [30, 40, 50]),
+        (a.clone(), [50, 60, 70]),
+        (first_folder.join("3.png"), [70, 80, 90]),
+        (second_folder.join("0.png"), [90, 100, 110]),
+        (b.clone(), [110, 120, 130]),
+        (second_folder.join("2.png"), [130, 140, 150]),
+    ] {
+        save_portrait(&path, color);
+    }
+    let runtime =
+        CollectionStoreRuntime::start_at(temp.join("collection.db")).expect("collection actor");
+    let client = runtime.client();
+    app.install_collection_runtime(runtime);
+    wait_until(
+        "collection actor ready",
+        std::time::Duration::from_secs(5),
+        || {
+            app.poll_collection_ui(&driver.ctx);
+            matches!(app.collection_store_client_for_read(), Ok(Some(_)))
+        },
+    );
+    let created = client
+        .create_collection("Cross-folder order".into())
+        .unwrap()
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    let registrations = [&a, &b, &c]
+        .map(|path| {
+            CollectionRegistration::from_trusted_path(path, CollectionResolvedKind::Image).unwrap()
+        })
+        .to_vec();
+    client
+        .add_batch(created.collection_id(), created.revision(), registrations)
+        .unwrap()
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .unwrap()
+        .unwrap();
+    app.open_collection_grid_from_navigation(created.collection_id());
+    wait_until(
+        "collection grid installed",
+        std::time::Duration::from_secs(10),
+        || {
+            app.poll_collection_ui(&driver.ctx);
+            app.poll_collection_grid(&driver.ctx);
+            app.items.len() == 3
+        },
+    );
+    assert_eq!(
+        app.items,
+        [&a, &b, &c]
+            .map(|path| GridItem::Image(path.clone()))
+            .to_vec(),
+        "the production collection grid must install registration order"
+    );
+    [a, b, c]
+}
+
+fn collection_order_current_path(app: &mut App, detached: bool) -> Option<std::path::PathBuf> {
+    let current = |owner: &App| {
+        owner
+            .fullscreen_idx
+            .and_then(|idx| owner.items.get(idx))
+            .and_then(|item| match item {
+                GridItem::Image(path) => Some(path.clone()),
+                _ => None,
+            })
+    };
+    if detached {
+        app.with_active_viewer_context(|owner| current(owner))
+            .flatten()
+    } else {
+        current(app)
+    }
+}
+
+fn collection_order_painted(
+    frame: &ScenarioFrame,
+    viewport: Option<egui::ViewportId>,
+    path: &std::path::Path,
+) -> bool {
+    let key = GridItem::Image(path.to_path_buf()).perf_key();
+    match viewport {
+        Some(viewport) => records_for(frame, viewport)
+            .iter()
+            .any(|record| record.provenance.item == key),
+        None => frame
+            .records
+            .values()
+            .flatten()
+            .any(|record| record.provenance.item == key),
+    }
+}
+
+fn collection_order_open(
+    app: &mut App,
+    driver: &mut ScenarioDriver,
+    detached: bool,
+    index: usize,
+    path: &std::path::Path,
+) {
+    app.selected = Some(index);
+    let viewport = if detached {
+        assert!(app.open_grid_container_in_detached_book_context(&driver.ctx, index));
+        let window_id = app.active_detached_window_id().expect("detached grid open");
+        let viewport = App::detached_image_window_viewport_id(window_id);
+        driver.focus(viewport);
+        Some(viewport)
+    } else {
+        app.fs_open_intent_from_grid = true;
+        app.open_fullscreen(index, HistoryTrigger::UserChosen);
+        assert_eq!(
+            collection_order_current_path(app, false).as_deref(),
+            Some(path),
+            "full grid open before first frame"
+        );
+        None
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let frame = driver.root(app);
+        let actual = collection_order_current_path(app, detached);
+        if actual.as_deref() == Some(path) && collection_order_painted(&frame, viewport, path) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "collection image did not paint: expected={} actual={actual:?} viewport={viewport:?} frame={} records={:#?} errors={:?}",
+            path.display(),
+            frame.number,
+            frame.records,
+            frame.errors,
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn collection_order_page_turn(
+    app: &mut App,
+    driver: &mut ScenarioDriver,
+    detached: bool,
+    forward: bool,
+) {
+    let turn = |owner: &mut App| {
+        let from = owner.fullscreen_idx.expect("image is open");
+        owner.handle_fs_navigation(
+            &driver.ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            crate::ui_fullscreen::FsPageNav::Delta(if forward { 1 } else { -1 }),
+            None,
+            from,
+        );
+    };
+    if detached {
+        app.with_active_viewer_context(turn)
+            .expect("detached owner");
+    } else {
+        turn(app);
+    }
+}
+
+fn collection_order_slideshow_tick(app: &mut App, driver: &mut ScenarioDriver, detached: bool) {
+    let tick = |owner: &mut App| {
+        let from = owner.fullscreen_idx.expect("image is open");
+        owner.slideshow_playing = true;
+        owner.slideshow_anchor_idx = Some(from);
+        owner.slideshow_next_at = std::time::Instant::now();
+        // This is the production timer entry, which calls advance_slideshow.
+        owner.handle_fs_navigation(
+            &driver.ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            crate::ui_fullscreen::FsPageNav::None,
+            None,
+            from,
+        );
+    };
+    if detached {
+        app.with_active_viewer_context(tick)
+            .expect("detached owner");
+    } else {
+        tick(app);
+    }
+}
+
+fn collection_order_observe(
+    app: &mut App,
+    driver: &mut ScenarioDriver,
+    detached: bool,
+    expected: &std::path::Path,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let viewport = detached.then(|| {
+        App::detached_image_window_viewport_id(
+            app.active_detached_window_id()
+                .expect("detached window stays open"),
+        )
+    });
+    loop {
+        let frame = driver.root(app);
+        let actual = collection_order_current_path(app, detached);
+        let pending = if detached {
+            app.with_active_viewer_context(|owner| {
+                owner.top_level_grid_view.collection_navigation_pending()
+            })
+            .unwrap_or(false)
+        } else {
+            app.top_level_grid_view.collection_navigation_pending()
+        };
+        if !pending
+            && actual.as_deref() == Some(expected)
+            && collection_order_painted(&frame, viewport, expected)
+        {
+            return;
+        }
+        if !pending && actual.as_deref() != Some(expected) {
+            assert_eq!(actual.as_deref(), Some(expected));
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "collection navigation did not paint: expected={} actual={actual:?} pending={pending} viewport={viewport:?} frame={} records={:#?} errors={:?}",
+            expected.display(),
+            frame.number,
+            frame.records,
+            frame.errors,
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn multiwindow_scenario_collection_order_full_mode_control() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        driver.root(&mut app);
+        let temp = app.tmp.path().to_path_buf();
+        let [a, b, _c] = collection_order_fixture(&mut app, &mut driver, &temp);
+        collection_order_open(&mut app, &mut driver, false, 0, &a);
+        collection_order_page_turn(&mut app, &mut driver, false, true);
+        collection_order_observe(&mut app, &mut driver, false, &b);
+        collection_order_page_turn(&mut app, &mut driver, false, false);
+        collection_order_observe(&mut app, &mut driver, false, &a);
+        collection_order_slideshow_tick(&mut app, &mut driver, false);
+        collection_order_observe(&mut app, &mut driver, false, &b);
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+fn run_detached_collection_order_case(open_index: usize, forward: Option<bool>) {
+    let mut app = setup_app_for_test();
+    let mut driver = ScenarioDriver::new();
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+    app.startup_done = true;
+    app.startup_init = None;
+    app.settings.detached_viewer_open_images_in_window = true;
+    driver.root(&mut app);
+    let temp = app.tmp.path().to_path_buf();
+    let [a, b, _c] = collection_order_fixture(&mut app, &mut driver, &temp);
+    let opened = if open_index == 0 { &a } else { &b };
+    let expected = if open_index == 0 { &b } else { &a };
+    collection_order_open(&mut app, &mut driver, true, open_index, opened);
+    if let Some(forward) = forward {
+        collection_order_page_turn(&mut app, &mut driver, true, forward);
+    } else {
+        collection_order_slideshow_tick(&mut app, &mut driver, true);
+    }
+    collection_order_observe(&mut app, &mut driver, true, expected);
+}
+
+#[test]
+#[ignore = "known issue: backlog 1.267, collection order lost in a separate window; fix in v4.0.1"]
+fn multiwindow_scenario_collection_order_detached_next() {
+    std::thread::spawn(|| run_detached_collection_order_case(0, Some(true)))
+        .join()
+        .expect("scenario thread");
+}
+
+#[test]
+#[ignore = "known issue: backlog 1.267, collection order lost in a separate window; fix in v4.0.1"]
+fn multiwindow_scenario_collection_order_detached_prev() {
+    std::thread::spawn(|| run_detached_collection_order_case(1, Some(false)))
+        .join()
+        .expect("scenario thread");
+}
+
+#[test]
+#[ignore = "known issue: backlog 1.267, collection order lost in a separate window; fix in v4.0.1"]
+fn multiwindow_scenario_collection_order_detached_slideshow() {
+    std::thread::spawn(|| run_detached_collection_order_case(0, None))
+        .join()
+        .expect("scenario thread");
+}
