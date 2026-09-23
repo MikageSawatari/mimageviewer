@@ -154,10 +154,20 @@ where
 }
 
 /// One typed resource shared by live, continuous, holdover, and detached routes.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TestPaintProvenance {
+    pub(crate) context: crate::app::ViewerContextId,
+    pub(crate) item: String,
+    pub(crate) page: usize,
+}
+
 #[derive(Clone)]
 pub(crate) enum FullscreenPaintResource {
     Direct {
         source: egui::TextureHandle,
+        #[cfg(test)]
+        test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
         test_script_content_proof: Option<crate::test_script::TestScriptContentProof>,
     },
@@ -165,6 +175,8 @@ pub(crate) enum FullscreenPaintResource {
         source_id: FullscreenPaintSourceId,
         source: egui::TextureHandle,
         generation: FullscreenPaintSourceGeneration,
+        #[cfg(test)]
+        test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
         test_script_content_proof: Option<crate::test_script::TestScriptContentProof>,
     },
@@ -174,6 +186,8 @@ pub(crate) enum FullscreenPaintResource {
         generation: FullscreenPaintSourceGeneration,
         smoothing_percent: u32,
         output: Arc<LanczosOutput>,
+        #[cfg(test)]
+        test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
         test_script_content_proof: Option<crate::test_script::TestScriptContentProof>,
     },
@@ -183,6 +197,8 @@ impl FullscreenPaintResource {
     pub(crate) fn direct(source: egui::TextureHandle) -> Self {
         Self::Direct {
             source,
+            #[cfg(test)]
+            test_paint_provenance: None,
             #[cfg(all(windows, feature = "test-script"))]
             test_script_content_proof: None,
         }
@@ -217,6 +233,8 @@ impl FullscreenPaintResource {
             source_id,
             source,
             generation,
+            #[cfg(test)]
+            test_paint_provenance: None,
             #[cfg(all(windows, feature = "test-script"))]
             test_script_content_proof: None,
         }
@@ -285,6 +303,43 @@ impl FullscreenPaintResource {
                 Some(*source_id)
             }
             Self::Direct { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_paint_provenance(mut self, proof: TestPaintProvenance) -> Self {
+        match &mut self {
+            Self::Direct {
+                test_paint_provenance,
+                ..
+            }
+            | Self::Resampleable {
+                test_paint_provenance,
+                ..
+            }
+            | Self::Lanczos {
+                test_paint_provenance,
+                ..
+            } => *test_paint_provenance = Some(proof),
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_paint_provenance(&self) -> Option<&TestPaintProvenance> {
+        match self {
+            Self::Direct {
+                test_paint_provenance,
+                ..
+            }
+            | Self::Resampleable {
+                test_paint_provenance,
+                ..
+            }
+            | Self::Lanczos {
+                test_paint_provenance,
+                ..
+            } => test_paint_provenance.as_ref(),
         }
     }
 
@@ -364,6 +419,12 @@ impl FullscreenPaintResource {
             } => {
                 let original =
                     Self::resampleable_for_source(*source_id, source.clone(), *generation);
+                #[cfg(test)]
+                let original = if let Some(proof) = self.test_paint_provenance().cloned() {
+                    original.with_test_paint_provenance(proof)
+                } else {
+                    original
+                };
                 #[cfg(all(windows, feature = "test-script"))]
                 if let Some(proof) = self.test_script_content_proof().cloned() {
                     return original.with_test_script_content_proof(proof);
@@ -382,6 +443,8 @@ impl FullscreenPaintResource {
             generation,
             smoothing_percent,
             output,
+            #[cfg(test)]
+            test_paint_provenance: self.test_paint_provenance().cloned(),
             #[cfg(all(windows, feature = "test-script"))]
             test_script_content_proof: self.test_script_content_proof().cloned(),
         }

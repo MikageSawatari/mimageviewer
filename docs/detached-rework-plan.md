@@ -1454,6 +1454,21 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-23 複数viewportシナリオテスト T1（Codex実装、独立レビュー待ち）**
+
+`app::multiwindow_scenario_tests`がROOT `App::update`、即時/遅延child callback、画像meshを
+headlessで観測する。`FullscreenPaintResource`には`cfg(test)`限定で描画resource由来の
+context・項目・ページ証明を載せ、`app::paint_record_test_support`が`ui_fullscreen`の
+実際の画像提出点でmesh直前のテスト専用markerと一対一に結ぶ。同一texture IDの再利用も区別する。
+`sidecar_restore`の`cfg(test)` relayはchecking workerの受信済み結果を同一要求内で保留・配送する。
+いずれも観測/配送順序のテスト専用継ぎ目で、製品のdetached述語、状態遷移、viewport、描画結果を
+変更しない。変異確認で旧単ページsnapshot producerへ戻すとI2が失敗した。
+1ffce8118のOpening/Resuming所有と早期Active昇格抑止だけを戻しても、後続91e75ce42の
+`DetachedSessionContentPhase::Preparing`が保持するためS-Aは成功した。設計担当の確認後、
+`active_detached_transition_outstanding`を両方の保持判定を含まない旧pending ORに
+一時的に戻すと、S-Aのfolder/ZIPはともに初回ROOT passでI1失敗した。
+変異は正確に復元した。詳細は[シナリオ計画](multiwindow-scenario-test-plan.md) §8.2。
+
 **2026-09-20 §23.9 Collection追加ショートカット（親Codex／独立Sol構造合意）**
 
 Grid / 静止画FS / 動画・音声のキー入力から、現在mount済みviewer bundleの選択または表示中の

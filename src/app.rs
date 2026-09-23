@@ -79004,6 +79004,10 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 
 // テスト専用。`ui_fullscreen` など兄弟モジュールのテストからも
 // `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
+#[cfg(all(test, windows))]
+pub(crate) mod multiwindow_scenario_tests;
+#[cfg(test)]
+pub(crate) mod paint_record_test_support;
 #[cfg(test)]
 mod similar_navigation_tests;
 #[cfg(all(test, windows))]
@@ -79024,6 +79028,22 @@ mod still_seek_thumbnail_ownership;
 pub(crate) use tests::phase_c_support::{
     AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
 };
+
+#[cfg(test)]
+impl App {
+    pub(crate) fn test_paint_provenance_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::TestPaintProvenance> {
+        self.items
+            .get(idx)
+            .map(|item| crate::gpu_lanczos::TestPaintProvenance {
+                context: self.projected_viewer_context_id(),
+                item: item.perf_key(),
+                page: idx,
+            })
+    }
+}
 
 #[cfg(test)]
 mod favorite_view_state_tests {

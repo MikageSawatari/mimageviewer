@@ -9212,7 +9212,7 @@ impl App {
         let is_thumbnail = self.thumbnails.get(idx).is_some_and(|thumbnail| {
             matches!(thumbnail, ThumbnailState::Loaded { tex, .. } if tex.id() == texture.id())
         });
-        if self.fs_entry_is_animated(idx) || is_thumbnail {
+        let resource = if self.fs_entry_is_animated(idx) || is_thumbnail {
             crate::gpu_lanczos::FullscreenPaintResource::direct(texture)
         } else {
             crate::gpu_lanczos::FullscreenPaintResource::resampleable(
@@ -9223,7 +9223,14 @@ impl App {
                     input: self.input_generation.get(&idx).copied().unwrap_or(0),
                 },
             )
-        }
+        };
+        #[cfg(test)]
+        let resource = if let Some(proof) = self.test_paint_provenance_for_idx(idx) {
+            resource.with_test_paint_provenance(proof)
+        } else {
+            resource
+        };
+        resource
     }
 
     pub(crate) fn prepare_fullscreen_paint_resource(
@@ -17559,6 +17566,11 @@ impl App {
             &bg_style,
         );
         if let Some(source_uv_rect) = window.texture.visible_source_uv_rect() {
+            #[cfg(test)]
+            crate::app::paint_record_test_support::record_selected_paint_resource(
+                &painter,
+                &window.texture,
+            );
             crate::displayed_image_transform::paint_source_region_texture(
                 &painter,
                 window.texture.id(),
@@ -17570,6 +17582,11 @@ impl App {
                 egui::Color32::WHITE,
             );
         } else {
+            #[cfg(test)]
+            crate::app::paint_record_test_support::record_selected_paint_resource(
+                &painter,
+                &window.texture,
+            );
             crate::displayed_image_transform::paint_source_region_texture(
                 &painter,
                 window.texture.id(),
@@ -17603,6 +17620,11 @@ impl App {
                     &bg_style,
                 );
                 if let Some(source_uv_rect) = page.texture.visible_source_uv_rect() {
+                    #[cfg(test)]
+                    crate::app::paint_record_test_support::record_selected_paint_resource(
+                        &painter,
+                        &page.texture,
+                    );
                     crate::displayed_image_transform::paint_source_region_texture(
                         &painter,
                         page.texture.id(),
@@ -17614,6 +17636,11 @@ impl App {
                         egui::Color32::WHITE,
                     );
                 } else {
+                    #[cfg(test)]
+                    crate::app::paint_record_test_support::record_selected_paint_resource(
+                        &painter,
+                        &page.texture,
+                    );
                     crate::displayed_image_transform::paint_source_region_texture(
                         &painter,
                         page.texture.id(),
@@ -34970,6 +34997,11 @@ impl App {
                 ),
             };
             if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
+                #[cfg(test)]
+                crate::app::paint_record_test_support::record_selected_paint_resource(
+                    &painter,
+                    &paint_resource,
+                );
                 transform.paint_texture_source_region(
                     &painter,
                     paint_resource.paint_texture_id(),
@@ -34977,6 +35009,11 @@ impl App {
                     egui::Color32::WHITE,
                 );
             } else {
+                #[cfg(test)]
+                crate::app::paint_record_test_support::record_selected_paint_resource(
+                    &painter,
+                    &paint_resource,
+                );
                 transform.paint_texture(
                     &painter,
                     paint_resource.paint_texture_id(),
@@ -39784,6 +39821,11 @@ impl App {
                 ),
             };
             if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
+                #[cfg(test)]
+                crate::app::paint_record_test_support::record_selected_paint_resource(
+                    painter,
+                    &paint_resource,
+                );
                 transform.paint_texture_source_region(
                     painter,
                     paint_resource.paint_texture_id(),
@@ -39791,6 +39833,11 @@ impl App {
                     egui::Color32::WHITE,
                 );
             } else {
+                #[cfg(test)]
+                crate::app::paint_record_test_support::record_selected_paint_resource(
+                    painter,
+                    &paint_resource,
+                );
                 transform.paint_texture(
                     painter,
                     paint_resource.paint_texture_id(),

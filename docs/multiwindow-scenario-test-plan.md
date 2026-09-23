@@ -1,7 +1,7 @@
 # 複数ウィンドウ・画面遷移のシナリオ自動テスト計画
 
 2026-09-23 起案 (設計・検収 = ClaudeCode Opus 5.5 / 実装 = GPT-6 Sol / 独立レビュー = 別の GPT-6 Sol)。
-状態: **T0 レビュー済み (GPT-6 Sol xhigh, 2026-09-23)。指摘は §8 に反映**。
+状態: **T0 レビュー済み。T1 実装・対象検査済み、独立レビュー待ち（§8.2）**。
 
 ## 0. 背景
 
@@ -181,8 +181,10 @@ texture id 自体は正当に変わり得るので比較しない。
 
 ## 5. 受入条件
 
-- **変異確認**: T1 の検査は、1ffce8118 の修正を戻したソースで I1 が、fa862512e の修正を戻したソースで
-  I2 が**失敗する**こと。戻したソースは使い捨ての worktree で作り、master に入れない。
+- **変異確認**: T1 の検査は、`active_detached_transition_outstanding`を
+  1ffce8118 前の pending OR のみに戻す（後続91e75ce42の`Preparing`判定も外す）と I1 が、
+  fa862512e の修正を戻すと I2 が**失敗する**こと。戻したソースは一時的な作業ツリー変更に限り、
+  確認後に正確に復元してmasterに入れない。
   (挙動不変のリファクタではなく、不具合を拾う検査なので、修正前で落ちることを確かめる)
 - 現行 master で全シナリオが通る。10 回連続実行で結果が変わらない。
 - 製品コードの変更は `cfg(test)` / test-script 用の観測と、3.5 の受信関門に限る。
@@ -193,8 +195,8 @@ texture id 自体は正当に変わり得るので比較しない。
 | 段階 | 内容 | 状態 |
 | --- | --- | --- |
 | T0 | 本計画の独立レビュー | 済 (§8) |
-| T1 | H1 + H2 (画像 mesh) + I1/I2 + H5 (sidecar の受信継ぎ目) + 不具合 A・B の変異確認。指向シナリオ 2 本、pairwise 展開は T2 | 未 |
-| T2 | 操作語彙と組み合わせの拡張、一覧→フルスクリーン遷移、I3/I4/I6 | 未 |
+| T1 | H1 + H2 (画像 mesh) + I1/I2 + H5 (sidecar の受信継ぎ目) + 不具合 A・B の変異確認。指向シナリオ 2 本、pairwise 展開は T2 | 実装・対象検査済み。S-A folder/ZIPとS-Bは現行ソースで成功、A変異はI1、B変異はI2で失敗。独立レビュー待ち |
+| T2 | 操作語彙と組み合わせの拡張、一覧→フルスクリーン遷移、I3/I4/I6。安定化判定を指向fixture依存から共通化する（T1独立レビューP3） | 未 |
 | T3 | 第 2 層 (test-script 観測の追加、シナリオ、1 コマンドのスイート。出荷前手順の項目は増やさない) | 未 |
 
 ## 7. レビューで確認したい点
@@ -233,3 +235,38 @@ texture id 自体は正当に変わり得るので比較しない。
 - [P2] 窓の切り替えは test-script の activation 要求で、OS クリック経路は覆わない → §4 に範囲を明記。
 - 1 コマンド化は multi-script 対応なしで可能 (1 本の Rhai で順に回す)。`-InteractiveApproved` は残し、
   常設の了承の対象スイートのコマンドだけが付ける。
+
+### 8.2 T1 の変異確認 (2026-09-23)
+
+T1の3テストは、実画像フォルダ・実ZIPと有効な`mimageviewer.dat`をTempDirで作り、
+sidecar checking結果を最初のROOT pass前に受信側で保留したS-A 2媒体、縦長端単ページの
+active→parked描画を比べるS-Bを通した。対象3本を10回連続実行し全回成功、
+テスト本体は各回0.97〜1.12秒。I1は描画のほか実際のshapeにある明示的エラー文も観測する。
+S-Bは`fa862512e`の単ページfrozen producerを
+旧Double限定相当に戻すと、I2でactiveの左寄せ頂点`[0,478]`がparkedで中央`[240,720]`へ
+変わり失敗する。受信値はrelayがそのまま保持し、release時に同じstate machineへ返す。
+
+初回は`1ffce8118`のOpening/Resuming判定と早期Active昇格抑止だけを戻したため、
+後続`91e75ce42`の`DetachedSessionContentPhase::Preparing`が窓を保持し、
+S-Aのfolder/ZIPは両方成功した。設計担当が「初回描画前に窓が消える」種類の検出を
+受入意図と確認し、`active_detached_transition_outstanding`からruntime stateの
+Opening/Resuming/Closing判定と`Preparing`判定を共に外し、旧来のpending ORだけ残す
+変異へ改めた。この変異ではfolder/ZIPとも最初のROOT passで窓が消え、I1が
+`frame=0 -> 1 window=101 vanished without an explicit error before=[] after=[]`で失敗した。
+session開始時のActive昇格や`detached_window_state_for_show_label`は変更不要だった。
+変異を正確に復元した後の対象3テストは全件成功した。
+
+描画clipはactiveがviewport全体、parkedがmesh領域を指定する場合がある。
+PaintRecordには生のclipを保存し、I2ではmesh頂点領域との交差で得る可視clipを比較する。
+これは等価な描画を不一致にしないためで、実際に切られる領域が変わればI2は失敗する。
+
+### 8.3 T1 独立レビューの修正 (2026-09-23)
+
+- 非Windowsの`cfg(test)`でも描画フックを解決できるよう、提出証明の記録と抽出を
+  `app::paint_record_test_support`へ分離した。Windows依存のROOT/childシナリオだけを
+  `cfg(all(test, windows))`に保つ。
+- 画像meshの直前に提出ごとのテスト専用markerを置き、shape順に一対一で対応させる。
+  同一viewport・同一texture IDの2提出でも別々の出所を保持する単体テストを追加した。
+- I1の明示的エラーは対象窓のviewportに限る。ROOTと兄弟窓のエラーだけでは対象窓の
+  消失を許さない単体テストを追加した。
+- 安定化判定の指向fixture依存（P3）はT2で共通化する。

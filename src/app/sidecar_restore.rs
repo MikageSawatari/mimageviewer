@@ -209,6 +209,57 @@ struct CheckingWorkerResult {
     reuse: crate::sidecar_import::SidecarProbeReuseOutcome,
 }
 
+/// A test-owned delivery relay for one restore request. The worker and the
+/// production state machine are unchanged; only the receive boundary is held.
+#[cfg(test)]
+pub(super) struct SidecarCheckingRelay {
+    state: std::cell::RefCell<SidecarCheckingRelayState>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SidecarCheckingRelayState {
+    held: Option<Result<CheckingWorkerResult, String>>,
+    captured: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl SidecarCheckingRelay {
+    pub(super) fn new() -> std::rc::Rc<Self> {
+        std::rc::Rc::new(Self {
+            state: std::cell::RefCell::new(SidecarCheckingRelayState::default()),
+        })
+    }
+
+    pub(super) fn captured(&self) -> bool {
+        self.state.borrow().captured
+    }
+
+    pub(super) fn release(&self) {
+        self.state.borrow_mut().released = true;
+    }
+
+    fn route(&self, terminal: &mut Option<Result<CheckingWorkerResult, String>>) -> bool {
+        let mut state = self.state.borrow_mut();
+        if state.released {
+            if terminal.is_none() {
+                *terminal = state.held.take();
+            }
+            return false;
+        }
+        if let Some(result) = terminal.take() {
+            assert!(
+                state.held.is_none(),
+                "one relay owns one checking completion"
+            );
+            state.held = Some(result);
+            state.captured = true;
+        }
+        state.held.is_some()
+    }
+}
+
 struct Quiescing {
     local_adjust_fence: LocalAdjustFence,
     favorite_started: bool,
@@ -408,7 +459,14 @@ fn poll_preview_clear_completion(
     }
 }
 
-fn poll_checking_worker(checking: &mut Checking) -> CheckingPoll {
+fn poll_checking_worker(
+    checking: &mut Checking,
+    #[cfg(test)] relay: Option<&SidecarCheckingRelay>,
+) -> CheckingPoll {
+    #[cfg(test)]
+    if relay.is_some_and(|relay| relay.route(&mut checking.terminal)) {
+        return CheckingPoll::Pending;
+    }
     if checking.terminal.is_none() {
         checking.terminal = match checking.rx.try_recv() {
             Ok(result) => Some(Ok(result)),
@@ -417,6 +475,11 @@ fn poll_checking_worker(checking: &mut Checking) -> CheckingPoll {
             )),
             Err(TryRecvError::Empty) => None,
         };
+    }
+
+    #[cfg(test)]
+    if relay.is_some_and(|relay| relay.route(&mut checking.terminal)) {
+        return CheckingPoll::Pending;
     }
 
     let Some(handle) = checking.handle.as_ref() else {
@@ -453,6 +516,8 @@ fn poll_checking_worker(checking: &mut Checking) -> CheckingPoll {
 pub(crate) struct SidecarRestoreState {
     common: Common,
     phase: Phase,
+    #[cfg(test)]
+    checking_relay: Option<std::rc::Rc<SidecarCheckingRelay>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -526,6 +591,21 @@ impl SidecarRestoreState {
 }
 
 impl App {
+    #[cfg(test)]
+    pub(super) fn attach_sidecar_checking_relay_for_test(
+        &mut self,
+        relay: std::rc::Rc<SidecarCheckingRelay>,
+    ) {
+        let state = self
+            .sidecar_restore
+            .as_mut()
+            .expect("a restore request must exist before attaching its receive relay");
+        assert!(
+            state.checking_relay.is_none(),
+            "one relay per restore request"
+        );
+        state.checking_relay = Some(relay);
+    }
     fn retire_sidecar_probe_proofs(
         &mut self,
         proofs: impl IntoIterator<Item = Arc<crate::sidecar_import::SidecarProbeProof>>,
@@ -591,6 +671,7 @@ impl App {
     pub(crate) fn activate_sidecar_restore_modal_for_test(&mut self, folder: PathBuf) {
         let target_context = self.sidecar_restore_projected_context();
         self.sidecar_restore = Some(SidecarRestoreState {
+            checking_relay: None,
             common: Common {
                 request_id: 1,
                 started_at: std::time::Instant::now(),
@@ -627,6 +708,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let started_at = std::time::Instant::now();
         self.sidecar_restore = Some(SidecarRestoreState {
+            checking_relay: None,
             common: Common {
                 request_id: 1,
                 started_at,
@@ -886,6 +968,8 @@ impl App {
             .wrapping_add(1);
         let started_at = continuation.restore_started_at;
         self.sidecar_restore = Some(SidecarRestoreState {
+            #[cfg(test)]
+            checking_relay: None,
             common: Common {
                 request_id,
                 started_at,
@@ -1299,7 +1383,11 @@ impl App {
 
         let phase = std::mem::replace(&mut state.phase, Phase::Resuming);
         state.phase = match phase {
-            Phase::Checking(mut checking) => match poll_checking_worker(&mut checking) {
+            Phase::Checking(mut checking) => match poll_checking_worker(
+                &mut checking,
+                #[cfg(test)]
+                state.checking_relay.as_deref(),
+            ) {
                 CheckingPoll::Pending => Phase::Checking(checking),
                 CheckingPoll::Complete(Err(error)) => {
                     self.clear_sidecar_probe_reuse(&state.common.folder);
@@ -1762,7 +1850,11 @@ impl App {
         let phase = std::mem::replace(&mut state.phase, Phase::Resuming);
         let terminal = match phase {
             Phase::Quiescing(_) | Phase::Resuming => true,
-            Phase::Checking(mut checking) => match poll_checking_worker(&mut checking) {
+            Phase::Checking(mut checking) => match poll_checking_worker(
+                &mut checking,
+                #[cfg(test)]
+                state.checking_relay.as_deref(),
+            ) {
                 CheckingPoll::Pending => {
                     state.phase = Phase::Checking(checking);
                     false
@@ -2418,6 +2510,7 @@ mod tests {
 
     fn discarded_restore_state(folder: PathBuf) -> SidecarRestoreState {
         SidecarRestoreState {
+            checking_relay: None,
             common: Common {
                 request_id: 1,
                 started_at: std::time::Instant::now(),
@@ -2882,7 +2975,7 @@ mod tests {
         };
 
         assert!(matches!(
-            poll_checking_worker(&mut checking),
+            poll_checking_worker(&mut checking, None),
             CheckingPoll::Pending
         ));
         assert!(checking.handle.is_some());
@@ -2892,7 +2985,7 @@ mod tests {
         while !checking.handle.as_ref().unwrap().is_finished() {
             std::thread::yield_now();
         }
-        match poll_checking_worker(&mut checking) {
+        match poll_checking_worker(&mut checking, None) {
             CheckingPoll::Complete(Ok(result)) => {
                 assert_eq!(result.flush.unwrap_err(), "synthetic flush result")
             }
