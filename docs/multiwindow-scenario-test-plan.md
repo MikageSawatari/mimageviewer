@@ -322,5 +322,8 @@ collection restore は一覧への復帰先として保持されるが、現在�
 | 20260923T051403475Z | MultiWindowStills | **exit 0** | 全段 (フォルダ窓・ZIP 窓の描画、片側寄せ、parked 比較、往復、兄弟窓不変、閉じる) を通過 |
 | 20260923T051429982Z | MultiWindowPdf | **exit 0** | 既存シナリオ |
 
+| 20260923T075726158Z | MultiWindowStills | **exit 0** | 公開候補の再確認。対象は master `41b8c7585` (製品コードは配布ビルド `72070eb07` と同一、以降はテスト・文書のみ) |
+| 20260923T075742863Z | MultiWindowPdf | **exit 0** | 同上 |
+
 証跡は各 run の `target/ui-smoke-runs/<run>/`。窓の切り替えは test-script の activation 要求で、OS のクリック経路は含まない。
 `MultiWindowPdf` の出力には入力デスクトップ preflight の行が出ていない。preflight が新シナリオだけに入っている可能性があり、T2 で確認する。
