@@ -115,7 +115,7 @@ Phase A2 として扱う。Phase A 以前は両 view の初回 install でも同
 - 三経路とも UI スレッドの cold DB 検索や大量の index 投影を避ける。
   preview cache の一般的な版管理と回転の owner 整理は、従来どおり別途監査する。
 
-## 段階 B 設計 (2026-09-23、設計のみ・独立レビュー待ち)
+## 段階 B 設計 (2026-09-23、独立レビュー指摘を反映・設計のみ)
 
 ### 共通の install 契約
 
@@ -124,14 +124,14 @@ Phase A2 として扱う。Phase A 以前は両 view の初回 install でも同
   `page_key_for_grid_item` で実ページを識別する。worker は同じ exact-key 一括 lookup と
   `PageEditSnapshot::project` を使う。新しい index map owner は作らない
   (`src/app/page_edit_snapshot.rs:38-68, 74-146, 146-175`)。
-- 各要求は `{ViewerContextId, TopLevelGridSurface + surface generation, source items_generation,
-  request sequence, page_edit_revision, candidate order token}` を持つ。worker は候補 items の
-  **確定順序**に対する `(snapshot, projection)` を同じ結果に載せる。UI は全 stamp と最新 sequence、
-  候補順序 token を照合し、items の generation 更新と投影 install を一度の受理で行う。
-  token は不変候補 payload の identity とし、UI で全件の key を再計算して照合しない。
-  `source items_generation` は旧一覧からの要求を拒否し、受理後の新 generation に投影を結び直す。
-  edit revision が進んだ結果は拒否して再 prepare する。失敗・取消・surface 退出は現行の正しい
-  受理済み一覧を保持するか空の準備表示へ戻し、古い結果を部分 install しない。
+- 各要求は `{ViewerContextId, surface + surface generation, source items_generation,
+  request sequence, page_edit_revision}` と不変の候補 items を持つ。候補は sequence に一意に束縛し、
+  独立の order token はその外から候補順序を変更できる経路にだけ付ける。worker は**確定順序**の
+  `(snapshot, projection)` を同じ結果に載せる。UI は stamp と最新 sequence を照合し、items の
+  generation 更新と投影 install を一度の受理で行う。UI で全件 key を再計算しない。
+  `source items_generation` は旧一覧を拒否するが、同じ surface 内で別要求の受理により進んだ場合は
+  最新意図を新 generation に rebasing して再 prepare する。edit revision の進行も再 prepare する。
+  失敗・取消・surface 退出では正しい受理済み一覧を保持し、古い結果を部分 install しない。
   Phase A の受理例は `src/app/subfolder_expansion.rs:2119-2133` と
   `src/app/collection_grid.rs:1887-1930, 2320-2333`。
 
@@ -143,20 +143,27 @@ Phase A2 として扱う。Phase A 以前は両 view の初回 install でも同
   (`src/global_search_ui.rs:136-143, 1753-1765, 1853-1868, 1889-1935, 1248-1255, 1301-1309`)。
   **初回、各 streaming tick、Done、sort/filter・集約/ドリル変更、mtime 完了**を同じ prepare 入口にする
   (`src/global_search_ui.rs:1697-1726, 1896-1935`)。
-- 検索 session の単一 worker に受信済み hit batch (最大 500 件) と view/sort/filter 変更を順に渡し、
-  worker が候補順と Phase A snapshot の差分 lookup / 投影を作る。既存 UI の batch ごとの
-  rating `get_many` も worker 側へ移す (`src/global_search_ui.rs:1766-1817`、
-  `src/global_search.rs:35-37`、`src/fts_index.rs:69`)。新しい query / close では session を取消す
-  (`src/global_search_ui.rs:414-436, 1562-1597`)。
+- 検索 session の単一 worker に、**全 accepted hit batch を順序を保つ FIFO**で渡す。batch は
+  最大 500 件で連番を付ける。view/sort/filter と Done は最終 batch 連番を含む小さい「最新希望
+  view command」に畳むが、batch を latest slot で失わない。worker は指定連番まで追記してから
+  command と候補順、Phase A snapshot の差分 lookup / 投影を作る。UI の `all_hits` 全件を
+  要求ごとに複製しない。既存 UI も各 hit を clone
+  して保持するため、この追加コピーがないことを計測する (`src/global_search_ui.rs:439-459,
+  1759-1817`、`src/global_search.rs:35-37`、`src/fts_index.rs:69`)。batch rating `get_many` も
+  worker へ移す。新 query / close は session を取消す (`src/global_search_ui.rs:414-436, 1562-1597`)。
 - worker は同じ `PageEditSnapshot` と「照会済み key」集合 (空ヒットも記録) を session 内で再利用し、
   その tick に**新しく現れた実ページ key のみ**を smart-folder と同じ DB API で batch lookup する。
   並べ替え・ドリルは DB を引き直さず worker で再投影する。編集 revision 変更時だけ当該
   session の照会済み集合を失効させる。`load_and_project` を tick ごとに全件実行しない。
-  request は latest-wins の 1 slot に畳み、完了前の tick は最新候補へ収束させる。
-  検索は最大 10,000 hit、batch は 500 件なので、key/値/投影は O(採用 hit 数)、DB は
-  新規 key にだけ上限付き batch、UI への完成結果も 1 件に抑える。大量候補の sort / 投影 /
-  stale payload の破棄は worker 側に置き、UI に全件 clone や cold SELECT を追加しない
-  (`docs/ui-responsiveness.md:335-356, 386-408`)。
+  view command は単一 in-flight prepare と最新希望 sequence に分ける。受理/拒否/失敗のたび UI は
+  現在の generation を acknowledgement として返し、同一 session/surface にさらに新しい希望が
+  あれば直ちにそれを prepare する。generation/revision だけで拒否された最新希望も新 stamp で
+  再実行する。Done は希望状態に残すので、A が G→G+1 を install して B が旧 G で拒否されても、
+  後続 tick なしで B/Done の最終候補を G+1 から作り直す。旧 run/退出だけは再試行しない。
+  検索は最大 10,000 hit。key/値/投影は O(採用 hit 数)、DB は新規 key の上限付き batch のみ。
+  sort/投影/stale payload の破棄は worker。受理時の thumbnail/selection 再利用は既に全件を
+  走査するため (`src/global_search_ui.rs:1190-1309`)、10,000 hit の UI pass 時間を gate にする。
+  UI に追加の全件 clone や cold SELECT を置かない (`docs/ui-responsiveness.md:335-356, 386-408`)。
 - 受理は共通 stamp に加え search run ID、query/filter、Flat/Aggregated/Drilled path、sort、
   最新 rebuild sequence、初回なら Search surface の入場意図、以後は
   `items_are_global_search_view` を確認する。旧 run、後続 tick、
@@ -174,20 +181,30 @@ Phase A2 として扱う。Phase A 以前は両 view の初回 install でも同
   path status 判定 (`src/app.rs:19304-19340`) も worker へ移し、container 行には page snapshot を作らない。
 - **ページ open 境界**は履歴行を選択した瞬間ではなく、選択した container の folder scan または
   ZIP/PDF enumeration が実ページ items と順序を確定し、最初の `open_fullscreen` を許す直前。
-  `note_reading_history_open` は戻り先だけを記録し、folder の auto-open は列挙後、
-  ZIP/PDF は deferred open を使う (`src/app.rs:19343-19375, 40014-40039,
-  22513-22521, 22645-22666, 25249-25277, 26293-26307`)。
-  この列挙/scan worker の後段で、実ページ items に `PageEditSnapshot::load_and_project` を実行する。
-  PDF meta-cache の先行 placeholder は履歴起点では paint/auto-open を保留する
-  (`src/app.rs:26331-26342, 26522-26543`)。
-  変換 archive も最終的な実ページ key が確定してから同じ経路へ入れる。
-- 受理は要求時の履歴 context/surface generation を保持する open intent、選択 row の
-  key・container path/kind、open/scan/enumerate sequence、行き先の items generation/order、
-  edit revision を照合する。履歴 surface から物理 view へ移った後は、現在の surface でなく
-  この intent と行き先を照合する。別窓 open は source と行き先の `ViewerContextId` も照合する。
-  sidecar 後段が用意済み投影を prefix hydration で上書きしないよう同じ continuation を通し、
-  page snapshot と items を受理してから deferred fullscreen を解放する
-  (`src/app.rs:27385-27399, 28008-28043`)。Video/Audio はページ投影対象外。
+  `HistoryPageOpenIntent` は `{source context/surface generation, row key/path/kind,
+  open sequence, destination context ID, logical archive source, scan attempt sequence}` を保持する。
+  row 選択時に作り、`open_grid_container_in_detached_book_context` の早期 return **より前**に
+  detached destination へ渡す。main の `note_reading_history_open` は戻り先記録であり intent の
+  代用にしない (`src/app.rs:19343-19375, 40011-40039, 46717-46759`)。
+- folder auto-open (`src/app.rs:22513-22521, 22645-22666`)、ZIP enumerate
+  (`src/app.rs:25416-25469, 25620-25750`)、PDF enumerate の worker 後段で、行ではなく
+  destination の確定実ページ items に `load_and_project` を実行する。PDF meta-cache の
+  placeholder install は最終受理ではなく fullscreen を保留する (`src/app.rs:26331-26342,
+  26522-26543`)。検証時、page 数と**page key 順序**が一致すれば placeholder の既存
+  `items_generation` に対して投影を受理し、再 install しない branch でもここが受理点となる。
+  数または key 順序が違えば再構築候補と投影を同時受理する (`src/app.rs:26793-26834`)。
+- 変換 archive の intent は `MainGridArchive` / detached owner の conversion completion を
+  経て destination まで移し、alias/最終 container path が定まった**後**の実 item に
+  `page_key_for_grid_item` を適用する。source 論理 path と変換 cache path を混同しない
+  (`src/app.rs:19379-19417`, `src/ui_dialogs/archive_convert.rs:449-571, 1177-1251`)。
+  受理は source intent と destination ID、scan/enumerate attempt、destination items
+  generation/順序、edit revision を照合する。履歴 surface を出た後は元 surface の現在値でなく
+  intent の source stamp と destination の生存を照合する。sidecar continuation も同じ投影を
+  引き継ぎ、prefix hydration で上書きしない (`src/app.rs:27385-27399, 28008-28043`)。
+  password prompt は fullscreen を保留し、retry は attempt を進めて再 prepare する。
+  cancel、scan/enumerate/conversion/error、channel 切断、destination 破棄は intent と deferred
+  fullscreen を終端し、旧結果を受理しない (`src/app.rs:26836-26924, 26959-27020`)。
+  Video/Audio はページ投影対象外。
 
 ### レーティング一覧: 初回・再ソート・reload
 
@@ -197,25 +214,50 @@ Phase A2 として扱う。Phase A 以前は両 view の初回 install でも同
   (`src/rating_view.rs:60-120, 123-154`, `src/app.rs:24833-24855, 24879-24922,
   24933-24997, 25009-25081`)。build worker を final order + pin metadata + Phase A
   exact-key snapshot/projection まで拡張し、初回/DB reload は完成結果だけ受理する。
-- ローカル sort と既存行だけの★変更は、現在 bundle の同じ keyed snapshot を read-only lease で
-  worker に渡し、**DB を再照会せず**新順へ投影する。追加行のある reload は新 key だけを照会し、
-  edit revision が違えば再 prepare する。lease は同じ snapshot の参照であり第二の編集正本ではない。
-  行・snapshot を UI で大きく clone せず、希望 sort と行変更も受理まで live rows に反映しない。
-  受理時は context/surface generation、★数、
-  rating build/reload sequence、sort と display order、行 membership/order token、
-  source items_generation、edit revision を照合し、rows と items と投影を原子的に install する。
-  `RatingViewPending` が現在は stars しか持たないため sequence を追加する
-  (`src/rating_view.rs:60-90`, `src/app.rs:24886-24909, 25017-25022, 25074-25117`)。
+- ローカル sort も**worker-side rebuild**にする。worker が rating DB の現在行と pin を読み、
+  希望 sort/★数を適用して最終 rows/items を作り、
+  exact-key snapshot と投影を用意する。既存 mutable rows / snapshot を worker に貸さず、
+  UI で全行 clone・cold query・lock 待ちをしない。現行の UI 内 sort と★変更の in-place 行更新は
+  受理後の一括 install に移す (`src/app.rs:13875, 14720, 24918-24977, 30644-30656`)。
+  表示中の sort/rows/items/投影は受理まで旧版を保ち、希望 sort は要求内に置く。
+  ★変更は現行の成功した DB write の後でだけ新希望にし、失敗分を公開しない
+  (`src/app.rs:57052-57077, 57092-57125`)。prepare 中の sort/★/reload は希望 sequence を
+  更新し、worker completion 後に最新希望を再 prepare する。古い結果を live rows に混ぜず、
+  先行 prepare 中の★削除/再配置も最新 DB から再構築する。
+- 受理時は context/surface generation、★数、最新 build/reload/sort/★ sequence、希望 sort、
+  source items_generation、edit revision を照合し、rows/items/投影を原子的に install する。
+  order は不変候補 sequence が保証する。generation/revision だけで拒否された最新希望は rebase。
+  `RatingViewPending` に sequence が必要 (`src/rating_view.rs:60-90`,
+  `src/app.rs:24886-24909, 25017-25022, 25074-25117`)。
 
 ### pending 表示、context、検証と境界
 
 - **未編集画像を先に描き、後から編集済み画像へ切り替えることは不可**。
   色調補正/カラー化/LUT は初回 paint から完成画像と同じ色であるべき確定要件
-  (`docs/display-pipeline.md:1918-1941` の R1–R4)。snapshot pending 中は前の受理済み
-  display unit をその identity のまま保つ。初回/別ページで保持画像が無ければ中立の準備表示にし、
-  target の raw/fullscreen texture は公開しない。受理済み投影と当該ページの適切な rendition が
-  揃ってから target を提示し、次の held-page 移動はそのページの提示後に受理する。
-  これにより R1 のページ飛ばしも防ぐ。失敗時は誤った raw へ fall back せず既存表示/準備表示を保つ。
+  (`docs/display-pipeline.md:1918-1941` の R1–R4)。**表示 owner** は bundle の
+  `fs_holdover_tex` 内 `FsHoldover::NavigationSequence` / `FsNavigationSequenceTarget` を
+  virtual-list 置換の typed purpose へ拡張する。既存の holdover だけでは対象 edit の完成を証明
+  できない (`src/app/viewer_context_registry.rs:998, 2175`,
+  `src/app.rs:8847-8858, 9010-9018, 9071-9096, 9439-9465`)。
+- target は `{destination ViewerContextId, accepted items_generation, request sequence,
+  anchor exact page key, display unit の全 exact page key, page_edit_revision}`。受理済み投影に
+  対する各ページの編集 plan と source generation が一致する**完成 rendition stamp**を producer が
+  付け、全ページの最終効果・mask/erase/conceal/調整/geometry・comic 注釈を含む完成 texture
+  (必要時 `FinalCompositeKey` 一致かつ `complete=true`) のみ ready とする。編集なしと確定した
+  ページだけは同じ page/source identity の raw を ready とできる。単なる page texture identity、
+  best-effort comic/final cache、`FsCacheEntry::Failed` は ready 証明にならない
+  (`src/app.rs:8249-8253, 8807-8813, 17746-17755, 66599-66608, 67256-67261`,
+  `src/ui_fullscreen.rs:9160-9204, 10037-10045`)。純粋な ready 判定と producer 起動を分け、
+  paint 側の raw/edit/thumb fallback、見開き/連続/ルーペも同じ gate に通す
+  (`src/ui_fullscreen.rs:10287-10297, 25652-25723`)。
+- 初回 open は ready まで**grid に留め**、既存 fullscreen 中の置換は直前の受理済み
+  `FsDisplayUnitHoldover` をその identity で描き続ける。中立 fullscreen に入らない。
+  ready の target を実際に paint した時だけ sequence を解放し、次の held move を受理する。
+  failure (scan/decode/edit/final/comic/upload または channel 切断) は pending を終端し、
+  fullscreen 中なら grid に戻して error を示し、初回なら grid に留まる。cancel/close/context 破棄も
+  終端する。新要求は旧 sequence を supersede し直前の有効表示を引き継ぐか grid に戻し、旧 completion
+  を拒否する。password prompt は保留し retry で新 attempt、取消で終端する。timer で raw を解禁
+  しない。worker が応答しなくても grid/直前画像と取消操作を保ち、中立 loading に閉じ込めない。
 - snapshot と投影、pending/sequence は `ViewerContextBundle` に属し、mount/swap と cancel/drop を
   同じ context で扱う (`src/app/viewer_context_registry.rs:1021, 2194, 2836-2851`)。
   兄弟 context の index は渡さない。§1.267 の collection root 直接 Image は独立 context に
@@ -226,9 +268,12 @@ Phase A2 として扱う。Phase A 以前は両 view の初回 install でも同
 - テストでは Phase A の ignored 三件を un-ignore して production prepare/acceptance を通す。
   履歴 test は container index の mask 判定から、開いた Folder/ZIP/PDF の実ページ paint 判定へ直す
   (`src/app/tests.rs:1117-1161`)。search の連続 rebuild (新 key の lookup と旧 key の再利用)、
-  sort/drill 変更、rating の複数行 local re-sort と reload、各 route の古い sequence/revision/
-  context/order 拒否、pending 中の raw 禁止と最終 paint、通常フォルダ対照を追加する。
-  10,000 hit 条件で worker DB batch 数・UI pass 時間・stale result drop を計測する。
+  sort/drill 変更、G→G+1 中の B 拒否と `Done` 後の再 prepare、FIFO batch 無欠落、rating の
+  複数行 local re-sort/reload と prepare 中の sort/★変更、各 route の古い sequence/revision/
+  context 拒否を追加する。履歴は PDF placeholder 数/key 一致・不一致、password retry/cancel、
+  archive conversion の最終 key、detached destination 受理を通す。pending 中の raw/thumb 禁止、
+  成功 paint、各 producer failure/channel 切断/cancel/置換/閉じる終端、通常フォルダ対照を検証する。
+  10,000 hit で worker DB batch 数・UI pass 時間/全件 clone 無し・stale drop を計測する。
 - **Phase A2 との境界**: B は上記三 route の初回/置換/再ソート/履歴ページ open の受理まで。
   受理後の Snapshot Lock、rename、metadata import、content-identity restore、late write、
   兄弟 context 間の編集再同期、filename-stack grouping/flat 切替は A2 のまま
