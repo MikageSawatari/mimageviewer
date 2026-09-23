@@ -7,16 +7,23 @@ always-active guidance.
 
 ## Model Roles And Coordination
 
-- Default for Codex-led development: parent `gpt-6-astra` / `medium`;
-  implementation and tests `gpt-5.6-sol` / `xhigh`; independent review
-  `gpt-5.6-sol` / `xhigh`, with a reviewer separate from the implementer.
-  Later explicit user instructions override these defaults. Do not automatically
-  escalate to Astra high, max, or ultra during this usage-saving trial.
-- Starting with the next release after the 2026-09-09 role decision, release
-  preparation and publishing are led by ClaudeCode Opus. This includes the
-  release checklist from changelog/version updates through distribution builds,
+- Default development roles (2026-09-23 decision): ClaudeCode Opus 5.5 / `high`
+  leads overall management, design, task assignment, and acceptance;
+  Codex `gpt-6-sol` / `xhigh` implements and tests; a separate
+  `gpt-6-sol` / `xhigh` reviewer independently checks design and implementation.
+  Opus verifies findings and acceptance evidence; its own review does not replace
+  the independent reviewer. Later explicit user instructions override these defaults.
+- Use `gpt-6-astra` / `medium` only for bounded second opinions on difficult
+  structural designs, unresolved root causes, or material disagreements between
+  the design lead and reviewer. State the unresolved question and provide the
+  relevant code, findings, and evidence. Astra is not a standing coordinator or
+  an automatic extra review gate. Do not automatically raise Opus above `high`
+  or Astra above `medium`, or substitute Fable, during this usage-saving trial.
+- Release preparation and publishing remain led by ClaudeCode Opus (the
+  2026-09-09 responsibility split); the current lead uses Opus 5.5 / `high`.
+  This includes the release checklist from changelog/version updates through distribution builds,
   signing, GitHub Release, website updates, and distribution-channel submissions.
-  Development remains Codex-led with the model roles above. See
+  Product development follows the management/implementation split above. See
   [the release handoff](docs/release-operations.md#開発と公開の担当・引き継ぎ).
 - Routine release operations do not require a Codex coordinator, subagent team,
   or automatic Codex review. ClaudeCode Opus follows the existing release gates
@@ -27,6 +34,10 @@ always-active guidance.
 - This policy authorizes bounded subagents for substantial implementation and
   independent review. Handle simple questions and minor documentation changes
   locally; do not create a team solely to satisfy the role table.
+- Codex implementation/review tasks execute bounded handoffs from the design
+  lead; do not create an additional Astra parent solely to coordinate them.
+  When substantial work is delegated inside Codex, use the Sol settings above
+  and keep implementation and independent review in separate contexts.
 - Instructions do not change the running model. Use explicit model/effort
   overrides where supported, with a bounded handoff rather than full-history
   inheritance. The user selects the parent in the GUI. Report a mismatch or
@@ -36,7 +47,7 @@ always-active guidance.
   rationale, open findings, and valid verification evidence. Reconfigure an
   existing reviewer if supported; otherwise use a new reviewer with the requested
   settings. Do not repeat completed work or keep assigning work to the old role.
-- The parent defines scope, invariants, acceptance criteria, and file ownership
+- The design lead defines scope, invariants, acceptance criteria, and file ownership
   once per coherent chunk. Implementers verify key premises and make routine
   decisions within that scope; report contradictions, scope changes, and blockers.
   One writer owns each shared file. Do not require approval for every small edit.
@@ -52,13 +63,13 @@ always-active guidance.
   [the build/test policy](docs/development-build-and-test.md#検証の担当と結果の再利用).
   Required regression/full gates, verification builds, interactive approval,
   real-data protection, and feature preservation remain mandatory.
-- For Codex-led development, historical ClaudeCode design/acceptance duties map to the
-  parent and independent reviewer above. Required structural agreement means
-  agreement between that design lead and independent reviewer, with implementation
-  premise checks by the implementer. Preserve historical records and detached
-  plan constraints/decision recording. This mapping does not transfer release
-  ownership to Codex. Explicit ClaudeCode-led development tasks retain their
-  requested lead and use the independent review policy in `CLAUDE.md`.
+- Historical ClaudeCode design/acceptance and Codex implementation/review duties
+  map to the roles above. Required structural agreement means agreement between
+  the design lead and independent reviewer, with implementation premise checks
+  by the implementer. Preserve historical records and detached plan constraints
+  and decision recording. For explicit Codex-led tasks, design/acceptance duties
+  map to the requested lead and independent reviewer, with the same structural
+  agreement requirements; do not infer an Astra coordinator.
 
 ## Before Editing
 
