@@ -1454,6 +1454,37 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-23 Ctrl+G の `/` 区切り画像結果を複数窓で開くと初回描画前に閉じる件（Codex実装、独立レビュー構造合意、BA-7 の producer→terminal 境界）**
+
+`src/app.rs` の `poll_detached_physical_folder_open` で、detached image request の対象を
+物理 scan の `GridItem::Image` に対応付ける照合だけを、raw `folder_tree::path_eq`
+（小文字化のみ）から既存の `path_key::eq_keep_drive`（drive 保持、大小文字・区切り文字統一）
+へ変更した。Ctrl+G は `/` 区切りの path を保持し得る一方、Windows の `read_dir` が
+返す path は `\` を使うため、同一ファイルを「対象不在」と誤判定していた。
+この producer が `Failed` を返すと `update_active_viewer_context` が正規の
+`terminate_active_detached_open_before_viewport` を発行し、`Closing` を受けた窓が
+`active_terminal_before_viewport` で退役する。sidecar restore の開始直後に見える
+`prepare_viewer_presentation_close_terminal` は、その terminal 処理の結果としても発生する。
+今回の I1 再現では `pending_return_to_parent` を立てずに同じ退役へ到達した。
+提供ログは対象画像の path と terminal 発行元を出していないため、実機の個々の試行について
+別の close 要求が重なった可能性までは断定しない。
+
+分類は BA-7 の初期 open producer と typed session terminal の境界で起きる誤入力。
+runtime reducer、viewport、host、placement、close 操作の契約は変更しない。
+対象画像を先頭へ代替する fallback や窓の保持 guard は置かず、request と列挙結果の
+同一性を producer の対応付け点で正す。`src/app/multiwindow_scenario_tests.rs` の
+実物理 scan・有効 sidecar・I1 シナリオは修正前に初回 frame で窓消失、修正後に対象画像を描画。
+検索、レーティング、閲覧履歴、類似結果、コレクション、スマートフォルダのうち
+`GridItem::Image` を共通 detached open router に渡す入口は、path 表記が混在した場合に
+同じ誤判定を受ける。各入口の画面固有の状態や非画像の開き方には手を加えない。
+
+P2 追補: `src/app/snapshot_ops.rs` の required fullscreen target 解決でも、明示 target
+と scan 済み画像・動画・PDF の path、および ZIP 外側 path の direct / converted alias
+確認に同じ区切り文字差があった。strict target の照合だけを `path_key::eq_keep_drive`
+へ統一し、ZIP 内 entry 名の照合は変更しない。`resolve_snapshot_target_idx` の
+preferred / fallback 解決（同ファイル約 1806–1845 行）は別の契約を持つため今回変更せず、
+後続レビュー項目とする。
+
 **2026-09-23 複数viewportシナリオテスト T3（Codex実装、独立レビュー待ち）**
 
 `test-script`限定でactive画像resourceのmesh提出直後と、deferred passive snapshotの

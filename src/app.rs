@@ -41364,13 +41364,14 @@ impl App {
                     app.load_folder_with_scan(ready.path, Some(scan));
                 });
                 // 明示された画像 request は厳密に解決する。snapshot / folder-nav 用 helper は
-                // target miss 時に先頭へ fallback するため、ここでは使用しない。Windows の
-                // filesystem identity に合わせ、path の大文字小文字差は path_eq で吸収する。
+                // target miss 時に先頭へ fallback するため、ここでは使用しない。検索や
+                // 保存済み一覧の path と read_dir の path は区切り文字が異なり得るので、
+                // drive を保持する同一の filesystem identity で照合する。
                 let Some(image_idx) = self.items.iter().position(|item| {
                     matches!(
                         item,
                         GridItem::Image(candidate)
-                            if crate::folder_tree::path_eq(candidate, &image_path)
+                            if crate::path_key::eq_keep_drive(candidate, &image_path)
                     )
                 }) else {
                     self.log_detached_image_window_debug(format!(

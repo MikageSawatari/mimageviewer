@@ -639,6 +639,136 @@ fn run_scenario_a(book: ScenarioABook) {
     );
 }
 
+/// A synthetic search `GridItem::Image` exercises the production detached router, scan,
+/// sidecar restore, and lifecycle. Double-click dispatch and search-index integration are T2.
+#[test]
+fn multiwindow_scenario_search_result_image_sidecar_reaches_paint() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.sidecar_backup_enabled = true;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.settings.detached_viewer_open_images_in_window = true;
+
+        let folder = app.tmp.path().join("search-hit-parent");
+        std::fs::create_dir(&folder).unwrap();
+        let page = folder.join("page.png");
+        save_portrait(&page, [32, 120, 72]);
+        save_portrait(&folder.join("a-before.png"), [120, 32, 72]);
+        let search_page = PathBuf::from(page.to_string_lossy().replace('\\', "/"));
+        let mut sidecar = crate::sidecar::SidecarFile::new(folder.clone());
+        sidecar.set_adjust("page.png", crate::adjustment::AdjustParams::default());
+        assert!(sidecar.flush_blocking());
+        assert!(matches!(
+            crate::sidecar::SidecarFile::load_for_import(&folder),
+            crate::sidecar::SidecarImportLoad::Loaded(_)
+        ));
+
+        // Double-click dispatch uses this router before the generic image/fullscreen branch.
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.open_global_search();
+        app.global_search.focus_request = false;
+        app.global_search.done = true;
+        app.replace_search_view_items(vec![GridItem::Image(search_page.clone())], vec![None]);
+        assert!(app.open_grid_container_in_detached_book_context(&driver.ctx, 0));
+        let window_id = app.active_detached_window_id().expect("search hit opened a window");
+        let viewport = App::detached_image_window_viewport_id(window_id);
+        // ROOT retains focus until the newly created child host has received focus.
+
+        let mut scan_outcome = DetachedPhysicalFolderOpenPoll::Waiting;
+        wait_until(
+            "search hit parent scan",
+            std::time::Duration::from_secs(10),
+            || {
+                scan_outcome = app.with_active_viewer_context(|active| {
+                    active.poll_detached_physical_folder_open(&driver.ctx)
+                })
+                .expect("detached owner remains mountable");
+                !matches!(scan_outcome, DetachedPhysicalFolderOpenPoll::Waiting)
+            },
+        );
+        if matches!(scan_outcome, DetachedPhysicalFolderOpenPoll::Failed) {
+            // App::update uses this terminal transition for the same failed scan result.
+            app.with_active_viewer_context(|active| {
+                active.terminate_active_detached_open_before_viewport(
+                    "detached_physical_open_failed",
+                );
+            })
+            .expect("detached owner remains mountable");
+        }
+        assert!(app.sidecar_restore.is_some(), "valid parent sidecar starts a restore");
+        let relay = sidecar_restore::SidecarCheckingRelay::new();
+        app.attach_sidecar_checking_relay_for_test(Rc::clone(&relay));
+        wait_until(
+            "search hit sidecar checking completion",
+            std::time::Duration::from_secs(10),
+            || {
+                app.poll_sidecar_restore(&driver.ctx);
+                relay.captured()
+            },
+        );
+
+        let mut before = ScenarioFrame {
+            number: 0,
+            records: HashMap::new(),
+            errors: HashMap::new(),
+        };
+        let held = driver.root(&mut app);
+        assert!(
+            !assert_i1_open_or_paint(
+                "search result image with sidecar",
+                app.detached_window_state(window_id).is_some(),
+                window_id,
+                viewport,
+                &before,
+                &held,
+            ),
+            "held sidecar cannot paint completed content"
+        );
+        before = held;
+        relay.release();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let after = driver.root(&mut app);
+            let painted = assert_i1_open_or_paint(
+                "search result image with sidecar",
+                app.detached_window_state(window_id).is_some(),
+                window_id,
+                viewport,
+                &before,
+                &after,
+            );
+            if painted && app.sidecar_restore.is_none() && stable_content(&mut app, window_id).is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search hit never painted: window={:?} sidecar={} fullscreen={:?} pending={:?} paint={:?} errors={:?}",
+                app.detached_window_state(window_id),
+                app.sidecar_restore.is_some(),
+                app.with_active_viewer_context(|active| active.fullscreen_idx),
+                app.with_active_viewer_context(|active| active.fs_pending.len()),
+                records_for(&after, viewport),
+                after.errors,
+            );
+            before = after;
+            std::thread::yield_now();
+        }
+        assert!(app.items_are_global_search_view, "main search view is unchanged");
+        assert!(app.items.iter().any(|item| matches!(item, GridItem::Image(path) if path == &search_page)));
+        assert!(app.with_active_viewer_context(|active| {
+            active.fullscreen_idx.and_then(|idx| active.items.get(idx)).is_some_and(
+                |item| matches!(item, GridItem::Image(path) if crate::path_key::eq_keep_drive(path, &search_page)),
+            )
+        }).unwrap_or(false), "detached viewer selected the requested search hit");
+    })
+    .join()
+    .unwrap();
+}
+
 #[test]
 fn multiwindow_scenario_a_folder_sidecar_restore_reaches_paint() {
     std::thread::spawn(|| run_scenario_a(ScenarioABook::Folder))

@@ -1725,7 +1725,7 @@ impl App {
                 matches!(
                     item,
                     GridItem::Image(candidate) | GridItem::Video(candidate)
-                        if crate::folder_tree::path_eq(candidate, path)
+                        if crate::path_key::eq_keep_drive(candidate, path)
                 )
             }),
             SnapshotTarget::PdfPage { pdf_path, page_num } => self.items.iter().position(|item| {
@@ -1735,7 +1735,7 @@ impl App {
                         pdf_path: candidate,
                         page_num: candidate_page,
                         ..
-                    } if crate::folder_tree::path_eq(candidate, pdf_path)
+                    } if crate::path_key::eq_keep_drive(candidate, pdf_path)
                         && candidate_page == page_num
                 )
             }),
@@ -1759,16 +1759,16 @@ impl App {
         let (tree_path, target) = {
             let nav = self.zip_nav.as_ref()?;
             let tree_path = nav.tree.zip_path.clone();
-            let direct = crate::folder_tree::path_eq(&tree_path, requested_outer);
-            let converted_alias =
-                self.archive_source_override
-                    .as_deref()
-                    .is_some_and(|source| {
-                        crate::folder_tree::path_eq(source, requested_outer)
-                            && self.current_folder.as_deref().is_some_and(|current| {
-                                crate::folder_tree::path_eq(current, &tree_path)
-                            })
-                    });
+            let direct = crate::path_key::eq_keep_drive(&tree_path, requested_outer);
+            let converted_alias = self
+                .archive_source_override
+                .as_deref()
+                .is_some_and(|source| {
+                    crate::path_key::eq_keep_drive(source, requested_outer)
+                        && self.current_folder.as_deref().is_some_and(|current| {
+                            crate::path_key::eq_keep_drive(current, &tree_path)
+                        })
+                });
             if !direct && !converted_alias {
                 return None;
             }
@@ -2167,6 +2167,71 @@ mod tests {
         app.visible_indices = (0..app.items.len()).collect();
         app.current_folder = Some(PathBuf::from(r"E:\test"));
         app
+    }
+
+    #[test]
+    fn required_snapshot_target_matches_scanned_path_separator_variants() {
+        use crate::snapshot::SnapshotTarget;
+
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\page.png")),
+            GridItem::Video(PathBuf::from(r"E:\test\clip.mp4")),
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"E:\test\book.pdf"),
+                page_num: 3,
+                content_type: None,
+            },
+        ]);
+        assert_eq!(
+            app.resolve_required_snapshot_target_idx(&SnapshotTarget::Fs(PathBuf::from(
+                "E:/test/page.png"
+            ))),
+            Some(0)
+        );
+        assert_eq!(
+            app.resolve_required_snapshot_target_idx(&SnapshotTarget::Fs(PathBuf::from(
+                "E:/test/clip.mp4"
+            ))),
+            Some(1)
+        );
+        assert_eq!(
+            app.resolve_required_snapshot_target_idx(&SnapshotTarget::PdfPage {
+                pdf_path: PathBuf::from("E:/test/book.pdf"),
+                page_num: 3,
+            }),
+            Some(2)
+        );
+
+        let zip_path = PathBuf::from(r"E:\test\book.zip");
+        app.items = vec![GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: "page.png".into(),
+        }];
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(
+            zip_path.clone(),
+            vec![crate::zip_loader::ZipImageEntry {
+                entry_name: "page.png".into(),
+                uncompressed_size: 0,
+                mtime: 0,
+            }],
+        ));
+        app.zip_nav = Some(crate::zip_tree::ZipNavState::new(tree));
+        assert_eq!(
+            app.resolve_required_snapshot_target_idx(&SnapshotTarget::ZipImage {
+                zip_path: PathBuf::from("E:/test/book.zip"),
+                entry_name: "page.png".into(),
+            }),
+            Some(0)
+        );
+        app.archive_source_override = Some(PathBuf::from(r"E:\test\book.rar"));
+        app.current_folder = Some(PathBuf::from("E:/test/book.zip"));
+        assert_eq!(
+            app.resolve_required_snapshot_target_idx(&SnapshotTarget::ZipImage {
+                zip_path: PathBuf::from("E:/test/book.rar"),
+                entry_name: "page.png".into(),
+            }),
+            Some(0)
+        );
     }
 
     #[test]

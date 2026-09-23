@@ -123,7 +123,7 @@ texture id 自体は正当に変わり得るので比較しない。
 
 シナリオ = 「fixture × 設定 × 操作列」。操作列は小さな語彙から作る:
 
-`開く(一覧から / パスで)`、`フルスクリーンへ`、`フルスクリーンを閉じる`、`別窓で開く`、
+`開く(一覧から / パスで)`、`検索・一覧ビューから開く`、`フルスクリーンへ`、`フルスクリーンを閉じる`、`別窓で開く`、
 `focus(X)`、`次ページ(X)`、`前ページ(X)`、`拡大(X)`、`閉じる(X)`、`一覧へ戻る`。
 
 設定の軸: 見開き (単/見開き)、端の単ページを片側へ寄せる (ON/OFF)、表紙の扱い、
@@ -198,7 +198,7 @@ texture id 自体は正当に変わり得るので比較しない。
 | --- | --- | --- |
 | T0 | 本計画の独立レビュー | 済 (§8) |
 | T1 | H1 + H2 (画像 mesh) + I1/I2 + H5 (sidecar の受信継ぎ目) + 不具合 A・B の変異確認。指向シナリオ 2 本、pairwise 展開は T2 | 実装・対象検査済み。S-A folder/ZIPとS-Bは現行ソースで成功、A変異はI1、B変異はI2で失敗。独立レビュー待ち |
-| T2 | 操作語彙と組み合わせの拡張、単窓設定での一覧→フルスクリーン→一覧、I3/I4/I6。安定化判定を指向fixture依存から共通化する（T1独立レビューP3） | 未 |
+| T2 | 操作語彙と組み合わせの拡張、単窓設定での一覧→フルスクリーン→一覧、I3/I4/I6。安定化判定を指向fixture依存から共通化する（T1独立レビューP3）。Ctrl+G の double-click dispatch と検索 index の統合検証 | 未 |
 | T3 | 第 2 層 (test-script 観測の追加、シナリオ、1 コマンドのスイート。出荷前手順の項目は増やさない) | 実装・非対話検査済み。独立レビューと公開担当のlive実行待ち。窓切替はtest-script activation要求を使い、OSクリック配送は対象外 (§4) |
 
 ## 7. レビューで確認したい点
@@ -272,3 +272,17 @@ PaintRecordには生のclipを保存し、I2ではmesh頂点領域との交差�
 - I1の明示的エラーは対象窓のviewportに限る。ROOTと兄弟窓のエラーだけでは対象窓の
   消失を許さない単体テストを追加した。
 - 安定化判定の指向fixture依存（P3）はT2で共通化する。
+
+### 8.4 Ctrl+G 検索結果からの画像 open (2026-09-23)
+
+複数ウィンドウ設定で、`/` 区切りの Ctrl+G 画像結果を synthetic な `GridItem::Image` として
+検索一覧に置き、ダブルクリック時と同じ production detached router
+`open_grid_container_in_detached_book_context` を直接呼ぶ。親フォルダには別の先行画像と有効な
+`mimageviewer.dat` を置き、detached context の物理 scan、sidecar checking 保留と再開、
+ROOT / child 描画を通す。I1 に加え、対象画像の選択と main 検索一覧の維持を検査する。
+この layer-1 シナリオの範囲は router・scan・sidecar・lifecycle であり、
+double-click dispatch と検索 index の統合検証は T2 に残す。
+修正前は `poll_detached_physical_folder_open` の raw `path_eq` が検索結果の `/` と
+`read_dir` の `\` を別パスと扱い、対象不在として新規窓を最初の ROOT frame で退役させた。
+テストは `frame=0 -> 1 window=1 vanished without an explicit error` で失敗し、
+drive を保持した区切り文字正規化の照合へ変更後に成功した。
