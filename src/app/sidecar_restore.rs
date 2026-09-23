@@ -1306,9 +1306,27 @@ impl App {
         sidecar: Option<crate::sidecar::SidecarFile>,
     ) -> Phase {
         let effects = std::mem::take(&mut state.common.effects);
+        #[cfg(all(windows, feature = "test-script"))]
+        let imported = effects.edits_changed || effects.tags_changed;
         if let Some(sidecar) = sidecar {
+            #[cfg(all(windows, feature = "test-script"))]
+            let loaded = !sidecar.items().is_empty();
             if let Some(warning) = self.install_sidecar_restore_result(Some(sidecar), effects) {
                 append_warning(&mut state.common.warning, warning);
+            }
+            #[cfg(all(windows, feature = "test-script"))]
+            if loaded {
+                crate::test_script::publish_sidecar_load(
+                    state.common.target_context.serial(),
+                    state.common.items_generation,
+                );
+            }
+            #[cfg(all(windows, feature = "test-script"))]
+            if imported {
+                crate::test_script::publish_sidecar_import(
+                    state.common.target_context.serial(),
+                    state.common.items_generation,
+                );
             }
         } else {
             if let Some(warning) = self.disable_sidecar_restore_cache_owner(&state.common.folder) {

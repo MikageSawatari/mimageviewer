@@ -77,6 +77,107 @@ pub(crate) struct TestScriptContentProof {
     pub(crate) item_identity: String,
     pub(crate) source_texture_id: egui::TextureId,
     pub(crate) source_kind: TestScriptPaintSourceKind,
+    /// The selected source is an exact, complete final composite for this page.
+    pub(crate) final_composite_complete: bool,
+}
+
+/// One image mesh submitted during the latest callback for an exact window.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TestScriptPaintObservation {
+    pub(crate) owner: TestScriptWindowIdentity,
+    pub(crate) content: TestScriptContentProof,
+    pub(crate) texture: egui::TextureId,
+    pub(crate) vertices: Vec<([f32; 2], [f32; 2])>,
+    pub(crate) clip: [f32; 4],
+    pub(crate) viewport_size: [f32; 2],
+    pub(crate) pixels_per_point: f32,
+    pub(crate) placement: String,
+    pub(crate) revision: u64,
+}
+
+#[derive(Clone)]
+struct PendingPaintObservation {
+    content: TestScriptContentProof,
+    texture: egui::TextureId,
+    vertices: Vec<([f32; 2], [f32; 2])>,
+    clip: [f32; 4],
+    viewport_size: [f32; 2],
+    pixels_per_point: f32,
+    placement: String,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum TestScriptSidecarObservation {
+    Loaded,
+    Imported,
+}
+
+thread_local! {
+    static DRAWN_PAINT: std::cell::RefCell<std::collections::HashMap<egui::ViewportId, Vec<PendingPaintObservation>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Called immediately after the paint resource submits its mesh. Read the
+/// actual egui shape rather than recomputing geometry from a layout DTO.
+#[cfg(feature = "test-script")]
+pub(crate) fn record_drawn_paint(
+    painter: &egui::Painter,
+    resource: &crate::gpu_lanczos::FullscreenPaintResource,
+    placement: String,
+) {
+    let Some(content) = resource.test_script_content_proof().cloned() else {
+        return;
+    };
+    let shape = painter.ctx().graphics(|graphics| {
+        graphics
+            .get(painter.layer_id())
+            .and_then(|list| list.all_entries().last().cloned())
+    });
+    let Some(clipped) = shape else {
+        return;
+    };
+    let egui::Shape::Mesh(mesh) = clipped.shape else {
+        return;
+    };
+    let clip_rect = clipped.clip_rect;
+    if mesh.texture_id != resource.paint_texture_id() {
+        return;
+    }
+    let viewport = painter.ctx().viewport_id();
+    let size = painter.ctx().viewport_rect().size();
+    let pixels_per_point = painter.ctx().pixels_per_point();
+    DRAWN_PAINT.with(|drawn| {
+        drawn
+            .borrow_mut()
+            .entry(viewport)
+            .or_default()
+            .push(PendingPaintObservation {
+                content,
+                texture: mesh.texture_id,
+                vertices: mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| ([vertex.pos.x, vertex.pos.y], [vertex.uv.x, vertex.uv.y]))
+                    .collect(),
+                clip: [
+                    clip_rect.min.x,
+                    clip_rect.min.y,
+                    clip_rect.max.x,
+                    clip_rect.max.y,
+                ],
+                viewport_size: [size.x, size.y],
+                pixels_per_point,
+                placement,
+            });
+    });
+}
+
+fn take_drawn_paint(viewport: egui::ViewportId) -> Vec<PendingPaintObservation> {
+    DRAWN_PAINT.with(|drawn| drawn.borrow_mut().remove(&viewport).unwrap_or_default())
+}
+
+pub(crate) fn discard_drawn_paint(viewport: egui::ViewportId) {
+    let _ = take_drawn_paint(viewport);
 }
 
 /// Existing window lifetime owners represented without inventing a shared ID space.
@@ -339,7 +440,7 @@ impl TestScriptSeekStripSnapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) identity: Option<TestScriptWindowIdentity>,
     pub(crate) role: String,
@@ -363,6 +464,9 @@ pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) paint_source_texture: String,
     pub(crate) painted_page_index: Option<usize>,
     pub(crate) paint_revision: u64,
+    pub(crate) paints: Vec<TestScriptPaintObservation>,
+    pub(crate) sidecar_imported: bool,
+    pub(crate) sidecar_loaded: bool,
     pub(crate) seek_strip: TestScriptSeekStripSnapshot,
 }
 
@@ -453,6 +557,100 @@ impl TestScriptWindowSnapshot {
             "paint_revision".into(),
             saturating_rhai_int(self.paint_revision).into(),
         );
+        map.insert(
+            "paints".into(),
+            self.paints
+                .iter()
+                .map(|paint| {
+                    let mut item = Map::new();
+                    item.insert(
+                        "window_id".into(),
+                        optional_rhai_u64(paint.owner.window_id()),
+                    );
+                    item.insert(
+                        "context_serial".into(),
+                        saturating_rhai_int(paint.owner.context_serial()).into(),
+                    );
+                    item.insert(
+                        "item_identity".into(),
+                        paint.content.item_identity.clone().into(),
+                    );
+                    item.insert(
+                        "page_index".into(),
+                        saturating_rhai_int(paint.content.page_index as u64).into(),
+                    );
+                    item.insert(
+                        "items_generation".into(),
+                        saturating_rhai_int(paint.content.items_generation).into(),
+                    );
+                    item.insert("source".into(), paint.content.source_kind.as_str().into());
+                    item.insert(
+                        "final_composite_complete".into(),
+                        paint.content.final_composite_complete.into(),
+                    );
+                    item.insert(
+                        "source_texture".into(),
+                        format!("{:?}", paint.content.source_texture_id).into(),
+                    );
+                    item.insert("texture".into(), format!("{:?}", paint.texture).into());
+                    item.insert(
+                        "vertices".into(),
+                        Dynamic::from_array(
+                            paint
+                                .vertices
+                                .iter()
+                                .map(|(pos, uv)| {
+                                    Dynamic::from_array(
+                                        [
+                                            pos[0] as rhai::FLOAT,
+                                            pos[1] as rhai::FLOAT,
+                                            uv[0] as rhai::FLOAT,
+                                            uv[1] as rhai::FLOAT,
+                                        ]
+                                        .into_iter()
+                                        .map(Dynamic::from)
+                                        .collect(),
+                                    )
+                                })
+                                .collect(),
+                        ),
+                    );
+                    item.insert(
+                        "clip".into(),
+                        Dynamic::from_array(
+                            paint
+                                .clip
+                                .into_iter()
+                                .map(|x| Dynamic::from(x as rhai::FLOAT))
+                                .collect(),
+                        ),
+                    );
+                    item.insert(
+                        "viewport_size".into(),
+                        Dynamic::from_array(
+                            paint
+                                .viewport_size
+                                .into_iter()
+                                .map(|x| Dynamic::from(x as rhai::FLOAT))
+                                .collect(),
+                        ),
+                    );
+                    item.insert(
+                        "pixels_per_point".into(),
+                        (paint.pixels_per_point as rhai::FLOAT).into(),
+                    );
+                    item.insert("placement".into(), paint.placement.clone().into());
+                    item.insert(
+                        "revision".into(),
+                        saturating_rhai_int(paint.revision).into(),
+                    );
+                    Dynamic::from_map(item)
+                })
+                .collect::<rhai::Array>()
+                .into(),
+        );
+        map.insert("sidecar_imported".into(), self.sidecar_imported.into());
+        map.insert("sidecar_loaded".into(), self.sidecar_loaded.into());
         map.insert(
             "seek_strip".into(),
             Dynamic::from_map(self.seek_strip.to_rhai_map()),
@@ -1966,6 +2164,8 @@ fn joined_window_snapshots(
     authoritative: &[TestScriptWindowSnapshot],
     viewport_observations: &HashMap<TestScriptWindowIdentity, u64>,
     paint_observations: &HashMap<TestScriptPaintEvidenceKey, u64>,
+    frame_paints: &HashMap<TestScriptWindowIdentity, Vec<TestScriptPaintObservation>>,
+    sidecar_observations: &std::collections::HashSet<(u64, u64, TestScriptSidecarObservation)>,
 ) -> Vec<TestScriptWindowSnapshot> {
     authoritative
         .iter()
@@ -1994,6 +2194,19 @@ fn joined_window_snapshots(
                 window.painted_page_index = Some(key.content.page_index);
                 window.paint_revision = *revision;
             }
+            if let Some(identity) = &window.identity {
+                window.paints = frame_paints.get(identity).cloned().unwrap_or_default();
+            }
+            window.sidecar_imported = sidecar_observations.contains(&(
+                window.context_serial,
+                window.items_generation,
+                TestScriptSidecarObservation::Imported,
+            ));
+            window.sidecar_loaded = sidecar_observations.contains(&(
+                window.context_serial,
+                window.items_generation,
+                TestScriptSidecarObservation::Loaded,
+            ));
             window
         })
         .collect()
@@ -2016,6 +2229,8 @@ struct UiRuntime {
     authoritative_windows: Vec<TestScriptWindowSnapshot>,
     viewport_observations: HashMap<TestScriptWindowIdentity, u64>,
     paint_observations: HashMap<TestScriptPaintEvidenceKey, u64>,
+    frame_paints: HashMap<TestScriptWindowIdentity, Vec<TestScriptPaintObservation>>,
+    sidecar_observations: std::collections::HashSet<(u64, u64, TestScriptSidecarObservation)>,
     next_observation_revision: u64,
     pointer_regions: pointer_input::SharedRegionCatalog,
 }
@@ -2038,6 +2253,8 @@ impl UiRuntime {
             authoritative_windows: Vec::new(),
             viewport_observations: HashMap::new(),
             paint_observations: HashMap::new(),
+            frame_paints: HashMap::new(),
+            sidecar_observations: std::collections::HashSet::new(),
             next_observation_revision: 0,
             pointer_regions,
         }
@@ -2088,6 +2305,11 @@ impl UiRuntime {
                 window.accepts_owner(&key.owner) && window.current_content_matches(&key.content)
             })
         });
+        self.frame_paints.retain(|identity, _| {
+            self.authoritative_windows
+                .iter()
+                .any(|window| window.accepts_owner(identity))
+        });
     }
 
     fn joined_windows(&self) -> Vec<TestScriptWindowSnapshot> {
@@ -2095,6 +2317,8 @@ impl UiRuntime {
             &self.authoritative_windows,
             &self.viewport_observations,
             &self.paint_observations,
+            &self.frame_paints,
+            &self.sidecar_observations,
         )
     }
 
@@ -2152,6 +2376,7 @@ impl UiRuntime {
         owner: TestScriptWindowIdentity,
         content: Option<TestScriptContentProof>,
     ) -> Result<bool, String> {
+        let drawn = take_drawn_paint(owner.viewport_id());
         let owner_is_current = self
             .authoritative_windows
             .iter()
@@ -2162,6 +2387,22 @@ impl UiRuntime {
         self.next_observation_revision = self.next_observation_revision.wrapping_add(1).max(1);
         let revision = self.next_observation_revision;
         self.viewport_observations.insert(owner.clone(), revision);
+        let paints = drawn
+            .into_iter()
+            .filter(|paint| paint.content.context_serial == owner.context_serial())
+            .map(|paint| TestScriptPaintObservation {
+                owner: owner.clone(),
+                content: paint.content,
+                texture: paint.texture,
+                vertices: paint.vertices,
+                clip: paint.clip,
+                viewport_size: paint.viewport_size,
+                pixels_per_point: paint.pixels_per_point,
+                placement: paint.placement,
+                revision,
+            })
+            .collect();
+        self.frame_paints.insert(owner.clone(), paints);
         if let Some(content) = content
             && self.authoritative_windows.iter().any(|window| {
                 window.accepts_owner(&owner) && window.current_content_matches(&content)
@@ -2941,13 +3182,54 @@ pub(crate) fn publish_window_frame(
     owner: TestScriptWindowIdentity,
     content: Option<TestScriptContentProof>,
 ) {
+    let viewport = owner.viewport_id();
+    let Ok(mut guard) = runtime().lock() else {
+        discard_drawn_paint(viewport);
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        discard_drawn_paint(viewport);
+        return;
+    };
+    let _ = runtime.publish_window_frame(owner, content);
+}
+
+/// The restore worker applied at least one sidecar value to the central store.
+pub(crate) fn publish_sidecar_import(context_serial: u64, items_generation: u64) {
+    publish_sidecar_observation(
+        context_serial,
+        items_generation,
+        TestScriptSidecarObservation::Imported,
+    );
+}
+
+/// A nonempty, validated sidecar reached the terminal restore path for this context.
+pub(crate) fn publish_sidecar_load(context_serial: u64, items_generation: u64) {
+    publish_sidecar_observation(
+        context_serial,
+        items_generation,
+        TestScriptSidecarObservation::Loaded,
+    );
+}
+
+fn publish_sidecar_observation(
+    context_serial: u64,
+    items_generation: u64,
+    observation: TestScriptSidecarObservation,
+) {
     let Ok(mut guard) = runtime().lock() else {
         return;
     };
     let Some(runtime) = guard.as_mut() else {
         return;
     };
-    let _ = runtime.publish_window_frame(owner, content);
+    runtime
+        .sidecar_observations
+        .insert((context_serial, items_generation, observation));
+    let joined = runtime.joined_windows();
+    if let Ok(mut snapshot) = runtime.snapshot.write() {
+        snapshot.windows = joined;
+    }
 }
 
 pub(crate) fn publish_pointer_show(
@@ -3681,6 +3963,142 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn multi_window_stills_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/multi-window-stills.rhai"),
+        )
+        .unwrap();
+        build_engine(bridge).compile(&source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn drawn_paint_records_each_submitted_mesh_with_resource_provenance() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "paint-observation",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::NEAREST,
+        );
+        let make = |item: &str| {
+            crate::gpu_lanczos::FullscreenPaintResource::direct(texture.clone())
+                .with_test_script_content_proof(TestScriptContentProof {
+                    context_serial: 7,
+                    items_generation: 3,
+                    page_index: 0,
+                    item_identity: item.into(),
+                    source_texture_id: texture.id(),
+                    source_kind: TestScriptPaintSourceKind::FullOrProcessed,
+                    final_composite_complete: false,
+                })
+        };
+        let first = make("folder");
+        let second = make("zip");
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            for (index, resource) in [&first, &second].into_iter().enumerate() {
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(index as f32 * 20.0, 0.0),
+                    egui::vec2(10.0, 15.0),
+                );
+                painter.image(
+                    resource.paint_texture_id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                record_drawn_paint(&painter, resource, "normal".into());
+            }
+        });
+        let paints = take_drawn_paint(egui::ViewportId::ROOT);
+        assert_eq!(paints.len(), 2);
+        assert_eq!(paints[0].content.item_identity, "folder");
+        assert_eq!(paints[1].content.item_identity, "zip");
+        assert_ne!(paints[0].vertices[0].0, paints[1].vertices[0].0);
+        assert!(take_drawn_paint(egui::ViewportId::ROOT).is_empty());
+    }
+
+    #[test]
+    fn sidecar_import_evidence_is_tied_to_context_and_items_generation() {
+        let owner = window_identity(7, 11, 13);
+        let current = window_snapshot(owner, 17, 0, "folder::page");
+        let imports = std::collections::HashSet::from([
+            (11, 17, TestScriptSidecarObservation::Loaded),
+            (11, 17, TestScriptSidecarObservation::Imported),
+        ]);
+        let joined = joined_window_snapshots(
+            &[current.clone()],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &imports,
+        );
+        assert!(joined[0].sidecar_imported);
+        assert!(joined[0].sidecar_loaded);
+        let changed = window_snapshot(window_identity(7, 11, 13), 18, 0, "folder::page");
+        let joined = joined_window_snapshots(
+            &[changed],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &imports,
+        );
+        assert!(!joined[0].sidecar_imported);
+        assert!(!joined[0].sidecar_loaded);
+
+        let loaded_only =
+            std::collections::HashSet::from([(11, 17, TestScriptSidecarObservation::Loaded)]);
+        let joined = joined_window_snapshots(
+            &[current],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &loaded_only,
+        );
+        assert!(joined[0].sidecar_loaded);
+        assert!(!joined[0].sidecar_imported);
+    }
+
+    #[test]
+    fn frame_paints_publish_without_legacy_single_page_proof_and_clear_next_frame() {
+        let mut runtime = local_runtime();
+        let owner = window_identity(7, 11, 13);
+        runtime
+            .publish_windows(vec![window_snapshot(owner.clone(), 17, 0, "folder::page")])
+            .unwrap();
+        DRAWN_PAINT.with(|drawn| {
+            drawn.borrow_mut().insert(
+                owner.viewport_id(),
+                vec![PendingPaintObservation {
+                    content: content_proof(
+                        11,
+                        17,
+                        0,
+                        "folder::page",
+                        19,
+                        TestScriptPaintSourceKind::FullOrProcessed,
+                    ),
+                    texture: egui::TextureId::Managed(19),
+                    vertices: vec![([1.0, 2.0], [0.0, 0.0])],
+                    clip: [0.0, 0.0, 10.0, 10.0],
+                    viewport_size: [10.0, 10.0],
+                    pixels_per_point: 1.0,
+                    placement: "frozen".into(),
+                }],
+            );
+        });
+        runtime.publish_window_frame(owner.clone(), None).unwrap();
+        let first = runtime.joined_windows();
+        assert_eq!(first[0].paints.len(), 1);
+        assert!(!first[0].paint_matches_current_page);
+        runtime.publish_window_frame(owner, None).unwrap();
+        assert!(runtime.joined_windows()[0].paints.is_empty());
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn native_top_panorama_click_scenario_compiles_with_the_registered_api() {
         let (bridge, _, _) = runner_bridge(ready_snapshot());
         let source = std::fs::read_to_string(
@@ -4352,6 +4770,7 @@ mod tests {
             item_identity: item.to_string(),
             source_texture_id: egui::TextureId::Managed(texture),
             source_kind,
+            final_composite_complete: false,
         }
     }
 
@@ -4384,6 +4803,9 @@ mod tests {
             paint_source_texture: String::new(),
             painted_page_index: None,
             paint_revision: 0,
+            paints: Vec::new(),
+            sidecar_imported: false,
+            sidecar_loaded: false,
             seek_strip: TestScriptSeekStripSnapshot::closed(),
         }
     }
@@ -4409,8 +4831,14 @@ mod tests {
             1,
         );
         assert!(
-            joined_window_snapshots(&[current.clone()], &HashMap::new(), &observations)[0]
-                .paint_matches_current_page
+            joined_window_snapshots(
+                &[current.clone()],
+                &HashMap::new(),
+                &observations,
+                &HashMap::new(),
+                &Default::default()
+            )[0]
+            .paint_matches_current_page
         );
 
         let stale_cases = [
@@ -4472,6 +4900,8 @@ mod tests {
                 &[current.clone()],
                 &HashMap::new(),
                 &HashMap::from([(stale, 2)]),
+                &HashMap::new(),
+                &Default::default(),
             );
             assert!(!joined[0].paint_matches_current_page);
         }
@@ -4522,7 +4952,13 @@ mod tests {
             ),
         ]);
 
-        let joined = joined_window_snapshots(&[window], &HashMap::new(), &observations);
+        let joined = joined_window_snapshots(
+            &[window],
+            &HashMap::new(),
+            &observations,
+            &HashMap::new(),
+            &Default::default(),
+        );
         assert!(joined[0].full_texture_painted);
         assert_eq!(joined[0].paint_revision, 2);
         assert_eq!(joined[0].paint_source, "full_or_processed");

@@ -1454,6 +1454,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-23 複数viewportシナリオテスト T3（Codex実装、独立レビュー待ち）**
+
+`test-script`限定でactive画像resourceのmesh提出直後と、deferred passive snapshotの
+frozen singletonを含むmesh提出直後に、実際の頂点・UV・clipとresourceの出所を観測する。
+見開きthumbnail fallbackにも描画resource由来の証明を付け、観測のページ数を確認する。
+viewportやdetachedの述語・状態遷移・配置計算は変更しない。窓切替は既存のtest-script
+activation要求を通し、OSクリック配送は対象外。詳細は[シナリオ計画](multiwindow-scenario-test-plan.md) §4。
+
 **2026-09-23 複数viewportシナリオテスト T1（Codex実装、独立レビュー待ち）**
 
 `app::multiwindow_scenario_tests`がROOT `App::update`、即時/遅延child callback、画像meshを

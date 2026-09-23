@@ -626,6 +626,8 @@ pub(crate) struct DetachedImageWindowFrozenPage {
     pub(crate) clip_rect_norm: egui::Rect,
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) free_rotation: f32,
+    #[cfg(feature = "test-script")]
+    pub(crate) test_script_placement: String,
 }
 
 #[derive(Clone)]

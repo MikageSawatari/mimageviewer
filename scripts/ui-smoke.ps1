@@ -16,10 +16,12 @@ Automation must not pass this switch until that approval has been obtained.
 # Running this script opens and controls the disposable portable application.
 # Use -InteractiveApproved only after the user has explicitly approved the
 # described scenario and its expected duration.
+# MultiWindowStills switches windows through test-script activation requests;
+# it does not test OS click routing between windows.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -674,7 +676,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')
+    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -760,6 +762,40 @@ if ($script:archiveErrors.Count -gt 0) {
     $candidateFixtureGeneratorPdfDependencyPath = $null
 
     switch ($Scenario) {
+    'MultiWindowStills' {
+        $scenarioRoot = Join-Path $targetRoot 'ui-smoke\multi-window-stills'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\multi-window-stills.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_multi_window_stills_fixture.py'
+        $candidateFixtureGeneratorDependencyPath = Join-Path $PSScriptRoot 'page-turn\generate_fixture.py'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\multi-window-stills') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        foreach ($generatorPath in @($candidateScriptPath, $candidateFixtureGeneratorPath, $candidateFixtureGeneratorDependencyPath)) {
+            if (-not (Test-Path -LiteralPath $generatorPath -PathType Leaf)) {
+                throw "[ui-smoke] stills scenario input not found: $generatorPath"
+            }
+        }
+        & python $candidateFixtureGeneratorPath $candidateFixtureDir
+        if ($LASTEXITCODE -ne 0) { throw "[ui-smoke] stills fixture generator failed with exit $LASTEXITCODE" }
+        Assert-NoReparseTree $candidateFixtureDir 'multi-window-stills-fixture'
+        $folderBook = Join-Path $candidateFixtureDir 'a-folder'
+        $zipFolder = Join-Path $candidateFixtureDir 'z-zip'
+        $zipBook = Join-Path $zipFolder 'book.zip'
+        if (@(Get-ChildItem -LiteralPath $folderBook -Filter '*.png' -File).Count -ne 3 -or
+            -not (Test-Path -LiteralPath $zipBook -PathType Leaf) -or
+            -not (Test-Path -LiteralPath (Join-Path $folderBook 'mimageviewer.dat') -PathType Leaf) -or
+            -not (Test-Path -LiteralPath (Join-Path $zipFolder 'mimageviewer.dat') -PathType Leaf)) {
+            throw '[ui-smoke] stills fixture lacks folder/ZIP pages or sidecars'
+        }
+        $settingsJson = '{"detached_viewer_open_images_in_window":true,"auto_fullscreen_image_folders":true,"default_spread_mode":"LtrCover","default_reading_flow":"Paged","singleton_spread_placement_enabled":true,"sidecar_backup_enabled":true}'
+        [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
+    }
     'MultiWindowPdf' {
         $scenarioRoot = Join-Path $targetRoot 'ui-smoke\multi-window-pdf'
         $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\multi-window-pdf.rhai'
@@ -988,8 +1024,60 @@ public static class MivUiSmokeWindow
 
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetThreadDesktop(uint threadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+
+    [DllImport("user32.dll")]
+    public static extern bool CloseDesktop(IntPtr desktop);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool GetUserObjectInformation(IntPtr handle, int index,
+        System.Text.StringBuilder buffer, int length, out int needed);
 }
 '@
+}
+
+function Get-UiSmokeDesktopName {
+    param([IntPtr] $Handle)
+    if ($Handle -eq [IntPtr]::Zero) { throw '[ui-smoke] desktop handle is unavailable' }
+    $buffer = New-Object System.Text.StringBuilder 256
+    [int]$needed = 0
+    if (-not [MivUiSmokeWindow]::GetUserObjectInformation($Handle, 2, $buffer, $buffer.Capacity, [ref]$needed)) {
+        throw "[ui-smoke] desktop name query failed (Win32 $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+    }
+    return $buffer.ToString()
+}
+
+function Assert-UiSmokeInputDesktop {
+    $session = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+    $threadName = Get-UiSmokeDesktopName ([MivUiSmokeWindow]::GetThreadDesktop([MivUiSmokeWindow]::GetCurrentThreadId()))
+    $inputDesktop = [MivUiSmokeWindow]::OpenInputDesktop(0, $false, 1)
+    try {
+        $inputName = Get-UiSmokeDesktopName $inputDesktop
+    }
+    finally {
+        if ($inputDesktop -ne [IntPtr]::Zero) { $null = [MivUiSmokeWindow]::CloseDesktop($inputDesktop) }
+    }
+    $foreground = [MivUiSmokeWindow]::GetForegroundWindow()
+    if ($foreground -eq [IntPtr]::Zero) { throw '[ui-smoke] input desktop preflight: no foreground window' }
+    [uint32]$foregroundPid = 0
+    $foregroundThread = [MivUiSmokeWindow]::GetWindowThreadProcessId($foreground, [ref]$foregroundPid)
+    if ($foregroundThread -eq 0 -or $foregroundPid -eq 0) {
+        throw '[ui-smoke] input desktop preflight: foreground identity unavailable'
+    }
+    $foregroundSession = [System.Diagnostics.Process]::GetProcessById([int]$foregroundPid).SessionId
+    $foregroundName = Get-UiSmokeDesktopName ([MivUiSmokeWindow]::GetThreadDesktop($foregroundThread))
+    Write-UiSmokeEvent "desktop preflight: session=$session foreground_session=$foregroundSession thread=$threadName input=$inputName foreground=$foregroundName foreground_pid=$foregroundPid"
+    if ($session -ne $foregroundSession -or $threadName -ne $inputName -or $threadName -ne $foregroundName) {
+        throw '[ui-smoke] input desktop preflight mismatch'
+    }
 }
 
 function Get-UiSmokeForegroundIdentity {
@@ -1248,6 +1336,10 @@ $arguments = @(
     }
     if ($script:archiveErrors.Count -gt 0) {
         throw '[ui-smoke] scenario inputs could not be preserved before launch'
+    }
+
+    if ($Scenario -eq 'MultiWindowStills') {
+        Assert-UiSmokeInputDesktop
     }
 
     Write-UiSmokeEvent "scenario: $Scenario"

@@ -16,6 +16,7 @@
 | --- | --- | --- |
 | S0 | 診断ビルドの隔離と使い捨てデータでの起動 | `portable,test-script` の別target/staging、exact exe/data、成果物の証跡 |
 | S1 | 複数窓でPDFを開き、bindingとページの独立性を確認 | registry由来の窓snapshot、固定target、viewportを指定したKeyAction |
+| S1 stills | 画像フォルダとZIPを2窓で開き、rootのsidecar取り込み・detached ZIPの読込、右寄せsingletonのactive/parked paint形状を確認 | draw時のmesh・出所、最終合成の安定化、入力desktop事前検査。単窓一覧遷移はT2 |
 | S2 | 静止画の列の押下・ドラッグ・release | egui pointer timeline、描画ownerの名前付き矩形、frame acknowledgment |
 | S3 | 動画canvasのzoomとstrip/panel/modalとの入力優先順位 | 実OSマウス入力、exact native target/矩形、実配送と処理の観測 |
 

@@ -9224,6 +9224,16 @@ impl App {
                 },
             )
         };
+        #[cfg(all(windows, feature = "test-script"))]
+        let resource = if let Some(proof) = self.test_script_resource_content_proof(
+            idx,
+            resource.source_texture(),
+            self.test_script_paint_source_kind(idx, resource.source_texture()),
+        ) {
+            resource.with_test_script_content_proof(proof)
+        } else {
+            resource
+        };
         #[cfg(test)]
         let resource = if let Some(proof) = self.test_paint_provenance_for_idx(idx) {
             resource.with_test_paint_provenance(proof)
@@ -17068,6 +17078,8 @@ impl App {
                     clip_rect_norm,
                     rotation,
                     free_rotation: 0.0,
+                    #[cfg(feature = "test-script")]
+                    test_script_placement: format!("{:?}", transform.placement),
                 })
             })
             .collect()
@@ -17290,6 +17302,8 @@ impl App {
                 clip_rect_norm,
                 rotation: page.rotation,
                 free_rotation,
+                #[cfg(feature = "test-script")]
+                test_script_placement: format!("{:?}", resolved_placement),
             }];
         }
 
@@ -17494,6 +17508,8 @@ impl App {
                 clip_rect_norm: left_clip_rect_norm,
                 rotation: left_rot,
                 free_rotation: 0.0,
+                #[cfg(feature = "test-script")]
+                test_script_placement: format!("{:?}", resolved_placement),
             },
             crate::app::DetachedImageWindowFrozenPage {
                 texture: right_texture,
@@ -17502,6 +17518,8 @@ impl App {
                 clip_rect_norm: right_clip_rect_norm,
                 rotation: right_rot,
                 free_rotation: 0.0,
+                #[cfg(feature = "test-script")]
+                test_script_placement: format!("{:?}", resolved_placement),
             },
         ]
     }
@@ -17598,6 +17616,8 @@ impl App {
                 egui::Color32::WHITE,
             );
         }
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::record_drawn_paint(&painter, &window.texture, "snapshot_direct".into());
         window.texture.retain_native_output_for_paint(&painter);
     }
 
@@ -17652,6 +17672,12 @@ impl App {
                         egui::Color32::WHITE,
                     );
                 }
+                #[cfg(all(windows, feature = "test-script"))]
+                crate::test_script::record_drawn_paint(
+                    &painter,
+                    &page.texture,
+                    page.test_script_placement.clone(),
+                );
                 page.texture.retain_native_output_for_paint(&painter);
             }
             return;
@@ -18998,7 +19024,11 @@ impl App {
                                 .is_some_and(|witness| owner.matches_backend_witness(witness))
                             {
                                 crate::test_script::publish_window_frame(owner, content);
+                            } else {
+                                crate::test_script::discard_drawn_paint(vp_ctx.viewport_id());
                             }
+                        } else {
+                            crate::test_script::discard_drawn_paint(vp_ctx.viewport_id());
                         }
                         Self::draw_detached_image_window_bar(
                             ui,
@@ -19263,6 +19293,8 @@ impl App {
             #[cfg(feature = "test-script")]
             if let Some((witness, content)) = test_script_passive_frame {
                 self.test_script_publish_detached_frame(window.id, viewport_id, witness, content);
+            } else {
+                crate::test_script::discard_drawn_paint(viewport_id);
             }
 
             let right_drag_live =
@@ -22123,6 +22155,12 @@ impl App {
 
         {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
+                #[cfg(all(windows, feature = "test-script"))]
+                {
+                    test_script_current_item_paint =
+                        eframe::miv_test_script_window_witness::active()
+                            .map(|witness| (ctx.viewport_id(), witness, None));
+                }
                 if self.sidecar_restore_blocks_projected_context() {
                     Self::consume_sidecar_restore_viewport_input(ctx);
                 }
@@ -34903,7 +34941,20 @@ impl App {
         let using_full_texture = tex.is_some();
         let thumb_resource = thumb_tex
             .cloned()
-            .map(crate::gpu_lanczos::FullscreenPaintResource::direct);
+            .map(crate::gpu_lanczos::FullscreenPaintResource::direct)
+            .map(|resource| {
+                #[cfg(all(windows, feature = "test-script"))]
+                if let FsPageLayoutSource::CurrentItem = layout_source {
+                    if let Some(proof) = self.test_script_content_proof(
+                        page_idx,
+                        resource.source_texture(),
+                        crate::test_script::TestScriptPaintSourceKind::CatalogThumbnail,
+                    ) {
+                        return resource.with_test_script_content_proof(proof);
+                    }
+                }
+                resource
+            });
         let display_tex = if is_video {
             tex
         } else {
@@ -35020,6 +35071,12 @@ impl App {
                     egui::Color32::WHITE,
                 );
             }
+            #[cfg(all(windows, feature = "test-script"))]
+            crate::test_script::record_drawn_paint(
+                &painter,
+                &paint_resource,
+                format!("{:?}", transform.placement),
+            );
             paint_resource.retain_native_output_for_paint(&painter);
             if fit_bbox.is_none()
                 && should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan)
@@ -39640,12 +39697,22 @@ impl App {
         allow_thumbnail: bool,
     ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         display_tex.cloned().or_else(|| {
-            allow_thumbnail
-                .then(|| {
-                    self.fs_thumbnail_texture_for_display(idx)
-                        .map(crate::gpu_lanczos::FullscreenPaintResource::direct)
-                })
-                .flatten()
+            if !allow_thumbnail {
+                return None;
+            }
+            let texture = self.fs_thumbnail_texture_for_display(idx)?;
+            let resource = crate::gpu_lanczos::FullscreenPaintResource::direct(texture);
+            #[cfg(all(windows, feature = "test-script"))]
+            let resource = if let Some(proof) = self.test_script_resource_content_proof(
+                idx,
+                resource.source_texture(),
+                crate::test_script::TestScriptPaintSourceKind::CatalogThumbnail,
+            ) {
+                resource.with_test_script_content_proof(proof)
+            } else {
+                resource
+            };
+            Some(resource)
         })
     }
 
@@ -39844,6 +39911,12 @@ impl App {
                     egui::Color32::WHITE,
                 );
             }
+            #[cfg(all(windows, feature = "test-script"))]
+            crate::test_script::record_drawn_paint(
+                painter,
+                &paint_resource,
+                format!("{:?}", transform.placement),
+            );
             paint_resource.retain_native_output_for_paint(painter);
             return Some(transform);
         } else {
@@ -46684,6 +46757,50 @@ mod tests {
     mod still_seek_menu;
     mod still_seek_rotation;
     use super::*;
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn spread_thumbnail_fallback_carries_sibling_page_proof() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/test/first.png")),
+            GridItem::Image(PathBuf::from("c:/test/sibling.png")),
+        ];
+        app.items_generation = 41;
+        app.fullscreen_idx = Some(0);
+        let texture = ctx.load_texture(
+            "spread-thumbnail-proof",
+            egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails = vec![
+            ThumbnailState::Pending,
+            ThumbnailState::Loaded {
+                tex: texture.clone(),
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                from_edit_preview: false,
+                rendered_at_px: 2,
+                source_dims: Some((2, 2)),
+                layout_dims: None,
+            },
+        ];
+        let resource = app
+            .fs_spread_page_paint_resource(1, None, true)
+            .expect("sibling thumbnail fallback");
+        let proof = resource
+            .test_script_content_proof()
+            .expect("fallback keeps draw-time provenance");
+        assert_eq!(proof.page_index, 1);
+        assert_eq!(proof.items_generation, 41);
+        assert_eq!(proof.item_identity, app.items[1].perf_key());
+        assert_eq!(proof.source_texture_id, texture.id());
+        assert_eq!(
+            proof.source_kind,
+            crate::test_script::TestScriptPaintSourceKind::CatalogThumbnail
+        );
+        assert!(!proof.final_composite_complete);
+    }
 
     fn secondary_press_owner(context_id: u64, fs_idx: usize) -> FullscreenSecondaryPressOwner {
         FullscreenSecondaryPressOwner::new(

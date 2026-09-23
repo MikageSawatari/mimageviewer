@@ -1610,6 +1610,9 @@ mod tests {
             paint_source_texture: "source".to_string(),
             painted_page_index: Some(page_index),
             paint_revision: 1,
+            paints: Vec::new(),
+            sidecar_imported: false,
+            sidecar_loaded: false,
             seek_strip: crate::test_script::TestScriptSeekStripSnapshot::closed(),
         }
     }

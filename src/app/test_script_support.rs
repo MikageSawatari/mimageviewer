@@ -193,6 +193,9 @@ impl App {
                 paint_source_texture: String::new(),
                 painted_page_index: None,
                 paint_revision: 0,
+                paints: Vec::new(),
+                sidecar_imported: false,
+                sidecar_loaded: false,
                 seek_strip: context.video_seek_strip_test_script_snapshot(),
             }
         })
@@ -400,11 +403,26 @@ impl App {
         source_kind: crate::test_script::TestScriptPaintSourceKind,
     ) -> Option<crate::test_script::TestScriptContentProof> {
         let context_id = self.mounted_viewer_context_id()?;
+        let current =
+            self.with_viewer_context_ref(context_id, |context| context.fullscreen_idx())?;
+        if current != Some(page_index) {
+            return None;
+        }
+        self.test_script_resource_content_proof(page_index, texture, source_kind)
+    }
+
+    /// Called only when an indexed page resource is selected. Unlike the
+    /// single-page legacy evidence, a spread may submit another visible page.
+    pub(crate) fn test_script_resource_content_proof(
+        &self,
+        page_index: usize,
+        texture: &egui::TextureHandle,
+        source_kind: crate::test_script::TestScriptPaintSourceKind,
+    ) -> Option<crate::test_script::TestScriptContentProof> {
+        let context_id = self.mounted_viewer_context_id()?;
         let context = self.with_viewer_context_ref(context_id, |context| {
-            let current = (context.fullscreen_idx() == Some(page_index))
-                .then(|| context.items().get(page_index))
-                .flatten()?;
-            Some((context.items_generation(), current.perf_key()))
+            let item = context.items().get(page_index)?;
+            Some((context.items_generation(), item.perf_key()))
         })??;
         Some(crate::test_script::TestScriptContentProof {
             context_serial: context_id.serial(),
@@ -413,6 +431,7 @@ impl App {
             item_identity: context.1,
             source_texture_id: texture.id(),
             source_kind,
+            final_composite_complete: self.final_composite_texture_is_complete(page_index, texture),
         })
     }
 
@@ -432,9 +451,11 @@ impl App {
         // proof with that manager-issued host incarnation.
         self.test_script_publish_window_snapshots();
         let Some(owner) = self.test_script_window_identity(window_id, viewport_id) else {
+            crate::test_script::discard_drawn_paint(viewport_id);
             return;
         };
         if !owner.matches_backend_witness(witness) {
+            crate::test_script::discard_drawn_paint(viewport_id);
             return;
         }
         crate::test_script::publish_window_frame(owner, content);
@@ -448,9 +469,11 @@ impl App {
     ) {
         self.test_script_publish_window_snapshots();
         let Some(owner) = self.test_script_root_window_identity(viewport_id) else {
+            crate::test_script::discard_drawn_paint(viewport_id);
             return;
         };
         if !owner.matches_backend_witness(witness) {
+            crate::test_script::discard_drawn_paint(viewport_id);
             return;
         }
         crate::test_script::publish_window_frame(owner, content);
@@ -467,6 +490,7 @@ impl App {
         )>,
     ) {
         let Some((painted_viewport_id, witness, content)) = painted else {
+            crate::test_script::discard_drawn_paint(expected_viewport_id);
             return;
         };
         match test_script_active_paint_owner(
@@ -483,7 +507,7 @@ impl App {
             }) => {
                 self.test_script_publish_detached_frame(window_id, viewport_id, witness, content);
             }
-            None => {}
+            None => crate::test_script::discard_drawn_paint(painted_viewport_id),
         }
     }
 }

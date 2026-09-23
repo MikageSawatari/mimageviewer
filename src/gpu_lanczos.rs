@@ -2969,6 +2969,7 @@ mod tests {
             item_identity: "proof-item".to_owned(),
             source_texture_id: source.id(),
             source_kind: crate::test_script::TestScriptPaintSourceKind::FullOrProcessed,
+            final_composite_complete: false,
         };
 
         let direct = FullscreenPaintResource::direct(source.clone())
