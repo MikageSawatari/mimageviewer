@@ -459,3 +459,31 @@ auto-aspect値の退避復元ではなく、viewer cursor移動とGrid presentat
 
 - root leaf用typed factoryを既存`MaterializedStill` forkの拡張とするか、fresh `build_viewer_context`へimmutable presentationを渡すか。どちらでもmainのworker複合体を移さず、別窓のitems/session generationを一度で一致させる必要がある（`src/app/viewer_context_registry.rs:2244-2258,2794-2868,3267-3337`）。
 - passive再活性化でprepared / source pathを保持するtyped payloadの配置と、ParkedLive mediaのcollection pendingをownerでpollする位置。現在のdescriptor fallbackとpoll入口が物理Image / main中心なので、ここを回帰対象として設計合意したい（`src/app.rs:47333-47391,45595-45613,77044-77054`）。
+
+### 独立レビュー結果と確定事項（GPT-6 Sol xhigh、2026-09-23）
+
+レビュー担当は**構造修正（BA-7）であることに合意**した。detached predicate、viewport / HWND lifecycle、placement、
+focus の変更は不要。設計担当（Opus）が指摘をコードで確認し、以下を確定とする。
+
+- **[P1] 新 bundle の navigation scope を collection root の意味にする。** 既存の detached image builder は
+  `DetachedPhysical` を設定し、visible-index の再構築で 1 つの物理フォルダの項目だけを残す（`src/app.rs:46553,52699,53736`）。
+  複数フォルダにまたがる root 一覧ではこれが Home / End・見開きなど `visible_indices` を読む処理から項目を落とす。
+  full mode の root と既存 media fork と同じ reader order を保つ scope を使い、scope に依存する分岐を実装前に洗い出す。
+- **[P2] passive 再活性化の typed payload は、活性化以外の consumer も更新する。** snapshot の descriptor と sync stamp は
+  reopen identity の有無、右ドラッグ入力の識別、元パス削除の検出にも使われている（`src/app.rs:613,895,1578,11943`）。
+  コレクション削除と元ファイル削除は別の期待値として扱う。
+- **[P2] F12 の検証はモード別。** 「常に新しいウィンドウで画像を開く」では F12 が無効（`src/app.rs:67568`）。
+  F12 が有効なモードで collection origin が保たれること、常時新規モードでは既存の無効動作を確かめる。
+- **確定 (a) factory**: 既存 `MaterializedStill` fork は拡張しない（物理 scope に絞り surface を `Folder` に置き換えるため、
+  `viewer_context_registry.rs:2794,2841`）。**fresh `build_viewer_context` に typed collection-root open plan を渡す**。
+  Grid 入力時に installed immutable presentation と stable entry identity を capture し、予約した context の新しい
+  `items_generation` に root session を bind してから解決済み index を開く。main の worker・selection は継承しない。
+- **確定 (b) reopen と poll**: typed reopen route は、静止画 snapshot を作る時点で mount 済み bundle から
+  `DetachedImageWindowSnapshot` に capture する。活性化は現在の main-index stamp と物理 image fallback より**前**に
+  この route を dispatch する。live media の collection grid watch / navigation は各 owner の mount 内で poll する
+  （active detached は既存 worker poll の隣、`ParkedLive` は `poll_video` の後で EOF 由来の要求を進める）。
+  parked 静止画には定期 poll を置かない（`src/app.rs:47987,47218,47256,47523,45595`）。
+- **追加する検収**: factory の不変条件（完全な順序、新 generation への bind、main 状態不変、物理 scan なし）、
+  AtRest bundle が無い状態を強制した passive 再活性化、owner-mounted poll の編集 / 削除・兄弟窓の stale result・
+  `ParkedLive` 動画 / 音声 EOF、BS / Esc・タイトル・child restore・実際の Grid 入力経路。lifecycle と兄弟窓のテストでは
+  window identity、placement、focus、viewport の動作が変わらないことも確かめる。
