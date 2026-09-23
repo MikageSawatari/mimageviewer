@@ -1,5 +1,7 @@
 //! Headless ROOT and child-viewport scenario driver. No native windows are launched.
 
+#![cfg(all(test, windows))]
+
 use super::paint_record_test_support::{PaintRecord, paint_records, with_capture};
 use super::*;
 use std::cell::RefCell;
