@@ -1,6 +1,19 @@
 // Window switching uses the test-script activation request and viewport Focus.
 // This scenario does not exercise OS click routing between windows.
 
+// On a timeout, log every window's snapshot before failing, so the failed
+// condition can be read from the evidence without rerunning.
+fn wait_dump(ready, timeout_ms) {
+    try {
+        wait_until(ready, timeout_ms);
+    } catch (error) {
+        let s = snapshot();
+        log("multi-window-stills: wait failed; is_fullscreen=" + s.is_fullscreen
+            + " items_len=" + s.items_len + " windows=" + s.windows.to_debug());
+        throw error;
+    }
+}
+
 fn detached(s) {
     let windows = [];
     for window in s.windows {
@@ -114,11 +127,11 @@ fn selected(window) {
 }
 
 log("multi-window-stills: waiting for root grid");
-wait_until(|s| !s.is_fullscreen && s.items_len == 2 && s.pending_thumbs == 0, 30000);
+wait_dump(|s| !s.is_fullscreen && s.items_len == 2 && s.pending_thumbs == 0, 30000);
 select_root();
 run_action("GridMoveFirst");
 run_action("GridOpenSelected");
-wait_until(|s| {
+wait_dump(|s| {
     let windows = detached(s);
     windows.len == 1 && painted(windows[0], 1) && windows[0].page_ready
         && windows[0].page_index == 0
@@ -130,7 +143,7 @@ log("multi-window-stills: folder painted and sidecar imported");
 select_root();
 run_action("GridMoveLast");
 run_action("GridOpenSelected");
-wait_until(|s| {
+wait_dump(|s| {
     if s.is_fullscreen || s.items_len != 1 { return false; }
     for window in s.windows {
         if window.role == "root" && window.sidecar_imported { return true; }
@@ -141,7 +154,7 @@ log("multi-window-stills: ZIP folder sidecar imported");
 select_root();
 run_action("GridMoveFirst");
 run_action("GridOpenSelected");
-wait_until(|s| {
+wait_dump(|s| {
     let windows = detached(s);
     if windows.len != 2 || by_id(s, folder.window_id) == () { return false; }
     let zip_loaded = false;
@@ -163,14 +176,14 @@ log("multi-window-stills: ZIP painted");
 
 selected(first);
 run_action("FsJumpFirst");
-wait_until(|s| {
+wait_dump(|s| {
     let w = by_id(s, first.window_id);
     w != () && painted(w, 1) && w.page_ready && final_current_paint(w)
         && w.paints[0].revision > first.paints[0].revision
 }, 30000);
 let settling = by_id(snapshot(), first.window_id);
 run_action("FsJumpFirst");
-wait_until(|s| {
+wait_dump(|s| {
     let w = by_id(s, first.window_id);
     w != () && painted(w, 1) && final_current_paint(w)
         && w.paints[0].revision > settling.paints[0].revision
@@ -192,7 +205,7 @@ if bounds[0] >= bounds[2] || bounds[0] < midpoint - pixel
 
 selected(second);
 run_action("FsJumpFirst");
-wait_until(|s| {
+wait_dump(|s| {
     let a = by_id(s, first.window_id);
     let b = by_id(s, second.window_id);
     a != () && b != () && painted(a, 1) && painted(b, 1)
@@ -206,7 +219,7 @@ if !same_paints(active.paints, parked.paints) {
 
 selected(first);
 run_action("FsJumpFirst");
-wait_until(|s| {
+wait_dump(|s| {
     let w = by_id(s, first.window_id);
     w != () && painted(w, 1) && w.paints[0].revision > parked.paints[0].revision
 }, 30000);
@@ -214,7 +227,7 @@ let returned = by_id(snapshot(), first.window_id);
 if !same_paints(active.paints, returned.paints) { fail("I5: singleton paint changed on return"); }
 let sibling = by_id(snapshot(), second.window_id);
 run_action("FsPageNext");
-wait_until(|s| {
+wait_dump(|s| {
     let a = by_id(s, first.window_id);
     let b = by_id(s, second.window_id);
     a != () && b != () && a.page_index == 1 && painted(a, 2)
@@ -228,8 +241,8 @@ if !same_paints(sibling.paints, sibling_after.paints) {
 }
 
 run_action("FsClose");
-wait_until(|s| by_id(s, first.window_id) == (), 30000);
+wait_dump(|s| by_id(s, first.window_id) == (), 30000);
 selected(second);
 run_action("FsClose");
-wait_until(|s| detached(s).len == 0 && !s.is_fullscreen, 30000);
+wait_dump(|s| detached(s).len == 0 && !s.is_fullscreen, 30000);
 log("multi-window-stills: done");
