@@ -1454,6 +1454,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-23 §1.268 Phase B: virtual-list prepare owner の context swap**
+
+`src/app/viewer_context_registry.rs` の bundle swap に Ctrl+G の search session/prepare と
+rating の rows・希望順・pending・sequence を加えた。物理 detached fork はこれらを UI thread で
+clone せず、元 main context に保持する。新しい物理 context は空の route state を持つ。
+理由は、別 context に mount 中の worker 結果が兄弟の items を置換したり、元 context の
+pending を失わせたりしないため。独立 reviewer が合意した Phase B の bundle-owned projection と
+sibling isolation を既存 swap 境界に実装する構造変更であり、detached predicate、viewport
+identity、window lifecycle には分岐を追加しない。実装の独立レビューは別途行う。
+
 **2026-09-23 §1.267 コレクション直下画像の別窓 root owner（Codex 実装、独立 reviewer 合意、BA-7）**
 
 Grid 入力時の immutable prepared と entry ID / source key を typed open plan に固定し、

@@ -8,6 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::grid_item::GridItem;
+use crate::page_edit_write_epoch::{PAGE_EDIT_WRITES, WriteStamp};
+
+pub(crate) struct StablePageEditProjection {
+    pub snapshot: PageEditSnapshot,
+    pub projection: PageEditProjection,
+    pub stamp: WriteStamp,
+}
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PageEditAvailability {
@@ -21,7 +28,7 @@ pub(crate) struct PageEditAvailability {
 }
 
 impl PageEditAvailability {
-    pub(super) fn for_app(app: &super::App) -> Self {
+    pub(crate) fn for_app(app: &super::App) -> Self {
         Self {
             adjustment: app.adjustment_db.is_some(),
             export_crop: app.export_crop_db.is_some(),
@@ -49,6 +56,7 @@ pub(crate) struct PageEditSnapshot {
 pub(crate) struct PageEditProjection {
     pub adjustment: HashMap<usize, crate::adjustment::AdjustParams>,
     pub export_crop: HashMap<usize, crate::export_crop::CropSettings>,
+    pub export_crop_pages: HashSet<usize>,
     pub view_trim: HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
     pub mask: HashSet<usize>,
     pub conceal: HashSet<usize>,
@@ -57,7 +65,7 @@ pub(crate) struct PageEditProjection {
 }
 
 impl PageEditSnapshot {
-    pub(super) fn load_and_project(
+    pub(crate) fn load_and_project(
         items: &[GridItem],
         available: PageEditAvailability,
         cancel: &AtomicBool,
@@ -143,7 +151,7 @@ impl PageEditSnapshot {
     }
 
     /// Only call for a prepared view. Large projection stays in its prepare worker.
-    pub(super) fn project(&self, items: &[GridItem]) -> PageEditProjection {
+    pub(crate) fn project(&self, items: &[GridItem]) -> PageEditProjection {
         let mut projection = PageEditProjection::default();
         for (index, item) in items.iter().enumerate() {
             let Some(key) = crate::edit_source::page_key_for_grid_item(item) else {
@@ -154,6 +162,7 @@ impl PageEditSnapshot {
             }
             if let Some(value) = self.export_crop.get(&key) {
                 projection.export_crop.insert(index, *value);
+                projection.export_crop_pages.insert(index);
             }
             if let Some(value) = self.view_trim.get(&key) {
                 projection.view_trim.insert(index, *value);
@@ -172,6 +181,47 @@ impl PageEditSnapshot {
             }
         }
         projection
+    }
+
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        self.adjustment.extend(other.adjustment);
+        self.export_crop.extend(other.export_crop);
+        self.view_trim.extend(other.view_trim);
+        self.mask.extend(other.mask);
+        self.conceal.extend(other.conceal);
+        self.comic.extend(other.comic);
+        self.local_adjust.extend(other.local_adjust);
+    }
+
+    pub(crate) fn load_and_project_stable(
+        items: &[GridItem],
+        available: PageEditAvailability,
+        cancel: &AtomicBool,
+    ) -> Result<Option<StablePageEditProjection>, String> {
+        let before = PAGE_EDIT_WRITES.sample();
+        if before.active_writers != 0 {
+            return Ok(None);
+        }
+        let Some((snapshot, projection)) = Self::load_and_project(items, available, cancel)? else {
+            return Ok(None);
+        };
+        let after = PAGE_EDIT_WRITES.sample();
+        Ok(Self::stable_projection(before, after, snapshot, projection))
+    }
+
+    pub(crate) fn stable_projection(
+        before: WriteStamp,
+        after: WriteStamp,
+        snapshot: Self,
+        projection: PageEditProjection,
+    ) -> Option<StablePageEditProjection> {
+        crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(before, after).then_some(
+            StablePageEditProjection {
+                snapshot,
+                projection,
+                stamp: after,
+            },
+        )
     }
 
     fn set_value<T: Clone>(map: &mut HashMap<String, T>, key: &str, value: Option<&T>) {

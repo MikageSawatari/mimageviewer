@@ -1564,6 +1564,7 @@ fn commit_edit_rows(
     }
 
     let transaction_started = Instant::now();
+    let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
     connection
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("cannot begin atomic edit sidecar import: {error}"))?;

@@ -768,6 +768,11 @@ where
 
     let database_open_started = std::time::Instant::now();
     ensure_database_schemas(data_dir)?;
+    // Declared before the connection so unwind drops SQLite first and only then
+    // publishes completion for any still-open batch.
+    let mut page_edit_write: Option<crate::page_edit_write_epoch::EditWriteGuard<'static>> = None;
+    let mut rating_write: Option<crate::page_edit_write_epoch::EditWriteGuard<'static>> = None;
+    let mut tag_write: Option<crate::page_edit_write_epoch::EditWriteGuard<'static>> = None;
     let conn = open_import_connection(data_dir)?;
     let database_open_ms = database_open_started.elapsed().as_secs_f64() * 1000.0;
     let mut summary = ImportSummary {
@@ -812,6 +817,14 @@ where
                 TargetState::Changed => summary.skipped_changed += 1,
                 TargetState::Ready => {
                     if !batch_active {
+                        page_edit_write =
+                            Some(crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin());
+                        if manifest.sections.ratings {
+                            rating_write = Some(crate::rating_db::RATING_WRITES.begin());
+                        }
+                        if manifest.sections.tags {
+                            tag_write = Some(crate::tags_db::TAG_WRITES.begin());
+                        }
                         begin_import_batch(&conn)?;
                         batch_active = true;
                         batch_started = std::time::Instant::now();
@@ -925,6 +938,9 @@ where
             {
                 let commit_started = std::time::Instant::now();
                 commit_import_batch(&conn)?;
+                drop(page_edit_write.take());
+                drop(rating_write.take());
+                drop(tag_write.take());
                 let current_commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
                 commit_ms += current_commit_ms;
                 max_commit_ms = max_commit_ms.max(current_commit_ms);
@@ -974,6 +990,9 @@ where
     let commit_result = if batch_active {
         let commit_started = std::time::Instant::now();
         let result = commit_import_batch(&conn);
+        drop(page_edit_write.take());
+        drop(rating_write.take());
+        drop(tag_write.take());
         let current_commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
         commit_ms += current_commit_ms;
         max_commit_ms = max_commit_ms.max(current_commit_ms);
@@ -1086,7 +1105,10 @@ fn begin_import_batch(conn: &Connection) -> Result<(), TransferError> {
 }
 
 fn commit_import_batch(conn: &Connection) -> Result<(), TransferError> {
-    conn.execute_batch("COMMIT").map_err(db_error)
+    conn.execute_batch("COMMIT").map_err(|error| {
+        let _ = conn.execute_batch("ROLLBACK");
+        db_error(error)
+    })
 }
 
 /// 仮想項目のDB identity。ZIP member名は表示・manifestではcaseを保持するが、

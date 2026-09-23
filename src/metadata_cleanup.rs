@@ -749,6 +749,37 @@ where
     let mut report = DeleteReport::default();
     let mut deleted = BTreeMap::<String, usize>::new();
     let mut protected = BTreeMap::<String, usize>::new();
+    // One cleanup request can delete from several stores. Keep a prepare from
+    // accepting an intermediate mixture between descriptor transactions.
+    let page_edit_write = scan
+        .candidates
+        .iter()
+        .filter_map(|candidate| STORES.get(candidate.descriptor_index))
+        .any(|descriptor| {
+            matches!(
+                descriptor.file,
+                "adjustment.db"
+                    | "mask.db"
+                    | "conceal.db"
+                    | "local_adjust.db"
+                    | "comic.db"
+                    | "export_crop.db"
+                    | "view_trim.db"
+            )
+        })
+        .then(|| crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin());
+    let rating_write = scan
+        .candidates
+        .iter()
+        .filter_map(|candidate| STORES.get(candidate.descriptor_index))
+        .any(|descriptor| descriptor.file == "rating.db")
+        .then(|| crate::rating_db::RATING_WRITES.begin());
+    let tag_write = scan
+        .candidates
+        .iter()
+        .filter_map(|candidate| STORES.get(candidate.descriptor_index))
+        .any(|descriptor| descriptor.file == "tags.db")
+        .then(|| crate::tags_db::TAG_WRITES.begin());
     for index in 0..STORES.len() {
         let candidates = scan
             .candidates
@@ -781,6 +812,9 @@ where
     }
     report.deleted_by_store = counts_to_vec(deleted);
     report.protected_after_scan = counts_to_vec(protected);
+    drop(rating_write);
+    drop(tag_write);
+    drop(page_edit_write);
     report
 }
 
@@ -807,6 +841,20 @@ fn delete_descriptor<F>(
             return;
         }
     };
+    let _rating_write =
+        (descriptor.file == "rating.db").then(|| crate::rating_db::RATING_WRITES.begin());
+    let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+    let _page_edit_write = matches!(
+        descriptor.file,
+        "adjustment.db"
+            | "mask.db"
+            | "conceal.db"
+            | "local_adjust.db"
+            | "comic.db"
+            | "export_crop.db"
+            | "view_trim.db"
+    )
+    .then(|| crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin());
     let transaction =
         match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(transaction) => transaction,

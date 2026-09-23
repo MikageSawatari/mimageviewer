@@ -1527,12 +1527,14 @@ impl MaskDb {
 
     /// マスクを削除する。
     pub fn delete(&self, key: &str) -> rusqlite::Result<()> {
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         self.conn
             .execute("DELETE FROM masks WHERE path = ?1", [key])?;
         Ok(())
     }
 
     pub fn copy_entry_key(&self, from_key: &str, to_key: &str) -> rusqlite::Result<()> {
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         if from_key == to_key {
             return Ok(());
         }
@@ -1579,6 +1581,7 @@ impl MaskDb {
         w: usize,
         h: usize,
     ) -> rusqlite::Result<()> {
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         self.conn.execute(
             "INSERT INTO masks (path, mask_data, width, height, vectors)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1701,6 +1704,7 @@ impl MaskDb {
         w: usize,
         h: usize,
     ) -> rusqlite::Result<()> {
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         let blob = compress_mask(mask);
         let shapes_json = shapes_to_json(shapes);
         self.conn.execute(

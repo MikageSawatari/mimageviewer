@@ -114,6 +114,10 @@ pub struct RatingDb {
     conn: rusqlite::Connection,
 }
 
+/// All connections, including worker and migration connections, publish through this epoch.
+pub(crate) static RATING_WRITES: crate::page_edit_write_epoch::EditWriteEpoch =
+    crate::page_edit_write_epoch::EditWriteEpoch::new();
+
 impl RatingDb {
     /// DB を開く (なければ作成)。
     pub fn open() -> Result<Self, rusqlite::Error> {
@@ -278,6 +282,7 @@ impl RatingDb {
         if writes.is_empty() {
             return Ok(());
         }
+        let _rating_write = RATING_WRITES.begin();
         let transaction = self.conn.unchecked_transaction()?;
         let timestamp = now_ms();
         for &(key, stars, meta) in writes {
@@ -303,6 +308,7 @@ impl RatingDb {
         meta: Option<&RatingMeta>,
         rated_at_ms: Option<i64>,
     ) -> Result<(), rusqlite::Error> {
+        let _rating_write = RATING_WRITES.begin();
         Self::set_with_timestamp_on(&self.conn, key, stars, meta, rated_at_ms)
     }
 
@@ -366,6 +372,7 @@ impl RatingDb {
         if from_key == to_key {
             return Ok(());
         }
+        let _rating_write = RATING_WRITES.begin();
         let to_source_path = source_path_from_rating_key(to_key);
         self.conn.execute(
             "INSERT INTO ratings (
@@ -396,6 +403,7 @@ impl RatingDb {
         if from_key == to_key {
             return Ok(());
         }
+        let _rating_write = RATING_WRITES.begin();
         self.copy_entry_key(from_key, to_key)?;
         self.conn
             .execute("DELETE FROM ratings WHERE path = ?1", [from_key])?;
@@ -452,6 +460,7 @@ impl RatingDb {
 
     /// 全レコードを削除 (リセット)。
     pub fn clear_all(&self) -> Result<usize, rusqlite::Error> {
+        let _rating_write = RATING_WRITES.begin();
         self.conn.execute("DELETE FROM ratings", [])
     }
 

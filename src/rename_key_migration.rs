@@ -1131,6 +1131,10 @@ pub(crate) fn copy_stores_at(
     mappings: &[StoreCopyPathMapping],
 ) -> StoreCopyReport {
     let mut report = StoreCopyReport::default();
+    // A prepared virtual list must not observe a mixture of copied stores.
+    let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+    let _rating_write = crate::rating_db::RATING_WRITES.begin();
+    let _tag_write = crate::tags_db::TAG_WRITES.begin();
     for descriptor in STORES.iter().copied().filter(|store| store.unique) {
         let normalized = mappings
             .iter()
@@ -1290,6 +1294,9 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
     let new_k = crate::adjustment_db::normalize_path(new_path);
     let old_s = crate::path_key::normalize(old_path);
     let new_s = crate::path_key::normalize(new_path);
+    let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+    let rating_write = crate::rating_db::RATING_WRITES.begin();
+    let tag_write = crate::tags_db::TAG_WRITES.begin();
     for descriptor in STORES.iter().filter(|store| store.rename_generic) {
         let (old_key, new_key) = match descriptor.normalization {
             StoreKeyNormalization::KeepDrive => (&old_k, &new_k),
@@ -1306,6 +1313,9 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
             &mut report,
         );
     }
+    drop(rating_write);
+    drop(tag_write);
+    drop(page_edit_write);
 
     // 本ページブックマークは container_key だけでなく raw container_path と、画像本では
     // container 相対 page identity も同時更新する必要があるため generic STORES へは載せない。
@@ -1370,6 +1380,9 @@ pub(crate) fn purge_removed_paths_at(
     let keep_drive_keys = normalized_removed_keys(removed, StoreKeyNormalization::KeepDrive);
     let drive_stripped_keys =
         normalized_removed_keys(removed, StoreKeyNormalization::DriveStripped);
+    let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+    let rating_write = crate::rating_db::RATING_WRITES.begin();
+    let tag_write = crate::tags_db::TAG_WRITES.begin();
     for descriptor in STORES {
         let keys = match descriptor.normalization {
             StoreKeyNormalization::KeepDrive => &keep_drive_keys,
@@ -1377,6 +1390,9 @@ pub(crate) fn purge_removed_paths_at(
         };
         purge_store(data_dir, descriptor, keys, &mut report);
     }
+    drop(rating_write);
+    drop(tag_write);
+    drop(page_edit_write);
 
     match crate::pdf_passwords::PdfPasswordStore::purge_paths_at(data_dir, pdf_paths) {
         Ok(rows) => report.rows += rows,
@@ -1485,6 +1501,10 @@ fn purge_store(
         if !table_exists {
             return Ok(0);
         }
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _rating_write =
+            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
         let tx = conn.transaction()?;
         let mut changed = 0usize;
 
@@ -1552,6 +1572,10 @@ fn migrate_store(
     let result = (|| -> Result<usize, rusqlite::Error> {
         let mut conn = rusqlite::Connection::open(db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _rating_write =
+            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
         let tx = conn.transaction()?;
         let columns = table_columns(&tx, descriptor.table)?;
         if columns.is_empty()
@@ -1719,6 +1743,10 @@ fn copy_store_transaction(
         let mut conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _rating_write =
+            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         let columns = table_columns(&tx, descriptor.table).map_err(|error| error.to_string())?;
         if columns.is_empty()

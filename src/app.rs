@@ -157,7 +157,13 @@ pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
 mod grid_paint;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
-pub(crate) use metadata_ops::probe_image_dims_from_bytes;
+pub(crate) use metadata_ops::{probe_image_dims_from_bytes, tag_item_path};
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RATING_INSTALL_UI_PREWARMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static RATING_INSTALL_UI_TAG_PREWARMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 #[cfg(windows)]
 mod native_video;
 #[cfg(windows)]
@@ -172,7 +178,7 @@ use presentation_transition::{
 #[cfg(all(windows, test))]
 use presentation_transition::{PreparingProgress, PresentationTransitionState};
 pub(crate) mod normalize;
-mod page_edit_snapshot;
+pub(crate) mod page_edit_snapshot;
 mod prefetch_policy;
 mod recursive_snapshot_scan;
 mod runtime_ops;
@@ -238,7 +244,7 @@ use metadata_ops::{
     details_created_time_path, facet_ai_filter_applies, facet_ext_for_item, facet_kind_for_item,
     facet_tag_filter_applies, format_details_duration, item_supports_tags, passes_rating_filter,
     path_extension_lower, path_in_subtree_ci, run_details_meta_load, run_metadata_load,
-    run_metadata_search, stem_lower, tag_item_path,
+    run_metadata_search, stem_lower,
 };
 pub(crate) use metadata_ops::{FacetField, format_details_timestamp};
 pub(crate) use prefetch_policy::{
@@ -13876,6 +13882,8 @@ pub struct App {
     /// rating_view_rows がどの星の build 完了結果か。空の正規結果と未ロードを区別する。
     pub(crate) rating_view_rows_stars: Option<u8>,
     pub(crate) rating_view_pending: Option<crate::rating_view::RatingViewPending>,
+    pub(crate) rating_view_request_sequence: u64,
+    pub(crate) rating_view_accepted_write_generation: u64,
     pub(crate) rating_view_skipped: usize,
     pub(crate) rating_view_saved_folder: Option<PathBuf>,
     pub(crate) rating_view_subfolder_restore:
@@ -16934,6 +16942,8 @@ impl App {
             rating_view_rows: Vec::new(),
             rating_view_rows_stars: None,
             rating_view_pending: None,
+            rating_view_request_sequence: 0,
+            rating_view_accepted_write_generation: 0,
             rating_view_skipped: 0,
             rating_view_saved_folder: None,
             rating_view_subfolder_restore: None,
@@ -20470,7 +20480,12 @@ impl App {
                 self.pending_rating_view_zipdir_open = None;
                 if self.rating_view_rows_stars == Some(*stars) && self.rating_view_pending.is_none()
                 {
-                    self.install_rating_view_rows();
+                    self.rating_view_stars = *stars;
+                    self.address = format!(
+                        "{} レーティング一覧を読み込み中…",
+                        "★".repeat(*stars as usize)
+                    );
+                    self.request_rating_view_build();
                 } else {
                     self.rating_view_stars = *stars;
                     self.rating_view_sort = crate::rating_view::RatingViewSort::default();
@@ -21129,7 +21144,7 @@ impl App {
                 self.rating_view_sort =
                     crate::rating_view::RatingViewSort::Normal(self.settings.sort_order);
             }
-            self.install_rating_view_rows();
+            self.request_rating_view_build();
             return;
         }
         if self.items_are_bookmark_view {
@@ -22610,6 +22625,9 @@ impl App {
             existing_keys,
             video_items,
             Some(folder_signature),
+            None,
+            None,
+            None,
             None,
             authority,
         );
@@ -24760,16 +24778,14 @@ impl App {
             "{} レーティング一覧を読み込み中…",
             "★".repeat(stars as usize)
         );
-        self.rating_view_pending = Some(crate::rating_view::spawn_rating_view_build(
-            crate::rating_db::RatingDb::db_path(),
-            stars,
-        ));
+        self.request_rating_view_build();
     }
 
     pub(crate) fn close_rating_view(&mut self) {
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
         }
+        self.rating_view_request_sequence = self.rating_view_request_sequence.wrapping_add(1);
         self.rating_view_rows.clear();
         self.rating_view_rows_stars = None;
         self.rating_view_skipped = 0;
@@ -24848,7 +24864,7 @@ impl App {
         if let Some(top) = self.rating_view_nav_stack.last().cloned() {
             let _ = self.load_folder_or_convert_archive(top);
         } else {
-            self.install_rating_view_rows();
+            self.request_rating_view_build();
             if let Some(popped_path) = popped.as_ref() {
                 self.select_rating_view_row_for_opened_path(popped_path);
             }
@@ -24880,33 +24896,119 @@ impl App {
         if self.sidecar_restore_active() {
             return;
         }
-        let Some(pending) = self.rating_view_pending.as_ref() else {
+        if self.rating_view_pending.is_none() {
+            if self.items_are_rating_view
+                && self.rating_view_accepted_write_generation
+                    != crate::rating_db::RATING_WRITES.sample().completed_writes
+            {
+                self.request_rating_view_build();
+            }
             return;
-        };
+        }
+        let pending = self.rating_view_pending.as_ref().unwrap();
+        if pending.context != self.projected_viewer_context_id()
+            || (pending.source_generation != self.items_generation && !self.items_are_rating_view)
+        {
+            if let Some(pending) = self.rating_view_pending.take() {
+                pending.cancel();
+            }
+            return;
+        }
+        let stale = pending.sequence != self.rating_view_request_sequence
+            || pending.rating_write_generation != self.rating_session_write_generation
+            || pending.sort != self.rating_view_sort
+            || pending.stars != self.rating_view_stars
+            || pending.source_generation != self.items_generation;
+        if stale {
+            self.request_rating_view_build();
+            return;
+        }
         match pending.rx.try_recv() {
             Ok(Ok(result)) => {
                 self.rating_view_pending = None;
-                if result.stars == self.rating_view_stars {
+                // The generic item install clears the outgoing edit maps. Finish its pending
+                // trim write before validating the worker's DB-read stamp.
+                self.persist_pending_view_trim_state();
+                if result.prepared.as_ref().is_some_and(|prepared| {
+                    crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+                        .accepts(prepared.page_edits.stamp)
+                        && crate::rating_db::RATING_WRITES.accepts(prepared.rating_stamp)
+                        && crate::tags_db::TAG_WRITES.accepts(prepared.tag_stamp)
+                }) {
+                    self.rating_view_accepted_write_generation = result
+                        .prepared
+                        .as_ref()
+                        .unwrap()
+                        .rating_stamp
+                        .completed_writes;
                     self.apply_rating_view_result(result);
+                } else {
+                    self.request_rating_view_build();
                 }
             }
             Ok(Err(msg)) => {
                 self.rating_view_pending = None;
-                crate::logger::log(format!("rating-view: build failed: {msg}"));
-                self.show_feedback_toast("[レーティング一覧を読み込めませんでした]".to_string());
+                if msg == "page-edit read changed during rating prepare"
+                    || msg == "rating read changed during rating prepare"
+                    || msg == "tag read changed during rating prepare"
+                    || msg == "cancelled"
+                {
+                    self.request_rating_view_build();
+                } else {
+                    self.rating_view_accepted_write_generation =
+                        crate::rating_db::RATING_WRITES.sample().completed_writes;
+                    crate::logger::log(format!("rating-view: build failed: {msg}"));
+                    self.show_feedback_toast(
+                        "[レーティング一覧を読み込めませんでした]".to_string(),
+                    );
+                }
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.rating_view_pending = None;
+                self.rating_view_accepted_write_generation =
+                    crate::rating_db::RATING_WRITES.sample().completed_writes;
+                self.show_feedback_toast("[レーティング一覧を読み込めませんでした]".to_string());
             }
         }
+    }
+
+    fn request_rating_view_build(&mut self) {
+        if let Some(pending) = self.rating_view_pending.take() {
+            pending.cancel();
+        }
+        self.rating_view_request_sequence = self.rating_view_request_sequence.wrapping_add(1);
+        self.rating_view_pending = Some(crate::rating_view::spawn_rating_view_build(
+            crate::rating_db::RatingDb::db_path(),
+            self.rating_view_stars.clamp(1, 5),
+            self.rating_view_request_sequence,
+            self.items_generation,
+            self.projected_viewer_context_id(),
+            self.rating_session_write_generation,
+            crate::rating_view::RatingViewPrepareOptions {
+                sort: self.rating_view_sort,
+                display_order: self.settings.grid_display_order.clone(),
+                pin_db: self.folder_thumb_pin_db.clone(),
+                folder_thumb_sort: self.settings.folder_thumb_sort,
+                folder_thumb_depth: self.settings.folder_thumb_depth,
+                edits: page_edit_snapshot::PageEditAvailability::for_app(self),
+                tags_db_path: self
+                    .tags_db
+                    .as_ref()
+                    .map(|_| crate::tags_db::TagsDb::db_path()),
+            },
+        ));
     }
 
     fn apply_rating_view_result(&mut self, result: crate::rating_view::RatingViewBuildResult) {
         self.rating_view_rows_stars = Some(result.stars);
         self.rating_view_rows = result.rows;
         self.rating_view_skipped = result.skipped;
-        self.install_rating_view_rows();
+        if let Some(prepared) = result.prepared {
+            self.install_prepared_rating_view_rows(prepared);
+        } else {
+            self.install_rating_view_rows();
+        }
         if self.rating_view_skipped > 0 {
             self.show_feedback_toast(format!(
                 "見つからない項目を {} 件除外しました",
@@ -24918,7 +25020,7 @@ impl App {
     pub(crate) fn set_rating_view_sort(&mut self, sort: crate::rating_view::RatingViewSort) {
         self.rating_view_sort = sort;
         if self.items_are_rating_view {
-            self.install_rating_view_rows();
+            self.request_rating_view_build();
         }
     }
 
@@ -24933,48 +25035,9 @@ impl App {
     pub(crate) fn refresh_rating_view_after_rating_changes(&mut self, changes: &[(String, u8)]) {
         if changes.is_empty() {
             self.rebuild_visible_indices();
-            return;
+        } else {
+            self.request_rating_view_build();
         }
-        let view_stars = self.rating_view_stars;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_millis().min(i64::MAX as u128) as i64);
-        let changed: std::collections::HashMap<&str, u8> = changes
-            .iter()
-            .map(|(key, stars)| (key.as_str(), *stars))
-            .collect();
-        self.rating_view_rows.retain_mut(|row| {
-            let Some(&new_stars) = changed.get(row.key.as_str()) else {
-                return true;
-            };
-            if new_stars == view_stars && new_stars > 0 {
-                if let Some(ts) = now_ms {
-                    row.rated_at_ms = Some(ts);
-                }
-                true
-            } else {
-                false
-            }
-        });
-        let existing: std::collections::HashSet<&str> = self
-            .rating_view_rows
-            .iter()
-            .map(|row| row.key.as_str())
-            .collect();
-        let restore_keys: Vec<String> = changes
-            .iter()
-            .filter(|(key, stars)| {
-                *stars == view_stars && *stars > 0 && !existing.contains(key.as_str())
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        drop(existing);
-        if !restore_keys.is_empty() {
-            self.reload_current_rating_view_preserving_sort();
-            return;
-        }
-        self.install_rating_view_rows();
     }
 
     pub(crate) fn reload_current_rating_view_preserving_sort(&mut self) {
@@ -24983,17 +25046,16 @@ impl App {
             pending.cancel();
         }
         self.rating_view_stars = stars;
-        self.rating_view_rows.clear();
-        self.rating_view_rows_stars = None;
-        self.rating_view_skipped = 0;
+        if !self.items_are_rating_view {
+            self.rating_view_rows.clear();
+            self.rating_view_rows_stars = None;
+            self.rating_view_skipped = 0;
+        }
         self.address = format!(
             "{} レーティング一覧を読み込み中…",
             "★".repeat(stars as usize)
         );
-        self.rating_view_pending = Some(crate::rating_view::spawn_rating_view_build(
-            crate::rating_db::RatingDb::db_path(),
-            stars,
-        ));
+        self.request_rating_view_build();
     }
 
     pub(crate) fn reload_open_metadata_views_after_cleanup(&mut self) {
@@ -25004,6 +25066,29 @@ impl App {
             self.tag_view.last_executed.clear();
             self.execute_tag_view();
         }
+    }
+
+    fn install_prepared_rating_view_rows(
+        &mut self,
+        prepared: crate::rating_view::RatingViewPreparedItems,
+    ) {
+        let previous_selected = self.selected;
+        let previous_selected_key = previous_selected.and_then(|idx| self.rating_path_key(idx));
+        let retained_details_rated_at_sort = (self.items_are_rating_view
+            && self.settings.details_sort_key == crate::settings::DetailsSortKey::RatedAt)
+            .then_some(self.settings.details_sort_ascending);
+        let saved_folder = self.rating_view_saved_folder.clone();
+        if let Some(restore_state) =
+            self.take_subfolder_expansion_restore_for_synthetic_path(saved_folder.as_deref())
+        {
+            self.rating_view_subfolder_restore = Some(restore_state);
+        }
+        self.start_loading_prepared_rating_items(prepared);
+        self.finish_rating_view_install(
+            previous_selected,
+            previous_selected_key,
+            retained_details_rated_at_sort,
+        );
     }
 
     fn install_rating_view_rows(&mut self) {
@@ -25079,6 +25164,19 @@ impl App {
             video_items,
             None,
         );
+        self.finish_rating_view_install(
+            previous_selected,
+            previous_selected_key,
+            retained_details_rated_at_sort,
+        );
+    }
+
+    fn finish_rating_view_install(
+        &mut self,
+        previous_selected: Option<usize>,
+        previous_selected_key: Option<String>,
+        retained_details_rated_at_sort: Option<bool>,
+    ) {
         self.items_are_rating_view = true;
         if let Some(ascending) = retained_details_rated_at_sort {
             // generic な一覧差し替えは一度 view flag を落として通常ビュー退出を確定する。
@@ -25641,6 +25739,9 @@ impl App {
                     Vec::new(),
                     None,
                     None,
+                    None,
+                    None,
+                    None,
                     authority,
                 );
                 self.set_empty_items_reason(
@@ -25680,6 +25781,9 @@ impl App {
             image_metas,
             existing_keys,
             Vec::new(),
+            None,
+            None,
+            None,
             None,
             None,
             authority,
@@ -27351,6 +27455,9 @@ impl App {
             video_items,
             folder_signature,
             None,
+            None,
+            None,
+            None,
             VisibleInstallAuthority::Ordinary,
         );
     }
@@ -27371,6 +27478,40 @@ impl App {
             video_items,
             None,
             Some(metadata),
+            None,
+            None,
+            None,
+            VisibleInstallAuthority::Ordinary,
+        );
+    }
+
+    fn start_loading_prepared_rating_items(
+        &mut self,
+        prepared: crate::rating_view::RatingViewPreparedItems,
+    ) {
+        let crate::rating_view::RatingViewPreparedItems {
+            items,
+            image_metas,
+            existing_keys,
+            pin_map,
+            video_items,
+            page_edits,
+            rating_stamp: _,
+            tag_stamp: _,
+            rating_cache,
+            tags_cache,
+        } = prepared;
+        self.start_loading_items_inner(
+            rating_view_synthetic_path(),
+            items,
+            image_metas,
+            existing_keys,
+            video_items,
+            None,
+            None,
+            Some((page_edits.snapshot, page_edits.projection)),
+            Some(pin_map),
+            Some((rating_cache, tags_cache)),
             VisibleInstallAuthority::Ordinary,
         );
     }
@@ -27384,6 +27525,17 @@ impl App {
         video_items: Vec<(usize, PathBuf, u64)>,
         folder_signature: Option<u64>,
         mut prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
+        prepared_page_edits: Option<(
+            page_edit_snapshot::PageEditSnapshot,
+            page_edit_snapshot::PageEditProjection,
+        )>,
+        prepared_pin_map: Option<
+            std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+        >,
+        mut prepared_rating_tags: Option<(
+            std::collections::HashMap<usize, u8>,
+            std::collections::HashMap<String, Vec<String>>,
+        )>,
         authority: VisibleInstallAuthority<'_>,
     ) {
         // An earlier accepted load owns the sole restore continuation.  Results from sibling
@@ -27733,6 +27885,9 @@ impl App {
             .as_ref()
             .is_some_and(|metadata| metadata.aggregate.is_some());
         self.install_new_items_inner(items, image_metas, !has_prepared_aggregate);
+        if let Some(pin_map) = prepared_pin_map {
+            self.folder_pin_map = pin_map;
+        }
         let mut prepared_aggregate = prepared_subfolder
             .as_mut()
             .and_then(|metadata| metadata.aggregate.take());
@@ -27818,6 +27973,8 @@ impl App {
         let prewarm_rating_t0 = std::time::Instant::now();
         if let Some(prepared) = prepared_subfolder.as_mut() {
             self.rating_cache = std::mem::take(&mut prepared.rating_cache);
+        } else if let Some((rating_cache, _)) = prepared_rating_tags.as_mut() {
+            self.rating_cache = std::mem::take(rating_cache);
         } else {
             self.prewarm_rating_cache();
         }
@@ -27846,6 +28003,15 @@ impl App {
             }
             self.tag_prewarm_queued.clear();
             self.replace_tags_cache(std::mem::take(&mut prepared.tags_cache));
+            if self.settings.write_rating_to_xmp {
+                self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+            }
+        } else if let Some((_, tags_cache)) = prepared_rating_tags.as_mut() {
+            if let Some(pending) = self.tag_prewarm_pending.take() {
+                pending.cancel();
+            }
+            self.tag_prewarm_queued.clear();
+            self.replace_tags_cache(std::mem::take(tags_cache));
             if self.settings.write_rating_to_xmp {
                 self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
             }
@@ -27984,6 +28150,7 @@ impl App {
             source_path,
             source_is_directory,
             prepared_subfolder,
+            prepared_page_edits,
             prepared_aggregate,
             catalog_existing_keys,
             video_items,
@@ -28009,6 +28176,7 @@ impl App {
             source_path,
             source_is_directory: _,
             mut prepared_subfolder,
+            prepared_page_edits: direct_page_edits,
             mut prepared_aggregate,
             catalog_existing_keys,
             video_items,
@@ -28020,9 +28188,11 @@ impl App {
             cancel,
             restore_started_at,
         } = continuation;
-        let mut prepared_page_edits = prepared_subfolder
-            .as_mut()
-            .and_then(|metadata| metadata.page_edits.take());
+        let mut prepared_page_edits = direct_page_edits.or_else(|| {
+            prepared_subfolder
+                .as_mut()
+                .and_then(|metadata| metadata.page_edits.take())
+        });
         self.page_edit_snapshot = prepared_page_edits
             .as_mut()
             .map(|(snapshot, _)| std::mem::take(snapshot));
@@ -28099,7 +28269,7 @@ impl App {
         let crop_t0 = std::time::Instant::now();
         if let Some((_, projection)) = prepared_page_edits.as_mut() {
             self.export_crop_page_settings = std::mem::take(&mut projection.export_crop);
-            self.export_crop_pages = self.export_crop_page_settings.keys().copied().collect();
+            self.export_crop_pages = std::mem::take(&mut projection.export_crop_pages);
         } else if let Some(metadata) = prepared_aggregate.as_mut() {
             self.export_crop_page_settings =
                 std::mem::take(&mut metadata.export_crop_page_settings);
@@ -30637,6 +30807,30 @@ impl App {
         if let Some(p) = self.stamp_embed_pending.take() {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn virtual_list_context_id(&self) -> ViewerContextId {
+        self.projected_viewer_context_id()
+    }
+
+    pub(crate) fn install_prepared_page_edits(
+        &mut self,
+        prepared: page_edit_snapshot::StablePageEditProjection,
+    ) {
+        let page_edit_snapshot::StablePageEditProjection {
+            snapshot,
+            projection,
+            ..
+        } = prepared;
+        self.page_edit_snapshot = Some(snapshot);
+        self.adjustment_page_params = projection.adjustment;
+        self.export_crop_page_settings = projection.export_crop;
+        self.export_crop_pages = projection.export_crop_pages;
+        self.view_trim_page_overrides = projection.view_trim;
+        self.mask_pages = projection.mask;
+        self.conceal_pages = projection.conceal;
+        self.comic_pages = projection.comic;
+        self.local_adjust_pages = projection.local_adjust;
     }
 
     /// Keep the page-key owner and the active index projection in step after an edit mutation.
@@ -36097,9 +36291,13 @@ impl App {
         // 付け替えの後に古い key の保存が着地すると、移したはずの行が書き戻る。
         self.wait_for_local_adjust_writes();
         let mut errors = Vec::new();
+        let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let rating_write = crate::rating_db::RATING_WRITES.begin();
         for (from, to) in mappings {
             self.copy_book_page_edit_key(&from, &to, &mut errors);
         }
+        drop(rating_write);
+        drop(page_edit_write);
         self.finish_book_page_edit_mapping("copy", errors);
     }
 
@@ -36112,9 +36310,11 @@ impl App {
             return;
         }
         let mut errors = Vec::new();
+        let rating_write = crate::rating_db::RATING_WRITES.begin();
         for (from, to) in mappings {
             self.copy_book_page_semantic_key(&from, &to, &mut errors);
         }
+        drop(rating_write);
         self.finish_book_page_semantic_mapping(errors);
     }
 
@@ -36152,12 +36352,16 @@ impl App {
         // 付け替えの後に古い key の保存が着地すると、移したはずの行が書き戻る。
         self.wait_for_local_adjust_writes();
         let mut errors = Vec::new();
+        let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let rating_write = crate::rating_db::RATING_WRITES.begin();
         for (from, temp, _) in &temp_mappings {
             self.move_book_page_edit_key(from, temp, &mut errors);
         }
         for (_, temp, to) in &temp_mappings {
             self.move_book_page_edit_key(temp, to, &mut errors);
         }
+        drop(rating_write);
+        drop(page_edit_write);
         self.finish_book_page_edit_mapping("move", errors);
     }
 
@@ -55367,6 +55571,9 @@ impl App {
     ) {
         self.rating_session_write_generation =
             self.rating_session_write_generation.wrapping_add(1).max(1);
+        // Every successful rating DB write, including metadata panel and fullscreen keys,
+        // invalidates a prepared rating order at the shared publication boundary.
+        self.rating_view_request_sequence = self.rating_view_request_sequence.wrapping_add(1);
         self.rating_session_writes.insert(
             key,
             RatingSessionWrite {
@@ -56208,6 +56415,8 @@ impl App {
     /// 結果に含まれないキーは 0 (未評価) としてキャッシュに入れ、以後の DB アクセスを抑制する。
     /// ページ単位とコンテナの両方を対象とする。
     pub(crate) fn prewarm_rating_cache(&mut self) {
+        #[cfg(test)]
+        RATING_INSTALL_UI_PREWARMS.with(|calls| calls.set(calls.get() + 1));
         if self.rating_db.is_none() {
             return;
         }
@@ -56477,6 +56686,8 @@ impl App {
     ///
     /// rating の opt-in XMP ハイドレーションだけは既存 `tag_prewarm` worker を使う。
     pub(crate) fn prewarm_grid_tags(&mut self) {
+        #[cfg(test)]
+        RATING_INSTALL_UI_TAG_PREWARMS.with(|calls| calls.set(calls.get() + 1));
         // 旧プリフェッチ (別フォルダの残り) は cancel: 以降の XMP 読みを無駄にしない。
         if let Some(pending) = self.tag_prewarm_pending.take() {
             pending.cancel();
@@ -78427,7 +78638,7 @@ fn make_load_request(
 /// (`{base}#pin:{source_id}`) を含めないと、`apply_folder_thumb_pin` が書いた
 /// 行が毎回のフォルダロードで catalog から削除されて再生成が走り続ける
 /// (Codex Phase B P2 指摘)。
-fn folder_thumb_existing_keys_for(
+pub(crate) fn folder_thumb_existing_keys_for(
     item: &GridItem,
     item_meta: Option<(i64, i64)>,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,

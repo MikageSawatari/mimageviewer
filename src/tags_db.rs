@@ -83,6 +83,10 @@ pub struct TagsDb {
     path: PathBuf,
 }
 
+/// All tags.db writers, including worker and migration connections, publish here.
+pub(crate) static TAG_WRITES: crate::page_edit_write_epoch::EditWriteEpoch =
+    crate::page_edit_write_epoch::EditWriteEpoch::new();
+
 impl TagsDb {
     pub fn open() -> Result<Self, rusqlite::Error> {
         let path = Self::db_path();
@@ -270,6 +274,7 @@ impl TagsDb {
         S: AsRef<str>,
     {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM item_tags WHERE item_key = ?1", [item_key])?;
@@ -302,6 +307,7 @@ impl TagsDb {
         S: AsRef<str>,
     {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let normalized = collapse_tags(tags, now);
         let tx = self.conn.transaction()?;
@@ -346,6 +352,7 @@ impl TagsDb {
         }
 
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let transaction_started = std::time::Instant::now();
         let tx = self
             .conn
@@ -430,6 +437,7 @@ impl TagsDb {
         tag_name: &str,
     ) -> Result<(TagToggleOutcome, Vec<String>, Vec<String>), rusqlite::Error> {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let tag = normalize_tag_display_name(tag_name);
         let tag_key = normalize_tag_key(&tag);
@@ -466,6 +474,7 @@ impl TagsDb {
         item_key: &str,
     ) -> Result<(bool, Vec<String>, Vec<String>), rusqlite::Error> {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let before = self.display_tags_for_item(item_key);
         let tx = self.conn.transaction()?;
@@ -480,6 +489,7 @@ impl TagsDb {
             return Ok(());
         }
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM item_tags WHERE item_key = ?1", [to_key])?;
         tx.execute("DELETE FROM tag_item_state WHERE item_key = ?1", [to_key])?;
@@ -505,6 +515,7 @@ impl TagsDb {
             return Ok(());
         }
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM item_tags WHERE item_key = ?1", [to_key])?;
         tx.execute("DELETE FROM tag_item_state WHERE item_key = ?1", [to_key])?;
@@ -540,6 +551,7 @@ impl TagsDb {
         }
 
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let tx = self.conn.transaction()?;
         let affected_items = item_keys_for_tag_key_tx(&tx, &old_key)?;
@@ -610,6 +622,7 @@ impl TagsDb {
         source: &str,
     ) -> Result<(), rusqlite::Error> {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let tx = self.conn.transaction()?;
         upsert_item_state_tx(&tx, item_key, source, now)?;
@@ -626,6 +639,7 @@ impl TagsDb {
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         self.conn.execute(
             "INSERT INTO tag_meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -647,6 +661,7 @@ impl TagsDb {
         folder_key: &str,
         sidecar_mtime: i64,
     ) -> Result<(), rusqlite::Error> {
+        let _tag_write = TAG_WRITES.begin();
         self.conn.execute(
             "INSERT INTO tag_sidecar_sync (folder_key, sidecar_mtime) VALUES (?1, ?2)
              ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = excluded.sidecar_mtime",
@@ -656,6 +671,7 @@ impl TagsDb {
     }
 
     pub fn sidecar_sync_clear(&self, folder_key: &str) -> Result<(), rusqlite::Error> {
+        let _tag_write = TAG_WRITES.begin();
         self.conn
             .execute(
                 "DELETE FROM tag_sidecar_sync WHERE folder_key = ?1",
@@ -681,6 +697,7 @@ impl TagsDb {
         }
 
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let tx = self.conn.transaction()?;
         let mut report = LegacyImportReport::default();
@@ -936,6 +953,7 @@ impl TagsDb {
             return Ok(0);
         }
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let tx = self.conn.transaction()?;
         let mut removed_tags = 0usize;
         {

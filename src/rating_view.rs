@@ -61,10 +61,40 @@ pub struct RatingViewBuildResult {
     pub stars: u8,
     pub rows: Vec<RatingViewRow>,
     pub skipped: usize,
+    pub(crate) prepared: Option<RatingViewPreparedItems>,
+}
+
+pub(crate) struct RatingViewPreparedItems {
+    pub(crate) items: Vec<GridItem>,
+    pub(crate) image_metas: Vec<Option<(i64, i64)>>,
+    pub(crate) existing_keys: std::collections::HashSet<String>,
+    pub(crate) pin_map:
+        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pub(crate) video_items: Vec<(usize, PathBuf, u64)>,
+    pub(crate) page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,
+    pub(crate) rating_stamp: crate::page_edit_write_epoch::WriteStamp,
+    pub(crate) tag_stamp: crate::page_edit_write_epoch::WriteStamp,
+    pub(crate) rating_cache: std::collections::HashMap<usize, u8>,
+    pub(crate) tags_cache: std::collections::HashMap<String, Vec<String>>,
+}
+
+pub(crate) struct RatingViewPrepareOptions {
+    pub(crate) sort: RatingViewSort,
+    pub(crate) display_order: crate::settings::GridDisplayOrder,
+    pub(crate) pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
+    pub(crate) folder_thumb_sort: crate::settings::SortOrder,
+    pub(crate) folder_thumb_depth: u32,
+    pub(crate) edits: crate::app::page_edit_snapshot::PageEditAvailability,
+    pub(crate) tags_db_path: Option<PathBuf>,
 }
 
 pub struct RatingViewPending {
     pub stars: u8,
+    pub sequence: u64,
+    pub source_generation: u64,
+    pub(crate) context: crate::app::ViewerContextId,
+    pub rating_write_generation: u64,
+    pub sort: RatingViewSort,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<RatingViewBuildResult, String>>,
 }
@@ -75,19 +105,36 @@ impl RatingViewPending {
     }
 }
 
-pub fn spawn_rating_view_build(db_path: PathBuf, stars: u8) -> RatingViewPending {
+pub(crate) fn spawn_rating_view_build(
+    db_path: PathBuf,
+    stars: u8,
+    sequence: u64,
+    source_generation: u64,
+    context: crate::app::ViewerContextId,
+    rating_write_generation: u64,
+    options: RatingViewPrepareOptions,
+) -> RatingViewPending {
+    let options_sort = options.sort;
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("rating-view-build".to_string())
         .spawn(move || {
-            let result = build_rating_view_rows(db_path, stars, &cancel_worker)
-                .map_err(|err| err.to_string());
+            let result = prepare_rating_view(db_path, stars, options, &cancel_worker);
             let _ = tx.send(result);
         })
         .ok();
-    RatingViewPending { stars, cancel, rx }
+    RatingViewPending {
+        stars,
+        sequence,
+        source_generation,
+        context,
+        rating_write_generation,
+        sort: options_sort,
+        cancel,
+        rx,
+    }
 }
 
 fn build_rating_view_rows(
@@ -117,7 +164,129 @@ fn build_rating_view_rows(
         stars,
         rows: out,
         skipped,
+        prepared: None,
     })
+}
+
+fn prepare_rating_view(
+    db_path: PathBuf,
+    stars: u8,
+    options: RatingViewPrepareOptions,
+    cancel: &AtomicBool,
+) -> Result<RatingViewBuildResult, String> {
+    let rating_before = crate::rating_db::RATING_WRITES.sample();
+    if rating_before.active_writers != 0 {
+        return Err("rating read changed during rating prepare".into());
+    }
+    let mut result = match build_rating_view_rows(db_path, stars, cancel) {
+        Ok(result) => result,
+        Err(error) => {
+            if !crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(
+                rating_before,
+                crate::rating_db::RATING_WRITES.sample(),
+            ) {
+                return Err("rating read changed during rating prepare".into());
+            }
+            return Err(error.to_string());
+        }
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    let (items, image_metas) =
+        sort_and_materialize_rows(&mut result.rows, options.sort, &options.display_order);
+    let video_items = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let GridItem::Video(path) = item else {
+                return None;
+            };
+            let size = image_metas[index]
+                .map(|(_, size)| size.max(0) as u64)
+                .unwrap_or(0);
+            Some((index, path.clone(), size))
+        })
+        .collect();
+    let pin_map = if let Some(db) = options.pin_db.as_ref() {
+        let containers = items
+            .iter()
+            .filter_map(GridItem::container_path)
+            .collect::<Vec<_>>();
+        db.lookup_many(containers)
+    } else {
+        Default::default()
+    };
+    let existing_keys = items
+        .iter()
+        .zip(image_metas.iter())
+        .flat_map(|(item, meta)| {
+            crate::app::folder_thumb_existing_keys_for(
+                item,
+                *meta,
+                &pin_map,
+                options.pin_db.as_deref(),
+                Some(options.folder_thumb_sort),
+                options.folder_thumb_depth,
+                true,
+            )
+        })
+        .collect();
+    let page_edits = crate::app::page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
+        &items,
+        options.edits,
+        cancel,
+    )?
+    .ok_or_else(|| "page-edit read changed during rating prepare".to_string())?;
+    let rating_cache = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.accepts_rating())
+        .map(|(index, _)| (index, stars))
+        .collect();
+    let tag_keys = items
+        .iter()
+        .filter_map(crate::app::tag_item_path)
+        .map(crate::tags_db::item_key_for_path)
+        .collect::<std::collections::HashSet<_>>();
+    let tag_before = crate::tags_db::TAG_WRITES.sample();
+    if tag_before.active_writers != 0 {
+        return Err("tag read changed during rating prepare".into());
+    }
+    let mut loaded_tags = options
+        .tags_db_path
+        .as_deref()
+        .and_then(|path| crate::tags_db::TagsDb::open_readonly(path).ok())
+        .map(|db| db.get_many_display_tags(&tag_keys.iter().cloned().collect::<Vec<_>>()))
+        .unwrap_or_default();
+    let tags_cache = tag_keys
+        .into_iter()
+        .map(|key| {
+            let tags = loaded_tags.remove(&key).unwrap_or_default();
+            (key, tags)
+        })
+        .collect();
+    let tag_stamp = crate::tags_db::TAG_WRITES.sample();
+    if !crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(tag_before, tag_stamp) {
+        return Err("tag read changed during rating prepare".into());
+    }
+    let rating_stamp = crate::rating_db::RATING_WRITES.sample();
+    if !crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(rating_before, rating_stamp) {
+        return Err("rating read changed during rating prepare".into());
+    }
+    result.prepared = Some(RatingViewPreparedItems {
+        items,
+        image_metas,
+        existing_keys,
+        pin_map,
+        video_items,
+        page_edits,
+        rating_stamp,
+        tag_stamp,
+        rating_cache,
+        tags_cache,
+    });
+    Ok(result)
 }
 
 pub fn sort_rows(rows: &mut [RatingViewRow], sort: RatingViewSort) {

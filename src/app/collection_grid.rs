@@ -2324,7 +2324,7 @@ impl App {
             self.page_edit_snapshot = Some(snapshot);
             self.adjustment_page_params = std::mem::take(&mut projection.adjustment);
             self.export_crop_page_settings = std::mem::take(&mut projection.export_crop);
-            self.export_crop_pages = self.export_crop_page_settings.keys().copied().collect();
+            self.export_crop_pages = std::mem::take(&mut projection.export_crop_pages);
             self.view_trim_page_overrides = std::mem::take(&mut projection.view_trim);
             self.mask_pages = std::mem::take(&mut projection.mask);
             self.conceal_pages = std::mem::take(&mut projection.conceal);

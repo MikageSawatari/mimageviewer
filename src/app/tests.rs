@@ -1114,11 +1114,55 @@ fn phase_b_masked_image() -> (phase_c_support::AppTestEnv, PathBuf) {
     (app, image)
 }
 
+fn phase_b_search_stream(
+    app: &mut App,
+    ctx: &egui::Context,
+) -> crossbeam_channel::Sender<crate::global_search::SearchStreamEvent> {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    app.begin_search_page_edit_prepare_for_test(ctx);
+    app.global_search.pending = Some(crate::indexer_manager::SearchHandle {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+    });
+    tx
+}
+
+fn phase_b_search_batch(
+    path: &std::path::Path,
+    valid_hits: usize,
+) -> crate::global_search::SearchStreamEvent {
+    crate::global_search::SearchStreamEvent::Batch {
+        hits: vec![crate::global_search::GlobalHit {
+            path: path.to_string_lossy().to_string(),
+            score: 1.0,
+            stars: 0,
+            mtime: 1,
+            file_size: Some(5),
+        }],
+        scanned_candidates: valid_hits,
+        valid_hits,
+    }
+}
+
 #[test]
-#[ignore = "backlog 1.268 phase B: needs worker-side prepare lifecycle"]
 fn phase_b_search_streaming_result_projects_saved_mask() {
     let (mut app, image) = phase_b_masked_image();
-    app.replace_search_view_items(vec![GridItem::Image(image)], vec![Some((1, 5))]);
+    let ctx = egui::Context::default();
+    let stream = phase_b_search_stream(&mut app, &ctx);
+    stream.send(phase_b_search_batch(&image, 1)).unwrap();
+    stream
+        .send(crate::global_search::SearchStreamEvent::Done {
+            truncated: false,
+            reason: crate::global_search::DoneReason::Complete,
+        })
+        .unwrap();
+    for _ in 0..100 {
+        app.poll_global_search_events(&ctx);
+        if app.mask_pages.contains(&0) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert!(
         app.mask_pages.contains(&0),
         "search result paint must use saved mask"
@@ -1126,38 +1170,510 @@ fn phase_b_search_streaming_result_projects_saved_mask() {
 }
 
 #[test]
-#[ignore = "backlog 1.268 phase B: needs worker-side prepare lifecycle"]
-fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
-    let (mut app, image) = phase_b_masked_image();
-    app.rating_view_rows = vec![crate::rating_view::RatingViewRow {
-        key: crate::adjustment_db::normalize_path(&image),
-        item: GridItem::Image(image),
-        image_meta: Some((1, 5)),
-        rated_at_ms: Some(1),
-    }];
-    app.install_rating_view_rows();
+fn phase_b_search_rebuild_retains_done_and_new_page_edits() {
+    let (mut app, first) = phase_b_masked_image();
+    let second = app.tmp.path().join("phase-b-second.png");
+    std::fs::write(&second, b"image").unwrap();
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(
+            &crate::adjustment_db::normalize_path(&second),
+            &[true],
+            &[],
+            1,
+            1,
+        )
+        .unwrap();
+    let ctx = egui::Context::default();
+    let stream = phase_b_search_stream(&mut app, &ctx);
+    stream.send(phase_b_search_batch(&first, 1)).unwrap();
+    for _ in 0..100 {
+        app.poll_global_search_events(&ctx);
+        if app.items_are_global_search_view && app.items.len() == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(app.items.len(), 1);
+    let first_generation = app.items_generation;
+    // Done arrives with the final batch while a previous accepted replacement
+    // has already advanced the source generation.
+    stream.send(phase_b_search_batch(&second, 2)).unwrap();
+    stream
+        .send(crate::global_search::SearchStreamEvent::Done {
+            truncated: false,
+            reason: crate::global_search::DoneReason::Complete,
+        })
+        .unwrap();
+    for _ in 0..100 {
+        app.poll_global_search_events(&ctx);
+        if app.items.len() == 2 && app.mask_pages.len() == 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.items_generation > first_generation);
+    assert_eq!(app.items.len(), 2);
+    assert_eq!(app.mask_pages.len(), 2);
+}
+
+#[test]
+fn phase_b_query_change_discards_old_stream_and_prepare() {
+    let (mut app, first) = phase_b_masked_image();
+    let ctx = egui::Context::default();
+    let stream = phase_b_search_stream(&mut app, &ctx);
+    app.global_search.query = "old query".into();
+    app.global_search.last_executed = "old query".into();
+    app.rebuild_items_from_global_search();
+    stream.send(phase_b_search_batch(&first, 1)).unwrap();
+    stream
+        .send(crate::global_search::SearchStreamEvent::Done {
+            truncated: false,
+            reason: crate::global_search::DoneReason::Complete,
+        })
+        .unwrap();
+    for _ in 0..100 {
+        app.poll_global_search_events(&ctx);
+        if app.items.len() == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(app.items.len(), 1);
+    let old_prepare_cancel = app.search_prepare_cancel_for_test();
+    app.global_search.query = "new query".into();
+    app.reset_global_search_for_query_change(&ctx);
+    assert!(old_prepare_cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!std::sync::Arc::ptr_eq(
+        &old_prepare_cancel,
+        &app.search_prepare_cancel_for_test(),
+    ));
+    for _ in 0..100 {
+        app.poll_global_search_events(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert!(
-        app.mask_pages.contains(&0),
-        "rating row paint must use saved mask"
+        app.items.is_empty(),
+        "old query hits reappeared during debounce"
     );
 }
 
 #[test]
-#[ignore = "backlog 1.268 phase B: needs worker-side prepare lifecycle"]
-fn phase_b_reading_history_container_resolves_masked_member_before_paint() {
+fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("phase-b-search-late-mask.png");
+    std::fs::write(&image, b"image").unwrap();
+    let ctx = egui::Context::default();
+    let stream = phase_b_search_stream(&mut app, &ctx);
+    for _ in 0..100 {
+        app.poll_global_search_events(&ctx);
+        if app.items_are_global_search_view {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.items_are_global_search_view);
+    app.clear_page_edit_state();
+    assert!(app.page_edit_snapshot.is_none());
+    app.hold_next_search_ready_for_test();
+    stream.send(phase_b_search_batch(&image, 1)).unwrap();
+    stream
+        .send(crate::global_search::SearchStreamEvent::Done {
+            truncated: false,
+            reason: crate::global_search::DoneReason::Complete,
+        })
+        .unwrap();
+    for _ in 0..100 {
+        app.poll_global_search_events(&ctx);
+        if app.search_ready_is_held_for_test() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.search_ready_is_held_for_test());
+    assert!(app.page_edit_snapshot.is_none());
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    app.release_search_ready_for_test();
+    for _ in 0..100 {
+        app.poll_global_search_events(&ctx);
+        if app.items.len() == 1 && app.mask_pages.contains(&0) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.mask_pages.contains(&0));
+}
+
+#[test]
+fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
+    let (mut app, image) = phase_b_masked_image();
+    let tag_key = crate::tags_db::item_key_for_path(&image);
+    app.tags_db
+        .as_mut()
+        .unwrap()
+        .set_item_tags(&tag_key, ["phase-b"], crate::tags_db::source::EDIT)
+        .unwrap();
+    let earlier = app.tmp.path().join("aaa-unedited.png");
+    std::fs::write(&earlier, b"image").unwrap();
+    let earlier_meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+        .with_source_path(&earlier);
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(
+            &crate::adjustment_db::normalize_path(&earlier),
+            3,
+            Some(&earlier_meta),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let key = crate::adjustment_db::normalize_path(&image);
+    let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+        .with_source_path(&image);
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&key, 3, Some(&meta))
+        .unwrap();
+    RATING_INSTALL_UI_PREWARMS.with(|calls| calls.set(0));
+    RATING_INSTALL_UI_TAG_PREWARMS.with(|calls| calls.set(0));
+    app.enter_rating_view(3);
+    let ctx = egui::Context::default();
+    for _ in 0..100 {
+        app.poll_rating_view();
+        app.poll_sidecar_restore(&ctx);
+        if app.items_are_rating_view && app.mask_pages.contains(&0) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    app.set_rating_view_sort(crate::rating_view::RatingViewSort::Normal(
+        crate::settings::SortOrder::FileName,
+    ));
+    for _ in 0..100 {
+        app.poll_rating_view();
+        app.poll_sidecar_restore(&ctx);
+        if app.rating_view_pending.is_none() && !app.sidecar_restore_active() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let masked_index = app
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::Image(path) if path == &image))
+        .unwrap();
+    assert_eq!(
+        masked_index, 1,
+        "local filename sort must rebuild final order"
+    );
+    assert!(
+        app.mask_pages.contains(&masked_index),
+        "rating row paint must use saved mask after sort"
+    );
+    assert_eq!(app.rating_cache.get(&masked_index), Some(&3));
+    assert_eq!(
+        app.tags_cache.get(&tag_key),
+        Some(&vec!["#phase-b".to_string()])
+    );
+    RATING_INSTALL_UI_PREWARMS.with(|calls| assert_eq!(calls.get(), 0));
+    RATING_INSTALL_UI_TAG_PREWARMS.with(|calls| assert_eq!(calls.get(), 0));
+}
+
+#[test]
+fn phase_b_rating_pending_result_rebases_after_shared_star_write() {
+    let (mut app, image) = phase_b_masked_image();
+    let key = crate::adjustment_db::normalize_path(&image);
+    let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+        .with_source_path(&image);
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&key, 3, Some(&meta))
+        .unwrap();
+    app.enter_rating_view(3);
+    let pending = app.rating_view_pending.take().unwrap();
+    let result = loop {
+        match pending.rx.try_recv() {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(error) => panic!("rating prepare disconnected: {error}"),
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    assert!(tx.send(result).is_ok());
+    app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
+    app.write_user_rating_shared(&key, 0, Some(&meta)).unwrap();
+    let ctx = egui::Context::default();
+    for _ in 0..100 {
+        app.poll_rating_view();
+        app.poll_sidecar_restore(&ctx);
+        if app.items_are_rating_view && app.rating_view_pending.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.items_are_rating_view);
+    assert!(
+        app.items.is_empty(),
+        "a pre-write ★ result must not install"
+    );
+}
+
+#[test]
+fn phase_b_rating_pending_result_rebases_after_tag_write() {
+    let (mut app, image) = phase_b_masked_image();
+    let key = crate::adjustment_db::normalize_path(&image);
+    let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+        .with_source_path(&image);
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&key, 3, Some(&meta))
+        .unwrap();
+    app.tags_db
+        .as_mut()
+        .unwrap()
+        .set_item_tags(&key, ["old"], crate::tags_db::source::EDIT)
+        .unwrap();
+    app.enter_rating_view(3);
+    let pending = app.rating_view_pending.take().unwrap();
+    let result = loop {
+        match pending.rx.try_recv() {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(error) => panic!("rating prepare disconnected: {error}"),
+        }
+    };
+    let prepared_tags = &result
+        .as_ref()
+        .unwrap()
+        .prepared
+        .as_ref()
+        .unwrap()
+        .tags_cache;
+    assert_eq!(prepared_tags.get(&key), Some(&vec!["#old".to_string()]));
+    app.tags_db
+        .as_mut()
+        .unwrap()
+        .set_item_tags(&key, ["new"], crate::tags_db::source::EDIT)
+        .unwrap();
+    app.set_tags_cache_entry(key.clone(), vec!["#new".to_string()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(result).unwrap();
+    app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
+    let ctx = egui::Context::default();
+    for _ in 0..100 {
+        app.poll_rating_view();
+        app.poll_sidecar_restore(&ctx);
+        if app.items_are_rating_view && app.rating_view_pending.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.items_are_rating_view);
+    assert_eq!(app.tags_cache.get(&key), Some(&vec!["#new".to_string()]));
+}
+
+#[test]
+fn phase_b_rating_pending_result_rebases_after_book_page_copy() {
+    let (mut app, image) = phase_b_masked_image();
+    let copied = app.tmp.path().join("phase-b-copied.png");
+    std::fs::write(&copied, b"image").unwrap();
+    let key = crate::adjustment_db::normalize_path(&image);
+    let copied_key = crate::adjustment_db::normalize_path(&copied);
+    let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+        .with_source_path(&image);
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&key, 3, Some(&meta))
+        .unwrap();
+    app.enter_rating_view(3);
+    let pending = app.rating_view_pending.take().unwrap();
+    let result = loop {
+        match pending.rx.try_recv() {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(error) => panic!("rating prepare disconnected: {error}"),
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(result).unwrap();
+    app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
+    let local_generation = app.rating_session_write_generation;
+    let mut errors = Vec::new();
+    app.copy_book_page_semantic_key(&key, &copied_key, &mut errors);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(app.rating_session_write_generation, local_generation);
+    let ctx = egui::Context::default();
+    for _ in 0..100 {
+        app.poll_rating_view();
+        app.poll_sidecar_restore(&ctx);
+        if app.items_are_rating_view && app.items.len() == 2 && app.rating_view_pending.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        app.items.len(),
+        2,
+        "stale pre-copy rating order was installed"
+    );
+}
+
+#[test]
+fn phase_b_rating_rejects_edit_written_without_view_snapshot() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("phase-b-late-mask.png");
+    std::fs::write(&image, b"image").unwrap();
+    let key = crate::adjustment_db::normalize_path(&image);
+    let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+        .with_source_path(&image);
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&key, 3, Some(&meta))
+        .unwrap();
+    app.enter_rating_view(3);
+    let pending = app.rating_view_pending.take().unwrap();
+    let result = loop {
+        match pending.rx.try_recv() {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(error) => panic!("rating prepare disconnected: {error}"),
+        }
+    };
+    assert!(app.page_edit_snapshot.is_none());
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    assert!(tx.send(result).is_ok());
+    app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
+    let ctx = egui::Context::default();
+    for _ in 0..100 {
+        app.poll_rating_view();
+        app.poll_sidecar_restore(&ctx);
+        if app.items_are_rating_view && app.mask_pages.contains(&0) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.mask_pages.contains(&0));
+}
+
+#[test]
+fn phase_b_reading_history_opened_folder_resolves_masked_member_before_paint() {
     let (mut app, image) = phase_b_masked_image();
     let folder = image.parent().unwrap().to_path_buf();
     app.install_reading_history_entries(vec![crate::reading_history_db::ReadingHistoryEntry::new(
-        folder,
+        folder.clone(),
         crate::reading_history_db::ReadingHistoryKind::Folder,
         None,
         "masked member".into(),
         None,
         None,
     )]);
+    let ctx = egui::Context::default();
+    for _ in 0..100 {
+        app.poll_sidecar_restore(&ctx);
+        if !app.sidecar_restore_active() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    app.note_reading_history_open(0);
+    app.load_folder(folder);
+    for _ in 0..100 {
+        app.poll_sidecar_restore(&ctx);
+        if !app.sidecar_restore_active() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let index = app
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::Image(path) if path == &image))
+        .unwrap();
     assert!(
-        app.mask_pages.contains(&0),
-        "history entry must resolve member edit before paint"
+        app.mask_pages.contains(&index),
+        "opened history book page must resolve its saved edit before paint"
+    );
+}
+
+#[test]
+fn phase_b_reading_history_opened_zip_resolves_masked_member_before_paint() {
+    let mut app = phase_c_support::setup_app();
+    let archive = app.tmp.path().join("history-book.zip");
+    let file = std::fs::File::create(&archive).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file("page.jpg", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut zip, b"page").unwrap();
+    zip.finish().unwrap();
+    let key = crate::adjustment_db::zip_entry_key(&archive, "page.jpg");
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    app.install_reading_history_entries(vec![crate::reading_history_db::ReadingHistoryEntry::new(
+        archive.clone(),
+        crate::reading_history_db::ReadingHistoryKind::Zip,
+        None,
+        "masked archive".into(),
+        None,
+        None,
+    )]);
+    let ctx = egui::Context::default();
+    for _ in 0..100 {
+        app.poll_sidecar_restore(&ctx);
+        if !app.sidecar_restore_active() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    app.note_reading_history_open(0);
+    app.load_zip_as_folder(archive.clone());
+    for _ in 0..100 {
+        app.poll_zip_enumerate();
+        app.poll_sidecar_restore(&ctx);
+        if app
+            .items
+            .iter()
+            .any(|item| matches!(item, GridItem::ZipImage { .. }))
+            && !app.sidecar_restore_active()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let index = app
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::ZipImage { .. }))
+        .unwrap();
+    assert!(
+        app.mask_pages.contains(&index),
+        "opened history ZIP page must resolve its saved edit"
     );
 }
 
@@ -11745,6 +12261,9 @@ mod phase_c_folder_nav_history_tests {
         rating_app.active_quick_folder_slot = None;
         rating_app.rating_view_stars = 4;
         rating_app.rating_view_rows_stars = Some(4);
+        let prior = rating_app.tmp.path().join("before-rating-history");
+        rating_app.current_folder = Some(prior.clone());
+        rating_app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prior.clone())];
         rating_app.set_active_folder_nav_suppress_record_once(true);
         assert_eq!(
             rating_app.dispatch_synthetic_folder_history_target(&FolderNavHistoryTarget::Rating {
@@ -11752,10 +12271,41 @@ mod phase_c_folder_nav_history_tests {
             }),
             super::SyntheticFolderHistoryDispatch::Restored
         );
+        // Restoration owns the typed history position immediately; the item install is async.
+        assert!(rating_app.rating_view_pending.is_some());
+        assert_eq!(
+            rating_app.folder_nav_current_target(),
+            Some(FolderNavHistoryTarget::Rating { stars: 4 })
+        );
+        assert!(
+            rating_app
+                .address
+                .contains("★★★★ レーティング一覧を読み込み中")
+        );
+        assert_eq!(
+            rating_app.folder_nav_back_stack.last(),
+            Some(&FolderNavHistoryTarget::Path(prior))
+        );
+        assert!(!rating_app.suppress_folder_nav_record_once);
+
+        let ctx = egui::Context::default();
+        for _ in 0..200 {
+            rating_app.poll_rating_view();
+            rating_app.poll_sidecar_restore(&ctx);
+            if rating_app.items_are_rating_view && rating_app.rating_view_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(rating_app.items_are_rating_view);
         assert_eq!(
             rating_app.current_folder.as_ref(),
             Some(&super::rating_view_synthetic_path())
+        );
+        assert_eq!(rating_app.address, "★★★★ レーティング一覧");
+        assert_eq!(
+            rating_app.folder_nav_current_target(),
+            Some(FolderNavHistoryTarget::Rating { stars: 4 })
         );
         assert!(!rating_app.suppress_folder_nav_record_once);
     }
@@ -14722,6 +15272,7 @@ mod phase_c_drill_nav_tests {
                 rated_at_ms: Some(100),
             }],
             skipped: 0,
+            prepared: None,
         });
         assert!(app.items_are_rating_view);
         assert!(
@@ -17491,6 +18042,42 @@ mod phase_c_drill_address_tests {
             root_repaint_delay(&output),
             std::time::Duration::ZERO,
             "terminal event 後に即時 repaint を継続しない"
+        );
+    }
+
+    #[test]
+    fn aggregated_streaming_address_shows_received_hits_before_rating_prepare() {
+        let mut app = setup_app();
+        app.global_search.active = true;
+        app.global_search.query = "glasses".to_string();
+        app.global_search.last_executed = app.global_search.query.clone();
+        app.global_search.aggregate = true;
+        app.global_search.aggregate_auto = false;
+        app.items_are_global_search_view = true;
+        let tx = install_search_receiver(&mut app);
+        tx.send(SearchStreamEvent::Batch {
+            hits: (0..3)
+                .map(|index| GlobalHit {
+                    path: format!("c:/search/{index}.jpg"),
+                    score: 1.0,
+                    stars: 0,
+                    mtime: 0,
+                    file_size: None,
+                })
+                .collect(),
+            scanned_candidates: 412_000,
+            valid_hits: 3,
+        })
+        .unwrap();
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.poll_global_search_events(ctx);
+        });
+        assert!(
+            app.address.contains("ヒット 3 件 · 412,000 件を確認"),
+            "{}",
+            app.address
         );
     }
 
@@ -67627,6 +68214,16 @@ mod rating_view_navigation_tests {
     fn rating_view_back_from_opened_container_returns_to_result_grid() {
         let mut app = setup_app();
         let opened = app.tmp.path().join("books").join("a.zip");
+        std::fs::create_dir_all(opened.parent().unwrap()).unwrap();
+        std::fs::write(&opened, b"zip").unwrap();
+        let key = crate::adjustment_db::normalize_path(&opened);
+        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipFile)
+            .with_source_path(&opened);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 4, Some(&meta))
+            .unwrap();
         app.rating_view_stars = 4;
         app.rating_view_saved_folder = Some(app.tmp.path().join("before"));
         app.rating_view_rows = vec![crate::rating_view::RatingViewRow {
@@ -67640,6 +68237,16 @@ mod rating_view_navigation_tests {
         app.current_folder = Some(opened.clone());
 
         app.rating_view_back();
+
+        let ctx = egui::Context::default();
+        for _ in 0..100 {
+            app.poll_rating_view();
+            app.poll_sidecar_restore(&ctx);
+            if app.items_are_rating_view && !app.sidecar_restore_active() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
         assert!(app.rating_view_nav_stack.is_empty());
         assert!(app.items_are_rating_view);

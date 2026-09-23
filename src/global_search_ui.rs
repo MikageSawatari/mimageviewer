@@ -202,6 +202,129 @@ pub enum GlobalSearchView {
     },
 }
 
+#[derive(Clone)]
+struct SearchViewWish {
+    sequence: u64,
+    run_sequence: u64,
+    query: String,
+    filters: GlobalSearchFilters,
+    source_generation: u64,
+    context: crate::app::ViewerContextId,
+    through_batch: u64,
+    view: GlobalSearchView,
+    sort_mode: ContainerSortMode,
+    sort_order: crate::settings::SortOrder,
+    rating_filter: [bool; 6],
+    done: bool,
+}
+
+enum SearchPrepareCommand {
+    Batch(u64, Vec<GlobalHit>),
+    Mtime(MtimeLookupResult),
+    View(SearchViewWish),
+}
+
+enum SearchPrepareOutput {
+    RatedBatch(u64, Vec<GlobalHit>),
+    Ready(SearchViewWish, SearchPreparedItems),
+    Retry(SearchViewWish),
+    Failed(SearchViewWish, String),
+}
+
+struct SearchPreparedItems {
+    items: Vec<GridItem>,
+    image_metas: Vec<Option<(i64, i64)>>,
+    drilled_counts: HashMap<String, [u32; 6]>,
+    page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,
+    #[cfg(test)]
+    lookup_passes: usize,
+    #[cfg(test)]
+    looked_up_keys: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SearchPrepareTestMetrics {
+    pub(crate) rated_batches: u64,
+    pub(crate) lookup_passes: usize,
+    pub(crate) looked_up_keys: usize,
+    pub(crate) stale_rejections: usize,
+    pub(crate) ui_accept_ms: f64,
+}
+
+pub(crate) struct SearchPageEditPrepare {
+    tx: mpsc::Sender<SearchPrepareCommand>,
+    rx: mpsc::Receiver<SearchPrepareOutput>,
+    cancel: Arc<AtomicBool>,
+    next_sequence: u64,
+    raw_batch_sequence: u64,
+    rated_batch_sequence: u64,
+    in_flight: Option<u64>,
+    desired: Option<SearchViewWish>,
+    #[cfg(test)]
+    hold_ready_for_test: bool,
+    #[cfg(test)]
+    held_ready_for_test: Option<SearchPrepareOutput>,
+    #[cfg(test)]
+    metrics: SearchPrepareTestMetrics,
+}
+
+impl Drop for SearchPageEditPrepare {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl SearchPageEditPrepare {
+    fn spawn(
+        ctx: &egui::Context,
+        available: crate::app::page_edit_snapshot::PageEditAvailability,
+    ) -> Result<Self, String> {
+        let (tx, command_rx) = mpsc::channel();
+        let (output_tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let repaint = ctx.clone();
+        std::thread::Builder::new()
+            .name("search-page-edit-prepare".into())
+            .spawn(move || {
+                search_prepare_worker(command_rx, output_tx, worker_cancel, repaint, available);
+            })
+            .map_err(|error| format!("検索結果の準備 worker を起動できません: {error}"))?;
+        Ok(Self {
+            tx,
+            rx,
+            cancel,
+            next_sequence: 0,
+            raw_batch_sequence: 0,
+            rated_batch_sequence: 0,
+            in_flight: None,
+            desired: None,
+            #[cfg(test)]
+            hold_ready_for_test: false,
+            #[cfg(test)]
+            held_ready_for_test: None,
+            #[cfg(test)]
+            metrics: SearchPrepareTestMetrics::default(),
+        })
+    }
+
+    fn send_next(&mut self) {
+        if self.in_flight.is_some() {
+            return;
+        }
+        if let Some(wish) = self.desired.clone() {
+            if self
+                .tx
+                .send(SearchPrepareCommand::View(wish.clone()))
+                .is_ok()
+            {
+                self.in_flight = Some(wish.sequence);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TagBridgeSuggestion {
     pub tag: String,
@@ -217,6 +340,8 @@ pub struct GlobalSearchState {
     pub query: String,
     /// 最後に実行したクエリ (変更検知用)
     pub last_executed: String,
+    /// Changes on every new search intent, including the debounce interval.
+    pub run_sequence: u64,
     /// 次フレームでフォーカス要求
     pub focus_request: bool,
     /// TextEdit がフォーカスを持っているか (他キーバインドが取らないようにするため)
@@ -227,6 +352,8 @@ pub struct GlobalSearchState {
     pub last_sort_at: Option<Instant>,
     /// 起動中の検索
     pub pending: Option<SearchHandle>,
+    /// One prepare owner per Ctrl+G run. Hit batches use a FIFO; view wishes coalesce.
+    pub(crate) page_edit_prepare: Option<SearchPageEditPrepare>,
     /// 親コンテナ path → 集約済みヒット (docs §10.4.2 ContainerHit)
     pub containers: HashMap<PathBuf, ContainerHit>,
     /// 生の全ヒット (drill-down 時に container でフィルタするため保持)
@@ -301,11 +428,13 @@ impl Default for GlobalSearchState {
             active: false,
             query: String::new(),
             last_executed: String::new(),
+            run_sequence: 0,
             focus_request: false,
             has_focus: false,
             last_change_at: None,
             last_sort_at: None,
             pending: None,
+            page_edit_prepare: None,
             containers: HashMap::new(),
             all_hits: Vec::new(),
             aggregate: false,
@@ -413,8 +542,10 @@ impl GlobalSearchState {
 
     /// 新規検索を開始する (既存 pending があれば cancel してから)。
     pub fn reset_for_new_query(&mut self) {
+        self.run_sequence = self.run_sequence.wrapping_add(1);
         // SearchHandle は Drop で cancel するので、take() だけで OK
         self.pending = None;
+        self.page_edit_prepare = None;
         self.containers.clear();
         self.all_hits.clear();
         // 新クエリは一覧から開始し、自動切替を再有効化、drill state もリセット (§4.3.2)。
@@ -755,6 +886,12 @@ pub(crate) fn build_aggregated_items(
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     // Newer/Older ソートのとき mtime を遅延取得 (初回のみ fs::metadata 同期呼び出し)。
     ensure_container_mtime_populated(state);
+    build_aggregated_items_prepared(state)
+}
+
+fn build_aggregated_items_prepared(
+    state: &GlobalSearchState,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     let containers = sort_containers_with_mode(&state.containers, state.sort_mode);
     let items: Vec<GridItem> = containers
         .iter()
@@ -1140,6 +1277,161 @@ pub(crate) fn thumb_reuse_key(item: &GridItem) -> Option<ThumbReuseKey> {
 // -----------------------------------------------------------------------
 // App 側との連携 (impl App 拡張)
 // -----------------------------------------------------------------------
+
+fn search_prepare_worker(
+    rx: mpsc::Receiver<SearchPrepareCommand>,
+    tx: mpsc::Sender<SearchPrepareOutput>,
+    cancel: Arc<AtomicBool>,
+    ctx: egui::Context,
+    available: crate::app::page_edit_snapshot::PageEditAvailability,
+) {
+    let mut state = GlobalSearchState::default();
+    let rating_db =
+        crate::rating_db::RatingDb::open_readonly(&crate::rating_db::RatingDb::db_path()).ok();
+    let mut snapshot = crate::app::page_edit_snapshot::PageEditSnapshot::default();
+    let mut queried = HashSet::new();
+    #[cfg(test)]
+    let mut lookup_passes = 0usize;
+    #[cfg(test)]
+    let mut looked_up_keys = 0usize;
+    let mut cache_completion = crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+        .sample()
+        .completed_writes;
+    while let Ok(command) = rx.recv() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match command {
+            SearchPrepareCommand::Batch(sequence, mut hits) => {
+                if let Some(db) = rating_db.as_ref() {
+                    let keys = hits
+                        .iter()
+                        .map(|hit| hit_rating_key(&hit.path))
+                        .collect::<Vec<_>>();
+                    let ratings = db.get_many(&keys);
+                    for (hit, key) in hits.iter_mut().zip(&keys) {
+                        if let Some(&stars) = ratings.get(key) {
+                            hit.stars = stars;
+                        }
+                    }
+                }
+                for hit in &hits {
+                    state.accumulate_hit(hit);
+                }
+                if tx
+                    .send(SearchPrepareOutput::RatedBatch(sequence, hits))
+                    .is_err()
+                {
+                    break;
+                }
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            SearchPrepareCommand::Mtime(result) => {
+                if let Some(container) = state.containers.get_mut(&result.path) {
+                    container.mtime = result.mtime;
+                }
+            }
+            SearchPrepareCommand::View(wish) => {
+                state.sort_mode = wish.sort_mode;
+                let (items, image_metas, drilled_counts) = match &wish.view {
+                    GlobalSearchView::Flat => {
+                        let (items, metas) =
+                            build_flat_items(&state, wish.sort_order, &wish.rating_filter);
+                        (items, metas, HashMap::new())
+                    }
+                    GlobalSearchView::Aggregated => {
+                        let (items, metas) = build_aggregated_items_prepared(&state);
+                        (items, metas, HashMap::new())
+                    }
+                    GlobalSearchView::DrilledInto {
+                        current_path,
+                        is_zip,
+                        ..
+                    } => {
+                        let counts =
+                            compute_drilled_subfolder_counts(&state, current_path, *is_zip);
+                        let (items, metas) = build_drilled_items(
+                            &state,
+                            current_path,
+                            *is_zip,
+                            wish.sort_order,
+                            &wish.rating_filter,
+                        );
+                        (items, metas, counts)
+                    }
+                };
+                let before = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+                if cache_completion != before.completed_writes {
+                    snapshot = Default::default();
+                    queried.clear();
+                    cache_completion = before.completed_writes;
+                }
+                if before.active_writers != 0 {
+                    let _ = tx.send(SearchPrepareOutput::Retry(wish));
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    continue;
+                }
+                let mut new_items = Vec::new();
+                for item in &items {
+                    if let Some(key) = crate::edit_source::page_key_for_grid_item(item)
+                        && queried.insert(key)
+                    {
+                        new_items.push(item.clone());
+                    }
+                }
+                let loaded = crate::app::page_edit_snapshot::PageEditSnapshot::load_and_project(
+                    &new_items, available, &cancel,
+                );
+                #[cfg(test)]
+                if !new_items.is_empty() {
+                    lookup_passes += 1;
+                    looked_up_keys += new_items.len();
+                }
+                match loaded {
+                    Ok(Some((new_snapshot, _))) => snapshot.merge_from(new_snapshot),
+                    Ok(None) => break,
+                    Err(error) => {
+                        queried.clear();
+                        snapshot = Default::default();
+                        let _ = tx.send(SearchPrepareOutput::Failed(wish, error));
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                        continue;
+                    }
+                }
+                let projection = snapshot.project(&items);
+                let after = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+                if let Some(page_edits) =
+                    crate::app::page_edit_snapshot::PageEditSnapshot::stable_projection(
+                        before,
+                        after,
+                        snapshot.clone(),
+                        projection,
+                    )
+                {
+                    cache_completion = after.completed_writes;
+                    let _ = tx.send(SearchPrepareOutput::Ready(
+                        wish,
+                        SearchPreparedItems {
+                            items,
+                            image_metas,
+                            drilled_counts,
+                            page_edits,
+                            #[cfg(test)]
+                            lookup_passes,
+                            #[cfg(test)]
+                            looked_up_keys,
+                        },
+                    ));
+                } else {
+                    queried.clear();
+                    snapshot = Default::default();
+                    let _ = tx.send(SearchPrepareOutput::Retry(wish));
+                }
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+        }
+    }
+}
 
 impl App {
     /// Ctrl+G 検索結果ビュー専用の軽量 items 差し替え (Codex P2 指摘対応)。
@@ -1565,6 +1857,7 @@ impl App {
         self.cancel_pending_folder_nav();
         // pending があれば SearchHandle の Drop impl で cancel される
         self.global_search.pending = None;
+        self.global_search.page_edit_prepare = None;
         // Ctrl+G 結果の動画サムネ抽出スレッドを cancel。後続の load_folder で
         // cancel_token 自体も bump されるが、こちらは Shell call 中の worker に
         // 早めに「やめてよい」を伝える専用フラグ。
@@ -1635,9 +1928,28 @@ impl App {
         self.spawn_global_search(ctx);
     }
 
+    fn restart_search_page_edit_prepare(&mut self, ctx: &egui::Context) -> bool {
+        self.global_search.page_edit_prepare = None;
+        match SearchPageEditPrepare::spawn(
+            ctx,
+            crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
+        ) {
+            Ok(prepare) => self.global_search.page_edit_prepare = Some(prepare),
+            Err(error) => {
+                self.global_search.reject_message = Some(error);
+                self.global_search.done = true;
+                return false;
+            }
+        }
+        true
+    }
+
     /// 現在のクエリで検索を spawn する。
     pub(crate) fn spawn_global_search(&mut self, ctx: &egui::Context) {
         self.global_search.reset_for_new_query();
+        if !self.restart_search_page_edit_prepare(ctx) {
+            return;
+        }
         self.global_search.last_executed = self.global_search.query.clone();
         if let Some(db) = self.tags_db.as_ref() {
             self.global_search.tag_bridge_suggestions = tag_bridge_suggestions_for_query(
@@ -1706,6 +2018,9 @@ impl App {
         loop {
             match pending.rx.try_recv() {
                 Ok(result) => {
+                    if let Some(prepare) = self.global_search.page_edit_prepare.as_ref() {
+                        let _ = prepare.tx.send(SearchPrepareCommand::Mtime(result.clone()));
+                    }
                     if let Some(container) = self.global_search.containers.get_mut(&result.path) {
                         if container.mtime.is_none() {
                             container.mtime = result.mtime;
@@ -1734,6 +2049,7 @@ impl App {
 
     /// SearchStreamEvent を try_recv で処理する (毎フレーム呼ぶ)。
     pub(crate) fn poll_global_search_events(&mut self, ctx: &egui::Context) {
+        self.poll_search_page_edit_prepare(ctx);
         if self.global_search.done {
             return;
         }
@@ -1755,67 +2071,26 @@ impl App {
         let mut events_processed = 0;
         let mut changed = false;
         let mut stats_changed = false;
-        let mut drain_incomplete = false;
         while events_processed < MAX_EVENTS_PER_FRAME {
             match rx.try_recv() {
                 Ok(SearchStreamEvent::Batch {
-                    mut hits,
+                    hits,
                     scanned_candidates,
                     valid_hits,
                 }) => {
-                    // drilled view のサブフォルダバッジ件数を rating_filter で
-                    // 絞り込めるよう、batch ごとに rating DB を bulk lookup して
-                    // hit.stars に詰める。1 batch = PAGE_SIZE (=500) 件で IN 句
-                    // 1 発、warm SQLite で 1-3ms 程度。
-                    // perf::event で span を取り、cold sqlite で重くなったら
-                    // analyze_perf.py で検知できるようにしておく。
-                    let did_rating_lookup = if hits.is_empty() {
-                        false
-                    } else if let Some(db) = self.rating_db.as_ref() {
-                        let perf_enabled = crate::perf::is_enabled();
-                        let t0 = std::time::Instant::now();
-                        let keys: Vec<String> =
-                            hits.iter().map(|h| hit_rating_key(&h.path)).collect();
-                        let map = db.get_many(&keys);
-                        for (h, k) in hits.iter_mut().zip(keys.iter()) {
-                            if let Some(&v) = map.get(k) {
-                                h.stars = v;
-                            }
-                        }
-                        if perf_enabled {
-                            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            crate::perf::event(
-                                "search",
-                                "rating_bulk_lookup",
-                                None,
-                                0,
-                                &[
-                                    ("count", serde_json::Value::from(keys.len())),
-                                    ("ms", serde_json::Value::from(ms)),
-                                ],
-                            );
-                        }
-                        !keys.is_empty()
-                    } else {
-                        false
-                    };
-                    for h in &hits {
-                        self.global_search.accumulate_hit(h);
+                    // Accepted batches enter the worker FIFO in order. The worker does
+                    // the rating lookup before returning each rated batch to this owner.
+                    if let Some(prepare) = self.global_search.page_edit_prepare.as_mut() {
+                        prepare.raw_batch_sequence = prepare.raw_batch_sequence.wrapping_add(1);
+                        let _ = prepare.tx.send(SearchPrepareCommand::Batch(
+                            prepare.raw_batch_sequence,
+                            hits,
+                        ));
                     }
                     self.global_search.total_scanned = scanned_candidates;
                     self.global_search.total_valid = valid_hits;
                     stats_changed = true;
-                    if !hits.is_empty() {
-                        changed = true;
-                    }
                     events_processed += 1;
-                    // UI スレッド予算を守るため、rating bulk lookup を含む batch は
-                    // 1 フレーム 1 件に制限する (Codex P2)。8 batch 同時着 → ~24ms
-                    // を回避し、次フレームに残りを回す (request_repaint 済み)。
-                    if did_rating_lookup {
-                        drain_incomplete = true;
-                        break;
-                    }
                 }
                 Ok(SearchStreamEvent::Done { truncated, reason }) => {
                     self.global_search.done = true;
@@ -1850,6 +2125,7 @@ impl App {
         if stats_changed {
             self.update_global_search_address();
         }
+        self.poll_search_page_edit_prepare(ctx);
         if changed {
             // docs §10.4.3: 順序再評価は 1 秒毎で十分 (頻繁な入れ替えでチラつかない)
             let should_resort = match self.global_search.last_sort_at {
@@ -1870,12 +2146,263 @@ impl App {
         if !self.global_search.done {
             // worker event は callback が ROOT を起こす。即時 repaint は、この frame の
             // drain 予算で channel に event が残った可能性がある場合だけ要求する。
-            if drain_incomplete || events_processed >= MAX_EVENTS_PER_FRAME {
+            if events_processed >= MAX_EVENTS_PER_FRAME {
                 ctx.request_repaint();
             } else {
                 // callback 取りこぼし時の保険。delayed request は pass ごとに消えるため、
                 // pending 中は poll owner が毎 pass 再武装する。
                 ctx.request_repaint_after(Duration::from_millis(1000));
+            }
+        }
+    }
+
+    pub(crate) fn poll_search_page_edit_prepare(&mut self, ctx: &egui::Context) {
+        let Some(mut prepare) = self.global_search.page_edit_prepare.take() else {
+            return;
+        };
+        let mut rebuild = false;
+        for _ in 0..MAX_EVENTS_PER_FRAME {
+            #[cfg(test)]
+            if prepare.hold_ready_for_test && prepare.held_ready_for_test.is_some() {
+                break;
+            }
+            #[cfg(test)]
+            let received = prepare
+                .held_ready_for_test
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| prepare.rx.try_recv());
+            #[cfg(not(test))]
+            let received = prepare.rx.try_recv();
+            let output = match received {
+                Ok(output) => output,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    prepare.in_flight = None;
+                    prepare.desired = None;
+                    break;
+                }
+            };
+            match output {
+                SearchPrepareOutput::RatedBatch(sequence, hits) => {
+                    if sequence == prepare.rated_batch_sequence.wrapping_add(1) {
+                        prepare.rated_batch_sequence = sequence;
+                        #[cfg(test)]
+                        {
+                            prepare.metrics.rated_batches = sequence;
+                        }
+                        for hit in &hits {
+                            self.global_search.accumulate_hit(hit);
+                        }
+                        let should_resort = self.global_search.last_sort_at.is_none_or(|at| {
+                            at.elapsed() >= Duration::from_millis(RESORT_INTERVAL_MS)
+                        });
+                        if should_resort || self.global_search.done {
+                            rebuild = self.items_are_global_search_view;
+                            self.global_search.last_sort_at = Some(Instant::now());
+                        }
+                    }
+                }
+                SearchPrepareOutput::Ready(wish, prepared) => {
+                    #[cfg(test)]
+                    if prepare.hold_ready_for_test {
+                        prepare.held_ready_for_test =
+                            Some(SearchPrepareOutput::Ready(wish, prepared));
+                        break;
+                    }
+                    if prepare.in_flight != Some(wish.sequence) {
+                        continue;
+                    }
+                    prepare.in_flight = None;
+                    let latest = prepare
+                        .desired
+                        .as_ref()
+                        .is_some_and(|desired| desired.sequence == wish.sequence);
+                    let same_surface = self.global_search.active
+                        && wish.run_sequence == self.global_search.run_sequence
+                        && wish.query == self.global_search.query
+                        && wish.filters == self.global_search.filters
+                        && wish.context == self.virtual_list_context_id()
+                        && wish.source_generation == self.items_generation
+                        && (self.items_are_global_search_view
+                            || !self.global_search.last_executed.is_empty())
+                        && wish.view == self.global_search.view()
+                        && wish.sort_mode == self.global_search.sort_mode
+                        && wish.sort_order == self.settings.sort_order
+                        && wish.rating_filter == self.effective_rating_filter()
+                        && wish.done == self.global_search.done;
+                    if latest && same_surface {
+                        // replace_search_view_items clears the outgoing index maps. Publish any
+                        // dirty view-trim row before the stamp check, so that write cannot make
+                        // this prepared projection stale inside the accepted swap.
+                        self.persist_pending_view_trim_state();
+                    }
+                    if latest
+                        && same_surface
+                        && crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+                            .accepts(prepared.page_edits.stamp)
+                    {
+                        #[cfg(test)]
+                        let accept_started = Instant::now();
+                        #[cfg(test)]
+                        {
+                            prepare.metrics.lookup_passes = prepared.lookup_passes;
+                            prepare.metrics.looked_up_keys = prepared.looked_up_keys;
+                        }
+                        self.search_drilled_folder_counts = prepared.drilled_counts;
+                        self.replace_search_view_items(prepared.items, prepared.image_metas);
+                        self.install_prepared_page_edits(prepared.page_edits);
+                        self.restore_search_selection_after_prepare();
+                        self.update_global_search_address();
+                        #[cfg(test)]
+                        {
+                            prepare.metrics.ui_accept_ms =
+                                accept_started.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        prepare.desired = None;
+                    } else if !self.global_search.active
+                        || !self.items_are_global_search_view
+                            && wish.source_generation != self.items_generation
+                    {
+                        prepare.desired = None;
+                    } else {
+                        #[cfg(test)]
+                        {
+                            prepare.metrics.stale_rejections += 1;
+                        }
+                    }
+                }
+                SearchPrepareOutput::Retry(wish) => {
+                    if prepare.in_flight == Some(wish.sequence) {
+                        prepare.in_flight = None;
+                    }
+                }
+                SearchPrepareOutput::Failed(wish, error) => {
+                    if prepare.in_flight == Some(wish.sequence) {
+                        prepare.in_flight = None;
+                        if prepare
+                            .desired
+                            .as_ref()
+                            .is_some_and(|desired| desired.sequence == wish.sequence)
+                        {
+                            prepare.desired = None;
+                            crate::logger::log(format!("search-page-edit-prepare: {error}"));
+                            self.show_feedback_toast(
+                                "[検索結果を準備できませんでした]".to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if self.global_search.active && prepare.in_flight.is_none() && !rebuild {
+            if let Some(wish) = prepare.desired.as_mut() {
+                prepare.next_sequence = prepare.next_sequence.wrapping_add(1);
+                wish.sequence = prepare.next_sequence;
+                wish.source_generation = self.items_generation;
+                wish.context = self.virtual_list_context_id();
+                wish.through_batch = prepare.raw_batch_sequence;
+                wish.done = self.global_search.done;
+                prepare.send_next();
+            }
+        }
+        self.global_search.page_edit_prepare = Some(prepare);
+        if rebuild {
+            self.rebuild_items_from_global_search();
+        }
+        if self
+            .global_search
+            .page_edit_prepare
+            .as_ref()
+            .is_some_and(|p| p.in_flight.is_some())
+        {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_search_page_edit_prepare_for_test(&mut self, ctx: &egui::Context) {
+        self.global_search.active = true;
+        self.global_search.last_executed = "test".into();
+        self.global_search.page_edit_prepare = Some(
+            SearchPageEditPrepare::spawn(
+                ctx,
+                crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
+            )
+            .unwrap(),
+        );
+        self.rebuild_items_from_global_search();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_search_ready_for_test(&mut self) {
+        self.global_search
+            .page_edit_prepare
+            .as_mut()
+            .unwrap()
+            .hold_ready_for_test = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_ready_is_held_for_test(&self) -> bool {
+        self.global_search
+            .page_edit_prepare
+            .as_ref()
+            .unwrap()
+            .held_ready_for_test
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_search_ready_for_test(&mut self) {
+        self.global_search
+            .page_edit_prepare
+            .as_mut()
+            .unwrap()
+            .hold_ready_for_test = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_prepare_metrics_for_test(&self) -> SearchPrepareTestMetrics {
+        self.global_search
+            .page_edit_prepare
+            .as_ref()
+            .unwrap()
+            .metrics
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_prepare_cancel_for_test(&self) -> Arc<AtomicBool> {
+        Arc::clone(
+            &self
+                .global_search
+                .page_edit_prepare
+                .as_ref()
+                .unwrap()
+                .cancel,
+        )
+    }
+
+    fn restore_search_selection_after_prepare(&mut self) {
+        if let Some(target) = self.global_search.restore_select_path.take() {
+            let index = self
+                .items
+                .iter()
+                .position(|item| match item {
+                    GridItem::SearchContainer { path, .. } => path == &target,
+                    GridItem::Folder(path)
+                    | GridItem::Image(path)
+                    | GridItem::ZipFile(path)
+                    | GridItem::PdfFile(path) => path == &target,
+                    GridItem::ZipImage { zip_path, .. } => zip_path == &target,
+                    GridItem::PdfPage { pdf_path, .. } => pdf_path == &target,
+                    _ => false,
+                })
+                .filter(|&index| self.idx_visible(index))
+                .or_else(|| self.visible_indices.first().copied());
+            if let Some(index) = index {
+                self.selected = Some(index);
+                self.scroll_to_selected = true;
             }
         }
     }
@@ -1887,6 +2414,31 @@ impl App {
     /// thumbnails / visible_indices と、Codex P2-1/P2-2 で指摘された
     /// search_filter / checked を整合させるだけに留める。
     pub(crate) fn rebuild_items_from_global_search(&mut self) {
+        if self.global_search.page_edit_prepare.is_some() {
+            self.global_search.maybe_auto_switch_aggregate();
+            ensure_container_mtime_populated(&mut self.global_search);
+            let context = self.virtual_list_context_id();
+            let rating_filter = self.effective_rating_filter();
+            let view = self.global_search.view();
+            let prepare = self.global_search.page_edit_prepare.as_mut().unwrap();
+            prepare.next_sequence = prepare.next_sequence.wrapping_add(1);
+            prepare.desired = Some(SearchViewWish {
+                sequence: prepare.next_sequence,
+                run_sequence: self.global_search.run_sequence,
+                query: self.global_search.query.clone(),
+                filters: self.global_search.filters.clone(),
+                source_generation: self.items_generation,
+                context,
+                through_batch: prepare.raw_batch_sequence,
+                view,
+                sort_mode: self.global_search.sort_mode,
+                sort_order: self.settings.sort_order,
+                rating_filter,
+                done: self.global_search.done,
+            });
+            prepare.send_next();
+            return;
+        }
         // Codex P3 対応: DrilledInto ビューで done=true rebuild を迎えたとき、
         // `build_drilled_items` は `ensure_container_mtime_populated` を呼ばないため
         // mtime が埋まらないまま残る。結果、その状態で `global_search_ctrl_nav`
@@ -2237,20 +2789,34 @@ impl App {
         match self.global_search.view() {
             GlobalSearchView::Flat | GlobalSearchView::Aggregated => {
                 // 集約時はコンテナ数、一覧時はヒット数を件数として表示する。
+                let searching = self.global_search.is_searching();
                 let n = if self.global_search.aggregate {
                     self.global_search.containers.len()
                 } else {
-                    self.global_search.all_hits.len()
+                    // Rated batches reach all_hits only after worker I/O. The stream count is
+                    // known on receipt and remains correct through Done while they catch up.
+                    self.global_search
+                        .all_hits
+                        .len()
+                        .max(self.global_search.total_valid)
                 };
                 let n = crate::ui_helpers::format_count(n as u64);
                 if query.is_empty() {
                     self.address = "🌐 アイテム検索".to_string();
-                } else if self.global_search.is_searching() {
+                } else if searching {
                     let scanned =
                         crate::ui_helpers::format_count(self.global_search.total_scanned as u64);
-                    self.address = format!(
-                        "🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中 · {scanned} 件を確認)"
-                    );
+                    if self.global_search.aggregate {
+                        let hits =
+                            crate::ui_helpers::format_count(self.global_search.total_valid as u64);
+                        self.address = format!(
+                            "🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中 · ヒット {hits} 件 · {scanned} 件を確認)"
+                        );
+                    } else {
+                        self.address = format!(
+                            "🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中 · {scanned} 件を確認)"
+                        );
+                    }
                 } else {
                     self.address = format!("🌐 アイテム検索: \"{query}\"  ({n} 件)");
                 }
@@ -2622,44 +3188,7 @@ impl App {
             }
         }
         if query_changed {
-            self.cancel_pending_folder_nav();
-            self.global_search.last_change_at = Some(Instant::now());
-            // Codex P3 対応: クエリが変わったら drill state を即リセットし、
-            // 旧検索の pending / containers / all_hits も直ちに破棄してから空の
-            // 一覧ビューとして rebuild する (debounce 完了までの間、旧結果で
-            // drill-back 判定が残ったり、旧クエリでの rebuild race が起きないように)。
-            // 新クエリなので自動ビュー切替も再有効化する (§4.3.2)。
-            self.global_search.drill = None;
-            self.global_search.aggregate = false;
-            self.global_search.aggregate_auto = true;
-            self.global_search.pending = None; // SearchHandle::Drop で cancel
-            // **Codex P3-1 対応**: 旧 containers 向けの mtime worker も即 drop。
-            // containers は直後に clear するので、worker が SMB 越しに走り続けても
-            // 結果適用先が存在しない。新クエリの `ensure_container_mtime_populated`
-            // が pending 検出で early-return しないよう、ここでも明示的に外す。
-            self.global_search.mtime_lookup_pending = None;
-            self.global_search.containers.clear();
-            self.global_search.all_hits.clear();
-            self.global_search.done = false;
-            self.global_search.truncated = false;
-            self.global_search.total_valid = 0;
-            self.global_search.total_scanned = 0;
-            self.global_search.tag_bridge_suggestions.clear();
-            // **review #5 対応**: 旧クエリ結果に対する self.selected / scroll_offset_y が
-            // 残っていると、poll_global_search_events の guard (selected.is_some()
-            // || scroll_offset_y > 0.5) が次フレームで aggregate_auto を false に
-            // 落としてしまい、新クエリで 1000+ hit 時の自動切替が発火しない。
-            // 旧クエリ結果から作った items は直後の rebuild で全て無効化されるので、
-            // selected / scroll もここで「ユーザー未操作」状態へ戻す。
-            self.selected = None;
-            self.scroll_offset_y = 0.0;
-            // query == last_executed でも debounce → spawn を必ず再走させる。
-            // そうしないと、Enter 2 連打で旧検索が cancel されたあと
-            // poll_global_search_debounce が「クエリが変わっていない」と判定して
-            // 新 spawn を skip し、結果 0 件のまま固着する。
-            self.global_search.last_executed.clear();
-            self.rebuild_items_from_global_search();
-            ctx.request_repaint_after(Duration::from_millis(DEBOUNCE_MS));
+            self.reset_global_search_for_query_change(ctx);
         }
         if sort_changed {
             // ソート変更はクエリ再実行不要 — items を並べ替えるだけ。
@@ -2669,6 +3198,49 @@ impl App {
             // 集約トグルの切替は items を作り直すだけ (クエリ再実行不要)。
             self.rebuild_items_from_global_search();
         }
+    }
+
+    pub(crate) fn reset_global_search_for_query_change(&mut self, ctx: &egui::Context) {
+        self.global_search.run_sequence = self.global_search.run_sequence.wrapping_add(1);
+        self.cancel_pending_folder_nav();
+        self.global_search.last_change_at = Some(Instant::now());
+        // Codex P3 対応: クエリが変わったら drill state を即リセットし、
+        // 旧検索の pending / containers / all_hits も直ちに破棄してから空の
+        // 一覧ビューとして rebuild する (debounce 完了までの間、旧結果で
+        // drill-back 判定が残ったり、旧クエリでの rebuild race が起きないように)。
+        // 新クエリなので自動ビュー切替も再有効化する (§4.3.2)。
+        self.global_search.drill = None;
+        self.global_search.aggregate = false;
+        self.global_search.aggregate_auto = true;
+        self.global_search.pending = None; // SearchHandle::Drop で cancel
+        // **Codex P3-1 対応**: 旧 containers 向けの mtime worker も即 drop。
+        // containers は直後に clear するので、worker が SMB 越しに走り続けても
+        // 結果適用先が存在しない。新クエリの `ensure_container_mtime_populated`
+        // が pending 検出で early-return しないよう、ここでも明示的に外す。
+        self.global_search.mtime_lookup_pending = None;
+        self.global_search.containers.clear();
+        self.global_search.all_hits.clear();
+        self.global_search.done = false;
+        self.global_search.truncated = false;
+        self.global_search.total_valid = 0;
+        self.global_search.total_scanned = 0;
+        self.global_search.tag_bridge_suggestions.clear();
+        // **review #5 対応**: 旧クエリ結果に対する self.selected / scroll_offset_y が
+        // 残っていると、poll_global_search_events の guard (selected.is_some()
+        // || scroll_offset_y > 0.5) が次フレームで aggregate_auto を false に
+        // 落としてしまい、新クエリで 1000+ hit 時の自動切替が発火しない。
+        // 旧クエリ結果から作った items は直後の rebuild で全て無効化されるので、
+        // selected / scroll もここで「ユーザー未操作」状態へ戻す。
+        self.selected = None;
+        self.scroll_offset_y = 0.0;
+        // query == last_executed でも debounce → spawn を必ず再走させる。
+        // そうしないと、Enter 2 連打で旧検索が cancel されたあと
+        // poll_global_search_debounce が「クエリが変わっていない」と判定して
+        // 新 spawn を skip し、結果 0 件のまま固着する。
+        self.global_search.last_executed.clear();
+        self.restart_search_page_edit_prepare(ctx);
+        self.rebuild_items_from_global_search();
+        ctx.request_repaint_after(Duration::from_millis(DEBOUNCE_MS));
     }
 }
 
@@ -2681,6 +3253,90 @@ mod tests {
     use super::*;
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
+
+    #[cfg(windows)]
+    #[test]
+    fn ten_thousand_result_stream_prepare_acceptance_has_bounded_cost() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.begin_search_page_edit_prepare_for_test(&ctx);
+        app.global_search.aggregate_auto = false;
+        let (stream, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(crate::indexer_manager::SearchHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        let started = Instant::now();
+        for batch in 0..20 {
+            let hits = (batch * 500..(batch + 1) * 500)
+                .map(|index| GlobalHit {
+                    path: format!("C:/search/{index:05}.png"),
+                    score: 1.0,
+                    stars: 0,
+                    mtime: 0,
+                    file_size: Some(0),
+                })
+                .collect();
+            stream
+                .send(SearchStreamEvent::Batch {
+                    hits,
+                    scanned_candidates: (batch + 1) * 500,
+                    valid_hits: (batch + 1) * 500,
+                })
+                .unwrap();
+        }
+        stream
+            .send(SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::Complete,
+            })
+            .unwrap();
+        while app.items.len() != 10_000 && started.elapsed() < Duration::from_secs(30) {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let initial = app.search_prepare_metrics_for_test();
+        assert_eq!(app.items.len(), 10_000);
+        assert_eq!(initial.rated_batches, 20, "FIFO lost a stream batch");
+        assert_eq!(initial.looked_up_keys, 10_000);
+        assert!(initial.lookup_passes <= 21);
+        let accepted_generation = app.items_generation;
+        app.hold_next_search_ready_for_test();
+        app.settings.sort_order = crate::settings::SortOrder::FileNameDesc;
+        app.rebuild_items_from_global_search();
+        while !app.search_ready_is_held_for_test() && started.elapsed() < Duration::from_secs(30) {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.search_ready_is_held_for_test());
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.rebuild_items_from_global_search();
+        app.release_search_ready_for_test();
+        while app.items_generation == accepted_generation
+            && started.elapsed() < Duration::from_secs(30)
+        {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let final_metrics = app.search_prepare_metrics_for_test();
+        eprintln!(
+            "10,000-hit stream: batches={}, lookup_passes={}, looked_up_keys={}, stale={}, ui_accept={:.1}ms, end_to_end={:.1}ms",
+            final_metrics.rated_batches,
+            final_metrics.lookup_passes,
+            final_metrics.looked_up_keys,
+            final_metrics.stale_rejections,
+            final_metrics.ui_accept_ms,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        assert!(app.items_generation > accepted_generation);
+        assert_eq!(
+            final_metrics.looked_up_keys, 10_000,
+            "sort re-queried old keys"
+        );
+        assert_eq!(final_metrics.lookup_passes, initial.lookup_passes);
+        assert!(final_metrics.stale_rejections >= 1);
+        assert!(final_metrics.ui_accept_ms < 5_000.0);
+    }
 
     fn zip_hit(zip: &str, entry: &str) -> String {
         format!("{zip}{SEP}{entry}")

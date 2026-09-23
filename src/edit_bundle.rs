@@ -459,6 +459,7 @@ impl PreparedPageEditBundle {
     /// 6 DB を 1 transaction で全置換する。`adjustment.db` を main database として
     /// 開くため、SQLite の multi-database super-journal が利用できる。
     pub fn apply_atomic(&self, paths: &EditBundleDbPaths, key: &str) -> Result<(), String> {
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         let conn = Connection::open(&paths.adjustment)
             .map_err(|e| format!("編集DBを開けませんでした: {e}"))?;
         conn.busy_timeout(Duration::from_secs(2))

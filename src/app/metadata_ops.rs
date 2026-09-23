@@ -191,7 +191,7 @@ pub(super) fn facet_ext_for_item(item: &GridItem) -> String {
     }
 }
 
-pub(super) fn tag_item_path(item: &GridItem) -> Option<&Path> {
+pub(crate) fn tag_item_path(item: &GridItem) -> Option<&Path> {
     match item {
         GridItem::Folder(p)
         | GridItem::Image(p)

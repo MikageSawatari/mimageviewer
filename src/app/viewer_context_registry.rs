@@ -923,12 +923,25 @@ pub(in crate::app) struct ViewerContextBundle {
     /// 一緒に fork / mount / retire されなければ sibling の `take()` で失われる。
     global_search_subfolder_restore:
         Option<super::subfolder_expansion::SubfolderExpansionRestoreState>,
+    global_search: crate::global_search_ui::GlobalSearchState,
     favsearch_subfolder_restore: Option<super::subfolder_expansion::SubfolderExpansionRestoreState>,
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
     items_are_reading_history_view: bool,
     items_are_bookmark_view: bool,
     items_are_rating_view: bool,
+    rating_view_stars: u8,
+    rating_view_sort: crate::rating_view::RatingViewSort,
+    rating_view_rows: Vec<crate::rating_view::RatingViewRow>,
+    rating_view_rows_stars: Option<u8>,
+    rating_view_pending: Option<crate::rating_view::RatingViewPending>,
+    rating_view_request_sequence: u64,
+    rating_view_accepted_write_generation: u64,
+    rating_view_skipped: usize,
+    rating_view_saved_folder: Option<PathBuf>,
+    rating_view_subfolder_restore:
+        Option<super::subfolder_expansion::SubfolderExpansionRestoreState>,
+    rating_view_nav_stack: Vec<PathBuf>,
     items_are_subfolder_expansion_view: bool,
     items_are_smart_folder_view: bool,
     items_are_drive_list: bool,
@@ -1501,12 +1514,24 @@ impl ViewerContextBundle {
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             snapshot: None,
             global_search_subfolder_restore: None,
+            global_search: crate::global_search_ui::GlobalSearchState::default(),
             favsearch_subfolder_restore: None,
             items_are_global_search_view: false,
             items_are_tag_view: false,
             items_are_reading_history_view: false,
             items_are_bookmark_view: false,
             items_are_rating_view: false,
+            rating_view_stars: 0,
+            rating_view_sort: crate::rating_view::RatingViewSort::default(),
+            rating_view_rows: Vec::new(),
+            rating_view_rows_stars: None,
+            rating_view_pending: None,
+            rating_view_request_sequence: 0,
+            rating_view_accepted_write_generation: 0,
+            rating_view_skipped: 0,
+            rating_view_saved_folder: None,
+            rating_view_subfolder_restore: None,
+            rating_view_nav_stack: Vec::new(),
             items_are_subfolder_expansion_view: false,
             items_are_smart_folder_view: false,
             items_are_drive_list: false,
@@ -1852,12 +1877,24 @@ impl App {
             top_level_grid_view,
             snapshot,
             global_search_subfolder_restore,
+            global_search,
             favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
             items_are_bookmark_view,
             items_are_rating_view,
+            rating_view_stars,
+            rating_view_sort,
+            rating_view_rows,
+            rating_view_rows_stars,
+            rating_view_pending,
+            rating_view_request_sequence,
+            rating_view_accepted_write_generation,
+            rating_view_skipped,
+            rating_view_saved_folder,
+            rating_view_subfolder_restore,
+            rating_view_nav_stack,
             items_are_subfolder_expansion_view,
             items_are_smart_folder_view,
             items_are_drive_list,
@@ -2111,12 +2148,24 @@ impl App {
         swap_field!(snapshot);
         swap_field!(rating_filter_suppressed_at);
         swap_field!(global_search_subfolder_restore);
+        swap_field!(global_search);
         swap_field!(favsearch_subfolder_restore);
         swap_field!(items_are_global_search_view);
         swap_field!(items_are_tag_view);
         swap_field!(items_are_reading_history_view);
         swap_field!(items_are_bookmark_view);
         swap_field!(items_are_rating_view);
+        swap_field!(rating_view_stars);
+        swap_field!(rating_view_sort);
+        swap_field!(rating_view_rows);
+        swap_field!(rating_view_rows_stars);
+        swap_field!(rating_view_pending);
+        swap_field!(rating_view_request_sequence);
+        swap_field!(rating_view_accepted_write_generation);
+        swap_field!(rating_view_skipped);
+        swap_field!(rating_view_saved_folder);
+        swap_field!(rating_view_subfolder_restore);
+        swap_field!(rating_view_nav_stack);
         swap_field!(items_are_subfolder_expansion_view);
         swap_field!(items_are_smart_folder_view);
         swap_field!(items_are_drive_list);
@@ -2409,12 +2458,24 @@ impl App {
             top_level_grid_view,
             snapshot,
             global_search_subfolder_restore,
+            global_search,
             favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
             items_are_bookmark_view,
             items_are_rating_view,
+            rating_view_stars,
+            rating_view_sort,
+            rating_view_rows,
+            rating_view_rows_stars,
+            rating_view_pending,
+            rating_view_request_sequence,
+            rating_view_accepted_write_generation,
+            rating_view_skipped,
+            rating_view_saved_folder,
+            rating_view_subfolder_restore,
+            rating_view_nav_stack,
             items_are_subfolder_expansion_view,
             items_are_smart_folder_view,
             items_are_drive_list,
@@ -2688,6 +2749,18 @@ impl App {
         // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
         keep_in_main!(
             navigation_scope,
+            global_search,
+            rating_view_stars,
+            rating_view_sort,
+            rating_view_rows,
+            rating_view_rows_stars,
+            rating_view_pending,
+            rating_view_request_sequence,
+            rating_view_accepted_write_generation,
+            rating_view_skipped,
+            rating_view_saved_folder,
+            rating_view_subfolder_restore,
+            rating_view_nav_stack,
             // 新しい parked context は複製済み items/cache の独立 owner になる。進行中の
             // receiver だけは複製できないため、元の main context に残す。
             facet_name_cache_pending,
@@ -4074,6 +4147,28 @@ mod tests {
         assert_eq!(app.video_zoom_state, Some(state_main));
         app.swap_viewer_context_bundle(&mut fork);
         assert_eq!(app.video_zoom_state, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn virtual_list_route_state_survives_context_swap_without_sibling_leak() {
+        let mut app = crate::app::setup_app_for_test();
+        app.global_search.active = true;
+        app.global_search.query = "main search".into();
+        app.rating_view_stars = 3;
+        app.rating_view_request_sequence = 41;
+        let mut sibling = ViewerContextBundle::empty();
+        sibling.rating_view_stars = 5;
+        sibling.rating_view_request_sequence = 9;
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert!(!app.global_search.active);
+        assert_eq!(app.rating_view_stars, 5);
+        assert_eq!(app.rating_view_request_sequence, 9);
+        assert_eq!(sibling.global_search.query, "main search");
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert!(app.global_search.active);
+        assert_eq!(app.rating_view_stars, 3);
+        assert_eq!(app.rating_view_request_sequence, 41);
     }
 
     #[cfg(windows)]
