@@ -33,7 +33,7 @@
 
 - 出どころ: v4.0.0 公開前の実機確認。利用者が「通常表示では反映される消しゴムの結果が、サブ展開すると閲覧時に
   反映されない。消しゴムツールを開くとマスクは残っており、ツールを抜けると反映される」と報告
-  (対象 `h:\home\mimageviewer_old	estimage5-12-31-095639_0_edited_3.png`)。
+  (対象 `h:\home\mimageviewer_old\testimage\2025-12-31-095639_0_edited_3.png`)。
 - **ログ** (同セッションの `mimageviewer.log`、公開担当が解析): 通常表示ではサムネイルが edit preview を使い
   (`edit_preview_cache_hit`)、ツールを閉じると `outcome=save has_source_edits=true`。サブ展開ではサムネイルを
   原画から作り直し、ツールを閉じると `outcome=delete_no_edits has_source_edits=false`。
