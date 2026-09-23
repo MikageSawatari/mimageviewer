@@ -434,6 +434,10 @@ pub(crate) struct PreparedSubfolderMetadata {
     pub(crate) rating_cache: HashMap<usize, u8>,
     pub(crate) tags_cache: HashMap<String, Vec<String>>,
     pub(crate) local_adjust_pages: HashSet<usize>,
+    pub(crate) page_edits: Option<(
+        super::page_edit_snapshot::PageEditSnapshot,
+        super::page_edit_snapshot::PageEditProjection,
+    )>,
     pub(crate) video_pin_blobs: HashMap<PathBuf, Vec<u8>>,
     /// サブ展開は synthetic path のため、通常フォルダの同期 lookup を使わず prepare
     /// worker でコンテナ項目だけを一括照会する。スマートフォルダは aggregate 側に持つ。
@@ -482,6 +486,7 @@ pub(crate) struct PreparedSubfolderExpansion {
     pub(crate) image_metas: Vec<Option<(i64, i64)>>,
     pub(crate) video_items: Vec<(usize, PathBuf, u64)>,
     pub(crate) metadata: PreparedSubfolderMetadata,
+    page_edit_revision: u64,
 }
 
 pub(crate) enum SubfolderExpansionPrepareEvent {
@@ -1138,6 +1143,8 @@ struct SubfolderExpansionPrepareOptions {
     load_ratings: bool,
     load_tags: bool,
     load_local_adjust: bool,
+    page_edit_availability: super::page_edit_snapshot::PageEditAvailability,
+    page_edit_revision: u64,
     load_video_pins: bool,
     folder_pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
     removed_paths: HashSet<String>,
@@ -1292,7 +1299,10 @@ fn prepare_subfolder_expansion(
         }
     }
 
-    if reused_metadata.is_none() && options.load_local_adjust {
+    if reused_metadata.is_none()
+        && options.load_local_adjust
+        && !options.page_edit_availability.local_adjust
+    {
         prepare_progress(tx, SubfolderExpansionPreparePhase::Adjustments, 0, total);
         let db = crate::local_adjust_db::LocalAdjustDb::open_readonly(
             &crate::local_adjust_db::LocalAdjustDb::db_path(),
@@ -1316,6 +1326,20 @@ fn prepare_subfolder_expansion(
                 total,
             );
         }
+    }
+
+    // A resort replaces the projection in its worker as well. Reading exact keys again avoids
+    // cloning a potentially million-entry keyed snapshot on the UI thread.
+    let page_edits = super::page_edit_snapshot::PageEditSnapshot::load_and_project(
+        &items,
+        options.page_edit_availability,
+        cancel,
+    )?;
+    let Some(page_edits) = page_edits else {
+        return Ok(None);
+    };
+    if options.page_edit_availability.local_adjust {
+        local_adjust_pages = page_edits.1.local_adjust.clone();
     }
 
     let mut video_pin_blobs = HashMap::new();
@@ -1355,10 +1379,12 @@ fn prepare_subfolder_expansion(
             rating_cache,
             tags_cache,
             local_adjust_pages,
+            page_edits: Some(page_edits),
             video_pin_blobs,
             folder_pin_map: Some(folder_pin_map),
             aggregate: None,
         },
+        page_edit_revision: options.page_edit_revision,
     }))
 }
 
@@ -1901,6 +1927,8 @@ impl App {
             load_ratings: self.rating_db.is_some(),
             load_tags: self.tags_db.is_some(),
             load_local_adjust: self.local_adjust_db.is_some(),
+            page_edit_availability: super::page_edit_snapshot::PageEditAvailability::for_app(self),
+            page_edit_revision: self.page_edit_revision,
             load_video_pins: self.video_pin_db.is_some(),
             folder_pin_db: self.folder_thumb_pin_db.clone(),
             removed_paths: self.subfolder_expansion_removed_paths.clone(),
@@ -2088,6 +2116,10 @@ impl App {
         prepared: PreparedSubfolderExpansion,
         ctx: Option<&egui::Context>,
     ) {
+        if prepared.page_edit_revision != self.page_edit_revision {
+            self.start_subfolder_expansion_prepare(prepared.snapshot, prepared.show_toast);
+            return;
+        }
         let install_t0 = Instant::now();
         let perf_on = crate::perf::is_enabled();
         let seq = self.input_seq;
@@ -2098,6 +2130,7 @@ impl App {
             image_metas,
             video_items,
             metadata,
+            page_edit_revision: _,
         } = prepared;
         let entry_count = items.len();
         if perf_on {
@@ -2439,6 +2472,103 @@ fn remove_paths_from_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_a_subfolder_mask_is_projected_after_accepted_prepare() {
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("subfolder-root");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let image = child.join("masked.png");
+        std::fs::write(&image, b"image").unwrap();
+        let key = crate::adjustment_db::normalize_path(&image);
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        let snapshot = SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
+            entries: Arc::new(vec![SubfolderExpansionEntry {
+                path: image.clone(),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 5,
+            }]),
+            video_thumb_overrides: HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+        };
+        app.start_subfolder_expansion_prepare(snapshot, false);
+        app.finish_subfolder_expansion_prepare_for_test();
+        assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+        assert!(
+            app.mask_pages.contains(&0),
+            "paint path must apply the saved mask"
+        );
+    }
+
+    #[test]
+    fn phase_a_subfolder_rejects_stale_edit_projection_and_reprepares() {
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("stale-subfolder-root");
+        let image = root.join("masked.png");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&image, b"image").unwrap();
+        let key = crate::adjustment_db::normalize_path(&image);
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        let snapshot = SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
+            entries: Arc::new(vec![SubfolderExpansionEntry {
+                path: image,
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 5,
+            }]),
+            video_thumb_overrides: HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+        };
+        app.start_subfolder_expansion_prepare(snapshot, false);
+        let pending = app.subfolder_expansion_install_pending.take().unwrap();
+        let prepared = loop {
+            match pending.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                SubfolderExpansionPrepareEvent::Progress(_) => {}
+                SubfolderExpansionPrepareEvent::Done(prepared) => break *prepared,
+                SubfolderExpansionPrepareEvent::Cancelled => panic!("prepare was cancelled"),
+                SubfolderExpansionPrepareEvent::Error(message) => panic!("{message}"),
+            }
+        };
+        assert!(
+            prepared
+                .metadata
+                .page_edits
+                .as_ref()
+                .unwrap()
+                .1
+                .mask
+                .contains(&0)
+        );
+        app.mask_db.as_ref().unwrap().delete(&key).unwrap();
+        app.page_edit_revision = app.page_edit_revision.wrapping_add(1);
+
+        let generation_before_rejection = app.items_generation;
+        app.install_prepared_subfolder_expansion(prepared, None);
+        assert_eq!(app.items_generation, generation_before_rejection);
+        assert!(app.subfolder_expansion_install_pending.is_some());
+        app.finish_subfolder_expansion_prepare_for_test();
+        assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+        assert!(
+            !app.mask_pages.contains(&0),
+            "stale mask must not be installed"
+        );
+    }
 
     #[test]
     fn relative_place_labels_use_the_pressed_root() {
@@ -2969,6 +3099,8 @@ mod tests {
             load_ratings: false,
             load_tags: false,
             load_local_adjust: false,
+            page_edit_availability: Default::default(),
+            page_edit_revision: 0,
             load_video_pins: false,
             folder_pin_db: None,
             removed_paths: HashSet::new(),
@@ -3336,6 +3468,8 @@ mod tests {
             load_ratings: false,
             load_tags: false,
             load_local_adjust: false,
+            page_edit_availability: Default::default(),
+            page_edit_revision: 0,
             load_video_pins: false,
             folder_pin_db: None,
             removed_paths: HashSet::from([crate::adjustment_db::normalize_path(&removed_path)]),
@@ -3404,6 +3538,8 @@ mod tests {
             load_ratings: true,
             load_tags: true,
             load_local_adjust: true,
+            page_edit_availability: Default::default(),
+            page_edit_revision: 0,
             load_video_pins: false,
             folder_pin_db: None,
             removed_paths: HashSet::new(),

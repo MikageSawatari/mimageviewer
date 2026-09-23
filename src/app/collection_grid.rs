@@ -181,6 +181,8 @@ pub(in crate::app) fn prepare_collection_grid_install(
     auto_aspect_client: Option<&crate::auto_aspect_cache::CollectionAutoAspectCacheClient>,
     pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
     thumbnail_source_epoch: u64,
+    page_edit_availability: super::page_edit_snapshot::PageEditAvailability,
+    page_edit_revision: u64,
 ) -> Result<CollectionGridPreparedInstall, CollectionPrepareError> {
     let perf_start = crate::perf::is_enabled().then(Instant::now);
     let classify_start = crate::perf::is_enabled().then(Instant::now);
@@ -235,6 +237,19 @@ pub(in crate::app) fn prepare_collection_grid_install(
     if cancel.load(Ordering::Acquire) {
         return Err(CollectionPrepareError::Cancelled);
     }
+    let edit_items = prepared
+        .entries
+        .iter()
+        .map(|entry| entry.item.clone())
+        .collect::<Vec<_>>();
+    let page_edits = super::page_edit_snapshot::PageEditSnapshot::load_and_project(
+        &edit_items,
+        page_edit_availability,
+        cancel,
+    )
+    .map_err(CollectionPrepareError::Io)?
+    .ok_or(CollectionPrepareError::Cancelled)?;
+    let retained_page_edits = Some(Arc::new(page_edits.0.clone()));
     let pin_start = crate::perf::is_enabled().then(Instant::now);
     let pin_db =
         crate::video_pins::VideoPinDb::open_readonly(&crate::video_pins::VideoPinDb::db_path());
@@ -322,6 +337,9 @@ pub(in crate::app) fn prepare_collection_grid_install(
     }
     Ok(CollectionGridPreparedInstall {
         prepared,
+        page_edits: Some(page_edits),
+        retained_page_edits,
+        page_edit_revision,
         thumbnail_sources,
         auto_aspect_lookup,
         reuse_key: CollectionGridPrepareReuseKey::new(
@@ -1132,19 +1150,35 @@ impl App {
             return false;
         }
         if let Some(prepared) = owner.navigation_prepared.clone() {
+            let previous_edit_snapshot = self
+                .top_level_grid_view
+                .collection_session()
+                .and_then(CollectionGridSession::installed_presentation)
+                .filter(|presentation| {
+                    Arc::ptr_eq(&presentation.prepared, &prepared)
+                        && presentation.page_edit_revision == self.page_edit_revision
+                })
+                .and_then(|presentation| presentation.page_edit_snapshot.clone());
             let presentation = owner
                 .navigation_request
                 .as_ref()
                 .and_then(|request| request.root_thumbnail_sources.as_ref())
                 .map(|source_owner| {
-                    Arc::new(CollectionGridInstalledPresentation::new(
+                    let mut presentation = CollectionGridInstalledPresentation::new(
                         Arc::clone(&prepared),
                         source_owner.presentation.clone(),
                         source_owner.reuse_key.clone(),
-                    ))
+                    );
+                    presentation.page_edit_snapshot = source_owner
+                        .retained_edit_snapshot
+                        .clone()
+                        .filter(|_| source_owner.page_edit_revision == self.page_edit_revision)
+                        .or_else(|| previous_edit_snapshot.clone());
+                    presentation.page_edit_revision = self.page_edit_revision;
+                    Arc::new(presentation)
                 })
                 .unwrap_or_else(|| {
-                    Arc::new(CollectionGridInstalledPresentation::new(
+                    let mut presentation = CollectionGridInstalledPresentation::new(
                         prepared,
                         CollectionGridPresentationSources::Oversized(
                             CollectionGridThumbnailSourceIdentity::default(),
@@ -1153,7 +1187,10 @@ impl App {
                             owner.stamp.collection_id,
                             owner.accepted_revision,
                         ),
-                    ))
+                    );
+                    presentation.page_edit_snapshot = previous_edit_snapshot;
+                    presentation.page_edit_revision = self.page_edit_revision;
+                    Arc::new(presentation)
                 });
             if let Some(session) = self.top_level_grid_view.collection_session_mut() {
                 session.accepted_revision = presentation.prepared.collection_revision;
@@ -1451,6 +1488,8 @@ impl App {
         let settings = self.settings.clone();
         let pin_stamp = self.video_pin_db.as_ref().map(|db| db.mutation_stamp());
         let thumbnail_source_epoch = self.collection_thumbnail_source_epoch;
+        let page_edit_availability = super::page_edit_snapshot::PageEditAvailability::for_app(self);
+        let page_edit_revision = self.page_edit_revision;
         let auto_aspect_client = self
             .collection_auto_aspect_cache
             .as_ref()
@@ -1469,6 +1508,8 @@ impl App {
                     auto_aspect_client.as_ref(),
                     pin_stamp,
                     thumbnail_source_epoch,
+                    page_edit_availability,
+                    page_edit_revision,
                 );
                 let _ = sender.send(result);
             });
@@ -1844,6 +1885,7 @@ impl App {
                     let accepts = self.collection_grid_stamp_is_current(stamp)
                         && prepared.prepared.collection_id == stamp.collection_id
                         && prepared.prepared.collection_revision == exact_revision
+                        && prepared.page_edit_revision == self.page_edit_revision
                         && prepared.reuse_key
                             == self.collection_grid_prepare_reuse_key(
                                 stamp.collection_id,
@@ -1977,6 +2019,9 @@ impl App {
         let perf_start = crate::perf::is_enabled().then(Instant::now);
         let CollectionGridPreparedInstall {
             prepared,
+            page_edits,
+            retained_page_edits,
+            page_edit_revision,
             thumbnail_sources,
             auto_aspect_lookup,
             reuse_key,
@@ -2092,6 +2137,7 @@ impl App {
             video_pin_blobs,
             collection_seed,
             prepared.auto_aspect_eligible_total,
+            page_edits,
         );
         self.checked = checked;
         if let Some(query) = old_search_query {
@@ -2125,11 +2171,11 @@ impl App {
             session.accepted_revision = prepared.collection_revision;
             session.wanted_revision = session.wanted_revision.max(prepared.collection_revision);
             session.installed_items_generation = Some(installed_generation);
-            let presentation = Arc::new(CollectionGridInstalledPresentation::new(
-                prepared,
-                presentation_sources,
-                reuse_key,
-            ));
+            let mut presentation =
+                CollectionGridInstalledPresentation::new(prepared, presentation_sources, reuse_key);
+            presentation.page_edit_snapshot = retained_page_edits;
+            presentation.page_edit_revision = page_edit_revision;
+            let presentation = Arc::new(presentation);
             session.load = if presentation.prepared.entries.is_empty() {
                 CollectionGridLoadState::Empty(presentation)
             } else {
@@ -2187,6 +2233,9 @@ impl App {
         self.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
+                page_edits: None,
+                retained_page_edits: None,
+                page_edit_revision: self.page_edit_revision,
                 thumbnail_sources: CollectionGridPreparedThumbnailDelivery::default(),
                 auto_aspect_lookup: None,
                 reuse_key,
@@ -2219,6 +2268,7 @@ impl App {
             Arc::new(std::collections::HashMap::new()),
             collection_seed,
             auto_aspect_eligible_total,
+            None,
         );
     }
 
@@ -2231,6 +2281,10 @@ impl App {
         video_pin_blobs: Arc<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
         collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
         auto_aspect_eligible_total: usize,
+        page_edits: Option<(
+            super::page_edit_snapshot::PageEditSnapshot,
+            super::page_edit_snapshot::PageEditProjection,
+        )>,
     ) {
         // A grid menu owns the old item generation. Do not let its saved row index operate on
         // the newly installed collection; a menu owned by another viewer context is untouched.
@@ -2262,6 +2316,17 @@ impl App {
         self.install_prepared_aggregate_items(items, image_metas);
         self.invalidate_idx_state_and_queues();
         self.clear_page_edit_state();
+        if let Some((snapshot, mut projection)) = page_edits {
+            self.page_edit_snapshot = Some(snapshot);
+            self.adjustment_page_params = std::mem::take(&mut projection.adjustment);
+            self.export_crop_page_settings = std::mem::take(&mut projection.export_crop);
+            self.export_crop_pages = self.export_crop_page_settings.keys().copied().collect();
+            self.view_trim_page_overrides = std::mem::take(&mut projection.view_trim);
+            self.mask_pages = std::mem::take(&mut projection.mask);
+            self.conceal_pages = std::mem::take(&mut projection.conceal);
+            self.comic_pages = std::mem::take(&mut projection.comic);
+            self.local_adjust_pages = std::mem::take(&mut projection.local_adjust);
+        }
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
@@ -2503,6 +2568,83 @@ mod tests {
                 .expect("add request"),
         )
         .snapshot
+    }
+
+    #[test]
+    fn phase_a_collection_mask_is_projected_for_accepted_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("masked.png");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let key = crate::adjustment_db::normalize_path(&image);
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        app.conceal_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        let snapshot =
+            collection_with_sources(&client, &[(image.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+        assert!(
+            app.mask_pages.contains(&0),
+            "paint path must apply the saved mask"
+        );
+        assert!(
+            app.conceal_pages.contains(&0),
+            "paint path must apply the saved conceal edit"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn phase_a_collection_install_projects_zip_page_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip = temp.path().join("pages.zip");
+        std::fs::write(&zip, b"zip").unwrap();
+        let (mut app, _client) = start_ready_app(&temp.path().join("collection.db"));
+        let item = GridItem::ZipImage {
+            zip_path: zip.clone(),
+            entry_name: "page.png".into(),
+        };
+        let key = crate::adjustment_db::zip_entry_key(&zip, "page.png");
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        let prepared = super::super::page_edit_snapshot::PageEditSnapshot::load_and_project(
+            std::slice::from_ref(&item),
+            super::super::page_edit_snapshot::PageEditAvailability {
+                mask: true,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        app.install_collection_grid_items_with_thumbnail_sources(
+            vec![item],
+            vec![Some((1, 5))],
+            None,
+            std::collections::HashMap::new(),
+            Arc::new(std::collections::HashMap::new()),
+            None,
+            0,
+            Some(prepared),
+        );
+        assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+        assert!(
+            app.mask_pages.contains(&0),
+            "ZIP member uses its exact page key"
+        );
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]
@@ -5028,6 +5170,9 @@ mod tests {
         sender
             .send(Ok(CollectionGridPreparedInstall {
                 prepared: (*installed).clone(),
+                page_edits: None,
+                retained_page_edits: None,
+                page_edit_revision: app.page_edit_revision,
                 thumbnail_sources: prepare_collection_grid_thumbnail_sources(
                     CollectionGridThumbnailSources::default(),
                     &AtomicBool::new(false),
@@ -5517,6 +5662,9 @@ mod tests {
         prepare_sender
             .send(Ok(CollectionGridPreparedInstall {
                 prepared: (*installed_prepared).clone(),
+                page_edits: None,
+                retained_page_edits: None,
+                page_edit_revision: app.page_edit_revision,
                 thumbnail_sources: prepared_sources,
                 auto_aspect_lookup: None,
                 reuse_key: app.collection_grid_prepare_reuse_key(
@@ -5554,6 +5702,9 @@ mod tests {
         late_sender
             .send(Ok(CollectionGridPreparedInstall {
                 prepared: (*installed_prepared).clone(),
+                page_edits: None,
+                retained_page_edits: None,
+                page_edit_revision: app.page_edit_revision,
                 thumbnail_sources: prepare_collection_grid_thumbnail_sources(
                     CollectionGridThumbnailSources::default(),
                     &AtomicBool::new(false),

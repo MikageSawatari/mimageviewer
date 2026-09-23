@@ -5292,6 +5292,7 @@ fn prepare_smart_folder(
             rating_cache,
             tags_cache,
             local_adjust_pages,
+            page_edits: None,
             video_pin_blobs,
             folder_pin_map: None,
             aggregate: Some(super::subfolder_expansion::PreparedAggregateMetadata {
@@ -5848,6 +5849,7 @@ impl App {
     /// deliberately frozen result: direct cell state may still update, but membership/order and
     /// its reusable metadata remain unchanged until an explicit reopen.
     pub(crate) fn invalidate_smart_folder_resort_metadata(&mut self) {
+        self.page_edit_revision = self.page_edit_revision.wrapping_add(1);
         if self.top_level_grid_view.smart_folder_session().is_some() {
             return;
         }

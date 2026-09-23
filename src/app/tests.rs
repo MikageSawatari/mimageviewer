@@ -962,6 +962,205 @@ fn edit_preview_close_observes_a_materialized_generation_after_direct_entry_loss
     );
 }
 
+fn phase_a_seed_shared_preview() -> (phase_c_support::AppTestEnv, PathBuf, String) {
+    let mut app = phase_c_support::setup_app();
+    app.settings.edit_preview_cache_enabled = true;
+    assert!(app.edit_preview_cache.is_some());
+    let image = app.tmp.path().join("shared-preview.png");
+    let key = crate::adjustment_db::normalize_path(&image);
+    let preview = app.edit_preview_cache.as_ref().unwrap();
+    preview.save(
+        key.clone(),
+        1,
+        5,
+        None,
+        Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
+        None,
+        None,
+        1_000_000,
+        None,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while preview.has_pending_commands() {
+        assert!(std::time::Instant::now() < deadline, "preview save stalled");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(preview.db().load(&key, 1, 5, 8).is_some(), "preview seeded");
+    app.items = vec![GridItem::Image(image.clone())];
+    app.image_metas = vec![Some((1, 5))];
+    app.fullscreen_idx = Some(0);
+    (app, image, key)
+}
+
+fn phase_a_shared_preview_exists(app: &App, key: &str) -> bool {
+    let preview = app.edit_preview_cache.as_ref().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while preview.has_pending_commands() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "preview close stalled"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    preview.db().load(key, 1, 5, 8).is_some()
+}
+
+#[test]
+fn phase_a_unchanged_tool_close_never_deletes_shared_preview() {
+    let (mut app, _image, key) = phase_a_seed_shared_preview();
+    let views = [
+        (
+            "subfolder",
+            crate::app::subfolder_expansion_synthetic_path(),
+        ),
+        ("search", PathBuf::from("__global_search__")),
+        ("collection", PathBuf::from("__collection__")),
+        (
+            "reading history",
+            crate::app::reading_history_synthetic_path(),
+        ),
+        ("rating", crate::app::rating_view_synthetic_path()),
+        ("normal folder", app.tmp.path().join("normal")),
+    ];
+    for (name, folder) in views {
+        app.current_folder = Some(folder);
+        app.clear_page_edit_state();
+        assert!(
+            matches!(
+                app.snapshot_edit_preview_close_update(0),
+                Some(EditPreviewCloseUpdate::Skip {
+                    observation: EditPreviewCloseObservation {
+                        outcome: EditPreviewCloseOutcome::SkipNoEdits,
+                        ..
+                    }
+                })
+            ),
+            "{name}: a read-only close cannot delete a page-keyed shared preview"
+        );
+        app.cache_current_edit_preview_if_ready();
+        assert!(
+            phase_a_shared_preview_exists(&app, &key),
+            "{name}: unchanged close deleted the shared preview"
+        );
+    }
+}
+
+#[test]
+fn phase_a_nonresident_edit_result_close_preserves_shared_preview() {
+    let (mut app, _image, key) = phase_a_seed_shared_preview();
+    app.mask_pages.insert(0);
+    assert!(matches!(
+        app.snapshot_edit_preview_close_update(0),
+        Some(EditPreviewCloseUpdate::Skip {
+            observation: EditPreviewCloseObservation {
+                outcome: EditPreviewCloseOutcome::SkipEditResultNotResident { .. },
+                ..
+            }
+        })
+    ));
+    app.cache_current_edit_preview_if_ready();
+    assert!(
+        phase_a_shared_preview_exists(&app, &key),
+        "nonresident edit result deleted the shared preview"
+    );
+}
+
+#[test]
+fn phase_a_missing_comic_fonts_close_preserves_shared_preview() {
+    let (mut app, _image, key) = phase_a_seed_shared_preview();
+    app.comic_docs.insert(
+        key.clone(),
+        vec![comic_core::AnnotationObject::new_text(
+            1,
+            (0.0, 0.0),
+            comic_core::TextBlock::default(),
+        )],
+    );
+    app.comic_fonts = None;
+    let edit_key = app.current_edit_result_key(0);
+    app.edit_result_cache.insert(
+        edit_key,
+        EditResultEntry {
+            pixels: Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
+            texture: None,
+        },
+    );
+    assert!(matches!(
+        app.snapshot_edit_preview_close_update(0),
+        Some(EditPreviewCloseUpdate::Skip {
+            observation: EditPreviewCloseObservation {
+                outcome: EditPreviewCloseOutcome::SkipComicFontsUnavailable,
+                ..
+            }
+        })
+    ));
+    app.cache_current_edit_preview_if_ready();
+    assert!(
+        phase_a_shared_preview_exists(&app, &key),
+        "missing comic fonts deleted the shared preview"
+    );
+}
+
+fn phase_b_masked_image() -> (phase_c_support::AppTestEnv, PathBuf) {
+    let app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("phase-b-masked.png");
+    std::fs::write(&image, b"image").unwrap();
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    (app, image)
+}
+
+#[test]
+#[ignore = "backlog 1.268 phase B: needs worker-side prepare lifecycle"]
+fn phase_b_search_streaming_result_projects_saved_mask() {
+    let (mut app, image) = phase_b_masked_image();
+    app.replace_search_view_items(vec![GridItem::Image(image)], vec![Some((1, 5))]);
+    assert!(
+        app.mask_pages.contains(&0),
+        "search result paint must use saved mask"
+    );
+}
+
+#[test]
+#[ignore = "backlog 1.268 phase B: needs worker-side prepare lifecycle"]
+fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
+    let (mut app, image) = phase_b_masked_image();
+    app.rating_view_rows = vec![crate::rating_view::RatingViewRow {
+        key: crate::adjustment_db::normalize_path(&image),
+        item: GridItem::Image(image),
+        image_meta: Some((1, 5)),
+        rated_at_ms: Some(1),
+    }];
+    app.install_rating_view_rows();
+    assert!(
+        app.mask_pages.contains(&0),
+        "rating row paint must use saved mask"
+    );
+}
+
+#[test]
+#[ignore = "backlog 1.268 phase B: needs worker-side prepare lifecycle"]
+fn phase_b_reading_history_container_resolves_masked_member_before_paint() {
+    let (mut app, image) = phase_b_masked_image();
+    let folder = image.parent().unwrap().to_path_buf();
+    app.install_reading_history_entries(vec![crate::reading_history_db::ReadingHistoryEntry::new(
+        folder,
+        crate::reading_history_db::ReadingHistoryKind::Folder,
+        None,
+        "masked member".into(),
+        None,
+        None,
+    )]);
+    assert!(
+        app.mask_pages.contains(&0),
+        "history entry must resolve member edit before paint"
+    );
+}
+
 #[test]
 fn initial_scan_settled_gate_waits_for_both_index_kinds() {
     let mut pending = true;
@@ -77149,6 +77348,7 @@ fn prepared_aggregate_installs_exact_per_item_edit_state() {
         rating_cache: Default::default(),
         tags_cache: Default::default(),
         local_adjust_pages: std::collections::HashSet::from([0]),
+        page_edits: None,
         video_pin_blobs: Default::default(),
         folder_pin_map: None,
         aggregate: Some(crate::app::subfolder_expansion::PreparedAggregateMetadata {

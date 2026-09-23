@@ -531,6 +531,13 @@ pub(crate) enum CollectionGridLoadState {
 
 pub(crate) struct CollectionGridPreparedInstall {
     pub(crate) prepared: crate::collection_store::CollectionPreparedSnapshot,
+    pub(crate) page_edits: Option<(
+        super::page_edit_snapshot::PageEditSnapshot,
+        super::page_edit_snapshot::PageEditProjection,
+    )>,
+    pub(crate) retained_page_edits:
+        Option<std::sync::Arc<super::page_edit_snapshot::PageEditSnapshot>>,
+    pub(crate) page_edit_revision: u64,
     pub(crate) thumbnail_sources: CollectionGridPreparedThumbnailDelivery,
     pub(crate) auto_aspect_lookup: Option<crate::auto_aspect_cache::CollectionAutoAspectLookup>,
     pub(crate) reuse_key: CollectionGridPrepareReuseKey,
@@ -612,21 +619,57 @@ pub(crate) enum CollectionGridPresentationSources {
 #[derive(Clone, Debug)]
 pub(crate) struct CollectionGridNavigationSources {
     pub(crate) reuse_key: CollectionGridPrepareReuseKey,
+    pub(crate) page_edit_revision: u64,
     pub(crate) presentation: CollectionGridPresentationSources,
     live: std::sync::Arc<std::sync::Mutex<Option<CollectionGridThumbnailSources>>>,
+    pub(crate) retained_edit_snapshot:
+        Option<std::sync::Arc<super::page_edit_snapshot::PageEditSnapshot>>,
+    page_edits: std::sync::Arc<
+        std::sync::Mutex<
+            Option<(
+                super::page_edit_snapshot::PageEditSnapshot,
+                super::page_edit_snapshot::PageEditProjection,
+            )>,
+        >,
+    >,
 }
 
 impl CollectionGridNavigationSources {
     pub(crate) fn new(
         reuse_key: CollectionGridPrepareReuseKey,
+        page_edit_revision: u64,
         presentation: CollectionGridPresentationSources,
         live: Option<CollectionGridThumbnailSources>,
     ) -> Self {
         Self {
             reuse_key,
+            page_edit_revision,
             presentation,
             live: std::sync::Arc::new(std::sync::Mutex::new(live)),
+            retained_edit_snapshot: None,
+            page_edits: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn publish_page_edits(
+        &self,
+        page_edits: Option<(
+            super::page_edit_snapshot::PageEditSnapshot,
+            super::page_edit_snapshot::PageEditProjection,
+        )>,
+    ) {
+        if let Ok(mut slot) = self.page_edits.lock() {
+            *slot = page_edits;
+        }
+    }
+
+    pub(crate) fn take_page_edits(
+        &self,
+    ) -> Option<(
+        super::page_edit_snapshot::PageEditSnapshot,
+        super::page_edit_snapshot::PageEditProjection,
+    )> {
+        self.page_edits.lock().ok()?.take()
     }
 
     pub(crate) fn identity(&self) -> CollectionGridThumbnailSourceIdentity {
@@ -717,12 +760,25 @@ impl Default for CollectionGridPreparedThumbnailDelivery {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct CollectionGridInstalledPresentation {
     pub(crate) prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
     pub(crate) sources: CollectionGridPresentationSources,
     pub(crate) reuse_key: CollectionGridPrepareReuseKey,
+    pub(crate) page_edit_snapshot:
+        Option<std::sync::Arc<super::page_edit_snapshot::PageEditSnapshot>>,
+    pub(crate) page_edit_revision: u64,
 }
+
+impl PartialEq for CollectionGridInstalledPresentation {
+    fn eq(&self, other: &Self) -> bool {
+        self.prepared == other.prepared
+            && self.sources == other.sources
+            && self.reuse_key == other.reuse_key
+    }
+}
+
+impl Eq for CollectionGridInstalledPresentation {}
 
 impl CollectionGridInstalledPresentation {
     pub(crate) fn new(
@@ -734,6 +790,8 @@ impl CollectionGridInstalledPresentation {
             prepared,
             sources,
             reuse_key,
+            page_edit_snapshot: None,
+            page_edit_revision: 0,
         }
     }
 

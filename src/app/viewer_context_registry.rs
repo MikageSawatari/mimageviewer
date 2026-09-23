@@ -1018,6 +1018,7 @@ pub(in crate::app) struct ViewerContextBundle {
     export_crop_page_settings: std::collections::HashMap<usize, crate::export_crop::CropSettings>,
     export_crop_pages: std::collections::HashSet<usize>,
     mask_pages: std::collections::HashSet<usize>,
+    page_edit_snapshot: Option<super::page_edit_snapshot::PageEditSnapshot>,
     comic_pages: std::collections::HashSet<usize>,
     conceal_pages: std::collections::HashSet<usize>,
     erase_mask_generation: std::collections::HashMap<usize, u64>,
@@ -1581,6 +1582,7 @@ impl ViewerContextBundle {
             export_crop_page_settings: std::collections::HashMap::new(),
             export_crop_pages: std::collections::HashSet::new(),
             mask_pages: std::collections::HashSet::new(),
+            page_edit_snapshot: None,
             comic_pages: std::collections::HashSet::new(),
             conceal_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
@@ -1930,6 +1932,7 @@ impl App {
             export_crop_page_settings,
             export_crop_pages,
             mask_pages,
+            page_edit_snapshot,
             comic_pages,
             conceal_pages,
             erase_mask_generation,
@@ -2188,6 +2191,7 @@ impl App {
         swap_field!(export_crop_page_settings);
         swap_field!(export_crop_pages);
         swap_field!(mask_pages);
+        swap_field!(page_edit_snapshot);
         swap_field!(comic_pages);
         swap_field!(conceal_pages);
         swap_field!(erase_mask_generation);
@@ -2485,6 +2489,7 @@ impl App {
             export_crop_page_settings,
             export_crop_pages,
             mask_pages,
+            page_edit_snapshot,
             comic_pages,
             conceal_pages,
             erase_mask_generation,
@@ -2767,6 +2772,7 @@ impl App {
             export_crop_page_settings,
             export_crop_pages,
             mask_pages,
+            page_edit_snapshot,
             comic_pages,
             conceal_pages,
             erase_mask_generation,
@@ -2828,6 +2834,9 @@ impl App {
         detached.export_crop_page_settings = self.export_crop_page_settings.clone();
         detached.export_crop_pages = self.export_crop_pages.clone();
         detached.mask_pages = self.mask_pages.clone();
+        // This fork navigates to a physical context. Do not clone the potentially large
+        // virtual-list keyed owner on the UI thread; its current index maps are copied above.
+        detached.page_edit_snapshot = None;
         detached.comic_pages = self.comic_pages.clone();
         detached.conceal_pages = self.conceal_pages.clone();
         detached.erase_mask_generation = self.erase_mask_generation.clone();

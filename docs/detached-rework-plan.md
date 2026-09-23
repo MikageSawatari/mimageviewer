@@ -1454,6 +1454,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-23 仮想一覧のページ編集 snapshot を viewer context に帰属させる Phase A（Codex 実装、独立 Sol reviewer が構造的変更と合意）**
+
+`src/app/viewer_context_registry.rs:2194` の bundle swap に `page_edit_snapshot` を加え、
+サブ展開・コレクションの受理済み一覧と同じ viewer context が keyed owner を保持する。
+物理 detached context の fork（同ファイル約 2839 行）では、仮想一覧用の大きな snapshot を
+UI スレッドで clone しない。従来から複製する index map は維持し、fork 先の
+`page_edit_snapshot` は空とする。物理 context の owner を仮想一覧から誤って複製しない
+所有境界の修正であり、detached predicate、viewport、host、配置、focus、window lifecycle
+は変更しない。独立 reviewer は child handoff と fork の差分を確認し、症状パッチではない
+構造的変更で、従来の index-map copy と表示機能を維持すると合意した。
+
 **2026-09-23 Ctrl+G の `/` 区切り画像結果を複数窓で開くと初回描画前に閉じる件（Codex実装、独立レビュー構造合意、BA-7 の producer→terminal 境界）**
 
 `src/app.rs` の `poll_detached_physical_folder_open` で、detached image request の対象を

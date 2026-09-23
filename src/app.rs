@@ -172,6 +172,7 @@ use presentation_transition::{
 #[cfg(all(windows, test))]
 use presentation_transition::{PreparingProgress, PresentationTransitionState};
 pub(crate) mod normalize;
+mod page_edit_snapshot;
 mod prefetch_policy;
 mod recursive_snapshot_scan;
 mod runtime_ops;
@@ -7485,35 +7486,35 @@ pub(crate) struct EditResultEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditPreviewCloseOutcome {
-    DeleteNoEdits,
-    DeleteEditResultNotResident {
+    SkipNoEdits,
+    SkipEditResultNotResident {
         /// A matching downstream cache, job, failure, or drop record proves that this exact edit
         /// generation existed even though its direct `edit_result_cache` entry is no longer
         /// resident. `false` means only that no such evidence remains; it does not prove that the
         /// generation never completed.
         edit_result_generation_observed: bool,
     },
-    DeleteComicFontsUnavailable,
+    SkipComicFontsUnavailable,
     Save,
 }
 
 impl EditPreviewCloseOutcome {
     fn as_str(self) -> &'static str {
         match self {
-            Self::DeleteNoEdits => "delete_no_edits",
-            Self::DeleteEditResultNotResident { .. } => "delete_edit_result_not_resident",
-            Self::DeleteComicFontsUnavailable => "delete_comic_fonts_unavailable",
+            Self::SkipNoEdits => "skip_no_edits",
+            Self::SkipEditResultNotResident { .. } => "skip_edit_result_not_resident",
+            Self::SkipComicFontsUnavailable => "skip_comic_fonts_unavailable",
             Self::Save => "save",
         }
     }
 
     fn edit_result_generation_observed(self) -> Option<bool> {
         match self {
-            Self::DeleteNoEdits => None,
-            Self::DeleteEditResultNotResident {
+            Self::SkipNoEdits => None,
+            Self::SkipEditResultNotResident {
                 edit_result_generation_observed,
             } => Some(edit_result_generation_observed),
-            Self::DeleteComicFontsUnavailable | Self::Save => Some(true),
+            Self::SkipComicFontsUnavailable | Self::Save => Some(true),
         }
     }
 }
@@ -7586,7 +7587,7 @@ enum EditPreviewCloseUpdate {
         annotations: Option<crate::edit_preview_cache::EditPreviewAnnotations>,
         crop: Option<crate::export_crop::CropRect>,
     },
-    DeleteIfPresent {
+    Skip {
         observation: EditPreviewCloseObservation,
     },
 }
@@ -14311,6 +14312,8 @@ pub struct App {
     /// Advances on every path-keyed metadata write that can affect a smart-folder grid. Prepare
     /// results captured before the write are rejected at install time.
     pub(crate) smart_folder_metadata_revision: u64,
+    /// Global page-edit mutation epoch used to reject prepared cross-folder edit snapshots.
+    pub(crate) page_edit_revision: u64,
     /// Source view captured when a smart-folder scan starts. Search result synthetic paths are
     /// never stored here; their pre-search return context is transferred directly instead.
     pub(crate) smart_folder_open_origin: Option<smart_folder::SmartFolderOpenOrigin>,
@@ -14663,6 +14666,9 @@ pub struct App {
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
     /// フォルダロード時に mask_db から一括取得し、save/delete/apply でメンテナンスする。
     pub(crate) mask_pages: std::collections::HashSet<usize>,
+    /// Exact-key owner for the prepared cross-folder page-edit generation. The idx maps above
+    /// and below are projections of this snapshot only while it is present.
+    pub(crate) page_edit_snapshot: Option<page_edit_snapshot::PageEditSnapshot>,
     /// 現フォルダでテキスト注釈 (comic) を持つページの item_idx 集合 (サムネイル「文」
     /// バッジ描画用)。フォルダロード時に comic_db.load_comic_keys から一括取得し、
     /// save_comic_objects で idx 単位にメンテナンスする (mask_pages と同形)。
@@ -17065,6 +17071,7 @@ impl App {
             smart_folder_saved_folder: None,
             smart_folder_retired_payloads: Vec::new(),
             smart_folder_metadata_revision: 0,
+            page_edit_revision: 0,
             smart_folder_open_origin: None,
             smart_folder_local_search_reapply: None,
             smart_folder_removed_paths: std::collections::HashMap::new(),
@@ -17188,6 +17195,7 @@ impl App {
             local_adjust_brush_deferred_render: None,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
+            page_edit_snapshot: None,
             comic_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
             local_adjust_cache: std::collections::HashMap::new(),
@@ -27339,6 +27347,7 @@ impl App {
             ));
             return;
         }
+        self.page_edit_snapshot = None;
         let detached_physical = self.navigation_scope.is_detached_physical();
         let smart_open_path = match &authority {
             VisibleInstallAuthority::Ordinary => None,
@@ -27962,6 +27971,12 @@ impl App {
             cancel,
             restore_started_at,
         } = continuation;
+        let mut prepared_page_edits = prepared_subfolder
+            .as_mut()
+            .and_then(|metadata| metadata.page_edits.take());
+        self.page_edit_snapshot = prepared_page_edits
+            .as_mut()
+            .map(|(snapshot, _)| std::mem::take(snapshot));
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -27975,7 +27990,9 @@ impl App {
             );
         }
         let adj_t0 = std::time::Instant::now();
-        if let Some(metadata) = prepared_aggregate.as_mut() {
+        if let Some((_, projection)) = prepared_page_edits.as_mut() {
+            self.adjustment_page_params = std::mem::take(&mut projection.adjustment);
+        } else if let Some(metadata) = prepared_aggregate.as_mut() {
             self.adjustment_page_params = std::mem::take(&mut metadata.adjustment_page_params);
         } else if let Some(db) = &self.adjustment_db {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
@@ -28031,7 +28048,10 @@ impl App {
         // サムネイル画像には反映せず、フルスクリーン表示 / コピー / エクスポートの
         // 最終段だけで使う。
         let crop_t0 = std::time::Instant::now();
-        if let Some(metadata) = prepared_aggregate.as_mut() {
+        if let Some((_, projection)) = prepared_page_edits.as_mut() {
+            self.export_crop_page_settings = std::mem::take(&mut projection.export_crop);
+            self.export_crop_pages = self.export_crop_page_settings.keys().copied().collect();
+        } else if let Some(metadata) = prepared_aggregate.as_mut() {
             self.export_crop_page_settings =
                 std::mem::take(&mut metadata.export_crop_page_settings);
             self.export_crop_pages = self.export_crop_page_settings.keys().copied().collect();
@@ -28063,7 +28083,9 @@ impl App {
         }
 
         let view_trim_t0 = std::time::Instant::now();
-        if let Some(metadata) = prepared_aggregate.as_mut() {
+        if let Some((_, projection)) = prepared_page_edits.as_mut() {
+            self.view_trim_page_overrides = std::mem::take(&mut projection.view_trim);
+        } else if let Some(metadata) = prepared_aggregate.as_mut() {
             self.view_trim_page_overrides = std::mem::take(&mut metadata.view_trim_page_overrides);
         } else {
             self.hydrate_view_trim_page_overrides_for_current_items();
@@ -28083,7 +28105,11 @@ impl App {
 
         // 消しゴムマスク: フォルダ内でマスクを持つページを列挙
         let mask_t0 = std::time::Instant::now();
-        if let Some(metadata) = prepared_aggregate.as_mut() {
+        if let Some((_, projection)) = prepared_page_edits.as_mut() {
+            self.mask_pages = std::mem::take(&mut projection.mask);
+            self.conceal_pages = std::mem::take(&mut projection.conceal);
+            self.comic_pages = std::mem::take(&mut projection.comic);
+        } else if let Some(metadata) = prepared_aggregate.as_mut() {
             self.mask_pages = std::mem::take(&mut metadata.mask_pages);
             self.conceal_pages = std::mem::take(&mut metadata.conceal_pages);
             self.comic_pages = std::mem::take(&mut metadata.comic_pages);
@@ -28103,6 +28129,7 @@ impl App {
 
         // 隠蔽加工マスク: バッジ用に「マスクを持つページ」を集合化 (mask_db と同様)
         if prepared_aggregate.is_none()
+            && prepared_page_edits.is_none()
             && let Some(db) = &self.conceal_db
         {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
@@ -28120,6 +28147,7 @@ impl App {
 
         // テキスト注釈 (comic): バッジ用に「注釈を持つページ」を集合化 (mask_db と同様)。
         if prepared_aggregate.is_none()
+            && prepared_page_edits.is_none()
             && let Some(db) = &self.comic_db
         {
             let prefix = crate::adjustment_db::normalize_path(&source_path);
@@ -30541,6 +30569,7 @@ impl App {
     /// regular open は `ViewerContextId`、残る 3 種は legacy owner=None が mounted 所有を表す
     /// (review-v2.3.0 追補3: 角度A-1)。
     pub(crate) fn clear_page_edit_state(&mut self) {
+        self.page_edit_snapshot = None;
         self.adjustment_page_params.clear();
         self.local_adjust_page_layers.clear();
         self.local_adjust_pages.clear();
@@ -30559,6 +30588,23 @@ impl App {
         if let Some(p) = self.stamp_embed_pending.take() {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Keep the page-key owner and the active index projection in step after an edit mutation.
+    /// No database lookup or whole-list scan is needed; the writer already updated the idx maps.
+    pub(crate) fn sync_prepared_page_edit_key_for_idx(&mut self, idx: usize) {
+        if self.page_edit_snapshot.is_none() {
+            return;
+        }
+        let Some(key) = self.page_path_key(idx) else {
+            return;
+        };
+        let Some(mut snapshot) = self.page_edit_snapshot.take() else {
+            return;
+        };
+        snapshot.sync_key(&key, idx, self);
+        self.page_edit_snapshot = Some(snapshot);
+        self.page_edit_revision = self.page_edit_revision.wrapping_add(1);
     }
 
     fn hydrate_local_adjust_layer_keys_for_current_items(&mut self) {
@@ -60711,9 +60757,9 @@ impl App {
             has_crop,
         };
         if !has_source_edits && !has_annotations && !has_crop {
-            return Some(EditPreviewCloseUpdate::DeleteIfPresent {
+            return Some(EditPreviewCloseUpdate::Skip {
                 observation: EditPreviewCloseObservation {
-                    outcome: EditPreviewCloseOutcome::DeleteNoEdits,
+                    outcome: EditPreviewCloseOutcome::SkipNoEdits,
                     item_key,
                     page,
                 },
@@ -60722,13 +60768,13 @@ impl App {
 
         let edit_key = self.current_edit_result_key(idx);
         let Some(entry) = self.edit_result_cache.get(&edit_key) else {
-            // 最新世代がまだ完成していない場合、古いプレビューを表示する方が危険。
-            // 今回は削除し、次に完成結果を表示して閉じた時に再生成する。
+            // The missing result cannot validate a shared preview's version. A sibling context
+            // may already have saved a newer one, so this read-only close must not delete it.
             let edit_result_generation_observed =
                 self.edit_result_generation_observed_downstream(edit_key);
-            return Some(EditPreviewCloseUpdate::DeleteIfPresent {
+            return Some(EditPreviewCloseUpdate::Skip {
                 observation: EditPreviewCloseObservation {
-                    outcome: EditPreviewCloseOutcome::DeleteEditResultNotResident {
+                    outcome: EditPreviewCloseOutcome::SkipEditResultNotResident {
                         edit_result_generation_observed,
                     },
                     item_key,
@@ -60743,9 +60789,9 @@ impl App {
             // navigation 境界で新しいフォント列挙やファイル読み込みを同期実行しない。
             let Some(fonts) = self.comic_fonts.clone() else {
                 // 注釈を欠いたプレビューで旧結果を上書きしない。
-                return Some(EditPreviewCloseUpdate::DeleteIfPresent {
+                return Some(EditPreviewCloseUpdate::Skip {
                     observation: EditPreviewCloseObservation {
-                        outcome: EditPreviewCloseOutcome::DeleteComicFontsUnavailable,
+                        outcome: EditPreviewCloseOutcome::SkipComicFontsUnavailable,
                         item_key,
                         page,
                     },
@@ -60808,15 +60854,14 @@ impl App {
                     self.edit_preview_repaint_ctx.clone(),
                 )
             }
-            EditPreviewCloseUpdate::DeleteIfPresent { observation } => {
+            EditPreviewCloseUpdate::Skip { observation } => {
                 observation.emit(self.input_seq);
-                service.delete_if_present(observation.item_key)
             }
         }
     }
 
     /// 補正レイヤーモード退出・別編集モードへの切替・ページ移動の境界で、現在ページの
-    /// 完成済み edit-result を保存する。未完成なら旧 preview を削除するだけに留める。
+    /// 完成済み edit-result を保存する。未完成なら共有 preview には触れない。
     pub(crate) fn cache_current_edit_preview_if_ready(&mut self) {
         let update = self
             .fullscreen_idx
@@ -61360,6 +61405,7 @@ impl App {
         // 画面上の編集は残す。durable な mirror だけ、正本が受け取れたときに書く。
         Self::set_page_key_presence(&mut self.mask_page_keys, &key, true);
         self.mask_pages.insert(idx);
+        self.sync_prepared_page_edit_key_for_idx(idx);
         self.bump_erase_mask_generation(idx);
         if !self.edit_store_write_succeeded("消しゴムのマスク", written) {
             return;
@@ -61386,6 +61432,7 @@ impl App {
         let written = Self::edit_store_write(self.mask_db.as_ref().map(|db| db.delete(&key)));
         Self::set_page_key_presence(&mut self.mask_page_keys, &key, false);
         self.mask_pages.remove(&idx);
+        self.sync_prepared_page_edit_key_for_idx(idx);
         self.bump_erase_mask_generation(idx);
         if !self.edit_store_write_succeeded("消しゴムのマスクの削除", written) {
             return;
@@ -61455,6 +61502,7 @@ impl App {
         );
         Self::set_page_key_presence(&mut self.conceal_page_keys, &key, true);
         self.conceal_pages.insert(idx);
+        self.sync_prepared_page_edit_key_for_idx(idx);
         self.bump_conceal_mask_generation(idx);
         if !self.edit_store_write_succeeded("隠蔽加工", written) {
             return;
@@ -61482,6 +61530,7 @@ impl App {
         let written = Self::edit_store_write(self.conceal_db.as_ref().map(|db| db.delete(&key)));
         Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
         self.conceal_pages.remove(&idx);
+        self.sync_prepared_page_edit_key_for_idx(idx);
         self.bump_conceal_mask_generation(idx);
         if !self.edit_store_write_succeeded("隠蔽加工の削除", written) {
             return;
@@ -61730,6 +61779,7 @@ impl App {
             self.local_adjust_page_layers.insert(idx, layers);
             self.local_adjust_pages.insert(idx);
         }
+        self.sync_prepared_page_edit_key_for_idx(idx);
     }
 
     pub(crate) fn ensure_local_adjust_masks_match_source_dims(&mut self, idx: usize) -> bool {
@@ -61786,6 +61836,7 @@ impl App {
             self.export_crop_page_settings.insert(idx, settings);
             self.export_crop_pages.insert(idx);
             Self::set_page_key_presence(&mut self.export_crop_page_keys, &key, true);
+            self.sync_prepared_page_edit_key_for_idx(idx);
             if !self.edit_store_write_succeeded("切り出し範囲", written) {
                 return;
             }
@@ -61796,6 +61847,7 @@ impl App {
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
             Self::set_page_key_presence(&mut self.export_crop_page_keys, &key, false);
+            self.sync_prepared_page_edit_key_for_idx(idx);
             if !self.edit_store_write_succeeded("切り出し範囲の削除", written) {
                 return;
             }
@@ -61842,6 +61894,7 @@ impl App {
         if let Some(key) = key {
             Self::set_page_key_presence(&mut self.export_crop_page_keys, &key, present);
         }
+        self.sync_prepared_page_edit_key_for_idx(idx);
         // (上記 set_export_crop_for_idx と同じ理由でキャッシュ無効化しない。Codex P2)
     }
 
@@ -61879,6 +61932,7 @@ impl App {
             ));
         }
         self.export_crop_page_settings.insert(idx, adopted);
+        self.sync_prepared_page_edit_key_for_idx(idx);
         self.export_crop_pages.insert(idx);
         Some(adopted)
     }
@@ -66277,6 +66331,7 @@ impl App {
             self.comic_pages.insert(idx);
         }
         Self::set_page_key_presence(&mut self.comic_page_keys, key, !objects.is_empty());
+        self.sync_prepared_page_edit_key_for_idx(idx);
         // 永続編集プレビューは edit-result の上に注釈を焼くため、注釈内容が変わった時点で
         // 旧 WebP を失効させる。最新 scene は編集境界で worker へ snapshot する。
         self.invalidate_edit_preview_cache_for_key(key);
@@ -68148,6 +68203,7 @@ impl App {
             } else {
                 self.adjustment_page_params.insert(*idx, params.clone());
             }
+            self.sync_prepared_page_edit_key_for_idx(*idx);
         }
         Self::set_page_key_presence(
             &mut self.adjusted_page_keys,
@@ -68237,6 +68293,7 @@ impl App {
 
         for idx in &indices {
             self.adjustment_page_params.remove(idx);
+            self.sync_prepared_page_edit_key_for_idx(*idx);
         }
         Self::set_page_key_presence(&mut self.adjusted_page_keys, &target.page_key, false);
         // set 側と同じ理由で、正本が受け取れたときだけ sidecar を写す (R-26)。
@@ -68385,6 +68442,7 @@ impl App {
         if matches_default {
             for idx in &indices {
                 self.adjustment_page_params.remove(idx);
+                self.sync_prepared_page_edit_key_for_idx(*idx);
             }
             let written = Self::edit_store_write(
                 self.adjustment_db
@@ -68402,6 +68460,7 @@ impl App {
         } else {
             for idx in &indices {
                 self.adjustment_page_params.insert(*idx, params.clone());
+                self.sync_prepared_page_edit_key_for_idx(*idx);
             }
             let written = Self::edit_store_write(
                 self.adjustment_db
@@ -68442,6 +68501,7 @@ impl App {
             .collect();
         for idx in &indices {
             self.adjustment_page_params.remove(idx);
+            self.sync_prepared_page_edit_key_for_idx(*idx);
         }
         let written = Self::edit_store_write(
             self.adjustment_db

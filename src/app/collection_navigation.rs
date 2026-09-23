@@ -1594,20 +1594,29 @@ impl App {
             .and_then(CollectionGridSession::installed_presentation)
             .filter(|presentation| {
                 presentation.reuse_key == reuse_key
+                    && presentation.page_edit_revision == self.page_edit_revision
                     && reuse_key.order.matches_prepared(&presentation.prepared)
             })
             .and_then(|presentation| {
-                presentation
-                    .sources
-                    .retained()
-                    .map(|sources| (Arc::clone(&presentation.prepared), Arc::clone(sources)))
+                presentation.sources.retained().and_then(|sources| {
+                    presentation.page_edit_snapshot.as_ref().map(|snapshot| {
+                        (
+                            Arc::clone(&presentation.prepared),
+                            Arc::clone(sources),
+                            Arc::clone(snapshot),
+                        )
+                    })
+                })
             });
-        if let Some((prepared, sources)) = retained {
-            request.root_thumbnail_sources = Some(Arc::new(CollectionGridNavigationSources::new(
+        if let Some((prepared, sources, edit_snapshot)) = retained {
+            let mut owner = CollectionGridNavigationSources::new(
                 reuse_key,
+                self.page_edit_revision,
                 CollectionGridPresentationSources::Retained(sources),
                 None,
-            )));
+            );
+            owner.retained_edit_snapshot = Some(edit_snapshot);
+            request.root_thumbnail_sources = Some(Arc::new(owner));
             let target_kind = request.action.target_kind();
             self.spawn_collection_navigation_preflight(ctx, request, watch, prepared, target_kind);
             return;
@@ -1616,6 +1625,8 @@ impl App {
         let settings = self.settings.clone();
         let pin_stamp = self.video_pin_db.as_ref().map(|db| db.mutation_stamp());
         let thumbnail_source_epoch = self.collection_thumbnail_source_epoch;
+        let page_edit_availability = super::page_edit_snapshot::PageEditAvailability::for_app(self);
+        let page_edit_revision = self.page_edit_revision;
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1633,6 +1644,8 @@ impl App {
                     None,
                     pin_stamp,
                     thumbnail_source_epoch,
+                    page_edit_availability,
+                    page_edit_revision,
                 );
                 if let Some(start) = perf_start {
                     crate::perf::event(
@@ -1758,6 +1771,15 @@ impl App {
                     .retained()
                     .map(|sources| (Arc::clone(owner), Arc::clone(sources)))
             });
+        let warm_page_edits = request.root_thumbnail_sources.as_ref().and_then(|owner| {
+            owner.retained_edit_snapshot.as_ref().map(|snapshot| {
+                (
+                    Arc::clone(owner),
+                    Arc::clone(snapshot),
+                    Arc::clone(&prepared),
+                )
+            })
+        });
         let collection_id = request.origin.collection_id;
         let request_sequence = request.origin.intent_sequence;
         let spawn = std::thread::Builder::new()
@@ -1767,6 +1789,16 @@ impl App {
                     && !worker_cancel.load(Ordering::Acquire)
                 {
                     owner.publish_live(retained.payload.clone());
+                }
+                if let Some((owner, snapshot, prepared)) = warm_page_edits
+                    && !worker_cancel.load(Ordering::Acquire)
+                {
+                    let items = prepared
+                        .entries
+                        .iter()
+                        .map(|entry| entry.item.clone())
+                        .collect::<Vec<_>>();
+                    owner.publish_page_edits(Some(((*snapshot).clone(), snapshot.project(&items))));
                 }
                 let result = preflight_candidates(
                     candidates,
@@ -1902,6 +1934,7 @@ impl App {
                     Ok(Ok(install))
                         if install.prepared.collection_id == request.origin.collection_id
                             && install.prepared.collection_revision == exact_revision
+                            && install.page_edit_revision == self.page_edit_revision
                             && install.reuse_key
                                 == self.collection_grid_prepare_reuse_key(
                                     request.origin.collection_id,
@@ -1909,12 +1942,16 @@ impl App {
                                 ) =>
                     {
                         let mut request = request;
-                        request.root_thumbnail_sources =
-                            Some(Arc::new(CollectionGridNavigationSources::new(
-                                install.reuse_key,
-                                install.thumbnail_sources.presentation,
-                                Some(install.thumbnail_sources.live),
-                            )));
+                        let mut owner = CollectionGridNavigationSources::new(
+                            install.reuse_key,
+                            install.page_edit_revision,
+                            install.thumbnail_sources.presentation,
+                            Some(install.thumbnail_sources.live),
+                        );
+                        owner.retained_edit_snapshot = install.retained_page_edits;
+                        let owner = Arc::new(owner);
+                        owner.publish_page_edits(install.page_edits);
+                        request.root_thumbnail_sources = Some(owner);
                         let target_kind = request.action.target_kind();
                         self.spawn_collection_navigation_preflight(
                             ctx,
@@ -1957,6 +1994,14 @@ impl App {
                 }
                 RevisionObservation::Revision(revision)
                     if revision > prepared.collection_revision =>
+                {
+                    cancel.store(true, Ordering::Release);
+                    self.restart_collection_navigation(ctx, request);
+                }
+                _ if request
+                    .root_thumbnail_sources
+                    .as_ref()
+                    .is_some_and(|owner| owner.page_edit_revision != self.page_edit_revision) =>
                 {
                     cancel.store(true, Ordering::Release);
                     self.restart_collection_navigation(ctx, request);
@@ -2383,11 +2428,12 @@ impl App {
             .root_thumbnail_sources
             .as_ref()
             .is_some_and(|owner| {
-                owner.reuse_key
-                    != self.collection_grid_prepare_reuse_key(
-                        request.origin.collection_id,
-                        prepared.collection_revision,
-                    )
+                owner.page_edit_revision != self.page_edit_revision
+                    || owner.reuse_key
+                        != self.collection_grid_prepare_reuse_key(
+                            request.origin.collection_id,
+                            prepared.collection_revision,
+                        )
             })
         {
             return false;
@@ -2466,6 +2512,10 @@ impl App {
     ) -> bool {
         if !self.collection_navigation_request_is_current(request)
             || prepared.collection_id != request.origin.collection_id
+            || request
+                .root_thumbnail_sources
+                .as_ref()
+                .is_some_and(|owner| owner.page_edit_revision != self.page_edit_revision)
         {
             return false;
         }
@@ -2678,19 +2728,30 @@ impl App {
             (request.action.is_media_eof() && preserved_player.is_some())
                 .then_some(prepared.entries.len())
         });
-        let (thumbnail_sources, reuse_key) = match request.root_thumbnail_sources.take() {
-            Some(owner) => (owner.take_delivery(), owner.reuse_key.clone()),
-            None => (
-                CollectionGridPreparedThumbnailDelivery::default(),
-                self.collection_grid_prepare_reuse_key(
-                    request.origin.collection_id,
-                    prepared.collection_revision,
+        let (thumbnail_sources, reuse_key, page_edits, retained_page_edits) =
+            match request.root_thumbnail_sources.take() {
+                Some(owner) => (
+                    owner.take_delivery(),
+                    owner.reuse_key.clone(),
+                    owner.take_page_edits(),
+                    owner.retained_edit_snapshot.clone(),
                 ),
-            ),
-        };
+                None => (
+                    CollectionGridPreparedThumbnailDelivery::default(),
+                    self.collection_grid_prepare_reuse_key(
+                        request.origin.collection_id,
+                        prepared.collection_revision,
+                    ),
+                    None,
+                    None,
+                ),
+            };
         self.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
+                page_edits,
+                retained_page_edits,
+                page_edit_revision: self.page_edit_revision,
                 thumbnail_sources,
                 auto_aspect_lookup: None,
                 reuse_key,
@@ -3489,6 +3550,7 @@ mod tests {
                 prepared.collection_id,
                 prepared.collection_revision,
             ),
+            app.page_edit_revision,
             sources.presentation,
             Some(sources.live),
         ))
@@ -3536,8 +3598,14 @@ mod tests {
             prepared.collection_id,
             prepared.collection_revision,
         );
+        let page_edit_revision = app.page_edit_revision;
         app.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
+                page_edits: None,
+                retained_page_edits: Some(Arc::new(
+                    super::super::page_edit_snapshot::PageEditSnapshot::default(),
+                )),
+                page_edit_revision,
                 prepared: (*prepared).clone(),
                 thumbnail_sources: prepared_thumbnail_sources(
                     CollectionGridThumbnailSources::default(),
@@ -3773,8 +3841,14 @@ mod tests {
             prepared.collection_id,
             prepared.collection_revision,
         );
+        let page_edit_revision = app.page_edit_revision;
         app.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
+                page_edits: None,
+                retained_page_edits: Some(Arc::new(
+                    super::super::page_edit_snapshot::PageEditSnapshot::default(),
+                )),
+                page_edit_revision,
                 prepared: (*prepared).clone(),
                 thumbnail_sources: sources,
                 auto_aspect_lookup: None,
@@ -3803,6 +3877,7 @@ mod tests {
             },
             root_thumbnail_sources: Some(Arc::new(CollectionGridNavigationSources::new(
                 installed.reuse_key.clone(),
+                app.page_edit_revision,
                 CollectionGridPresentationSources::Retained(retained),
                 None,
             ))),
@@ -3830,6 +3905,11 @@ mod tests {
             &child_presentation.prepared,
             &installed.prepared
         ));
+        assert_eq!(
+            child_presentation.page_edit_revision,
+            app.page_edit_revision
+        );
+        assert!(child_presentation.page_edit_snapshot.is_some());
         assert!(Arc::ptr_eq(
             &child_presentation
                 .sources
@@ -3875,6 +3955,7 @@ mod tests {
         return_request.root_thumbnail_sources =
             Some(Arc::new(CollectionGridNavigationSources::new(
                 child_presentation.reuse_key.clone(),
+                app.page_edit_revision,
                 CollectionGridPresentationSources::Retained(
                     child_presentation.sources.retained().unwrap().clone(),
                 ),
@@ -4622,8 +4703,12 @@ mod tests {
             prepared.collection_id,
             prepared.collection_revision,
         );
+        let page_edit_revision = app.page_edit_revision;
         app.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
+                page_edits: None,
+                retained_page_edits: None,
+                page_edit_revision,
                 prepared: (*prepared).clone(),
                 thumbnail_sources: prepared_sources_a,
                 auto_aspect_lookup: None,

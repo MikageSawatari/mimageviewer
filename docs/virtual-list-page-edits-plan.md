@@ -34,7 +34,7 @@
 ローカル調整の有無 (スマートフォルダと同じ集合)。回転は別の keyed DB / cache 経路なので、この snapshot には
 入れず、キー規則と lifecycle の監査を別に行う。
 
-## 最初の slice
+## 当初の一括 slice 案
 
 - 共通の exact-key snapshot と投影を作り、上表の 5 経路 (サブ展開・Ctrl+G・コレクション・閲覧履歴・
   レーティング一覧) へ接続する。ZIP/PDF のページは既存の `page_key_for_grid_item` のキーを使う。
@@ -45,6 +45,75 @@
 - ファイル名スタックの切り替えがフォルダ prefix で再 hydrate している経路 ([filename_stack_ui.rs](../src/filename_stack_ui.rs))
   がサブ展開の失敗を引き継ぐかを監査する。
 - 後回し: preview cache の版管理全般、回転の refactor。
+
+## 段階
+
+### Phase A (2026-09-23、完了範囲: 初回 install と非破壊 close)
+
+- `src/app/page_edit_snapshot.rs` に実ページ key を正本とする共通 snapshot と index 投影を追加。
+  スマートフォルダと同じ DB の exact-key 複数検索を prepare worker で実行し、
+  ZIP/PDF ページも `page_key_for_grid_item` の key に従う。
+- サブ展開の prepare (`src/app/subfolder_expansion.rs:1337`) と受理
+  (`src/app/subfolder_expansion.rs:2124`) に編集 revision を結び、古い結果は再 prepare する。
+  `src/app.rs:27974` の sidecar 継続で投影を install する。
+- コレクション prepare (`src/app/collection_grid.rs:245`) と grid 受理
+  (`src/app/collection_grid.rs:1865`)、別の navigation prepare/landing
+  (`src/app/collection_navigation.rs:1930`, `src/app/collection_navigation.rs:2850`) に
+  同じ revision gate を設ける。snapshot と投影は表示 bundle に属する
+  (`src/app/viewer_context_registry.rs`)。
+- close 時の `DeleteNoEdits` を全 view で撤去。編集結果不在と注釈フォント不在による
+  shared preview 削除も撤去し、これら三つは共有キャッシュを変更しない。
+  投影の欠落・古さと、別 context の保存結果を区別できないため。
+  明示保存・削除による key 失効と、完成済み編集結果の close 保存は継続
+  (`src/app.rs:60726`, `src/app.rs:60828`)。
+- サブ展開とコレクションで保存済み mask が表示用 index に入る回帰テストを追加。
+  サブ展開は実際の prepare 受理と stale revision 拒否を通し、コレクションは conceal と
+  ZIP member の exact page key も確認する。close は六つの view と三つの skip outcome で
+  実際の共有 preview 行の存続を確認する。Phase B の失敗を記録する ignored test も追加。
+
+Phase A の表示保証は上記 2 view の受理された初回 install に限定する。
+後続の状態変更・一覧切替で既存の synthetic-path hydration が編集投影を落とす問題は
+Phase A2 として扱う。Phase A 以前は両 view の初回 install でも同じ編集が表示されなかった。
+
+### Phase A2 (未実装: install 後の整合)
+
+- Snapshot Lock: サブ展開・コレクションから固定すると、synthetic origin を使った
+  prefix rehydrate が初回 install で正しく表示した編集を落とす。固定一覧への復帰でも同じ
+  (`src/app/snapshot_ops.rs:826`, `src/app/snapshot_ops.rs:1048`,
+  `src/app/snapshot_ops.rs:1144`)。subset の key と世代に結び付く worker 投影が必要。
+- rename 後の mounted context 再 hydrate は synthetic `current_folder` を prefix として
+  使う (`src/app.rs:33447`, `src/app.rs:33451`)。移行後の key と現在の items を
+  worker で照合する。
+- metadata import は index 投影を入れ替える一方、keyed snapshot を更新しない
+  (`src/app.rs:32098`, `src/app.rs:32131`)。import worker の結果に owner の更新を含める。
+- content-identity restore 完了は synthetic view の page-edit state を clear する
+  (`src/app/content_identity_restore.rs:438`, `src/app/content_identity_restore.rs:448`)。
+  完了時点の view identity / items generation を確認して worker で再投影する。
+- 非同期 local-adjust 書込は初回 install 後に確定し得る
+  (`src/app.rs:61693`, `src/app.rs:61727`)。revision は増えるが
+  (`src/app/smart_folder.rs:5852`)、既に install 済みの投影は自動更新されない。
+  兄弟 viewer context の編集にも同じ再同期が必要。context の状態交換は
+  `src/app/viewer_context_registry.rs:2194`、fork 時の複製は同ファイル `:2837`。
+- ファイル名スタックは script 結果の group/aggregate materialize が UI 側で行われ
+  (`src/filename_stack_ui.rs:338`)、`start_loading_items` が snapshot を破棄する。
+  flat 切替も synthetic prefix で再 hydrate する (`src/filename_stack_ui.rs:752`)。
+  group/materialize と flat member の投影を同じ worker 世代で準備する。
+
+### Phase B (未実装)
+
+- Ctrl+G は結果を streaming 差し替えする度に `replace_search_view_items` が
+  編集 map を消す (`src/global_search_ui.rs:1252`, `src/global_search_ui.rs:1309`)。
+  増分の keyed snapshot と worker prepare、各置換の identity/generation/epoch gate を設ける。
+- 閲覧履歴は `install_reading_history_entries` が synthetic path で直接ロードする
+  (`src/app.rs:24592`, `src/app.rs:24633`)。現行の履歴行は Folder/Zip/Pdf 等の
+  container であり、画像ページそのものの行はない
+  (`src/reading_history_db.rs:25`, `src/app.rs:77400`)。
+  ページを開く境界を先に確定した上で worker prepare/acceptance を設ける。
+- レーティング一覧は `install_rating_view_rows` が直接ロードし、ローカル再ソートも
+  同じ入口を使う (`src/app.rs:24960`, `src/app.rs:25025`)。
+  worker prepare と再ソートを含む結果受理の gate を追加する。
+- 三経路とも UI スレッドの cold DB 検索や大量の index 投影を避ける。
+  preview cache の一般的な版管理と回転の owner 整理は、従来どおり別途監査する。
 
 ## 設計調査の原文
 
