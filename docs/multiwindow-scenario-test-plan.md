@@ -286,3 +286,19 @@ double-click dispatch と検索 index の統合検証は T2 に残す。
 `read_dir` の `\` を別パスと扱い、対象不在として新規窓を最初の ROOT frame で退役させた。
 テストは `frame=0 -> 1 window=1 vanished without an explicit error` で失敗し、
 drive を保持した区切り文字正規化の照合へ変更後に成功した。
+
+## 9. 実行記録
+
+### 2026-09-23 第 2 層の初回実行 (公開担当 = ClaudeCode Opus、常設の了承に基づく)
+
+対象は master `9c8886d08` を元にした使い捨ての `target/portable-smoke` (`portable,test-script`)。
+
+| run | scenario | 結果 | 備考 |
+| --- | --- | --- | --- |
+| 20260923T042648874Z | MultiWindowStills | exit 1 | 2 窓の描画待ちが timeout。どの条件で落ちたかをスクリプトが出していなかったため、待ちごとに全窓の snapshot を出すよう変更 (`7932882a4`) |
+| 20260923T051245654Z | MultiWindowStills | exit 1 | 2 窓とも描画済み・片側寄せ (`SingletonSpread { side: Right }`, x 482-960) は正しかった。ZIP 窓の `sidecar_loaded` を要求していたが、同じフォルダの sidecar を一覧が先に取り込んでいるため ZIP 窓には読むものが無い。**スクリプト側の条件が厳しすぎた** (製品の不具合ではない)。detached の ZIP 復元は第 1 層 S-A ZIP が担う |
+| 20260923T051403475Z | MultiWindowStills | **exit 0** | 全段 (フォルダ窓・ZIP 窓の描画、片側寄せ、parked 比較、往復、兄弟窓不変、閉じる) を通過 |
+| 20260923T051429982Z | MultiWindowPdf | **exit 0** | 既存シナリオ |
+
+証跡は各 run の `target/ui-smoke-runs/<run>/`。窓の切り替えは test-script の activation 要求で、OS のクリック経路は含まない。
+`MultiWindowPdf` の出力には入力デスクトップ preflight の行が出ていない。preflight が新シナリオだけに入っている可能性があり、T2 で確認する。
