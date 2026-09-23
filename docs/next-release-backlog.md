@@ -29,6 +29,30 @@
 
 ## 1. 優先候補
 
+### 1.267 複数ウィンドウでコレクションから開いた画像の前後移動・スライドショーが元フォルダ順になる — v4.0.1 で修正 (2026-09-23)
+
+- 出どころ: v4.0.0 公開前の実機確認。利用者が「複数ウィンドウモードで、コレクションの静止画を開いて S キーで
+  スライドショーにすると、元のフォルダの次のファイルを再生する。フル機能だと正しくコレクションの順」と報告。
+  動画の連続再生はコレクション順で正しい (利用者)。
+- **自動テストで確認** (第 1 層、[multiwindow_scenario_tests.rs](../src/app/multiwindow_scenario_tests.rs)):
+  フル機能では A → 次 B → 前 A → スライドショー B と通る。複数ウィンドウでは 次 / 前 / スライドショーの
+  **3 つとも**元フォルダ順に着地する (`one/3.png` / `two/0.png` / `one/3.png`)。
+  失敗する 3 本は `#[ignore = "known issue: backlog 1.267 ..."]` で、修正時に ignore を外す。
+- **原因 (コード)**: 複数ウィンドウの画像 open は detached の image router
+  ([app.rs](../src/app.rs) `start_active_detached_book_context` 経由) が画像の**親フォルダを走査した物理 context**
+  を作るため、コレクションの origin が無い。Ctrl+G 検索結果から開く経路と同じ。
+- **仕様との関係**: マニュアル ([collections.html](../htdocs/mimageviewer/manual/collections.html) `#order`) は
+  前後移動・スライドショーがコレクションの有効な順番を保つと約束している。
+  [collection-playback-plan.md](collection-playback-plan.md) §2.1 はコレクション直下の登録画像での次 / スライドショーを
+  latest prepared の画像列から選ぶ前提で、**別ウィンドウで画像 leaf を開く場合は決めていなかった**。
+  「別ウィンドウは切り離される」という設計判断ではない。
+- 利用者判断 (2026-09-23): v4.0.0 は既知の問題として案内 ([known-issues.html](../htdocs/mimageviewer/manual/known-issues.html))、
+  **v4.0.1 で修正**。修正は detached とコレクションの両方の所有境界に触れる構造変更なので、
+  detached リワークの規則 (実装前の Sol 独立レビュー、構造修正の合意、detached-rework-plan への記録) に従う。
+  Home / End・見開き・音声の連続再生・登録コンテナ内のページ送りは未確認なので、修正時に同じ経路かを確かめる。
+  修正したら known-issues.html の該当項目を削除する。
+- 規模 / 優先度: 中 / P1 (v4.0.1)。
+
 ### 1.263 固定の「ファイル整理先」へ選択項目をコピー・移動する — >>444、>>447 (2026-09-21)
 
 - 出典: mIV スレ >>444 の「登録済みフォルダへ少ない操作で移動したい」という要望。
