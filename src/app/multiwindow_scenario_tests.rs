@@ -1125,26 +1125,37 @@ fn collection_order_observe(
     loop {
         let frame = driver.root(app);
         let actual = collection_order_current_path(app, detached);
-        let pending = if detached {
+        let (pending, display_pending) = if detached {
             app.with_active_viewer_context(|owner| {
-                owner.top_level_grid_view.collection_navigation_pending()
+                (
+                    owner.top_level_grid_view.collection_navigation_pending(),
+                    owner.fs_nav_is_locked(),
+                )
             })
-            .unwrap_or(false)
+            .expect("detached collection navigation owner")
         } else {
-            app.top_level_grid_view.collection_navigation_pending()
+            (
+                app.top_level_grid_view.collection_navigation_pending(),
+                app.fs_nav_is_locked(),
+            )
         };
+        // The collection request hands its target to the fullscreen display sequence. A
+        // painted thumbnail can precede that sequence's terminal readiness, when another Ctrl
+        // action is still deliberately blocked. Observe both typed owners before issuing the
+        // next action; a wrong target after both finish remains a hard failure.
         if !pending
+            && !display_pending
             && actual.as_deref() == Some(expected)
             && collection_order_painted(&frame, viewport, expected)
         {
             return;
         }
-        if !pending && actual.as_deref() != Some(expected) {
+        if !pending && !display_pending && actual.as_deref() != Some(expected) {
             assert_eq!(actual.as_deref(), Some(expected));
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "collection navigation did not paint: expected={} actual={actual:?} pending={pending} viewport={viewport:?} frame={} records={:#?} errors={:?}",
+            "collection navigation did not paint: expected={} actual={actual:?} pending={pending} display_pending={display_pending} viewport={viewport:?} frame={} records={:#?} errors={:?}",
             expected.display(),
             frame.number,
             frame.records,

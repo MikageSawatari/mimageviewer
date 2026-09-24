@@ -123,6 +123,54 @@ const GAMEPAD_LIST_VISIBLE_ROWS: usize = 12;
 const RING_STICK_COMMIT_THRESHOLD: f32 = 0.50;
 const RING_STICK_HYSTERESIS_DEGREES: f32 = 8.0;
 
+// Grid ring, gesture, and mouse-button commands share the same item-input gate.
+// Keep commands that leave the view or control the window available during a
+// stale aggregate refresh. An unrecognized/new action is item-owned by default.
+fn grid_ring_action_allowed_during_refresh(action: &RingActionId) -> bool {
+    action.favorite_slot_number().is_some()
+        || action.drive_letter().is_some()
+        || action.location_rating_stars().is_some()
+        || matches!(
+            action,
+            RingActionId::None
+                | RingActionId::ToggleDetachedViewer
+                | RingActionId::ToggleWindowMode
+                | RingActionId::ToggleMaximize
+                | RingActionId::MinimizeWindow
+                | RingActionId::CloseMainWindow
+                | RingActionId::QuitApplication
+                | RingActionId::OpenPreferences
+                | RingActionId::OpenOperationCustomize
+                | RingActionId::ClearRecentFolders
+                | RingActionId::ClearQuickFolderSlots
+                | RingActionId::CycleFavorite
+                | RingActionId::OpenLocationDriveList
+                | RingActionId::OpenLocationReadingHistory
+                | RingActionId::OpenLocationBooksRoot
+                | RingActionId::OpenLocationDesktop
+                | RingActionId::OpenLocationPictures
+                | RingActionId::OpenLocationDownloads
+                | RingActionId::GridToggleDetails
+                | RingActionId::GridColumnCount1
+                | RingActionId::GridColumnCount2
+                | RingActionId::GridColumnCount3
+                | RingActionId::GridColumnCount4
+                | RingActionId::GridColumnCount5
+                | RingActionId::GridColumnCount6
+                | RingActionId::GridColumnCount7
+                | RingActionId::GridColumnCount8
+                | RingActionId::GridColumnCount9
+                | RingActionId::GridColumnCount10
+                | RingActionId::GridHistoryBack
+                | RingActionId::GridHistoryForward
+                | RingActionId::GridParentFolder
+                | RingActionId::TreeFolderPrev
+                | RingActionId::TreeFolderNext
+                | RingActionId::SiblingFolderPrev
+                | RingActionId::SiblingFolderNext
+        )
+}
+
 #[derive(Clone, Copy)]
 enum GridSelectionEdge {
     First,
@@ -2754,6 +2802,10 @@ impl App {
     }
 
     fn dispatch_gamepad_grid_analog(&mut self, now: Instant) -> bool {
+        if !self.grid_item_input_allowed() {
+            self.reset_gamepad_continuous_steps(now);
+            return false;
+        }
         let mut changed = false;
         let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
@@ -2964,6 +3016,9 @@ impl App {
 
     fn open_gamepad_ring_picker(&mut self, ctx: &egui::Context) {
         let context = self.current_ring_shortcut_context();
+        if context == RingShortcutContext::Grid && !self.grid_item_input_allowed() {
+            return;
+        }
         let mut picker = self.build_ring_picker_state(context);
         picker.clamp_row(picker_rows_for_context(context).len());
         self.gamepad_favorite_picker = None;
@@ -3836,6 +3891,9 @@ impl App {
     }
 
     fn preview_grid_picker_row(&mut self, picker: &RingPickerState, row: RingPickerRowId) {
+        if !self.grid_item_input_allowed() {
+            return;
+        }
         match row {
             RingPickerRowId::GridColumns if self.settings.grid_cols != picker.grid_cols => {
                 self.set_grid_view_mode(GridViewMode::Thumbnail);
@@ -4881,7 +4939,9 @@ impl App {
             .flatten();
         match picker.context {
             RingShortcutContext::Grid
-                if self.current_ring_picker_anchor(RingShortcutContext::Grid) == picker.anchor =>
+                if self.grid_item_input_allowed()
+                    && self.current_ring_picker_anchor(RingShortcutContext::Grid)
+                        == picker.anchor =>
             {
                 self.apply_grid_picker_state(picker)
             }
@@ -5773,6 +5833,12 @@ impl App {
         action: RingActionId,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        if context == RingShortcutContext::Grid
+            && !self.grid_item_input_allowed()
+            && !grid_ring_action_allowed_during_refresh(&action)
+        {
+            return None;
+        }
         if let Some(slot) = action.favorite_slot_number() {
             return self.apply_ring_favorite_slot(ctx, slot, source);
         }
@@ -6651,6 +6717,9 @@ impl App {
     }
 
     fn handle_gamepad_direction_for_grid(&mut self, dir: PadDir) {
+        if !self.grid_item_input_allowed() {
+            return;
+        }
         let display_order = self.current_grid_order().to_vec();
         let vi_len = display_order.len();
         if vi_len == 0 {
@@ -7128,6 +7197,9 @@ impl App {
             }
             return None;
         }
+        if !self.grid_item_input_allowed() {
+            return None;
+        }
         let idx = self.selected?;
         if self.items_are_bookmark_view {
             if let Some(row) = self.bookmark_browser_rows.get(idx).cloned() {
@@ -7254,6 +7326,9 @@ impl App {
     }
 
     fn scroll_gamepad_grid(&mut self, direction: f32) {
+        if !self.grid_item_input_allowed() {
+            return;
+        }
         let cell_h = self.last_cell_h.max(1.0);
         let prev_offset = self.scroll_offset_y;
         self.scroll_offset_y = (self.scroll_offset_y + direction * cell_h * 2.0).max(0.0);
@@ -8128,6 +8203,77 @@ mod tests {
         update_mouse_middle_click_state, video_seek_ring_action,
     };
     use crate::adjustment::PostFilter;
+
+    #[test]
+    fn stale_aggregate_gamepad_item_actions_wait_for_acceptance() {
+        use crate::filename_stack::StackView;
+        use crate::filename_stack_ui::StackReturnState;
+        use crate::grid_item::GridItem;
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("a.png")),
+            GridItem::Image(PathBuf::from("b.png")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+        app.settings.grid_cols = 2;
+        let view = Arc::new(StackView::build(
+            PathBuf::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            app.settings.stack_separator,
+            app.settings.sort_order,
+        ));
+        app.stack_view = Some(Arc::clone(&view));
+        app.stack_return_state = Some(StackReturnState::Refreshing { view });
+        app.handle_gamepad_direction_for_grid(PadDir::Right);
+        let _ = app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::GridToggleCheck,
+            "stale-grid-test",
+        );
+        assert_eq!(app.selected, Some(0));
+        assert!(app.checked.is_empty());
+
+        app.stack_return_state = None;
+        app.handle_gamepad_direction_for_grid(PadDir::Right);
+        let _ = app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::GridToggleCheck,
+            "accepted-grid-test",
+        );
+        assert_eq!(app.selected, Some(1));
+        assert!(app.checked.contains(&1));
+    }
+
+    #[test]
+    fn stale_aggregate_ring_actions_distinguish_navigation_from_items() {
+        use crate::ring_shortcut::RingActionId;
+        assert!(super::grid_ring_action_allowed_during_refresh(
+            &RingActionId::GridHistoryBack
+        ));
+        assert!(super::grid_ring_action_allowed_during_refresh(
+            &RingActionId::CloseMainWindow
+        ));
+        for item_action in [
+            RingActionId::GridToggleCheck,
+            RingActionId::GridOpenSelectedAsPage,
+            RingActionId::GridMoveFirst,
+            RingActionId::AddToCollection,
+        ] {
+            assert!(!super::grid_ring_action_allowed_during_refresh(
+                &item_action
+            ));
+        }
+    }
 
     /// 「ゲームパッドの操作を受け付ける」を切ったら、本当に届かない。
     ///

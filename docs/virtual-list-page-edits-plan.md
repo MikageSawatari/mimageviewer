@@ -369,15 +369,31 @@ Phase A2 として扱う。Phase A 以前は両 view の初回 install でも同
   10,000 key の単体構築 3.329 ms、全体受理 0.004 ms、1 key 差分受理 0.142 ms（テスト環境）だった。
   100,000 key の実際の UI 分割構築は上記の 49 frame・最大 1.291 ms。
   上限を設けない巨大 subfolder の総メモリと既存 rename UI 全走査は別途性能確認が必要。
-- **filename-stack switching**: script worker が返すのは key 列だけ。UI が group/fallback・`StackView`・
+- **filename-stack switching (A2 chunk 2)**: 旧経路では script worker が返すのは key 列だけ。UI が group/fallback・`StackView`・
   aggregate items を作る (`src/filename_stack_ui.rs:217-277,338-413`)。flat open と aggregate 復帰も UI で
   materialize して `swap_stack_view_items` が synthetic prefix rehydrate するため、サブ展開の flat 実ページ編集が消える
   (`src/filename_stack_ui.rs:690-701,726-775`)。script/fallback grouping、aggregate と flat の候補順、
   flat 実ページの keyed snapshot/投影を同じ worker prepare に移し、UI は候補を move/install するだけにする。
-  戻り側も現行 flat での保存を取り込んだ worker 投影を受理してから aggregate へ替える。
+  flat 受理時に同じ stamp の aggregate 順・投影を bundle に保持する。fullscreen close はその
+  保持結果で同フレーム中に aggregate へ戻す。stamp が変わっていれば古い aggregate を表示し、
+  grid 入力を止めたまま worker 再読込の受理を待つ。flat grid は表示しない。
   context、source items generation、subfolder snapshot/revision、stack request sequence、script/rule・separator・sort・
   display-order 版、候補順、書込 stamp で受理し、OFF/別フォルダ/別スクリプト結果は cancel/rebase。
   現行の fullscreen 中の script-result 保留と detached park 境界は維持 (`src/filename_stack_ui.rs:282-334`)。
+  実装では source items を UI で 2,048 件/frame ずつ収集し、sort metadata の再結合、script/fallback
+  grouping、両順の materialize と exact-key 投影を worker に移した。受理時は mounted context ID、
+  source items generation/件数、subfolder entries identity、request sequence、view identity、ページ編集・★・
+  タグ write stamp と現在の separator/script/sort/display order を照合し、古い DB read は worker で再 prepare する。
+  grouping が完了済みなら再試行は候補順を保持して edit/★/tag の read だけを繰り返す。
+  writer 中は guard 完了の repaint を待ち、DB read 失敗は 100 ms–4 s の指数 backoff を使う。
+  古い aggregate の更新待ちには grid widget と item 対象のキー経路（通常 grid dispatch、選択・本/コレクション追加・
+  export・tag、clipboard、Delete）を止める。履歴・親/兄弟フォルダ・保存グループ等の画面遷移、Esc、設定と
+  window 操作は通す。4 秒上限で 2 回目の失敗（連続 8 回）後は最後に受理された aggregate と投影で
+  grid 入力を再開し、「編集情報を更新できませんでした。自動で再試行します。」を非 modal 通知する。
+  同じ候補順で 4 秒上限の裏側再試行を続け、成功時のみ新しい投影へ差し替える。画面遷移時は pending を破棄する。
+  flat の synthetic prefix 再 hydrate を
+  廃止し、`Stack` セルは編集キーを持たない。Shift+上下は install 済み flat 順を参照するため再 grouping
+  しない。サムネ・badge の描画規則は不変。
 
 ### 既存経路、検証、出荷判断
 
@@ -392,17 +408,17 @@ Phase A2 として扱う。Phase A 以前は両 view の初回 install でも同
   conceal/補正が snapshot と idx に一致、(4) virtual へ移動した後に restore 完了して対象編集が現れる、
   (5) install 後の local-adjust worker commit と削除、(6) window A の保存で parked/active の window B だけが
   対象 key を更新し B の read-only close では A が不変、(7) サブ展開 stack の aggregate→flat→close→再 open で
-  mask が残る。各試験で旧/新要求の逆着、write 中と commit 後、items/order 変更、cancel を挟み、
+  mask が残る。flat close 直後の aggregate 復帰と stale stamp 時の入力抑止、持続する read 失敗時の
+  grouping 再利用と bounded wake、grouping 中の separator/script/sort/display order 変更も検証する。
+  各試験で旧/新要求の逆着、write 中と commit 後、items/order 変更、cancel を挟み、
   stale 結果が idx を汚さず最新希望へ再 prepare されることも確認。通常フォルダと ZIP/PDF key を対照にする。
   さらに collection と Ctrl+G からの Snapshot Lock 復帰、外部書込後の collection navigation retained
   snapshot reuse/最終 landing、通知 drop/overflow・panic、nested/multi-store writer、idle active view の
   wakeup と parked remount、失敗した full reread の後に新規書込なしで成功する retry を個別に検証する。
   10,000 件級で worker lookup/projection、追加 key memory、
   UI 受理時間を計測し、UI cold query・全件 clone が無いことを確認。
-- **v4.1.0 判断**: 上の七遷移に原理的な実装不能は見つからない。ただし filename-stack は script worker が
-  key のみを返す現構造から grouping・両順序・投影・flat/aggregate の受理 lifecycle を移す独立した大きな chunk。
-  v4.1.0 に含めるなら単独の構造レビューと性能検証が必要。これを後送する判断なら filename-stack 切替の
-  編集表示保証も同時に後送し、A2 全件完了とは扱わない。
+- **v4.1.0 判断**: filename-stack 切替はユーザー決定により v4.1.0 に含め、上記 chunk 2 で実装した。
+  独立した構造レビューと実機確認は acceptance 時に行う。
 
 ## 設計調査の原文
 

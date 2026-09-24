@@ -192,6 +192,7 @@ mod snapshot_ops;
 mod startup_ops;
 mod subfolder_expansion;
 pub(crate) use subfolder_expansion::listing_sort_metas_for_items;
+pub(crate) use subfolder_expansion::{SubfolderExpansionEntry, listing_sort_metas_for_entries};
 #[cfg(all(windows, feature = "test-script"))]
 mod test_script_support;
 pub(crate) use subfolder_expansion::{
@@ -6966,8 +6967,8 @@ enum PreGridPerfStage {
     DetailsColumnMenuCheck,
     PopupWheelSuppression,
     FolderPaneScrollGuard,
-    ProcessScroll,
     StackReconcile,
+    ProcessScroll,
 }
 
 impl PreGridPerfStage {
@@ -6984,8 +6985,8 @@ impl PreGridPerfStage {
         Self::DetailsColumnMenuCheck,
         Self::PopupWheelSuppression,
         Self::FolderPaneScrollGuard,
-        Self::ProcessScroll,
         Self::StackReconcile,
+        Self::ProcessScroll,
     ];
 
     fn short_label(self) -> &'static str {
@@ -7110,8 +7111,8 @@ impl PreGridPerfBreakdown {
             "folder_pane_scroll_guard_ms",
             PreGridPerfStage::FolderPaneScrollGuard,
         ),
-        ("process_scroll_ms", PreGridPerfStage::ProcessScroll),
         ("stack_reconcile_ms", PreGridPerfStage::StackReconcile),
+        ("process_scroll_ms", PreGridPerfStage::ProcessScroll),
     ];
 
     fn emit(&self, frame_number: u64) {
@@ -14304,11 +14305,12 @@ pub struct App {
     pub(crate) stack_mode_requested: bool,
     /// 集約ビューの実体 (groups + passthrough)。`stack_mode_requested` && 通常フォルダのとき
     /// `load_folder_with_scan` が構築し、`start_loading_items` がクリアする (zip_nav と同様)。
-    pub(crate) stack_view: Option<crate::filename_stack::StackView>,
+    pub(crate) stack_view: Option<std::sync::Arc<crate::filename_stack::StackView>>,
     /// 今 `self.items` がフラット読書ビュー (= スタックを開いてフルスクリーン中) か。
-    /// グリッドは常に集約だが、セルを開くと一時的にフラット展開へ差し替える。フルスクリーンを
-    /// 閉じると `stack_reconcile_after_fullscreen_close` が集約へ戻す。
+    /// セルを開くと一時的にフラット展開へ差し替える。フルスクリーンを閉じると
+    /// 保持済み集約を同期復帰し、書込 stamp が古いときだけ worker へ再読込を依頼する。
     pub(crate) stack_showing_flat: bool,
+    pub(crate) stack_return_state: Option<crate::filename_stack_ui::StackReturnState>,
     /// 直近のスタック集約構築で採用された分類ルールの表示名 (スクリプト経由のみ)。
     /// トグル成功トーストに出す (`docs/filename-stack-scripting-plan.md`)。
     pub(crate) stack_active_rule: Option<String>,
@@ -14317,7 +14319,9 @@ pub struct App {
     pub(crate) stack_script_error: Option<String>,
     /// ユーザー定義スクリプトによるグループ分けをワーカーで実行中の保留状態。完了後に
     /// `poll_stack_script` が集約ビューへ差し替える (`docs/filename-stack-scripting-plan.md`)。
-    pub(crate) stack_script_pending: Option<crate::filename_stack_ui::StackScriptPending>,
+    pub(crate) stack_script_pending: Option<crate::filename_stack_ui::StackPreparePending>,
+    /// Invalidates grouping and view-switch results even if the source items have not changed.
+    pub(crate) stack_request_sequence: u64,
     /// スタックを ON にした瞬間のカーソル画像パス。集約完了時にこの画像を含むスタックセルへ
     /// カーソルを移す (トグルで被写体が飛ばないように)。OFF 側は `select_after_load` で扱う。
     pub(crate) stack_toggle_select_path: Option<std::path::PathBuf>,
@@ -17109,9 +17113,11 @@ impl App {
             stack_mode_requested: false,
             stack_view: None,
             stack_showing_flat: false,
+            stack_return_state: None,
             stack_active_rule: None,
             stack_script_error: None,
             stack_script_pending: None,
+            stack_request_sequence: 0,
             stack_toggle_select_path: None,
             subfolder_expansion_root: None,
             subfolder_expansion_roots: Vec::new(),
@@ -21563,6 +21569,7 @@ impl App {
         // ファイル名スタックも同様に解除 (SLI を通らない経路なので明示的に)。
         self.stack_mode_requested = false;
         self.stack_view = None;
+        self.stack_return_state = None;
         self.stack_showing_flat = false;
         self.cancel_stack_script_pending();
         if self.items_are_subfolder_expansion_view {
@@ -22597,19 +22604,12 @@ impl App {
             // スクリプト本文の読み込み (ファイル I/O) はワーカー側で行うので、ここでは
             // 「スクリプトを使うか」のフラグだけを渡す (UI スレッドの同期 read_to_string 回避)。
             let script_enabled = self.settings.stack_script_enabled;
-            let (passthrough, passthrough_metas, passthrough_sort_metas, media) =
-                crate::filename_stack_ui::extract_stack_parts(
-                    &items,
-                    &image_metas,
-                    &listing_sort_metas,
-                );
             Some((
                 script_enabled,
                 self.settings.stack_separator,
-                passthrough,
-                passthrough_metas,
-                passthrough_sort_metas,
-                media,
+                crate::filename_stack_ui::StackListingSource::Normal(std::sync::Arc::new(
+                    listing_sort_metas,
+                )),
                 existing_keys.clone(),
                 path.clone(),
             ))
@@ -22633,26 +22633,16 @@ impl App {
             None,
             authority,
         );
-        if let Some((
-            script_enabled,
-            separator,
-            passthrough,
-            passthrough_metas,
-            passthrough_sort_metas,
-            media,
-            stack_existing,
-            stack_folder,
-        )) = stack_async_prep
+        if let Some((script_enabled, separator, listing, stack_existing, stack_folder)) =
+            stack_async_prep
         {
             // start_loading_items が stack_mode_requested / stack_script_pending をリセットした
             // 後で、通常フォルダ表示のままワーカーへグループ分けを投げる。
             self.stack_mode_requested = true;
             self.spawn_stack_script_worker(
+                stack_folder.clone(),
                 stack_folder,
-                passthrough,
-                passthrough_metas,
-                passthrough_sort_metas,
-                media,
+                listing,
                 separator,
                 folder_sort,
                 stack_existing,
@@ -27464,6 +27454,40 @@ impl App {
         );
     }
 
+    /// Stack grouping has already prepared its candidate order and all bulk display lookups on
+    /// the worker. Keep the normal loader's video/thumbnail lifecycle without cold UI reads.
+    pub(crate) fn start_loading_stack_items(
+        &mut self,
+        source_path: PathBuf,
+        prepared: crate::filename_stack_ui::StackPreparedItems,
+        existing_keys: std::collections::HashSet<String>,
+        folder_signature: Option<u64>,
+        pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    ) {
+        let crate::filename_stack_ui::StackPreparedItems {
+            items,
+            metas,
+            videos,
+            edits,
+            rating_cache,
+            tags_cache,
+            ..
+        } = prepared;
+        self.start_loading_items_inner(
+            source_path,
+            items,
+            metas,
+            existing_keys,
+            videos,
+            folder_signature,
+            None,
+            Some((edits.snapshot, edits.projection)),
+            Some(pin_map),
+            Some((rating_cache, tags_cache)),
+            VisibleInstallAuthority::Ordinary,
+        );
+    }
+
     pub(crate) fn start_loading_subfolder_items(
         &mut self,
         source_path: PathBuf,
@@ -27614,6 +27638,7 @@ impl App {
         // 再設定するのと同じパターン)。これにより Ctrl+G 等 SLI を通る経路でも確実に解除され、
         // 同一フォルダ再読込 (ソート変更・メンバー戻り) では hook が復元する。
         self.stack_view = None;
+        self.stack_return_state = None;
         self.stack_mode_requested = false;
         self.stack_showing_flat = false;
         // 進行中のスタックスクリプトワーカーも破棄 (旧フォルダ向けの結果を適用しない)。
@@ -28765,7 +28790,7 @@ impl App {
 
     /// Installs an asynchronously prepared aggregate without consulting container databases on
     /// the UI thread. The aggregate owner supplies the aligned metadata and refresh lifecycle.
-    pub(in crate::app) fn install_prepared_aggregate_items(
+    pub(crate) fn install_prepared_aggregate_items(
         &mut self,
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
@@ -40180,6 +40205,135 @@ impl App {
         )
     }
 
+    /// While a stale stack aggregate is visible, only commands that leave the view or operate
+    /// on the window itself may run. The ordinary grid dispatch below contains item actions
+    /// mixed with navigation, so route this one typed state through an explicit allowlist.
+    fn handle_stack_refresh_keyboard(
+        &mut self,
+        ctx: &egui::Context,
+        main_has_focus: bool,
+        browser_back_count: u32,
+        browser_forward_count: u32,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        let (mouse_back, mouse_forward) = ctx.input(|input| {
+            (
+                main_has_focus && input.pointer.button_pressed(egui::PointerButton::Extra1),
+                main_has_focus && input.pointer.button_pressed(egui::PointerButton::Extra2),
+            )
+        });
+        let browser_back = main_has_focus && browser_back_count > 0;
+        let browser_forward = main_has_focus && browser_forward_count > 0;
+        if mouse_back || mouse_forward || browser_back || browser_forward {
+            return self.apply_mouse_back_forward_button(
+                ctx,
+                mouse_forward || browser_forward,
+                ActionSurface::MainWindow,
+                "grid-mouse",
+            );
+        }
+        if self.dialog_escape_pressed(ctx) {
+            self.toggle_stack_mode();
+            return None;
+        }
+        if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {
+            self.show_context_shortcuts_help = true;
+            return None;
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridOpenPreferences)
+        {
+            self.show_preferences = true;
+            return None;
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridOpenOperationCustomize)
+        {
+            self.show_operation_customize = true;
+            return None;
+        }
+        for action in [
+            KeyAction::GridClearRecentFolders,
+            KeyAction::GridClearQuickFolderSlots,
+        ] {
+            if self.keymap.consume_action(ctx, action) {
+                self.apply_history_clear_key_action(ctx, action, "grid-history-clear-key");
+                return None;
+            }
+        }
+        if self.keymap.consume_action(ctx, KeyAction::GridReload) {
+            self.reload_top_level_grid(ctx);
+            return None;
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridToggleStackMode)
+        {
+            self.toggle_stack_mode();
+            return None;
+        }
+        if self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::GridToggleMaximize)
+        {
+            self.toggle_main_window_maximized(ctx);
+            return None;
+        }
+        if self.keymap.consume_action(ctx, KeyAction::GridParentFolder) {
+            if self.is_snapshot_active() && self.snapshot_return_to_list_view() {
+                return None;
+            }
+            if self.local_search_blocks_parent_nav() {
+                self.cancel_pending_folder_nav();
+                return None;
+            }
+            return self.resolve_grid_parent_nav();
+        }
+        let history_shortcut_allowed = !self.global_search.active
+            && !self.favsearch.active
+            && !self.tag_view.active
+            && !self.show_search_bar
+            && !self.is_snapshot_active();
+        if history_shortcut_allowed {
+            if self.keymap.consume_action(ctx, KeyAction::GridHistoryBack) {
+                return Some(crate::ui_main::AddressBarNav::HistoryBack);
+            }
+            if self
+                .keymap
+                .consume_action(ctx, KeyAction::GridHistoryForward)
+            {
+                return Some(crate::ui_main::AddressBarNav::HistoryForward);
+            }
+        }
+        for (action, forward, mode) in [
+            (KeyAction::GridTreeFolderPrev, false, FolderNavMode::Grid),
+            (KeyAction::GridTreeFolderNext, true, FolderNavMode::Grid),
+            (
+                KeyAction::GridSiblingFolderPrev,
+                false,
+                FolderNavMode::SiblingGrid,
+            ),
+            (
+                KeyAction::GridSiblingFolderNext,
+                true,
+                FolderNavMode::SiblingGrid,
+            ),
+        ] {
+            if self.keymap.consume_action(ctx, action) {
+                if self.is_snapshot_active() {
+                    let _ = self.snapshot_navigate_grid(forward);
+                } else if self.items_are_subfolder_expansion_view {
+                    self.cancel_pending_folder_nav();
+                } else if let Some(folder) = self.effective_folder() {
+                    self.start_folder_nav(folder, forward, mode);
+                }
+                return None;
+            }
+        }
+        None
+    }
+
     fn handle_keyboard(&mut self, ctx: &egui::Context) -> Option<crate::ui_main::AddressBarNav> {
         // マウスドライバ / AHK 経由で積まれた進む/戻る pending を early-return より前に
         // drain する。検索バー / ダイアログ / IME 変換中などショートカットを止める分岐で
@@ -40305,6 +40459,15 @@ impl App {
             .find(|action| self.keymap.consume_action_no_repeat(ctx, *action))
         {
             return self.apply_saved_group_key_action(ctx, action);
+        }
+
+        if !self.grid_item_input_allowed() {
+            return self.handle_stack_refresh_keyboard(
+                ctx,
+                main_has_focus,
+                browser_back_count,
+                browser_forward_count,
+            );
         }
 
         if let Some(action) =
@@ -43683,7 +43846,10 @@ impl App {
     /// Ctrl+C / Ctrl+X / Ctrl+V ショートカットを処理する。
     fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
         let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if !main_focused || self.shortcuts_blocked_by_text_input(ctx) {
+        if !main_focused
+            || self.shortcuts_blocked_by_text_input(ctx)
+            || !self.grid_item_input_allowed()
+        {
             return;
         }
 
@@ -51685,6 +51851,9 @@ impl App {
         load_contract: FsPageLoadContract,
         mut perf: Option<&mut FsOpenPerfRecorder>,
     ) {
+        if !self.grid_item_input_allowed() {
+            return;
+        }
         if self.defer_sidecar_restore_fullscreen(
             idx,
             history_trigger,
@@ -56306,7 +56475,7 @@ impl App {
     /// context ごとの cache ownership は維持しつつ、DB とユーザー最終値だけを共有する。
     /// `ViewerContextBundle` の swap 前後と新規一覧の DB prewarm 後に呼ばれるため、行 identity が
     /// 同じで bookmark grid の再 install を省略しても古い星を表示し続けない。
-    fn sync_current_context_rating_session_writes(&mut self) -> bool {
+    pub(crate) fn sync_current_context_rating_session_writes(&mut self) -> bool {
         let seen = self.rating_session_write_seen_generation;
         let current = self.rating_session_write_generation;
         if seen == current {
@@ -76355,6 +76524,9 @@ impl App {
             main_viewport_explicit_input,
             fullscreen_root_key_handled,
         );
+        // A root-key or focus close can happen above. Restore the retained aggregate before
+        // ordinary keyboard routing sees an index from the flat fullscreen order.
+        self.stack_reconcile_after_fullscreen_close(ctx);
 
         if !fullscreen_root_key_handled {
             self.handle_clipboard_shortcuts(ctx);
@@ -76908,6 +77080,10 @@ impl App {
         let t_menus_dialogs = frame_t0.elapsed();
         mark_update_perf(&mut update_perf, UpdatePerfStage::MenusAndDialogs);
 
+        // A close from the viewer viewport or a dialog also lands before the address/toolbar
+        // and grid are drawn. Its first grid-facing frame uses the aggregate order.
+        self.stack_reconcile_after_fullscreen_close(ctx);
+
         // ── ツールバー ───────────────────────────────────────────────
         let toolbar_fav_nav = self.render_toolbar(ctx);
         // ツールバーお気に入りクリックは「指定フォルダへ飛ぶ」操作なので、検索系
@@ -77015,6 +77191,7 @@ impl App {
             && !self.tag_view.has_focus
             && !main_viewer_blocked
             && !self.any_dialog_open()
+            && self.grid_item_input_allowed()
         {
             let ctrl_a = self.keymap.pressed_action(ctx, KeyAction::GridSelectAll);
             let deselect = self.keymap.pressed_action(ctx, KeyAction::GridDeselect);
@@ -77043,6 +77220,7 @@ impl App {
             && !self.tag_view.has_focus
             && !main_viewer_blocked
             && !self.any_dialog_open()
+            && self.grid_item_input_allowed()
         {
             let pressed_p = self.keymap.consume_action(ctx, KeyAction::GridPin);
             if pressed_p {
@@ -77126,6 +77304,7 @@ impl App {
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
             && !self.tag_view.has_focus
+            && self.grid_item_input_allowed()
             && self.keymap.pressed_action(ctx, KeyAction::GridTagApply)
         {
             self.open_tag_apply_dialog();
@@ -77251,15 +77430,16 @@ impl App {
                 ctx.pointer_latest_pos(),
             );
         mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::FolderPaneScrollGuard);
-        if !folder_pane_blocks_grid_scroll && !details_column_menu_open {
+        // Close the stack transition before any grid wheel or cell input sees the flat order.
+        self.stack_reconcile_after_fullscreen_close(ctx);
+        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::StackReconcile);
+        if self.grid_item_input_allowed()
+            && !folder_pane_blocks_grid_scroll
+            && !details_column_menu_open
+        {
             self.process_scroll(ctx);
         }
         mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::ProcessScroll);
-
-        // ファイル名スタック: フラット読書フルスクリーンを閉じたら集約グリッドへ戻す
-        // (render_grid の直前で reconcile して、閉じた瞬間に集約表示が出るようにする)。
-        self.stack_reconcile_after_fullscreen_close();
-        mark_pre_grid_perf(&mut pre_grid_perf, PreGridPerfStage::StackReconcile);
         let pre_grid_perf = pre_grid_perf.map(|recorder| {
             recorder.finish(details_column_menu_open, folder_pane_blocks_grid_scroll)
         });
@@ -78279,6 +78459,8 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::page_edit_write_epoch::PAGE_EDIT_WRITES.register_repaint_context(ctx);
+        crate::rating_db::RATING_WRITES.register_repaint_context(ctx);
+        crate::tags_db::TAG_WRITES.register_repaint_context(ctx);
         self.poll_page_edit_reconciliation(ctx);
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());

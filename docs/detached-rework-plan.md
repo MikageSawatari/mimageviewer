@@ -1454,6 +1454,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-24 §1.268 A2 chunk 2: filename-stack prepare の bundle owner**
+
+`src/app/viewer_context_registry.rs` の bundle swap に stack prepare pending と request sequence を
+加え、grouping/flat/aggregate の worker 結果を page-edit snapshot と同じ mounted context で受理する。
+flat fullscreen 中に保持する受理済み aggregate 順・投影も同じ bundle で swap し、close 時の同期復帰と
+stale stamp 時の worker refresh を同じ owner に閉じ込める。
+物理 detached fork は receiver を複製せず元 main に残し、`StackView` の immutable 本体のみ Arc で共有する。
+既存の detached park 境界、predicate、HWND、focus、window lifecycle には分岐を追加しない。
+これは chunk 1 の snapshot owner に合わせる構造的変更であり、設計 lead が chunk 2 として承認した。
+独立 reviewer の実装判定は未了。
+
 **2026-09-24 §1.268 A2 chunk 1: page-edit reconcile の bundle mount/remount**
 
 `src/app/viewer_context_registry.rs` の既存 bundle swap に `page_edit_reconcile_pending` を加え、

@@ -2346,7 +2346,9 @@ impl App {
         self.archive_source_override = None;
         self.zip_nav = None;
         self.stack_view = None;
+        self.stack_return_state = None;
         self.stack_mode_requested = false;
+        self.stack_showing_flat = false;
         self.cancel_stack_script_pending();
         self.install_prepared_aggregate_items(items, image_metas);
         self.invalidate_idx_state_and_queues();

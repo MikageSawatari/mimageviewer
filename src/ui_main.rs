@@ -6223,7 +6223,8 @@ impl App {
                             let response = ui.menu_button(TopMenuId::Books.label(), |ui| {
                                 let active_name = self.active_book_name();
                                 ui.label(format!("追加先の本: {active_name}"));
-                                let has_selection = self.selected.is_some() || !self.checked.is_empty();
+                                let has_selection = self.grid_item_input_allowed()
+                                    && (self.selected.is_some() || !self.checked.is_empty());
                                 for &command in books_menu_commands {
                                     match command {
                                         MenuCommandId::BooksAddSelectionToActiveBook => {
@@ -6237,7 +6238,7 @@ impl App {
                                                 } else {
                                                     "追加する画像・ページを選択してください"
                                                 });
-                                            if add_resp.clicked() {
+                                            if add_resp.clicked() && self.grid_item_input_allowed() {
                                                 self.add_grid_selection_to_active_book(ctx);
                                                 ui.close();
                                             }
@@ -6342,7 +6343,7 @@ impl App {
                                 for &command in commands {
                                     match command {
                                         MenuCommandId::CollectionsAddSelectionToTarget => {
-                                            let enabled = add_target.is_some()
+                                            let enabled = self.grid_item_input_allowed() && add_target.is_some()
                                                 && (self.selected.is_some() || !self.checked.is_empty());
                                             if ui
                                                 .add_enabled(enabled, egui::Button::new(&collection_add_menu_label))
@@ -6530,7 +6531,7 @@ impl App {
                                     if command != MenuCommandId::ConvertToZip {
                                         continue;
                                     }
-                                    let enabled = convert_target_count > 0
+                                    let enabled = self.grid_item_input_allowed() && convert_target_count > 0
                                         && self.archive_convert.is_none()
                                         && self.batch_convert.is_none();
                                     let response = ui
@@ -6553,7 +6554,8 @@ impl App {
                         TopMenuId::Video => {
                             let video_menu_commands = &resolved_top_menu.commands;
                             let response = ui.menu_button(TopMenuId::Video.label(), |ui| {
-                                let can_apply_to_selected = selected_video_path.is_some();
+                                let can_apply_to_selected =
+                                    self.grid_item_input_allowed() && selected_video_path.is_some();
                                 for &command in video_menu_commands {
                                     match command {
                                         MenuCommandId::VideoRegisterUpscale => {
@@ -6622,7 +6624,8 @@ impl App {
                                     }
                                     ui.separator();
                                     let selection_count = self.tag_target_path_count(crate::app::ActionSurface::MainWindow);
-                                    let has_target = selection_count > 0;
+                                    let has_target =
+                                        self.grid_item_input_allowed() && selection_count > 0;
                                     if ui
                                         .add_enabled(
                                             has_target,
@@ -8364,7 +8367,7 @@ impl App {
         if self.viewer_session_blocks_main_window() || self.any_dialog_open() {
             return;
         }
-        if show_checked_selection_overlay(ctx, checked_count) {
+        if show_checked_selection_overlay(ctx, checked_count) && self.grid_item_input_allowed() {
             self.checked.clear();
         }
     }
@@ -8542,7 +8545,10 @@ impl App {
     fn dispatch_collection_toolbar_intent(&mut self, intent: CollectionToolbarIntent) {
         match intent {
             CollectionToolbarIntent::SelectTarget(id) => self.select_collection_toolbar_target(id),
-            CollectionToolbarIntent::Add(id) => self.add_grid_selection_to_collection(id),
+            CollectionToolbarIntent::Add(id) if self.grid_item_input_allowed() => {
+                self.add_grid_selection_to_collection(id)
+            }
+            CollectionToolbarIntent::Add(_) => {}
             CollectionToolbarIntent::Open(id) => self.open_collection_grid_from_navigation(id),
         }
     }
@@ -9875,7 +9881,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.settings.save();
             self.book_manager_rename_name = name;
         }
-        if toolbar_book_add {
+        if toolbar_book_add && self.grid_item_input_allowed() {
             self.add_grid_selection_to_active_book(ctx);
         }
         if toolbar_book_open_active {
@@ -9885,7 +9891,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if let Some(name) = toolbar_book_pin_open {
             toolbar_fav_nav = Some(crate::books::book_folder(&self.book_root_path(), &name));
         }
-        if let Some(name) = toolbar_book_pin_add {
+        if let Some(name) = toolbar_book_pin_add.filter(|_| self.grid_item_input_allowed()) {
             self.add_grid_selection_to_named_book(ctx, name);
         }
         if let Some(intent) = toolbar_collection_intent {
@@ -9920,7 +9926,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
         // ★付与 (右クリックメニュー、§1.1)。apply_rating_to_selection は対象解決・undo・
         // 再描画を自前で行う。コンテナ付与は変更時のみトースト。
-        if let Some(n) = toolbar_rating_assign_selection {
+        if let Some(n) = toolbar_rating_assign_selection.filter(|_| self.grid_item_input_allowed())
+        {
             self.apply_rating_to_selection(n);
         }
         if let Some(n) = toolbar_rating_assign_container {
@@ -9938,7 +9945,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
 
         // ツールバーのタグ項目クリック
-        if let Some(name) = toolbar_tag_click {
+        if let Some(name) = toolbar_tag_click.filter(|_| self.grid_item_input_allowed()) {
             self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::MainWindow);
         }
         if let Some(name) = toolbar_tag_search {
@@ -9947,7 +9954,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if let Some(name) = toolbar_tag_container {
             self.request_tag_toggle_for_current_container(&name);
         }
-        if toolbar_tag_apply {
+        if toolbar_tag_apply && self.grid_item_input_allowed() {
             self.open_tag_apply_dialog();
         }
         if toolbar_tag_view_open {
@@ -13260,7 +13267,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 ui.add_space(3.0);
                 // pin ボタンクリックは closure 抜けてから処理する (App ミュータブル借用が必要)
                 match pin_click {
-                    PinButtonClick::Toggle => self.toggle_folder_pin_from_selection(),
+                    PinButtonClick::Toggle if self.grid_item_input_allowed() => {
+                        self.toggle_folder_pin_from_selection()
+                    }
+                    PinButtonClick::Toggle => {}
                     PinButtonClick::Remove => self.remove_folder_pin_for_current_container(),
                     PinButtonClick::None => {}
                 }
@@ -14058,6 +14068,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     }
 
     fn begin_grid_right_drag_primary_frame(&mut self, ctx: &egui::Context) -> bool {
+        if !self.grid_item_input_allowed() {
+            self.cancel_mouse_ring_flick();
+            self.cancel_mouse_gesture();
+            return true;
+        }
         let (primary_pressed, primary_down, primary_released) = ctx.input(|input| {
             (
                 input.pointer.primary_pressed(),
@@ -14091,6 +14106,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
         let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
+        if !self.grid_item_input_allowed() {
+            return None;
+        }
         self.begin_grid_cell_pointer_trace(ctx, cell_rect, idx);
         let (
             time_since_last_click,
@@ -14671,7 +14689,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         hit_cell: bool,
         suppress_primary_pointer: bool,
     ) {
-        if self.settings.grid_click_selection_mode.normalized() != GridClickSelectionMode::Explorer
+        if !self.grid_item_input_allowed()
+            || self.settings.grid_click_selection_mode.normalized()
+                != GridClickSelectionMode::Explorer
             || hit_cell
             || suppress_primary_pointer
             || self.any_dialog_open()
@@ -14700,7 +14720,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         ctx: &egui::Context,
         rect: egui::Rect,
     ) {
-        if self.any_dialog_open()
+        if !self.grid_item_input_allowed()
+            || self.any_dialog_open()
             || self.items_are_drive_list
             || self.mouse_ring_flick.is_some()
             || self.mouse_gesture.is_some()
@@ -14741,7 +14762,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     }
 
     fn update_grid_mouse_ring_flick(&mut self, ctx: &egui::Context) {
-        if self.any_dialog_open() {
+        if !self.grid_item_input_allowed() || self.any_dialog_open() {
             self.cancel_mouse_ring_flick();
             self.cancel_mouse_gesture();
             return;
@@ -14779,7 +14800,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         ctx: &egui::Context,
         target_idx: Option<usize>,
     ) {
-        if self.selection_info_bar_contains_pointer(ctx) {
+        if !self.grid_item_input_allowed() || self.selection_info_bar_contains_pointer(ctx) {
             return;
         }
         let pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
@@ -16697,6 +16718,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<AddressBarNav> {
+                if !self.grid_item_input_allowed() {
+                    ui.disable();
+                }
                 let suppress_primary_pointer = self.begin_grid_right_drag_primary_frame(ctx);
                 // Preserve the grid-owned pending click for this frame's cell check, while
                 // clearing App state up front so a primary click not accepted by any cell breaks
@@ -16708,7 +16732,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // Sole MainGrid driver. Embedded still fullscreen returns
                 // before render_grid, preventing a double feed on main ctx.
                 let touch_scroll_enabled =
-                    self.settings.grid_view_mode != GridViewMode::Details && !self.items.is_empty();
+                    self.settings.grid_view_mode != GridViewMode::Details
+                    && !self.items.is_empty()
+                    && self.grid_item_input_allowed();
                 let touch_frame = crate::touch_correlation::drive_egui_touch_input(
                     ctx,
                     crate::touch_correlation::TouchSurface::MainGrid,
@@ -16986,7 +17012,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     }
                 }
-                for command in touch_frame.commands().iter().copied() {
+                for command in touch_frame
+                    .commands()
+                    .iter()
+                    .copied()
+                    .take(if self.grid_item_input_allowed() {
+                        usize::MAX
+                    } else {
+                        0
+                    })
+                {
                     match command {
                         crate::touch_input::TouchCommand::ScrollGrid { delta_y } => {
                             let previous_direction = match touch_scroll_phase {
@@ -23449,7 +23484,24 @@ mod saved_group_number_ui_tests {
 mod grid_reclick_open_tests {
     use super::*;
     use crate::app::{AppTestEnvForTest, setup_app_for_test};
+    use crate::filename_stack::StackView;
+    use crate::filename_stack_ui::StackReturnState;
     use egui_kittest::Harness;
+    use std::sync::Arc;
+
+    fn block_stale_aggregate(app: &mut AppTestEnvForTest) {
+        let view = Arc::new(StackView::build(
+            PathBuf::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            app.settings.stack_separator,
+            app.settings.sort_order,
+        ));
+        app.stack_view = Some(Arc::clone(&view));
+        app.stack_return_state = Some(StackReturnState::Refreshing { view });
+        assert!(!app.grid_item_input_allowed());
+    }
 
     fn cell_rect(idx: usize) -> egui::Rect {
         egui::Rect::from_min_size(
@@ -24096,6 +24148,65 @@ mod grid_reclick_open_tests {
         assert_eq!(harness.state().app.checked, HashSet::from([1]));
         assert_eq!(harness.state().activations, 0);
         pointer_button(&mut harness, pos, egui::PointerButton::Secondary, false);
+    }
+
+    #[test]
+    fn stale_aggregate_background_click_is_ignored_until_acceptance() {
+        let mut harness = handler_harness(
+            GridClickSelectionMode::Explorer,
+            false,
+            Some(1),
+            false,
+            false,
+        );
+        harness.state_mut().app.checked = HashSet::from([1]);
+        block_stale_aggregate(&mut harness.state_mut().app);
+        let background = egui::pos2(440.0, 170.0);
+        click_at(&mut harness, background);
+        assert_eq!(harness.state().app.selected, Some(1));
+        assert_eq!(harness.state().app.checked, HashSet::from([1]));
+
+        harness.state_mut().app.stack_return_state = None;
+        click_at(&mut harness, background);
+        assert_eq!(harness.state().app.selected, None);
+        assert!(harness.state().app.checked.is_empty());
+    }
+
+    #[test]
+    fn stale_aggregate_cell_right_drag_is_ignored_until_acceptance() {
+        let mut harness = handler_harness(
+            GridClickSelectionMode::Explorer,
+            false,
+            Some(1),
+            false,
+            false,
+        );
+        harness
+            .state_mut()
+            .app
+            .settings
+            .ring_shortcuts
+            .set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::RingShortcut,
+            );
+        harness
+            .state_mut()
+            .app
+            .settings
+            .ring_shortcuts
+            .select_grid_item_on_right_drag_start = true;
+        block_stale_aggregate(&mut harness.state_mut().app);
+        let pos = cell_rect(0).center();
+        pointer_button(&mut harness, pos, egui::PointerButton::Secondary, true);
+        assert!(harness.state().app.mouse_ring_flick.is_none());
+        assert_eq!(harness.state().app.selected, Some(1));
+        pointer_button(&mut harness, pos, egui::PointerButton::Secondary, false);
+
+        harness.state_mut().app.stack_return_state = None;
+        pointer_button(&mut harness, pos, egui::PointerButton::Secondary, true);
+        assert!(harness.state().app.mouse_ring_flick.is_some());
+        assert_eq!(harness.state().app.selected, Some(0));
     }
 
     #[test]

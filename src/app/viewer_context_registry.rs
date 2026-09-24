@@ -727,8 +727,11 @@ pub(in crate::app) struct ViewerContextBundle {
     archive_source_override: Option<PathBuf>,
     zip_nav: Option<crate::zip_tree::ZipNavState>,
     stack_mode_requested: bool,
-    stack_view: Option<crate::filename_stack::StackView>,
+    stack_view: Option<std::sync::Arc<crate::filename_stack::StackView>>,
     stack_showing_flat: bool,
+    stack_return_state: Option<crate::filename_stack_ui::StackReturnState>,
+    stack_script_pending: Option<crate::filename_stack_ui::StackPreparePending>,
+    stack_request_sequence: u64,
     stack_active_rule: Option<String>,
     stack_script_error: Option<String>,
     stack_toggle_select_path: Option<PathBuf>,
@@ -1379,6 +1382,9 @@ impl ViewerContextBundle {
             stack_mode_requested: false,
             stack_view: None,
             stack_showing_flat: false,
+            stack_return_state: None,
+            stack_script_pending: None,
+            stack_request_sequence: 0,
             stack_active_rule: None,
             stack_script_error: None,
             stack_toggle_select_path: None,
@@ -1748,6 +1754,9 @@ impl App {
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
+            stack_return_state,
+            stack_script_pending,
+            stack_request_sequence,
             stack_active_rule,
             stack_script_error,
             stack_toggle_select_path,
@@ -2009,6 +2018,9 @@ impl App {
         swap_field!(stack_mode_requested);
         swap_field!(stack_view);
         swap_field!(stack_showing_flat);
+        swap_field!(stack_return_state);
+        swap_field!(stack_script_pending);
+        swap_field!(stack_request_sequence);
         swap_field!(stack_active_rule);
         swap_field!(stack_script_error);
         swap_field!(stack_toggle_select_path);
@@ -2331,6 +2343,9 @@ impl App {
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
+            stack_return_state,
+            stack_script_pending,
+            stack_request_sequence,
             stack_active_rule,
             stack_script_error,
             stack_toggle_select_path,
@@ -2599,6 +2614,7 @@ impl App {
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
+            stack_request_sequence,
             stack_active_rule,
             stack_script_error,
             stack_toggle_select_path,
@@ -2654,6 +2670,7 @@ impl App {
 
         // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
         move_to_parked!(
+            stack_return_state,
             vst3_deferred_media_open,
             fullscreen_idx,
             fullscreen_page_slice,
@@ -2768,6 +2785,7 @@ impl App {
             rating_view_nav_stack,
             // 新しい parked context は複製済み items/cache の独立 owner になる。進行中の
             // receiver だけは複製できないため、元の main context に残す。
+            stack_script_pending,
             facet_name_cache_pending,
             requested,
             metadata_import_refresh_index,

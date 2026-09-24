@@ -353,8 +353,14 @@ pub(crate) fn listing_sort_metas_for_items(
     snapshot: &SubfolderExpansionSnapshot,
     items: &[GridItem],
 ) -> Vec<crate::settings::ListingSortMetadata> {
-    let by_path: HashMap<String, crate::settings::ListingSortMetadata> = snapshot
-        .entries
+    listing_sort_metas_for_entries(&snapshot.entries, items)
+}
+
+pub(crate) fn listing_sort_metas_for_entries(
+    entries: &[SubfolderExpansionEntry],
+    items: &[GridItem],
+) -> Vec<crate::settings::ListingSortMetadata> {
+    let by_path: HashMap<String, crate::settings::ListingSortMetadata> = entries
         .iter()
         .map(|entry| {
             (
@@ -1621,6 +1627,7 @@ impl App {
         self.cancel_stack_script_pending();
         self.stack_mode_requested = false;
         self.stack_view = None;
+        self.stack_return_state = None;
         self.stack_showing_flat = false;
         self.subfolder_expansion_root = Some(root.clone());
         self.subfolder_expansion_roots = roots.clone();

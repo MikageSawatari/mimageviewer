@@ -796,7 +796,8 @@ impl crate::app::App {
     }
 
     pub(crate) fn grid_context_menu_owner_is_current(&self, owner: GridContextMenuOwner) -> bool {
-        owner.context_id == self.collection_grid_context_id()
+        (owner.index == usize::MAX || self.grid_item_input_allowed())
+            && owner.context_id == self.collection_grid_context_id()
             && owner.items_generation == self.items_generation
     }
 
@@ -1566,6 +1567,18 @@ impl crate::app::App {
             crate::native_context_menu::ShellClipboardVerb,
         ),
     {
+        if !self.grid_item_input_allowed()
+            && !(target.is_folder_context
+                && matches!(
+                    &command,
+                    MenuCommand::NewFolder
+                        | MenuCommand::Paste
+                        | MenuCommand::OpenFolderInExplorer
+                        | MenuCommand::OpenExternalToolSettings
+                ))
+        {
+            return None;
+        }
         match command {
             MenuCommand::NewFolder => {
                 if target.is_folder_context
@@ -2255,6 +2268,7 @@ impl crate::app::App {
         if self.viewer_session_blocks_main_window()
             || self.address_has_focus
             || self.any_dialog_open()
+            || !self.grid_item_input_allowed()
         {
             return;
         }

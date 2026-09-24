@@ -2013,7 +2013,7 @@ impl crate::app::App {
         &self,
         targets: &[LaunchTarget],
     ) -> Result<Vec<LaunchTarget>, String> {
-        expand_stack_targets(targets, self.stack_view.as_ref())
+        expand_stack_targets(targets, self.stack_view.as_deref())
     }
 
     fn launch_target_item_index(&self, target: &LaunchTarget) -> Option<usize> {

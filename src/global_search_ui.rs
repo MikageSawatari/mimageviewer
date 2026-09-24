@@ -1466,6 +1466,7 @@ impl App {
         // 復活してしまう (Codex P2)。
         self.stack_mode_requested = false;
         self.stack_view = None;
+        self.stack_return_state = None;
         self.stack_showing_flat = false;
         // 進行中のスタックスクリプトワーカーも明示破棄する。`poll_stack_script` の妥当性判定
         // (stack_mode_requested=false) でも次フレームに破棄されるが、他の解除経路

@@ -10464,6 +10464,89 @@ mod phase_c_key_tests {
         app
     }
 
+    fn setup_stack_refresh_key_app() -> AppTestEnv {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("stack-refresh-keys");
+        std::fs::create_dir(&folder).unwrap();
+        let page = folder.join("solo_0.png");
+        image::RgbaImage::new(1, 1).save(&page).unwrap();
+        app.items = vec![GridItem::Image(page.clone())];
+        app.image_metas = vec![None];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::now());
+        let view = std::sync::Arc::new(crate::filename_stack::StackView::build(
+            folder,
+            Vec::new(),
+            Vec::new(),
+            vec![crate::filename_stack::StackMember {
+                path: page,
+                mtime: 0,
+                size: Some(1),
+                is_video: false,
+            }],
+            app.settings.stack_separator,
+            app.settings.sort_order,
+        ));
+        app.stack_mode_requested = true;
+        app.stack_view = Some(std::sync::Arc::clone(&view));
+        app.stack_return_state =
+            Some(crate::filename_stack_ui::StackReturnState::Refreshing { view });
+        app
+    }
+
+    #[test]
+    fn stack_stale_return_blocks_item_keys_but_restores_them_after_acceptance() {
+        let mut app = setup_stack_refresh_key_app();
+        assert!(grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Space).is_none());
+        assert!(
+            app.checked.is_empty(),
+            "Space cannot change retained aggregate selection"
+        );
+        assert!(matches!(
+            grid_key_nav(&mut app, egui::Modifiers::ALT, egui::Key::ArrowLeft),
+            Some(crate::ui_main::AddressBarNav::HistoryBack)
+        ));
+        app.stack_return_state = None; // accepted replacement clears the blocking return state
+        assert!(grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Space).is_none());
+        assert_eq!(app.checked, std::collections::HashSet::from([0]));
+    }
+
+    #[test]
+    fn stack_stale_return_escape_leaves_stack_view() {
+        let mut app = setup_stack_refresh_key_app();
+        assert!(grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Escape).is_none());
+        assert!(!app.stack_mode_requested);
+        assert!(app.grid_item_input_allowed());
+    }
+
+    #[test]
+    fn stack_stale_return_blocks_delete_key_until_acceptance() {
+        let mut app = setup_stack_refresh_key_app();
+        for blocked in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Delete,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            let _owner = app.keyboard_owner_for_pass(&ctx);
+            app.handle_delete_key(&ctx);
+            let _ = ctx.end_pass();
+            assert_eq!(app.show_delete_confirm, !blocked);
+            if blocked {
+                app.stack_return_state = None; // accepted aggregate replacement
+            }
+        }
+    }
+
     #[test]
     fn grid_cursor_wrap_shift_down_at_end_clamps_range_selection() {
         let mut app = setup_grid_cursor_wrap_app();
@@ -26432,7 +26515,7 @@ mod favorite_adjustment_defaults_tests {
         );
         app.items = items;
         app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
-        app.stack_view = Some(sv);
+        app.stack_view = Some(std::sync::Arc::new(sv));
         app.stack_showing_flat = false;
         app.selected = Some(0);
         app.rebuild_visible_indices();
@@ -26511,7 +26594,7 @@ mod favorite_adjustment_defaults_tests {
         let (items, _metas) = sv.materialize_aggregated();
         app.items = items;
         app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
-        app.stack_view = Some(sv);
+        app.stack_view = Some(std::sync::Arc::new(sv));
         app.stack_showing_flat = false;
         app.selected = Some(0);
         app.rebuild_visible_indices();
@@ -32714,7 +32797,7 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(dir);
         app.items = items;
         app.stack_mode_requested = true;
-        app.stack_view = Some(stack_view);
+        app.stack_view = Some(std::sync::Arc::new(stack_view));
         app.stack_showing_flat = true;
         app.stack_active_rule = Some("テストルール".to_string());
         app.stack_script_error = Some("テストエラー".to_string());
@@ -68131,7 +68214,7 @@ mod still_window_mode_key_tests {
         app.current_folder = Some(dir);
         app.items = items;
         app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
-        app.stack_view = Some(stack_view);
+        app.stack_view = Some(std::sync::Arc::new(stack_view));
         app.stack_showing_flat = true;
         app.rebuild_visible_indices();
     }
