@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 
 use crate::path_key;
 use crate::settings::{
-    FinalCoverSpreadPreference, ReadingDirection, ReadingFlow, SingletonSpreadEndpointPreferences,
-    SingletonSpreadPlacementPreference, SpreadMode,
+    FinalCoverSpreadPreference, PageAlonePreference, PageAlonePreferences, ReadingDirection,
+    ReadingFlow, SingletonSpreadEndpointPreferences, SingletonSpreadPlacementPreference,
+    SpreadMode,
 };
 use rusqlite::{OpenFlags, OptionalExtension};
 
@@ -101,6 +102,11 @@ impl SpreadDb {
             CREATE TABLE IF NOT EXISTS singleton_spread_placements (
                 path TEXT PRIMARY KEY,
                 preference INTEGER NOT NULL CHECK (preference BETWEEN 0 AND 2)
+            );
+            CREATE TABLE IF NOT EXISTS page_alone_preferences (
+                path TEXT PRIMARY KEY,
+                after_cover_preference INTEGER NOT NULL CHECK (after_cover_preference BETWEEN 0 AND 2),
+                last_preference INTEGER NOT NULL CHECK (last_preference BETWEEN 0 AND 2)
             )",
         )?;
         ensure_column(&conn, "flow", "INTEGER NOT NULL DEFAULT 0")?;
@@ -342,6 +348,62 @@ impl SpreadDb {
         Ok(())
     }
 
+    /// An absent table in a released read-only database means both controls
+    /// inherit their new default-OFF global settings. A damaged present table
+    /// remains an error rather than being mistaken for inherited preferences.
+    pub(crate) fn get_page_alone_preferences_with_fallback(
+        &self,
+        key: &Path,
+        fallback: Option<&Path>,
+    ) -> Result<PageAlonePreferences, rusqlite::Error> {
+        if !table_exists_checked(&self.conn, "page_alone_preferences")? {
+            return Ok(PageAlonePreferences::default());
+        }
+        let read = |path: &Path| -> Result<Option<PageAlonePreferences>, rusqlite::Error> {
+            let key = normalize_path(path);
+            self.conn.query_row(
+                "SELECT after_cover_preference, last_preference FROM page_alone_preferences WHERE path = ?1",
+                [&key],
+                |row| {
+                    let after_cover = PageAlonePreference::from_int(row.get(0)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?;
+                    let last = PageAlonePreference::from_int(row.get(1)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?;
+                    Ok(PageAlonePreferences { after_cover, last })
+                },
+            ).optional()
+        };
+        if let Some(preferences) = read(key)? {
+            return Ok(preferences);
+        }
+        if let Some(fallback) = fallback {
+            if let Some(preferences) = read(fallback)? {
+                return Ok(preferences);
+            }
+        }
+        Ok(PageAlonePreferences::default())
+    }
+
+    pub(crate) fn set_page_alone_preferences(
+        &self,
+        path: &Path,
+        fallback: Option<&Path>,
+        preferences: PageAlonePreferences,
+    ) -> Result<(), rusqlite::Error> {
+        let key = normalize_path(path);
+        if preferences == PageAlonePreferences::default() && fallback.is_none() {
+            self.conn
+                .execute("DELETE FROM page_alone_preferences WHERE path = ?1", [&key])?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO page_alone_preferences (path, after_cover_preference, last_preference) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET after_cover_preference = ?2, last_preference = ?3",
+                rusqlite::params![key, preferences.after_cover.to_int(), preferences.last.to_int()],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn set_mode_and_direction(
         &mut self,
         path: &Path,
@@ -448,65 +510,40 @@ impl SpreadDb {
         let final_covers = transaction.execute("DELETE FROM final_cover_spreads", [])?;
         let singleton_placements =
             transaction.execute("DELETE FROM singleton_spread_endpoint_placements", [])?;
+        let page_alone = transaction.execute("DELETE FROM page_alone_preferences", [])?;
         transaction.execute("DELETE FROM singleton_spread_placements", [])?;
         transaction.commit()?;
-        Ok(spreads + final_covers + singleton_placements)
+        Ok(spreads + final_covers + singleton_placements + page_alone)
     }
 
     /// 登録件数
     pub fn count(&self) -> usize {
-        let spreads = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM spreads", [], |row| {
-                row.get::<_, usize>(0)
-            })
-            .unwrap_or(0);
-        let final_covers = if table_exists(&self.conn, "final_cover_spreads") {
-            self.conn
-                .query_row(
-                    "SELECT COUNT(*) FROM final_cover_spreads AS f
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM spreads AS s WHERE s.path = f.path
-                     )",
-                    [],
-                    |row| row.get::<_, usize>(0),
-                )
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let mut tables = vec!["spreads"];
+        if table_exists(&self.conn, "final_cover_spreads") {
+            tables.push("final_cover_spreads");
+        }
         let endpoint_table =
             if singleton_endpoint_placement_marker_present(&self.conn).unwrap_or(false) {
                 "singleton_spread_endpoint_placements"
             } else {
                 "singleton_spread_placements"
             };
-        let singleton_placements = if table_exists(&self.conn, endpoint_table) {
-            let sql = if table_exists(&self.conn, "final_cover_spreads") {
-                format!(
-                    "SELECT COUNT(*) FROM {endpoint_table} AS p
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM spreads AS s WHERE s.path = p.path
-                 )
-                 AND NOT EXISTS (
-                     SELECT 1 FROM final_cover_spreads AS f WHERE f.path = p.path
-                 )"
-                )
-            } else {
-                format!(
-                    "SELECT COUNT(*) FROM {endpoint_table} AS p
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM spreads AS s WHERE s.path = p.path
-                 )"
-                )
-            };
-            self.conn
-                .query_row(&sql, [], |row| row.get::<_, usize>(0))
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        spreads + final_covers + singleton_placements
+        if table_exists(&self.conn, endpoint_table) {
+            tables.push(endpoint_table);
+        }
+        if table_exists(&self.conn, "page_alone_preferences") {
+            tables.push("page_alone_preferences");
+        }
+        let union = tables
+            .iter()
+            .map(|table| format!("SELECT path FROM {table}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ");
+        self.conn
+            .query_row(&format!("SELECT COUNT(*) FROM ({union})"), [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -1114,6 +1151,74 @@ mod tests {
         assert_eq!(db.count(), 2, "root and nested keys count once each");
         assert_eq!(db.clear_all().unwrap(), 2);
         assert_eq!(db.count(), 0);
+    }
+
+    #[test]
+    fn page_alone_preferences_keep_independent_nested_overrides_and_read_only_compatibility() {
+        use crate::settings::{PageAlonePreference as Preference, PageAlonePreferences};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let root = Path::new("C:/books/outer.zip");
+        let nested = Path::new("C:/books/outer.zip/book");
+        let db = SpreadDb::open_at(&path).unwrap();
+        db.set_page_alone_preferences(
+            root,
+            None,
+            PageAlonePreferences {
+                after_cover: Preference::On,
+                last: Preference::Off,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_page_alone_preferences_with_fallback(nested, Some(root))
+                .unwrap(),
+            PageAlonePreferences {
+                after_cover: Preference::On,
+                last: Preference::Off
+            },
+        );
+        db.set_page_alone_preferences(nested, Some(root), PageAlonePreferences::default())
+            .unwrap();
+        assert_eq!(
+            db.get_page_alone_preferences_with_fallback(nested, Some(root))
+                .unwrap(),
+            PageAlonePreferences::default(),
+            "explicit nested FollowGlobal must block the root row",
+        );
+        assert_eq!(db.count(), 2);
+        db.conn
+            .execute_batch(
+                "ALTER TABLE page_alone_preferences RENAME TO damaged_page_alone_preferences;",
+            )
+            .unwrap();
+        assert_eq!(
+            db.get_page_alone_preferences_with_fallback(root, None)
+                .unwrap(),
+            PageAlonePreferences::default(),
+            "missing table on a read-only released DB inherits defaults",
+        );
+        let old = SpreadDb::open_existing_read_only_at(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            old.get_page_alone_preferences_with_fallback(root, None)
+                .unwrap(),
+            PageAlonePreferences::default(),
+        );
+        assert!(
+            old.set_page_alone_preferences(root, None, PageAlonePreferences::default())
+                .is_err()
+        );
+        db.conn
+            .execute_batch(
+                "CREATE TABLE page_alone_preferences(path TEXT PRIMARY KEY, wrong INTEGER);",
+            )
+            .unwrap();
+        assert!(
+            db.get_page_alone_preferences_with_fallback(root, None)
+                .is_err()
+        );
     }
 
     #[test]

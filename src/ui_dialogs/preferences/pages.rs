@@ -9131,6 +9131,17 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             &mut state.settings.singleton_spread_last_enabled,
         );
     });
+    anchored(ui, state, "spread/page-alone", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.page_after_cover_alone_enabled,
+            "表紙の次のページを単独で表示",
+        );
+        ui.checkbox(
+            &mut state.settings.last_page_alone_enabled,
+            "最終ページを単独で表示",
+        );
+        ui.small("表紙あり見開きだけに適用します。単独ページの空き側は白く表示し、書き出し画像には含めません。本ごとに変更できます。");
+    });
     ui.add_space(8.0);
     anchored(ui, state, "spread/reading-flow", |ui, state| {
         let s = &mut state.settings;

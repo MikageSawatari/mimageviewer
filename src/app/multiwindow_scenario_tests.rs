@@ -2,7 +2,10 @@
 
 #![cfg(all(test, windows))]
 
-use super::paint_record_test_support::{PaintRecord, paint_records, with_capture};
+use super::paint_record_test_support::{
+    PaintRecord, WhiteCompanionPaintRecord, paint_records, white_companion_paint_records,
+    with_capture,
+};
 use super::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -15,6 +18,7 @@ const CHILD_SIZE: egui::Vec2 = egui::vec2(960.0, 720.0);
 struct ScenarioFrame {
     number: usize,
     records: HashMap<egui::ViewportId, Vec<PaintRecord>>,
+    white: HashMap<egui::ViewportId, Vec<WhiteCompanionPaintRecord>>,
     errors: HashMap<egui::ViewportId, Vec<String>>,
 }
 
@@ -144,14 +148,20 @@ impl ScenarioDriver {
             })
         });
         let mut records = HashMap::new();
+        let mut white = HashMap::new();
         let mut errors = HashMap::new();
         records.insert(
             egui::ViewportId::ROOT,
             paint_records(egui::ViewportId::ROOT, &output),
         );
+        white.insert(
+            egui::ViewportId::ROOT,
+            white_companion_paint_records(egui::ViewportId::ROOT, &output),
+        );
         errors.insert(egui::ViewportId::ROOT, error_messages(&output));
         for (id, output) in self.child_outputs.borrow_mut().drain(..) {
             records.insert(id, paint_records(id, &output));
+            white.insert(id, white_companion_paint_records(id, &output));
             errors.insert(id, error_messages(&output));
         }
         let registered = output
@@ -171,6 +181,7 @@ impl ScenarioDriver {
         ScenarioFrame {
             number: self.number,
             records,
+            white,
             errors,
         }
     }
@@ -183,12 +194,15 @@ impl ScenarioDriver {
         let input = Self::input(id, *self.focused.borrow(), CHILD_SIZE, &self.known.borrow());
         let output = with_capture(|| self.ctx.run(input, |ctx| callback(ctx)));
         let mut records = HashMap::new();
+        let mut white = HashMap::new();
         let mut errors = HashMap::new();
         records.insert(id, paint_records(id, &output));
+        white.insert(id, white_companion_paint_records(id, &output));
         errors.insert(id, error_messages(&output));
         ScenarioFrame {
             number: self.number,
             records,
+            white,
             errors,
         }
     }
@@ -294,11 +308,13 @@ fn multiwindow_scenario_i1_ignores_root_and_sibling_errors() {
     let before = ScenarioFrame {
         number: 0,
         records: HashMap::new(),
+        white: HashMap::new(),
         errors: HashMap::new(),
     };
     let after = ScenarioFrame {
         number: 1,
         records: HashMap::new(),
+        white: HashMap::new(),
         errors: HashMap::from([
             (egui::ViewportId::ROOT, vec!["root error".to_owned()]),
             (sibling, vec!["sibling error".to_owned()]),
@@ -381,6 +397,8 @@ fn configure_active_still_pages(
         .first()
         .and_then(|path| path.parent())
         .map(std::path::Path::to_path_buf);
+    app.top_level_grid_view
+        .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
     app.items = paths.iter().cloned().map(GridItem::Image).collect();
     app.thumbnails = vec![ThumbnailState::Pending; paths.len()];
     app.image_metas = vec![None; paths.len()];
@@ -410,6 +428,269 @@ fn configure_active_still_pages(
             animation: crate::fs_animation::StaticAnimationState::Still,
         },
     );
+}
+
+#[test]
+fn page_alone_white_companion_is_drawn_in_active_and_parked_window() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.page_after_cover_alone_enabled = true;
+        app.settings.final_cover_spread_enabled = false;
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 80.0,
+                y: 80.0,
+                w: CHILD_SIZE.x,
+                h: CHILD_SIZE.y,
+                maximized: false,
+            });
+        let folder = app.tmp.path().join("page-alone-paint");
+        let first = folder.join("first");
+        let second = folder.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let paths = |root: &std::path::Path| {
+            (0..3)
+                .map(|i| root.join(format!("{i}.png")))
+                .collect::<Vec<_>>()
+        };
+        let first_paths = paths(&first);
+        let second_paths = paths(&second);
+        for path in first_paths.iter().chain(second_paths.iter()) {
+            save_portrait(path, [96, 64, 32]);
+        }
+        let second_ctx = driver.ctx.clone();
+        app.build_active_context_for_test(Some(200), DetachedSource::Book, |active| {
+            configure_active_still_pages(
+                active,
+                &second_ctx,
+                &second_paths,
+                1,
+                200,
+                egui::Color32::LIGHT_RED,
+                Default::default(),
+            );
+        });
+        assert!(app.pause_current_active_viewer_context(&driver.ctx));
+        let first_ctx = driver.ctx.clone();
+        app.build_active_context_for_test(Some(100), DetachedSource::Book, |active| {
+            configure_active_still_pages(
+                active,
+                &first_ctx,
+                &first_paths,
+                1,
+                100,
+                egui::Color32::LIGHT_BLUE,
+                Default::default(),
+            );
+        });
+        assert!(app.settings.page_after_cover_alone_enabled);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.set_detached_window_live_hwnds_for_test([0x1000, 0x2000]);
+        app.detached_window_hwnd_set(100, 0x1000);
+        app.detached_window_hwnd_set(200, 0x2000);
+        let viewport = App::detached_image_window_viewport_id(100);
+        driver.focus(viewport);
+        let mut active = driver.root(&mut app);
+        for _ in 0..12 {
+            if !records_for(&active, viewport).is_empty()
+                && active
+                    .white
+                    .get(&viewport)
+                    .is_some_and(|records| !records.is_empty())
+            {
+                break;
+            }
+            active = driver.root(&mut app);
+        }
+        let owner = stable_content(&mut app, 100).expect("active book state");
+        assert_eq!(owner.spread_mode, crate::settings::SpreadMode::LtrCover);
+        app.with_window_viewer_context(100, |owner| {
+            assert!(owner.page_alone_enabled_for_current_book().after_cover);
+            assert_eq!(owner.items.len(), 3);
+            assert_eq!(owner.visible_indices, vec![0, 1, 2]);
+            assert_eq!(owner.current_reader_order(), &[0, 1, 2]);
+            assert!(owner.current_folder.is_some());
+            assert!(!owner.show_search_bar);
+            assert!(!owner.stack_mode_requested);
+            assert!(owner.stack_view.is_none());
+            assert!(matches!(
+                owner.top_level_grid_view.surface(),
+                crate::app::top_level_grid_view::TopLevelGridSurface::Folder
+            ));
+            let (nav, eligible, projection) = owner.page_alone_test_projection();
+            assert_eq!(nav, vec![0, 1, 2]);
+            assert!(eligible);
+            assert_eq!(projection[1].0, vec![1]);
+            assert_eq!(
+                projection[1].1,
+                crate::displayed_image_transform::SingletonSpreadPlacement::RightWhite
+            );
+            let painted = owner
+                .fullscreen_page_layout
+                .page_by_idx(1)
+                .expect("the ready real page has a painted transform");
+            assert!(
+                matches!(
+                    painted.transform.placement,
+                    crate::displayed_image_transform::ResolvedDisplayPlacement::SingletonSpread {
+                        side:
+                            crate::displayed_image_transform::SingletonSpreadPlacement::RightWhite,
+                        ..
+                    }
+                ),
+                "painted placement={:?}",
+                painted.transform.placement
+            );
+        })
+        .unwrap();
+        assert_eq!(records_for(&active, viewport).len(), 1, "real page paint");
+        let active_white = active.white.get(&viewport).expect("white paint records");
+        assert_eq!(active_white.len(), 1, "white draw shape");
+        assert_eq!(active_white[0].viewport, viewport);
+        assert!(active_white[0].rect.intersects(active_white[0].clip));
+
+        app.queue_deferred_detached_window_activation(200, "page_alone_paint_test");
+        let second_viewport = App::detached_image_window_viewport_id(200);
+        driver.focus(second_viewport);
+        let mut activated = driver.root(&mut app);
+        for _ in 0..12 {
+            if !records_for(&activated, second_viewport).is_empty()
+                && activated
+                    .white
+                    .get(&second_viewport)
+                    .is_some_and(|records| !records.is_empty())
+            {
+                break;
+            }
+            activated = driver.root(&mut app);
+        }
+        assert_i1_open_or_paint(
+            "page-alone-white",
+            true,
+            200,
+            second_viewport,
+            &active,
+            &activated,
+        );
+        assert_eq!(records_for(&activated, second_viewport).len(), 1);
+        assert_eq!(activated.white.get(&second_viewport).map(Vec::len), Some(1));
+        assert_eq!(
+            app.detached_window_state(100),
+            Some(DetachedWindowState::Parked)
+        );
+        let parked = driver.deferred(viewport);
+        assert_i2_stable_paint("page-alone-white", viewport, &active, &parked, 1.0);
+        let parked_white = parked
+            .white
+            .get(&viewport)
+            .expect("parked white paint records");
+        assert_eq!(parked_white.len(), 1, "parked frozen white draw shape");
+        assert_eq!(parked_white[0].viewport, viewport);
+        assert!((parked_white[0].rect.center().x - active_white[0].rect.center().x).abs() < 1.0);
+        assert!((parked_white[0].rect.center().y - active_white[0].rect.center().y).abs() < 1.0);
+        for (label, active, parked) in [
+            (
+                "white width",
+                active_white[0].rect.width(),
+                parked_white[0].rect.width(),
+            ),
+            (
+                "white height",
+                active_white[0].rect.height(),
+                parked_white[0].rect.height(),
+            ),
+            (
+                "clip left",
+                active_white[0].clip.left(),
+                parked_white[0].clip.left(),
+            ),
+            (
+                "clip top",
+                active_white[0].clip.top(),
+                parked_white[0].clip.top(),
+            ),
+            (
+                "clip right",
+                active_white[0].clip.right(),
+                parked_white[0].clip.right(),
+            ),
+            (
+                "clip bottom",
+                active_white[0].clip.bottom(),
+                parked_white[0].clip.bottom(),
+            ),
+        ] {
+            assert!(
+                (active - parked).abs() < 1.0,
+                "{label} differs between active and parked white paint: {active} vs {parked}"
+            );
+        }
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn page_alone_white_companion_does_not_paint_as_a_failed_real_texture() {
+    std::thread::spawn(|| {
+        let mut app = setup_app_for_test();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        app.startup_done = true;
+        app.startup_init = None;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.page_after_cover_alone_enabled = true;
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 80.0,
+                y: 80.0,
+                w: CHILD_SIZE.x,
+                h: CHILD_SIZE.y,
+                maximized: false,
+            });
+        let paths = (0..3)
+            .map(|i| app.tmp.path().join(format!("missing-{i}.png")))
+            .collect::<Vec<_>>();
+        let ctx = driver.ctx.clone();
+        app.build_active_context_for_test(Some(100), DetachedSource::Book, |active| {
+            configure_active_still_pages(
+                active,
+                &ctx,
+                &paths,
+                1,
+                100,
+                egui::Color32::LIGHT_BLUE,
+                Default::default(),
+            );
+            active.fs_cache.remove(&1);
+        });
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.set_detached_window_live_hwnds_for_test([0x1000]);
+        app.detached_window_hwnd_set(100, 0x1000);
+        let viewport = App::detached_image_window_viewport_id(100);
+        driver.focus(viewport);
+        let loading = driver.root(&mut app);
+        assert!(
+            loading.white.get(&viewport).is_none_or(Vec::is_empty),
+            "a loading real page cannot make the white decoration appear ready"
+        );
+        app.fs_cache.insert(1, FsCacheEntry::Failed);
+        let failed = driver.root(&mut app);
+        assert!(
+            failed.white.get(&viewport).is_none_or(Vec::is_empty),
+            "a failed real page cannot paint a white decoration"
+        );
+    })
+    .join()
+    .expect("scenario thread");
 }
 
 #[test]
@@ -764,6 +1045,7 @@ fn run_scenario_a(book: ScenarioABook) {
     let mut before = ScenarioFrame {
         number: 0,
         records: HashMap::new(),
+        white: HashMap::new(),
         errors: HashMap::new(),
     };
     let held = driver.root(&mut app);
@@ -892,6 +1174,7 @@ fn multiwindow_scenario_search_result_image_sidecar_reaches_paint() {
         let mut before = ScenarioFrame {
             number: 0,
             records: HashMap::new(),
+            white: HashMap::new(),
             errors: HashMap::new(),
         };
         let held = driver.root(&mut app);

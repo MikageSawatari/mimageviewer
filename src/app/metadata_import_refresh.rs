@@ -78,6 +78,7 @@ pub(crate) struct ContainerStateResult {
     pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     pub(crate) singleton_spread_endpoint_preferences:
         crate::settings::SingletonSpreadEndpointPreferences,
+    pub(crate) page_alone_preferences: crate::settings::PageAlonePreferences,
     pub(crate) view_trim: Option<crate::view_trim::ViewTrimBookState>,
 }
 
@@ -555,6 +556,18 @@ fn build_context_result(
                         return None;
                     }
                 };
+                let page_alone_preferences = match spread_db
+                    .map(|db| db.get_page_alone_preferences_with_fallback(path, fallback))
+                    .transpose()
+                {
+                    Ok(value) => value.unwrap_or_default(),
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "spread: metadata refresh page-alone read failed: {error}"
+                        ));
+                        return None;
+                    }
+                };
                 let view_trim = container_trim_db.and_then(|db| db.get_book_state(path));
                 Some(ContainerStateResult {
                     spread_mode,
@@ -562,6 +575,7 @@ fn build_context_result(
                     reading_direction,
                     final_cover_spread_preference,
                     singleton_spread_endpoint_preferences,
+                    page_alone_preferences,
                     view_trim,
                 })
             })
@@ -797,7 +811,10 @@ mod tests {
 
     #[test]
     fn spread_preferences_refresh_preserves_nested_fallback_and_explicit_follow_global() {
-        use crate::settings::{FinalCoverSpreadPreference, SingletonSpreadPlacementPreference};
+        use crate::settings::{
+            FinalCoverSpreadPreference, PageAlonePreference, PageAlonePreferences,
+            SingletonSpreadPlacementPreference,
+        };
 
         let temp = tempfile::TempDir::new().unwrap();
         let data_dir = temp.path().join("data");
@@ -814,6 +831,16 @@ mod tests {
                 &root,
                 None,
                 SingletonSpreadPlacementPreference::Center.into(),
+            )
+            .unwrap();
+        spread_db
+            .set_page_alone_preferences(
+                &root,
+                None,
+                PageAlonePreferences {
+                    after_cover: PageAlonePreference::On,
+                    last: PageAlonePreference::Off,
+                },
             )
             .unwrap();
 
@@ -854,6 +881,13 @@ mod tests {
             state.singleton_spread_endpoint_preferences,
             SingletonSpreadPlacementPreference::Center
         );
+        assert_eq!(
+            state.page_alone_preferences,
+            PageAlonePreferences {
+                after_cover: PageAlonePreference::On,
+                last: PageAlonePreference::Off
+            }
+        );
 
         spread_db
             .set_final_cover_spread_preference(
@@ -869,6 +903,9 @@ mod tests {
                 SingletonSpreadPlacementPreference::FollowGlobal.into(),
             )
             .unwrap();
+        spread_db
+            .set_page_alone_preferences(&nested, Some(&root), PageAlonePreferences::default())
+            .unwrap();
         let state = refresh();
         assert_eq!(
             state.final_cover_spread_preference,
@@ -877,6 +914,10 @@ mod tests {
         assert_eq!(
             state.singleton_spread_endpoint_preferences,
             SingletonSpreadPlacementPreference::FollowGlobal
+        );
+        assert_eq!(
+            state.page_alone_preferences,
+            PageAlonePreferences::default()
         );
     }
 

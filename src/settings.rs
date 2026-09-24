@@ -3202,6 +3202,83 @@ impl SingletonSpreadEndpointPreferences {
     }
 }
 
+/// Whether a near-end real page is displayed alone in cover-on spread mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PageAlonePreference {
+    #[default]
+    FollowGlobal,
+    On,
+    Off,
+}
+
+impl PageAlonePreference {
+    pub(crate) const fn all() -> &'static [Self] {
+        &[Self::FollowGlobal, Self::On, Self::Off]
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FollowGlobal => "全体設定に従う",
+            Self::On => "オン",
+            Self::Off => "オフ",
+        }
+    }
+
+    pub(crate) const fn effective(self, global_enabled: bool) -> bool {
+        match self {
+            Self::FollowGlobal => global_enabled,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+
+    pub(crate) const fn to_int(self) -> i32 {
+        match self {
+            Self::FollowGlobal => 0,
+            Self::On => 1,
+            Self::Off => 2,
+        }
+    }
+
+    pub(crate) const fn from_int(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::FollowGlobal),
+            1 => Some(Self::On),
+            2 => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn toggled(self, global_enabled: bool) -> Self {
+        if self.effective(global_enabled) {
+            Self::Off
+        } else {
+            Self::On
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PageAloneSettings {
+    pub after_cover: bool,
+    pub last: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PageAlonePreferences {
+    pub after_cover: PageAlonePreference,
+    pub last: PageAlonePreference,
+}
+
+impl PageAlonePreferences {
+    pub(crate) const fn effective(self, global: PageAloneSettings) -> PageAloneSettings {
+        PageAloneSettings {
+            after_cover: self.after_cover.effective(global.after_cover),
+            last: self.last.effective(global.last),
+        }
+    }
+}
+
 // ReadingFlow (フルスクリーン連結方式)
 // -----------------------------------------------------------------------
 
@@ -4614,6 +4691,12 @@ pub struct Settings {
     /// 見開き末尾の単ページを本来の側へ置く全体既定。
     #[serde(default)]
     pub singleton_spread_last_enabled: bool,
+    /// In cover-on spread mode, show the real page after the cover alone.
+    #[serde(default)]
+    pub page_after_cover_alone_enabled: bool,
+    /// In cover-on spread mode, show the final real page alone.
+    #[serde(default)]
+    pub last_page_alone_enabled: bool,
     /// 見開き内の左右ページ間隔 (画面 px)。0 でページを隙間なく接続する。
     #[serde(default = "default_spread_page_gap_px")]
     pub spread_page_gap_px: u32,
@@ -6827,6 +6910,8 @@ impl Default for Settings {
             final_cover_spread_enabled: true,
             singleton_spread_first_enabled: false,
             singleton_spread_last_enabled: false,
+            page_after_cover_alone_enabled: false,
+            last_page_alone_enabled: false,
             spread_page_gap_px: default_spread_page_gap_px(),
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
             fullscreen_image_margin_color: FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT,
@@ -9538,6 +9623,35 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_alone_key_action_writes_opposite_effective_value() {
+        assert!(!Settings::default().page_after_cover_alone_enabled);
+        assert!(!Settings::default().last_page_alone_enabled);
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.page_after_cover_alone_enabled);
+        assert!(!legacy.last_page_alone_enabled);
+        for global in [false, true] {
+            let selected = PageAlonePreference::FollowGlobal.toggled(global);
+            assert_eq!(
+                selected,
+                if global {
+                    PageAlonePreference::Off
+                } else {
+                    PageAlonePreference::On
+                }
+            );
+            assert_eq!(selected.effective(global), !global);
+        }
+        assert_eq!(
+            PageAlonePreference::On.toggled(false),
+            PageAlonePreference::Off
+        );
+        assert_eq!(
+            PageAlonePreference::Off.toggled(true),
+            PageAlonePreference::On
+        );
+    }
 
     /// ゲームパッドの有効/無効は既定 true。設定を知らない頃のファイルを読んでも、
     /// 既存利用者のパッドを黙って切らない。

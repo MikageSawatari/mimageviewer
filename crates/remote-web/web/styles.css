@@ -1323,6 +1323,21 @@ select {
   justify-content: flex-start;
 }
 
+.viewer-pages[data-singleton-placement="left_white"] {
+  justify-content: flex-start;
+}
+
+.viewer-pages[data-singleton-placement="right_white"] {
+  justify-content: flex-end;
+}
+
+.viewer-white-companion {
+  flex: 0 0 auto;
+  align-self: center;
+  background: #fff;
+  pointer-events: none;
+}
+
 .viewer-pages[data-singleton-placement="right"] {
   justify-content: flex-end;
 }

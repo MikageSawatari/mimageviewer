@@ -985,6 +985,7 @@ pub(in crate::app) struct ViewerContextBundle {
     spread_mode: crate::settings::SpreadMode,
     final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     singleton_spread_endpoint_preferences: crate::settings::SingletonSpreadEndpointPreferences,
+    page_alone_preferences: crate::settings::PageAlonePreferences,
     spread_shift_anchor_idx: Option<usize>,
     reading_flow: crate::settings::ReadingFlow,
     reading_direction: crate::settings::ReadingDirection,
@@ -1573,6 +1574,7 @@ impl ViewerContextBundle {
             final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference::default(),
             singleton_spread_endpoint_preferences:
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
+            page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift_anchor_idx: None,
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
@@ -1939,6 +1941,7 @@ impl App {
             spread_mode,
             final_cover_spread_preference,
             singleton_spread_endpoint_preferences,
+            page_alone_preferences,
             spread_shift_anchor_idx,
             reading_flow,
             reading_direction,
@@ -2214,6 +2217,7 @@ impl App {
         swap_field!(spread_mode);
         swap_field!(final_cover_spread_preference);
         swap_field!(singleton_spread_endpoint_preferences);
+        swap_field!(page_alone_preferences);
         swap_field!(spread_shift_anchor_idx);
         swap_field!(reading_flow);
         swap_field!(reading_direction);
@@ -2528,6 +2532,7 @@ impl App {
             spread_mode,
             final_cover_spread_preference,
             singleton_spread_endpoint_preferences,
+            page_alone_preferences,
             spread_shift_anchor_idx,
             reading_flow,
             reading_direction,
@@ -2842,6 +2847,7 @@ impl App {
             spread_mode,
             final_cover_spread_preference,
             singleton_spread_endpoint_preferences,
+            page_alone_preferences,
             spread_shift_anchor_idx,
             reading_flow,
             reading_direction,
@@ -2915,6 +2921,7 @@ impl App {
         detached.spread_mode = self.spread_mode;
         detached.final_cover_spread_preference = self.final_cover_spread_preference;
         detached.singleton_spread_endpoint_preferences = self.singleton_spread_endpoint_preferences;
+        detached.page_alone_preferences = self.page_alone_preferences;
         detached.spread_shift_anchor_idx = self.spread_shift_anchor_idx;
         detached.reading_flow = self.reading_flow;
         detached.reading_direction = self.reading_direction;
@@ -3236,6 +3243,47 @@ impl App {
                 || last_changed
                     && preferences.last
                         == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal)
+            {
+                continue;
+            }
+            bundle.similar_panel.preview.invalidate();
+            bundle
+                .fs_lanczos_cache
+                .retain_similar_preview_resource(None);
+            bundle.fullscreen_navigator_interaction.invalidate();
+            if matches!(
+                bundle.fs_holdover_tex,
+                Some(crate::app::FsHoldover::FinalEffectSourceReload(_))
+            ) {
+                bundle.fs_holdover_tex = None;
+            }
+            bundle.fullscreen_page_layout.clear();
+            bundle.fs_vertical_scroll = 0.0;
+            bundle.fs_pan = egui::Vec2::ZERO;
+            bundle.fs_free_rotation = 0.0;
+            bundle.fs_vertical_cache_keep_set.clear();
+            bundle.continuous_page_transitions.clear();
+            bundle.slideshow_scroll_range_cache = None;
+        }
+    }
+
+    pub(crate) fn invalidate_page_alone_in_parked_contexts(
+        &mut self,
+        after_cover_changed: bool,
+        last_changed: bool,
+    ) {
+        for id in self.viewer_contexts.table.other_ids() {
+            let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) else {
+                continue;
+            };
+            if !bundle.spread_mode.has_cover() {
+                continue;
+            }
+            let preferences = bundle.page_alone_preferences;
+            if !(after_cover_changed
+                && preferences.after_cover == crate::settings::PageAlonePreference::FollowGlobal
+                || last_changed
+                    && preferences.last == crate::settings::PageAlonePreference::FollowGlobal)
             {
                 continue;
             }
@@ -3994,6 +4042,69 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_alone_preference_survives_context_exchange_and_only_inherited_changes_invalidate() {
+        use crate::settings::{PageAlonePreference as P, PageAlonePreferences};
+        let mut app = crate::app::setup_app_for_test();
+        let inherited_after = app.build_window_context_for_test(731, |owner| {
+            owner.spread_mode = crate::settings::SpreadMode::LtrCover;
+            owner.page_alone_preferences = PageAlonePreferences {
+                after_cover: P::FollowGlobal,
+                last: P::Off,
+            };
+            owner.fs_vertical_scroll = 111.0;
+        });
+        let explicit_after = app.build_window_context_for_test(732, |owner| {
+            owner.spread_mode = crate::settings::SpreadMode::LtrCover;
+            owner.page_alone_preferences = PageAlonePreferences {
+                after_cover: P::On,
+                last: P::FollowGlobal,
+            };
+            owner.fs_vertical_scroll = 222.0;
+        });
+        let cover_off = app.build_window_context_for_test(733, |owner| {
+            owner.spread_mode = crate::settings::SpreadMode::Ltr;
+            owner.page_alone_preferences = PageAlonePreferences::default();
+            owner.fs_vertical_scroll = 333.0;
+        });
+        app.invalidate_page_alone_in_parked_contexts(true, false);
+        for (id, preference, scroll) in [
+            (
+                inherited_after,
+                PageAlonePreferences {
+                    after_cover: P::FollowGlobal,
+                    last: P::Off,
+                },
+                0.0,
+            ),
+            (
+                explicit_after,
+                PageAlonePreferences {
+                    after_cover: P::On,
+                    last: P::FollowGlobal,
+                },
+                222.0,
+            ),
+            (cover_off, PageAlonePreferences::default(), 333.0),
+        ] {
+            app.with_viewer_context(id, |owner| {
+                assert_eq!(owner.page_alone_preferences, preference);
+                assert_eq!(owner.fs_vertical_scroll, scroll);
+            })
+            .unwrap();
+        }
+        app.invalidate_page_alone_in_parked_contexts(false, true);
+        app.with_viewer_context(explicit_after, |owner| {
+            assert_eq!(owner.fs_vertical_scroll, 0.0);
+        })
+        .unwrap();
+        app.with_viewer_context(cover_off, |owner| {
+            assert_eq!(owner.fs_vertical_scroll, 333.0);
+        })
+        .unwrap();
     }
 
     #[cfg(windows)]

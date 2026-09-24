@@ -12,9 +12,9 @@ use mimageviewer_ipc::{
     FolderListResponse, MediaError, MediaErrorCode, PageGroup, PagePayload, PagePriority,
     PageRequest, PageResponse, RemoteAddress, RemoteAiProgressPhase, RemoteAiStartRequest,
     RemoteAiTerminalCode, RemoteBookBookmarkList, RemoteBookBookmarkRow, RemoteBookBookmarkTarget,
-    RemoteEntryKind, RemoteFinalCoverSpreadPreference, RemotePageDisplaySlot,
-    RemotePagePresentationRole, RemotePagePresentationSlot, RemotePageRenderContext,
-    RemoteReadingDirection, RemoteSingletonSpreadPlacement,
+    RemoteEntryKind, RemoteFinalCoverSpreadPreference, RemotePageAlonePreference,
+    RemotePageDisplaySlot, RemotePagePresentationRole, RemotePagePresentationSlot,
+    RemotePageRenderContext, RemoteReadingDirection, RemoteSingletonSpreadPlacement,
     RemoteSingletonSpreadPlacementPreference, RemoteSpreadMode, RemoteSubresource,
     RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
     RemoteWriteResult, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
@@ -1961,6 +1961,10 @@ struct SpreadPayload {
     singleton_last_preference: RemoteSingletonSpreadPlacementPreference,
     singleton_first_enabled: bool,
     singleton_last_enabled: bool,
+    page_after_cover_alone_preference: RemotePageAlonePreference,
+    last_page_alone_preference: RemotePageAlonePreference,
+    page_after_cover_alone_enabled: bool,
+    last_page_alone_enabled: bool,
     spread_page_gap_px: u32,
     image_count: usize,
     video_count: usize,
@@ -2784,7 +2788,8 @@ impl ContainerEngine {
             RemoteWriteRequest::SetSpread { address, .. }
             | RemoteWriteRequest::SetFinalCoverSpreadPreference { address, .. }
             | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { address, .. }
-            | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { address, .. } => {
+            | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { address, .. }
+            | RemoteWriteRequest::SetPageAlonePreference { address, .. } => {
                 let resolved = self
                     .resolve(address)
                     .map_err(remote_write_error_from_media)?;
@@ -4598,6 +4603,10 @@ impl ContainerEngine {
             singleton_spread_last_preference: spread.singleton_last_preference,
             singleton_spread_first_enabled: spread.singleton_first_enabled,
             singleton_spread_last_enabled: spread.singleton_last_enabled,
+            page_after_cover_alone_preference: spread.page_after_cover_alone_preference,
+            last_page_alone_preference: spread.last_page_alone_preference,
+            page_after_cover_alone_enabled: spread.page_after_cover_alone_enabled,
+            last_page_alone_enabled: spread.last_page_alone_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
@@ -4756,6 +4765,10 @@ impl ContainerEngine {
             singleton_spread_last_preference: spread.singleton_last_preference,
             singleton_spread_first_enabled: spread.singleton_first_enabled,
             singleton_spread_last_enabled: spread.singleton_last_enabled,
+            page_after_cover_alone_preference: spread.page_after_cover_alone_preference,
+            last_page_alone_preference: spread.last_page_alone_preference,
+            page_after_cover_alone_enabled: spread.page_after_cover_alone_enabled,
+            last_page_alone_enabled: spread.last_page_alone_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
@@ -4845,6 +4858,10 @@ impl ContainerEngine {
             singleton_spread_last_preference: spread.singleton_last_preference,
             singleton_spread_first_enabled: spread.singleton_first_enabled,
             singleton_spread_last_enabled: spread.singleton_last_enabled,
+            page_after_cover_alone_preference: spread.page_after_cover_alone_preference,
+            last_page_alone_preference: spread.last_page_alone_preference,
+            page_after_cover_alone_enabled: spread.page_after_cover_alone_enabled,
+            last_page_alone_enabled: spread.last_page_alone_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
@@ -4874,8 +4891,13 @@ impl ContainerEngine {
         } else {
             crate::spread_db::container_key_with_fallback(&resolved.logical, &[])
         };
-        let (stored_mode, stored_direction, final_cover_preference, singleton_placement_preference) =
-            self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
+        let (
+            stored_mode,
+            stored_direction,
+            final_cover_preference,
+            singleton_placement_preference,
+            page_alone_preference,
+        ) = self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
         let source_items = source_items.unwrap_or(items);
         let (default_mode, default_direction) = if use_book_defaults {
             (
@@ -4914,12 +4936,18 @@ impl ContainerEngine {
                 last: reading_settings.singleton_spread_last_enabled,
             },
         );
-        let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_composition(
+        let page_alone_enabled =
+            page_alone_preference.effective(crate::settings::PageAloneSettings {
+                after_cover: reading_settings.page_after_cover_alone_enabled,
+                last: reading_settings.last_page_alone_enabled,
+            });
+        let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_page_alone(
             items,
             core_spread_mode(effective),
             &landscape,
             final_cover_enabled,
             singleton_placement_enabled,
+            page_alone_enabled,
             complete_book_eligible,
         );
         let container_address = page_identity_from_resolved(resolved, &request.address.subresource);
@@ -4982,6 +5010,12 @@ impl ContainerEngine {
             ),
             singleton_first_enabled: singleton_placement_enabled.first,
             singleton_last_enabled: singleton_placement_enabled.last,
+            page_after_cover_alone_preference: remote_page_alone_preference(
+                page_alone_preference.after_cover,
+            ),
+            last_page_alone_preference: remote_page_alone_preference(page_alone_preference.last),
+            page_after_cover_alone_enabled: page_alone_enabled.after_cover,
+            last_page_alone_enabled: page_alone_enabled.last,
             spread_page_gap_px: reading_settings.spread_page_gap_px,
             image_count,
             video_count,
@@ -5000,6 +5034,7 @@ impl ContainerEngine {
             Option<crate::settings::ReadingDirection>,
             crate::settings::FinalCoverSpreadPreference,
             crate::settings::SingletonSpreadEndpointPreferences,
+            crate::settings::PageAlonePreferences,
         ),
         MediaError,
     > {
@@ -5033,11 +5068,24 @@ impl ContainerEngine {
                 )
             })?
             .unwrap_or_default();
+        let page_alone_preference = db
+            .as_ref()
+            .map(|db| db.get_page_alone_preferences_with_fallback(key, fallback))
+            .transpose()
+            .map_err(|error| {
+                crate::logger::log(format!("remote_ipc: page-alone read failed: {error}"));
+                media_error(
+                    MediaErrorCode::Internal,
+                    "単独ページの保存設定を読み込めませんでした",
+                )
+            })?
+            .unwrap_or_default();
         Ok((
             stored.mode,
             stored.direction,
             final_cover_preference,
             singleton_placement_preference,
+            page_alone_preference,
         ))
     }
 
@@ -6883,6 +6931,24 @@ fn remote_singleton_spread_placement(
         crate::displayed_image_transform::SingletonSpreadPlacement::Right => {
             RemoteSingletonSpreadPlacement::Right
         }
+        crate::displayed_image_transform::SingletonSpreadPlacement::LeftWhite => {
+            RemoteSingletonSpreadPlacement::LeftWhite
+        }
+        crate::displayed_image_transform::SingletonSpreadPlacement::RightWhite => {
+            RemoteSingletonSpreadPlacement::RightWhite
+        }
+    }
+}
+
+fn remote_page_alone_preference(
+    preference: crate::settings::PageAlonePreference,
+) -> RemotePageAlonePreference {
+    match preference {
+        crate::settings::PageAlonePreference::FollowGlobal => {
+            RemotePageAlonePreference::FollowGlobal
+        }
+        crate::settings::PageAlonePreference::On => RemotePageAlonePreference::On,
+        crate::settings::PageAlonePreference::Off => RemotePageAlonePreference::Off,
     }
 }
 
@@ -7558,6 +7624,10 @@ mod tests {
                 RemoteSingletonSpreadPlacementPreference::FollowGlobal,
             singleton_spread_first_enabled: false,
             singleton_spread_last_enabled: false,
+            page_after_cover_alone_preference: RemotePageAlonePreference::FollowGlobal,
+            last_page_alone_preference: RemotePageAlonePreference::FollowGlobal,
+            page_after_cover_alone_enabled: false,
+            last_page_alone_enabled: false,
             image_count: total,
             video_count: 0,
             other_count: 0,
@@ -10960,6 +11030,75 @@ mod tests {
                 .map(|group| (&group.anchor, &group.pages, group.slice))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn page_alone_remote_payload_has_real_addresses_and_white_only_for_complete_cover_books() {
+        let temp = tempfile::tempdir().unwrap();
+        let pages = (0..5)
+            .map(|index| {
+                let path = temp.path().join(format!("{index:03}.jpg"));
+                std::fs::write(&path, b"not-an-image").unwrap();
+                crate::grid_item::GridItem::Image(path)
+            })
+            .collect::<Vec<_>>();
+        let resolved = resolve_existing(temp.path().to_string_lossy().as_ref()).unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            page_after_cover_alone_enabled: true,
+            last_page_alone_enabled: true,
+            final_cover_spread_enabled: true,
+            ..Default::default()
+        });
+        *engine
+            .spread_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Ok(None);
+        let request = ContainerRequest {
+            address: RemoteAddress::file(temp.path().to_string_lossy().into_owned()),
+            spread_mode: Some(RemoteSpreadMode::LtrCover),
+            reading_direction: Some(RemoteReadingDirection::Ltr),
+            force_single_page: false,
+        };
+        let complete = engine
+            .spread_payload(&request, &resolved, &pages, None, None, true, true)
+            .unwrap();
+        assert_eq!(
+            complete.page_after_cover_alone_preference,
+            RemotePageAlonePreference::FollowGlobal
+        );
+        assert!(complete.page_after_cover_alone_enabled);
+        assert!(complete.last_page_alone_enabled);
+        assert_eq!(
+            complete
+                .groups
+                .iter()
+                .map(|group| group.pages.len())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2, 1]
+        );
+        assert_eq!(
+            complete.groups[1].singleton_placement,
+            RemoteSingletonSpreadPlacement::RightWhite
+        );
+        assert_eq!(
+            complete.groups[3].singleton_placement,
+            RemoteSingletonSpreadPlacement::RightWhite
+        );
+        assert!(
+            complete
+                .groups
+                .iter()
+                .all(|group| group.presentation.is_none()),
+            "white singles suppress the end-cover supplement"
+        );
+        let incomplete = engine
+            .spread_payload(&request, &resolved, &pages, None, None, true, false)
+            .unwrap();
+        assert_eq!(incomplete.groups.len(), 3);
+        assert!(incomplete.groups.iter().all(|group| !matches!(
+            group.singleton_placement,
+            RemoteSingletonSpreadPlacement::LeftWhite | RemoteSingletonSpreadPlacement::RightWhite
+        )));
     }
 
     #[test]

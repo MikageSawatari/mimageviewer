@@ -1676,6 +1676,8 @@ pub enum KeyAction {
     FsSpreadShiftRight,
     FsSpreadShiftPrev,
     FsSpreadShiftNext,
+    FsTogglePageAfterCoverAlone,
+    FsToggleLastPageAlone,
     FsSlideshow,
     FsSeekStripToggle,
     FsSpaceCheck,
@@ -2221,6 +2223,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsSpreadShiftRight,
     KeyAction::FsSpreadShiftPrev,
     KeyAction::FsSpreadShiftNext,
+    KeyAction::FsTogglePageAfterCoverAlone,
+    KeyAction::FsToggleLastPageAlone,
     KeyAction::FsSlideshow,
     KeyAction::FsSeekStripToggle,
     KeyAction::FsSpaceCheck,
@@ -4129,6 +4133,8 @@ impl KeyAction {
             FsSpreadShiftRight => "FsSpreadShiftRight",
             FsSpreadShiftPrev => "FsSpreadShiftPrev",
             FsSpreadShiftNext => "FsSpreadShiftNext",
+            FsTogglePageAfterCoverAlone => "FsTogglePageAfterCoverAlone",
+            FsToggleLastPageAlone => "FsToggleLastPageAlone",
             FsSlideshow => "FsSlideshow",
             FsSeekStripToggle => "FsSeekStripToggle",
             FsSpaceCheck => "FsSpaceCheck",
@@ -4839,6 +4845,8 @@ impl KeyAction {
             FsSpreadShiftRight => "見開き表示を右方向へ1ページずらす",
             FsSpreadShiftPrev => "見開き表示を前のページ方向へ1ページずらす",
             FsSpreadShiftNext => "見開き表示を次のページ方向へ1ページずらす",
+            FsTogglePageAfterCoverAlone => "表紙の次のページを単独で表示",
+            FsToggleLastPageAlone => "最終ページを単独で表示",
             FsSlideshow => "スライドショーの再生または停止を切り替える",
             FsSeekStripToggle => "画像フルスクリーンのサムネイル列表示を切り替える",
             FsSpaceCheck => "現在の画像のチェックを切り替える。スライドショー中は停止する",
@@ -5344,6 +5352,8 @@ impl KeyAction {
             | FsSpreadShiftRight
             | FsSpreadShiftPrev
             | FsSpreadShiftNext
+            | FsTogglePageAfterCoverAlone
+            | FsToggleLastPageAlone
             | FsPagePrev
             | FsPageNext
             | FsFixedJumpPrev
@@ -5842,6 +5852,8 @@ impl KeyAction {
             | FsSpreadShiftRight
             | FsSpreadShiftPrev
             | FsSpreadShiftNext
+            | FsTogglePageAfterCoverAlone
+            | FsToggleLastPageAlone
             | FsSlideshow
             | FsSeekStripToggle
             | FsSpaceCheck
@@ -6367,6 +6379,7 @@ impl KeyAction {
             FsSpreadShiftLeft => ChordList::one(Chord::ctrl(Left)),
             FsSpreadShiftRight => ChordList::one(Chord::ctrl(Right)),
             FsSpreadShiftPrev | FsSpreadShiftNext => ChordList::EMPTY,
+            FsTogglePageAfterCoverAlone | FsToggleLastPageAlone => ChordList::EMPTY,
             FsSlideshow => ChordList::one(Chord::key(S)),
             FsSeekStripToggle => ChordList::one(Chord::shift(S)),
             FsSpaceCheck => ChordList::one(Chord::key(Space)),
@@ -12176,6 +12189,19 @@ mod tests {
             Some(Chord::ctrl(KeyName::G))
         );
         assert!(KeyAction::FsLocalAdjustMode.is_user_facing());
+    }
+
+    #[test]
+    fn page_alone_actions_are_unbound_image_fullscreen_press_actions() {
+        for action in [
+            KeyAction::FsTogglePageAfterCoverAlone,
+            KeyAction::FsToggleLastPageAlone,
+        ] {
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(action.default_chords().iter().count(), 0);
+            assert!(ALL_ACTIONS.contains(&action));
+        }
     }
 
     #[test]

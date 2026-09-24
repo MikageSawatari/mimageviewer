@@ -2019,6 +2019,7 @@ fn operation_description(message: &ClientMessage) -> String {
             | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. } => {
                 "端の単ページ配置を書き込み中"
             }
+            RemoteWriteRequest::SetPageAlonePreference { .. } => "単独ページ設定を書き込み中",
             RemoteWriteRequest::RecordReadingProgress { .. } => "読書位置を記録中",
             RemoteWriteRequest::SetRating { .. } => "レーティングを書き込み中",
             RemoteWriteRequest::SetBookmark { .. } => "ブックマークを書き込み中",

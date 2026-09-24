@@ -2002,6 +2002,11 @@ impl crate::app::App {
                 Some(*endpoint),
                 *preference,
             ),
+            RemoteWriteRequest::SetPageAlonePreference {
+                address,
+                endpoint,
+                preference,
+            } => self.persist_remote_page_alone_preference(address, *endpoint, *preference),
             RemoteWriteRequest::RecordReadingProgress {
                 address,
                 context_address,
@@ -2329,6 +2334,56 @@ impl crate::app::App {
                     "remote_ipc: UI write failed kind=set_singleton_spread_placement_preference duration_ms={:.1} error={error}",
                     started.elapsed().as_secs_f64() * 1000.0
                 ));
+                write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "spread.db への保存に失敗しました",
+                )
+            }
+        }
+    }
+
+    fn persist_remote_page_alone_preference(
+        &mut self,
+        address: &mimageviewer_ipc::RemoteAddress,
+        endpoint: mimageviewer_ipc::RemotePageAloneEndpoint,
+        preference: mimageviewer_ipc::RemotePageAlonePreference,
+    ) -> RemoteWriteResponse {
+        let key = match remote_spread_key(address) {
+            Ok(key) => key,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        let Ok(db) = self.spread_db.as_mut() else {
+            return write_error(
+                RemoteWriteErrorCode::PersistenceFailed,
+                "spread.db を開けなかったため保存できません",
+            );
+        };
+        let result = db
+            .get_page_alone_preferences_with_fallback(&key.exact, key.fallback.as_deref())
+            .and_then(|mut current| {
+                let value = match preference {
+                    mimageviewer_ipc::RemotePageAlonePreference::FollowGlobal => {
+                        crate::settings::PageAlonePreference::FollowGlobal
+                    }
+                    mimageviewer_ipc::RemotePageAlonePreference::On => {
+                        crate::settings::PageAlonePreference::On
+                    }
+                    mimageviewer_ipc::RemotePageAlonePreference::Off => {
+                        crate::settings::PageAlonePreference::Off
+                    }
+                };
+                match endpoint {
+                    mimageviewer_ipc::RemotePageAloneEndpoint::AfterCover => {
+                        current.after_cover = value
+                    }
+                    mimageviewer_ipc::RemotePageAloneEndpoint::Last => current.last = value,
+                }
+                db.set_page_alone_preferences(&key.exact, key.fallback.as_deref(), current)
+            });
+        match result {
+            Ok(()) => RemoteWriteResponse::Success(RemoteWriteResult::applied()),
+            Err(error) => {
+                crate::logger::log(format!("remote_ipc: page-alone write failed: {error}"));
                 write_error(
                     RemoteWriteErrorCode::PersistenceFailed,
                     "spread.db への保存に失敗しました",
@@ -3691,6 +3746,7 @@ fn remote_write_uses_settings_family(request: &RemoteWriteRequest) -> bool {
         | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
         | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
         | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
+        | RemoteWriteRequest::SetPageAlonePreference { .. }
         | RemoteWriteRequest::RecordReadingProgress { .. }
         | RemoteWriteRequest::SetRating { .. }
         | RemoteWriteRequest::SetBookmark { .. }

@@ -1454,6 +1454,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-24 §1.240: 表紙あり見開きの白い相方面**
+
+承認済み §1.240 の本別設定を既存 viewer context bundle に保持し、休止窓 snapshot は
+捕捉時の実ページ texture と白い相方の矩形・clip を同じ frozen record に保存する。
+active と passive は同じ実ページ配置から描き、白い面の draw 証拠を別 record で検査する。
+window identity、park/focus predicate、HWND、lifecycle は変更しない。白面は実ページの
+decoration であり新しい navigation/page owner を作らない。
+再レビューの修正では、live holdover にも捕捉時の配置・白矩形・clip と実ページ矩形の
+viewport 基準を保持し、設定変更では動かさず resize 時だけ再投影する。休止窓は同じ
+捕捉 geometry を frozen record へ渡す。active/parked の実 paint は白矩形の中心・寸法・
+clip を比較する。window identity と lifecycle は変更しない。
+
 **2026-09-24 §1.268 A2 chunk 2: filename-stack prepare の bundle owner**
 
 `src/app/viewer_context_registry.rs` の bundle swap に stack prepare pending と request sequence を

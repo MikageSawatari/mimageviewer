@@ -31,6 +31,78 @@ struct PaintSubmission {
     provenance: TestPaintProvenance,
 }
 
+#[derive(Clone)]
+struct WhiteCompanionSubmission;
+
+/// Marker emitted next to the actual draw shape, never inferred from a unit DTO.
+pub(crate) fn record_white_companion_paint(painter: &egui::Painter, rect: egui::Rect) {
+    if !CAPTURE_DEPTH.with(|depth| depth.get() > 0) {
+        return;
+    }
+    painter.add(egui::PaintCallback {
+        rect,
+        callback: Arc::new(WhiteCompanionSubmission),
+    });
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WhiteCompanionPaintRecord {
+    pub(crate) viewport: egui::ViewportId,
+    pub(crate) rect: egui::Rect,
+    pub(crate) clip: egui::Rect,
+}
+
+pub(crate) fn white_companion_paint_records(
+    viewport: egui::ViewportId,
+    output: &egui::FullOutput,
+) -> Vec<WhiteCompanionPaintRecord> {
+    fn visit(
+        viewport: egui::ViewportId,
+        clip: egui::Rect,
+        shape: &egui::Shape,
+        pending: &mut bool,
+        records: &mut Vec<WhiteCompanionPaintRecord>,
+    ) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(viewport, clip, shape, pending, records);
+                }
+            }
+            egui::Shape::Callback(callback)
+                if callback
+                    .callback
+                    .downcast_ref::<WhiteCompanionSubmission>()
+                    .is_some() =>
+            {
+                *pending = true;
+            }
+            egui::Shape::Rect(shape) if std::mem::take(pending) => {
+                assert_eq!(shape.fill, egui::Color32::WHITE);
+                records.push(WhiteCompanionPaintRecord {
+                    viewport,
+                    rect: shape.rect,
+                    clip,
+                });
+            }
+            _ => {}
+        }
+    }
+    let mut records = Vec::new();
+    let mut pending = false;
+    for clipped in &output.shapes {
+        visit(
+            viewport,
+            clipped.clip_rect,
+            &clipped.shape,
+            &mut pending,
+            &mut records,
+        );
+    }
+    assert!(!pending, "white companion marker has no draw shape");
+    records
+}
+
 pub(crate) fn record_selected_paint_resource(
     painter: &egui::Painter,
     resource: &FullscreenPaintResource,

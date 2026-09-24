@@ -27,6 +27,12 @@ export const CommandName = Object.freeze({
   SINGLETON_LAST_CENTER: "singleton_last_center",
   SINGLETON_PLACEMENT_PLACE: "singleton_placement_place",
   SINGLETON_PLACEMENT_CENTER: "singleton_placement_center",
+  PAGE_AFTER_COVER_FOLLOW_GLOBAL: "page_after_cover_follow_global",
+  PAGE_AFTER_COVER_ON: "page_after_cover_on",
+  PAGE_AFTER_COVER_OFF: "page_after_cover_off",
+  LAST_PAGE_ALONE_FOLLOW_GLOBAL: "last_page_alone_follow_global",
+  LAST_PAGE_ALONE_ON: "last_page_alone_on",
+  LAST_PAGE_ALONE_OFF: "last_page_alone_off",
   SET_TRANSFORM: "set_transform",
   PAN_BY: "pan_by",
   TOGGLE_MENU: "toggle_menu",
@@ -1221,8 +1227,10 @@ export function viewerSpreadLayout({
   }));
   if (!sources.length) return { pages: [], gap: 0 };
   if (sources.length === 1) {
+    const whiteCompanion = ["left_white", "right_white"].includes(singletonPlacement);
     const placement = ["left", "right"].includes(singletonPlacement)
       ? singletonPlacement
+      : whiteCompanion ? singletonPlacement.replace("_white", "")
       : "center";
     const resolvedGap = placement === "center" ? 0 : Math.max(0, Number(gap) || 0);
     const availableWidth = Math.max(1, Number(viewportWidth) || 1);
@@ -1247,7 +1255,7 @@ export function viewerSpreadLayout({
     return {
       pages: [page],
       gap: resolvedGap,
-      singletonPlacement: placement,
+      singletonPlacement: whiteCompanion ? singletonPlacement : placement,
       cssWidth: placement === "center" ? page.cssWidth : page.cssWidth * 2 + resolvedGap,
       cssHeight: page.cssHeight,
     };

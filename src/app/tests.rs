@@ -59095,17 +59095,21 @@ mod still_window_mode_key_tests {
             assert_eq!(page_count_before, 1);
             assert_eq!(contextless_snapshot.frozen_continuous_pages.len(), 1);
             let contextless_page = &contextless_snapshot.frozen_continuous_pages[0];
-            match expected {
-                crate::displayed_image_transform::SingletonSpreadPlacement::Left => assert!(
+            match expected.side() {
+                crate::displayed_image_transform::SingletonSpreadPlacement::Left
+                | crate::displayed_image_transform::SingletonSpreadPlacement::LeftWhite => assert!(
                     contextless_page.paint_rect_norm.center().x < 0.5,
                     "left singleton was centered in the Context-free paged bake: {:?}",
                     contextless_page.paint_rect_norm
                 ),
-                crate::displayed_image_transform::SingletonSpreadPlacement::Right => assert!(
-                    contextless_page.paint_rect_norm.center().x > 0.5,
-                    "right singleton was centered in the Context-free paged bake: {:?}",
-                    contextless_page.paint_rect_norm
-                ),
+                crate::displayed_image_transform::SingletonSpreadPlacement::Right
+                | crate::displayed_image_transform::SingletonSpreadPlacement::RightWhite => {
+                    assert!(
+                        contextless_page.paint_rect_norm.center().x > 0.5,
+                        "right singleton was centered in the Context-free paged bake: {:?}",
+                        contextless_page.paint_rect_norm
+                    )
+                }
                 crate::displayed_image_transform::SingletonSpreadPlacement::Center => {
                     unreachable!()
                 }
@@ -59134,11 +59138,13 @@ mod still_window_mode_key_tests {
                 .expect("parked window publishes a passive snapshot");
             assert_eq!(passive.frozen_continuous_pages.len(), 1);
             let passive_page = &passive.frozen_continuous_pages[0];
-            match expected {
-                crate::displayed_image_transform::SingletonSpreadPlacement::Left => {
+            match expected.side() {
+                crate::displayed_image_transform::SingletonSpreadPlacement::Left
+                | crate::displayed_image_transform::SingletonSpreadPlacement::LeftWhite => {
                     assert!(passive_page.paint_rect_norm.center().x < 0.5)
                 }
-                crate::displayed_image_transform::SingletonSpreadPlacement::Right => {
+                crate::displayed_image_transform::SingletonSpreadPlacement::Right
+                | crate::displayed_image_transform::SingletonSpreadPlacement::RightWhite => {
                     assert!(passive_page.paint_rect_norm.center().x > 0.5)
                 }
                 crate::displayed_image_transform::SingletonSpreadPlacement::Center => {

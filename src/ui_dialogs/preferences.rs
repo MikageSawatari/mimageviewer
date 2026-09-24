@@ -2324,6 +2324,10 @@ impl App {
                     self.settings.singleton_spread_first_enabled,
                     self.settings.singleton_spread_last_enabled,
                 );
+                let old_page_alone_enabled = (
+                    self.settings.page_after_cover_alone_enabled,
+                    self.settings.last_page_alone_enabled,
+                );
                 let old_ui_font = self.settings.ui_font.clone();
                 let old_creative_luts = self.settings.creative_luts.clone();
                 let mut creative_lut_transaction =
@@ -2412,6 +2416,27 @@ impl App {
                         || last_endpoint_changed
                             && self.singleton_spread_endpoint_preferences.last
                                 == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+                    {
+                        self.invalidate_singleton_spread_placement_display(ctx);
+                    }
+                }
+                let after_cover_changed =
+                    old_page_alone_enabled.0 != self.settings.page_after_cover_alone_enabled;
+                let last_page_changed =
+                    old_page_alone_enabled.1 != self.settings.last_page_alone_enabled;
+                if after_cover_changed || last_page_changed {
+                    #[cfg(windows)]
+                    self.invalidate_page_alone_in_parked_contexts(
+                        after_cover_changed,
+                        last_page_changed,
+                    );
+                    if self.spread_mode.has_cover()
+                        && (after_cover_changed
+                            && self.page_alone_preferences.after_cover
+                                == crate::settings::PageAlonePreference::FollowGlobal
+                            || last_page_changed
+                                && self.page_alone_preferences.last
+                                    == crate::settings::PageAlonePreference::FollowGlobal)
                     {
                         self.invalidate_singleton_spread_placement_display(ctx);
                     }

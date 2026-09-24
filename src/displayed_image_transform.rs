@@ -100,6 +100,32 @@ pub(crate) enum SingletonSpreadPlacement {
     Center,
     Left,
     Right,
+    /// A forced real singleton occupies the left slot; its right slot paints white.
+    LeftWhite,
+    /// A forced real singleton occupies the right slot; its left slot paints white.
+    RightWhite,
+}
+
+impl SingletonSpreadPlacement {
+    pub(crate) const fn side(self) -> Self {
+        match self {
+            Self::LeftWhite => Self::Left,
+            Self::RightWhite => Self::Right,
+            other => other,
+        }
+    }
+
+    pub(crate) const fn has_white_companion(self) -> bool {
+        matches!(self, Self::LeftWhite | Self::RightWhite)
+    }
+
+    pub(crate) const fn with_white_companion(self) -> Self {
+        match self.side() {
+            Self::Left => Self::LeftWhite,
+            Self::Right => Self::RightWhite,
+            _ => Self::Center,
+        }
+    }
 }
 
 impl ResolvedDisplayPlacement {
@@ -354,9 +380,9 @@ impl DisplayedImageGeometry {
                 gap
             };
             let magnitude = (visible_width * total_scale + gap) * 0.5;
-            match side {
-                SingletonSpreadPlacement::Left => -magnitude,
-                SingletonSpreadPlacement::Right => magnitude,
+            match side.side() {
+                SingletonSpreadPlacement::Left | SingletonSpreadPlacement::LeftWhite => -magnitude,
+                SingletonSpreadPlacement::Right | SingletonSpreadPlacement::RightWhite => magnitude,
                 SingletonSpreadPlacement::Center => 0.0,
             }
         });
@@ -2532,15 +2558,20 @@ mod tests {
                     let (zoom, pan) = zoom_pan.expect("active Z owns zoom/pan");
                     assert_eq!(pan, egui::Vec2::ZERO);
                     assert!(zoom > 1.0);
-                    let inner_edge = match singleton_side {
-                        SingletonSpreadPlacement::Left => transform.paint_rect.right(),
-                        SingletonSpreadPlacement::Right => transform.paint_rect.left(),
-                        SingletonSpreadPlacement::Center => unreachable!(),
-                    };
+                    let inner_edge =
+                        match singleton_side.side() {
+                            SingletonSpreadPlacement::Left
+                            | SingletonSpreadPlacement::LeftWhite => transform.paint_rect.right(),
+                            SingletonSpreadPlacement::Right
+                            | SingletonSpreadPlacement::RightWhite => transform.paint_rect.left(),
+                            SingletonSpreadPlacement::Center => unreachable!(),
+                        };
                     let expected = base.viewport_rect.center().x
-                        + match singleton_side {
-                            SingletonSpreadPlacement::Left => -singleton_gap * zoom * 0.5,
-                            SingletonSpreadPlacement::Right => singleton_gap * zoom * 0.5,
+                        + match singleton_side.side() {
+                            SingletonSpreadPlacement::Left
+                            | SingletonSpreadPlacement::LeftWhite => -singleton_gap * zoom * 0.5,
+                            SingletonSpreadPlacement::Right
+                            | SingletonSpreadPlacement::RightWhite => singleton_gap * zoom * 0.5,
                             SingletonSpreadPlacement::Center => 0.0,
                         };
                     close(inner_edge, expected);
@@ -2552,15 +2583,20 @@ mod tests {
                 } else {
                     assert!(zoom_pan.is_none());
                     assert!(resolved.aim_frame.is_some());
-                    let inner_edge = match singleton_side {
-                        SingletonSpreadPlacement::Left => transform.paint_rect.right(),
-                        SingletonSpreadPlacement::Right => transform.paint_rect.left(),
-                        SingletonSpreadPlacement::Center => unreachable!(),
-                    };
+                    let inner_edge =
+                        match singleton_side.side() {
+                            SingletonSpreadPlacement::Left
+                            | SingletonSpreadPlacement::LeftWhite => transform.paint_rect.right(),
+                            SingletonSpreadPlacement::Right
+                            | SingletonSpreadPlacement::RightWhite => transform.paint_rect.left(),
+                            SingletonSpreadPlacement::Center => unreachable!(),
+                        };
                     let expected = base.viewport_rect.center().x
-                        + match singleton_side {
-                            SingletonSpreadPlacement::Left => -singleton_gap * 0.5,
-                            SingletonSpreadPlacement::Right => singleton_gap * 0.5,
+                        + match singleton_side.side() {
+                            SingletonSpreadPlacement::Left
+                            | SingletonSpreadPlacement::LeftWhite => -singleton_gap * 0.5,
+                            SingletonSpreadPlacement::Right
+                            | SingletonSpreadPlacement::RightWhite => singleton_gap * 0.5,
                             SingletonSpreadPlacement::Center => 0.0,
                         };
                     close(inner_edge, expected);

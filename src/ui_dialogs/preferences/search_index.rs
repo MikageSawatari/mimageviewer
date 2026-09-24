@@ -620,6 +620,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["単ページ", "先頭", "末尾", "片側", "本ごとの設定"]
     ),
     entry!(
+        "spread/page-alone",
+        SpreadMode,
+        "表紙の次のページを単独で表示",
+        ["最終ページ", "白い相方", "見開き", "本ごとの設定"]
+    ),
+    entry!(
         "spread/reading-flow",
         SpreadMode,
         "デフォルトの連結方式",

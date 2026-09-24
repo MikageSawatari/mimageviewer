@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 59;
+pub const PROTOCOL_VERSION: u32 = 60;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -591,6 +591,11 @@ pub enum RemoteWriteRequest {
         endpoint: RemoteSingletonSpreadEndpoint,
         preference: RemoteSingletonSpreadPlacementPreference,
     },
+    SetPageAlonePreference {
+        address: RemoteAddress,
+        endpoint: RemotePageAloneEndpoint,
+        preference: RemotePageAlonePreference,
+    },
     /// 表示完了済みのページ位置。page fields と record_history は remote-web の
     /// 観測値として受けるが、本体 write worker がローカルと同じ列挙規則で検証・
     /// 正規化してから UI thread へ渡す。
@@ -678,6 +683,7 @@ impl RemoteWriteRequest {
             | Self::SetFinalCoverSpreadPreference { address, .. }
             | Self::SetSingletonSpreadPlacementPreference { address, .. }
             | Self::SetSingletonSpreadEndpointPreference { address, .. }
+            | Self::SetPageAlonePreference { address, .. }
             | Self::RecordReadingProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
@@ -699,6 +705,7 @@ impl RemoteWriteRequest {
             | Self::SetFinalCoverSpreadPreference { address, .. }
             | Self::SetSingletonSpreadPlacementPreference { address, .. }
             | Self::SetSingletonSpreadEndpointPreference { address, .. }
+            | Self::SetPageAlonePreference { address, .. }
             | Self::RecordReadingProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
@@ -744,6 +751,7 @@ impl RemoteWriteRequest {
             | Self::SetFinalCoverSpreadPreference { .. }
             | Self::SetSingletonSpreadPlacementPreference { .. }
             | Self::SetSingletonSpreadEndpointPreference { .. }
+            | Self::SetPageAlonePreference { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
             | Self::GetAdjustmentState { .. }
@@ -781,6 +789,7 @@ impl RemoteWriteRequest {
             | Self::SetFinalCoverSpreadPreference { .. }
             | Self::SetSingletonSpreadPlacementPreference { .. }
             | Self::SetSingletonSpreadEndpointPreference { .. }
+            | Self::SetPageAlonePreference { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
             | Self::GetAdjustmentState { .. }
@@ -798,6 +807,7 @@ impl RemoteWriteRequest {
             Self::SetSingletonSpreadEndpointPreference { .. } => {
                 "set_singleton_spread_endpoint_preference"
             }
+            Self::SetPageAlonePreference { .. } => "set_page_alone_preference",
             Self::RecordReadingProgress { .. } => "record_reading_progress",
             Self::SetRating { .. } => "set_rating",
             Self::SetBookmark { .. } => "set_bookmark",
@@ -1045,6 +1055,25 @@ pub enum RemoteSingletonSpreadPlacement {
     Center,
     Left,
     Right,
+    LeftWhite,
+    RightWhite,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePageAlonePreference {
+    #[default]
+    FollowGlobal,
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePageAloneEndpoint {
+    #[default]
+    AfterCover,
+    Last,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1085,6 +1114,14 @@ pub struct ContainerPayload {
     pub singleton_spread_first_enabled: bool,
     #[serde(default)]
     pub singleton_spread_last_enabled: bool,
+    #[serde(default)]
+    pub page_after_cover_alone_preference: RemotePageAlonePreference,
+    #[serde(default)]
+    pub last_page_alone_preference: RemotePageAlonePreference,
+    #[serde(default)]
+    pub page_after_cover_alone_enabled: bool,
+    #[serde(default)]
+    pub last_page_alone_enabled: bool,
     /// 本体 seek overlay と同じ nav item 分類による件数内訳。
     pub image_count: usize,
     pub video_count: usize,
@@ -3221,7 +3258,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 59);
+        assert_eq!(PROTOCOL_VERSION, 60);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3397,7 +3434,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 59);
+        assert_eq!(PROTOCOL_VERSION, 60);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3565,6 +3602,10 @@ mod tests {
                 singleton_spread_last_preference: RemoteSingletonSpreadPlacementPreference::Center,
                 singleton_spread_first_enabled: true,
                 singleton_spread_last_enabled: false,
+                page_after_cover_alone_preference: RemotePageAlonePreference::FollowGlobal,
+                last_page_alone_preference: RemotePageAlonePreference::FollowGlobal,
+                page_after_cover_alone_enabled: false,
+                last_page_alone_enabled: false,
                 image_count: 2,
                 video_count: 0,
                 other_count: 0,
@@ -4417,7 +4458,7 @@ mod tests {
 
     #[test]
     fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
-        assert_eq!(PROTOCOL_VERSION, 59);
+        assert_eq!(PROTOCOL_VERSION, 60);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();

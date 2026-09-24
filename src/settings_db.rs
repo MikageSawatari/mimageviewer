@@ -322,6 +322,8 @@ pub(crate) struct RemoteReadingSettings {
     pub(crate) final_cover_spread_enabled: bool,
     pub(crate) singleton_spread_first_enabled: bool,
     pub(crate) singleton_spread_last_enabled: bool,
+    pub(crate) page_after_cover_alone_enabled: bool,
+    pub(crate) last_page_alone_enabled: bool,
     pub(crate) spread_page_gap_px: u32,
 }
 
@@ -333,6 +335,8 @@ impl RemoteReadingSettings {
             final_cover_spread_enabled: settings.final_cover_spread_enabled,
             singleton_spread_first_enabled: settings.singleton_spread_first_enabled,
             singleton_spread_last_enabled: settings.singleton_spread_last_enabled,
+            page_after_cover_alone_enabled: settings.page_after_cover_alone_enabled,
+            last_page_alone_enabled: settings.last_page_alone_enabled,
             spread_page_gap_px: settings.spread_page_gap_px,
         }
     }
@@ -836,6 +840,16 @@ impl SettingsDb {
             )?,
             singleton_spread_first_enabled: endpoints.first,
             singleton_spread_last_enabled: endpoints.last,
+            page_after_cover_alone_enabled: read_settings_kv_typed(
+                &inner.conn,
+                "page_after_cover_alone_enabled",
+                || fallback.page_after_cover_alone_enabled,
+            )?,
+            last_page_alone_enabled: read_settings_kv_typed(
+                &inner.conn,
+                "last_page_alone_enabled",
+                || fallback.last_page_alone_enabled,
+            )?,
             spread_page_gap_px: read_settings_kv_typed(&inner.conn, "spread_page_gap_px", || {
                 fallback.spread_page_gap_px
             })?,

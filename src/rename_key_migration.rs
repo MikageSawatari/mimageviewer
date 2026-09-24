@@ -1055,6 +1055,13 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         true,
         StoreKeyNormalization::DriveStripped,
     ),
+    optional_legacy_store(
+        "spread.db",
+        "page_alone_preferences",
+        "path",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
     store(
         "view_trim.db",
         "view_trim_books",
@@ -2208,10 +2215,10 @@ mod tests {
         let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
         assert_eq!(
             STORES.len(),
-            25,
-            "endpoint preference を含む現行 descriptor 数"
+            26,
+            "endpoint と page-alone preference を含む現行 descriptor 数"
         );
-        assert_eq!(covered, 24);
+        assert_eq!(covered, 25);
         assert_eq!(report.rows, covered * 2);
 
         for descriptor in STORES {

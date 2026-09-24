@@ -638,10 +638,17 @@ pub(crate) struct DetachedImageWindowFrozenPage {
     pub(crate) paint_rect_norm: egui::Rect,
     pub(crate) uv_rect: egui::Rect,
     pub(crate) clip_rect_norm: egui::Rect,
+    pub(crate) white_companion: Option<DetachedFrozenWhiteCompanion>,
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) free_rotation: f32,
     #[cfg(feature = "test-script")]
     pub(crate) test_script_placement: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct DetachedFrozenWhiteCompanion {
+    pub(crate) paint_rect_norm: egui::Rect,
+    pub(crate) clip_rect_norm: egui::Rect,
 }
 
 #[derive(Clone)]
@@ -9024,10 +9031,21 @@ pub(crate) struct FsDisplayUnitHoldover {
     pub(crate) layout_projection: FsDisplayUnitLayoutProjection,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum FsDisplayUnitLayoutProjection {
     Canonical,
     Painted(crate::displayed_image_transform::ResolvedDisplayPlacement),
+    /// The real page and white slot keep their painted placement and viewport
+    /// basis for a live holdover, even if settings change before it retires.
+    PaintedWhite(FsCapturedWhiteCompanion),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FsCapturedWhiteCompanion {
+    pub(crate) real_transform: crate::displayed_image_transform::DisplayedImageTransform,
+    pub(crate) layout_size: egui::Vec2,
+    pub(crate) paint_rect: egui::Rect,
+    pub(crate) clip_rect: egui::Rect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13971,6 +13989,7 @@ pub struct App {
     pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     pub(crate) singleton_spread_endpoint_preferences:
         crate::settings::SingletonSpreadEndpointPreferences,
+    pub(crate) page_alone_preferences: crate::settings::PageAlonePreferences,
     /// Ctrl+←/→ の「1 ページずらし」用セッション内アンカー。
     /// 保存はせず、この idx から先だけ見開きの組み始めを一時的にずらす。
     pub(crate) spread_shift_anchor_idx: Option<usize>,
@@ -16993,6 +17012,7 @@ impl App {
             final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference::default(),
             singleton_spread_endpoint_preferences:
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
+            page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift_anchor_idx: None,
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
@@ -21289,6 +21309,14 @@ impl App {
         )
     }
 
+    pub(crate) fn page_alone_enabled_for_current_book(&self) -> crate::settings::PageAloneSettings {
+        self.page_alone_preferences
+            .effective(crate::settings::PageAloneSettings {
+                after_cover: self.settings.page_after_cover_alone_enabled,
+                last: self.settings.last_page_alone_enabled,
+            })
+    }
+
     /// 代表サムネピン (`folder_thumb_pins`) のコンテナキー。見開きキーとは
     /// **ルート表示の扱いだけ** 異なる。
     ///
@@ -21357,8 +21385,12 @@ impl App {
         let endpoint_preferences = db
             .get_singleton_spread_endpoint_preferences_with_fallback(key, fallback)
             .map_err(|error| error.to_string())?;
+        let page_alone_preferences = db
+            .get_page_alone_preferences_with_fallback(key, fallback)
+            .map_err(|error| error.to_string())?;
         self.final_cover_spread_preference = final_cover_preference;
         self.singleton_spread_endpoint_preferences = endpoint_preferences;
+        self.page_alone_preferences = page_alone_preferences;
         let stored_spread = stored.mode.unwrap_or(defaults.spread_mode);
         self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
         self.reading_direction = stored.direction.unwrap_or(defaults.reading_direction);
@@ -33082,6 +33114,7 @@ impl App {
             self.final_cover_spread_preference = container.final_cover_spread_preference;
             self.singleton_spread_endpoint_preferences =
                 container.singleton_spread_endpoint_preferences;
+            self.page_alone_preferences = container.page_alone_preferences;
             let trim = container.view_trim.unwrap_or_default();
             self.view_trim_apply_mode = match trim.apply_mode {
                 crate::view_trim::ViewTrimApplyMode::Page => {

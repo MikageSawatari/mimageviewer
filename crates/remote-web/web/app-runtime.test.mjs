@@ -48,10 +48,16 @@ class FakeElement {
     for (const listener of this.listeners.get(event.type) ?? []) listener(event);
   }
   setAttribute() {}
-  append(...nodes) { this.children.push(...nodes); }
-  replaceChildren(...nodes) { this.children = nodes; }
+  append(...nodes) { nodes.forEach((node) => { node.parent = this; this.children.push(node); }); }
+  prepend(...nodes) { nodes.forEach((node) => { node.parent = this; }); this.children.unshift(...nodes); }
+  replaceChildren(...nodes) { this.children = []; this.append(...nodes); }
   replaceWith(node) { this.replacedWith = node; }
-  remove() { this.removed = true; }
+  remove() { this.removed = true; if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); }
+  querySelector(selector) {
+    if (!selector.startsWith(".")) return null;
+    return this.children.find((child) => child.classList.contains(selector.slice(1)) ||
+      String(child.className ?? "").split(/\s+/).includes(selector.slice(1))) ?? null;
+  }
   async decode() { return FakeElement.decodeHook?.(this); }
 }
 
@@ -148,6 +154,7 @@ const {
   favoriteSearchHash,
   favoriteSearchResultTitle,
   finalCoverSpreadWriteRequest,
+  pageAloneWriteRequest,
   singletonSpreadPlacementWriteRequest,
   gridReturnItemIdentity,
   historyStateWithoutPersistentCollectionSession,
@@ -3849,7 +3856,7 @@ test("AI settings recovery terminal tells the user to retry without hiding the t
   controller.destroy();
 });
 
-test("singleton spread loadGroup keeps one DOM page and its virtual side through refit", async () => {
+test("singleton spread keeps the real DOM page and a white decoration only when requested", async () => {
   const stage = new FakeElement("div");
   stage.clientWidth = 1600;
   stage.clientHeight = 1000;
@@ -3887,7 +3894,8 @@ test("singleton spread loadGroup keeps one DOM page and its virtual side through
     },
   });
 
-  for (const side of ["left", "right"]) {
+  for (const side of ["left", "right", "left_white", "right_white"]) {
+    const hasWhite = side.endsWith("_white");
     const displayed = await viewer.loadGroup({
       pages: [page(side)],
       name: `${side} endpoint`,
@@ -3899,16 +3907,24 @@ test("singleton spread loadGroup keeps one DOM page and its virtual side through
       interactionStartedAt: performance.now(),
     });
     assert.deepEqual(displayed, { outcome: ViewerGroupLoadOutcome.APPLIED });
-    assert.equal(pageLayer.children.length, 1);
+    assert.equal(pageLayer.children.length, hasWhite ? 2 : 1);
     assert.equal(viewer.images.length, 1);
+    assert.equal(Boolean(pageLayer.querySelector(".viewer-white-companion")), hasWhite);
     assert.equal(pageLayer.dataset.singletonPlacement, side);
     assert.equal(pageLayer.dataset.singletonGap, "12");
     const assertVirtualExtent = () => {
       const pageWidth = parseFloat(viewer.images[0].style.width);
       const layerWidth = parseFloat(pageLayer.style.width);
       assert.ok(Math.abs(layerWidth - (pageWidth * 2 + 12)) < 0.01);
-      assert.equal(pageLayer.children.length, 1);
+      assert.equal(pageLayer.children.length, hasWhite ? 2 : 1);
       assert.equal(viewer.images.length, 1);
+      const white = pageLayer.querySelector(".viewer-white-companion");
+      assert.equal(Boolean(white), hasWhite);
+      if (white) {
+        assert.equal(white.style.width, viewer.images[0].style.width);
+        assert.equal(white.style.height, viewer.images[0].style.height);
+        assert.equal(pageLayer.children.indexOf(white), side === "left_white" ? 1 : 0);
+      }
       assert.equal(pageLayer.dataset.singletonPlacement, side);
       assert.equal(pageLayer.dataset.singletonGap, "12");
     };
@@ -3927,7 +3943,7 @@ test("singleton spread loadGroup keeps one DOM page and its virtual side through
       true,
     );
     assert.notEqual(viewer.images[0], previous);
-    assert.equal(pageLayer.children.length, 1);
+    assert.equal(pageLayer.children.length, hasWhite ? 2 : 1);
     assert.equal(pageLayer.dataset.singletonPlacement, side);
     assert.equal(pageLayer.dataset.singletonGap, "12");
     // The production DOM copies CSSStyleDeclaration.cssText during adjustment
@@ -4361,6 +4377,29 @@ test("endpoint placement menus and writes keep first and last independent", () =
     preference: "center",
   });
   assert.equal(singletonSpreadPlacementWriteRequest(address, "middle", "center"), null);
+});
+
+test("page-alone menu exposes two independent tri-state controls only for real books", () => {
+  const address = { path: "C:/book/book.zip", subresource: { kind: "zip_directory", prefix: "inner/" } };
+  const menu = viewerMenuDefinitions({
+    hasContainer: true,
+    barsVisible: true,
+    supportsPageAloneSetting: true,
+    pageAfterCoverPreference: "on",
+    lastPagePreference: "follow_global",
+    pageAfterCoverEnabled: true,
+    lastPageEnabled: false,
+  });
+  assert.ok(menu.spread.actions.some(([, label]) => label === "単独ページと白い相方"));
+  assert.ok(menu.spread.actions.length <= VIEWER_MENU_MAX_ACTIONS);
+  assert.match(menu.page_after_cover.actions[2][1], /^✓ /);
+  assert.match(menu.last_page_alone.actions[1][1], /^✓ /);
+  assert.deepEqual(pageAloneWriteRequest(address, "after_cover", "off"), {
+    kind: "set_page_alone_preference", address, endpoint: "after_cover", preference: "off",
+  });
+  assert.equal(pageAloneWriteRequest(address, "middle", "off"), null);
+  assert.equal(viewerMenuDefinitions({ hasContainer: true, barsVisible: true }).spread.actions
+    .some(([, label]) => label === "単独ページと白い相方"), false);
 });
 
 test("supplemental cover presentation stays outside navigation and has explicit slot context", () => {
