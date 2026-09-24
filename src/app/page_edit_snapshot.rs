@@ -5,6 +5,7 @@
 //! prove that a page has no durable edit.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::grid_item::GridItem;
@@ -14,6 +15,69 @@ pub(crate) struct StablePageEditProjection {
     pub snapshot: PageEditSnapshot,
     pub projection: PageEditProjection,
     pub stamp: WriteStamp,
+}
+
+pub(crate) enum ReconcileReady {
+    Full(StablePageEditProjection),
+    Keys {
+        prepared: StablePageEditProjection,
+        indices: Vec<usize>,
+    },
+}
+
+impl ReconcileReady {
+    pub(crate) fn stamp(&self) -> WriteStamp {
+        match self {
+            Self::Full(prepared) | Self::Keys { prepared, .. } => prepared.stamp,
+        }
+    }
+}
+
+pub(crate) struct ReconcilePending {
+    pub context_id: super::viewer_context_registry::ViewerContextId,
+    pub items_generation: u64,
+    pub page_edit_revision: u64,
+    pub order: Option<Arc<PageKeyOrder>>,
+    pub cancel: Arc<AtomicBool>,
+    pub receiver: std::sync::mpsc::Receiver<Result<Option<ReconcileReady>, String>>,
+    pub started_stamp: WriteStamp,
+    pub retry_attempt: u8,
+}
+
+pub(crate) enum ReconcileStatus {
+    Building(ReconcileBuild),
+    Running(ReconcilePending),
+    Failed {
+        context_id: super::viewer_context_registry::ViewerContextId,
+        items_generation: u64,
+        page_edit_revision: u64,
+        completed_writes: u64,
+        retry_attempt: u8,
+        retry_at: std::time::Instant,
+    },
+}
+
+/// Repeated transient DB failures keep retrying, but never busy-poll the UI thread.
+pub(crate) fn reconcile_retry_delay(attempt: u8) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    std::time::Duration::from_millis((100_u64 << shift).min(4_000))
+}
+
+pub(crate) struct ReconcileBuild {
+    pub context_id: super::viewer_context_registry::ViewerContextId,
+    pub items_generation: u64,
+    pub page_edit_revision: u64,
+    pub item_count: usize,
+    pub builder: PageKeyOrderBuilder,
+    pub overlay: Option<PageEditSnapshot>,
+    pub availability: PageEditAvailability,
+    pub retry_attempt: u8,
+}
+
+impl Drop for ReconcilePending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -50,6 +114,107 @@ pub(crate) struct PageEditSnapshot {
     pub conceal: HashSet<String>,
     pub comic: HashSet<String>,
     pub local_adjust: HashSet<String>,
+    pub(crate) order: Arc<PageKeyOrder>,
+    pub(crate) stamp: Option<WriteStamp>,
+    /// Unsaved local-adjust layers take precedence over a later DB read until write completion.
+    pub(crate) volatile_keys: HashSet<String>,
+}
+
+/// The accepted page order without another key-to-index map or a clone of `GridItem`.
+/// Empty adjacent offsets denote structural items, which have no page edit key.
+#[derive(Debug, Default)]
+pub(crate) struct PageKeyOrder {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+#[derive(Default)]
+pub(crate) struct PageKeyOrderBuilder {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+impl PageKeyOrderBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            offsets: vec![0],
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub(crate) fn push(&mut self, item: &GridItem) -> Result<(), String> {
+        if let Some(key) = crate::edit_source::page_key_for_grid_item(item) {
+            self.bytes.extend_from_slice(key.as_bytes());
+        }
+        self.offsets.push(
+            u32::try_from(self.bytes.len())
+                .map_err(|_| "page-key order exceeds 4 GiB".to_owned())?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> PageKeyOrder {
+        self.bytes.shrink_to_fit();
+        self.offsets.shrink_to_fit();
+        PageKeyOrder {
+            bytes: self.bytes,
+            offsets: self.offsets,
+        }
+    }
+}
+
+impl PageKeyOrder {
+    pub(crate) fn from_items(items: &[GridItem]) -> Result<Self, String> {
+        let mut order = PageKeyOrderBuilder::new();
+        for item in items {
+            order.push(item)?;
+        }
+        Ok(order.finish())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub(crate) fn key_at(&self, index: usize) -> Option<&str> {
+        let start = *self.offsets.get(index)? as usize;
+        let end = *self.offsets.get(index + 1)? as usize;
+        (start != end).then(|| std::str::from_utf8(&self.bytes[start..end]).expect("UTF-8 key"))
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.bytes.capacity() + self.offsets.capacity() * std::mem::size_of::<u32>()
+    }
+
+    pub(crate) fn subset_for_keys(
+        &self,
+        keys: &HashSet<String>,
+    ) -> Result<(Arc<Self>, Vec<usize>), String> {
+        let mut subset = Self {
+            bytes: Vec::new(),
+            offsets: vec![0],
+        };
+        let mut indices = Vec::new();
+        for index in 0..self.len() {
+            let Some(key) = self.key_at(index) else {
+                continue;
+            };
+            if !keys.contains(key) {
+                continue;
+            }
+            subset.bytes.extend_from_slice(key.as_bytes());
+            subset.offsets.push(
+                u32::try_from(subset.bytes.len())
+                    .map_err(|_| "page-key subset exceeds 4 GiB".to_owned())?,
+            );
+            indices.push(index);
+        }
+        Ok((Arc::new(subset), indices))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -65,17 +230,79 @@ pub(crate) struct PageEditProjection {
 }
 
 impl PageEditSnapshot {
+    pub(crate) fn apply_view_trim_overlay(
+        &mut self,
+        overrides: &[(String, Option<crate::view_trim::ViewTrimPageOverride>)],
+    ) {
+        for (key, value) in overrides {
+            Self::set_value(&mut self.view_trim, key, value.as_ref());
+        }
+    }
+
+    pub(crate) fn apply_read_key_values(
+        &mut self,
+        read: &Self,
+        key: &str,
+        preserve_view_trim: bool,
+    ) {
+        Self::set_value(&mut self.adjustment, key, read.adjustment.get(key));
+        Self::set_value(&mut self.export_crop, key, read.export_crop.get(key));
+        if !preserve_view_trim {
+            Self::set_value(&mut self.view_trim, key, read.view_trim.get(key));
+        }
+        Self::set_presence(&mut self.mask, key, read.mask.contains(key));
+        Self::set_presence(&mut self.conceal, key, read.conceal.contains(key));
+        Self::set_presence(&mut self.comic, key, read.comic.contains(key));
+        if !self.volatile_keys.contains(key) {
+            Self::set_presence(&mut self.local_adjust, key, read.local_adjust.contains(key));
+        }
+    }
+
+    pub(crate) fn volatile_overlay(&self) -> Self {
+        let mut overlay = Self::default();
+        overlay.volatile_keys = self.volatile_keys.clone();
+        for key in &self.volatile_keys {
+            Self::set_presence(
+                &mut overlay.local_adjust,
+                key,
+                self.local_adjust.contains(key),
+            );
+        }
+        overlay
+    }
+
+    pub(crate) fn apply_volatile_overlay(&mut self, overlay: &Self) {
+        for key in &overlay.volatile_keys {
+            Self::set_presence(
+                &mut self.local_adjust,
+                key,
+                overlay.local_adjust.contains(key),
+            );
+        }
+        self.volatile_keys
+            .extend(overlay.volatile_keys.iter().cloned());
+    }
+
     pub(crate) fn load_and_project(
         items: &[GridItem],
         available: PageEditAvailability,
         cancel: &AtomicBool,
     ) -> Result<Option<(Self, PageEditProjection)>, String> {
-        let keys = items
-            .iter()
-            .filter_map(crate::edit_source::page_key_for_grid_item)
+        let order = Arc::new(PageKeyOrder::from_items(items)?);
+        Self::load_and_project_order(order, available, cancel)
+    }
+
+    fn load_and_project_order(
+        order: Arc<PageKeyOrder>,
+        available: PageEditAvailability,
+        cancel: &AtomicBool,
+    ) -> Result<Option<(Self, PageEditProjection)>, String> {
+        let keys = (0..order.len())
+            .filter_map(|index| order.key_at(index).map(str::to_owned))
             .collect::<Vec<_>>();
         let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
         let mut snapshot = Self::default();
+        snapshot.order = order;
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -146,7 +373,7 @@ impl PageEditSnapshot {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let projection = snapshot.project(items);
+        let projection = snapshot.project_order();
         Ok((!cancel.load(Ordering::Relaxed)).then_some((snapshot, projection)))
     }
 
@@ -183,6 +410,38 @@ impl PageEditSnapshot {
         projection
     }
 
+    pub(crate) fn project_order(&self) -> PageEditProjection {
+        let mut projection = PageEditProjection::default();
+        for index in 0..self.order.len() {
+            let Some(key) = self.order.key_at(index) else {
+                continue;
+            };
+            if let Some(value) = self.adjustment.get(key) {
+                projection.adjustment.insert(index, value.clone());
+            }
+            if let Some(value) = self.export_crop.get(key) {
+                projection.export_crop.insert(index, *value);
+                projection.export_crop_pages.insert(index);
+            }
+            if let Some(value) = self.view_trim.get(key) {
+                projection.view_trim.insert(index, *value);
+            }
+            if self.mask.contains(key) {
+                projection.mask.insert(index);
+            }
+            if self.conceal.contains(key) {
+                projection.conceal.insert(index);
+            }
+            if self.comic.contains(key) {
+                projection.comic.insert(index);
+            }
+            if self.local_adjust.contains(key) {
+                projection.local_adjust.insert(index);
+            }
+        }
+        projection
+    }
+
     pub(crate) fn merge_from(&mut self, other: Self) {
         self.adjustment.extend(other.adjustment);
         self.export_crop.extend(other.export_crop);
@@ -209,12 +468,30 @@ impl PageEditSnapshot {
         Ok(Self::stable_projection(before, after, snapshot, projection))
     }
 
+    pub(crate) fn load_and_project_order_stable(
+        order: Arc<PageKeyOrder>,
+        available: PageEditAvailability,
+        cancel: &AtomicBool,
+    ) -> Result<Option<StablePageEditProjection>, String> {
+        let before = PAGE_EDIT_WRITES.sample();
+        if before.active_writers != 0 {
+            return Ok(None);
+        }
+        let Some((snapshot, projection)) = Self::load_and_project_order(order, available, cancel)?
+        else {
+            return Ok(None);
+        };
+        let after = PAGE_EDIT_WRITES.sample();
+        Ok(Self::stable_projection(before, after, snapshot, projection))
+    }
+
     pub(crate) fn stable_projection(
         before: WriteStamp,
         after: WriteStamp,
-        snapshot: Self,
+        mut snapshot: Self,
         projection: PageEditProjection,
     ) -> Option<StablePageEditProjection> {
+        snapshot.stamp = Some(after);
         crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(before, after).then_some(
             StablePageEditProjection {
                 snapshot,

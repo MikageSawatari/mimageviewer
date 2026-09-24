@@ -1330,7 +1330,7 @@ fn prepare_subfolder_expansion(
 
     // A resort replaces the projection in its worker as well. Reading exact keys again avoids
     // cloning a potentially million-entry keyed snapshot on the UI thread.
-    let page_edits = super::page_edit_snapshot::PageEditSnapshot::load_and_project(
+    let page_edits = super::page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
         &items,
         options.page_edit_availability,
         cancel,
@@ -1338,6 +1338,7 @@ fn prepare_subfolder_expansion(
     let Some(page_edits) = page_edits else {
         return Ok(None);
     };
+    let page_edits = (page_edits.snapshot, page_edits.projection);
     if options.page_edit_availability.local_adjust {
         local_adjust_pages = page_edits.1.local_adjust.clone();
     }
@@ -2116,7 +2117,14 @@ impl App {
         prepared: PreparedSubfolderExpansion,
         ctx: Option<&egui::Context>,
     ) {
-        if prepared.page_edit_revision != self.page_edit_revision {
+        if prepared.page_edit_revision != self.page_edit_revision
+            || prepared
+                .metadata
+                .page_edits
+                .as_ref()
+                .and_then(|(snapshot, _)| snapshot.stamp)
+                .is_none_or(|stamp| !crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp))
+        {
             self.start_subfolder_expansion_prepare(prepared.snapshot, prepared.show_toast);
             return;
         }
@@ -2510,7 +2518,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_a_subfolder_rejects_stale_edit_projection_and_reprepares() {
+    fn phase_a2_subfolder_external_write_rejects_stale_projection_and_reprepares() {
         let mut app = crate::app::setup_app_for_test();
         let root = app.tmp.path().join("stale-subfolder-root");
         let image = root.join("masked.png");
@@ -2556,7 +2564,6 @@ mod tests {
                 .contains(&0)
         );
         app.mask_db.as_ref().unwrap().delete(&key).unwrap();
-        app.page_edit_revision = app.page_edit_revision.wrapping_add(1);
 
         let generation_before_rejection = app.items_generation;
         app.install_prepared_subfolder_expansion(prepared, None);

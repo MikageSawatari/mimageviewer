@@ -638,6 +638,15 @@ pub(crate) struct CollectionGridNavigationSources {
 }
 
 impl CollectionGridNavigationSources {
+    pub(crate) fn page_edit_stamp_is_current(&self) -> bool {
+        self.retained_edit_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.stamp)
+            .is_some_and(|stamp| crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp))
+    }
+}
+
+impl CollectionGridNavigationSources {
     pub(crate) fn new(
         reuse_key: CollectionGridPrepareReuseKey,
         page_edit_revision: u64,

@@ -614,6 +614,7 @@ impl App {
     ///    items / thumbnails / visible_indices / scroll_offset / selected を退避して
     ///    snapshot subset で置き換え
     pub(crate) fn activate_snapshot(&mut self, source_label: SnapshotSourceLabel) {
+        let source_had_exact_page_edits = self.page_edit_snapshot.is_some();
         // Step 1: capture (= visible_indices から SnapshotEntry を構築)。
         let captured_entries: Vec<SnapshotEntry> = self
             .visible_indices
@@ -764,6 +765,11 @@ impl App {
         self.mark_color_filter_scope_dirty();
 
         self.snapshot = Some(SnapshotState {
+            page_edit_source: if source_had_exact_page_edits {
+                crate::snapshot::SnapshotPageEditSource::PreparedExact
+            } else {
+                crate::snapshot::SnapshotPageEditSource::PhysicalPrefix
+            },
             items: captured_entries,
             membership,
             origin,
@@ -803,19 +809,13 @@ impl App {
         // 保存される。`invalidate_idx_state_and_queues` は idx-keyed cache を落とすがユーザー
         // 設定マップ (adjustment_page_params 等) は残すため、ここで明示的に処理する必要がある。
         //
-        // cross-folder 検索 view 由来 snapshot (= Ctrl+S/Ctrl+G) は **clear のみ**:
-        // - subset が cross-folder で単一 prefix hydrate できない (origin = 検索前の実
-        //   current_folder なので、prefix 配下の subset item だけ部分的に hydrate されてしまう)。
-        // - 検索 view は元々ページ編集 overlay を出さない設計 (replace_search_view_items が
-        //   clear する) なので、その snapshot も overlay 無しで揃える。
-        // 判定は `pre_snapshot_search_origin.is_some()` (= Ctrl+S/Ctrl+G でのみ Some)。
-        // **`search_was_active` では判定しない**: あれは Ctrl+F (= 単一フォルダの構造フィルタ)
-        // でも true になるが、Ctrl+F の subset は origin 配下に収まるので通常どおり rehydrate
-        // すべき。`search_was_active` で gate すると Ctrl+F snapshot が誤って clear され、
-        // しかも list 復帰 (pre_snapshot_search_origin で判定) との非対称を生む (Codex follow-up)。
-        // 通常フォルダ / Ctrl+F filter 由来は origin の DB から subset idx で hydrate し直す。
-        // deactivate / list 復帰でも同じ判定で対称に処理する。
-        if let Some((origin, is_search_view)) = self
+        // A prepared virtual source carries exact page keys, so its subset must use the same
+        // worker projection. A physical folder / Ctrl+F source keeps its prefix rehydrate.
+        // A search result that has not accepted its first prepared snapshot cannot use a
+        // physical prefix; clear only that unprepared fallback.
+        if source_had_exact_page_edits {
+            self.prepare_page_edits_for_current_virtual_items();
+        } else if let Some((origin, is_search_view)) = self
             .snapshot
             .as_ref()
             .map(|s| (s.origin.clone(), s.pre_snapshot_search_origin.is_some()))
@@ -1045,7 +1045,11 @@ impl App {
             // (child folder 経路は load_folder 由来で既に hydrate 済みなので不要。検索 view 由来
             //  解除は上の at_origin + pre_search_origin 分岐で load_folder に入るのでこちらは通らない。)
             let origin = snap.origin.clone();
-            self.rehydrate_page_edit_state_for_current_items(&origin);
+            if snap.page_edit_source == crate::snapshot::SnapshotPageEditSource::PreparedExact {
+                self.prepare_page_edits_for_current_virtual_items();
+            } else {
+                self.rehydrate_page_edit_state_for_current_items(&origin);
+            }
             if self.color_filter.enabled {
                 self.mark_color_filter_scope_dirty();
                 self.rebuild_visible_indices();
@@ -1078,7 +1082,7 @@ impl App {
         // list_view_items / list_view_thumbnails は activate_snapshot 時に保存した clone を
         // 使う (= reconstruct だと folder 代表サムネが Pending に戻って「フォルダアイコン」
         // 表示になるユーザー報告対応)。
-        let (snap_origin, list_items, list_thumbs, list_image_metas, is_search_snapshot) = {
+        let (snap_origin, list_items, list_thumbs, list_image_metas, exact_page_edits) = {
             let Some(snap) = self.snapshot.as_ref() else {
                 return false;
             };
@@ -1089,7 +1093,7 @@ impl App {
                 snap.list_view_image_metas.clone(),
                 // 検索 view 由来 snapshot は origin が cross-folder prefix なので rehydrate せず
                 // clear のみ (= activate と同じ判定。pre_snapshot_search_origin Some が search 由来)。
-                snap.pre_snapshot_search_origin.is_some(),
+                snap.page_edit_source == crate::snapshot::SnapshotPageEditSource::PreparedExact,
             )
         };
         // 既に snapshot root に居れば何もしない (= 通常 BS の対象)
@@ -1137,9 +1141,9 @@ impl App {
         // snapshot list (= subset) に戻したので、ページ編集状態も subset idx で合わせ直す
         // (= activate と同じ、Codex P1)。通常フォルダ由来は origin の DB から hydrate
         // (child folder で編集した分は DB に同期保存済みなので subset 該当ページに反映される)。
-        // 検索 view 由来は cross-folder prefix なので clear のみ (= activate と対称)。
-        if is_search_snapshot {
-            self.clear_page_edit_state();
+        // Prepared virtual sources use their exact keys; physical sources keep prefix hydrate.
+        if exact_page_edits {
+            self.prepare_page_edits_for_current_virtual_items();
         } else {
             self.rehydrate_page_edit_state_for_current_items(&snap_origin);
         }

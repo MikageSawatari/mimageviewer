@@ -159,7 +159,7 @@ impl ComicDb {
 
     /// JSON 文字列を直接保存する（サイドカーからのインポート用、再シリアライズ回避）。
     pub fn set_raw(&self, key: &str, doc_version: u32, doc_json: &str) -> rusqlite::Result<()> {
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(key);
         self.conn.execute(
             "INSERT INTO comic_entries (page_path, doc_version, doc_json)
              VALUES (?1, ?2, ?3)
@@ -171,7 +171,7 @@ impl ComicDb {
 
     /// 注釈ドキュメントを削除する。
     pub fn delete(&self, key: &str) -> rusqlite::Result<()> {
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(key);
         self.conn
             .execute("DELETE FROM comic_entries WHERE page_path = ?1", [key])?;
         Ok(())

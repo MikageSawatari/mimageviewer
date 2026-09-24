@@ -905,7 +905,8 @@ impl CropDb {
     }
 
     pub fn set(&self, page_key: &str, settings: CropSettings) -> Result<(), rusqlite::Error> {
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _page_edit_write =
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(page_key);
         self.conn.execute(
             "INSERT INTO export_crop_pages
                 (page_path, min_x, min_y, max_x, max_y, aspect_mode,
@@ -939,7 +940,8 @@ impl CropDb {
     }
 
     pub fn remove(&self, page_key: &str) -> Result<(), rusqlite::Error> {
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _page_edit_write =
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(page_key);
         self.conn.execute(
             "DELETE FROM export_crop_pages WHERE page_path = ?1",
             [page_key],

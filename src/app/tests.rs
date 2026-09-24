@@ -7,6 +7,559 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[test]
+fn phase_a2_compact_ten_thousand_page_keys_and_ui_acceptance() {
+    let mut app = setup_app_for_test();
+    let items = (0..10_000)
+        .map(|index| {
+            GridItem::Image(PathBuf::from(format!(
+                "C:/books/chapter/page-{index:05}.png"
+            )))
+        })
+        .collect::<Vec<_>>();
+    let order_started = std::time::Instant::now();
+    let compact_order = page_edit_snapshot::PageKeyOrder::from_items(&items).unwrap();
+    let order_ms = order_started.elapsed().as_secs_f64() * 1000.0;
+    let prepared = page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
+        &items,
+        page_edit_snapshot::PageEditAvailability::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+    let parked_orders = [
+        compact_order,
+        page_edit_snapshot::PageKeyOrder::from_items(&items).unwrap(),
+        page_edit_snapshot::PageKeyOrder::from_items(&items).unwrap(),
+    ];
+    let retained = parked_orders[0].retained_bytes();
+    assert!(
+        retained <= 1_000_000,
+        "compact order retained {retained} bytes"
+    );
+    let parked_peak = parked_orders
+        .iter()
+        .map(|order| order.retained_bytes())
+        .sum::<usize>();
+    assert!(parked_peak <= 3_000_000);
+    app.items = items;
+    let started = std::time::Instant::now();
+    app.install_prepared_page_edits(prepared);
+    let accept_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let key = app.page_path_key(5_000).unwrap();
+    let keys = std::iter::once(key.clone()).collect::<std::collections::HashSet<_>>();
+    let (subset, indices) = app
+        .page_edit_snapshot
+        .as_ref()
+        .unwrap()
+        .order
+        .subset_for_keys(&keys)
+        .unwrap();
+    let mut read = page_edit_snapshot::PageEditSnapshot::default();
+    read.order = subset;
+    read.mask.insert(key);
+    let projection = read.project_order();
+    let delta_started = std::time::Instant::now();
+    app.apply_page_edit_key_delta(
+        page_edit_snapshot::StablePageEditProjection {
+            snapshot: read,
+            projection,
+            stamp: crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample(),
+        },
+        &indices,
+    );
+    let delta_ms = delta_started.elapsed().as_secs_f64() * 1000.0;
+    assert!(app.mask_pages.contains(&5_000));
+    eprintln!(
+        "A2 10,000 keys: retained={retained} bytes, three parked bundles={parked_peak} bytes, standalone order build={order_ms:.3} ms, UI full acceptance={accept_ms:.3} ms, one-key delta={delta_ms:.3} ms"
+    );
+    assert!(order_ms < 50.0, "compact order build took {order_ms:.3} ms");
+    assert!(accept_ms < 50.0, "UI acceptance took {accept_ms:.3} ms");
+    assert!(delta_ms < 50.0, "UI delta acceptance took {delta_ms:.3} ms");
+}
+
+#[test]
+fn phase_a2_hundred_thousand_keys_build_in_bounded_ui_batches() {
+    let mut app = setup_app_for_test();
+    app.items = (0..100_000)
+        .map(|index| {
+            GridItem::Image(PathBuf::from(format!(
+                "C:/books/very-large/page-{index:06}.png"
+            )))
+        })
+        .collect();
+    app.current_folder = Some(search_results_synthetic_path());
+    let started = std::time::Instant::now();
+    app.prepare_page_edits_for_current_virtual_items();
+    let begin_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let ctx = egui::Context::default();
+    let mut frames = 0;
+    let mut max_frame_ms: f64 = 0.0;
+    loop {
+        let before = match app.page_edit_reconcile_pending.as_ref() {
+            Some(page_edit_snapshot::ReconcileStatus::Building(build)) => build.builder.len(),
+            Some(page_edit_snapshot::ReconcileStatus::Running(_)) => break,
+            _ => panic!("large order build stopped before worker handoff"),
+        };
+        let frame_started = std::time::Instant::now();
+        app.poll_page_edit_reconciliation(&ctx);
+        max_frame_ms = max_frame_ms.max(frame_started.elapsed().as_secs_f64() * 1000.0);
+        frames += 1;
+        let after = match app.page_edit_reconcile_pending.as_ref() {
+            Some(page_edit_snapshot::ReconcileStatus::Building(build)) => build.builder.len(),
+            Some(page_edit_snapshot::ReconcileStatus::Running(_)) => 100_000,
+            _ => panic!("large order build lost its request"),
+        };
+        assert!(
+            after - before <= 2048,
+            "a frame normalized {} keys",
+            after - before
+        );
+        assert!(frames < 1_000, "large order build did not finish");
+    }
+    eprintln!(
+        "A2 100,000-key UI order: start={begin_ms:.3} ms, frames={frames}, max frame={max_frame_ms:.3} ms"
+    );
+    assert!(
+        frames >= 49,
+        "order construction must be split across frames"
+    );
+    assert!(begin_ms < 50.0);
+    assert!(max_frame_ms < 50.0);
+}
+
+fn phase_a2_install_virtual_page(app: &mut App, image: &Path) {
+    app.items = vec![GridItem::Image(image.to_path_buf())];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.image_metas = vec![None];
+    app.visible_indices = vec![0];
+    app.current_folder = Some(search_results_synthetic_path());
+    let prepared = page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
+        &app.items,
+        page_edit_snapshot::PageEditAvailability {
+            mask: true,
+            ..Default::default()
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+    app.install_prepared_page_edits(prepared);
+}
+
+fn phase_a2_wait_for_mask(app: &mut App) {
+    let ctx = egui::Context::default();
+    for _ in 0..100 {
+        app.poll_page_edit_reconciliation(&ctx);
+        if app.mask_pages.contains(&0) && app.page_edit_snapshot.is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("virtual page mask did not reconcile");
+}
+
+#[test]
+fn phase_a2_snapshot_lock_keeps_saved_virtual_page_edit() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("snapshot-mask.png");
+    std::fs::write(&image, b"image").unwrap();
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    assert!(app.mask_pages.contains(&0));
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+    phase_a2_wait_for_mask(&mut app);
+    assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+    app.current_folder = Some(app.tmp.path().join("subfolder-child"));
+    app.items = vec![GridItem::Image(
+        app.tmp.path().join("subfolder-child/other.png"),
+    )];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.image_metas = vec![None];
+    app.visible_indices = vec![0];
+    assert!(app.snapshot_return_to_list_view());
+    phase_a2_wait_for_mask(&mut app);
+    assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+}
+
+#[test]
+fn phase_a2_snapshot_lock_from_search_and_child_list_return_keep_edit() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("search-snapshot-mask.png");
+    std::fs::write(&image, b"image").unwrap();
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    app.global_search.active = true;
+    app.global_search.saved_folder = Some(app.tmp.path().to_path_buf());
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+        query: "saved".into(),
+    });
+    phase_a2_wait_for_mask(&mut app);
+    app.current_folder = Some(app.tmp.path().join("child"));
+    app.items = vec![GridItem::Image(app.tmp.path().join("child/other.png"))];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.image_metas = vec![None];
+    app.visible_indices = vec![0];
+    assert!(app.snapshot_return_to_list_view());
+    phase_a2_wait_for_mask(&mut app);
+    assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+}
+
+#[test]
+fn phase_a2_snapshot_lock_from_collection_keeps_edit() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("collection-snapshot-mask.png");
+    std::fs::write(&image, b"image").unwrap();
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    app.top_level_grid_view
+        .replace_surface(top_level_grid_view::TopLevelGridSurface::Collection(
+            top_level_grid_view::CollectionGridIdentity {
+                collection_id: crate::collection_store::CollectionId::new(),
+            },
+        ));
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+    phase_a2_wait_for_mask(&mut app);
+    assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+    app.current_folder = Some(app.tmp.path().join("collection-child"));
+    app.items = vec![GridItem::Image(
+        app.tmp.path().join("collection-child/other.png"),
+    )];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.image_metas = vec![None];
+    app.visible_indices = vec![0];
+    assert!(app.snapshot_return_to_list_view());
+    phase_a2_wait_for_mask(&mut app);
+    assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+}
+
+#[test]
+fn phase_a2_idle_virtual_view_refreshes_after_external_page_write() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("late-mask.png");
+    std::fs::write(&image, b"image").unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    assert!(app.mask_pages.is_empty());
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    phase_a2_wait_for_mask(&mut app);
+}
+
+#[test]
+fn phase_a2_failed_full_reread_retries_without_another_write() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("failed-read.png");
+    std::fs::write(&image, b"image").unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    let order = std::sync::Arc::clone(&app.page_edit_snapshot.as_ref().unwrap().order);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.page_edit_reconcile_pending = Some(page_edit_snapshot::ReconcileStatus::Running(
+        page_edit_snapshot::ReconcilePending {
+            context_id: app.virtual_list_context_id(),
+            items_generation: app.items_generation,
+            page_edit_revision: app.page_edit_revision,
+            order: Some(order),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            receiver,
+            started_stamp: crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample(),
+            retry_attempt: 0,
+        },
+    ));
+    sender
+        .send(Err("injected DB read failure".to_owned()))
+        .unwrap();
+    let ctx = egui::Context::default();
+    app.poll_page_edit_reconciliation(&ctx);
+    assert!(matches!(
+        app.page_edit_reconcile_pending,
+        Some(page_edit_snapshot::ReconcileStatus::Failed { .. })
+    ));
+    app.poll_page_edit_reconciliation(&ctx);
+    assert!(matches!(
+        app.page_edit_reconcile_pending,
+        Some(page_edit_snapshot::ReconcileStatus::Failed { .. })
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    phase_a2_wait_for_mask(&mut app);
+    assert!(app.page_edit_snapshot.as_ref().unwrap().mask.contains(&key));
+}
+
+#[test]
+fn phase_a2_late_local_adjust_commit_and_delete_reconcile() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("late-local-adjust.png");
+    std::fs::write(&image, b"image").unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    let key = crate::adjustment_db::normalize_path(&image);
+    let layer = local_adjust_core::LocalAdjustmentLayer::new(
+        "external",
+        local_adjust_core::LocalMask::Full,
+        local_adjust_core::LocalEffect::None,
+    );
+    app.local_adjust_db
+        .as_ref()
+        .unwrap()
+        .set_layers(&key, &[layer])
+        .unwrap();
+    let ctx = egui::Context::default();
+    for wanted in [true, false] {
+        if !wanted {
+            app.local_adjust_db
+                .as_ref()
+                .unwrap()
+                .remove_layers(&key)
+                .unwrap();
+        }
+        for _ in 0..100 {
+            app.poll_page_edit_reconciliation(&ctx);
+            if app.local_adjust_pages.contains(&0) == wanted
+                && app
+                    .page_edit_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .local_adjust
+                    .contains(&key)
+                    == wanted
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.local_adjust_pages.contains(&0), wanted);
+        assert_eq!(
+            app.page_edit_snapshot
+                .as_ref()
+                .unwrap()
+                .local_adjust
+                .contains(&key),
+            wanted
+        );
+    }
+}
+
+#[test]
+fn phase_a2_rename_rebuilds_virtual_projection_for_new_key() {
+    let mut app = phase_c_support::setup_app();
+    let old = app.tmp.path().join("old-name.png");
+    let new = app.tmp.path().join("new-name.png");
+    std::fs::write(&old, b"image").unwrap();
+    phase_a2_install_virtual_page(&mut app, &old);
+    std::fs::rename(&old, &new).unwrap();
+    let key = crate::adjustment_db::normalize_path(&new);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    app.items[0] = GridItem::Image(new);
+    app.rehydrate_mounted_context_after_rename();
+    phase_a2_wait_for_mask(&mut app);
+    assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+    assert!(app.page_edit_snapshot.as_ref().unwrap().mask.contains(&key));
+}
+
+#[test]
+fn phase_a2_content_restore_keeps_virtual_owner_and_reloads_saved_edit() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("restored.png");
+    std::fs::write(&image, b"image").unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    app.finish_content_identity_restore(Vec::new());
+    phase_a2_wait_for_mask(&mut app);
+    assert!(app.page_edit_snapshot.as_ref().unwrap().mask.contains(&key));
+}
+
+#[test]
+fn phase_a2_unrelated_restore_does_not_clear_virtual_projection() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("unrelated-restore.png");
+    std::fs::write(&image, b"image").unwrap();
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    let order = std::sync::Arc::clone(&app.page_edit_snapshot.as_ref().unwrap().order);
+    app.finish_content_identity_restore(Vec::new());
+    assert!(app.mask_pages.contains(&0));
+    assert!(std::sync::Arc::ptr_eq(
+        &order,
+        &app.page_edit_snapshot.as_ref().unwrap().order
+    ));
+    assert!(app.page_edit_reconcile_pending.is_none());
+}
+
+#[test]
+fn phase_a2_metadata_import_updates_virtual_keyed_owner() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("imported.png");
+    std::fs::write(&image, b"image").unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    app.view_trim_dirty_page_overrides.insert(0);
+    app.view_trim_page_overrides
+        .insert(0, crate::view_trim::ViewTrimPageOverride::default());
+    app.local_adjust_selected_layers.insert(0, 0);
+    let result = metadata_import_refresh::ContextResult {
+        context_id: app.virtual_list_context_id(),
+        items_generation: app.items_generation,
+        rating_cache: None,
+        tags_cache: None,
+        current_rating: None,
+        page_state: Some(metadata_import_refresh::PageStateResult {
+            adjustment_page_params: Default::default(),
+            local_adjust_pages: Default::default(),
+            export_crop_page_settings: Default::default(),
+            view_trim_page_overrides: Default::default(),
+            mask_pages: [0].into(),
+            conceal_pages: Default::default(),
+            comic_pages: Default::default(),
+            rotation_cache: Default::default(),
+            thumbnail_reset_indices: Vec::new(),
+        }),
+        folder_pin_map: None,
+        folder_pin_reset_indices: None,
+        video_pin_blobs: None,
+        video_items: None,
+        container_state: None,
+    };
+    let changed = crate::metadata_transfer::ImportChangedSections {
+        page_state: true,
+        ..Default::default()
+    };
+    assert!(app.apply_current_metadata_import_terminal_result(result, changed));
+    assert!(app.view_trim_dirty_page_overrides.contains(&0));
+    assert_eq!(app.local_adjust_selected_layers.get(&0), Some(&0));
+    // A user can change the unsaved trim after the worker captured its overlay.
+    app.view_trim_page_overrides.remove(&0);
+    phase_a2_wait_for_mask(&mut app);
+    assert!(!app.view_trim_page_overrides.contains_key(&0));
+    assert!(app.page_edit_snapshot.as_ref().unwrap().mask.contains(&key));
+}
+
+#[test]
+fn phase_a2_metadata_import_writer_notification_refreshes_synthetic_view() {
+    let mut app = phase_c_support::setup_app();
+    let root = app.tmp.path().join("import-book");
+    std::fs::create_dir(&root).unwrap();
+    let image = root.join("page.png");
+    std::fs::write(&image, b"image").unwrap();
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    let data_dir = app.tmp.path().to_path_buf();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let exported =
+        crate::metadata_transfer::export_at(&data_dir, &root, false, &cancel, |_| {}).unwrap();
+    assert!(exported.page_states > 0);
+    app.mask_db.as_ref().unwrap().delete(&key).unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    assert!(!app.mask_pages.contains(&0));
+    // Production import hands off the idle tags connection before switching its
+    // journal mode for the multi-store transaction.
+    drop(app.tags_db.take());
+    let imported = std::thread::spawn(move || {
+        crate::metadata_transfer::import_at(
+            &data_dir,
+            &root,
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap()
+    })
+    .join()
+    .unwrap();
+    assert!(imported.changed.page_state);
+    assert!(app.mask_db.as_ref().unwrap().get(&key, 1, 1).is_some());
+    // The synthetic context is not in the physical metadata refresh index. The production
+    // import writer's completion notice must refresh its already-installed keyed owner.
+    phase_a2_wait_for_mask(&mut app);
+    assert!(app.page_edit_snapshot.as_ref().unwrap().mask.contains(&key));
+}
+
+#[test]
+#[cfg(windows)]
+fn phase_a2_sibling_write_refreshes_parked_bundle_on_remount() {
+    let mut app = phase_c_support::setup_app();
+    let image = app.tmp.path().join("sibling-mask.png");
+    std::fs::write(&image, b"image").unwrap();
+    phase_a2_install_virtual_page(&mut app, &image);
+    let sibling = app.build_window_context_for_test(18_268, |context| {
+        phase_a2_install_virtual_page(context, &image);
+    });
+    let ctx = egui::Context::default();
+    crate::page_edit_write_epoch::PAGE_EDIT_WRITES.register_repaint_context(&ctx);
+    let before_open = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+    app.with_viewer_context(sibling, |context| {
+        assert!(!context.mask_pages.contains(&0));
+    })
+    .unwrap();
+    assert_eq!(
+        crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample(),
+        before_open
+    );
+    let key = crate::adjustment_db::normalize_path(&image);
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    phase_a2_wait_for_mask(&mut app);
+    let mut sibling_ready = false;
+    for _ in 0..100 {
+        sibling_ready = app
+            .with_viewer_context(sibling, |context| context.mask_pages.contains(&0))
+            .unwrap();
+        if sibling_ready {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(sibling_ready, "parked sibling must reprepare on remount");
+    assert!(app.mask_pages.contains(&0), "main bundle remains intact");
+}
+
 #[cfg(windows)]
 #[path = "tests/detached_binding_identity.rs"]
 mod detached_binding_identity;

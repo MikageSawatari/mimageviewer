@@ -1032,6 +1032,7 @@ pub(in crate::app) struct ViewerContextBundle {
     export_crop_pages: std::collections::HashSet<usize>,
     mask_pages: std::collections::HashSet<usize>,
     page_edit_snapshot: Option<super::page_edit_snapshot::PageEditSnapshot>,
+    page_edit_reconcile_pending: Option<super::page_edit_snapshot::ReconcileStatus>,
     comic_pages: std::collections::HashSet<usize>,
     conceal_pages: std::collections::HashSet<usize>,
     erase_mask_generation: std::collections::HashMap<usize, u64>,
@@ -1608,6 +1609,7 @@ impl ViewerContextBundle {
             export_crop_pages: std::collections::HashSet::new(),
             mask_pages: std::collections::HashSet::new(),
             page_edit_snapshot: None,
+            page_edit_reconcile_pending: None,
             comic_pages: std::collections::HashSet::new(),
             conceal_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
@@ -1970,6 +1972,7 @@ impl App {
             export_crop_pages,
             mask_pages,
             page_edit_snapshot,
+            page_edit_reconcile_pending,
             comic_pages,
             conceal_pages,
             erase_mask_generation,
@@ -2241,6 +2244,7 @@ impl App {
         swap_field!(export_crop_pages);
         swap_field!(mask_pages);
         swap_field!(page_edit_snapshot);
+        swap_field!(page_edit_reconcile_pending);
         swap_field!(comic_pages);
         swap_field!(conceal_pages);
         swap_field!(erase_mask_generation);
@@ -2551,6 +2555,7 @@ impl App {
             export_crop_pages,
             mask_pages,
             page_edit_snapshot,
+            page_edit_reconcile_pending,
             comic_pages,
             conceal_pages,
             erase_mask_generation,
@@ -2846,6 +2851,7 @@ impl App {
             export_crop_pages,
             mask_pages,
             page_edit_snapshot,
+            page_edit_reconcile_pending,
             comic_pages,
             conceal_pages,
             erase_mask_generation,
@@ -2910,6 +2916,7 @@ impl App {
         // This fork navigates to a physical context. Do not clone the potentially large
         // virtual-list keyed owner on the UI thread; its current index maps are copied above.
         detached.page_edit_snapshot = None;
+        detached.page_edit_reconcile_pending = None;
         detached.comic_pages = self.comic_pages.clone();
         detached.conceal_pages = self.conceal_pages.clone();
         detached.erase_mask_generation = self.erase_mask_generation.clone();
@@ -3321,6 +3328,9 @@ impl App {
         let ops = self.viewer_contexts.table.plan_mount(id)?;
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
+        if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
+            self.poll_page_edit_reconciliation(&ctx);
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         let ops = self
             .viewer_contexts
@@ -3329,6 +3339,9 @@ impl App {
             .expect("mounted viewer-context owner disappeared");
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
+        if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
+            self.poll_page_edit_reconciliation(&ctx);
+        }
         match result {
             Ok(value) => Ok(value),
             Err(payload) => std::panic::resume_unwind(payload),

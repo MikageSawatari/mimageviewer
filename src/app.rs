@@ -14726,6 +14726,7 @@ pub struct App {
     /// Exact-key owner for the prepared cross-folder page-edit generation. The idx maps above
     /// and below are projections of this snapshot only while it is present.
     pub(crate) page_edit_snapshot: Option<page_edit_snapshot::PageEditSnapshot>,
+    page_edit_reconcile_pending: Option<page_edit_snapshot::ReconcileStatus>,
     /// 現フォルダでテキスト注釈 (comic) を持つページの item_idx 集合 (サムネイル「文」
     /// バッジ描画用)。フォルダロード時に comic_db.load_comic_keys から一括取得し、
     /// save_comic_objects で idx 単位にメンテナンスする (mask_pages と同形)。
@@ -17255,6 +17256,7 @@ impl App {
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             page_edit_snapshot: None,
+            page_edit_reconcile_pending: None,
             comic_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
             local_adjust_cache: std::collections::HashMap::new(),
@@ -30763,14 +30765,14 @@ impl App {
     /// 変えたらこちらも揃えること** (= 同期漏れ防止。snapshot 経路だけ古い hydration を
     /// 引きずると Codex P1 が再発する)。
     ///
-    /// 用途: ★固定 (snapshot) の activate / deactivate / list 復帰のように、`load_folder` を
+    /// 用途: 物理フォルダ由来の ★固定 (snapshot) activate / deactivate / list 復帰のように、`load_folder` を
     /// 通さずに `items` を差し替える経路。これらで呼ばないと、差し替え前 idx に紐付いた補正・
     /// マスクが新しい items の別ページに乗る (Codex P1)。補正・マスク等の編集は `set_page_params`
     /// 等が DB に同期保存するので、DB から読み直せば snapshot 中の編集も反映される。
     ///
     /// `prefix_path` は DB prefix クエリに使うフォルダ / ZIP / PDF パス (= snapshot origin)。
-    /// 検索 view 由来 snapshot のように prefix が合成 path / cross-folder の場合は DB が空ヒット
-    /// になり、マップは空のまま (= 検索 view は元々ページ編集状態を持たない設計と整合)。
+    /// 合成 path / cross-folder の仮想一覧にはこの prefix 読込を使わず、exact-key の
+    /// `PageEditSnapshot` を worker で prepare する。
     ///
     /// `local_adjust_selected_layers` は DB を持たない UI 選択状態なので clear のみ
     /// (load_folder と同じ。再選択時に 0 始まりで復元される)。
@@ -30779,8 +30781,7 @@ impl App {
     /// 全 clear する。
     ///
     /// `rehydrate_page_edit_state_for_current_items` の clear 段であり、
-    /// 「ページ編集 overlay を出さない」べき経路 (= 検索 view 由来 snapshot や
-    /// `replace_search_view_items`) からも単独で呼ぶ。**ここに列挙するマップ集合が
+    /// 仮想一覧の次の prepare を待つ間にも単独で呼ぶ。**ここに列挙するマップ集合が
     /// idx-keyed ページ編集状態の正準リスト**。新しい idx-keyed ページ編集マップを足したら
     /// ここと `remove_items_batch` の shift 群の両方に追加すること。bundle 外の native pending
     /// (`native_video_source_swap_pending` / `native_video_open_pending` /
@@ -30788,6 +30789,7 @@ impl App {
     /// regular open は `ViewerContextId`、残る 3 種は legacy owner=None が mounted 所有を表す
     /// (review-v2.3.0 追補3: 角度A-1)。
     pub(crate) fn clear_page_edit_state(&mut self) {
+        self.page_edit_reconcile_pending = None;
         self.page_edit_snapshot = None;
         self.adjustment_page_params.clear();
         self.local_adjust_page_layers.clear();
@@ -30817,6 +30819,7 @@ impl App {
         &mut self,
         prepared: page_edit_snapshot::StablePageEditProjection,
     ) {
+        self.page_edit_reconcile_pending = None;
         let page_edit_snapshot::StablePageEditProjection {
             snapshot,
             projection,
@@ -30831,6 +30834,611 @@ impl App {
         self.conceal_pages = projection.conceal;
         self.comic_pages = projection.comic;
         self.local_adjust_pages = projection.local_adjust;
+    }
+
+    /// Reconcile only the mounted bundle. Parked bundles retain their compact order and check
+    /// the process-wide write stamp on remount; no database query runs on this thread.
+    fn poll_page_edit_reconciliation(&mut self, ctx: &egui::Context) {
+        use std::sync::mpsc::TryRecvError;
+
+        const KEY_ORDER_ITEMS_PER_FRAME: usize = 2048;
+        const KEY_ORDER_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+
+        if matches!(
+            self.page_edit_reconcile_pending,
+            Some(page_edit_snapshot::ReconcileStatus::Building(_))
+        ) {
+            let Some(page_edit_snapshot::ReconcileStatus::Building(mut build)) =
+                self.page_edit_reconcile_pending.take()
+            else {
+                unreachable!()
+            };
+            if self.virtual_list_context_id() != build.context_id
+                || self.items_generation != build.items_generation
+                || self.page_edit_revision != build.page_edit_revision
+                || self.items.len() != build.item_count
+            {
+                return;
+            }
+            let started = std::time::Instant::now();
+            let until = build.item_count.min(
+                build
+                    .builder
+                    .len()
+                    .saturating_add(KEY_ORDER_ITEMS_PER_FRAME),
+            );
+            while build.builder.len() < until {
+                let index = build.builder.len();
+                if let Err(error) = build.builder.push(&self.items[index]) {
+                    crate::logger::log(format!("virtual page-edit key order failed: {error}"));
+                    self.show_feedback_toast("ページ編集の読込に失敗しました".to_owned());
+                    return;
+                }
+                if index % 64 == 63 && started.elapsed() >= KEY_ORDER_FRAME_BUDGET {
+                    break;
+                }
+            }
+            if build.builder.len() < build.item_count {
+                self.page_edit_reconcile_pending =
+                    Some(page_edit_snapshot::ReconcileStatus::Building(build));
+                ctx.request_repaint();
+                return;
+            }
+            self.spawn_virtual_page_edit_prepare_from_order(build);
+            return;
+        }
+
+        if let Some(page_edit_snapshot::ReconcileStatus::Failed {
+            context_id,
+            items_generation,
+            page_edit_revision,
+            completed_writes,
+            retry_attempt,
+            retry_at,
+        }) = self.page_edit_reconcile_pending.as_ref()
+        {
+            let still_current = self.virtual_list_context_id() == *context_id
+                && self.items_generation == *items_generation
+                && self.page_edit_revision == *page_edit_revision;
+            let stamp = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+            // The writer guard repaints on completion, which resumes this retry.
+            // Polling here would keep an idle view updating while a writer runs.
+            if still_current && stamp.active_writers != 0 {
+                return;
+            }
+            if still_current
+                && stamp.completed_writes == *completed_writes
+                && std::time::Instant::now() < *retry_at
+            {
+                ctx.request_repaint_after(
+                    retry_at.saturating_duration_since(std::time::Instant::now()),
+                );
+                return;
+            }
+            let retry_attempt = *retry_attempt;
+            self.page_edit_reconcile_pending = None;
+            if !still_current {
+                return;
+            }
+            if self.page_edit_snapshot.is_none() {
+                self.prepare_page_edits_for_current_virtual_items_with_attempt(retry_attempt);
+                return;
+            }
+            self.spawn_existing_page_edit_reconciliation(ctx, true, retry_attempt);
+            return;
+        }
+        if let Some(page_edit_snapshot::ReconcileStatus::Running(pending)) =
+            self.page_edit_reconcile_pending.as_ref()
+        {
+            let retry_initial = pending.order.is_none()
+                && self.virtual_list_context_id() == pending.context_id
+                && self.items_generation == pending.items_generation
+                && self.page_edit_revision == pending.page_edit_revision;
+            match pending.receiver.try_recv() {
+                Ok(Ok(Some(ready))) => {
+                    let current = self.virtual_list_context_id() == pending.context_id
+                        && self.items_generation == pending.items_generation
+                        && self.page_edit_revision == pending.page_edit_revision
+                        && match pending.order.as_ref() {
+                            Some(order) => {
+                                self.page_edit_snapshot.as_ref().is_some_and(|snapshot| {
+                                    std::sync::Arc::ptr_eq(&snapshot.order, order)
+                                })
+                            }
+                            None => self.page_edit_snapshot.is_none(),
+                        }
+                        && crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(ready.stamp());
+                    self.page_edit_reconcile_pending = None;
+                    if current {
+                        match ready {
+                            page_edit_snapshot::ReconcileReady::Full(mut prepared) => {
+                                prepared.snapshot.stamp = Some(prepared.stamp);
+                                // The trim editor can change its unsaved override while the
+                                // worker reads. Apply its latest bundle-owned values at the
+                                // acceptance boundary without reprojecting the whole list.
+                                let dirty_trim =
+                                    self.dirty_view_trim_key_overrides(&prepared.snapshot.order);
+                                prepared.snapshot.apply_view_trim_overlay(&dirty_trim);
+                                for &index in &self.view_trim_dirty_page_overrides {
+                                    if let Some(value) = self.view_trim_page_overrides.get(&index) {
+                                        prepared.projection.view_trim.insert(index, *value);
+                                    } else {
+                                        prepared.projection.view_trim.remove(&index);
+                                    }
+                                }
+                                let changed =
+                                    self.changed_page_edit_projection_indices(&prepared.projection);
+                                self.install_prepared_page_edits(prepared);
+                                for index in changed {
+                                    self.bump_erase_mask_generation(index);
+                                }
+                            }
+                            page_edit_snapshot::ReconcileReady::Keys { prepared, indices } => {
+                                self.apply_page_edit_key_delta(prepared, &indices);
+                            }
+                        }
+                        ctx.request_repaint();
+                        return;
+                    }
+                    if retry_initial {
+                        self.prepare_page_edits_for_current_virtual_items();
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+                Ok(Ok(None)) => {
+                    self.page_edit_reconcile_pending = None;
+                    if retry_initial {
+                        self.prepare_page_edits_for_current_virtual_items();
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+                outcome @ (Ok(Err(_)) | Err(TryRecvError::Disconnected)) => {
+                    let error = match outcome {
+                        Ok(Err(error)) => error,
+                        _ => "worker disconnected".to_owned(),
+                    };
+                    let current = self.virtual_list_context_id() == pending.context_id
+                        && self.items_generation == pending.items_generation
+                        && self.page_edit_revision == pending.page_edit_revision;
+                    let started_stamp = pending.started_stamp;
+                    let context_id = pending.context_id;
+                    let items_generation = pending.items_generation;
+                    let page_edit_revision = pending.page_edit_revision;
+                    let retry_attempt = pending.retry_attempt.saturating_add(1);
+                    self.page_edit_reconcile_pending = None;
+                    let now = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+                    if current
+                        && (now.active_writers != 0
+                            || now.completed_writes != started_stamp.completed_writes)
+                    {
+                        if retry_initial {
+                            self.prepare_page_edits_for_current_virtual_items();
+                        } else {
+                            ctx.request_repaint();
+                        }
+                        return;
+                    }
+                    if current {
+                        crate::logger::log(format!(
+                            "virtual page-edit reconciliation failed: {error}"
+                        ));
+                        if retry_attempt == 1 {
+                            self.show_feedback_toast("ページ編集の読込を再試行します".to_owned());
+                        }
+                        let delay = page_edit_snapshot::reconcile_retry_delay(retry_attempt);
+                        self.page_edit_reconcile_pending =
+                            Some(page_edit_snapshot::ReconcileStatus::Failed {
+                                context_id,
+                                items_generation,
+                                page_edit_revision,
+                                completed_writes: now.completed_writes,
+                                retry_attempt,
+                                retry_at: std::time::Instant::now() + delay,
+                            });
+                        ctx.request_repaint_after(delay);
+                    }
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
+            }
+        }
+
+        let Some(snapshot) = self.page_edit_snapshot.as_ref() else {
+            return;
+        };
+        let Some(stamp) = snapshot.stamp else {
+            return;
+        };
+        if crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp) {
+            return;
+        }
+        self.spawn_existing_page_edit_reconciliation(ctx, false, 0);
+    }
+
+    fn spawn_existing_page_edit_reconciliation(
+        &mut self,
+        ctx: &egui::Context,
+        force_full: bool,
+        retry_attempt: u8,
+    ) {
+        use std::sync::atomic::Ordering;
+        let Some(snapshot) = self.page_edit_snapshot.as_ref() else {
+            return;
+        };
+        let Some(stamp) = snapshot.stamp else {
+            return;
+        };
+        // Missing/overflowed/panicking notices request a full worker reread. Ordinary
+        // per-key writes fetch only matching pages in the immutable accepted order.
+        let read_stamp = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+        if read_stamp.active_writers != 0 {
+            return;
+        }
+        let changed_keys = if force_full {
+            None
+        } else {
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+                .changed_keys_since(stamp.completed_writes, read_stamp.completed_writes)
+        };
+        let order = std::sync::Arc::clone(&snapshot.order);
+        let overlay = snapshot.volatile_overlay();
+        let availability = page_edit_snapshot::PageEditAvailability::for_app(self);
+        let context_id = self.virtual_list_context_id();
+        let items_generation = self.items_generation;
+        let page_edit_revision = self.page_edit_revision;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let worker_order = std::sync::Arc::clone(&order);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let repaint = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("page-edit-reconcile".into())
+            .spawn(move || {
+                let result = if let Some(keys) = changed_keys {
+                    let keys = keys.into_iter().collect::<std::collections::HashSet<_>>();
+                    worker_order
+                        .subset_for_keys(&keys)
+                        .and_then(|(subset, indices)| {
+                            page_edit_snapshot::PageEditSnapshot::load_and_project_order_stable(
+                                subset,
+                                availability,
+                                &worker_cancel,
+                            )
+                            .map(|prepared| {
+                                prepared.and_then(|prepared| {
+                                    (prepared.stamp.completed_writes == read_stamp.completed_writes)
+                                        .then_some(page_edit_snapshot::ReconcileReady::Keys {
+                                            prepared,
+                                            indices,
+                                        })
+                                })
+                            })
+                        })
+                } else {
+                    page_edit_snapshot::PageEditSnapshot::load_and_project_order_stable(
+                        worker_order,
+                        availability,
+                        &worker_cancel,
+                    )
+                    .map(|prepared| {
+                        prepared.map(|mut prepared| {
+                            prepared.snapshot.apply_volatile_overlay(&overlay);
+                            prepared.projection = prepared.snapshot.project_order();
+                            page_edit_snapshot::ReconcileReady::Full(prepared)
+                        })
+                    })
+                };
+                let _ = sender.send(result);
+                repaint.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.page_edit_reconcile_pending = Some(page_edit_snapshot::ReconcileStatus::Running(
+                page_edit_snapshot::ReconcilePending {
+                    context_id,
+                    items_generation,
+                    page_edit_revision,
+                    order: Some(order),
+                    cancel,
+                    receiver,
+                    started_stamp: read_stamp,
+                    retry_attempt,
+                },
+            ));
+        } else {
+            cancel.store(true, Ordering::Relaxed);
+            let retry_attempt = retry_attempt.saturating_add(1);
+            let delay = page_edit_snapshot::reconcile_retry_delay(retry_attempt);
+            self.page_edit_reconcile_pending = Some(page_edit_snapshot::ReconcileStatus::Failed {
+                context_id,
+                items_generation,
+                page_edit_revision,
+                completed_writes: read_stamp.completed_writes,
+                retry_attempt,
+                retry_at: std::time::Instant::now() + delay,
+            });
+            ctx.request_repaint_after(delay);
+        }
+    }
+
+    fn changed_page_edit_projection_indices(
+        &self,
+        next: &page_edit_snapshot::PageEditProjection,
+    ) -> std::collections::HashSet<usize> {
+        let mut changed = std::collections::HashSet::new();
+        macro_rules! compare_map {
+            ($current:expr, $next:expr) => {
+                for index in $current.keys().chain($next.keys()) {
+                    if $current.get(index) != $next.get(index) {
+                        changed.insert(*index);
+                    }
+                }
+            };
+        }
+        macro_rules! compare_set {
+            ($current:expr, $next:expr) => {
+                for index in $current.symmetric_difference(&$next) {
+                    changed.insert(*index);
+                }
+            };
+        }
+        compare_map!(self.adjustment_page_params, next.adjustment);
+        compare_map!(self.export_crop_page_settings, next.export_crop);
+        compare_map!(self.view_trim_page_overrides, next.view_trim);
+        compare_set!(self.mask_pages, next.mask);
+        compare_set!(self.conceal_pages, next.conceal);
+        compare_set!(self.comic_pages, next.comic);
+        compare_set!(self.local_adjust_pages, next.local_adjust);
+        changed
+    }
+
+    fn dirty_view_trim_key_overrides(
+        &self,
+        order: &page_edit_snapshot::PageKeyOrder,
+    ) -> Vec<(String, Option<crate::view_trim::ViewTrimPageOverride>)> {
+        self.view_trim_dirty_page_overrides
+            .iter()
+            .filter_map(|&index| {
+                order.key_at(index).map(|key| {
+                    (
+                        key.to_owned(),
+                        self.view_trim_page_overrides.get(&index).copied(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn apply_page_edit_key_delta(
+        &mut self,
+        prepared: page_edit_snapshot::StablePageEditProjection,
+        indices: &[usize],
+    ) {
+        let Some(mut current) = self.page_edit_snapshot.take() else {
+            return;
+        };
+        if indices.iter().enumerate().any(|(subset_index, &index)| {
+            prepared.snapshot.order.key_at(subset_index) != current.order.key_at(index)
+        }) {
+            self.page_edit_snapshot = Some(current);
+            return;
+        }
+        let mut changed = Vec::new();
+        for (subset_index, &index) in indices.iter().enumerate() {
+            let Some(key) = prepared.snapshot.order.key_at(subset_index) else {
+                continue;
+            };
+            let preserve_local_adjust = current.volatile_keys.contains(key);
+            let preserve_view_trim = self.view_trim_dirty_page_overrides.contains(&index);
+            let mut different = false;
+            macro_rules! update_map {
+                ($field:expr, $source:expr) => {{
+                    let value = $source.get(&subset_index);
+                    different |= $field.get(&index) != value;
+                    if let Some(value) = value {
+                        $field.insert(index, value.clone());
+                    } else {
+                        $field.remove(&index);
+                    }
+                }};
+            }
+            macro_rules! update_set {
+                ($field:expr, $source:expr) => {{
+                    let present = $source.contains(&subset_index);
+                    different |= $field.contains(&index) != present;
+                    if present {
+                        $field.insert(index);
+                    } else {
+                        $field.remove(&index);
+                    }
+                }};
+            }
+            update_map!(self.adjustment_page_params, prepared.projection.adjustment);
+            update_map!(
+                self.export_crop_page_settings,
+                prepared.projection.export_crop
+            );
+            update_set!(
+                self.export_crop_pages,
+                prepared.projection.export_crop_pages
+            );
+            if !preserve_view_trim {
+                update_map!(self.view_trim_page_overrides, prepared.projection.view_trim);
+            }
+            update_set!(self.mask_pages, prepared.projection.mask);
+            update_set!(self.conceal_pages, prepared.projection.conceal);
+            update_set!(self.comic_pages, prepared.projection.comic);
+            if !preserve_local_adjust {
+                update_set!(self.local_adjust_pages, prepared.projection.local_adjust);
+            }
+            current.apply_read_key_values(&prepared.snapshot, key, preserve_view_trim);
+            if different {
+                changed.push(index);
+            }
+        }
+        current.stamp = Some(prepared.stamp);
+        self.page_edit_snapshot = Some(current);
+        for index in changed {
+            self.bump_erase_mask_generation(index);
+        }
+    }
+
+    /// Rebuild an exact-key owner after a virtual list changes its index space without going
+    /// through a Phase A/B install (Snapshot Lock and its saved-list return).
+    fn prepare_page_edits_for_current_virtual_items(&mut self) {
+        self.prepare_page_edits_for_current_virtual_items_with_attempt(0);
+    }
+
+    fn prepare_page_edits_for_current_virtual_items_with_attempt(&mut self, retry_attempt: u8) {
+        let overlay = self
+            .page_edit_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.volatile_overlay());
+        self.clear_page_edit_state();
+        // Only a fixed batch of GridItem keys is normalized per frame. The compact order is
+        // finalized and queried on a worker, without cloning the whole item list on the UI.
+        self.page_edit_reconcile_pending = Some(page_edit_snapshot::ReconcileStatus::Building(
+            page_edit_snapshot::ReconcileBuild {
+                context_id: self.virtual_list_context_id(),
+                items_generation: self.items_generation,
+                page_edit_revision: self.page_edit_revision,
+                item_count: self.items.len(),
+                builder: page_edit_snapshot::PageKeyOrderBuilder::new(),
+                overlay,
+                availability: page_edit_snapshot::PageEditAvailability::for_app(self),
+                retry_attempt,
+            },
+        ));
+        if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn spawn_virtual_page_edit_prepare_from_order(
+        &mut self,
+        build: page_edit_snapshot::ReconcileBuild,
+    ) {
+        let page_edit_snapshot::ReconcileBuild {
+            context_id,
+            items_generation,
+            page_edit_revision,
+            builder,
+            overlay,
+            availability,
+            retry_attempt,
+            ..
+        } = build;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let repaint = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context();
+        let started_stamp = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+        let spawned = std::thread::Builder::new()
+            .name("virtual-page-edit-prepare".into())
+            .spawn(move || {
+                let order = std::sync::Arc::new(builder.finish());
+                let result = page_edit_snapshot::PageEditSnapshot::load_and_project_order_stable(
+                    order,
+                    availability,
+                    &worker_cancel,
+                )
+                .map(|prepared| {
+                    prepared.map(|mut prepared| {
+                        if let Some(overlay) = overlay.as_ref() {
+                            prepared.snapshot.apply_volatile_overlay(overlay);
+                            prepared.projection = prepared.snapshot.project_order();
+                        }
+                        page_edit_snapshot::ReconcileReady::Full(prepared)
+                    })
+                });
+                let _ = sender.send(result);
+                if let Some(ctx) = repaint {
+                    ctx.request_repaint();
+                }
+            });
+        if spawned.is_ok() {
+            self.page_edit_reconcile_pending = Some(page_edit_snapshot::ReconcileStatus::Running(
+                page_edit_snapshot::ReconcilePending {
+                    context_id,
+                    items_generation,
+                    page_edit_revision,
+                    order: None,
+                    cancel,
+                    receiver,
+                    started_stamp,
+                    retry_attempt,
+                },
+            ));
+        } else {
+            let retry_attempt = retry_attempt.saturating_add(1);
+            let delay = page_edit_snapshot::reconcile_retry_delay(retry_attempt);
+            self.page_edit_reconcile_pending = Some(page_edit_snapshot::ReconcileStatus::Failed {
+                context_id,
+                items_generation,
+                page_edit_revision,
+                completed_writes: started_stamp.completed_writes,
+                retry_attempt,
+                retry_at: std::time::Instant::now() + delay,
+            });
+            if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
+                ctx.request_repaint_after(delay);
+            }
+        }
+    }
+
+    /// Metadata import changes durable values but leaves this listing's order intact. Retain
+    /// the accepted display until a fresh worker read lands; do not clear unsaved UI overrides.
+    fn reprepare_page_edits_for_existing_virtual_order(&mut self) {
+        let Some(snapshot) = self.page_edit_snapshot.as_ref() else {
+            return;
+        };
+        let order = std::sync::Arc::clone(&snapshot.order);
+        let overlay = snapshot.volatile_overlay();
+        let availability = page_edit_snapshot::PageEditAvailability::for_app(self);
+        let context_id = self.virtual_list_context_id();
+        let items_generation = self.items_generation;
+        let page_edit_revision = self.page_edit_revision;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let worker_order = std::sync::Arc::clone(&order);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let repaint = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context();
+        let started_stamp = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+        let spawned = std::thread::Builder::new()
+            .name("metadata-page-edit-reconcile".into())
+            .spawn(move || {
+                let result = page_edit_snapshot::PageEditSnapshot::load_and_project_order_stable(
+                    worker_order,
+                    availability,
+                    &worker_cancel,
+                )
+                .map(|prepared| {
+                    prepared.map(|mut prepared| {
+                        prepared.snapshot.apply_volatile_overlay(&overlay);
+                        prepared.projection = prepared.snapshot.project_order();
+                        page_edit_snapshot::ReconcileReady::Full(prepared)
+                    })
+                });
+                let _ = sender.send(result);
+                if let Some(ctx) = repaint {
+                    ctx.request_repaint();
+                }
+            });
+        if spawned.is_ok() {
+            self.page_edit_reconcile_pending = Some(page_edit_snapshot::ReconcileStatus::Running(
+                page_edit_snapshot::ReconcilePending {
+                    context_id,
+                    items_generation,
+                    page_edit_revision,
+                    order: Some(order),
+                    cancel,
+                    receiver,
+                    started_stamp,
+                    retry_attempt: 0,
+                },
+            ));
+        }
     }
 
     /// Keep the page-key owner and the active index projection in step after an edit mutation.
@@ -32350,6 +32958,8 @@ impl App {
         }
         let rating_cache_replaced = result.rating_cache.is_some();
         let tags_cache_replaced = result.tags_cache.is_some();
+        let virtual_page_reprepare =
+            result.page_state.is_some() && self.page_edit_snapshot.is_some();
         let rebuild_display =
             rating_cache_replaced || tags_cache_replaced || result.page_state.is_some();
         if let Some(ratings) = result.rating_cache.take() {
@@ -32373,16 +32983,18 @@ impl App {
             for index in &page.thumbnail_reset_indices {
                 self.evict_thumbnail_for_reload(*index);
             }
-            self.adjustment_page_params = page.adjustment_page_params;
-            self.local_adjust_pages = page.local_adjust_pages;
-            self.local_adjust_page_layers.clear();
-            self.local_adjust_selected_layers.clear();
-            self.export_crop_pages = page.export_crop_page_settings.keys().copied().collect();
-            self.export_crop_page_settings = page.export_crop_page_settings;
-            self.view_trim_page_overrides = page.view_trim_page_overrides;
-            self.mask_pages = page.mask_pages;
-            self.conceal_pages = page.conceal_pages;
-            self.comic_pages = page.comic_pages;
+            if !virtual_page_reprepare {
+                self.adjustment_page_params = page.adjustment_page_params;
+                self.local_adjust_pages = page.local_adjust_pages;
+                self.local_adjust_page_layers.clear();
+                self.local_adjust_selected_layers.clear();
+                self.export_crop_pages = page.export_crop_page_settings.keys().copied().collect();
+                self.export_crop_page_settings = page.export_crop_page_settings;
+                self.view_trim_page_overrides = page.view_trim_page_overrides;
+                self.mask_pages = page.mask_pages;
+                self.conceal_pages = page.conceal_pages;
+                self.comic_pages = page.comic_pages;
+            }
             self.rotation_cache = page.rotation_cache.into();
             self.reconcile_spread_landscapes_from_rotation_cache();
             self.adjustment_cache.clear();
@@ -32399,6 +33011,9 @@ impl App {
             self.cancel_all_erase_inpaint_pending();
             self.bump_all_adjustment_generations();
             self.clear_all_final_pipeline_caches();
+        }
+        if virtual_page_reprepare {
+            self.reprepare_page_edits_for_existing_virtual_order();
         }
         if let Some(container) = result.container_state.take() {
             let stored_spread = container
@@ -33693,7 +34308,11 @@ impl App {
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
-        self.rehydrate_page_edit_state_for_current_items(&folder);
+        if self.page_edit_snapshot.is_some() {
+            self.prepare_page_edits_for_current_virtual_items();
+        } else {
+            self.rehydrate_page_edit_state_for_current_items(&folder);
+        }
         self.rating_cache.clear();
         self.current_folder_rating_cache = None;
         self.clear_tags_cache();
@@ -62262,6 +62881,13 @@ impl App {
             // 画面には残す。durable な mirror だけ書かない。
             return;
         }
+        if !self.local_adjust_write_pending.contains_key(&key)
+            && let Some(snapshot) = self.page_edit_snapshot.as_mut()
+        {
+            if snapshot.volatile_keys.remove(&key) {
+                self.page_edit_revision = self.page_edit_revision.wrapping_add(1);
+            }
+        }
         if layers.is_empty() {
             self.with_sidecar_coords_mut(sidecar.as_ref(), |sc, rel| {
                 sc.remove_local_adjust_layers(rel)
@@ -62325,6 +62951,11 @@ impl App {
             self.local_adjust_pages.insert(idx);
         }
         self.sync_prepared_page_edit_key_for_idx(idx);
+        if let Some(key) = self.page_path_key(idx)
+            && let Some(snapshot) = self.page_edit_snapshot.as_mut()
+        {
+            snapshot.volatile_keys.insert(key);
+        }
     }
 
     pub(crate) fn ensure_local_adjust_masks_match_source_dims(&mut self, idx: usize) -> bool {
@@ -77647,6 +78278,8 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        crate::page_edit_write_epoch::PAGE_EDIT_WRITES.register_repaint_context(ctx);
+        self.poll_page_edit_reconciliation(ctx);
         let update_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
         let update_cycles_t0 = update_t0.map(|_| Self::thread_cycles_now());
         // Process-global clipboard events must be visible before fullscreen/native early

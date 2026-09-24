@@ -1595,6 +1595,13 @@ impl App {
             .filter(|presentation| {
                 presentation.reuse_key == reuse_key
                     && presentation.page_edit_revision == self.page_edit_revision
+                    && presentation
+                        .page_edit_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.stamp)
+                        .is_some_and(|stamp| {
+                            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp)
+                        })
                     && reuse_key.order.matches_prepared(&presentation.prepared)
             })
             .and_then(|presentation| {
@@ -1935,6 +1942,13 @@ impl App {
                         if install.prepared.collection_id == request.origin.collection_id
                             && install.prepared.collection_revision == exact_revision
                             && install.page_edit_revision == self.page_edit_revision
+                            && install
+                                .retained_page_edits
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.stamp)
+                                .is_some_and(|stamp| {
+                                    crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp)
+                                })
                             && install.reuse_key
                                 == self.collection_grid_prepare_reuse_key(
                                     request.origin.collection_id,
@@ -2510,12 +2524,10 @@ impl App {
         prepared: &CollectionPreparedSnapshot,
         target: &CollectionPreparedNavigationTarget,
     ) -> bool {
+        // A page-edit write invalidates retained root edits, not this physical target.
+        // Keep navigation alive; commit_collection_navigation rebases a stale edit owner.
         if !self.collection_navigation_request_is_current(request)
             || prepared.collection_id != request.origin.collection_id
-            || request
-                .root_thumbnail_sources
-                .as_ref()
-                .is_some_and(|owner| owner.page_edit_revision != self.page_edit_revision)
         {
             return false;
         }
@@ -2633,6 +2645,13 @@ impl App {
                     installed.prepared.as_ref(),
                     prepared.as_ref(),
                 ) && installed.sources.identity() == prepared_thumbnail_source_identity
+                    && installed
+                        .page_edit_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.stamp)
+                        .is_some_and(|stamp| {
+                            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp)
+                        })
                     && installed.reuse_key
                         == self.collection_grid_prepare_reuse_key(
                             request.origin.collection_id,
@@ -2872,6 +2891,8 @@ impl App {
                         request.origin.collection_id,
                         prepared.collection_revision,
                     )
+                    || owner.page_edit_revision != self.page_edit_revision
+                    || owner.retained_edit_snapshot.is_some() && !owner.page_edit_stamp_is_current()
             })
         {
             self.restart_collection_navigation(ctx, request);
@@ -3599,12 +3620,12 @@ mod tests {
             prepared.collection_revision,
         );
         let page_edit_revision = app.page_edit_revision;
+        let mut retained_edits = super::super::page_edit_snapshot::PageEditSnapshot::default();
+        retained_edits.stamp = Some(crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample());
         app.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 page_edits: None,
-                retained_page_edits: Some(Arc::new(
-                    super::super::page_edit_snapshot::PageEditSnapshot::default(),
-                )),
+                retained_page_edits: Some(Arc::new(retained_edits)),
                 page_edit_revision,
                 prepared: (*prepared).clone(),
                 thumbnail_sources: prepared_thumbnail_sources(
@@ -3781,6 +3802,238 @@ mod tests {
     }
 
     #[test]
+    fn external_page_write_prevents_retained_collection_navigation_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.jpg");
+        let second = temp.path().join("second.jpg");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("edit-stamp".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    [&first, &second]
+                        .into_iter()
+                        .map(|path| {
+                            crate::collection_store::CollectionRegistration::from_trusted_path(
+                                path,
+                                CollectionResolvedKind::Image,
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        let mut edit_snapshot = super::super::page_edit_snapshot::PageEditSnapshot::default();
+        edit_snapshot.stamp = Some(crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample());
+        let reuse_key = app.collection_grid_prepare_reuse_key(
+            prepared.collection_id,
+            prepared.collection_revision,
+        );
+        let page_edit_revision = app.page_edit_revision;
+        app.apply_collection_grid_prepared_install(
+            CollectionGridPreparedInstall {
+                page_edits: None,
+                retained_page_edits: Some(Arc::new(edit_snapshot)),
+                page_edit_revision,
+                prepared: (*prepared).clone(),
+                thumbnail_sources: prepared_thumbnail_sources(
+                    CollectionGridThumbnailSources::default(),
+                ),
+                auto_aspect_lookup: None,
+                reuse_key,
+            },
+            None,
+        );
+        let installed = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::installed_presentation)
+            .unwrap()
+            .clone();
+        app.fullscreen_idx = Some(0);
+        let mut in_flight = manual_navigation_request(&mut app, 0);
+        in_flight.origin.intent_sequence = app
+            .top_level_grid_view
+            .advance_collection_navigation_sequence();
+        let mut sources = CollectionGridNavigationSources::new(
+            installed.reuse_key.clone(),
+            app.page_edit_revision,
+            installed.sources.clone(),
+            None,
+        );
+        sources.retained_edit_snapshot = installed.page_edit_snapshot.clone();
+        in_flight.root_thumbnail_sources = Some(Arc::new(sources));
+        let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Image);
+        let landed_owner = app
+            .collection_navigation_source_open_owner(
+                &in_flight,
+                &client.subscribe().unwrap(),
+                Arc::clone(&installed.prepared),
+                &target,
+            )
+            .unwrap();
+        assert!(app.collection_navigation_source_owner_is_current(&landed_owner));
+        let key = crate::adjustment_db::normalize_path(&second);
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        assert!(
+            app.collection_navigation_source_owner_landed_is_current(&landed_owner),
+            "an edit write must not cancel an otherwise valid physical source open"
+        );
+        assert!(
+            !landed_owner
+                .navigation_request
+                .as_ref()
+                .unwrap()
+                .root_thumbnail_sources
+                .as_ref()
+                .unwrap()
+                .page_edit_stamp_is_current()
+        );
+        app.current_folder = Some(second.clone());
+        assert!(app.commit_collection_grid_source_open_owned(&landed_owner, second.clone()));
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .and_then(CollectionGridSession::installed_presentation)
+                .unwrap()
+                .page_edit_snapshot
+                .is_none(),
+            "the final landing must discard the stale retained projection"
+        );
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| session.installed_items_generation.is_none()),
+            "the physical child must request a fresh root installation on return"
+        );
+        app.cancel_collection_navigation_intent();
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn external_edit_during_preflight_restarts_navigation_instead_of_ending_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.jpg");
+        let second = temp.path().join("second.jpg");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = recv(client.create_collection("preflight-edit".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    [&first, &second]
+                        .into_iter()
+                        .map(|path| {
+                            crate::collection_store::CollectionRegistration::from_trusted_path(
+                                path,
+                                CollectionResolvedKind::Image,
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        let mut edit_snapshot = super::super::page_edit_snapshot::PageEditSnapshot::default();
+        edit_snapshot.stamp = Some(crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample());
+        let reuse_key = app.collection_grid_prepare_reuse_key(
+            prepared.collection_id,
+            prepared.collection_revision,
+        );
+        let page_edit_revision = app.page_edit_revision;
+        app.apply_collection_grid_prepared_install(
+            CollectionGridPreparedInstall {
+                page_edits: None,
+                retained_page_edits: Some(Arc::new(edit_snapshot)),
+                page_edit_revision,
+                prepared: (*prepared).clone(),
+                thumbnail_sources: prepared_thumbnail_sources(
+                    CollectionGridThumbnailSources::default(),
+                ),
+                auto_aspect_lookup: None,
+                reuse_key,
+            },
+            None,
+        );
+        let installed = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::installed_presentation)
+            .unwrap()
+            .clone();
+        app.fullscreen_idx = Some(0);
+        let mut request = manual_navigation_request(&mut app, 0);
+        request.origin.intent_sequence = app
+            .top_level_grid_view
+            .advance_collection_navigation_sequence();
+        let mut sources = CollectionGridNavigationSources::new(
+            installed.reuse_key.clone(),
+            app.page_edit_revision,
+            installed.sources.clone(),
+            None,
+        );
+        sources.retained_edit_snapshot = installed.page_edit_snapshot.clone();
+        request.root_thumbnail_sources = Some(Arc::new(sources));
+        let target_kind = request.action.target_kind();
+        let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Image);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(Some(CollectionNavigationPreflightReady {
+                target,
+                payload: CollectionNavigationPreflightPayload::Media,
+                rejected: Vec::new(),
+            })))
+            .unwrap();
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(CollectionNavigationPending::Preflighting {
+                request,
+                watch: client.subscribe().unwrap(),
+                prepared,
+                target_kind,
+                cancel: Arc::new(AtomicBool::new(false)),
+                receiver,
+            }));
+        let key = crate::adjustment_db::normalize_path(&second);
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        app.poll_collection_navigation(&egui::Context::default());
+        assert!(
+            app.top_level_grid_view.collection_navigation_pending(),
+            "a stale retained edit must restart the navigation, not end its intent"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn physical_child_carries_reusable_thumbnail_payload_back_to_root() {
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("book");
@@ -3842,12 +4095,12 @@ mod tests {
             prepared.collection_revision,
         );
         let page_edit_revision = app.page_edit_revision;
+        let mut retained_edits = super::super::page_edit_snapshot::PageEditSnapshot::default();
+        retained_edits.stamp = Some(crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample());
         app.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 page_edits: None,
-                retained_page_edits: Some(Arc::new(
-                    super::super::page_edit_snapshot::PageEditSnapshot::default(),
-                )),
+                retained_page_edits: Some(Arc::new(retained_edits)),
                 page_edit_revision,
                 prepared: (*prepared).clone(),
                 thumbnail_sources: sources,
@@ -4704,10 +4957,23 @@ mod tests {
             prepared.collection_revision,
         );
         let page_edit_revision = app.page_edit_revision;
+        let edit_items = prepared
+            .entries
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        let edits = super::super::page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
+            &edit_items,
+            super::super::page_edit_snapshot::PageEditAvailability::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        let retained_edits = Some(Arc::new(edits.snapshot.clone()));
         app.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
-                page_edits: None,
-                retained_page_edits: None,
+                page_edits: Some((edits.snapshot, edits.projection)),
+                retained_page_edits: retained_edits,
                 page_edit_revision,
                 prepared: (*prepared).clone(),
                 thumbnail_sources: prepared_sources_a,

@@ -242,13 +242,14 @@ pub(in crate::app) fn prepare_collection_grid_install(
         .iter()
         .map(|entry| entry.item.clone())
         .collect::<Vec<_>>();
-    let page_edits = super::page_edit_snapshot::PageEditSnapshot::load_and_project(
+    let page_edits = super::page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
         &edit_items,
         page_edit_availability,
         cancel,
     )
     .map_err(CollectionPrepareError::Io)?
     .ok_or(CollectionPrepareError::Cancelled)?;
+    let page_edits = (page_edits.snapshot, page_edits.projection);
     let retained_page_edits = Some(Arc::new(page_edits.0.clone()));
     let pin_start = crate::perf::is_enabled().then(Instant::now);
     let pin_db =
@@ -1157,6 +1158,13 @@ impl App {
                 .filter(|presentation| {
                     Arc::ptr_eq(&presentation.prepared, &prepared)
                         && presentation.page_edit_revision == self.page_edit_revision
+                        && presentation
+                            .page_edit_snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.stamp)
+                            .is_some_and(|stamp| {
+                                crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp)
+                            })
                 })
                 .and_then(|presentation| presentation.page_edit_snapshot.clone());
             let presentation = owner
@@ -1172,7 +1180,10 @@ impl App {
                     presentation.page_edit_snapshot = source_owner
                         .retained_edit_snapshot
                         .clone()
-                        .filter(|_| source_owner.page_edit_revision == self.page_edit_revision)
+                        .filter(|_| {
+                            source_owner.page_edit_revision == self.page_edit_revision
+                                && source_owner.page_edit_stamp_is_current()
+                        })
                         .or_else(|| previous_edit_snapshot.clone());
                     presentation.page_edit_revision = self.page_edit_revision;
                     Arc::new(presentation)
@@ -1890,6 +1901,13 @@ impl App {
                         && prepared.prepared.collection_id == stamp.collection_id
                         && prepared.prepared.collection_revision == exact_revision
                         && prepared.page_edit_revision == self.page_edit_revision
+                        && prepared
+                            .page_edits
+                            .as_ref()
+                            .and_then(|(snapshot, _)| snapshot.stamp)
+                            .is_some_and(|stamp| {
+                                crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp)
+                            })
                         && prepared.reuse_key
                             == self.collection_grid_prepare_reuse_key(
                                 stamp.collection_id,
@@ -2230,6 +2248,19 @@ impl App {
         prepared: Arc<CollectionPreparedSnapshot>,
         previous: Option<Arc<CollectionPreparedSnapshot>>,
     ) {
+        let items = prepared
+            .entries
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        let edits = super::page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
+            &items,
+            super::page_edit_snapshot::PageEditAvailability::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        let retained_edits = Some(Arc::new(edits.snapshot.clone()));
         let reuse_key = self.collection_grid_prepare_reuse_key(
             prepared.collection_id,
             prepared.collection_revision,
@@ -2237,8 +2268,8 @@ impl App {
         self.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
                 prepared: (*prepared).clone(),
-                page_edits: None,
-                retained_page_edits: None,
+                page_edits: Some((edits.snapshot, edits.projection)),
+                retained_page_edits: retained_edits,
                 page_edit_revision: self.page_edit_revision,
                 thumbnail_sources: CollectionGridPreparedThumbnailDelivery::default(),
                 auto_aspect_lookup: None,
@@ -2648,6 +2679,76 @@ mod tests {
             app.mask_pages.contains(&0),
             "ZIP member uses its exact page key"
         );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn phase_a2_collection_prepare_rejects_external_edit_after_worker_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("stale.png");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let key = crate::adjustment_db::normalize_path(&image);
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        let snapshot = collection_with_sources(&client, &[(image, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let installed = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(|session| session.prepared().cloned())
+            .unwrap();
+        let old_snapshot = app.page_edit_snapshot.as_ref().unwrap().clone();
+        let old_projection = old_snapshot.project(&app.items);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(CollectionGridPreparedInstall {
+                prepared: (*installed).clone(),
+                page_edits: Some((old_snapshot.clone(), old_projection)),
+                retained_page_edits: Some(Arc::new(old_snapshot)),
+                page_edit_revision: app.page_edit_revision,
+                thumbnail_sources: prepare_collection_grid_thumbnail_sources(
+                    CollectionGridThumbnailSources::default(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap(),
+                auto_aspect_lookup: None,
+                reuse_key: app.collection_grid_prepare_reuse_key(
+                    installed.collection_id,
+                    installed.collection_revision,
+                ),
+            }))
+            .unwrap();
+        app.mask_db.as_ref().unwrap().delete(&key).unwrap();
+        let stamp = app.collection_grid_stamp().unwrap();
+        let generation = app.items_generation;
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Preparing {
+            stamp,
+            exact_revision: installed.collection_revision,
+            lease: crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("edit-stamp-test"),
+                Instant::now(),
+                "prepare",
+            ),
+            installed: Some(Arc::clone(&installed)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            receiver,
+        };
+        app.poll_collection_grid(&egui::Context::default());
+        assert_eq!(app.items_generation, generation, "stale edit was installed");
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::RequestNeeded { .. }
+        ));
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert!(!app.mask_pages.contains(&0));
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -5665,11 +5766,20 @@ mod tests {
         ));
         assert_eq!(app.items_generation, generation_before_prepare);
 
+        let edits = super::super::page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
+            &app.items,
+            super::super::page_edit_snapshot::PageEditAvailability::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        let retained_edits = Some(Arc::new(edits.snapshot.clone()));
+
         prepare_sender
             .send(Ok(CollectionGridPreparedInstall {
                 prepared: (*installed_prepared).clone(),
-                page_edits: None,
-                retained_page_edits: None,
+                page_edits: Some((edits.snapshot, edits.projection)),
+                retained_page_edits: retained_edits,
                 page_edit_revision: app.page_edit_revision,
                 thumbnail_sources: prepared_sources,
                 auto_aspect_lookup: None,

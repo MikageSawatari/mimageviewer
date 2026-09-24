@@ -252,7 +252,7 @@ impl ConcealDb {
 
     /// マスクを削除する。
     pub fn delete(&self, key: &str) -> rusqlite::Result<()> {
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(key);
         self.conn
             .execute("DELETE FROM conceal_entries WHERE page_path = ?1", [key])?;
         Ok(())
@@ -338,7 +338,7 @@ impl ConcealDb {
         w: usize,
         h: usize,
     ) -> rusqlite::Result<()> {
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(key);
         self.conn.execute(
             "INSERT INTO conceal_entries (page_path, bitmap_w, bitmap_h, bitmap_data, shapes)
              VALUES (?1, ?2, ?3, ?4, ?5)

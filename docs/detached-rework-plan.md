@@ -1454,6 +1454,19 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-24 §1.268 A2 chunk 1: page-edit reconcile の bundle mount/remount**
+
+`src/app/viewer_context_registry.rs` の既存 bundle swap に `page_edit_reconcile_pending` を加え、
+page-key 順・prepared worker・取消 token をページ編集 snapshot と同じ context に保持する。
+`with_viewer_context` の mount と元 context への remount 後に、process-wide write stamp を
+確認し、必要ならその context 専用の worker reread を開始・受理する。parked bundle は
+mount まで DB を読まず、兄弟 context の idx map を変更しない。物理 detached fork は
+仮想一覧の pending/compact key order を複製しない。phase A の snapshot swap と同じ
+所有境界であり、detached predicate、viewport/HWND、配置、focus の判定は変更しない。
+独立 reviewer は A2 設計の keyed snapshot・worker projection・stale gate と parked
+remount を構造的と評価し、設計 lead はこの境界の実装を承認した。chunk 2 の filename-stack
+acceptance は別レビューで扱う。
+
 **2026-09-23 §1.268 Phase B: virtual-list prepare owner の context swap**
 
 `src/app/viewer_context_registry.rs` の bundle swap に Ctrl+G の search session/prepare と

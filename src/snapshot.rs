@@ -482,6 +482,8 @@ impl Default for FilterState {
 /// log に出したい場合は `origin` / `items.len()` 等の具体的 field を個別に出す。
 #[derive(Clone)]
 pub struct SnapshotState {
+    /// How the saved listing resolves page edits when restored from a child or the lock subset.
+    pub page_edit_source: SnapshotPageEditSource,
     // ── snapshot 本体 ──
     /// snapshot に含まれる entry list (= top-level grid 表示順を保つ)
     pub items: Vec<SnapshotEntry>,
@@ -549,6 +551,12 @@ pub struct SnapshotState {
     ///
     /// 通常 folder からの ★固定では None。
     pub pre_snapshot_search_origin: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotPageEditSource {
+    PhysicalPrefix,
+    PreparedExact,
 }
 
 // ═══════════════════════════════════════════════════════════

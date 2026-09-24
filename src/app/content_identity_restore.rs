@@ -443,8 +443,14 @@ impl App {
             && let Some(folder) = self.current_folder.clone()
         {
             self.rehydrate_page_edit_state_for_current_items(&folder);
+        } else if self.page_edit_snapshot.is_some() {
+            // The restore worker's page-edit write guard wakes the keyed owner. Keep the
+            // accepted projection until its scoped notification is reconciled; an unrelated
+            // restore must not clear this virtual listing.
+            if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
+                self.poll_page_edit_reconciliation(&ctx);
+            }
         } else {
-            // 合成 view はページ編集 overlay を出さない既存契約を維持する。
             self.clear_page_edit_state();
         }
         self.finish_book_page_edit_mapping_after_idx_refresh("restore", errors);

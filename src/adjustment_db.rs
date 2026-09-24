@@ -150,7 +150,8 @@ impl AdjustmentDb {
         page_key: &str,
         params: &AdjustParams,
     ) -> Result<(), rusqlite::Error> {
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _page_edit_write =
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(page_key);
         let json = serde_json::to_string(params).unwrap_or_default();
         self.conn.execute(
             "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)
@@ -162,7 +163,8 @@ impl AdjustmentDb {
 
     /// ページのパラメータ個別設定を削除する。
     pub fn remove_page_params(&self, page_key: &str) -> Result<(), rusqlite::Error> {
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _page_edit_write =
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(page_key);
         self.conn
             .execute("DELETE FROM page_params WHERE page_path = ?1", [page_key])?;
         Ok(())

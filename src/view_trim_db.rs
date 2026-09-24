@@ -97,7 +97,8 @@ impl ViewTrimDb {
         page_key: &str,
         page_override: ViewTrimPageOverride,
     ) -> Result<(), rusqlite::Error> {
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _page_edit_write =
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(page_key);
         let json = serde_json::to_string(&page_override).unwrap_or_else(|_| "{}".to_string());
         self.conn.execute(
             "INSERT INTO view_trim_pages (page_path, override_json, updated_at)
@@ -120,7 +121,8 @@ impl ViewTrimDb {
     }
 
     pub fn remove_page_override(&self, page_key: &str) -> Result<(), rusqlite::Error> {
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _page_edit_write =
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(page_key);
         self.conn.execute(
             "DELETE FROM view_trim_pages WHERE page_path = ?1",
             [page_key],
