@@ -9917,11 +9917,27 @@ impl App {
                     return None;
                 }
                 let mut pages = screen_pages.to_vec();
-                if self.spread_mode.is_rtl() {
+                let supplement_side = pages
+                    .iter()
+                    .any(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+                    .then(|| {
+                        if pages[0].role == SpreadPageRole::Navigation {
+                            SingletonSpreadPlacement::Left
+                        } else {
+                            SingletonSpreadPlacement::Right
+                        }
+                    });
+                if supplement_side.is_some() {
+                    pages.sort_by_key(|page| page.role != SpreadPageRole::Navigation);
+                } else if self.spread_mode.is_rtl() {
                     pages.reverse();
                 }
-                SpreadDisplayComposition::from_presentation_pages(navigation_anchor_idx, pages)
-                    .map(|composition| (composition, transform))
+                SpreadDisplayComposition::from_presentation_pages(navigation_anchor_idx, pages).map(
+                    |mut composition| {
+                        composition.supplemented_navigation_side = supplement_side;
+                        (composition, transform)
+                    },
+                )
             }
             FullscreenPageLayoutKind::Empty | FullscreenPageLayoutKind::Continuous => None,
         }
@@ -13774,6 +13790,9 @@ pub(crate) struct SpreadDisplayComposition {
     navigation_anchor_idx: usize,
     pages: Vec<SpreadPageOccurrence>,
     singleton_placement: SingletonSpreadPlacement,
+    /// A forced final page keeps its physical side when the cover fills the
+    /// companion slot. Reading order still keeps the navigation page first.
+    supplemented_navigation_side: Option<SingletonSpreadPlacement>,
 }
 
 impl SpreadDisplayComposition {
@@ -13813,6 +13832,7 @@ impl SpreadDisplayComposition {
             navigation_anchor_idx,
             pages,
             singleton_placement: SingletonSpreadPlacement::Center,
+            supplemented_navigation_side: None,
         })
     }
 
@@ -13852,6 +13872,14 @@ impl SpreadDisplayComposition {
         &self,
         spread_mode: SpreadMode,
     ) -> Vec<SpreadPageOccurrence> {
+        if let Some(side) = self.supplemented_navigation_side {
+            debug_assert_eq!(self.pages.len(), 2);
+            return if side == SingletonSpreadPlacement::Right {
+                vec![self.pages[1], self.pages[0]]
+            } else {
+                self.pages.clone()
+            };
+        }
         if self.pages.len() == 2 && spread_mode.is_rtl() {
             self.pages.iter().rev().copied().collect()
         } else {
@@ -13925,7 +13953,6 @@ fn compose_spread_navigation_unit(
     if final_cover_enabled
         && complete_book_eligible
         && spread_mode.has_cover()
-        && !base.singleton_placement.has_white_companion()
         && is_last_unit
         && first_unit_pages.len() == 1
         && last_unit_pages.len() == 1
@@ -13933,6 +13960,10 @@ fn compose_spread_navigation_unit(
     {
         let cover_idx = first_unit_pages[0];
         if cover_idx != navigation_anchor_idx {
+            if base.singleton_placement.has_white_companion() {
+                base.supplemented_navigation_side = Some(base.singleton_placement.side());
+                base.singleton_placement = SingletonSpreadPlacement::Center;
+            }
             base.pages.push(SpreadPageOccurrence {
                 idx: cover_idx,
                 role: SpreadPageRole::FrontCoverSupplement,
@@ -27196,6 +27227,23 @@ impl App {
             .spread_pair(self.spread_mode)
     }
 
+    /// Export and capture use navigation pages. A cover supplement occupies a
+    /// visible slot but is never part of the saved output.
+    fn resolve_visible_spread_output_pair(&mut self, idx: usize) -> SpreadPair {
+        if self
+            .resolve_visible_spread_presentation_in_reading_order(idx)
+            .is_some_and(|pages| {
+                pages
+                    .iter()
+                    .any(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+            })
+        {
+            SpreadPair::Single
+        } else {
+            self.resolve_visible_spread_pair(idx)
+        }
+    }
+
     /// Role-aware pages in the reader's order for the spread currently on screen.
     ///
     /// The layout stores screen order, while `BothPages` external-tool launches retain the
@@ -27211,7 +27259,12 @@ impl App {
                 .iter()
                 .any(|page| page.role == SpreadPageRole::Navigation && page.idx == idx)
         {
-            if self.spread_mode.is_rtl() {
+            if pages
+                .iter()
+                .any(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+            {
+                pages.sort_by_key(|page| page.role != SpreadPageRole::Navigation);
+            } else if self.spread_mode.is_rtl() {
                 pages.reverse();
             }
             return Some(pages.into_iter().collect());
@@ -44199,7 +44252,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Result<crate::capture::CapturePixelWork, String> {
-        match self.resolve_visible_spread_pair(idx) {
+        match self.resolve_visible_spread_output_pair(idx) {
             SpreadPair::Single => self
                 .prepare_capture_pixel_job(ctx, idx)
                 .map(crate::capture::CapturePixelWork::Single),
@@ -45287,7 +45340,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> Result<ExportDialogTarget, String> {
-        match self.resolve_visible_spread_pair(fs_idx) {
+        match self.resolve_visible_spread_output_pair(fs_idx) {
             SpreadPair::Single => self.prepare_single_export_dialog_target(ctx, fs_idx),
             SpreadPair::Double { left, right } => {
                 self.prepare_spread_export_dialog_target(ctx, left, right)
@@ -66802,7 +66855,7 @@ mod tests {
             1,
             FsCacheEntry::Static {
                 tex,
-                pixels: std::sync::Arc::new(pixels),
+                pixels: std::sync::Arc::new(pixels.clone()),
                 source_dims: Some([32, 48]),
                 load_seq: 1,
                 animation: crate::fs_animation::StaticAnimationState::Still,
@@ -66824,6 +66877,51 @@ mod tests {
         let capture = app.prepare_capture_pixel_work(&ctx, 1).unwrap();
         assert!(matches!(
             capture,
+            crate::capture::CapturePixelWork::Single(_)
+        ));
+
+        app.settings.last_page_alone_enabled = true;
+        app.settings.final_cover_spread_enabled = true;
+        app.fullscreen_idx = Some(2);
+        for idx in [0, 2] {
+            let tex = ctx.load_texture(
+                format!("page-alone-assisted-{idx}"),
+                pixels.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels: std::sync::Arc::new(pixels.clone()),
+                    source_dims: Some([32, 48]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+        }
+        let assisted = app.capture_fs_display_unit(2).expect("assisted final unit");
+        assert_eq!(assisted.pages.len(), 2);
+        assert_eq!(
+            assisted.singleton_placement,
+            SingletonSpreadPlacement::Center
+        );
+        assert_eq!(assisted.pages[0].idx(), 0);
+        assert_eq!(assisted.pages[1].idx(), 2);
+        assert_eq!(
+            assisted.pages[0].occurrence.role,
+            SpreadPageRole::FrontCoverSupplement
+        );
+        assert_eq!(
+            app.resolve_visible_spread_pair(2),
+            SpreadPair::Double { left: 0, right: 2 }
+        );
+        assert!(matches!(
+            app.prepare_export_dialog_target(&ctx, 2).unwrap().composite,
+            crate::export_dialog::ExportComposite::Single(_)
+        ));
+        assert!(matches!(
+            app.prepare_capture_pixel_work(&ctx, 2).unwrap(),
             crate::capture::CapturePixelWork::Single(_)
         ));
     }
@@ -68085,47 +68183,79 @@ mod tests {
             }
         }
 
-        for (count, choice, has_supplement) in [
-            (2, 1, false),
-            (3, 1, false),
-            (5, 1, false),
-            (4, 2, false),
-            (2, 0, true),
-            (4, 0, true),
-        ] {
+        // Per row: 00, 10, 01, 11. A side means the final navigation page
+        // receives the cover on its other side when assist is ON.
+        let final_sides = [
+            [None, None, None, None],
+            [Some(false), Some(true), Some(true), Some(true)],
+            [None, Some(false), Some(false), Some(true)],
+            [Some(false), None, Some(true), Some(false)],
+            [None, Some(false), Some(false), Some(true)],
+        ];
+        for (count_offset, row) in final_sides.into_iter().enumerate() {
+            let count = count_offset + 1;
             let nav = (1..=count).collect::<Vec<_>>();
-            let settings = PageAloneSettings {
-                after_cover: choice & 1 != 0,
-                last: choice & 2 != 0,
-            };
-            let units = build_spread_display_units_with_page_alone(
-                &nav,
-                SpreadMode::LtrCover,
-                None,
-                settings,
-                |_, _| false,
-                |_| true,
-            );
-            let final_composition = resolve_spread_display_composition(
-                &units,
-                units.len() - 1,
-                SpreadMode::LtrCover,
-                true,
-                false,
-                true,
-            )
-            .unwrap();
-            assert_eq!(
-                final_composition.pages.len() == 2,
-                has_supplement,
-                "assist count={count} choice={choice}"
-            );
-            assert_eq!(
-                final_composition
-                    .singleton_placement()
-                    .has_white_companion(),
-                !has_supplement
-            );
+            for (choice, right_in_ltr) in row.into_iter().enumerate() {
+                let settings = PageAloneSettings {
+                    after_cover: choice & 1 != 0,
+                    last: choice & 2 != 0,
+                };
+                for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+                    let units = build_spread_display_units_with_page_alone(
+                        &nav,
+                        mode,
+                        None,
+                        settings,
+                        |_, _| false,
+                        |_| true,
+                    );
+                    for assist in [false, true] {
+                        for (unit_pos, unit) in units.iter().enumerate() {
+                            let composition = resolve_spread_display_composition(
+                                &units, unit_pos, mode, assist, false, true,
+                            )
+                            .unwrap();
+                            assert_eq!(composition.navigation_pages(), unit.pages);
+                            assert_eq!(composition.navigation_anchor_idx(), unit.anchor_idx());
+                            let supplement = composition
+                                .pages_in_screen_order(mode)
+                                .into_iter()
+                                .filter(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+                                .collect::<Vec<_>>();
+                            let expected_side = assist.then_some(right_in_ltr).flatten();
+                            assert_eq!(
+                                supplement.len(),
+                                usize::from(unit_pos + 1 == units.len() && expected_side.is_some()),
+                                "count={count} choice={choice} mode={mode:?} assist={assist} unit={unit_pos}"
+                            );
+                            if unit_pos + 1 == units.len() {
+                                if let Some(right) = expected_side {
+                                    let right = right ^ mode.is_rtl();
+                                    let screen = composition.pages_in_screen_order(mode);
+                                    assert_eq!(
+                                        screen[usize::from(right)].idx,
+                                        unit.anchor_idx(),
+                                        "final real page keeps its natural side"
+                                    );
+                                    assert_eq!(
+                                        composition.singleton_placement(),
+                                        SingletonSpreadPlacement::Center,
+                                        "the cover replaces white"
+                                    );
+                                }
+                            } else if matches!(
+                                unit.formation,
+                                SpreadDisplayUnitFormation::Singleton(
+                                    SpreadDisplaySingletonCause::ForcedAfterCover(_)
+                                        | SpreadDisplaySingletonCause::ForcedBoundary(_)
+                                )
+                            ) {
+                                assert!(composition.singleton_placement().has_white_companion());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -68158,14 +68288,31 @@ mod tests {
             expected.extend((4..=33).step_by(2).map(|first| vec![first, first + 1]));
             expected.extend([vec![34], vec![36]]);
             assert_eq!(pages, expected);
-            let forced = [1, units.len() - 2, units.len() - 1];
-            for at in forced {
+            for at in [1, units.len() - 2] {
                 let composition =
                     resolve_spread_display_composition(&units, at, mode, true, false, true)
                         .unwrap();
                 assert!(composition.singleton_placement().has_white_companion());
                 assert_eq!(composition.pages.len(), 1);
             }
+            let last = resolve_spread_display_composition(
+                &units,
+                units.len() - 1,
+                mode,
+                true,
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(last.navigation_pages(), vec![36]);
+            assert_eq!(last.pages_in_reading_order()[1].idx, 1);
+            assert_eq!(
+                last.pages_in_reading_order()[1].role,
+                SpreadPageRole::FrontCoverSupplement
+            );
+            assert_eq!(last.singleton_placement(), SingletonSpreadPlacement::Center);
+            let screen = last.pages_in_screen_order(mode);
+            assert_eq!(screen[usize::from(mode.is_rtl())].idx, 36);
         }
         let short = [0, 1, 2, 3, 4];
         for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
@@ -68228,6 +68375,92 @@ mod tests {
         assert!(
             white_companion_rect_for_real(real, SingletonSpreadPlacement::Right, 4.0).is_none()
         );
+    }
+
+    #[test]
+    fn forced_final_landscape_or_nonpairable_uses_the_ordinary_assist_gate() {
+        let nav = [0, 1, 2];
+        for (settings, blocked_idx) in [
+            (
+                crate::settings::PageAloneSettings {
+                    after_cover: true,
+                    last: true,
+                },
+                1,
+            ),
+            (
+                crate::settings::PageAloneSettings {
+                    after_cover: false,
+                    last: true,
+                },
+                2,
+            ),
+        ] {
+            for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+                for nonpairable in [false, true] {
+                    for forced in [false, true] {
+                        let units = build_spread_display_units_with_page_alone(
+                            &nav[..=blocked_idx],
+                            mode,
+                            None,
+                            if forced {
+                                settings
+                            } else {
+                                crate::settings::PageAloneSettings::default()
+                            },
+                            |_, idx| !nonpairable && idx == blocked_idx,
+                            |idx| !nonpairable || idx != blocked_idx,
+                        );
+                        for assist in [false, true] {
+                            let last = resolve_spread_display_composition(
+                                &units,
+                                units.len() - 1,
+                                mode,
+                                assist,
+                                false,
+                                true,
+                            )
+                            .unwrap();
+                            assert_eq!(last.navigation_pages(), vec![blocked_idx]);
+                            let screen = last.pages_in_screen_order(mode);
+                            assert_eq!(screen.len(), if assist { 2 } else { 1 });
+                            if forced {
+                                if assist {
+                                    let side = match units.last().unwrap().formation {
+                                        SpreadDisplayUnitFormation::Singleton(
+                                            SpreadDisplaySingletonCause::ForcedAfterCover(side)
+                                            | SpreadDisplaySingletonCause::ForcedLast(side)
+                                            | SpreadDisplaySingletonCause::ForcedBoundary(side),
+                                        ) => side,
+                                        other => {
+                                            panic!("expected forced final singleton: {other:?}")
+                                        }
+                                    };
+                                    assert_eq!(
+                                        last.singleton_placement(),
+                                        SingletonSpreadPlacement::Center
+                                    );
+                                    assert_eq!(
+                                        screen
+                                            [usize::from(side == SingletonSpreadPlacement::Right)]
+                                        .idx,
+                                        blocked_idx,
+                                        "forced page keeps its natural side with the cover attached"
+                                    );
+                                    assert_eq!(
+                                        screen[usize::from(side == SingletonSpreadPlacement::Left)]
+                                            .role,
+                                        SpreadPageRole::FrontCoverSupplement
+                                    );
+                                } else {
+                                    assert!(last.singleton_placement().has_white_companion());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -69699,7 +69932,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_page_alone_groups_keep_real_addresses_and_white_slot_side() {
+    fn remote_page_alone_groups_replace_final_white_with_cover_presentation() {
         let items = (0..5)
             .map(|idx| GridItem::Image(PathBuf::from(format!("c:/book/{idx}.png"))))
             .collect::<Vec<_>>();
@@ -69707,17 +69940,13 @@ mod tests {
             after_cover: true,
             last: true,
         };
-        for (mode, after, last) in [
+        for (mode, after, real_screen_pos) in [
             (
                 SpreadMode::LtrCover,
                 SingletonSpreadPlacement::RightWhite,
-                SingletonSpreadPlacement::RightWhite,
+                1,
             ),
-            (
-                SpreadMode::RtlCover,
-                SingletonSpreadPlacement::LeftWhite,
-                SingletonSpreadPlacement::LeftWhite,
-            ),
+            (SpreadMode::RtlCover, SingletonSpreadPlacement::LeftWhite, 0),
         ] {
             let groups = build_remote_spread_page_groups_with_page_alone(
                 &items,
@@ -69745,8 +69974,22 @@ mod tests {
                 ]
             );
             assert_eq!(groups[1].singleton_placement, after);
-            assert_eq!(groups[3].singleton_placement, last);
-            assert!(groups.iter().all(|group| group.presentation.is_none()));
+            assert_eq!(
+                groups[3].singleton_placement,
+                SingletonSpreadPlacement::Center
+            );
+            assert!(groups[..3].iter().all(|group| group.presentation.is_none()));
+            let presentation = groups[3].presentation.as_ref().unwrap();
+            assert_eq!(presentation[real_screen_pos].idx, 4);
+            assert_eq!(
+                presentation[real_screen_pos].role,
+                SpreadPageRole::Navigation
+            );
+            assert_eq!(presentation[1 - real_screen_pos].idx, 0);
+            assert_eq!(
+                presentation[1 - real_screen_pos].role,
+                SpreadPageRole::FrontCoverSupplement
+            );
             let incomplete = build_remote_spread_page_groups_with_page_alone(
                 &items,
                 mode,

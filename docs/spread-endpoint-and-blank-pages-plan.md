@@ -49,14 +49,15 @@
 | 5 | C1; (2R,3L); (4R,5L) | C1; 2L□; (3R,4L); 5R□ | C1; (2R,3L); 4R□; 5R□ | C1; 2L□; (3R,4L); 5L□ |
 
 - 表紙なし見開きでは 00/10/01/11 がすべて同じ従来列になる。1=E1、2=(1,2)、3=(1,2);E3、4=(1,2);(3,4)、5=(1,2);(3,4);E5。LTR の pair は左→右、RTL は右→左。端数 E の配置は §1.239 の first/last 設定を使う。Single と Split も従来列を保持する。
-- 末尾表紙補助 ON でも、§1.240 により白い相方を持つ単独ページは**強制単独表示が優先**し、表紙を添えない。強制境界で余った末尾ページにも同じ規則を適用する。通常の端数 E には従来どおり末尾表紙補助を適用する。以下は LTR の補助 ON 時の最終 presentation（RTL は左右反転）。unit の数と実 anchor は上表と同じ。
+- **末尾表紙補助 ON なら、末尾の単独ページの空いた側には白ではなく表紙を添える**（2026-09-25 利用者報告により改訂）。当初は「白い相方を持つ強制単独が優先し、表紙を添えない」と設計したが、利用者が両切替 ON・末尾補助 ON で「表紙が添えられず白が添えられる」ことを不具合として報告した（画面は利用者が観測）。改訂後の規則: 最終 unit が実 1 ページで空き側を持つとき、それが強制単独・強制境界の余り・通常の端数 E のいずれでも、通常の最終単独と同じ末尾補助の適格判定（単一の判定を共有する。現行コードでは通常の横長の最終単独にも表紙を添える）を満たせば表紙を添える。適格でなければ強制単独は白、通常 E は §1.239 の配置。表紙の次の強制単独（最終 unit でないもの）は常に白。unit の数・実 anchor・ページ送り・export/capture の出力は末尾補助の従来規則のまま（添えた表紙は移動先にも出力にもならない）。以下は LTR の補助 ON 時の最終 presentation（RTL は左右反転、□ は白、+表紙1 は添えた表紙）。
 
   | 実ページ数 | 切替 | 最終 presentation |
   | --- | --- | --- |
-  | 2 | 10 | `2R□`（補助なし） |
-  | 3 | 10 | `3L□`（補助なし） |
-  | 5 | 10 | `5L□`（補助なし） |
-  | 4 | 01 | `4R□`（補助なし） |
+  | 2 | 10 / 01 / 11 | `2R` + 表紙1（白なし） |
+  | 3 | 10 | `2R□; 3L` + 表紙1 |
+  | 4 | 01 | `4R` + 表紙1 |
+  | 4 | 11 | `2R□; 3L□; 4L` + 表紙1 |
+  | 5 | 10 | `5L` + 表紙1 |
   | 2 | 00 | `E2 + 表紙1`（通常補助） |
   | 4 | 00 | `E4 + 表紙1`（通常補助） |
 
@@ -66,7 +67,7 @@
 
 - 白い相方は実ページの保存回転・表示トリム後の可視寸法を参照する layout-only decoration。§1.218 の二 slot 仮想 canvas、fit、gap を再利用するが、paint owner は実ページ texture と別の、同じ viewport に clip された固定 WHITE の矩形とする。texture-present 分岐の外に描画責務を持ち、実ページが ready で描かれた frame だけ表示する。実 texture が未到着・失敗なら loading/error を示し、白面を偽の成功ページに見せない。draw 経路が白矩形の PaintRecord を発行する。
 - paged と縦横連結は同じ decoration geometry を使う。Z zoom では実ページ transform と同じ倍率で gap も拡大する。holdover は捕捉時の実 texture・白 rect・clip・配置入力を一体で保持し、後の設定変更から再計算しない。viewport resize 時は捕捉した入力から縦横比を保って再投影する。F12 active と passive frozen snapshot にも白 decoration を保存し、実描画で一致を検証する。Remote は実 address 1 件と address の無い white decoration を送る。Web は実ページの ready presentation に従属する白い DOM 矩形として描き、白用 fetch・decode・cache・edit target を作らない。通常の §1.218 endpoint singleton の空き側は背景色のまま。
-- 強制 singleton と境界で余った singleton は §1.239 の Center/Place より優先して上表の側に置く。強制されない真の端数 E だけに §1.239 を適用し、1 unit が両端なら先頭優先。保存回転後を含む横長ページが強制対象なら例外として片側へ置き、通常の横長は従来どおり中央にする。この横長例外は、通常の横長を中央へ置く実装と literal blank-insertion oracle が一致しないことを明示した仕様である。末尾補助は両切替の値ではなく、最終 presentation が白い相方を持つかで抑止する。通常の E なら従来の補助条件を使う。
+- 強制 singleton と境界で余った singleton は §1.239 の Center/Place より優先して上表の側に置く。強制されない真の端数 E だけに §1.239 を適用し、1 unit が両端なら先頭優先。保存回転後を含む横長ページが強制対象なら例外として片側へ置き、通常の横長は従来どおり中央にする。この横長例外は、通常の横長を中央へ置く実装と literal blank-insertion oracle が一致しないことを明示した仕様である。末尾補助は強制単独でも抑止しない。最終 unit が実 1 ページで補助の適格条件を満たせば、空き側を白ではなく表紙で埋める（上記改訂）。
 - 完全な本かどうかの context gate と canonical permutation proof は pairing より前に判定する。cache token に item 世代・実読書列・mode・横長 epoch・spread-shift anchor・両切替の実効値・eligibility を含めるか、同じ条件の gated construction を持つ。検索、collection、切詰め、synthetic の列では builder に強制境界を渡さず、従来 unit 列を保つ。shift anchor は強制境界を越える pair を作らず、境界内の segment に正規化してから組み直す。旧 anchor の index だけを新 grouping へ流用しない。
 - 実ページ数・実 index・resume・bookmark・履歴・go-to-page・rating/tag/edit 対象は不変。前後操作、Home/End、slideshow、連結 scroll は実 anchor を持つ再構成後の unit を進む。paged seek は切替の ON/OFF にかかわらず従来の unit fraction（unit 先頭=0、末尾=1、1 unit なら 0）を track と tick に使う。ON 時は実 unit 数が変わる分だけ目盛り間隔が変わる。click は最寄りの unit に着地し、その実 anchor を選ぶ。strip の各 label/thumbnail と page-number cache、prepared seek label は同じ real-page→unit 対応表から実ページを引き、白 slot に番号を付けない。paired unit 内の go-to-page 等が選んだ実ページ identity は保持し、表示番号の分母は実ページ総数のまま。
 - **利用者決定:** Ctrl+E export と capture は、強制 singleton なら実ページだけを出力し、白い相方を含めない。白は画面装飾であり保存画像の構成要素ではない。単独実ページの source、crop、補正、回転は既存 single-page output を使う。ペアの出力は従来の実ページ構成を維持する。

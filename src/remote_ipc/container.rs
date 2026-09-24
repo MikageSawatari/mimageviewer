@@ -11033,7 +11033,7 @@ mod tests {
     }
 
     #[test]
-    fn page_alone_remote_payload_has_real_addresses_and_white_only_for_complete_cover_books() {
+    fn page_alone_remote_payload_replaces_final_white_with_eligible_cover() {
         let temp = tempfile::tempdir().unwrap();
         let pages = (0..5)
             .map(|index| {
@@ -11053,52 +11053,101 @@ mod tests {
             .spread_db
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Ok(None);
+        for (mode, direction, white_side, real_screen_pos) in [
+            (
+                RemoteSpreadMode::LtrCover,
+                RemoteReadingDirection::Ltr,
+                RemoteSingletonSpreadPlacement::RightWhite,
+                1,
+            ),
+            (
+                RemoteSpreadMode::RtlCover,
+                RemoteReadingDirection::Rtl,
+                RemoteSingletonSpreadPlacement::LeftWhite,
+                0,
+            ),
+        ] {
+            let request = ContainerRequest {
+                address: RemoteAddress::file(temp.path().to_string_lossy().into_owned()),
+                spread_mode: Some(mode),
+                reading_direction: Some(direction),
+                force_single_page: false,
+            };
+            let complete = engine
+                .spread_payload(&request, &resolved, &pages, None, None, true, true)
+                .unwrap();
+            assert_eq!(
+                complete.page_after_cover_alone_preference,
+                RemotePageAlonePreference::FollowGlobal
+            );
+            assert!(complete.page_after_cover_alone_enabled);
+            assert!(complete.last_page_alone_enabled);
+            assert_eq!(
+                complete
+                    .groups
+                    .iter()
+                    .map(|group| group.pages.len())
+                    .collect::<Vec<_>>(),
+                vec![1, 1, 2, 1]
+            );
+            assert_eq!(complete.groups[1].singleton_placement, white_side);
+            assert!(complete.groups[1].presentation.is_none());
+            let final_group = &complete.groups[3];
+            assert_eq!(
+                final_group.singleton_placement,
+                RemoteSingletonSpreadPlacement::Center,
+                "an attached cover must remove the white DOM decoration"
+            );
+            let presentation = final_group.presentation.as_ref().unwrap();
+            assert_eq!(presentation.len(), 2);
+            assert_eq!(presentation[real_screen_pos].address, final_group.pages[0]);
+            assert_eq!(
+                presentation[real_screen_pos].role,
+                RemotePagePresentationRole::Navigation
+            );
+            assert_eq!(
+                presentation[1 - real_screen_pos].address,
+                complete.groups[0].pages[0]
+            );
+            assert_eq!(
+                presentation[1 - real_screen_pos].role,
+                RemotePagePresentationRole::FrontCoverSupplement
+            );
+
+            let incomplete = engine
+                .spread_payload(&request, &resolved, &pages, None, None, true, false)
+                .unwrap();
+            assert_eq!(incomplete.groups.len(), 3);
+            assert!(incomplete.groups.iter().all(|group| !matches!(
+                group.singleton_placement,
+                RemoteSingletonSpreadPlacement::LeftWhite
+                    | RemoteSingletonSpreadPlacement::RightWhite
+            )));
+        }
+        let without_assist = ContainerEngine::new(crate::settings::Settings {
+            page_after_cover_alone_enabled: true,
+            last_page_alone_enabled: true,
+            final_cover_spread_enabled: false,
+            ..Default::default()
+        });
+        *without_assist
+            .spread_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Ok(None);
         let request = ContainerRequest {
             address: RemoteAddress::file(temp.path().to_string_lossy().into_owned()),
             spread_mode: Some(RemoteSpreadMode::LtrCover),
             reading_direction: Some(RemoteReadingDirection::Ltr),
             force_single_page: false,
         };
-        let complete = engine
+        let white = without_assist
             .spread_payload(&request, &resolved, &pages, None, None, true, true)
             .unwrap();
         assert_eq!(
-            complete.page_after_cover_alone_preference,
-            RemotePageAlonePreference::FollowGlobal
-        );
-        assert!(complete.page_after_cover_alone_enabled);
-        assert!(complete.last_page_alone_enabled);
-        assert_eq!(
-            complete
-                .groups
-                .iter()
-                .map(|group| group.pages.len())
-                .collect::<Vec<_>>(),
-            vec![1, 1, 2, 1]
-        );
-        assert_eq!(
-            complete.groups[1].singleton_placement,
+            white.groups.last().unwrap().singleton_placement,
             RemoteSingletonSpreadPlacement::RightWhite
         );
-        assert_eq!(
-            complete.groups[3].singleton_placement,
-            RemoteSingletonSpreadPlacement::RightWhite
-        );
-        assert!(
-            complete
-                .groups
-                .iter()
-                .all(|group| group.presentation.is_none()),
-            "white singles suppress the end-cover supplement"
-        );
-        let incomplete = engine
-            .spread_payload(&request, &resolved, &pages, None, None, true, false)
-            .unwrap();
-        assert_eq!(incomplete.groups.len(), 3);
-        assert!(incomplete.groups.iter().all(|group| !matches!(
-            group.singleton_placement,
-            RemoteSingletonSpreadPlacement::LeftWhite | RemoteSingletonSpreadPlacement::RightWhite
-        )));
+        assert!(white.groups.last().unwrap().presentation.is_none());
     }
 
     #[test]

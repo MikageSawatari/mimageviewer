@@ -2039,15 +2039,28 @@ mod tests {
         view: Arc<StackView>,
         ctx: &egui::Context,
     ) -> StackScriptPending {
-        let (items, metas) = view.materialize_aggregated();
-        let read = read_stack_candidate(
-            StackCandidateOrder::new(items, metas),
-            crate::app::page_edit_snapshot::PageEditAvailability::for_app(app),
-            app.rating_db.is_some(),
-            app.tags_db.is_some(),
-            &AtomicBool::new(false),
-        );
-        assert!(read.result.as_ref().unwrap().is_some());
+        // Production retries Ok(None) when another test's process-wide edit,
+        // rating, or tag write epoch overlaps this stable snapshot. This
+        // fixture needs an accepted candidate, not a particular attempt.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let read = loop {
+            let (items, metas) = view.materialize_aggregated();
+            let read = read_stack_candidate(
+                StackCandidateOrder::new(items, metas),
+                crate::app::page_edit_snapshot::PageEditAvailability::for_app(app),
+                app.rating_db.is_some(),
+                app.tags_db.is_some(),
+                &AtomicBool::new(false),
+            );
+            match &read.result {
+                Ok(Some(_)) => break read,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(None) => panic!("stack candidate stayed unstable for five seconds"),
+                Err(error) => panic!("stack candidate read failed: {error}"),
+            }
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Ok(Some(StackGroupReady {
             view: Arc::clone(&view),

@@ -3952,6 +3952,23 @@ test("singleton spread keeps the real DOM page and a white decoration only when 
     assert.equal(viewer.refitVisibleContent("page"), true);
     assertVirtualExtent();
   }
+
+  // A final-cover supplement replaces the decoration with a real second
+  // presentation slot while the navigation group still has one real target.
+  const assisted = await viewer.loadGroup({
+    pages: [page("cover-supplement"), page("forced-final")],
+    name: "assisted forced final",
+    fitMode: "page",
+    gap: 12,
+    singletonPlacement: "center",
+    index: 0,
+    count: 1,
+    interactionStartedAt: performance.now(),
+  });
+  assert.deepEqual(assisted, { outcome: ViewerGroupLoadOutcome.APPLIED });
+  assert.equal(pageLayer.children.length, 2);
+  assert.equal(viewer.images.length, 2);
+  assert.equal(pageLayer.querySelector(".viewer-white-companion"), null);
   viewer.destroy();
 });
 
@@ -4456,6 +4473,33 @@ test("supplemental cover presentation stays outside navigation and has explicit 
     context_address: contextAddress,
     display_slot: "spread_right",
     spread_partner: last.address,
+  });
+
+  const forcedRight = {
+    ...lastGroup,
+    presentationSlots: normalizePagePresentationSlots(
+      [
+        { address: cover.address, role: "front_cover_supplement" },
+        { address: last.address, role: "navigation" },
+      ],
+      [last],
+      byAddress
+    ),
+  };
+  assert.deepEqual(pageGroupNavigationEntries(forcedRight), [last]);
+  assert.deepEqual(
+    pageGroupPresentationSlots(forcedRight).map(({ entry, role }) => [entry.name, role]),
+    [["cover.jpg", "front_cover_supplement"], ["last.jpg", "navigation"]]
+  );
+  assert.deepEqual(pageRenderContextForSlot(forcedRight, 0, contextAddress), {
+    context_address: contextAddress,
+    display_slot: "spread_left",
+    spread_partner: last.address,
+  });
+  assert.deepEqual(pageRenderContextForSlot(forcedRight, 1, contextAddress), {
+    context_address: contextAddress,
+    display_slot: "spread_right",
+    spread_partner: cover.address,
   });
 });
 
