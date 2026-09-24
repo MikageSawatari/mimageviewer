@@ -6667,7 +6667,10 @@ impl App {
         }
         let next = self.spread_mode.next_in_spread_cycle();
         self.apply_fullscreen_spread_mode(ctx, fs_idx, next);
-        self.show_feedback_toast(format!("[Pad:{}]", next.label()));
+        // Report only the state actually applied: a rejected write keeps the old mode.
+        if self.spread_mode == next {
+            self.show_feedback_toast(format!("[Pad:{}]", next.label()));
+        }
         None
     }
 

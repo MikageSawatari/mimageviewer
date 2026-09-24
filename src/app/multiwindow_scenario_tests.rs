@@ -316,8 +316,8 @@ struct StableContent {
     item: String,
     page: usize,
     spread_mode: crate::settings::SpreadMode,
-    singleton_preference: crate::settings::SingletonSpreadPlacementPreference,
-    singleton_enabled: bool,
+    singleton_preference: crate::settings::SingletonSpreadEndpointPreferences,
+    singleton_enabled: crate::settings::SingletonSpreadEndpointSettings,
 }
 
 fn stable_content(app: &mut App, window_id: u64) -> Option<StableContent> {
@@ -334,8 +334,11 @@ fn stable_content(app: &mut App, window_id: u64) -> Option<StableContent> {
             item,
             page,
             spread_mode: owner.spread_mode,
-            singleton_preference: owner.singleton_spread_placement_preference,
-            singleton_enabled: owner.settings.singleton_spread_placement_enabled,
+            singleton_preference: owner.singleton_spread_endpoint_preferences,
+            singleton_enabled: crate::settings::SingletonSpreadEndpointSettings {
+                first: owner.settings.singleton_spread_first_enabled,
+                last: owner.settings.singleton_spread_last_enabled,
+            },
         })
     })
     .expect("window retains its viewer context")
@@ -353,19 +356,44 @@ fn configure_active_still(
     window_id: u64,
     color: egui::Color32,
 ) {
-    app.current_folder = path.parent().map(std::path::Path::to_path_buf);
-    app.items = vec![GridItem::Image(path)];
-    app.thumbnails = vec![ThumbnailState::Pending];
-    app.image_metas = vec![None];
-    app.visible_indices = vec![0];
-    app.details_order = vec![0];
-    app.fullscreen_idx = Some(0);
+    configure_active_still_pages(
+        app,
+        ctx,
+        &[path],
+        0,
+        window_id,
+        color,
+        crate::settings::SingletonSpreadPlacementPreference::Place.into(),
+    );
+    app.spread_mode = crate::settings::SpreadMode::Ltr;
+}
+
+fn configure_active_still_pages(
+    app: &mut App,
+    ctx: &egui::Context,
+    paths: &[std::path::PathBuf],
+    page: usize,
+    window_id: u64,
+    color: egui::Color32,
+    preference: crate::settings::SingletonSpreadEndpointPreferences,
+) {
+    app.current_folder = paths
+        .first()
+        .and_then(|path| path.parent())
+        .map(std::path::Path::to_path_buf);
+    app.items = paths.iter().cloned().map(GridItem::Image).collect();
+    app.thumbnails = vec![ThumbnailState::Pending; paths.len()];
+    app.image_metas = vec![None; paths.len()];
+    app.visible_indices = (0..paths.len()).collect();
+    app.details_order = (0..paths.len()).collect();
+    app.fullscreen_idx = Some(page);
     app.viewer_presentation = ViewerPresentation::DetachedWindow;
     app.detached_viewer_independent_active = true;
-    app.spread_mode = crate::settings::SpreadMode::Ltr;
-    app.singleton_spread_placement_preference =
-        crate::settings::SingletonSpreadPlacementPreference::Place;
-    app.record_page_dims_for_spread(0, (600, 900));
+    app.spread_mode = crate::settings::SpreadMode::LtrCover;
+    app.singleton_spread_endpoint_preferences = preference;
+    for idx in 0..paths.len() {
+        app.record_page_dims_for_spread(idx, (600, 900));
+    }
     let pixels = egui::ColorImage::filled([600, 900], color);
     let texture = ctx.load_texture(
         format!("scenario_window_{window_id}"),
@@ -373,7 +401,7 @@ fn configure_active_still(
         egui::TextureOptions::LINEAR,
     );
     app.fs_cache.insert(
-        0,
+        page,
         FsCacheEntry::Static {
             tex: texture,
             pixels: Arc::new(pixels),
@@ -393,7 +421,8 @@ fn multiwindow_scenario_b_activation_keeps_singleton_paint() {
         app.startup_done = true;
         app.startup_init = None;
         app.settings.detached_viewer_open_images_in_window = true;
-        app.settings.singleton_spread_placement_enabled = true;
+        app.settings.singleton_spread_first_enabled = true;
+        app.settings.singleton_spread_last_enabled = false;
         app.settings.detached_viewer_window_placement =
             Some(crate::settings::DetachedViewerWindowPlacement {
                 x: 80.0,
@@ -479,6 +508,150 @@ fn multiwindow_scenario_b_activation_keeps_singleton_paint() {
         // The next ROOT pass drains the parked child event.
         let _ = driver.root(&mut app);
         assert!(after_root.number < after.number);
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+fn scenario_b_endpoint_paint_center(
+    label: &str,
+    page: usize,
+    preference: crate::settings::SingletonSpreadEndpointPreferences,
+    global_first: bool,
+    global_last: bool,
+) -> f32 {
+    let mut app = setup_app_for_test();
+    let mut driver = ScenarioDriver::new();
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+    app.startup_done = true;
+    app.startup_init = None;
+    app.settings.detached_viewer_open_images_in_window = true;
+    app.settings.singleton_spread_first_enabled = global_first;
+    app.settings.singleton_spread_last_enabled = global_last;
+    app.settings.final_cover_spread_enabled = false;
+    app.settings.detached_viewer_window_placement =
+        Some(crate::settings::DetachedViewerWindowPlacement {
+            x: 80.0,
+            y: 80.0,
+            w: CHILD_SIZE.x,
+            h: CHILD_SIZE.y,
+            maximized: false,
+        });
+    let folder = app.tmp.path().join(label);
+    let first_folder = folder.join("first");
+    let second_folder = folder.join("second");
+    std::fs::create_dir_all(&first_folder).unwrap();
+    std::fs::create_dir_all(&second_folder).unwrap();
+    let first_paths = [first_folder.join("0.png"), first_folder.join("1.png")];
+    let second_paths = [second_folder.join("0.png"), second_folder.join("1.png")];
+    for (paths, color) in [
+        (&first_paths, [16, 88, 160]),
+        (&second_paths, [200, 48, 32]),
+    ] {
+        for path in paths {
+            save_portrait(path, color);
+        }
+    }
+    let second_ctx = driver.ctx.clone();
+    app.build_active_context_for_test(Some(200), DetachedSource::Book, |active| {
+        configure_active_still_pages(
+            active,
+            &second_ctx,
+            &second_paths,
+            page,
+            200,
+            egui::Color32::LIGHT_RED,
+            preference,
+        );
+    });
+    assert!(app.pause_current_active_viewer_context(&driver.ctx));
+    let first_ctx = driver.ctx.clone();
+    app.build_active_context_for_test(Some(100), DetachedSource::Book, |active| {
+        configure_active_still_pages(
+            active,
+            &first_ctx,
+            &first_paths,
+            page,
+            100,
+            egui::Color32::LIGHT_BLUE,
+            preference,
+        );
+    });
+    app.fs_viewport_shown = true;
+    app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+    app.set_detached_window_live_hwnds_for_test([0x1000, 0x2000]);
+    app.detached_window_hwnd_set(100, 0x1000);
+    app.detached_window_hwnd_set(200, 0x2000);
+    let first_viewport = App::detached_image_window_viewport_id(100);
+    driver.focus(first_viewport);
+    let mut before = driver.root(&mut app);
+    for _ in 0..12 {
+        if !records_for(&before, first_viewport).is_empty() {
+            break;
+        }
+        before = driver.root(&mut app);
+    }
+    let before_paint = records_for(&before, first_viewport);
+    assert_eq!(
+        before_paint.len(),
+        1,
+        "{label}: expected one real painted page"
+    );
+    assert_eq!(before_paint[0].provenance.page, page);
+    let center_x = visible_clip(&before_paint[0]).center().x;
+    let before_state = stable_content(&mut app, 100).expect("active paint is stable");
+
+    app.queue_deferred_detached_window_activation(200, "scenario_test_focus");
+    driver.focus(App::detached_image_window_viewport_id(200));
+    let _ = driver.root(&mut app);
+    assert_eq!(app.active_detached_window_id(), Some(200));
+    assert_eq!(
+        app.detached_window_state(100),
+        Some(DetachedWindowState::Parked)
+    );
+    let after = driver.deferred(first_viewport);
+    let after_state = stable_content(&mut app, 100).expect("parked paint is stable");
+    assert_eq!(
+        before_state, after_state,
+        "{label}: only activation changes"
+    );
+    assert_i2_stable_paint(label, first_viewport, &before, &after, 1.0);
+    let _ = driver.root(&mut app);
+    center_x
+}
+
+#[test]
+fn multiwindow_i2_last_endpoint_and_mixed_inheritance_affect_real_paint() {
+    std::thread::spawn(|| {
+        use crate::settings::{
+            SingletonSpreadEndpointPreferences as Preferences,
+            SingletonSpreadPlacementPreference as Preference,
+        };
+
+        let inherited = Preferences::default();
+        let last_on = scenario_b_endpoint_paint_center("last-on", 1, inherited, false, true);
+        let last_off = scenario_b_endpoint_paint_center("last-off", 1, inherited, false, false);
+        assert!(last_on + 20.0 < last_off, "global last must move the painted page left: on={last_on} off={last_off}");
+
+        let mixed_last = Preferences {
+            first: Preference::Place,
+            last: Preference::FollowGlobal,
+        };
+        let mixed_last_on =
+            scenario_b_endpoint_paint_center("mixed-last-on", 1, mixed_last, false, true);
+        let mixed_last_off =
+            scenario_b_endpoint_paint_center("mixed-last-off", 1, mixed_last, false, false);
+        assert!(mixed_last_on + 20.0 < mixed_last_off, "mixed last inheritance must move real paint: on={mixed_last_on} off={mixed_last_off}");
+
+        let mixed_first = Preferences {
+            first: Preference::FollowGlobal,
+            last: Preference::Place,
+        };
+        let mixed_first_on =
+            scenario_b_endpoint_paint_center("mixed-first-on", 0, mixed_first, true, false);
+        let mixed_first_off =
+            scenario_b_endpoint_paint_center("mixed-first-off", 0, mixed_first, false, false);
+        assert!(mixed_first_on > mixed_first_off + 20.0, "mixed first inheritance must move real paint: on={mixed_first_on} off={mixed_first_off}");
     })
     .join()
     .expect("scenario thread");

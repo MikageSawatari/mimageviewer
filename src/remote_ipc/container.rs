@@ -758,7 +758,7 @@ pub(super) struct ContainerEngine {
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
-    spread_db: Mutex<Option<crate::spread_db::SpreadDb>>,
+    spread_db: Mutex<Result<Option<crate::spread_db::SpreadDb>, String>>,
     view_trim_db: Mutex<Option<crate::view_trim_db::ViewTrimDb>>,
     resume_reader: Option<ResumeReader>,
     adjustment_settings: AdjustmentSettingsSource,
@@ -1957,6 +1957,10 @@ struct SpreadPayload {
     final_cover_enabled: bool,
     singleton_placement_preference: RemoteSingletonSpreadPlacementPreference,
     singleton_placement_enabled: bool,
+    singleton_first_preference: RemoteSingletonSpreadPlacementPreference,
+    singleton_last_preference: RemoteSingletonSpreadPlacementPreference,
+    singleton_first_enabled: bool,
+    singleton_last_enabled: bool,
     spread_page_gap_px: u32,
     image_count: usize,
     video_count: usize,
@@ -2263,16 +2267,13 @@ impl ContainerEngine {
         reading_settings: RemoteReadingSettingsSource,
     ) -> Self {
         let spread_db_path = crate::data_dir::get().join("spread.db");
-        let spread_db =
-            match crate::spread_db::SpreadDb::open_existing_read_only_at(&spread_db_path) {
-                Ok(db) => db,
-                Err(error) => {
-                    crate::logger::log(format!(
-                        "remote_ipc: spread DB read-only open failed: {error}"
-                    ));
-                    None
-                }
-            };
+        let spread_db = crate::spread_db::SpreadDb::open_existing_read_only_at(&spread_db_path)
+            .map_err(|error| {
+                crate::logger::log(format!(
+                    "remote_ipc: spread DB read-only open failed: {error}"
+                ));
+                error.to_string()
+            });
         let view_trim_db_path = crate::data_dir::get().join("view_trim.db");
         let view_trim_db =
             match crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&view_trim_db_path) {
@@ -2782,7 +2783,8 @@ impl ContainerEngine {
         match request {
             RemoteWriteRequest::SetSpread { address, .. }
             | RemoteWriteRequest::SetFinalCoverSpreadPreference { address, .. }
-            | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { address, .. } => {
+            | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { address, .. }
+            | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { address, .. } => {
                 let resolved = self
                     .resolve(address)
                     .map_err(remote_write_error_from_media)?;
@@ -4592,6 +4594,10 @@ impl ContainerEngine {
             final_cover_spread_enabled: spread.final_cover_enabled,
             singleton_spread_placement_preference: spread.singleton_placement_preference,
             singleton_spread_placement_enabled: spread.singleton_placement_enabled,
+            singleton_spread_first_preference: spread.singleton_first_preference,
+            singleton_spread_last_preference: spread.singleton_last_preference,
+            singleton_spread_first_enabled: spread.singleton_first_enabled,
+            singleton_spread_last_enabled: spread.singleton_last_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
@@ -4746,6 +4752,10 @@ impl ContainerEngine {
             final_cover_spread_enabled: spread.final_cover_enabled,
             singleton_spread_placement_preference: spread.singleton_placement_preference,
             singleton_spread_placement_enabled: spread.singleton_placement_enabled,
+            singleton_spread_first_preference: spread.singleton_first_preference,
+            singleton_spread_last_preference: spread.singleton_last_preference,
+            singleton_spread_first_enabled: spread.singleton_first_enabled,
+            singleton_spread_last_enabled: spread.singleton_last_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
@@ -4831,6 +4841,10 @@ impl ContainerEngine {
             final_cover_spread_enabled: spread.final_cover_enabled,
             singleton_spread_placement_preference: spread.singleton_placement_preference,
             singleton_spread_placement_enabled: spread.singleton_placement_enabled,
+            singleton_spread_first_preference: spread.singleton_first_preference,
+            singleton_spread_last_preference: spread.singleton_last_preference,
+            singleton_spread_first_enabled: spread.singleton_first_enabled,
+            singleton_spread_last_enabled: spread.singleton_last_enabled,
             image_count: spread.image_count,
             video_count: spread.video_count,
             other_count: spread.other_count,
@@ -4861,7 +4875,7 @@ impl ContainerEngine {
             crate::spread_db::container_key_with_fallback(&resolved.logical, &[])
         };
         let (stored_mode, stored_direction, final_cover_preference, singleton_placement_preference) =
-            self.stored_spread_state(&key.exact, key.fallback.as_deref());
+            self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
         let source_items = source_items.unwrap_or(items);
         let (default_mode, default_direction) = if use_book_defaults {
             (
@@ -4894,8 +4908,12 @@ impl ContainerEngine {
         };
         let final_cover_enabled =
             final_cover_preference.effective(reading_settings.final_cover_spread_enabled);
-        let singleton_placement_enabled = singleton_placement_preference
-            .effective(reading_settings.singleton_spread_placement_enabled);
+        let singleton_placement_enabled = singleton_placement_preference.effective(
+            crate::settings::SingletonSpreadEndpointSettings {
+                first: reading_settings.singleton_spread_first_enabled,
+                last: reading_settings.singleton_spread_last_enabled,
+            },
+        );
         let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_composition(
             items,
             core_spread_mode(effective),
@@ -4953,9 +4971,17 @@ impl ContainerEngine {
             final_cover_preference: remote_final_cover_preference(final_cover_preference),
             final_cover_enabled,
             singleton_placement_preference: remote_singleton_spread_placement_preference(
-                singleton_placement_preference,
+                singleton_placement_preference.first,
             ),
-            singleton_placement_enabled,
+            singleton_placement_enabled: singleton_placement_enabled.first,
+            singleton_first_preference: remote_singleton_spread_placement_preference(
+                singleton_placement_preference.first,
+            ),
+            singleton_last_preference: remote_singleton_spread_placement_preference(
+                singleton_placement_preference.last,
+            ),
+            singleton_first_enabled: singleton_placement_enabled.first,
+            singleton_last_enabled: singleton_placement_enabled.last,
             spread_page_gap_px: reading_settings.spread_page_gap_px,
             image_count,
             video_count,
@@ -4968,16 +4994,25 @@ impl ContainerEngine {
         &self,
         key: &Path,
         fallback: Option<&Path>,
-    ) -> (
-        Option<crate::settings::SpreadMode>,
-        Option<crate::settings::ReadingDirection>,
-        crate::settings::FinalCoverSpreadPreference,
-        crate::settings::SingletonSpreadPlacementPreference,
-    ) {
+    ) -> Result<
+        (
+            Option<crate::settings::SpreadMode>,
+            Option<crate::settings::ReadingDirection>,
+            crate::settings::FinalCoverSpreadPreference,
+            crate::settings::SingletonSpreadEndpointPreferences,
+        ),
+        MediaError,
+    > {
         let db = self
             .spread_db
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let db = db.as_ref().map_err(|error| {
+            media_error(
+                MediaErrorCode::Internal,
+                format!("見開き設定 DB を開けませんでした: {error}"),
+            )
+        })?;
         let stored = db
             .as_ref()
             .map(|db| db.get_state_with_fallback(key, fallback))
@@ -4988,14 +5023,22 @@ impl ContainerEngine {
             .unwrap_or_default();
         let singleton_placement_preference = db
             .as_ref()
-            .map(|db| db.get_singleton_spread_placement_preference_with_fallback(key, fallback))
+            .map(|db| db.get_singleton_spread_endpoint_preferences_with_fallback(key, fallback))
+            .transpose()
+            .map_err(|error| {
+                crate::logger::log(format!("remote_ipc: endpoint spread read failed: {error}"));
+                media_error(
+                    MediaErrorCode::Internal,
+                    "見開き端の保存設定を読み込めませんでした",
+                )
+            })?
             .unwrap_or_default();
-        (
+        Ok((
             stored.mode,
             stored.direction,
             final_cover_preference,
             singleton_placement_preference,
-        )
+        ))
     }
 
     fn remote_view_trim_plan(
@@ -7509,6 +7552,12 @@ mod tests {
             singleton_spread_placement_preference:
                 RemoteSingletonSpreadPlacementPreference::FollowGlobal,
             singleton_spread_placement_enabled: false,
+            singleton_spread_first_preference:
+                RemoteSingletonSpreadPlacementPreference::FollowGlobal,
+            singleton_spread_last_preference:
+                RemoteSingletonSpreadPlacementPreference::FollowGlobal,
+            singleton_spread_first_enabled: false,
+            singleton_spread_last_enabled: false,
             image_count: total,
             video_count: 0,
             other_count: 0,
@@ -10559,7 +10608,7 @@ mod tests {
         *engine
             .spread_db
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+            .unwrap_or_else(|error| error.into_inner()) = Ok(None);
         let open = |relative: &str| {
             let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
                 address: favorite_address(&favorite, relative),
@@ -10615,7 +10664,7 @@ mod tests {
         *engine
             .spread_db
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(writable);
+            .unwrap_or_else(|error| error.into_inner()) = Ok(Some(writable));
 
         let stored_payload = open("mixed-media");
         assert_eq!(stored_payload.configured_spread_mode, RemoteSpreadMode::Rtl);
@@ -10632,13 +10681,14 @@ mod tests {
         let engine = ContainerEngine::new(crate::settings::Settings {
             default_spread_mode: crate::settings::SpreadMode::LtrCover,
             default_reading_direction: crate::settings::ReadingDirection::Ltr,
-            singleton_spread_placement_enabled: true,
+            singleton_spread_first_enabled: true,
+            singleton_spread_last_enabled: true,
             ..Default::default()
         });
         *engine
             .spread_db
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+            .unwrap_or_else(|error| error.into_inner()) = Ok(None);
 
         for extension in ["zip", "pdf"] {
             let path = temp.path().join(format!("book.{extension}"));
@@ -10682,6 +10732,8 @@ mod tests {
                 RemoteSingletonSpreadPlacementPreference::FollowGlobal
             );
             assert!(spread.singleton_placement_enabled);
+            assert!(spread.singleton_first_enabled);
+            assert!(spread.singleton_last_enabled);
             assert_eq!(spread.groups.len(), 1);
             assert_eq!(spread.groups[0].pages.len(), 1);
             assert_eq!(
@@ -10690,6 +10742,89 @@ mod tests {
                 "one-page {extension} must use the LtrCover first-page slot"
             );
         }
+    }
+
+    #[test]
+    fn spread_endpoint_schema_damage_returns_remote_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        *engine.spread_db.lock().unwrap() =
+            Ok(Some(crate::spread_db::SpreadDb::open_at(&path).unwrap()));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE singleton_spread_endpoint_placements")
+            .unwrap();
+        assert!(
+            engine
+                .stored_spread_state(Path::new("C:/books/book.zip"), None)
+                .is_err()
+        );
+        *engine.spread_db.lock().unwrap() = Err("injected open failure".into());
+        assert!(
+            engine
+                .stored_spread_state(Path::new("C:/books/book.zip"), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_endpoint_preferences_project_both_book_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book.zip");
+        std::fs::write(&book, b"container").unwrap();
+        let db = crate::spread_db::SpreadDb::open_at(&temp.path().join("spread.db")).unwrap();
+        db.set_singleton_spread_endpoint_preferences(
+            &book,
+            None,
+            crate::settings::SingletonSpreadEndpointPreferences {
+                first: crate::settings::SingletonSpreadPlacementPreference::Center,
+                last: crate::settings::SingletonSpreadPlacementPreference::Place,
+            },
+        )
+        .unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            default_spread_mode: crate::settings::SpreadMode::LtrCover,
+            singleton_spread_first_enabled: true,
+            singleton_spread_last_enabled: false,
+            ..Default::default()
+        });
+        *engine.spread_db.lock().unwrap() = Ok(Some(db));
+        let resolved = resolve_existing(book.to_string_lossy().as_ref()).unwrap();
+        let spread = engine
+            .spread_payload(
+                &ContainerRequest {
+                    address: RemoteAddress::file(book.to_string_lossy().into_owned()),
+                    spread_mode: None,
+                    reading_direction: None,
+                    force_single_page: false,
+                },
+                &resolved,
+                &[crate::grid_item::GridItem::ZipImage {
+                    zip_path: book,
+                    entry_name: "001.jpg".into(),
+                }],
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+        assert!(!spread.singleton_first_enabled);
+        assert!(spread.singleton_last_enabled);
+        assert_eq!(
+            spread.singleton_first_preference,
+            RemoteSingletonSpreadPlacementPreference::Center
+        );
+        assert_eq!(
+            spread.singleton_last_preference,
+            RemoteSingletonSpreadPlacementPreference::Place
+        );
+        assert_eq!(
+            spread.groups[0].singleton_placement,
+            RemoteSingletonSpreadPlacement::Center,
+            "first wins on one-unit books"
+        );
     }
 
     #[test]
@@ -10718,7 +10853,7 @@ mod tests {
         *engine
             .spread_db
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+            .unwrap_or_else(|error| error.into_inner()) = Ok(None);
         let request = |subresource| ContainerRequest {
             address: RemoteAddress {
                 path: zip_path.to_string_lossy().into_owned(),
@@ -10778,7 +10913,7 @@ mod tests {
         *engine
             .spread_db
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+            .unwrap_or_else(|error| error.into_inner()) = Ok(None);
         let request = ContainerRequest {
             address: RemoteAddress::file(temp.path().to_string_lossy().into_owned()),
             spread_mode: Some(RemoteSpreadMode::LtrCover),

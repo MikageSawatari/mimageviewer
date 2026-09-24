@@ -1048,6 +1048,13 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         true,
         StoreKeyNormalization::DriveStripped,
     ),
+    optional_legacy_store(
+        "spread.db",
+        "singleton_spread_endpoint_placements",
+        "path",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
     store(
         "view_trim.db",
         "view_trim_books",
@@ -2199,8 +2206,12 @@ mod tests {
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
-        assert_eq!(STORES.len(), 24, "A1 ledger を含む現行 descriptor 数");
-        assert_eq!(covered, 23);
+        assert_eq!(
+            STORES.len(),
+            25,
+            "endpoint preference を含む現行 descriptor 数"
+        );
+        assert_eq!(covered, 24);
         assert_eq!(report.rows, covered * 2);
 
         for descriptor in STORES {

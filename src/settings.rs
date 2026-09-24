@@ -3152,6 +3152,56 @@ impl SingletonSpreadPlacementPreference {
     }
 }
 
+/// Independent global choices for singleton pages at the two book endpoints.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SingletonSpreadEndpointSettings {
+    pub first: bool,
+    pub last: bool,
+}
+
+impl From<bool> for SingletonSpreadEndpointSettings {
+    fn from(enabled: bool) -> Self {
+        Self {
+            first: enabled,
+            last: enabled,
+        }
+    }
+}
+
+/// A book may follow or override either endpoint independently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SingletonSpreadEndpointPreferences {
+    pub first: SingletonSpreadPlacementPreference,
+    pub last: SingletonSpreadPlacementPreference,
+}
+
+impl From<SingletonSpreadPlacementPreference> for SingletonSpreadEndpointPreferences {
+    fn from(preference: SingletonSpreadPlacementPreference) -> Self {
+        Self {
+            first: preference,
+            last: preference,
+        }
+    }
+}
+
+impl PartialEq<SingletonSpreadPlacementPreference> for SingletonSpreadEndpointPreferences {
+    fn eq(&self, other: &SingletonSpreadPlacementPreference) -> bool {
+        self.first == *other && self.last == *other
+    }
+}
+
+impl SingletonSpreadEndpointPreferences {
+    pub(crate) const fn effective(
+        self,
+        global: SingletonSpreadEndpointSettings,
+    ) -> SingletonSpreadEndpointSettings {
+        SingletonSpreadEndpointSettings {
+            first: self.first.effective(global.first),
+            last: self.last.effective(global.last),
+        }
+    }
+}
+
 // ReadingFlow (フルスクリーン連結方式)
 // -----------------------------------------------------------------------
 
@@ -4558,9 +4608,12 @@ pub struct Settings {
     /// 表紙あり見開きで、末尾の単ページへ表紙を添える全体既定。各本の明示設定が優先する。
     #[serde(default = "default_true")]
     pub final_cover_spread_enabled: bool,
-    /// 見開きの先頭・末尾に残る単ページを、本来の左右へ置く全体既定。
+    /// 見開き先頭の単ページを本来の側へ置く全体既定。
     #[serde(default)]
-    pub singleton_spread_placement_enabled: bool,
+    pub singleton_spread_first_enabled: bool,
+    /// 見開き末尾の単ページを本来の側へ置く全体既定。
+    #[serde(default)]
+    pub singleton_spread_last_enabled: bool,
     /// 見開き内の左右ページ間隔 (画面 px)。0 でページを隙間なく接続する。
     #[serde(default = "default_spread_page_gap_px")]
     pub spread_page_gap_px: u32,
@@ -6772,7 +6825,8 @@ impl Default for Settings {
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
-            singleton_spread_placement_enabled: false,
+            singleton_spread_first_enabled: false,
+            singleton_spread_last_enabled: false,
             spread_page_gap_px: default_spread_page_gap_px(),
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
             fullscreen_image_margin_color: FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT,
@@ -7228,7 +7282,21 @@ fn try_parse_settings_file(path: &Path) -> LoadFileResult {
             return LoadFileResult::ParseError;
         }
     };
-    match serde_json::from_str::<Settings>(text) {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).and_then(|mut value| {
+        if let Some(map) = value.as_object_mut() {
+            if let Some(legacy) = map
+                .get("singleton_spread_placement_enabled")
+                .and_then(serde_json::Value::as_bool)
+            {
+                map.entry("singleton_spread_first_enabled")
+                    .or_insert(serde_json::Value::Bool(legacy));
+                map.entry("singleton_spread_last_enabled")
+                    .or_insert(serde_json::Value::Bool(legacy));
+            }
+        }
+        serde_json::from_value::<Settings>(value)
+    });
+    match parsed {
         Ok(s) => LoadFileResult::Ok(s),
         Err(e) => {
             settings_diag_log(&format!(
@@ -12979,7 +13047,8 @@ mod tests {
     #[test]
     fn singleton_spread_placement_defaults_off_and_book_preference_resolves_explicitly() {
         let legacy: Settings = serde_json::from_str("{}").unwrap();
-        assert!(!legacy.singleton_spread_placement_enabled);
+        assert!(!legacy.singleton_spread_first_enabled);
+        assert!(!legacy.singleton_spread_last_enabled);
         assert!(SingletonSpreadPlacementPreference::FollowGlobal.effective(true));
         assert!(!SingletonSpreadPlacementPreference::FollowGlobal.effective(false));
         assert!(SingletonSpreadPlacementPreference::Place.effective(false));
@@ -12995,6 +13064,25 @@ mod tests {
             );
         }
         assert_eq!(SingletonSpreadPlacementPreference::from_int(3), None);
+        let global = SingletonSpreadEndpointSettings {
+            first: true,
+            last: false,
+        };
+        assert_eq!(
+            SingletonSpreadEndpointPreferences {
+                first: SingletonSpreadPlacementPreference::Center,
+                last: SingletonSpreadPlacementPreference::Place,
+            }
+            .effective(global),
+            SingletonSpreadEndpointSettings {
+                first: false,
+                last: true
+            }
+        );
+        assert_eq!(
+            SingletonSpreadEndpointPreferences::default().effective(global),
+            global
+        );
     }
 
     #[test]

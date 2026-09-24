@@ -24812,7 +24812,8 @@ mod favorite_adjustment_defaults_tests {
         );
 
         let defaults = SpreadRestoreDefaults::for_book(&app.settings);
-        app.apply_spread_for_key_with_fallback(&nested, Some(&root), defaults);
+        app.apply_spread_for_key_with_fallback(&nested, Some(&root), defaults)
+            .unwrap();
 
         assert_eq!(app.spread_mode, crate::settings::SpreadMode::LtrCover);
         assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
@@ -59000,7 +59001,7 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.spread_mode = mode;
-        app.singleton_spread_placement_preference = preference;
+        app.singleton_spread_endpoint_preferences = preference.into();
         app.record_page_dims_for_spread(0, (size[0] as u32, size[1] as u32));
         let pixels = egui::ColorImage::filled(size, egui::Color32::LIGHT_BLUE);
         let texture = ctx.load_texture(label, pixels.clone(), egui::TextureOptions::LINEAR);
@@ -59037,7 +59038,8 @@ mod still_window_mode_key_tests {
             let mut app = setup_app();
             let ctx = egui::Context::default();
             app.settings.detached_viewer_open_images_in_window = true;
-            app.settings.singleton_spread_placement_enabled = true;
+            app.settings.singleton_spread_first_enabled = true;
+            app.settings.singleton_spread_last_enabled = true;
             app.settings.detached_viewer_window_placement =
                 Some(crate::settings::DetachedViewerWindowPlacement {
                     x: 80.0,
@@ -59048,8 +59050,8 @@ mod still_window_mode_key_tests {
                 });
 
             let sibling_id = app.build_window_context_for_test(200, |sibling| {
-                sibling.singleton_spread_placement_preference =
-                    crate::settings::SingletonSpreadPlacementPreference::Center;
+                sibling.singleton_spread_endpoint_preferences =
+                    crate::settings::SingletonSpreadPlacementPreference::Center.into();
             });
             let context_id =
                 app.build_active_context_for_test(Some(100), DetachedSource::Book, |active| {
@@ -59078,7 +59080,7 @@ mod still_window_mode_key_tests {
                         .build_active_detached_image_window_snapshot(None)
                         .expect("paged snapshot must not require an egui Context");
                     (
-                        mounted.singleton_spread_placement_preference,
+                        mounted.singleton_spread_endpoint_preferences,
                         unit.singleton_placement,
                         unit.pages.len(),
                         snapshot,
@@ -59145,14 +59147,14 @@ mod still_window_mode_key_tests {
             }
             app.with_window_viewer_context(100, |parked| {
                 assert_eq!(
-                    parked.singleton_spread_placement_preference,
+                    parked.singleton_spread_endpoint_preferences,
                     crate::settings::SingletonSpreadPlacementPreference::Place
                 );
             })
             .expect("parked bundle stays addressable");
             app.with_viewer_context(sibling_id, |sibling| {
                 assert_eq!(
-                    sibling.singleton_spread_placement_preference,
+                    sibling.singleton_spread_endpoint_preferences,
                     crate::settings::SingletonSpreadPlacementPreference::Center,
                     "mount/park/deposit of one window must not mutate its sibling"
                 );
@@ -59166,7 +59168,7 @@ mod still_window_mode_key_tests {
                         .capture_fs_display_unit(0)
                         .expect("remounted endpoint singleton must remain canonical");
                     (
-                        remounted.singleton_spread_placement_preference,
+                        remounted.singleton_spread_endpoint_preferences,
                         unit.singleton_placement,
                         unit.pages.len(),
                     )
@@ -59177,13 +59179,117 @@ mod still_window_mode_key_tests {
             assert_eq!(page_count_after, page_count_before);
             app.with_viewer_context(sibling_id, |sibling| {
                 assert_eq!(
-                    sibling.singleton_spread_placement_preference,
+                    sibling.singleton_spread_endpoint_preferences,
                     crate::settings::SingletonSpreadPlacementPreference::Center,
                     "activation/remount must leave the sibling preference untouched"
                 );
             })
             .expect("sibling remains independently mountable after remount");
         }
+    }
+
+    #[test]
+    fn damaged_endpoint_table_is_an_app_read_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let mut app = setup_app();
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&path).unwrap());
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE singleton_spread_endpoint_placements")
+            .unwrap();
+        let before = app.singleton_spread_endpoint_preferences;
+        let defaults = SpreadRestoreDefaults::for_book(&app.settings);
+        assert!(
+            app.apply_spread_for_key_with_fallback(
+                std::path::Path::new("C:/books/book.zip"),
+                None,
+                defaults,
+            )
+            .is_err()
+        );
+        assert_eq!(app.singleton_spread_endpoint_preferences, before);
+        app.spread_db = Err("injected open failure".into());
+        assert!(
+            app.apply_spread_for_key_with_fallback(
+                std::path::Path::new("C:/books/book.zip"),
+                None,
+                defaults,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn app_book_open_projects_released_endpoints_when_writable_migration_fails() {
+        use crate::settings::{
+            SingletonSpreadEndpointPreferences, SingletonSpreadPlacementPreference as Preference,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let first = std::path::Path::new("C:/books/first.zip");
+        let second = std::path::Path::new("C:/books/second.zip");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE singleton_spread_placements (path TEXT PRIMARY KEY, preference INTEGER NOT NULL);
+             CREATE TABLE singleton_spread_endpoint_placements (path TEXT PRIMARY KEY, first_preference INTEGER, last_preference INTEGER);
+             CREATE TRIGGER fail_endpoint_copy BEFORE INSERT ON singleton_spread_endpoint_placements
+             BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+        )
+        .unwrap();
+        for (book, preference) in [(first, 1), (second, 2)] {
+            conn.execute(
+                "INSERT INTO singleton_spread_placements (path, preference) VALUES (?1, ?2)",
+                rusqlite::params![crate::path_key::normalize(book), preference],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        assert!(crate::spread_db::SpreadDb::open_at(&path).is_err());
+
+        let mut app = setup_app();
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_for_app_at(&path).unwrap());
+        app.singleton_spread_endpoint_preferences = SingletonSpreadEndpointPreferences {
+            first: Preference::Center,
+            last: Preference::Place,
+        };
+        let defaults = SpreadRestoreDefaults::for_book(&app.settings);
+        app.apply_spread_for_key(first, defaults).unwrap();
+        assert_eq!(
+            app.singleton_spread_endpoint_preferences,
+            SingletonSpreadEndpointPreferences::from(Preference::Place)
+        );
+        app.apply_spread_for_key(second, defaults).unwrap();
+        assert_eq!(
+            app.singleton_spread_endpoint_preferences,
+            SingletonSpreadEndpointPreferences::from(Preference::Center),
+            "the second book must replace the first book's preferences"
+        );
+        assert!(
+            app.spread_db
+                .as_ref()
+                .unwrap()
+                .set_singleton_spread_endpoint_preferences(
+                    first,
+                    None,
+                    SingletonSpreadEndpointPreferences::default(),
+                )
+                .is_err(),
+            "legacy projection must stay read-only"
+        );
+
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_endpoint_copy")
+            .unwrap();
+        let retried = crate::spread_db::SpreadDb::open_at(&path).unwrap();
+        assert_eq!(
+            retried
+                .get_singleton_spread_endpoint_preferences_with_fallback(first, None)
+                .unwrap(),
+            SingletonSpreadEndpointPreferences::from(Preference::Place)
+        );
     }
 
     #[test]
@@ -59211,7 +59317,8 @@ mod still_window_mode_key_tests {
             let mut app = setup_app();
             let ctx = egui::Context::default();
             app.settings.detached_viewer_open_images_in_window = true;
-            app.settings.singleton_spread_placement_enabled = global_enabled;
+            app.settings.singleton_spread_first_enabled = global_enabled;
+            app.settings.singleton_spread_last_enabled = global_enabled;
             app.settings.detached_viewer_window_placement =
                 Some(crate::settings::DetachedViewerWindowPlacement {
                     x: 80.0,
@@ -59265,7 +59372,8 @@ mod still_window_mode_key_tests {
             let mut app = setup_app();
             let ctx = egui::Context::default();
             app.settings.detached_viewer_open_images_in_window = true;
-            app.settings.singleton_spread_placement_enabled = true;
+            app.settings.singleton_spread_first_enabled = true;
+            app.settings.singleton_spread_last_enabled = true;
             app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
             app.settings.spread_page_gap_px = 0;
             app.settings.detached_viewer_window_placement =
@@ -59333,7 +59441,8 @@ mod still_window_mode_key_tests {
             let window_id = if active { 311 } else { 312 };
             let window_size = egui::vec2(960.0, 720.0);
             app.settings.detached_viewer_open_images_in_window = true;
-            app.settings.singleton_spread_placement_enabled = true;
+            app.settings.singleton_spread_first_enabled = true;
+            app.settings.singleton_spread_last_enabled = true;
             app.settings.spread_page_gap_px = 18;
             app.settings.detached_viewer_window_placement =
                 Some(crate::settings::DetachedViewerWindowPlacement {
@@ -59439,7 +59548,7 @@ mod still_window_mode_key_tests {
 
             app.with_window_viewer_context(window_id, |parked| {
                 assert_eq!(
-                    parked.singleton_spread_placement_preference,
+                    parked.singleton_spread_endpoint_preferences,
                     crate::settings::SingletonSpreadPlacementPreference::Place
                 );
                 assert_eq!(parked.fs_zoom_active, active);
@@ -59459,7 +59568,7 @@ mod still_window_mode_key_tests {
             assert!(app.activate_detached_image_window_snapshot(&ctx, window_id));
             app.with_active_viewer_context(|remounted| {
                 assert_eq!(
-                    remounted.singleton_spread_placement_preference,
+                    remounted.singleton_spread_endpoint_preferences,
                     crate::settings::SingletonSpreadPlacementPreference::Place
                 );
                 assert_eq!(remounted.fs_zoom_active, active);
@@ -59758,7 +59867,8 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let window_size = egui::vec2(960.0, 720.0);
         app.settings.detached_viewer_open_images_in_window = true;
-        app.settings.singleton_spread_placement_enabled = true;
+        app.settings.singleton_spread_first_enabled = true;
+        app.settings.singleton_spread_last_enabled = true;
         app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
         app.settings.spread_page_gap_px = 20;
         app.settings.global_preset.post_filter = crate::adjustment::PostFilter::Nearest;

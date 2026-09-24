@@ -984,7 +984,7 @@ pub(in crate::app) struct ViewerContextBundle {
     analysis_sv_cache: Option<(f32, egui::Vec2, usize, egui::TextureHandle)>,
     spread_mode: crate::settings::SpreadMode,
     final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
-    singleton_spread_placement_preference: crate::settings::SingletonSpreadPlacementPreference,
+    singleton_spread_endpoint_preferences: crate::settings::SingletonSpreadEndpointPreferences,
     spread_shift_anchor_idx: Option<usize>,
     reading_flow: crate::settings::ReadingFlow,
     reading_direction: crate::settings::ReadingDirection,
@@ -1571,8 +1571,8 @@ impl ViewerContextBundle {
             analysis_sv_cache: None,
             spread_mode: crate::settings::SpreadMode::default(),
             final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference::default(),
-            singleton_spread_placement_preference:
-                crate::settings::SingletonSpreadPlacementPreference::default(),
+            singleton_spread_endpoint_preferences:
+                crate::settings::SingletonSpreadEndpointPreferences::default(),
             spread_shift_anchor_idx: None,
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
@@ -1938,7 +1938,7 @@ impl App {
             analysis_sv_cache,
             spread_mode,
             final_cover_spread_preference,
-            singleton_spread_placement_preference,
+            singleton_spread_endpoint_preferences,
             spread_shift_anchor_idx,
             reading_flow,
             reading_direction,
@@ -2213,7 +2213,7 @@ impl App {
         swap_field!(analysis_sv_cache);
         swap_field!(spread_mode);
         swap_field!(final_cover_spread_preference);
-        swap_field!(singleton_spread_placement_preference);
+        swap_field!(singleton_spread_endpoint_preferences);
         swap_field!(spread_shift_anchor_idx);
         swap_field!(reading_flow);
         swap_field!(reading_direction);
@@ -2527,7 +2527,7 @@ impl App {
             analysis_sv_cache,
             spread_mode,
             final_cover_spread_preference,
-            singleton_spread_placement_preference,
+            singleton_spread_endpoint_preferences,
             spread_shift_anchor_idx,
             reading_flow,
             reading_direction,
@@ -2841,7 +2841,7 @@ impl App {
             view_trim_save_pending,
             spread_mode,
             final_cover_spread_preference,
-            singleton_spread_placement_preference,
+            singleton_spread_endpoint_preferences,
             spread_shift_anchor_idx,
             reading_flow,
             reading_direction,
@@ -2914,7 +2914,7 @@ impl App {
         detached.view_trim_page_overrides = self.view_trim_page_overrides.clone();
         detached.spread_mode = self.spread_mode;
         detached.final_cover_spread_preference = self.final_cover_spread_preference;
-        detached.singleton_spread_placement_preference = self.singleton_spread_placement_preference;
+        detached.singleton_spread_endpoint_preferences = self.singleton_spread_endpoint_preferences;
         detached.spread_shift_anchor_idx = self.spread_shift_anchor_idx;
         detached.reading_flow = self.reading_flow;
         detached.reading_direction = self.reading_direction;
@@ -3220,13 +3220,22 @@ impl App {
         }
     }
 
-    pub(crate) fn invalidate_singleton_spread_placement_in_parked_contexts(&mut self) {
+    pub(crate) fn invalidate_singleton_spread_placement_in_parked_contexts(
+        &mut self,
+        first_changed: bool,
+        last_changed: bool,
+    ) {
         for id in self.viewer_contexts.table.other_ids() {
             let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) else {
                 continue;
             };
-            if bundle.singleton_spread_placement_preference
-                != crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+            let preferences = bundle.singleton_spread_endpoint_preferences;
+            if !(first_changed
+                && preferences.first
+                    == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+                || last_changed
+                    && preferences.last
+                        == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal)
             {
                 continue;
             }
@@ -3961,23 +3970,25 @@ mod tests {
 
         let mut app = crate::app::setup_app_for_test();
         let a = app.build_window_context_for_test(721, |app| {
-            app.singleton_spread_placement_preference = SingletonSpreadPlacementPreference::Place;
+            app.singleton_spread_endpoint_preferences =
+                SingletonSpreadPlacementPreference::Place.into();
         });
         let b = app.build_window_context_for_test(722, |app| {
-            app.singleton_spread_placement_preference = SingletonSpreadPlacementPreference::Center;
+            app.singleton_spread_endpoint_preferences =
+                SingletonSpreadPlacementPreference::Center.into();
         });
 
         for _ in 0..2 {
             app.with_viewer_context(a, |app| {
                 assert_eq!(
-                    app.singleton_spread_placement_preference,
+                    app.singleton_spread_endpoint_preferences,
                     SingletonSpreadPlacementPreference::Place
                 );
             })
             .unwrap();
             app.with_viewer_context(b, |app| {
                 assert_eq!(
-                    app.singleton_spread_placement_preference,
+                    app.singleton_spread_endpoint_preferences,
                     SingletonSpreadPlacementPreference::Center
                 );
             })
@@ -4023,24 +4034,45 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn global_singleton_placement_change_invalidates_only_parked_follow_global_geometry() {
-        use crate::settings::SingletonSpreadPlacementPreference;
+        use crate::settings::{
+            SingletonSpreadEndpointPreferences, SingletonSpreadPlacementPreference,
+        };
 
         let mut app = crate::app::setup_app_for_test();
         let inherited = app.build_window_context_for_test(723, |app| {
-            app.singleton_spread_placement_preference =
-                SingletonSpreadPlacementPreference::FollowGlobal;
+            app.singleton_spread_endpoint_preferences =
+                SingletonSpreadPlacementPreference::FollowGlobal.into();
             app.fs_vertical_scroll = 123.0;
             app.fullscreen_page_layout
                 .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
         });
         let explicit = app.build_window_context_for_test(724, |app| {
-            app.singleton_spread_placement_preference = SingletonSpreadPlacementPreference::Place;
+            app.singleton_spread_endpoint_preferences =
+                SingletonSpreadPlacementPreference::Place.into();
             app.fs_vertical_scroll = 456.0;
             app.fullscreen_page_layout
                 .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
         });
+        let first_explicit = app.build_window_context_for_test(725, |app| {
+            app.singleton_spread_endpoint_preferences = SingletonSpreadEndpointPreferences {
+                first: SingletonSpreadPlacementPreference::Place,
+                last: SingletonSpreadPlacementPreference::FollowGlobal,
+            };
+            app.fs_vertical_scroll = 725.0;
+            app.fullscreen_page_layout
+                .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
+        });
+        let last_explicit = app.build_window_context_for_test(726, |app| {
+            app.singleton_spread_endpoint_preferences = SingletonSpreadEndpointPreferences {
+                first: SingletonSpreadPlacementPreference::FollowGlobal,
+                last: SingletonSpreadPlacementPreference::Center,
+            };
+            app.fs_vertical_scroll = 726.0;
+            app.fullscreen_page_layout
+                .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
+        });
 
-        app.invalidate_singleton_spread_placement_in_parked_contexts();
+        app.invalidate_singleton_spread_placement_in_parked_contexts(true, true);
 
         let inherited = app.viewer_contexts.table.at_rest(inherited).unwrap();
         assert_eq!(inherited.fs_vertical_scroll, 0.0);
@@ -4054,6 +4086,62 @@ mod tests {
             explicit.fullscreen_page_layout.kind(),
             crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous
         );
+        for id in [first_explicit, last_explicit] {
+            let mixed = app.viewer_contexts.table.at_rest(id).unwrap();
+            assert_eq!(mixed.fs_vertical_scroll, 0.0);
+            assert_eq!(
+                mixed.fullscreen_page_layout.kind(),
+                crate::displayed_image_transform::FullscreenPageLayoutKind::Empty
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn global_endpoint_change_preserves_parked_scroll_and_pan_when_changed_end_is_explicit() {
+        use crate::settings::{
+            SingletonSpreadEndpointPreferences as Preferences,
+            SingletonSpreadPlacementPreference as Preference,
+        };
+
+        for (first_changed, last_changed, preferences) in [
+            (
+                true,
+                false,
+                Preferences {
+                    first: Preference::Place,
+                    last: Preference::FollowGlobal,
+                },
+            ),
+            (
+                false,
+                true,
+                Preferences {
+                    first: Preference::FollowGlobal,
+                    last: Preference::Center,
+                },
+            ),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            let id = app.build_window_context_for_test(727, |app| {
+                app.singleton_spread_endpoint_preferences = preferences;
+                app.fs_vertical_scroll = 727.0;
+                app.fs_pan = egui::vec2(12.0, -34.0);
+                app.fullscreen_page_layout
+                    .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
+            });
+            app.invalidate_singleton_spread_placement_in_parked_contexts(
+                first_changed,
+                last_changed,
+            );
+            let parked = app.viewer_contexts.table.at_rest(id).unwrap();
+            assert_eq!(parked.fs_vertical_scroll, 727.0);
+            assert_eq!(parked.fs_pan, egui::vec2(12.0, -34.0));
+            assert_eq!(
+                parked.fullscreen_page_layout.kind(),
+                crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous
+            );
+        }
     }
 
     #[cfg(windows)]

@@ -1871,7 +1871,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-現行版は **v58**。v58 は永続コレクションの着地位置を実媒体別の
+現行版は **v59**。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
 `{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
 catalog / snapshot / navigation を追加した。collection の session spread request と
 address-based `page_groups` を追加した版は v49。
@@ -2834,7 +2834,7 @@ ZIP の中身が 1 つのフォルダにまとまっていると、本体は `co
 ので、端末がそれを使えばよい。ずれを見つけやすくするため、要求側と実効側でキーが別行に
 なることを ui.rs の試験で固定した。
 
-## 16. 見開き端の単ページ配置 (§1.218、2026-09-13)
+## 16. 見開き端の単ページ配置 (§1.218 / §1.239)
 
 coreのcanonical `SpreadDisplayUnit`がpage列とtyped形成理由を同じcache tokenで持ち、共通
 `SpreadDisplayComposition`がcomplete-book proof、unit位置、形成理由から`Center / Left / Right`を解決する。
@@ -2849,6 +2849,8 @@ leaseは増やさない。Page / Width / Originalのrefit、resize、調整blob�
 placementを使う。actual DOM回帰はLeft / Rightそれぞれで`ImageViewer.loadGroup`を通し、image 1件、
 仮想幅`2 * page + gap`、dataset、各refitとadjustment replacement後の維持を固定する。
 
-本別設定は`全体設定に従う / 配置する / 中央表示`のtyped writeで、全体既定はOFF。書込後のrefreshは
+先頭と末尾はそれぞれ`全体設定に従う / 配置する / 中央表示`のtyped writeで、全体既定は各OFF。
+Remote payload は二端の preference と実効 bool を個別に返す。v59 write は endpoint を指定し、
+選んだ端だけを更新して同じ本の他端を保持する。書込後のrefreshは
 現在anchor / slice / historyを維持し、group layoutだけを更新する。詳細は
 [§1.218設計・検証記録](section218-singleton-spread-placement.md)を参照。

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 58;
+pub const PROTOCOL_VERSION: u32 = 59;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -586,6 +586,11 @@ pub enum RemoteWriteRequest {
         address: RemoteAddress,
         preference: RemoteSingletonSpreadPlacementPreference,
     },
+    SetSingletonSpreadEndpointPreference {
+        address: RemoteAddress,
+        endpoint: RemoteSingletonSpreadEndpoint,
+        preference: RemoteSingletonSpreadPlacementPreference,
+    },
     /// 表示完了済みのページ位置。page fields と record_history は remote-web の
     /// 観測値として受けるが、本体 write worker がローカルと同じ列挙規則で検証・
     /// 正規化してから UI thread へ渡す。
@@ -672,6 +677,7 @@ impl RemoteWriteRequest {
             Self::SetSpread { address, .. }
             | Self::SetFinalCoverSpreadPreference { address, .. }
             | Self::SetSingletonSpreadPlacementPreference { address, .. }
+            | Self::SetSingletonSpreadEndpointPreference { address, .. }
             | Self::RecordReadingProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
@@ -692,6 +698,7 @@ impl RemoteWriteRequest {
             Self::SetSpread { address, .. }
             | Self::SetFinalCoverSpreadPreference { address, .. }
             | Self::SetSingletonSpreadPlacementPreference { address, .. }
+            | Self::SetSingletonSpreadEndpointPreference { address, .. }
             | Self::RecordReadingProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
@@ -736,6 +743,7 @@ impl RemoteWriteRequest {
             Self::SetSpread { .. }
             | Self::SetFinalCoverSpreadPreference { .. }
             | Self::SetSingletonSpreadPlacementPreference { .. }
+            | Self::SetSingletonSpreadEndpointPreference { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
             | Self::GetAdjustmentState { .. }
@@ -772,6 +780,7 @@ impl RemoteWriteRequest {
             Self::SetSpread { .. }
             | Self::SetFinalCoverSpreadPreference { .. }
             | Self::SetSingletonSpreadPlacementPreference { .. }
+            | Self::SetSingletonSpreadEndpointPreference { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
             | Self::GetAdjustmentState { .. }
@@ -785,6 +794,9 @@ impl RemoteWriteRequest {
             Self::SetFinalCoverSpreadPreference { .. } => "set_final_cover_spread_preference",
             Self::SetSingletonSpreadPlacementPreference { .. } => {
                 "set_singleton_spread_placement_preference"
+            }
+            Self::SetSingletonSpreadEndpointPreference { .. } => {
+                "set_singleton_spread_endpoint_preference"
             }
             Self::RecordReadingProgress { .. } => "record_reading_progress",
             Self::SetRating { .. } => "set_rating",
@@ -1020,6 +1032,14 @@ pub enum RemoteSingletonSpreadPlacementPreference {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RemoteSingletonSpreadEndpoint {
+    #[default]
+    First,
+    Last,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RemoteSingletonSpreadPlacement {
     #[default]
     Center,
@@ -1057,6 +1077,14 @@ pub struct ContainerPayload {
     pub singleton_spread_placement_preference: RemoteSingletonSpreadPlacementPreference,
     #[serde(default)]
     pub singleton_spread_placement_enabled: bool,
+    #[serde(default)]
+    pub singleton_spread_first_preference: RemoteSingletonSpreadPlacementPreference,
+    #[serde(default)]
+    pub singleton_spread_last_preference: RemoteSingletonSpreadPlacementPreference,
+    #[serde(default)]
+    pub singleton_spread_first_enabled: bool,
+    #[serde(default)]
+    pub singleton_spread_last_enabled: bool,
     /// 本体 seek overlay と同じ nav item 分類による件数内訳。
     pub image_count: usize,
     pub video_count: usize,
@@ -3193,7 +3221,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 58);
+        assert_eq!(PROTOCOL_VERSION, 59);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3369,7 +3397,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 58);
+        assert_eq!(PROTOCOL_VERSION, 59);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3533,6 +3561,10 @@ mod tests {
                 singleton_spread_placement_preference:
                     RemoteSingletonSpreadPlacementPreference::Place,
                 singleton_spread_placement_enabled: true,
+                singleton_spread_first_preference: RemoteSingletonSpreadPlacementPreference::Place,
+                singleton_spread_last_preference: RemoteSingletonSpreadPlacementPreference::Center,
+                singleton_spread_first_enabled: true,
+                singleton_spread_last_enabled: false,
                 image_count: 2,
                 video_count: 0,
                 other_count: 0,
@@ -3662,6 +3694,11 @@ mod tests {
             RemoteWriteRequest::SetSingletonSpreadPlacementPreference {
                 address: container.clone(),
                 preference: RemoteSingletonSpreadPlacementPreference::Place,
+            },
+            RemoteWriteRequest::SetSingletonSpreadEndpointPreference {
+                address: container.clone(),
+                endpoint: RemoteSingletonSpreadEndpoint::Last,
+                preference: RemoteSingletonSpreadPlacementPreference::Center,
             },
             RemoteWriteRequest::RecordReadingProgress {
                 address: page.clone(),
@@ -4379,8 +4416,8 @@ mod tests {
     }
 
     #[test]
-    fn persistent_collection_shuffle_order_round_trips_on_protocol_58() {
-        assert_eq!(PROTOCOL_VERSION, 58);
+    fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
+        assert_eq!(PROTOCOL_VERSION, 59);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();
@@ -4427,7 +4464,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_collection_landed_position_is_a_typed_protocol_58_field() {
+    fn persistent_collection_landed_position_is_a_typed_protocol_59_field() {
         let identity = PersistentCollectionIdentity {
             entry_id: "11111111-1111-4111-8111-111111111111".to_owned(),
             source_identity: "a".repeat(64),

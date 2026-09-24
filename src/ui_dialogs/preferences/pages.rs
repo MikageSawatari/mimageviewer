@@ -9127,7 +9127,8 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/singleton-placement", |ui, state| {
         draw_singleton_spread_placement_setting(
             ui,
-            &mut state.settings.singleton_spread_placement_enabled,
+            &mut state.settings.singleton_spread_first_enabled,
+            &mut state.settings.singleton_spread_last_enabled,
         );
     });
     ui.add_space(8.0);
@@ -9636,8 +9637,13 @@ mod context_menu_layout_settings_tests {
     }
 }
 
-pub(super) fn draw_singleton_spread_placement_setting(ui: &mut egui::Ui, enabled: &mut bool) {
-    ui.checkbox(enabled, "見開きの先頭・末尾の単ページを片側に配置");
+pub(super) fn draw_singleton_spread_placement_setting(
+    ui: &mut egui::Ui,
+    first: &mut bool,
+    last: &mut bool,
+) {
+    ui.checkbox(first, "見開き先頭の単ページを片側に配置");
+    ui.checkbox(last, "見開き末尾の単ページを片側に配置");
     ui.small("本の端に単独で残るページだけを、見開きで本来ある側へ配置します。本ごとの設定が優先されます。");
 }
 

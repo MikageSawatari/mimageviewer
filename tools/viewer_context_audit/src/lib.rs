@@ -199,7 +199,7 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn other_viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn poll_similar_preview_workers_in_all_contexts (& mut self , ctx : & egui :: Context ,)",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_final_cover_spread_display_in_parked_contexts (& mut self)",
-    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_singleton_spread_placement_in_parked_contexts (& mut self)",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_singleton_spread_placement_in_parked_contexts (& mut self , first_changed : bool , last_changed : bool ,)",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn with_viewer_context_ref < R > (& self , id : ViewerContextId , f : impl FnOnce (ContextRef < '_ >) -> R ,) -> Option < R >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn bind_window (& mut self , id : ViewerContextId , window_id : u64 ,) -> Result < () , BindError >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn unbind_window (& mut self , window_id : u64) -> Option < ViewerContextId >",

@@ -2320,8 +2320,10 @@ impl App {
                 let old_fullscreen_side_panel_mode =
                     self.settings.fullscreen_side_panel_mode.normalized();
                 let old_final_cover_spread_enabled = self.settings.final_cover_spread_enabled;
-                let old_singleton_spread_placement_enabled =
-                    self.settings.singleton_spread_placement_enabled;
+                let old_singleton_spread_placement_enabled = (
+                    self.settings.singleton_spread_first_enabled,
+                    self.settings.singleton_spread_last_enabled,
+                );
                 let old_ui_font = self.settings.ui_font.clone();
                 let old_creative_luts = self.settings.creative_luts.clone();
                 let mut creative_lut_transaction =
@@ -2394,13 +2396,22 @@ impl App {
                         self.invalidate_final_cover_spread_display(ctx);
                     }
                 }
-                if old_singleton_spread_placement_enabled
-                    != self.settings.singleton_spread_placement_enabled
-                {
+                let first_endpoint_changed = old_singleton_spread_placement_enabled.0
+                    != self.settings.singleton_spread_first_enabled;
+                let last_endpoint_changed = old_singleton_spread_placement_enabled.1
+                    != self.settings.singleton_spread_last_enabled;
+                if first_endpoint_changed || last_endpoint_changed {
                     #[cfg(windows)]
-                    self.invalidate_singleton_spread_placement_in_parked_contexts();
-                    if self.singleton_spread_placement_preference
-                        == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+                    self.invalidate_singleton_spread_placement_in_parked_contexts(
+                        first_endpoint_changed,
+                        last_endpoint_changed,
+                    );
+                    if first_endpoint_changed
+                        && self.singleton_spread_endpoint_preferences.first
+                            == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+                        || last_endpoint_changed
+                            && self.singleton_spread_endpoint_preferences.last
+                                == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
                     {
                         self.invalidate_singleton_spread_placement_display(ctx);
                     }
@@ -4161,7 +4172,8 @@ mod tests {
     fn singleton_spread_placement_setting_snapshot() {
         use egui_kittest::Harness;
 
-        let mut enabled = true;
+        let mut first_enabled = true;
+        let mut last_enabled = false;
         let mut fonts_ready = false;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(540.0, 100.0))
@@ -4175,7 +4187,11 @@ mod tests {
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.set_width(ui.available_width());
-                    draw_singleton_spread_placement_setting(ui, &mut enabled);
+                    draw_singleton_spread_placement_setting(
+                        ui,
+                        &mut first_enabled,
+                        &mut last_enabled,
+                    );
                 });
             });
         harness.run();

@@ -49,6 +49,7 @@ const SCHEMA_VERSION: &str = "1";
 const EXTERNAL_TOOLS_MIGRATION_META_KEY: &str = "external_tools_migrated_from_custom_open_with";
 const RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY: &str = "recent_open_with_apps_launch_classified";
 const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v2";
+const SINGLETON_ENDPOINT_MIGRATION_META_KEY: &str = "singleton_spread_endpoints_v1";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
     'sort_order', 'show_hidden_files', 'grid_display_order',
     'archive_file_handling', 'archive_convert_without_dialog',
@@ -319,7 +320,8 @@ pub(crate) struct RemoteReadingSettings {
     pub(crate) default_spread_mode: crate::settings::SpreadMode,
     pub(crate) default_reading_direction: crate::settings::ReadingDirection,
     pub(crate) final_cover_spread_enabled: bool,
-    pub(crate) singleton_spread_placement_enabled: bool,
+    pub(crate) singleton_spread_first_enabled: bool,
+    pub(crate) singleton_spread_last_enabled: bool,
     pub(crate) spread_page_gap_px: u32,
 }
 
@@ -329,7 +331,8 @@ impl RemoteReadingSettings {
             default_spread_mode: settings.default_spread_mode,
             default_reading_direction: settings.default_reading_direction,
             final_cover_spread_enabled: settings.final_cover_spread_enabled,
-            singleton_spread_placement_enabled: settings.singleton_spread_placement_enabled,
+            singleton_spread_first_enabled: settings.singleton_spread_first_enabled,
+            singleton_spread_last_enabled: settings.singleton_spread_last_enabled,
             spread_page_gap_px: settings.spread_page_gap_px,
         }
     }
@@ -659,6 +662,13 @@ impl SettingsDb {
                  continuing with stored settings and retrying on the next load: {e}"
             )),
         }
+        match migrate_singleton_spread_endpoints(&inner.conn) {
+            Ok(true) => log_diag("settings_db: migrated singleton spread endpoint settings"),
+            Ok(false) => {}
+            Err(e) => log_diag(&format!(
+                "settings_db: singleton endpoint migration failed; projecting legacy value and suppressing save until retry: {e}"
+            )),
+        }
         let settings = build_settings_from_db(&inner.conn)?;
         inner.last_saved_vst3_chain = Some(settings.vst3_plugins.clone());
         inner.last_saved_vst3_slots = Some(settings.vst3_chain_slots.clone());
@@ -801,12 +811,13 @@ impl SettingsDb {
     ///
     /// Missing keys in an older DB use the startup snapshot, matching the
     /// serde/default compatibility of a full settings load. The shared DB lock
-    /// is held once so the four values form one request snapshot.
+    /// is held once so the layout values form one request snapshot.
     pub(crate) fn load_remote_reading_settings(
         &self,
         fallback: &Settings,
     ) -> Result<RemoteReadingSettings, SettingsDbError> {
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let endpoints = read_singleton_endpoint_settings(&inner.conn)?;
         Ok(RemoteReadingSettings {
             default_spread_mode: read_settings_kv_typed(
                 &inner.conn,
@@ -823,11 +834,8 @@ impl SettingsDb {
                 "final_cover_spread_enabled",
                 || fallback.final_cover_spread_enabled,
             )?,
-            singleton_spread_placement_enabled: read_settings_kv_typed(
-                &inner.conn,
-                "singleton_spread_placement_enabled",
-                || fallback.singleton_spread_placement_enabled,
-            )?,
+            singleton_spread_first_enabled: endpoints.first,
+            singleton_spread_last_enabled: endpoints.last,
             spread_page_gap_px: read_settings_kv_typed(&inner.conn, "spread_page_gap_px", || {
                 fallback.spread_page_gap_px
             })?,
@@ -852,6 +860,13 @@ impl SettingsDb {
     /// - commit 成功後にのみ hash を更新する (= 「メモリ更新済み、DB 未更新」防止)
     pub fn save_full(&self, settings: &Settings) -> Result<(), SettingsDbError> {
         let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let bootstrapped = existing_bootstrap_marker_present(&inner.conn)?;
+        if bootstrapped {
+            if !singleton_endpoint_marker_present(&inner.conn)? {
+                return Err(SettingsDbError::SaveSuppressed);
+            }
+            read_singleton_endpoint_settings(&inner.conn)?;
+        }
 
         // 1. 事前の差分判定 (transaction 外)。共有 `Arc` の同一性で見るので O(行数)。
         let chain_changed = inner
@@ -943,6 +958,10 @@ impl SettingsDb {
         // marker を立ててよいのは「移行を実行した migration 自身」と「移行対象が原理的に
         // 存在しない新規 DB の bootstrap」の 2 つだけ。
         if bootstrap_save {
+            tx.execute(
+                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+                params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+            )?;
             tx.execute(
                 "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
                 params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
@@ -1860,6 +1879,78 @@ fn migrate_folder_thumb_sort_default_v2(conn: &Connection) -> Result<bool, Setti
     Ok(true)
 }
 
+fn singleton_endpoint_marker_present(conn: &Connection) -> Result<bool, SettingsDbError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = ?1",
+            params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// The marker is the authority. A partial pair of new keys cannot supersede the
+/// released value, even when the current process failed to commit migration.
+fn read_singleton_endpoint_settings(
+    conn: &Connection,
+) -> Result<crate::settings::SingletonSpreadEndpointSettings, SettingsDbError> {
+    let read_raw = |key: &str| -> Result<Option<bool>, SettingsDbError> {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings_kv WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(SettingsDbError::from))
+            .transpose()
+    };
+    if !singleton_endpoint_marker_present(conn)? {
+        let legacy = read_raw("singleton_spread_placement_enabled")?.unwrap_or(false);
+        return Ok(crate::settings::SingletonSpreadEndpointSettings {
+            first: legacy,
+            last: legacy,
+        });
+    }
+    let first = read_raw("singleton_spread_first_enabled")?.ok_or_else(|| {
+        SettingsDbError::Incompatible(
+            "completed singleton endpoint migration lacks first key".into(),
+        )
+    })?;
+    let last = read_raw("singleton_spread_last_enabled")?.ok_or_else(|| {
+        SettingsDbError::Incompatible(
+            "completed singleton endpoint migration lacks last key".into(),
+        )
+    })?;
+    Ok(crate::settings::SingletonSpreadEndpointSettings { first, last })
+}
+
+fn migrate_singleton_spread_endpoints(conn: &Connection) -> Result<bool, SettingsDbError> {
+    let tx = conn.unchecked_transaction()?;
+    if !existing_bootstrap_marker_present(&tx)? || singleton_endpoint_marker_present(&tx)? {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let settings = read_singleton_endpoint_settings(&tx)?;
+    for (key, value) in [
+        ("singleton_spread_first_enabled", settings.first),
+        ("singleton_spread_last_enabled", settings.last),
+    ] {
+        tx.execute(
+            "INSERT INTO settings_kv(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, serde_json::to_string(&value)?],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO schema_meta(key, value) VALUES (?1, '1')",
+        params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 fn write_settings_kv(
     tx: &rusqlite::Transaction<'_>,
     map: &Map<String, Value>,
@@ -2733,6 +2824,15 @@ fn migrate_recent_open_with_launch(conn: &Connection) -> Result<bool, SettingsDb
 
 fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError> {
     let mut map = read_settings_kv(conn)?;
+    let endpoints = read_singleton_endpoint_settings(conn)?;
+    map.insert(
+        "singleton_spread_first_enabled".into(),
+        Value::Bool(endpoints.first),
+    );
+    map.insert(
+        "singleton_spread_last_enabled".into(),
+        Value::Bool(endpoints.last),
+    );
 
     // 複合テーブルを読み、JSON Value にして Map に挿入する。
     let favorites = read_favorites(conn)?;
@@ -5161,7 +5261,8 @@ mod tests {
         live.default_spread_mode = crate::settings::SpreadMode::RtlCover;
         live.default_reading_direction = crate::settings::ReadingDirection::Rtl;
         live.final_cover_spread_enabled = false;
-        live.singleton_spread_placement_enabled = true;
+        live.singleton_spread_first_enabled = true;
+        live.singleton_spread_last_enabled = true;
         live.spread_page_gap_px = 19;
         db.save_full(&live).unwrap();
 
@@ -5169,7 +5270,8 @@ mod tests {
         fallback.default_spread_mode = crate::settings::SpreadMode::Ltr;
         fallback.default_reading_direction = crate::settings::ReadingDirection::Ltr;
         fallback.final_cover_spread_enabled = true;
-        fallback.singleton_spread_placement_enabled = false;
+        fallback.singleton_spread_first_enabled = false;
+        fallback.singleton_spread_last_enabled = false;
         fallback.spread_page_gap_px = 3;
         assert_eq!(
             db.load_remote_reading_settings(&fallback).unwrap(),
@@ -5182,18 +5284,127 @@ mod tests {
             .conn
             .execute_batch(
                 "DELETE FROM settings_kv WHERE key = 'final_cover_spread_enabled';
-                 DELETE FROM settings_kv WHERE key = 'singleton_spread_placement_enabled';",
+                 DELETE FROM settings_kv WHERE key = 'singleton_spread_last_enabled';",
             )
             .unwrap();
-        let loaded = db.load_remote_reading_settings(&fallback).unwrap();
-        assert!(loaded.final_cover_spread_enabled);
-        assert!(!loaded.singleton_spread_placement_enabled);
-        assert_eq!(loaded.default_spread_mode, live.default_spread_mode);
-        assert_eq!(
-            loaded.default_reading_direction,
-            live.default_reading_direction
-        );
-        assert_eq!(loaded.spread_page_gap_px, live.spread_page_gap_px);
+        assert!(db.load_remote_reading_settings(&fallback).is_err());
+    }
+
+    #[test]
+    fn singleton_endpoint_bootstrap_and_released_value_migration() {
+        for legacy in [Some(true), Some(false), None] {
+            let db = SettingsDb::open_in_memory_for_test().unwrap();
+            db.save_full(&Settings::default()).unwrap();
+            {
+                let inner = db.inner.lock().unwrap();
+                assert!(singleton_endpoint_marker_present(&inner.conn).unwrap());
+                assert_eq!(
+                    read_singleton_endpoint_settings(&inner.conn).unwrap(),
+                    crate::settings::SingletonSpreadEndpointSettings::default()
+                );
+                inner
+                    .conn
+                    .execute(
+                        "DELETE FROM schema_meta WHERE key = ?1",
+                        params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+                    )
+                    .unwrap();
+                inner.conn.execute(
+                    "DELETE FROM settings_kv WHERE key IN ('singleton_spread_first_enabled', 'singleton_spread_last_enabled', 'singleton_spread_placement_enabled')",
+                    [],
+                ).unwrap();
+                if let Some(value) = legacy {
+                    inner.conn.execute(
+                        "INSERT INTO settings_kv(key, value) VALUES ('singleton_spread_placement_enabled', ?1)",
+                        [serde_json::to_string(&value).unwrap()],
+                    ).unwrap();
+                }
+                // One new key without the marker is explicitly incomplete.
+                inner.conn.execute(
+                    "INSERT INTO settings_kv(key, value) VALUES ('singleton_spread_first_enabled', 'false')",
+                    [],
+                ).unwrap();
+                assert_eq!(
+                    read_singleton_endpoint_settings(&inner.conn).unwrap(),
+                    crate::settings::SingletonSpreadEndpointSettings::from(legacy.unwrap_or(false))
+                );
+            }
+            assert!(matches!(
+                db.save_full(&Settings::default()),
+                Err(SettingsDbError::SaveSuppressed)
+            ));
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(
+                loaded.singleton_spread_first_enabled,
+                legacy.unwrap_or(false)
+            );
+            assert_eq!(
+                loaded.singleton_spread_last_enabled,
+                legacy.unwrap_or(false)
+            );
+            assert_eq!(
+                db.load_remote_reading_settings(&Settings::default())
+                    .unwrap()
+                    .singleton_spread_last_enabled,
+                legacy.unwrap_or(false)
+            );
+            db.save_full(&loaded).unwrap();
+        }
+    }
+
+    #[test]
+    fn singleton_endpoint_failed_migration_projects_old_then_retries_and_backup_recovers() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute(
+                    "DELETE FROM schema_meta WHERE key = ?1",
+                    params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+                )
+                .unwrap();
+            inner.conn.execute(
+                "INSERT INTO settings_kv(key, value) VALUES ('singleton_spread_placement_enabled', 'true')",
+                [],
+            ).unwrap();
+            inner
+                .conn
+                .execute_batch(
+                    "CREATE TRIGGER fail_singleton_endpoint BEFORE UPDATE ON settings_kv
+                 WHEN NEW.key = 'singleton_spread_last_enabled'
+                 BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+                )
+                .unwrap();
+        }
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.singleton_spread_first_enabled && loaded.singleton_spread_last_enabled);
+        assert!(matches!(
+            db.save_full(&loaded),
+            Err(SettingsDbError::SaveSuppressed)
+        ));
+        {
+            let inner = db.inner.lock().unwrap();
+            assert!(!singleton_endpoint_marker_present(&inner.conn).unwrap());
+            inner
+                .conn
+                .execute_batch("DROP TRIGGER fail_singleton_endpoint")
+                .unwrap();
+        }
+        let backup = dir.path().join("settings.db.bak1");
+        db.backup_to(&backup).unwrap();
+        let recovered_dir = TempDir::new().unwrap();
+        std::fs::copy(&backup, recovered_dir.path().join("settings.db")).unwrap();
+        let recovered = SettingsDb::open(recovered_dir.path()).unwrap();
+        let recovered_settings = recovered.load_into_settings().unwrap();
+        assert!(recovered_settings.singleton_spread_first_enabled);
+        assert!(recovered_settings.singleton_spread_last_enabled);
+        assert!(singleton_endpoint_marker_present(&recovered.inner.lock().unwrap().conn).unwrap());
+        let retried = db.load_into_settings().unwrap();
+        assert!(retried.singleton_spread_first_enabled && retried.singleton_spread_last_enabled);
+        db.save_full(&retried).unwrap();
     }
 
     #[test]
@@ -7324,6 +7535,41 @@ mod tests {
         let outcome = boot_settings_db(dir);
         assert_eq!(outcome.source, BootSource::RestoredFromDbBackup);
         assert_eq!(outcome.settings.grid_cols, 21);
+    }
+
+    #[test]
+    fn boot_recovers_released_singleton_value_from_backup_then_migrates_both_endpoints() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+            {
+                let inner = db.inner.lock().unwrap();
+                inner
+                    .conn
+                    .execute(
+                        "DELETE FROM schema_meta WHERE key = ?1",
+                        params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+                    )
+                    .unwrap();
+                inner.conn.execute("INSERT INTO settings_kv(key, value) VALUES ('singleton_spread_placement_enabled', 'true')", []).unwrap();
+                inner.conn.execute("DELETE FROM settings_kv WHERE key IN ('singleton_spread_first_enabled', 'singleton_spread_last_enabled')", []).unwrap();
+            }
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        }
+        std::fs::remove_file(dir.join("settings.db")).unwrap();
+        std::fs::write(dir.join("settings.db"), b"GARBAGE-NOT-A-SQLITE-DB-CONTENT").unwrap();
+        let _ = std::fs::remove_file(dir.join("settings.db-wal"));
+        let _ = std::fs::remove_file(dir.join("settings.db-shm"));
+        let outcome = boot_settings_db(dir);
+        assert_eq!(outcome.source, BootSource::RestoredFromDbBackup);
+        assert!(outcome.settings.singleton_spread_first_enabled);
+        assert!(outcome.settings.singleton_spread_last_enabled);
+        assert!(
+            singleton_endpoint_marker_present(&outcome.db.unwrap().inner.lock().unwrap().conn)
+                .unwrap()
+        );
     }
 
     #[test]

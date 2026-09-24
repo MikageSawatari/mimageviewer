@@ -13964,13 +13964,13 @@ pub struct App {
 
     // ── フルスクリーン表示モード ──────────────────────────────
     /// 表示モード DB (フォルダごとのページ構成 / 連結方式永続化)
-    pub(crate) spread_db: Option<crate::spread_db::SpreadDb>,
+    pub(crate) spread_db: Result<crate::spread_db::SpreadDb, String>,
     /// 現在のフォルダの基本ページ構成。表紙あり/なし・LTR/RTL は `spread_db` で
     /// フォルダ単位に永続化される。
     pub(crate) spread_mode: crate::settings::SpreadMode,
     pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
-    pub(crate) singleton_spread_placement_preference:
-        crate::settings::SingletonSpreadPlacementPreference,
+    pub(crate) singleton_spread_endpoint_preferences:
+        crate::settings::SingletonSpreadEndpointPreferences,
     /// Ctrl+←/→ の「1 ページずらし」用セッション内アンカー。
     /// 保存はせず、この idx から先だけ見開きの組み始めを一時的にずらす。
     pub(crate) spread_shift_anchor_idx: Option<usize>,
@@ -16155,7 +16155,11 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_rating", 0, t);
 
         let t = std::time::Instant::now();
-        let spread_db = crate::spread_db::SpreadDb::open().ok();
+        let spread_db = crate::spread_db::SpreadDb::open_for_app().map_err(|error| {
+            let message = format!("spread.db open failed: {error}");
+            crate::logger::log(message.clone());
+            message
+        });
         crate::perf::emit_ms("startup", "db_open_spread", 0, t);
 
         let t = std::time::Instant::now();
@@ -16987,8 +16991,8 @@ impl App {
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
             final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference::default(),
-            singleton_spread_placement_preference:
-                crate::settings::SingletonSpreadPlacementPreference::default(),
+            singleton_spread_endpoint_preferences:
+                crate::settings::SingletonSpreadEndpointPreferences::default(),
             spread_shift_anchor_idx: None,
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
@@ -21274,9 +21278,15 @@ impl App {
             .effective(self.settings.final_cover_spread_enabled)
     }
 
-    pub(crate) fn singleton_spread_placement_enabled_for_current_book(&self) -> bool {
-        self.singleton_spread_placement_preference
-            .effective(self.settings.singleton_spread_placement_enabled)
+    pub(crate) fn singleton_spread_placement_enabled_for_current_book(
+        &self,
+    ) -> crate::settings::SingletonSpreadEndpointSettings {
+        self.singleton_spread_endpoint_preferences.effective(
+            crate::settings::SingletonSpreadEndpointSettings {
+                first: self.settings.singleton_spread_first_enabled,
+                last: self.settings.singleton_spread_last_enabled,
+            },
+        )
     }
 
     /// 代表サムネピン (`folder_thumb_pins`) のコンテナキー。見開きキーとは
@@ -21324,8 +21334,8 @@ impl App {
         &mut self,
         key: &std::path::Path,
         defaults: SpreadRestoreDefaults,
-    ) {
-        self.apply_spread_for_key_with_fallback(key, None, defaults);
+    ) -> Result<(), String> {
+        self.apply_spread_for_key_with_fallback(key, None, defaults)
     }
 
     /// `apply_spread_for_key` の fallback キー付き版。`key` に保存が無い項目を
@@ -21339,17 +21349,16 @@ impl App {
         key: &std::path::Path,
         fallback: Option<&std::path::Path>,
         defaults: SpreadRestoreDefaults,
-    ) {
-        let db = self.spread_db.as_ref();
-        let stored = db
-            .map(|db| db.get_state_with_fallback(key, fallback))
-            .unwrap_or_default();
-        self.final_cover_spread_preference = db
-            .map(|db| db.get_final_cover_spread_preference_with_fallback(key, fallback))
-            .unwrap_or_default();
-        self.singleton_spread_placement_preference = db
-            .map(|db| db.get_singleton_spread_placement_preference_with_fallback(key, fallback))
-            .unwrap_or_default();
+    ) -> Result<(), String> {
+        let db = self.spread_db.as_ref().map_err(Clone::clone)?;
+        let stored = db.get_state_with_fallback(key, fallback);
+        let final_cover_preference =
+            db.get_final_cover_spread_preference_with_fallback(key, fallback);
+        let endpoint_preferences = db
+            .get_singleton_spread_endpoint_preferences_with_fallback(key, fallback)
+            .map_err(|error| error.to_string())?;
+        self.final_cover_spread_preference = final_cover_preference;
+        self.singleton_spread_endpoint_preferences = endpoint_preferences;
         let stored_spread = stored.mode.unwrap_or(defaults.spread_mode);
         self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
         self.reading_direction = stored.direction.unwrap_or(defaults.reading_direction);
@@ -21363,6 +21372,7 @@ impl App {
         // 読み順の対応表は `SpreadMode::reading_direction` が正本。ここへ写すと、
         // モードを足したとき保存済みの本を開く経路だけ古いままになる。
         self.update_reading_direction_from_spread_mode(self.spread_mode);
+        Ok(())
     }
 
     pub(crate) fn apply_view_trim_for_key(&mut self, key: &std::path::Path) {
@@ -25811,7 +25821,11 @@ impl App {
         if let Some(key) = self.spread_container_key() {
             let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
             let defaults = SpreadRestoreDefaults::for_book(&self.settings);
-            self.apply_spread_for_key_with_fallback(&key, fb.as_deref(), defaults);
+            if let Err(error) =
+                self.apply_spread_for_key_with_fallback(&key, fb.as_deref(), defaults)
+            {
+                crate::logger::log(format!("spread: failed to load endpoint settings: {error}"));
+            }
             self.apply_view_trim_for_key_with_fallback(&key, fb.as_deref());
         }
         self.enter_pending_rating_view_zipdir_after_open(&zip_path);
@@ -26069,7 +26083,11 @@ impl App {
         if let Some(key) = self.spread_container_key() {
             let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
             let defaults = SpreadRestoreDefaults::for_book(&self.settings);
-            self.apply_spread_for_key_with_fallback(&key, fb.as_deref(), defaults);
+            if let Err(error) =
+                self.apply_spread_for_key_with_fallback(&key, fb.as_deref(), defaults)
+            {
+                crate::logger::log(format!("spread: failed to load endpoint settings: {error}"));
+            }
             self.apply_view_trim_for_key_with_fallback(&key, fb.as_deref());
         }
         // ★付きの本を開いて一時解除したフィルタを、本より上の階層へ戻ったら復元する
@@ -28082,7 +28100,9 @@ impl App {
         // 旧実装の SpreadMode::Vertical は「単ページ + 縦連結」として解釈する。
         // ZIP の場合はここで一旦 zip_path キーで読むが、finalize_zip_enumerate が zip_nav
         // 設定後に「ルート本のキー (zip_path + 実効 prefix)」で読み直す (本ごと独立記憶)。
-        self.apply_spread_for_key(&source_path, spread_restore_defaults);
+        if let Err(error) = self.apply_spread_for_key(&source_path, spread_restore_defaults) {
+            crate::logger::log(format!("spread: failed to load endpoint settings: {error}"));
+        }
         self.apply_view_trim_for_key(&source_path);
         self.spread_popup_open = false;
         self.fit_popup_open = false;
@@ -33060,8 +33080,8 @@ impl App {
             self.update_reading_direction_from_spread_mode(self.spread_mode);
             self.spread_shift_anchor_idx = None;
             self.final_cover_spread_preference = container.final_cover_spread_preference;
-            self.singleton_spread_placement_preference =
-                container.singleton_spread_placement_preference;
+            self.singleton_spread_endpoint_preferences =
+                container.singleton_spread_endpoint_preferences;
             let trim = container.view_trim.unwrap_or_default();
             self.view_trim_apply_mode = match trim.apply_mode {
                 crate::view_trim::ViewTrimApplyMode::Page => {

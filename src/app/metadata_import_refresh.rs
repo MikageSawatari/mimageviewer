@@ -76,8 +76,8 @@ pub(crate) struct ContainerStateResult {
     pub(crate) reading_flow: Option<crate::settings::ReadingFlow>,
     pub(crate) reading_direction: Option<crate::settings::ReadingDirection>,
     pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
-    pub(crate) singleton_spread_placement_preference:
-        crate::settings::SingletonSpreadPlacementPreference,
+    pub(crate) singleton_spread_endpoint_preferences:
+        crate::settings::SingletonSpreadEndpointPreferences,
     pub(crate) view_trim: Option<crate::view_trim::ViewTrimBookState>,
 }
 
@@ -530,7 +530,7 @@ fn build_context_result(
     });
     let container_state =
         if changed.container_state && spread_db.is_some() && container_trim_db.is_some() {
-            request.spread_container_path.as_deref().map(|path| {
+            request.spread_container_path.as_deref().and_then(|path| {
                 let fallback = request.spread_container_fallback.as_deref();
                 let stored = spread_db
                     .map(|db| db.get_state_with_fallback(path, fallback))
@@ -541,20 +541,29 @@ fn build_context_result(
                 let final_cover_spread_preference = spread_db
                     .map(|db| db.get_final_cover_spread_preference_with_fallback(path, fallback))
                     .unwrap_or_default();
-                let singleton_spread_placement_preference = spread_db
+                let singleton_spread_endpoint_preferences = match spread_db
                     .map(|db| {
-                        db.get_singleton_spread_placement_preference_with_fallback(path, fallback)
+                        db.get_singleton_spread_endpoint_preferences_with_fallback(path, fallback)
                     })
-                    .unwrap_or_default();
+                    .transpose()
+                {
+                    Ok(value) => value.unwrap_or_default(),
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "spread: metadata refresh endpoint read failed: {error}"
+                        ));
+                        return None;
+                    }
+                };
                 let view_trim = container_trim_db.and_then(|db| db.get_book_state(path));
-                ContainerStateResult {
+                Some(ContainerStateResult {
                     spread_mode,
                     reading_flow,
                     reading_direction,
                     final_cover_spread_preference,
-                    singleton_spread_placement_preference,
+                    singleton_spread_endpoint_preferences,
                     view_trim,
-                }
+                })
             })
         } else {
             None
@@ -801,10 +810,10 @@ mod tests {
             .set_final_cover_spread_preference(&root, None, FinalCoverSpreadPreference::Off)
             .unwrap();
         spread_db
-            .set_singleton_spread_placement_preference(
+            .set_singleton_spread_endpoint_preferences(
                 &root,
                 None,
-                SingletonSpreadPlacementPreference::Center,
+                SingletonSpreadPlacementPreference::Center.into(),
             )
             .unwrap();
 
@@ -842,7 +851,7 @@ mod tests {
             FinalCoverSpreadPreference::Off
         );
         assert_eq!(
-            state.singleton_spread_placement_preference,
+            state.singleton_spread_endpoint_preferences,
             SingletonSpreadPlacementPreference::Center
         );
 
@@ -854,10 +863,10 @@ mod tests {
             )
             .unwrap();
         spread_db
-            .set_singleton_spread_placement_preference(
+            .set_singleton_spread_endpoint_preferences(
                 &nested,
                 Some(&root),
-                SingletonSpreadPlacementPreference::FollowGlobal,
+                SingletonSpreadPlacementPreference::FollowGlobal.into(),
             )
             .unwrap();
         let state = refresh();
@@ -866,7 +875,7 @@ mod tests {
             FinalCoverSpreadPreference::FollowGlobal
         );
         assert_eq!(
-            state.singleton_spread_placement_preference,
+            state.singleton_spread_endpoint_preferences,
             SingletonSpreadPlacementPreference::FollowGlobal
         );
     }

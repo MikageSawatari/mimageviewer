@@ -148,6 +148,7 @@ const {
   favoriteSearchHash,
   favoriteSearchResultTitle,
   finalCoverSpreadWriteRequest,
+  singletonSpreadPlacementWriteRequest,
   gridReturnItemIdentity,
   historyStateWithoutPersistentCollectionSession,
   imageRequest,
@@ -4301,7 +4302,7 @@ test("a real container exposes the tri-state final-cover setting without adding 
     finalCoverPreference: "off",
     finalCoverEnabled: false,
   });
-  const finalCoverActions = container.spread.actions.filter(([name]) =>
+  const finalCoverActions = container.final_cover.actions.filter(([name]) =>
     name.startsWith("final_cover_")
   );
   assert.deepEqual(
@@ -4318,7 +4319,7 @@ test("a real container exposes the tri-state final-cover setting without adding 
     supportsFinalCoverSetting: false,
   });
   assert.equal(
-    collection.spread.actions.some(([name]) => name.startsWith("final_cover_")),
+    collection.spread.actions.some(([, , , payload]) => payload?.menuPage === "final_cover"),
     false
   );
 });
@@ -4334,6 +4335,32 @@ test("final-cover writes keep the effective container address and typed preferen
     preference: "follow_global",
   });
   assert.equal(finalCoverSpreadWriteRequest(address, "unknown"), null);
+});
+
+test("endpoint placement menus and writes keep first and last independent", () => {
+  const address = { path: "C:/book/book.zip", subresource: { kind: "file" } };
+  const definitions = viewerMenuDefinitions({
+    hasContainer: true,
+    barsVisible: true,
+    supportsFinalCoverSetting: true,
+    supportsSingletonPlacementSetting: true,
+    singletonPlacementPreference: "place",
+    singletonPlacementEnabled: true,
+    singletonLastPreference: "center",
+    singletonLastEnabled: false,
+  });
+  assert.ok(definitions.spread.actions.some(([, label]) => label === "先頭の単ページ配置"));
+  assert.ok(definitions.spread.actions.some(([, label]) => label === "末尾の単ページ配置"));
+  assert.ok(definitions.spread.actions.length <= VIEWER_MENU_MAX_ACTIONS);
+  assert.match(definitions.singleton_placement.actions[2][1], /^✓ /);
+  assert.match(definitions.singleton_placement_last.actions[3][1], /^✓ /);
+  assert.deepEqual(singletonSpreadPlacementWriteRequest(address, "last", "center"), {
+    kind: "set_singleton_spread_endpoint_preference",
+    address,
+    endpoint: "last",
+    preference: "center",
+  });
+  assert.equal(singletonSpreadPlacementWriteRequest(address, "middle", "center"), null);
 });
 
 test("supplemental cover presentation stays outside navigation and has explicit slot context", () => {

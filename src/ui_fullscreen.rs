@@ -13688,9 +13688,10 @@ fn compose_spread_navigation_unit(
     is_last_unit: bool,
     spread_mode: SpreadMode,
     final_cover_enabled: bool,
-    singleton_placement_enabled: bool,
+    singleton_placement_enabled: impl Into<crate::settings::SingletonSpreadEndpointSettings>,
     complete_book_eligible: bool,
 ) -> Option<SpreadDisplayComposition> {
+    let singleton_placement_enabled = singleton_placement_enabled.into();
     let navigation_anchor_idx = unit.anchor_idx();
     let navigation_pages = unit.pages.as_slice();
     let first_unit_pages = first_unit.pages.as_slice();
@@ -13715,21 +13716,25 @@ fn compose_spread_navigation_unit(
         }
     }
     if spread_mode.is_spread()
-        && singleton_placement_enabled
+        && (singleton_placement_enabled.first || singleton_placement_enabled.last)
         && complete_book_eligible
         && base.pages.len() == 1
         && unit.formation
             == SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::UnpairedSlot)
     {
         let first = navigation_pages == first_unit_pages;
-        base.singleton_placement = if first {
+        base.singleton_placement = if first && singleton_placement_enabled.first {
             let right = spread_mode.is_rtl() ^ spread_mode.has_cover();
             if right {
                 SingletonSpreadPlacement::Right
             } else {
                 SingletonSpreadPlacement::Left
             }
-        } else if is_last_unit && navigation_pages == last_unit_pages {
+        } else if !first
+            && is_last_unit
+            && navigation_pages == last_unit_pages
+            && singleton_placement_enabled.last
+        {
             if spread_mode.is_rtl() {
                 SingletonSpreadPlacement::Right
             } else {
@@ -13751,9 +13756,10 @@ fn resolve_spread_display_composition(
     unit_pos: usize,
     spread_mode: SpreadMode,
     final_cover_enabled: bool,
-    singleton_placement_enabled: bool,
+    singleton_placement_enabled: impl Into<crate::settings::SingletonSpreadEndpointSettings>,
     complete_book_eligible: bool,
 ) -> Option<SpreadDisplayComposition> {
+    let singleton_placement_enabled = singleton_placement_enabled.into();
     let unit = units.get(unit_pos)?;
     let first = units.first()?;
     let last = units.last()?;
@@ -14204,7 +14210,7 @@ pub(crate) fn build_remote_spread_page_groups(
         spread_mode,
         is_landscape,
         false,
-        false,
+        crate::settings::SingletonSpreadEndpointSettings::default(),
         false,
     )
 }
@@ -14258,7 +14264,7 @@ pub(crate) fn build_remote_direct_image_page_groups(
                 unit_pos,
                 spread_mode,
                 false,
-                false,
+                crate::settings::SingletonSpreadEndpointSettings::default(),
                 false,
             )
             .expect("remote direct-image unit comes from the same non-empty unit list");
@@ -14280,9 +14286,10 @@ pub(crate) fn build_remote_spread_page_groups_with_composition(
     spread_mode: SpreadMode,
     is_landscape: &[bool],
     final_cover_enabled: bool,
-    singleton_placement_enabled: bool,
+    singleton_placement_enabled: impl Into<crate::settings::SingletonSpreadEndpointSettings>,
     complete_book_eligible: bool,
 ) -> Vec<RemotePageGroupSpec> {
+    let singleton_placement_enabled = singleton_placement_enabled.into();
     let visible = (0..items.len()).collect::<Vec<_>>();
     let nav = build_image_reading_indices(items, &visible);
     // 分割は本体と**同じステップ列**から作る。並べ替えの規則を 2 か所に持たない。
@@ -16038,7 +16045,8 @@ impl App {
             self.singleton_spread_placement_enabled_for_current_book();
         let units = self.build_spread_display_units_for_nav(&nav);
         let eligible = ((self.spread_mode.has_cover() && final_cover_enabled)
-            || singleton_placement_enabled)
+            || singleton_placement_enabled.first
+            || singleton_placement_enabled.last)
             && self.spread_complete_book_eligible(&nav);
         let composition = find_spread_display_unit(&units, anchor_idx).and_then(|(unit_pos, _)| {
             resolve_spread_display_composition(
@@ -23623,7 +23631,7 @@ impl App {
                         let final_cover_preference_before =
                             self.final_cover_spread_preference;
                         let singleton_placement_preference_before =
-                            self.singleton_spread_placement_preference;
+                            self.singleton_spread_endpoint_preferences;
                         // 消しゴム / 隠蔽加工モード中は上部バーを抑制 (自前パネルと競合させない)。
                         // 音楽ビューも画像用の上部ホバーバーは出さない (music view が自前で
                         // 上情報バー + 下シークバーを描くため、Inc 3 パネル漏れ修正)。
@@ -23789,7 +23797,7 @@ impl App {
                                 &mut self.reading_flow,
                                 &mut self.reading_direction,
                                 &mut self.final_cover_spread_preference,
-                                &mut self.singleton_spread_placement_preference,
+                                &mut self.singleton_spread_endpoint_preferences,
                                 &mut self.spread_popup_open,
                                 is_spread_double,
                                 &mut self.local_adjust_mode,
@@ -24031,45 +24039,74 @@ impl App {
                         self.draw_export_dialog(ctx);
                         self.draw_export_progress_dialog(ctx);
 
-                        let spread_changed_from_direction = self.reading_direction
-                            != reading_direction_before
-                            && self.sync_spread_mode_from_reading_direction();
-                        // ホバーバーのポップアップからモードが変更された場合
-                        if self.spread_mode != spread_before {
-                            if !spread_changed_from_direction {
-                                self.update_reading_direction_from_spread_mode(self.spread_mode);
-                            }
-                            self.spread_shift_anchor_idx = None;
-                            self.persist_current_spread_mode();
-                            if !self.reading_flow.is_paged() {
-                                self.reset_continuous_reading_transform();
-                                self.disable_non_paged_fullscreen_modes(fs_idx);
-                            }
-                            if self.spread_mode.is_spread() && self.analysis_mode {
-                                self.reset_analysis_mode();
-                            }
-                            self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
-                            if !spread_changed_from_direction {
-                                self.normalize_spread_position(ctx);
-                            }
-                        }
-                        let reading_flow_changed = self.reading_flow != reading_flow_before;
-                        if reading_flow_changed
-                            || self.reading_direction != reading_direction_before
+                        // The popup edits temporary fields during drawing. Restore the
+                        // previous state and persist the complete proposed presentation
+                        // before applying the popup's existing display transitions.
+                        let requested_spread = self.spread_mode;
+                        let requested_flow = self.reading_flow;
+                        let requested_direction = self.reading_direction;
+                        self.spread_mode = spread_before;
+                        self.reading_flow = reading_flow_before;
+                        self.reading_direction = reading_direction_before;
+                        if requested_spread != spread_before
+                            || requested_flow != reading_flow_before
+                            || requested_direction != reading_direction_before
                         {
-                            self.reset_continuous_reading_transform();
-                            if reading_flow_changed {
-                                self.set_default_fullscreen_fit_for_flow(
-                                    ctx,
-                                    fs_idx,
-                                    self.reading_flow,
-                                );
+                            let stored_mode = if requested_direction != reading_direction_before {
+                                requested_spread.with_reading_direction(requested_direction)
+                            } else {
+                                requested_spread
+                            };
+                            if let Err(error) = self.persist_spread_presentation(
+                                stored_mode,
+                                requested_flow,
+                                requested_direction,
+                            ) {
+                                crate::logger::log(format!(
+                                    "spread: failed to save popup presentation: {error}"
+                                ));
+                            } else {
+                                self.spread_mode = requested_spread;
+                                self.reading_flow = requested_flow;
+                                self.reading_direction = requested_direction;
+                                let spread_changed_from_direction = self.reading_direction
+                                    != reading_direction_before
+                                    && self.sync_spread_mode_from_reading_direction();
+                                if self.spread_mode != spread_before {
+                                    if !spread_changed_from_direction {
+                                        self.update_reading_direction_from_spread_mode(self.spread_mode);
+                                    }
+                                    self.spread_shift_anchor_idx = None;
+                                    if !self.reading_flow.is_paged() {
+                                        self.reset_continuous_reading_transform();
+                                        self.disable_non_paged_fullscreen_modes(fs_idx);
+                                    }
+                                    if self.spread_mode.is_spread() && self.analysis_mode {
+                                        self.reset_analysis_mode();
+                                    }
+                                    self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+                                    if !spread_changed_from_direction {
+                                        self.normalize_spread_position(ctx);
+                                    }
+                                }
+                                let reading_flow_changed = self.reading_flow != reading_flow_before;
+                                if reading_flow_changed
+                                    || self.reading_direction != reading_direction_before
+                                {
+                                    self.reset_continuous_reading_transform();
+                                    if reading_flow_changed {
+                                        self.set_default_fullscreen_fit_for_flow(
+                                            ctx,
+                                            fs_idx,
+                                            self.reading_flow,
+                                        );
+                                    }
+                                    if !self.reading_flow.is_paged() {
+                                        self.disable_non_paged_fullscreen_modes(fs_idx);
+                                    }
+                                    ctx.request_repaint();
+                                }
                             }
-                            if !self.reading_flow.is_paged() {
-                                self.disable_non_paged_fullscreen_modes(fs_idx);
-                            }
-                            self.persist_current_reading_flow();
-                            ctx.request_repaint();
                         }
                         if self.final_cover_spread_preference
                             != final_cover_preference_before
@@ -24084,13 +24121,13 @@ impl App {
                                 preference,
                             );
                         }
-                        if self.singleton_spread_placement_preference
+                        if self.singleton_spread_endpoint_preferences
                             != singleton_placement_preference_before
                         {
-                            let preference = self.singleton_spread_placement_preference;
-                            self.singleton_spread_placement_preference =
+                            let preference = self.singleton_spread_endpoint_preferences;
+                            self.singleton_spread_endpoint_preferences =
                                 singleton_placement_preference_before;
-                            self.set_singleton_spread_placement_preference_for_fullscreen(
+                            self.set_singleton_spread_endpoint_preferences_for_fullscreen(
                                 ctx,
                                 preference,
                             );
@@ -28903,7 +28940,7 @@ impl App {
 
         if let Some(mode) = new_spread {
             self.apply_fullscreen_spread_mode(ctx, fs_idx, mode);
-            // フィードバック表示
+            // Report only the state actually applied after persistence.
             let key_num = if key_1 {
                 1
             } else if key_2 {
@@ -28919,7 +28956,9 @@ impl App {
             } else {
                 9
             };
-            self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
+            if self.spread_mode == mode {
+                self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
+            }
         }
         // 表示操作の数字キーは、連結読みで画面中央に来る ZIP 区切りページ上でも有効にする。
         // セパレータは画像処理の対象ではないが、0/6/7 はフォルダ単位の表示設定なので
@@ -28928,12 +28967,16 @@ impl App {
         if key_6 && display_mode_keys_supported {
             let flow = self.reading_flow.next();
             self.set_reading_flow_for_fullscreen(ctx, fs_idx, flow);
-            self.show_feedback_toast(format!("[6:{}]", flow.label()));
+            if self.reading_flow == flow {
+                self.show_feedback_toast(format!("[6:{}]", flow.label()));
+            }
         }
         if key_7 && display_mode_keys_supported {
             let direction = self.reading_direction.next();
             self.set_reading_direction_for_fullscreen(ctx, fs_idx, direction);
-            self.show_feedback_toast(format!("[7:{}]", direction.label()));
+            if self.reading_direction == direction {
+                self.show_feedback_toast(format!("[7:{}]", direction.label()));
+            }
         }
         if key_0 && display_mode_keys_supported {
             self.cycle_fullscreen_fit_mode(ctx, fs_idx);
@@ -35439,64 +35482,48 @@ impl App {
         self.scroll_vertical_reading_by(ctx, delta, history_trigger);
     }
 
-    pub(crate) fn persist_current_spread_mode(&self) {
-        // ネスト ZIP は本 (zip_path + 階層) ごとに独立記憶。通常は current_folder。
-        if let (Some(db), Some(key)) = (&self.spread_db, self.spread_container_key()) {
-            if let Err(error) = db.set(
-                &key,
-                self.spread_mode,
+    fn persist_spread_presentation(
+        &self,
+        mode: SpreadMode,
+        flow: ReadingFlow,
+        direction: ReadingDirection,
+    ) -> Result<(), String> {
+        let Some(key) = self.spread_container_key() else {
+            return Ok(());
+        };
+        let db = self.spread_db.as_ref().map_err(Clone::clone)?;
+        db.set_presentation_state(
+            &key,
+            mode,
+            flow,
+            direction,
+            (
                 self.settings.default_spread_mode,
                 self.settings.default_reading_flow,
                 self.settings.default_reading_direction,
-            ) {
-                crate::logger::log(format!("spread: failed to save mode: {error}"));
-            } else {
-                self.record_current_container_content_identity(
-                    crate::content_identity::ContentIdentityTrigger::Edit,
-                );
-            }
-        }
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        self.record_current_container_content_identity(
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
+        Ok(())
     }
 
-    pub(crate) fn persist_current_reading_flow(&self) {
-        if let (Some(db), Some(key)) = (&self.spread_db, self.spread_container_key()) {
-            if let Err(error) = db.set_flow(
-                &key,
-                self.reading_flow,
-                self.reading_direction,
-                self.settings.default_spread_mode,
-                self.settings.default_reading_flow,
-                self.settings.default_reading_direction,
-            ) {
-                crate::logger::log(format!("spread: failed to save reading flow: {error}"));
-            } else {
-                self.record_current_container_content_identity(
-                    crate::content_identity::ContentIdentityTrigger::Edit,
-                );
-            }
-        }
-    }
-
-    fn persist_current_final_cover_spread_preference(&self) {
+    fn persist_current_final_cover_spread_preference(
+        &self,
+        preference: crate::settings::FinalCoverSpreadPreference,
+    ) -> Result<(), String> {
         let Some(key) = self.spread_container_key_with_fallback() else {
-            return;
+            return Ok(());
         };
-        let Some(db) = self.spread_db.as_ref() else {
-            return;
-        };
-        if let Err(error) = db.set_final_cover_spread_preference(
-            &key.exact,
-            key.fallback.as_deref(),
-            self.final_cover_spread_preference,
-        ) {
-            crate::logger::log(format!(
-                "spread: failed to save final-cover preference: {error}"
-            ));
-        } else {
-            self.record_current_container_content_identity(
-                crate::content_identity::ContentIdentityTrigger::Edit,
-            );
-        }
+        let db = self.spread_db.as_ref().map_err(Clone::clone)?;
+        db.set_final_cover_spread_preference(&key.exact, key.fallback.as_deref(), preference)
+            .map_err(|error| error.to_string())?;
+        self.record_current_container_content_identity(
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
+        Ok(())
     }
 
     /// Invalidate the geometry owners whose visible composition depends on the effective
@@ -35524,31 +35551,34 @@ impl App {
         if self.final_cover_spread_preference == preference {
             return;
         }
+        if let Err(error) = self.persist_current_final_cover_spread_preference(preference) {
+            crate::logger::log(format!(
+                "spread: failed to save final-cover preference: {error}"
+            ));
+            return;
+        }
         self.final_cover_spread_preference = preference;
-        self.persist_current_final_cover_spread_preference();
         self.invalidate_final_cover_spread_display(ctx);
     }
 
-    fn persist_current_singleton_spread_placement_preference(&self) {
-        let Some(key) = self.spread_container_key_with_fallback() else {
-            return;
-        };
-        let Some(db) = self.spread_db.as_ref() else {
-            return;
-        };
-        if let Err(error) = db.set_singleton_spread_placement_preference(
+    fn persist_current_singleton_spread_endpoint_preferences(
+        &self,
+        preference: crate::settings::SingletonSpreadEndpointPreferences,
+    ) -> Result<(), String> {
+        let key = self
+            .spread_container_key_with_fallback()
+            .ok_or_else(|| "no current spread container".to_owned())?;
+        let db = self.spread_db.as_ref().map_err(Clone::clone)?;
+        db.set_singleton_spread_endpoint_preferences(
             &key.exact,
             key.fallback.as_deref(),
-            self.singleton_spread_placement_preference,
-        ) {
-            crate::logger::log(format!(
-                "spread: failed to save singleton placement preference: {error}"
-            ));
-        } else {
-            self.record_current_container_content_identity(
-                crate::content_identity::ContentIdentityTrigger::Edit,
-            );
-        }
+            preference,
+        )
+        .map_err(|error| error.to_string())?;
+        self.record_current_container_content_identity(
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
+        Ok(())
     }
 
     pub(crate) fn invalidate_singleton_spread_placement_display(&mut self, ctx: &egui::Context) {
@@ -35562,16 +35592,21 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn set_singleton_spread_placement_preference_for_fullscreen(
+    fn set_singleton_spread_endpoint_preferences_for_fullscreen(
         &mut self,
         ctx: &egui::Context,
-        preference: crate::settings::SingletonSpreadPlacementPreference,
+        preference: crate::settings::SingletonSpreadEndpointPreferences,
     ) {
-        if self.singleton_spread_placement_preference == preference {
+        if self.singleton_spread_endpoint_preferences == preference {
             return;
         }
-        self.singleton_spread_placement_preference = preference;
-        self.persist_current_singleton_spread_placement_preference();
+        if let Err(error) = self.persist_current_singleton_spread_endpoint_preferences(preference) {
+            crate::logger::log(format!(
+                "spread: failed to save singleton placement preference: {error}"
+            ));
+            return;
+        }
+        self.singleton_spread_endpoint_preferences = preference;
         self.invalidate_singleton_spread_placement_display(ctx);
     }
 
@@ -35797,6 +35832,11 @@ impl App {
             }
             return;
         }
+        let direction = mode.reading_direction().unwrap_or(self.reading_direction);
+        if let Err(error) = self.persist_spread_presentation(mode, self.reading_flow, direction) {
+            crate::logger::log(format!("spread: failed to save mode: {error}"));
+            return;
+        }
         self.invalidate_similar_preview();
         self.spread_mode = mode;
         self.settings.update_active_favorite_spread_mode(mode);
@@ -35810,9 +35850,6 @@ impl App {
             self.reset_continuous_reading_transform();
             self.disable_non_paged_fullscreen_modes(fs_idx);
         }
-        // DB に保存
-        self.persist_current_spread_mode();
-        self.persist_current_reading_flow();
         // 分析モードを解除 (post-filter バイパスも戻す)
         if mode.is_spread() && self.analysis_mode {
             self.reset_analysis_mode();
@@ -35830,6 +35867,12 @@ impl App {
         if flow == self.reading_flow {
             return;
         }
+        if let Err(error) =
+            self.persist_spread_presentation(self.spread_mode, flow, self.reading_direction)
+        {
+            crate::logger::log(format!("spread: failed to save reading flow: {error}"));
+            return;
+        }
         self.invalidate_similar_preview();
         self.reading_flow = flow;
         self.settings.update_active_favorite_reading_flow(flow);
@@ -35839,7 +35882,6 @@ impl App {
         if !flow.is_paged() {
             self.disable_non_paged_fullscreen_modes(fs_idx);
         }
-        self.persist_current_reading_flow();
         ctx.request_repaint();
     }
 
@@ -35870,19 +35912,23 @@ impl App {
         direction: ReadingDirection,
     ) {
         let direction_changed = direction != self.reading_direction;
-        self.reading_direction = direction;
-        let spread_changed = self.sync_spread_mode_from_reading_direction();
-        if !direction_changed && !spread_changed {
+        let proposed_mode = self.spread_mode.with_reading_direction(direction);
+        if !direction_changed && proposed_mode == self.spread_mode {
             return;
         }
+        if let Err(error) =
+            self.persist_spread_presentation(proposed_mode, self.reading_flow, direction)
+        {
+            crate::logger::log(format!("spread: failed to save reading direction: {error}"));
+            return;
+        }
+        self.reading_direction = direction;
+        let spread_changed = self.sync_spread_mode_from_reading_direction();
+        debug_assert!(direction_changed || spread_changed);
         self.reset_continuous_reading_transform();
         if !self.reading_flow.is_paged() {
             self.disable_non_paged_fullscreen_modes(fs_idx);
         }
-        if spread_changed {
-            self.persist_current_spread_mode();
-        }
-        self.persist_current_reading_flow();
         ctx.request_repaint();
     }
 
@@ -35943,7 +35989,8 @@ impl App {
                 self.singleton_spread_placement_enabled_for_current_book();
             let units = self.build_spread_display_units_for_nav(&image_indices);
             let eligible = ((spread_mode.has_cover() && final_cover_enabled)
-                || singleton_placement_enabled)
+                || singleton_placement_enabled.first
+                || singleton_placement_enabled.last)
                 && self.spread_complete_book_eligible(&image_indices);
             image_units.extend((0..units.len()).filter_map(|unit_pos| {
                 resolve_spread_display_composition(
@@ -40064,8 +40111,8 @@ impl App {
         reading_flow: &mut ReadingFlow,
         reading_direction: &mut ReadingDirection,
         final_cover_spread_preference: &mut crate::settings::FinalCoverSpreadPreference,
-        singleton_spread_placement_preference:
-            &mut crate::settings::SingletonSpreadPlacementPreference,
+        singleton_spread_endpoint_preferences:
+            &mut crate::settings::SingletonSpreadEndpointPreferences,
         spread_popup_open: &mut bool,
         is_spread_double: bool,
         _local_adjust_mode: &mut bool,
@@ -41153,39 +41200,56 @@ impl App {
                                 }
                             }
 
-                            draw_spread_popup_heading(scroll_ui, "端の単ページ配置");
-                            for &preference in
-                                crate::settings::SingletonSpreadPlacementPreference::all()
-                            {
-                                let item_rect = allocate_spread_popup_row(scroll_ui);
-                                let item_resp = scroll_ui.interact(
-                                    item_rect,
-                                    egui::Id::new(format!(
-                                        "singleton_spread_placement_popup_{}",
-                                        preference.to_int()
-                                    )),
-                                    egui::Sense::click(),
+                            for endpoint in 0..2 {
+                                draw_spread_popup_heading(
+                                    scroll_ui,
+                                    if endpoint == 0 {
+                                        "先頭の単ページ配置"
+                                    } else {
+                                        "末尾の単ページ配置"
+                                    },
                                 );
-                                let is_current =
-                                    *singleton_spread_placement_preference == preference;
-                                let bg = if is_current {
-                                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                                } else if item_resp.hovered() {
-                                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-                                scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
-                                scroll_ui.painter().text(
-                                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
-                                    egui::Align2::LEFT_CENTER,
-                                    preference.label(),
-                                    egui::FontId::proportional(13.0),
-                                    egui::Color32::from_gray(220),
-                                );
-                                if item_resp.clicked() {
-                                    *singleton_spread_placement_preference = preference;
-                                    *spread_popup_open = false;
+                                for &preference in
+                                    crate::settings::SingletonSpreadPlacementPreference::all()
+                                {
+                                    let item_rect = allocate_spread_popup_row(scroll_ui);
+                                    let item_resp = scroll_ui.interact(
+                                        item_rect,
+                                        egui::Id::new(format!(
+                                            "singleton_spread_placement_popup_{endpoint}_{}",
+                                            preference.to_int()
+                                        )),
+                                        egui::Sense::click(),
+                                    );
+                                    let current = if endpoint == 0 {
+                                        singleton_spread_endpoint_preferences.first
+                                    } else {
+                                        singleton_spread_endpoint_preferences.last
+                                    };
+                                    let bg = if current == preference {
+                                        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                                    } else if item_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+                                    scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
+                                    scroll_ui.painter().text(
+                                        egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        preference.label(),
+                                        egui::FontId::proportional(13.0),
+                                        egui::Color32::from_gray(220),
+                                    );
+                                    if item_resp.clicked() {
+                                        if endpoint == 0 {
+                                            singleton_spread_endpoint_preferences.first =
+                                                preference;
+                                        } else {
+                                            singleton_spread_endpoint_preferences.last = preference;
+                                        }
+                                        *spread_popup_open = false;
+                                    }
                                 }
                             }
                         });
@@ -50707,8 +50771,8 @@ mod tests {
                     let mut reading_direction = ReadingDirection::Ltr;
                     let mut final_cover_spread_preference =
                         crate::settings::FinalCoverSpreadPreference::FollowGlobal;
-                    let mut singleton_spread_placement_preference =
-                        crate::settings::SingletonSpreadPlacementPreference::FollowGlobal;
+                    let mut singleton_spread_endpoint_preferences =
+                        crate::settings::SingletonSpreadEndpointPreferences::default();
                     let mut spread_popup_open = false;
                     let mut local_adjust_mode = false;
                     let mut fit_popup_open = false;
@@ -50758,7 +50822,7 @@ mod tests {
                         &mut reading_flow,
                         &mut reading_direction,
                         &mut final_cover_spread_preference,
-                        &mut singleton_spread_placement_preference,
+                        &mut singleton_spread_endpoint_preferences,
                         &mut spread_popup_open,
                         is_spread_double,
                         &mut local_adjust_mode,
@@ -50816,7 +50880,7 @@ mod tests {
 
     struct SpreadPopupTestState {
         open: bool,
-        singleton_preference: crate::settings::SingletonSpreadPlacementPreference,
+        singleton_preference: crate::settings::SingletonSpreadEndpointPreferences,
     }
 
     fn spread_popup_test_frame(
@@ -50937,7 +51001,7 @@ mod tests {
                 });
         });
         ctx.read_response(egui::Id::new(format!(
-            "singleton_spread_placement_popup_{}",
+            "singleton_spread_placement_popup_1_{}",
             target.to_int()
         )))
         .map(|response| response.rect)
@@ -50952,13 +51016,14 @@ mod tests {
                     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, height));
                 let mut state = SpreadPopupTestState {
                     open: true,
-                    singleton_preference: if target
+                    singleton_preference: (if target
                         == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
                     {
                         crate::settings::SingletonSpreadPlacementPreference::Center
                     } else {
                         crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
-                    },
+                    })
+                    .into(),
                 };
                 let first_row =
                     spread_popup_test_frame(&ctx, full_rect, Vec::new(), &mut state, target)
@@ -51045,7 +51110,7 @@ mod tests {
                     &mut state,
                     target,
                 );
-                assert_eq!(state.singleton_preference, target);
+                assert_eq!(state.singleton_preference.last, target);
                 assert!(!state.open, "selection must close the popup");
             }
         }
@@ -52530,7 +52595,8 @@ mod tests {
         let mut app = final_cover_local_test_app(1);
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
-        app.settings.singleton_spread_placement_enabled = true;
+        app.settings.singleton_spread_first_enabled = true;
+        app.settings.singleton_spread_last_enabled = true;
         let pixels =
             std::sync::Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::LIGHT_BLUE));
         let texture = ctx.load_texture(
@@ -52565,7 +52631,8 @@ mod tests {
 
         // Change the effective preference after paint. Capture must describe the old pixels,
         // rather than recomputing placement from the new preference/proof.
-        app.settings.singleton_spread_placement_enabled = false;
+        app.settings.singleton_spread_first_enabled = false;
+        app.settings.singleton_spread_last_enabled = false;
         assert_eq!(
             app.spread_display_composition_for_anchor(0)
                 .singleton_placement(),
@@ -52581,7 +52648,8 @@ mod tests {
         let mut app = final_cover_local_test_app(1);
         app.spread_mode = SpreadMode::Ltr;
         app.fullscreen_idx = Some(0);
-        app.settings.singleton_spread_placement_enabled = true;
+        app.settings.singleton_spread_first_enabled = true;
+        app.settings.singleton_spread_last_enabled = true;
         app.rotation_cache
             .insert(0, crate::rotation_db::Rotation::None);
         let pixels =
@@ -52843,7 +52911,8 @@ mod tests {
     fn singleton_cause_and_placement_rebuild_after_late_dimensions_and_saved_rotation() {
         let mut app = final_cover_local_test_app(1);
         app.spread_mode = SpreadMode::Ltr;
-        app.settings.singleton_spread_placement_enabled = true;
+        app.settings.singleton_spread_first_enabled = true;
+        app.settings.singleton_spread_last_enabled = true;
         app.rotation_cache
             .insert(0, crate::rotation_db::Rotation::None);
         let nav = app.current_grid_order().to_vec();
@@ -67047,6 +67116,92 @@ mod tests {
     }
 
     #[test]
+    fn singleton_endpoint_first_and_last_switches_are_independent() {
+        let units = [
+            SpreadDisplayUnit::singleton(0, 0, SpreadDisplaySingletonCause::UnpairedSlot),
+            SpreadDisplayUnit::paired(1, 1, 2),
+            SpreadDisplayUnit::singleton(3, 3, SpreadDisplaySingletonCause::UnpairedSlot),
+        ];
+        for (mode, first_side, last_side) in [
+            (
+                SpreadMode::Ltr,
+                SingletonSpreadPlacement::Left,
+                SingletonSpreadPlacement::Left,
+            ),
+            (
+                SpreadMode::Rtl,
+                SingletonSpreadPlacement::Right,
+                SingletonSpreadPlacement::Right,
+            ),
+            (
+                SpreadMode::LtrCover,
+                SingletonSpreadPlacement::Right,
+                SingletonSpreadPlacement::Left,
+            ),
+            (
+                SpreadMode::RtlCover,
+                SingletonSpreadPlacement::Left,
+                SingletonSpreadPlacement::Right,
+            ),
+        ] {
+            for first in [false, true] {
+                for last in [false, true] {
+                    let settings = crate::settings::SingletonSpreadEndpointSettings { first, last };
+                    let first_paint =
+                        resolve_spread_display_composition(&units, 0, mode, false, settings, true)
+                            .unwrap();
+                    let middle_paint =
+                        resolve_spread_display_composition(&units, 1, mode, false, settings, true)
+                            .unwrap();
+                    let last_paint =
+                        resolve_spread_display_composition(&units, 2, mode, false, settings, true)
+                            .unwrap();
+                    assert_eq!(
+                        first_paint.singleton_placement(),
+                        if first {
+                            first_side
+                        } else {
+                            SingletonSpreadPlacement::Center
+                        }
+                    );
+                    assert_eq!(
+                        middle_paint.singleton_placement(),
+                        SingletonSpreadPlacement::Center
+                    );
+                    assert_eq!(
+                        last_paint.singleton_placement(),
+                        if last {
+                            last_side
+                        } else {
+                            SingletonSpreadPlacement::Center
+                        }
+                    );
+                    assert_eq!(first_paint.navigation_pages(), vec![0]);
+                    assert_eq!(last_paint.navigation_pages(), vec![3]);
+                }
+            }
+            let one = [units[0].clone()];
+            let paint = resolve_spread_display_composition(
+                &one,
+                0,
+                mode,
+                false,
+                crate::settings::SingletonSpreadEndpointSettings {
+                    first: false,
+                    last: true,
+                },
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                paint.singleton_placement(),
+                SingletonSpreadPlacement::Center,
+                "one-unit books keep the first-wins rule"
+            );
+        }
+    }
+
+    #[test]
     fn singleton_endpoint_sides_follow_spread_phase_and_one_page_uses_first_priority() {
         let units = vec![
             SpreadDisplayUnit::singleton(0, 10, SpreadDisplaySingletonCause::UnpairedSlot),
@@ -67380,6 +67535,137 @@ mod tests {
     }
 
     #[test]
+    fn failed_singleton_endpoint_write_keeps_previous_pair_and_paint_layout() {
+        use crate::settings::{
+            SingletonSpreadEndpointPreferences, SingletonSpreadPlacementPreference as Preference,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let mut app = final_cover_local_test_app(2);
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&path).unwrap());
+        let ctx = egui::Context::default();
+        let requested = SingletonSpreadEndpointPreferences {
+            first: Preference::Place,
+            last: Preference::FollowGlobal,
+        };
+        let old = app.singleton_spread_endpoint_preferences;
+        app.fullscreen_page_layout
+            .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Spread);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_endpoint_write BEFORE INSERT ON singleton_spread_endpoint_placements
+                 BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            )
+            .unwrap();
+        app.set_singleton_spread_endpoint_preferences_for_fullscreen(&ctx, requested);
+        assert_eq!(app.singleton_spread_endpoint_preferences, old);
+        assert_eq!(
+            app.fullscreen_page_layout.kind(),
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Spread
+        );
+        assert_eq!(
+            app.spread_db
+                .as_ref()
+                .unwrap()
+                .get_singleton_spread_endpoint_preferences_with_fallback(
+                    app.current_folder.as_deref().unwrap(),
+                    None,
+                )
+                .unwrap(),
+            old
+        );
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_endpoint_write")
+            .unwrap();
+        app.set_singleton_spread_endpoint_preferences_for_fullscreen(&ctx, requested);
+        assert_eq!(app.singleton_spread_endpoint_preferences, requested);
+        assert_eq!(
+            app.fullscreen_page_layout.kind(),
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Empty
+        );
+    }
+
+    #[test]
+    fn read_only_migration_fallback_rejects_spread_flow_direction_and_cover_changes() {
+        use crate::settings::FinalCoverSpreadPreference;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE singleton_spread_placements (path TEXT PRIMARY KEY, preference INTEGER NOT NULL);
+             CREATE TABLE singleton_spread_endpoint_placements (path TEXT PRIMARY KEY, first_preference INTEGER, last_preference INTEGER);
+             CREATE TRIGGER fail_endpoint_copy BEFORE INSERT ON singleton_spread_endpoint_placements
+             BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO singleton_spread_placements (path, preference) VALUES (?1, 1)",
+            [crate::path_key::normalize(std::path::Path::new("c:/book"))],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut app = final_cover_local_test_app(2);
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_for_app_at(&path).unwrap());
+        app.fullscreen_idx = Some(0);
+        let ctx = egui::Context::default();
+        app.fullscreen_page_layout
+            .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Spread);
+
+        app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::RtlCover);
+        assert_eq!(app.spread_mode, SpreadMode::LtrCover);
+        assert_eq!(app.reading_direction, ReadingDirection::Ltr);
+        app.set_reading_flow_for_fullscreen(&ctx, 0, ReadingFlow::Vertical);
+        assert_eq!(app.reading_flow, ReadingFlow::Paged);
+        app.set_reading_direction_for_fullscreen(&ctx, 0, ReadingDirection::Rtl);
+        assert_eq!(app.reading_direction, ReadingDirection::Ltr);
+        assert_eq!(app.spread_mode, SpreadMode::LtrCover);
+        app.set_final_cover_spread_preference_for_fullscreen(&ctx, FinalCoverSpreadPreference::Off);
+        assert_eq!(
+            app.final_cover_spread_preference,
+            FinalCoverSpreadPreference::FollowGlobal
+        );
+        assert_eq!(
+            app.fullscreen_page_layout.kind(),
+            crate::displayed_image_transform::FullscreenPageLayoutKind::Spread,
+            "a rejected write must not invalidate the displayed layout"
+        );
+    }
+
+    #[test]
+    fn spread_presentation_setters_store_one_coherent_mode_flow_direction_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let mut app = final_cover_local_test_app(2);
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&path).unwrap());
+        app.fullscreen_idx = Some(0);
+        let ctx = egui::Context::default();
+        let key = app.current_folder.clone().unwrap();
+
+        app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::RtlCover);
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        app.set_reading_flow_for_fullscreen(&ctx, 0, ReadingFlow::Vertical);
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        app.set_reading_direction_for_fullscreen(&ctx, 0, ReadingDirection::Ltr);
+        assert_eq!(app.spread_mode, SpreadMode::LtrCover);
+        assert_eq!(app.reading_direction, ReadingDirection::Ltr);
+
+        let saved = app
+            .spread_db
+            .as_ref()
+            .unwrap()
+            .get_state_with_fallback(&key, None);
+        assert_eq!(saved.mode, Some(SpreadMode::LtrCover));
+        assert_eq!(saved.flow, Some(ReadingFlow::Vertical));
+        assert_eq!(saved.direction, Some(ReadingDirection::Ltr));
+    }
+
+    #[test]
     fn last_page_supplement_visual_snapshots() {
         let mut snapshots = egui_kittest::SnapshotResults::new();
         for (name, mode) in [
@@ -67679,7 +67965,8 @@ mod tests {
             let mut app = final_cover_local_test_app(1);
             app.spread_mode = SpreadMode::Ltr;
             app.reading_flow = flow;
-            app.settings.singleton_spread_placement_enabled = true;
+            app.settings.singleton_spread_first_enabled = true;
+            app.settings.singleton_spread_last_enabled = true;
             app.rotation_cache
                 .insert(0, crate::rotation_db::Rotation::None);
             app.record_page_dims_for_spread(0, (1600, 900));
@@ -67690,6 +67977,40 @@ mod tests {
                 units[current_pos].singleton_placement,
                 SingletonSpreadPlacement::Center,
                 "{flow:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn continuous_reading_uses_independent_endpoint_placement_in_both_flows() {
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            let mut app = final_cover_local_test_app(4);
+            app.reading_flow = flow;
+            app.settings.final_cover_spread_enabled = false;
+            app.settings.singleton_spread_first_enabled = true;
+            app.settings.singleton_spread_last_enabled = false;
+            let (units, first_pos) = app.continuous_reading_units_and_pos(0).unwrap();
+            assert_eq!(
+                units[first_pos].singleton_placement,
+                SingletonSpreadPlacement::Right
+            );
+            let (units, last_pos) = app.continuous_reading_units_and_pos(3).unwrap();
+            assert_eq!(
+                units[last_pos].singleton_placement,
+                SingletonSpreadPlacement::Center
+            );
+
+            app.settings.singleton_spread_first_enabled = false;
+            app.settings.singleton_spread_last_enabled = true;
+            let (units, first_pos) = app.continuous_reading_units_and_pos(0).unwrap();
+            assert_eq!(
+                units[first_pos].singleton_placement,
+                SingletonSpreadPlacement::Center
+            );
+            let (units, last_pos) = app.continuous_reading_units_and_pos(3).unwrap();
+            assert_eq!(
+                units[last_pos].singleton_placement,
+                SingletonSpreadPlacement::Left
             );
         }
     }

@@ -1407,6 +1407,8 @@ const state = {
   finalCoverSpreadEnabled: true,
   singletonSpreadPlacementPreference: "follow_global",
   singletonSpreadPlacementEnabled: false,
+  singletonSpreadLastPreference: "follow_global",
+  singletonSpreadLastEnabled: false,
   forceSinglePage: false,
   localSettings: LOCAL_SETTINGS_LOAD.settings,
   localSettingsStorageAvailable: LOCAL_SETTINGS_LOAD.storageAvailable,
@@ -3177,14 +3179,21 @@ function dispatchCommand(requested, meta = {}) {
         CommandName.SINGLETON_PLACEMENT_FOLLOW_GLOBAL,
         CommandName.SINGLETON_PLACEMENT_PLACE,
         CommandName.SINGLETON_PLACEMENT_CENTER,
+        CommandName.SINGLETON_LAST_FOLLOW_GLOBAL,
+        CommandName.SINGLETON_LAST_PLACE,
+        CommandName.SINGLETON_LAST_CENTER,
       ].includes(requested.name)
     ) {
       const preferences = {
         [CommandName.SINGLETON_PLACEMENT_FOLLOW_GLOBAL]: "follow_global",
         [CommandName.SINGLETON_PLACEMENT_PLACE]: "place",
         [CommandName.SINGLETON_PLACEMENT_CENTER]: "center",
+        [CommandName.SINGLETON_LAST_FOLLOW_GLOBAL]: "follow_global",
+        [CommandName.SINGLETON_LAST_PLACE]: "place",
+        [CommandName.SINGLETON_LAST_CENTER]: "center",
       };
       handled = requestSingletonSpreadPlacementPreference(
+        requested.name.startsWith("singleton_last_") ? "last" : "first",
         preferences[requested.name]
       );
     } else if (requested.name.startsWith("spread_")) {
@@ -4581,10 +4590,14 @@ export function applyContainerData(address, data, forceSinglePage, options = {})
     finalCoverSpreadEnabled: data.final_cover_spread_enabled !== false,
     singletonSpreadPlacementPreference:
       normalizeSingletonSpreadPlacementPreference(
-        data.singleton_spread_placement_preference
+        data.singleton_spread_first_preference
       ),
     singletonSpreadPlacementEnabled:
-      data.singleton_spread_placement_enabled === true,
+      data.singleton_spread_first_enabled === true,
+    singletonSpreadLastPreference: normalizeSingletonSpreadPlacementPreference(
+      data.singleton_spread_last_preference
+    ),
+    singletonSpreadLastEnabled: data.singleton_spread_last_enabled === true,
     imageCount: Math.max(0, Math.floor(Number(data.image_count) || 0)),
     videoCount: Math.max(0, Math.floor(Number(data.video_count) || 0)),
     otherCount: Math.max(0, Math.floor(Number(data.other_count) || 0)),
@@ -4616,6 +4629,8 @@ export function applyContainerData(address, data, forceSinglePage, options = {})
     state.container.singletonSpreadPlacementPreference;
   state.singletonSpreadPlacementEnabled =
     state.container.singletonSpreadPlacementEnabled;
+  state.singletonSpreadLastPreference = state.container.singletonSpreadLastPreference;
+  state.singletonSpreadLastEnabled = state.container.singletonSpreadLastEnabled;
   state.forceSinglePage = forceSinglePage;
   setContainerPageGroups(data.page_groups ?? [], nextPageGroups);
   const resumeEntryIndex = state.container.resumePage
@@ -4715,6 +4730,8 @@ function setSinglePageGroups() {
   state.finalCoverSpreadEnabled = true;
   state.singletonSpreadPlacementPreference = "follow_global";
   state.singletonSpreadPlacementEnabled = false;
+  state.singletonSpreadLastPreference = "follow_global";
+  state.singletonSpreadLastEnabled = false;
   state.forceSinglePage = false;
 }
 
@@ -5238,12 +5255,13 @@ export function finalCoverSpreadWriteRequest(address, preference) {
   };
 }
 
-export function singletonSpreadPlacementWriteRequest(address, preference) {
+export function singletonSpreadPlacementWriteRequest(address, endpoint, preference) {
   const normalized = normalizeSingletonSpreadPlacementPreference(preference);
-  if (!remoteAddressLooksValid(address) || normalized !== preference) return null;
+  if (!remoteAddressLooksValid(address) || normalized !== preference || !["first", "last"].includes(endpoint)) return null;
   return {
-    kind: "set_singleton_spread_placement_preference",
+    kind: "set_singleton_spread_endpoint_preference",
     address,
+    endpoint,
     preference: normalized,
   };
 }
@@ -6078,16 +6096,21 @@ function requestFinalCoverSpreadPreference(preference) {
   return true;
 }
 
-function requestSingletonSpreadPlacementPreference(preference) {
+function requestSingletonSpreadPlacementPreference(endpoint, preference) {
   const normalized = normalizeSingletonSpreadPlacementPreference(preference);
   if (!state.container || normalized !== preference) return false;
   const address = state.container.address;
-  const writeRequest = singletonSpreadPlacementWriteRequest(address, normalized);
+  const writeRequest = singletonSpreadPlacementWriteRequest(address, endpoint, normalized);
   if (!writeRequest) return false;
   const identity = activeSpreadContextIdentity();
   const sequence = ++spreadWriteSequence;
-  state.singletonSpreadPlacementPreference = normalized;
-  state.container.singletonSpreadPlacementPreference = normalized;
+  if (endpoint === "last") {
+    state.singletonSpreadLastPreference = normalized;
+    state.container.singletonSpreadLastPreference = normalized;
+  } else {
+    state.singletonSpreadPlacementPreference = normalized;
+    state.container.singletonSpreadPlacementPreference = normalized;
+  }
   spreadWriteTail = spreadWriteTail.catch(() => {}).then(async () => {
     let writeError = null;
     try {
@@ -9716,6 +9739,8 @@ const MenuPageAction = Object.freeze({
   DISPLAY: "menu_page_display",
   SPREAD: "menu_page_spread",
   SINGLETON_PLACEMENT: "menu_page_singleton_placement",
+  SINGLETON_PLACEMENT_LAST: "menu_page_singleton_placement_last",
+  FINAL_COVER: "menu_page_final_cover",
   POSITION: "menu_page_position",
 });
 
@@ -9795,6 +9820,8 @@ export function viewerMenuDefinitions({
   supportsSingletonPlacementSetting = false,
   singletonPlacementPreference = "follow_global",
   singletonPlacementEnabled = false,
+  singletonLastPreference = "follow_global",
+  singletonLastEnabled = false,
 }) {
   const back = [MenuPageAction.BACK, "操作メニューへ戻る", "戻る"];
   const mainActions = [
@@ -9868,7 +9895,42 @@ export function viewerMenuDefinitions({
         [CommandName.SPREAD_SPLIT_LTR, "横長分割 左→右", "6"],
         [CommandName.SPREAD_SPLIT_RTL, "横長分割 右→左", "7"],
         ...(supportsFinalCoverSetting
-          ? [
+          ? [[
+              MenuPageAction.FINAL_COVER,
+              "末尾に表紙を添える",
+              finalCoverPreference === "follow_global"
+                ? finalCoverEnabled ? "全体設定: ON" : "全体設定: OFF"
+                : finalCoverPreference === "on" ? "この本: ON" : "この本: OFF",
+              { menuPage: "final_cover" },
+            ]]
+          : []),
+        ...(supportsSingletonPlacementSetting
+          ? [[
+              MenuPageAction.SINGLETON_PLACEMENT,
+              "先頭の単ページ配置",
+              singletonPlacementPreference === "follow_global"
+                ? singletonPlacementEnabled
+                  ? "全体設定: 配置する"
+                  : "全体設定: 中央"
+                : singletonPlacementPreference === "place"
+                  ? "この本: 配置する"
+                  : "この本: 中央",
+              { menuPage: "singleton_placement" },
+            ], [
+              MenuPageAction.SINGLETON_PLACEMENT_LAST,
+              "末尾の単ページ配置",
+              singletonLastPreference === "follow_global"
+                ? singletonLastEnabled ? "全体設定: 配置する" : "全体設定: 中央"
+                : singletonLastPreference === "place" ? "この本: 配置する" : "この本: 中央",
+              { menuPage: "singleton_placement_last" },
+            ]]
+          : []),
+      ],
+    },
+    final_cover: {
+      title: "末尾に表紙を添える",
+      actions: [
+        back,
               [
                 CommandName.FINAL_COVER_FOLLOW_GLOBAL,
                 `${finalCoverPreference === "follow_global" ? "✓ " : ""}末尾に表紙: 全体設定に従う`,
@@ -9888,26 +9950,10 @@ export function viewerMenuDefinitions({
                 `${finalCoverPreference === "off" ? "✓ " : ""}末尾に表紙: OFF`,
                 "この本",
               ],
-            ]
-          : []),
-        ...(supportsSingletonPlacementSetting
-          ? [[
-              MenuPageAction.SINGLETON_PLACEMENT,
-              "端の単ページ配置",
-              singletonPlacementPreference === "follow_global"
-                ? singletonPlacementEnabled
-                  ? "全体設定: 配置する"
-                  : "全体設定: 中央"
-                : singletonPlacementPreference === "place"
-                  ? "この本: 配置する"
-                  : "この本: 中央",
-              { menuPage: "singleton_placement" },
-            ]]
-          : []),
       ],
     },
     singleton_placement: {
-      title: "端の単ページ配置",
+      title: "先頭の単ページ配置",
       actions: [
         back,
         [
@@ -9925,6 +9971,19 @@ export function viewerMenuDefinitions({
           `${singletonPlacementPreference === "center" ? "✓ " : ""}中央に表示`,
           "この本",
         ],
+      ],
+    },
+    singleton_placement_last: {
+      title: "末尾の単ページ配置",
+      actions: [
+        back,
+        [CommandName.SINGLETON_LAST_FOLLOW_GLOBAL,
+          `${singletonLastPreference === "follow_global" ? "✓ " : ""}全体設定に従う`,
+          singletonLastEnabled ? "現在: 配置する" : "現在: 中央"],
+        [CommandName.SINGLETON_LAST_PLACE,
+          `${singletonLastPreference === "place" ? "✓ " : ""}本来の側へ配置`, "この本"],
+        [CommandName.SINGLETON_LAST_CENTER,
+          `${singletonLastPreference === "center" ? "✓ " : ""}中央に表示`, "この本"],
       ],
     },
     position: {
@@ -9949,6 +10008,8 @@ function menuDefinition(context, page = "main") {
       supportsSingletonPlacementSetting: Boolean(state.container),
       singletonPlacementPreference: state.singletonSpreadPlacementPreference,
       singletonPlacementEnabled: state.singletonSpreadPlacementEnabled,
+      singletonLastPreference: state.singletonSpreadLastPreference,
+      singletonLastEnabled: state.singletonSpreadLastEnabled,
     });
     return definitions[page] ?? definitions.main;
   }

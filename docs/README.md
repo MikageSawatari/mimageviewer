@@ -12,7 +12,7 @@
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
 | [final-cover-spread-plan.md](final-cover-spread-plan.md) | 末尾に表紙を添える見開きの実装・検証記録。本体・連結読み・Remoteで共有する描画構成、読書位置と表示役割の分離、全体/本別設定 |
 | [section218-singleton-spread-placement.md](section218-singleton-spread-placement.md) | §1.218見開き端の単ページ配置。実装・自動検証・独立レビュー・確認build完了、本体・Remoteの利用者確認済み。ページ構成を変えない配置、全体/本別設定、連結読み・Remote・保持画像の共通geometry |
-| [spread-endpoint-and-blank-pages-plan.md](spread-endpoint-and-blank-pages-plan.md) | §1.239先頭/末尾の配置分離と§1.240表示専用白紙の設計案。現行所有境界、旧設定移行、typed構成・操作投影、Remote・多窓検証、§1.242への境界 |
+| [spread-endpoint-and-blank-pages-plan.md](spread-endpoint-and-blank-pages-plan.md) | §1.239先頭/末尾の配置分離と§1.240端近くの実ページ単独表示。旧設定移行、白い空き slot の描画、Remote・多窓検証、将来の本構成との境界 |
 | [async-architecture.md](async-architecture.md) | 並列処理・キャンセル・キャッシュ競合を触るとき。ワーカー一覧とテンプレ。動画 packet/control channel、bridge 内 per-slot VST GUI thread、Normalize scan lifecycle を含む |
 | [similar-index-incremental-reconcile-plan.md](similar-index-incremental-reconcile-plan.md) | 類似索引の全件反復を解消する独立ブランチの設計・実装計画。watch 差分、収束条件、scope prune、検索 snapshot 公開と synthetic 検証 |
 | [similar-index-startup-and-delta-optimization-plan.md](similar-index-startup-and-delta-optimization-plan.md) | 起動FS確認の分類別計測と、更新時DB整理のscope限定化・メモリ案比較。実装・性能検証記録 |

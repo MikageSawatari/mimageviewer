@@ -1,11 +1,12 @@
 use mimageviewer_ipc::{
     RemoteAdjustmentReadOnlyState, RemoteAdjustmentScope, RemoteAdjustmentState,
     RemoteAiModelCatalog, RemoteAiModelOption, RemoteFinalCoverSpreadPreference, RemoteItemState,
-    RemoteReadingDirection, RemoteSessionIdentity, RemoteSingletonSpreadPlacementPreference,
-    RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus, RemoteWriteError,
-    RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult,
-    SessionConnectionKind, SessionResponse, SessionStatus, TailnetProbe, VideoStreamControlAction,
-    VideoStreamEndBehavior, VideoStreamError, VideoStreamErrorCode,
+    RemoteReadingDirection, RemoteSessionIdentity, RemoteSingletonSpreadEndpoint,
+    RemoteSingletonSpreadPlacementPreference, RemoteSpreadMode, RemoteSubresource,
+    RemoteWebFeatureStatus, RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest,
+    RemoteWriteResponse, RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus,
+    TailnetProbe, VideoStreamControlAction, VideoStreamEndBehavior, VideoStreamError,
+    VideoStreamErrorCode,
 };
 use qrcode::{Color, QrCode};
 
@@ -1987,7 +1988,20 @@ impl crate::app::App {
             RemoteWriteRequest::SetSingletonSpreadPlacementPreference {
                 address,
                 preference,
-            } => self.persist_remote_singleton_spread_placement_preference(address, *preference),
+            } => self.persist_remote_singleton_spread_placement_preference(
+                address,
+                None,
+                *preference,
+            ),
+            RemoteWriteRequest::SetSingletonSpreadEndpointPreference {
+                address,
+                endpoint,
+                preference,
+            } => self.persist_remote_singleton_spread_placement_preference(
+                address,
+                Some(*endpoint),
+                *preference,
+            ),
             RemoteWriteRequest::RecordReadingProgress {
                 address,
                 context_address,
@@ -2189,7 +2203,7 @@ impl crate::app::App {
             self.settings.default_reading_flow,
             self.settings.default_reading_direction,
         );
-        let Some(db) = self.spread_db.as_mut() else {
+        let Ok(db) = self.spread_db.as_mut() else {
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
                 "spread.db を開けなかったため保存できません",
@@ -2232,7 +2246,7 @@ impl crate::app::App {
             Ok(key) => key,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
-        let Some(db) = self.spread_db.as_mut() else {
+        let Ok(db) = self.spread_db.as_mut() else {
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
                 "spread.db を開けなかったため保存できません",
@@ -2267,24 +2281,42 @@ impl crate::app::App {
     fn persist_remote_singleton_spread_placement_preference(
         &mut self,
         address: &mimageviewer_ipc::RemoteAddress,
+        endpoint: Option<RemoteSingletonSpreadEndpoint>,
         preference: RemoteSingletonSpreadPlacementPreference,
     ) -> RemoteWriteResponse {
         let key = match remote_spread_key(address) {
             Ok(key) => key,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
-        let Some(db) = self.spread_db.as_mut() else {
+        let Ok(db) = self.spread_db.as_mut() else {
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
                 "spread.db を開けなかったため保存できません",
             );
         };
         let started = std::time::Instant::now();
-        match db.set_singleton_spread_placement_preference(
-            &key.exact,
-            key.fallback.as_deref(),
-            core_singleton_spread_placement_preference(preference),
-        ) {
+        let result = db
+            .get_singleton_spread_endpoint_preferences_with_fallback(
+                &key.exact,
+                key.fallback.as_deref(),
+            )
+            .and_then(|mut current| {
+                let preference = core_singleton_spread_placement_preference(preference);
+                match endpoint {
+                    Some(RemoteSingletonSpreadEndpoint::First) => current.first = preference,
+                    Some(RemoteSingletonSpreadEndpoint::Last) => current.last = preference,
+                    None => {
+                        current.first = preference;
+                        current.last = preference;
+                    }
+                }
+                db.set_singleton_spread_endpoint_preferences(
+                    &key.exact,
+                    key.fallback.as_deref(),
+                    current,
+                )
+            });
+        match result {
             Ok(()) => {
                 crate::logger::log(format!(
                     "remote_ipc: UI write applied kind=set_singleton_spread_placement_preference duration_ms={:.1}",
@@ -3658,6 +3690,7 @@ fn remote_write_uses_settings_family(request: &RemoteWriteRequest) -> bool {
         RemoteWriteRequest::SetSpread { .. }
         | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
         | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
+        | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
         | RemoteWriteRequest::RecordReadingProgress { .. }
         | RemoteWriteRequest::SetRating { .. }
         | RemoteWriteRequest::SetBookmark { .. }
