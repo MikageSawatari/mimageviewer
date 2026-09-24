@@ -358,6 +358,9 @@ async decode が `FsCacheEntry::Failed` で終端し、crash / 半端な owner �
 | 20260924T183609138Z | MultiWindowStills | exit 2 | 起動時の設定上書きが §1.239 で分割された旧名 `singleton_spread_placement_enabled` を渡して拒否された。**スクリプト側の追従漏れ** (製品の不具合ではない)。新しい 2 キーへ直した |
 | 20260924T183616499Z | MultiWindowPdf | **exit 0** | 既存シナリオ |
 | 20260924T183704856Z | MultiWindowStills | **exit 0** | 設定名の修正後 |
+| 20260924T213342676Z | MultiWindowRarNav | **exit 0** | §1.275/§1.276 (`9a9051048`) まで含む master `27bb534be` で再実行 |
+| 20260924T213352008Z | MultiWindowStills | **exit 0** | 同上 |
+| 20260924T213402061Z | MultiWindowPdf | **exit 0** | 同上 |
 
 証跡は各 run の `target/ui-smoke-runs/<run>/`。窓の切り替えは test-script の activation 要求で、OS のクリック経路は含まない。
 `MultiWindowPdf` の出力には入力デスクトップ preflight の行が出ていない。preflight が新シナリオだけに入っている可能性があり、T2 で確認する。
