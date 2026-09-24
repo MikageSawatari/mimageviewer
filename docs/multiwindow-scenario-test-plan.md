@@ -347,5 +347,17 @@ async decode が `FsCacheEntry::Failed` で終端し、crash / 半端な owner �
 | 20260923T075726158Z | MultiWindowStills | **exit 0** | 公開候補の再確認。対象は master `41b8c7585` (製品コードは配布ビルド `72070eb07` と同一、以降はテスト・文書のみ) |
 | 20260923T075742863Z | MultiWindowPdf | **exit 0** | 同上 |
 
+### 2026-09-25 §1.270 と §1.240 追補の確認 (公開担当 = ClaudeCode Opus、利用者の当夜の了承に基づく)
+
+対象は master `5c2ecee89` に §1.270 の未コミット差分を載せた使い捨て `target/portable-smoke` (`portable,test-script`)。
+同じ差分は `c633825c1` としてコミットした。
+
+| run | scenario | 結果 | 備考 |
+| --- | --- | --- | --- |
+| 20260924T183512238Z | MultiWindowRarNav | **exit 0** | 直読み RAR → ZIP → CBR → ZIP → RAR の全段で、同じ別窓の着地・描画出所・root 不変を通過 |
+| 20260924T183609138Z | MultiWindowStills | exit 2 | 起動時の設定上書きが §1.239 で分割された旧名 `singleton_spread_placement_enabled` を渡して拒否された。**スクリプト側の追従漏れ** (製品の不具合ではない)。新しい 2 キーへ直した |
+| 20260924T183616499Z | MultiWindowPdf | **exit 0** | 既存シナリオ |
+| 20260924T183704856Z | MultiWindowStills | **exit 0** | 設定名の修正後 |
+
 証跡は各 run の `target/ui-smoke-runs/<run>/`。窓の切り替えは test-script の activation 要求で、OS のクリック経路は含まない。
 `MultiWindowPdf` の出力には入力デスクトップ preflight の行が出ていない。preflight が新シナリオだけに入っている可能性があり、T2 で確認する。
