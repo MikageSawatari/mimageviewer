@@ -263,6 +263,115 @@ Phase A2 として扱う。Phase A 以前は両 view の初回 install でも同
   (import batch)、`src/rating_db.rs:118,285,311,375,406,463` (全 connection)、`src/rating_view.rs:176,252`
   (worker read stamp / prewarm)、`src/app.rs:24897,24930,27506,27950,36275-36350` (accept / install / book page copy/move)。
 
+## 段階 A2 設計 (2026-09-24、install 後の整合)
+
+### 正本、受理、表示
+
+- 対象は Phase A/B で初回受理済みのサブ展開・collection・Ctrl+G・rating の実ページ。
+  編集正本は各 `ViewerContextBundle` の `PageEditSnapshot` 一つ、idx map はその投影だけ
+  (`src/app/page_edit_snapshot.rs:3-5,44-65,67-77,153-184`,
+  `src/app/viewer_context_registry.rs:1034,2243`)。新しい編集用 index map は作らない。
+  ZIP/PDF を含む page key は既存 `page_key_for_grid_item` に従う。サムネイル挙動は変えない。
+- 同じ並びの編集変更は、worker が変更 key だけ DB から読み、受理済み候補の **worker 作成の不変 page-key 順**で
+  該当 idx の sparse delta を作る。UI は小さな delta を keyed snapshot と投影へ同時適用する。
+  多数 key・順序変更・通知欠落時は worker が同じ `load_and_project_stable` で全体を再構築し、完成品だけ移す。
+  page-key 順は items の版を示す入力であり、第二の編集 index map ではない。初回 prepare が候補と共に作り、
+  items を直接変更する経路は順序版を失効させて全体 prepare に切り替える。UI で巨大な `items` / snapshot を
+  clone して worker に渡さない (`src/app/page_edit_snapshot.rs:196-223`,
+  `docs/ui-responsiveness.md:335-348`)。
+- 共通受理条件は context ID、top-level surface/対象 identity、source と target の items generation・順序版、
+  要求 sequence、現行 App-global `page_edit_revision` (`src/app.rs:14373,30850`)、
+  `PAGE_EDIT_WRITES` の active=0 かつ同じ completed count。
+  worker の DB 読込前後も書込 stamp を検査する
+  (`src/page_edit_write_epoch.rs:17-93`, `src/app/page_edit_snapshot.rs:196-223`)。不一致・置換 cancel は旧候補の
+  index を新しい items に貼らず、残る最新希望を owner が再 prepare (次 tick 頼みにしない)。DB/error は
+  旧受理表示を保って明示的に通知し、再読込または次の変更で再要求する。context 破棄は pending を cancel する。
+  Phase A の subfolder/collection 初回 prepare は今も非 stamp の `load_and_project` と local revision gate なので、
+  A2 で同じ stable stamp と通知 cursor を受理結果に結ぶ (`src/app/subfolder_expansion.rs:1333-1387,2114-2122`,
+  `src/app/collection_grid.rs:245-252,1887-1936`)。Phase B の search/rating は既に stamp を照合する。
+  未 commit の同一 bundle 編集は DB 結果で上書きしない。既存 keyed snapshot の変更 key を小さな overlay として
+  新候補の worker 算出 idx に移し、local-adjust の先行 memory 更新と後着 commit を区別する
+  (`src/app.rs:62105-62122,62240-62284,62307-62327`)。編集中に revision が動けば結果を破棄して再 prepare。
+  遷移の items と編集投影は一緒に受理し、同じ idx の別ページへ編集を漏らさない。受理後の fullscreen は通常フォルダと
+  同じ `open_fullscreen` / raw・holdover・編集結果の既存選択規則を使う (`src/ui_fullscreen.rs:9160-9204`、本書「段階 B 設計」)。
+
+### 遷移ごとの変更点
+
+- **Snapshot Lock**: `snapshot_ops.rs:766-796` が subset と世代を置換した後、検索由来なら
+  `clear_page_edit_state`、その他は origin prefix で同期 rehydrate する (`src/app/snapshot_ops.rs:818-827`)。
+  正しい初回 install の後でも synthetic origin の編集が消える。固定解除時の saved-items 復帰も prefix、
+  固定一覧への復帰も clear/prefix (`src/app/snapshot_ops.rs:1022-1048,1133-1145`)。
+  lock/subset・元一覧・list 復帰の各候補を同じ page-key prepare に通し、snapshot の保存 payload と編集投影を
+  一つの受理単位にする。選択/フィルタ版、snapshot generation ID、source items generation を gate に追加。
+  フォルダ内 Ctrl+F subset も既存どおり残す。大きな subset 抽出/投影は worker で行う。
+- **rename**: 移行完了 worker の受信後、影響 context を選別する処理は既にあるが、synthetic view でも
+  `current_folder` prefix を UI から読み直すため keyed owner が消える
+  (`src/app.rs:33434-33523,33609-33644,33689-33699`)。現行の無関係 context 不変更・ドラッグ中 main の
+  繰延べは維持 (`src/app.rs:33602-33608,33637-33644`)。移行 report の旧/新 path 範囲を編集通知へ渡し、
+  現行の synthetic items 全走査 (`src/app.rs:33627-33635`) も不変 key 順を使う worker の範囲照合へ移し、
+  移行完了後の実 key に該当する bundle だけ worker 再 prepare。旧/新 path、migration job/完了順、
+  context/items/編集 stamp を gate にし、移行失敗・journal 再試行は実 DB 状態から再収束する。
+- **metadata import**: UI の候補 index は `current_folder`/archive path で affected 判定するため synthetic
+  view を落とし得る (`src/app.rs:31800-31820`)。worker は既に各 item の exact page key をまとめて読むが
+  idx-only `PageStateResult` を返し、受理は idx maps だけ置換して snapshot を更新しない
+  (`src/app/metadata_import_refresh.rs:363-435`, `src/app.rs:32343-32349,32372-32402`)。
+  影響判定を worker の実 page-key 順と import 範囲で行い、既存 worker の lookup を共通 snapshot に収めて同じ投影を返す。
+  import transaction/refresh request、context/items generation、書込 stamp を受理条件に加え、失敗なら旧正本を
+  保ち再取得する。既存の rotation・rating・tag・thumbnail refresh はそのまま扱う。
+- **content-identity restore**: 完了時に物理一覧は prefix rehydrate、synthetic view は無条件 clear
+  (`src/app/content_identity_restore.rs:421-450`)。worker report の復元先 page key を、後述の書込通知として
+  各該当 bundle へ渡す。物理一覧の現行経路は維持し、virtual は現在の実 key と照合して worker で再投影。
+  restore request/完了 report と context/items generation・書込 stamp で古い結果を拒否する。部分成功・失敗時も
+  report の成功 key と authoritative DB 状態で収束し、無関係 virtual view を clear しない。
+- **late writes**: UI 同一 context の edit は `sync_prepared_page_edit_key_for_idx` が snapshot と投影を更新する
+  (`src/app.rs:30836-30850,61953-62078`)。その直接 sync を通らない worker 書込と別 context の commit は
+  既設投影へ届かない。local-adjust は memory を先行更新して worker 完了が後から来る
+  (`src/app.rs:62105-62122,62240-62284`) ので、origin bundle の未保存値を通知の DB 読みで戻さない。
+  `PAGE_EDIT_WRITES` は全 writer の active/completed を数えるが key 通知を持たない
+  (`src/page_edit_write_epoch.rs:17-93`)。成功 commit の guard を閉じる前に実 page key の変更通知を発行し、
+  bulk/import/migration は範囲または全再照会通知にする。失敗・部分成功で key が不明なら保守的な再照会。
+  各 guard は成功/失敗とも通知 (失敗時は unknown) を軽量 log へ置いてから、既定どおり completed を加算し
+  active を減らす。bundle は通知連番 cursor と最後に処理した completed count を持つ。active=0 の時点で
+  通知数と completed 差分が合わない/overflow なら全再 prepare とし、通知欠落でも編集を取り逃がさない。
+  worker の cold DB と大きな投影だけを worker へ置き、UI は通知を束ねて該当 bundle を dirty にするだけ。
+  read-only open/switch/close は通知しない。
+- **sibling contexts**: snapshot は bundle swap と共に動き、physical detached fork は仮想一覧 owner を
+  UI で複製しない (`src/app/viewer_context_registry.rs:2243,2848,2912`)。書込通知は process 共通の事実だが、
+  dirty key/要求/結果は各 bundle が所有する。main・active detached は各自の不変 key 順で再投影し、
+  parked bundle は通知 cursor/dirty 範囲だけ保持して remount 時に worker refresh を要求する。
+  通知 log が切れた parked bundle は全再 prepare。兄弟の idx map、選択、texture、shared preview を
+  read-only 遷移で変更しない。rename の既存 parked 選別は再利用する (`src/app.rs:33647-33685`)。
+- **filename-stack switching**: script worker が返すのは key 列だけ。UI が group/fallback・`StackView`・
+  aggregate items を作る (`src/filename_stack_ui.rs:217-277,338-413`)。flat open と aggregate 復帰も UI で
+  materialize して `swap_stack_view_items` が synthetic prefix rehydrate するため、サブ展開の flat 実ページ編集が消える
+  (`src/filename_stack_ui.rs:690-701,726-775`)。script/fallback grouping、aggregate と flat の候補順、
+  flat 実ページの keyed snapshot/投影を同じ worker prepare に移し、UI は候補を move/install するだけにする。
+  戻り側も現行 flat での保存を取り込んだ worker 投影を受理してから aggregate へ替える。
+  context、source items generation、subfolder snapshot/revision、stack request sequence、script/rule・separator・sort・
+  display-order 版、候補順、書込 stamp で受理し、OFF/別フォルダ/別スクリプト結果は cancel/rebase。
+  現行の fullscreen 中の script-result 保留と detached park 境界は維持 (`src/filename_stack_ui.rs:282-334`)。
+
+### 既存経路、検証、出荷判断
+
+- **既存 generic path の対照**: 同じ bundle 内の成功した保存は keyed sync が既にある。物理フォルダの restore は
+  prefix rehydrate 済みで、`restore_completion_rehydrates_idx_page_edits_without_folder_reload`
+  (`src/app/content_identity_restore.rs:674-703`) が対照。rename の無関係 context 保持と parked 選別は
+  `src/app/tests.rs:55529-55568,55610-55680` が既存保証。A2 では virtual view にも同等の keyed 結果を
+  要求する追加テストを置き、同一 bundle の mask 保存→snapshot/投影即時更新は旧コードでも通る対照テストを
+  追加する。既存対照を弱めない。
+- **fail-before/pass-after**: (1) mask を初回表示したサブ展開で Snapshot Lock→解除→list 復帰、
+  (2) cross-folder virtual item の rename 後も新 key の mask、(3) synthetic view 表示中の metadata import で
+  conceal/補正が snapshot と idx に一致、(4) virtual へ移動した後に restore 完了して対象編集が現れる、
+  (5) install 後の local-adjust worker commit と削除、(6) window A の保存で parked/active の window B だけが
+  対象 key を更新し B の read-only close では A が不変、(7) サブ展開 stack の aggregate→flat→close→再 open で
+  mask が残る。各試験で旧/新要求の逆着、write 中と commit 後、items/order 変更、cancel を挟み、
+  stale 結果が idx を汚さず最新希望へ再 prepare されることも確認。通常フォルダと ZIP/PDF key を対照にする。
+  10,000 件級で worker lookup/projection と UI 受理時間を計測し、UI cold query・全件 clone が無いことを確認。
+- **v4.1.0 判断**: 上の七遷移に原理的な実装不能は見つからない。ただし filename-stack は script worker が
+  key のみを返す現構造から grouping・両順序・投影・flat/aggregate の受理 lifecycle を移す独立した大きな chunk。
+  v4.1.0 に含めるなら単独の構造レビューと性能検証が必要。これを後送する判断なら filename-stack 切替の
+  編集表示保証も同時に後送し、A2 全件完了とは扱わない。
+
 ## 設計調査の原文
 
 ## Findings
