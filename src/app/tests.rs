@@ -8,6 +8,71 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[test]
+fn rar_nav_main_ignore_setting_can_leave_open_rar_but_cannot_land_on_another() {
+    let mut app = setup_app_for_test();
+    let root = app.tmp.path().join("rar-main-ignore-nav");
+    std::fs::create_dir(&root).unwrap();
+    let fixtures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/archives/multiwindow-rar-nav");
+    for name in [
+        "01-direct.rar",
+        "02-solid.rar",
+        "06-control.zip",
+        "08-direct.cbr",
+    ] {
+        std::fs::copy(fixtures.join(name), root.join(name)).unwrap();
+    }
+    let images = root.join("10-images");
+    std::fs::create_dir(&images).unwrap();
+    std::fs::write(images.join("page.jpg"), b"page").unwrap();
+    let opened = root.join("01-direct.rar");
+    app.current_folder = Some(opened.clone());
+    app.archive_source_override = Some(opened.clone());
+    app.items = vec![GridItem::ZipImage {
+        zip_path: opened.clone(),
+        entry_name: "page.jpg".into(),
+    }];
+    app.settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
+    let take_result = |app: &mut App| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(result) = app.poll_folder_nav() {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder nav worker stalled"
+            );
+            std::thread::yield_now();
+        }
+    };
+    app.start_folder_nav(opened, true, FolderNavMode::Grid);
+    let first = take_result(&mut app);
+    assert_eq!(
+        first.target.as_ref().unwrap().logical_source(),
+        root.join("06-control.zip").as_path()
+    );
+    app.start_folder_nav(root.join("06-control.zip"), true, FolderNavMode::Grid);
+    let second = take_result(&mut app);
+    assert_eq!(
+        second.target.as_ref().unwrap().logical_source(),
+        images.as_path()
+    );
+    app.start_folder_nav(
+        root.join("01-direct.rar"),
+        true,
+        FolderNavMode::SlideshowNext,
+    );
+    let slideshow = take_result(&mut app);
+    assert!(matches!(slideshow.mode, FolderNavMode::SlideshowNext));
+    assert_eq!(
+        slideshow.target.as_ref().unwrap().logical_source(),
+        root.join("06-control.zip").as_path()
+    );
+    assert!(slideshow.hit_image_folder);
+}
+
+#[test]
 fn phase_a2_compact_ten_thousand_page_keys_and_ui_acceptance() {
     let mut app = setup_app_for_test();
     let items = (0..10_000)
@@ -11320,9 +11385,8 @@ mod folder_pane_open_nav_tests {
         assert!(
             nav_tx
                 .send(FolderNavThreadResult {
-                    outcome: None,
-                    smart_kind: None,
-                    scanned: FolderNavScanResult::NotNeeded,
+                    target: None,
+                    hit_image_folder: false,
                 })
                 .is_err(),
             "the previous tree-order worker must no longer have an apply receiver"
@@ -52624,9 +52688,8 @@ mod still_window_mode_key_tests {
         let (detached_tx, detached_rx) = mpsc::channel::<FolderNavThreadResult>();
         detached_tx
             .send(FolderNavThreadResult {
-                outcome: None,
-                smart_kind: None,
-                scanned: FolderNavScanResult::NotNeeded,
+                target: None,
+                hit_image_folder: false,
             })
             .unwrap();
         app.build_active_context_for_test(Some(13), DetachedSource::Image, |context| {
@@ -53379,9 +53442,8 @@ mod still_window_mode_key_tests {
         let (result_tx, result_rx) = mpsc::channel::<FolderNavThreadResult>();
         result_tx
             .send(FolderNavThreadResult {
-                outcome: None,
-                smart_kind: None,
-                scanned: FolderNavScanResult::NotNeeded,
+                target: None,
+                hit_image_folder: false,
             })
             .unwrap();
         let pdf = PathBuf::from(r"C:\books\current.pdf");
@@ -62696,10 +62758,19 @@ mod still_window_mode_key_tests {
         app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
         let result = wait_folder_nav_result(&mut app);
 
-        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
+        assert_eq!(
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.expected_next.as_path())
+        );
         assert_ne!(
-            result.path.as_ref(),
-            Some(&fixture.cache_wrong_next),
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.cache_wrong_next.as_path()),
             "変換キャッシュ ZIP の物理パスを起点にすると archive_cache 側へ逸れる"
         );
         assert!(result.hit_image_folder);
@@ -62715,8 +62786,20 @@ mod still_window_mode_key_tests {
         app.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
         let result = wait_folder_nav_result(&mut app);
 
-        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
-        assert_ne!(result.path.as_ref(), Some(&fixture.cache_wrong_next));
+        assert_eq!(
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.expected_next.as_path())
+        );
+        assert_ne!(
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.cache_wrong_next.as_path())
+        );
         assert!(result.hit_image_folder);
     }
 
@@ -62729,8 +62812,20 @@ mod still_window_mode_key_tests {
         app.chain_folder_nav_if_pending(1, FolderNavMode::Fullscreen);
         let result = wait_folder_nav_result(&mut app);
 
-        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
-        assert_ne!(result.path.as_ref(), Some(&fixture.cache_wrong_next));
+        assert_eq!(
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.expected_next.as_path())
+        );
+        assert_ne!(
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.cache_wrong_next.as_path())
+        );
         assert!(result.hit_image_folder);
     }
 
@@ -71309,8 +71404,11 @@ mod smart_folder_transition_tests {
         app.open_smart_folder_staged(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
         let make_result = |state| super::FolderNavResult {
-            path: Some(second.clone()),
-            smart_kind: Some(super::smart_folder::SmartChildKind::Pdf),
+            target: Some(super::FolderNavTarget {
+                route: super::FolderNavRoute::FullFeature(second.clone()),
+                smart_kind: Some(super::smart_folder::SmartChildKind::Pdf),
+                scanned: super::FolderNavScanResult::NotNeeded,
+            }),
             hit_image_folder: true,
             forward: true,
             mode: super::FolderNavMode::SmartFolder {
@@ -71318,7 +71416,6 @@ mod smart_folder_transition_tests {
                 fullscreen: false,
             },
             queued_steps: 0,
-            scanned: super::FolderNavScanResult::NotNeeded,
         };
         let captured = app.top_level_grid_view.smart_folder().unwrap().clone();
         let mut reversed = captured.navigation_entries.as_ref().clone();

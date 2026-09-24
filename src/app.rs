@@ -3214,11 +3214,43 @@ pub(crate) struct PdfPasswordRequest {
 /// ヒット先が通常ディレクトリだった場合の事前スキャン結果を載せる。
 /// 事前スキャンがあれば UI スレッドの `load_folder` は `read_dir` をスキップできる。
 pub(crate) struct FolderNavThreadResult {
-    outcome: Option<crate::folder_tree::FolderNavOutcome>,
+    target: Option<FolderNavTarget>,
+    hit_image_folder: bool,
+}
+
+/// One worker result owns the navigation destination and its pre-scan.
+pub(crate) struct FolderNavTarget {
+    route: FolderNavRoute,
     smart_kind: Option<smart_folder::SmartChildKind>,
-    /// `outcome.path` がディレクトリなら scan 成否を保持する。ZIP/PDF ファイルは
-    /// 専用ローダーに委譲するため `NotNeeded`。
     scanned: FolderNavScanResult,
+}
+
+pub(crate) enum FolderNavRoute {
+    /// The full-feature owner retains its established conversion/open routing.
+    FullFeature(PathBuf),
+    /// A detached worker proved the backing and classification before sending.
+    Detached(crate::folder_tree::FolderNavLanding),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZipCacheRouting {
+    Lookup,
+    ProvenBacking,
+}
+
+impl FolderNavRoute {
+    fn logical_source(&self) -> &Path {
+        match self {
+            Self::FullFeature(path) => path,
+            Self::Detached(landing) => &landing.logical_source,
+        }
+    }
+}
+
+impl FolderNavTarget {
+    fn logical_source(&self) -> &Path {
+        self.route.logical_source()
+    }
 }
 
 pub(crate) enum FolderNavScanResult {
@@ -5338,9 +5370,7 @@ fn resolve_converted_archive_candidate_with(
 /// `poll_folder_nav` がワーカー完了を検知したときに返す情報。
 pub(crate) struct FolderNavResult {
     /// DFS が見つけた次フォルダ (None なら DFS が尽きた)。
-    pub path: Option<PathBuf>,
-    /// Captured by the worker from the Smart root row or nested DFS candidate.
-    pub smart_kind: Option<smart_folder::SmartChildKind>,
+    pub target: Option<FolderNavTarget>,
     /// `folder_should_stop` をパスしたフォルダ (= 画像/動画/ZIP/PDF あり) か。
     /// `false` のときは skip_limit 尽きまたは DFS 末端でのフォールバック、または
     /// 結果自体が `None` (path も None)。Fullscreen モードの後処理は false なら
@@ -5356,9 +5386,6 @@ pub(crate) struct FolderNavResult {
     /// App 上の accumulator を従来どおり clear する。この値だけは完了した folder-nav
     /// request 自身が所有し、適用成功後に次の DFS へ引き渡す。
     pub queued_steps: i32,
-    /// DFS スレッドで事前走査した `path` の中身、または走査失敗。
-    /// 失敗を空一覧として `load_folder` へ適用して catalog を削除しない。
-    pub scanned: FolderNavScanResult,
 }
 
 /// 非同期メタデータ読み込み (フルスクリーン表示対象画像の AI/EXIF/XMP) の状態。
@@ -5971,9 +5998,19 @@ fn navigate_smart_folder_scope(
                 current,
                 |path| {
                     let next = if forward {
-                        next_folder_dfs(path, tree_opts)
+                        crate::folder_tree::next_folder_dfs_with_context(
+                            path,
+                            tree_opts,
+                            Some(cancel),
+                            None,
+                        )
                     } else {
-                        prev_folder_dfs(path, tree_opts)
+                        crate::folder_tree::prev_folder_dfs_with_context(
+                            path,
+                            tree_opts,
+                            Some(cancel),
+                            None,
+                        )
                     }?;
                     crate::search_index_db::is_under(&next, entry_root).then_some(next)
                 },
@@ -6036,9 +6073,19 @@ fn navigate_smart_folder_scope(
                 return None;
             }
             let next = if forward {
-                next_folder_dfs(&cursor, tree_opts)
+                crate::folder_tree::next_folder_dfs_with_context(
+                    &cursor,
+                    tree_opts,
+                    Some(cancel),
+                    None,
+                )
             } else {
-                prev_folder_dfs(&cursor, tree_opts)
+                crate::folder_tree::prev_folder_dfs_with_context(
+                    &cursor,
+                    tree_opts,
+                    Some(cancel),
+                    None,
+                )
             };
             let Some(next) = next.filter(|next| crate::search_index_db::is_under(next, entry_root))
             else {
@@ -6072,7 +6119,12 @@ fn navigate_smart_folder_scope(
             let mut cursor = if forward {
                 root.to_path_buf()
             } else {
-                crate::folder_tree::last_descendant_dir(root, tree_opts)
+                crate::folder_tree::last_descendant_dir_with_context(
+                    root,
+                    tree_opts,
+                    Some(cancel),
+                    None,
+                )
             };
             loop {
                 if cancel.load(Ordering::Relaxed) {
@@ -6085,9 +6137,19 @@ fn navigate_smart_folder_scope(
                     break;
                 }
                 let next = if forward {
-                    next_folder_dfs(&cursor, tree_opts)
+                    crate::folder_tree::next_folder_dfs_with_context(
+                        &cursor,
+                        tree_opts,
+                        Some(cancel),
+                        None,
+                    )
                 } else {
-                    prev_folder_dfs(&cursor, tree_opts)
+                    crate::folder_tree::prev_folder_dfs_with_context(
+                        &cursor,
+                        tree_opts,
+                        Some(cancel),
+                        None,
+                    )
                 };
                 let Some(next) = next.filter(|next| crate::search_index_db::is_under(next, root))
                 else {
@@ -6151,8 +6213,7 @@ fn smart_folder_nav_target_kind(
 use eframe::egui;
 
 use crate::folder_tree::{
-    FolderNavOutcome, is_apple_double, navigate_folder_with_skip, next_folder_dfs,
-    next_sibling_folder, prev_folder_dfs, prev_sibling_folder, walk_dirs_recursive,
+    FolderNavOutcome, is_apple_double, navigate_folder_with_skip, walk_dirs_recursive,
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
@@ -21771,9 +21832,44 @@ impl App {
 
     fn load_folder_nav_target(
         &mut self,
-        path: PathBuf,
+        route: FolderNavRoute,
         pre_scan: Option<ScannedDir>,
     ) -> FolderOpenOutcome {
+        use crate::folder_tree::FolderNavLandingKind;
+        let path = match route {
+            FolderNavRoute::Detached(landing) => {
+                // The pending receiver is bundle-owned; apply a proven backing only while
+                // that same detached context is mounted.
+                if !self.navigation_scope.is_detached_physical()
+                    || !self.snapshot_scope_allows_open(
+                        &landing.logical_source,
+                        &OpenRequestOwner::Navigation,
+                    )
+                {
+                    return FolderOpenOutcome::Ignored;
+                }
+                match landing.kind {
+                    FolderNavLandingKind::DirectRar | FolderNavLandingKind::ConversionCacheHit => {
+                        self.load_zip_as_folder_proven_navigation_backing(landing.backing_path);
+                        self.archive_source_override = Some(landing.logical_source.clone());
+                        self.address = landing.logical_source.to_string_lossy().to_string();
+                        return FolderOpenOutcome::Loaded;
+                    }
+                    FolderNavLandingKind::Folder | FolderNavLandingKind::NativeZipPdf => {
+                        return if self.load_folder_with_scan_owned(
+                            landing.logical_source,
+                            pre_scan,
+                            OpenRequestOwner::Navigation,
+                        ) {
+                            FolderOpenOutcome::Loaded
+                        } else {
+                            FolderOpenOutcome::Ignored
+                        };
+                    }
+                }
+            }
+            FolderNavRoute::FullFeature(path) => path,
+        };
         if path.is_file() && crate::folder_tree::is_convertible_archive_path(&path) {
             self.load_folder_or_convert_archive(path)
         } else {
@@ -25304,7 +25400,24 @@ impl App {
     }
 
     pub(crate) fn load_zip_as_folder_with_input_seq(&mut self, zip_path: PathBuf, input_seq: u64) {
-        self.load_zip_as_folder_with_prepared_enumeration(zip_path, input_seq, None);
+        self.load_zip_as_folder_with_prepared_enumeration(
+            zip_path,
+            input_seq,
+            None,
+            ZipCacheRouting::Lookup,
+        );
+    }
+
+    fn load_zip_as_folder_proven_navigation_backing(&mut self, zip_path: PathBuf) {
+        // Detached navigation already validated the source/cache pair and playable ZIP
+        // pages on its worker. Re-entering the ordinary lookup here would perform
+        // metadata and archive-cache I/O on the UI thread.
+        self.load_zip_as_folder_with_prepared_enumeration(
+            zip_path,
+            self.input_seq,
+            None,
+            ZipCacheRouting::ProvenBacking,
+        );
     }
 
     pub(in crate::app) fn load_zip_as_folder_prepared(
@@ -25316,6 +25429,7 @@ impl App {
             zip_path,
             self.input_seq,
             Some(enumeration),
+            ZipCacheRouting::Lookup,
         );
     }
 
@@ -25324,6 +25438,7 @@ impl App {
         zip_path: PathBuf,
         input_seq: u64,
         prepared: Option<crate::zip_loader::ZipEnumeration>,
+        cache_routing: ZipCacheRouting,
     ) {
         crate::logger::log(format!(
             "=== load_zip_as_folder: {} ===",
@@ -25354,7 +25469,8 @@ impl App {
         // キャッシュ ZIP 自身を開く内側の再帰呼び出しでは lookup が miss するので
         // 無限再帰にはならない。lookup は mtime+size 検証付き (元 ZIP が更新されたら
         // miss して通常経路 → 列挙で再検出 → 再変換提案)。
-        if prepared.is_none()
+        if cache_routing == ZipCacheRouting::Lookup
+            && prepared.is_none()
             && !crate::rar_loader::is_rar_path(&zip_path)
             && !self.settings.archive_file_handling_ignores_convertible()
             && let Some(cached) = self.try_archive_cache_lookup(&zip_path)
@@ -41513,11 +41629,16 @@ impl App {
         // 値をスナップショットして worker thread に move する。
         let detached_physical = self.navigation_scope.is_detached_physical();
         let mut tree_opts = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
-        if detached_physical {
+        if detached_physical
+            && tree_opts.archive_policy
+                != crate::folder_tree::NavigationArchivePolicy::IgnoreConvertible
+        {
             // A detached physical viewer must not open a conversion dialog owned
             // by the main window. Native still containers remain eligible.
-            tree_opts.include_convertible_archives = false;
+            tree_opts.archive_policy =
+                crate::folder_tree::NavigationArchivePolicy::DetachedReadable;
         }
+        let archive_cache_db = self.archive_cache_db.clone();
         let show_hidden_files = self.settings.show_hidden_files;
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -41551,6 +41672,9 @@ impl App {
         };
 
         std::thread::spawn(move || {
+            let cache = archive_cache_db.as_deref();
+            let decisions = crate::folder_tree::FolderNavDecisionMemo::default();
+            let memo = Some(&decisions);
             let t0 = std::time::Instant::now();
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -41580,22 +41704,38 @@ impl App {
                     None
                 } else {
                     let path = if forward {
-                        next_sibling_folder(&current, tree_opts)
+                        crate::folder_tree::next_sibling_folder_with_memo(
+                            &current,
+                            tree_opts,
+                            Some(&cancel_w),
+                            cache,
+                            memo,
+                        )
                     } else {
-                        prev_sibling_folder(&current, tree_opts)
+                        crate::folder_tree::prev_sibling_folder_with_memo(
+                            &current,
+                            tree_opts,
+                            Some(&cancel_w),
+                            cache,
+                            memo,
+                        )
                     };
                     path.map(|path| FolderNavOutcome {
                         hit_image_folder: if still_only {
-                            crate::folder_tree::folder_has_still_image_with_options(
+                            crate::folder_tree::folder_has_still_image_with_memo(
                                 &path,
                                 Some(&cancel_w),
                                 tree_opts,
+                                cache,
+                                memo,
                             )
                         } else {
-                            crate::folder_tree::folder_should_stop_with_options(
+                            crate::folder_tree::folder_should_stop_with_memo(
                                 &path,
                                 Some(&cancel_w),
                                 tree_opts,
+                                cache,
+                                memo,
                             )
                         },
                         path,
@@ -41604,15 +41744,23 @@ impl App {
             } else if forward {
                 navigate_folder_with_skip(
                     &current,
-                    |p| next_folder_dfs(p, tree_opts),
+                    |p| {
+                        crate::folder_tree::next_folder_dfs_with_memo(
+                            p,
+                            tree_opts,
+                            Some(&cancel_w),
+                            cache,
+                            memo,
+                        )
+                    },
                     |path, cancel| {
                         if still_only {
-                            crate::folder_tree::folder_has_still_image_with_options(
-                                path, cancel, tree_opts,
+                            crate::folder_tree::folder_has_still_image_with_memo(
+                                path, cancel, tree_opts, cache, memo,
                             )
                         } else {
-                            crate::folder_tree::folder_should_stop_with_options(
-                                path, cancel, tree_opts,
+                            crate::folder_tree::folder_should_stop_with_memo(
+                                path, cancel, tree_opts, cache, memo,
                             )
                         }
                     },
@@ -41622,15 +41770,23 @@ impl App {
             } else {
                 navigate_folder_with_skip(
                     &current,
-                    |p| prev_folder_dfs(p, tree_opts),
+                    |p| {
+                        crate::folder_tree::prev_folder_dfs_with_memo(
+                            p,
+                            tree_opts,
+                            Some(&cancel_w),
+                            cache,
+                            memo,
+                        )
+                    },
                     |path, cancel| {
                         if still_only {
-                            crate::folder_tree::folder_has_still_image_with_options(
-                                path, cancel, tree_opts,
+                            crate::folder_tree::folder_has_still_image_with_memo(
+                                path, cancel, tree_opts, cache, memo,
                             )
                         } else {
-                            crate::folder_tree::folder_should_stop_with_options(
-                                path, cancel, tree_opts,
+                            crate::folder_tree::folder_should_stop_with_memo(
+                                path, cancel, tree_opts, cache, memo,
                             )
                         }
                     },
@@ -41651,7 +41807,9 @@ impl App {
                     let scan_t0 = std::time::Instant::now();
                     let scan = scan_directory_with_convertible_archives(
                         &o.path,
-                        tree_opts.include_convertible_archives,
+                        tree_opts
+                            .archive_policy
+                            .includes_convertible_in_directory_scan(),
                         show_hidden_files,
                     );
                     if crate::perf::is_enabled() {
@@ -41734,11 +41892,29 @@ impl App {
                         smart_folder_nav_target_kind(state, &outcome.path, &scanned)
                     })
                 });
-                let _ = tx.send(FolderNavThreadResult {
-                    outcome,
-                    smart_kind,
-                    scanned,
+                let target = outcome.as_ref().and_then(|outcome| {
+                    let route = if detached_physical {
+                        FolderNavRoute::Detached(decisions.resolve(
+                            &outcome.path,
+                            tree_opts,
+                            Some(&cancel_w),
+                            cache,
+                        )?)
+                    } else {
+                        FolderNavRoute::FullFeature(outcome.path.clone())
+                    };
+                    Some(FolderNavTarget {
+                        route,
+                        smart_kind,
+                        scanned,
+                    })
                 });
+                if !cancel_w.load(Ordering::Relaxed) {
+                    let _ = tx.send(FolderNavThreadResult {
+                        target,
+                        hit_image_folder: outcome.as_ref().is_some_and(|o| o.hit_image_folder),
+                    });
+                }
             }
         });
 
@@ -42605,18 +42781,12 @@ impl App {
                 let pending = self.folder_nav_pending.take().unwrap();
                 let queued_steps = std::mem::take(&mut self.pending_folder_nav_steps);
                 self.pending_folder_nav_mode = FolderNavMode::Grid;
-                let (path, hit_image_folder) = match thread_result.outcome {
-                    Some(o) => (Some(o.path), o.hit_image_folder),
-                    None => (None, false),
-                };
                 Some(FolderNavResult {
-                    path,
-                    smart_kind: thread_result.smart_kind,
-                    hit_image_folder,
+                    target: thread_result.target,
+                    hit_image_folder: thread_result.hit_image_folder,
                     forward: pending.forward,
                     mode: pending.mode,
                     queued_steps,
-                    scanned: thread_result.scanned,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -42625,13 +42795,11 @@ impl App {
                 let queued_steps = std::mem::take(&mut self.pending_folder_nav_steps);
                 self.pending_folder_nav_mode = FolderNavMode::Grid;
                 Some(FolderNavResult {
-                    path: None,
-                    smart_kind: None,
+                    target: None,
                     hit_image_folder: false,
                     forward: pending.forward,
                     mode: pending.mode,
                     queued_steps,
-                    scanned: FolderNavScanResult::NotNeeded,
                 })
             }
         }
@@ -42947,7 +43115,7 @@ impl App {
                 &[
                     ("forward", serde_json::Value::from(result.forward)),
                     ("mode", serde_json::Value::from(apply_mode_tag)),
-                    ("found", serde_json::Value::from(result.path.is_some())),
+                    ("found", serde_json::Value::from(result.target.is_some())),
                     (
                         "hit_image_folder",
                         serde_json::Value::from(result.hit_image_folder),
@@ -42976,11 +43144,15 @@ impl App {
                 }
             };
         if let FolderNavMode::SmartFolder { state, fullscreen } = &result.mode {
-            let probe = result.path.as_deref().unwrap_or_else(|| {
-                // An empty worker result still belongs to the captured root order.
-                // The synthetic path cannot be a deleted physical entry.
-                Path::new("")
-            });
+            let probe = result
+                .target
+                .as_ref()
+                .map(FolderNavTarget::logical_source)
+                .unwrap_or_else(|| {
+                    // An empty worker result still belongs to the captured root order.
+                    // The synthetic path cannot be a deleted physical entry.
+                    Path::new("")
+                });
             if !self.smart_folder_navigation_target_current(state, probe) {
                 self.clear_pending_folder_nav_steps();
                 if *fullscreen {
@@ -42994,7 +43166,7 @@ impl App {
                 return;
             }
         }
-        let Some(path) = result.path else {
+        let Some(target) = result.target else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
                 FolderNavMode::SiblingGrid => {
@@ -43170,7 +43342,10 @@ impl App {
             return;
         }
         // DFS スレッドで事前スキャン済みなら UI スレッドの read_dir を省ける。
-        let scanned = match result.scanned {
+        let path = target.logical_source().to_path_buf();
+        let smart_kind = target.smart_kind;
+        let route = target.route;
+        let scanned = match target.scanned {
             FolderNavScanResult::NotNeeded => None,
             FolderNavScanResult::Ready(scan) => Some(scan),
             FolderNavScanResult::Failed(error) => {
@@ -43188,7 +43363,7 @@ impl App {
         match result.mode {
             FolderNavMode::Grid | FolderNavMode::SiblingGrid => {
                 if !matches!(
-                    self.load_folder_nav_target(path, scanned),
+                    self.load_folder_nav_target(route, scanned),
                     FolderOpenOutcome::Loaded
                 ) {
                     continue_burst = false;
@@ -43201,7 +43376,7 @@ impl App {
                 let restore_video_tile = fullscreen && self.video_tile_mode_active;
                 #[cfg(not(windows))]
                 let restore_video_tile = false;
-                let Some(kind) = result.smart_kind else {
+                let Some(kind) = smart_kind else {
                     self.clear_pending_folder_nav_steps();
                     self.finish_unbound_smart_folder_navigation_sequence();
                     self.release_fs_nav_lock();
@@ -43246,7 +43421,7 @@ impl App {
                 // 注: close_fullscreen は slideshow_playing=false にするが、SlideshowNext は
                 // resume_slideshow フラグ (= reopen 側で再開) で復帰するので問題ない。
                 self.close_fullscreen_for_folder_nav_reopen();
-                let open_outcome = self.load_folder_nav_target(path, scanned);
+                let open_outcome = self.load_folder_nav_target(route, scanned);
                 if !matches!(open_outcome, FolderOpenOutcome::Loaded) {
                     let deferred_conversion =
                         matches!(open_outcome, FolderOpenOutcome::ConversionDialogOpened)
@@ -43309,7 +43484,7 @@ impl App {
                     if fullscreen {
                         self.close_fullscreen_for_folder_nav_reopen();
                     }
-                    let open_outcome = self.load_folder_nav_target(path.clone(), scanned);
+                    let open_outcome = self.load_folder_nav_target(route, scanned);
                     if !matches!(open_outcome, FolderOpenOutcome::Loaded) {
                         self.clear_pending_folder_nav_steps();
                         self.release_fs_nav_lock();
@@ -43437,7 +43612,7 @@ impl App {
             .copied()
             .find_map(|i| pick_virtual(i, &self.items))?;
         if !matches!(
-            self.load_folder_nav_target(virtual_path, None),
+            self.load_folder_nav_target(FolderNavRoute::FullFeature(virtual_path), None),
             FolderOpenOutcome::Loaded
         ) {
             return None;
@@ -80515,6 +80690,7 @@ impl App {
             .get(idx)
             .map(|item| crate::gpu_lanczos::TestPaintProvenance {
                 context: self.projected_viewer_context_id(),
+                items_generation: self.items_generation,
                 item: item.perf_key(),
                 page: idx,
             })

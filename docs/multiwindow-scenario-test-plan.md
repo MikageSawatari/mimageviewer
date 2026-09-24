@@ -172,6 +172,13 @@ texture id 自体は正当に変わり得るので比較しない。
   activation とその後の描画は覆うが、**OS 上のクリックで窓を切り替える経路は覆わない** (L2 P2)。
 - sidecar 復元の完了順序は実 worker 任せで揺れる。不具合 A の回帰検出は第 1 層の受信継ぎ目が担い、
   第 2 層は実環境での統合を確かめる。
+- `MultiWindowRarNav`: 使い捨て portable profile 内へ実 RAR/CBR/ZIP fixture をコピーし、
+  `01-direct.rar` を別窓に開く。同じ窓へ Ctrl+↓ を 2 回送り、未キャッシュの solid RAR を
+  飛ばして `06-control.zip`、`08-direct.cbr` へ進む。Ctrl+↑ で ZIP、RAR へ戻る。
+  各着地で window/context identity、現在 item、page readiness、paint の context / item /
+  generation / page 一致と main grid の generation / 選択 item 不変を検査する。
+  実行は `scripts/ui-smoke.ps1 -Scenario MultiWindowRarNav -InteractiveApproved`。
+  ユーザーの実行待ちであり、この記録時点では live 結果はない。
 
 **運用の変更 (2026-09-24 利用者決定):** 常設の了承は取り下げ。第 2 層も毎回、実行前に利用者の確認を取る。必要なときは事前に知らせ、利用者が指定した時間帯 (夜間など) に実行する。以下の 2026-09-23 の記述は履歴として残す。
 

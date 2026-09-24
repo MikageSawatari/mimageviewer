@@ -247,6 +247,13 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
   `folder_should_stop` と `sorted_subdirs` は RAR/CBR/7z/CB7/LZH/LHA も ZIP/PDF と同じ
   コンテナ候補として扱い、`App::load_folder_nav_target` から
   `load_folder_or_convert_archive` へ渡す。`Ignore` では一覧スキャンと同じく候補から外す。
+  現在開いている実ファイルは、`Ignore` や同名フォルダ/ZIP 優先で着地候補から外れても
+  ツリー順の起点として保持する。別窓の静止画 viewer では、RAR/CBR は画像を含む直読み可能な
+  アーカイブか、画像を含む検証済み変換キャッシュがある場合だけ着地できる。直読みを優先し、
+  変換が必要な未キャッシュのアーカイブには着地しない。RAR header 検査が失敗したときも
+  着地しない。判定とキャッシュのページ検証は DFS worker 上で行い、同じ移動内の列挙・
+  停止判定・target 作成で判定結果を再利用する。別窓の読込では検証済み backing を直接渡し、
+  UI thread でキャッシュ DB を再照会しない。
   通常フォルダ一覧には分割 RAR の後続パートも実ファイルとして表示するが、フォルダ横断では
   同じ本へ何度も停止しないよう後続パートを候補から外す。この判定は DFS worker で指定された
   ファイルの RAR header `volume_info()` を確認する。`unrar` の `is_multipart()` /

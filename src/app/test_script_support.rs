@@ -161,6 +161,11 @@ impl App {
             let page_index = context.fullscreen_idx();
             let item = page_index.and_then(|idx| context.items().get(idx));
             let item_identity = item.map(GridItem::perf_key).unwrap_or_default();
+            let selected_item_identity = context
+                .selected()
+                .and_then(|idx| context.items().get(idx))
+                .map(GridItem::perf_key)
+                .unwrap_or_default();
             let media_kind = item.map(test_script_media_kind).unwrap_or("none");
             let page_ready = page_index.is_some_and(|idx| {
                 matches!(
@@ -184,6 +189,7 @@ impl App {
                 page_index,
                 items_generation: context.items_generation(),
                 item_identity,
+                selected_item_identity,
                 page_ready,
                 viewport_rendered: false,
                 viewport_revision: 0,

@@ -1454,6 +1454,24 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+**2026-09-25 §1.270: 別窓 RAR の物理ツリー移動**
+
+物理ツリーの既存 current path を着地可否と独立したソート起点として列挙し、Ignore、
+同名抑制、別窓の可読性判定で候補外でも前後に脱出できるようにした。ナビゲーションの
+archive policy を AllSupported / DetachedReadable / IgnoreConvertible に分け、別窓では
+既存 RAR 直読み inspector と画像ページのある有効な変換キャッシュだけを worker で候補にする。
+DFS/兄弟列挙・ヘッダ/キャッシュ検査に cancel を伝搬し、キャンセル時は結果全体を破棄する。
+worker は論理 source、確定 backing、種別を一つの target として送り、既存の bundle 所有
+`folder_nav_pending` の受信側が mounted 別窓だけに適用する。main 所有の変換 request と
+grid/generation には触れない。実装レビューで見つかった UI thread 上のキャッシュ再照会を
+検証済み backing 専用 reader route で除き、RAR header 検査失敗を候補外とし、worker 内の
+判定を列挙・停止判定・target に再利用した。第 1 層は着地点の context / item / page の
+paint 出所を検査する。第 2 層 `MultiWindowRarNav` は実 HWND での Ctrl+↑↓ と同じ
+窓 identity / generation / paint 出所を検査し、2026-09-25 の使い捨て portable-smoke 実行で
+RAR → ZIP → CBR → ZIP → RAR の全段が PASS した (MultiWindowStills / MultiWindowPdf も同時に PASS)。
+fixture は `git add -f` で追跡し、差分だけを当てた clean worktree で `rar_nav_` 20 件が通過。
+設計 lead D1–D5 と独立 Sol reviewer が §2 適合 (症状パッチではなく構造修正) に合意し、**実装も独立レビューで承認済み**。
+
 **2026-09-24 §1.240: 表紙あり見開きの白い相方面**
 
 承認済み §1.240 の本別設定を既存 viewer context bundle に保持し、休止窓 snapshot は

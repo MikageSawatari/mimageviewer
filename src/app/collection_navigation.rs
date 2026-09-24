@@ -636,7 +636,9 @@ fn preflight_candidates(
                     if qualifies && !cancel.load(Ordering::Acquire) {
                         super::folder_scan::scan_directory_with_convertible_archives_cancel(
                             path,
-                            tree_options.include_convertible_archives,
+                            tree_options
+                                .archive_policy
+                                .includes_convertible_in_directory_scan(),
                             show_hidden_files,
                             Some(cancel),
                         )
@@ -691,7 +693,10 @@ fn preflight_candidates(
                     }
                 }
                 CollectionResolvedKind::ConvertibleArchive => {
-                    if !tree_options.include_convertible_archives {
+                    if !tree_options
+                        .archive_policy
+                        .includes_convertible_in_directory_scan()
+                    {
                         rejected.push(candidate.target.entry_id);
                         continue;
                     }
