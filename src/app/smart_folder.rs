@@ -4584,11 +4584,12 @@ fn prepare_video_folder_pin_seeds(
         if resolved.kind != crate::folder_thumb_pins::ResolvedKind::Video {
             continue;
         }
-        let Some(base_key) = super::container_cache_base_key(
-            item,
+        let Some(base_key) = crate::thumb_loader::folder_thumb_cache_key_for_path(
+            container_path,
             true,
-            Some(resources.folder_thumb_sort),
+            resources.folder_thumb_sort,
             resources.folder_thumb_depth,
+            crate::catalog::FolderThumbProvenance::Seeded,
         ) else {
             continue;
         };
@@ -5253,7 +5254,7 @@ fn prepare_smart_folder(
                         });
                         if !unchanged
                             && !matches!(
-                                db.save_thumb_bytes(
+                                db.save_seeded_folder_bytes(
                                     &seed.cache_key,
                                     seed.mtime,
                                     seed.file_size,

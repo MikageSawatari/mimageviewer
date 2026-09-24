@@ -470,7 +470,7 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 | GridItem | `zip_entry` | `pdf_page` | `cache_key_override` | サムネ取得方法 |
 | --- | --- | --- | --- | --- |
 | Image | None | None | なし | ファイル直接デコード |
-| Folder | None | None | `folderthumb:auto-vN:{sort}:d{depth}:{dirname-or-fullpath}` | 再帰的に代表画像を探してデコード |
+| Folder | None | None | `folderthumb:auto-v3:{sort}:d{depth}:{dirname-or-fullpath}` | 直下画像を優先し、無ければ子フォルダと既存 ZIP/PDF WebP を設定順で選ぶ。詳細は [選定 proof](folder-representative-plan.md) |
 | ZipFile | None | None | `zipthumb:{filename}` | `zip_loader::read_first_image_bytes` で先頭画像 |
 | PdfFile | None | Some(0) | `pdfthumb:{filename}` | PDF ワーカーでページ 0 をレンダリング |
 | ConvertibleArchive | None または Some(entry) | None | `archivethumb:{format}:{filename-or-fullpath}` | 有効な変換キャッシュ ZIP があれば、その ZIP から先頭画像またはピン画像を読む。キャッシュ未作成/失効時は LoadRequest なしでアイコン表示 |
@@ -610,8 +610,9 @@ worker を再起動しない。archive 候補が desired scope から外れて s
   - `folder_thumb_existing_keys_for` も同じ cascade を実行して existing_keys に leaf
     pinned_key を含める。これをしないと delete_missing が cascade 由来の cache 行を
     毎ロード掃除してしまう (Phase D 後のバグ修正 / 二重実装で識別)。
-  - **実フォルダ再帰の cache-only 境界**: 上位 Folder の既存代表 cache hit は従来どおり
-    再探索しない。miss して `resolve_folder_thumb_image` が子フォルダを辿る場合、非 Image
+  - **実フォルダ再帰の cache-only 境界**: 上位 Folder の既存代表 cache hit は
+    [選定 proof](folder-representative-plan.md) を worker で検証し、有効なら再探索しない。
+    miss して `resolve_folder_thumb_image` が子フォルダを辿る場合、非 Image
     leaf (PDF / ZIP / Video / 仮想ページ) は、子フォルダが直上一覧で作った
     `folderthumb:auto-v2:{sort}:d{depth}:{child}#pin:{source_id}` の完全一致 WebP だけを
     直上 catalog から読み取り専用で再利用する。DB / 行が無い、metadata 不一致、WebP

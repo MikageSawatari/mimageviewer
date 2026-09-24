@@ -16206,11 +16206,29 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_video_pins", 0, t);
 
         let t = std::time::Instant::now();
-        let folder_thumb_pin_db = crate::folder_thumb_pins::FolderThumbPinDb::open()
-            .map(std::sync::Arc::new)
-            .map_err(|e| crate::logger::log(format!("folder_thumb_pin_db open failed: {e}")))
-            .ok();
-        crate::perf::emit_ms("startup", "db_open_folder_thumb_pins", 0, t);
+        let opened_folder_thumb_pins =
+            crate::folder_thumb_pins::FolderThumbPinDb::open_with_migration_info()
+                .map_err(|e| crate::logger::log(format!("folder_thumb_pin_db open failed: {e}")))
+                .ok();
+        let migration_ran = opened_folder_thumb_pins
+            .as_ref()
+            .map(|(_, migrated)| *migrated);
+        let folder_thumb_pin_db = opened_folder_thumb_pins.map(|(db, _)| std::sync::Arc::new(db));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "startup",
+                "db_open_folder_thumb_pins",
+                None,
+                0,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(t.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("migration_ran", serde_json::Value::from(migration_ran)),
+                ],
+            );
+        }
 
         let t = std::time::Instant::now();
         let video_bookmark_db = crate::video_bookmarks::VideoBookmarkDb::open().ok();
@@ -29729,11 +29747,12 @@ impl App {
             if !matches!(resolved.kind, ResolvedKind::Video) {
                 continue;
             }
-            let Some(base_key) = container_cache_base_key(
-                item,
+            let Some(base_key) = crate::thumb_loader::folder_thumb_cache_key_for_path(
+                container_path,
                 use_full_path_keys,
-                Some(self.settings.folder_thumb_sort),
+                self.settings.folder_thumb_sort,
                 self.settings.folder_thumb_depth,
+                crate::catalog::FolderThumbProvenance::Seeded,
             ) else {
                 continue;
             };
@@ -29812,8 +29831,13 @@ impl App {
             if already_seeded {
                 continue;
             }
-            match cat.save_thumb_bytes(&pinned_key, resolved.mtime, resolved.file_size, None, &webp)
-            {
+            match cat.save_seeded_folder_bytes(
+                &pinned_key,
+                resolved.mtime,
+                resolved.file_size,
+                None,
+                &webp,
+            ) {
                 Ok(true) => {}
                 Ok(false) => {
                     crate::logger::log(format!(
@@ -29845,6 +29869,8 @@ impl App {
                         jpeg_data: webp,
                         source_dims: None,
                         layout_dims: None,
+                        folder_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
+                        selection_proof: None,
                     },
                 );
             }
@@ -29891,6 +29917,8 @@ impl App {
                             jpeg_data: webp,
                             source_dims: None,
                             layout_dims: None,
+                            folder_provenance: None,
+                            selection_proof: None,
                         })
                     }
                     FileKind::ZipFile => {
@@ -30007,20 +30035,23 @@ impl App {
                 };
                 let key = crate::path_key::normalize_keep_drive(path);
                 let source = self.folder_pin_map.get(&key)?.clone();
-                let base_key = container_cache_base_key(
-                    item,
+                let base_key = crate::thumb_loader::folder_thumb_cache_key_for_path(
+                    path,
                     true,
-                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_sort,
                     self.settings.folder_thumb_depth,
+                    crate::catalog::FolderThumbProvenance::Seeded,
                 )?;
                 Some((path.clone(), source, base_key))
             }) else {
                 continue;
             };
             let prefix = drive_list_pinned_cache_key_prefix(&base_key, &source);
-            let Some(entry) = self.drive_list_pin_seed_entry(&container_path, &source) else {
+            let Some(mut entry) = self.drive_list_pin_seed_entry(&container_path, &source) else {
                 continue;
             };
+            entry.folder_provenance = Some(crate::catalog::FolderThumbProvenance::Seeded);
+            entry.selection_proof = None;
             let key = drive_list_pinned_cache_key(&prefix, entry.mtime, entry.file_size);
             let already_cached = cache_map
                 .read()
@@ -30034,7 +30065,7 @@ impl App {
             if already_cached {
                 continue;
             }
-            match target_cat.save_thumb_bytes(
+            match target_cat.save_seeded_folder_bytes(
                 &key,
                 entry.mtime,
                 entry.file_size,
@@ -79184,8 +79215,13 @@ fn make_drive_list_pin_load_request(
         ));
         return None;
     }
-    let base_key =
-        container_cache_base_key(item, true, Some(folder_thumb_sort), folder_thumb_depth)?;
+    let base_key = crate::thumb_loader::folder_thumb_cache_key_for_path(
+        container_path,
+        true,
+        folder_thumb_sort,
+        folder_thumb_depth,
+        crate::catalog::FolderThumbProvenance::Seeded,
+    )?;
     let cache_key_prefix = drive_list_pinned_cache_key_prefix(&base_key, source);
     Some(LoadRequest {
         idx,
@@ -79193,6 +79229,7 @@ fn make_drive_list_pin_load_request(
         cache_key_override: Some(base_key.clone()),
         folder_thumb_sort: Some(folder_thumb_sort),
         folder_thumb_depth,
+        folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
         pinned_only: Some(crate::thumb_loader::PinnedOnlyRequest { cache_key_prefix }),
         ..Default::default()
     })
@@ -79554,6 +79591,7 @@ fn make_load_request(
                 req,
                 path,
                 &base_key,
+                use_full_path_keys,
                 ContainerKindForPin::ConvertibleArchive,
                 pin_map,
                 converted_archive_cache_paths,
@@ -79583,6 +79621,7 @@ fn make_load_request(
                 req,
                 p,
                 &base_key,
+                use_full_path_keys,
                 ContainerKindForPin::ZipFile,
                 pin_map,
                 converted_archive_cache_paths,
@@ -79611,6 +79650,7 @@ fn make_load_request(
                 req,
                 p,
                 &base_key,
+                use_full_path_keys,
                 ContainerKindForPin::PdfFile,
                 pin_map,
                 converted_archive_cache_paths,
@@ -79631,12 +79671,14 @@ fn make_load_request(
                 cache_key_override: Some(base_key.clone()),
                 folder_thumb_sort,
                 folder_thumb_depth,
+                folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 ..base
             };
             Some(apply_folder_thumb_pin(
                 req,
                 p,
                 &base_key,
+                use_full_path_keys,
                 ContainerKindForPin::Folder,
                 pin_map,
                 converted_archive_cache_paths,
@@ -79729,9 +79771,28 @@ pub(crate) fn folder_thumb_existing_keys_for(
                 root_metadata,
             )
         {
+            let pinned_base_key = if matches!(item, GridItem::Folder(_)) {
+                crate::thumb_loader::folder_thumb_cache_key_for_path(
+                    container_path,
+                    use_full_path_keys,
+                    folder_thumb_sort.unwrap_or(crate::settings::SortOrder::Numeric),
+                    folder_thumb_depth,
+                    if matches!(
+                        resolved.kind,
+                        crate::folder_thumb_pins::ResolvedKind::Folder
+                    ) {
+                        crate::catalog::FolderThumbProvenance::AutoSelected
+                    } else {
+                        crate::catalog::FolderThumbProvenance::Seeded
+                    },
+                )
+                .unwrap_or_else(|| base_key.clone())
+            } else {
+                base_key.clone()
+            };
             keys.push(format!(
                 "{}{}{}",
-                base_key,
+                pinned_base_key,
                 crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
                 resolved.source_id,
             ));
@@ -79759,9 +79820,28 @@ pub(crate) fn folder_thumb_existing_keys_for(
         if let Some(resolved) =
             resolve_pin_target_cascaded(container_path, source, pin_db, folder_thumb_depth as usize)
         {
+            let pinned_base_key = if matches!(item, GridItem::Folder(_)) {
+                crate::thumb_loader::folder_thumb_cache_key_for_path(
+                    container_path,
+                    use_full_path_keys,
+                    folder_thumb_sort.unwrap_or(crate::settings::SortOrder::Numeric),
+                    folder_thumb_depth,
+                    if matches!(
+                        resolved.kind,
+                        crate::folder_thumb_pins::ResolvedKind::Folder
+                    ) {
+                        crate::catalog::FolderThumbProvenance::AutoSelected
+                    } else {
+                        crate::catalog::FolderThumbProvenance::Seeded
+                    },
+                )
+                .unwrap_or_else(|| base_key.clone())
+            } else {
+                base_key.clone()
+            };
             keys.push(format!(
                 "{}{}{}",
-                base_key,
+                pinned_base_key,
                 crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
                 resolved.source_id,
             ));
@@ -79910,6 +79990,7 @@ fn apply_folder_thumb_pin(
     base_req: LoadRequest,
     container: &std::path::Path,
     base_key: &str,
+    use_full_path_keys: bool,
     container_kind: ContainerKindForPin,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     converted_archive_cache_paths: &std::collections::HashMap<String, ConvertedArchiveSourceState>,
@@ -79968,9 +80049,30 @@ fn apply_folder_thumb_pin(
     use crate::folder_thumb_pins::ResolvedKind;
     use crate::thumb_loader::ResolveStrategy;
 
+    let folder_provenance = matches!(container_kind, ContainerKindForPin::Folder).then_some(
+        if matches!(resolved.kind, ResolvedKind::Folder) {
+            crate::catalog::FolderThumbProvenance::AutoSelected
+        } else {
+            crate::catalog::FolderThumbProvenance::Seeded
+        },
+    );
+    let effective_base_key = if let Some(provenance) = folder_provenance {
+        crate::thumb_loader::folder_thumb_cache_key_for_path(
+            container,
+            use_full_path_keys,
+            base_req
+                .folder_thumb_sort
+                .unwrap_or(crate::settings::SortOrder::Numeric),
+            base_req.folder_thumb_depth,
+            provenance,
+        )
+        .unwrap_or_else(|| base_key.to_owned())
+    } else {
+        base_key.to_owned()
+    };
     let pinned_key = format!(
         "{}{}{}",
-        base_key,
+        effective_base_key,
         crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
         resolved.source_id,
     );
@@ -80042,6 +80144,7 @@ fn apply_folder_thumb_pin(
             resolve_override: None,
             folder_thumb_sort: base_req.folder_thumb_sort,
             folder_thumb_depth: base_req.folder_thumb_depth,
+            folder_thumb_provenance: folder_provenance,
             idx: base_req.idx,
             source_policy: LoadSourcePolicy::CacheOrSource,
             priority: base_req.priority,
@@ -80132,6 +80235,7 @@ fn apply_folder_thumb_pin(
         // base_req から継承するので Folder → Folder の pin で sort/depth が消えない。
         folder_thumb_sort: base_req.folder_thumb_sort,
         folder_thumb_depth: base_req.folder_thumb_depth,
+        folder_thumb_provenance: folder_provenance,
         idx: base_req.idx,
         source_policy: base_req.source_policy,
         priority: base_req.priority,

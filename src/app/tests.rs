@@ -3170,6 +3170,8 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
                 jpeg_data: vec![0],
                 source_dims: None,
                 layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
             },
         )])));
     app.current_color_cache_map = Some(std::sync::Arc::clone(&cache_map));
@@ -18267,6 +18269,8 @@ fn begin_detached_bookmark_media_test(
                 jpeg_data: Vec::new(),
                 source_dims: None,
                 layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
             },
         )]),
     )));
@@ -27796,6 +27800,8 @@ mod favorite_adjustment_defaults_tests {
                 jpeg_data: webp,
                 source_dims: Some((2, 2)),
                 layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
             },
         )]));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -29082,6 +29088,8 @@ mod favorite_adjustment_defaults_tests {
                 jpeg_data: webp,
                 source_dims: Some((2, 2)),
                 layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
             },
         )]));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -29316,6 +29324,70 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn folder_request_and_cleanup_share_typed_pin_keys() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        let app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(folder.join("child")).unwrap();
+        std::fs::write(folder.join("cover.jpg"), b"not decoded").unwrap();
+        let item = GridItem::Folder(folder.clone());
+        for (source, provenance, version) in [
+            (
+                FolderPinSource::File {
+                    rel: "child".to_owned(),
+                    kind: FileKind::Folder,
+                },
+                crate::catalog::FolderThumbProvenance::AutoSelected,
+                "auto-v3",
+            ),
+            (
+                FolderPinSource::File {
+                    rel: "cover.jpg".to_owned(),
+                    kind: FileKind::Image,
+                },
+                crate::catalog::FolderThumbProvenance::Seeded,
+                "auto-v2",
+            ),
+        ] {
+            let pins = std::collections::HashMap::from([(
+                crate::path_key::normalize_keep_drive(&folder),
+                source,
+            )]);
+            let req = make_load_request(
+                &item,
+                0,
+                1,
+                2,
+                false,
+                None,
+                Some(crate::settings::SortOrder::Numeric),
+                3,
+                &pins,
+                &std::collections::HashMap::new(),
+                None,
+                Some(&folder),
+                app.folder_thumb_pin_db.as_deref(),
+                app.video_pin_db.as_ref(),
+                false,
+            )
+            .unwrap();
+            let key = req.cache_key_override.unwrap();
+            assert_eq!(req.folder_thumb_provenance, Some(provenance));
+            assert!(key.contains(version), "{key}");
+            let keep = folder_thumb_existing_keys_for(
+                &item,
+                Some((1, 2)),
+                &pins,
+                app.folder_thumb_pin_db.as_deref(),
+                Some(crate::settings::SortOrder::Numeric),
+                3,
+                false,
+            );
+            assert!(keep.contains(&key), "cleanup must preserve {key}");
+        }
+    }
+
+    #[test]
     fn folder_pin_to_zip_file_cascades_to_the_zips_pinned_page() {
         let app = setup_app();
         let folder = app.tmp.path().join("shelf");
@@ -29369,6 +29441,11 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(req.edit_preview_validate_container);
         let pinned_key = req.cache_key_override.clone().unwrap();
+        assert_eq!(
+            req.folder_thumb_provenance,
+            Some(crate::catalog::FolderThumbProvenance::Seeded)
+        );
+        assert!(pinned_key.contains("auto-v2"), "{pinned_key}");
         assert!(pinned_key.contains("#pin:cascade:"), "{pinned_key}");
         assert!(pinned_key.contains(":zipentry||chapter/page02.jpg|-|"));
 
@@ -32946,6 +33023,169 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    #[test]
+    fn late_folder_thumbnail_result_stays_with_its_viewer_context() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = app.tmp.path().join("first-folder");
+        let second = app.tmp.path().join("second-folder");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let prepare = |app: &mut App, folder: PathBuf| {
+            app.items = vec![GridItem::Folder(folder)];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.keep_set.insert(0);
+            app.keep_range = (0, 1);
+            app.requested.insert(0, false);
+        };
+        let send = |app: &mut App, red: u8| {
+            app.tx
+                .send(crate::thumb_loader::ThumbMsg {
+                    idx: 0,
+                    image: Some(egui::ColorImage::new(
+                        [2, 2],
+                        vec![egui::Color32::from_rgb(red, 10, 20); 4],
+                    )),
+                    origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                    from_edit_preview: false,
+                    edit_preview_adjustment: None,
+                    source_dims: Some((2, 2)),
+                    layout_dims: None,
+                    canceled: false,
+                    finalized: false,
+                    input_seq: 0,
+                    items_gen: app.items_generation,
+                })
+                .unwrap();
+        };
+        prepare(&mut app, first);
+        send(&mut app, 90);
+        let owner = app.stash_mounted_and_start_fresh("test_late_folder_thumb_owner");
+        prepare(&mut app, second);
+        send(&mut app, 180);
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+        app.with_viewer_context(owner, |mounted| {
+            assert!(matches!(mounted.thumbnails[0], ThumbnailState::Pending));
+            mounted.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+            assert!(matches!(
+                mounted.thumbnails[0],
+                ThumbnailState::Loaded { .. }
+            ));
+        })
+        .unwrap();
+        assert!(
+            matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
+            "the sibling's thumbnail must remain intact"
+        );
+    }
+
+    #[test]
+    fn smart_collection_and_rating_folder_requests_reach_shared_resolver() {
+        let app = setup_app();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let smart = super::smart_folder::smart_folder_synthetic_path(uuid::Uuid::new_v4());
+        let rating = super::rating_view_synthetic_path();
+        for (name, parent, full_path_key) in [
+            ("smart", smart, true),
+            ("collection", app.tmp.path().join("collection-source"), true),
+            ("rating", rating, true),
+        ] {
+            let folder = app.tmp.path().join(format!("{name}-library"));
+            std::fs::create_dir_all(&folder).unwrap();
+            let archive = folder.join("10-book.cbz");
+            std::fs::write(&archive, b"invalid archive bytes").unwrap();
+            let blue = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                8,
+                8,
+                image::Rgba([20, 40, 220, 255]),
+            ));
+            let webp = crate::catalog::encode_thumb_webp(&blue, 8, 80.0).unwrap().0;
+            let archive_meta = std::fs::metadata(&archive).unwrap();
+            crate::catalog::CatalogDb::open(&cache_dir, &folder)
+                .unwrap()
+                .save_thumb_bytes(
+                    "zipthumb:10-book.cbz",
+                    crate::ui_helpers::mtime_secs(&archive_meta),
+                    archive_meta.len() as i64,
+                    Some((8, 8)),
+                    &webp,
+                )
+                .unwrap();
+            let folder_meta = std::fs::metadata(&folder).unwrap();
+            let mut request = make_load_request(
+                &GridItem::Folder(folder.clone()),
+                0,
+                crate::ui_helpers::mtime_secs(&folder_meta),
+                0,
+                false,
+                None,
+                Some(crate::settings::SortOrder::Numeric),
+                3,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                None,
+                Some(&parent),
+                app.folder_thumb_pin_db.as_deref(),
+                None,
+                full_path_key,
+            )
+            .unwrap();
+            assert_eq!(
+                request.folder_thumb_provenance,
+                Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            );
+            assert!(
+                request
+                    .cache_key_override
+                    .as_deref()
+                    .unwrap()
+                    .contains("auto-v3")
+            );
+            request.force_cache = true;
+            let catalog = Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent).unwrap());
+            let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let done = Arc::new(AtomicUsize::new(0));
+            let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+            let keep_start = Arc::new(AtomicUsize::new(0));
+            let keep_end = Arc::new(AtomicUsize::new(1));
+            crate::thumb_loader::process_load_request(
+                &request,
+                &cache_map,
+                &tx,
+                Some(&catalog),
+                64,
+                75,
+                64,
+                CacheDecision::from_settings(&app.settings),
+                &done,
+                &stats,
+                None,
+                &keep_start,
+                &keep_end,
+                None,
+                app.folder_thumb_pin_db.as_deref(),
+                None,
+                None,
+            );
+            let image = rx
+                .try_iter()
+                .find_map(|message| message.image)
+                .unwrap_or_else(|| panic!("{name} did not resolve archive WebP"));
+            let pixel = image.pixels[0].to_srgba_unmultiplied();
+            assert!(pixel[2] > pixel[0], "{name} should use the cached archive");
+            let key = request.cache_key_override.as_deref().unwrap();
+            let row = catalog.load_one(key).unwrap().unwrap();
+            assert_eq!(
+                row.folder_provenance,
+                Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+            );
+            assert!(row.selection_proof.is_some());
+        }
+    }
+
     /// PDF を仮想フォルダとして開いた直後、親フォルダ catalog の `pdfthumb:foo.pdf`
     /// が PDF 自身の catalog に `page_0000` として seed されることを確認する回帰
     /// テスト。これによって PDFium による初回 1 ページ目レンダリング (200-500ms)
@@ -33095,6 +33335,8 @@ mod favorite_adjustment_defaults_tests {
                 jpeg_data: webp_bytes.clone(),
                 source_dims: Some((400, 400)),
                 layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
             },
         );
 

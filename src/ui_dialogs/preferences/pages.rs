@@ -8447,7 +8447,7 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(4.0);
         ui.label(
         "フォルダの代表画像を探すとき、サブフォルダを何階層まで探索するか。\n\
-         1 以上ではサブフォルダ内の画像を直接の子ファイルより優先します。0 にすると直接の子ファイルのみ使用します。",
+         直下の画像を設定した順序で優先します。画像がない場合だけ、子フォルダと作成済みサムネイルのある ZIP/PDF を設定した深さまで探します。0 では直下の画像のみ使用します。",
     );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
