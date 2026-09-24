@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/epub-pdf-worker",
     "crates/susie-worker",
     "crates/susie-crash-plugin",
     "crates/launcher",

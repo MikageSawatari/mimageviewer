@@ -1,0 +1,21 @@
+[package]
+name = "epub-pdf-worker"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mimageviewer-epub-pdf"
+path = "src/main.rs"
+
+[dependencies]
+quick-xml = "0.41"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+lopdf = "0.36"
+percent-encoding = "2"
+walkdir = "2"
+base64 = "0.22"
+sha2 = "0.10"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
