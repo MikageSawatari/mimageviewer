@@ -477,8 +477,10 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
         }
         let data = read_member(&mut z, &item.path)?;
         let (mut size, direct_image) = if item.media_type == "image/svg+xml" {
+            // An SVG page is printed as a document (iframe), never as <img>: SVG loaded as an
+            // image may not fetch external resources, so its <image href="page.jpg"> would be blank.
             let (s, _) = xhtml_info(&data, &item.path)?;
-            (s, Some(item.path.clone()))
+            (s, None)
         } else if item.media_type.starts_with("image/") {
             (
                 image_size(&data).map(|(w, h)| (w, h, "image_intrinsic".into())),
