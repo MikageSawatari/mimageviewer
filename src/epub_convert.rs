@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::epub_cache::{
-    self, EpubCache, GenerationRow, PublishOutcome, SourceGuard, WriteDenyingSource,
+    self, EpubCache, GenerationRow, PublishOutcome, ReservedOutput, SourceGuard, WriteDenyingSource,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -102,7 +102,7 @@ pub type ConvertResult = Result<PublishOutcome, EpubConvertError>;
 pub trait ConvertedPdfVerifier: Send + Sync {
     fn verify(
         &self,
-        path: &Path,
+        output: &ReservedOutput,
         pages: usize,
         cancel: &CancelToken,
     ) -> Result<(), EpubConvertError>;
@@ -114,11 +114,11 @@ pub struct PdfiumConvertedPdfVerifier;
 impl ConvertedPdfVerifier for PdfiumConvertedPdfVerifier {
     fn verify(
         &self,
-        path: &Path,
+        output: &ReservedOutput,
         pages: usize,
         cancel: &CancelToken,
     ) -> Result<(), EpubConvertError> {
-        crate::pdf_loader::verify_converted_pdf_with_cancel(path, pages, Some(cancel.pool_flag()))
+        crate::pdf_loader::verify_converted_pdf_with_cancel(output, pages, Some(cancel.pool_flag()))
     }
 }
 
@@ -287,7 +287,7 @@ pub fn convert_at<S: WorkerSpawner>(
     if timeout_secs == 0 {
         return Err(EpubConvertError::Invalid);
     }
-    let id = db.reserve_generation_id(source)?;
+    let reserved = db.reserve_output(source)?;
     if cancel.is_cancelled() {
         return Err(EpubConvertError::Cancelled);
     }
@@ -297,14 +297,14 @@ pub fn convert_at<S: WorkerSpawner>(
     if cancel.is_cancelled() {
         return Err(EpubConvertError::Cancelled);
     }
-    let final_path = epub_cache::generation_file(context.data_dir, source, id);
+    let final_path = reserved.final_path();
     fs::create_dir_all(final_path.parent().ok_or(EpubConvertError::Protocol)?)?;
-    let part = final_path.with_extension("pdf.part");
-    let _part_cleanup = PartCleanup(part.clone());
+    let part = reserved.part_path();
+    let _part_cleanup = PartCleanup(part.to_owned());
     let spec = WorkerSpec {
         executable: worker_executable()?,
         input: source_copy,
-        output: part.clone(),
+        output: part.to_owned(),
         work_dir: temp.path.join("work"),
         user_data_dir: temp.path.join("ud"),
         timeout_secs,
@@ -337,20 +337,20 @@ pub fn convert_at<S: WorkerSpawner>(
     }
     let result = parsed?;
     let (pages, direction, profile) = validate_result(code, result)?;
-    verifier.verify(&part, pages, cancel)?;
+    verifier.verify(&reserved, pages, cancel)?;
     if cancel.is_cancelled() {
         return Err(EpubConvertError::Cancelled);
     }
-    promote_part(&part, &final_path)?;
+    promote_part(part, final_path)?;
     let candidate = GenerationRow {
-        generation_id: id,
+        generation_id: reserved.generation_id(),
         src_path_key: epub_cache::src_key(source),
         src_path: source.to_owned(),
         src_state: state,
         src_sha256: full_hash,
         src_head_hash: head_hash,
-        pdf_file: final_path.clone(),
-        pdf_size: fs::metadata(&final_path)?.len(),
+        pdf_file: final_path.to_owned(),
+        pdf_size: fs::metadata(final_path)?.len(),
         page_count: pages as u32,
         direction,
         profile,
@@ -836,11 +836,11 @@ mod tests {
     impl ConvertedPdfVerifier for TestPdfVerifier {
         fn verify(
             &self,
-            path: &Path,
+            output: &ReservedOutput,
             pages: usize,
             _cancel: &CancelToken,
         ) -> Result<(), EpubConvertError> {
-            verify_converted_pdf_stage2a(path, pages)
+            verify_converted_pdf_stage2a(output.part_path(), pages)
         }
     }
 

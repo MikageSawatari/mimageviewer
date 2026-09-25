@@ -135,6 +135,29 @@ pub fn generation_file(data_dir: &Path, source: &Path, id: i64) -> PathBuf {
         .join(format!("{stem}.g{id}.pdf"))
 }
 
+/// Capability for the `.part` file recorded by a committed generation reservation.
+/// Only `EpubCache::reserve_output` can construct it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReservedOutput {
+    generation_id: i64,
+    final_path: PathBuf,
+    part_path: PathBuf,
+}
+
+impl ReservedOutput {
+    pub fn generation_id(&self) -> i64 {
+        self.generation_id
+    }
+
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+
+    pub fn part_path(&self) -> &Path {
+        &self.part_path
+    }
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -183,7 +206,7 @@ impl EpubCache {
         Ok(Self { conn, data_dir })
     }
 
-    pub fn reserve_generation_id(&mut self, source: &Path) -> Result<i64, CacheError> {
+    pub fn reserve_output(&mut self, source: &Path) -> Result<ReservedOutput, CacheError> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO generation_ids (reserved_at,pdf_file) VALUES (?1,'')",
@@ -196,7 +219,11 @@ impl EpubCache {
             params![id, path.to_string_lossy()],
         )?;
         tx.commit()?;
-        Ok(id)
+        Ok(ReservedOutput {
+            generation_id: id,
+            part_path: path.with_extension("pdf.part"),
+            final_path: path,
+        })
     }
 
     pub fn publish<G: SourceGuard>(
@@ -844,6 +871,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn epub_cache_reserved_output_token_matches_recorded_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        let output = db.reserve_output(&source).unwrap();
+        let recorded: String = db
+            .conn
+            .query_row(
+                "SELECT pdf_file FROM generation_ids WHERE generation_id=?1",
+                [output.generation_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let recorded = PathBuf::from(recorded);
+        let expected_part = recorded.with_extension("pdf.part");
+        assert_eq!(output.final_path(), recorded.as_path());
+        assert_eq!(output.part_path(), expected_part.as_path());
+    }
+
     struct FakeGuard(SourceState);
     impl SourceGuard for FakeGuard {
         fn state(&self) -> io::Result<SourceState> {
@@ -852,7 +899,7 @@ mod tests {
     }
 
     fn candidate(db: &mut EpubCache, root: &Path, src: &Path, state: SourceState) -> GenerationRow {
-        let id = db.reserve_generation_id(src).unwrap();
+        let id = db.reserve_output(src).unwrap().generation_id();
         let pdf = generation_file(root, src, id);
         fs::create_dir_all(pdf.parent().unwrap()).unwrap();
         fs::write(&pdf, b"%PDF-1.4\n").unwrap();
@@ -1028,7 +1075,7 @@ mod tests {
         assert!(retired(&db, a.generation_id));
         db.conn.execute("DELETE FROM generations", []).unwrap();
         db.conn.execute("DELETE FROM generation_ids", []).unwrap();
-        assert!(db.reserve_generation_id(&src).unwrap() > a.generation_id);
+        assert!(db.reserve_output(&src).unwrap().generation_id() > a.generation_id);
     }
 
     #[test]
@@ -1141,7 +1188,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = EpubCache::open_at(tmp.path()).unwrap();
         let src = tmp.path().join("book.epub");
-        let id = db.reserve_generation_id(&src).unwrap();
+        let id = db.reserve_output(&src).unwrap().generation_id();
         let final_file = generation_file(tmp.path(), &src, id);
         let nested = final_file.parent().unwrap();
         fs::create_dir_all(nested).unwrap();
@@ -1203,7 +1250,7 @@ mod tests {
         let mut db = EpubCache::open_at(tmp.path()).unwrap();
         let published = candidate(&mut db, tmp.path(), &src, state(1));
         db.publish(&published, &FakeGuard(state(1))).unwrap();
-        let pending = db.reserve_generation_id(&src).unwrap();
+        let pending = db.reserve_output(&src).unwrap().generation_id();
         assert!(pending > published.generation_id);
         drop(db);
         assert!(matches!(
@@ -1218,7 +1265,7 @@ mod tests {
         assert_eq!(count, 0);
         assert!(db.generation(published.generation_id).unwrap().is_some());
         assert!(published.pdf_file.exists());
-        assert!(db.reserve_generation_id(&src).unwrap() > pending);
+        assert!(db.reserve_output(&src).unwrap().generation_id() > pending);
     }
 
     #[cfg(windows)]
@@ -1240,7 +1287,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = EpubCache::open_at(tmp.path()).unwrap();
         let src = tmp.path().join("book.epub");
-        let id = db.reserve_generation_id(&src).unwrap();
+        let id = db.reserve_output(&src).unwrap().generation_id();
         let path = generation_file(tmp.path(), &src, id);
         let outside = tmp.path().join("outside");
         fs::create_dir(&outside).unwrap();
@@ -1274,7 +1321,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = EpubCache::open_at(tmp.path()).unwrap();
         let src = tmp.path().join("book.epub");
-        let id = db.reserve_generation_id(&src).unwrap();
+        let id = db.reserve_output(&src).unwrap().generation_id();
         let path = generation_file(tmp.path(), &src, id);
         let root = tmp.path().join("epub_cache");
         let inside = root.join("real");

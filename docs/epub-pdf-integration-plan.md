@@ -602,3 +602,8 @@ EPUB は新しい待ち手を返す前に同期登録する。未固定 EPUB の
 固定表の mutex はメモリ検索・挿入だけを保護し、元ファイル stat・DB 照合中は保持しない。`ResolvedReadPath` を要求エンコーダの必須型とし、
 pool 投入では `PdfPoolRequest` がエンコード済み要求と解決済みパスを対にして解決漏れをコンパイル時に防ぐ。
 通常 PDF の無 stat 判定は純粋な拡張子分類で検証する。
+独立レビューの P2 追補: 変換 PDF の物理検証は `EpubCache::reserve_output` が予約を確定したときだけ発行する
+`ReservedOutput` token を要求する。token は非公開フィールドに世代 ID・世代 PDF パス・予約済み `.part` パスを持ち、
+変換ランナー、`ConvertedPdfVerifier`、`pdf_loader::verify_converted_pdf` の順にそのまま渡す。
+裸の `Path` を物理例外として PDF pool に投入できない。通常 PDF の解決は EPUB 側の I/O 分岐を注入したテストでも
+呼出し 0 回を確認する。

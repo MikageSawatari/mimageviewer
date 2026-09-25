@@ -65,8 +65,8 @@ impl ResolvedReadPath {
         Self(path)
     }
 
-    fn physical_converter_output(path: &Path) -> Self {
-        Self(path.to_owned())
+    fn physical_converter_output(output: &epub_cache::ReservedOutput) -> Self {
+        Self(output.part_path().to_owned())
     }
 
     pub fn as_path(&self) -> &Path {
@@ -205,16 +205,27 @@ fn read_target_without_io(logical: &Path) -> Option<Result<ReadTarget, PdfReadEr
 /// EPUB resolution can stat the source and access SQLite; call that branch only
 /// from a background thread. The PDF passthrough branch performs no I/O.
 pub fn resolve_read_target(logical: &Path) -> Result<ReadTarget, PdfReadError> {
-    if classify_read_path(logical) == ReadPathClass::Passthrough {
-        return Ok(passthrough_read_target(logical));
+    resolve_read_target_with(logical, |logical| {
+        let gate = EPUB_GATE
+            .get()
+            .ok_or_else(|| PdfReadError::EpubUnavailable {
+                reason: "startup gate has not run".into(),
+            })?;
+        ensure_epub_gate(gate)?;
+        resolve_epub_at(logical, &crate::data_dir::get(), epub_pinned())
+    })
+}
+
+/// All source stat and database work belongs in `resolve_epub`; the PDF branch
+/// returns before calling it.
+fn resolve_read_target_with(
+    logical: &Path,
+    resolve_epub: impl FnOnce(&Path) -> Result<ReadTarget, PdfReadError>,
+) -> Result<ReadTarget, PdfReadError> {
+    match classify_read_path(logical) {
+        ReadPathClass::Passthrough => Ok(passthrough_read_target(logical)),
+        ReadPathClass::Epub => resolve_epub(logical),
     }
-    let gate = EPUB_GATE
-        .get()
-        .ok_or_else(|| PdfReadError::EpubUnavailable {
-            reason: "startup gate has not run".into(),
-        })?;
-    ensure_epub_gate(gate)?;
-    resolve_epub_at(logical, &crate::data_dir::get(), epub_pinned())
 }
 
 fn ensure_epub_gate(gate: &GateOutcome) -> Result<(), PdfReadError> {
@@ -4314,12 +4325,13 @@ pub fn enumerate_pages_with_options(
 }
 
 /// Blocks on the PDF worker pool. Call from a converter/background thread only.
-/// `path` is the physical `.part` and deliberately bypasses EPUB resolution.
+/// The reservation identifies the physical `.part` and deliberately bypasses
+/// logical EPUB resolution. A bare path cannot enter this API.
 pub fn verify_converted_pdf(
-    path: &Path,
+    output: &epub_cache::ReservedOutput,
     expected_pages: usize,
 ) -> Result<(), crate::epub_convert::EpubConvertError> {
-    verify_converted_pdf_with_cancel(path, expected_pages, None)
+    verify_converted_pdf_with_cancel(output, expected_pages, None)
 }
 
 fn display_enumerated_pages(result: &mut PdfEnumerateResult, target: &ReadTarget) {
@@ -4345,11 +4357,11 @@ fn enumerate_worker_options(target: &ReadTarget, requested: EnumerateOptions) ->
 }
 
 pub(crate) fn verify_converted_pdf_with_cancel(
-    path: &Path,
+    output: &epub_cache::ReservedOutput,
     expected_pages: usize,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(), crate::epub_convert::EpubConvertError> {
-    let read_path = ResolvedReadPath::physical_converter_output(path);
+    let read_path = ResolvedReadPath::physical_converter_output(output);
     let request = encode_enumerate_request(&read_path, None, EnumerateOptions::default());
     let response = get_pool()
         .execute(
@@ -5386,7 +5398,7 @@ mod tests {
 
     fn publish_test_generation(db: &mut EpubCache, root: &Path, source: &Path) -> GenerationRow {
         let state = epub_cache::source_state(&fs::metadata(source).unwrap());
-        let id = db.reserve_generation_id(source).unwrap();
+        let id = db.reserve_output(source).unwrap().generation_id();
         let pdf = epub_cache::generation_file(root, source, id);
         fs::create_dir_all(pdf.parent().unwrap()).unwrap();
         fs::write(&pdf, b"%PDF-1.4\n").unwrap();
@@ -5413,6 +5425,7 @@ mod tests {
 
     #[test]
     fn pdf_resolver_classification_and_passthrough_are_pure() {
+        let epub_io_calls = std::cell::Cell::new(0);
         let pdf = Path::new("book.pdf");
         assert_eq!(classify_read_path(pdf), ReadPathClass::Passthrough);
         assert_eq!(
@@ -5432,6 +5445,31 @@ mod tests {
                 size: None
             }
         );
+        let resolved = resolve_read_target_with(pdf, |_| {
+            epub_io_calls.set(epub_io_calls.get() + 1);
+            Err(PdfReadError::NotConverted)
+        })
+        .unwrap();
+        assert_eq!(resolved, target);
+        assert_eq!(epub_io_calls.get(), 0);
+        assert!(matches!(
+            resolve_read_target_with(Path::new("book.epub"), |_| {
+                epub_io_calls.set(epub_io_calls.get() + 1);
+                Err(PdfReadError::NotConverted)
+            }),
+            Err(PdfReadError::NotConverted)
+        ));
+        assert_eq!(epub_io_calls.get(), 1);
+    }
+
+    #[test]
+    fn converted_pdf_verifier_only_accepts_reserved_output_type() {
+        let _verify: fn(
+            &epub_cache::ReservedOutput,
+            usize,
+        ) -> Result<(), crate::epub_convert::EpubConvertError> = verify_converted_pdf;
+        let _physical: fn(&epub_cache::ReservedOutput) -> ResolvedReadPath =
+            ResolvedReadPath::physical_converter_output;
     }
 
     #[test]

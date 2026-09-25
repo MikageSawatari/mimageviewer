@@ -8,6 +8,7 @@ S2b は `pdf_loader` の読み取り経路だけを用意する段階で、一�
 PDFium の open admission・worker 文書キャッシュ・列挙合流にはその実ファイルのパスを渡す。
 表示や perf のキーは論理パスのままにする。通常 PDF の解決はパスをそのまま返し、stat を追加しない。
 IPC の要求生成には `ResolvedReadPath` を必須にし、PDF pool へは要求 bytes と解決済みパスを `PdfPoolRequest` で対にして渡す。
+変換 PDF の物理 `.part` 検証だけは例外で、キャッシュの世代予約時に発行した `ReservedOutput` token を必須にする。
 非同期列挙では通常 PDF と固定表にある EPUB の待ち手を呼出元で直ちに登録する。
 新しいハンドルを受け取ってから旧ハンドルを破棄しても同じ実行要求に合流できる。
 未固定の EPUB だけは元ファイル stat と DB 照合を背景スレッドで済ませてから登録する。
