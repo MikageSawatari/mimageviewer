@@ -693,6 +693,23 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["静止画", "プレビュー", "サムネイル列", "常に表示"]
     ),
     entry!(
+        "spread/seek-preview-size",
+        SpreadMode,
+        "シーク位置プレビューの大きさ",
+        [
+            "静止画",
+            "シーク",
+            "サムネイル",
+            "最小",
+            "小",
+            "中",
+            "大",
+            "最大",
+            "px",
+            "個別"
+        ]
+    ),
+    entry!(
         "spread/seek-bar-with-strip",
         SpreadMode,
         "サムネイル列表示中の通常シークバー",
@@ -962,6 +979,23 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         Video,
         "シークストリップの高さ",
         ["動画", "最大", "px", "カスタマイズ", "seek"]
+    ),
+    entry!(
+        "video/seek-preview-size",
+        Video,
+        "シーク位置プレビューの大きさ",
+        [
+            "動画",
+            "シーク",
+            "サムネイル",
+            "最小",
+            "小",
+            "中",
+            "大",
+            "最大",
+            "px",
+            "個別"
+        ]
     ),
     entry!(
         "video/seek-strip-cycle",

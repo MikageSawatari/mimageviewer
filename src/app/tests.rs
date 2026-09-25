@@ -82736,6 +82736,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
                 maximum: 240,
                 ..Default::default()
             },
+            seek_preview_size: crate::settings::VideoSeekPreviewSize::Large,
+            seek_preview_size_values: crate::settings::VideoSeekPreviewSizeValues::default(),
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Hide,
         };
@@ -82829,6 +82831,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
             seek_strip_height_values:
                 crate::video::seek_strip_layout::SeekStripHeightValues::default(),
+            seek_preview_size: crate::settings::VideoSeekPreviewSize::default(),
+            seek_preview_size_values: crate::settings::VideoSeekPreviewSizeValues::default(),
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::default(),
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::default(),
         };

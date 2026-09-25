@@ -1,6 +1,193 @@
 use super::*;
 use crate::rotation_db::Rotation;
 
+// The pre-1.249 single/spread formula, expressed with already rotated texture sizes.
+fn old_still_seek_preview_layout_oracle(
+    full_rect: egui::Rect,
+    panel_top: f32,
+    pointer_x: f32,
+    page_sizes: &[Option<egui::Vec2>],
+) -> StillSeekPreviewLayout {
+    let pane_count = page_sizes.len().max(1);
+    let per_pane_max_width = (STILL_SEEK_PREVIEW_MAX_WIDTH
+        - STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32)
+        / pane_count as f32;
+    let pane_size = page_sizes
+        .iter()
+        .filter_map(|page| *page)
+        .map(|page_size| {
+            let scale = (per_pane_max_width / page_size.x.max(1.0))
+                .min(STILL_SEEK_PREVIEW_MAX_HEIGHT / page_size.y.max(1.0));
+            page_size * scale
+        })
+        .fold(egui::Vec2::ZERO, |acc, page_size| {
+            egui::vec2(acc.x.max(page_size.x), acc.y.max(page_size.y))
+        });
+    let pane_size = if pane_size == egui::Vec2::ZERO {
+        egui::vec2(160.0_f32.min(per_pane_max_width), 100.0)
+    } else {
+        pane_size
+    };
+    let desired_image_size = egui::vec2(
+        pane_size.x * pane_count as f32 + STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32,
+        pane_size.y,
+    );
+    let bubble_size = desired_image_size + egui::vec2(12.0, 34.0);
+    let min_left = full_rect.left() + 8.0;
+    let max_left = (full_rect.right() - bubble_size.x - 8.0).max(min_left);
+    let left = (pointer_x - bubble_size.x * 0.5).clamp(min_left, max_left);
+    let bubble_rect = egui::Rect::from_min_size(
+        egui::pos2(left, panel_top - 10.0 - bubble_size.y),
+        bubble_size,
+    );
+    let image_bounds = egui::Rect::from_min_max(
+        bubble_rect.min + egui::vec2(6.0, 6.0),
+        egui::pos2(bubble_rect.right() - 6.0, bubble_rect.bottom() - 24.0),
+    );
+    let pane_width = (image_bounds.width() - STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32)
+        / pane_count as f32;
+    StillSeekPreviewLayout {
+        bubble_rect,
+        image_bounds,
+        pane_width,
+    }
+}
+
+#[test]
+fn default_seek_preview_matches_old_single_spread_and_rotated_layout_when_it_fits() {
+    use crate::settings::{StillSeekPreviewSize, StillSeekPreviewSizeValues};
+
+    let rotated = rotated_display_size(egui::vec2(120.0, 80.0), Rotation::Cw90);
+    let page_sets = [
+        vec![Some(egui::vec2(120.0, 80.0))],
+        vec![Some(rotated)],
+        vec![Some(rotated), Some(egui::vec2(120.0, 80.0))],
+        vec![None, Some(rotated)],
+    ];
+    let mut compared = 0;
+    for origin in [egui::Pos2::ZERO, egui::pos2(40.0, 25.0)] {
+        for width in [280.0, 420.0, 800.0, 1600.0] {
+            for height in [240.0, 400.0, 900.0] {
+                let full = egui::Rect::from_min_size(origin, egui::vec2(width, height));
+                for clearance in [64.0_f32, 140.0, 300.0] {
+                    let panel_top = full.bottom() - clearance.min(height - 20.0);
+                    let allowed = egui::Rect::from_min_max(
+                        egui::pos2(full.left() + 8.0, full.top() + TOP_BAR_HEIGHT + 8.0),
+                        egui::pos2(full.right() - 8.0, panel_top - 10.0),
+                    );
+                    for pages in &page_sets {
+                        for x in [full.left(), full.center().x, full.right()] {
+                            let old =
+                                old_still_seek_preview_layout_oracle(full, panel_top, x, pages);
+                            let new = still_seek_preview_layout(
+                                full,
+                                panel_top,
+                                x,
+                                pages,
+                                StillSeekPreviewSize::Large,
+                                StillSeekPreviewSizeValues::default(),
+                            );
+                            if allowed.contains_rect(old.bubble_rect) {
+                                let new = new.expect("old popup fits");
+                                assert_eq!(new.bubble_rect, old.bubble_rect);
+                                assert_eq!(new.image_bounds, old.image_bounds);
+                                assert_eq!(new.pane_width, old.pane_width);
+                                compared += 1;
+                            } else if let Some(new) = new {
+                                assert!(allowed.contains_rect(new.bubble_rect));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(compared > 100);
+}
+
+#[test]
+fn seek_preview_steps_preserve_legacy_single_and_spread_sizes_after_rotation() {
+    use crate::settings::{StillSeekPreviewSize, StillSeekPreviewSizeValues};
+
+    let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+    let portrait = egui::vec2(80.0, 120.0);
+    let rotated = rotated_display_size(egui::vec2(120.0, 80.0), Rotation::Cw90);
+    assert_eq!(rotated, portrait);
+    let values = StillSeekPreviewSizeValues::default();
+    for step in StillSeekPreviewSize::ALL {
+        let scale = values.points(step) / 180.0;
+        let single =
+            still_seek_preview_layout(full, 900.0, 800.0, &[Some(rotated)], step, values).unwrap();
+        assert!((single.image_bounds.width() - 120.0 * scale).abs() < 0.001);
+        assert!((single.pane_width - 120.0 * scale).abs() < 0.001);
+        assert!((single.image_bounds.height() - (180.0 * scale + 4.0)).abs() < 0.001);
+
+        let spread = still_seek_preview_layout(
+            full,
+            900.0,
+            800.0,
+            &[Some(portrait), Some(rotated)],
+            step,
+            values,
+        )
+        .unwrap();
+        assert!((spread.image_bounds.width() - 240.0 * scale).abs() < 0.001);
+        assert!(
+            (spread.pane_width * 2.0 + STILL_SEEK_PREVIEW_PANE_GAP - spread.image_bounds.width())
+                .abs()
+                < 0.001
+        );
+    }
+    let mut custom = values;
+    custom.large = 270;
+    let enlarged = still_seek_preview_layout(
+        full,
+        900.0,
+        800.0,
+        &[Some(rotated)],
+        StillSeekPreviewSize::Large,
+        custom,
+    )
+    .unwrap();
+    assert_eq!(enlarged.pane_width, 180.0);
+}
+
+#[test]
+fn seek_preview_narrow_layout_fits_screen_above_strip_with_aspect_preserved() {
+    use crate::settings::{StillSeekPreviewSize, StillSeekPreviewSizeValues};
+
+    let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 320.0));
+    let panel_top = 280.0;
+    for step in StillSeekPreviewSize::ALL {
+        for pages in [
+            vec![Some(egui::vec2(120.0, 80.0))],
+            vec![Some(egui::vec2(80.0, 120.0)), Some(egui::vec2(120.0, 80.0))],
+        ] {
+            let layout = still_seek_preview_layout(
+                full,
+                panel_top,
+                0.0,
+                &pages,
+                step,
+                StillSeekPreviewSizeValues::default(),
+            )
+            .unwrap();
+            assert!(layout.bubble_rect.left() >= full.left() + 8.0);
+            assert!(layout.bubble_rect.right() <= full.right() - 8.0);
+            assert!(layout.bubble_rect.top() >= full.top() + TOP_BAR_HEIGHT + 8.0);
+            assert!(layout.bubble_rect.bottom() + 10.0 <= panel_top);
+            for page in pages.iter().flatten() {
+                let pane = egui::Rect::from_min_size(
+                    layout.image_bounds.min,
+                    egui::vec2(layout.pane_width, layout.image_bounds.height()),
+                );
+                let fitted = fit_texture_rect(*page, pane);
+                assert!((fitted.aspect_ratio() - page.x / page.y).abs() < 0.001);
+            }
+        }
+    }
+}
+
 fn page_texture(ctx: &egui::Context, idx: usize, rotation: Rotation) -> egui::TextureHandle {
     // All displayed pages are portrait, but the raw landscape pixels for 90/270
     // make both the orientation and bubble-size regressions observable.

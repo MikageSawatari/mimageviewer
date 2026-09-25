@@ -5113,6 +5113,87 @@ struct StillSeekPreviewPage {
     rotation: crate::rotation_db::Rotation,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct StillSeekPreviewLayout {
+    bubble_rect: egui::Rect,
+    image_bounds: egui::Rect,
+    pane_width: f32,
+}
+
+fn still_seek_preview_layout(
+    full_rect: egui::Rect,
+    panel_top: f32,
+    pointer_x: f32,
+    page_sizes: &[Option<egui::Vec2>],
+    size: crate::settings::StillSeekPreviewSize,
+    values: crate::settings::StillSeekPreviewSizeValues,
+) -> Option<StillSeekPreviewLayout> {
+    let pane_count = page_sizes.len().max(1);
+    let gap_count = (pane_count - 1) as f32;
+    // 180pt is the legacy image-box height; the 240pt width limit follows it proportionally.
+    let scale = values.points(size) / STILL_SEEK_PREVIEW_MAX_HEIGHT;
+    let per_pane_max_width = (STILL_SEEK_PREVIEW_MAX_WIDTH * scale
+        - STILL_SEEK_PREVIEW_PANE_GAP * gap_count)
+        / pane_count as f32;
+    let pane_size = page_sizes
+        .iter()
+        .filter_map(|page| *page)
+        .map(|page_size| {
+            let fit = (per_pane_max_width / page_size.x.max(1.0))
+                .min(STILL_SEEK_PREVIEW_MAX_HEIGHT * scale / page_size.y.max(1.0));
+            page_size * fit
+        })
+        .fold(egui::Vec2::ZERO, |acc, page_size| {
+            egui::vec2(acc.x.max(page_size.x), acc.y.max(page_size.y))
+        });
+    let pane_size = if pane_size == egui::Vec2::ZERO {
+        egui::vec2((160.0 * scale).min(per_pane_max_width), 100.0 * scale)
+    } else {
+        pane_size
+    };
+    // The bubble has 6pt image padding on each side, 34pt of label/padding below the image,
+    // and 8pt screen margins. The top HUD can be visible at the same time as the seek row.
+    let max_image_width = full_rect.width() - 28.0;
+    let max_image_height = panel_top - 10.0 - (full_rect.top() + TOP_BAR_HEIGHT + 8.0) - 34.0;
+    let max_pane_width =
+        (max_image_width - STILL_SEEK_PREVIEW_PANE_GAP * gap_count) / pane_count as f32;
+    if max_pane_width <= 0.0 || max_image_height <= 0.0 {
+        return None;
+    }
+    let fit = (max_pane_width / pane_size.x)
+        .min(max_image_height / pane_size.y)
+        .min(1.0);
+    let pane_size = pane_size * fit;
+    let image_size = egui::vec2(
+        pane_size.x * pane_count as f32 + STILL_SEEK_PREVIEW_PANE_GAP * gap_count,
+        pane_size.y,
+    );
+    let bubble_size = image_size + egui::vec2(12.0, 34.0);
+    if bubble_size.x < 24.0 {
+        return None;
+    }
+    let min_left = full_rect.left() + 8.0;
+    let left =
+        (pointer_x - bubble_size.x * 0.5).clamp(min_left, full_rect.right() - bubble_size.x - 8.0);
+    let bubble_rect = egui::Rect::from_min_size(
+        egui::pos2(left, panel_top - 10.0 - bubble_size.y),
+        bubble_size,
+    );
+    let image_bounds = egui::Rect::from_min_max(
+        bubble_rect.min + egui::vec2(6.0, 6.0),
+        egui::pos2(bubble_rect.right() - 6.0, bubble_rect.bottom() - 24.0),
+    );
+    // Match the former pane geometry after the bubble rect has been positioned; deriving
+    // this from the final bounds also avoids a floating-point shift at the default size.
+    let pane_width =
+        (image_bounds.width() - STILL_SEEK_PREVIEW_PANE_GAP * gap_count) / pane_count as f32;
+    Some(StillSeekPreviewLayout {
+        bubble_rect,
+        image_bounds,
+        pane_width,
+    })
+}
+
 enum StillSeekSpreadPreparation {
     Single,
     Ready(Arc<Vec<SpreadDisplayUnit>>),
@@ -5144,44 +5225,22 @@ fn paint_still_seek_preview(
     pointer_x: f32,
     textures: &[Option<StillSeekPreviewPage>],
     label: &str,
+    size: crate::settings::StillSeekPreviewSize,
+    values: crate::settings::StillSeekPreviewSizeValues,
 ) {
-    let pane_count = textures.len().max(1);
-    // 1 枚あたりの幅は、全体が最大幅に収まるように分け合う。見開きでも吹き出しが
-    // 横に伸びて画面からはみ出さないようにする。
-    let per_pane_max_width = (STILL_SEEK_PREVIEW_MAX_WIDTH
-        - STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32)
-        / pane_count as f32;
-    let pane_size = textures
+    let page_sizes: Vec<_> = textures
         .iter()
-        .filter_map(|tex| tex.as_ref())
         .map(|page| {
-            let size = rotated_display_size(page.texture.size_vec2(), page.rotation);
-            let scale = (per_pane_max_width / size.x.max(1.0))
-                .min(STILL_SEEK_PREVIEW_MAX_HEIGHT / size.y.max(1.0));
-            size * scale
+            page.as_ref()
+                .map(|page| rotated_display_size(page.texture.size_vec2(), page.rotation))
         })
-        .fold(egui::Vec2::ZERO, |acc, size| {
-            egui::vec2(acc.x.max(size.x), acc.y.max(size.y))
-        });
-    let pane_size = if pane_size == egui::Vec2::ZERO {
-        // まだ 1 枚も読めていないときの見た目。読み込み後に伸縮しすぎないよう、
-        // 1 枚版の従来サイズを枚数ぶん並べた大きさにする。
-        egui::vec2(160.0_f32.min(per_pane_max_width), 100.0)
-    } else {
-        pane_size
+        .collect();
+    let Some(layout) =
+        still_seek_preview_layout(full_rect, panel_top, pointer_x, &page_sizes, size, values)
+    else {
+        return;
     };
-    let desired_image_size = egui::vec2(
-        pane_size.x * pane_count as f32 + STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32,
-        pane_size.y,
-    );
-    let bubble_size = desired_image_size + egui::vec2(12.0, 34.0);
-    let min_left = full_rect.left() + 8.0;
-    let max_left = (full_rect.right() - bubble_size.x - 8.0).max(min_left);
-    let left = (pointer_x - bubble_size.x * 0.5).clamp(min_left, max_left);
-    let bubble_rect = egui::Rect::from_min_size(
-        egui::pos2(left, panel_top - 10.0 - bubble_size.y),
-        bubble_size,
-    );
+    let bubble_rect = layout.bubble_rect;
     let background = egui::Color32::from_rgba_unmultiplied(12, 14, 18, 244);
     painter.rect_filled(bubble_rect, 6.0, background);
     painter.rect_stroke(
@@ -5200,12 +5259,8 @@ fn paint_still_seek_preview(
         background,
         egui::Stroke::NONE,
     ));
-    let image_bounds = egui::Rect::from_min_max(
-        bubble_rect.min + egui::vec2(6.0, 6.0),
-        egui::pos2(bubble_rect.right() - 6.0, bubble_rect.bottom() - 24.0),
-    );
-    let pane_width = (image_bounds.width() - STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32)
-        / pane_count as f32;
+    let image_bounds = layout.image_bounds;
+    let pane_width = layout.pane_width;
     for (pane, texture) in textures.iter().enumerate() {
         let left = image_bounds.left() + (pane_width + STILL_SEEK_PREVIEW_PANE_GAP) * pane as f32;
         let pane_bounds = egui::Rect::from_min_size(
@@ -5244,7 +5299,7 @@ fn paint_still_seek_preview(
             egui::Color32::from_gray(170),
         );
     }
-    painter.text(
+    painter.with_clip_rect(bubble_rect).text(
         egui::pos2(bubble_rect.center().x, bubble_rect.bottom() - 12.0),
         egui::Align2::CENTER_CENTER,
         label,
@@ -16134,6 +16189,8 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         full_rect.center().x + 40.0,
         &[None, None],
         "20-21 / 128",
+        crate::settings::StillSeekPreviewSize::Large,
+        crate::settings::StillSeekPreviewSizeValues::default(),
     );
 }
 
@@ -21490,6 +21547,8 @@ impl App {
                 preview_pointer_x.unwrap_or(full_rect.center().x),
                 &textures,
                 &label,
+                self.settings.still_seek_preview_size,
+                self.settings.still_seek_preview_size_values,
             );
         }
         if !primary_down && self.fs_seek_drag_active {

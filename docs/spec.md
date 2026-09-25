@@ -1944,6 +1944,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `still_seek_strip_locked` | bool | false | 静止画のサムネイル列を固定表示する。ON は下部ページシークバー固定を含意し、列表示中はバーと列を画像フィット範囲から除外する。列を閉じると OFF になる |
 | `still_seek_strip_visible` | bool | false | 静止画ページシークバーの source page サムネイル列を表示する |
 | `still_seek_strip_height` | enum | `large` | 静止画サムネイル列の高さ。`large` 104pt / `medium` 72pt / `small` 48pt / `smallest` 36pt |
+| `still_seek_preview_size` | enum | `large` | 静止画シーク位置プレビューの大きさ。`smallest` / `small` / `medium` / `large` / `maximum`。列の高さ・表示方針とは独立 |
+| `still_seek_preview_size_values` | object | 最小 90 / 小 117 / 中 144 / 大 180 / 最大 360 | 各段階の画像枠の高さ (px 相当)。大 180 が従来値で、幅の上限は高さ × 240/180。保存値は保持し描画時だけ 45〜540 に制限 |
 | `still_seek_hover_preview_mode` | enum | `always` | 静止画シークの hover preview。`always` / `hide_with_thumbnail_strip` / `never` |
 | `still_seek_bar_with_strip` | enum | `show` | 静止画サムネイル列表示中の通常シークバー。`show` / `hide` |
 | `fullscreen_top_bar_locked` | bool | false | 静止画フルスクリーンの上部情報バーを固定表示する。ON のときは上端のバー領域を画像フィット範囲から除外する |
@@ -2011,6 +2013,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `video_seek_bar_locked` | bool | false | 動画の下部シークバーを固定表示する。ON のときは下端のバー領域と共通余白を映像フィット範囲から除外する。上部・静止画設定とは独立 |
 | `video_seek_strip_span` | enum | `window` | シークストリップが動画のどこを写すか。`window` = 再生位置の周辺、`whole` = 動画全体を帯の横幅へ収める。表示内容 (場面 / 波形) と直交し、行き来しても保つ |
 | `video_seek_strip_height` | enum | `large` | シークストリップの高さ。`large` 104pt / `medium` 72pt / `small` 48pt / `smallest` 36pt。低いほど全体表示で一度に並ぶ枚数が増える |
+| `video_seek_preview_size` | enum | `large` | 動画シーク位置プレビューの大きさ。`smallest` / `small` / `medium` / `large` / `maximum`。静止画・列の高さ・表示方針とは独立 |
+| `video_seek_preview_size_values` | object | 最小 176 / 小 229 / 中 282 / 大 352 / 最大 704 | 各段階のプレビュー画像幅の上限 (px 相当)。大 352 が従来の 300〜352pt 規則の上限で、下限も選択値 / 352 に比例。保存値は保持し描画時だけ 88〜1056 に制限 |
 | `video_seek_strip_cycle` | object | 4 つとも true | `Shift+S` の巡回に含める表示 (`thumbnails_window` / `thumbnails_whole` / `waveform_window` / `waveform_whole`)。機能の非表示ではなく、外した表示も右下メニューから選べる。全解除は読み込み時に `thumbnails_window` だけ有効へ正規化する |
 | `video_seek_strip_locked` | bool | false | 動画のシークストリップを固定表示する。ON は下部シークバー固定と `video_seek_strip_state` の表示状態 (なしなら `video_seek_strip_last_choice` から復元) を含意し、ストリップ表示中だけその高さを映像フィット範囲から除外する。利用者が自分でストリップを閉じると OFF になる |
 | `video_seek_hover_preview_mode` | enum | `always` | 動画シークの hover preview。`always` / `hide_with_thumbnail_strip` / `never`。波形表示は thumbnail strip と数えない |

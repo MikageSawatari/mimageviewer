@@ -328,6 +328,11 @@ idle frame で本全体を再走査しない。本体側の見開き解決規則
 `rotated_display_size` で 90° / 270° の縦横を入れ替えてから決め、描画は本体・列と共通の
 `draw_rotated_image` を使う。見開きも画面上の左右順を保ち、2 枚それぞれの回転と寸法を使う。
 テクスチャまたは回転が未取得のプレビュー枠は「読み込み中…」とする。
+`still_seek_preview_size` と `still_seek_preview_size_values` は吹き出しの表示寸法だけを変え、
+既定の最小 90 / 小 117 / 中 144 / 大 180 / 最大 360pt は従来の画像枠高 180pt の
+0.5 / 0.65 / 0.8 / 1 / 2 倍に当たる。画像枠の最大幅は高さ × 240/180 とする。
+既存のサムネイル読み込みと見開きの構成を変えない。上部バー・下部バー・列と画面端の
+間に収まるよう、描画時に縦横同率で縮小する。
 
 回帰は `src/ui_fullscreen/tests/still_seek_rotation.rs`。実 overlay を実行したスレッドの
 RotationDb read-only open / SELECT 回数が増えないこと、未確定セルの停止と worker 完了後の

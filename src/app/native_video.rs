@@ -8642,6 +8642,8 @@ impl App {
             fixed_bar_gap_px: self.settings.fullscreen_fixed_bar_gap_px,
             seek_strip_height: self.settings.video_seek_strip_height,
             seek_strip_height_values: self.settings.video_seek_strip_height_values,
+            seek_preview_size: self.settings.video_seek_preview_size,
+            seek_preview_size_values: self.settings.video_seek_preview_size_values,
             seek_hover_preview_mode: self.settings.video_seek_hover_preview_mode,
             seek_bar_with_strip: self.settings.video_seek_bar_with_strip,
         }

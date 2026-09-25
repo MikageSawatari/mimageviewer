@@ -4770,6 +4770,12 @@ pub struct Settings {
     /// 静止画ページシークストリップの高さプリセット。
     #[serde(default)]
     pub still_seek_strip_height: StillSeekStripHeight,
+    /// 静止画シーク位置プレビューの大きさの段階。列の高さとは独立。
+    #[serde(default)]
+    pub still_seek_preview_size: StillSeekPreviewSize,
+    /// 静止画シーク位置プレビューの段階別高さ。保存値は解決時だけ制限する。
+    #[serde(default)]
+    pub still_seek_preview_size_values: StillSeekPreviewSizeValues,
     /// 静止画ページシークストリップのプリセット別高さ。保存値はそのまま保持し、
     /// 実描画時だけ安全範囲へ制限する。
     #[serde(default)]
@@ -5274,6 +5280,12 @@ pub struct Settings {
     /// ストリップの高さ (最大 / 大 / 中 / 小 / 最小)。
     #[serde(default)]
     pub video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    /// 動画シーク位置プレビューの大きさの段階。列の高さとは独立。
+    #[serde(default)]
+    pub video_seek_preview_size: VideoSeekPreviewSize,
+    /// 動画シーク位置プレビューの段階別最大画像幅。保存値は解決時だけ制限する。
+    #[serde(default)]
+    pub video_seek_preview_size_values: VideoSeekPreviewSizeValues,
     /// 動画・音声シークストリップの段階別高さ。静止画の値とは独立して保存する。
     #[serde(default)]
     pub video_seek_strip_height_values: crate::video::seek_strip_layout::SeekStripHeightValues,
@@ -6162,6 +6174,191 @@ pub enum StillSeekStripHeight {
     Smallest,
 }
 
+pub const STILL_SEEK_PREVIEW_HEIGHT_MIN_POINTS: u32 = 45;
+pub const STILL_SEEK_PREVIEW_HEIGHT_MAX_POINTS: u32 = 540;
+pub const VIDEO_SEEK_PREVIEW_WIDTH_MIN_POINTS: u32 = 88;
+pub const VIDEO_SEEK_PREVIEW_WIDTH_MAX_POINTS: u32 = 1056;
+
+/// 静止画シーク位置プレビューの高さプリセット。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StillSeekPreviewSize {
+    Maximum,
+    #[default]
+    Large,
+    Medium,
+    Small,
+    Smallest,
+}
+
+impl StillSeekPreviewSize {
+    pub const ALL: [Self; 5] = [
+        Self::Maximum,
+        Self::Large,
+        Self::Medium,
+        Self::Small,
+        Self::Smallest,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Maximum => "最大",
+            Self::Large => "大",
+            Self::Medium => "中",
+            Self::Small => "小",
+            Self::Smallest => "最小",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StillSeekPreviewSizeValues {
+    #[serde(default = "default_still_seek_preview_height_smallest")]
+    pub smallest: u32,
+    #[serde(default = "default_still_seek_preview_height_small")]
+    pub small: u32,
+    #[serde(default = "default_still_seek_preview_height_medium")]
+    pub medium: u32,
+    #[serde(default = "default_still_seek_preview_height_large")]
+    pub large: u32,
+    #[serde(default = "default_still_seek_preview_height_maximum")]
+    pub maximum: u32,
+}
+
+const fn default_still_seek_preview_height_smallest() -> u32 {
+    90
+}
+const fn default_still_seek_preview_height_small() -> u32 {
+    117
+}
+const fn default_still_seek_preview_height_medium() -> u32 {
+    144
+}
+const fn default_still_seek_preview_height_large() -> u32 {
+    180
+}
+const fn default_still_seek_preview_height_maximum() -> u32 {
+    360
+}
+
+impl Default for StillSeekPreviewSizeValues {
+    fn default() -> Self {
+        Self {
+            smallest: 90,
+            small: 117,
+            medium: 144,
+            large: 180,
+            maximum: 360,
+        }
+    }
+}
+
+impl StillSeekPreviewSizeValues {
+    pub fn points(self, preset: StillSeekPreviewSize) -> f32 {
+        let stored = match preset {
+            StillSeekPreviewSize::Maximum => self.maximum,
+            StillSeekPreviewSize::Large => self.large,
+            StillSeekPreviewSize::Medium => self.medium,
+            StillSeekPreviewSize::Small => self.small,
+            StillSeekPreviewSize::Smallest => self.smallest,
+        };
+        stored.clamp(
+            STILL_SEEK_PREVIEW_HEIGHT_MIN_POINTS,
+            STILL_SEEK_PREVIEW_HEIGHT_MAX_POINTS,
+        ) as f32
+    }
+}
+
+/// 動画シーク位置プレビューの最大画像幅プリセット。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSeekPreviewSize {
+    Maximum,
+    #[default]
+    Large,
+    Medium,
+    Small,
+    Smallest,
+}
+
+impl VideoSeekPreviewSize {
+    pub const ALL: [Self; 5] = [
+        Self::Maximum,
+        Self::Large,
+        Self::Medium,
+        Self::Small,
+        Self::Smallest,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Maximum => "最大",
+            Self::Large => "大",
+            Self::Medium => "中",
+            Self::Small => "小",
+            Self::Smallest => "最小",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoSeekPreviewSizeValues {
+    #[serde(default = "default_video_seek_preview_width_smallest")]
+    pub smallest: u32,
+    #[serde(default = "default_video_seek_preview_width_small")]
+    pub small: u32,
+    #[serde(default = "default_video_seek_preview_width_medium")]
+    pub medium: u32,
+    #[serde(default = "default_video_seek_preview_width_large")]
+    pub large: u32,
+    #[serde(default = "default_video_seek_preview_width_maximum")]
+    pub maximum: u32,
+}
+
+const fn default_video_seek_preview_width_smallest() -> u32 {
+    176
+}
+const fn default_video_seek_preview_width_small() -> u32 {
+    229
+}
+const fn default_video_seek_preview_width_medium() -> u32 {
+    282
+}
+const fn default_video_seek_preview_width_large() -> u32 {
+    352
+}
+const fn default_video_seek_preview_width_maximum() -> u32 {
+    704
+}
+
+impl Default for VideoSeekPreviewSizeValues {
+    fn default() -> Self {
+        Self {
+            smallest: 176,
+            small: 229,
+            medium: 282,
+            large: 352,
+            maximum: 704,
+        }
+    }
+}
+
+impl VideoSeekPreviewSizeValues {
+    pub fn points(self, preset: VideoSeekPreviewSize) -> f32 {
+        let stored = match preset {
+            VideoSeekPreviewSize::Maximum => self.maximum,
+            VideoSeekPreviewSize::Large => self.large,
+            VideoSeekPreviewSize::Medium => self.medium,
+            VideoSeekPreviewSize::Small => self.small,
+            VideoSeekPreviewSize::Smallest => self.smallest,
+        };
+        stored.clamp(
+            VIDEO_SEEK_PREVIEW_WIDTH_MIN_POINTS,
+            VIDEO_SEEK_PREVIEW_WIDTH_MAX_POINTS,
+        ) as f32
+    }
+}
+
 impl StillSeekStripHeight {
     pub const ALL: [Self; 5] = [
         Self::Maximum,
@@ -6935,6 +7132,8 @@ impl Default for Settings {
             still_seek_strip_locked: false,
             still_seek_strip_visible: default_still_seek_strip_visible(),
             still_seek_strip_height: StillSeekStripHeight::default(),
+            still_seek_preview_size: StillSeekPreviewSize::default(),
+            still_seek_preview_size_values: StillSeekPreviewSizeValues::default(),
             still_seek_strip_height_values: StillSeekStripHeightValues::default(),
             still_seek_hover_preview_mode: default_still_seek_hover_preview_mode(),
             still_seek_bar_with_strip: default_still_seek_bar_with_strip(),
@@ -7098,6 +7297,8 @@ impl Default for Settings {
             video_seek_strip_last_choice: VideoSeekStripMode::default(),
             video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan::default(),
             video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            video_seek_preview_size: VideoSeekPreviewSize::default(),
+            video_seek_preview_size_values: VideoSeekPreviewSizeValues::default(),
             video_seek_strip_height_values:
                 crate::video::seek_strip_layout::SeekStripHeightValues::default(),
             video_seek_strip_cycle: crate::video::seek_strip_layout::SeekStripCycleSet::default(),
@@ -9858,6 +10059,68 @@ mod tests {
         assert_eq!(
             restored.video_seek_bar_with_strip,
             VideoSeekBarWithStrip::Hide
+        );
+    }
+
+    #[test]
+    fn seek_preview_sizes_default_and_round_trip_independently() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.still_seek_preview_size, StillSeekPreviewSize::Large);
+        assert_eq!(missing.video_seek_preview_size, VideoSeekPreviewSize::Large);
+        assert_eq!(
+            missing.still_seek_preview_size_values,
+            StillSeekPreviewSizeValues::default()
+        );
+        assert_eq!(
+            missing.video_seek_preview_size_values,
+            VideoSeekPreviewSizeValues::default()
+        );
+        for still in StillSeekPreviewSize::ALL {
+            for video in VideoSeekPreviewSize::ALL {
+                let mut settings = Settings::default();
+                settings.still_seek_preview_size = still;
+                settings.video_seek_preview_size = video;
+                settings.still_seek_preview_size_values.small = 123;
+                settings.video_seek_preview_size_values.maximum = 800;
+                let stored = serde_json::to_value(&settings).unwrap();
+                let loaded: Settings = serde_json::from_value(stored).unwrap();
+                assert_eq!(loaded.still_seek_preview_size, still);
+                assert_eq!(loaded.video_seek_preview_size, video);
+                assert_eq!(loaded.still_seek_preview_size_values.small, 123);
+                assert_eq!(loaded.video_seek_preview_size_values.maximum, 800);
+            }
+        }
+        let partial: Settings = serde_json::from_str(
+            r#"{"still_seek_preview_size_values":{"small":250},"video_seek_preview_size_values":{"maximum":900}}"#,
+        ).unwrap();
+        assert_eq!(partial.still_seek_preview_size_values.small, 250);
+        assert_eq!(partial.still_seek_preview_size_values.large, 180);
+        assert_eq!(partial.video_seek_preview_size_values.maximum, 900);
+        assert_eq!(partial.video_seek_preview_size_values.large, 352);
+        let mut out_of_range = partial;
+        out_of_range.still_seek_preview_size_values.smallest = 1;
+        out_of_range.video_seek_preview_size_values.maximum = 9999;
+        assert_eq!(
+            out_of_range
+                .still_seek_preview_size_values
+                .points(StillSeekPreviewSize::Smallest),
+            STILL_SEEK_PREVIEW_HEIGHT_MIN_POINTS as f32
+        );
+        assert_eq!(
+            out_of_range
+                .video_seek_preview_size_values
+                .points(VideoSeekPreviewSize::Maximum),
+            VIDEO_SEEK_PREVIEW_WIDTH_MAX_POINTS as f32
+        );
+        assert_eq!(out_of_range.still_seek_preview_size_values.smallest, 1);
+        assert_eq!(out_of_range.video_seek_preview_size_values.maximum, 9999);
+        assert!(
+            serde_json::from_str::<Settings>(r#"{"video_seek_preview_size":"future_size"}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Settings>(r#"{"still_seek_preview_size":"future_size"}"#)
+                .is_err()
         );
     }
 
