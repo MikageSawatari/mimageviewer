@@ -137,6 +137,29 @@ fn normalize_path(path: &str, allow_parent: bool) -> Result<String, EpubError> {
     }
     Ok(stack.join("/"))
 }
+/// `http:`, `data:`, `//host/...` etc. point outside the archive. They are not archive paths:
+/// the parser skips them instead of rejecting the book (the renderer blocks the request).
+fn is_external_href(href: &str) -> bool {
+    let href = href.trim();
+    if href.starts_with("//") {
+        return true;
+    }
+    match href.find(':') {
+        Some(i) => {
+            let scheme = &href[..i];
+            !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                && !href[..i].contains('/')
+        }
+        None => false,
+    }
+}
 fn resolve(base: &str, href: &str) -> Result<String, EpubError> {
     let parent = base.rsplit_once('/').map(|x| x.0).unwrap_or("");
     normalize_path(&format!("{parent}/{href}"), true)
@@ -290,7 +313,11 @@ fn xhtml_info(bytes: &[u8], path: &str) -> Result<XhtmlInfo, EpubError> {
                 if (name == b"img" || name == b"image") && in_body {
                     images += 1;
                     if let Some(src) = attr(&a, "src").or_else(|| attr(&a, "href")) {
-                        image = Some(resolve(path, src)?);
+                        // An external image is not a local page image; the page takes the
+                        // iframe path, where the request is blocked.
+                        if !is_external_href(src) {
+                            image = Some(resolve(path, src)?);
+                        }
                     }
                 }
                 if in_body
@@ -371,17 +398,21 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
                         let href = attr(&a, "href")
                             .ok_or_else(|| invalid("manifest item lacks href"))?
                             .to_string();
-                        manifest.push(ManifestItem {
-                            id,
-                            path: resolve(&opf_path, &href)?,
-                            href,
-                            media_type: attr(&a, "media-type").unwrap_or("").into(),
-                            properties: attr(&a, "properties")
-                                .unwrap_or("")
-                                .split_whitespace()
-                                .map(str::to_string)
-                                .collect(),
-                        });
+                        // EPUB allows remote resources in the manifest; they are not in the
+                        // archive, so they are skipped rather than treated as unsafe paths.
+                        if !is_external_href(&href) {
+                            manifest.push(ManifestItem {
+                                id,
+                                path: resolve(&opf_path, &href)?,
+                                href,
+                                media_type: attr(&a, "media-type").unwrap_or("").into(),
+                                properties: attr(&a, "properties")
+                                    .unwrap_or("")
+                                    .split_whitespace()
+                                    .map(str::to_string)
+                                    .collect(),
+                            });
+                        }
                     }
                     b"spine" => {
                         direction = attr(&a, "page-progression-direction")
@@ -615,6 +646,26 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(p.spine[0].size_source.as_deref(), Some("opf_viewport"));
+    }
+    #[test]
+    fn external_references_do_not_invalidate_the_book() {
+        assert!(is_external_href("http://example.invalid/a.png"));
+        assert!(is_external_href("HTTPS://example.invalid/a.png"));
+        assert!(is_external_href("data:image/png;base64,AAAA"));
+        assert!(is_external_href("//example.invalid/a.png"));
+        assert!(!is_external_href("a.jpg"));
+        assert!(!is_external_href("img/a%3Ab.jpg"));
+        assert!(!is_external_href("../img/a.jpg"));
+        // A page whose only image is remote is not a local direct image, and a remote
+        // manifest item is skipped instead of rejecting the book as an unsafe path.
+        let opf = opf("rtl", "").replace(
+            "</manifest>",
+            r#"<item id="r" href="https://example.invalid/font.woff2" media-type="font/woff2"/></manifest>"#,
+        );
+        let page = br#"<html><head><meta name="viewport" content="width=1200,height=1700"/></head><body><img src="http://example.invalid/remote.png"/></body></html>"#;
+        let p = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", page)])).unwrap();
+        assert_eq!(p.spine.len(), 1);
+        assert_eq!(p.spine[0].direct_image, None);
     }
     #[test]
     fn svg_viewbox() {
