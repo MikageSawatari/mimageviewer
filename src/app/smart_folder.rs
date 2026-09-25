@@ -1022,8 +1022,8 @@ impl SmartPhysicalPreflight {
                     });
                 }
                 match handle.rx.try_recv() {
-                    Ok(Ok(pages)) => SmartPhysicalPoll::Ready(SmartPhysicalReady::PdfPages {
-                        pages,
+                    Ok(Ok(result)) => SmartPhysicalPoll::Ready(SmartPhysicalReady::PdfPages {
+                        pages: result.pages,
                         password,
                         save_password,
                     }),
@@ -1032,7 +1032,7 @@ impl SmartPhysicalPreflight {
                     }
                     Ok(Err(error)) => {
                         let detail = error.to_string();
-                        if detail.contains("Password") || detail.contains("password") {
+                        if matches!(error, crate::pdf_loader::PdfReadError::PasswordRequired) {
                             SmartPhysicalPoll::PasswordRequired {
                                 path,
                                 invalid_password: password.is_some(),

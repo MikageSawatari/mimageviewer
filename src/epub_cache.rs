@@ -116,7 +116,7 @@ impl From<rusqlite::Error> for CacheError {
 }
 
 pub fn src_key(path: &Path) -> String {
-    crate::path_key::normalize(path)
+    crate::path_key::normalize_keep_drive(path)
 }
 
 pub fn generation_file(data_dir: &Path, source: &Path, id: i64) -> PathBuf {
@@ -832,6 +832,17 @@ pub fn startup_gate(data_dir: &Path) -> GateOutcome {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn epub_cache_source_key_distinguishes_drives() {
+        let c = Path::new(r"C:\Books\a.epub");
+        let d = Path::new(r"D:\Books\a.epub");
+        assert_ne!(src_key(c), src_key(d));
+        assert_ne!(
+            generation_file(Path::new("cache"), c, 1),
+            generation_file(Path::new("cache"), d, 1)
+        );
+    }
 
     struct FakeGuard(SourceState);
     impl SourceGuard for FakeGuard {

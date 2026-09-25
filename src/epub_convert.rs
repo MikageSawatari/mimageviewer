@@ -100,7 +100,26 @@ pub type ConvertResult = Result<PublishOutcome, EpubConvertError>;
 
 /// Verifies the finished worker output before it is promoted or published.
 pub trait ConvertedPdfVerifier: Send + Sync {
-    fn verify(&self, path: &Path, pages: usize) -> Result<(), EpubConvertError>;
+    fn verify(
+        &self,
+        path: &Path,
+        pages: usize,
+        cancel: &CancelToken,
+    ) -> Result<(), EpubConvertError>;
+}
+
+/// Production verifier. `verify` blocks on the PDF pool; run it only on a worker thread.
+pub struct PdfiumConvertedPdfVerifier;
+
+impl ConvertedPdfVerifier for PdfiumConvertedPdfVerifier {
+    fn verify(
+        &self,
+        path: &Path,
+        pages: usize,
+        cancel: &CancelToken,
+    ) -> Result<(), EpubConvertError> {
+        crate::pdf_loader::verify_converted_pdf_with_cancel(path, pages, Some(cancel.pool_flag()))
+    }
 }
 
 #[derive(Clone)]
@@ -109,7 +128,7 @@ pub struct CancelToken {
 }
 
 struct CancelInner {
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
     #[cfg(windows)]
     event: std::os::windows::io::OwnedHandle,
 }
@@ -126,7 +145,7 @@ impl CancelToken {
         };
         Ok(Self {
             inner: Arc::new(CancelInner {
-                cancelled: AtomicBool::new(false),
+                cancelled: Arc::new(AtomicBool::new(false)),
                 #[cfg(windows)]
                 event,
             }),
@@ -146,6 +165,10 @@ impl CancelToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn pool_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.inner.cancelled)
     }
 }
 
@@ -314,7 +337,7 @@ pub fn convert_at<S: WorkerSpawner>(
     }
     let result = parsed?;
     let (pages, direction, profile) = validate_result(code, result)?;
-    verifier.verify(&part, pages)?;
+    verifier.verify(&part, pages, cancel)?;
     if cancel.is_cancelled() {
         return Err(EpubConvertError::Cancelled);
     }
@@ -811,7 +834,12 @@ mod tests {
 
     struct TestPdfVerifier;
     impl ConvertedPdfVerifier for TestPdfVerifier {
-        fn verify(&self, path: &Path, pages: usize) -> Result<(), EpubConvertError> {
+        fn verify(
+            &self,
+            path: &Path,
+            pages: usize,
+            _cancel: &CancelToken,
+        ) -> Result<(), EpubConvertError> {
             verify_converted_pdf_stage2a(path, pages)
         }
     }

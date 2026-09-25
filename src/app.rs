@@ -26867,7 +26867,7 @@ impl App {
 
         match result {
             Ok(pages) => {
-                let actual_count = pages.len() as u32;
+                let actual_count = pages.pages.len() as u32;
                 crate::logger::log(format!("  pdf: {actual_count} pages"));
                 self.pdf_current_password = password.clone();
 
@@ -26911,7 +26911,7 @@ impl App {
                         .file_name()
                         .and_then(|n| n.to_str())
                         .map(|s| s.to_string()),
-                    pages.first(),
+                    pages.pages.first(),
                 ) {
                     let page0_mtime = page0.mtime;
                     let page0_size = page0.file_size as i64;
@@ -26960,7 +26960,7 @@ impl App {
 
                 if need_rebuild {
                     let (items, image_metas, existing_keys) =
-                        Self::build_pdf_page_rows(&pdf_path, &pages);
+                        Self::build_pdf_page_rows(&pdf_path, &pages.pages);
 
                     self.start_loading_items(
                         pdf_path.clone(),
@@ -26981,8 +26981,7 @@ impl App {
             }
             Err(e) => {
                 let err_msg = format!("{e}");
-                // パスワードエラーかどうかを判定 (エラーメッセージに "Password" が含まれる)
-                if err_msg.contains("Password") || err_msg.contains("password") {
+                if matches!(e, crate::pdf_loader::PdfReadError::PasswordRequired) {
                     // 誤ったパスワードを DPAPI/セッションキャッシュに保存していた場合は破棄し、
                     // ユーザーに再入力してもらう。DPAPI も破棄しないと、次の load_pdf_as_folder が
                     // また stale を拾って無限ループになる。

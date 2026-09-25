@@ -15,9 +15,6 @@
 //!   │     ├── Worker 0: mimageviewer.exe --pdf-worker
 //!   │     ├── Worker 1: mimageviewer.exe --pdf-worker
 //!   │     └── Worker 2: mimageviewer.exe --pdf-worker
-//!   │
-//!   └── PdfWorker (in-process, フルスクリーン再レンダリング専用)
-//!       async Render を優先 / 通常チャネルで処理
 //! ```
 //!
 //! 通信: stdin/stdout バイナリプロトコル (長さプレフィックス付き)。
@@ -26,11 +23,212 @@
 //! `%APPDATA%/mimageviewer/pdfium.dll` に展開される。
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+
+use crate::epub_cache::{self, EpubCache, GateOutcome};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentStamp {
+    /// `None` means this PDF path has not been statted by the caller yet.
+    File {
+        mtime: Option<std::time::SystemTime>,
+        size: Option<u64>,
+    },
+    Generation {
+        id: i64,
+        pdf_size: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadTarget {
+    pub read_path: PathBuf,
+    pub stamp: DocumentStamp,
+    /// Original EPUB attributes for display, separate from the generation stamp.
+    pub display_source_state: Option<epub_cache::SourceState>,
+    /// Direction recorded for this immutable EPUB generation; PDFs have no value here.
+    pub epub_direction: Option<PdfReadingDirection>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PdfReadError {
+    PasswordRequired,
+    NotConverted,
+    EpubUnavailable { reason: Arc<str> },
+    Other(Arc<std::io::Error>),
+}
+
+impl PdfReadError {
+    pub fn kind(&self) -> std::io::ErrorKind {
+        match self {
+            Self::PasswordRequired => std::io::ErrorKind::PermissionDenied,
+            Self::NotConverted => std::io::ErrorKind::NotFound,
+            Self::EpubUnavailable { .. } => std::io::ErrorKind::NotConnected,
+            Self::Other(error) => error.kind(),
+        }
+    }
+
+    fn into_io(self) -> std::io::Error {
+        let kind = self.kind();
+        std::io::Error::new(kind, self)
+    }
+
+    fn from_io(error: std::io::Error) -> Self {
+        if let Some(typed) = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Self>())
+        {
+            return typed.clone();
+        }
+        if is_password_required_error(&error) {
+            Self::PasswordRequired
+        } else {
+            Self::Other(Arc::new(error))
+        }
+    }
+}
+
+impl fmt::Display for PdfReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PasswordRequired => write!(f, "PDF password required"),
+            Self::NotConverted => write!(f, "EPUB has not been converted"),
+            Self::EpubUnavailable { reason } => write!(f, "EPUB unavailable: {reason}"),
+            Self::Other(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PdfReadError {}
+
+impl From<std::io::Error> for PdfReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::from_io(error)
+    }
+}
+
+static EPUB_GATE: OnceLock<GateOutcome> = OnceLock::new();
+static EPUB_PINNED: OnceLock<Mutex<HashMap<String, ReadTarget>>> = OnceLock::new();
+
+/// Install the startup gate once and retain its liveness lock for the process.
+pub(crate) fn install_epub_gate(gate: GateOutcome) {
+    let _ = EPUB_GATE.set(gate);
+}
+
+fn is_epub(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+}
+
+fn epub_pinned() -> &'static Mutex<HashMap<String, ReadTarget>> {
+    EPUB_PINNED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve only on a background thread. This can stat the source and access SQLite.
+pub fn resolve_read_target(logical: &Path) -> Result<ReadTarget, PdfReadError> {
+    if !is_epub(logical) {
+        return Ok(ReadTarget {
+            read_path: logical.to_owned(),
+            stamp: DocumentStamp::File {
+                mtime: None,
+                size: None,
+            },
+            display_source_state: None,
+            epub_direction: None,
+        });
+    }
+    let gate = EPUB_GATE
+        .get()
+        .ok_or_else(|| PdfReadError::EpubUnavailable {
+            reason: "startup gate has not run".into(),
+        })?;
+    ensure_epub_gate(gate)?;
+    resolve_epub_at(logical, &crate::data_dir::get(), epub_pinned())
+}
+
+fn ensure_epub_gate(gate: &GateOutcome) -> Result<(), PdfReadError> {
+    if let GateOutcome::Disabled(reason) = gate {
+        Err(PdfReadError::EpubUnavailable {
+            reason: format!("{reason:?}").into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn resolve_epub_at(
+    logical: &Path,
+    data_dir: &Path,
+    pinned: &Mutex<HashMap<String, ReadTarget>>,
+) -> Result<ReadTarget, PdfReadError> {
+    let key = epub_cache::src_key(logical);
+    let mut pinned = pinned
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(target) = pinned.get(&key) {
+        return Ok(target.clone());
+    }
+    let source = match std::fs::metadata(logical) {
+        Ok(metadata) => epub_cache::source_state(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PdfReadError::NotConverted);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut db = EpubCache::open_at(data_dir).map_err(|error| {
+        PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
+    })?;
+    let row = db
+        .current_generation(&key)
+        .map_err(|error| {
+            PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
+        })?
+        .ok_or(PdfReadError::NotConverted)?;
+    if row.src_state != source {
+        return Err(PdfReadError::NotConverted);
+    }
+    match std::fs::metadata(&row.pdf_file) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(PdfReadError::NotConverted),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            db.detach_missing(&key, row.generation_id)
+                .map_err(|error| {
+                    PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
+                })?;
+            return Err(PdfReadError::NotConverted);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let target = ReadTarget {
+        read_path: row.pdf_file,
+        stamp: DocumentStamp::Generation {
+            id: row.generation_id,
+            pdf_size: row.pdf_size,
+        },
+        display_source_state: Some(source),
+        epub_direction: parse_epub_direction_name(&row.direction),
+    };
+    pinned.insert(key, target.clone());
+    Ok(target)
+}
+
+/// The caller must be a background worker; PDFs are statted here at consumer demand.
+pub fn pdf_document_stamp(logical: &Path) -> Result<DocumentStamp, PdfReadError> {
+    let target = resolve_read_target(logical)?;
+    if is_epub(logical) {
+        return Ok(target.stamp);
+    }
+    let metadata = std::fs::metadata(logical)?;
+    Ok(DocumentStamp::File {
+        mtime: Some(metadata.modified()?),
+        size: Some(metadata.len()),
+    })
+}
 
 /// PDF レンダ要求の優先度 (3 段階)。
 ///
@@ -575,16 +773,18 @@ fn pdfium_open_error(error: PdfiumError) -> std::io::Error {
 
 /// subprocess IPC 後も失われない marker を正本にし、旧 worker の英語 Display も許容する。
 pub(crate) fn is_password_required_error(error: &std::io::Error) -> bool {
+    if let Some(typed) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<PdfReadError>())
+    {
+        return matches!(typed, PdfReadError::PasswordRequired);
+    }
     let message = error.to_string();
     message.contains(PDF_PASSWORD_REQUIRED_MARKER)
         || message.contains("Password")
         || message.contains("password")
 }
 
-// (旧 `core_render` は `core_render_with_count` (v1.0.0 で page_count も返す)
-//  に置き換えられた。後者は in-process worker 専用で、IPC worker は同じ
-//  document 描画 helper を直前 1 冊キャッシュ経由で呼ぶ。)
-//
 // **lopdf fast-path 検討 (撤回、v1.0.0 開発中)**:
 // `Document::load` は eager に全オブジェクトをパースする実装で、PDFium の lazy
 // 経路 (warm 0.4ms p50) より 200-12000x 遅いことが `examples/bench_pdf_count.rs`
@@ -612,7 +812,7 @@ pub(crate) fn is_password_required_error(error: &std::io::Error) -> bool {
 // レスポンス (worker → main):
 //   [4B msg_len LE][1B status][payload]
 //     Success (0):
-//       Enumerate: [4B page_count][per page: 8B mtime LE + 8B file_size LE]
+//       Enumerate: [4B page_count][per page: 8B mtime LE + 8B file_size LE][1B direction]
 //       Render:    [4B width][4B height][rgba_bytes...]
 //       Render metrics (perf 有効時だけ Render success の次フレーム):
 //         [4B magic PDM1][1B version][1B doc_reused][9 * 8B counters]
@@ -881,10 +1081,17 @@ fn encode_path_and_password(buf: &mut Vec<u8>, path: &Path, password: Option<&st
     buf.extend_from_slice(pw_bytes);
 }
 
-fn encode_enumerate_request(path: &Path, password: Option<&str>) -> Vec<u8> {
+fn encode_enumerate_request(
+    path: &Path,
+    password: Option<&str>,
+    options: EnumerateOptions,
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(MSG_ENUMERATE);
     encode_path_and_password(&mut buf, path, password);
+    if options.want_direction {
+        buf.push(1);
+    }
     buf
 }
 
@@ -1038,8 +1245,22 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
     let payload = &data[1..];
     match msg_type {
         MSG_ENUMERATE => {
-            let (path, password, _) = decode_path_and_password(payload)?;
-            Ok(DecodedRequest::Enumerate { path, password })
+            let (path, password, remaining) = decode_path_and_password(payload)?;
+            let want_direction = match remaining {
+                [] | [0] => false,
+                [1] => true,
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid enumerate direction flag",
+                    ));
+                }
+            };
+            Ok(DecodedRequest::Enumerate {
+                path,
+                password,
+                options: EnumerateOptions { want_direction },
+            })
         }
         MSG_PAGE_SIZES => {
             let (path, password, _) = decode_path_and_password(payload)?;
@@ -1155,6 +1376,7 @@ enum DecodedRequest {
     Enumerate {
         path: PathBuf,
         password: Option<String>,
+        options: EnumerateOptions,
     },
     Render {
         path: PathBuf,
@@ -1185,7 +1407,7 @@ enum DecodedRequest {
 
 fn pdf_document_identity(request: &DecodedRequest) -> Option<PdfDocumentIdentity> {
     let (path, password) = match request {
-        DecodedRequest::Enumerate { path, password }
+        DecodedRequest::Enumerate { path, password, .. }
         | DecodedRequest::GetInfo { path, password }
         | DecodedRequest::PageSizes { path, password }
         | DecodedRequest::Open { path, password } => (path, password),
@@ -1268,16 +1490,18 @@ pub fn run_worker_process() {
         };
 
         match req {
-            DecodedRequest::Enumerate { path, password } => {
-                match ipc_enumerate(&mut document_cache, &path, password.as_deref()) {
-                    Ok(resp) => {
-                        let _ = write_msg(&mut stdout, &resp);
-                    }
-                    Err(e) => {
-                        let _ = send_error(&mut stdout, &e.to_string());
-                    }
+            DecodedRequest::Enumerate {
+                path,
+                password,
+                options,
+            } => match ipc_enumerate(&mut document_cache, &path, password.as_deref(), options) {
+                Ok(resp) => {
+                    let _ = write_msg(&mut stdout, &resp);
                 }
-            }
+                Err(e) => {
+                    let _ = send_error(&mut stdout, &e.to_string());
+                }
+            },
             DecodedRequest::PageSizes { path, password } => {
                 match ipc_page_sizes(&mut document_cache, &path, password.as_deref()) {
                     Ok(resp) => {
@@ -1386,10 +1610,32 @@ fn ipc_enumerate(
     cache: &mut PdfDocumentCache<'_>,
     path: &Path,
     password: Option<&str>,
+    options: EnumerateOptions,
+) -> std::io::Result<Vec<u8>> {
+    let pdfium = cache.pdfium;
+    ipc_enumerate_with_direction_reader(cache, path, password, options, || {
+        raw_pdf_viewer_direction(pdfium, path, password)
+    })
+}
+
+fn ipc_enumerate_with_direction_reader(
+    cache: &mut PdfDocumentCache<'_>,
+    path: &Path,
+    password: Option<&str>,
+    options: EnumerateOptions,
+    read_direction: impl FnOnce() -> std::io::Result<Option<PdfReadingDirection>>,
 ) -> std::io::Result<Vec<u8>> {
     let (entries, _) = cache.with_document(path, password, |document, key| {
         Ok(core_enumerate(document, key))
     })?;
+    let direction = if options.want_direction {
+        read_direction().unwrap_or_else(|error| {
+            eprintln!("pdf-worker: viewer direction unavailable: {error}");
+            None
+        })
+    } else {
+        None
+    };
     let count = entries.len() as u32;
     let mut buf = Vec::with_capacity(1 + 4 + entries.len() * 16);
     buf.push(STATUS_OK);
@@ -1398,7 +1644,77 @@ fn ipc_enumerate(
         buf.extend_from_slice(&e.mtime.to_le_bytes());
         buf.extend_from_slice(&e.file_size.to_le_bytes());
     }
+    buf.push(match direction {
+        Some(PdfReadingDirection::L2R) => 1,
+        Some(PdfReadingDirection::R2L) => 2,
+        None => 0,
+    });
     Ok(buf)
+}
+
+struct RawPdfDocument<'a> {
+    bindings: &'a dyn PdfiumLibraryBindings,
+    handle: FPDF_DOCUMENT,
+}
+
+impl Drop for RawPdfDocument<'_> {
+    fn drop(&mut self) {
+        self.bindings.FPDF_CloseDocument(self.handle);
+    }
+}
+
+fn raw_pdf_viewer_direction(
+    pdfium: &Pdfium,
+    path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<Option<PdfReadingDirection>> {
+    let path_text = path.to_string_lossy();
+    if path_text.contains('\0') || password.is_some_and(|value| value.contains('\0')) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "NUL in PDF path or password",
+        ));
+    }
+    let bindings = pdfium.bindings();
+    let handle = bindings.FPDF_LoadDocument(&path_text, password);
+    if handle.is_null() {
+        return Err(std::io::Error::other(format!(
+            "PDF direction open failed (PDFium status {})",
+            bindings.FPDF_GetLastError()
+        )));
+    }
+    let document = RawPdfDocument { bindings, handle };
+    let mut buffer = [0i8; 64];
+    let len = bindings.FPDF_VIEWERREF_GetName(
+        document.handle,
+        "Direction",
+        buffer.as_mut_ptr(),
+        buffer.len() as _,
+    ) as usize;
+    if !(2..=64).contains(&len) {
+        return Ok(None);
+    }
+    if buffer[len - 1] != 0 {
+        return Ok(None);
+    }
+    let name: Vec<u8> = buffer[..len - 1].iter().map(|&byte| byte as u8).collect();
+    Ok(parse_pdf_direction_name(std::str::from_utf8(&name).ok()))
+}
+
+fn parse_pdf_direction_name(name: Option<&str>) -> Option<PdfReadingDirection> {
+    match name {
+        Some("R2L") => Some(PdfReadingDirection::R2L),
+        Some("L2R") => Some(PdfReadingDirection::L2R),
+        _ => None,
+    }
+}
+
+fn parse_epub_direction_name(name: &str) -> Option<PdfReadingDirection> {
+    match name {
+        "rtl" => Some(PdfReadingDirection::R2L),
+        "ltr" => Some(PdfReadingDirection::L2R),
+        _ => None,
+    }
 }
 
 /// 全ページの用紙寸法 (points) を 1 往復で返す。
@@ -1580,49 +1896,6 @@ struct CoreRenderOutput {
 }
 
 /// core_render に page_count 取得を追加した拡張版 (v1.0.0)。
-/// in-process worker 用。IPC worker は `core_render_document` を cache 経由で呼ぶ。
-fn core_render_with_count(
-    pdfium: &Pdfium,
-    path: &Path,
-    page_num: u32,
-    target: PdfRenderTarget,
-    password: Option<&str>,
-) -> std::io::Result<(
-    image::DynamicImage,
-    PdfPageContentType,
-    u32,
-    PdfPageSizePoints,
-)> {
-    let doc = pdfium
-        .load_pdf_from_file(path, password)
-        .map_err(pdfium_open_error)?;
-    let page_count = doc.pages().len() as u32;
-    let page = doc
-        .pages()
-        .get(page_num as u16)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-    let content_type = analyze_page_content(&page);
-    let page_w = page.width().value;
-    let page_h = page.height().value;
-    let target_px = resolve_render_target_long_edge(target, page_w, page_h, content_type);
-    let (tw, th) = fit_to_target(page_w, page_h, target_px as f32);
-    let render_config = PdfRenderConfig::new()
-        .set_target_width(tw as i32)
-        .set_maximum_height(th as i32);
-    let bitmap = page
-        .render_with_config(&render_config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-    Ok((
-        bitmap.as_image(),
-        content_type,
-        page_count,
-        PdfPageSizePoints {
-            width: page_w,
-            height: page_h,
-        },
-    ))
-}
-
 fn core_render_document(
     document: &PdfDocument<'_>,
     page_num: u32,
@@ -2660,7 +2933,7 @@ impl PdfWorkerPool {
         }
     }
 
-    fn parse_enumerate_response(data: &[u8]) -> std::io::Result<Vec<PdfPageEntry>> {
+    fn parse_enumerate_response(data: &[u8]) -> std::io::Result<PdfEnumerateResult> {
         if data.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2696,7 +2969,22 @@ impl PdfWorkerPool {
             });
             offset += 16;
         }
-        Ok(entries)
+        let direction = match data.get(offset) {
+            Some(1) => Some(PdfReadingDirection::L2R),
+            Some(2) => Some(PdfReadingDirection::R2L),
+            Some(0) | None => None,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid PDF direction",
+                ));
+            }
+        };
+        Ok(PdfEnumerateResult {
+            pages: entries,
+            direction,
+            stamp: None,
+        })
     }
 
     /// `ipc_get_info` レスポンスを PdfDocumentInfo にデコード。
@@ -3493,151 +3781,6 @@ impl Drop for PdfWorkerPool {
 // フルスクリーン再レンダリング専用の in-process PDFium スレッド
 // -----------------------------------------------------------------------
 
-enum WorkerRequest {
-    Render {
-        path: PathBuf,
-        page_num: u32,
-        target: PdfRenderTarget,
-        password: Option<String>,
-        cancel: Option<Arc<AtomicBool>>,
-        reply: mpsc::Sender<std::io::Result<RenderResult>>,
-    },
-}
-
-/// フルスクリーン再レンダリング専用の in-process PDFium スレッド。
-struct PdfWorker {
-    tx: mpsc::Sender<WorkerRequest>,
-    priority_tx: mpsc::Sender<WorkerRequest>,
-}
-
-/// フルスクリーン再レンダリング専用の in-process PDFium スレッドを保持する。
-static WORKER: OnceLock<PdfWorker> = OnceLock::new();
-
-/// フルスクリーン再レンダリング専用の in-process PDFium スレッドを返す。
-fn get_worker() -> &'static PdfWorker {
-    WORKER.get_or_init(|| PdfWorker::start())
-}
-
-impl PdfWorker {
-    fn start() -> Self {
-        let (tx, rx) = mpsc::channel::<WorkerRequest>();
-        let (priority_tx, priority_rx) = mpsc::channel::<WorkerRequest>();
-
-        std::thread::Builder::new()
-            .name("pdf-worker".to_string())
-            .spawn(move || {
-                crate::logger::log("pdf-worker: starting (dual-channel)");
-
-                let pdfium = match Self::init_pdfium() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        crate::logger::log(format!("pdf-worker: init failed: {e}"));
-                        loop {
-                            match priority_rx.try_recv() {
-                                Ok(req) => {
-                                    Self::reply_init_error(&req, &e);
-                                    continue;
-                                }
-                                Err(mpsc::TryRecvError::Disconnected) => return,
-                                Err(mpsc::TryRecvError::Empty) => {}
-                            }
-                            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                                Ok(req) => Self::reply_init_error(&req, &e),
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                            }
-                        }
-                    }
-                };
-
-                crate::logger::log("pdf-worker: ready");
-
-                loop {
-                    loop {
-                        match priority_rx.try_recv() {
-                            Ok(req) => Self::handle_request(&pdfium, req),
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                crate::logger::log("pdf-worker: stopped");
-                                return;
-                            }
-                        }
-                    }
-                    match rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                        Ok(req) => Self::handle_request(&pdfium, req),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            crate::logger::log("pdf-worker: stopped");
-                            return;
-                        }
-                    }
-                }
-            })
-            .expect("failed to spawn pdf-worker thread");
-
-        PdfWorker { tx, priority_tx }
-    }
-
-    fn handle_request(pdfium: &Pdfium, req: WorkerRequest) {
-        match req {
-            WorkerRequest::Render {
-                path,
-                page_num,
-                target,
-                password,
-                cancel,
-                reply,
-            } => {
-                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    return;
-                }
-                let result =
-                    core_render_with_count(pdfium, &path, page_num, target, password.as_deref())
-                        .map(
-                            |(image, content_type, page_count, page_size_points)| RenderResult {
-                                image,
-                                content_type,
-                                page_count,
-                                page_size_points,
-                            },
-                        );
-                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    return;
-                }
-                let _ = reply.send(result);
-            }
-        }
-    }
-
-    fn init_pdfium() -> Result<Pdfium, String> {
-        let dll_path = ensure_dll_extracted()?;
-        let dll_dir = dll_path
-            .parent()
-            .ok_or_else(|| "cannot determine DLL directory".to_string())?;
-
-        let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
-            dll_dir.to_str().ok_or("non-UTF8 path")?,
-        ))
-        .map_err(|e| format!("PDFium binding failed: {e}"))?;
-        Ok(Pdfium::new(bindings))
-    }
-
-    fn reply_init_error(req: &WorkerRequest, e: &str) {
-        match req {
-            WorkerRequest::Render { reply, .. } => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )));
-            }
-        }
-    }
-}
-
-// -----------------------------------------------------------------------
-// 公開データ型
-// -----------------------------------------------------------------------
-
 /// 初回 PDF ラスタライズで再現する表示倍率。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PdfDisplayFitMode {
@@ -3869,6 +4012,43 @@ pub struct PdfPageEntry {
     pub file_size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfReadingDirection {
+    L2R,
+    R2L,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct EnumerateOptions {
+    /// Plain PDFs incur a second PDFium open only when this is true.
+    pub want_direction: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfEnumerateResult {
+    pub pages: Vec<PdfPageEntry>,
+    pub direction: Option<PdfReadingDirection>,
+    /// EPUB generation only. PDF keeps its existing page attributes; callers needing
+    /// a standalone PDF stamp can call `pdf_document_stamp` on a worker.
+    pub stamp: Option<DocumentStamp>,
+}
+
+impl From<Vec<PdfPageEntry>> for PdfEnumerateResult {
+    fn from(pages: Vec<PdfPageEntry>) -> Self {
+        Self {
+            pages,
+            direction: None,
+            stamp: None,
+        }
+    }
+}
+
+impl std::iter::FromIterator<PdfPageEntry> for PdfEnumerateResult {
+    fn from_iter<T: IntoIterator<Item = PdfPageEntry>>(iter: T) -> Self {
+        Vec::from_iter(iter).into()
+    }
+}
+
 /// PDF document metadata (§16 step 17)。全文検索インデクサが ingest する。
 /// pdfium-render の `PdfDocument::metadata()` から 4 タグを抜き取ったもの。
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -3920,8 +4100,9 @@ pub fn get_document_info(
     pdf_path: &Path,
     password: Option<&str>,
 ) -> std::io::Result<PdfDocumentInfo> {
+    let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
     let pool = get_pool();
-    let req = encode_get_info_request(pdf_path, password);
+    let req = encode_get_info_request(&read.read_path, password);
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
     // get_document_info は indexer 経由の background なので epoch=0 + AbortOnCancel
     let resp = pool.execute(
@@ -3942,8 +4123,9 @@ pub fn get_document_info(
 /// 切り離せる (2026-08-26 の利用者報告: まだサムネイルの無い PDF では分割が黙って
 /// 効かなかった)。
 pub fn get_page_sizes(pdf_path: &Path, password: Option<&str>) -> std::io::Result<Vec<(f32, f32)>> {
+    let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
     let pool = get_pool();
-    let req = encode_page_sizes_request(pdf_path, password);
+    let req = encode_page_sizes_request(&read.read_path, password);
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
     // ページ構成を組むための背景処理。epoch=0 (prune 対象外) + AbortOnCancel。
     let resp = pool.execute(
@@ -3965,8 +4147,9 @@ pub fn analyze_page_content_type(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<PdfPageAnalysis> {
+    let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
     let pool = get_pool();
-    let req = encode_analyze_page_request(pdf_path, page_num, password);
+    let req = encode_analyze_page_request(&read.read_path, page_num, password);
     let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);
     let resp = pool.execute(
         &req,
@@ -3997,8 +4180,22 @@ pub fn enumerate_pages_with_cancel(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<Vec<PdfPageEntry>> {
+    enumerate_pages_with_options(pdf_path, password, cancel, EnumerateOptions::default())
+        .map(|result| result.pages)
+}
+
+/// Background-only enumeration. Direction is optional for PDFs and always comes
+/// from the pinned generation row for EPUBs.
+pub fn enumerate_pages_with_options(
+    pdf_path: &Path,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+    options: EnumerateOptions,
+) -> std::io::Result<PdfEnumerateResult> {
+    let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
     let pool = get_pool();
-    let req = encode_enumerate_request(pdf_path, password);
+    let worker_options = enumerate_worker_options(&read, options);
+    let req = encode_enumerate_request(&read.read_path, password, worker_options);
     // enumerate は列挙のみで軽量 (PDFium page 列挙) だが Normal 扱いでよい
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
     // enumerate_pages_with_cancel は background catch-up 経路なので epoch=0
@@ -4011,7 +4208,74 @@ pub fn enumerate_pages_with_cancel(
         0,
         CancelWaitPolicy::AbortOnCancel,
     )?;
-    PdfWorkerPool::parse_enumerate_response(&resp.bytes)
+    let mut result = PdfWorkerPool::parse_enumerate_response(&resp.bytes)?;
+    display_enumerated_pages(&mut result, &read);
+    Ok(result)
+}
+
+/// Blocks on the PDF worker pool. Call from a converter/background thread only.
+/// `path` is the physical `.part` and deliberately bypasses EPUB resolution.
+pub fn verify_converted_pdf(
+    path: &Path,
+    expected_pages: usize,
+) -> Result<(), crate::epub_convert::EpubConvertError> {
+    verify_converted_pdf_with_cancel(path, expected_pages, None)
+}
+
+fn display_enumerated_pages(result: &mut PdfEnumerateResult, target: &ReadTarget) {
+    if matches!(&target.stamp, DocumentStamp::Generation { .. }) {
+        result.direction = target.epub_direction;
+        result.stamp = Some(target.stamp.clone());
+    }
+    if let Some(source) = target.display_source_state {
+        const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+        let mtime = (source.mtime_ticks.saturating_sub(FILETIME_UNIX_EPOCH) / 10_000_000) as i64;
+        for page in &mut result.pages {
+            page.mtime = mtime;
+            page.file_size = source.size;
+        }
+    }
+}
+
+fn enumerate_worker_options(target: &ReadTarget, requested: EnumerateOptions) -> EnumerateOptions {
+    EnumerateOptions {
+        want_direction: requested.want_direction
+            && !matches!(&target.stamp, DocumentStamp::Generation { .. }),
+    }
+}
+
+pub(crate) fn verify_converted_pdf_with_cancel(
+    path: &Path,
+    expected_pages: usize,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(), crate::epub_convert::EpubConvertError> {
+    let request = encode_enumerate_request(path, None, EnumerateOptions::default());
+    let response = get_pool()
+        .execute(
+            &request,
+            cancel.as_ref(),
+            JobPriority::Normal,
+            None,
+            0,
+            CancelWaitPolicy::AbortOnCancel,
+        )
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::Interrupted
+                && cancel
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                crate::epub_convert::EpubConvertError::Cancelled
+            } else {
+                crate::epub_convert::EpubConvertError::Io(error)
+            }
+        })?;
+    let result = PdfWorkerPool::parse_enumerate_response(&response.bytes)
+        .map_err(|_| crate::epub_convert::EpubConvertError::InvalidPdf)?;
+    if result.pages.len() != expected_pages || expected_pages == 0 {
+        return Err(crate::epub_convert::EpubConvertError::InvalidPdf);
+    }
+    Ok(())
 }
 
 pub fn render_page(
@@ -4149,6 +4413,8 @@ fn render_page_target(
         ));
     }
 
+    let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
+
     let perf_enabled = crate::perf::is_enabled();
     let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);
     let t0 = std::time::Instant::now();
@@ -4182,7 +4448,7 @@ fn render_page_target(
             ],
         );
     }
-    let req = encode_render_request(pdf_path, page_num, target, password, perf_enabled);
+    let req = encode_render_request(&read.read_path, page_num, target, password, perf_enabled);
     let resp = pool.execute(
         &req,
         cancel.as_ref(),
@@ -4302,49 +4568,23 @@ pub const PDF_RENDER_MIN_LONG_PX: u32 = 256;
 /// PDF レンダ結果の長辺ピクセル上限 (テクスチャメモリ保護、`target_px` clamp 上限)。
 pub const PDF_RENDER_MAX_LONG_PX: u32 = 8192;
 
-pub fn render_page_async(
-    pdf_path: &Path,
-    page_num: u32,
-    target_px: u32,
-    password: Option<&str>,
-    priority: bool,
-) -> (
-    Arc<AtomicBool>,
-    mpsc::Receiver<std::io::Result<RenderResult>>,
-) {
-    let cancel = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel();
-    // 表示中ページの再レンダ等は priority レーン (worker が先に drain する)。
-    // AI 先読み用の native 再レンダ (非表示ページ) は通常レーンに流し、visible の
-    // 再レンダ / UI ナビの enumerate を妨げない (GitHub issue #1 の先読み画像化)。
-    let worker = get_worker();
-    let sender = if priority {
-        &worker.priority_tx
-    } else {
-        &worker.tx
-    };
-    let _ = sender.send(WorkerRequest::Render {
-        path: pdf_path.to_path_buf(),
-        page_num,
-        target: PdfRenderTarget::LongEdge(target_px),
-        password: password.map(String::from),
-        cancel: Some(Arc::clone(&cancel)),
-        reply: tx,
-    });
-    (cancel, rx)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PdfEnumerateKey {
     normalized_path: String,
     password: Option<String>,
+    want_direction: bool,
 }
 
 impl PdfEnumerateKey {
     fn new(pdf_path: &Path, password: Option<&str>) -> Self {
+        Self::with_options(pdf_path, password, EnumerateOptions::default())
+    }
+
+    fn with_options(pdf_path: &Path, password: Option<&str>, options: EnumerateOptions) -> Self {
         Self {
             normalized_path: crate::path_key::normalize_keep_drive(pdf_path),
             password: password.map(String::from),
+            want_direction: options.want_direction,
         }
     }
 }
@@ -4358,7 +4598,7 @@ struct PdfEnumerateWaiterId(u64);
 struct PdfEnumerateRunning {
     request_id: PdfEnumerateRequestId,
     source_cancel: Arc<AtomicBool>,
-    waiters: HashMap<PdfEnumerateWaiterId, mpsc::Sender<std::io::Result<Vec<PdfPageEntry>>>>,
+    waiters: HashMap<PdfEnumerateWaiterId, mpsc::Sender<Result<PdfEnumerateResult, PdfReadError>>>,
 }
 
 struct PdfEnumerateCoordinatorState {
@@ -4409,7 +4649,22 @@ impl PdfEnumerateCoordinator {
         key: PdfEnumerateKey,
     ) -> (PdfEnumerateHandle, PdfEnumerateAdmission) {
         let (tx, rx) = mpsc::channel();
-        let waiter_cancel = Arc::new(AtomicBool::new(false));
+        let (lease, admission) = self.subscribe_with_sender(key, tx);
+        (
+            PdfEnumerateHandle {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+                lease: Arc::new(Mutex::new(Some(lease))),
+            },
+            admission,
+        )
+    }
+
+    fn subscribe_with_sender(
+        self: &Arc<Self>,
+        key: PdfEnumerateKey,
+        tx: mpsc::Sender<Result<PdfEnumerateResult, PdfReadError>>,
+    ) -> (PdfEnumerateWaiterLease, PdfEnumerateAdmission) {
         let mut retired_waiters = Vec::new();
 
         let (request_id, waiter_id, admission) = {
@@ -4461,31 +4716,27 @@ impl PdfEnumerateCoordinator {
 
         // cancel 済み entry の待ち手は新 request へ暗黙合流させない。
         for sender in retired_waiters {
-            let _ = sender.send(Err(std::io::Error::new(
+            let _ = sender.send(Err(PdfReadError::Other(Arc::new(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "coalesced PDF enumerate source was already cancelled",
-            )));
+            )))));
         }
 
-        let handle = PdfEnumerateHandle {
-            cancel: waiter_cancel,
-            rx,
-            lease: PdfEnumerateWaiterLease {
-                coordinator: Arc::clone(self),
-                key,
-                request_id,
-                waiter_id,
-                active: AtomicBool::new(true),
-            },
+        let lease = PdfEnumerateWaiterLease {
+            coordinator: Arc::clone(self),
+            key,
+            request_id,
+            waiter_id,
+            active: AtomicBool::new(true),
         };
-        (handle, admission)
+        (lease, admission)
     }
 
     fn complete(
         &self,
         key: &PdfEnumerateKey,
         request_id: PdfEnumerateRequestId,
-        result: std::io::Result<Vec<PdfPageEntry>>,
+        result: Result<PdfEnumerateResult, PdfReadError>,
     ) {
         let waiters = {
             let mut state = self
@@ -4509,11 +4760,7 @@ impl PdfEnumerateCoordinator {
         };
 
         for sender in waiters {
-            let cloned = match &result {
-                Ok(pages) => Ok(pages.clone()),
-                Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
-            };
-            let _ = sender.send(cloned);
+            let _ = sender.send(result.clone());
         }
     }
 
@@ -4579,22 +4826,26 @@ impl PdfEnumerateWaiterLease {
 pub struct PdfEnumerateHandle {
     /// この待ち手だけの cancel 状態。App の stale-result guard でも参照する。
     pub cancel: Arc<AtomicBool>,
-    pub rx: mpsc::Receiver<std::io::Result<Vec<PdfPageEntry>>>,
-    lease: PdfEnumerateWaiterLease,
+    pub rx: mpsc::Receiver<Result<PdfEnumerateResult, PdfReadError>>,
+    lease: Arc<Mutex<Option<PdfEnumerateWaiterLease>>>,
 }
 
 impl PdfEnumerateHandle {
     /// この待ち手だけを明示キャンセルする。全待ち手が離れた場合だけ source へ伝搬する。
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
-        self.lease.cancel();
+        if let Some(lease) = self.lease.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            lease.cancel();
+        }
     }
 }
 
 impl Drop for PdfEnumerateHandle {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
-        self.lease.cancel();
+        if let Some(lease) = self.lease.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            lease.cancel();
+        }
     }
 }
 
@@ -4608,7 +4859,11 @@ pub(crate) fn completed_enumerate_handle(
     let PdfEnumerateAdmission::Start(start) = admission else {
         unreachable!("a fresh test coordinator must start one request");
     };
-    coordinator.complete(&key, start.request_id, result);
+    coordinator.complete(
+        &key,
+        start.request_id,
+        result.map(Into::into).map_err(Into::into),
+    );
     handle
 }
 
@@ -4628,22 +4883,142 @@ pub(crate) fn completed_enumerate_handle_for_test(
 ///    待たず、呼び出し元へ直ちにハンドルを返す。
 /// 2. **multi-process pool + `JobPriority::Critical`** — Normal priority のキャッシュ作成等を
 ///    押しのけて先に処理する。
-/// 3. **実行中 request を `(path, password)` で共有する** — 同じ PDF の再オープンは既存の
+/// 3. **実行中 request を `(read_path, password, want_direction)` で共有する** — 同じ PDF の再オープンは既存の
 ///    PDFium 処理へ待ち手として合流する。時間窓や完了結果 cache は使わない。
 /// 4. **待ち手単位の cancel** — 各 `PdfEnumerateHandle` は個別に離脱でき、最後の待ち手が
 ///    離れた時だけ pool request の cancel token を立てる。
+struct PdfEnumerateAdmissionTask {
+    logical: PathBuf,
+    password: Option<String>,
+    options: EnumerateOptions,
+    cancel: Arc<AtomicBool>,
+    lease: Arc<Mutex<Option<PdfEnumerateWaiterLease>>>,
+    reply: mpsc::Sender<Result<PdfEnumerateResult, PdfReadError>>,
+}
+
+static PDF_ENUMERATE_ADMISSION_TX: OnceLock<
+    Result<mpsc::Sender<PdfEnumerateAdmissionTask>, String>,
+> = OnceLock::new();
+static EPUB_ENUMERATE_ADMISSION_TX: OnceLock<
+    Result<mpsc::Sender<PdfEnumerateAdmissionTask>, String>,
+> = OnceLock::new();
+
+fn pdf_enumerate_admission_sender(
+    epub: bool,
+) -> Result<&'static mpsc::Sender<PdfEnumerateAdmissionTask>, PdfReadError> {
+    let slot = if epub {
+        &EPUB_ENUMERATE_ADMISSION_TX
+    } else {
+        &PDF_ENUMERATE_ADMISSION_TX
+    };
+    slot.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        let name = if epub {
+            "epub-enumerate-admission"
+        } else {
+            "pdf-enumerate-admission"
+        };
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    run_pdf_enumerate_admission(task);
+                }
+            })
+            .map(|_| tx)
+            .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .map_err(|reason| {
+        PdfReadError::Other(Arc::new(std::io::Error::other(format!(
+            "failed to start PDF enumerate admission thread: {reason}"
+        ))))
+    })
+}
+
 pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnumerateHandle {
-    let key = PdfEnumerateKey::new(pdf_path, password);
+    enumerate_pages_async_with_options(pdf_path, password, EnumerateOptions::default())
+}
+
+pub fn enumerate_pages_async_with_options(
+    pdf_path: &Path,
+    password: Option<&str>,
+    options: EnumerateOptions,
+) -> PdfEnumerateHandle {
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let lease = Arc::new(Mutex::new(None));
+    let handle = PdfEnumerateHandle {
+        cancel: Arc::clone(&cancel),
+        rx,
+        lease: Arc::clone(&lease),
+    };
+    let task = PdfEnumerateAdmissionTask {
+        logical: pdf_path.to_owned(),
+        password: password.map(str::to_owned),
+        options,
+        cancel,
+        lease,
+        reply: tx.clone(),
+    };
+    match pdf_enumerate_admission_sender(is_epub(pdf_path)) {
+        Ok(sender) => {
+            if sender.send(task).is_err() {
+                let _ = tx.send(Err(PdfReadError::Other(Arc::new(std::io::Error::other(
+                    "PDF enumerate admission thread disconnected",
+                )))));
+            }
+        }
+        Err(error) => {
+            let _ = tx.send(Err(error));
+        }
+    }
+    handle
+}
+
+fn run_pdf_enumerate_admission(task: PdfEnumerateAdmissionTask) {
+    if complete_pre_registration_cancel(&task.cancel, &task.reply) {
+        return;
+    }
+    let read = match resolve_read_target(&task.logical) {
+        Ok(read) => read,
+        Err(error) => {
+            let _ = task.reply.send(Err(error));
+            return;
+        }
+    };
+    if complete_pre_registration_cancel(&task.cancel, &task.reply) {
+        return;
+    }
+    let worker_options = enumerate_worker_options(&read, task.options);
+    let key =
+        PdfEnumerateKey::with_options(&read.read_path, task.password.as_deref(), worker_options);
     let coordinator = Arc::clone(pdf_enumerate_coordinator());
-    let (handle, admission) = coordinator.subscribe(key.clone());
-    let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
+    let (registered, admission) =
+        coordinator.subscribe_with_sender(key.clone(), task.reply.clone());
+    {
+        let mut lease = task
+            .lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *lease = Some(registered);
+        if task.cancel.load(Ordering::Relaxed)
+            && let Some(registered) = lease.take()
+        {
+            registered.cancel();
+        }
+    }
+    if task.cancel.load(Ordering::Relaxed) {
+        let _ = task.reply.send(Err(pre_registration_interrupted()));
+        return;
+    }
+    let perf_key = crate::grid_item::pdf_file_perf_key(&task.logical);
     let PdfEnumerateAdmission::Start(start) = admission else {
         if crate::perf::is_enabled() {
             crate::perf::event("pdf", "enumerate_join", Some(&perf_key), 0, &[]);
         }
-        return handle;
+        return;
     };
-
     if crate::perf::is_enabled() {
         let reason = match start.reason {
             PdfEnumerateStartReason::NoRunningRequest => "no_running_request",
@@ -4657,52 +5032,61 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
             &[("reason", serde_json::Value::from(reason))],
         );
     }
-
-    let req = encode_enumerate_request(pdf_path, password);
+    let request =
+        encode_enumerate_request(&read.read_path, task.password.as_deref(), worker_options);
     let request_id = start.request_id;
     let source_cancel = start.source_cancel;
-    let coordinator_w = Arc::clone(&coordinator);
-    let key_w = key.clone();
-    if let Err(e) = std::thread::Builder::new()
+    let coordinator_worker = Arc::clone(&coordinator);
+    let key_worker = key.clone();
+    if let Err(error) = std::thread::Builder::new()
         .name("pdf-enumerate-nav".into())
         .spawn(move || {
-            if source_cancel.load(Ordering::Relaxed) {
-                return;
-            }
-            // 初期化は初回だけ設定数 (最大 10) の readiness 待ちを含むため、必ずこの
-            // UI 外スレッドから開始する。
-            let pool = get_pool();
-            // Critical は epoch チェック対象外 (= 0 で send) + AbortOnCancel
-            // (UI nav の即時応答 UX を優先、harvest は不要)
-            let resp = pool.execute(
-                &req,
-                Some(&source_cancel),
-                JobPriority::Critical,
-                Some(perf_key),
-                0,
-                CancelWaitPolicy::AbortOnCancel,
-            );
-            let result =
-                resp.and_then(|response| PdfWorkerPool::parse_enumerate_response(&response.bytes));
-            coordinator_w.complete(&key_w, request_id, result);
+            let result = get_pool()
+                .execute(
+                    &request,
+                    Some(&source_cancel),
+                    JobPriority::Critical,
+                    Some(perf_key),
+                    0,
+                    CancelWaitPolicy::AbortOnCancel,
+                )
+                .and_then(|response| PdfWorkerPool::parse_enumerate_response(&response.bytes))
+                .map_err(PdfReadError::from_io)
+                .map(|mut result| {
+                    display_enumerated_pages(&mut result, &read);
+                    result
+                });
+            coordinator_worker.complete(&key_worker, request_id, result);
         })
     {
-        crate::logger::log(format!("pdf-enumerate-nav: spawn failed: {e}"));
         coordinator.complete(
             &key,
             request_id,
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to start PDF page enumeration thread: {e}"),
-            )),
+            Err(PdfReadError::Other(Arc::new(std::io::Error::other(
+                format!("failed to start PDF page enumeration thread: {error}"),
+            )))),
         );
     }
-    handle
 }
 
-// -----------------------------------------------------------------------
-// 内部ユーティリティ
-// -----------------------------------------------------------------------
+fn pre_registration_interrupted() -> PdfReadError {
+    PdfReadError::Other(Arc::new(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "PDF enumeration cancelled before registration",
+    )))
+}
+
+fn complete_pre_registration_cancel(
+    cancel: &AtomicBool,
+    sender: &mpsc::Sender<Result<PdfEnumerateResult, PdfReadError>>,
+) -> bool {
+    if cancel.load(Ordering::Relaxed) {
+        let _ = sender.send(Err(pre_registration_interrupted()));
+        true
+    } else {
+        false
+    }
+}
 
 fn resolve_render_target_long_edge(
     target: PdfRenderTarget,
@@ -4797,6 +5181,478 @@ fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::epub_cache::{GenerationRow, SourceGuard, SourceState};
+    use std::fs;
+
+    struct TestSource(SourceState);
+    impl SourceGuard for TestSource {
+        fn state(&self) -> std::io::Result<SourceState> {
+            Ok(self.0)
+        }
+    }
+
+    fn publish_test_generation(db: &mut EpubCache, root: &Path, source: &Path) -> GenerationRow {
+        let state = epub_cache::source_state(&fs::metadata(source).unwrap());
+        let id = db.reserve_generation_id(source).unwrap();
+        let pdf = epub_cache::generation_file(root, source, id);
+        fs::create_dir_all(pdf.parent().unwrap()).unwrap();
+        fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let row = GenerationRow {
+            generation_id: id,
+            src_path_key: epub_cache::src_key(source),
+            src_path: source.to_owned(),
+            src_state: state,
+            src_sha256: "full".into(),
+            src_head_hash: "head".into(),
+            pdf_file: pdf,
+            pdf_size: 9,
+            page_count: 1,
+            direction: "rtl".into(),
+            profile: "reflow-v1".into(),
+            created_at: 1,
+        };
+        assert!(matches!(
+            db.publish(&row, &TestSource(state)),
+            Ok(epub_cache::PublishOutcome::Published)
+        ));
+        row
+    }
+
+    #[test]
+    fn pdf_resolver_passthrough_never_stats_the_path() {
+        let missing = Path::new("this-path-must-not-exist.pdf");
+        assert_eq!(
+            resolve_read_target(missing).unwrap(),
+            ReadTarget {
+                read_path: missing.to_owned(),
+                stamp: DocumentStamp::File {
+                    mtime: None,
+                    size: None
+                },
+                display_source_state: None,
+                epub_direction: None,
+            }
+        );
+    }
+
+    #[test]
+    fn epub_display_attributes_are_separate_from_generation_stamp() {
+        let target = ReadTarget {
+            read_path: PathBuf::from("generation.pdf"),
+            stamp: DocumentStamp::Generation {
+                id: 31,
+                pdf_size: 900,
+            },
+            display_source_state: Some(SourceState {
+                mtime_ticks: 116_444_736_000_000_000 + 42 * 10_000_000,
+                size: 123,
+            }),
+            epub_direction: Some(PdfReadingDirection::R2L),
+        };
+        let mut result = PdfEnumerateResult::from(vec![PdfPageEntry {
+            page_num: 0,
+            mtime: 999,
+            file_size: 900,
+        }]);
+        display_enumerated_pages(&mut result, &target);
+        assert_eq!(result.pages[0].mtime, 42);
+        assert_eq!(result.pages[0].file_size, 123);
+        assert_eq!(result.direction, Some(PdfReadingDirection::R2L));
+        assert_eq!(result.stamp, Some(target.stamp.clone()));
+        assert!(
+            !enumerate_worker_options(
+                &target,
+                EnumerateOptions {
+                    want_direction: true
+                }
+            )
+            .want_direction
+        );
+        assert_eq!(
+            target.stamp,
+            DocumentStamp::Generation {
+                id: 31,
+                pdf_size: 900
+            }
+        );
+    }
+
+    #[test]
+    fn epub_resolver_pins_first_generation_across_retire_and_republish() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("book.epub");
+        fs::write(&source, b"first").unwrap();
+        let mut db = EpubCache::open_at(root.path()).unwrap();
+        let first = publish_test_generation(&mut db, root.path(), &source);
+        let pinned = Mutex::new(HashMap::new());
+        let target = resolve_epub_at(&source, root.path(), &pinned).unwrap();
+        assert_eq!(target.epub_direction, Some(PdfReadingDirection::R2L));
+        assert_eq!(
+            target.stamp,
+            DocumentStamp::Generation {
+                id: first.generation_id,
+                pdf_size: 9
+            }
+        );
+        db.retire_current(&first.src_path_key).unwrap();
+        assert_eq!(
+            resolve_epub_at(&source, root.path(), &pinned).unwrap(),
+            target
+        );
+        fs::write(&source, b"second, changed size").unwrap();
+        let mut another_connection = EpubCache::open_at(root.path()).unwrap();
+        let second = publish_test_generation(&mut another_connection, root.path(), &source);
+        assert_ne!(first.generation_id, second.generation_id);
+        assert_eq!(
+            resolve_epub_at(&source, root.path(), &pinned).unwrap(),
+            target
+        );
+        let fresh = Mutex::new(HashMap::new());
+        assert_eq!(
+            resolve_epub_at(&source, root.path(), &fresh).unwrap().stamp,
+            DocumentStamp::Generation {
+                id: second.generation_id,
+                pdf_size: 9
+            }
+        );
+    }
+
+    #[test]
+    fn epub_resolver_rejects_changed_source_and_detaches_missing_pdf() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("book.epub");
+        fs::write(&source, b"first").unwrap();
+        let mut db = EpubCache::open_at(root.path()).unwrap();
+        let row = publish_test_generation(&mut db, root.path(), &source);
+        fs::write(&source, b"changed size").unwrap();
+        assert!(matches!(
+            resolve_epub_at(&source, root.path(), &Mutex::new(HashMap::new())),
+            Err(PdfReadError::NotConverted)
+        ));
+        fs::write(&source, b"first").unwrap();
+        // Restore the exact recorded state for the missing-file branch.
+        let state = epub_cache::source_state(&fs::metadata(&source).unwrap());
+        if state != row.src_state {
+            let newer = publish_test_generation(&mut db, root.path(), &source);
+            fs::remove_file(&newer.pdf_file).unwrap();
+            assert!(matches!(
+                resolve_epub_at(&source, root.path(), &Mutex::new(HashMap::new())),
+                Err(PdfReadError::NotConverted)
+            ));
+            assert!(db.current_generation(&row.src_path_key).unwrap().is_none());
+        } else {
+            fs::remove_file(&row.pdf_file).unwrap();
+            assert!(matches!(
+                resolve_epub_at(&source, root.path(), &Mutex::new(HashMap::new())),
+                Err(PdfReadError::NotConverted)
+            ));
+            assert!(db.current_generation(&row.src_path_key).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn epub_gate_disabled_is_typed() {
+        let gate = GateOutcome::Disabled(epub_cache::GateReason::Schema(
+            epub_cache::CacheError::InvalidState("test gate"),
+        ));
+        assert!(matches!(
+            ensure_epub_gate(&gate),
+            Err(PdfReadError::EpubUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn epub_resolver_concurrent_first_writer_wins() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("book.epub");
+        fs::write(&source, b"first").unwrap();
+        let mut db = EpubCache::open_at(root.path()).unwrap();
+        let row = publish_test_generation(&mut db, root.path(), &source);
+        let pinned = Arc::new(Mutex::new(HashMap::new()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let source = source.clone();
+                let root = root.path().to_owned();
+                let pinned = Arc::clone(&pinned);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    resolve_epub_at(&source, &root, &pinned).unwrap()
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(
+                handle.join().unwrap().stamp,
+                DocumentStamp::Generation {
+                    id: row.generation_id,
+                    pdf_size: 9
+                }
+            );
+        }
+        assert_eq!(pinned.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn enumerate_uses_read_path_for_coalescing() {
+        let root = tempfile::tempdir().unwrap();
+        let first_source = root.path().join("first.epub");
+        let second_source = root.path().join("second.epub");
+        fs::write(&first_source, b"first").unwrap();
+        fs::write(&second_source, b"second").unwrap();
+        let mut db = EpubCache::open_at(root.path()).unwrap();
+        publish_test_generation(&mut db, root.path(), &first_source);
+        publish_test_generation(&mut db, root.path(), &second_source);
+        let pinned = Mutex::new(HashMap::new());
+        let first_read = resolve_epub_at(&first_source, root.path(), &pinned).unwrap();
+        let second_read = resolve_epub_at(&second_source, root.path(), &pinned).unwrap();
+        let first = PdfEnumerateKey::new(&first_read.read_path, None);
+        let second = PdfEnumerateKey::new(&second_read.read_path, None);
+        assert_ne!(first, second);
+        let coordinator = Arc::new(PdfEnumerateCoordinator::default());
+        let (_a, a) = coordinator.subscribe(first);
+        let (_b, b) = coordinator.subscribe(second);
+        assert!(matches!(a, PdfEnumerateAdmission::Start(_)));
+        assert!(matches!(b, PdfEnumerateAdmission::Start(_)));
+
+        let pdf = PdfEnumerateKey::new(Path::new(r"C:\books\same.pdf"), None);
+        let (_a, a) = coordinator.subscribe(pdf.clone());
+        let (_b, b) = coordinator.subscribe(pdf);
+        assert!(matches!(a, PdfEnumerateAdmission::Start(_)));
+        assert!(matches!(b, PdfEnumerateAdmission::JoinedRunning));
+
+        let with_direction = PdfEnumerateKey::with_options(
+            Path::new(r"C:\books\same.pdf"),
+            None,
+            EnumerateOptions {
+                want_direction: true,
+            },
+        );
+        let (_c, c) = coordinator.subscribe(with_direction.clone());
+        assert!(matches!(c, PdfEnumerateAdmission::Start(_)));
+        let (_d, d) = coordinator.subscribe(with_direction);
+        assert!(matches!(d, PdfEnumerateAdmission::JoinedRunning));
+    }
+
+    #[test]
+    fn enumerate_typed_failures_reach_every_waiter() {
+        for failure in [PdfReadError::NotConverted, PdfReadError::PasswordRequired] {
+            let coordinator = Arc::new(PdfEnumerateCoordinator::default());
+            let key = PdfEnumerateKey::new(Path::new("same.pdf"), None);
+            let (first, admission) = coordinator.subscribe(key.clone());
+            let (second, joined) = coordinator.subscribe(key.clone());
+            assert!(matches!(joined, PdfEnumerateAdmission::JoinedRunning));
+            let PdfEnumerateAdmission::Start(start) = admission else {
+                panic!("expected start")
+            };
+            coordinator.complete(&key, start.request_id, Err(failure.clone()));
+            for handle in [first, second] {
+                let received = handle.rx.recv().unwrap().unwrap_err();
+                assert!(matches!(
+                    (&failure, received),
+                    (PdfReadError::NotConverted, PdfReadError::NotConverted)
+                        | (
+                            PdfReadError::PasswordRequired,
+                            PdfReadError::PasswordRequired
+                        )
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn enumerate_cancel_before_registration_completes_receiver() {
+        let (tx, rx) = mpsc::channel();
+        run_pdf_enumerate_admission(PdfEnumerateAdmissionTask {
+            logical: PathBuf::from("unconverted.epub"),
+            password: None,
+            options: EnumerateOptions::default(),
+            cancel: Arc::new(AtomicBool::new(true)),
+            lease: Arc::new(Mutex::new(None)),
+            reply: tx,
+        });
+        assert_eq!(
+            rx.recv().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn public_pdfium_entries_resolve_before_encoding() {
+        let source = include_str!("pdf_loader.rs");
+        for entry in [
+            "get_document_info",
+            "get_page_sizes",
+            "analyze_page_content_type",
+            "enumerate_pages_with_options",
+            "render_page_target",
+            "run_pdf_enumerate_admission",
+        ] {
+            let start = source.find(&format!("fn {entry}(")).unwrap();
+            let tail = &source[start..];
+            let end = tail
+                .find("\nfn ")
+                .or_else(|| tail.find("\npub fn "))
+                .unwrap_or(tail.len());
+            assert!(
+                tail[..end].contains("resolve_read_target"),
+                "{entry} bypasses resolver"
+            );
+        }
+        let async_entry = source
+            .split("pub fn enumerate_pages_async_with_options(")
+            .nth(1)
+            .expect("async enumerate entry");
+        assert!(
+            async_entry
+                .split("\nfn ")
+                .next()
+                .unwrap()
+                .contains("PdfEnumerateAdmissionTask")
+        );
+        for entry in [
+            "enumerate_pages",
+            "enumerate_pages_with_cancel",
+            "enumerate_pages_async",
+            "render_page",
+            "render_page_for_display",
+            "render_page_canonical_raster",
+        ] {
+            let start = source.find(&format!("pub fn {entry}(")).unwrap();
+            let tail = &source[start..];
+            let end = tail
+                .find("\nfn ")
+                .or_else(|| tail.find("\npub fn "))
+                .unwrap_or(tail.len());
+            assert!(
+                tail[..end].contains("render_page_target")
+                    || tail[..end].contains("render_page(")
+                    || tail[..end].contains("enumerate_pages_with_cancel")
+                    || tail[..end].contains("enumerate_pages_with_options")
+                    || tail[..end].contains("enumerate_pages_async_with_options"),
+                "{entry} bypasses resolved helper"
+            );
+        }
+    }
+
+    fn minimal_direction_pdf(direction: Option<&str>) -> Vec<u8> {
+        let viewer = direction.map_or(String::new(), |value| {
+            format!("/ViewerPreferences << /Direction /{value} >>")
+        });
+        let objects = [
+            format!("<< /Type /Catalog /Pages 2 0 R {viewer} >>"),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] >>".into(),
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = vec![0];
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Root 1 0 R /Size 4 >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn pdf_enumerate_direction_comes_from_viewer_preferences() {
+        assert_eq!(
+            parse_pdf_direction_name(Some("R2L")),
+            Some(PdfReadingDirection::R2L)
+        );
+        assert_eq!(parse_pdf_direction_name(None), None);
+        assert_eq!(
+            parse_epub_direction_name("rtl"),
+            Some(PdfReadingDirection::R2L)
+        );
+        assert_eq!(
+            parse_epub_direction_name("ltr"),
+            Some(PdfReadingDirection::L2R)
+        );
+        assert_eq!(parse_epub_direction_name("default"), None);
+        let dll = Path::new("vendor/pdfium/bin");
+        let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+            dll.to_str().unwrap(),
+        ))
+        .unwrap();
+        let pdfium = Pdfium::new(bindings);
+        let mut cache = PdfDocumentCache::new(&pdfium);
+        let root = tempfile::tempdir().unwrap();
+        for (name, direction, expected) in [
+            ("rtl.pdf", Some("R2L"), Some(PdfReadingDirection::R2L)),
+            ("plain.pdf", None, None),
+        ] {
+            let path = root.path().join(name);
+            fs::write(&path, minimal_direction_pdf(direction)).unwrap();
+            let response = ipc_enumerate(
+                &mut cache,
+                &path,
+                None,
+                EnumerateOptions {
+                    want_direction: true,
+                },
+            )
+            .unwrap();
+            let result = PdfWorkerPool::parse_enumerate_response(&response).unwrap();
+            assert_eq!(result.pages.len(), 1);
+            assert_eq!(result.direction, expected);
+
+            let response = ipc_enumerate_with_direction_reader(
+                &mut cache,
+                &path,
+                None,
+                EnumerateOptions::default(),
+                || panic!("false must not open the PDF for direction"),
+            )
+            .unwrap();
+            let result = PdfWorkerPool::parse_enumerate_response(&response).unwrap();
+            assert_eq!(result.pages.len(), 1);
+            assert_eq!(result.direction, None);
+        }
+    }
+
+    #[test]
+    fn enumerate_direction_flag_round_trips_and_rejects_invalid_values() {
+        let path = Path::new("book.pdf");
+        let plain = encode_enumerate_request(path, None, EnumerateOptions::default());
+        let requested = encode_enumerate_request(
+            path,
+            None,
+            EnumerateOptions {
+                want_direction: true,
+            },
+        );
+        assert_eq!(requested.len(), plain.len() + 1);
+        assert!(matches!(
+            decode_request(&plain).unwrap(),
+            DecodedRequest::Enumerate {
+                options: EnumerateOptions {
+                    want_direction: false
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode_request(&requested).unwrap(),
+            DecodedRequest::Enumerate {
+                options: EnumerateOptions {
+                    want_direction: true
+                },
+                ..
+            }
+        ));
+        let mut invalid = requested;
+        *invalid.last_mut().unwrap() = 2;
+        assert!(decode_request(&invalid).is_err());
+    }
 
     static CONFIGURED_POOL_SIZE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -4845,9 +5701,9 @@ mod tests {
         assert_eq!(pool_request_count, 1);
 
         let expected = enumerate_test_pages();
-        coordinator.complete(&key, start.request_id, Ok(expected.clone()));
-        assert_eq!(first.rx.recv().unwrap().unwrap(), expected);
-        assert_eq!(second.rx.recv().unwrap().unwrap(), expected);
+        coordinator.complete(&key, start.request_id, Ok(expected.clone().into()));
+        assert_eq!(first.rx.recv().unwrap().unwrap().pages, expected);
+        assert_eq!(second.rx.recv().unwrap().unwrap().pages, expected);
     }
 
     #[test]
@@ -4866,8 +5722,8 @@ mod tests {
         assert!(!start.source_cancel.load(Ordering::Relaxed));
 
         let expected = enumerate_test_pages();
-        coordinator.complete(&key, start.request_id, Ok(expected.clone()));
-        assert_eq!(second.rx.recv().unwrap().unwrap(), expected);
+        coordinator.complete(&key, start.request_id, Ok(expected.clone().into()));
+        assert_eq!(second.rx.recv().unwrap().unwrap().pages, expected);
     }
 
     #[test]
@@ -4906,8 +5762,8 @@ mod tests {
         assert!(!start.source_cancel.load(Ordering::Relaxed));
 
         let expected = enumerate_test_pages();
-        coordinator.complete(&key, start.request_id, Ok(expected.clone()));
-        assert_eq!(second.rx.recv().unwrap().unwrap(), expected);
+        coordinator.complete(&key, start.request_id, Ok(expected.clone().into()));
+        assert_eq!(second.rx.recv().unwrap().unwrap().pages, expected);
     }
 
     #[test]
@@ -4950,7 +5806,8 @@ mod tests {
                 page_num: 99,
                 mtime: 0,
                 file_size: 0,
-            }]),
+            }]
+            .into()),
         );
         assert!(matches!(
             second.rx.try_recv(),
@@ -4958,8 +5815,8 @@ mod tests {
         ));
 
         let expected = enumerate_test_pages();
-        coordinator.complete(&key, second_start.request_id, Ok(expected.clone()));
-        assert_eq!(second.rx.recv().unwrap().unwrap(), expected);
+        coordinator.complete(&key, second_start.request_id, Ok(expected.clone().into()));
+        assert_eq!(second.rx.recv().unwrap().unwrap().pages, expected);
     }
 
     fn document_cache_key(
@@ -5010,7 +5867,7 @@ mod tests {
         let password = Some("secret");
         let expected = test_document_identity(r"C:\Books\same.pdf", password);
         let requests = [
-            encode_enumerate_request(path, password),
+            encode_enumerate_request(path, password, EnumerateOptions::default()),
             encode_render_request(path, 3, PdfRenderTarget::LongEdge(800), password, false),
             encode_get_info_request(path, password),
             encode_analyze_page_request(path, 3, password),

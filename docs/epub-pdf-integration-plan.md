@@ -242,8 +242,12 @@ EPUB を「**中身のバイト列が変換キャッシュに置いてある PDF
 - **設定 (D10)**: 見開き設定に「PDF / EPUB の右開き指定に従う」(`follow_document_reading_direction`、既定 false) を追加する。
   右開きでは左右キーの進行方向や見開きの並びが逆になり、利用者によっては自動の切り替えが困る。既定 OFF で既存の PDF の
   開き方を変えない。PDF と EPUB で別の設定にはしない (変換後は同じ PDF の本として扱うため)。
-- **方向の取得**: PDF ワーカーの**列挙応答**に方向を含め (PDFium の viewer preference 読み取り)、非同期列挙の結果とともに UI へ
-  渡す。UI スレッドで別途 `get_document_info` を同期に呼ばない (I5)。設定が OFF でも取得は行う (応答の形を設定で変えない)。
+- **方向の取得**: 非同期列挙の結果に方向を含めて UI へ渡す (UI スレッドで別途 `get_document_info` を同期に呼ばない、I5)。
+  - EPUB: 変換時に世代表の `direction` 列へ保存した値を使う (解決した `ReadTarget` が保持)。PDF を読み直さない。
+  - 普通の PDF: 列挙要求に `want_direction` を付けたときだけ、PDF ワーカーが公開 PDFium 関数で文書をもう一度開いて
+    `/ViewerPreferences /Direction` を読む。付けない既定では追加の処理をしない。S2c は D10 設定が ON かつ保存済みの
+    見開き設定が無い本に限って付ける。
+  - `pdfium-render` の複製 (開いている文書のハンドルから読むため、22MB・667 ファイル) は採らない (S2b の判断)。
 - **適用条件**: 設定が ON、かつ本に保存済みの見開き設定が無いときだけ。見開き設定の復元 (`apply_spread_for_key_with_fallback`、
   `app.rs:21375-21407`) は方向の正本が `spread_mode` (`SpreadMode::reading_direction`、`:21403-21405`) なので、既定の見開き
   モードに副作用の無い `SpreadMode::with_reading_direction` (`settings.rs:3039`) を適用する
@@ -570,3 +574,26 @@ S1 の独立レビューはポリシーによる上書きの検出を求め (2 �
 削除し、7 は想定外の終了コードとして扱う。`WEBVIEW2_*` 環境変数の除去は変換器・本体とも継続。反映後にサンドボックス外で
 通信 (TCP 0・HTTP 0)、環境変数上書きへの耐性、一時フォルダの削除を再確認した。
 
+### S2b pdf_loader 読み取り境界 (2026-09-25)
+
+`pdf_loader` に EPUB 論理パスから不変 PDF 世代への解決とプロセス内の挿入専用固定表を追加した。
+初回だけ元ファイルの FILETIME・サイズを現在世代と照合し、欠落世代は条件付きで切り離す。
+起動ゲートの結果は `pdf_loader` が保持する。通常 PDF は解決時の stat を行わない。
+同期の PDFium 入口と非同期列挙は実読込パスを IPC に渡し、列挙合流も実読込パスで行う。
+非同期列挙は解決・合流登録・要求組み立てを背景スレッドへ移し、型付き失敗を全 waiter に配布する。
+未使用の in-process `render_page_async` を削除した。列挙応答に方向を追加し、
+`PdfiumConvertedPdfVerifier` で物理 `.part` を検証する。
+EPUB を UI から開く導線、世代スタンプの全派生キャッシュへの接続、方向設定と適用は S2c/S3 に残る。
+レビューで S2a の `src_key` がドライブ文字を落とし別ドライブの同名 EPUB を衝突させることが判明したため、
+未リリースの EPUB 専用 DB・世代ファイル名・固定表を `normalize_keep_drive` に統一した。
+表示用のページ属性は初回解決時の元 EPUB 状態で固定し、列挙結果の世代スタンプとは分離した。
+通常 PDF の列挙 admission は EPUB の DB 待ちと別スレッドにしている。
+設計オーナーの追補決定により `pdfium-render` のローカル fork は採用しない。EPUB 方向は固定した
+世代行の `direction` から渡し、変換 PDF を方向のために再読込しない。通常 PDF は `want_direction=true`
+のときだけ公開 PDFium bindings の `FPDF_LoadDocument` / `FPDF_VIEWERREF_GetName` /
+`FPDF_CloseDocument` で追加 open する。既定 `false` には追加 open が無い。
+通常 PDF の列挙合流キーには `want_direction` を含め、方向不要の in-flight 応答へ方向要求を合流させない。
+EPUB は常に世代行の方向を応答へ載せるため、ワーカーへは `want_direction=false` を送る。
+追加 open の失敗は方向無しとしてページ列挙を維持し、ワーカーの診断へ理由を記録する。
+この条件付き取得は §4.3 の常時方向取得という旧記述に優先する。
+S2c ではスマートフォルダーの `PdfPages` 経路にも列挙結果の方向を運ぶ。

@@ -1048,7 +1048,7 @@ pub fn run() -> eframe::Result {
 
     // Keep the shared liveness lock alive until run() returns. A disabled gate is
     // retained as a typed outcome for the EPUB integration in the next stage.
-    let _epub_gate = epub_cache::startup_gate(&data_dir::get());
+    pdf_loader::install_epub_gate(epub_cache::startup_gate(&data_dir::get()));
 
     // --perf-log: 構造化イベントログ (JSON Lines) を有効化する。
     // 無指定時は `perf::is_enabled()` が false のまま、全 perf::event 呼出しが即 return。

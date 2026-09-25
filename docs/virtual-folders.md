@@ -1,5 +1,25 @@
 # 仮想フォルダ (ZIP / RAR / PDF) 処理
 
+## EPUB → PDF 読み取り境界 (S2b)
+
+S2b は `pdf_loader` の読み取り経路だけを用意する段階で、一覧や UI はまだ `.epub` を開かない。
+将来の `PdfFile` / `PdfPage` と履歴・保存キーは元 EPUB の論理パスを保持する。
+`pdf_loader::resolve_read_target` は背景スレッドで論理パスを変換世代の PDF パスへ解決し、
+PDFium の open admission・worker 文書キャッシュ・列挙合流にはその実ファイルのパスを渡す。
+表示や perf のキーは論理パスのままにする。通常 PDF の解決はパスをそのまま返し、stat を追加しない。
+
+EPUB の初回解決では元ファイルの完全精度の FILETIME とサイズを `epub_cache.db` の現在世代と照合する。
+有効な世代が無ければ `NotConverted`、起動時の削除ゲートが無効なら `EpubUnavailable` を返す。
+世代ファイルが欠落していれば現在表から条件付きで切り離す。
+成功した世代は正規化した論理パスでプロセス内の固定表へ挿入し、以後は元 EPUB の変更や別接続の
+再公開があっても実行中は同じ世代を読み続ける。派生データの照合には PDF の従来の時刻・サイズと
+区別した `DocumentStamp::Generation { id, pdf_size }` を使う。
+固定した EPUB 世代行の `direction` (`rtl` / `ltr` / `default`) も列挙結果へ渡す。EPUB の変換 PDF は方向取得のために再読込しない。
+通常 PDF の `/ViewerPreferences /Direction` は `EnumerateOptions.want_direction=true` の要求時だけ取得する。
+その場合だけ PDF ワーカーは公開 PDFium bindings で PDF をもう一度開いて方向を読み、必ず閉じる。
+追加 open の失敗時は方向無しとしてページ列挙を維持する。既定の `false` では追加 open を行わない。
+S2c は D10 設定が ON かつ本ごとの見開き保存値が無い場合だけ `true` を渡す。
+
 ZIP アーカイブ、直接閲覧できる RAR/CBR、PDF ドキュメントは「中身のページをフォルダ内のファイルに見立てて扱う」仮想フォルダとして実装されている。
 通常画像ファイルとの処理分岐が多く、修正漏れが起きやすい。**ZIP/PDF 対応のある機能を触るときは必ずこのドキュメントを見る**。
 
@@ -341,7 +361,7 @@ PDF は **非同期**で開く:
 
 ```
 1. 即座に items = [] で画面を更新
-2. `PdfEnumerateCoordinator` で同じ `(path, password)` の実行中 enumerate を確認する
+2. 背景 admission で解決し、`PdfEnumerateCoordinator` で同じ `(実読込パス, password, want_direction)` の実行中 enumerate を確認する
    - cancel されていなければ新しい pool 要求を作らず waiter として合流
    - cancel 済み、または key が異なる場合は明示的に新規要求を開始
    - 時間窓と完了結果 cache は使わない
