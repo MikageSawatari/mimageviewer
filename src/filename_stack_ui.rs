@@ -2034,7 +2034,7 @@ mod tests {
                 .unwrap();
             app.record_rating_session_write(key, stars, true);
         }
-        app.sync_current_context_rating_session_writes();
+        app.publish_current_context_rating_writes();
         assert_eq!(app.stack_view.as_ref().unwrap().groups[0].key, "b");
         assert_eq!(
             app.stack_view.as_ref().unwrap().groups[0]

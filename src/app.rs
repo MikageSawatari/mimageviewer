@@ -13917,6 +13917,8 @@ pub struct App {
     /// 現在 mount 中の context が `rating_session_writes` を反映済みの世代。
     /// idx cache と同じ context ownership なので `ViewerContextBundle` と交換する。
     pub(crate) rating_session_write_seen_generation: u64,
+    #[cfg(test)]
+    pub(crate) rating_publication_count: usize,
     /// modal import中だけ保持する、path keyから現在context cache indexへの逆引き。
     /// import開始前に1回構築し、streaming refresh batchごとの全items走査を避ける。
     metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
@@ -17043,6 +17045,8 @@ impl App {
             rating_session_write_generation: 0,
             rating_session_writes: std::collections::HashMap::new(),
             rating_session_write_seen_generation: 0,
+            #[cfg(test)]
+            rating_publication_count: 0,
             metadata_import_refresh_index: None,
             current_folder_rating_cache: None,
             rating_counts_cache: None,
@@ -25168,7 +25172,7 @@ impl App {
                 && self.rating_view_accepted_write_generation
                     != crate::rating_db::RATING_WRITES.sample().completed_writes
             {
-                self.request_rating_view_build();
+                self.request_rating_view_membership_refresh();
             }
             return;
         }
@@ -25182,8 +25186,9 @@ impl App {
             return;
         }
         let stale = pending.sequence != self.rating_view_request_sequence
-            || pending.rating_write_generation != self.rating_session_write_generation
             || pending.sort != self.rating_view_sort
+            || pending.order_request
+                != crate::rating_sort::ListingOrderRequest::from_settings(&self.settings)
             || pending.stars != self.rating_view_stars
             || pending.source_generation != self.items_generation;
         if stale {
@@ -25192,6 +25197,18 @@ impl App {
         }
         match pending.rx.try_recv() {
             Ok(Ok(result)) => {
+                let read_generation = pending.rating_write_generation;
+                let rating_header_survivors = (pending.membership_only
+                    && self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+                    && self.settings.details_sort_key == crate::settings::DetailsSortKey::Rating)
+                    .then(|| {
+                        self.details_order
+                            .iter()
+                            .filter_map(|&index| {
+                                self.rating_view_rows.get(index).map(|row| row.key.clone())
+                            })
+                            .collect::<Vec<_>>()
+                    });
                 self.rating_view_pending = None;
                 // The generic item install clears the outgoing edit maps. Finish its pending
                 // trim write before validating the worker's DB-read stamp.
@@ -25199,7 +25216,6 @@ impl App {
                 if result.prepared.as_ref().is_some_and(|prepared| {
                     crate::page_edit_write_epoch::PAGE_EDIT_WRITES
                         .accepts(prepared.page_edits.stamp)
-                        && crate::rating_db::RATING_WRITES.accepts(prepared.rating_stamp)
                         && crate::tags_db::TAG_WRITES.accepts(prepared.tag_stamp)
                 }) {
                     self.rating_view_accepted_write_generation = result
@@ -25209,6 +25225,20 @@ impl App {
                         .rating_stamp
                         .completed_writes;
                     self.apply_rating_view_result(result);
+                    self.overlay_rating_session_writes_since(read_generation);
+                    if let Some(keys) = rating_header_survivors {
+                        let positions = self
+                            .rating_view_rows
+                            .iter()
+                            .enumerate()
+                            .map(|(index, row)| (row.key.as_str(), index))
+                            .collect::<std::collections::HashMap<_, _>>();
+                        self.details_order = keys
+                            .iter()
+                            .filter_map(|key| positions.get(key.as_str()).copied())
+                            .collect();
+                    }
+                    self.rebuild_visible_indices_after_rating_publication();
                 } else {
                     self.request_rating_view_build();
                 }
@@ -25216,7 +25246,6 @@ impl App {
             Ok(Err(msg)) => {
                 self.rating_view_pending = None;
                 if msg == "page-edit read changed during rating prepare"
-                    || msg == "rating read changed during rating prepare"
                     || msg == "tag read changed during rating prepare"
                     || msg == "cancelled"
                 {
@@ -25241,6 +25270,26 @@ impl App {
     }
 
     fn request_rating_view_build(&mut self) {
+        self.request_rating_view_build_with_intent(
+            crate::rating_view::RatingViewBuildIntent::Reorder,
+        );
+    }
+
+    fn request_rating_view_membership_refresh(&mut self) {
+        let survivor_keys = self
+            .rating_view_rows
+            .iter()
+            .map(|row| row.key.clone())
+            .collect();
+        self.request_rating_view_build_with_intent(
+            crate::rating_view::RatingViewBuildIntent::Membership { survivor_keys },
+        );
+    }
+
+    fn request_rating_view_build_with_intent(
+        &mut self,
+        intent: crate::rating_view::RatingViewBuildIntent,
+    ) {
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
         }
@@ -25253,7 +25302,11 @@ impl App {
             self.projected_viewer_context_id(),
             self.rating_session_write_generation,
             crate::rating_view::RatingViewPrepareOptions {
+                intent,
                 sort: self.rating_view_sort,
+                order_request: crate::rating_sort::ListingOrderRequest::from_settings(
+                    &self.settings,
+                ),
                 display_order: self.settings.grid_display_order.clone(),
                 pin_db: self.folder_thumb_pin_db.clone(),
                 folder_thumb_sort: self.settings.folder_thumb_sort,
@@ -25297,14 +25350,6 @@ impl App {
         self.items_are_rating_view
             .then(|| self.rating_view_rows.get(idx))
             .flatten()
-    }
-
-    pub(crate) fn refresh_rating_view_after_rating_changes(&mut self, changes: &[(String, u8)]) {
-        if changes.is_empty() {
-            self.rebuild_visible_indices();
-        } else {
-            self.request_rating_view_build();
-        }
     }
 
     pub(crate) fn reload_current_rating_view_preserving_sort(&mut self) {
@@ -25369,7 +25414,9 @@ impl App {
         // Normal sort は従来どおり再配置し、rows も再配置後の順序へ揃え直す。
         let (items, image_metas) = crate::rating_view::sort_and_materialize_rows(
             &mut self.rating_view_rows,
-            self.rating_view_sort,
+            self.rating_view_sort.for_listing_order(
+                crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
+            ),
             &self.settings.grid_display_order,
         );
         let video_items: Vec<(usize, PathBuf, u64)> = items
@@ -31989,6 +32036,7 @@ impl App {
         if sorted_desc_idxs.is_empty() {
             return;
         }
+        self.remove_smart_folder_rating_masks(sorted_desc_idxs);
         let previous_items_generation = self.items_generation;
         let removed_snapshot_paths: Vec<std::path::PathBuf> = sorted_desc_idxs
             .iter()
@@ -35955,7 +36003,10 @@ impl App {
         &self,
         bookmark: &crate::book_bookmarks::BookBookmark,
     ) -> Option<usize> {
-        (0..self.items.len()).find(|idx| self.book_bookmark_matches_item(bookmark, *idx))
+        (0..self.items.len()).find(|idx| {
+            self.smart_folder_rule_qualifies_index(*idx)
+                && self.book_bookmark_matches_item(bookmark, *idx)
+        })
     }
 
     fn resolve_current_archive_bookmark_target(
@@ -54461,17 +54512,28 @@ impl App {
     /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
-        self.rebuild_visible_indices_impl(true);
+        self.rebuild_visible_indices_impl(true, false);
     }
 
     /// DB / bookmarkなど外部snapshotの更新で、現在mount中のcontext-owned表示集合だけを
     /// 再計算する。`facet_filter_scope`とsuppressionはApp-globalなので、detached/pausedを
     /// 一時mountする経路ではnavigation扱いのscope同期を行わない。
     fn rebuild_visible_indices_preserving_facet_scope(&mut self) {
-        self.rebuild_visible_indices_impl(false);
+        self.rebuild_visible_indices_impl(false, false);
     }
 
-    fn rebuild_visible_indices_impl(&mut self, sync_facet_scope: bool) {
+    /// A rating publication changes membership, but the rating header retains
+    /// the order established by its last explicit sort or items install.
+    pub(crate) fn rebuild_visible_indices_after_rating_publication(&mut self) {
+        self.rebuild_visible_indices_impl(false, true);
+        self.refresh_smart_folder_rating_navigation_entries();
+    }
+
+    fn rebuild_visible_indices_impl(
+        &mut self,
+        sync_facet_scope: bool,
+        preserve_rating_details_order: bool,
+    ) {
         if matches!(self.navigation_scope, ViewerNavigationScope::CollectionRoot) {
             // The root's installed prepared order is the navigation domain. App-global search,
             // rating, and facet filters belong to the main grid and must not trim this owner.
@@ -54548,12 +54610,33 @@ impl App {
             };
 
         let n = self.items.len();
+        let smart_rating_membership = self.smart_folder_rating_membership_flags();
+        let mut smart_rule_total = 0;
+        let mut smart_rule_search_matches = 0;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
+            if smart_rating_membership
+                .as_ref()
+                .is_some_and(|flags| !flags[i])
+            {
+                continue;
+            }
+            if smart_rating_membership.is_some() {
+                smart_rule_total += 1;
+                if search_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.contains(&i))
+                {
+                    smart_rule_search_matches += 1;
+                }
+            }
             if let Some(ref f) = search_filter {
                 if !f.contains(&i) {
                     continue;
                 }
+            }
+            if self.items_are_rating_view && self.get_rating(i) != self.rating_view_stars {
+                continue;
             }
             if rating_filter_active {
                 let stars = self.get_rating(i);
@@ -54574,6 +54657,12 @@ impl App {
                 continue;
             }
             result.push(i);
+        }
+        if smart_rating_membership.is_some()
+            && let Some(session) = self.top_level_grid_view.smart_folder_session_mut()
+        {
+            session.rating_rule_qualifying_count = smart_rule_total;
+            session.rating_rule_search_match_count = smart_rule_search_matches;
         }
         self.visible_indices = result;
         if let Some(t0) = facet_name_filter_t0 {
@@ -54632,7 +54721,29 @@ impl App {
             }
         }
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
-            self.rebuild_details_order();
+            if preserve_rating_details_order
+                && self.settings.details_sort_key == crate::settings::DetailsSortKey::Rating
+                && self.details_header_sort_active()
+            {
+                let visible = self.visible_indices.iter().copied().collect::<HashSet<_>>();
+                let mut retained = self
+                    .details_order
+                    .iter()
+                    .copied()
+                    .filter(|idx| visible.contains(idx))
+                    .collect::<Vec<_>>();
+                let already = retained.iter().copied().collect::<HashSet<_>>();
+                retained.extend(
+                    self.visible_indices
+                        .iter()
+                        .copied()
+                        .filter(|idx| !already.contains(idx)),
+                );
+                self.details_order = retained;
+                self.details_order_revision = self.details_order_revision.wrapping_add(1);
+            } else {
+                self.rebuild_details_order();
+            }
         } else {
             self.details_order.clear();
         }
@@ -54708,6 +54819,9 @@ impl App {
             && !rating_filter.iter().all(|&b| b);
         let mut out = Vec::new();
         for i in 0..self.items.len() {
+            if !self.smart_folder_rule_qualifies_index(i) {
+                continue;
+            }
             if let Some(ref f) = search_filter {
                 if !f.contains(&i) {
                     continue;
@@ -56238,6 +56352,9 @@ impl App {
         // あるが、検索は低頻度操作なので許容範囲。xmp_cache は既読分のルックアップ
         // 専用で、スレッドは自分が読み取った分は `xmp_additions` で UI に返す。
         let items_snapshot = self.items.clone();
+        // Keep raw indices stable while the worker searches only rows in this root's rule.
+        // Publication will intersect any completed match set with current membership again.
+        let smart_rule_membership = self.smart_folder_rating_membership_flags();
         let xmp_snapshot = self.xmp_cache.clone();
         // PDF document info 照合 (§4.1.1) はワーカースレッドで保存済みパスワードを
         // 引く。ストアごと clone してスレッドへ渡す (decrypt は照合対象 PDF だけ遅延)。
@@ -56263,6 +56380,7 @@ impl App {
         let cancel_w = Arc::clone(&cancel);
         let progress = Arc::new(SearchProgressShared::new(ctrl_f_progress_total(
             &items_snapshot,
+            smart_rule_membership.as_deref(),
         )));
         let progress_w = Arc::clone(&progress);
         let (tx, rx) = mpsc::channel();
@@ -56275,6 +56393,7 @@ impl App {
                 let result = run_metadata_search(
                     &tokens,
                     &items_snapshot,
+                    smart_rule_membership.as_deref(),
                     &xmp_snapshot,
                     fts_meta_clone.as_ref(),
                     &pdf_passwords,
@@ -56783,9 +56902,6 @@ impl App {
     ) {
         self.rating_session_write_generation =
             self.rating_session_write_generation.wrapping_add(1).max(1);
-        // Every successful rating DB write, including metadata panel and fullscreen keys,
-        // invalidates a prepared rating order at the shared publication boundary.
-        self.rating_view_request_sequence = self.rating_view_request_sequence.wrapping_add(1);
         self.rating_session_writes.insert(
             key,
             RatingSessionWrite {
@@ -56806,6 +56922,17 @@ impl App {
         stars: u8,
         meta: Option<&crate::rating_db::RatingMeta>,
     ) -> Result<(), String> {
+        self.write_user_rating_shared_deferred(key, stars, meta)?;
+        self.publish_current_context_rating_writes();
+        Ok(())
+    }
+
+    fn write_user_rating_shared_deferred(
+        &mut self,
+        key: &str,
+        stars: u8,
+        meta: Option<&crate::rating_db::RatingMeta>,
+    ) -> Result<(), String> {
         self.rating_db
             .as_ref()
             .ok_or_else(|| "レーティング DB を利用できません".to_string())?
@@ -56815,7 +56942,6 @@ impl App {
         // counter. Detached/main contexts may consume it only after SQLite is
         // the durable source of truth.
         self.record_rating_session_write(key.to_string(), stars, true);
-        self.sync_current_context_rating_session_writes();
         Ok(())
     }
 
@@ -56842,7 +56968,7 @@ impl App {
         for (key, stars, _) in writes {
             self.record_rating_session_write(key.clone(), *stars, true);
         }
-        self.sync_current_context_rating_session_writes();
+        self.publish_current_context_rating_writes();
         Ok(())
     }
 
@@ -56933,6 +57059,44 @@ impl App {
         changed
     }
 
+    /// Publish durable path-key writes into the mounted context's display state.
+    /// Parked contexts run this same step on mount after their bundle is swapped in.
+    pub(crate) fn publish_current_context_rating_writes(&mut self) {
+        let seen = self.rating_session_write_seen_generation;
+        if seen == self.rating_session_write_generation {
+            return;
+        }
+        let updates = self.rating_session_writes_after(seen);
+        self.sync_current_context_rating_session_writes();
+        if updates.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.rating_publication_count += 1;
+        }
+        self.invalidate_rating_counts_cache();
+        self.publish_search_rating_writes(&updates);
+        if self.items_are_rating_view && self.rating_view_pending.is_none() {
+            self.request_rating_view_membership_refresh();
+        }
+        self.schedule_smart_folder_rating_membership();
+        self.rebuild_visible_indices_after_rating_publication();
+    }
+
+    pub(crate) fn rating_session_writes_after(&self, generation: u64) -> Vec<(String, u8)> {
+        self.rating_session_writes
+            .iter()
+            .filter_map(|(key, write)| {
+                (write.generation > generation).then_some((key.clone(), write.stars))
+            })
+            .collect()
+    }
+
+    pub(crate) fn rating_session_value_for_key(&self, key: &str) -> Option<u8> {
+        self.rating_session_writes.get(key).map(|write| write.stars)
+    }
+
     /// The R4 refresh control uses this surface rule; Snapshot has no reload
     /// action in `reload_top_level_grid` and must never show an active refresh icon.
     pub(crate) fn grid_sort_refresh_available(&self) -> bool {
@@ -56944,7 +57108,7 @@ impl App {
 
     /// A prepared rating order carries its own pre-read stamp. The context's
     /// seen generation may already have advanced while that order was prepared.
-    fn overlay_rating_session_writes_since(&mut self, generation: u64) {
+    pub(crate) fn overlay_rating_session_writes_since(&mut self, generation: u64) {
         let updates = self
             .items
             .iter()
@@ -57014,11 +57178,26 @@ impl App {
     }
 
     fn set_rating_result(&mut self, idx: usize, stars: u8) -> Result<bool, String> {
+        self.set_rating_result_inner(idx, stars, true)
+    }
+
+    fn set_rating_result_deferred(&mut self, idx: usize, stars: u8) -> Result<bool, String> {
+        self.set_rating_result_inner(idx, stars, false)
+    }
+
+    fn set_rating_result_inner(
+        &mut self,
+        idx: usize,
+        stars: u8,
+        publish: bool,
+    ) -> Result<bool, String> {
         let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
         if !accepts {
             return Ok(false);
         }
-        self.sync_current_context_rating_session_writes();
+        if publish {
+            self.sync_current_context_rating_session_writes();
+        }
         let stars = stars.min(5);
         let key = match self.rating_path_key(idx) {
             Some(k) => k,
@@ -57031,7 +57210,7 @@ impl App {
         // DB write と App-global path generation の記録を同じ ownership
         // boundary に通す。detached unmount 時は swap 境界が main / parked
         // cache へ同じ値を反映する。
-        self.write_user_rating_shared(&key, stars, meta.as_ref())?;
+        self.write_user_rating_shared_deferred(&key, stars, meta.as_ref())?;
         self.rating_cache.insert(idx, stars);
         self.invalidate_rating_counts_cache();
         // コンテナ自身の★は子孫集計と別軸なので、単一ファイルレーティング (画像 / 動画 /
@@ -57064,6 +57243,9 @@ impl App {
             idx,
             crate::content_identity::ContentIdentityTrigger::Edit,
         );
+        if publish {
+            self.publish_current_context_rating_writes();
+        }
         Ok(true)
     }
 
@@ -58208,7 +58390,7 @@ impl App {
         for (key, stars) in imported_writes {
             self.record_rating_session_write(key, stars, false);
         }
-        self.sync_current_context_rating_session_writes();
+        self.publish_current_context_rating_writes();
         if rating_written {
             self.schedule_current_smart_folder_metadata_refresh(
                 smart_folder::SmartFolderMetadataDependency::Rating,
@@ -58591,7 +58773,7 @@ impl App {
         let mut undo_records = Vec::with_capacity(targets.len());
         let mut first_error = None;
         for record @ (idx, _, after) in pending_records {
-            match self.set_rating_result(idx, after) {
+            match self.set_rating_result_deferred(idx, after) {
                 Ok(true) => {
                     successful_targets.push((idx, after));
                     undo_records.push(record);
@@ -58635,14 +58817,6 @@ impl App {
         if matches!(edit, RatingEdit::Step(_)) {
             self.show_feedback_toast(format!("[{summary}]"));
         }
-        let rating_view_changes: Vec<(String, u8)> = if self.items_are_rating_view {
-            successful_targets
-                .iter()
-                .filter_map(|&(idx, after)| self.rating_path_key(idx).map(|key| (key, after)))
-                .collect()
-        } else {
-            Vec::new()
-        };
         let bulk = successful_targets.len() > 1;
         if bulk {
             crate::logger::log(format!(
@@ -58661,53 +58835,7 @@ impl App {
         if bulk || (matches!(edit, RatingEdit::Step(_)) && !self.checked.is_empty()) {
             self.checked.clear();
         }
-        // Ctrl+G ヒットの stars はバッチ受信時の snapshot。レーティング変更後に
-        // drilled view のサブフォルダ件数 / 枝刈りが古いまま残らないよう、
-        // 該当する all_hits エントリを最新値で書き換える (Codex P3)。
-        // 合成ビューを再構築するのは現在 items が合成ビュー由来のときだけ:
-        // Ctrl+G から実フォルダ/ZIP/PDF を開いた直後は items が PDF ページ等の
-        // 実体ビューなので、ここで rebuild_items_from_global_search を呼ぶと
-        // ページ一覧が検索 drilled view の合成 items に置き換わる事故になる
-        // (Codex P2)。
-        if self.global_search.active {
-            self.refresh_global_search_hit_stars(
-                &successful_targets
-                    .iter()
-                    .map(|&(idx, _)| idx)
-                    .collect::<Vec<_>>(),
-            );
-        }
-        if self.items_are_rating_view {
-            self.refresh_rating_view_after_rating_changes(&rating_view_changes);
-        } else if self.global_search.active && self.items_are_global_search_view {
-            self.rebuild_items_from_global_search();
-        } else {
-            self.rebuild_visible_indices();
-        }
-    }
-
-    /// `set_rating` で書き換えた idx 群について、Ctrl+G の `all_hits` 中の対応する
-    /// hit エントリの `stars` を最新値で更新する。drilled view バッジ件数 / 枝刈り /
-    /// 直下ファイルフィルタが snapshot のまま古くならないようにする (Codex P3)。
-    fn refresh_global_search_hit_stars(&mut self, idxs: &[usize]) {
-        // 対象 idx → (rating_db キー, 新 stars) の対応を作る
-        let mut updates: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
-        for &idx in idxs {
-            let Some(key) = self.rating_path_key(idx) else {
-                continue;
-            };
-            let new_stars = self.rating_cache.get(&idx).copied().unwrap_or(0);
-            updates.insert(key, new_stars);
-        }
-        if updates.is_empty() {
-            return;
-        }
-        for h in self.global_search.all_hits.iter_mut() {
-            let hit_key = crate::global_search_ui::hit_rating_key(&h.path);
-            if let Some(&v) = updates.get(&hit_key) {
-                h.stars = v;
-            }
-        }
+        self.publish_current_context_rating_writes();
     }
 
     /// 現在動画の mute を反転し、セッション状態と次回起動用の保存状態にも反映する。
@@ -70281,6 +70409,9 @@ impl App {
         let mut indices: Vec<usize> = Vec::new();
         let mut keys: Vec<String> = Vec::new();
         for idx in 0..self.items.len() {
+            if !self.smart_folder_rule_qualifies_index(idx) {
+                continue;
+            }
             match self.items.get(idx) {
                 Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })
@@ -70304,6 +70435,9 @@ impl App {
         let mut map: std::collections::HashMap<std::path::PathBuf, Vec<String>> =
             std::collections::HashMap::new();
         for idx in 0..self.items.len() {
+            if !self.smart_folder_rule_qualifies_index(idx) {
+                continue;
+            }
             match self.items.get(idx) {
                 Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })
@@ -70432,12 +70566,14 @@ impl App {
     fn snapshot_inherited_default_params(&self) -> Vec<(usize, crate::adjustment::AdjustParams)> {
         (0..self.items.len())
             .filter(|idx| {
-                matches!(
-                    self.items.get(*idx),
-                    Some(GridItem::Image(_))
-                        | Some(GridItem::ZipImage { .. })
-                        | Some(GridItem::PdfPage { .. })
-                ) && !self.adjustment_page_params.contains_key(idx)
+                self.smart_folder_rule_qualifies_index(*idx)
+                    && matches!(
+                        self.items.get(*idx),
+                        Some(GridItem::Image(_))
+                            | Some(GridItem::ZipImage { .. })
+                            | Some(GridItem::PdfPage { .. })
+                    )
+                    && !self.adjustment_page_params.contains_key(idx)
             })
             .map(|idx| (idx, self.effective_default_for_idx(idx).clone()))
             .collect()
@@ -70474,9 +70610,11 @@ impl App {
     fn prune_page_params_matching_default(&mut self) {
         let redundant: Vec<usize> = (0..self.items.len())
             .filter(|idx| {
-                self.adjustment_page_params
-                    .get(idx)
-                    .is_some_and(|p| p == self.effective_default_for_idx(*idx))
+                self.smart_folder_rule_qualifies_index(*idx)
+                    && self
+                        .adjustment_page_params
+                        .get(idx)
+                        .is_some_and(|p| p == self.effective_default_for_idx(*idx))
             })
             .collect();
         for idx in redundant {
@@ -70513,7 +70651,9 @@ impl App {
     fn remaining_page_override_count(&self, exclude_idx: Option<usize>) -> usize {
         (0..self.items.len())
             .filter(|idx| {
-                Some(*idx) != exclude_idx && self.adjustment_page_params.contains_key(idx)
+                self.smart_folder_rule_qualifies_index(*idx)
+                    && Some(*idx) != exclude_idx
+                    && self.adjustment_page_params.contains_key(idx)
             })
             .count()
     }
@@ -81511,6 +81651,31 @@ mod favorite_view_state_tests {
 #[cfg(test)]
 mod rated_at_details_sort_tests {
     use super::*;
+
+    #[test]
+    fn rating_publication_keeps_header_survivors_and_appends_new_members() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = setup_app_for_test();
+        app.items = (0..5)
+            .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\rating-order\{idx}.jpg"))))
+            .collect();
+        app.image_metas = vec![Some((0, 0)); 5];
+        app.thumbnails = vec![ThumbnailState::Pending; 5];
+        app.rating_cache = HashMap::from([(0, 4), (1, 0), (2, 5), (3, 0), (4, 4)]);
+        app.settings.rating_filter = [false, false, false, false, true, true];
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_rating = true;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Rating;
+        app.settings.details_sort_ascending = false;
+        app.rebuild_visible_indices();
+        assert_eq!(app.details_order, vec![2, 0, 4]);
+
+        app.rating_cache.extend([(0, 5), (1, 5), (2, 4), (3, 4)]);
+        app.rebuild_visible_indices_after_rating_publication();
+        assert_eq!(app.details_order, vec![2, 0, 4, 1, 3]);
+        app.rebuild_details_order();
+        assert_eq!(app.details_order, vec![0, 1, 2, 3, 4]);
+    }
 
     fn row(name: &str, rated_at_ms: Option<i64>) -> crate::rating_view::RatingViewRow {
         let path = PathBuf::from(format!(r"C:\rating-view\{name}"));

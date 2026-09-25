@@ -1631,8 +1631,10 @@ pub(super) fn probe_audio_details(path: &Path, cancel: &AtomicBool) -> Option<De
     })
 }
 
-pub(super) fn ctrl_f_progress_total(items: &[GridItem]) -> usize {
-    items.len()
+pub(super) fn ctrl_f_progress_total(items: &[GridItem], eligible: Option<&[bool]>) -> usize {
+    eligible
+        .map(|flags| flags.iter().take(items.len()).filter(|&&flag| flag).count())
+        .unwrap_or(items.len())
 }
 
 pub(super) fn mark_ctrl_f_progress(progress: Option<&SearchProgressShared>, matched: bool) {
@@ -1831,6 +1833,7 @@ impl MetadataSearchPass2<'_> {
 pub(super) fn run_metadata_search(
     tokens: &[crate::search_query::Token],
     items: &[GridItem],
+    eligible: Option<&[bool]>,
     xmp_snapshot: &std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
     _fts_meta: Option<&std::sync::Arc<crate::fts_meta::FtsMetaDb>>,
     pdf_passwords: &crate::pdf_passwords::PdfPasswordStore,
@@ -1847,6 +1850,7 @@ pub(super) fn run_metadata_search(
     let pass1_started = total_started;
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut scanned_items = 0_usize;
+    let eligible_total = ctrl_f_progress_total(items, eligible);
 
     // §19 target フィルタ: target が含むソースだけを判定対象にする。
     let use_name = target.includes(crate::fts_index::SourceKind::Filename);
@@ -1871,6 +1875,9 @@ pub(super) fn run_metadata_search(
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
+        }
+        if eligible.is_some_and(|flags| !flags.get(idx).copied().unwrap_or(false)) {
+            continue;
         }
         let processed_in_pass1 = match item {
             GridItem::Folder(_)
@@ -2003,6 +2010,9 @@ pub(super) fn run_metadata_search(
                     items
                         .par_iter()
                         .enumerate()
+                        .filter(|(idx, _)| {
+                            eligible.is_none_or(|flags| flags.get(*idx).copied().unwrap_or(false))
+                        })
                         .filter_map(|(idx, item)| pass2.process(idx, item))
                         .collect()
                 })
@@ -2014,6 +2024,9 @@ pub(super) fn run_metadata_search(
                 items
                     .iter()
                     .enumerate()
+                    .filter(|(idx, _)| {
+                        eligible.is_none_or(|flags| flags.get(*idx).copied().unwrap_or(false))
+                    })
                     .filter_map(|(idx, item)| pass2.process(idx, item))
                     .collect()
             }
@@ -2069,7 +2082,7 @@ pub(super) fn run_metadata_search(
                     "total_ms",
                     serde_json::Value::from(total_started.elapsed().as_secs_f64() * 1000.0),
                 ),
-                ("items_total", serde_json::Value::from(items.len())),
+                ("items_total", serde_json::Value::from(eligible_total)),
                 ("items_scanned", serde_json::Value::from(scanned_items)),
                 ("pass2_items", serde_json::Value::from(pass2_items)),
                 ("pass2_file_reads", serde_json::Value::from(read_keys.len())),

@@ -170,6 +170,120 @@ fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
 }
 
 const ROOT_SIZE: egui::Vec2 = egui::vec2(1200.0, 800.0);
+
+#[test]
+fn rating_publication_reaches_main_and_two_detached_without_reordering_siblings() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let mut app = super::tests::phase_c_support::setup_app();
+    let folder = app.tmp.path().join("r3-shared-ratings");
+    std::fs::create_dir_all(&folder).unwrap();
+    for name in ["a.jpg", "b.jpg"] {
+        std::fs::write(folder.join(name), b"image").unwrap();
+    }
+    let a_key = crate::adjustment_db::normalize_path(&folder.join("a.jpg"));
+    let b_key = crate::adjustment_db::normalize_path(&folder.join("b.jpg"));
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&b_key, 5, None)
+        .unwrap();
+    let spec = crate::rating_sort::RatingSortSpec {
+        direction: crate::rating_sort::RatingSortDirection::Desc,
+        unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+    };
+    let mut filter = [false; 6];
+    filter[5] = true;
+    app.settings.rating_filter = filter;
+    crate::rating_sort::with_test_rating_order(spec, || {
+        app.load_folder_with_scan(folder.clone(), None)
+    });
+    let main_generation = app.items_generation;
+    let first = app.build_active_context_for_test(Some(911), DetachedSource::Image, |_| {});
+    let second = app.build_active_context_for_test(Some(912), DetachedSource::Image, |_| {});
+    for id in [first, second] {
+        crate::rating_sort::with_test_rating_order(spec, || {
+            app.with_viewer_context(id, |mounted| {
+                mounted.load_folder_with_scan(folder.clone(), None)
+            })
+            .unwrap();
+        });
+    }
+    app.with_viewer_context(first, |mounted| {
+        mounted
+            .write_user_ratings_shared(&[(a_key.clone(), 5, None), (b_key.clone(), 4, None)])
+            .unwrap();
+        assert_eq!(
+            mounted
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+        assert_eq!(mounted.rating_cache.get(&0), Some(&4));
+        assert_eq!(mounted.rating_cache.get(&1), Some(&5));
+        assert_eq!(mounted.visible_indices, [1]);
+    })
+    .unwrap();
+    assert_eq!(app.items_generation, main_generation);
+    assert_eq!(
+        app.items
+            .iter()
+            .map(|item| item.name().into_owned())
+            .collect::<Vec<_>>(),
+        ["b.jpg", "a.jpg"]
+    );
+    assert_eq!(app.rating_cache.get(&0), Some(&4));
+    assert_eq!(app.rating_cache.get(&1), Some(&5));
+    assert_eq!(app.visible_indices, [1]);
+    let second_generation = app
+        .with_viewer_context(second, |mounted| {
+            assert_eq!(
+                mounted
+                    .items
+                    .iter()
+                    .map(|item| item.name().into_owned())
+                    .collect::<Vec<_>>(),
+                ["b.jpg", "a.jpg"]
+            );
+            assert_eq!(mounted.rating_cache.get(&0), Some(&4));
+            assert_eq!(mounted.rating_cache.get(&1), Some(&5));
+            assert_eq!(mounted.visible_indices, [1]);
+            mounted.items_generation
+        })
+        .unwrap();
+    crate::rating_sort::with_test_rating_order(spec, || {
+        app.with_viewer_context(first, |mounted| {
+            mounted.load_folder_with_scan(folder.clone(), None)
+        })
+        .unwrap();
+    });
+    app.with_viewer_context(first, |mounted| {
+        assert_eq!(
+            mounted
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["a.jpg", "b.jpg"]
+        );
+    })
+    .unwrap();
+    assert_eq!(app.items_generation, main_generation);
+    app.with_viewer_context(second, |mounted| {
+        assert_eq!(mounted.items_generation, second_generation);
+        assert_eq!(
+            mounted
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+    })
+    .unwrap();
+}
+
 const CHILD_SIZE: egui::Vec2 = egui::vec2(960.0, 720.0);
 
 struct ScenarioFrame {

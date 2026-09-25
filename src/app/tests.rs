@@ -1950,6 +1950,162 @@ fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
 }
 
 #[test]
+fn rating_search_write_after_worker_read_keeps_order_and_overlays_badges() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let mut app = phase_c_support::setup_app();
+    let a = app.tmp.path().join("r3-a.jpg");
+    let b = app.tmp.path().join("r3-b.jpg");
+    for path in [&a, &b] {
+        std::fs::write(path, b"image").unwrap();
+    }
+    let a_key = crate::adjustment_db::normalize_path(&a);
+    let b_key = crate::adjustment_db::normalize_path(&b);
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&a_key, 1, None)
+        .unwrap();
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&b_key, 5, None)
+        .unwrap();
+    let spec = crate::rating_sort::RatingSortSpec {
+        direction: crate::rating_sort::RatingSortDirection::Desc,
+        unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+    };
+    crate::rating_sort::with_test_rating_order(spec, || {
+        let ctx = egui::Context::default();
+        let stream = phase_b_search_stream(&mut app, &ctx);
+        app.global_search.aggregate_auto = false;
+        stream.send(phase_b_search_batch(&a, 1)).unwrap();
+        stream.send(phase_b_search_batch(&b, 2)).unwrap();
+        stream
+            .send(crate::global_search::SearchStreamEvent::Done {
+                truncated: false,
+                reason: crate::global_search::DoneReason::Complete,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.items.len() != 2 && std::time::Instant::now() < deadline {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["r3-b.jpg", "r3-a.jpg"]
+        );
+        app.hold_next_search_ready_for_test();
+        app.rebuild_items_from_global_search();
+        while !app.search_ready_is_held_for_test() && std::time::Instant::now() < deadline {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.search_ready_is_held_for_test());
+        let generation = app.items_generation;
+        app.write_user_ratings_shared(&[(a_key.clone(), 5, None), (b_key.clone(), 4, None)])
+            .unwrap();
+        app.release_search_ready_for_test();
+        while app.items_generation == generation && std::time::Instant::now() < deadline {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["r3-b.jpg", "r3-a.jpg"]
+        );
+        assert_eq!(app.rating_cache.get(&0), Some(&4));
+        assert_eq!(app.rating_cache.get(&1), Some(&5));
+        assert_eq!(
+            app.global_search
+                .all_hits
+                .iter()
+                .map(|hit| hit.stars)
+                .collect::<Vec<_>>(),
+            [5, 4]
+        );
+    });
+}
+
+#[test]
+fn rating_search_departure_is_hidden_before_first_paint_and_entrant_appends_later() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let mut app = phase_c_support::setup_app();
+    let paths = ["a", "b", "c"].map(|name| app.tmp.path().join(format!("r3-filter-{name}.jpg")));
+    let keys = paths
+        .iter()
+        .map(|path| crate::adjustment_db::normalize_path(path))
+        .collect::<Vec<_>>();
+    for (path, (key, stars)) in paths.iter().zip(keys.iter().zip([5, 5, 4])) {
+        std::fs::write(path, b"image").unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(key, stars, None)
+            .unwrap();
+    }
+    app.settings.rating_filter = [false; 6];
+    app.settings.rating_filter[5] = true;
+    let spec = crate::rating_sort::RatingSortSpec {
+        direction: crate::rating_sort::RatingSortDirection::Desc,
+        unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+    };
+    crate::rating_sort::with_test_rating_order(spec, || {
+        let ctx = egui::Context::default();
+        let stream = phase_b_search_stream(&mut app, &ctx);
+        app.global_search.aggregate_auto = false;
+        for (index, path) in paths.iter().enumerate() {
+            stream.send(phase_b_search_batch(path, index + 1)).unwrap();
+        }
+        stream
+            .send(crate::global_search::SearchStreamEvent::Done {
+                truncated: false,
+                reason: crate::global_search::DoneReason::Complete,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.items.len() != 2 && std::time::Instant::now() < deadline {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.items.len(), 2);
+        app.hold_next_search_ready_for_test();
+        app.rebuild_items_from_global_search();
+        while !app.search_ready_is_held_for_test() && std::time::Instant::now() < deadline {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.search_ready_is_held_for_test());
+        app.write_user_ratings_shared(&[(keys[0].clone(), 4, None), (keys[2].clone(), 5, None)])
+            .unwrap();
+        let before_install = app.items_generation;
+        app.release_search_ready_for_test();
+        while app.items_generation == before_install && std::time::Instant::now() < deadline {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let visible = |app: &App| {
+            app.visible_indices
+                .iter()
+                .map(|&index| app.items[index].name().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visible(&app), ["r3-filter-b.jpg"]);
+        while visible(&app).len() != 2 && std::time::Instant::now() < deadline {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(visible(&app), ["r3-filter-b.jpg", "r3-filter-c.jpg"]);
+    });
+}
+
+#[test]
 fn audit_virtual_page_and_search_readers_with_foreign_writers() {
     crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
         phase_a2_compact_ten_thousand_page_keys_and_ui_acceptance();
@@ -2039,7 +2195,7 @@ fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
 fn audit_rating_view_readers_with_foreign_writers() {
     crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
         phase_b_rating_list_projects_saved_mask_after_local_sort();
-        phase_b_rating_pending_result_rebases_after_shared_star_write();
+        phase_b_rating_pending_result_publishes_after_shared_star_write();
         phase_b_rating_pending_result_rebases_after_tag_write();
         phase_b_rating_pending_result_rebases_after_book_page_copy();
         phase_b_rating_rejects_edit_written_without_view_snapshot();
@@ -2047,7 +2203,7 @@ fn audit_rating_view_readers_with_foreign_writers() {
 }
 
 #[test]
-fn phase_b_rating_pending_result_rebases_after_shared_star_write() {
+fn phase_b_rating_pending_result_publishes_after_shared_star_write() {
     let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let key = crate::adjustment_db::normalize_path(&image);
@@ -2073,6 +2229,7 @@ fn phase_b_rating_pending_result_rebases_after_shared_star_write() {
     assert!(tx.send(result).is_ok());
     app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
     app.write_user_rating_shared(&key, 0, Some(&meta)).unwrap();
+    let before_install = app.items_generation;
     let ctx = egui::Context::default();
     for _ in 0..100 {
         app.poll_rating_view();
@@ -2083,9 +2240,21 @@ fn phase_b_rating_pending_result_rebases_after_shared_star_write() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(app.items_are_rating_view);
+    assert_eq!(app.items_generation, before_install.wrapping_add(1));
+    assert!(
+        app.visible_indices.is_empty(),
+        "the prepared row installs once, then the committed star is hidden before paint"
+    );
+    for _ in 0..100 {
+        app.poll_rating_view();
+        if app.rating_view_pending.is_none() && app.items.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert!(
         app.items.is_empty(),
-        "a pre-write ★ result must not install"
+        "membership refresh removes the departed row"
     );
 }
 
@@ -5079,6 +5248,7 @@ fn grid_selection_rating_records_one_batched_undo_entry() {
 
     app.apply_rating_to_selection(4);
 
+    assert_eq!(app.rating_publication_count, 1);
     assert_eq!(app.meta_undo.undo_len(), 1);
     match app.meta_undo.peek_undo().expect("batched grid undo") {
         crate::undo_stack::UndoEntry::Rating { changes, summary } => {
@@ -5093,6 +5263,10 @@ fn grid_selection_rating_records_one_batched_undo_entry() {
         }
         other => panic!("expected rating undo, got {other:?}"),
     }
+    app.apply_meta_undo();
+    assert_eq!(app.rating_publication_count, 2);
+    app.apply_meta_redo();
+    assert_eq!(app.rating_publication_count, 3);
 }
 
 #[test]
@@ -14873,7 +15047,8 @@ mod phase_c_drill_nav_tests {
         app.items.clear();
         app.visible_indices.clear();
 
-        app.refresh_rating_view_after_rating_changes(&[(key.clone(), 5)]);
+        app.items_are_rating_view = true;
+        app.write_user_rating_shared(&key, 5, Some(&meta)).unwrap();
 
         assert_eq!(existing.key, key);
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
@@ -14889,6 +15064,88 @@ mod phase_c_drill_nav_tests {
             .expect("rating view reload ok");
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].key, key);
+    }
+
+    #[test]
+    fn rating_view_accepts_after_read_write_once_then_appends_membership() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = setup_app();
+        let mut keys = Vec::new();
+        for name in ["a", "b", "c", "d"] {
+            let path = app.tmp.path().join(format!("r3-view-{name}.jpg"));
+            std::fs::write(&path, b"image").unwrap();
+            let key = crate::adjustment_db::normalize_path(&path);
+            let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+                .with_source_path(&path);
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&key, if name == "d" { 0 } else { 3 }, Some(&meta))
+                .unwrap();
+            keys.push((key, meta));
+        }
+        app.enter_rating_view(3);
+        let pending = app.rating_view_pending.take().unwrap();
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let initial_keys = result
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(initial_keys.len(), 3);
+        let removed = initial_keys[1].clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(tx.send(result).is_ok());
+        app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
+        app.write_user_ratings_shared(&[
+            (removed.clone(), 0, None),
+            (keys[3].0.clone(), 3, Some(keys[3].1.clone())),
+        ])
+        .unwrap();
+        let before_install = app.items_generation;
+        app.poll_rating_view();
+        assert!(app.items_are_rating_view);
+        assert_eq!(app.items_generation, before_install.wrapping_add(1));
+        assert_eq!(
+            app.rating_view_rows
+                .iter()
+                .map(|row| row.key.clone())
+                .collect::<Vec<_>>(),
+            initial_keys
+        );
+        assert_eq!(app.visible_indices.len(), 2);
+        assert!(
+            app.visible_indices
+                .iter()
+                .all(|&index| app.rating_view_rows[index].key != removed)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            app.poll_rating_view();
+            if app.rating_view_pending.is_none()
+                && app.rating_view_rows.iter().any(|row| row.key == keys[3].0)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let expected = initial_keys
+            .into_iter()
+            .filter(|key| key != &removed)
+            .chain(std::iter::once(keys[3].0.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            app.rating_view_rows
+                .iter()
+                .map(|row| row.key.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
@@ -17392,8 +17649,6 @@ mod phase_c_drill_nav_tests {
             )));
         // rating を 1 に変更
         app.set_rating(0, 1);
-        let idxs = vec![0_usize];
-        app.refresh_global_search_hit_stars(&idxs);
         // all_hits.stars が更新されているはず
         assert_eq!(
             app.global_search.all_hits[0].stars, 1,
@@ -70244,10 +70499,11 @@ mod ctrl_f_structural_filter_tests {
             std::collections::HashMap::new();
         let pw = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let progress = SearchProgressShared::new(ctrl_f_progress_total(items));
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(items, None));
         match run_metadata_search(
             &tokens,
             items,
+            None,
             &xmp,
             None,
             &pw,
@@ -70292,7 +70548,7 @@ mod ctrl_f_structural_filter_tests {
         let xmp = std::collections::HashMap::new();
         let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items));
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items, None));
 
         let SearchThreadResult::Done {
             matches,
@@ -70300,6 +70556,7 @@ mod ctrl_f_structural_filter_tests {
         } = run_metadata_search(
             &tokens,
             &items,
+            None,
             &xmp,
             None,
             &passwords,
@@ -70338,7 +70595,7 @@ mod ctrl_f_structural_filter_tests {
         let xmp = std::collections::HashMap::new();
         let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items));
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(&items, None));
         let target =
             crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
 
@@ -70347,6 +70604,7 @@ mod ctrl_f_structural_filter_tests {
                 run_metadata_search(
                     &tokens,
                     &items,
+                    None,
                     &xmp,
                     None,
                     &passwords,

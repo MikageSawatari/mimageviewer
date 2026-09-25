@@ -196,15 +196,6 @@ impl App {
                     self.meta_undo.push_undo_from_redo(entry);
                     return;
                 }
-                if self.items_are_rating_view {
-                    let view_changes: Vec<(String, u8)> = changes
-                        .iter()
-                        .map(|c| (c.path_key.clone(), c.before))
-                        .collect();
-                    self.refresh_rating_view_after_rating_changes(&view_changes);
-                } else {
-                    self.rebuild_visible_indices();
-                }
             }
             UndoEntry::Tag { changes, .. } => {
                 self.submit_tag_restore_jobs(changes, /* use_before */ true);
@@ -252,15 +243,6 @@ impl App {
                     // Keep the failed operation retryable on the Redo side.
                     self.meta_undo.push_redo(entry);
                     return;
-                }
-                if self.items_are_rating_view {
-                    let view_changes: Vec<(String, u8)> = changes
-                        .iter()
-                        .map(|c| (c.path_key.clone(), c.after))
-                        .collect();
-                    self.refresh_rating_view_after_rating_changes(&view_changes);
-                } else {
-                    self.rebuild_visible_indices();
                 }
             }
             UndoEntry::Tag { changes, .. } => {

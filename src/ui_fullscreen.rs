@@ -16473,7 +16473,12 @@ impl App {
         #[cfg(test)]
         FINAL_COVER_ELIGIBILITY_SCAN_COUNT
             .set(FINAL_COVER_ELIGIBILITY_SCAN_COUNT.get().saturating_add(1));
-        if nav.len() != self.items.len() || !self.items.iter().all(GridItem::has_page_data) {
+        if nav.len() != self.smart_folder_rule_total()
+            || !nav.iter().all(|&idx| {
+                self.smart_folder_rule_qualifies_index(idx)
+                    && self.items.get(idx).is_some_and(GridItem::has_page_data)
+            })
+        {
             return false;
         }
         let mut unique = std::collections::HashSet::with_capacity(nav.len());
@@ -44398,6 +44403,7 @@ impl App {
         };
         indices.sort_unstable();
         indices.dedup();
+        indices.retain(|&index| self.smart_folder_rule_qualifies_index(index));
         indices
     }
 
@@ -45076,10 +45082,15 @@ impl App {
 
     /// 覚えた index がまだ同じページを指しているか。違えば同じキーの項目を探し直す。
     fn export_batch_index_for_key(&self, idx: usize, page_key: &str) -> Option<usize> {
-        if self.page_path_key(idx).as_deref() == Some(page_key) {
+        if self.smart_folder_rule_qualifies_index(idx)
+            && self.page_path_key(idx).as_deref() == Some(page_key)
+        {
             return Some(idx);
         }
-        (0..self.items.len()).find(|&idx| self.page_path_key(idx).as_deref() == Some(page_key))
+        (0..self.items.len()).find(|&idx| {
+            self.smart_folder_rule_qualifies_index(idx)
+                && self.page_path_key(idx).as_deref() == Some(page_key)
+        })
     }
 
     /// `Ok(None)` は対象外 (フォルダ / 動画 / 音声 / アーカイブ本体など)。

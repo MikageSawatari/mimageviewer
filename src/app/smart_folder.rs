@@ -177,9 +177,12 @@ struct PreparedSmartFolder {
     video_items: Vec<(usize, PathBuf, u64)>,
     metadata: super::subfolder_expansion::PreparedSubfolderMetadata,
     resort_metadata: Arc<ReusedSmartFolderMetadata>,
+    item_rating_masks: Option<Vec<[bool; 6]>>,
     /// Metadata generation captured before the worker opened its DB snapshots. Installation
     /// rejects this result if an edit/tag/rating write advanced the UI-side generation.
     metadata_revision: u64,
+    rating_write_generation: u64,
+    rating_sort_failed: bool,
     refresh: bool,
     /// True only for a newly completed filesystem scan.  Its snapshot is authoritative and may
     /// retire the previous generation's delete tombstones after successful installation.
@@ -228,6 +231,7 @@ pub(crate) struct ReusedSmartFolderMetadata {
     /// Membership in the same snapshot generation. Entry indices avoid cloning every included
     /// path and doing a HashSet lookup for each candidate during a sort-only prepare.
     included_entry_indices: Arc<Vec<usize>>,
+    rating_masks: Option<Arc<Vec<[bool; 6]>>>,
     ratings_by_path: HashMap<String, u8>,
     tags_by_path: HashMap<String, Vec<String>>,
     local_adjust_paths: HashSet<String>,
@@ -433,6 +437,13 @@ pub(crate) struct SmartFolderSession {
     definition_id: uuid::Uuid,
     snapshot: Option<SmartFolderSnapshot>,
     resort_metadata: Option<Arc<ReusedSmartFolderMetadata>>,
+    item_rating_masks: Option<Vec<[bool; 6]>>,
+    /// Number of installed root rows satisfying the Smart Folder rule, before UI filters.
+    pub(crate) rating_rule_qualifying_count: usize,
+    /// Ctrl+F matches among rule-qualified rows, before other temporary UI filters.
+    pub(crate) rating_rule_search_match_count: usize,
+    rating_membership_generation: u64,
+    rating_membership_pending: Option<SmartFolderRatingMembershipPending>,
     presentation: SmartFolderPresentation,
     metadata_revision: u64,
     /// Provenance of the staged navigation that installed this visible session. A Remote
@@ -531,6 +542,8 @@ impl SmartFolderSession {
     fn new(
         snapshot: SmartFolderSnapshot,
         resort_metadata: Arc<ReusedSmartFolderMetadata>,
+        item_rating_masks: Option<Vec<[bool; 6]>>,
+        rating_membership_generation: u64,
         presentation: SmartFolderPresentation,
         metadata_revision: u64,
     ) -> Self {
@@ -538,6 +551,11 @@ impl SmartFolderSession {
             definition_id: snapshot.definition.id,
             snapshot: Some(snapshot),
             resort_metadata: Some(resort_metadata),
+            item_rating_masks,
+            rating_rule_qualifying_count: 0,
+            rating_rule_search_match_count: 0,
+            rating_membership_generation,
+            rating_membership_pending: None,
             presentation,
             metadata_revision,
             adopted_request_id: None,
@@ -657,7 +675,11 @@ fn retire_smart_folder_session_payloads(values: Vec<RetiredSmartFolderPayload>) 
 
 impl Drop for SmartFolderSession {
     fn drop(&mut self) {
-        let mut retired = Vec::with_capacity(3);
+        let mut retired = Vec::with_capacity(4);
+        if let Some(pending) = self.rating_membership_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+            retired.push(Box::new(pending) as RetiredSmartFolderPayload);
+        }
         if let Some(snapshot) = self.snapshot.take() {
             retired.push(Box::new(snapshot) as RetiredSmartFolderPayload);
         }
@@ -671,6 +693,16 @@ impl Drop for SmartFolderSession {
         }
         retire_smart_folder_session_payloads(retired);
     }
+}
+
+struct SmartFolderRatingMembershipPending {
+    definition_id: uuid::Uuid,
+    write_generation: u64,
+    metadata_revision: u64,
+    page_edit_revision: u64,
+    changed_keys: HashSet<String>,
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<Result<Option<PreparedSmartFolder>, String>>,
 }
 
 enum SmartFolderPrepareEvent {
@@ -758,12 +790,12 @@ pub(crate) enum SmartChildKind {
     ConvertibleArchive,
 }
 
-fn smart_root_navigation_entries(
-    items: &[GridItem],
+fn smart_root_navigation_entries<'a>(
+    items: impl IntoIterator<Item = &'a GridItem>,
 ) -> Vec<super::top_level_grid_view::SmartRootNavEntry> {
     use super::top_level_grid_view::SmartRootNavEntry;
     items
-        .iter()
+        .into_iter()
         .filter_map(|item| {
             let (logical_path, kind) = match item {
                 GridItem::Folder(path) => (path, SmartChildKind::Folder),
@@ -1155,6 +1187,452 @@ impl Drop for SmartFolderTransition {
 }
 
 impl App {
+    /// The Smart Folder rule is the root row domain. Other grids have no rule mask.
+    pub(crate) fn smart_folder_rule_qualifies_index(&self, index: usize) -> bool {
+        if !self.items_are_smart_folder_view {
+            return true;
+        }
+        let Some(session) = self.top_level_grid_view.smart_folder_session() else {
+            return true;
+        };
+        if !matches!(session.phase, SmartFolderOpenPhase::Root) {
+            return true;
+        }
+        let Some(masks) = session.item_rating_masks.as_ref() else {
+            return true;
+        };
+        let stars = self.rating_cache.get(&index).copied().unwrap_or(0).min(5);
+        masks.get(index).is_some_and(|mask| mask[stars as usize])
+    }
+
+    pub(crate) fn smart_folder_rule_total(&self) -> usize {
+        if self.items_are_smart_folder_view
+            && let Some(session) = self.top_level_grid_view.smart_folder_session()
+            && matches!(session.phase, SmartFolderOpenPhase::Root)
+            && session.item_rating_masks.is_some()
+        {
+            session.rating_rule_qualifying_count
+        } else {
+            self.items.len()
+        }
+    }
+
+    pub(crate) fn local_search_result_counts(&self) -> Option<(usize, usize)> {
+        let filter = self.search_filter.as_ref()?;
+        let total = self.smart_folder_rule_total();
+        if self.items_are_smart_folder_view
+            && let Some(session) = self.top_level_grid_view.smart_folder_session()
+            && matches!(session.phase, SmartFolderOpenPhase::Root)
+            && session.item_rating_masks.is_some()
+        {
+            Some((session.rating_rule_search_match_count, total))
+        } else {
+            Some((filter.len(), total))
+        }
+    }
+
+    pub(crate) fn smart_folder_rating_membership_flags(&self) -> Option<Vec<bool>> {
+        if !self.items_are_smart_folder_view {
+            return None;
+        }
+        let session = self.top_level_grid_view.smart_folder_session()?;
+        if !matches!(session.phase, SmartFolderOpenPhase::Root) {
+            return None;
+        }
+        let masks = session.item_rating_masks.as_ref()?;
+        Some(
+            self.items
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let stars = self.rating_cache.get(&index).copied().unwrap_or(0).min(5);
+                    masks.get(index).is_none_or(|mask| mask[stars as usize])
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn remove_smart_folder_rating_masks(&mut self, indices_desc: &[usize]) {
+        if !self.items_are_smart_folder_view {
+            return;
+        }
+        if let Some(session) = self.top_level_grid_view.smart_folder_session_mut()
+            && matches!(session.phase, SmartFolderOpenPhase::Root)
+            && let Some(masks) = session.item_rating_masks.as_mut()
+        {
+            for &index in indices_desc {
+                if index < masks.len() {
+                    masks.remove(index);
+                }
+            }
+        }
+    }
+
+    /// Root navigation follows rating-rule membership, independent of temporary UI filters.
+    /// Updating the Arc only when its
+    /// contents change also invalidates a staged Ctrl+Up/Down target captured before a departure.
+    pub(crate) fn refresh_smart_folder_rating_navigation_entries(&mut self) {
+        if !self.items_are_smart_folder_view {
+            return;
+        }
+        let Some(session) = self.top_level_grid_view.smart_folder_session() else {
+            return;
+        };
+        if !matches!(session.phase, SmartFolderOpenPhase::Root) {
+            return;
+        }
+        let Some(masks) = session.item_rating_masks.as_ref() else {
+            return;
+        };
+        let started = crate::perf::is_enabled().then(Instant::now);
+        let qualifying_items = self.items.iter().enumerate().filter_map(|(index, item)| {
+            let stars = self.rating_cache.get(&index).copied().unwrap_or(0).min(5);
+            masks
+                .get(index)
+                .is_none_or(|mask| mask[stars as usize])
+                .then_some(item)
+        });
+        let entries = smart_root_navigation_entries(qualifying_items);
+        if let Some(started) = started {
+            crate::perf::event(
+                "smart_folder",
+                "rating_navigation_projection",
+                None,
+                self.smart_folder_generation,
+                &[
+                    (
+                        "qualifying",
+                        serde_json::Value::from(session.rating_rule_qualifying_count),
+                    ),
+                    ("targets", serde_json::Value::from(entries.len())),
+                    (
+                        "ms",
+                        serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
+        if let Some(state) = self.top_level_grid_view.smart_folder_mut()
+            && state.navigation_entries.as_ref() != &entries
+        {
+            let _ = state.refresh_navigation_entries(entries);
+        }
+    }
+
+    pub(crate) fn schedule_smart_folder_rating_membership(&mut self) {
+        if !self.items_are_smart_folder_view {
+            return;
+        }
+        let Some(session) = self.top_level_grid_view.smart_folder_session() else {
+            return;
+        };
+        if session.rating_membership_pending.is_some()
+            || !matches!(session.phase, SmartFolderOpenPhase::Root)
+            || !smart_folder_definition_uses_metadata(
+                &session
+                    .root_snapshot()
+                    .expect("installed smart snapshot")
+                    .definition,
+                SmartFolderMetadataDependency::Rating,
+            )
+        {
+            return;
+        }
+        let generation = session.rating_membership_generation;
+        let Some(snapshot) = session.root_snapshot() else {
+            return;
+        };
+        let definition_id = snapshot.definition.id;
+        let definition = snapshot.definition.clone();
+        let entries = Arc::clone(&snapshot.entries);
+        let changed = self.rating_session_writes_after(generation);
+        if changed.is_empty() {
+            return;
+        }
+        let changed_keys = changed
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<HashSet<_>>();
+        let worker_keys = changed_keys.clone();
+        let write_generation = self.rating_session_write_generation;
+        let display_order = self.settings.grid_display_order.clone();
+        let removed_paths = self
+            .smart_folder_removed_paths
+            .get(&definition_id)
+            .cloned()
+            .unwrap_or_default();
+        let load_ratings = self.rating_db.is_some();
+        let load_tags = self.tags_db.is_some();
+        let load_local_adjust = self.local_adjust_db.is_some();
+        let resources = SmartFolderPrepareResources {
+            membership_only: true,
+            prepare_catalog: false,
+            load_adjustments: self.adjustment_db.is_some(),
+            load_export_crops: self.export_crop_db.is_some(),
+            load_view_trims: self.view_trim_db.is_some(),
+            load_masks: self.mask_db.is_some(),
+            load_conceals: self.conceal_db.is_some(),
+            load_comics: self.comic_db.is_some(),
+            load_video_pins: self.video_pin_db.is_some(),
+            rating_write_overlay: changed.into_iter().collect(),
+            folder_thumb_sort: self.settings.folder_thumb_sort,
+            folder_thumb_depth: self.settings.folder_thumb_depth,
+            folder_pin_db: self.folder_thumb_pin_db.clone(),
+            archive_cache_db: self.archive_cache_db.clone(),
+            reused_catalog_db: None,
+            reused_catalog_entries: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (result_tx, rx) = mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("smart-folder-rating-membership".into())
+            .spawn(move || {
+                let mut selected = Vec::new();
+                for (index, entry) in entries.iter().enumerate() {
+                    if index.is_multiple_of(METADATA_CHUNK_SIZE)
+                        && worker_cancel.load(Ordering::Relaxed)
+                    {
+                        return;
+                    }
+                    let key = crate::adjustment_db::normalize_path(&entry.path);
+                    if worker_keys.contains(&key)
+                        && !smart_folder_path_is_removed(&key, &removed_paths)
+                    {
+                        selected.push(entry.clone());
+                    }
+                }
+                let snapshot = SmartFolderSnapshot {
+                    definition,
+                    entries: Arc::new(selected),
+                    video_thumb_overrides: HashMap::new(),
+                    diag: SmartFolderDiag::default(),
+                };
+                let (progress_tx, _progress_rx) = mpsc::channel();
+                let result = prepare_smart_folder(
+                    snapshot,
+                    crate::rating_sort::ListingOrderRequest::Standard(
+                        crate::settings::SortOrder::FileName,
+                    ),
+                    write_generation,
+                    display_order,
+                    false,
+                    false,
+                    HashSet::new(),
+                    HashSet::new(),
+                    load_ratings,
+                    load_tags,
+                    load_local_adjust,
+                    None,
+                    None,
+                    resources,
+                    &worker_cancel,
+                    &progress_tx,
+                );
+                let _ = result_tx.send(result);
+            });
+        match spawn {
+            Ok(_) => {
+                if let Some(session) = self.top_level_grid_view.smart_folder_session_mut() {
+                    session.rating_membership_pending = Some(SmartFolderRatingMembershipPending {
+                        definition_id,
+                        write_generation,
+                        metadata_revision: self.smart_folder_metadata_revision,
+                        page_edit_revision: self.page_edit_revision,
+                        changed_keys,
+                        cancel,
+                        rx,
+                    });
+                }
+            }
+            Err(error) => self.show_feedback_toast(format!(
+                "スマートフォルダの評価更新を開始できませんでした: {error}"
+            )),
+        }
+    }
+
+    fn poll_smart_folder_rating_membership(&mut self, ctx: &egui::Context) {
+        let ready = {
+            let Some(session) = self.top_level_grid_view.smart_folder_session_mut() else {
+                return;
+            };
+            let Some(pending) = session.rating_membership_pending.as_ref() else {
+                return;
+            };
+            match pending.rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    None
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("評価更新ワーカーが終了しました".into()))
+                }
+            }
+        };
+        let Some(result) = ready else {
+            return;
+        };
+        let Some(pending) = self
+            .top_level_grid_view
+            .smart_folder_session_mut()
+            .and_then(|session| session.rating_membership_pending.take())
+        else {
+            return;
+        };
+        if !self.items_are_smart_folder_view
+            || self.current_smart_folder_id != Some(pending.definition_id)
+        {
+            return;
+        }
+        if pending.metadata_revision != self.smart_folder_metadata_revision
+            || pending.page_edit_revision != self.page_edit_revision
+        {
+            self.schedule_smart_folder_rating_membership();
+            return;
+        }
+        match result {
+            Ok(Some(prepared)) => self.install_smart_folder_rating_membership(prepared, pending),
+            Ok(None) => {}
+            Err(error) => {
+                crate::logger::log(format!("smart_folder: rating membership failed: {error}"));
+                self.show_feedback_toast("スマートフォルダの評価条件を更新できませんでした".into());
+            }
+        }
+    }
+
+    fn install_smart_folder_rating_membership(
+        &mut self,
+        prepared: PreparedSmartFolder,
+        pending: SmartFolderRatingMembershipPending,
+    ) {
+        let Some(session) = self.top_level_grid_view.smart_folder_session() else {
+            return;
+        };
+        if !matches!(session.phase, SmartFolderOpenPhase::Root)
+            || session.definition_id != pending.definition_id
+        {
+            return;
+        }
+        let mut current = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                item.drag_source_path()
+                    .map(crate::adjustment_db::normalize_path)
+                    .map(|key| (key, index))
+            })
+            .collect::<HashMap<_, _>>();
+        let PreparedSmartFolder {
+            items,
+            image_metas,
+            item_rating_masks,
+            video_items,
+            metadata,
+            ..
+        } = prepared;
+        let item_rating_masks = item_rating_masks.expect("rating-rule membership worker");
+        let video_sources = video_items
+            .into_iter()
+            .map(|(index, path, size)| (index, (path, size)))
+            .collect::<HashMap<_, _>>();
+        let mut appended_videos = Vec::new();
+        let mut aggregate = metadata.aggregate;
+        for (source_index, ((item, image_meta), mask)) in items
+            .into_iter()
+            .zip(image_metas)
+            .zip(item_rating_masks)
+            .enumerate()
+        {
+            let Some(path) = item.drag_source_path() else {
+                continue;
+            };
+            let key = crate::adjustment_db::normalize_path(path);
+            // A departed row stays at its original index. If it re-qualifies during this
+            // session, the visible projection shows it there again; only truly new rows append.
+            if current.contains_key(&key) || !pending.changed_keys.contains(&key) {
+                continue;
+            }
+            let stars = self.rating_session_value_for_key(&key).unwrap_or_else(|| {
+                metadata
+                    .rating_cache
+                    .get(&source_index)
+                    .copied()
+                    .unwrap_or(0)
+            });
+            if !mask[stars.min(5) as usize] {
+                continue;
+            }
+            let index = self.push_grid_item_pending(item);
+            self.image_metas.push(image_meta);
+            if let Some((path, size)) = video_sources.get(&source_index) {
+                appended_videos.push((index, path.clone(), *size));
+            }
+            self.rating_cache.insert(index, stars);
+            if let Some(tags) = metadata.tags_cache.get(&key) {
+                self.tags_cache.insert(key.clone(), tags.clone());
+            }
+            if metadata.local_adjust_pages.contains(&source_index) {
+                self.local_adjust_pages.insert(index);
+            }
+            if let Some(extra) = aggregate.as_mut() {
+                if let Some(value) = extra.adjustment_page_params.remove(&source_index) {
+                    self.adjustment_page_params.insert(index, value);
+                }
+                if let Some(value) = extra.export_crop_page_settings.remove(&source_index) {
+                    self.export_crop_page_settings.insert(index, value);
+                }
+                if let Some(value) = extra.view_trim_page_overrides.remove(&source_index) {
+                    self.view_trim_page_overrides.insert(index, value);
+                }
+                if extra.mask_pages.contains(&source_index) {
+                    self.mask_pages.insert(index);
+                }
+                if extra.conceal_pages.contains(&source_index) {
+                    self.conceal_pages.insert(index);
+                }
+                if extra.comic_pages.contains(&source_index) {
+                    self.comic_pages.insert(index);
+                }
+            }
+            if let Some(session) = self.top_level_grid_view.smart_folder_session_mut() {
+                session
+                    .item_rating_masks
+                    .as_mut()
+                    .expect("rating-rule session")
+                    .push(mask);
+            }
+            current.insert(key, index);
+        }
+        if let Some(extra) = aggregate {
+            self.folder_pin_map.extend(extra.folder_pin_map);
+            self.converted_archive_cache_paths
+                .extend(extra.converted_archive_cache_paths);
+        }
+        if !appended_videos.is_empty() {
+            self.spawn_video_thread(
+                self.tx.clone(),
+                Arc::clone(&self.cancel_token),
+                appended_videos,
+                self.video_thumb_overrides.clone(),
+                Arc::new(metadata.video_pin_blobs),
+            );
+        }
+        let retired_metadata = self
+            .top_level_grid_view
+            .smart_folder_session_mut()
+            .and_then(|session| {
+                session.rating_membership_generation = pending.write_generation;
+                session.resort_metadata.take()
+            });
+        self.retire_smart_folder_payloads(
+            retired_metadata.map(|metadata| Box::new(metadata) as RetiredSmartFolderPayload),
+        );
+        self.rebuild_visible_indices_after_rating_publication();
+        self.schedule_smart_folder_rating_membership();
+    }
+
     fn release_staged_smart_nav_lock(&mut self, request_id: u64, intent: &SmartTransitionIntent) {
         if let SmartTransitionIntent::FolderNav(nav) = intent
             && matches!(
@@ -2414,6 +2892,11 @@ impl App {
                         definition_id,
                         snapshot: None,
                         resort_metadata: None,
+                        item_rating_masks: None,
+                        rating_rule_qualifying_count: 0,
+                        rating_rule_search_match_count: 0,
+                        rating_membership_generation: prepared.rating_write_generation,
+                        rating_membership_pending: None,
                         presentation: prepared.presentation.clone(),
                         metadata_revision: prepared.metadata_revision,
                         adopted_request_id: Some(request_id),
@@ -2708,8 +3191,13 @@ impl App {
             smart_folder_tombstones_after_scan_start(&current_tombstones, &tombstones_at_start);
         spawn_smart_folder_result_count(
             snapshot,
+            matches!(
+                crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
+                crate::rating_sort::ListingOrderRequest::Rating(_)
+            ),
             transition.request_id,
             self.smart_folder_metadata_revision,
+            self.rating_session_write_generation,
             refresh,
             tombstones_at_start,
             removed_paths,
@@ -2773,7 +3261,8 @@ impl App {
         );
         spawn_smart_folder_prepare(
             snapshot,
-            presentation.sort,
+            presentation.order_request,
+            self.rating_session_write_generation,
             presentation.display,
             transition.request_id,
             self.smart_folder_metadata_revision,
@@ -2787,7 +3276,13 @@ impl App {
             membership,
             None,
             SmartFolderPrepareResources {
+                membership_only: false,
                 prepare_catalog: true,
+                rating_write_overlay: self
+                    .rating_session_writes
+                    .iter()
+                    .map(|(key, write)| (key.clone(), write.stars))
+                    .collect(),
                 load_adjustments: self.adjustment_db.is_some(),
                 load_export_crops: self.export_crop_db.is_some(),
                 load_view_trims: self.view_trim_db.is_some(),
@@ -4119,9 +4614,36 @@ fn metadata_filter_passes(
     bookmarks: &crate::bookmark_browser::BookmarkPresence,
     converted_archive_paths: &HashMap<String, ConvertedArchiveSourceState>,
 ) -> bool {
+    metadata_filter_passes_at_rating(
+        filter,
+        entry,
+        key,
+        ratings,
+        tags,
+        edits,
+        bookmarks,
+        converted_archive_paths,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn metadata_filter_passes_at_rating(
+    filter: &crate::settings::SmartFolderFilter,
+    entry: &SmartFolderEntry,
+    key: &str,
+    ratings: &HashMap<String, u8>,
+    tags: &HashMap<String, Vec<String>>,
+    edits: &SmartEditKeySets,
+    bookmarks: &crate::bookmark_browser::BookmarkPresence,
+    converted_archive_paths: &HashMap<String, ConvertedArchiveSourceState>,
+    rating_override: Option<u8>,
+) -> bool {
     use crate::settings::{FacetEditFlag, FacetTagMode};
 
-    let rating = ratings.get(key).copied().unwrap_or(0).min(5) as usize;
+    let rating = rating_override
+        .unwrap_or_else(|| ratings.get(key).copied().unwrap_or(0))
+        .min(5) as usize;
     if !filter.ratings[rating] {
         return false;
     }
@@ -4384,6 +4906,7 @@ struct SmartEntrySortKey {
     display_row: usize,
     name: crate::filename_sort::SortNameKey,
     relative_parent: Arc<crate::filename_sort::SortNameKey>,
+    rating: Option<crate::rating_sort::RatingSortKey>,
 }
 
 fn build_smart_entry_sort_keys(
@@ -4392,6 +4915,23 @@ fn build_smart_entry_sort_keys(
     sort: crate::settings::SortOrder,
     display_order: &crate::settings::GridDisplayOrder,
 ) -> Vec<SmartEntrySortKey> {
+    build_smart_entry_sort_keys_for_request(
+        entries,
+        included,
+        crate::rating_sort::ListingOrderRequest::Standard(sort),
+        None,
+        display_order,
+    )
+}
+
+fn build_smart_entry_sort_keys_for_request(
+    entries: &[SmartFolderEntry],
+    included: &[usize],
+    request: crate::rating_sort::ListingOrderRequest,
+    facts: Option<&crate::rating_db::CompleteRatingFacts>,
+    display_order: &crate::settings::GridDisplayOrder,
+) -> Vec<SmartEntrySortKey> {
+    let sort = request.standard_fallback();
     let mut relative_parent_keys =
         HashMap::<PathBuf, Arc<crate::filename_sort::SortNameKey>>::new();
     included
@@ -4426,6 +4966,14 @@ fn build_smart_entry_sort_keys(
                 }),
                 name: sort.name_key(name),
                 relative_parent,
+                rating: match request {
+                    crate::rating_sort::ListingOrderRequest::Standard(_) => None,
+                    crate::rating_sort::ListingOrderRequest::Rating(_) => Some(
+                        facts
+                            .expect("smart-folder rating sort requires complete facts")
+                            .key_for_requested(&crate::adjustment_db::normalize_path(&entry.path)),
+                    ),
+                },
             }
         })
         .collect()
@@ -4434,6 +4982,7 @@ fn build_smart_entry_sort_keys(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SmartFolderPresentation {
     sort: crate::settings::SortOrder,
+    order_request: crate::rating_sort::ListingOrderRequest,
     display: crate::settings::GridDisplayOrder,
     grouping: crate::settings::SubfolderExpansionOrder,
 }
@@ -4442,6 +4991,7 @@ impl SmartFolderPresentation {
     fn current(app: &App, grouping: crate::settings::SubfolderExpansionOrder) -> Self {
         Self {
             sort: app.settings.sort_order,
+            order_request: crate::rating_sort::ListingOrderRequest::from_settings(&app.settings),
             display: app.settings.grid_display_order.normalized(),
             grouping,
         }
@@ -4456,6 +5006,7 @@ impl SmartFolderPresentation {
     ) -> Self {
         let from_state = |state: &crate::settings::FavoriteViewState| Self {
             sort: state.sort_order,
+            order_request: crate::rating_sort::ListingOrderRequest::Standard(state.sort_order),
             display: state.grid_display_order.normalized(),
             grouping,
         };
@@ -4499,8 +5050,31 @@ fn compare_smart_entries_within_group(
     .then_with(|| a.path.cmp(&b.path))
 }
 
+fn compare_smart_entries_for_request(
+    request: crate::rating_sort::ListingOrderRequest,
+    a: &SmartFolderEntry,
+    ak: &SmartEntrySortKey,
+    b: &SmartFolderEntry,
+    bk: &SmartEntrySortKey,
+) -> std::cmp::Ordering {
+    match request {
+        crate::rating_sort::ListingOrderRequest::Standard(sort) => {
+            compare_smart_entries_within_group(sort, a, ak, b, bk)
+        }
+        crate::rating_sort::ListingOrderRequest::Rating(spec) => spec
+            .compare(
+                ak.rating.expect("complete smart-folder rating facts"),
+                &ak.name,
+                bk.rating.expect("complete smart-folder rating facts"),
+                &bk.name,
+            )
+            .then_with(|| a.path.cmp(&b.path)),
+    }
+}
+
 #[derive(Clone, Default)]
 struct SmartFolderPrepareResources {
+    membership_only: bool,
     prepare_catalog: bool,
     load_adjustments: bool,
     load_export_crops: bool,
@@ -4509,6 +5083,9 @@ struct SmartFolderPrepareResources {
     load_conceals: bool,
     load_comics: bool,
     load_video_pins: bool,
+    /// Latest committed writes captured with this request. Sort-only metadata
+    /// reuse must not publish badges from the prior prepared generation.
+    rating_write_overlay: HashMap<String, u8>,
     folder_thumb_sort: crate::settings::SortOrder,
     folder_thumb_depth: u32,
     folder_pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
@@ -4630,7 +5207,11 @@ fn prepare_video_folder_pin_seeds(
 struct EvaluatedSmartFolderMembership {
     keys: Arc<Vec<String>>,
     included: Vec<usize>,
+    rating_masks: Option<Arc<Vec<[bool; 6]>>>,
     ratings: HashMap<String, u8>,
+    rating_facts: Option<crate::rating_db::CompleteRatingFacts>,
+    rating_read_failed: bool,
+    rating_write_generation: u64,
     tags: HashMap<String, Vec<String>>,
     local_adjust: HashSet<String>,
     converted_archive_paths: HashMap<String, ConvertedArchiveSourceState>,
@@ -4640,12 +5221,14 @@ struct EvaluatedSmartFolderMembership {
 fn evaluate_smart_folder_membership(
     snapshot: &SmartFolderSnapshot,
     removed_paths: &HashSet<String>,
+    rating_order: bool,
     load_ratings: bool,
     load_tags: bool,
     load_local_adjust: bool,
     reused_metadata: Option<&ReusedSmartFolderMetadata>,
     archive_cache_db: Option<&crate::archive_cache::ArchiveCacheDb>,
     read_only: bool,
+    rating_write_generation: u64,
     cancel: &AtomicBool,
     tx: &mpsc::Sender<SmartFolderPrepareEvent>,
 ) -> Result<Option<EvaluatedSmartFolderMembership>, String> {
@@ -4673,6 +5256,8 @@ fn evaluate_smart_folder_membership(
         });
 
     let mut ratings = HashMap::new();
+    let mut rating_facts = None;
+    let mut rating_read_failed = false;
     if !reuse_metadata
         && load_ratings
         && (!read_only
@@ -4681,18 +5266,53 @@ fn evaluate_smart_folder_membership(
                 .unwrap_or(false))
     {
         report(SmartFolderPhase::Ratings, 0);
-        let db = crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
-            .map_err(|error| format!("レーティング DB を読み込めませんでした: {error}"))?;
-        for (chunk_index, chunk) in keys.chunks(METADATA_CHUNK_SIZE).enumerate() {
-            if cancel.load(Ordering::Relaxed) {
-                return Ok(None);
+        match crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path()) {
+            Ok(db) if rating_order => match db.get_many_complete(&keys, rating_write_generation) {
+                Ok(facts) => {
+                    ratings.extend(
+                        facts
+                            .iter_requested_ratings()
+                            .filter(|(_, stars)| *stars > 0)
+                            .map(|(key, stars)| (key.to_owned(), stars)),
+                    );
+                    rating_facts = Some(facts);
+                }
+                Err(error) => {
+                    rating_read_failed = true;
+                    crate::logger::log(format!(
+                        "smart_folder: complete rating read failed, using display fallback: {error}"
+                    ));
+                    for (chunk_index, chunk) in keys.chunks(METADATA_CHUNK_SIZE).enumerate() {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Ok(None);
+                        }
+                        ratings.extend(db.get_many(chunk));
+                        report(
+                            SmartFolderPhase::Ratings,
+                            ((chunk_index + 1) * METADATA_CHUNK_SIZE).min(total),
+                        );
+                    }
+                }
+            },
+            Ok(db) => {
+                for (chunk_index, chunk) in keys.chunks(METADATA_CHUNK_SIZE).enumerate() {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    ratings.extend(db.get_many(chunk));
+                    report(
+                        SmartFolderPhase::Ratings,
+                        ((chunk_index + 1) * METADATA_CHUNK_SIZE).min(total),
+                    );
+                }
             }
-            ratings.extend(db.get_many(chunk));
-            report(
-                SmartFolderPhase::Ratings,
-                ((chunk_index + 1) * METADATA_CHUNK_SIZE).min(total),
-            );
+            Err(error) if rating_order => {
+                rating_read_failed = true;
+                crate::logger::log(format!("smart_folder: rating DB open failed: {error}"));
+            }
+            Err(error) => return Err(format!("レーティング DB を読み込めませんでした: {error}")),
         }
+        report(SmartFolderPhase::Ratings, total);
     }
 
     let mut tags = HashMap::new();
@@ -4801,6 +5421,12 @@ fn evaluate_smart_folder_membership(
             .map(|metadata| metadata.included_entry_indices.len())
             .unwrap_or(total),
     );
+    let rating_membership_changes_with_stars = smart_folder_definition_uses_metadata(
+        &snapshot.definition,
+        SmartFolderMetadataDependency::Rating,
+    );
+    let mut fresh_rating_masks =
+        (!reuse_metadata && rating_membership_changes_with_stars).then(|| vec![[false; 6]; total]);
     if let Some(metadata) = reused_metadata {
         for (position, &entry_index) in metadata.included_entry_indices.iter().enumerate() {
             if position.is_multiple_of(METADATA_CHUNK_SIZE) {
@@ -4858,6 +5484,30 @@ fn evaluate_smart_folder_membership(
                     })
             });
             if included_by_rule {
+                if let Some(masks) = fresh_rating_masks.as_mut() {
+                    let mask = &mut masks[index];
+                    for stars in 0..=5 {
+                        mask[stars] = entry.matching_rule_indices.iter().any(|rule_index| {
+                            snapshot
+                                .definition
+                                .rules
+                                .get(*rule_index)
+                                .is_some_and(|rule| {
+                                    metadata_filter_passes_at_rating(
+                                        &rule.filter,
+                                        entry,
+                                        key,
+                                        &ratings,
+                                        &tags,
+                                        &edit_keys,
+                                        &bookmark_presence,
+                                        &converted_archive_paths,
+                                        Some(stars as u8),
+                                    )
+                                })
+                        });
+                    }
+                }
                 included.push(index);
             }
         }
@@ -4866,7 +5516,13 @@ fn evaluate_smart_folder_membership(
     Ok(Some(EvaluatedSmartFolderMembership {
         keys,
         included,
+        rating_masks: reused_metadata
+            .and_then(|metadata| metadata.rating_masks.as_ref().map(Arc::clone))
+            .or_else(|| fresh_rating_masks.map(Arc::new)),
         ratings,
+        rating_facts,
+        rating_read_failed,
+        rating_write_generation,
         tags,
         local_adjust,
         converted_archive_paths,
@@ -4875,7 +5531,8 @@ fn evaluate_smart_folder_membership(
 
 fn prepare_smart_folder(
     snapshot: SmartFolderSnapshot,
-    sort: crate::settings::SortOrder,
+    request: crate::rating_sort::ListingOrderRequest,
+    rating_write_generation: u64,
     display_order: crate::settings::GridDisplayOrder,
     refresh: bool,
     authoritative_rescan: bool,
@@ -4890,6 +5547,7 @@ fn prepare_smart_folder(
     cancel: &AtomicBool,
     tx: &mpsc::Sender<SmartFolderPrepareEvent>,
 ) -> Result<Option<PreparedSmartFolder>, String> {
+    let sort = request.standard_fallback();
     let reuse_metadata = reused_metadata.is_some();
     let reuse_resort_metadata_unchanged = reuse_metadata && removed_paths.is_empty();
     let total = snapshot.entries.len();
@@ -4918,12 +5576,14 @@ fn prepare_smart_folder(
         let Some(membership) = evaluate_smart_folder_membership(
             &snapshot,
             &removed_paths,
+            matches!(request, crate::rating_sort::ListingOrderRequest::Rating(_)),
             load_ratings,
             load_tags,
             load_local_adjust,
             reused_metadata.as_deref(),
             resources.archive_cache_db.as_deref(),
             false,
+            rating_write_generation,
             cancel,
             tx,
         )?
@@ -4935,11 +5595,40 @@ fn prepare_smart_folder(
     let EvaluatedSmartFolderMembership {
         keys,
         included,
-        ratings,
+        rating_masks,
+        mut ratings,
+        mut rating_facts,
+        mut rating_read_failed,
+        rating_write_generation,
         tags,
         local_adjust,
         converted_archive_paths: converted_archive_paths_for_filter,
     } = membership;
+
+    // A sort-only prepare can reuse its other metadata, but rating order must
+    // read current complete facts. The installed membership remains the
+    // snapshot's candidate set until an explicit reopen or reload.
+    if matches!(request, crate::rating_sort::ListingOrderRequest::Rating(_))
+        && rating_facts.is_none()
+        && !rating_read_failed
+    {
+        match crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
+            .and_then(|db| db.get_many_complete(&keys, rating_write_generation))
+        {
+            Ok(facts) => {
+                ratings = facts
+                    .iter_requested_ratings()
+                    .filter(|(_, stars)| *stars > 0)
+                    .map(|(key, stars)| (key.to_owned(), stars))
+                    .collect();
+                rating_facts = Some(facts);
+            }
+            Err(error) => {
+                crate::logger::log(format!("smart_folder: rating sort read failed: {error}"));
+                rating_read_failed = true;
+            }
+        }
+    }
 
     // Aggregate views cannot hydrate per-item state from one folder prefix. Query only the
     // filtered exact keys on this worker; loading each entire metadata DB would duplicate all
@@ -5027,33 +5716,52 @@ fn prepare_smart_folder(
     report(SmartFolderPhase::Sorting, 0);
     let grouping = snapshot.definition.grouping;
     let display_order = display_order.normalized();
-    let sort_keys = build_smart_entry_sort_keys(&snapshot.entries, &included, sort, &display_order);
-    let sorted_positions = super::recursive_snapshot_scan::cancelable_sorted_indices(
-        included.len(),
-        cancel,
-        |a_position, b_position| {
-            let a_index = included[a_position];
-            let b_index = included[b_position];
-            let a = &snapshot.entries[a_index];
-            let b = &snapshot.entries[b_index];
-            let ak = &sort_keys[a_position];
-            let bk = &sort_keys[b_position];
-            let within = || compare_smart_entries_within_group(sort, a, ak, b, bk);
-            ak.display_row
-                .cmp(&bk.display_row)
-                .then_with(|| match grouping {
-                    crate::settings::SubfolderExpansionOrder::Flat => within()
-                        .then_with(|| a.source_order.cmp(&b.source_order))
-                        .then_with(|| ak.relative_parent.compare_file_name(&bk.relative_parent)),
-                    crate::settings::SubfolderExpansionOrder::FolderGrouped => a
-                        .source_order
-                        .cmp(&b.source_order)
-                        .then_with(|| ak.relative_parent.compare_file_name(&bk.relative_parent))
-                        .then_with(within),
-                })
-        },
-        |completed| report(SmartFolderPhase::Sorting, completed),
+    let rating_sort_failed = matches!(request, crate::rating_sort::ListingOrderRequest::Rating(_))
+        && (rating_read_failed || rating_facts.is_none());
+    let effective_request = if rating_sort_failed {
+        crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName)
+    } else {
+        request
+    };
+    let sort_keys = build_smart_entry_sort_keys_for_request(
+        &snapshot.entries,
+        &included,
+        effective_request,
+        rating_facts.as_ref(),
+        &display_order,
     );
+    let sorted_positions = if resources.membership_only {
+        Some((0..included.len()).collect())
+    } else {
+        super::recursive_snapshot_scan::cancelable_sorted_indices(
+            included.len(),
+            cancel,
+            |a_position, b_position| {
+                let a_index = included[a_position];
+                let b_index = included[b_position];
+                let a = &snapshot.entries[a_index];
+                let b = &snapshot.entries[b_index];
+                let ak = &sort_keys[a_position];
+                let bk = &sort_keys[b_position];
+                let within = || compare_smart_entries_for_request(effective_request, a, ak, b, bk);
+                ak.display_row
+                    .cmp(&bk.display_row)
+                    .then_with(|| match grouping {
+                        crate::settings::SubfolderExpansionOrder::Flat => within()
+                            .then_with(|| a.source_order.cmp(&b.source_order))
+                            .then_with(|| {
+                                ak.relative_parent.compare_file_name(&bk.relative_parent)
+                            }),
+                        crate::settings::SubfolderExpansionOrder::FolderGrouped => a
+                            .source_order
+                            .cmp(&b.source_order)
+                            .then_with(|| ak.relative_parent.compare_file_name(&bk.relative_parent))
+                            .then_with(within),
+                    })
+            },
+            |completed| report(SmartFolderPhase::Sorting, completed),
+        )
+    };
     let Some(sorted_positions) = sorted_positions else {
         return Ok(None);
     };
@@ -5061,6 +5769,9 @@ fn prepare_smart_folder(
     report(SmartFolderPhase::Building, 0);
     let mut items = Vec::with_capacity(sorted_positions.len());
     let mut image_metas = Vec::with_capacity(sorted_positions.len());
+    let mut item_rating_masks = rating_masks
+        .as_ref()
+        .map(|_| Vec::with_capacity(sorted_positions.len()));
     let mut rating_cache = HashMap::new();
     let mut tags_cache = HashMap::new();
     let mut local_adjust_pages = HashSet::new();
@@ -5107,11 +5818,26 @@ fn prepare_smart_folder(
         let key = &keys[entry_index];
         items.push(item);
         image_metas.push(Some((entry.mtime, entry.file_size.unwrap_or(0))));
-        let rating = reused_metadata
+        if let Some(masks) = item_rating_masks.as_mut() {
+            masks.push(
+                rating_masks
+                    .as_ref()
+                    .and_then(|all| all.get(entry_index))
+                    .copied()
+                    .unwrap_or([true; 6]),
+            );
+        }
+        let rating = rating_facts
             .as_ref()
-            .and_then(|metadata| metadata.ratings_by_path.get(key))
-            .or_else(|| ratings.get(key))
-            .copied()
+            .map(|facts| facts.value_for_requested(key))
+            .or_else(|| resources.rating_write_overlay.get(key).copied())
+            .or_else(|| {
+                reused_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.ratings_by_path.get(key))
+                    .copied()
+            })
+            .or_else(|| ratings.get(key).copied())
             .filter(|rating| *rating > 0);
         if let Some(rating) = rating {
             rating_cache.insert(display_index, rating);
@@ -5204,6 +5930,7 @@ fn prepare_smart_folder(
         Arc::new(ReusedSmartFolderMetadata {
             normalized_keys: Arc::clone(&keys),
             included_entry_indices: Arc::new(included.clone()),
+            rating_masks: rating_masks.as_ref().map(Arc::clone),
             ratings_by_path: resort_ratings_by_path,
             tags_by_path: resort_tags_by_path,
             local_adjust_paths: resort_local_adjust_paths,
@@ -5292,6 +6019,7 @@ fn prepare_smart_folder(
     };
     let presentation = SmartFolderPresentation {
         sort,
+        order_request: request,
         display: display_order.normalized(),
         grouping: snapshot.definition.grouping,
     };
@@ -5321,7 +6049,10 @@ fn prepare_smart_folder(
             }),
         },
         resort_metadata,
+        item_rating_masks,
         metadata_revision: 0,
+        rating_write_generation,
+        rating_sort_failed,
         refresh,
         authoritative_rescan,
         authoritative_ignored_tombstones,
@@ -5332,7 +6063,9 @@ fn prepare_smart_folder(
 #[allow(clippy::too_many_arguments)]
 fn count_smart_folder_results(
     snapshot: SmartFolderSnapshot,
+    rating_order: bool,
     metadata_revision: u64,
+    rating_write_generation: u64,
     refresh: bool,
     tombstones_at_start: HashSet<String>,
     removed_paths: HashSet<String>,
@@ -5346,12 +6079,14 @@ fn count_smart_folder_results(
     let Some(membership) = evaluate_smart_folder_membership(
         &snapshot,
         &removed_paths,
+        rating_order,
         load_ratings,
         load_tags,
         load_local_adjust,
         None,
         archive_cache_db.as_deref(),
         false,
+        rating_write_generation,
         cancel,
         tx,
     )?
@@ -5372,8 +6107,10 @@ fn count_smart_folder_results(
 #[allow(clippy::too_many_arguments)]
 fn spawn_smart_folder_result_count(
     snapshot: SmartFolderSnapshot,
+    rating_order: bool,
     generation: u64,
     metadata_revision: u64,
+    rating_write_generation: u64,
     refresh: bool,
     tombstones_at_start: HashSet<String>,
     removed_paths: HashSet<String>,
@@ -5392,7 +6129,9 @@ fn spawn_smart_folder_result_count(
             let started = Instant::now();
             let event = match count_smart_folder_results(
                 snapshot,
+                rating_order,
                 metadata_revision,
+                rating_write_generation,
                 refresh,
                 tombstones_at_start,
                 removed_paths,
@@ -5445,7 +6184,8 @@ fn spawn_smart_folder_result_count(
 
 fn spawn_smart_folder_prepare(
     snapshot: SmartFolderSnapshot,
-    sort: crate::settings::SortOrder,
+    request: crate::rating_sort::ListingOrderRequest,
+    rating_write_generation: u64,
     display_order: crate::settings::GridDisplayOrder,
     generation: u64,
     metadata_revision: u64,
@@ -5470,7 +6210,8 @@ fn spawn_smart_folder_prepare(
             let started = Instant::now();
             let event = match prepare_smart_folder(
                 snapshot,
-                sort,
+                request,
+                rating_write_generation,
                 display_order,
                 refresh,
                 authoritative_rescan,
@@ -5616,14 +6357,15 @@ fn smart_folder_definition_uses_metadata(
 ) -> bool {
     definition.rules.iter().any(|rule| match dependency {
         SmartFolderMetadataDependency::Rating => {
-            rule.filter.ratings != [true; 6]
-                || rule.filter.edits.iter().any(|flag| {
-                    matches!(
-                        flag,
-                        crate::settings::FacetEditFlag::Rated
-                            | crate::settings::FacetEditFlag::Unrated
-                    )
-                })
+            rule.enabled
+                && (rule.filter.ratings != [true; 6]
+                    || rule.filter.edits.iter().any(|flag| {
+                        matches!(
+                            flag,
+                            crate::settings::FacetEditFlag::Rated
+                                | crate::settings::FacetEditFlag::Unrated
+                        )
+                    }))
         }
         SmartFolderMetadataDependency::Tags => {
             !rule.filter.tags.is_empty()
@@ -5729,12 +6471,14 @@ pub(crate) fn build_remote_smart_folder_entries(
     let membership = evaluate_smart_folder_membership(
         &snapshot,
         &HashSet::new(),
+        false,
         load_ratings,
         load_tags,
         load_local_adjust,
         None,
         archive_cache.as_ref(),
         true,
+        0,
         &cancel,
         &prepare_tx,
     )?
@@ -5961,6 +6705,11 @@ impl App {
         &mut self,
         dependency: SmartFolderMetadataDependency,
     ) {
+        if matches!(dependency, SmartFolderMetadataDependency::Rating) {
+            // Rating writes are published into each context without replacing
+            // the resident root or rejecting an in-flight prepared order.
+            return;
+        }
         // Even when this metadata kind is not part of the definition's filter, the prepared grid
         // owns badges/adjustments/crops/pins that a later sort would otherwise roll back.
         self.invalidate_smart_folder_resort_metadata();
@@ -6172,8 +6921,13 @@ impl App {
             smart_folder_tombstones_after_scan_start(&current_tombstones, &tombstones_at_start);
         match spawn_smart_folder_result_count(
             snapshot,
+            matches!(
+                crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
+                crate::rating_sort::ListingOrderRequest::Rating(_)
+            ),
             generation,
             self.smart_folder_metadata_revision,
+            self.rating_session_write_generation,
             refresh,
             tombstones_at_start,
             removed_paths,
@@ -6236,7 +6990,8 @@ impl App {
         };
         match spawn_smart_folder_prepare(
             snapshot,
-            self.settings.sort_order,
+            crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
+            self.rating_session_write_generation,
             self.settings.grid_display_order.clone(),
             generation,
             self.smart_folder_metadata_revision,
@@ -6250,7 +7005,13 @@ impl App {
             precounted_membership,
             reused_metadata,
             SmartFolderPrepareResources {
+                membership_only: false,
                 prepare_catalog: !is_sort_only,
+                rating_write_overlay: self
+                    .rating_session_writes
+                    .iter()
+                    .map(|(key, write)| (key.clone(), write.stars))
+                    .collect(),
                 load_adjustments: self.adjustment_db.is_some(),
                 load_export_crops: self.export_crop_db.is_some(),
                 load_view_trims: self.view_trim_db.is_some(),
@@ -6793,8 +7554,12 @@ impl App {
             }
         }
         session.returned_to_root();
+        let rating_generation = session.rating_membership_generation;
         self.top_level_grid_view
             .install_smart_folder_session(session);
+        self.overlay_rating_session_writes_since(rating_generation);
+        self.rebuild_visible_indices_after_rating_publication();
+        self.schedule_smart_folder_rating_membership();
         true
     }
 
@@ -7062,6 +7827,7 @@ impl App {
 
     pub(crate) fn poll_smart_folder(&mut self, ctx: &egui::Context) {
         self.poll_smart_folder_transition_root(ctx);
+        self.poll_smart_folder_rating_membership(ctx);
         // Retain accepted scan/count/prepare results while the App-global sidecar coordinator owns
         // a load continuation. Normal polling consumes the same payload exactly once afterwards.
         if self.sidecar_restore_active() {
@@ -7313,6 +8079,7 @@ impl App {
                             authoritative_rescan,
                             authoritative_ignored_tombstones,
                             applied_tombstones,
+                            ..
                         } = prepared;
                         adopt_smart_folder_presentation(
                             &mut snapshot.definition,
@@ -7400,7 +8167,10 @@ impl App {
             video_items,
             metadata,
             resort_metadata,
+            item_rating_masks,
             metadata_revision,
+            rating_write_generation,
+            rating_sort_failed,
             refresh,
             authoritative_rescan,
             authoritative_ignored_tombstones,
@@ -7557,13 +8327,24 @@ impl App {
         self.top_level_grid_view.replace_surface(
             super::top_level_grid_view::TopLevelGridSurface::SmartFolder(top_level_state),
         );
+        debug_assert!(
+            item_rating_masks
+                .as_ref()
+                .is_none_or(|masks| masks.len() == self.items.len())
+        );
         self.top_level_grid_view
             .install_smart_folder_session(SmartFolderSession::new(
                 snapshot,
                 resort_metadata,
+                item_rating_masks,
+                rating_write_generation,
                 presentation,
                 metadata_revision,
             ));
+        self.overlay_rating_session_writes_since(rating_write_generation);
+        self.rebuild_visible_indices_after_rating_publication();
+        let qualifying_count = self.smart_folder_rule_total();
+        self.schedule_smart_folder_rating_membership();
         self.smart_folder_progress = None;
         self.address = format!("スマートフォルダ: {definition_name}");
         if let Some(&index) = self.visible_indices.first() {
@@ -7600,10 +8381,13 @@ impl App {
                 .map(|(path, error)| format!(" / {}: {error}", path.display()))
                 .unwrap_or_default();
             self.show_feedback_toast(format!(
-                "スマートフォルダを{prefix}: {item_count}件 (読めなかった項目 {skipped}件){source_detail}"
+                "スマートフォルダを{prefix}: {qualifying_count}件 (読めなかった項目 {skipped}件){source_detail}"
             ));
         } else {
-            self.show_feedback_toast(format!("スマートフォルダを{prefix}: {item_count}件"));
+            self.show_feedback_toast(format!("スマートフォルダを{prefix}: {qualifying_count}件"));
+        }
+        if rating_sort_failed {
+            self.show_feedback_toast("評価順を読み込めなかったため名前順で表示しました".into());
         }
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -7791,12 +8575,35 @@ impl App {
                 .entry(id)
                 .or_default()
                 .extend(removed.iter().cloned());
-            if let Some(grid) = self
-                .top_level_grid_view
-                .smart_folder_session_mut()
-                .and_then(|session| session.phase.parked_root_mut())
-            {
-                grid.remove_paths(&removed);
+            if let Some(session) = self.top_level_grid_view.smart_folder_session_mut() {
+                let parked_removed = session
+                    .phase
+                    .parked_root_mut()
+                    .map(|grid| {
+                        grid.items
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, item)| {
+                                let path = item.drag_source_path()?;
+                                smart_folder_path_is_removed(
+                                    &crate::path_key::normalize_keep_drive(path),
+                                    &removed,
+                                )
+                                .then_some(index)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if let Some(masks) = session.item_rating_masks.as_mut() {
+                    for &index in parked_removed.iter().rev() {
+                        if index < masks.len() {
+                            masks.remove(index);
+                        }
+                    }
+                }
+                if let Some(grid) = session.phase.parked_root_mut() {
+                    grid.remove_paths(&removed);
+                }
             }
         }
 
@@ -8150,6 +8957,894 @@ mod tests {
         }
     }
 
+    fn install_rating_rule_test_root(
+        app: &mut crate::app::App,
+        root: PathBuf,
+        entries: &[(&str, SmartFolderEntryKind, u8)],
+        allowed: [bool; 6],
+        defer_video_result: bool,
+    ) -> Vec<String> {
+        std::fs::create_dir_all(&root).unwrap();
+        let mut definition = crate::settings::SmartFolderDefinition::new("test-rating-rule");
+        let rule_id = uuid::Uuid::new_v4();
+        let mut filter = crate::settings::SmartFolderFilter::default();
+        filter.ratings = allowed;
+        definition
+            .rules
+            .push(rule(rule_id, root.clone(), true, true, filter));
+        let mut keys = Vec::new();
+        let snapshot_entries = entries
+            .iter()
+            .map(|(name, kind, stars)| {
+                let path = root.join(name);
+                if *kind == SmartFolderEntryKind::Folder {
+                    std::fs::create_dir_all(&path).unwrap();
+                } else {
+                    std::fs::write(&path, b"test").unwrap();
+                }
+                let key = crate::adjustment_db::normalize_path(&path);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&key, *stars, None)
+                    .unwrap();
+                keys.push(key);
+                let mut entry = smart_entry(path.to_str().unwrap(), 0, "");
+                entry.source_id = rule_id;
+                entry.source_root = root.clone();
+                entry.kind = *kind;
+                entry
+            })
+            .collect::<Vec<_>>();
+        let snapshot = SmartFolderSnapshot {
+            definition,
+            entries: Arc::new(snapshot_entries),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let (tx, _rx) = mpsc::channel();
+        let mut prepared = prepare_smart_folder(
+            snapshot,
+            crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName),
+            app.rating_session_write_generation,
+            crate::settings::GridDisplayOrder::default(),
+            false,
+            false,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            false,
+            false,
+            None,
+            None,
+            SmartFolderPrepareResources::default(),
+            &AtomicBool::new(false),
+            &tx,
+        )
+        .unwrap()
+        .unwrap();
+        if defer_video_result {
+            prepared.video_items.clear();
+        }
+        assert!(app.install_prepared_smart_folder(prepared));
+        keys
+    }
+
+    fn wait_for_smart_rating_membership(app: &mut crate::app::App) {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app
+            .top_level_grid_view
+            .smart_folder_session()
+            .is_some_and(|session| session.rating_membership_pending.is_some())
+            && Instant::now() < deadline
+        {
+            app.poll_smart_folder_rating_membership(&ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            app.top_level_grid_view
+                .smart_folder_session()
+                .is_some_and(|session| session.rating_membership_pending.is_none())
+        );
+    }
+
+    fn wait_for_local_search(app: &mut crate::app::App, ctx: &egui::Context) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.search_pending.is_some() && Instant::now() < deadline {
+            app.poll_search(ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.search_pending.is_none());
+    }
+
+    #[test]
+    fn smart_folder_rating_keys_sort_rows_with_complete_facts() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::rating_db::RatingDb::open_at(tmp.path().join("ratings.db")).unwrap();
+        let entries = ["a.zip", "b.zip", "c.zip"]
+            .map(|name| smart_entry(&format!(r"C:\Books\{name}"), 0, ""));
+        let keys = entries
+            .iter()
+            .map(|entry| crate::adjustment_db::normalize_path(&entry.path))
+            .collect::<Vec<_>>();
+        db.set_user_rating(&keys[0], 1, None).unwrap();
+        db.set_user_rating(&keys[1], 5, None).unwrap();
+        let facts = db.get_many_complete(&keys, 11).unwrap();
+        let request =
+            crate::rating_sort::ListingOrderRequest::Rating(crate::rating_sort::RatingSortSpec {
+                direction: crate::rating_sort::RatingSortDirection::Desc,
+                unrated_position: Default::default(),
+            });
+        let sort_keys = build_smart_entry_sort_keys_for_request(
+            &entries,
+            &[0, 1, 2],
+            request,
+            Some(&facts),
+            &crate::settings::GridDisplayOrder::default(),
+        );
+        let mut positions = [0, 1, 2];
+        positions.sort_by(|a, b| {
+            compare_smart_entries_for_request(
+                request,
+                &entries[*a],
+                &sort_keys[*a],
+                &entries[*b],
+                &sort_keys[*b],
+            )
+        });
+        assert_eq!(positions, [1, 2, 0]);
+        assert_eq!(facts.write_generation(), 11);
+    }
+
+    #[test]
+    fn rating_smart_prepare_overlays_batch_write_after_read_without_reordering() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-smart-race");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.jpg");
+        let b = root.join("b.jpg");
+        for path in [&a, &b] {
+            std::fs::write(path, b"image").unwrap();
+        }
+        let a_key = crate::adjustment_db::normalize_path(&a);
+        let b_key = crate::adjustment_db::normalize_path(&b);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&a_key, 1, None)
+            .unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&b_key, 5, None)
+            .unwrap();
+        let mut definition = crate::settings::SmartFolderDefinition::new("r3-smart");
+        let rule_id = uuid::Uuid::new_v4();
+        definition
+            .rules
+            .push(rule(rule_id, root.clone(), true, true, Default::default()));
+        let entries = [&a, &b]
+            .into_iter()
+            .map(|path| {
+                let mut entry = smart_entry(path.to_str().unwrap(), 0, "");
+                entry.source_id = rule_id;
+                entry.source_root = root.clone();
+                entry.kind = SmartFolderEntryKind::Image;
+                entry
+            })
+            .collect();
+        let snapshot = SmartFolderSnapshot {
+            definition,
+            entries: Arc::new(entries),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let request =
+            crate::rating_sort::ListingOrderRequest::Rating(crate::rating_sort::RatingSortSpec {
+                direction: crate::rating_sort::RatingSortDirection::Desc,
+                unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+            });
+        let (tx, _rx) = mpsc::channel();
+        let prepared = prepare_smart_folder(
+            snapshot,
+            request,
+            app.rating_session_write_generation,
+            crate::settings::GridDisplayOrder::default(),
+            false,
+            false,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            false,
+            false,
+            None,
+            None,
+            SmartFolderPrepareResources::default(),
+            &AtomicBool::new(false),
+            &tx,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            prepared
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+        app.write_user_ratings_shared(&[(a_key, 5, None), (b_key, 4, None)])
+            .unwrap();
+        assert!(app.install_prepared_smart_folder(prepared));
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+        assert_eq!(app.rating_cache.get(&0), Some(&4));
+        assert_eq!(app.rating_cache.get(&1), Some(&5));
+    }
+
+    #[test]
+    fn rating_smart_membership_drops_departure_before_paint_and_appends_entrant() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-smart-membership");
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"].map(|name| root.join(name));
+        for path in &paths {
+            std::fs::write(path, b"image").unwrap();
+        }
+        let keys = paths
+            .iter()
+            .map(|path| crate::adjustment_db::normalize_path(path))
+            .collect::<Vec<_>>();
+        for (key, stars) in keys.iter().zip([5, 5, 4, 5]) {
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(key, stars, None)
+                .unwrap();
+        }
+        let mut definition = crate::settings::SmartFolderDefinition::new("rating-membership");
+        let rule_id = uuid::Uuid::new_v4();
+        let mut filter = crate::settings::SmartFolderFilter::default();
+        filter.ratings = [false; 6];
+        filter.ratings[5] = true;
+        definition
+            .rules
+            .push(rule(rule_id, root.clone(), true, true, filter));
+        let entries = paths
+            .iter()
+            .map(|path| {
+                let mut entry = smart_entry(path.to_str().unwrap(), 0, "");
+                entry.source_id = rule_id;
+                entry.source_root = root.clone();
+                entry.kind = SmartFolderEntryKind::Image;
+                entry
+            })
+            .collect();
+        let snapshot = SmartFolderSnapshot {
+            definition,
+            entries: Arc::new(entries),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let request =
+            crate::rating_sort::ListingOrderRequest::Rating(crate::rating_sort::RatingSortSpec {
+                direction: crate::rating_sort::RatingSortDirection::Desc,
+                unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+            });
+        let (tx, _rx) = mpsc::channel();
+        let prepared = prepare_smart_folder(
+            snapshot,
+            request,
+            app.rating_session_write_generation,
+            crate::settings::GridDisplayOrder::default(),
+            false,
+            false,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            false,
+            false,
+            None,
+            None,
+            SmartFolderPrepareResources::default(),
+            &AtomicBool::new(false),
+            &tx,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(prepared.items.len(), 3);
+        app.write_user_ratings_shared(&[(keys[0].clone(), 4, None), (keys[2].clone(), 5, None)])
+            .unwrap();
+        assert!(app.install_prepared_smart_folder(prepared));
+        let visible_names = |app: &crate::app::App| {
+            app.visible_indices
+                .iter()
+                .map(|&index| app.items[index].name().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visible_names(&app), ["b.jpg", "d.jpg"]);
+        assert_eq!(app.smart_folder_rule_total(), 2);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(message, _, _)| message.contains("2件"))
+        );
+        let installed_generation = app.items_generation;
+        let ctx = egui::Context::default();
+        let start = Instant::now();
+        while visible_names(&app).len() != 3 && start.elapsed() < std::time::Duration::from_secs(10)
+        {
+            app.poll_smart_folder_rating_membership(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(visible_names(&app), ["b.jpg", "d.jpg", "c.jpg"]);
+        assert_eq!(app.smart_folder_rule_total(), 3);
+        assert_eq!(app.items_generation, installed_generation);
+        assert_eq!(app.items.len(), 4);
+        // The hidden departure kept its raw index, so re-qualification restores its old place.
+        app.write_user_ratings_shared(&[(keys[0].clone(), 5, None)])
+            .unwrap();
+        assert_eq!(visible_names(&app), ["a.jpg", "b.jpg", "d.jpg", "c.jpg"]);
+        assert_eq!(app.smart_folder_rule_total(), 4);
+    }
+
+    #[test]
+    fn rating_smart_navigation_and_checks_follow_visible_containers() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let mut allowed = [false; 6];
+        allowed[5] = true;
+        let root = app.tmp.path().join("r3-smart-container-membership");
+        let keys = install_rating_rule_test_root(
+            &mut app,
+            root,
+            &[
+                ("a", SmartFolderEntryKind::Folder, 5),
+                ("b.zip", SmartFolderEntryKind::Zip, 5),
+                ("c.zip", SmartFolderEntryKind::Zip, 4),
+            ],
+            allowed,
+            false,
+        );
+        let visible_names = |app: &crate::app::App| {
+            app.visible_indices
+                .iter()
+                .map(|&index| app.items[index].name().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let nav_names = |app: &crate::app::App| {
+            app.top_level_grid_view
+                .smart_folder()
+                .unwrap()
+                .navigation_entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .logical_path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(nav_names(&app), ["a", "b.zip"]);
+        let stale_state = app.top_level_grid_view.smart_folder().unwrap().clone();
+        let generation = app.items_generation;
+        app.checked.extend([0, 1]);
+        app.write_user_ratings_shared(&[(keys[0].clone(), 4, None), (keys[2].clone(), 5, None)])
+            .unwrap();
+        assert_eq!(visible_names(&app), ["b.zip"]);
+        assert_eq!(app.smart_folder_rule_total(), 1);
+        assert_eq!(nav_names(&app), ["b.zip"]);
+        assert!(!app.smart_folder_navigation_target_current(
+            &stale_state,
+            app.items[0].drag_source_path().unwrap(),
+        ));
+        assert_eq!(app.checked, HashSet::from([1]));
+        wait_for_smart_rating_membership(&mut app);
+        assert_eq!(visible_names(&app), ["b.zip", "c.zip"]);
+        assert_eq!(app.smart_folder_rule_total(), 2);
+        assert_eq!(nav_names(&app), ["b.zip", "c.zip"]);
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .unwrap()
+                .navigation_entry_at_offset(true)
+                .unwrap()
+                .logical_path
+                .file_name()
+                .unwrap(),
+            "b.zip"
+        );
+        assert_eq!(app.items_generation, generation);
+        app.write_user_ratings_shared(&[(keys[0].clone(), 5, None)])
+            .unwrap();
+        assert_eq!(visible_names(&app), ["a", "b.zip", "c.zip"]);
+        assert_eq!(nav_names(&app), ["a", "b.zip", "c.zip"]);
+        assert_eq!(app.checked, HashSet::from([1]));
+    }
+
+    #[test]
+    fn rating_smart_navigation_survives_write_during_temporary_search() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let mut allowed = [false; 6];
+        allowed[5] = true;
+        let root = app.tmp.path().join("r3-smart-search-navigation");
+        let keys = install_rating_rule_test_root(
+            &mut app,
+            root,
+            &[
+                ("a", SmartFolderEntryKind::Folder, 5),
+                ("b.zip", SmartFolderEntryKind::Zip, 5),
+                ("c.zip", SmartFolderEntryKind::Zip, 4),
+            ],
+            allowed,
+            false,
+        );
+        let names = |app: &crate::app::App| {
+            app.top_level_grid_view
+                .smart_folder()
+                .unwrap()
+                .navigation_entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .logical_path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        app.show_search_bar = true;
+        app.search_query = "a".into();
+        app.search_filter = Some(HashSet::from([0]));
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, [0]);
+        app.write_user_ratings_shared(&[(keys[1].clone(), 4, None), (keys[2].clone(), 5, None)])
+            .unwrap();
+        wait_for_smart_rating_membership(&mut app);
+        assert_eq!(app.visible_indices, [0]);
+        assert_eq!(app.smart_folder_rule_total(), 2);
+        assert_eq!(names(&app), ["a", "c.zip"]);
+
+        app.show_search_bar = false;
+        app.search_query.clear();
+        app.search_filter = None;
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices
+                .iter()
+                .map(|&index| app.items[index].name().into_owned())
+                .collect::<Vec<_>>(),
+            ["a", "c.zip"]
+        );
+        assert_eq!(names(&app), ["a", "c.zip"]);
+        let c_path = app.items[*app.visible_indices.last().unwrap()]
+            .drag_source_path()
+            .unwrap();
+        let state = app.top_level_grid_view.smart_folder().unwrap();
+        assert!(app.smart_folder_navigation_target_current(state, c_path));
+    }
+
+    #[test]
+    fn rating_smart_ctrl_f_search_counts_only_rule_qualified_rows() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let mut allowed = [false; 6];
+        allowed[5] = true;
+        let root = app.tmp.path().join("r3-smart-local-search-count");
+        let keys = install_rating_rule_test_root(
+            &mut app,
+            root,
+            &[
+                ("a.jpg", SmartFolderEntryKind::Image, 5),
+                ("b.jpg", SmartFolderEntryKind::Image, 5),
+            ],
+            allowed,
+            false,
+        );
+        let ctx = egui::Context::default();
+        app.search_target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+        app.show_search_bar = true;
+        app.search_query = "b.jpg".into();
+        app.execute_search(&ctx);
+        assert_eq!(
+            app.search_pending
+                .as_ref()
+                .unwrap()
+                .progress_snapshot()
+                .total,
+            2
+        );
+        wait_for_local_search(&mut app, &ctx);
+        assert_eq!(app.local_search_result_counts(), Some((1, 2)));
+        assert_eq!(app.visible_indices.len(), 1);
+
+        app.write_user_ratings_shared(&[(keys[1].clone(), 4, None)])
+            .unwrap();
+        assert_eq!(app.local_search_result_counts(), Some((0, 1)));
+        assert!(app.visible_indices.is_empty());
+
+        app.execute_search(&ctx);
+        assert_eq!(
+            app.search_pending
+                .as_ref()
+                .unwrap()
+                .progress_snapshot()
+                .total,
+            1
+        );
+        wait_for_local_search(&mut app, &ctx);
+        assert!(app.search_filter.as_ref().unwrap().is_empty());
+        assert_eq!(app.local_search_result_counts(), Some((0, 1)));
+
+        app.search_query = "a.jpg".into();
+        app.execute_search(&ctx);
+        wait_for_local_search(&mut app, &ctx);
+        assert_eq!(app.local_search_result_counts(), Some((1, 1)));
+        assert_eq!(app.visible_indices.len(), 1);
+    }
+
+    #[test]
+    fn rating_smart_root_aggregates_skip_departed_rows() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let mut allowed = [false; 6];
+        allowed[5] = true;
+        let root = app.tmp.path().join("r3-smart-root-aggregates");
+        let keys = install_rating_rule_test_root(
+            &mut app,
+            root,
+            &[
+                ("a.jpg", SmartFolderEntryKind::Image, 5),
+                ("b.jpg", SmartFolderEntryKind::Image, 5),
+            ],
+            allowed,
+            false,
+        );
+        let departed = app
+            .items
+            .iter()
+            .position(|item| item.name() == "b.jpg")
+            .unwrap();
+        app.write_user_ratings_shared(&[(keys[1].clone(), 4, None)])
+            .unwrap();
+        assert!(!app.smart_folder_rule_qualifies_index(departed));
+        assert_eq!(
+            app.facet_candidate_indices(crate::app::FacetField::Kind),
+            [0]
+        );
+        assert_eq!(app.collect_image_page_keys().0, [0]);
+        assert_eq!(
+            app.snapshot_inherited_default_params()
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        app.adjustment_page_params
+            .insert(departed, crate::adjustment::AdjustParams::default());
+        assert_eq!(app.remaining_page_override_count(None), 0);
+        app.checked.insert(departed);
+        app.selected = Some(departed);
+        assert!(app.grid_selection_indices().is_empty());
+        assert!(app.checked_real_file_paths().is_empty());
+
+        let key = app.items[0].perf_key();
+        let (mtime, file_size) = app.image_metas[0].unwrap_or((0, 0));
+        let expected = crate::color_search::scan_scope_signature(
+            "folder",
+            std::iter::once((key.as_str(), mtime, file_size)),
+        );
+        assert_eq!(app.color_current_scope_signature(), Some(expected));
+    }
+
+    #[test]
+    fn rating_smart_details_header_retains_survivor_order() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let mut allowed = [false; 6];
+        allowed[4] = true;
+        allowed[5] = true;
+        let root = app.tmp.path().join("r3-smart-details-membership");
+        let keys = install_rating_rule_test_root(
+            &mut app,
+            root,
+            &[
+                ("a.jpg", SmartFolderEntryKind::Image, 5),
+                ("b.jpg", SmartFolderEntryKind::Image, 4),
+                ("c.jpg", SmartFolderEntryKind::Image, 5),
+                ("d.jpg", SmartFolderEntryKind::Image, 4),
+            ],
+            allowed,
+            false,
+        );
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Rating;
+        app.rebuild_details_order();
+        assert!(app.details_header_sort_active());
+        let old_order = app.details_order.clone();
+        let departed = app
+            .items
+            .iter()
+            .position(|item| item.name() == "c.jpg")
+            .unwrap();
+        let expected = old_order
+            .into_iter()
+            .filter(|&index| index != departed)
+            .collect::<Vec<_>>();
+        app.write_user_ratings_shared(&[
+            (keys[0].clone(), 4, None),
+            (keys[1].clone(), 5, None),
+            (keys[2].clone(), 3, None),
+        ])
+        .unwrap();
+        assert_eq!(app.details_order, expected);
+        wait_for_smart_rating_membership(&mut app);
+        assert_eq!(app.details_order, expected);
+    }
+
+    #[test]
+    fn rating_smart_append_keeps_surviving_video_result_current() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let mut allowed = [false; 6];
+        allowed[5] = true;
+        let root = app.tmp.path().join("r3-smart-video-membership");
+        let keys = install_rating_rule_test_root(
+            &mut app,
+            root,
+            &[
+                ("a.jpg", SmartFolderEntryKind::Image, 5),
+                ("b.mp4", SmartFolderEntryKind::Video, 5),
+                ("c.jpg", SmartFolderEntryKind::Image, 4),
+            ],
+            allowed,
+            true,
+        );
+        let video_index = app
+            .items
+            .iter()
+            .position(|item| item.name() == "b.mp4")
+            .unwrap();
+        app.keep_set.insert(video_index);
+        app.keep_range = (0, app.items.len());
+        app.requested.insert(video_index, false);
+        let generation = app.items_generation;
+        app.tx
+            .send(crate::thumb_loader::ThumbMsg {
+                idx: video_index,
+                image: Some(egui::ColorImage::from_rgba_unmultiplied(
+                    [2, 2],
+                    &[255u8; 16],
+                )),
+                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: Some((2, 2)),
+                layout_dims: None,
+                canceled: false,
+                finalized: false,
+                input_seq: 0,
+                items_gen: generation,
+            })
+            .unwrap();
+        app.write_user_ratings_shared(&[(keys[0].clone(), 4, None), (keys[2].clone(), 5, None)])
+            .unwrap();
+        wait_for_smart_rating_membership(&mut app);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.items[video_index].name(), "b.mp4");
+        app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(
+            app.thumbnails[video_index],
+            ThumbnailState::Loaded { .. }
+        ));
+    }
+
+    #[test]
+    fn smart_folder_without_rating_rule_has_no_membership_masks() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-smart-no-rating-rule");
+        let keys = install_rating_rule_test_root(
+            &mut app,
+            root,
+            &[("a.jpg", SmartFolderEntryKind::Image, 5)],
+            [true; 6],
+            false,
+        );
+        let navigation = Arc::clone(
+            &app.top_level_grid_view
+                .smart_folder()
+                .unwrap()
+                .navigation_entries,
+        );
+        let session = app.top_level_grid_view.smart_folder_session().unwrap();
+        assert!(session.item_rating_masks.is_none());
+        assert!(
+            session
+                .resort_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.rating_masks.is_none())
+        );
+        assert!(app.smart_folder_rating_membership_flags().is_none());
+        app.write_user_ratings_shared(&[(keys[0].clone(), 4, None)])
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &navigation,
+            &app.top_level_grid_view
+                .smart_folder()
+                .unwrap()
+                .navigation_entries,
+        ));
+    }
+
+    #[test]
+    fn disabled_rating_rule_does_not_allocate_membership_masks() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-smart-disabled-rating-rule");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.jpg");
+        std::fs::write(&path, b"image").unwrap();
+        let mut definition = crate::settings::SmartFolderDefinition::new("disabled-rating");
+        let active_id = uuid::Uuid::new_v4();
+        definition.rules.push(rule(
+            active_id,
+            root.clone(),
+            true,
+            true,
+            Default::default(),
+        ));
+        let mut disabled_filter = crate::settings::SmartFolderFilter::default();
+        disabled_filter.ratings = [false, false, false, false, false, true];
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root.clone(),
+            false,
+            true,
+            disabled_filter,
+        ));
+        assert!(!smart_folder_definition_uses_metadata(
+            &definition,
+            SmartFolderMetadataDependency::Rating
+        ));
+        let mut entry = smart_entry(path.to_str().unwrap(), 0, "");
+        entry.source_id = active_id;
+        entry.source_root = root;
+        entry.kind = SmartFolderEntryKind::Image;
+        entry.matching_rule_indices = vec![0, 1];
+        let snapshot = SmartFolderSnapshot {
+            definition,
+            entries: Arc::new(vec![entry]),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let (tx, _rx) = mpsc::channel();
+        let prepared = prepare_smart_folder(
+            snapshot,
+            crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName),
+            app.rating_session_write_generation,
+            crate::settings::GridDisplayOrder::default(),
+            false,
+            false,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            false,
+            false,
+            None,
+            None,
+            SmartFolderPrepareResources::default(),
+            &AtomicBool::new(false),
+            &tx,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(prepared.item_rating_masks.is_none());
+        assert!(prepared.resort_metadata.rating_masks.is_none());
+        assert!(app.install_prepared_smart_folder(prepared));
+        assert_eq!(app.smart_folder_rule_total(), 1);
+    }
+
+    #[test]
+    fn rating_smart_complete_read_failure_after_first_chunk_uses_name_fallback() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-smart-read-failure");
+        let mut definition = crate::settings::SmartFolderDefinition::new("read-failure");
+        let rule_id = uuid::Uuid::new_v4();
+        definition.rules.push(rule(
+            rule_id,
+            root.clone(),
+            true,
+            true,
+            crate::settings::SmartFolderFilter::default(),
+        ));
+        let entries = (0..501)
+            .map(|index| {
+                let path = root.join(format!("{index:03}.jpg"));
+                let mut entry = smart_entry(path.to_str().unwrap(), 0, "");
+                entry.source_id = rule_id;
+                entry.source_root = root.clone();
+                entry.kind = SmartFolderEntryKind::Image;
+                entry
+            })
+            .collect::<Vec<_>>();
+        let rated_key = crate::adjustment_db::normalize_path(&entries[499].path);
+        let bad_key = crate::adjustment_db::normalize_path(&entries[500].path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&rated_key, 5, None)
+            .unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&bad_key, 2, None)
+            .unwrap();
+        let conn = rusqlite::Connection::open(crate::rating_db::RatingDb::db_path()).unwrap();
+        conn.execute(
+            "UPDATE ratings SET stars = 'broken' WHERE path = ?1",
+            [&bad_key],
+        )
+        .unwrap();
+        let snapshot = SmartFolderSnapshot {
+            definition,
+            entries: Arc::new(entries),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let (tx, _rx) = mpsc::channel();
+        let prepared = prepare_smart_folder(
+            snapshot,
+            crate::rating_sort::ListingOrderRequest::Rating(crate::rating_sort::RatingSortSpec {
+                direction: crate::rating_sort::RatingSortDirection::Desc,
+                unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+            }),
+            app.rating_session_write_generation,
+            crate::settings::GridDisplayOrder::default(),
+            false,
+            false,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            false,
+            false,
+            None,
+            None,
+            SmartFolderPrepareResources::default(),
+            &AtomicBool::new(false),
+            &tx,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(prepared.rating_sort_failed);
+        assert_eq!(prepared.items[0].name(), "000.jpg");
+        assert_eq!(prepared.metadata.rating_cache.get(&499), Some(&5));
+        assert!(!prepared.metadata.rating_cache.contains_key(&500));
+        assert!(app.install_prepared_smart_folder(prepared));
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(message, _, _)| message.contains("名前順"))
+        );
+    }
+
     fn unfiltered_scan_options() -> SmartFolderScanOptions {
         SmartFolderScanOptions {
             show_hidden_files: false,
@@ -8245,6 +9940,8 @@ mod tests {
             .install_smart_folder_session(SmartFolderSession::new(
                 snapshot,
                 Arc::new(ReusedSmartFolderMetadata::default()),
+                Some(vec![[true; 6]; 2]),
+                0,
                 presentation,
                 metadata_revision,
             ));
@@ -9062,7 +10759,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let counted = count_smart_folder_results(
             snapshot,
+            false,
             7,
+            0,
             false,
             HashSet::new(),
             HashSet::new(),
@@ -9171,7 +10870,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let prepared = prepare_smart_folder(
             snapshot,
-            crate::settings::SortOrder::FileName,
+            crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName),
+            0,
             display_order,
             false,
             false,
@@ -9229,7 +10929,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let prepared = prepare_smart_folder(
             snapshot,
-            crate::settings::SortOrder::FileName,
+            crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName),
+            0,
             crate::settings::GridDisplayOrder::default(),
             false,
             false,
@@ -9394,7 +11095,8 @@ mod tests {
         let started = Instant::now();
         let prepared = prepare_smart_folder(
             snapshot,
-            crate::settings::SortOrder::FileName,
+            crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName),
+            0,
             crate::settings::GridDisplayOrder::default(),
             false,
             false,
@@ -9419,7 +11121,8 @@ mod tests {
         let resort_started = Instant::now();
         let resort = prepare_smart_folder(
             resort_snapshot,
-            crate::settings::SortOrder::DateDesc,
+            crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::DateDesc),
+            0,
             crate::settings::GridDisplayOrder::default(),
             false,
             false,
@@ -9488,7 +11191,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let prepared = prepare_smart_folder(
             snapshot,
-            crate::settings::SortOrder::FileName,
+            crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName),
+            0,
             crate::settings::GridDisplayOrder::default(),
             false,
             false,
@@ -9620,7 +11324,8 @@ mod tests {
 
         let prepared = prepare_smart_folder(
             snapshot,
-            crate::settings::SortOrder::FileName,
+            crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName),
+            0,
             crate::settings::GridDisplayOrder::default(),
             false,
             true,

@@ -951,19 +951,12 @@ fn folder_rating_tooltip(keymap: &Keymap) -> String {
     }
 }
 
-fn thumbnail_item_counts(items: &[GridItem], visible_indices: &[usize]) -> (usize, usize) {
-    // 全 GridItem が一覧上の 1 項目に対応するため、数百万件でも長さを読むだけでよい。
-    (items.len(), visible_indices.len())
-}
-
-fn thumbnail_count_label(items: &[GridItem], visible_indices: &[usize]) -> String {
-    let (total, visible) = thumbnail_item_counts(items, visible_indices);
+fn thumbnail_count_label(total: usize, visible: usize) -> String {
     let width = total.max(1).to_string().len();
     format!("({:>width$}/{})", visible, total, width = width)
 }
 
-fn filtered_count_label(items: &[GridItem], visible_indices: &[usize]) -> String {
-    let (total, visible) = thumbnail_item_counts(items, visible_indices);
+fn filtered_count_label(total: usize, visible: usize) -> String {
     format!("{visible} / {total} 件")
 }
 
@@ -11052,7 +11045,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(filtered_count_label(&self.items, &self.visible_indices))
+                    egui::RichText::new(filtered_count_label(
+                        self.smart_folder_rule_total(),
+                        self.visible_indices.len(),
+                    ))
                     .small(),
                 );
             });
@@ -11103,7 +11099,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 || self.settings.details_show_video_duration
                 || self.settings.details_show_video_dimensions
                 || self.settings.details_show_video_codec)
-            || self.items.is_empty()
+            || self.current_grid_order().is_empty()
         {
             return;
         }
@@ -12680,7 +12676,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             && !self.items_are_tag_view
             && self.search_filter.is_none()
             && self.search_pending.is_none())
-        .then(|| thumbnail_count_label(&self.items, &self.visible_indices));
+        .then(|| thumbnail_count_label(self.smart_folder_rule_total(), self.visible_indices.len()));
         // 📌 (代表サムネ固定) ボタンの表示判定 + 状態をあらかじめ計算する。
         // closure 内で `self` のミュータブル借用が衝突しないように外で確定しておく。
         let pin_button_info = self.compute_folder_pin_button_state();
@@ -13554,11 +13550,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             progress.matched, progress.done, progress.total
                         ));
                     }
-                } else if let Some(ref filter) = self.search_filter {
+                } else if let Some((matched, total)) = self.local_search_result_counts() {
                     ui.separator();
-                    // 構造アイテム (Folder/ZIP/PDF) も含む可視マッチ全体を数える。
-                    // Vec の長さだけを使い、数百万件を毎フレーム走査しない。
-                    let (total, matched) = (self.items.len(), filter.len());
+                    // Count the root's rule domain, excluding departed Smart Folder rows.
+                    // The projection is cached when visible_indices is rebuilt.
                     ui.label(
                         egui::RichText::new(format!("{matched}/{total} 件"))
                             .size(11.0)
@@ -17633,6 +17628,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     /// 参照するのは一覧・サムネイル・遅延メタデータの既存キャッシュだけで、I/O は行わない。
     fn selection_info_content(&self) -> Option<SelectionInfoContent> {
         let mut checked_indices = self.checked.iter().copied().collect::<Vec<_>>();
+        checked_indices.retain(|&index| self.smart_folder_rule_qualifies_index(index));
         checked_indices.sort_unstable();
         if checked_indices.len() > 1 {
             let mut lines = vec![format!("{} 個選択", checked_indices.len())];
@@ -17655,6 +17651,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
 
         let idx = self.selected?;
+        if !self.smart_folder_rule_qualifies_index(idx) {
+            return None;
+        }
         let item = self.items.get(idx)?;
         let bookmark_row = self.bookmark_view_row(idx);
         let mut lines = Vec::new();
@@ -19038,6 +19037,7 @@ mod selection_info_tests {
         app.settings.details_show_video_dimensions = false;
         app.settings.details_show_video_codec = false;
         app.items = vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.zip"))];
+        app.visible_indices = vec![0];
         app.details_image_dims_state = LazyColumnState::Loading { done: 1, total: 2 };
         let ctx = egui::Context::default();
         let mut raw_input = egui::RawInput::default();
@@ -19065,6 +19065,7 @@ mod selection_info_tests {
         app.settings.grid_view_mode = GridViewMode::Details;
         app.settings.details_show_page_count = true;
         app.items = vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.zip"))];
+        app.visible_indices = vec![0];
         app.details_image_dims_state = LazyColumnState::Reconciling {
             done: 2,
             total: 2,
@@ -19096,6 +19097,7 @@ mod selection_info_tests {
         app.settings.grid_view_mode = GridViewMode::Details;
         app.settings.details_show_page_count = true;
         app.items = vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.zip"))];
+        app.visible_indices = vec![0];
         app.details_image_dims_state = LazyColumnState::Ready { failed: 2 };
         let ctx = egui::Context::default();
         let mut raw_input = egui::RawInput::default();
@@ -19112,6 +19114,28 @@ mod selection_info_tests {
         });
 
         assert!(bottom_delta >= 24.5);
+    }
+
+    #[test]
+    fn details_lazy_status_hides_when_grid_has_no_visible_rows() {
+        let mut app = setup_app_for_test();
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_show_page_count = true;
+        app.items = vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.zip"))];
+        app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 1 };
+        let ctx = egui::Context::default();
+        let mut raw_input = egui::RawInput::default();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(640.0, 480.0),
+        ));
+        let mut bottom_delta = 0.0;
+        let _ = ctx.run(raw_input, |ctx| {
+            let before = ctx.available_rect();
+            app.render_details_lazy_status_bar(ctx);
+            bottom_delta = before.bottom() - ctx.available_rect().bottom();
+        });
+        assert!(bottom_delta.abs() < 0.01);
     }
 
     #[test]
@@ -19160,25 +19184,12 @@ mod rating_filter_op_tests {
 
     #[test]
     fn thumbnail_count_label_pads_visible_to_total_digits() {
-        let items: Vec<GridItem> = (0..100)
-            .map(|i| GridItem::Image(PathBuf::from(format!("img_{i}.jpg"))))
-            .collect();
-        let visible_indices: Vec<usize> = (0..20).collect();
-
-        assert_eq!(thumbnail_count_label(&items, &visible_indices), "( 20/100)");
+        assert_eq!(thumbnail_count_label(100, 20), "( 20/100)");
     }
 
     #[test]
     fn filtered_count_label_shows_visible_and_total_counts() {
-        let items: Vec<GridItem> = (0..300)
-            .map(|i| GridItem::Image(PathBuf::from(format!("img_{i}.jpg"))))
-            .collect();
-        let visible_indices: Vec<usize> = (0..123).collect();
-
-        assert_eq!(
-            filtered_count_label(&items, &visible_indices),
-            "123 / 300 件"
-        );
+        assert_eq!(filtered_count_label(300, 123), "123 / 300 件");
     }
 
     #[test]

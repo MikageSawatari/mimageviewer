@@ -2,7 +2,7 @@
 
 最終更新: 2026-09-25
 
-状態: 設計第5版 (独立レビューで ACCEPT)。R1 (`7c6a7d492`)・R2 完了、R3 着手前。
+状態: 設計第5版 (独立レビューで ACCEPT)。R1 (`7c6a7d492`)・R2 (`c36bf45eb`)・R3 完了、R4 着手前。
 
 - 初版 (`d05fc1a76`、2026-09-15): 別セッションで作成。
 - 第2版 (`23d553814`): 独立レビュー 1 回目 (GPT-6 Sol / xhigh、REVISE) を反映。
@@ -319,6 +319,10 @@ rebuild へ分ける。query、sort 変更、reload だけが通常の sorted re
    件数から外し、次の明示 reload / 開き直し / 定義 rebuild まで隠したままにする (R3 再レビューで決定)。
    取り除くと後続 index がずれ、Ctrl+↑↓ の移動先一覧、Details の評価ヘッダ順、checked、動画サムネイルの
    進行中作業がそれぞれ壊れたため。同じ session 中に再び条件を満たした行は元の位置で再表示される。
+   Ctrl+↑↓ の移動先と総件数は Smart Folder 条件で判定し、Ctrl+F など一時的な表示フィルタには従わせない。
+   総件数は表示中の件数ラベルと install toast に共通して使う。
+   Ctrl+F の走査・進捗・ヒット件数、facet と色検索の候補、一括操作の対象も同じ条件を先に適用する。
+   後で条件から外れた行を `items` に保持しても、現 root の列挙対象には戻さない。
 4. rating filter / Rated・Unrated facet と Details state を更新する。
 5. selected が非表示になった場合は既存の nearest-visible policy、checked は既存の WYSIWYG policy。
 

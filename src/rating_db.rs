@@ -126,6 +126,14 @@ pub(crate) struct CompleteRatingFacts {
 }
 
 impl CompleteRatingFacts {
+    pub(crate) fn value_for_requested(&self, key: &str) -> u8 {
+        assert!(
+            self.requested_keys.contains(key),
+            "rating key was not requested: {key}"
+        );
+        self.rated_values.get(key).copied().unwrap_or(0)
+    }
+
     /// Only call this for a ratable row whose key was included in the request.
     /// A missing request is a producer bug, not an unsupported item.
     pub(crate) fn key_for_requested(&self, key: &str) -> crate::rating_sort::RatingSortKey {

@@ -1455,6 +1455,22 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-26 §1.237B R3: rating publication at context swap**
+
+`swap_viewer_context_bundle` の rating cache 同期を、mount 中の書き込みと同じ
+`publish_current_context_rating_writes` に接続した。書き込み ledger は App 全体、
+`rating_cache`・検索 hit・Rating view・visible/Details state は各 viewer context が所有する。
+swap 前は退避する context、swap 後は復元した context だけに未反映世代を適用し、
+`items` の既存順や sibling の generation を変更しない。Rating view の新規行は既存 worker、
+Ctrl+G の membership は既存 prepare worker が作り、UI thread で stat/DB 読み取りを増やさない。
+評価条件を持つ Smart Folder は session が root の候補 snapshot・行ごとの評価適合 mask・
+membership worker を所有する。別 context での書き込みは mount 時に同じ publication を通り、
+root 復帰時も prepared 世代以降の書き込みを重ねる。
+評価条件のない定義は mask を持たない。評価条件から外れた root 行は session 中に raw items
+から消さず、可視一覧・root 移動先から外す。新規に入る行は末尾へ追加し、既存 index と
+動画サムネイルの世代を保つ。再び条件を満たした既存行は元の位置へ戻る。
+detached predicate、viewport、focus、host lifecycle は変更しないため §2 の症状パッチではない。
+
 **2026-09-25 §1.237 part A: rating step actions**
 
 `src/ui_fullscreen.rs` の既存 Rating key dispatch と `src/app/native_video.rs` の native key dispatch に、直接★指定と同じ context-local rating edit を接続。main / detached 共通の `App` 書き込み・session publication・Undo・表示更新経路を使用し、detached predicate、viewport identity、host、focus、lifecycle は変更しない。追加の detached 状態、時間窓、retry、repaint、reset は設けず、各 mounted context の既存 rating owner を使う機能追加なので §2 の症状パッチではない。

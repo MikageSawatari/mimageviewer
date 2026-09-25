@@ -1730,9 +1730,7 @@ impl App {
         // その時点の最新世代へ揃えてから ownership を渡す。この関数はnavigationではなく
         // ownership交換のプリミティブなので、同期に伴う表示再構築でApp-globalなfacet
         // scope / suppressionを変更してはならない。
-        if self.sync_current_context_rating_session_writes() {
-            self.rebuild_visible_indices_preserving_facet_scope();
-        }
+        self.publish_current_context_rating_writes();
         let favorite_view_now = std::time::Instant::now();
         self.capture_active_favorite_view_change_at(favorite_view_now);
         let favorite_view_inherited =
@@ -2293,9 +2291,7 @@ impl App {
         // 毎フレーム消え、Pending サムネがフレームごとに重複エンキュー/重複デコードされる
         // churn になっていた (review-v2.3.0 P2-8)。channel/token/キューを bundle 化した現在は
         // bookkeeping がコンテキストと一緒に移動するため clear 不要。
-        if self.sync_current_context_rating_session_writes() {
-            self.rebuild_visible_indices_preserving_facet_scope();
-        }
+        self.publish_current_context_rating_writes();
         let favorite_path = self.effective_folder();
         self.transition_favorite_view_for_path_with_inherited_at(
             favorite_path.as_deref(),
