@@ -523,21 +523,31 @@ x64 で `+crt-static` なので VC runtime 検査の追加設定は不要 (`chec
 
 ## 9. 段階の記録
 
-### S1 変換器の仕上げ (2026-09-25)
+### S1 変換器の仕上げ (2026-09-25、**独立レビュー 4 回目で承認**)
 
-実装: Codex Sol (`2113b88b0` までの 2 コミット + 検収側の修正 1 件)。実機の確認は検収側 (ClaudeCode) がサンドボックス外で実施
-(Codex のサンドボックス内では WebView2 が起動しないため)。
+実装: Codex Sol (同一セッションで 4 往復)。実機の確認は検収側 (ClaudeCode) がサンドボックス外で実施 (Codex のサンドボックス内では
+WebView2 が起動しない)。独立レビュー: 別の Codex Sol セッション (読み取り専用)、4 回目で承認。最終コミット `78b91108c`。
 
 | 完了条件 (§5 S1) | 結果 | 確かめ方 |
 | --- | --- | --- |
-| 通信ゼロ | 合格 | 外部 URL の代わりに `127.0.0.1` の HTTP サーバーを参照する合成 EPUB (リフロー・固定の 2 種) を変換。サーバーが受けた要求は **0 件**。レポートは CSS `@import`・`<link>`・iframe・画像・背景画像・フォントの 6 種をすべて遮断として記録 |
-| 本のスクリプトを実行しない | 合格 | 同じ合成 EPUB の inline script (DOM に印を付け、`fetch` する) が動いていない (`book_script_ran=false`、`fetch` の要求も発生せず) |
-| Job Object (中止) | 合格 | `epub-pdf-job-probe cancel`: WebView2 7 プロセスすべてが Job 内、Job を閉じた後に変換器ごと消滅 |
-| Job Object (親の強制終了) | 合格 | `epub-pdf-job-probe parent-kill`: 同上。終了後に変換器の残存なし (tasklist) |
-| 27 冊の回帰 | 合格 | 固定レイアウトの 17 冊はページ数・画像判定 (JPEG の SHA-256 一致) とも前回と同一。リフローを含む本はページが小さくなった分だけページ数が増えた (想定どおり。cole-voyage-of-life は固定とリフローが交互の本で、増えたのはリフロー側) |
+| 通信ゼロ | 合格 (DNS は仕様に基づく) | `127.0.0.1` に **TCP の accept を記録するリスナー**と HTTP サーバーを立て、preconnect / dns-prefetch / prefetch / preload / modulepreload と外部の CSS・フォント・画像・iframe・背景画像を含む合成 EPUB (リフロー・固定) を変換。TCP accept **0 件**・HTTP **0 件**。要求フィルタは全 source kind (`ICoreWebView2_22`)。DNS は管理者権限なしでは直接観測できないため、Chromium の `--host-resolver-rules="MAP * ^NOTFOUND"` (`net/dns/mapped_host_resolver.h` で構文を確認) による |
+| 外部設定による上書きへの耐性 | 合格 (ポリシーは単体テストのみ) | `WEBVIEW2_USER_DATA_FOLDER` と `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--host-resolver-rules=` を与えても、指定した一時フォルダを使い通信 0 件。レジストリのポリシー (AUMID → exe 名 → `*`、HKLM/HKCU、両ビュー) の検出は、利用者設定を書き換えないため偽レジストリの単体テストで確認。実際の一時フォルダはファイル ID で照合 |
+| 本のスクリプトを実行しない | 合格 | 合成 EPUB の inline script が動かない (`book_script_ran=false`、script の `fetch` も発生せず)。ホスト側の判定は CDP |
+| Job Object (中止・親の強制終了) | 合格 | `epub-pdf-job-probe`: WebView2 の子プロセスをコマンドラインの一時フォルダ名 (目印) でシステム全体から探す。中止直前に変換器と生存中の目印プロセス (6 個) がすべて Job 内、Job の外 0 個、終了後 約 50 ms で全消滅 |
+| 27 冊の回帰 | 合格 | 固定レイアウトの 17 冊はページ数・画像判定 (JPEG の SHA-256 一致) とも不変。リフローを含む本は `reflow-v1` でページ数が増えた (想定どおり)。レビュー対応の各修正後も 27 冊で差分なし |
 | リフロー `reflow-v1` (720×1024 CSS px、余白 32 px) | 採用 | 草枕 (本の CSS どおり 1 行 28 字)、Moby-Dick、ごん狐を画像化して目視 |
 
-検収で見つけて直した不具合: 本文の画像や manifest に `http:` などの外部参照があると、パスの安全検査が「アーカイブ外を指す」と
-判定して**本全体を不正な EPUB として拒否**していた。外部参照は読み飛ばし (要求は描画時に遮断される)、回帰テストを追加 (`2113b88b0`)。
+**訂正の記録**: 最初の検収では「HTTP サーバーが受けた要求 0 件」をもって通信ゼロとしたが、独立レビュー 1 回目の指摘どおり、
+preconnect は HTTP を送らずに TCP 接続だけを張る。修正前の変換器で TCP accept が 2 件あることを実測で確認し (確認方法が漏れを
+検出できることの確認でもある)、確認方法を TCP accept の記録へ改めた。また DNS 遮断の指定は当初 `~NOTFOUND` で誤っていた
+(レビュー 2 回目、Chromium のソースで確認して `^NOTFOUND` へ)。
 
-合成 EPUB の生成は `C:\home\mimageviewer_testdata_epub\gen_probe.py` (リポジトリ外)。
+独立レビューで見つかり直した主な点: 外部参照を含む本を不正扱いにしていた (検収側で発見)、別ボリュームへの出力公開の失敗、
+進捗 JSON の最終行が出ない経路、一時フォルダの指定が出力を含むと削除される、`\\host` の外部判定、無期限待機、旧 Runtime での
+部分フィルタ、外部設定による上書き、Job probe が誤って合格し得る判定、panic 後の一時フォルダ残り。
+
+S2 へ引き継ぐ事項: 強制終了で残る `<out>.tmp-<pid>-<n>` と `.part` は本体の削除ゲートで回収する (§4.4)。本体は変換器を起動する
+ときに `WEBVIEW2_*` を外し、存在しない一時フォルダのパスを渡す。終了コード 0/2/3/4/5/6/7/8 と `--progress-json` の契約は
+`crates/epub-pdf-worker/README.md` と `src/protocol.rs` が正本。
+
+合成 EPUB の生成: `C:\home\mimageviewer_testdata_epub\gen_probe.py`、`gen_probe_preconnect.py` (リポジトリ外)。
