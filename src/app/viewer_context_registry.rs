@@ -1672,7 +1672,9 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         if let Some(mut pending) = self.folder_pane_open_pending.take() {
+            let restore = pending.epub_restore.take();
             pending.cancel_with_diagnostic("context_parked");
+            self.finish_pane_open_restore(restore, super::PaneOpenRestoreExit::Abandoned);
         }
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = FolderNavMode::Grid;

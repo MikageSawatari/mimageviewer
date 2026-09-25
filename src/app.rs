@@ -4937,6 +4937,15 @@ pub(crate) struct FolderPaneOpenReady {
     epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
 }
 
+/// What happened to the view which a pane scan was going to replace. The EPUB
+/// rollback has exactly one owner until the successor is visibly adopted.
+#[derive(Clone, Copy)]
+enum PaneOpenRestoreExit {
+    ReplacedByPaneScan,
+    Adopted,
+    Abandoned,
+}
+
 #[cfg(windows)]
 struct ResolvedMainFolderOpen {
     path: PathBuf,
@@ -21779,7 +21788,7 @@ impl App {
     pub(crate) fn enter_drive_list(&mut self, origin: Option<PathBuf>) {
         crate::logger::log("=== enter_drive_list ===");
         // ドライブ一覧へ移るので in-flight のフォルダペイン open scan は破棄する。
-        self.cancel_folder_pane_open();
+        self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
         self.gamepad_location_picker = None;
         // 閲覧履歴の戻り先予約はここで捨てる (本コンテキストを抜けた)。
         self.reading_history_return_from = None;
@@ -22177,6 +22186,7 @@ impl App {
     ) -> bool {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
+            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
             return false;
         }
         if matches!(owner, OpenRequestOwner::Navigation)
@@ -22494,6 +22504,7 @@ impl App {
         // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
+            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
             return false;
         }
         // A converted cache ZIP is an implementation alias outside the source archive's smart
@@ -22514,17 +22525,17 @@ impl App {
                 self.clear_smart_folder_view_state();
             }
         }
-        // 別経路の load が走ったら、この bundle の in-flight folder open scan は stale なので
-        // 破棄する。poll_folder_pane_open は pending を take してから適用するため、自分自身の
-        // 完了結果を pre-scan 付きで load する場合は no-op。
-        self.cancel_folder_pane_open();
+        // Retire a previous pane scan only when this load has been adopted or refused.
+        // An EPUB rollback in that scan must survive a failed successor.
         if !detached_physical {
             if self.restore_smart_folder_for_synthetic_path(&path) {
                 self.suppress_nav_record_for_search_restore = false;
+                self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
                 return true;
             }
             if self.restore_subfolder_expansion_for_synthetic_path(&path) {
                 self.suppress_nav_record_for_search_restore = false;
+                self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
                 return true;
             }
         }
@@ -22659,8 +22670,10 @@ impl App {
                     collection_history_origin.as_ref(),
                 ) {
                     self.pending_auto_fs_open = false;
+                    self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
                     return false;
                 }
+                self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
                 self.load_zip_as_folder(path);
                 if crate::perf::is_enabled() {
                     crate::perf::event(
@@ -22687,8 +22700,10 @@ impl App {
                     collection_history_origin.as_ref(),
                 ) {
                     self.pending_auto_fs_open = false;
+                    self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
                     return false;
                 }
+                self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
                 self.load_pdf_as_folder_owned(path, owner);
                 if let Some(pending) = self.pdf_enumerate_pending.as_mut() {
                     pending.4 = pdf_open_history_snapshot;
@@ -22744,6 +22759,7 @@ impl App {
                     self.pending_auto_fs_open = false;
                     self.release_fs_nav_lock();
                     self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
+                    self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
                     return false;
                 }
             },
@@ -22754,8 +22770,10 @@ impl App {
             collection_history_origin.as_ref(),
         ) {
             self.pending_auto_fs_open = false;
+            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
             return false;
         }
+        self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
         self.install_scanned_folder_listing(
             path,
             scan,
@@ -41822,7 +41840,7 @@ impl App {
         }
         // folder scan pending も bundle-owned。mounted detached からキャンセルすると
         // その detached の image open だけが止まり、unmounted main の request には触れない。
-        self.cancel_folder_pane_open();
+        self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
         self.clear_pending_folder_nav_steps();
         self.release_fs_nav_lock();
     }
@@ -42519,14 +42537,25 @@ impl App {
     }
 
     fn start_folder_open_scan(&mut self, path: PathBuf, purpose: FolderOpenScanPurpose) {
+        self.start_folder_open_scan_with_restore(path, purpose, None);
+    }
+
+    fn start_folder_open_scan_with_restore(
+        &mut self,
+        path: PathBuf,
+        purpose: FolderOpenScanPurpose,
+        inherited_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
+    ) {
         // A pane click is an independent main-context open even before its worker scan finishes.
         // Candidate, detached and fullscreen scans may target another viewer context; a refresh
         // does not express a new open. Retire only the proven main-context pane intent here.
-        let mut epub_restore = if matches!(purpose, FolderOpenScanPurpose::PaneNavigation) {
+        let epub_restore = if matches!(purpose, FolderOpenScanPurpose::PaneNavigation) {
             self.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded)
         } else {
             None
         };
+        debug_assert!(inherited_restore.is_none() || epub_restore.is_none());
+        let mut epub_restore = inherited_restore.or(epub_restore);
         if !matches!(
             &purpose,
             FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
@@ -42534,18 +42563,15 @@ impl App {
             self.retire_staged_smart_navigation_for_independent_intent();
         }
         // 旧 pending を破棄 (連打で最後のクリックだけ生かす)。
-        if let Some(mut prev) = self.folder_pane_open_pending.take() {
-            if matches!(purpose, FolderOpenScanPurpose::PaneNavigation) && epub_restore.is_none() {
-                epub_restore = prev.epub_restore.take();
-            }
-            #[cfg(windows)]
-            let detached_lease = prev.purpose.detached_loading_lease();
-            prev.cancel_with_diagnostic("scan_replaced");
-            #[cfg(windows)]
-            if let Some(lease) = detached_lease {
-                self.cancel_detached_loading_shell_from_main(lease, "folder_scan_replaced");
-            }
-        }
+        let previous = self.cancel_folder_pane_open(
+            if matches!(purpose, FolderOpenScanPurpose::PaneNavigation) {
+                PaneOpenRestoreExit::ReplacedByPaneScan
+            } else {
+                PaneOpenRestoreExit::Abandoned
+            },
+        );
+        debug_assert!(epub_restore.is_none() || previous.is_none());
+        epub_restore = epub_restore.or(previous);
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -42587,16 +42613,70 @@ impl App {
 
     /// 進行中のフォルダペイン open scan をキャンセルして破棄する。
     /// 別の nav 源 (アドレスバー / Ctrl+↑↓ / グリッド) が勝ったときに呼ぶ。
-    fn cancel_folder_pane_open(&mut self) {
-        if let Some(mut prev) = self.folder_pane_open_pending.take() {
-            #[cfg(windows)]
-            let detached_lease = prev.purpose.detached_loading_lease();
-            prev.cancel_with_diagnostic("scan_cancelled");
-            #[cfg(windows)]
-            if let Some(lease) = detached_lease {
-                self.cancel_detached_loading_shell_from_main(lease, "folder_scan_cancelled");
+    fn finish_pane_open_restore(
+        &mut self,
+        restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
+        exit: PaneOpenRestoreExit,
+    ) -> Option<crate::ui_dialogs::epub_convert::EpubOpenRestore> {
+        match exit {
+            PaneOpenRestoreExit::ReplacedByPaneScan => restore,
+            PaneOpenRestoreExit::Adopted => None,
+            PaneOpenRestoreExit::Abandoned => {
+                if let Some(restore) = restore {
+                    self.restore_epub_open(restore);
+                }
+                None
             }
         }
+    }
+
+    fn cancel_folder_pane_open(
+        &mut self,
+        exit: PaneOpenRestoreExit,
+    ) -> Option<crate::ui_dialogs::epub_convert::EpubOpenRestore> {
+        if let Some(mut prev) = self.folder_pane_open_pending.take() {
+            let restore = prev.epub_restore.take();
+            #[cfg(windows)]
+            let detached_lease = prev.purpose.detached_loading_lease();
+            let replaced = matches!(exit, PaneOpenRestoreExit::ReplacedByPaneScan);
+            prev.cancel_with_diagnostic(if replaced {
+                "scan_replaced"
+            } else {
+                "scan_cancelled"
+            });
+            #[cfg(windows)]
+            if let Some(lease) = detached_lease {
+                self.cancel_detached_loading_shell_from_main(
+                    lease,
+                    if replaced {
+                        "folder_scan_replaced"
+                    } else {
+                        "folder_scan_cancelled"
+                    },
+                );
+            }
+            return self.finish_pane_open_restore(restore, exit);
+        }
+        None
+    }
+
+    fn replace_ready_folder_pane_open(
+        &mut self,
+        path: PathBuf,
+        ready: Option<FolderPaneOpenReady>,
+    ) {
+        let inherited = ready.and_then(|mut ready| {
+            ready.finish_diagnostic("ready_replaced");
+            self.finish_pane_open_restore(
+                ready.epub_restore.take(),
+                PaneOpenRestoreExit::ReplacedByPaneScan,
+            )
+        });
+        self.start_folder_open_scan_with_restore(
+            path,
+            FolderOpenScanPurpose::PaneNavigation,
+            inherited,
+        );
     }
 
     pub(crate) fn context_folder_jump_pending(&self) -> bool {
@@ -42619,7 +42699,7 @@ impl App {
         ) {
             return false;
         }
-        self.cancel_folder_pane_open();
+        self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
         true
     }
 
@@ -42674,9 +42754,10 @@ impl App {
                 // A still-owned disconnected channel is therefore an abnormal worker exit and
                 // must complete an exact fullscreen request through its normal failure boundary.
                 let mut pending = self.folder_pane_open_pending.take().unwrap();
-                if let Some(restore) = pending.epub_restore.take() {
-                    self.restore_epub_open(restore);
-                }
+                self.finish_pane_open_restore(
+                    pending.epub_restore.take(),
+                    PaneOpenRestoreExit::Abandoned,
+                );
                 #[cfg(windows)]
                 let detached_lease = pending.purpose.detached_loading_lease();
                 let detached_context_open = matches!(
@@ -42746,9 +42827,10 @@ impl App {
         let scan = match ready.scan {
             Ok(scan) => scan,
             Err(error) => {
-                if let Some(restore) = ready.epub_restore.take() {
-                    self.restore_epub_open(restore);
-                }
+                self.finish_pane_open_restore(
+                    ready.epub_restore.take(),
+                    PaneOpenRestoreExit::Abandoned,
+                );
                 crate::logger::log(format!(
                     "folder open scan failed path={} purpose={} error={error}",
                     ready.path.display(),
@@ -78190,7 +78272,7 @@ impl App {
             || open_folder_nav.is_some()
             || context_nav.is_some();
         if higher_priority_than_folder_pane {
-            self.cancel_folder_pane_open();
+            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
         }
         // フォルダツリーペインの worker scan 完了は、通常 nav 優先順位の候補として回収する。
         let mut folder_pane_open_ready = if higher_priority_than_folder_pane {
@@ -78408,10 +78490,7 @@ impl App {
                 // 済ませてから開く (UI スレッドの read_dir が大/遅/ネットワークフォルダで
                 // 固まるのを防ぐ)。同期 load はせず、完了後に通常 nav 優先順位で裁定する。
                 // 対象は実ディレクトリ前提。
-                if let Some(mut replaced) = folder_pane_open_ready.take() {
-                    replaced.finish_diagnostic("ready_replaced");
-                }
-                self.start_folder_pane_open(p);
+                self.replace_ready_folder_pane_open(p, folder_pane_open_ready.take());
                 None
             } else if let Some(ready) = folder_pane_open_ready.take() {
                 #[cfg(windows)]
@@ -78473,9 +78552,10 @@ impl App {
                             Some(path)
                         }
                         (_, Err(error)) => {
-                            if let Some(restore) = epub_restore {
-                                self.restore_epub_open(restore);
-                            }
+                            self.finish_pane_open_restore(
+                                epub_restore,
+                                PaneOpenRestoreExit::Abandoned,
+                            );
                             crate::logger::log(format!(
                                 "folder open scan failed path={} error={error}",
                                 path.display()
@@ -78562,11 +78642,14 @@ impl App {
                         navigate_owner.clone(),
                     ),
                 };
-                if matches!(open_outcome, FolderOpenOutcome::Ignored)
-                    && let Some(restore) = pane_epub_restore.take()
-                {
-                    self.restore_epub_open(restore);
-                }
+                self.finish_pane_open_restore(
+                    pane_epub_restore.take(),
+                    if matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                        PaneOpenRestoreExit::Adopted
+                    } else {
+                        PaneOpenRestoreExit::Abandoned
+                    },
+                );
                 // Ctrl+G 絞り込みビュー中に container (PDF/ZIP/サブフォルダ) を開いたら
                 // current_path を進めておく。BS で「PDF ページ → ヒット一覧 →
                 // Aggregated」の 2 段階で戻れるようにする修正 (2026-04 ユーザー報告)。

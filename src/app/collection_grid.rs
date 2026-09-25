@@ -4191,7 +4191,7 @@ mod tests {
             pending.purpose,
             super::super::FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
         ));
-        app.cancel_folder_pane_open();
+        app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
         assert!(app.folder_pane_open_pending.is_none());
         assert_eq!(
             app.items_generation, generation,

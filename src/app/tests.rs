@@ -324,7 +324,12 @@ fn epub_failure_replacement_does_not_restore_superseded_history_or_address() {
     let old = Path::new("C:/books/old.epub");
     let new = Path::new("C:/books/new.epub");
     let previous = PathBuf::from("C:/books/previous.pdf");
+    let before = PathBuf::from("C:/books/before.pdf");
     app.current_folder = Some(previous.clone());
+    app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+        .history
+        .back_stack
+        .push(FolderNavHistoryTarget::Path(before.clone()));
     app.address = old.to_string_lossy().into_owned();
     let snapshot = app.folder_nav_history_snapshot();
     assert_eq!(
@@ -345,6 +350,10 @@ fn epub_failure_replacement_does_not_restore_superseded_history_or_address() {
         preserve_after_password_prompt: false,
     });
     app.fs_nav_locked_gen = Some(7);
+    app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+        .history
+        .back_stack
+        .push(FolderNavHistoryTarget::Path(previous.clone()));
     app.recent_folders
         .push(PathBuf::from("C:/books/intermediate"));
     assert_eq!(
@@ -378,6 +387,10 @@ fn epub_failure_replacement_does_not_restore_superseded_history_or_address() {
     assert!(app.epub_convert.is_none());
     assert_eq!(app.fs_nav_locked_gen, None);
     assert_eq!(app.address, previous.to_string_lossy());
+    assert_eq!(
+        app.navigate_folder_history_back(),
+        Some(FolderNavHistoryTarget::Path(before))
+    );
 }
 
 #[test]
@@ -658,6 +671,125 @@ fn epub_pane_scan_failure_restores_address_history_and_releases_lock() {
     );
     assert_eq!(app.fs_nav_locked_gen, None);
     assert_eq!(app.current_folder.as_deref(), Some(previous.as_path()));
+}
+
+fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
+    let mut app = setup_app_for_test();
+    let temp = TempDir::new().unwrap();
+    let previous = temp.path().join("previous");
+    let b = temp.path().join("pane-b");
+    let c = temp.path().join("pane-c");
+    std::fs::create_dir(&previous).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    if c_succeeds {
+        std::fs::create_dir(&c).unwrap();
+    }
+    app.current_folder = Some(previous.clone());
+    app.address = previous.to_string_lossy().into_owned();
+    let before = temp.path().join("before");
+    app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+        .history
+        .back_stack
+        .push(FolderNavHistoryTarget::Path(before.clone()));
+    let history = app.folder_nav_history_snapshot();
+    let epub = temp.path().join("a.epub");
+    std::fs::write(&epub, b"test").unwrap();
+    app.settings
+        .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+    assert_eq!(
+        app.route_pdf_open_failure(
+            OpenRequestOwner::Navigation,
+            &epub,
+            PdfOpenFailure::NotConverted,
+        ),
+        PdfOpenFailureRoute::ConversionDialogOpened,
+    );
+    let state = app.epub_convert.as_mut().unwrap();
+    state.open_restore.history = Some(history);
+    state.deferred_fullscreen = Some(DeferredFsReopen {
+        history_trigger: HistoryTrigger::UserChosen,
+        resume_slideshow: false,
+        target: DeferredFsTarget::None,
+        resume_to_last_page: false,
+        from_explicit_open: false,
+        preserve_after_password_prompt: false,
+    });
+    app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+        .history
+        .back_stack
+        .push(FolderNavHistoryTarget::Path(epub.clone()));
+    app.address = epub.to_string_lossy().into_owned();
+    app.fs_nav_locked_gen = Some(app.items_generation);
+
+    app.start_folder_pane_open(b);
+    assert!(app.epub_convert.is_none());
+    assert_eq!(app.fs_nav_locked_gen, None);
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let b_ready = loop {
+        if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+            break ready;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pane B scan timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    // Same frame: the completed B scan loses to the newly selected C pane.
+    app.replace_ready_folder_pane_open(c.clone(), Some(b_ready));
+    assert!(
+        app.folder_pane_open_pending
+            .as_ref()
+            .unwrap()
+            .epub_restore
+            .is_some()
+    );
+    let c_ready = loop {
+        if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+            break ready;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pane C scan timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    if c_succeeds {
+        let mut resolved = app.resolve_main_folder_open_ready(&ctx, c_ready).unwrap();
+        assert!(resolved.epub_restore.is_some());
+        assert!(app.load_folder_with_scan_owned(
+            resolved.path,
+            Some(resolved.scan),
+            OpenRequestOwner::Navigation,
+        ));
+        app.finish_pane_open_restore(resolved.epub_restore.take(), PaneOpenRestoreExit::Adopted);
+        assert_eq!(app.current_folder.as_deref(), Some(c.as_path()));
+        assert_eq!(app.address, c.to_string_lossy());
+        assert_ne!(
+            app.navigate_folder_history_back(),
+            Some(FolderNavHistoryTarget::Path(before))
+        );
+    } else {
+        assert!(app.resolve_main_folder_open_ready(&ctx, c_ready).is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(previous.as_path()));
+        assert_eq!(app.address, previous.to_string_lossy());
+        assert_eq!(
+            app.navigate_folder_history_back(),
+            Some(FolderNavHistoryTarget::Path(before)),
+        );
+    }
+    assert_eq!(app.fs_nav_locked_gen, None);
+}
+
+#[test]
+fn epub_ready_pane_replacement_failed_successor_restores_original_view() {
+    epub_ready_pane_replacement_scenario(false);
+}
+
+#[test]
+fn epub_ready_pane_replacement_adopted_successor_drops_restore() {
+    epub_ready_pane_replacement_scenario(true);
 }
 
 #[test]
@@ -12494,7 +12626,7 @@ mod folder_pane_open_nav_tests {
             "the previous tree-order worker must no longer have an apply receiver"
         );
         assert!(pane_tx.send(Ok(empty_scan())).is_ok());
-        app.cancel_folder_pane_open();
+        app.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
     }
 }
 
@@ -14584,7 +14716,7 @@ mod phase_c_folder_nav_history_tests {
                     .back_stack,
                 vec![origin]
             );
-            app.cancel_folder_pane_open();
+            app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
             assert!(!app.context_folder_jump_pending());
             assert!(app.items.is_empty());
             assert!(app.current_folder.is_none());
@@ -14642,7 +14774,7 @@ mod phase_c_folder_nav_history_tests {
                 .history
                 .suppress_record_once
         );
-        app.cancel_folder_pane_open();
+        app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
     }
 
     #[cfg(windows)]

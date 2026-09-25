@@ -1070,7 +1070,7 @@ mod tests {
         assert_eq!(app.folder_nav_back_stack.len(), history);
         app.retire_saved_group_open_if_replaced();
         assert!(app.saved_group_open.is_none());
-        app.cancel_folder_pane_open();
+        app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
         assert!(app.saved_group_ready_nav().is_none());
     }
 

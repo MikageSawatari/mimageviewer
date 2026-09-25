@@ -2621,7 +2621,7 @@ impl App {
             crate::thumb_loader::bump_catchup_epoch();
             let _ = crate::pdf_loader::bump_render_context_epoch();
         }
-        self.cancel_folder_pane_open();
+        self.cancel_folder_pane_open(super::PaneOpenRestoreExit::Adopted);
         self.clear_meta_undo();
         crate::zip_loader::clear_nested_cache();
         self.zip_nav = None;
