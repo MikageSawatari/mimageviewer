@@ -996,6 +996,7 @@ mod tests {
             let progress = rx.recv().unwrap();
             assert_eq!(progress.phase, Phase::Print);
             assert_eq!(progress.pages, expected_pages);
+            assert_eq!(progress.done, if expected_pages.is_some() { 2 } else { 18 });
             assert_eq!(progress.total, if expected_pages.is_some() { 5 } else { 0 });
         }
     }

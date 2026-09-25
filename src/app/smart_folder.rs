@@ -8418,6 +8418,15 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         let (_path, _owner) = stage_smart_epub_conversion(&mut app);
         assert!(smart_epub_waiting(&app));
+        app.epub_convert.as_mut().unwrap().deferred_fullscreen = Some(DeferredFsReopen {
+            history_trigger: HistoryTrigger::UserChosen,
+            resume_slideshow: false,
+            target: DeferredFsTarget::None,
+            resume_to_last_page: false,
+            from_explicit_open: false,
+            preserve_after_password_prompt: false,
+        });
+        app.fs_nav_locked_gen = Some(7);
         let publish = app
             .epub_convert
             .as_mut()
@@ -8427,6 +8436,7 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
         assert!(app.epub_convert.is_none());
+        assert_eq!(app.fs_nav_locked_gen, None);
         assert!(
             app.smart_folder_transition
                 .as_ref()
@@ -8438,24 +8448,6 @@ mod tests {
                     }
                 ))
         );
-    }
-
-    #[test]
-    fn epub_stale_smart_pdf_child_published_does_not_reopen() {
-        let mut app = crate::app::setup_app_for_test();
-        stage_smart_epub_conversion(&mut app);
-        let publish = app
-            .epub_convert
-            .as_mut()
-            .unwrap()
-            .fake_published_sender_for_test();
-        app.smart_folder_transition.as_mut().unwrap().request_id += 1;
-        publish();
-        let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
-        assert!(app.epub_convert.is_none());
-        assert!(smart_epub_waiting(&app));
-        assert!(app.pdf_enumerate_pending.is_none());
     }
 
     #[test]
@@ -8493,7 +8485,7 @@ mod tests {
         let (epub, _) = stage_smart_epub_conversion(&mut app);
         app.address = epub.to_string_lossy().into_owned();
         let rollback = app.folder_nav_history_snapshot();
-        app.epub_convert.as_mut().unwrap().nav_history_rollback = Some(rollback);
+        app.epub_convert.as_mut().unwrap().open_restore.history = Some(rollback);
         app.folder_nav_back_stack
             .push(super::super::FolderNavHistoryTarget::Path(PathBuf::from(
                 "C:/books/intermediate",

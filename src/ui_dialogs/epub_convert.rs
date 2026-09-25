@@ -34,6 +34,12 @@ pub(crate) enum EpubConvertExit {
     Superseded,
 }
 
+/// View state to restore if a request ends before any successor owns the view.
+pub(crate) struct EpubOpenRestore {
+    pub(crate) logical: PathBuf,
+    pub(crate) history: Option<FolderNavHistorySnapshot>,
+}
+
 enum EpubConvertMsg {
     InspectDone(Result<EpubInspectSummary, EpubConvertError>),
     Progress(ConvertProgress),
@@ -47,7 +53,7 @@ pub(crate) struct EpubConvertState {
     // refreshes do not supersede an open, but another top-level surface or staged Smart open does.
     pub(crate) surface_generation: u64,
     pub(crate) smart_transition_sequence: u64,
-    pub(crate) nav_history_rollback: Option<FolderNavHistorySnapshot>,
+    pub(crate) open_restore: EpubOpenRestore,
     pub(crate) deferred_fullscreen: Option<crate::app::DeferredFsReopen>,
     pub(crate) phase: EpubConvertPhase,
     cancel: CancelToken,
@@ -80,12 +86,16 @@ impl EpubConvertState {
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         tx.send(EpubConvertMsg::ConvertDone(Ok(outcome))).unwrap();
+        let logical = src_path.clone();
         Self {
             src_path,
             owner,
             surface_generation,
             smart_transition_sequence,
-            nav_history_rollback: None,
+            open_restore: EpubOpenRestore {
+                logical,
+                history: None,
+            },
             deferred_fullscreen: None,
             phase: EpubConvertPhase::Converting(None),
             cancel: CancelToken::new().unwrap(),
@@ -130,6 +140,14 @@ fn progress_label(progress: &ConvertProgress) -> String {
         epub_convert::Phase::Verify => "変換結果を確認中",
     }
     .into()
+}
+
+fn progress_fraction(progress: &ConvertProgress) -> f32 {
+    if progress.total == 0 {
+        0.0
+    } else {
+        (progress.done as f32 / progress.total as f32).clamp(0.0, 1.0)
+    }
 }
 
 fn summary_direction(direction: &str) -> &'static str {
@@ -233,7 +251,10 @@ impl App {
                     owner,
                     surface_generation: self.top_level_grid_view.generation(),
                     smart_transition_sequence: self.smart_folder_transition_sequence,
-                    nav_history_rollback: None,
+                    open_restore: EpubOpenRestore {
+                        logical: logical.to_owned(),
+                        history: None,
+                    },
                     deferred_fullscreen: None,
                     phase: EpubConvertPhase::Scanning,
                     cancel,
@@ -279,29 +300,53 @@ impl App {
         }
     }
 
-    pub(crate) fn finish_epub_convert(&mut self, exit: EpubConvertExit) {
+    pub(crate) fn restore_epub_open(&mut self, restore: EpubOpenRestore) {
+        if let Some(snapshot) = restore.history {
+            self.restore_folder_nav_history(snapshot);
+        }
+        self.restore_address_after_epub_open_aborted(&restore.logical);
+    }
+
+    pub(crate) fn finish_epub_convert(&mut self, exit: EpubConvertExit) -> Option<EpubOpenRestore> {
         let Some(mut state) = self.epub_convert.take() else {
-            return;
+            return None;
         };
-        let rollback = state.nav_history_rollback.take();
-        let deferred = state.deferred_fullscreen.take();
-        let source = state.src_path.clone();
+        let had_deferred = state.deferred_fullscreen.take().is_some();
         let owner = state.owner.clone();
+        let active_logical = state.src_path.clone();
+        let restore = std::mem::replace(
+            &mut state.open_restore,
+            EpubOpenRestore {
+                logical: state.src_path.clone(),
+                history: None,
+            },
+        );
         drop(state);
         self.abort_smart_archive_open_for_owner(&owner);
-        if exit == EpubConvertExit::Abort {
-            if let Some(snapshot) = rollback {
-                self.restore_folder_nav_history(snapshot);
-            }
-            if deferred.is_some() {
+        if had_deferred {
+            if exit == EpubConvertExit::Abort {
                 self.finish_visible_container_fs_nav_failed();
             }
-            self.restore_address_after_epub_open_aborted(&source);
+            // Archive conversion uses this same terminal path. No replacement conversion or
+            // pane scan explicitly takes over the old fullscreen navigation lock.
+            self.release_fs_nav_lock();
+        }
+        match exit {
+            EpubConvertExit::Abort => {
+                // A replacement may have updated the address to its own EPUB path while
+                // retaining the first request's rollback snapshot.
+                self.restore_address_after_epub_open_aborted(&active_logical);
+                self.restore_epub_open(restore);
+                None
+            }
+            EpubConvertExit::Superseded => Some(restore),
         }
     }
 
-    fn replace_epub_convert_state(&mut self, state: EpubConvertState) {
-        self.finish_epub_convert(EpubConvertExit::Superseded);
+    fn replace_epub_convert_state(&mut self, mut state: EpubConvertState) {
+        if let Some(restore) = self.finish_epub_convert(EpubConvertExit::Superseded) {
+            state.open_restore = restore;
+        }
         self.epub_convert = Some(state);
     }
 
@@ -342,7 +387,13 @@ impl App {
                         self.finish_epub_convert(EpubConvertExit::Superseded);
                         return;
                     }
-                    let rollback = state.nav_history_rollback.take();
+                    let restore = std::mem::replace(
+                        &mut state.open_restore,
+                        EpubOpenRestore {
+                            logical: path.clone(),
+                            history: None,
+                        },
+                    );
                     let deferred = state.deferred_fullscreen.take();
                     drop(state);
                     if matches!(
@@ -351,6 +402,9 @@ impl App {
                             if matches!(intent.smart_folder_owner, crate::app::SmartGridArchiveOwner::Transition(_))
                     ) {
                         let _ = self.supply_smart_epub_conversion(&path, &owner);
+                        if deferred.is_some() {
+                            self.release_fs_nav_lock();
+                        }
                         return;
                     }
                     let reopened = if matches!(owner, OpenRequestOwner::CollectionGridPhysical(_)) {
@@ -364,10 +418,16 @@ impl App {
                         && crate::folder_tree::path_eq(&pending.0, &path)
                         && pending.3 == owner
                     {
-                        pending.4 = rollback;
+                        pending.4 = restore.history;
                         if deferred.is_some() {
                             self.fs_nav_after_pdf_enumerate = deferred;
                         }
+                    } else {
+                        if deferred.is_some() {
+                            self.release_fs_nav_lock();
+                        }
+                        // A rejected owner already belongs to a newer view; it must not
+                        // roll that view's navigation history back.
                     }
                     return;
                 }
@@ -429,8 +489,7 @@ impl App {
                         }
                         EpubConvertPhase::Converting(progress) => {
                             if let Some(progress) = progress {
-                                let fraction = if progress.total == 0 { 0.0 } else { progress.done as f32 / progress.total as f32 };
-                                ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).text(progress_label(progress)));
+                                ui.add(egui::ProgressBar::new(progress_fraction(progress)).text(progress_label(progress)));
                             } else { ui.label("変換を準備しています..."); }
                             if ui.button("キャンセル").clicked() { close = true; }
                         }
@@ -485,7 +544,10 @@ mod tests {
                 owner: OpenRequestOwner::Navigation,
                 surface_generation: 0,
                 smart_transition_sequence: 0,
-                nav_history_rollback: None,
+                open_restore: EpubOpenRestore {
+                    logical: PathBuf::from("C:/books/book.epub"),
+                    history: None,
+                },
                 deferred_fullscreen: None,
                 phase,
                 cancel: cancel.clone(),
@@ -577,6 +639,16 @@ mod tests {
         }))
         .unwrap();
         let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let Some(EpubConvertPhase::Converting(Some(progress))) =
+            app.epub_convert.as_ref().map(|state| &state.phase)
+        else {
+            panic!("progress was not adopted by the dialog");
+        };
+        assert_eq!(
+            (progress.done, progress.total, progress.pages),
+            (2, 4, Some(17))
+        );
+        assert_eq!(progress_fraction(progress), 0.5);
         let output = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
         let mut text = String::new();
         let mut stack: Vec<&egui::epaint::Shape> =
@@ -589,16 +661,24 @@ mod tests {
             }
         }
         assert!(text.contains("ページを変換中 (17 ページ)"), "{text}");
-        assert!(!text.contains("0 %"), "{text}");
     }
 
     #[test]
     fn fake_worker_publication_reopens_logical_epub_with_same_owner() {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
-        let (state, tx, _) = fake_state(EpubConvertPhase::Converting(None));
+        let (mut state, tx, _) = fake_state(EpubConvertPhase::Converting(None));
         let source = state.src_path.clone();
         let owner = state.owner.clone();
+        state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
+            resume_slideshow: false,
+            target: crate::app::DeferredFsTarget::None,
+            resume_to_last_page: false,
+            from_explicit_open: false,
+            preserve_after_password_prompt: false,
+        });
+        app.fs_nav_locked_gen = Some(7);
         app.epub_convert = Some(state);
         tx.send(EpubConvertMsg::ConvertDone(Ok(PublishOutcome::Published)))
             .unwrap();
@@ -609,6 +689,8 @@ mod tests {
                 .as_ref()
                 .is_some_and(|pending| { pending.0 == source && pending.3 == owner })
         );
+        assert!(app.fs_nav_after_pdf_enumerate.is_some());
+        assert_eq!(app.fs_nav_locked_gen, Some(7));
     }
 
     #[test]

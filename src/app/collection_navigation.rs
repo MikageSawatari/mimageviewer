@@ -3230,7 +3230,7 @@ impl App {
                         match self.route_pdf_open_failure(owner, &path, failure) {
                             super::PdfOpenFailureRoute::ConversionDialogOpened => {
                                 if let Some(state) = self.epub_convert.as_mut() {
-                                    state.nav_history_rollback = epub_history_snapshot;
+                                    state.open_restore.history = epub_history_snapshot;
                                 }
                                 FolderOpenOutcome::ConversionDialogOpened
                             }

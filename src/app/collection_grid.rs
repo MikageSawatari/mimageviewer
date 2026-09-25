@@ -4335,6 +4335,7 @@ mod tests {
         let pending = app.folder_pane_open_pending.take().unwrap();
         pending.cancel.store(true, Ordering::Relaxed);
         let ready = super::super::FolderPaneOpenReady {
+            epub_restore: None,
             path: pending.path,
             scan: Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,

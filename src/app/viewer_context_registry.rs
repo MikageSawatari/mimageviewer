@@ -3839,6 +3839,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         (
             FolderPaneOpenPending {
+                epub_restore: None,
                 path: PathBuf::from("c:/trace/pending"),
                 cancel,
                 rx,

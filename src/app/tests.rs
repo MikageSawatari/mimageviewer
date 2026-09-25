@@ -335,7 +335,7 @@ fn epub_failure_replacement_does_not_restore_superseded_history_or_address() {
         ),
         PdfOpenFailureRoute::ConversionDialogOpened
     );
-    app.epub_convert.as_mut().unwrap().nav_history_rollback = Some(snapshot);
+    app.epub_convert.as_mut().unwrap().open_restore.history = Some(snapshot);
     app.epub_convert.as_mut().unwrap().deferred_fullscreen = Some(DeferredFsReopen {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
@@ -360,8 +360,24 @@ fn epub_failure_replacement_does_not_restore_superseded_history_or_address() {
         app.recent_folders,
         vec![PathBuf::from("C:/books/intermediate")]
     );
-    assert_eq!(app.fs_nav_locked_gen, Some(7));
+    assert_eq!(app.fs_nav_locked_gen, None);
     assert_eq!(app.epub_convert.as_ref().unwrap().src_path, new);
+    app.address = new.to_string_lossy().into_owned();
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    };
+    let _ = ctx.run(input, |ctx| app.show_epub_convert_dialog(ctx));
+    assert!(app.epub_convert.is_none());
+    assert_eq!(app.fs_nav_locked_gen, None);
+    assert_eq!(app.address, previous.to_string_lossy());
 }
 
 #[test]
@@ -451,7 +467,7 @@ fn epub_superseded_by_collection_navigation_preserves_back_history() {
         PdfOpenFailureRoute::ConversionDialogOpened,
     );
     let rollback = app.folder_nav_history_snapshot();
-    app.epub_convert.as_mut().unwrap().nav_history_rollback = Some(rollback);
+    app.epub_convert.as_mut().unwrap().open_restore.history = Some(rollback);
     let collection_id = crate::collection_store::CollectionId::new();
     app.open_collection_grid_from_navigation(collection_id);
     assert_eq!(
@@ -536,8 +552,9 @@ fn epub_pane_scan_supersedes_deferred_reopen_before_worker_completes() {
         .unwrap()
         .fake_published_sender_for_test();
     let rollback = app.folder_nav_history_snapshot();
+    app.address = epub.to_string_lossy().into_owned();
     let state = app.epub_convert.as_mut().unwrap();
-    state.nav_history_rollback = Some(rollback);
+    state.open_restore.history = Some(rollback);
     state.deferred_fullscreen = Some(DeferredFsReopen {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
@@ -546,9 +563,18 @@ fn epub_pane_scan_supersedes_deferred_reopen_before_worker_completes() {
         from_explicit_open: false,
         preserve_after_password_prompt: false,
     });
+    app.fs_nav_locked_gen = Some(app.items_generation);
 
     app.start_folder_pane_open(destination.clone());
     assert!(app.epub_convert.is_none());
+    assert!(
+        app.folder_pane_open_pending
+            .as_ref()
+            .unwrap()
+            .epub_restore
+            .is_some()
+    );
+    assert_eq!(app.fs_nav_locked_gen, None);
     publish();
     let ctx = egui::Context::default();
     let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
@@ -564,10 +590,74 @@ fn epub_pane_scan_supersedes_deferred_reopen_before_worker_completes() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     };
     let ready = app.resolve_main_folder_open_ready(&ctx, ready).unwrap();
+    assert!(ready.epub_restore.is_some());
     app.load_folder_with_scan(ready.path, Some(ready.scan));
     assert_eq!(app.current_folder.as_deref(), Some(destination.as_path()));
     assert!(app.pdf_enumerate_pending.is_none());
     assert!(app.fs_nav_after_pdf_enumerate.is_none());
+    assert_eq!(app.fs_nav_locked_gen, None);
+}
+
+#[test]
+fn epub_pane_scan_failure_restores_address_history_and_releases_lock() {
+    let mut app = setup_app_for_test();
+    app.active_quick_folder_slot = None;
+    let temp = TempDir::new().unwrap();
+    let previous = temp.path().join("previous");
+    std::fs::create_dir(&previous).unwrap();
+    app.current_folder = Some(previous.clone());
+    app.address = previous.to_string_lossy().into_owned();
+    app.folder_nav_back_stack
+        .push(FolderNavHistoryTarget::Path(previous.clone()));
+    let history = app.folder_nav_history_snapshot();
+    let epub = temp.path().join("old.epub");
+    std::fs::write(&epub, b"test").unwrap();
+    app.settings
+        .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+    assert_eq!(
+        app.route_pdf_open_failure(
+            OpenRequestOwner::Navigation,
+            &epub,
+            PdfOpenFailure::NotConverted,
+        ),
+        PdfOpenFailureRoute::ConversionDialogOpened,
+    );
+    let state = app.epub_convert.as_mut().unwrap();
+    state.open_restore.history = Some(history);
+    state.deferred_fullscreen = Some(DeferredFsReopen {
+        history_trigger: HistoryTrigger::UserChosen,
+        resume_slideshow: false,
+        target: DeferredFsTarget::None,
+        resume_to_last_page: false,
+        from_explicit_open: false,
+        preserve_after_password_prompt: false,
+    });
+    app.folder_nav_back_stack
+        .push(FolderNavHistoryTarget::Path(epub.clone()));
+    assert_eq!(app.folder_nav_back_stack.len(), 2);
+    app.address = epub.to_string_lossy().into_owned();
+    app.fs_nav_locked_gen = Some(app.items_generation);
+    let deleted = temp.path().join("deleted");
+    app.start_folder_pane_open(deleted);
+    assert!(app.epub_convert.is_none());
+    assert_eq!(app.fs_nav_locked_gen, None);
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let ready = loop {
+        if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+            break ready;
+        }
+        assert!(std::time::Instant::now() < deadline, "pane scan timed out");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+    assert_eq!(app.address, previous.to_string_lossy());
+    assert_eq!(
+        app.folder_nav_back_stack,
+        vec![FolderNavHistoryTarget::Path(previous.clone())]
+    );
+    assert_eq!(app.fs_nav_locked_gen, None);
+    assert_eq!(app.current_folder.as_deref(), Some(previous.as_path()));
 }
 
 #[test]
@@ -609,7 +699,7 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
         app.top_level_grid_view.generation(),
         app.smart_folder_transition_sequence,
     );
-    state.nav_history_rollback = Some(app.folder_nav_history_snapshot());
+    state.open_restore.history = Some(app.folder_nav_history_snapshot());
     state.deferred_fullscreen = Some(DeferredFsReopen {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
@@ -725,7 +815,7 @@ fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
     let state = app.epub_convert.as_ref().unwrap();
     assert_eq!(state.src_path, source);
     assert_eq!(state.owner, OpenRequestOwner::Navigation);
-    assert!(state.nav_history_rollback.is_some());
+    assert!(state.open_restore.history.is_some());
     let ctx = egui::Context::default();
     let input = egui::RawInput {
         events: vec![egui::Event::Key {
@@ -12315,6 +12405,7 @@ mod folder_pane_open_nav_tests {
         let (tx, rx) = mpsc::channel();
         tx.send(Ok(empty_scan())).expect("send scan");
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            epub_restore: None,
             path: target.clone(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
@@ -12350,6 +12441,7 @@ mod folder_pane_open_nav_tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            epub_restore: None,
             path: target,
             cancel: Arc::clone(&cancel),
             rx,
@@ -12378,6 +12470,7 @@ mod folder_pane_open_nav_tests {
         let (pane_tx, pane_rx) = mpsc::channel();
         let pane_cancel = Arc::new(AtomicBool::new(false));
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            epub_restore: None,
             path: app.tmp.path().join("exact-pane-target"),
             cancel: Arc::clone(&pane_cancel),
             rx: pane_rx,
@@ -14322,6 +14415,7 @@ mod phase_c_folder_nav_history_tests {
             .cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
         FolderPaneOpenReady {
+            epub_restore: None,
             path: pending.path,
             scan,
             purpose: pending.purpose,
@@ -17825,6 +17919,7 @@ mod phase_c_drill_nav_tests {
                 .expect("the real gamepad path must start folder classification");
             real_pending.cancel.store(true, Ordering::Relaxed);
             app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                epub_restore: None,
                 path: folder.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: scan_rx,
@@ -51243,6 +51338,7 @@ mod still_window_mode_key_tests {
                 .expect("real physical scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                epub_restore: None,
                 path: first.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: scan_rx,
@@ -51426,6 +51522,7 @@ mod still_window_mode_key_tests {
                 .expect("real physical scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                epub_restore: None,
                 path: folder.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: scan_rx,
@@ -52020,6 +52117,7 @@ mod still_window_mode_key_tests {
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
             context.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                epub_restore: None,
                 path: folder,
                 cancel,
                 rx,
@@ -52955,6 +53053,7 @@ mod still_window_mode_key_tests {
         pending.cancel.store(true, Ordering::Relaxed);
         app.selected = None;
         let ready = FolderPaneOpenReady {
+            epub_restore: None,
             path: folder.clone(),
             scan: Ok(scan_directory(&folder)),
             purpose: pending.purpose,
@@ -53050,6 +53149,7 @@ mod still_window_mode_key_tests {
             .expect("the main bundle must own the Folder candidate scan");
         real_pending.cancel.store(true, Ordering::Relaxed);
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            epub_restore: None,
             path: child.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             rx: scan_rx,
@@ -53156,6 +53256,7 @@ mod still_window_mode_key_tests {
         let real_pending = app.folder_pane_open_pending.take().unwrap();
         real_pending.cancel.store(true, Ordering::Relaxed);
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            epub_restore: None,
             path: child.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             rx: scan_rx,
@@ -53318,6 +53419,7 @@ mod still_window_mode_key_tests {
             .wanted_revision = restore.revision_at_open + 1;
 
         let ready = FolderPaneOpenReady {
+            epub_restore: None,
             path: folder.clone(),
             scan: Ok(scan_directory(&folder)),
             purpose: pending.purpose,
@@ -53464,6 +53566,7 @@ mod still_window_mode_key_tests {
                 .expect("real detached image scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                epub_restore: None,
                 path: folder,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: scan_rx,
@@ -53515,6 +53618,7 @@ mod still_window_mode_key_tests {
                 .expect("real physical scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                epub_restore: None,
                 path: folder.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: scan_rx,
@@ -53942,6 +54046,7 @@ mod still_window_mode_key_tests {
         fn scan_pending(cancel: Arc<AtomicBool>) -> FolderPaneOpenPending {
             let (_tx, rx) = mpsc::channel::<std::io::Result<ScannedDir>>();
             FolderPaneOpenPending {
+                epub_restore: None,
                 path: PathBuf::from(r"C:\detached"),
                 cancel,
                 rx,
@@ -54638,6 +54743,7 @@ mod still_window_mode_key_tests {
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.current_folder = Some(PathBuf::from(r"C:\books\images"));
             bundle.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                epub_restore: None,
                 path: PathBuf::from(r"C:\books\images"),
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: scan_rx,
