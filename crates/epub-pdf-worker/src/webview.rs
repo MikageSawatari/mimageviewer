@@ -3,7 +3,7 @@ use base64::Engine;
 use std::{
     cell::RefCell,
     collections::HashSet,
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::mpsc::{self, Receiver, TryRecvError},
     time::{Duration, Instant},
@@ -23,26 +23,17 @@ use webview2_com::{
 use windows::{
     Win32::{
         Foundation::{
-            APPMODEL_ERROR_NO_APPLICATION, E_FAIL, E_NOINTERFACE, E_POINTER, ERROR_FILE_NOT_FOUND,
-            ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT,
-            RECT, WPARAM,
+            E_NOINTERFACE, E_POINTER, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
         },
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
             LibraryLoader::GetModuleHandleW,
-            Registry::{
-                HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_ANY, RRF_SUBKEY_WOW6432KEY,
-                RRF_SUBKEY_WOW6464KEY, RegGetValueW,
-            },
         },
-        UI::{
-            Shell::GetCurrentProcessExplicitAppUserModelID,
-            WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG,
-                MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW,
-                QS_ALLINPUT, RegisterClassW, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE,
-                WNDCLASSW, WS_OVERLAPPEDWINDOW,
-            },
+        UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG,
+            MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+            RegisterClassW, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WNDCLASSW,
+            WS_OVERLAPPEDWINDOW,
         },
     },
     core::{Interface, PCWSTR, PWSTR},
@@ -107,130 +98,38 @@ pub fn clear_webview_environment() {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PolicyHive {
-    Machine,
-    User,
+#[derive(Default)]
+struct UserDataFolderObservation {
+    redirected_to: Option<PathBuf>,
+    error: Option<String>,
 }
 
-impl PolicyHive {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Machine => "HKLM",
-            Self::User => "HKCU",
-        }
+fn observe_user_data_folder(
+    requested: &Path,
+    actual: Result<PathBuf, String>,
+    same_identity: impl FnOnce(&Path, &Path) -> Result<bool, String>,
+) -> UserDataFolderObservation {
+    match actual {
+        Ok(actual) => match same_identity(requested, &actual) {
+            Ok(true) => UserDataFolderObservation::default(),
+            Ok(false) => UserDataFolderObservation {
+                redirected_to: Some(actual),
+                error: None,
+            },
+            Err(error) => UserDataFolderObservation {
+                redirected_to: None,
+                error: Some(format!(
+                    "cannot compare requested {} with actual {}: {error}",
+                    requested.display(),
+                    actual.display()
+                )),
+            },
+        },
+        Err(error) => UserDataFolderObservation {
+            redirected_to: None,
+            error: Some(error),
+        },
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RegistryView {
-    View64,
-    View32,
-}
-
-const ENVIRONMENT_POLICIES: [&str; 4] = [
-    "AdditionalBrowserArguments",
-    "UserDataFolder",
-    "BrowserExecutableFolder",
-    "ReleaseChannelPreference",
-];
-
-fn scan_policy_overrides(
-    aumid: Option<&str>,
-    executable: &str,
-    mut read: impl FnMut(PolicyHive, RegistryView, &str, &str) -> Result<bool, String>,
-) -> Result<(), String> {
-    let mut value_names = Vec::new();
-    if let Some(aumid) = aumid.filter(|value| !value.is_empty()) {
-        value_names.push(aumid);
-    }
-    value_names.extend([executable, "*"]);
-    for policy in ENVIRONMENT_POLICIES {
-        for value_name in &value_names {
-            for hive in [PolicyHive::Machine, PolicyHive::User] {
-                for view in [RegistryView::View64, RegistryView::View32] {
-                    let found = read(hive, view, policy, value_name).map_err(|error| {
-                        format!(
-                            "WebView2 overridden: cannot inspect {} WebView2 {policy} policy value {value_name}: {error}",
-                            hive.label()
-                        )
-                    })?;
-                    if found {
-                        return Err(format!(
-                            "WebView2 overridden by {}\\Software\\Policies\\Microsoft\\Edge\\WebView2\\{policy} value {value_name}",
-                            hive.label()
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn registry_policy_value(
-    hive: PolicyHive,
-    view: RegistryView,
-    policy: &str,
-    value_name: &str,
-) -> Result<bool, String> {
-    let hive = match hive {
-        PolicyHive::Machine => HKEY_LOCAL_MACHINE,
-        PolicyHive::User => HKEY_CURRENT_USER,
-    };
-    let view = match view {
-        RegistryView::View64 => RRF_SUBKEY_WOW6464KEY,
-        RegistryView::View32 => RRF_SUBKEY_WOW6432KEY,
-    };
-    let subkey = wide(&format!(
-        "Software\\Policies\\Microsoft\\Edge\\WebView2\\{policy}"
-    ));
-    let value = wide(value_name);
-    let mut bytes = 0;
-    let result = unsafe {
-        RegGetValueW(
-            hive,
-            PCWSTR(subkey.as_ptr()),
-            PCWSTR(value.as_ptr()),
-            RRF_RT_ANY | view,
-            None,
-            None,
-            Some(&mut bytes),
-        )
-    };
-    if result == ERROR_SUCCESS {
-        Ok(true)
-    } else if result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND {
-        Ok(false)
-    } else {
-        Err(format!("{result:?}"))
-    }
-}
-
-fn explicit_app_user_model_id() -> Result<Option<String>, String> {
-    match unsafe { GetCurrentProcessExplicitAppUserModelID() } {
-        Ok(value) if value.is_null() => Ok(None),
-        Ok(value) => Ok(Some(take_pwstr(value)).filter(|value| !value.is_empty())),
-        Err(error)
-            if error.code() == E_FAIL
-                || error.code() == APPMODEL_ERROR_NO_APPLICATION.to_hresult() =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(format!(
-            "WebView2 overridden: cannot read explicit AppUserModelID: {error}"
-        )),
-    }
-}
-
-pub fn reject_policy_overrides() -> Result<(), String> {
-    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    let executable = executable
-        .file_name()
-        .ok_or("worker executable has no file name")?
-        .to_string_lossy();
-    let aumid = explicit_app_user_model_id()?;
-    scan_policy_overrides(aumid.as_deref(), &executable, registry_policy_value)
 }
 
 fn network_options() -> Result<ICoreWebView2EnvironmentOptions, String> {
@@ -287,11 +186,12 @@ pub struct Host {
     blocked: Rc<RefCell<BlockedRequests>>,
     pub request_filter: String,
     pub version: String,
+    pub user_data_folder_redirected: Option<PathBuf>,
+    pub user_data_folder_check_error: Option<String>,
 }
 
 impl Host {
     pub fn new(user_data: &Path, deadline: Instant) -> Result<Self, String> {
-        reject_policy_overrides()?;
         let mut version_ptr = PWSTR::null();
         let probe = unsafe {
             GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut version_ptr)
@@ -316,6 +216,8 @@ impl Host {
             blocked: Rc::new(RefCell::new(BlockedRequests::default())),
             request_filter: String::new(),
             version,
+            user_data_folder_redirected: None,
+            user_data_folder_check_error: None,
         };
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
             .ok()
@@ -381,25 +283,35 @@ impl Host {
                 h.version
             )
         })?);
-        let environment7: ICoreWebView2Environment7 = h
-            .environment
-            .as_ref()
-            .unwrap()
-            .cast()
-            .map_err(|e| format!("WebView2 unsupported: ICoreWebView2Environment7: {e}"))?;
-        let mut actual_ptr = PWSTR::null();
-        unsafe { environment7.UserDataFolder(&mut actual_ptr) }
-            .map_err(|e| format!("WebView2 unsupported: UserDataFolder unavailable: {e}"))?;
-        let actual = std::path::PathBuf::from(take_pwstr(actual_ptr));
-        if !crate::paths::same_directory_identity(user_data, &actual)
-            .map_err(|e| format!("WebView2 overridden: cannot identify user data folders: {e}"))?
-        {
-            return Err(format!(
-                "WebView2 overridden: requested user data folder {}, actual {}",
+        let actual = (|| -> Result<PathBuf, String> {
+            let environment7: ICoreWebView2Environment7 = h
+                .environment
+                .as_ref()
+                .unwrap()
+                .cast()
+                .map_err(|e| format!("ICoreWebView2Environment7 unavailable: {e}"))?;
+            let mut actual_ptr = PWSTR::null();
+            unsafe { environment7.UserDataFolder(&mut actual_ptr) }
+                .map_err(|e| format!("UserDataFolder query failed: {e}"))?;
+            if actual_ptr.is_null() {
+                return Err("UserDataFolder query returned no path".into());
+            }
+            Ok(PathBuf::from(take_pwstr(actual_ptr)))
+        })();
+        let observation =
+            observe_user_data_folder(user_data, actual, crate::paths::same_directory_identity);
+        if let Some(actual) = &observation.redirected_to {
+            eprintln!(
+                "WebView2 user data folder differs: requested {}, actual {}",
                 user_data.display(),
                 actual.display()
-            ));
+            );
         }
+        if let Some(error) = &observation.error {
+            eprintln!("WebView2 user data folder check: {error}");
+        }
+        h.user_data_folder_redirected = observation.redirected_to;
+        h.user_data_folder_check_error = observation.error;
 
         let (tx, rx) = mpsc::channel();
         let callback = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
@@ -724,85 +636,33 @@ mod tests {
     }
 
     #[test]
-    fn policy_lookup_orders_aumid_exe_wildcard_and_all_views() {
-        let mut calls = Vec::new();
-        scan_policy_overrides(
-            Some("Example.App"),
-            "worker.exe",
-            |hive, view, policy, name| {
-                calls.push((hive, view, policy.to_string(), name.to_string()));
-                Ok(false)
-            },
-        )
-        .unwrap();
-        assert_eq!(calls.len(), 4 * 3 * 2 * 2);
-        for (policy_index, policy) in ENVIRONMENT_POLICIES.iter().enumerate() {
-            for (name_index, name) in ["Example.App", "worker.exe", "*"].iter().enumerate() {
-                let start = (policy_index * 3 + name_index) * 4;
-                assert_eq!(calls[start].2, *policy);
-                assert_eq!(calls[start].3, *name);
-                assert_eq!(calls[start].0, PolicyHive::Machine);
-                assert_eq!(calls[start].1, RegistryView::View64);
-                assert_eq!(calls[start + 1].1, RegistryView::View32);
-                assert_eq!(calls[start + 2].0, PolicyHive::User);
-                assert_eq!(calls[start + 3].1, RegistryView::View32);
-            }
-        }
+    fn user_data_folder_mismatch_is_diagnostic() {
+        let requested = Path::new(r"C:\worker\requested");
+        let actual = PathBuf::from(r"C:\policy\actual");
+        let observation = observe_user_data_folder(requested, Ok(actual.clone()), |_, _| Ok(false));
+        assert_eq!(observation.redirected_to, Some(actual));
+        assert!(observation.error.is_none());
     }
 
     #[test]
-    fn policy_lookup_rejects_aumid_before_exe_and_each_policy() {
-        for policy_to_find in ENVIRONMENT_POLICIES {
-            let mut seen = Vec::new();
-            let error = scan_policy_overrides(
-                Some("Example.App"),
-                "worker.exe",
-                |hive, view, policy, name| {
-                    seen.push((policy.to_string(), name.to_string()));
-                    Ok(hive == PolicyHive::User
-                        && view == RegistryView::View32
-                        && policy == policy_to_find
-                        && name == "Example.App")
-                },
-            )
-            .unwrap_err();
-            assert!(error.contains(policy_to_find));
-            assert!(error.contains("Example.App"));
-            assert!(
-                !seen
-                    .iter()
-                    .any(|(policy, name)| { policy == policy_to_find && name == "worker.exe" })
-            );
-        }
-    }
+    fn user_data_folder_identity_error_is_diagnostic() {
+        let actual = PathBuf::from(r"C:\policy\actual");
+        let observation = observe_user_data_folder(
+            Path::new(r"C:\worker\requested"),
+            Ok(actual.clone()),
+            |_, _| Err("access denied".into()),
+        );
+        assert!(observation.redirected_to.is_none());
+        let error = observation.error.unwrap();
+        assert!(error.contains(&actual.display().to_string()));
+        assert!(error.contains("access denied"));
 
-    #[test]
-    fn policy_lookup_checks_exe_and_wildcard_without_aumid() {
-        let mut names = Vec::new();
-        let error = scan_policy_overrides(None, "worker.exe", |_, _, policy, name| {
-            names.push(name.to_string());
-            Ok(policy == "UserDataFolder" && name == "*")
-        })
-        .unwrap_err();
-        assert!(error.contains("UserDataFolder"));
-        assert!(error.contains("value *"));
-        assert!(names.contains(&"worker.exe".to_string()));
-        assert!(!names.contains(&"Example.App".to_string()));
-    }
-
-    #[test]
-    fn policy_lookup_fails_closed_when_registry_cannot_be_read() {
-        let error = scan_policy_overrides(Some("Example.App"), "worker.exe", |_, _, _, _| {
-            Err("access denied".into())
-        })
-        .unwrap_err();
-        assert!(error.contains("cannot inspect"));
-        assert!(error.contains("AdditionalBrowserArguments"));
-        assert!(error.contains("Example.App"));
-    }
-
-    #[test]
-    fn explicit_aumid_query_is_available() {
-        explicit_app_user_model_id().unwrap();
+        let observation = observe_user_data_folder(
+            Path::new(r"C:\worker\requested"),
+            Err("query unavailable".into()),
+            |_, _| unreachable!(),
+        );
+        assert!(observation.redirected_to.is_none());
+        assert_eq!(observation.error.as_deref(), Some("query unavailable"));
     }
 }

@@ -5,7 +5,7 @@ use epub_pdf_worker::{
     protocol::{Event, Phase},
     render::{self, Segment},
     report::{SourceImage, UserDataCleanup},
-    webview::{self, Host},
+    webview::Host,
 };
 use std::{
     fs,
@@ -211,9 +211,7 @@ impl Engine {
             .ok()
             .zip(fs::canonicalize(out).ok())
             .is_some_and(|(a, b)| a == b);
-        let result = if let Err(error) = webview::reject_policy_overrides() {
-            Err((7, error))
-        } else if same_file {
+        let result = if same_file {
             Err((3, "input and output refer to the same file".into()))
         } else {
             OutputTemp::new(out, std::process::id(), self.sequence)
@@ -333,6 +331,11 @@ impl Engine {
         let host = self.host.as_ref().unwrap();
         r.webview_runtime = Some(host.version.clone());
         r.web_resource_filter = Some(host.request_filter.clone());
+        r.user_data_folder_redirected = host
+            .user_data_folder_redirected
+            .as_ref()
+            .map(|path| path.display().to_string());
+        r.user_data_folder_check_error = host.user_data_folder_check_error.clone();
         host.map_folder(&root).map_err(|e| (5, e))?;
         let mut part_files = Vec::<PathBuf>::new();
         let mut size_sources = Vec::<Option<String>>::new();
@@ -457,6 +460,7 @@ impl Engine {
     }
     fn finish(mut self) -> UserDataCleanup {
         self.host.take();
+        // Only the fresh requested path created by Engine::new belongs to us.
         let cleanup = cleanup_user_data(&self.user_data);
         self.owns_user_data = false;
         cleanup
@@ -472,9 +476,7 @@ impl Drop for Engine {
     }
 }
 fn classify_webview_error(e: String) -> (i32, String) {
-    let code = if e.contains("WebView2 overridden") {
-        7
-    } else if e.contains("WebView2 unsupported") {
+    let code = if e.contains("WebView2 unsupported") {
         8
     } else if e.contains("runtime missing") {
         4

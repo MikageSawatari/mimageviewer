@@ -1,4 +1,4 @@
-//! Stable line-delimited JSON contract for the S2 host.
+//! Stable line-delimited JSON contract for the S2 host. Exit code 7 is unused.
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +39,6 @@ pub enum Status {
     Drm,
     Invalid,
     Webview2Missing,
-    Webview2Overridden,
     Webview2Unsupported,
     RenderFailed,
     Timeout,
@@ -51,7 +50,6 @@ impl Event {
             2 => Status::Drm,
             3 => Status::Invalid,
             4 => Status::Webview2Missing,
-            7 => Status::Webview2Overridden,
             8 => Status::Webview2Unsupported,
             6 => Status::Timeout,
             _ => Status::RenderFailed,
@@ -74,7 +72,6 @@ impl Event {
             2 => Status::Drm,
             3 => Status::Invalid,
             4 => Status::Webview2Missing,
-            7 => Status::Webview2Overridden,
             8 => Status::Webview2Unsupported,
             6 => Status::Timeout,
             _ => Status::RenderFailed,
@@ -114,19 +111,11 @@ mod tests {
                 blocked_requests: 3,
                 message: "deadline".into(),
             },
-            Event::failure(7, "policy".into()),
             Event::failure(8, "interface".into()),
         ] {
             let encoded = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
         }
-        assert!(matches!(
-            Event::failure(7, "policy".into()),
-            Event::Result {
-                status: Status::Webview2Overridden,
-                ..
-            }
-        ));
         assert!(matches!(
             Event::failure(8, "interface".into()),
             Event::Result {

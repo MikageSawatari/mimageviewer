@@ -28,6 +28,8 @@ pub struct Report {
     pub image_fidelity: Option<String>,
     pub webview_runtime: Option<String>,
     pub web_resource_filter: Option<String>,
+    pub user_data_folder_redirected: Option<String>,
+    pub user_data_folder_check_error: Option<String>,
     pub print_to_pdf_comparison: Option<String>,
     pub user_data_cleanup: Option<UserDataCleanup>,
 }
@@ -73,6 +75,8 @@ impl Report {
             image_fidelity: None,
             webview_runtime: None,
             web_resource_filter: None,
+            user_data_folder_redirected: None,
+            user_data_folder_check_error: None,
             print_to_pdf_comparison: None,
             user_data_cleanup: None,
         }
@@ -83,7 +87,6 @@ impl Report {
             2 => "drm",
             3 => "invalid_epub",
             4 => "runtime_missing",
-            7 => "webview2_overridden",
             8 => "webview2_unsupported",
             6 => "timeout",
             _ => "render_failure",

@@ -44,8 +44,8 @@ stream with no human messages. Phases are `parse`, `extract`, `init`, `print`,
 `print.done` is the number of PDF pages printed so far; `print.total` is 0
 because reflow pagination is not known in advance. Other phases use 0/1 and
 1/1. Result statuses are `success`, `drm`, `invalid`, `webview2_missing`,
-`render_failed`, `timeout`, `webview2_overridden`, and
-`webview2_unsupported`. `blocked_requests` counts blocked attempts.
+`render_failed`, `timeout`, and `webview2_unsupported`.
+`blocked_requests` counts blocked attempts.
 When `--progress-json` is present, argument errors and panics also produce
 exactly one final `result` line. Panics use `render_failed` / exit code 5.
 The detailed per-book report contains up to 200 distinct blocked URLs and the
@@ -59,8 +59,8 @@ total attempt count, plus `book_script_ran`.
 | 4 | WebView2 Runtime missing |
 | 5 | WebView2 initialization, rendering, PDF validation, or merge failure |
 | 6 | timeout |
-| 7 | WebView2 registry policy or actual user data folder overrides requested settings |
-| 8 | WebView2 lacks the environment folder query or all-source request filter |
+| 7 | unused |
+| 8 | WebView2 lacks a required interface, such as the all-source request filter |
 
 `--timeout-secs 0` is invalid CLI input (exit 3); it cannot exercise the
 WebView2 timeout path. The debug build has a test-only
@@ -111,8 +111,8 @@ than `ExecuteScript`, whose interaction with disabled page scripts is not
 specified by the locally available bindings. Runtime behavior still needs an
 outside-sandbox check.
 
-The WebView2 environment receives these browser arguments before a controller
-is created:
+The worker requests these browser arguments before a WebView2 controller is
+created. WebView2 policies may change the effective settings:
 
 | Argument | Reason |
 | --- | --- |
@@ -135,19 +135,20 @@ Before environment creation, the worker removes every `WEBVIEW2_*` process
 variable, including `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`,
 `WEBVIEW2_USER_DATA_FOLDER`, `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`,
 `WEBVIEW2_RELEASE_CHANNEL_PREFERENCE`, and
-`WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER`. It checks both registry views under
-`HKLM` and `HKCU\Software\Policies\Microsoft\Edge\WebView2` for the current
-process's explicit AppUserModelID, then the worker exe name, then `*` values
-in `AdditionalBrowserArguments`, `UserDataFolder`,
-`BrowserExecutableFolder`, and `ReleaseChannelPreference`. Any such policy
-causes exit 7 before conversion. After environment creation,
-`ICoreWebView2Environment7::UserDataFolder` must match the requested folder
-by directory identity (volume serial and file ID from `FileIdInfo`). A missing
-or inaccessible reported folder, or an identity mismatch, causes exit 7; the
-worker never deletes the unexpected folder.
+`WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER`. The worker does not inspect or reject
+WebView2 registry policies; WebView2 follows any policies present. After
+environment creation, the worker compares
+`ICoreWebView2Environment7::UserDataFolder` with the requested folder by
+directory identity (volume serial and file ID from `FileIdInfo`). A different
+actual folder is logged and recorded as `user_data_folder_redirected` in the
+per-book report, and conversion continues. A failed folder query or identity
+comparison is recorded as `user_data_folder_check_error` and also does not stop
+conversion. Cleanup targets only the fresh folder the worker created at the
+requested path; it never targets the reported actual folder when redirected.
 The new filter includes service-worker and shared-worker request sources; a
-fresh user data folder and disabled page scripts prevent book service workers
-from being registered. Cross-origin iframes are cancelled at navigation and
+fresh requested user data folder and disabled page scripts prevent book service
+workers from being registered when WebView2 uses that folder. Cross-origin
+iframes are cancelled at navigation and
 their resources receive 403. Page scripts cannot initiate WebSockets while
 disabled. WebSocket handshakes are not guaranteed to raise
 `WebResourceRequested`; the resolver rule blocks hostnames, while a direct-IP

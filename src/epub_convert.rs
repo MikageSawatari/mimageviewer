@@ -32,7 +32,6 @@ pub enum Status {
     Drm,
     Invalid,
     Webview2Missing,
-    Webview2Overridden,
     Webview2Unsupported,
     RenderFailed,
     Timeout,
@@ -72,7 +71,6 @@ pub enum EpubConvertError {
     Drm,
     Invalid,
     WebView2Missing,
-    WebView2Overridden,
     WebView2Unsupported,
     RenderFailed,
     Timeout,
@@ -496,7 +494,6 @@ fn validate_result(
         Status::Webview2Missing => 4,
         Status::RenderFailed => 5,
         Status::Timeout => 6,
-        Status::Webview2Overridden => 7,
         Status::Webview2Unsupported => 8,
     };
     if code != exit_code || code != expected {
@@ -507,7 +504,6 @@ fn validate_result(
         Status::Drm => Err(EpubConvertError::Drm),
         Status::Invalid => Err(EpubConvertError::Invalid),
         Status::Webview2Missing => Err(EpubConvertError::WebView2Missing),
-        Status::Webview2Overridden => Err(EpubConvertError::WebView2Overridden),
         Status::Webview2Unsupported => Err(EpubConvertError::WebView2Unsupported),
         Status::RenderFailed => Err(EpubConvertError::RenderFailed),
         Status::Timeout => Err(EpubConvertError::Timeout),
@@ -850,7 +846,7 @@ mod tests {
                 4 => "webview2_missing",
                 5 => "render_failed",
                 6 => "timeout",
-                7 => "webview2_overridden",
+                7 => "render_failed", // retired code: deliberately mismatches the status contract
                 8 => "webview2_unsupported",
                 _ => unreachable!(),
             };
@@ -945,7 +941,6 @@ mod tests {
             (4, "missing"),
             (5, "render"),
             (6, "timeout"),
-            (7, "overridden"),
             (8, "unsupported"),
         ] {
             let (result, _tmp, _, temp_root) = run(FakeMode::Failure(code));
@@ -956,12 +951,21 @@ mod tests {
                     | (Err(EpubConvertError::WebView2Missing), "missing")
                     | (Err(EpubConvertError::RenderFailed), "render")
                     | (Err(EpubConvertError::Timeout), "timeout")
-                    | (Err(EpubConvertError::WebView2Overridden), "overridden")
                     | (Err(EpubConvertError::WebView2Unsupported), "unsupported")
             );
             assert!(matched, "code {code}: {result:?}");
             assert!(fs::read_dir(temp_root).unwrap().next().is_none());
         }
+    }
+
+    #[test]
+    fn epub_convert_fake_exit_seven_is_unexpected() {
+        let (result, _tmp, _, temp_root) = run(FakeMode::Failure(7));
+        assert!(
+            matches!(result, Err(EpubConvertError::Protocol)),
+            "{result:?}"
+        );
+        assert!(fs::read_dir(temp_root).unwrap().next().is_none());
     }
 
     #[test]
