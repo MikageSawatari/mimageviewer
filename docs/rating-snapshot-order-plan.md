@@ -1,12 +1,13 @@
 # 評価順のスナップショット固定 設計計画
 
-最終更新: 2026-09-15
+最終更新: 2026-09-25
 
-状態: 利用者仕様を反映した実装前設計。製品コードは未編集、Cargo / GUI は未実行。
+状態: 実装前設計 第2版。2026-09-15 の初版 (`d05fc1a76`) を、独立レビュー (GPT-6 Sol / xhigh、
+2026-09-25、判定 REVISE) の指摘と v4.1.0 時点のコード照合で改訂した。製品コードは未編集。
 
 本書は [レーティング操作・一覧ソート・タグジャンプ計画](rating-sort-and-tag-navigation-plan.md) のうち、
-評価変更へ追従して表示順を動かす旧 Phase C 案を置き換える。完了済みのタグジャンプと名前 / 番号降順、
-評価増減の操作規則は変更しない。
+評価変更へ追従して表示順を動かす旧 Phase C 案を置き換える。完了済みのタグジャンプ、名前 / 番号降順、
+評価の1段階増減 (§1.237A、`8878aca2b`) は変更しない。
 
 ## 0. 決定と対象
 
@@ -15,340 +16,363 @@
 `GridReload`、sort横の更新アイコン、選択中と同じ評価sortの再選択、一覧の開き直し、または
 並べ替え条件の明示変更で評価を再取得し、その時点で再び並べる。
 
-この仕様により、全表示経路を `GridDisplayOrderState` へ移す再構造は行わない。materialize 済みの
-`items` 順そのものを評価順 snapshot とし、既存の index-keyed cache、selection、navigation、
-thumbnail queue を並べ替え後に追従させる仕組みを追加しない。
+materialize 済みの `items` 順そのものを評価順 snapshot とする。全表示経路を共通の display-order owner へ
+移す再構造、items / cache の permutation、thumbnail queue の再設計は行わない。
 
-対象は次である。
+### 0.1 評価順を適用する一覧
 
-- `SortOrder::RatingAsc / RatingDesc` と未評価位置設定。
-- 通常フォルダ、Ctrl+G / Ctrl+S / タグ、Smart Folder、サブフォルダ展開、ブックマーク、
-  レーティング一覧の Normal sort。
-- Standard order のコレクション。
-- Remote の物理フォルダと、既に接続済みの特殊一覧。
-- 評価列ヘッダで並べた詳細表示についても、評価変更だけでは既存行の相対順を変えない。
+- 通常の物理フォルダ (main と各 detached viewer context。Ctrl+↑↓ / BS / folder pane 経由を含む)。
+- Ctrl+G の flat / drill / ZIP hit。
+- Smart Folder resident root、サブフォルダ展開、ブックマーク。
+- ファイル名 prefix スタック (集約表示の group 順と、group 内 member 順。§4.2)。
+- レーティング一覧 (全行同じ★なので名前 tie のみ。`RatedAtAsc / Desc` は従来どおり)。
+- Collection の Standard order (PC と Remote の両方)。
+- Remote の物理フォルダ一覧、Remote から見える上記の特殊一覧。
+- 詳細表示の評価列ヘッダ (`DetailsSortKey::Rating`) も、評価変更だけでは既存行の相対順を変えない。
 
-本 / ZIP / PDF のページ順、閲覧履歴、★固定 snapshot、Manual order のコレクションは対象外であり、
-それぞれの固定順を維持する。コレクション Phase 4 / 5 の navigation / Remote 接続をこの実装から
-先行させない。フォルダ代表サムネイルの候補順も既存4候補のallowlistを維持する。
+### 0.2 評価順を適用しない一覧 (既存の固定順を維持)
 
-## 1. 現行経路の確認
+- 本 / ZIP / PDF のページ順 (`BOOK_READING_PAGE_ORDER` / page order lock)。
+- Ctrl+S (お気に入り検索) とタグ一覧。**現行でもどの sort も適用せず検索結果順で install している**
+  (`apply_favsearch_results`、タグ結果 install)。評価順だけを接続すると他の sort と不整合になるため、
+  本計画では現行の結果順を維持する。sort 対応は別件とする。
+- 閲覧履歴 (MRU)、★固定 snapshot、ドライブ一覧。
+- Collection の Manual order と Shuffle order。
+- フォルダ代表サムネイルの候補順 (§1.275/§1.276 の allowlist)。
 
-### 1.1 更新操作は追加不要
+## 1. 現行経路の確認 (2026-09-25 v4.1.0 時点)
 
-`KeyAction::GridReload` は既に `KeyContext::Grid` の操作として存在し、既定 chord は
-`ChordList::EMPTY` である。ファイルメニューの `MenuCommandId::FileReload` は
-「最新の情報に更新」を表示し、同じ `KeyAction::GridReload` を参照する。キーボード経路は
-`handle_grid_keys`、メニュー経路は `ui_main.rs` から、ともに
-`App::reload_top_level_grid(ctx)` を呼ぶ。
+### 1.1 更新操作
 
-`reload_top_level_grid` は `TopLevelGridSurface` の網羅 match を持ち、Folder、各検索、Smart Folder、
-サブフォルダ展開、Rating、ReadingHistory、Bookmarks、DriveList、Collection をそれぞれ既存の
-再入場経路へ送る。`Snapshot` は意図どおり no-op、Smart Folder / サブ展開の準備中は二重起動しない。
-したがって新しい Action、固定 F5、別メニュー項目は追加しない。操作カスタマイズで F5 等を割り当てる
-既存仕様も維持する。
+`KeyAction::GridReload` は `KeyContext::Grid` の操作で、既定 chord は無い。ファイルメニューの
+`MenuCommandId::FileReload`「最新の情報に更新」も同じ action を参照し、キーボード・メニューとも
+`App::reload_top_level_grid(ctx)` へ合流する。同関数は `TopLevelGridSurface` の網羅 match
+(`src/app/top_level_grid_view.rs`) で各 surface の再入場経路へ送る。新しい Action、固定 F5、
+別メニュー項目は追加しない。
 
-sort toolbar / popupの横には一覧更新アイコンを追加する。tooltipとaccessible labelは「最新の情報に更新」
-とし、独自reload関数や疑似キー入力を作らず `reload_top_level_grid(ctx)` へ直接合流させる。通常一覧、
-特殊一覧、Collectionのいずれも現在の `TopLevelGridSurface` が行先を決める。
+**ただし Collection 分岐は `open_collection_grid(id, None)` を呼び、新しい session として空の grid を
+install するため、現状では選択 anchor を引き継がない。** §6.1 で直す。
 
-選択中と同じ `RatingAsc / RatingDesc` をもう一度clickした場合も同じrouterへ送る。eguiの
-`selectable_value` / combo responseは同値選択で `changed()==false` になるため、reload判定を
-`changed()` だけに依存させない。control適用前のsortと `response.clicked()` を使い、別sortなら既存の
-sort変更経路、同じ評価sortなら `GridReload` のどちらか一方だけを発行する。同一clickからsort変更と
-reloadを二重発行しない。
+sort control は `Button::selectable`、`selectable_label`、menu button で描かれている
+(`src/ui_main.rs`)。同値を再 click しても値は変わらないため、reload 判定は `changed()` ではなく
+click 前の sort と `clicked()` から一つの dispatch 決定として作る (§7.3)。
 
-### 1.2 現在の評価取得と解消する同期 I/O
+### 1.2 評価の取得経路
 
-現行の `start_loading_items_inner` は items install 後に `prewarm_rating_cache()` を呼び、
-`RatingDb::get_many` を UI thread から実行する。Ctrl+G の batch poll も `hit.stars` を埋めるために
-UI thread から `get_many` を呼ぶ。collection Grid は prepare 自体は worker だが、install 後の
-`rebuild_visible_indices` より前に rating cache を受け取らないため、条件によっては point read へ
-落ちうる。
+- 通常フォルダ: `start_loading_items_inner` が items install 後に `prewarm_rating_cache()` を呼び、
+  UI thread から `RatingDb::get_many` を実行する。folder open の worker
+  (`FolderOpenScanPurpose` / `FolderPaneOpenReady`) は scan だけを返し、materialize と prewarm は
+  UI 側で行う。
+- Ctrl+G: 評価の `get_many` は既に `search_prepare_worker` 内で行われ、hit の `stars` に載る
+  (初版の「UI thread の batch poll」は誤り)。
+- Smart Folder / サブフォルダ展開: 既存 worker が評価を取得済み。
+- Collection: prepare は worker だが、install で `rebuild_visible_indices` を呼ぶ時点で rating cache を
+  持たず、cache miss の `get_rating` が UI thread の point read へ落ちうる。
+- 他に UI thread に残る評価読み取りとして、XMP hydration の `get_many`、`current_folder_rating` の
+  point read がある。
 
-評価順では DB snapshot が比較 key そのものになる。これらを比較中の lazy read に任せず、全対象 key を
-worker で一括取得してから並べる。描画、comparator、`rebuild_visible_indices`、target loop から SQLite を
-読まない。
+`RatingDb::get_many` は 500 件 chunk ごとに別 statement で読み、prepare / query の失敗 chunk と
+失敗 row を無言で読み飛ばして plain map を返す。**結果に無い key が「未評価」なのか「読めなかった」のか
+区別できず、chunk 間で一つの SQLite snapshot でもない。** 評価順の比較 key には使えない (§2.2)。
 
-既に worker で rating を取得している Smart Folder とサブフォルダ展開、`stars` を持つ Ctrl+G hit は
-その snapshot を再利用する。別の DB read を重ねない。
+### 1.3 viewer context の所有
 
-### 1.3 既存の selection / viewer 復元境界
+各 viewer context (main と detached) の bundle は自分の `rating_cache`、session write の seen generation、
+folder pending request を持つ (`src/app/viewer_context_registry.rs`)。swap 時に cache 値を同期し
+`rebuild_visible_indices` を呼ぶが、**parked context の Ctrl+G `all_hits` / Rating view membership は
+更新しない**。active context 側の評価編集経路はそれらを別途更新している。§5.2 で一本化する。
 
-評価順の実装は次の既存 identity 境界を使い、raw index を再読込後へ持ち越さない。
+### 1.4 既存の selection 復元境界
 
-- 通常フォルダの明示 reload は `preserve_cursor_hint_for_reload` / `select_after_load` と
-  `scroll_to_selected` を使う。同名衝突しうる新しい非同期 request では exact path を request 内に持つ。
-- Smart Folder resident root は session の active child / saved selection と scroll snapshot を持つ。
-- Collection は `CollectionGridViewportAnchor { entry_id, source_key }` で選択と checked を再解決する。
-- Bookmark は stable row ID、Ctrl+G streaming rebuild は content key、Rating view は rating key を使う。
-- Remote session release は `GridItem::perf_key()` で開いていた項目を再解決して fullscreen を戻す。
-- 通常フォルダの外部変更は main viewer が開いている間は既存どおり reload を defer する。
+raw index を reload 後へ持ち越さず、次の stable identity を使う。
 
-評価変更だけなら `items` を入れ替えないため、選択中 / fullscreen 中の同じ index が同じ項目を指し続ける。
-明示 reload または sort 変更で items を入れ替える場合だけ、上記の owner が stable identity を再解決する。
+- 通常フォルダ: `preserve_cursor_hint_for_reload` / `select_after_load` と exact path。
+- Smart Folder resident root: session の active child / saved selection と scroll snapshot。
+- Collection: `CollectionGridViewportAnchor { entry_id, source_key }` (reload でも渡すよう §6.1 で直す)。
+- Bookmark は stable row ID、Ctrl+G は content key、Rating view は rating key。
+- Remote session release は `GridItem::perf_key()` で fullscreen を戻す。
+- 通常フォルダの外部変更は main viewer が開いている間は reload を defer する (既存)。
 
 ## 2. 比較契約
 
-### 2.1 typed availability
+### 2.1 typed key
 
-評価 key は `Option<u8>` 相当で扱う。
+評価 key は項目ごとに次の型で持つ。
 
-- `Some(0)`: 評価可能だが未評価。
-- `Some(1..=5)`: 評価済み。
-- `None`: 評価非対応。Stack / SearchContainer 等の集約セルもここに含む。
+```text
+RatingSortKey = Supported(u8 /* 0..=5, 0 = 未評価 */) | Unsupported
+```
 
-0 を評価非対応 sentinel にしない。`None` は昇順 / 降順とも評価 domain の後ろへ置き、相互は名前昇順で
-確定する。物理一覧の folder / media category と `GridDisplayOrder` は既存どおり先に適用し、同じ category
-内だけを評価で並べる。コレクション Standard order も既存の category rank を維持する。
-
-未評価位置は既決定の `RatingSortUnratedPosition` を使う。
+- `Unsupported` は評価非対応の項目 (ドライブ等)。昇順 / 降順とも評価 domain の後ろに置き、相互は
+  名前昇順。0 を非対応 sentinel にしない。
+- 物理一覧の folder / media category と `GridDisplayOrder` は既存どおり先に適用し、同じ category 内だけを
+  評価で並べる。Collection Standard も既存の category rank を維持する。
+- 未評価位置は新設の `RatingSortUnratedPosition` (未実装) で選ぶ。
 
 | 設定 | 降順 | 昇順 |
 | --- | --- | --- |
 | `BetweenThreeAndTwo` | 5, 4, 3, 0, 2, 1 | 1, 2, 0, 3, 4, 5 |
 | `BelowAll` | 5, 4, 3, 2, 1, 0 | 0, 1, 2, 3, 4, 5 |
 
-昇順は評価可能 domain の完全な逆順とする。同じ評価の tie は方向にかかわらずファイル名昇順である。
-比較は純粋関数にし、2設定 × 2方向 × 0..=5、`None`、同値 filename tie を table test で固定する。
+昇順は評価可能 domain の完全な逆順。同じ評価の tie は方向にかかわらずファイル名昇順。比較は純粋関数にし、
+2設定 × 2方向 × 0..=5、`Unsupported`、同値 tie を table test で固定する。
 
-### 2.2 shared metadata の最小拡張
+`RatingSortSpec { order, unrated_position }` を worker request に焼き付け、worker 完了時に設定を引き直さない。
 
-`ListingSortMetadata` へ `rating: Option<u8>` を追加する場合、既存の `new(mtime, size)` は
-`rating=None` のまま互換にし、rating snapshot を持つ producer だけが builder で設定する。
-Rating sort を rating 未準備の古い comparator へ流して全行を未対応扱いにする fallback は禁止する。
-Rating variant は rating-aware comparator を通すか debug test で失敗させる。
+### 2.2 完全な評価 facts
 
-`RatingSortSpec { order, unrated_position }` 相当の小さい値を worker request に焼き付ける。設定を worker
-完了時に引き直さない。`SortOrder`、未評価位置、必要なら `GridDisplayOrder` のいずれかが変わった結果は
-stale として破棄し、新しい request だけを適用する。
+評価順の比較には、対象 key 全件について「読めた」ことが保証された facts だけを使う。
+
+- `RatingDb` に fallible な一括読み取りを追加する。**一つの read transaction** の中で全 chunk を読み、
+  どの chunk / row が失敗しても `Err` を返す。既存 `get_many` の無言スキップ挙動は既存呼び出し元のために残す。
+- 結果は `CompleteRatingFacts` (対象 key 集合 + 値 map + 読み取り stamp) として型で区別する。
+  map に無い key を 0 と解釈してよいのは、この型の中だけである。
+- Rating comparator は `CompleteRatingFacts` から作った key だけを受け取る。facts を持たない producer が
+  Rating variant を comparator へ渡したら、debug test で落ちる経路にする (無言で全件未評価扱いにしない)。
+- `ListingSortMetadata` は現状 `mtime` と `file_size` だけを持つ。評価は同構造へ `Option` で足さず、
+  Rating sort 時だけ完全な key 列を別引数 / builder で渡す形にし、「評価が無い metadata」と
+  「未評価」の混同を型で防ぐ。
+
+読み取り失敗時: 既存一覧を保持できる reload では保持して通知する。初回 navigation では一覧を開けなくしない
+ため、評価順を適用できなかったことを通知し、決定的な名前順で install する。
 
 ## 3. snapshot の所有と寿命
 
 ### 3.1 items 順が正本
 
-別の永続 `thumbnail_order`、全画面共通 rank map、App-global pending bool は追加しない。worker が評価を
-取得して sort を終えた `items + aligned sidecars` を既存 install 境界へ渡す。accepted install が
-`items_generation` を進めた時点から、その items 順が評価順 snapshot である。
+別の永続 order、全画面共通 rank map、App-global pending bool は追加しない。worker が評価を取得して sort を
+終えた items を既存の install 境界へ渡す。accepted install が `items_generation` を進めた時点から、その
+items 順がその context の評価順 snapshot である。
 
-snapshot は次のどれかが accepted になるまで生存する。
+snapshot を置き換えるのは次だけである。
 
 1. 別フォルダ / 別 top-level surface / 別 collection を開く。
-2. 「最新の情報に更新」または割り当て済み `GridReload` を実行する。
-3. sort横の更新アイコン、または選択中と同じ評価sortを再選択する。
-4. toolbar / menu の sort、未評価位置、collection Standard sort を明示変更する。
-5. filesystem membership change、collection revision、Smart Folder 定義変更等により、その surface の
-   既存仕様が full requery / rescan / reprepare を accepted する。
-6. 一覧を明示的に閉じて後で開き直す。
+2. 「最新の情報に更新」、割り当て済み `GridReload`、sort横の更新アイコン、選択中評価sortの再選択。
+3. sort、未評価位置、collection Standard sort の明示変更。
+4. filesystem membership change、collection revision、Smart Folder 定義変更等、その surface の既存仕様が
+   full requery / rescan / reprepare を accepted したとき。
+5. 一覧を閉じて開き直す。
 
-次は snapshot を失効させない。
+次は snapshot を置き換えない: 直接評価 / 増減 / リング操作、Undo / Redo、XMP hydration、metadata import 後の
+cache refresh、別 viewer context や Remote からの書き込み、rating filter / facet / Ctrl+F 変更、
+thumbnail / details 切替、fullscreen open / close、Smart Folder resident root との往復。
+評価の書き込み自体を reload 理由に昇格させない。
 
-- 単一 / 複数の直接評価、評価増減、リング preview / commit。
-- Undo / Redo。
-- XMP hydration、metadata import 後の rating cache refresh、別 viewer context の session write。
-- rating filter / facet / Ctrl+F の変更、thumbnail / details 表示切替。
-- fullscreen open / close、Smart Folder resident root から child を開いて同じ resident root へ戻る操作。
+### 3.2 install 境界の規則 (初版の overlay 案を置き換え)
 
-評価変更と同時に別理由の full reload が accepted された場合は、その reload が新しい snapshot 境界になる。
-rating write 自体を reload 理由へ昇格させない。
+初版は「worker 開始後 install 前の session write を初回 sort key に重ねる」としていたが、session write
+ledger は path ごとに最新 1 件しか持たず、`sync_current_context_rating_session_writes` は worker が並べた
+items ではなく index cache を更新するため、安全な境界にならない。次の単純な規則に置き換える。
 
-### 3.2 worker snapshot の確定点
+1. worker は読み取り開始前に、その時点の `rating_session_write_generation` を stamp として取る。
+2. worker は §2.2 の単一 transaction で facts を読み、sort して結果を返す。
+3. UI thread は結果を受け取った同じ event-loop step の中で、stamp より後に commit された session write の
+   うち、この一覧の対象 key に当たるものがあるかを ledger で確認する。
+4. 当たるものがあれば結果を捨て、同じ request identity で prepare をやり直す。無ければそのまま install する。
+   確認と install の間に他の処理を挟まない。
+5. install 後の書き込みは cache / filter / membership だけを更新し、順序へ反映しない (§5)。
 
-rating-aware prepare request は surface identity、surface / items generation、destination identity、
-`RatingSortSpec`、開始時の `rating_session_write_generation` を持つ。worker は read-only `RatingDb` を開き、
-normalized key を 500件単位等の既存 `get_many` chunk で取得し、未登録を0として aligned facts を完成させる。
+同じ process 以外 (別プロセスの mIV 等) による DB 書き込みは、次に要求された一覧から順序へ反映される。
+worker の前後境界は、制御可能な barrier を使ったテストで両側を確認する。
 
-apply 時に同じ context / surface / destination / sort spec であることを再確認する。開始後、install 前に
-同じ process で commit された session write は cache 表示だけでなく初回 sort key にも重ね、accepted install
-直前までを一つの snapshot にする。install 後の write は cache / filterだけを更新し、順序へ反映しない。
+cancel、別 navigation の勝利、context retire、surface 変更、より新しい request、worker disconnect で古い結果を
+捨てる。別 context の一覧へ結果を適用しない。
 
-cancel、別navigation勝利、context retire、surface変更、より新しい request、worker disconnect で古い結果を
-捨てる。別 context の一覧へ結果を適用しない。DB read に失敗した場合は無言で全件0として正常完了せず、
-既存一覧を保持できる reloadでは保持して通知する。初回 navigation では一覧を開けなくしないため、
-評価順を適用できなかったことを通知して deterministic な名前 tie 順で install する。
+## 4. producer ごとの接続
 
-## 4. surface ごとの接続
+### 4.1 一覧表
 
-| surface | 評価 snapshot の取得 | 再取得 / install | 固定する境界 |
+`sort_order` で items を materialize するすべての経路を対象に、適用するか固定かを決める。
+
+| producer | 評価 facts の取得 | snapshot を作る契機 | 備考 |
 | --- | --- | --- | --- |
-| 通常の物理フォルダ | scan 後の ratable path keyをworkerで `get_many` | folder open、sort変更、`GridReload`、filesystem full reload | category block内のitems順 |
-| ZIP / PDF / 本のページ | 取得しない | 既存enumerateのみ | `BOOK_READING_PAGE_ORDER` / page order lock |
-| Ctrl+G | search hitの`stars`。現行UI-thread batch readはsearch workerへ移す | query / reload / drill materialize | hit / containerのitems順 |
-| Ctrl+S / タグ | query worker結果のpathを同workerまたはrating prepareでbatch取得 | query / reload | result items順 |
-| Smart Folder | 既存workerの`ratings_by_path`を使う | open / explicit reload / definition rebuild | resident sessionのroot順 |
-| サブフォルダ展開 | 既存workerのrating cacheを使う | scan / explicit reload | prepared snapshot順 |
-| Bookmark | bookmark build workerへbatch rating factsを追加 | open / refresh | stable bookmark row順 |
-| Rating view | 全行が同じ★なのでRating sortはfilename tieのみ | 既存view build / membership refresh | `RatedAtAsc/Desc`は従来どおり別sort |
-| Collection Manual | ratingを表示/filter用にだけ取得 | collection prepare | DBのmanual position |
-| Collection Standard | collection prepare workerでrating factsも揃える | open / explicit reload / relevant revision | definition-owned Standard sort順 |
-| Reading history / ★固定 | 評価sortを適用しない | 既存reload / no-op | MRU / snapshot順 |
-| Drive list | 評価sortを適用しない | drive refresh | drive順 |
+| 物理フォルダ (main / detached) | folder open worker を typed prepared listing に拡張して取得 | open、Ctrl+↑↓ / BS、sort変更、reload、filesystem full reload | Rating sort 時だけ materialize まで worker で行う |
+| ファイル名 prefix スタック | 物理フォルダ等の prepared facts を再利用 | 元一覧と同じ | §4.2 |
+| Ctrl+G | `search_prepare_worker` の既存 `stars` (完全性を §2.2 に揃える) | query、reload、drill materialize | 評価変更時は membership-only rebuild (§5.1) |
+| Smart Folder | 既存 worker の評価 | open、reload、定義 rebuild | resident session の root 順 |
+| サブフォルダ展開 | 既存 worker の評価 | scan、reload | prepared snapshot 順 |
+| Bookmark | build worker に facts 取得を追加 | open、refresh | stable row 順 |
+| Rating view | 全行同じ★ | 既存 view build / membership refresh | 名前 tie のみ |
+| Collection Standard (PC / Remote) | `prepare_collection_snapshot` worker で facts 取得 | open、reload、revision 更新 | §6 |
+| Collection Manual / Shuffle | 表示 / filter 用のみ | prepare | 保存順 / seed 順を維持 |
+| Remote 物理フォルダ | `ContainerService::recompute_folder_listing` の worker で facts 取得 | list request | §6.2 |
+| Ctrl+S / タグ / 閲覧履歴 / ★固定 / ドライブ | 取得しない | 既存 | §0.2 |
 
-更新操作のCollectionでの意味はorder modeごとに分ける。
+Special view は各既存の pending owner を拡張する。全 surface 共用の App-global
+`rating_sort_pending: Option<_>` を追加しない。
 
-- 通常 / 特殊一覧: 現在surfaceのquery / scanをやり直し、Rating sortなら最新評価で再sortする。
-- Collection Standard: `open_collection_grid(current_id, None)`相当の既存snapshot requestから最新revisionを
-  取り直し、definition-owned sortがRatingなら最新評価でprepareする。
-- Collection Manual: 同じsnapshot requestでmembership、missing解決、rating badge / filter factsを更新するが、
-  DBのmanual positionを再sortしない。更新アイコンを無効にせず、Standardへ暗黙変更しない。
+物理フォルダは scan と rating facts を別々の untyped `Option` に残さない。既存の `FolderOpenScanPurpose` /
+`FolderPaneOpenReady` と同じ request owner が、scan、任意の exact selection、facts、sort spec を
+成功 / cancel / error まで一緒に持つ `PreparedFolderListing` 相当を返す。非 Rating sort の既存即時経路を
+非同期化する必要はない。detached context の folder open / Ctrl+↑↓ も同じ worker 経路を使い、pending は
+その context の bundle が所有する。一つの context の close / cancel が sibling の pending を失効させない。
 
-どの経路もreload開始前にsurface固有のstable selection identityをcaptureし、accepted install後に再解決する。
-同じ評価sortの再選択でもraw indexやscroll先頭へ落とさない。対象が消えた場合だけ各surfaceの既存fallbackを使う。
+### 4.2 ファイル名 prefix スタック
 
-Folder 用には scan と rating facts を別々の untyped `Option` に残さない。既存の
-`FolderOpenScanPurpose` / `FolderPaneOpenReady` と同じ request ownerが、scan、任意の exact selection、
-rating facts、sort spec を成功 / cancel / errorまで一緒に持つ `PreparedFolderListing` 相当を返す。
-Rating sort時の直接 `load_folder` もこのworker prepareへ合流させ、UI threadの `prewarm_rating_cache` を
-比較前提にしない。非Rating sortの既存即時経路まで一度に非同期化する必要はない。
+`filename_stack::group_media` / `sort_members` は `SortOrder` で member と group を並べる。
+Rating sort 時は次のとおりにする。
 
-Special view は各既存 pending ownerを拡張する。全surface共用のApp-global
-`rating_sort_pending: Option<_>` を追加しない。Smart Folder、subfolder、collectionの既存 generation / cancel
-stampをそのまま使う。
+- group 内の member は評価 key で並べる (同値は名前 tie)。
+- 集約表示の group 順は、その group の代表 member (member 順の先頭) の評価 key で決める。
+  これにより集約表示とフラット表示で先頭 member の並びが一致する。
+- 評価 key は元一覧と同じ `CompleteRatingFacts` から作る。スタック化の時点で DB を読まない。
+- 評価変更後に代表 member や group 順を入れ替えない (snapshot 固定)。
 
 ## 5. 評価変更後の処理
 
-### 5.1 書込、Undo、外部反映
+### 5.1 書き込み、Undo、外部反映
 
 既存の `write_user_rating_shared` / batch transaction、session generation、XMP writer、folder count、
-content identity、Undo recordを維持する。成功した変更だけを cacheへ公開する契約も変えない。
+content identity、Undo record を維持する。成功した変更だけを cache へ公開する契約も変えない。
 
-変更後は次だけを行う。
+変更後は §5.2 の publication だけを行う。`items` の sort、Smart Folder / collection の再 prepare、
+thumbnail queue の全再投影は行わない。
 
-1. 現在contextの `rating_cache` と表示中のrating badge / details revisionを更新する。
-2. rating filter、Rated / Unrated facet、Rating view固有membershipを既存規則で更新する。
-3. Ctrl+Gの`all_hits.stars`とdrill件数を更新する。
-4. selectedが非表示になった場合は既存nearest-visible policy、checkedは既存WYSIWYG policyを適用する。
+Ctrl+G の現行 `rebuild_items_from_global_search()` は評価変更後に最新 stars で全体を作り直すため、
+Rating sort のまま呼ぶと行が動く。評価変更時は stable item / container identity で既存行の相対順を維持し、
+消えた行を除去、count を更新、新たに filter へ入った行だけ candidate 順で末尾へ追加する membership-only
+rebuild へ分ける。query、sort 変更、reload だけが通常の sorted rebuild を呼ぶ。
 
-`items` のsort、Smart Folder / collectionの再prepare、thumbnail queueの全再投影は行わない。Undo / Redo、
-XMP hydration、metadata import refresh、viewer-context swapのsession write同期も同じ契約である。
+### 5.2 context ごとの publication (mounted / parked 共通)
 
-Ctrl+Gの現行 `rebuild_items_from_global_search()` はrating変更後に最新starsで全体を作り直すため、Rating sortを
-追加したまま呼ぶと行が動く。rating変更時は、stable item / container identityを使って既存行の相対順を維持し、
-消えた行を除去、既存行のcountを更新、新たにfilterへ入った行だけcandidate順で末尾へ追加する
-membership-only rebuildへ分ける。query、sort変更、`GridReload`だけが通常のsorted rebuildを呼ぶ。
+評価の書き込み (どの window / Remote から来たものでも) を各 viewer context へ反映する処理を、context が
+所有する一つの手続きにまとめる。mounted の context には即時、parked の context には mount / swap 時に
+同じ手続きを適用する。
 
-Rating viewは「★Nの一覧」というmembership自体が機能なので、Nから外れた行の除去とNへ入った行の追加を
-続ける。RatingAsc / Descでは全行の評価が同じでfilename tieになるため、このmembership更新が他の評価bucketを
-使った再配置になることはない。既存`RatedAtAsc / Desc`の意味も変えない。
+1. path key の書き込みを `rating_cache` へ反映する。
+2. Ctrl+G の `all_hits.stars` と drill 件数を更新する (membership-only rebuild)。
+3. Rating view の membership (★N から外れた行の除去、入った行の追加) を更新する。
+4. rating filter / Rated・Unrated facet と Details state を更新する。
+5. selected が非表示になった場合は既存の nearest-visible policy、checked は既存の WYSIWYG policy。
 
-### 5.2 visible_indices と Details
+どの手順も survivor の相対順を保つ。現行の「active 側の編集経路だけが all_hits / Rating view を直す」
+二重実装はこの手続きへ寄せる。
 
-thumbnail表示では `visible_indices` が raw items index順を保つため、rating / facet filterを再計算しても
-survivorの順序は動かない。Rating sort専用のvisible permutationは不要である。
+### 5.3 visible_indices と Details
 
-詳細表示の `DetailsSortKey::Toolbar` は `visible_indices` をそのまま使う。既存の評価列ヘッダ
-`DetailsSortKey::Rating` も利用者仕様に合わせ、ヘッダclick、明示reload、items install時だけ評価で
-`details_order` を作る。rating変更に伴うmembership再計算では、現在の `details_order` に残るsurvivorの
-相対順を維持し、新たにvisibleになったrowだけraw items順で末尾へ追加する。既存の `details_order` を使えるため、
-全items用rank mapや新しいcontext fieldは不要である。別列のheader sortはその列の既存再構築規則を維持する。
+thumbnail 表示の `visible_indices` は raw items index 順を保つため、filter 再計算で survivor 順は動かない。
+Rating sort 専用の visible permutation は不要。
+
+詳細表示の `DetailsSortKey::Toolbar` は `visible_indices` をそのまま使う。評価列ヘッダ `DetailsSortKey::Rating`
+は、ヘッダ click、明示 reload、items install 時だけ評価で `details_order` を作る。評価変更に伴う membership
+再計算では現在の `details_order` に残る survivor の相対順を維持し、新たに visible になった row だけ raw items
+順で末尾へ追加する。別列のヘッダ sort はその列の既存規則を維持する。
 
 ## 6. Collection と Remote
 
 ### 6.1 Collection
 
-`CollectionOrderMode::Manual` は評価sort選択の影響を受けず、保存済みmanual positionを正本にする。
-Standardだけがdefinition-owned `standard_sort` を使い、Rating variant時は
-`prepare_collection_snapshot` worker内でrating DBをbatch取得する。prepared snapshotへsparse rating cacheも
-含め、`install_collection_grid_items` が `rebuild_visible_indices` を呼ぶ前にcacheを移す。
-
-rating writeはcollection DB revisionを進めないため、revision watchから自動prepareしない。表示中セルのbadgeと
-filter membershipだけを更新する。「最新の情報に更新」、collection reopen、entry追加 / 削除 / relink等で既存
-revisionが進んだprepareは新しいsnapshotを作る。childからrootへ戻る既存latest-snapshot再取得もreload境界であり、
-entry ID、source keyの順でselectionを復元する。
+- Manual / Shuffle は評価 sort の影響を受けない。
+- Standard だけが definition-owned `standard_sort` を使い、Rating variant 時は `prepare_collection_snapshot`
+  worker 内で §2.2 の facts を取得する。prepared snapshot に rating cache を含め、install の
+  `rebuild_visible_indices` より前に cache を移す (UI thread の point read へ落とさない)。
+- 評価の書き込みは collection revision を進めないため、revision watch から自動 prepare しない。
+- **明示 reload は prepared order のキャッシュを通さない。** Remote の prepared 再利用 key
+  (collection ID、revision、display order) には評価の新しさが入っていないため、明示 reload では再利用を
+  迂回し新しい facts で prepare する。PC 側の再利用も同じ規則にする。
+- reload の前に `CollectionGridViewportAnchor { entry_id, source_key }` を取り、`reload_top_level_grid` の
+  Collection 分岐がそれを `open_collection_grid` へ渡して install 後に選択・checked を再解決する。
+  child から root へ戻る既存の latest-snapshot 再取得も同じ anchor を使う。
 
 ### 6.2 Remote
 
-Remoteの物理フォルダ一覧はUI thread外の `ContainerService::recompute_folder_listing` で構築される。Rating sort時は
-同じworkerでread-only rating DBをbatch取得してから応答順を決める。book / ZIP / PDF pageのlock判定をratingで
-解除しない。
+- Remote の物理フォルダ一覧は `ContainerService::recompute_folder_listing` で構築される。Rating sort 時は
+  同じ worker で §2.2 の facts を取得してから応答順を決める。book / ZIP / PDF page の lock を評価で解除しない。
+- Remote へ返した container payload は一つの immutable snapshot とする。Remote から評価を書いた直後は現在
+  row の評価表示だけを更新し、client 側で自動 reorder しない。明示 reload、navigation、sort 変更による次の
+  list request が新しい snapshot を返す。
+- 永続 Collection は既に Remote へ接続済み (`remote_ipc/persistent_collections.rs`) なので、§6.1 の
+  Standard / Manual / Shuffle の契約と prepared-cache 迂回をそのまま payload に投影する。
+- Remote のタグ一覧は固定の sort を返しており (`remote_ipc/collections.rs`)、PC のタグ一覧と同じく
+  評価順を適用しない。
 
-Remoteへ返したcontainer payloadは一つのimmutable snapshotとみなす。Remoteから評価を書いた直後は現在rowの
-rating表示だけを更新し、client側で自動reorderしない。明示reload、navigation、sort変更による次のlist requestが
-新しいrating snapshotを返す。UI側の `SetSortOrder` は既存wire値とsettings保存を使い、新Actionを追加しない。
+## 7. 永続化と互換
 
-既に接続済みのSmart Folder等は各prepared snapshotを使う。native CollectionのRemote閲覧はcollection Phase 5の
-未接続範囲なので、この設計を理由に先行実装しない。Phase 5で接続するときはCollection Standard / Manualの同じ
-contractをpayloadへ投影する。
+`SortOrder` (settings とツールバー構成) と Collection definition の `standard_sort` はリリース済みデータである。
 
-## 7. 実装段階と残工数
+### 7.1 settings
 
-### Phase R1: pure key と保存設定
+- `SortOrder::RatingAsc / RatingDesc` と `RatingSortUnratedPosition` (既定 `BetweenThreeAndTwo`) を追加する。
+  後者は serde default 付きの新 field とし、Remote は既存の settings snapshot 経由で読む。
+- ツールバーの sort 候補は、既定の 8 件構成のままの利用者だけを 10 件へ拡張する独立の one-time marker を
+  持つ。custom / 並べ替え / 部分 / 空 / 後から隠した候補の構成には補完しない。
+- 旧版への戻し: settings DB は未知の enum variant を `Incompatible` として扱い、保存を抑止して DB family を
+  quarantine しない (`settings_db.rs`、既存)。これを test で固定する。
 
-- `RatingAsc / RatingDesc`、`RatingSortUnratedPosition`、純粋比較、serde / DB / Remote wire、toolbar 8→10の
-  独立one-time markerを追加する。
-- canonical 8だけを10へ拡張し、custom / reorder / partial / empty / 後から隠した候補を補完しない。
-- fixed-order / representative allowlistを先にtestで固定する。
+### 7.2 collection.db
 
-見込み: 0.5〜1日。
+v4.1.0 の `read_definition_row` は未知の `standard_sort` 文字列で `FromSqlConversionFailure` を返す。
+**Rating variant を collection.db に保存する前に、v4.1.0 がこの失敗をどう扱うか (該当 collection だけ読めない /
+store 全体が Unavailable / backup からの復元や上書き) をタグ `v4.1.0` のコードで確定する。**
+旧版がデータを失う・上書きする経路がある場合は、既存列に Rating を書かず、旧版が既知の値として読める形
+(例: 新しい列に Rating を持ち、既存列には従来の値を残す) に設計を変える。この確定は実装者が行い、
+結果を設計担当へ返してから保存形式を決める。
 
-### Phase R2: worker snapshot とproducer
+### 7.3 同値 click と更新アイコン
 
-- physical folderのtyped prepared listingを追加し、rating comparison用DB readをUI thread外へ出す。
-- Ctrl+G / Ctrl+S / tag / bookmarkへbatch factsを渡す。
-- 既存Smart Folder / subfolderのrating snapshotをsort keyへ接続する。
-- Collection Standardへrating factsとinstall前cache handoffを追加する。
+- sort control の click ごとに、click 前の sort と `clicked()` から「sort 変更」「reload」「何もしない」の
+  いずれか一つだけを決める。button / dropdown / menu / Collection の order mode 切替で同じ決定関数を使う。
+- 同じ評価 sort の再 click と sort 横の更新アイコンは、どちらも `reload_top_level_grid(ctx)` へ直接合流する。
+  独自 reload 関数や疑似キー入力を作らない。更新アイコンの tooltip / accessible label は「最新の情報に更新」。
+- 新しい KeyAction は追加しない (既存 `GridReload` を使う)。
 
-見込み: 1.5〜2.5日。
+## 8. 実装段階と見積もり
 
-### Phase R3: mutation時の固定と選択
+実装担当は段階ごとに一つの Codex セッションを使う。**利用者から Rating sort を選べるようにするのは最終段階
+(R5)** とし、途中の段階では variant を `SortOrder::all()`、ツールバー、menu、Remote wire に出さない。
+途中段階で公開済みの選択肢が未完成の producer へ届く状態を作らない。
 
-- rating write / Undo / hydration / session syncはcacheとmembershipだけを更新する。
-- Ctrl+G membership-only rebuild、Details rating headerのsurvivor順維持を追加する。
-- 明示reload / sort変更でstable identity selectionを復元する。
+| 段階 | 内容 | 受入条件と focused test |
+| --- | --- | --- |
+| R1 | 純粋な評価 rank / `RatingSortSpec`、`RatingSortKey`、fallible な単一 transaction 一括読み取りと `CompleteRatingFacts`。variant は内部のみ | 0–5 / Unsupported の全 table、tie、chunk 失敗、並行書き込み中の一貫 snapshot、固定順 / 代表候補 allowlist 不変 |
+| R2 | 物理フォルダの prepared listing (main / detached、open / reload / Ctrl+↑↓ / BS)、context 所有の pending、install 境界の規則 (§3.2)、ファイル名スタック | main と detached の置き換え、cancel / error、sibling 不変、exact selection、Rating 経路で UI thread の DB read が 0、install 前後の書き込み境界 |
+| R3 | Ctrl+G、Smart Folder、サブフォルダ展開、Bookmark、Rating view、Details、§5.2 の context publication | producer ごとの sort、書き込み / Undo / hydration 後に survivor 順不変、filter / Details ヘッダ、main + detached 2窓 (うち1つ parked) で別窓からの書き込み |
+| R4 | Collection Standard (PC / Remote)、Manual / Shuffle 維持、Remote 物理 / 特殊一覧、prepared cache の迂回、Collection reload の anchor、§7.2 の旧版挙動確定 | Collection reload / child 復帰の選択、Remote の明示 reload、書き込み後に client が並べ替えない、固定一覧の除外 |
+| R5 | 公開: settings / ツールバー 8→10 / menu / Remote の選択肢、未評価位置の設定 UI、同値 click と更新アイコン、旧版互換 test、マニュアル・spec・keymap 説明 | control ごとに dispatch が 1 回だけ、8→10 と custom の migration、旧版保護、`cargo fmt --check`、glyph check、`test-full.ps1`、`build-dev.ps1` |
 
-見込み: 0.75〜1.25日。
+見積もり: 約 9〜14 開発日、コード / テスト 30〜45 ファイル程度 (初版の 3.5〜6 日 / 16〜22 ファイルは、
+スタック、接続済みの Remote Collection、facts の完全性と cache、context 横断テストを含んでいなかった)。
+GUI 確認時間は含めない。
 
-### Phase R4: Remote、文書、gate
+## 9. 回帰試験
 
-- Remote worker batch rating sortとclient row patchを確認する。
-- manual / spec / keymap説明、focused regression、full gate、verification buildを完了する。
+### 9.1 snapshot 契約
 
-見込み: 0.75〜1.25日。GUI確認時間は含めない。
+- 6評価値 × 2未評価位置 × 2方向、`Unsupported`、同値 tie。
+- Rating sort で一覧を開き、単一 / 複数評価、増減、Undo / Redo 後も survivor 順が不変。
+- reload、menu reload、sort 変更、未評価位置変更、同値再 click、更新アイコンの後だけ最新評価で再 sort。
+- XMP hydration、metadata import、別 context / Remote からの書き込み後に badge / filter は更新され、順序は不変。
+- rating filter で row が消える / 現れる場合の survivor 順、newcomer 末尾、selected / checked の既存 policy。
+- thumbnail / Details 切替、Details 評価ヘッダ、別ヘッダ sort。
+- facts の読み取り失敗: reload では既存一覧を保持して通知、初回 open では名前順で install して通知。
 
-合計は約3.5〜6開発日、製品差分はおおむね16〜22ファイルを見込む。中心は `settings.rs`、
-folder load / top-level router、既存の検索・Smart Folder・subfolder・bookmark producer、collection prepare、
-Remote containerである。33ファイル規模の `GridDisplayOrderState`移行、items / cache permutation、
-thumbnail priority再設計、detached predicate変更は不要である。
-producerごとのrating facts接続は残るため、単一comparatorだけの小変更にはならない。
+### 9.2 surface
 
-## 8. 回帰試験
+- 物理フォルダ (main / detached)、スタックの集約 / フラット、Ctrl+G flat / drill / ZIP hit、Smart Folder、
+  サブフォルダ展開、Bookmark、Rating view。
+- Ctrl+S / タグ / 閲覧履歴 / ★固定 / ドライブ / 本のページ / Collection Manual・Shuffle で順序が変わらない。
+- Collection Standard の Rating snapshot、revision 更新、reload 時の anchor、child から root への復帰。
+- Remote 物理フォルダ、Remote Collection、書き込み後に row 不動、明示 reload 後に再 sort。
 
-### 8.1 snapshot契約
+### 9.3 lifecycle / I/O / 複数ウィンドウ
 
-- 6評価値 × 2未評価位置 × 2方向、`None`、同値filename tie。
-- RatingDesc / Ascで一覧を開き、単一 / 複数評価、増減、Undo / Redo後もsurvivor順が不変。
-- `GridReload`、menu reload、sort変更、未評価位置変更後だけ最新評価で再sort。
-- 選択中のRating sort再clickとsort横更新アイコンが `GridReload` と同じsurface routeを一度だけ発行する。
-- 同値sort clickを `changed()` だけで判定せず、通常 / 特殊一覧とCollection Standardで再取得・再sortする。
-- Collection Manualの更新はmanual positionを維持し、membership / metadataだけを更新する。
-- XMP hydration、metadata import、別context session write後にbadge / filterは更新されるが順序は不変。
-- rating filterでrowが消える / 現れる場合、survivor順、newcomer末尾、selected / checkedの既存policy。
-- thumbnail / Details切替、Details Rating header、別header sort。
+- prepare の cancel、置き換え、surface 退出、context retire、stale sort spec、worker disconnect、DB error。
+- install 前後の session write 境界 (barrier 付き)。
+- Rating sort の経路で UI thread から rating DB を読まない。既存の非 Rating 経路の UI thread 読み取り
+  (`prewarm_rating_cache`、XMP hydration、`current_folder_rating`) は本計画では移さず、別の負債として扱う。
+  本計画はそれを増やさない。
+- `src/app/multiwindow_scenario_tests.rs` に main + detached 2 窓のシナリオを追加し、parked の窓を含めて、
+  別窓からの書き込みで各窓の順序が不変・badge / filter が更新されること、1窓の reload が sibling の items /
+  generation を変えないことを確認する。
 
-### 8.2 surface
+## 10. 完了条件
 
-- physical Folder、Ctrl+G flat / drill / ZIP hit、Ctrl+S、tag、Smart Folder resident root、subfolder、bookmark。
-- Rating viewのmembership更新とRatedAt sort維持。
-- Collection Manual全variant不変、Standard Rating snapshot、revision refresh、childからroot復帰のanchor。
-- Remote physical folder parity、書込後row不動、explicit reload後再sort。
-- book folder、ZIP / PDF page、reading history、★固定、Stack / SearchContainer aggregateの非rating扱い。
-
-### 8.3 lifecycle / I/O
-
-- rating prepareのcancel、replacement、surface退出、context retire、stale sort spec、worker disconnect / DB error。
-- worker開始後install前のsession write overlayと、install後writeの順序固定。
-- UI threadからrating DB batch / point readを行わず、comparison中のDB accessが0であること。
-- reload後に同じpath / entry ID / rating key / bookmark IDを選択し、必要時だけensure-visible。
-- main viewer中のfilesystem refresh defer、Remote fullscreen key restore。
-
-## 9. 完了条件
-
-- 利用者操作で評価を変えても、Rating sort中の既存行が移動しない。
-- 「最新の情報に更新」と割り当て済み`GridReload`が同じrouterから最新評価を再取得し、再sortする。
-- sort横更新アイコンと選択中Rating sortの再選択も同じrouterへ合流し、selection identityを保持する。
-- rating filter、Undo / Redo、外部rating反映、Rating view membershipが退行しない。
-- Manual / fixed page orderを一度もRating comparatorへ渡さない。
-- rating sort用DB I/Oがworker batchにあり、UI / draw / comparatorからSQLiteを読まない。
-- items順をsnapshot正本として使い、全体display-order ownerや追加のApp-global sentinelを導入しない。
-- phaseごとのfocused tests、`cargo fmt --check`、UI glyph check、`scripts/test-full.ps1`、
-  `scripts/build-dev.ps1`が成功する。通常profile / GUIはagentが起動しない。
+- 利用者が評価を変えても、Rating sort 中の既存行が移動しない (どの窓・Remote から書いても)。
+- 「最新の情報に更新」、`GridReload`、更新アイコン、同値再 click が同じ router から最新評価を再取得し、
+  selection identity を保って再 sort する。
+- rating filter、Undo / Redo、外部評価の反映、Rating view membership が退行しない。
+- 固定順の一覧 (§0.2) を Rating comparator へ一度も渡さない。
+- Rating sort 用の DB 読み取りは worker の単一 transaction で行い、完全な facts だけを比較に使う。
+- 旧版へ戻しても settings / collection.db を失わない。
+- 段階ごとの focused test、`cargo fmt --check`、UI glyph check、`scripts/test-full.ps1`、
+  `scripts/build-dev.ps1` が成功する。GUI はエージェントが起動しない。
