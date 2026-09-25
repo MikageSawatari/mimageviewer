@@ -49,6 +49,8 @@ pub enum WorkerEvent {
         phase: Phase,
         done: usize,
         total: usize,
+        #[serde(default)]
+        pages: Option<usize>,
     },
     Result {
         status: Status,
@@ -67,6 +69,7 @@ pub struct ConvertProgress {
     pub phase: Phase,
     pub done: usize,
     pub total: usize,
+    pub pages: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -612,8 +615,18 @@ fn read_events(
         let event: WorkerEvent =
             serde_json::from_str(&line).map_err(|_| EpubConvertError::Protocol)?;
         match event {
-            WorkerEvent::Progress { phase, done, total } if final_result.is_none() => {
-                let _ = progress.send(ConvertProgress { phase, done, total });
+            WorkerEvent::Progress {
+                phase,
+                done,
+                total,
+                pages,
+            } if final_result.is_none() => {
+                let _ = progress.send(ConvertProgress {
+                    phase,
+                    done,
+                    total,
+                    pages,
+                });
             }
             WorkerEvent::Result { .. } if final_result.is_none() => final_result = Some(event),
             _ => return Err(EpubConvertError::Protocol),
@@ -956,6 +969,36 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn epub_convert_progress_parser_accepts_spine_pages_and_legacy_shape() {
+        for (progress_json, expected_pages) in [
+            (
+                r#"{"event":"progress","phase":"print","done":2,"total":5,"pages":18}"#,
+                Some(18),
+            ),
+            (
+                r#"{"event":"progress","phase":"print","done":18,"total":0}"#,
+                None,
+            ),
+        ] {
+            let stream = format!(
+                "{progress_json}\n{{\"event\":\"result\",\"status\":\"success\",\"exit_code\":0,\"page_count\":18,\"direction\":\"ltr\",\"layout\":\"reflow\",\"profile\":\"reflow-v1\",\"blocked_requests\":0,\"message\":\"\"}}\n"
+            );
+            let (tx, rx) = mpsc::channel();
+            assert!(matches!(
+                read_events(Box::new(Cursor::new(stream.into_bytes())), &tx).unwrap(),
+                WorkerEvent::Result {
+                    status: Status::Success,
+                    ..
+                }
+            ));
+            let progress = rx.recv().unwrap();
+            assert_eq!(progress.phase, Phase::Print);
+            assert_eq!(progress.pages, expected_pages);
+            assert_eq!(progress.total, if expected_pages.is_some() { 5 } else { 0 });
+        }
+    }
 
     struct TestPdfVerifier;
     impl ConvertedPdfVerifier for TestPdfVerifier {

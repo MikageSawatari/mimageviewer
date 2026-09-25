@@ -27,6 +27,13 @@ pub(crate) enum EpubConvertPhase {
     Error(String),
 }
 
+/// Abort restores the view left by this request. A later open already owns a superseded view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EpubConvertExit {
+    Abort,
+    Superseded,
+}
+
 enum EpubConvertMsg {
     InspectDone(Result<EpubInspectSummary, EpubConvertError>),
     Progress(ConvertProgress),
@@ -108,15 +115,21 @@ pub(crate) fn error_message(error: &EpubConvertError) -> String {
     }
 }
 
-fn progress_label(progress: &ConvertProgress) -> &'static str {
+fn progress_label(progress: &ConvertProgress) -> String {
     match progress.phase {
         epub_convert::Phase::Parse => "本を確認中",
         epub_convert::Phase::Extract => "内容を準備中",
         epub_convert::Phase::Init => "変換を準備中",
-        epub_convert::Phase::Print => "ページを変換中",
+        epub_convert::Phase::Print => {
+            return progress
+                .pages
+                .map(|pages| format!("ページを変換中 ({pages} ページ)"))
+                .unwrap_or_else(|| "ページを変換中".into());
+        }
         epub_convert::Phase::Merge => "ページをまとめています",
         epub_convert::Phase::Verify => "変換結果を確認中",
     }
+    .into()
 }
 
 fn summary_direction(direction: &str) -> &'static str {
@@ -262,11 +275,11 @@ impl App {
     ) {
         // Every accepted later open is a new request, including a reload of the same path.
         if self.epub_convert.is_some() {
-            self.cancel_current_epub_convert();
+            self.finish_epub_convert(EpubConvertExit::Superseded);
         }
     }
 
-    pub(crate) fn cancel_current_epub_convert(&mut self) {
+    pub(crate) fn finish_epub_convert(&mut self, exit: EpubConvertExit) {
         let Some(mut state) = self.epub_convert.take() else {
             return;
         };
@@ -276,17 +289,19 @@ impl App {
         let owner = state.owner.clone();
         drop(state);
         self.abort_smart_archive_open_for_owner(&owner);
-        if let Some(snapshot) = rollback {
-            self.restore_folder_nav_history(snapshot);
+        if exit == EpubConvertExit::Abort {
+            if let Some(snapshot) = rollback {
+                self.restore_folder_nav_history(snapshot);
+            }
+            if deferred.is_some() {
+                self.finish_visible_container_fs_nav_failed();
+            }
+            self.restore_address_after_epub_open_aborted(&source);
         }
-        if deferred.is_some() {
-            self.finish_visible_container_fs_nav_failed();
-        }
-        self.restore_address_after_epub_open_aborted(&source);
     }
 
     fn replace_epub_convert_state(&mut self, state: EpubConvertState) {
-        self.cancel_current_epub_convert();
+        self.finish_epub_convert(EpubConvertExit::Superseded);
         self.epub_convert = Some(state);
     }
 
@@ -296,7 +311,7 @@ impl App {
             .as_ref()
             .is_some_and(|state| !self.epub_conversion_owner_is_current(state))
         {
-            self.cancel_current_epub_convert();
+            self.finish_epub_convert(EpubConvertExit::Superseded);
             return;
         }
         let Some(mut state) = self.epub_convert.take() else {
@@ -324,7 +339,7 @@ impl App {
                     if !self.epub_conversion_owner_is_current(&state) {
                         // The cache publication is valid, but this view no longer owns the open.
                         self.epub_convert = Some(state);
-                        self.cancel_current_epub_convert();
+                        self.finish_epub_convert(EpubConvertExit::Superseded);
                         return;
                     }
                     let rollback = state.nav_history_rollback.take();
@@ -442,7 +457,7 @@ impl App {
         }
         if close {
             self.epub_convert = Some(state);
-            self.cancel_current_epub_convert();
+            self.finish_epub_convert(EpubConvertExit::Abort);
         } else {
             if matches!(
                 state.phase,
@@ -491,6 +506,7 @@ mod tests {
             phase: epub_convert::Phase::Print,
             done: 2,
             total: 4,
+            pages: Some(12),
         }))
         .unwrap();
         let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
@@ -545,6 +561,35 @@ mod tests {
         }
         assert!(text.contains("指定なし"), "{text}");
         assert!(!text.contains("左開き"), "{text}");
+    }
+
+    #[test]
+    fn epub_convert_dialog_print_progress_shows_page_count() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let (state, tx, _) = fake_state(EpubConvertPhase::Converting(None));
+        app.epub_convert = Some(state);
+        tx.send(EpubConvertMsg::Progress(ConvertProgress {
+            phase: epub_convert::Phase::Print,
+            done: 2,
+            total: 4,
+            pages: Some(17),
+        }))
+        .unwrap();
+        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let output = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let mut text = String::new();
+        let mut stack: Vec<&egui::epaint::Shape> =
+            output.shapes.iter().map(|shape| &shape.shape).collect();
+        while let Some(shape) = stack.pop() {
+            match shape {
+                egui::epaint::Shape::Text(shape) => text.push_str(shape.galley.text()),
+                egui::epaint::Shape::Vec(shapes) => stack.extend(shapes.iter()),
+                _ => {}
+            }
+        }
+        assert!(text.contains("ページを変換中 (17 ページ)"), "{text}");
+        assert!(!text.contains("0 %"), "{text}");
     }
 
     #[test]

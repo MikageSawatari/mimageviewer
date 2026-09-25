@@ -1648,7 +1648,7 @@ impl ViewerContextBundle {
 impl App {
     #[cfg(windows)]
     pub(in crate::app) fn pause_mounted_background_work_keep_current_frame(&mut self) {
-        self.cancel_current_epub_convert();
+        self.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
         self.slideshow_playing = false;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;

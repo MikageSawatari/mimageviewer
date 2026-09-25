@@ -162,6 +162,36 @@ fn cleanup_user_data(dir: &Path, mode: CleanupMode) -> UserDataCleanup {
         },
     }
 }
+struct PrintProgress {
+    completed_spine: usize,
+    total_spine: usize,
+    printed_pages: usize,
+}
+
+impl PrintProgress {
+    fn new(total_spine: usize) -> Self {
+        Self {
+            completed_spine: 0,
+            total_spine,
+            printed_pages: 0,
+        }
+    }
+
+    fn advance(&mut self, chunk_spine: usize, chunk_pages: usize) {
+        self.completed_spine += chunk_spine;
+        self.printed_pages += chunk_pages;
+    }
+
+    fn event(&self) -> Event {
+        Event::Progress {
+            phase: Phase::Print,
+            done: self.completed_spine,
+            total: self.total_spine,
+            pages: Some(self.printed_pages),
+        }
+    }
+}
+
 struct Engine {
     work_dir: PathBuf,
     user_data: PathBuf,
@@ -229,8 +259,21 @@ impl Engine {
         if self.progress_json {
             println!(
                 "{}",
-                serde_json::to_string(&Event::Progress { phase, done, total })
-                    .expect("protocol serialisation")
+                serde_json::to_string(&Event::Progress {
+                    phase,
+                    done,
+                    total,
+                    pages: None,
+                })
+                .expect("protocol serialisation")
+            );
+        }
+    }
+    fn print_progress(&self, progress: &PrintProgress) {
+        if self.progress_json {
+            println!(
+                "{}",
+                serde_json::to_string(&progress.event()).expect("protocol serialisation")
             );
         }
     }
@@ -386,8 +429,9 @@ impl Engine {
         let mut size_sources = Vec::<Option<String>>::new();
         let mut expected = Vec::<Option<(u32, u32)>>::new();
         let mut print_index = 0;
-        let mut printed_pages = 0;
-        self.progress(Phase::Print, 0, 0);
+        let total_spine = package.spine.iter().filter(|item| item.linear).count();
+        let mut print_progress = PrintProgress::new(total_spine);
+        self.print_progress(&print_progress);
         for (first, items) in render::segments(&package) {
             let fixed = items[0].rendition.layout.as_deref() == Some("pre-paginated");
             let mut segment = Segment {
@@ -458,8 +502,8 @@ impl Engine {
                     }
                 }
                 segment.output_pages += actual.len();
-                printed_pages += actual.len();
-                self.progress(Phase::Print, printed_pages, 0);
+                print_progress.advance(chunk.len(), actual.len());
+                self.print_progress(&print_progress);
                 segment.chunks += 1;
                 segment.print_ms += t.elapsed().as_millis();
                 part_files.push(part);
@@ -671,6 +715,46 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_progress_counts_completed_spine_and_keeps_pdf_pages_separate() {
+        let mut progress = PrintProgress::new(4);
+        assert_eq!(
+            progress.event(),
+            Event::Progress {
+                phase: Phase::Print,
+                done: 0,
+                total: 4,
+                pages: Some(0),
+            }
+        );
+        // One reflow spine item produced 17 pages; a fixed chunk contains three items.
+        progress.advance(1, 17);
+        assert_eq!(
+            progress.event(),
+            Event::Progress {
+                phase: Phase::Print,
+                done: 1,
+                total: 4,
+                pages: Some(17),
+            }
+        );
+        progress.advance(3, 3);
+        let event = progress.event();
+        assert_eq!(
+            event,
+            Event::Progress {
+                phase: Phase::Print,
+                done: 4,
+                total: 4,
+                pages: Some(20),
+            }
+        );
+        let wire = serde_json::to_value(event).unwrap();
+        assert_eq!(wire["done"], 4);
+        assert_eq!(wire["total"], 4);
+        assert_eq!(wire["pages"], 20);
+    }
 
     #[test]
     fn cleanup_mode_requires_verified_requested_identity() {

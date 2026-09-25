@@ -1225,7 +1225,10 @@ impl App {
         true
     }
 
-    fn retire_smart_folder_transition(&mut self) -> bool {
+    fn retire_smart_folder_transition(
+        &mut self,
+        epub_exit: crate::ui_dialogs::epub_convert::EpubConvertExit,
+    ) -> bool {
         let Some(transition) = self.smart_folder_transition.take() else {
             return false;
         };
@@ -1236,8 +1239,8 @@ impl App {
                         super::SmartGridArchiveOwner::Transition(id) if id == transition.request_id))
         }) {
             // The transition is already detached, so common EPUB cleanup cannot retire it
-            // recursively. It still must restore its history and stop the conversion worker.
-            self.cancel_current_epub_convert();
+            // recursively. The caller says whether this request was cancelled or replaced.
+            self.finish_epub_convert(epub_exit);
         }
         self.release_staged_smart_nav_lock(transition.request_id, &transition.intent);
         drop(transition);
@@ -1351,7 +1354,9 @@ impl App {
         if self.smart_pdf_password_dialog_path().is_none() {
             return false;
         }
-        self.retire_smart_folder_transition();
+        self.retire_smart_folder_transition(
+            crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
+        );
         self.clear_smart_pdf_dialog_if_unclaimed();
         self.reprepare_visible_smart_root_after_staged_terminal();
         true
@@ -1364,7 +1369,9 @@ impl App {
         if self.projected_viewer_context_id() != self.viewer_context_main() {
             return;
         }
-        if self.retire_smart_folder_transition() {
+        if self.retire_smart_folder_transition(
+            crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
+        ) {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
     }
@@ -1427,7 +1434,9 @@ impl App {
                 if matches!(&nav.mode, super::FolderNavMode::SmartFolder { fullscreen: true, .. }))
             });
         if fullscreen_nav {
-            self.retire_smart_folder_transition();
+            self.retire_smart_folder_transition(
+                crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
+            );
         }
     }
 
@@ -1479,7 +1488,9 @@ impl App {
         {
             return false;
         }
-        self.retire_smart_folder_transition();
+        self.retire_smart_folder_transition(
+            crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
+        );
         self.reprepare_visible_smart_root_after_staged_terminal();
         self.show_feedback_toast("スマートフォルダ処理を中止しました".into());
         true
@@ -1635,7 +1646,9 @@ impl App {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
         self.smart_folder_transition_sequence = request_id;
-        self.retire_smart_folder_transition();
+        self.retire_smart_folder_transition(
+            crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
+        );
         self.smart_folder_transition = Some(SmartFolderTransition {
             request_id,
             source,
@@ -1682,7 +1695,9 @@ impl App {
         )?;
         transition.phase = SmartFolderTransitionPhase::RootPrepare(pending);
         self.smart_folder_transition_sequence = request_id;
-        self.retire_smart_folder_transition();
+        self.retire_smart_folder_transition(
+            crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
+        );
         self.smart_folder_transition = Some(transition);
         Ok(request_id)
     }
@@ -1820,7 +1835,9 @@ impl App {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
         self.smart_folder_transition_sequence = request_id;
-        self.retire_smart_folder_transition();
+        self.retire_smart_folder_transition(
+            crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
+        );
         self.smart_folder_transition = Some(SmartFolderTransition {
             request_id,
             source: source_lease,
@@ -1995,7 +2012,9 @@ impl App {
             None => false,
         };
         if !started {
-            self.retire_smart_folder_transition();
+            self.retire_smart_folder_transition(
+                crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
+            );
             self.reprepare_visible_smart_root_after_staged_terminal();
             self.show_feedback_toast("アーカイブの読み取りを開始できませんでした".into());
         }
@@ -2223,7 +2242,9 @@ impl App {
             return None;
         };
         if !peek.is_current(self) {
-            self.retire_smart_folder_transition();
+            self.retire_smart_folder_transition(
+                crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
+            );
             self.reprepare_visible_smart_root_after_staged_terminal();
             return Some(StagedSmartHistoryAction::Handled);
         }
@@ -2231,7 +2252,9 @@ impl App {
         let Some(target) = next.advance(direction) else {
             return Some(StagedSmartHistoryAction::Handled);
         };
-        self.retire_smart_folder_transition();
+        self.retire_smart_folder_transition(
+            crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
+        );
         if next.virtual_current == next.previous {
             self.reprepare_visible_smart_root_after_staged_terminal();
             return Some(StagedSmartHistoryAction::Handled);
@@ -6502,7 +6525,9 @@ impl App {
     pub(crate) fn cancel_smart_folder_pending_and_restore_origin(&mut self) {
         // A staged request has not changed the source surface, so cancellation retires only its
         // offscreen workers and leaves the visible owner and history untouched.
-        self.retire_smart_folder_transition();
+        self.retire_smart_folder_transition(
+            crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
+        );
         let origin = self.smart_folder_open_origin.take();
         self.cancel_smart_folder_pending();
         self.restore_cancelled_smart_folder_origin(origin);
@@ -6589,7 +6614,9 @@ impl App {
                 }
             })
         {
-            self.retire_smart_folder_transition();
+            self.retire_smart_folder_transition(
+                crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
+            );
         }
         let pending_matches = self
             .smart_folder_pending
@@ -6711,7 +6738,9 @@ impl App {
                 if crate::folder_tree::path_eq(&source.logical_source, &intent.source_path))
         });
         if staged {
-            self.retire_smart_folder_transition();
+            self.retire_smart_folder_transition(
+                crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
+            );
             self.reprepare_visible_smart_root_after_staged_terminal();
         }
         staged
@@ -8059,7 +8088,9 @@ impl App {
         // Path facts in every offscreen scan are stale after a rename, including a target that
         // differs from the currently visible Smart definition. Retire that request without
         // touching the old visible session or its tombstones.
-        let retired_transition = self.retire_smart_folder_transition();
+        let retired_transition = self.retire_smart_folder_transition(
+            crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
+        );
         self.cancel_smart_folder_pending();
         if let Some(id) = reopen {
             let _ = self.refresh_smart_folder_staged(id);
@@ -8431,9 +8462,13 @@ mod tests {
     fn epub_smart_wait_ends_on_dialog_close() {
         let mut app = crate::app::setup_app_for_test();
         stage_smart_epub_conversion(&mut app);
+        assert!(app.epub_conversion_owner_is_current(app.epub_convert.as_ref().unwrap()));
         app.epub_convert.as_mut().unwrap().phase =
             crate::ui_dialogs::epub_convert::EpubConvertPhase::Error("test".into());
         let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        assert!(app.epub_convert.is_some());
+        assert!(smart_epub_waiting(&app));
         let input = egui::RawInput {
             events: vec![egui::Event::Key {
                 key: egui::Key::Escape,
@@ -8446,7 +8481,29 @@ mod tests {
         };
         let _ = ctx.run(input, |ctx| app.show_epub_convert_dialog(ctx));
         assert!(app.epub_convert.is_none());
-        assert!(!smart_epub_waiting(&app));
+        assert!(app.smart_folder_transition.is_none());
+    }
+
+    #[test]
+    fn epub_smart_abort_restores_its_history_and_address() {
+        let mut app = crate::app::setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        let previous = PathBuf::from("C:/books/previous");
+        app.current_folder = Some(previous.clone());
+        let (epub, _) = stage_smart_epub_conversion(&mut app);
+        app.address = epub.to_string_lossy().into_owned();
+        let rollback = app.folder_nav_history_snapshot();
+        app.epub_convert.as_mut().unwrap().nav_history_rollback = Some(rollback);
+        app.folder_nav_back_stack
+            .push(super::super::FolderNavHistoryTarget::Path(PathBuf::from(
+                "C:/books/intermediate",
+            )));
+
+        app.cancel_smart_folder_pending_and_restore_origin();
+        assert!(app.epub_convert.is_none());
+        assert!(app.smart_folder_transition.is_none());
+        assert!(app.folder_nav_back_stack.is_empty());
+        assert_eq!(app.address, previous.to_string_lossy());
     }
 
     #[test]

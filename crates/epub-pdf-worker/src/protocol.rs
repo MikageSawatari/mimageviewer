@@ -8,6 +8,8 @@ pub enum Event {
         phase: Phase,
         done: usize,
         total: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pages: Option<usize>,
     },
     Result {
         status: Status,
@@ -100,6 +102,7 @@ mod tests {
                 phase: Phase::Print,
                 done: 2,
                 total: 10,
+                pages: Some(7),
             },
             Event::Result {
                 status: Status::Timeout,
@@ -123,5 +126,17 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            serde_json::from_str::<Event>(
+                r#"{"event":"progress","phase":"print","done":1,"total":0}"#
+            )
+            .unwrap(),
+            Event::Progress {
+                phase: Phase::Print,
+                done: 1,
+                total: 0,
+                pages: None,
+            }
+        );
     }
 }

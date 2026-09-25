@@ -639,3 +639,18 @@ EPUB 変換状態は PDF 列挙 pending と同じ viewer context bundle に所�
 この入力時点まで「任意の後続オープン要求」を保証するには、viewer context ごとの共通要求世代と、
 detached 宛てスキャンとの所有境界を確定する必要がある。凍結中の detached 経路を局所的に分岐させず、
 設計確認後に扱う。
+
+### S2c-1 修正 3 (2026-09-26)
+
+EPUB 変換の終了を `Abort` と `Superseded` に分けた。利用者による取消や context pause は
+旧要求の履歴・アドレス・遅延 fullscreen を失敗として戻す。一方、後続オープンが画面を
+所有した場合は、旧要求の rollback と遅延 fullscreen を破棄し、後続オープンの履歴・
+アドレスを変更しない。フォルダペインの `PaneNavigation` は main context の独立した
+入力と確定しているため、worker 走査の開始時点で旧 EPUB を supersede する。
+`GridFolderCandidate`、detached 対象、fullscreen 目的、表示順 refresh は同じ所有者を
+確定できないため、この境界では退役させない。上記の残件はこれで解消した。
+
+変換 worker の印刷進捗は PDF ページ数を分母とせず、印刷対象の linear spine 項目の
+完了数 / 総数で示す。固定レイアウトの chunk は含む項目数だけ加算する。印刷済み PDF
+ページ数は進捗 JSON の `pages` に分離し、ダイアログの文言へ反映する。旧形式の
+`pages` が無い進捗イベントも runner は受け付ける。

@@ -316,7 +316,7 @@ fn epub_d10_off_pdf_open_policy_skips_spread_lookup() {
 }
 
 #[test]
-fn epub_failure_replacement_restores_previous_request_history_and_address() {
+fn epub_failure_replacement_does_not_restore_superseded_history_or_address() {
     use crate::settings::ArchiveFileHandling;
     let mut app = setup_app_for_test();
     app.settings
@@ -355,9 +355,12 @@ fn epub_failure_replacement_restores_previous_request_history_and_address() {
         ),
         PdfOpenFailureRoute::ConversionDialogOpened
     );
-    assert_eq!(app.address, previous.to_string_lossy());
-    assert!(app.recent_folders.is_empty());
-    assert!(app.fs_nav_locked_gen.is_none());
+    assert_eq!(app.address, old.to_string_lossy());
+    assert_eq!(
+        app.recent_folders,
+        vec![PathBuf::from("C:/books/intermediate")]
+    );
+    assert_eq!(app.fs_nav_locked_gen, Some(7));
     assert_eq!(app.epub_convert.as_ref().unwrap().src_path, new);
 }
 
@@ -427,6 +430,44 @@ fn epub_navigation_published_after_collection_root_open_cannot_replace_root() {
 }
 
 #[test]
+fn epub_superseded_by_collection_navigation_preserves_back_history() {
+    let mut app = setup_app_for_test();
+    app.active_quick_folder_slot = None;
+    let temp = TempDir::new().unwrap();
+    let previous = temp.path().join("previous");
+    std::fs::create_dir(&previous).unwrap();
+    app.current_folder = Some(previous.clone());
+    app.address = previous.to_string_lossy().into_owned();
+    app.settings
+        .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+    let epub = temp.path().join("old.epub");
+    std::fs::write(&epub, b"test").unwrap();
+    assert_eq!(
+        app.route_pdf_open_failure(
+            OpenRequestOwner::Navigation,
+            &epub,
+            PdfOpenFailure::NotConverted
+        ),
+        PdfOpenFailureRoute::ConversionDialogOpened,
+    );
+    let rollback = app.folder_nav_history_snapshot();
+    app.epub_convert.as_mut().unwrap().nav_history_rollback = Some(rollback);
+    let collection_id = crate::collection_store::CollectionId::new();
+    app.open_collection_grid_from_navigation(collection_id);
+    assert_eq!(
+        app.folder_nav_back_stack.last(),
+        Some(&FolderNavHistoryTarget::Path(previous.clone()))
+    );
+    let ctx = egui::Context::default();
+    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    assert!(app.epub_convert.is_none());
+    assert_eq!(
+        app.navigate_folder_history_back(),
+        Some(FolderNavHistoryTarget::Path(previous))
+    );
+}
+
+#[test]
 fn epub_navigation_published_after_smart_root_request_cannot_replace_request() {
     let mut app = setup_app_for_test();
     let temp = TempDir::new().unwrap();
@@ -465,6 +506,68 @@ fn epub_navigation_published_after_smart_root_request_cannot_replace_request() {
     assert!(app.epub_convert.is_none());
     assert!(app.smart_folder_transition.is_some());
     assert!(app.pdf_enumerate_pending.is_none());
+}
+
+#[test]
+fn epub_pane_scan_supersedes_deferred_reopen_before_worker_completes() {
+    let mut app = setup_app_for_test();
+    let temp = TempDir::new().unwrap();
+    let previous = temp.path().join("previous");
+    let destination = temp.path().join("pane-destination");
+    std::fs::create_dir(&previous).unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    app.current_folder = Some(previous.clone());
+    app.address = previous.to_string_lossy().into_owned();
+    app.settings
+        .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+    let epub = temp.path().join("old.epub");
+    std::fs::write(&epub, b"test").unwrap();
+    assert_eq!(
+        app.route_pdf_open_failure(
+            OpenRequestOwner::Navigation,
+            &epub,
+            PdfOpenFailure::NotConverted
+        ),
+        PdfOpenFailureRoute::ConversionDialogOpened,
+    );
+    let publish = app
+        .epub_convert
+        .as_mut()
+        .unwrap()
+        .fake_published_sender_for_test();
+    let rollback = app.folder_nav_history_snapshot();
+    let state = app.epub_convert.as_mut().unwrap();
+    state.nav_history_rollback = Some(rollback);
+    state.deferred_fullscreen = Some(DeferredFsReopen {
+        history_trigger: HistoryTrigger::UserChosen,
+        resume_slideshow: false,
+        target: DeferredFsTarget::None,
+        resume_to_last_page: false,
+        from_explicit_open: false,
+        preserve_after_password_prompt: false,
+    });
+
+    app.start_folder_pane_open(destination.clone());
+    assert!(app.epub_convert.is_none());
+    publish();
+    let ctx = egui::Context::default();
+    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    assert!(app.pdf_enumerate_pending.is_none());
+    assert!(app.fs_nav_after_pdf_enumerate.is_none());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let ready = loop {
+        if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+            break ready;
+        }
+        assert!(std::time::Instant::now() < deadline, "pane scan timed out");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let ready = app.resolve_main_folder_open_ready(&ctx, ready).unwrap();
+    app.load_folder_with_scan(ready.path, Some(ready.scan));
+    assert_eq!(app.current_folder.as_deref(), Some(destination.as_path()));
+    assert!(app.pdf_enumerate_pending.is_none());
+    assert!(app.fs_nav_after_pdf_enumerate.is_none());
 }
 
 #[test]
@@ -623,10 +726,18 @@ fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
     assert_eq!(state.src_path, source);
     assert_eq!(state.owner, OpenRequestOwner::Navigation);
     assert!(state.nav_history_rollback.is_some());
-    app.cancel_superseded_epub_convert(
-        Path::new("C:/books/other.pdf"),
-        &OpenRequestOwner::Navigation,
-    );
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    };
+    let _ = ctx.run(input, |ctx| app.show_epub_convert_dialog(ctx));
     assert!(app.epub_convert.is_none());
     assert_eq!(app.address, previous.to_string_lossy());
 }

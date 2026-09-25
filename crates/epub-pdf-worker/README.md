@@ -40,13 +40,16 @@ stream with no human messages. Phases are `parse`, `extract`, `init`, `print`,
 `merge`, and `verify`. For example:
 
 ```json
-{"event":"progress","phase":"print","done":3,"total":0}
+{"event":"progress","phase":"print","done":2,"total":5,"pages":3}
 {"event":"result","status":"success","exit_code":0,"page_count":3,"direction":"rtl","layout":"pre-paginated","profile":"reflow-v1","blocked_requests":0,"message":""}
 ```
 
-`print.done` is the number of PDF pages printed so far; `print.total` is 0
-because reflow pagination is not known in advance. Other phases use 0/1 and
-1/1. Result statuses are `success`, `drm`, `invalid`, `webview2_missing`,
+`print.done` counts completed linear spine items and `print.total` is the
+number of linear spine items to print. A fixed-layout chunk counts every item
+it contains. `print.pages` is the PDF page count printed so far; reflow
+pagination need not be known in advance. Older progress lines without `pages`
+remain accepted by the core. Other phases use 0/1 and 1/1. Result statuses are
+`success`, `drm`, `invalid`, `webview2_missing`,
 `render_failed`, `timeout`, and `webview2_unsupported`.
 `blocked_requests` counts blocked attempts.
 When `--progress-json` is present, argument errors and panics also produce

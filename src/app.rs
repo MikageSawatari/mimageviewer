@@ -42516,6 +42516,12 @@ impl App {
     }
 
     fn start_folder_open_scan(&mut self, path: PathBuf, purpose: FolderOpenScanPurpose) {
+        // A pane click is an independent main-context open even before its worker scan finishes.
+        // Candidate, detached and fullscreen scans may target another viewer context; a refresh
+        // does not express a new open. Retire only the proven main-context pane intent here.
+        if matches!(purpose, FolderOpenScanPurpose::PaneNavigation) {
+            self.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded);
+        }
         if !matches!(
             &purpose,
             FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
