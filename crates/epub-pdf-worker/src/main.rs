@@ -1,6 +1,7 @@
 use epub_pdf_worker::{
     Report,
     package::{self, EpubErrorKind},
+    protocol::{Event, Phase},
     render::{self, Segment},
     report::{SourceImage, UserDataCleanup},
     webview::Host,
@@ -12,12 +13,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-const USAGE: &str = "usage:\n  mimageviewer-epub-pdf inspect <in.epub>\n  mimageviewer-epub-pdf convert <in.epub> <out.pdf> --work-dir <dir> [--report <file.json>] [--timeout-secs N] [--force-iframe]\n  mimageviewer-epub-pdf batch <dir-with-epubs> <out-dir> [--timeout-secs N]";
+const USAGE: &str = "usage:\n  mimageviewer-epub-pdf inspect <in.epub>\n  mimageviewer-epub-pdf convert <in.epub> <out> --work-dir <dir> [--user-data-dir <dir>] [--progress-json] [--report <file.json>] [--timeout-secs N] [--force-iframe]\n  mimageviewer-epub-pdf batch <dir-with-epubs> <out-dir> [--timeout-secs N]";
 struct Options {
     timeout_secs: u64,
     force_iframe: bool,
     work_dir: Option<PathBuf>,
     report: Option<PathBuf>,
+    user_data_dir: Option<PathBuf>,
+    progress_json: bool,
 }
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -25,6 +28,8 @@ fn options(args: &[String]) -> Result<Options, String> {
         force_iframe: false,
         work_dir: None,
         report: None,
+        user_data_dir: None,
+        progress_json: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -48,6 +53,13 @@ fn options(args: &[String]) -> Result<Options, String> {
                 i += 1;
                 o.report = Some(PathBuf::from(args.get(i).ok_or("missing report path")?));
             }
+            "--user-data-dir" => {
+                i += 1;
+                o.user_data_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("missing user data directory")?,
+                ));
+            }
+            "--progress-json" => o.progress_json = true,
             "--force-iframe" => o.force_iframe = true,
             x => return Err(format!("unknown option: {x}")),
         }
@@ -114,9 +126,10 @@ struct Engine {
     unavailable: Option<(i32, String)>,
     run_id: String,
     sequence: usize,
+    progress_json: bool,
 }
 impl Engine {
-    fn new(dir: &Path) -> Result<Self, String> {
+    fn new(dir: &Path, user_data_dir: Option<&Path>, progress_json: bool) -> Result<Self, String> {
         let work_dir = absolute(dir)?;
         fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
         let run_id = format!(
@@ -127,7 +140,23 @@ impl Engine {
                 .map_err(|e| e.to_string())?
                 .as_millis()
         );
-        let user_data = work_dir.join(format!("webview2-user-data-{run_id}"));
+        let user_data = if let Some(dir) = user_data_dir {
+            let path = absolute(dir)?;
+            if path.exists()
+                && fs::read_dir(&path)
+                    .map_err(|e| e.to_string())?
+                    .next()
+                    .is_some()
+            {
+                return Err(format!(
+                    "user data directory is not empty: {}",
+                    path.display()
+                ));
+            }
+            path
+        } else {
+            work_dir.join(format!("webview2-user-data-{run_id}"))
+        };
         Ok(Self {
             work_dir,
             user_data,
@@ -135,7 +164,17 @@ impl Engine {
             unavailable: None,
             run_id,
             sequence: 0,
+            progress_json,
         })
+    }
+    fn progress(&self, phase: Phase, done: usize, total: usize) {
+        if self.progress_json {
+            println!(
+                "{}",
+                serde_json::to_string(&Event::Progress { phase, done, total })
+                    .expect("protocol serialisation")
+            );
+        }
     }
     fn process(
         &mut self,
@@ -147,7 +186,35 @@ impl Engine {
         let start = Instant::now();
         let deadline = start + Duration::from_secs(timeout_secs);
         let mut report = Report::new(input);
-        let result = self.process_inner(input, out, force_iframe, deadline, &mut report);
+        if let Some(host) = &self.host {
+            host.reset_blocked();
+        }
+        self.sequence += 1;
+        let temp_out = self
+            .work_dir
+            .join(format!("merged-{}-{}.pdf", self.run_id, self.sequence));
+        let same_file = fs::canonicalize(input)
+            .ok()
+            .zip(fs::canonicalize(out).ok())
+            .is_some_and(|(a, b)| a == b);
+        let result = if same_file {
+            Err((3, "input and output refer to the same file".into()))
+        } else {
+            self.process_inner(input, &temp_out, force_iframe, deadline, &mut report)
+        }
+        .and_then(|()| {
+            if Instant::now() >= deadline {
+                return Err((6, "WebView2 timeout before output publication".into()));
+            }
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent).map_err(|e| (5, e.to_string()))?;
+            }
+            fs::rename(&temp_out, out).map_err(|e| (5, format!("publish PDF: {e}")))
+        });
+        let _ = fs::remove_file(&temp_out);
+        if let Some(host) = &self.host {
+            (report.blocked_requests, report.blocked_request_count) = host.blocked_requests();
+        }
         if let Err((code, error)) = result {
             report.fail(code, error)
         } else {
@@ -170,6 +237,7 @@ impl Engine {
         r: &mut Report,
     ) -> Result<(), (i32, String)> {
         let t = Instant::now();
+        self.progress(Phase::Parse, 0, 1);
         let parsed = package::inspect_file(input);
         r.timings.insert("parse_ms".into(), t.elapsed().as_millis());
         let package = parsed.map_err(|e| {
@@ -183,6 +251,7 @@ impl Engine {
                 e.to_string(),
             )
         })?;
+        self.progress(Phase::Parse, 1, 1);
         r.title = package.title.clone();
         r.direction = Some(package.direction.clone());
         r.spine_count = Some(package.spine.len());
@@ -207,13 +276,14 @@ impl Engine {
             .into(),
         );
         r.drm = "none".into();
-        self.sequence += 1;
         let root = self
             .work_dir
             .join(format!("book-{}-{}", self.run_id, self.sequence));
         fs::create_dir_all(&root).map_err(|e| (5, e.to_string()))?;
         let t = Instant::now();
+        self.progress(Phase::Extract, 0, 1);
         package::extract_file(input, &root).map_err(|e| (3, e.to_string()))?;
+        self.progress(Phase::Extract, 1, 1);
         r.timings
             .insert("extract_ms".into(), t.elapsed().as_millis());
         let sources = render::source_images(&package, &root);
@@ -232,6 +302,7 @@ impl Engine {
         }
         if self.host.is_none() {
             let t = Instant::now();
+            self.progress(Phase::Init, 0, 1);
             match Host::new(&self.user_data, deadline) {
                 Ok(host) => self.host = Some(host),
                 Err(error) => {
@@ -243,6 +314,7 @@ impl Engine {
             r.timings
                 .insert("webview_init_ms".into(), t.elapsed().as_millis());
         }
+        self.progress(Phase::Init, 1, 1);
         let host = self.host.as_ref().unwrap();
         r.webview_runtime = Some(host.version.clone());
         host.map_folder(&root).map_err(|e| (5, e))?;
@@ -250,6 +322,8 @@ impl Engine {
         let mut size_sources = Vec::<Option<String>>::new();
         let mut expected = Vec::<Option<(u32, u32)>>::new();
         let mut print_index = 0;
+        let mut printed_pages = 0;
+        self.progress(Phase::Print, 0, 0);
         for (first, items) in render::segments(&package) {
             let fixed = items[0].rendition.layout.as_deref() == Some("pre-paginated");
             let mut segment = Segment {
@@ -279,6 +353,9 @@ impl Engine {
                 let url = render::virtual_url(&relative);
                 host.navigate(&url).map_err(|e| (5, e))?;
                 host.wait_ready(&url, deadline)
+                    .map_err(classify_webview_error)?;
+                r.book_script_ran |= host
+                    .book_script_ran(deadline)
                     .map_err(classify_webview_error)?;
                 let pdf = host
                     .devtools_pdf(deadline)
@@ -312,11 +389,13 @@ impl Engine {
                             item.height.unwrap_or(1700),
                         )));
                     } else {
-                        size_sources.push(Some("reflow_default_1200x1700".into()));
+                        size_sources.push(Some(render::REFLOW_PROFILE.into()));
                         expected.push(None);
                     }
                 }
                 segment.output_pages += actual.len();
+                printed_pages += actual.len();
+                self.progress(Phase::Print, printed_pages, 0);
                 segment.chunks += 1;
                 segment.print_ms += t.elapsed().as_millis();
                 part_files.push(part);
@@ -327,12 +406,12 @@ impl Engine {
             );
             r.segments.push(segment);
         }
-        if let Some(p) = out.parent() {
-            fs::create_dir_all(p).map_err(|e| (5, e.to_string()))?;
-        }
         let t = Instant::now();
+        self.progress(Phase::Merge, 0, 1);
         render::merge_pdf(&part_files, out, package.direction == "rtl").map_err(|e| (5, e))?;
+        self.progress(Phase::Merge, 1, 1);
         r.timings.insert("merge_ms".into(), t.elapsed().as_millis());
+        self.progress(Phase::Verify, 0, 1);
         let (pages, images) = render::inspect_pdf(out, &size_sources).map_err(|e| (5, e))?;
         for (page, expect) in pages.iter().zip(expected.iter()) {
             if let Some((w, h)) = expect
@@ -357,6 +436,7 @@ impl Engine {
         if !r.errors.is_empty() {
             return Err((5, "PDF page size verification failed".into()));
         }
+        self.progress(Phase::Verify, 1, 1);
         Ok(())
     }
     fn finish(mut self) -> UserDataCleanup {
@@ -393,7 +473,7 @@ fn run() -> Result<i32, String> {
         [cmd, input, out, rest @ ..] if cmd == "convert" => {
             let o = options(rest)?;
             let work = o.work_dir.ok_or("convert requires --work-dir")?;
-            let mut engine = Engine::new(&work)?;
+            let mut engine = Engine::new(&work, o.user_data_dir.as_deref(), o.progress_json)?;
             let mut r = engine.process(
                 Path::new(input),
                 Path::new(out),
@@ -404,13 +484,27 @@ fn run() -> Result<i32, String> {
             let report = o
                 .report
                 .unwrap_or_else(|| PathBuf::from(out).with_extension("json"));
-            write_json(&report, &r)?;
-            println!("{}: {} (report {})", r.file, r.status, report.display());
+            if let Err(error) = write_json(&report, &r) {
+                eprintln!("report {}: {error}", report.display());
+            }
+            if o.progress_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&Event::from_report(&r)).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("{}: {} (report {})", r.file, r.status, report.display());
+            }
             Ok(r.exit_code)
         }
         [cmd, input, out, rest @ ..] if cmd == "batch" => {
             let o = options(rest)?;
-            if o.force_iframe || o.work_dir.is_some() || o.report.is_some() {
+            if o.force_iframe
+                || o.work_dir.is_some()
+                || o.report.is_some()
+                || o.user_data_dir.is_some()
+                || o.progress_json
+            {
                 return Err("batch accepts only --timeout-secs".into());
             }
             let in_dir = Path::new(input);
@@ -428,7 +522,7 @@ fn run() -> Result<i32, String> {
                 .map(|x| x.path().to_path_buf())
                 .collect::<Vec<_>>();
             files.sort();
-            let mut engine = Engine::new(&out_dir.join("_work"))?;
+            let mut engine = Engine::new(&out_dir.join("_work"), None, false)?;
             let mut reports = Vec::new();
             for (n, file) in files.iter().enumerate() {
                 let stem = file.file_stem().unwrap_or_default().to_string_lossy();

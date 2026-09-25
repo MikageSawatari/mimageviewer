@@ -8,6 +8,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const REFLOW_PROFILE: &str = "reflow-v1";
+pub const REFLOW_WIDTH: u32 = 720;
+pub const REFLOW_HEIGHT: u32 = 1024;
+pub const REFLOW_MARGIN: u32 = 32;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Segment {
     pub kind: String,
@@ -100,8 +105,9 @@ pub fn print_html(items: &[&SpineItem], force_iframe: bool) -> String {
 pub fn reflow_print_copy(root: &Path, item: &SpineItem, index: usize) -> Result<String, String> {
     let source = root.join(&item.path);
     let data = fs::read_to_string(&source).map_err(|e| format!("{}: {e}", source.display()))?;
-    let style =
-        "<style>@page{size:1200px 1700px;margin:48px}html,body{print-color-adjust:exact}</style>";
+    let style = format!(
+        "<style>@page{{size:{REFLOW_WIDTH}px {REFLOW_HEIGHT}px;margin:{REFLOW_MARGIN}px}}</style>"
+    );
     let lower = data.to_ascii_lowercase();
     let content = if let Some(pos) = lower.find("</head>") {
         format!("{}{}{}", &data[..pos], style, &data[pos..])

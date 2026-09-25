@@ -1,20 +1,22 @@
 //! WebView2 host for EPUB printing. All COM objects belong to this STA thread.
 use base64::Engine;
 use std::{
+    cell::RefCell,
+    collections::HashSet,
     path::Path,
+    rc::Rc,
     sync::mpsc::{self, Receiver, TryRecvError},
-    thread,
     time::{Duration, Instant},
 };
 use webview2_com::{
     CallDevToolsProtocolMethodCompletedHandler, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, ExecuteScriptCompletedHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
-        COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY, CreateCoreWebView2EnvironmentWithOptions,
-        GetAvailableCoreWebView2BrowserVersionString, ICoreWebView2, ICoreWebView2_3,
-        ICoreWebView2Controller, ICoreWebView2Environment,
+        COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+        CreateCoreWebView2EnvironmentWithOptions, GetAvailableCoreWebView2BrowserVersionString,
+        ICoreWebView2, ICoreWebView2_3, ICoreWebView2Controller, ICoreWebView2Environment,
     },
-    take_pwstr,
+    NavigationStartingEventHandler, WebResourceRequestedEventHandler, take_pwstr,
 };
 use windows::{
     Win32::{
@@ -24,9 +26,10 @@ use windows::{
             LibraryLoader::GetModuleHandleW,
         },
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE,
-            PeekMessageW, RegisterClassW, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE,
-            WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG,
+            MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+            RegisterClassW, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WNDCLASSW,
+            WS_OVERLAPPEDWINDOW,
         },
     },
     core::{Interface, PCWSTR, PWSTR},
@@ -46,8 +49,13 @@ fn pump() {
     }
 }
 
-// wait_with_pump blocks in GetMessage. This bounded equivalent preserves the
-// deadline required by the conversion command.
+fn wait_for_messages(deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let millis = remaining.as_millis().min(u32::MAX as u128) as u32;
+    unsafe { MsgWaitForMultipleObjectsEx(None, millis, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
+    pump();
+}
+
 fn wait<T>(rx: Receiver<windows::core::Result<T>>, deadline: Instant) -> Result<T, String> {
     loop {
         match rx.try_recv() {
@@ -58,9 +66,34 @@ fn wait<T>(rx: Receiver<windows::core::Result<T>>, deadline: Instant) -> Result<
         if Instant::now() >= deadline {
             return Err("WebView2 timeout".into());
         }
-        pump();
-        thread::sleep(Duration::from_millis(10));
+        wait_for_messages(deadline);
     }
+}
+
+pub const MAX_RECORDED_BLOCKED_URLS: usize = 200;
+
+#[derive(Default)]
+struct BlockedRequests {
+    urls: Vec<String>,
+    seen: HashSet<String>,
+    count: usize,
+}
+
+impl BlockedRequests {
+    fn record(&mut self, url: String) {
+        self.count += 1;
+        if self.urls.len() < MAX_RECORDED_BLOCKED_URLS && self.seen.insert(url.clone()) {
+            self.urls.push(url);
+        }
+    }
+}
+
+fn allowed_virtual_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    scheme.eq_ignore_ascii_case("https") && authority.eq_ignore_ascii_case("epub.invalid")
 }
 
 unsafe extern "system" fn host_wnd_proc(
@@ -82,6 +115,7 @@ pub struct Host {
     controller: Option<ICoreWebView2Controller>,
     webview: Option<ICoreWebView2>,
     webview3: Option<ICoreWebView2_3>,
+    blocked: Rc<RefCell<BlockedRequests>>,
     pub version: String,
 }
 
@@ -108,6 +142,7 @@ impl Host {
             controller: None,
             webview: None,
             webview3: None,
+            blocked: Rc::new(RefCell::new(BlockedRequests::default())),
             version,
         };
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
@@ -210,11 +245,85 @@ impl Host {
             unsafe { controller.CoreWebView2() }.map_err(|e| format!("get_CoreWebView2: {e}"))?;
         h.webview3 = Some(view.cast().map_err(|e| format!("ICoreWebView2_3: {e}"))?);
         h.webview = Some(view);
+        let settings = unsafe { h.view().Settings() }.map_err(|e| format!("Settings: {e}"))?;
+        unsafe { settings.SetIsScriptEnabled(false) }
+            .map_err(|e| format!("SetIsScriptEnabled: {e}"))?;
+        h.install_request_guard()?;
         Ok(h)
     }
 
     fn view(&self) -> &ICoreWebView2 {
         self.webview.as_ref().unwrap()
+    }
+
+    fn install_request_guard(&self) -> Result<(), String> {
+        let filter = wide("*");
+        unsafe {
+            self.view().AddWebResourceRequestedFilter(
+                PCWSTR(filter.as_ptr()),
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+            )
+        }
+        .map_err(|e| format!("AddWebResourceRequestedFilter: {e}"))?;
+        let blocked = self.blocked.clone();
+        let environment = self.environment.as_ref().unwrap().clone();
+        let handler = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
+            let Some(args) = args else { return Ok(()) };
+            let mut uri = PWSTR::null();
+            let url = match unsafe { args.Request().and_then(|request| request.Uri(&mut uri)) } {
+                Ok(()) => take_pwstr(uri),
+                Err(_) => "<unavailable resource URL>".into(),
+            };
+            if !allowed_virtual_url(&url) {
+                blocked.borrow_mut().record(url);
+                let reason = wide("Blocked");
+                let headers = wide("Cache-Control: no-store\r\nContent-Type: text/plain\r\n");
+                let response = unsafe {
+                    environment.CreateWebResourceResponse(
+                        None,
+                        403,
+                        PCWSTR(reason.as_ptr()),
+                        PCWSTR(headers.as_ptr()),
+                    )?
+                };
+                unsafe { args.SetResponse(&response)? };
+            }
+            Ok(())
+        }));
+        let mut token = 0;
+        unsafe { self.view().add_WebResourceRequested(&handler, &mut token) }
+            .map_err(|e| format!("add_WebResourceRequested: {e}"))?;
+        let blocked = self.blocked.clone();
+        let navigation = NavigationStartingEventHandler::create(Box::new(move |_, args| {
+            let Some(args) = args else { return Ok(()) };
+            let mut uri = PWSTR::null();
+            let url = match unsafe { args.Uri(&mut uri) } {
+                Ok(()) => take_pwstr(uri),
+                Err(_) => "<unavailable navigation URL>".into(),
+            };
+            if !allowed_virtual_url(&url) {
+                blocked.borrow_mut().record(url);
+                unsafe { args.SetCancel(true)? };
+            }
+            Ok(())
+        }));
+        unsafe { self.view().add_NavigationStarting(&navigation, &mut token) }
+            .map_err(|e| format!("add_NavigationStarting: {e}"))?;
+        unsafe {
+            self.view()
+                .add_FrameNavigationStarting(&navigation, &mut token)
+        }
+        .map_err(|e| format!("add_FrameNavigationStarting: {e}"))?;
+        Ok(())
+    }
+
+    pub fn reset_blocked(&self) {
+        *self.blocked.borrow_mut() = BlockedRequests::default();
+    }
+
+    pub fn blocked_requests(&self) -> (Vec<String>, usize) {
+        let blocked = self.blocked.borrow();
+        (blocked.urls.clone(), blocked.count)
     }
 
     pub fn map_folder(&self, dir: &Path) -> Result<(), String> {
@@ -238,49 +347,35 @@ impl Host {
         unsafe { self.view().Navigate(PCWSTR(url.as_ptr())) }.map_err(|e| format!("Navigate: {e}"))
     }
 
-    pub fn script(&self, script: &str, deadline: Instant) -> Result<String, String> {
-        let (tx, rx) = mpsc::channel();
-        let callback = ExecuteScriptCompletedHandler::create(Box::new(move |result, text| {
-            let _ = tx.send(result.map(|()| text));
-            Ok(())
-        }));
-        let script = wide(script);
-        unsafe {
-            self.view()
-                .ExecuteScript(PCWSTR(script.as_ptr()), &callback)
+    pub fn script(&self, script: &str, deadline: Instant) -> Result<serde_json::Value, String> {
+        // ExecuteScript's interaction with disabled page scripts is not stated
+        // in the local bindings. Use CDP for host expressions; the reviewer
+        // must verify this path on a running WebView2 outside the sandbox.
+        let response = self.devtools_call(
+            "Runtime.evaluate",
+            &serde_json::json!({"expression":script,"returnByValue":true}),
+            deadline,
+        )?;
+        if response.get("exceptionDetails").is_some() {
+            return Err(format!("Runtime.evaluate: {response}"));
         }
-        .map_err(|e| format!("ExecuteScript: {e}"))?;
-        wait(rx, deadline)
+        Ok(response["result"]["value"].clone())
     }
 
-    pub fn wait_ready(&self, url: &str, deadline: Instant) -> Result<(), String> {
-        let desired = serde_json::to_string(url).map_err(|e| e.to_string())?;
-        let test = format!(
-            r#"(()=>location.href===new URL({desired}).href&&document.readyState==='complete'&&document.fonts.status==='loaded'&&[...document.images].every(i=>i.complete&&i.naturalWidth>0)&&[...document.querySelectorAll('iframe')].every(f=>f.contentDocument&&f.contentDocument.readyState==='complete'&&f.contentDocument.fonts.status==='loaded'&&[...f.contentDocument.images].every(i=>i.complete&&i.naturalWidth>0)))()"#
-        );
-        loop {
-            if Instant::now() >= deadline {
-                return Err("WebView2 timeout waiting for images/iframes/fonts".into());
-            }
-            if self.script(&test, deadline)?.trim() == "true" {
-                return Ok(());
-            }
-            pump();
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    pub fn devtools_pdf(&self, deadline: Instant) -> Result<Vec<u8>, String> {
+    fn devtools_call(
+        &self,
+        name: &str,
+        params: &serde_json::Value,
+        deadline: Instant,
+    ) -> Result<serde_json::Value, String> {
         let (tx, rx) = mpsc::channel();
         let callback =
             CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, text| {
                 let _ = tx.send(result.map(|()| text));
                 Ok(())
             }));
-        let method = wide("Page.printToPDF");
-        let args = wide(
-            r#"{"preferCSSPageSize":true,"printBackground":true,"marginTop":0,"marginBottom":0,"marginLeft":0,"marginRight":0,"displayHeaderFooter":false}"#,
-        );
+        let method = wide(name);
+        let args = wide(&params.to_string());
         unsafe {
             self.view().CallDevToolsProtocolMethod(
                 PCWSTR(method.as_ptr()),
@@ -288,17 +383,40 @@ impl Host {
                 &callback,
             )
         }
-        .map_err(|e| format!("CallDevToolsProtocolMethod: {e}"))?;
+        .map_err(|e| format!("CallDevToolsProtocolMethod({name}): {e}"))?;
         let response = wait(rx, deadline)?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response).map_err(|e| format!("invalid CDP response: {e}"))?;
+        serde_json::from_str(&response).map_err(|e| format!("invalid CDP response: {e}"))
+    }
+
+    pub fn wait_ready(&self, url: &str, deadline: Instant) -> Result<(), String> {
+        let desired = serde_json::to_string(url).map_err(|e| e.to_string())?;
+        let test = format!(
+            r#"(()=>{{const local=u=>{{try{{return new URL(u,location.href).origin===location.origin}}catch{{return false}}}};const images=d=>[...d.images].every(i=>i.complete&&(!local(i.src)||i.naturalWidth>0));return location.href===new URL({desired}).href&&document.readyState==='complete'&&document.fonts.status==='loaded'&&images(document)&&[...document.querySelectorAll('iframe')].every(f=>!local(f.src)||(f.contentDocument&&f.contentDocument.readyState==='complete'&&f.contentDocument.fonts.status==='loaded'&&images(f.contentDocument)))}})()"#
+        );
+        loop {
+            if Instant::now() >= deadline {
+                return Err("WebView2 timeout waiting for images/iframes/fonts".into());
+            }
+            if self.script(&test, deadline)? == true {
+                return Ok(());
+            }
+            wait_for_messages((Instant::now() + Duration::from_millis(100)).min(deadline));
+        }
+    }
+
+    pub fn book_script_ran(&self, deadline: Instant) -> Result<bool, String> {
+        Ok(self.script("document.body?.dataset?.mivBookScriptRan === '1' || [...document.querySelectorAll('iframe')].some(f => f.contentDocument?.body?.dataset?.mivBookScriptRan === '1')", deadline)? == true)
+    }
+
+    pub fn devtools_pdf(&self, deadline: Instant) -> Result<Vec<u8>, String> {
+        let parsed = self.devtools_call("Page.printToPDF", &serde_json::json!({"preferCSSPageSize":true,"printBackground":true,"marginTop":0,"marginBottom":0,"marginLeft":0,"marginRight":0,"displayHeaderFooter":false}), deadline)?;
         if let Some(error) = parsed.get("error") {
             return Err(format!("Page.printToPDF: {error}"));
         }
         let data = parsed.get("data").and_then(|x| x.as_str()).ok_or_else(|| {
             format!(
                 "Page.printToPDF omitted data: {}",
-                response.chars().take(300).collect::<String>()
+                parsed.to_string().chars().take(300).collect::<String>()
             )
         })?;
         base64::engine::general_purpose::STANDARD
@@ -336,5 +454,34 @@ impl Drop for Host {
         if self.com_initialized {
             unsafe { CoUninitialize() };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn virtual_host_only() {
+        assert!(allowed_virtual_url("https://epub.invalid/a"));
+        for url in [
+            "http://epub.invalid/a",
+            "https://epub.invalid.evil/a",
+            "https://epub.invalid:443/a",
+            "https://user@epub.invalid/a",
+            "file:///a",
+            "data:text/plain,a",
+        ] {
+            assert!(!allowed_virtual_url(url), "{url}");
+        }
+    }
+    #[test]
+    fn blocked_is_capped_and_counted() {
+        let mut b = BlockedRequests::default();
+        for i in 0..300 {
+            b.record(format!("http://example.invalid/{i}"));
+        }
+        b.record("http://example.invalid/0".into());
+        assert_eq!(b.count, 301);
+        assert_eq!(b.urls.len(), MAX_RECORDED_BLOCKED_URLS);
     }
 }
