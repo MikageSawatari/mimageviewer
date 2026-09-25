@@ -17,13 +17,17 @@ cargo build -p epub-pdf-worker
 `summary.json` / `summary.md`. One failed book does not stop later books. The
 batch process returns the first nonzero book code after writing the summary.
 `convert` writes the complete PDF exactly to the requested output path. It
-merges and verifies a unique temporary file beside `<out>` before renaming; a failed
+merges and verifies a unique temporary file named `<out>.tmp-<pid>-<n>` beside
+`<out>` before renaming; a failed
 or timed-out conversion leaves no partial output at the requested path. The
 input EPUB is opened only for reading. `--user-data-dir` selects a dedicated
 WebView2 folder; it must be absent or empty. If omitted, a unique folder below
 `--work-dir` is used. The converter rejects a user data folder that contains
 the input, output, output directory, or work directory. The report records
-whether cleanup succeeded.
+whether cleanup succeeded. An already existing empty user data folder is retained;
+only a folder created by the worker is deleted. The S2 host will remove all
+`WEBVIEW2_*` variables before spawning the worker, and the worker clears them
+again before using the loader.
 
 `--progress-json` applies to `convert`. It makes stdout a line-delimited JSON
 stream with no human messages. Phases are `parse`, `extract`, `init`, `print`,
@@ -37,7 +41,8 @@ stream with no human messages. Phases are `parse`, `extract`, `init`, `print`,
 `print.done` is the number of PDF pages printed so far; `print.total` is 0
 because reflow pagination is not known in advance. Other phases use 0/1 and
 1/1. Result statuses are `success`, `drm`, `invalid`, `webview2_missing`,
-`render_failed`, and `timeout`. `blocked_requests` counts blocked attempts.
+`render_failed`, `timeout`, `webview2_overridden`, and
+`webview2_unsupported`. `blocked_requests` counts blocked attempts.
 When `--progress-json` is present, argument errors and panics also produce
 exactly one final `result` line. Panics use `render_failed` / exit code 5.
 The detailed per-book report contains up to 200 distinct blocked URLs and the
@@ -51,6 +56,14 @@ total attempt count, plus `book_script_ran`.
 | 4 | WebView2 Runtime missing |
 | 5 | WebView2 initialization, rendering, PDF validation, or merge failure |
 | 6 | timeout |
+| 7 | WebView2 registry policy or actual user data folder overrides requested settings |
+| 8 | WebView2 lacks the environment folder query or all-source request filter |
+
+`--timeout-secs 0` is invalid CLI input (exit 3); it cannot exercise the
+WebView2 timeout path. The debug build has a test-only
+`MIV_EPUB_PDF_TEST_PANIC=after_user_data` hook immediately after creating the
+user data folder. Caught panics release WebView2 objects and delete a folder
+created by this worker before emitting the final result line.
 
 `inspect` reads the ZIP/package only. `batch` uses a unique
 WebView2 user data folder below the chosen work directory. The batch work
@@ -84,9 +97,10 @@ matching dimensions and FlateDecode. This is a byte-level fidelity screen,
 not a visual comparison. Image and layout quality must be checked separately
 by rendering PDF pages.
 
-All WebView2 resource contexts and request source kinds are filtered when
-`ICoreWebView2_22` is available. Older runtimes use the legacy filter. The
-per-book report's `web_resource_filter` identifies the selected scope. Only the mapped
+All WebView2 resource contexts and request source kinds require
+`ICoreWebView2_22`; an older runtime fails with `webview2_unsupported` rather
+than using the narrower legacy filter. The per-book report's
+`web_resource_filter` identifies the selected scope. Only the mapped
 `https://epub.invalid` origin is allowed; other requests receive a synthetic
 403 response and cross-origin navigations are cancelled. Page scripts are
 disabled. Host readiness and script probes use CDP `Runtime.evaluate` rather
@@ -99,7 +113,7 @@ is created:
 
 | Argument | Reason |
 | --- | --- |
-| `--host-resolver-rules="MAP * ~NOTFOUND"` | Fail DNS resolution for arbitrary host names. |
+| `--host-resolver-rules="MAP * ^NOTFOUND"` | Fail DNS resolution for arbitrary host names. |
 | `--disable-background-networking` | Suppress Chromium background services. |
 | `--dns-prefetch-disable` | Suppress speculative DNS lookups. |
 | `--disable-preconnect` | Request suppression of speculative TCP preconnects, including IP literal hints; confirm on Runtime 153 with a connection trace. |
@@ -114,6 +128,18 @@ The virtual host maps to a local folder through
 folder mapping but do not document DNS behavior. Successful conversion with
 the resolver rule, together with a DNS/network trace, is the required runtime
 confirmation that this mapping does not resolve `epub.invalid` externally.
+Before environment creation, the worker removes every `WEBVIEW2_*` process
+variable, including `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`,
+`WEBVIEW2_USER_DATA_FOLDER`, `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`,
+`WEBVIEW2_RELEASE_CHANNEL_PREFERENCE`, and
+`WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER`. It checks both registry views under
+`HKLM` and `HKCU\Software\Policies\Microsoft\Edge\WebView2` for the worker
+exe name and `*` values in `AdditionalBrowserArguments`, `UserDataFolder`,
+`BrowserExecutableFolder`, and `ReleaseChannelPreference`. Any such policy
+causes exit 7 before conversion. After environment creation,
+`ICoreWebView2Environment7::UserDataFolder` must match the requested folder
+after path normalization. A mismatch also causes exit 7; the worker never
+deletes the unexpected folder.
 The new filter includes service-worker and shared-worker request sources; a
 fresh user data folder and disabled page scripts prevent book service workers
 from being registered. Cross-origin iframes are cancelled at navigation and
@@ -161,10 +187,20 @@ log alone cannot detect a preconnect that opened a socket without sending HTTP.
 Build both binaries with `cargo build -p epub-pdf-worker --offline`. The probe
 starts the converter suspended, assigns it to a Job with
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then resumes it. It polls the Job PID
-list and independently snapshots process parent chains. It prints one JSON
-summary and succeeds only when all WebView2 descendants belonged to the Job
-and all observed processes disappear after cancellation. Run outside the
-restricted sandbox while the 300-page book is converting:
+list and independently snapshots process parent chains and command lines. Each
+run gives the converter a unique user data folder containing a `miv-job-...`
+marker. The probe scans every WebView2 process for that marker in its
+`--user-data-dir` argument, even if its parent chain no longer reaches the
+converter. It prints one JSON summary and succeeds only when every observed
+marker PID belonged to the Job, a nonempty live marker set and the converter
+belonged to the Job immediately before cancellation, and a system-wide scan
+finds no marker process or converter afterward.
+
+The probe reads process command lines with
+`NtQueryInformationProcess(ProcessCommandLineInformation)` using limited query
+access. If a live WebView2 command line cannot be read, the probe fails with
+that PID rather than silently omitting it. Run outside the restricted sandbox
+while the 300-page book is converting:
 
 ```powershell
 .\target\debug\epub-pdf-job-probe.exe cancel C:\home\mimageviewer_testdata_epub\synthetic\manga_rtl_300p_large.epub .\target\epub-probe\cancel 60
@@ -172,9 +208,13 @@ restricted sandbox while the 300-page book is converting:
 ```
 
 `parent-kill` relaunches the probe as an intermediate owner, terminates that
-owner, then checks that its converter and every observed WebView2 PID vanished.
+owner, then checks that its converter and every live marker-matching WebView2
+PID vanished.
 Immediately before closing the Job or killing the owner, the probe requires
-the converter and every observed WebView2 PID to be alive and in the Job.
-The summary includes `job_pids`, `pre_cancel_job_pids`, `webview_pids`,
-`webview_outside_job`, `pre_cancel_alive`, `termination_ms`, `gone`, and
+the converter and every currently live marker-matching WebView2 PID to be in
+the Job. Previously observed short-lived PIDs may already have exited.
+The summary includes `job_pids`, `pre_cancel_job_pids`,
+`pre_cancel_webview_pids`, `webview_pids`,
+`webview_outside_job`, `marker`, `marker_pids`, `marker_outside_job`,
+`pre_cancel_marker_pids`, `pre_cancel_alive`, `termination_ms`, `gone`, and
 `success`. Probe outputs are disposable.

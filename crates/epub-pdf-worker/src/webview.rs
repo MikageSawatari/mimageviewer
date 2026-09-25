@@ -16,18 +16,23 @@ use webview2_com::{
         COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
         CreateCoreWebView2EnvironmentWithOptions, GetAvailableCoreWebView2BrowserVersionString,
         ICoreWebView2, ICoreWebView2_3, ICoreWebView2_22, ICoreWebView2Controller,
-        ICoreWebView2Environment, ICoreWebView2EnvironmentOptions,
+        ICoreWebView2Environment, ICoreWebView2Environment7, ICoreWebView2EnvironmentOptions,
     },
     NavigationStartingEventHandler, WebResourceRequestedEventHandler, take_pwstr,
 };
 use windows::{
     Win32::{
         Foundation::{
-            E_NOINTERFACE, E_POINTER, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+            E_NOINTERFACE, E_POINTER, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
+            GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
         },
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
             LibraryLoader::GetModuleHandleW,
+            Registry::{
+                HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_ANY, RRF_SUBKEY_WOW6432KEY,
+                RRF_SUBKEY_WOW6464KEY, RegGetValueW,
+            },
         },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG,
@@ -79,7 +84,72 @@ fn wait<T>(rx: Receiver<windows::core::Result<T>>, deadline: Instant) -> Result<
 }
 
 pub const MAX_RECORDED_BLOCKED_URLS: usize = 200;
-pub const BROWSER_NETWORK_ARGUMENTS: &str = "--host-resolver-rules=\"MAP * ~NOTFOUND\" --disable-background-networking --dns-prefetch-disable --disable-preconnect --no-pings --disable-sync --disable-component-update --disable-extensions --no-first-run";
+pub const BROWSER_NETWORK_ARGUMENTS: &str = "--host-resolver-rules=\"MAP * ^NOTFOUND\" --disable-background-networking --dns-prefetch-disable --disable-preconnect --no-pings --disable-sync --disable-component-update --disable-extensions --no-first-run";
+
+fn is_webview_environment_key(key: &std::ffi::OsStr) -> bool {
+    key.to_string_lossy()
+        .to_ascii_uppercase()
+        .starts_with("WEBVIEW2_")
+}
+
+pub fn clear_webview_environment() {
+    // The loader recognizes WEBVIEW2_* process variables, and may add new
+    // overrides in later runtimes. Remove the entire namespace before probing.
+    for (key, _) in std::env::vars_os() {
+        if is_webview_environment_key(&key) {
+            // SAFETY: called at worker start, before any WebView2 or worker threads.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+}
+
+pub fn reject_policy_overrides() -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let executable = executable
+        .file_name()
+        .ok_or("worker executable has no file name")?
+        .to_string_lossy();
+    for (hive, hive_name) in [(HKEY_LOCAL_MACHINE, "HKLM"), (HKEY_CURRENT_USER, "HKCU")] {
+        for policy in [
+            "AdditionalBrowserArguments",
+            "UserDataFolder",
+            "BrowserExecutableFolder",
+            "ReleaseChannelPreference",
+        ] {
+            let subkey = wide(&format!(
+                "Software\\Policies\\Microsoft\\Edge\\WebView2\\{policy}"
+            ));
+            for target in [executable.as_ref(), "*"] {
+                let value = wide(target);
+                for view in [RRF_SUBKEY_WOW6464KEY, RRF_SUBKEY_WOW6432KEY] {
+                    let mut bytes = 0;
+                    let result = unsafe {
+                        RegGetValueW(
+                            hive,
+                            PCWSTR(subkey.as_ptr()),
+                            PCWSTR(value.as_ptr()),
+                            RRF_RT_ANY | view,
+                            None,
+                            None,
+                            Some(&mut bytes),
+                        )
+                    };
+                    if result == ERROR_SUCCESS {
+                        return Err(format!(
+                            "WebView2 overridden by {hive_name}\\Software\\Policies\\Microsoft\\Edge\\WebView2\\{policy} value {target}"
+                        ));
+                    }
+                    if result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND {
+                        return Err(format!(
+                            "WebView2 overridden: cannot inspect {hive_name} WebView2 {policy} policy value {target}: {result:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 fn network_options() -> Result<ICoreWebView2EnvironmentOptions, String> {
     let options: ICoreWebView2EnvironmentOptions = CoreWebView2EnvironmentOptions::default().into();
@@ -139,6 +209,7 @@ pub struct Host {
 
 impl Host {
     pub fn new(user_data: &Path, deadline: Instant) -> Result<Self, String> {
+        reject_policy_overrides()?;
         let mut version_ptr = PWSTR::null();
         let probe = unsafe {
             GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut version_ptr)
@@ -228,6 +299,25 @@ impl Host {
                 h.version
             )
         })?);
+        let environment7: ICoreWebView2Environment7 = h
+            .environment
+            .as_ref()
+            .unwrap()
+            .cast()
+            .map_err(|e| format!("WebView2 unsupported: ICoreWebView2Environment7: {e}"))?;
+        let mut actual_ptr = PWSTR::null();
+        unsafe { environment7.UserDataFolder(&mut actual_ptr) }
+            .map_err(|e| format!("WebView2 unsupported: UserDataFolder unavailable: {e}"))?;
+        let actual = std::path::PathBuf::from(take_pwstr(actual_ptr));
+        if !crate::paths::same_normalized_path(user_data, &actual)
+            .map_err(|e| format!("WebView2 overridden: cannot compare user data folders: {e}"))?
+        {
+            return Err(format!(
+                "WebView2 overridden: requested user data folder {}, actual {}",
+                user_data.display(),
+                actual.display()
+            ));
+        }
 
         let (tx, rx) = mpsc::channel();
         let callback = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
@@ -278,31 +368,21 @@ impl Host {
 
     fn install_request_guard(&self) -> Result<String, String> {
         let filter = wide("*");
-        let view22 = match self.view().cast::<ICoreWebView2_22>() {
-            Ok(view) => Some(view),
-            Err(error) if error.code() == E_NOINTERFACE => None,
-            Err(error) => return Err(format!("ICoreWebView2_22: {error}")),
-        };
-        let scope = if let Some(view22) = view22 {
-            unsafe {
-                view22.AddWebResourceRequestedFilterWithRequestSourceKinds(
-                    PCWSTR(filter.as_ptr()),
-                    COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
-                    COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
-                )
+        let view22 = self.view().cast::<ICoreWebView2_22>().map_err(|error| {
+            if error.code() == E_NOINTERFACE {
+                format!("WebView2 unsupported: ICoreWebView2_22 is required: {error}")
+            } else {
+                format!("ICoreWebView2_22: {error}")
             }
-            .map_err(|e| format!("AddWebResourceRequestedFilterWithRequestSourceKinds: {e}"))?;
-            "all_source_kinds"
-        } else {
-            unsafe {
-                self.view().AddWebResourceRequestedFilter(
-                    PCWSTR(filter.as_ptr()),
-                    COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
-                )
-            }
-            .map_err(|e| format!("AddWebResourceRequestedFilter: {e}"))?;
-            "legacy_document_only"
-        };
+        })?;
+        unsafe {
+            view22.AddWebResourceRequestedFilterWithRequestSourceKinds(
+                PCWSTR(filter.as_ptr()),
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+            )
+        }
+        .map_err(|e| format!("AddWebResourceRequestedFilterWithRequestSourceKinds: {e}"))?;
         let blocked = self.blocked.clone();
         let environment = self.environment.as_ref().unwrap().clone();
         let handler = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
@@ -352,7 +432,7 @@ impl Host {
                 .add_FrameNavigationStarting(&navigation, &mut token)
         }
         .map_err(|e| format!("add_FrameNavigationStarting: {e}"))?;
-        Ok(scope.into())
+        Ok("all_source_kinds".into())
     }
 
     pub fn reset_blocked(&self) {
@@ -538,5 +618,26 @@ mod tests {
         let mut arguments = PWSTR::null();
         unsafe { options.AdditionalBrowserArguments(&mut arguments) }.unwrap();
         assert_eq!(take_pwstr(arguments), BROWSER_NETWORK_ARGUMENTS);
+        assert_eq!(
+            BROWSER_NETWORK_ARGUMENTS,
+            "--host-resolver-rules=\"MAP * ^NOTFOUND\" --disable-background-networking --dns-prefetch-disable --disable-preconnect --no-pings --disable-sync --disable-component-update --disable-extensions --no-first-run"
+        );
+    }
+
+    #[test]
+    fn clears_entire_webview_override_namespace() {
+        for key in [
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "WEBVIEW2_USER_DATA_FOLDER",
+            "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+            "WEBVIEW2_RELEASE_CHANNEL_PREFERENCE",
+            "WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER",
+            "webview2_future_override",
+        ] {
+            assert!(is_webview_environment_key(std::ffi::OsStr::new(key)));
+        }
+        assert!(!is_webview_environment_key(std::ffi::OsStr::new(
+            "MIV_EPUB_PDF_TEST_PANIC"
+        )));
     }
 }

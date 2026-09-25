@@ -5,7 +5,7 @@ use epub_pdf_worker::{
     protocol::{Event, Phase},
     render::{self, Segment},
     report::{SourceImage, UserDataCleanup},
-    webview::Host,
+    webview::{self, Host},
 };
 use std::{
     fs,
@@ -124,6 +124,7 @@ fn cleanup_user_data(dir: &Path) -> UserDataCleanup {
 struct Engine {
     work_dir: PathBuf,
     user_data: PathBuf,
+    owns_user_data: bool,
     host: Option<Host>,
     unavailable: Option<(i32, String)>,
     run_id: String,
@@ -167,15 +168,30 @@ impl Engine {
         if let Some((input, out)) = convert {
             paths::validate_convert_paths(input, out, &work_dir, &user_data)?;
         }
-        Ok(Self {
+        let owns_user_data = !user_data.exists();
+        if owns_user_data {
+            if let Some(parent) = user_data.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            fs::create_dir(&user_data).map_err(|e| e.to_string())?;
+        }
+        let engine = Self {
             work_dir,
             user_data,
+            owns_user_data,
             host: None,
             unavailable: None,
             run_id,
             sequence: 0,
             progress_json,
-        })
+        };
+        #[cfg(debug_assertions)]
+        if std::env::var_os("MIV_EPUB_PDF_TEST_PANIC").as_deref()
+            == Some(std::ffi::OsStr::new("after_user_data"))
+        {
+            panic!("test panic after user data folder creation");
+        }
+        Ok(engine)
     }
     fn progress(&self, phase: Phase, done: usize, total: usize) {
         if self.progress_json {
@@ -204,10 +220,12 @@ impl Engine {
             .ok()
             .zip(fs::canonicalize(out).ok())
             .is_some_and(|(a, b)| a == b);
-        let result = if same_file {
+        let result = if let Err(error) = webview::reject_policy_overrides() {
+            Err((7, error))
+        } else if same_file {
             Err((3, "input and output refer to the same file".into()))
         } else {
-            OutputTemp::new(out, &self.run_id, self.sequence)
+            OutputTemp::new(out, std::process::id(), self.sequence)
                 .map_err(|e| (5, e))
                 .and_then(|temp| {
                     self.process_inner(input, temp.path(), force_iframe, deadline, &mut report)?;
@@ -448,11 +466,35 @@ impl Engine {
     }
     fn finish(mut self) -> UserDataCleanup {
         self.host.take();
-        cleanup_user_data(&self.user_data)
+        if self.owns_user_data {
+            let cleanup = cleanup_user_data(&self.user_data);
+            self.owns_user_data = false;
+            cleanup
+        } else {
+            UserDataCleanup {
+                path: self.user_data.display().to_string(),
+                deleted: false,
+                held_ms: 0,
+                error: Some("pre-existing user data folder retained".into()),
+            }
+        }
+    }
+}
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.host.take();
+        if self.owns_user_data {
+            let _ = cleanup_user_data(&self.user_data);
+            self.owns_user_data = false;
+        }
     }
 }
 fn classify_webview_error(e: String) -> (i32, String) {
-    let code = if e.contains("runtime missing") {
+    let code = if e.contains("WebView2 overridden") {
+        7
+    } else if e.contains("WebView2 unsupported") {
+        8
+    } else if e.contains("runtime missing") {
         4
     } else if e.contains("timeout") {
         6
@@ -462,6 +504,7 @@ fn classify_webview_error(e: String) -> (i32, String) {
     (code, e)
 }
 fn run() -> Result<(i32, Option<Event>), String> {
+    epub_pdf_worker::webview::clear_webview_environment();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [cmd, input] if cmd == "inspect" => match package::inspect_file(Path::new(input)) {

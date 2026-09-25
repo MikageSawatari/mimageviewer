@@ -5,16 +5,21 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
-    mem::{size_of, zeroed},
+    mem::{align_of, size_of, zeroed},
     os::windows::process::CommandExt,
     path::Path,
     process::{Child, Command},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows::{
+    Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation},
     Win32::{
-        Foundation::{CloseHandle, ERROR_BAD_LENGTH, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, HANDLE},
+        Foundation::{
+            CloseHandle, ERROR_BAD_LENGTH, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
+            ERROR_NO_MORE_FILES, HANDLE, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
+            STATUS_INFO_LENGTH_MISMATCH, STILL_ACTIVE, UNICODE_STRING,
+        },
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -27,8 +32,9 @@ use windows::{
                 QueryInformationJobObject, SetInformationJobObject,
             },
             Threading::{
-                CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION,
-                ResumeThread, STARTUPINFOW, TerminateProcess,
+                CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess,
+                OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread,
+                STARTUPINFOW, TerminateProcess,
             },
         },
     },
@@ -42,8 +48,12 @@ struct Summary {
     job_pids: BTreeSet<u32>,
     pre_cancel_job_pids: BTreeSet<u32>,
     pre_cancel_webview_pids: BTreeSet<u32>,
+    pre_cancel_marker_pids: BTreeSet<u32>,
     webview_pids: BTreeSet<u32>,
     webview_outside_job: BTreeSet<u32>,
+    marker: String,
+    marker_pids: BTreeSet<u32>,
+    marker_outside_job: BTreeSet<u32>,
     gone: bool,
     pre_cancel_alive: bool,
     termination_ms: Option<u128>,
@@ -147,6 +157,76 @@ fn job_members(job: HANDLE) -> Result<BTreeSet<u32>, String> {
 struct Process {
     parent: u32,
     name: String,
+    command_line: Option<String>,
+}
+
+fn process_command_line(pid: u32) -> Result<Option<String>, String> {
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => OwnedHandle(handle),
+        Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Ok(None),
+        Err(e) => return Err(format!("OpenProcess({pid}) for command line: {e}")),
+    };
+    let mut capacity = 4096usize;
+    loop {
+        if capacity > 1024 * 1024 {
+            return Err(format!("WebView2 PID {pid} command line exceeds 1 MiB"));
+        }
+        let mut storage = vec![0u64; capacity.div_ceil(size_of::<u64>())];
+        let mut required = 0;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle.0,
+                ProcessCommandLineInformation,
+                storage.as_mut_ptr().cast(),
+                (storage.len() * size_of::<u64>()) as u32,
+                &mut required,
+            )
+        };
+        if [
+            STATUS_INFO_LENGTH_MISMATCH,
+            STATUS_BUFFER_TOO_SMALL,
+            STATUS_BUFFER_OVERFLOW,
+        ]
+        .contains(&status)
+        {
+            capacity = (required as usize).max(capacity * 2);
+            continue;
+        }
+        if status.0 < 0 {
+            let mut exit_code = 0;
+            unsafe { GetExitCodeProcess(handle.0, &mut exit_code) }
+                .map_err(|e| format!("GetExitCodeProcess({pid}): {e}"))?;
+            if exit_code != STILL_ACTIVE.0 as u32 {
+                return Ok(None);
+            }
+            return Err(format!(
+                "NtQueryInformationProcess(ProcessCommandLineInformation, PID {pid}): {status:?}"
+            ));
+        }
+        let unicode = unsafe { &*(storage.as_ptr().cast::<UNICODE_STRING>()) };
+        let start = unicode.Buffer.0 as usize;
+        let end = start
+            .checked_add(unicode.Length as usize)
+            .ok_or_else(|| format!("WebView2 PID {pid} command line pointer overflow"))?;
+        let lower = storage.as_ptr() as usize;
+        let upper = lower + storage.len() * size_of::<u64>();
+        if unicode.Length % 2 != 0
+            || !start.is_multiple_of(align_of::<u16>())
+            || start < lower
+            || end > upper
+        {
+            return Err(format!("WebView2 PID {pid} invalid command line buffer"));
+        }
+        let mut exit_code = 0;
+        unsafe { GetExitCodeProcess(handle.0, &mut exit_code) }
+            .map_err(|e| format!("GetExitCodeProcess({pid}): {e}"))?;
+        if exit_code != STILL_ACTIVE.0 as u32 {
+            return Ok(None);
+        }
+        let words =
+            unsafe { std::slice::from_raw_parts(unicode.Buffer.0, unicode.Length as usize / 2) };
+        return Ok(Some(String::from_utf16_lossy(words)));
+    }
 }
 
 fn snapshot() -> Result<HashMap<u32, Process>, String> {
@@ -163,11 +243,29 @@ fn snapshot() -> Result<HashMap<u32, Process>, String> {
             .iter()
             .position(|x| *x == 0)
             .unwrap_or(item.szExeFile.len());
+        let name = String::from_utf16_lossy(&item.szExeFile[..len]);
+        let command_line = if name.eq_ignore_ascii_case("msedgewebview2.exe") {
+            match process_command_line(item.th32ProcessID)? {
+                Some(command_line) => Some(command_line),
+                None => {
+                    if let Err(error) = unsafe { Process32NextW(handle.0, &mut item) } {
+                        if error.code() != ERROR_NO_MORE_FILES.to_hresult() {
+                            return Err(format!("Process32NextW: {error}"));
+                        }
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         processes.insert(
             item.th32ProcessID,
             Process {
                 parent: item.th32ParentProcessID,
-                name: String::from_utf16_lossy(&item.szExeFile[..len]),
+                name,
+                command_line,
             },
         );
         if let Err(error) = unsafe { Process32NextW(handle.0, &mut item) } {
@@ -208,6 +306,23 @@ fn descendants_of(
         .collect()
 }
 
+fn marker_pids(marker: &str, processes: &HashMap<u32, Process>) -> BTreeSet<u32> {
+    if marker.is_empty() {
+        return BTreeSet::new();
+    }
+    processes
+        .iter()
+        .filter_map(|(&pid, process)| {
+            let command_line = process.command_line.as_deref()?;
+            let command_line = command_line.to_ascii_lowercase();
+            (process.name.eq_ignore_ascii_case("msedgewebview2.exe")
+                && command_line.contains("--user-data-dir")
+                && command_line.contains(&marker.to_ascii_lowercase()))
+            .then_some(pid)
+        })
+        .collect()
+}
+
 fn observe(
     summary: &mut Summary,
     job: HANDLE,
@@ -217,13 +332,18 @@ fn observe(
     let processes = snapshot()?;
     ancestry.extend(processes.iter().map(|(&pid, p)| (pid, p.parent)));
     let webviews = descendants_of(summary.converter_pid, &processes, ancestry);
+    let marked = marker_pids(&summary.marker, &processes);
     // Bracket the snapshot so a short-lived child can still be accounted for.
     members.extend(job_members(job)?);
     summary.job_pids.extend(&members);
     summary
         .webview_outside_job
         .extend(webviews.difference(&members));
+    summary
+        .marker_outside_job
+        .extend(marked.difference(&members));
     summary.webview_pids.extend(webviews);
+    summary.marker_pids.extend(marked);
     Ok(())
 }
 
@@ -236,7 +356,10 @@ fn wait_gone(summary: &mut Summary, timeout: Duration) -> Result<(), String> {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err("converter or WebView2 processes survived Job close".into());
+            let marked = marker_pids(&summary.marker, &live);
+            return Err(format!(
+                "converter or WebView2 processes survived Job close; live marker PIDs: {marked:?}"
+            ));
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -244,6 +367,7 @@ fn wait_gone(summary: &mut Summary, timeout: Duration) -> Result<(), String> {
 
 fn cancel_targets_gone(summary: &Summary, live: &HashMap<u32, Process>) -> bool {
     !live.contains_key(&summary.converter_pid)
+        && marker_pids(&summary.marker, live).is_empty()
         && summary
             .pre_cancel_webview_pids
             .iter()
@@ -256,13 +380,19 @@ fn verify_live_members(
     members: &BTreeSet<u32>,
     ancestry: &HashMap<u32, u32>,
 ) -> Result<BTreeSet<u32>, String> {
-    if summary.webview_pids.is_empty() {
-        return Err("no WebView2 process was observed".into());
+    if summary.marker_pids.is_empty() {
+        return Err("no marker-matching WebView2 process was observed".into());
     }
     if !summary.webview_outside_job.is_empty() {
         return Err(format!(
             "WebView2 PIDs outside Job: {:?}",
             summary.webview_outside_job
+        ));
+    }
+    if !summary.marker_outside_job.is_empty() {
+        return Err(format!(
+            "marker-matching WebView2 PIDs outside Job: {:?}",
+            summary.marker_outside_job
         ));
     }
     if !live.contains_key(&summary.converter_pid) {
@@ -271,10 +401,11 @@ fn verify_live_members(
     if !members.contains(&summary.converter_pid) {
         return Err("converter not in Job before cancel".into());
     }
-    let current = current_webviews(summary, live, ancestry);
-    if current.is_empty() {
-        return Err("no WebView2 process is alive before cancel".into());
+    let marked = marker_pids(&summary.marker, live);
+    if marked.is_empty() {
+        return Err("no marker-matching WebView2 process is alive before cancel".into());
     }
+    let current = current_webviews(summary, live, ancestry);
     for pid in &current {
         if !members.contains(pid) {
             return Err(format!("WebView2 PID {pid} not in Job before cancel"));
@@ -289,6 +420,7 @@ fn current_webviews(
     ancestry: &HashMap<u32, u32>,
 ) -> BTreeSet<u32> {
     let mut current = descendants_of(summary.converter_pid, live, ancestry);
+    current.extend(marker_pids(&summary.marker, live));
     // An observed renderer can outlive the intermediate process in its parent chain.
     current.extend(summary.webview_pids.iter().copied().filter(|pid| {
         live.get(pid)
@@ -307,12 +439,18 @@ fn check_before_cancel(
     ancestry.extend(live.iter().map(|(&pid, p)| (pid, p.parent)));
     members.extend(job_members(job)?);
     let current = current_webviews(summary, &live, ancestry);
+    let marked = marker_pids(&summary.marker, &live);
     summary
         .webview_outside_job
         .extend(current.difference(&members));
+    summary
+        .marker_outside_job
+        .extend(marked.difference(&members));
     let current = verify_live_members(summary, &live, &members, ancestry)?;
     summary.webview_pids.extend(&current);
+    summary.marker_pids.extend(&marked);
     summary.pre_cancel_webview_pids = current;
+    summary.pre_cancel_marker_pids = marked;
     summary.pre_cancel_job_pids = members.clone();
     summary.job_pids.extend(members);
     summary.pre_cancel_alive = true;
@@ -322,8 +460,15 @@ fn check_before_cancel(
 fn start_converter(
     input: &Path,
     output_dir: &Path,
-) -> Result<(OwnedHandle, OwnedHandle, OwnedHandle, u32), String> {
+) -> Result<(OwnedHandle, OwnedHandle, OwnedHandle, u32, String), String> {
     fs::create_dir_all(output_dir).map_err(|e| e.to_string())?;
+    let output_dir = fs::canonicalize(output_dir).map_err(|e| e.to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let marker = format!("miv-job-{}-{nonce}", std::process::id());
+    let user_data = output_dir.join(format!("user-data-{marker}"));
     let job =
         OwnedHandle(unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(|e| e.to_string())?);
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
@@ -349,7 +494,7 @@ fn start_converter(
         "--work-dir".into(),
         output_dir.join("work").to_string_lossy().into_owned(),
         "--user-data-dir".into(),
-        output_dir.join("user-data").to_string_lossy().into_owned(),
+        user_data.to_string_lossy().into_owned(),
         "--timeout-secs".into(),
         "600".into(),
         "--progress-json".into(),
@@ -385,7 +530,7 @@ fn start_converter(
     if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
         return Err("ResumeThread failed".into());
     }
-    Ok((job, process, thread_handle, pi.dwProcessId))
+    Ok((job, process, thread_handle, pi.dwProcessId, marker))
 }
 
 fn run_owner(input: &Path, output_dir: &Path, state: Option<&Path>, timeout: Duration) -> Summary {
@@ -399,14 +544,15 @@ fn run_owner(input: &Path, output_dir: &Path, state: Option<&Path>, timeout: Dur
         ..Summary::default()
     };
     let result = (|| -> Result<(), String> {
-        let (job, _process, _thread, pid) = start_converter(input, output_dir)?;
+        let (job, _process, _thread, pid, marker) = start_converter(input, output_dir)?;
         summary.converter_pid = pid;
+        summary.marker = marker;
         let deadline = Instant::now() + timeout;
         let mut ancestry = HashMap::new();
         let mut first_webview = None;
         loop {
             observe(&mut summary, job.0, &mut ancestry)?;
-            if !summary.webview_pids.is_empty() {
+            if !summary.marker_pids.is_empty() {
                 first_webview.get_or_insert_with(Instant::now);
             }
             if first_webview.is_some_and(|time: Instant| time.elapsed() >= Duration::from_secs(2)) {
@@ -422,7 +568,7 @@ fn run_owner(input: &Path, output_dir: &Path, state: Option<&Path>, timeout: Dur
             match check_before_cancel(&mut summary, job.0, &mut ancestry) {
                 Ok(()) => break,
                 Err(e)
-                    if e == "no WebView2 process is alive before cancel"
+                    if e == "no marker-matching WebView2 process is alive before cancel"
                         && Instant::now() < deadline =>
                 {
                     thread::sleep(Duration::from_millis(100));
@@ -446,7 +592,9 @@ fn run_owner(input: &Path, output_dir: &Path, state: Option<&Path>, timeout: Dur
                 observe(&mut summary, job.0, &mut ancestry)?;
                 match check_before_cancel(&mut summary, job.0, &mut ancestry) {
                     Ok(()) => {}
-                    Err(e) if e == "no WebView2 process is alive before cancel" => continue,
+                    Err(e) if e == "no marker-matching WebView2 process is alive before cancel" => {
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -457,13 +605,24 @@ fn run_owner(input: &Path, output_dir: &Path, state: Option<&Path>, timeout: Dur
         summary.termination_ms = Some(stopped_at.elapsed().as_millis());
         gone?;
         summary.success = summary.pre_cancel_alive
-            && !summary.pre_cancel_webview_pids.is_empty()
+            && !summary.pre_cancel_marker_pids.is_empty()
             && summary.webview_outside_job.is_empty()
+            && summary.marker_outside_job.is_empty()
             && summary.gone;
         Ok(())
     })();
     if let Err(e) = result {
         summary.message = e;
+        if let Some(path) = state {
+            let _ = fs::write(
+                path,
+                serde_json::to_vec(&OwnerState {
+                    summary: summary.clone(),
+                    ancestry: HashMap::new(),
+                })
+                .unwrap_or_default(),
+            );
+        }
     } else {
         summary.message = "all checks passed".into();
     }
@@ -496,6 +655,13 @@ fn run_parent_kill(input: &Path, output_dir: &Path, timeout: Duration) -> Summar
         let mut last_issue = "owner did not observe WebView2 before deadline".to_string();
         while Instant::now() < deadline {
             if let Some(status) = owner.0.try_wait().map_err(|e| e.to_string())? {
+                if let Ok(bytes) = fs::read(&state)
+                    && let Ok(value) = serde_json::from_slice::<OwnerState>(&bytes)
+                    && value.summary.message != "ready"
+                {
+                    summary = value.summary;
+                    return Err(format!("owner exited early: {status}: {}", summary.message));
+                }
                 return Err(format!("owner exited early: {status}"));
             }
             if let Ok(bytes) = fs::read(&state)
@@ -509,6 +675,12 @@ fn run_parent_kill(input: &Path, output_dir: &Path, timeout: Duration) -> Summar
                             summary.webview_outside_job
                         ));
                     }
+                    if !summary.marker_outside_job.is_empty() {
+                        return Err(format!(
+                            "marker-matching WebView2 PIDs outside Job: {:?}",
+                            summary.marker_outside_job
+                        ));
+                    }
                     // The owner refreshes Job membership; retry if a newly
                     // started renderer is newer than the state file.
                     let processes = snapshot()?;
@@ -519,8 +691,11 @@ fn run_parent_kill(input: &Path, output_dir: &Path, timeout: Duration) -> Summar
                         return Err("converter not in Job before parent-kill".into());
                     }
                     let current = current_webviews(&summary, &processes, &value.ancestry);
-                    if current.is_empty() {
-                        last_issue = "no WebView2 process is alive before parent-kill".into();
+                    let marked = marker_pids(&summary.marker, &processes);
+                    if marked.is_empty() {
+                        last_issue =
+                            "no marker-matching WebView2 process is alive before parent-kill"
+                                .into();
                     } else if !current.is_subset(&summary.pre_cancel_job_pids) {
                         last_issue = format!(
                             "current WebView2 PIDs not yet confirmed in Job: {:?}",
@@ -530,7 +705,9 @@ fn run_parent_kill(input: &Path, output_dir: &Path, timeout: Duration) -> Summar
                         );
                     } else {
                         summary.webview_pids.extend(&current);
+                        summary.marker_pids.extend(&marked);
                         summary.pre_cancel_webview_pids = current;
+                        summary.pre_cancel_marker_pids = marked;
                         ready = true;
                         break;
                     }
@@ -554,8 +731,9 @@ fn run_parent_kill(input: &Path, output_dir: &Path, timeout: Duration) -> Summar
         summary.termination_ms = Some(stopped_at.elapsed().as_millis());
         gone?;
         summary.success = summary.pre_cancel_alive
-            && !summary.pre_cancel_webview_pids.is_empty()
+            && !summary.pre_cancel_marker_pids.is_empty()
             && summary.webview_outside_job.is_empty()
+            && summary.marker_outside_job.is_empty()
             && summary.gone;
         Ok(())
     })();
@@ -595,6 +773,7 @@ mod tests {
                 Process {
                     parent: 1,
                     name: "mimageviewer-epub-pdf.exe".into(),
+                    command_line: None,
                 },
             ),
             (
@@ -602,6 +781,7 @@ mod tests {
                 Process {
                     parent: 10,
                     name: "msedgewebview2.exe".into(),
+                    command_line: None,
                 },
             ),
             (
@@ -609,6 +789,7 @@ mod tests {
                 Process {
                     parent: 11,
                     name: "msedgewebview2.exe".into(),
+                    command_line: None,
                 },
             ),
             (
@@ -616,6 +797,7 @@ mod tests {
                 Process {
                     parent: 2,
                     name: "msedgewebview2.exe".into(),
+                    command_line: None,
                 },
             ),
         ]);
@@ -632,18 +814,34 @@ mod tests {
     }
 
     #[test]
+    fn reads_current_process_command_line() {
+        let command_line = process_command_line(std::process::id()).unwrap().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let name = exe.file_name().unwrap().to_string_lossy();
+        assert!(
+            command_line
+                .to_ascii_lowercase()
+                .contains(&name.to_ascii_lowercase()),
+            "{command_line}"
+        );
+    }
+
+    #[test]
     fn cancellation_requires_live_job_members() {
         let mut summary = Summary {
             converter_pid: 10,
+            marker: "miv-job-test".into(),
             ..Summary::default()
         };
         let converter = Process {
             parent: 1,
             name: "mimageviewer-epub-pdf.exe".into(),
+            command_line: None,
         };
         let webview = Process {
             parent: 10,
             name: "msedgewebview2.exe".into(),
+            command_line: Some("msedgewebview2.exe --user-data-dir=C:\\tmp\\miv-job-test".into()),
         };
         let live = HashMap::from([(10, converter), (11, webview)]);
         let ancestry = HashMap::new();
@@ -651,6 +849,7 @@ mod tests {
             verify_live_members(&summary, &live, &BTreeSet::from([10, 11]), &ancestry).is_err()
         );
         summary.webview_pids.insert(11);
+        summary.marker_pids.insert(11);
         assert!(
             verify_live_members(
                 &summary,
@@ -682,8 +881,11 @@ mod tests {
     fn short_lived_webview_does_not_block_cancel() {
         let summary = Summary {
             converter_pid: 10,
+            marker: "miv-job-test".into(),
             webview_pids: BTreeSet::from([11, 12]),
+            marker_pids: BTreeSet::from([11, 12]),
             pre_cancel_webview_pids: BTreeSet::from([12]),
+            pre_cancel_marker_pids: BTreeSet::from([12]),
             ..Summary::default()
         };
         let live = HashMap::from([
@@ -692,6 +894,7 @@ mod tests {
                 Process {
                     parent: 1,
                     name: "converter.exe".into(),
+                    command_line: None,
                 },
             ),
             (
@@ -699,6 +902,7 @@ mod tests {
                 Process {
                     parent: 10,
                     name: "msedgewebview2.exe".into(),
+                    command_line: Some("--user-data-dir=C:\\tmp\\miv-job-test".into()),
                 },
             ),
         ]);
@@ -715,7 +919,7 @@ mod tests {
                 &HashMap::new()
             )
             .unwrap_err()
-            .contains("no WebView2 process is alive")
+            .contains("no marker-matching WebView2 process is alive")
         );
         assert!(!cancel_targets_gone(&summary, &live));
         assert!(cancel_targets_gone(&summary, &HashMap::new()));
@@ -733,6 +937,7 @@ mod tests {
                 Process {
                     parent: 1,
                     name: "converter.exe".into(),
+                    command_line: None,
                 },
             ),
             (
@@ -740,6 +945,7 @@ mod tests {
                 Process {
                     parent: 11,
                     name: "msedgewebview2.exe".into(),
+                    command_line: None,
                 },
             ),
         ]);
@@ -747,5 +953,49 @@ mod tests {
             current_webviews(&summary, &live, &HashMap::from([(11, 10)])),
             BTreeSet::from([12])
         );
+    }
+
+    #[test]
+    fn marker_finds_webview_without_parent_chain_and_checks_job() {
+        let summary = Summary {
+            converter_pid: 10,
+            marker: "miv-job-test".into(),
+            marker_pids: BTreeSet::from([13]),
+            ..Summary::default()
+        };
+        let live = HashMap::from([
+            (
+                10,
+                Process {
+                    parent: 1,
+                    name: "converter.exe".into(),
+                    command_line: None,
+                },
+            ),
+            (
+                13,
+                Process {
+                    parent: 999,
+                    name: "msedgewebview2.exe".into(),
+                    command_line: Some(
+                        "msedgewebview2.exe --user-data-dir=C:\\tmp\\user-data-miv-job-test".into(),
+                    ),
+                },
+            ),
+        ]);
+        assert_eq!(marker_pids(&summary.marker, &live), BTreeSet::from([13]));
+        assert_eq!(
+            verify_live_members(&summary, &live, &BTreeSet::from([10, 13]), &HashMap::new())
+                .unwrap(),
+            BTreeSet::from([13])
+        );
+        assert!(
+            verify_live_members(&summary, &live, &BTreeSet::from([10]), &HashMap::new())
+                .unwrap_err()
+                .contains("not in Job")
+        );
+        let after_cancel = HashMap::from([(13, live[&13].clone())]);
+        assert!(!cancel_targets_gone(&summary, &after_cancel));
+        assert!(cancel_targets_gone(&summary, &HashMap::new()));
     }
 }

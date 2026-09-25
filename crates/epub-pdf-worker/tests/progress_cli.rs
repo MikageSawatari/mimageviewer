@@ -107,3 +107,84 @@ fn unsafe_user_data_path_is_invalid_and_has_final_result() {
         fs::remove_dir_all(&root).unwrap();
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn panic_after_user_data_creation_cleans_folder_and_reports_once() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "epub-pdf-panic-test-{}-{nonce}",
+        std::process::id()
+    ));
+    let user_data = root.join("user-data");
+    let out = root.join("out.pdf.part");
+    let output = Command::new(binary())
+        .arg("convert")
+        .arg(root.join("missing.epub"))
+        .arg(&out)
+        .arg("--work-dir")
+        .arg(root.join("work"))
+        .arg("--user-data-dir")
+        .arg(&user_data)
+        .arg("--progress-json")
+        .env("MIV_EPUB_PDF_TEST_PANIC", "after_user_data")
+        .output()
+        .unwrap();
+    assert_final_result(&output, "render_failed", 5);
+    assert!(!user_data.exists());
+    assert!(!out.exists());
+    if root.exists() {
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn panic_keeps_preexisting_empty_user_data_folder() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "epub-pdf-existing-data-test-{}-{nonce}",
+        std::process::id()
+    ));
+    let user_data = root.join("user-data");
+    fs::create_dir_all(&user_data).unwrap();
+    let output = Command::new(binary())
+        .arg("convert")
+        .arg(root.join("missing.epub"))
+        .arg(root.join("out.pdf.part"))
+        .arg("--work-dir")
+        .arg(root.join("work"))
+        .arg("--user-data-dir")
+        .arg(&user_data)
+        .arg("--progress-json")
+        .env("MIV_EPUB_PDF_TEST_PANIC", "after_user_data")
+        .output()
+        .unwrap();
+    assert_final_result(&output, "render_failed", 5);
+    assert!(user_data.is_dir());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn zero_timeout_is_invalid_before_webview_creation() {
+    let output = Command::new(binary())
+        .args([
+            "convert",
+            "missing.epub",
+            "out.pdf",
+            "--work-dir",
+            "work",
+            "--timeout-secs",
+            "0",
+            "--progress-json",
+        ])
+        .output()
+        .unwrap();
+    assert_final_result(&output, "invalid", 3);
+}

@@ -53,6 +53,12 @@ fn same_or_under(path: &Path, root: &Path) -> bool {
     path.len() >= root.len() && path.iter().zip(&root).all(|(a, b)| a == b)
 }
 
+pub fn same_normalized_path(left: &Path, right: &Path) -> Result<bool, String> {
+    let left = normalized(left)?;
+    let right = normalized(right)?;
+    Ok(same_or_under(&left, &right) && same_or_under(&right, &left))
+}
+
 pub fn validate_convert_paths(
     input: &Path,
     out: &Path,
@@ -76,7 +82,7 @@ pub fn validate_convert_paths(
     Ok(())
 }
 
-pub fn output_temp_path(out: &Path, run_id: &str, sequence: usize) -> Result<PathBuf, String> {
+pub fn output_temp_path(out: &Path, pid: u32, sequence: usize) -> Result<PathBuf, String> {
     let parent = out
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -85,7 +91,7 @@ pub fn output_temp_path(out: &Path, run_id: &str, sequence: usize) -> Result<Pat
         .file_name()
         .ok_or("output has no file name")?
         .to_string_lossy();
-    Ok(parent.join(format!("{name}.tmp-{run_id}-{sequence}")))
+    Ok(parent.join(format!("{name}.tmp-{pid}-{sequence}")))
 }
 
 pub struct OutputTemp {
@@ -93,8 +99,8 @@ pub struct OutputTemp {
 }
 
 impl OutputTemp {
-    pub fn new(out: &Path, run_id: &str, sequence: usize) -> Result<Self, String> {
-        let path = output_temp_path(out, run_id, sequence)?;
+    pub fn new(out: &Path, pid: u32, sequence: usize) -> Result<Self, String> {
+        let path = output_temp_path(out, pid, sequence)?;
         fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
         fs::OpenOptions::new()
             .write(true)
@@ -134,21 +140,21 @@ mod tests {
         let root = test_root("path-test");
         let out = root.join("book.pdf.part");
         {
-            let temp = OutputTemp::new(&out, "run", 2).unwrap();
+            let temp = OutputTemp::new(&out, 123, 2).unwrap();
             assert_eq!(temp.path().parent(), out.parent());
-            assert_eq!(temp.path().file_name().unwrap(), "book.pdf.part.tmp-run-2");
+            assert_eq!(temp.path().file_name().unwrap(), "book.pdf.part.tmp-123-2");
             fs::write(temp.path(), b"partial").unwrap();
         }
-        assert!(!output_temp_path(&out, "run", 2).unwrap().exists());
+        assert!(!output_temp_path(&out, 123, 2).unwrap().exists());
         {
-            let temp = OutputTemp::new(&out, "run", 3).unwrap();
+            let temp = OutputTemp::new(&out, 123, 3).unwrap();
             fs::write(temp.path(), b"complete").unwrap();
             temp.publish(&out).unwrap();
         }
         assert_eq!(fs::read(&out).unwrap(), b"complete");
         assert_eq!(
-            output_temp_path(Path::new("book.pdf"), "run", 1).unwrap(),
-            Path::new(".").join("book.pdf.tmp-run-1")
+            output_temp_path(Path::new("book.pdf"), 123, 1).unwrap(),
+            Path::new(".").join("book.pdf.tmp-123-1")
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -176,5 +182,12 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn compares_normalized_user_data_paths() {
+        let root = test_root("same-path");
+        assert!(same_normalized_path(&root.join("a/../data"), &root.join("data")).unwrap());
+        assert!(!same_normalized_path(&root.join("data"), &root.join("other")).unwrap());
     }
 }

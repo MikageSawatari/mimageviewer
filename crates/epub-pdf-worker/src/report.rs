@@ -83,6 +83,8 @@ impl Report {
             2 => "drm",
             3 => "invalid_epub",
             4 => "runtime_missing",
+            7 => "webview2_overridden",
+            8 => "webview2_unsupported",
             6 => "timeout",
             _ => "render_failure",
         }
