@@ -41,6 +41,7 @@ struct Summary {
     converter_pid: u32,
     job_pids: BTreeSet<u32>,
     pre_cancel_job_pids: BTreeSet<u32>,
+    pre_cancel_webview_pids: BTreeSet<u32>,
     webview_pids: BTreeSet<u32>,
     webview_outside_job: BTreeSet<u32>,
     gone: bool,
@@ -48,6 +49,12 @@ struct Summary {
     termination_ms: Option<u128>,
     success: bool,
     message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OwnerState {
+    summary: Summary,
+    ancestry: HashMap<u32, u32>,
 }
 
 struct OwnedHandle(HANDLE);
@@ -206,11 +213,11 @@ fn observe(
     job: HANDLE,
     ancestry: &mut HashMap<u32, u32>,
 ) -> Result<(), String> {
+    let mut members = job_members(job)?;
     let processes = snapshot()?;
     ancestry.extend(processes.iter().map(|(&pid, p)| (pid, p.parent)));
     let webviews = descendants_of(summary.converter_pid, &processes, ancestry);
-    let mut members = job_members(job)?;
-    // A child can start between the snapshot and the first Job query.
+    // Bracket the snapshot so a short-lived child can still be accounted for.
     members.extend(job_members(job)?);
     summary.job_pids.extend(&members);
     summary
@@ -224,12 +231,7 @@ fn wait_gone(summary: &mut Summary, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
         let live = snapshot()?;
-        if !live.contains_key(&summary.converter_pid)
-            && summary
-                .webview_pids
-                .iter()
-                .all(|pid| !live.contains_key(pid))
-        {
+        if cancel_targets_gone(summary, &live) {
             summary.gone = true;
             return Ok(());
         }
@@ -240,11 +242,20 @@ fn wait_gone(summary: &mut Summary, timeout: Duration) -> Result<(), String> {
     }
 }
 
+fn cancel_targets_gone(summary: &Summary, live: &HashMap<u32, Process>) -> bool {
+    !live.contains_key(&summary.converter_pid)
+        && summary
+            .pre_cancel_webview_pids
+            .iter()
+            .all(|pid| !live.contains_key(pid))
+}
+
 fn verify_live_members(
     summary: &Summary,
     live: &HashMap<u32, Process>,
     members: &BTreeSet<u32>,
-) -> Result<(), String> {
+    ancestry: &HashMap<u32, u32>,
+) -> Result<BTreeSet<u32>, String> {
     if summary.webview_pids.is_empty() {
         return Err("no WebView2 process was observed".into());
     }
@@ -260,21 +271,48 @@ fn verify_live_members(
     if !members.contains(&summary.converter_pid) {
         return Err("converter not in Job before cancel".into());
     }
-    for pid in &summary.webview_pids {
-        if !live.contains_key(pid) {
-            return Err(format!("WebView2 PID {pid} already exited before cancel"));
-        }
+    let current = current_webviews(summary, live, ancestry);
+    if current.is_empty() {
+        return Err("no WebView2 process is alive before cancel".into());
+    }
+    for pid in &current {
         if !members.contains(pid) {
             return Err(format!("WebView2 PID {pid} not in Job before cancel"));
         }
     }
-    Ok(())
+    Ok(current)
 }
 
-fn check_before_cancel(summary: &mut Summary, job: HANDLE) -> Result<(), String> {
+fn current_webviews(
+    summary: &Summary,
+    live: &HashMap<u32, Process>,
+    ancestry: &HashMap<u32, u32>,
+) -> BTreeSet<u32> {
+    let mut current = descendants_of(summary.converter_pid, live, ancestry);
+    // An observed renderer can outlive the intermediate process in its parent chain.
+    current.extend(summary.webview_pids.iter().copied().filter(|pid| {
+        live.get(pid)
+            .is_some_and(|process| process.name.eq_ignore_ascii_case("msedgewebview2.exe"))
+    }));
+    current
+}
+
+fn check_before_cancel(
+    summary: &mut Summary,
+    job: HANDLE,
+    ancestry: &mut HashMap<u32, u32>,
+) -> Result<(), String> {
+    let mut members = job_members(job)?;
     let live = snapshot()?;
-    let members = job_members(job)?;
-    verify_live_members(summary, &live, &members)?;
+    ancestry.extend(live.iter().map(|(&pid, p)| (pid, p.parent)));
+    members.extend(job_members(job)?);
+    let current = current_webviews(summary, &live, ancestry);
+    summary
+        .webview_outside_job
+        .extend(current.difference(&members));
+    let current = verify_live_members(summary, &live, &members, ancestry)?;
+    summary.webview_pids.extend(&current);
+    summary.pre_cancel_webview_pids = current;
     summary.pre_cancel_job_pids = members.clone();
     summary.job_pids.extend(members);
     summary.pre_cancel_alive = true;
@@ -379,17 +417,38 @@ fn run_owner(input: &Path, output_dir: &Path, state: Option<&Path>, timeout: Dur
             }
             thread::sleep(Duration::from_millis(100));
         }
-        observe(&mut summary, job.0, &mut ancestry)?;
-        check_before_cancel(&mut summary, job.0)?;
+        loop {
+            observe(&mut summary, job.0, &mut ancestry)?;
+            match check_before_cancel(&mut summary, job.0, &mut ancestry) {
+                Ok(()) => break,
+                Err(e)
+                    if e == "no WebView2 process is alive before cancel"
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => return Err(e),
+            }
+        }
         if let Some(path) = state {
             summary.message = "ready".into();
-            fs::write(
-                path,
-                serde_json::to_vec(&summary).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
             loop {
-                thread::sleep(Duration::from_secs(1));
+                fs::write(
+                    path,
+                    serde_json::to_vec(&OwnerState {
+                        summary: summary.clone(),
+                        ancestry: ancestry.clone(),
+                    })
+                    .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                thread::sleep(Duration::from_millis(100));
+                observe(&mut summary, job.0, &mut ancestry)?;
+                match check_before_cancel(&mut summary, job.0, &mut ancestry) {
+                    Ok(()) => {}
+                    Err(e) if e == "no WebView2 process is alive before cancel" => continue,
+                    Err(e) => return Err(e),
+                }
             }
         }
         let stopped_at = Instant::now();
@@ -397,7 +456,8 @@ fn run_owner(input: &Path, output_dir: &Path, state: Option<&Path>, timeout: Dur
         let gone = wait_gone(&mut summary, Duration::from_secs(20));
         summary.termination_ms = Some(stopped_at.elapsed().as_millis());
         gone?;
-        summary.success = !summary.webview_pids.is_empty()
+        summary.success = summary.pre_cancel_alive
+            && !summary.pre_cancel_webview_pids.is_empty()
             && summary.webview_outside_job.is_empty()
             && summary.gone;
         Ok(())
@@ -433,33 +493,56 @@ fn run_parent_kill(input: &Path, output_dir: &Path, timeout: Duration) -> Summar
         );
         let deadline = Instant::now() + timeout;
         let mut ready = false;
+        let mut last_issue = "owner did not observe WebView2 before deadline".to_string();
         while Instant::now() < deadline {
-            if let Ok(bytes) = fs::read(&state)
-                && let Ok(value) = serde_json::from_slice::<Summary>(&bytes)
-            {
-                summary = value;
-                if summary.message == "ready" {
-                    ready = true;
-                    break;
-                }
-            }
             if let Some(status) = owner.0.try_wait().map_err(|e| e.to_string())? {
                 return Err(format!("owner exited early: {status}"));
             }
+            if let Ok(bytes) = fs::read(&state)
+                && let Ok(value) = serde_json::from_slice::<OwnerState>(&bytes)
+            {
+                summary = value.summary;
+                if summary.message == "ready" {
+                    if !summary.webview_outside_job.is_empty() {
+                        return Err(format!(
+                            "WebView2 PIDs outside Job: {:?}",
+                            summary.webview_outside_job
+                        ));
+                    }
+                    // The owner refreshes Job membership; retry if a newly
+                    // started renderer is newer than the state file.
+                    let processes = snapshot()?;
+                    if !processes.contains_key(&summary.converter_pid) {
+                        return Err("converter already exited before parent-kill".into());
+                    }
+                    if !summary.pre_cancel_job_pids.contains(&summary.converter_pid) {
+                        return Err("converter not in Job before parent-kill".into());
+                    }
+                    let current = current_webviews(&summary, &processes, &value.ancestry);
+                    if current.is_empty() {
+                        last_issue = "no WebView2 process is alive before parent-kill".into();
+                    } else if !current.is_subset(&summary.pre_cancel_job_pids) {
+                        last_issue = format!(
+                            "current WebView2 PIDs not yet confirmed in Job: {:?}",
+                            current
+                                .difference(&summary.pre_cancel_job_pids)
+                                .collect::<Vec<_>>()
+                        );
+                    } else {
+                        summary.webview_pids.extend(&current);
+                        summary.pre_cancel_webview_pids = current;
+                        ready = true;
+                        break;
+                    }
+                }
+            }
             thread::sleep(Duration::from_millis(100));
         }
-        // Snapshot independently while the owner is alive, before terminating it.
-        if ready {
-            let processes = snapshot()?;
-            summary.webview_pids.extend(descendants_of(
-                summary.converter_pid,
-                &processes,
-                &HashMap::new(),
-            ));
-            verify_live_members(&summary, &processes, &summary.pre_cancel_job_pids)?;
-            if owner.0.try_wait().map_err(|e| e.to_string())?.is_some() {
-                return Err("owner already exited before parent-kill".into());
-            }
+        if !ready {
+            return Err(last_issue);
+        }
+        if owner.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Err("owner already exited before parent-kill".into());
         }
         let stopped_at = Instant::now();
         owner
@@ -467,13 +550,11 @@ fn run_parent_kill(input: &Path, output_dir: &Path, timeout: Duration) -> Summar
             .kill()
             .map_err(|e| format!("TerminateProcess(owner): {e}"))?;
         owner.0.wait().map_err(|e| e.to_string())?;
-        if !ready {
-            return Err("owner did not observe WebView2 before deadline".into());
-        }
         let gone = wait_gone(&mut summary, Duration::from_secs(20));
         summary.termination_ms = Some(stopped_at.elapsed().as_millis());
         gone?;
-        summary.success = !summary.webview_pids.is_empty()
+        summary.success = summary.pre_cancel_alive
+            && !summary.pre_cancel_webview_pids.is_empty()
             && summary.webview_outside_job.is_empty()
             && summary.gone;
         Ok(())
@@ -494,7 +575,11 @@ fn main() {
         [mode, input, output_dir, state, timeout] if mode == "owner" => run_owner(Path::new(input), Path::new(output_dir), Some(Path::new(state)), Duration::from_secs(timeout.parse().unwrap_or(60))),
         _ => Summary { message: "usage: epub-pdf-job-probe <cancel|parent-kill> <large.epub> <output-dir> <timeout-secs>".into(), ..Summary::default() },
     };
-    println!("{}", serde_json::to_string(&summary).unwrap());
+    if args.first().is_some_and(|mode| mode == "owner") {
+        eprintln!("{}", serde_json::to_string(&summary).unwrap());
+    } else {
+        println!("{}", serde_json::to_string(&summary).unwrap());
+    }
     std::process::exit(if summary.success { 0 } else { 1 });
 }
 
@@ -561,18 +646,106 @@ mod tests {
             name: "msedgewebview2.exe".into(),
         };
         let live = HashMap::from([(10, converter), (11, webview)]);
-        assert!(verify_live_members(&summary, &live, &BTreeSet::from([10, 11])).is_err());
+        let ancestry = HashMap::new();
+        assert!(
+            verify_live_members(&summary, &live, &BTreeSet::from([10, 11]), &ancestry).is_err()
+        );
         summary.webview_pids.insert(11);
         assert!(
-            verify_live_members(&summary, &HashMap::new(), &BTreeSet::from([10, 11]))
-                .unwrap_err()
-                .contains("converter already exited")
+            verify_live_members(
+                &summary,
+                &HashMap::new(),
+                &BTreeSet::from([10, 11]),
+                &ancestry
+            )
+            .unwrap_err()
+            .contains("converter already exited")
         );
         assert!(
-            verify_live_members(&summary, &live, &BTreeSet::from([10]))
+            verify_live_members(&summary, &live, &BTreeSet::from([10]), &ancestry)
                 .unwrap_err()
                 .contains("not in Job")
         );
-        assert!(verify_live_members(&summary, &live, &BTreeSet::from([10, 11])).is_ok());
+        assert_eq!(
+            verify_live_members(&summary, &live, &BTreeSet::from([10, 11]), &ancestry).unwrap(),
+            BTreeSet::from([11])
+        );
+        summary.webview_outside_job.insert(12);
+        assert!(
+            verify_live_members(&summary, &live, &BTreeSet::from([10, 11]), &ancestry)
+                .unwrap_err()
+                .contains("outside Job")
+        );
+    }
+
+    #[test]
+    fn short_lived_webview_does_not_block_cancel() {
+        let summary = Summary {
+            converter_pid: 10,
+            webview_pids: BTreeSet::from([11, 12]),
+            pre_cancel_webview_pids: BTreeSet::from([12]),
+            ..Summary::default()
+        };
+        let live = HashMap::from([
+            (
+                10,
+                Process {
+                    parent: 1,
+                    name: "converter.exe".into(),
+                },
+            ),
+            (
+                12,
+                Process {
+                    parent: 10,
+                    name: "msedgewebview2.exe".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            verify_live_members(&summary, &live, &BTreeSet::from([10, 12]), &HashMap::new())
+                .unwrap(),
+            BTreeSet::from([12])
+        );
+        assert!(
+            verify_live_members(
+                &summary,
+                &HashMap::from([(10, live[&10].clone())]),
+                &BTreeSet::from([10]),
+                &HashMap::new()
+            )
+            .unwrap_err()
+            .contains("no WebView2 process is alive")
+        );
+        assert!(!cancel_targets_gone(&summary, &live));
+        assert!(cancel_targets_gone(&summary, &HashMap::new()));
+    }
+
+    #[test]
+    fn fresh_snapshot_finds_child_after_intermediate_parent_exits() {
+        let summary = Summary {
+            converter_pid: 10,
+            ..Summary::default()
+        };
+        let live = HashMap::from([
+            (
+                10,
+                Process {
+                    parent: 1,
+                    name: "converter.exe".into(),
+                },
+            ),
+            (
+                12,
+                Process {
+                    parent: 11,
+                    name: "msedgewebview2.exe".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            current_webviews(&summary, &live, &HashMap::from([(11, 10)])),
+            BTreeSet::from([12])
+        );
     }
 }
