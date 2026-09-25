@@ -214,6 +214,11 @@ install されない恐れがあった。次の規則に置き換える。
   読み取り中に書かれた key の並びは、書き込み前・後どちらの値でもよい (§2.2)。
 - 読み取り後、install 前に commit された書き込みは「表示後の評価変更」と同じ扱いにする。install 直後、
   最初の描画より前に cache / filter / membership へ反映し、順序へは反映しない。これで install は必ず一度で終わる。
+  membership のうち、**外れた行の除去と badge / filter は最初の描画より前**に行う。**新たに入る行** (★N 一覧、
+  Ctrl+G の評価条件、評価条件を持つ Smart Folder に読み取り後の書き込みで入る行) は、表示用の情報を worker で
+  用意する必要があるため、§5.2 の membership-only 更新で後のフレームに末尾へ追加してよい (R3 レビューで決定)。
+  install を捨てて作り直さないので、追加は survivor の順を変えず、書き込みが続いても install が終わらない
+  ことは起きない。
 - この反映は、**その prepared 結果が持つ書き込み世代 (§2.2) より新しい ledger entry** を重ねる。context の
   `seen_generation` を基準にしない。worker の prepare 中に同じ context で書き込みがあると `seen_generation` が
   先に進み、既存の `sync_current_context_rating_session_writes` は新しい書き込みが無いと判断して、古い facts の
@@ -308,6 +313,8 @@ rebuild へ分ける。query、sort 変更、reload だけが通常の sorted re
 1. path key の書き込みを `rating_cache` へ反映する。
 2. Ctrl+G の `all_hits.stars` と drill 件数を更新する (membership-only rebuild)。
 3. Rating view の membership (★N から外れた行の除去、入った行の追加) を更新する。
+   評価条件を持つ Smart Folder も同じく membership-only に更新する (外れた行を除き、入った行を末尾へ足す。
+   survivor の順は変えない)。評価の書き込みを理由に Smart Folder を全体再 prepare して並べ直さない。
 4. rating filter / Rated・Unrated facet と Details state を更新する。
 5. selected が非表示になった場合は既存の nearest-visible policy、checked は既存の WYSIWYG policy。
 
