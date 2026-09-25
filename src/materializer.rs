@@ -1493,8 +1493,25 @@ fn cleanup_own_process_directory(inner: &MaterializerInner) {
     let _ = std::fs::remove_dir(&inner.process_dir);
 }
 
-fn orphan_pid(name: &str) -> Option<u32> {
-    name.strip_prefix("ext-")?.parse().ok()
+fn orphan_pid(name: &str) -> Option<(u32, bool)> {
+    if let Some(id) = name.strip_prefix("ext-") {
+        return id.parse().ok().map(|pid| (pid, false));
+    }
+    let (pid, nonce) = name.strip_prefix("epub-")?.split_once('-')?;
+    if nonce.is_empty() {
+        return None;
+    }
+    pid.parse().ok().map(|pid| (pid, true))
+}
+
+/// Shared root for disposable EPUB conversions. Each conversion owns a distinct
+/// `epub-<pid>-<nonce>` child; startup cleanup recognizes dead owners.
+pub(crate) fn epub_temp_root() -> PathBuf {
+    if cfg!(feature = "portable") {
+        crate::data_dir::get().join("temp")
+    } else {
+        std::env::temp_dir().join("mimageviewer")
+    }
 }
 
 fn startup_cleanup_candidates<I, F>(entries: I, current_pid: u32, mut alive: F) -> Vec<PathBuf>
@@ -1508,7 +1525,13 @@ where
             path.file_name()
                 .and_then(|name| name.to_str())
                 .and_then(orphan_pid)
-                .is_some_and(|pid| pid == current_pid || !alive(pid))
+                .is_some_and(|(pid, epub)| {
+                    if epub {
+                        pid != current_pid && !alive(pid)
+                    } else {
+                        pid == current_pid || !alive(pid)
+                    }
+                })
         })
         .collect()
 }
@@ -1540,7 +1563,7 @@ fn cleanup_startup_directories(root: &Path, current_pid: u32, alive: impl FnMut(
     }
 }
 
-fn remove_tree_without_following_links(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_tree_without_following_links(path: &Path) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata_is_link_or_reparse(&metadata) {
         return std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path));
@@ -1567,7 +1590,7 @@ fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-fn validate_real_directory(path: &Path, label: &str) -> Result<(), String> {
+pub(crate) fn validate_real_directory(path: &Path, label: &str) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("{label}を確認できません: {}: {error}", path.display()))?;
     if metadata_is_link_or_reparse(&metadata) {
@@ -2078,6 +2101,20 @@ mod tests {
             ),
             vec![PathBuf::from("ext-99")],
             "the current PID directory predates this process and must be reclaimed before use"
+        );
+        assert_eq!(
+            startup_cleanup_candidates(
+                vec![
+                    PathBuf::from("epub-10-1"),
+                    PathBuf::from("epub-20-2"),
+                    PathBuf::from("epub-99-3"),
+                    PathBuf::from("epub-invalid-4")
+                ],
+                99,
+                |pid| pid == 10,
+            ),
+            vec![PathBuf::from("epub-20-2")],
+            "a live conversion owned by this PID must survive asynchronous startup cleanup"
         );
     }
 

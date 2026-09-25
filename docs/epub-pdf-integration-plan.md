@@ -551,3 +551,11 @@ S2 へ引き継ぐ事項: 強制終了で残る `<out>.tmp-<pid>-<n>` と `.part
 `crates/epub-pdf-worker/README.md` と `src/protocol.rs` が正本。
 
 合成 EPUB の生成: `C:\home\mimageviewer_testdata_epub\gen_probe.py`、`gen_probe_preconnect.py` (リポジトリ外)。
+
+### S2a EPUB キャッシュ・起動ゲート・ホスト側ランナー (2026-09-25)
+
+`src/epub_cache.rs` に専用 DB の世代予約、不変世代/現在/削除予約表、I8 の公開・削除予約・欠落切り離し、`.alive` を使う起動時削除ゲートを追加した。`src/lib.rs` は単一インスタンス取得後、コレクション・Remote・App の作成前にゲートを呼び、共有ロックの guard を `run` の間保持する。`src/epub_convert.rs` は固定した入力コピー、内容同定ハッシュ、Job Object 下の suspended worker、進捗 JSON、cancel/timeout、最小 PDF 確認と上書きなしの世代公開を担当する。`materializer` の死んだ PID の一時フォルダ掃除に `epub-<pid>-*` を追加した。
+
+この段階では変換 API の UI 接続、PDFium の `verify_converted_pdf`、`pdf_loader` の解決と固定表、グリッド・管理 UI は未実装 (S2b / S2c / S3)。実 WebView2 ワーカーの起動とネットワーク・Job 子孫の再実測は隔離環境外の検収で行う。
+`epub_cache.db` は新設かつ未リリースなので、既存データ用のスキーマ移行は設けない。
+進捗 JSON の serde 型はワーカーが独立 workspace package である構成を保つため、本体に同じフィールド名・列挙値を小さく複製する。S2a の fake worker テストには Windows の実 `CreateProcessW` / Job Object 経路を通るものを含める。
