@@ -47,12 +47,60 @@ pub enum DocumentStamp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadTarget {
-    pub read_path: PathBuf,
+    pub read_path: ResolvedReadPath,
     pub stamp: DocumentStamp,
     /// Original EPUB attributes for display, separate from the generation stamp.
     pub display_source_state: Option<epub_cache::SourceState>,
     /// Direction recorded for this immutable EPUB generation; PDFs have no value here.
     pub epub_direction: Option<PdfReadingDirection>,
+}
+
+/// A worker path whose origin has passed the logical-path resolver, except for
+/// the physical converter output admitted by `verify_converted_pdf`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResolvedReadPath(PathBuf);
+
+impl ResolvedReadPath {
+    fn from_resolution(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    fn physical_converter_output(path: &Path) -> Self {
+        Self(path.to_owned())
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadPathClass {
+    Passthrough,
+    Epub,
+}
+
+fn classify_read_path(logical: &Path) -> ReadPathClass {
+    if logical
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    {
+        ReadPathClass::Epub
+    } else {
+        ReadPathClass::Passthrough
+    }
+}
+
+fn passthrough_read_target(logical: &Path) -> ReadTarget {
+    ReadTarget {
+        read_path: ResolvedReadPath::from_resolution(logical.to_owned()),
+        stamp: DocumentStamp::File {
+            mtime: None,
+            size: None,
+        },
+        display_source_state: None,
+        epub_direction: None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -121,26 +169,44 @@ pub(crate) fn install_epub_gate(gate: GateOutcome) {
 }
 
 fn is_epub(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    classify_read_path(path) == ReadPathClass::Epub
 }
 
 fn epub_pinned() -> &'static Mutex<HashMap<String, ReadTarget>> {
     EPUB_PINNED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Resolve only on a background thread. This can stat the source and access SQLite.
+/// Returns a target only when deciding it requires no filesystem or database I/O.
+/// The pinned-table lock covers only an in-memory lookup, never source or DB I/O.
+fn read_target_without_io(logical: &Path) -> Option<Result<ReadTarget, PdfReadError>> {
+    match classify_read_path(logical) {
+        ReadPathClass::Passthrough => Some(resolve_read_target(logical)),
+        ReadPathClass::Epub => {
+            let gate = match EPUB_GATE.get() {
+                Some(gate) => gate,
+                None => {
+                    return Some(Err(PdfReadError::EpubUnavailable {
+                        reason: "startup gate has not run".into(),
+                    }));
+                }
+            };
+            if let Err(error) = ensure_epub_gate(gate) {
+                return Some(Err(error));
+            }
+            let key = epub_cache::src_key(logical);
+            let pinned = epub_pinned()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pinned.get(&key).cloned().map(Ok)
+        }
+    }
+}
+
+/// EPUB resolution can stat the source and access SQLite; call that branch only
+/// from a background thread. The PDF passthrough branch performs no I/O.
 pub fn resolve_read_target(logical: &Path) -> Result<ReadTarget, PdfReadError> {
-    if !is_epub(logical) {
-        return Ok(ReadTarget {
-            read_path: logical.to_owned(),
-            stamp: DocumentStamp::File {
-                mtime: None,
-                size: None,
-            },
-            display_source_state: None,
-            epub_direction: None,
-        });
+    if classify_read_path(logical) == ReadPathClass::Passthrough {
+        return Ok(passthrough_read_target(logical));
     }
     let gate = EPUB_GATE
         .get()
@@ -167,52 +233,63 @@ fn resolve_epub_at(
     pinned: &Mutex<HashMap<String, ReadTarget>>,
 ) -> Result<ReadTarget, PdfReadError> {
     let key = epub_cache::src_key(logical);
+    if let Some(target) = pinned
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Ok(target);
+    }
+    let candidate = (|| -> Result<ReadTarget, PdfReadError> {
+        let source = match std::fs::metadata(logical) {
+            Ok(metadata) => epub_cache::source_state(&metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PdfReadError::NotConverted);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut db = EpubCache::open_at(data_dir).map_err(|error| {
+            PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
+        })?;
+        let row = db
+            .current_generation(&key)
+            .map_err(|error| {
+                PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
+            })?
+            .ok_or(PdfReadError::NotConverted)?;
+        if row.src_state != source {
+            return Err(PdfReadError::NotConverted);
+        }
+        match std::fs::metadata(&row.pdf_file) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(PdfReadError::NotConverted),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                db.detach_missing(&key, row.generation_id)
+                    .map_err(|error| {
+                        PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
+                    })?;
+                return Err(PdfReadError::NotConverted);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(ReadTarget {
+            read_path: ResolvedReadPath::from_resolution(row.pdf_file),
+            stamp: DocumentStamp::Generation {
+                id: row.generation_id,
+                pdf_size: row.pdf_size,
+            },
+            display_source_state: Some(source),
+            epub_direction: parse_epub_direction_name(&row.direction),
+        })
+    })();
     let mut pinned = pinned
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(target) = pinned.get(&key) {
-        return Ok(target.clone());
+    if let Some(existing) = pinned.get(&key) {
+        return Ok(existing.clone());
     }
-    let source = match std::fs::metadata(logical) {
-        Ok(metadata) => epub_cache::source_state(&metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(PdfReadError::NotConverted);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let mut db = EpubCache::open_at(data_dir).map_err(|error| {
-        PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
-    })?;
-    let row = db
-        .current_generation(&key)
-        .map_err(|error| {
-            PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
-        })?
-        .ok_or(PdfReadError::NotConverted)?;
-    if row.src_state != source {
-        return Err(PdfReadError::NotConverted);
-    }
-    match std::fs::metadata(&row.pdf_file) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Err(PdfReadError::NotConverted),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            db.detach_missing(&key, row.generation_id)
-                .map_err(|error| {
-                    PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
-                })?;
-            return Err(PdfReadError::NotConverted);
-        }
-        Err(error) => return Err(error.into()),
-    }
-    let target = ReadTarget {
-        read_path: row.pdf_file,
-        stamp: DocumentStamp::Generation {
-            id: row.generation_id,
-            pdf_size: row.pdf_size,
-        },
-        display_source_state: Some(source),
-        epub_direction: parse_epub_direction_name(&row.direction),
-    };
+    let target = candidate?;
     pinned.insert(key, target.clone());
     Ok(target)
 }
@@ -603,7 +680,7 @@ fn estimate_tiled_size(sizes: &[(u32, u32)]) -> PdfPageContentType {
 /// authority and continues comparing path, password, mtime, and size.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PdfDocumentIdentity {
-    path: PathBuf,
+    path: ResolvedReadPath,
     password: Option<Box<str>>,
 }
 
@@ -1071,8 +1148,8 @@ fn read_msg(r: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
 }
 
 /// パス + パスワードをバッファに書き込む (Enumerate / Render 共通)。
-fn encode_path_and_password(buf: &mut Vec<u8>, path: &Path, password: Option<&str>) {
-    let path_lossy = path.to_string_lossy();
+fn encode_path_and_password(buf: &mut Vec<u8>, path: &ResolvedReadPath, password: Option<&str>) {
+    let path_lossy = path.as_path().to_string_lossy();
     let path_bytes = path_lossy.as_bytes();
     let pw_bytes = password.unwrap_or("").as_bytes();
     buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
@@ -1082,7 +1159,7 @@ fn encode_path_and_password(buf: &mut Vec<u8>, path: &Path, password: Option<&st
 }
 
 fn encode_enumerate_request(
-    path: &Path,
+    path: &ResolvedReadPath,
     password: Option<&str>,
     options: EnumerateOptions,
 ) -> Vec<u8> {
@@ -1095,24 +1172,28 @@ fn encode_enumerate_request(
     buf
 }
 
-fn encode_get_info_request(path: &Path, password: Option<&str>) -> Vec<u8> {
+fn encode_get_info_request(path: &ResolvedReadPath, password: Option<&str>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(MSG_GET_INFO);
     encode_path_and_password(&mut buf, path, password);
     buf
 }
 
-fn encode_page_sizes_request(path: &Path, password: Option<&str>) -> Vec<u8> {
+fn encode_page_sizes_request(path: &ResolvedReadPath, password: Option<&str>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(MSG_PAGE_SIZES);
     encode_path_and_password(&mut buf, path, password);
     buf
 }
 
-fn encode_analyze_page_request(path: &Path, page_num: u32, password: Option<&str>) -> Vec<u8> {
+fn encode_analyze_page_request(
+    path: &ResolvedReadPath,
+    page_num: u32,
+    password: Option<&str>,
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(MSG_ANALYZE_PAGE);
-    let path_lossy = path.to_string_lossy();
+    let path_lossy = path.as_path().to_string_lossy();
     let path_bytes = path_lossy.as_bytes();
     let pw_bytes = password.unwrap_or("").as_bytes();
     buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
@@ -1123,7 +1204,7 @@ fn encode_analyze_page_request(path: &Path, page_num: u32, password: Option<&str
     buf
 }
 
-fn encode_open_request(path: &Path, password: Option<&str>) -> Vec<u8> {
+fn encode_open_request(path: &ResolvedReadPath, password: Option<&str>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(MSG_OPEN);
     encode_path_and_password(&mut buf, path, password);
@@ -1131,7 +1212,7 @@ fn encode_open_request(path: &Path, password: Option<&str>) -> Vec<u8> {
 }
 
 fn encode_render_request(
-    path: &Path,
+    path: &ResolvedReadPath,
     page_num: u32,
     target: PdfRenderTarget,
     password: Option<&str>,
@@ -1142,7 +1223,7 @@ fn encode_render_request(
         PdfRenderTarget::LongEdge(_) => MSG_RENDER,
         PdfRenderTarget::Display { .. } => MSG_DISPLAY_RENDER,
     });
-    let path_lossy = path.to_string_lossy();
+    let path_lossy = path.as_path().to_string_lossy();
     let path_bytes = path_lossy.as_bytes();
     let pw_bytes = password.unwrap_or("").as_bytes();
     buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
@@ -1405,7 +1486,10 @@ enum DecodedRequest {
     Shutdown,
 }
 
-fn pdf_document_identity(request: &DecodedRequest) -> Option<PdfDocumentIdentity> {
+fn pdf_document_identity(
+    request: &DecodedRequest,
+    read_path: &ResolvedReadPath,
+) -> Option<PdfDocumentIdentity> {
     let (path, password) = match request {
         DecodedRequest::Enumerate { path, password, .. }
         | DecodedRequest::GetInfo { path, password }
@@ -1415,8 +1499,11 @@ fn pdf_document_identity(request: &DecodedRequest) -> Option<PdfDocumentIdentity
         | DecodedRequest::AnalyzePage { path, password, .. } => (path, password),
         DecodedRequest::Shutdown => return None,
     };
+    if path.to_string_lossy() != read_path.as_path().to_string_lossy() {
+        return None;
+    }
     Some(PdfDocumentIdentity {
-        path: path.clone(),
+        path: read_path.clone(),
         password: password
             .as_deref()
             .map(|value| value.to_owned().into_boxed_str()),
@@ -2386,12 +2473,24 @@ fn initialized_pool() -> Option<&'static PdfWorkerPool> {
     POOL.get().and_then(|result| result.as_ref().ok())
 }
 
+/// Encoded bytes stay paired with the resolved worker path at pool admission.
+struct PdfPoolRequest<'a> {
+    bytes: &'a [u8],
+    read_path: &'a ResolvedReadPath,
+}
+
+impl<'a> PdfPoolRequest<'a> {
+    fn new(bytes: &'a [u8], read_path: &'a ResolvedReadPath) -> Self {
+        Self { bytes, read_path }
+    }
+}
+
 /// `OnceLock<Result<..>>` を呼び出し側へ露出させず、既存の `execute()` の Err 契約を保つ。
 /// 詳細理由は typed notice とログに載せ、通常 PDF open の Password 判定へは渡さない。
 trait PdfWorkerPoolInitExt {
     fn execute(
         &self,
-        request: &[u8],
+        request: PdfPoolRequest<'_>,
         cancel: Option<&Arc<AtomicBool>>,
         priority: JobPriority,
         perf_key: Option<String>,
@@ -2405,7 +2504,7 @@ trait PdfWorkerPoolInitExt {
 impl PdfWorkerPoolInitExt for PdfWorkerPoolInit {
     fn execute(
         &self,
-        request: &[u8],
+        request: PdfPoolRequest<'_>,
         cancel: Option<&Arc<AtomicBool>>,
         priority: JobPriority,
         perf_key: Option<String>,
@@ -2818,25 +2917,26 @@ impl PdfWorkerPool {
 
     fn execute(
         &self,
-        request: &[u8],
+        request: PdfPoolRequest<'_>,
         cancel: Option<&Arc<AtomicBool>>,
         priority: JobPriority,
         perf_key: Option<String>,
         context_epoch: u64,
         cancel_policy: CancelWaitPolicy,
     ) -> std::io::Result<ProcessResponse> {
-        let decoded = decode_request(request).map_err(|_| {
+        let decoded = decode_request(request.bytes).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "invalid PDF worker request",
             )
         })?;
-        let document_identity = pdf_document_identity(&decoded).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "PDF worker request has no document identity",
-            )
-        })?;
+        let document_identity =
+            pdf_document_identity(&decoded, request.read_path).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "PDF worker request has no document identity",
+                )
+            })?;
 
         if self.worker_count == 0 {
             return Err(std::io::Error::new(
@@ -2848,7 +2948,7 @@ impl PdfWorkerPool {
         let (reply_tx, reply_rx) = mpsc::channel();
         // perf_key を後段 (cancel 検出時の perf イベント) でも使うので clone
         let job = Job {
-            request: request.to_vec(),
+            request: request.bytes.to_vec(),
             document_identity,
             cancel: cancel.cloned(),
             reply: reply_tx,
@@ -4106,7 +4206,7 @@ pub fn get_document_info(
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
     // get_document_info は indexer 経由の background なので epoch=0 + AbortOnCancel
     let resp = pool.execute(
-        &req,
+        PdfPoolRequest::new(&req, &read.read_path),
         None,
         JobPriority::Normal,
         Some(perf_key),
@@ -4129,7 +4229,7 @@ pub fn get_page_sizes(pdf_path: &Path, password: Option<&str>) -> std::io::Resul
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
     // ページ構成を組むための背景処理。epoch=0 (prune 対象外) + AbortOnCancel。
     let resp = pool.execute(
-        &req,
+        PdfPoolRequest::new(&req, &read.read_path),
         None,
         JobPriority::Normal,
         Some(perf_key),
@@ -4152,7 +4252,7 @@ pub fn analyze_page_content_type(
     let req = encode_analyze_page_request(&read.read_path, page_num, password);
     let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);
     let resp = pool.execute(
-        &req,
+        PdfPoolRequest::new(&req, &read.read_path),
         cancel.as_ref(),
         JobPriority::Normal,
         Some(perf_key),
@@ -4201,7 +4301,7 @@ pub fn enumerate_pages_with_options(
     // enumerate_pages_with_cancel は background catch-up 経路なので epoch=0
     // + AbortOnCancel (enumerate は cheap、cache 保存ロジック無し)。
     let resp = pool.execute(
-        &req,
+        PdfPoolRequest::new(&req, &read.read_path),
         cancel.as_ref(),
         JobPriority::Normal,
         Some(perf_key),
@@ -4249,10 +4349,11 @@ pub(crate) fn verify_converted_pdf_with_cancel(
     expected_pages: usize,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(), crate::epub_convert::EpubConvertError> {
-    let request = encode_enumerate_request(path, None, EnumerateOptions::default());
+    let read_path = ResolvedReadPath::physical_converter_output(path);
+    let request = encode_enumerate_request(&read_path, None, EnumerateOptions::default());
     let response = get_pool()
         .execute(
-            &request,
+            PdfPoolRequest::new(&request, &read_path),
             cancel.as_ref(),
             JobPriority::Normal,
             None,
@@ -4450,7 +4551,7 @@ fn render_page_target(
     }
     let req = encode_render_request(&read.read_path, page_num, target, password, perf_enabled);
     let resp = pool.execute(
-        &req,
+        PdfPoolRequest::new(&req, &read.read_path),
         cancel.as_ref(),
         priority,
         Some(perf_key.clone()),
@@ -4896,44 +4997,41 @@ struct PdfEnumerateAdmissionTask {
     reply: mpsc::Sender<Result<PdfEnumerateResult, PdfReadError>>,
 }
 
-static PDF_ENUMERATE_ADMISSION_TX: OnceLock<
-    Result<mpsc::Sender<PdfEnumerateAdmissionTask>, String>,
-> = OnceLock::new();
+struct PdfEnumerateStartWork {
+    logical: PathBuf,
+    read: ReadTarget,
+    password: Option<String>,
+    worker_options: EnumerateOptions,
+    key: PdfEnumerateKey,
+    coordinator: Arc<PdfEnumerateCoordinator>,
+    start: PdfEnumerateStart,
+}
+
 static EPUB_ENUMERATE_ADMISSION_TX: OnceLock<
     Result<mpsc::Sender<PdfEnumerateAdmissionTask>, String>,
 > = OnceLock::new();
 
-fn pdf_enumerate_admission_sender(
-    epub: bool,
-) -> Result<&'static mpsc::Sender<PdfEnumerateAdmissionTask>, PdfReadError> {
-    let slot = if epub {
-        &EPUB_ENUMERATE_ADMISSION_TX
-    } else {
-        &PDF_ENUMERATE_ADMISSION_TX
-    };
-    slot.get_or_init(|| {
-        let (tx, rx) = mpsc::channel();
-        let name = if epub {
-            "epub-enumerate-admission"
-        } else {
-            "pdf-enumerate-admission"
-        };
-        std::thread::Builder::new()
-            .name(name.into())
-            .spawn(move || {
-                while let Ok(task) = rx.recv() {
-                    run_pdf_enumerate_admission(task);
-                }
-            })
-            .map(|_| tx)
-            .map_err(|error| error.to_string())
-    })
-    .as_ref()
-    .map_err(|reason| {
-        PdfReadError::Other(Arc::new(std::io::Error::other(format!(
-            "failed to start PDF enumerate admission thread: {reason}"
-        ))))
-    })
+fn epub_enumerate_admission_sender()
+-> Result<&'static mpsc::Sender<PdfEnumerateAdmissionTask>, PdfReadError> {
+    EPUB_ENUMERATE_ADMISSION_TX
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("epub-enumerate-admission".into())
+                .spawn(move || {
+                    while let Ok(task) = rx.recv() {
+                        run_pdf_enumerate_admission(task);
+                    }
+                })
+                .map(|_| tx)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|reason| {
+            PdfReadError::Other(Arc::new(std::io::Error::other(format!(
+                "failed to start PDF enumerate admission thread: {reason}"
+            ))))
+        })
 }
 
 pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnumerateHandle {
@@ -4945,6 +5043,30 @@ pub fn enumerate_pages_async_with_options(
     password: Option<&str>,
     options: EnumerateOptions,
 ) -> PdfEnumerateHandle {
+    enumerate_pages_async_with_options_start(pdf_path, password, options, start_enumerate_worker)
+}
+
+fn enumerate_pages_async_with_options_start(
+    pdf_path: &Path,
+    password: Option<&str>,
+    options: EnumerateOptions,
+    start_worker: impl FnOnce(PdfEnumerateStartWork),
+) -> PdfEnumerateHandle {
+    match read_target_without_io(pdf_path) {
+        Some(Ok(read)) => {
+            return subscribe_known_enumeration(
+                pdf_enumerate_coordinator(),
+                pdf_path,
+                read,
+                password,
+                options,
+                start_worker,
+            );
+        }
+        Some(Err(error)) => return failed_enumerate_handle(error),
+        None => {}
+    }
+
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let lease = Arc::new(Mutex::new(None));
@@ -4961,7 +5083,7 @@ pub fn enumerate_pages_async_with_options(
         lease,
         reply: tx.clone(),
     };
-    match pdf_enumerate_admission_sender(is_epub(pdf_path)) {
+    match epub_enumerate_admission_sender() {
         Ok(sender) => {
             if sender.send(task).is_err() {
                 let _ = tx.send(Err(PdfReadError::Other(Arc::new(std::io::Error::other(
@@ -4972,6 +5094,46 @@ pub fn enumerate_pages_async_with_options(
         Err(error) => {
             let _ = tx.send(Err(error));
         }
+    }
+    handle
+}
+
+fn failed_enumerate_handle(error: PdfReadError) -> PdfEnumerateHandle {
+    let (tx, rx) = mpsc::channel();
+    let _ = tx.send(Err(error));
+    PdfEnumerateHandle {
+        cancel: Arc::new(AtomicBool::new(false)),
+        rx,
+        lease: Arc::new(Mutex::new(None)),
+    }
+}
+
+fn subscribe_known_enumeration(
+    coordinator: &Arc<PdfEnumerateCoordinator>,
+    logical: &Path,
+    read: ReadTarget,
+    password: Option<&str>,
+    options: EnumerateOptions,
+    start_worker: impl FnOnce(PdfEnumerateStartWork),
+) -> PdfEnumerateHandle {
+    let worker_options = enumerate_worker_options(&read, options);
+    let key = PdfEnumerateKey::with_options(read.read_path.as_path(), password, worker_options);
+    let (handle, admission) = coordinator.subscribe(key.clone());
+    match admission {
+        PdfEnumerateAdmission::Start(start) => start_worker(PdfEnumerateStartWork {
+            logical: logical.to_owned(),
+            read,
+            password: password.map(str::to_owned),
+            worker_options,
+            key,
+            coordinator: Arc::clone(coordinator),
+            start,
+        }),
+        PdfEnumerateAdmission::JoinedRunning if crate::perf::is_enabled() => {
+            let perf_key = crate::grid_item::pdf_file_perf_key(logical);
+            crate::perf::event("pdf", "enumerate_join", Some(&perf_key), 0, &[]);
+        }
+        PdfEnumerateAdmission::JoinedRunning => {}
     }
     handle
 }
@@ -4991,8 +5153,11 @@ fn run_pdf_enumerate_admission(task: PdfEnumerateAdmissionTask) {
         return;
     }
     let worker_options = enumerate_worker_options(&read, task.options);
-    let key =
-        PdfEnumerateKey::with_options(&read.read_path, task.password.as_deref(), worker_options);
+    let key = PdfEnumerateKey::with_options(
+        read.read_path.as_path(),
+        task.password.as_deref(),
+        worker_options,
+    );
     let coordinator = Arc::clone(pdf_enumerate_coordinator());
     let (registered, admission) =
         coordinator.subscribe_with_sender(key.clone(), task.reply.clone());
@@ -5012,13 +5177,38 @@ fn run_pdf_enumerate_admission(task: PdfEnumerateAdmissionTask) {
         let _ = task.reply.send(Err(pre_registration_interrupted()));
         return;
     }
-    let perf_key = crate::grid_item::pdf_file_perf_key(&task.logical);
     let PdfEnumerateAdmission::Start(start) = admission else {
         if crate::perf::is_enabled() {
+            let perf_key = crate::grid_item::pdf_file_perf_key(&task.logical);
             crate::perf::event("pdf", "enumerate_join", Some(&perf_key), 0, &[]);
         }
         return;
     };
+    start_enumerate_worker(PdfEnumerateStartWork {
+        logical: task.logical,
+        read,
+        password: task.password,
+        worker_options,
+        key,
+        coordinator,
+        start,
+    });
+}
+
+fn start_enumerate_worker(work: PdfEnumerateStartWork) {
+    let PdfEnumerateStartWork {
+        logical,
+        read,
+        password,
+        worker_options,
+        key,
+        coordinator,
+        start,
+    } = work;
+    if start.source_cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let perf_key = crate::grid_item::pdf_file_perf_key(&logical);
     if crate::perf::is_enabled() {
         let reason = match start.reason {
             PdfEnumerateStartReason::NoRunningRequest => "no_running_request",
@@ -5032,8 +5222,7 @@ fn run_pdf_enumerate_admission(task: PdfEnumerateAdmissionTask) {
             &[("reason", serde_json::Value::from(reason))],
         );
     }
-    let request =
-        encode_enumerate_request(&read.read_path, task.password.as_deref(), worker_options);
+    let request = encode_enumerate_request(&read.read_path, password.as_deref(), worker_options);
     let request_id = start.request_id;
     let source_cancel = start.source_cancel;
     let coordinator_worker = Arc::clone(&coordinator);
@@ -5043,7 +5232,7 @@ fn run_pdf_enumerate_admission(task: PdfEnumerateAdmissionTask) {
         .spawn(move || {
             let result = get_pool()
                 .execute(
-                    &request,
+                    PdfPoolRequest::new(&request, &read.read_path),
                     Some(&source_cancel),
                     JobPriority::Critical,
                     Some(perf_key),
@@ -5184,6 +5373,10 @@ mod tests {
     use crate::epub_cache::{GenerationRow, SourceGuard, SourceState};
     use std::fs;
 
+    fn resolved_test_path(path: &Path) -> ResolvedReadPath {
+        resolve_read_target(path).unwrap().read_path
+    }
+
     struct TestSource(SourceState);
     impl SourceGuard for TestSource {
         fn state(&self) -> std::io::Result<SourceState> {
@@ -5219,18 +5412,24 @@ mod tests {
     }
 
     #[test]
-    fn pdf_resolver_passthrough_never_stats_the_path() {
-        let missing = Path::new("this-path-must-not-exist.pdf");
+    fn pdf_resolver_classification_and_passthrough_are_pure() {
+        let pdf = Path::new("book.pdf");
+        assert_eq!(classify_read_path(pdf), ReadPathClass::Passthrough);
         assert_eq!(
-            resolve_read_target(missing).unwrap(),
-            ReadTarget {
-                read_path: missing.to_owned(),
-                stamp: DocumentStamp::File {
-                    mtime: None,
-                    size: None
-                },
-                display_source_state: None,
-                epub_direction: None,
+            classify_read_path(Path::new("book.txt")),
+            ReadPathClass::Passthrough
+        );
+        assert_eq!(
+            classify_read_path(Path::new("book.EPUB")),
+            ReadPathClass::Epub
+        );
+        let target = passthrough_read_target(pdf);
+        assert_eq!(target.read_path.as_path(), pdf);
+        assert_eq!(
+            target.stamp,
+            DocumentStamp::File {
+                mtime: None,
+                size: None
             }
         );
     }
@@ -5238,7 +5437,7 @@ mod tests {
     #[test]
     fn epub_display_attributes_are_separate_from_generation_stamp() {
         let target = ReadTarget {
-            read_path: PathBuf::from("generation.pdf"),
+            read_path: resolved_test_path(Path::new("generation.pdf")),
             stamp: DocumentStamp::Generation {
                 id: 31,
                 pdf_size: 900,
@@ -5407,8 +5606,8 @@ mod tests {
         let pinned = Mutex::new(HashMap::new());
         let first_read = resolve_epub_at(&first_source, root.path(), &pinned).unwrap();
         let second_read = resolve_epub_at(&second_source, root.path(), &pinned).unwrap();
-        let first = PdfEnumerateKey::new(&first_read.read_path, None);
-        let second = PdfEnumerateKey::new(&second_read.read_path, None);
+        let first = PdfEnumerateKey::new(first_read.read_path.as_path(), None);
+        let second = PdfEnumerateKey::new(second_read.read_path.as_path(), None);
         assert_ne!(first, second);
         let coordinator = Arc::new(PdfEnumerateCoordinator::default());
         let (_a, a) = coordinator.subscribe(first);
@@ -5433,6 +5632,39 @@ mod tests {
         assert!(matches!(c, PdfEnumerateAdmission::Start(_)));
         let (_d, d) = coordinator.subscribe(with_direction);
         assert!(matches!(d, PdfEnumerateAdmission::JoinedRunning));
+    }
+
+    #[test]
+    fn enumerate_pdf_app_handoff_joins_before_previous_handle_is_dropped() {
+        let logical = Path::new("same.pdf");
+        let mut issued = Vec::new();
+
+        let first = enumerate_pages_async_with_options_start(
+            logical,
+            None,
+            EnumerateOptions::default(),
+            |work| issued.push(work),
+        );
+        let second = enumerate_pages_async_with_options_start(
+            logical,
+            None,
+            EnumerateOptions::default(),
+            |work| issued.push(work),
+        );
+        assert_eq!(issued.len(), 1, "only one worker request is issued");
+        let work = issued.pop().unwrap();
+        let second_request_id = second.lease.lock().unwrap().as_ref().unwrap().request_id;
+        assert_eq!(second_request_id, work.start.request_id);
+
+        // App installs the new handle before dropping its previous handle.
+        drop(first);
+        assert!(!work.start.source_cancel.load(Ordering::Relaxed));
+        work.coordinator.complete(
+            &work.key,
+            work.start.request_id,
+            Ok(PdfEnumerateResult::from(vec![])),
+        );
+        assert!(second.rx.recv().unwrap().is_ok());
     }
 
     #[test]
@@ -5476,64 +5708,6 @@ mod tests {
             rx.recv().unwrap().unwrap_err().kind(),
             std::io::ErrorKind::Interrupted
         );
-    }
-
-    #[test]
-    fn public_pdfium_entries_resolve_before_encoding() {
-        let source = include_str!("pdf_loader.rs");
-        for entry in [
-            "get_document_info",
-            "get_page_sizes",
-            "analyze_page_content_type",
-            "enumerate_pages_with_options",
-            "render_page_target",
-            "run_pdf_enumerate_admission",
-        ] {
-            let start = source.find(&format!("fn {entry}(")).unwrap();
-            let tail = &source[start..];
-            let end = tail
-                .find("\nfn ")
-                .or_else(|| tail.find("\npub fn "))
-                .unwrap_or(tail.len());
-            assert!(
-                tail[..end].contains("resolve_read_target"),
-                "{entry} bypasses resolver"
-            );
-        }
-        let async_entry = source
-            .split("pub fn enumerate_pages_async_with_options(")
-            .nth(1)
-            .expect("async enumerate entry");
-        assert!(
-            async_entry
-                .split("\nfn ")
-                .next()
-                .unwrap()
-                .contains("PdfEnumerateAdmissionTask")
-        );
-        for entry in [
-            "enumerate_pages",
-            "enumerate_pages_with_cancel",
-            "enumerate_pages_async",
-            "render_page",
-            "render_page_for_display",
-            "render_page_canonical_raster",
-        ] {
-            let start = source.find(&format!("pub fn {entry}(")).unwrap();
-            let tail = &source[start..];
-            let end = tail
-                .find("\nfn ")
-                .or_else(|| tail.find("\npub fn "))
-                .unwrap_or(tail.len());
-            assert!(
-                tail[..end].contains("render_page_target")
-                    || tail[..end].contains("render_page(")
-                    || tail[..end].contains("enumerate_pages_with_cancel")
-                    || tail[..end].contains("enumerate_pages_with_options")
-                    || tail[..end].contains("enumerate_pages_async_with_options"),
-                "{entry} bypasses resolved helper"
-            );
-        }
     }
 
     fn minimal_direction_pdf(direction: Option<&str>) -> Vec<u8> {
@@ -5621,10 +5795,10 @@ mod tests {
 
     #[test]
     fn enumerate_direction_flag_round_trips_and_rejects_invalid_values() {
-        let path = Path::new("book.pdf");
-        let plain = encode_enumerate_request(path, None, EnumerateOptions::default());
+        let path = resolved_test_path(Path::new("book.pdf"));
+        let plain = encode_enumerate_request(&path, None, EnumerateOptions::default());
         let requested = encode_enumerate_request(
-            path,
+            &path,
             None,
             EnumerateOptions {
                 want_direction: true,
@@ -5835,7 +6009,7 @@ mod tests {
 
     fn test_document_identity(path: &str, password: Option<&str>) -> PdfDocumentIdentity {
         PdfDocumentIdentity {
-            path: PathBuf::from(path),
+            path: resolved_test_path(Path::new(path)),
             password: password.map(|value| value.to_owned().into_boxed_str()),
         }
     }
@@ -5863,26 +6037,29 @@ mod tests {
 
     #[test]
     fn all_document_requests_decode_to_the_same_scheduling_identity() {
-        let path = Path::new(r"C:\Books\same.pdf");
+        let path = resolved_test_path(Path::new(r"C:\Books\same.pdf"));
         let password = Some("secret");
         let expected = test_document_identity(r"C:\Books\same.pdf", password);
         let requests = [
-            encode_enumerate_request(path, password, EnumerateOptions::default()),
-            encode_render_request(path, 3, PdfRenderTarget::LongEdge(800), password, false),
-            encode_get_info_request(path, password),
-            encode_analyze_page_request(path, 3, password),
+            encode_enumerate_request(&path, password, EnumerateOptions::default()),
+            encode_render_request(&path, 3, PdfRenderTarget::LongEdge(800), password, false),
+            encode_get_info_request(&path, password),
+            encode_analyze_page_request(&path, 3, password),
         ];
 
         for request in requests {
             let decoded = decode_request(&request).unwrap();
-            assert_eq!(pdf_document_identity(&decoded), Some(expected.clone()));
+            assert_eq!(
+                pdf_document_identity(&decoded, &path),
+                Some(expected.clone())
+            );
         }
     }
 
     #[test]
     fn open_request_round_trip_preserves_document_identity() {
-        let path = Path::new(r"C:\Books\open.pdf");
-        let request = encode_open_request(path, Some("secret"));
+        let path = resolved_test_path(Path::new(r"C:\Books\open.pdf"));
+        let request = encode_open_request(&path, Some("secret"));
         let decoded = decode_request(&request).unwrap();
 
         assert!(matches!(
@@ -5892,7 +6069,7 @@ mod tests {
                     && password.as_deref() == Some("secret")
         ));
         assert_eq!(
-            pdf_document_identity(&decoded),
+            pdf_document_identity(&decoded, &path),
             Some(test_document_identity(r"C:\Books\open.pdf", Some("secret")))
         );
     }
@@ -6157,7 +6334,7 @@ C:\isolated\miv-data"#
             fit_mode: PdfDisplayFitMode::Height,
         };
         let encoded = encode_render_request(
-            Path::new("sample.pdf"),
+            &resolved_test_path(Path::new("sample.pdf")),
             7,
             PdfRenderTarget::Display {
                 viewport,
@@ -6252,14 +6429,14 @@ C:\isolated\miv-data"#
     #[test]
     fn only_successful_instrumented_render_expects_a_metrics_frame() {
         let plain = encode_render_request(
-            Path::new("sample.pdf"),
+            &resolved_test_path(Path::new("sample.pdf")),
             1,
             PdfRenderTarget::LongEdge(1024),
             Some(concat!("password-with-trailing-control-", "\u{1}")),
             false,
         );
         let measured = encode_render_request(
-            Path::new("sample.pdf"),
+            &resolved_test_path(Path::new("sample.pdf")),
             1,
             PdfRenderTarget::LongEdge(1024),
             None,
@@ -6277,7 +6454,11 @@ C:\isolated\miv-data"#
 
     #[test]
     fn analyze_page_request_and_typed_response_round_trip_without_pixels() {
-        let encoded = encode_analyze_page_request(Path::new("sample.pdf"), 9, Some("secret"));
+        let encoded = encode_analyze_page_request(
+            &resolved_test_path(Path::new("sample.pdf")),
+            9,
+            Some("secret"),
+        );
         match decode_request(&encoded).unwrap() {
             DecodedRequest::AnalyzePage {
                 path,
@@ -6405,7 +6586,8 @@ C:\isolated\miv-data"#
         assert!(PdfWorkerPool::parse_page_sizes_response(&lying).is_err());
 
         // 要求も往復する。opcode を足して decode 側を忘れると、ここが落ちる。
-        let request = encode_page_sizes_request(Path::new(r"C:ooks.pdf"), Some("pw"));
+        let request =
+            encode_page_sizes_request(&resolved_test_path(Path::new(r"C:ooks.pdf")), Some("pw"));
         match decode_request(&request).unwrap() {
             DecodedRequest::PageSizes { path, password } => {
                 assert_eq!(path, Path::new(r"C:ooks.pdf"));
@@ -6604,7 +6786,7 @@ C:\isolated\miv-data"#
         for request in [vec![0xff], encode_shutdown_request()] {
             let error = pool
                 .execute(
-                    &request,
+                    PdfPoolRequest::new(&request, &resolved_test_path(Path::new("invalid.pdf"))),
                     None,
                     JobPriority::Critical,
                     None,

@@ -4,9 +4,14 @@
 
 S2b は `pdf_loader` の読み取り経路だけを用意する段階で、一覧や UI はまだ `.epub` を開かない。
 将来の `PdfFile` / `PdfPage` と履歴・保存キーは元 EPUB の論理パスを保持する。
-`pdf_loader::resolve_read_target` は背景スレッドで論理パスを変換世代の PDF パスへ解決し、
+`pdf_loader::resolve_read_target` は論理パスを変換世代の PDF パスへ解決する。EPUB の初回解決は背景スレッドで行い、
 PDFium の open admission・worker 文書キャッシュ・列挙合流にはその実ファイルのパスを渡す。
 表示や perf のキーは論理パスのままにする。通常 PDF の解決はパスをそのまま返し、stat を追加しない。
+IPC の要求生成には `ResolvedReadPath` を必須にし、PDF pool へは要求 bytes と解決済みパスを `PdfPoolRequest` で対にして渡す。
+非同期列挙では通常 PDF と固定表にある EPUB の待ち手を呼出元で直ちに登録する。
+新しいハンドルを受け取ってから旧ハンドルを破棄しても同じ実行要求に合流できる。
+未固定の EPUB だけは元ファイル stat と DB 照合を背景スレッドで済ませてから登録する。
+固定表の mutex はメモリ検索と挿入だけを保護し、元ファイルの stat や DB 照合中は保持しない。
 
 EPUB の初回解決では元ファイルの完全精度の FILETIME とサイズを `epub_cache.db` の現在世代と照合する。
 有効な世代が無ければ `NotConverted`、起動時の削除ゲートが無効なら `EpubUnavailable` を返す。

@@ -587,7 +587,7 @@ EPUB を UI から開く導線、世代スタンプの全派生キャッシュ�
 レビューで S2a の `src_key` がドライブ文字を落とし別ドライブの同名 EPUB を衝突させることが判明したため、
 未リリースの EPUB 専用 DB・世代ファイル名・固定表を `normalize_keep_drive` に統一した。
 表示用のページ属性は初回解決時の元 EPUB 状態で固定し、列挙結果の世代スタンプとは分離した。
-通常 PDF の列挙 admission は EPUB の DB 待ちと別スレッドにしている。
+通常 PDF の列挙 admission は呼出元で I/O 無しに待ち手を登録し、EPUB の DB 待ちとは分離する。
 設計オーナーの追補決定により `pdfium-render` のローカル fork は採用しない。EPUB 方向は固定した
 世代行の `direction` から渡し、変換 PDF を方向のために再読込しない。通常 PDF は `want_direction=true`
 のときだけ公開 PDFium bindings の `FPDF_LoadDocument` / `FPDF_VIEWERREF_GetName` /
@@ -597,3 +597,8 @@ EPUB は常に世代行の方向を応答へ載せるため、ワーカーへは
 追加 open の失敗は方向無しとしてページ列挙を維持し、ワーカーの診断へ理由を記録する。
 この条件付き取得は §4.3 の常時方向取得という旧記述に優先する。
 S2c ではスマートフォルダーの `PdfPages` 経路にも列挙結果の方向を運ぶ。
+独立レビュー追補: App の新旧ハンドル handoff で旧要求が先に取消されないよう、通常 PDF と固定済み
+EPUB は新しい待ち手を返す前に同期登録する。未固定 EPUB の解決・登録は引き続き背景で行う。
+固定表の mutex はメモリ検索・挿入だけを保護し、元ファイル stat・DB 照合中は保持しない。`ResolvedReadPath` を要求エンコーダの必須型とし、
+pool 投入では `PdfPoolRequest` がエンコード済み要求と解決済みパスを対にして解決漏れをコンパイル時に防ぐ。
+通常 PDF の無 stat 判定は純粋な拡張子分類で検証する。
