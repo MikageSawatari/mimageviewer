@@ -21,7 +21,7 @@ batch process returns the first nonzero book code after writing the summary.
 | 0 | success |
 | 2 | DRM marker or unsupported encryption detected |
 | 3 | invalid EPUB, invalid path, or CLI input |
-| 4 | WebView2 Runtime or loader missing |
+| 4 | WebView2 Runtime missing |
 | 5 | WebView2 initialization, rendering, PDF validation, or merge failure |
 | 6 | timeout |
 
@@ -34,14 +34,11 @@ diagnosis. The input EPUB is never modified.
 
 ## Dependencies and implementation choices
 
-The offline Cargo cache in this worktree has no `webview2-com` and the configured
-crates.io connection is blocked. This spike therefore uses a narrow, local raw
-COM binding in `webview.rs` with the WebView2 SDK interface IDs and vtable
-slots. Win32 calls use `windows` 0.61 (resolved 0.61.3). The WebView2 loader is
-loaded dynamically: `WebView2Loader.dll` must be next to the executable for a
-portable build. For a local experiment, `MIV_WEBVIEW2_LOADER` can name an
-existing loader DLL by absolute path. The WebView2 Runtime is still required.
-No DLL is copied into the repository.
+`webview.rs` uses `webview2-com` 0.39 for WebView2 COM interfaces and completion
+handlers. This crate uses `windows` 0.62. On MSVC, `webview2-com-sys` links
+`WebView2LoaderStatic.lib`, so no `WebView2Loader.dll` is needed next to the
+executable. The WebView2 Runtime is still required. Build offline with
+`cargo build -p epub-pdf-worker --offline` when crates.io is unavailable.
 
 The parser uses `quick-xml` 0.41 and `zip` 2. Package reading rejects zip-slip
 paths and unsupported encryption. Fixed spine items are printed in spine order

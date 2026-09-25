@@ -2019,7 +2019,7 @@ dependencies = [
  "sha2",
  "walkdir",
  "webview2-com",
- "windows 0.61.3",
+ "windows 0.62.2",
  "zip",
 ]
 

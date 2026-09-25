@@ -289,43 +289,6 @@ impl Engine {
                 ));
                 fs::write(&part, &pdf).map_err(|e| (5, e.to_string()))?;
                 let actual = render::pdf_sizes(&part).map_err(|e| (5, e))?;
-                if input.file_name().and_then(|x| x.to_str()) == Some("manga_mixed_sizes.epub")
-                    && r.print_to_pdf_comparison.is_none()
-                {
-                    let native = self.work_dir.join(format!(
-                        "native-print-{}-{}.pdf",
-                        self.run_id, self.sequence
-                    ));
-                    r.print_to_pdf_comparison = Some(match host.print_to_pdf(&native, deadline) {
-                        Ok(true) => match render::pdf_sizes(&native) {
-                            Ok(sizes) => {
-                                let expected_sizes: Vec<_> = chunk
-                                    .iter()
-                                    .map(|x| {
-                                        (
-                                            x.width.unwrap_or(1200) as f64 * 0.75,
-                                            x.height.unwrap_or(1700) as f64 * 0.75,
-                                        )
-                                    })
-                                    .collect();
-                                let native_correct = sizes_match(&sizes, &expected_sizes);
-                                let cdp_correct = sizes_match(&actual, &expected_sizes);
-                                if native_correct && !cdp_correct {
-                                    fs::copy(&native, &part).map_err(|e| (5, e.to_string()))?;
-                                    segment.method = "ICoreWebView2_7::PrintToPdf".into();
-                                }
-                                format!(
-                                    "native_pages={}; native_honors_css_sizes={native_correct}; cdp_honors_css_sizes={cdp_correct}",
-                                    sizes.len()
-                                )
-                            }
-                            Err(e) => format!("native PDF inspection failed: {e}"),
-                        },
-                        Ok(false) => "PrintToPdf returned false".into(),
-                        Err(e) => format!("PrintToPdf error: {e}"),
-                    });
-                }
-                let actual = render::pdf_sizes(&part).map_err(|e| (5, e))?;
                 if fixed && actual.len() != chunk.len() {
                     return Err((
                         5,
@@ -401,15 +364,8 @@ impl Engine {
         cleanup_user_data(&self.user_data)
     }
 }
-fn sizes_match(actual: &[(f64, f64)], expected: &[(f64, f64)]) -> bool {
-    actual.len() == expected.len()
-        && actual
-            .iter()
-            .zip(expected)
-            .all(|(a, e)| (a.0 - e.0).abs() < 1.0 && (a.1 - e.1).abs() < 1.0)
-}
 fn classify_webview_error(e: String) -> (i32, String) {
-    let code = if e.contains("runtime missing") || e.contains("WebView2Loader.dll missing") {
+    let code = if e.contains("runtime missing") {
         4
     } else if e.contains("timeout") {
         6

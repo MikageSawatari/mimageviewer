@@ -1,26 +1,27 @@
-//! Narrow raw COM binding for the WebView2 APIs used by this spike.
-//!
-//! `webview2-com` is unavailable in the offline Cargo registry used by this
-//! worktree. The WebView2 SDK COM IIDs and vtable slots below are fixed ABI
-//! contracts. Loader is resolved dynamically; see README for distribution.
-#![allow(unsafe_op_in_unsafe_fn)]
+//! WebView2 host for EPUB printing. All COM objects belong to this STA thread.
 use base64::Engine;
 use std::{
-    cell::UnsafeCell,
-    ffi::c_void,
-    mem,
     path::Path,
-    ptr,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
+use webview2_com::{
+    CallDevToolsProtocolMethodCompletedHandler, CreateCoreWebView2ControllerCompletedHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler, ExecuteScriptCompletedHandler,
+    Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY, CreateCoreWebView2EnvironmentWithOptions,
+        GetAvailableCoreWebView2BrowserVersionString, ICoreWebView2, ICoreWebView2_3,
+        ICoreWebView2Controller, ICoreWebView2Environment,
+    },
+    take_pwstr,
+};
 use windows::{
     Win32::{
-        Foundation::{FreeLibrary, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{E_POINTER, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
-            LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
+            LibraryLoader::GetModuleHandleW,
         },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE,
@@ -28,185 +29,13 @@ use windows::{
             WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
-    core::{GUID, PCSTR, PCWSTR},
+    core::{Interface, PCWSTR, PWSTR},
 };
-
-type Raw = *mut c_void;
-const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
-const IID_ENV_CB: GUID = GUID::from_u128(0x4e8a3389_c9d8_4bd2_b6b5_124fee6cc14d);
-const IID_CTRL_CB: GUID = GUID::from_u128(0x6c4819f3_c9b7_4260_8127_c9f5bde7f68c);
-const IID_SCRIPT_CB: GUID = GUID::from_u128(0x49511172_cc67_4bca_9923_137112f4c4cc);
-const IID_CDP_CB: GUID = GUID::from_u128(0x5c4889f0_5ef6_4c5a_952c_d8f1b92d0574);
-const IID_PRINT_CB: GUID = GUID::from_u128(0xccf1ef04_fd8e_4d5f_b2de_0983e41b8c36);
-const IID_WEBVIEW3: GUID = GUID::from_u128(0xa0d6df20_3b92_416d_aa0c_437a9c727857);
-const IID_WEBVIEW7: GUID = GUID::from_u128(0x79c24d83_09a3_45ae_9418_487f32a58740);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
-unsafe fn read_wide(p: *const u16) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    let mut n = 0;
-    while *p.add(n) != 0 {
-        n += 1
-    }
-    String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
-}
-fn hr(code: i32, context: &str) -> Result<(), String> {
-    if code < 0 {
-        Err(format!("{context}: HRESULT 0x{:08X}", code as u32))
-    } else {
-        Ok(())
-    }
-}
-unsafe fn slot(p: Raw, n: usize) -> Raw {
-    *(*(p as *const *const Raw)).add(n)
-}
-unsafe fn add_ref(p: Raw) {
-    let f: unsafe extern "system" fn(Raw) -> u32 = mem::transmute(slot(p, 1));
-    f(p);
-}
-unsafe fn release(p: Raw) {
-    let f: unsafe extern "system" fn(Raw) -> u32 = mem::transmute(slot(p, 2));
-    f(p);
-}
-struct Com(Raw);
-impl Drop for Com {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { release(self.0) }
-        }
-    }
-}
-impl Com {
-    fn query(&self, iid: &GUID) -> Result<Self, String> {
-        unsafe {
-            let f: unsafe extern "system" fn(Raw, *const GUID, *mut Raw) -> i32 =
-                mem::transmute(slot(self.0, 0));
-            let mut out = ptr::null_mut();
-            hr(f(self.0, iid, &mut out), "QueryInterface")?;
-            Ok(Self(out))
-        }
-    }
-}
 
-#[derive(Clone, Copy)]
-enum CallbackKind {
-    Interface,
-    Text,
-    Bool,
-}
-#[derive(Default)]
-struct Completion {
-    done: bool,
-    code: i32,
-    object: Raw,
-    text: Option<String>,
-    boolean: bool,
-}
-#[repr(C)]
-struct CallbackVTable {
-    query: unsafe extern "system" fn(*mut Callback, *const GUID, *mut Raw) -> i32,
-    addref: unsafe extern "system" fn(*mut Callback) -> u32,
-    release: unsafe extern "system" fn(*mut Callback) -> u32,
-    invoke: unsafe extern "system" fn(*mut Callback, i32, Raw) -> i32,
-}
-#[repr(C)]
-struct Callback {
-    vtbl: *const CallbackVTable,
-    refs: AtomicU32,
-    iid: GUID,
-    kind: CallbackKind,
-    value: UnsafeCell<Completion>,
-}
-unsafe extern "system" fn cb_query(this: *mut Callback, iid: *const GUID, out: *mut Raw) -> i32 {
-    if iid.is_null() || out.is_null() {
-        return 0x80004003u32 as i32;
-    }
-    *out = ptr::null_mut();
-    if *iid == IID_IUNKNOWN || *iid == (*this).iid {
-        *out = this.cast();
-        cb_addref(this);
-        0
-    } else {
-        0x80004002u32 as i32
-    }
-}
-unsafe extern "system" fn cb_addref(this: *mut Callback) -> u32 {
-    (*this).refs.fetch_add(1, Ordering::Relaxed) + 1
-}
-unsafe extern "system" fn cb_release(this: *mut Callback) -> u32 {
-    let n = (*this).refs.fetch_sub(1, Ordering::Release) - 1;
-    if n == 0 {
-        std::sync::atomic::fence(Ordering::Acquire);
-        drop(Box::from_raw(this));
-    }
-    n
-}
-unsafe extern "system" fn cb_invoke(this: *mut Callback, code: i32, result: Raw) -> i32 {
-    let cb = &*this;
-    let out = &mut *cb.value.get();
-    out.code = code;
-    match cb.kind {
-        CallbackKind::Interface => {
-            out.object = result;
-            if !result.is_null() {
-                add_ref(result)
-            }
-        }
-        CallbackKind::Text => out.text = Some(read_wide(result.cast())),
-        CallbackKind::Bool => out.boolean = result as isize != 0,
-    }
-    out.done = true;
-    0
-}
-static CALLBACK_VTBL: CallbackVTable = CallbackVTable {
-    query: cb_query,
-    addref: cb_addref,
-    release: cb_release,
-    invoke: cb_invoke,
-};
-struct Pending(*mut Callback);
-impl Pending {
-    fn new(iid: GUID, kind: CallbackKind) -> Self {
-        Self(Box::into_raw(Box::new(Callback {
-            vtbl: &CALLBACK_VTBL,
-            refs: AtomicU32::new(1),
-            iid,
-            kind,
-            value: UnsafeCell::new(Completion::default()),
-        })))
-    }
-    fn raw(&self) -> Raw {
-        self.0.cast()
-    }
-    fn wait(&self, deadline: Instant) -> Result<Completion, String> {
-        loop {
-            unsafe {
-                let value = &mut *(*self.0).value.get();
-                if value.done {
-                    let value = mem::take(value);
-                    hr(value.code, "WebView2 callback")?;
-                    return Ok(value);
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err("WebView2 timeout".into());
-            }
-            pump();
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-}
-impl Drop for Pending {
-    fn drop(&mut self) {
-        unsafe {
-            cb_release(self.0);
-        }
-    }
-}
 fn pump() {
     unsafe {
         let mut msg = MSG::default();
@@ -216,6 +45,24 @@ fn pump() {
         }
     }
 }
+
+// wait_with_pump blocks in GetMessage. This bounded equivalent preserves the
+// deadline required by the conversion command.
+fn wait<T>(rx: Receiver<windows::core::Result<T>>, deadline: Instant) -> Result<T, String> {
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result.map_err(|e| format!("WebView2 callback: {e}")),
+            Err(TryRecvError::Disconnected) => return Err("WebView2 callback disconnected".into()),
+            Err(TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err("WebView2 timeout".into());
+        }
+        pump();
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 unsafe extern "system" fn host_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -225,35 +72,33 @@ unsafe extern "system" fn host_wnd_proc(
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-type VersionFn = unsafe extern "system" fn(*const u16, *mut *mut u16) -> i32;
-type CreateFn = unsafe extern "system" fn(*const u16, *const u16, Raw, Raw) -> i32;
 pub struct Host {
-    module: HMODULE,
     hwnd: HWND,
     instance: HINSTANCE,
     class_name: Vec<u16>,
     class_registered: bool,
     com_initialized: bool,
-    environment: Option<Com>,
-    controller: Option<Com>,
-    webview: Option<Com>,
-    webview3: Option<Com>,
-    webview7: Option<Com>,
+    environment: Option<ICoreWebView2Environment>,
+    controller: Option<ICoreWebView2Controller>,
+    webview: Option<ICoreWebView2>,
+    webview3: Option<ICoreWebView2_3>,
     pub version: String,
 }
+
 impl Host {
     pub fn new(user_data: &Path, deadline: Instant) -> Result<Self, String> {
-        let loader = std::env::var_os("MIV_WEBVIEW2_LOADER")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_exe()
-                    .unwrap_or_default()
-                    .with_file_name("WebView2Loader.dll")
-            });
-        let dll = unsafe { LoadLibraryW(PCWSTR(wide(&loader.to_string_lossy()).as_ptr())) }
-            .map_err(|e| format!("WebView2Loader.dll missing ({}): {e}", loader.display()))?;
+        let mut version_ptr = PWSTR::null();
+        let probe = unsafe {
+            GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut version_ptr)
+        };
+        if let Err(error) = probe {
+            return Err(format!("WebView2 runtime missing: {error}"));
+        }
+        if version_ptr.is_null() {
+            return Err("WebView2 runtime missing: empty version".into());
+        }
+        let version = take_pwstr(version_ptr);
         let mut h = Self {
-            module: dll,
             hwnd: HWND::default(),
             instance: HINSTANCE::default(),
             class_name: wide("mIV-epub-pdf-worker-hidden-host"),
@@ -263,38 +108,11 @@ impl Host {
             controller: None,
             webview: None,
             webview3: None,
-            webview7: None,
-            version: String::new(),
+            version,
         };
-        let version_fn: VersionFn = unsafe {
-            mem::transmute(
-                GetProcAddress(
-                    dll,
-                    PCSTR(
-                        c"GetAvailableCoreWebView2BrowserVersionString"
-                            .as_ptr()
-                            .cast(),
-                    ),
-                )
-                .ok_or("loader lacks runtime probe")?,
-            )
-        };
-        let mut version_ptr = ptr::null_mut();
-        let code = unsafe { version_fn(ptr::null(), &mut version_ptr) };
-        if code < 0 || version_ptr.is_null() {
-            return Err(format!(
-                "WebView2 runtime missing: HRESULT 0x{:08X}",
-                code as u32
-            ));
-        }
-        h.version = unsafe { read_wide(version_ptr) };
-        unsafe {
-            windows::Win32::System::Com::CoTaskMemFree(Some(version_ptr.cast()));
-        }
-        hr(
-            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.0,
-            "CoInitializeEx",
-        )?;
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+            .ok()
+            .map_err(|e| format!("CoInitializeEx: {e}"))?;
         h.com_initialized = true;
         let module =
             unsafe { GetModuleHandleW(None) }.map_err(|e| format!("GetModuleHandleW: {e}"))?;
@@ -308,7 +126,7 @@ impl Host {
         if unsafe { RegisterClassW(&class) } == 0 {
             return Err(format!(
                 "RegisterClassW: {}",
-                windows::core::Error::from_win32()
+                unsafe { GetLastError() }.to_hresult()
             ));
         }
         h.class_registered = true;
@@ -329,112 +147,112 @@ impl Host {
             )
         }
         .map_err(|e| format!("hidden host window: {e}"))?;
-        let create_fn: CreateFn = unsafe {
-            mem::transmute(
-                GetProcAddress(
-                    dll,
-                    PCSTR(c"CreateCoreWebView2EnvironmentWithOptions".as_ptr().cast()),
-                )
-                .ok_or("loader lacks environment factory")?,
-            )
-        };
-        let callback = Pending::new(IID_ENV_CB, CallbackKind::Interface);
+
+        let (tx, rx) = mpsc::channel();
+        let callback = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
+            move |result, environment| {
+                let _ = tx.send(result.and_then(|()| {
+                    environment.ok_or_else(|| windows::core::Error::from(E_POINTER))
+                }));
+                Ok(())
+            },
+        ));
         let ud = wide(&user_data.to_string_lossy());
-        hr(
-            unsafe { create_fn(ptr::null(), ud.as_ptr(), ptr::null_mut(), callback.raw()) },
-            "CreateCoreWebView2EnvironmentWithOptions",
-        )?;
-        h.environment = Some(Com(callback
-            .wait(deadline)
-            .map_err(|e| {
-                format!(
-                    "WebView2 runtime {}; environment creation failed: {e}",
-                    h.version
-                )
-            })?
-            .object));
-        let env = h.environment.as_ref().unwrap();
-        let callback = Pending::new(IID_CTRL_CB, CallbackKind::Interface);
         unsafe {
-            let f: unsafe extern "system" fn(Raw, HWND, Raw) -> i32 =
-                mem::transmute(slot(env.0, 3));
-            hr(
-                f(env.0, h.hwnd, callback.raw()),
-                "CreateCoreWebView2Controller",
-            )?;
+            CreateCoreWebView2EnvironmentWithOptions(
+                PCWSTR::null(),
+                PCWSTR(ud.as_ptr()),
+                None,
+                &callback,
+            )
         }
-        h.controller = Some(Com(callback
-            .wait(deadline)
-            .map_err(|e| {
-                format!(
-                    "WebView2 runtime {}; controller creation failed: {e}",
-                    h.version
-                )
-            })?
-            .object));
+        .map_err(|e| format!("CreateCoreWebView2EnvironmentWithOptions: {e}"))?;
+        h.environment = Some(wait(rx, deadline).map_err(|e| {
+            format!(
+                "WebView2 runtime {}; environment creation failed: {e}",
+                h.version
+            )
+        })?);
+
+        let (tx, rx) = mpsc::channel();
+        let callback = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
+            move |result, controller| {
+                let _ = tx.send(result.and_then(|()| {
+                    controller.ok_or_else(|| windows::core::Error::from(E_POINTER))
+                }));
+                Ok(())
+            },
+        ));
+        unsafe {
+            h.environment
+                .as_ref()
+                .unwrap()
+                .CreateCoreWebView2Controller(h.hwnd, &callback)
+        }
+        .map_err(|e| format!("CreateCoreWebView2Controller: {e}"))?;
+        h.controller = Some(wait(rx, deadline).map_err(|e| {
+            format!(
+                "WebView2 runtime {}; controller creation failed: {e}",
+                h.version
+            )
+        })?);
         let controller = h.controller.as_ref().unwrap();
         unsafe {
-            let set_bounds: unsafe extern "system" fn(Raw, RECT) -> i32 =
-                mem::transmute(slot(controller.0, 6));
-            hr(
-                set_bounds(
-                    controller.0,
-                    RECT {
-                        left: 0,
-                        top: 0,
-                        right: 1200,
-                        bottom: 1700,
-                    },
-                ),
-                "put_Bounds",
-            )?;
+            controller.SetBounds(RECT {
+                left: 0,
+                top: 0,
+                right: 1200,
+                bottom: 1700,
+            })
         }
-        let mut view = ptr::null_mut();
-        unsafe {
-            let f: unsafe extern "system" fn(Raw, *mut Raw) -> i32 =
-                mem::transmute(slot(controller.0, 25));
-            hr(f(controller.0, &mut view), "get_CoreWebView2")?;
-        }
-        h.webview = Some(Com(view));
-        h.webview3 = Some(h.webview.as_ref().unwrap().query(&IID_WEBVIEW3)?);
-        h.webview7 = h.webview.as_ref().unwrap().query(&IID_WEBVIEW7).ok();
+        .map_err(|e| format!("put_Bounds: {e}"))?;
+        let view =
+            unsafe { controller.CoreWebView2() }.map_err(|e| format!("get_CoreWebView2: {e}"))?;
+        h.webview3 = Some(view.cast().map_err(|e| format!("ICoreWebView2_3: {e}"))?);
+        h.webview = Some(view);
         Ok(h)
     }
-    fn view(&self) -> Raw {
-        self.webview.as_ref().unwrap().0
+
+    fn view(&self) -> &ICoreWebView2 {
+        self.webview.as_ref().unwrap()
     }
+
     pub fn map_folder(&self, dir: &Path) -> Result<(), String> {
         let host = wide("epub.invalid");
         let folder = wide(&dir.to_string_lossy());
-        let v = self.webview3.as_ref().unwrap().0;
         unsafe {
-            let f: unsafe extern "system" fn(Raw, *const u16, *const u16, i32) -> i32 =
-                mem::transmute(slot(v, 71));
-            hr(
-                f(v, host.as_ptr(), folder.as_ptr(), 0),
-                "SetVirtualHostNameToFolderMapping",
-            )
+            self.webview3
+                .as_ref()
+                .unwrap()
+                .SetVirtualHostNameToFolderMapping(
+                    PCWSTR(host.as_ptr()),
+                    PCWSTR(folder.as_ptr()),
+                    COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY,
+                )
         }
+        .map_err(|e| format!("SetVirtualHostNameToFolderMapping: {e}"))
     }
+
     pub fn navigate(&self, url: &str) -> Result<(), String> {
-        let v = self.view();
         let url = wide(url);
-        unsafe {
-            let f: unsafe extern "system" fn(Raw, *const u16) -> i32 = mem::transmute(slot(v, 5));
-            hr(f(v, url.as_ptr()), "Navigate")
-        }
+        unsafe { self.view().Navigate(PCWSTR(url.as_ptr())) }.map_err(|e| format!("Navigate: {e}"))
     }
+
     pub fn script(&self, script: &str, deadline: Instant) -> Result<String, String> {
-        let v = self.view();
+        let (tx, rx) = mpsc::channel();
+        let callback = ExecuteScriptCompletedHandler::create(Box::new(move |result, text| {
+            let _ = tx.send(result.map(|()| text));
+            Ok(())
+        }));
         let script = wide(script);
-        let callback = Pending::new(IID_SCRIPT_CB, CallbackKind::Text);
         unsafe {
-            let f: unsafe extern "system" fn(Raw, *const u16, Raw) -> i32 =
-                mem::transmute(slot(v, 29));
-            hr(f(v, script.as_ptr(), callback.raw()), "ExecuteScript")?;
+            self.view()
+                .ExecuteScript(PCWSTR(script.as_ptr()), &callback)
         }
-        Ok(callback.wait(deadline)?.text.unwrap_or_default())
+        .map_err(|e| format!("ExecuteScript: {e}"))?;
+        wait(rx, deadline)
     }
+
     pub fn wait_ready(&self, url: &str, deadline: Instant) -> Result<(), String> {
         let desired = serde_json::to_string(url).map_err(|e| e.to_string())?;
         let test = format!(
@@ -451,22 +269,27 @@ impl Host {
             thread::sleep(Duration::from_millis(100));
         }
     }
+
     pub fn devtools_pdf(&self, deadline: Instant) -> Result<Vec<u8>, String> {
-        let v = self.view();
-        let callback = Pending::new(IID_CDP_CB, CallbackKind::Text);
+        let (tx, rx) = mpsc::channel();
+        let callback =
+            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, text| {
+                let _ = tx.send(result.map(|()| text));
+                Ok(())
+            }));
         let method = wide("Page.printToPDF");
         let args = wide(
             r#"{"preferCSSPageSize":true,"printBackground":true,"marginTop":0,"marginBottom":0,"marginLeft":0,"marginRight":0,"displayHeaderFooter":false}"#,
         );
         unsafe {
-            let f: unsafe extern "system" fn(Raw, *const u16, *const u16, Raw) -> i32 =
-                mem::transmute(slot(v, 36));
-            hr(
-                f(v, method.as_ptr(), args.as_ptr(), callback.raw()),
-                "CallDevToolsProtocolMethod",
-            )?;
+            self.view().CallDevToolsProtocolMethod(
+                PCWSTR(method.as_ptr()),
+                PCWSTR(args.as_ptr()),
+                &callback,
+            )
         }
-        let response = callback.wait(deadline)?.text.unwrap_or_default();
+        .map_err(|e| format!("CallDevToolsProtocolMethod: {e}"))?;
+        let response = wait(rx, deadline)?;
         let parsed: serde_json::Value =
             serde_json::from_str(&response).map_err(|e| format!("invalid CDP response: {e}"))?;
         if let Some(error) = parsed.get("error") {
@@ -482,30 +305,11 @@ impl Host {
             .decode(data)
             .map_err(|e| e.to_string())
     }
-    pub fn print_to_pdf(&self, path: &Path, deadline: Instant) -> Result<bool, String> {
-        let Some(v) = &self.webview7 else {
-            return Err("ICoreWebView2_7 unavailable".into());
-        };
-        let callback = Pending::new(IID_PRINT_CB, CallbackKind::Bool);
-        let path = wide(&path.to_string_lossy());
-        unsafe {
-            let f: unsafe extern "system" fn(Raw, *const u16, Raw, Raw) -> i32 =
-                mem::transmute(slot(v.0, 80));
-            hr(
-                f(v.0, path.as_ptr(), ptr::null_mut(), callback.raw()),
-                "ICoreWebView2_7::PrintToPdf",
-            )?;
-        }
-        Ok(callback.wait(deadline)?.boolean)
-    }
+
     pub fn close(&mut self) {
-        if let Some(c) = &self.controller {
-            unsafe {
-                let f: unsafe extern "system" fn(Raw) -> i32 = mem::transmute(slot(c.0, 24));
-                let _ = f(c.0);
-            }
+        if let Some(controller) = &self.controller {
+            let _ = unsafe { controller.Close() };
         }
-        self.webview7 = None;
         self.webview3 = None;
         self.webview = None;
         self.controller = None;
@@ -525,16 +329,12 @@ impl Host {
         }
     }
 }
+
 impl Drop for Host {
     fn drop(&mut self) {
         self.close();
-        unsafe {
-            if self.com_initialized {
-                CoUninitialize();
-            }
-            if !self.module.is_invalid() {
-                let _ = FreeLibrary(self.module);
-            }
+        if self.com_initialized {
+            unsafe { CoUninitialize() };
         }
     }
 }
