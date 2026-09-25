@@ -29,6 +29,61 @@
 
 ## 1. 優先候補
 
+### 1.280 レーティング一覧を一度開くと、以後のフォルダ履歴 (←/→) が壊れる — v4.0.0 からの退行、原因特定済み (2026-09-25)
+
+- 出典: 利用者メール (2026-09-25、v3.10.0 → v4.0.0 更新後から)。症状 1 は開発者本人が v4.1.0 で再現。
+  症状 2 は報告者の記述のみで、こちらでは未確認。
+- 症状 (報告):
+  1. レーティング一覧からフォルダ hoge を開く → ← でレーティング一覧へ戻る → → で hoge へ進めない
+     (v3.10.0 では進めた)。
+  2. レーティング一覧からお気に入りのフォルダを開き、さらにフォルダを開いてから ← を押すと、
+     お気に入りのフォルダではなくレーティング一覧へ戻る。
+- 原因 (コード調査。実行時の確認はまだ):
+  - レーティング一覧から通常のフォルダへ移っても、表示の種類 (`top_level_grid_view` の surface) が
+    `Rating { stars }` のまま残る。`load_folder_with_scan_claimed` (`src/app.rs` 22349 付近) が Folder へ
+    戻すのは DriveList / ReadingHistory / Bookmarks / Collection だけで、Rating が入っていない。
+    これは v3.10.0 にもあった。
+  - `e9dfde0da` (Fix collection history and root removal、v4.0.0) で、履歴の「今いる場所」を
+    `folder_nav_current_location()` (= 実際のフォルダの path) から `folder_nav_current_target()`
+    (= `current_top_level_restore_snapshot()`、surface を読む) へ変えた。このため、hoge を表示中でも
+    今いる場所が `Rating` と読まれる。
+  - 症状 1: ← のとき `navigate_folder_history_back` が「今いる場所 = Rating」と「戻り先 = Rating」を同じと
+    判断し、進む stack へ何も積まない。
+  - 症状 2: お気に入りのフォルダ F からさらに開くとき、移動元が F ではなく Rating と記録され、
+    `push_folder_nav_stack` の連続重複除去で F が履歴から消える。
+  - 残った Rating の surface は、別の特殊ビュー (コレクション・ドライブ一覧・スマートフォルダ等) へ入るまで
+    消えない。コード上は、レーティング一覧を一度開いた後の通常フォルダ間の移動がすべて「移動元 = Rating」と
+    記録されることになる (未確認)。
+- 同じ残留 surface を読む他の経路 (未確認、修正時に列挙して確かめる):
+  - 検索開始時の戻り先 (`src/app.rs` 24025 付近の `current_top_level_restore_snapshot()`)。Rating 経由で
+    開いたフォルダから Ctrl+G / Ctrl+S / Ctrl+T を開いて閉じると、元のフォルダではなくレーティング一覧へ
+    戻る可能性がある。こちらは v3.10.0 からある可能性。
+  - 通常フォルダの除外件数チップ (`current_normal_folder_omitted_counts`) は surface が Folder のときだけ出るので、
+    Rating 経由のフォルダでは出ない可能性。
+  - スマートフォルダ・スナップショット・コレクションへ入るときの戻り先
+    (`smart_folder.rs` / `snapshot_ops.rs` / `collection_grid.rs` の `current_top_level_restore_snapshot()`)。
+- 方針候補: 症状パッチ (履歴側で Rating を特別扱いする等) ではなく、「レーティング一覧から実フォルダの表示を
+  採用した時点で surface を Folder へ移す」ことで surface の所有を正す。ただしレーティング一覧の中から開いた
+  コンテナを BS でレーティング一覧へ戻す仕組み (`rating_view_nav_stack`) は surface と別に持っているので、
+  それを壊さないことを確かめる。surface を消す位置は DriveList 等と同じ load 採用の境界が候補。
+- 回帰確認 (テストを足す): 実際に load を通して Rating → hoge → ← → → が hoge に戻ること、Rating → F → G →
+  ← が F になること、BS でレーティング一覧へ戻る動作、A/B クイックフォルダの両方、検索の開閉の戻り先。
+  既存テスト (`folder_nav_forward_from_synthetic_view_records_synthetic_on_back_stack` 等) は stack を
+  直接組み立てていて、load 後に surface が残る状態を通っていない。
+- 規模 / 優先度: Small〜Medium / **P1** (リリース済み機能の退行。利用者報告あり。次版で直したい)。
+
+### 1.281 レーティング一覧の並び順を次に開いたときも保つ — 利用者要望 (2026-09-25)
+
+- 出典: §1.280 と同じ利用者メール。レーティング一覧を開くたびに「★時刻↓」に戻るので、毎回並べ直している
+  (本棚の代わりに使っている)。
+- 現状: `enter_rating_view` と履歴からの復帰 (`dispatch_synthetic_folder_history_target_with_rollback`) の
+  2 か所で `rating_view_sort` を `RatingViewSort::default()` (★設定時刻の新しい順) に戻している。v3.10.0 も同じ。
+- 方針候補: 一覧の並べ方 (`RatingViewSort`) を設定に保存し、両方の入口がそれを読む。詳細表示の列ソートの
+  所有権を戻す処理 (§1.143 の `reset_details_sort_to_toolbar`) は変えない。保存するのは一覧専用の並べ方だけ。
+  ★の段 (★1〜★5) ごとに分けるかは決める (既定は全段共通で十分と思われる)。
+- 新しい設定項目の追加なので移行は不要 (未設定なら今の既定)。
+- 規模 / 優先度: Small / P2。
+
 ### 1.279 フルスクリーンで最初に高画質縮小を使うフレームが UI スレッドで約 0.6 秒止まる (2026-09-25)
 
 - 出典: v4.1.0 公開前の perf smoke (`perf_events.1.jsonl`、2026-09-25 20:15)。観測は perf ログから。
