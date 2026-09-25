@@ -111,6 +111,11 @@ perf ログ有効時のみ動作し、無効時は時計を読まない:
 
 ## 2. 非同期 I/O の実装テンプレ
 
+EPUB の事前確認と変換もこの境界を使う。`EpubConvertState` が取消 token と結果 receiver を持ち、
+UI は `try_recv` で確認・進捗・完了を受け取る。`inspect` と `convert` の起動、元 EPUB の読み込み、
+WebView2、PDFium 検証、キャッシュ公開はすべて背景スレッドで行う。ダイアログの閉鎖、別のオープン要求、
+アプリ終了では token を取り消し、Job に属する変換器を停止する。制限時間は 600 秒。
+
 ```rust
 // (1) App に pending 状態を追加
 pub(crate) struct XxxPending {

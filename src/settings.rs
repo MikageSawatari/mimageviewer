@@ -4676,6 +4676,9 @@ pub struct Settings {
     /// デフォルトのページ構成
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
+    /// 本に保存した見開きモードがない場合、PDF / EPUB の右開き指定に従う。
+    #[serde(default)]
+    pub follow_document_reading_direction: bool,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -6905,6 +6908,7 @@ impl Default for Settings {
             active_book_name: default_active_book_name(),
             pinned_books: Vec::new(),
             default_spread_mode: SpreadMode::default(),
+            follow_document_reading_direction: false,
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,

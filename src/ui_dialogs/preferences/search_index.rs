@@ -608,6 +608,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["単ページ", "見開き", "比較", "構成"]
     ),
     entry!(
+        "spread/document-direction",
+        SpreadMode,
+        "PDF / EPUB の右開き指定に従う",
+        ["PDF", "EPUB", "右開き", "綴じ方向"]
+    ),
+    entry!(
         "spread/final-cover",
         SpreadMode,
         "末尾に表紙を添える",

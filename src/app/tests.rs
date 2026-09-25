@@ -79,6 +79,159 @@ fn phase_a2_compact_ten_thousand_page_keys_and_ui_acceptance() {
 }
 
 #[test]
+fn document_direction_changes_only_unsaved_default_and_placeholder_policy() {
+    use crate::pdf_loader::PdfReadingDirection;
+    use crate::settings::SpreadMode;
+
+    let default = SpreadMode::LtrCover;
+    let favorite_default = default;
+    assert_eq!(
+        default_spread_for_document_direction(default, false, Some(PdfReadingDirection::R2L)),
+        default
+    );
+    assert_eq!(
+        default_spread_for_document_direction(default, true, Some(PdfReadingDirection::R2L)),
+        SpreadMode::RtlCover
+    );
+    assert_eq!(favorite_default, default);
+    assert_eq!(
+        Some(SpreadMode::Ltr).unwrap_or_else(|| default_spread_for_document_direction(
+            default,
+            true,
+            Some(PdfReadingDirection::R2L),
+        )),
+        SpreadMode::Ltr
+    );
+    assert!(pdf_meta_placeholder_allowed(
+        std::path::Path::new("book.pdf"),
+        false,
+        false
+    ));
+    assert!(!pdf_meta_placeholder_allowed(
+        std::path::Path::new("book.pdf"),
+        true,
+        false
+    ));
+    assert!(pdf_meta_placeholder_allowed(
+        std::path::Path::new("book.pdf"),
+        true,
+        true
+    ));
+    assert!(!pdf_meta_placeholder_allowed(
+        std::path::Path::new("book.epub"),
+        false,
+        true
+    ));
+}
+
+#[test]
+fn epub_failure_route_preserves_owner_and_archive_handling_policy() {
+    use crate::settings::ArchiveFileHandling;
+    use crate::ui_dialogs::epub_convert::EpubConvertPhase;
+
+    let mut app = setup_app_for_test();
+    let path = Path::new("C:/books/book.epub");
+    let owner = OpenRequestOwner::Navigation;
+    app.settings
+        .set_archive_file_handling(ArchiveFileHandling::Ignore);
+    assert_eq!(
+        app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::NotConverted),
+        PdfOpenFailureRoute::Handled
+    );
+    assert!(app.epub_convert.is_none());
+
+    app.settings
+        .set_archive_file_handling(ArchiveFileHandling::Ask);
+    assert_eq!(
+        app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::NotConverted),
+        PdfOpenFailureRoute::ConversionDialogOpened
+    );
+    let state = app.epub_convert.take().unwrap();
+    assert_eq!(state.owner, owner);
+    assert_eq!(state.src_path, path);
+    assert!(matches!(state.phase, EpubConvertPhase::Scanning));
+    drop(state);
+
+    app.settings
+        .set_archive_file_handling(ArchiveFileHandling::Convert);
+    assert_eq!(
+        app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::NotConverted),
+        PdfOpenFailureRoute::ConversionDialogOpened
+    );
+    let state = app.epub_convert.take().unwrap();
+    assert_eq!(state.owner, owner);
+    assert!(matches!(state.phase, EpubConvertPhase::Converting(_)));
+    drop(state);
+
+    assert_eq!(
+        app.route_pdf_open_failure(
+            owner.clone(),
+            path,
+            PdfOpenFailure::EpubUnavailable("起動時の確認に失敗".into())
+        ),
+        PdfOpenFailureRoute::Handled
+    );
+    assert!(app.epub_convert.is_none());
+    assert_eq!(
+        app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::PasswordRequired),
+        PdfOpenFailureRoute::Unhandled
+    );
+    assert_eq!(
+        app.route_pdf_open_failure(owner, path, PdfOpenFailure::Other("test".into())),
+        PdfOpenFailureRoute::Unhandled
+    );
+}
+
+#[test]
+fn epub_openable_path_uses_the_pdf_enumeration_route() {
+    let mut app = setup_app_for_test();
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("book.epub");
+    std::fs::write(&source, b"not converted yet").unwrap();
+    let resolved = crate::folder_tree::resolve_openable_path_detailed(&source).unwrap();
+    assert_eq!(resolved.path, source);
+    assert!(app.load_folder_with_scan_owned(source.clone(), None, OpenRequestOwner::Navigation));
+    assert!(app.pdf_enumerate_pending.as_ref().is_some_and(|pending| {
+        pending.0 == source && pending.3 == OpenRequestOwner::Navigation
+    }));
+}
+
+#[test]
+fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
+    let mut app = setup_app_for_test();
+    app.settings
+        .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+    let source = PathBuf::from("C:/books/book.epub");
+    let previous = PathBuf::from("C:/books/previous");
+    app.current_folder = Some(previous.clone());
+    app.address = source.to_string_lossy().into_owned();
+    let snapshot = app.folder_nav_history_snapshot();
+    let error = std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        crate::pdf_loader::PdfReadError::NotConverted,
+    );
+    let handle = crate::pdf_loader::completed_enumerate_result_handle(&source, Err(error));
+    app.pdf_enumerate_pending = Some((
+        source.clone(),
+        None,
+        handle,
+        OpenRequestOwner::Navigation,
+        Some(snapshot),
+    ));
+    app.poll_pdf_enumerate();
+    let state = app.epub_convert.as_ref().unwrap();
+    assert_eq!(state.src_path, source);
+    assert_eq!(state.owner, OpenRequestOwner::Navigation);
+    assert!(state.nav_history_rollback.is_some());
+    app.cancel_superseded_epub_convert(
+        Path::new("C:/books/other.pdf"),
+        &OpenRequestOwner::Navigation,
+    );
+    assert!(app.epub_convert.is_none());
+    assert_eq!(app.address, previous.to_string_lossy());
+}
+
+#[test]
 fn phase_a2_hundred_thousand_keys_build_in_bounded_ui_batches() {
     let mut app = setup_app_for_test();
     app.items = (0..100_000)
@@ -9305,7 +9458,7 @@ mod startup_open_path_resolve_tests {
         assert!(
             app.pdf_enumerate_pending
                 .as_ref()
-                .is_some_and(|(path, _, _)| crate::folder_tree::path_eq(path, &source))
+                .is_some_and(|(path, _, _, _, _)| crate::folder_tree::path_eq(path, &source))
         );
         assert_bookmark_is_awaiting_page(&app);
         // Mutation: replace Some(Box::new(pending)) with None in Activation adoption. The
@@ -17811,7 +17964,7 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
             active
                 .pdf_enumerate_pending
                 .as_ref()
-                .is_some_and(|(path, _, _)| crate::path_key::eq_keep_drive(path, &pdf))
+                .is_some_and(|(path, _, _, _, _)| crate::path_key::eq_keep_drive(path, &pdf))
         );
         assert!(matches!(
             active.bookmark_view_state,
@@ -72371,7 +72524,8 @@ mod smart_folder_transition_tests {
         let index = select_real_path(&mut app, &target);
         let old_handle =
             crate::pdf_loader::completed_enumerate_handle_for_test(&old, Ok(Vec::new()));
-        app.pdf_enumerate_pending = Some((old, None, old_handle));
+        app.pdf_enumerate_pending =
+            Some((old, None, old_handle, OpenRequestOwner::Navigation, None));
 
         assert!(app.begin_smart_grid_container_navigation(index, target.clone(), true));
         assert!(
@@ -72393,7 +72547,9 @@ mod smart_folder_transition_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(
-            app.pdf_enumerate_pending.as_ref().map(|(path, _, _)| path),
+            app.pdf_enumerate_pending
+                .as_ref()
+                .map(|(path, _, _, _, _)| path),
             Some(&target)
         );
         assert!(app.fs_nav_after_pdf_enumerate.is_some());
@@ -72555,7 +72711,13 @@ mod smart_folder_transition_tests {
                 "old PDF failed",
             )),
         );
-        app.pdf_enumerate_pending = Some((old_pdf, None, old_handle));
+        app.pdf_enumerate_pending = Some((
+            old_pdf,
+            None,
+            old_handle,
+            OpenRequestOwner::Navigation,
+            None,
+        ));
         app.poll_pdf_enumerate();
         assert!(app.fs_navigation_sequence_owned_by_smart_folder());
 

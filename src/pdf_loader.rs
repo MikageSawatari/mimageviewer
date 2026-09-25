@@ -141,6 +141,13 @@ impl PdfReadError {
     }
 }
 
+pub(crate) fn typed_read_error(error: &std::io::Error) -> Option<PdfReadError> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<PdfReadError>())
+        .cloned()
+}
+
 impl fmt::Display for PdfReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -166,6 +173,20 @@ static EPUB_PINNED: OnceLock<Mutex<HashMap<String, ReadTarget>>> = OnceLock::new
 /// Install the startup gate once and retain its liveness lock for the process.
 pub(crate) fn install_epub_gate(gate: GateOutcome) {
     let _ = EPUB_GATE.set(gate);
+}
+
+/// Conversion shares the process-lifetime startup gate with resolution.
+/// Call only from a background worker; the guard itself stays owned here.
+pub(crate) fn epub_conversion_guard() -> Result<&'static epub_cache::AliveGuard, PdfReadError> {
+    match EPUB_GATE.get() {
+        Some(GateOutcome::Enabled { guard, .. }) => Ok(guard),
+        Some(GateOutcome::Disabled(reason)) => Err(PdfReadError::EpubUnavailable {
+            reason: epub_gate_reason_message(reason).into(),
+        }),
+        None => Err(PdfReadError::EpubUnavailable {
+            reason: "起動時の確認が完了していません".into(),
+        }),
+    }
 }
 
 fn is_epub(path: &Path) -> bool {
@@ -231,10 +252,18 @@ fn resolve_read_target_with(
 fn ensure_epub_gate(gate: &GateOutcome) -> Result<(), PdfReadError> {
     if let GateOutcome::Disabled(reason) = gate {
         Err(PdfReadError::EpubUnavailable {
-            reason: format!("{reason:?}").into(),
+            reason: epub_gate_reason_message(reason).into(),
         })
     } else {
         Ok(())
+    }
+}
+
+fn epub_gate_reason_message(reason: &epub_cache::GateReason) -> String {
+    match reason {
+        epub_cache::GateReason::Lock(_) => "変換キャッシュを使用できません".into(),
+        epub_cache::GateReason::Schema(_) => "変換キャッシュのデータを読み込めません".into(),
+        epub_cache::GateReason::Cleanup(_) => "変換キャッシュの安全確認に失敗しました".into(),
     }
 }
 
@@ -4966,17 +4995,20 @@ pub(crate) fn completed_enumerate_handle(
     pdf_path: &Path,
     result: std::io::Result<Vec<PdfPageEntry>>,
 ) -> PdfEnumerateHandle {
+    completed_enumerate_result_handle(pdf_path, result.map(Into::into))
+}
+
+pub(crate) fn completed_enumerate_result_handle(
+    pdf_path: &Path,
+    result: std::io::Result<PdfEnumerateResult>,
+) -> PdfEnumerateHandle {
     let coordinator = Arc::new(PdfEnumerateCoordinator::default());
     let key = PdfEnumerateKey::new(pdf_path, None);
     let (handle, admission) = coordinator.subscribe(key.clone());
     let PdfEnumerateAdmission::Start(start) = admission else {
         unreachable!("a fresh test coordinator must start one request");
     };
-    coordinator.complete(
-        &key,
-        start.request_id,
-        result.map(Into::into).map_err(Into::into),
-    );
+    coordinator.complete(&key, start.request_id, result.map_err(Into::into));
     handle
 }
 

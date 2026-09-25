@@ -997,11 +997,7 @@ pub(in crate::app) struct ViewerContextBundle {
     pdf_password_request: Option<PdfPasswordRequest>,
     pdf_current_password: Option<String>,
     pdf_password_pending_save: Option<(PathBuf, String)>,
-    pdf_enumerate_pending: Option<(
-        PathBuf,
-        Option<String>,
-        crate::pdf_loader::PdfEnumerateHandle,
-    )>,
+    pdf_enumerate_pending: Option<super::PdfEnumeratePending>,
     zip_enumerate_pending: Option<ZipEnumeratePending>,
     fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
     pending_auto_fs_open: bool,

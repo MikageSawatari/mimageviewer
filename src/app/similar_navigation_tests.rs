@@ -1624,7 +1624,7 @@ fn similar_hit_pdf_handler_polls_and_missing_required_page_never_falls_back() {
     );
 
     app.open_similar_hit_for_test(&ctx, &hit);
-    let (pending_path, password, pending_handle) = app
+    let (pending_path, password, pending_handle, owner, history_snapshot) = app
         .pdf_enumerate_pending
         .take()
         .expect("PDF handler must start asynchronous enumeration");
@@ -1646,7 +1646,7 @@ fn similar_hit_pdf_handler_polls_and_missing_required_page_never_falls_back() {
             },
         ]),
     );
-    app.pdf_enumerate_pending = Some((pending_path, password, completed));
+    app.pdf_enumerate_pending = Some((pending_path, password, completed, owner, history_snapshot));
 
     app.poll_pdf_enumerate();
 

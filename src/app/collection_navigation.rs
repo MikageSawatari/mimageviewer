@@ -189,8 +189,9 @@ enum CollectionNavigationPreflightPayload {
     Media,
     Folder(ScannedDir),
     Zip(crate::zip_loader::ZipEnumeration),
-    PdfPages(Vec<crate::pdf_loader::PdfPageEntry>),
+    PdfPages(crate::pdf_loader::PdfEnumerateResult),
     PdfPasswordRequired,
+    PdfOpenFailure(super::PdfOpenFailure),
     ConvertibleArchive(crate::archive_converter::ArchiveImageSummary),
     ConvertiblePasswordRequired,
 }
@@ -204,6 +205,7 @@ pub(in crate::app) struct CollectionNavigationPreflightReady {
 struct CollectionNavigationPreflightCandidate {
     target: CollectionPreparedNavigationTarget,
     pdf_password: Option<String>,
+    want_direction: bool,
 }
 
 struct CollectionNavigationRootLanding {
@@ -314,7 +316,7 @@ pub(in crate::app) enum CollectionNavigationPending {
         password: String,
         save: bool,
         cancel: Arc<AtomicBool>,
-        receiver: std::sync::mpsc::Receiver<std::io::Result<Vec<crate::pdf_loader::PdfPageEntry>>>,
+        receiver: std::sync::mpsc::Receiver<std::io::Result<crate::pdf_loader::PdfEnumerateResult>>,
     },
     AwaitingOuterContinuation {
         steps: i32,
@@ -676,16 +678,32 @@ fn preflight_candidates(
                     .map(CollectionNavigationPreflightPayload::Zip)
                 }
                 CollectionResolvedKind::Pdf => {
-                    match crate::pdf_loader::enumerate_pages_with_cancel(
+                    match crate::pdf_loader::enumerate_pages_with_options(
                         path,
                         candidate.pdf_password.as_deref(),
                         Some(Arc::clone(cancel)),
+                        crate::pdf_loader::EnumerateOptions {
+                            want_direction: candidate.want_direction,
+                        },
                     ) {
-                        Ok(pages) if !pages.is_empty() => {
+                        Ok(pages) if !pages.pages.is_empty() => {
                             Some(CollectionNavigationPreflightPayload::PdfPages(pages))
                         }
                         Err(error) if crate::pdf_loader::is_password_required_error(&error) => {
                             Some(CollectionNavigationPreflightPayload::PdfPasswordRequired)
+                        }
+                        Err(error)
+                            if matches!(
+                                crate::pdf_loader::typed_read_error(&error),
+                                Some(
+                                    crate::pdf_loader::PdfReadError::NotConverted
+                                        | crate::pdf_loader::PdfReadError::EpubUnavailable { .. }
+                                )
+                            ) =>
+                        {
+                            Some(CollectionNavigationPreflightPayload::PdfOpenFailure(
+                                crate::pdf_loader::typed_read_error(&error).unwrap().into(),
+                            ))
                         }
                         _ => None,
                     }
@@ -1506,14 +1524,21 @@ impl App {
         let worker_cancel = Arc::clone(&cancel);
         let worker_path = target.source_path.clone();
         let worker_password = password.clone();
+        let want_direction = self.settings.follow_document_reading_direction
+            && self.spread_db.as_ref().is_ok_and(|db| {
+                db.get_state_with_fallback(&worker_path, None)
+                    .mode
+                    .is_none()
+            });
         let (sender, receiver) = std::sync::mpsc::channel();
         let spawn = std::thread::Builder::new()
             .name("collection-pdf-password-preflight".into())
             .spawn(move || {
-                let result = crate::pdf_loader::enumerate_pages_with_cancel(
+                let result = crate::pdf_loader::enumerate_pages_with_options(
                     &worker_path,
                     Some(&worker_password),
                     Some(worker_cancel),
+                    crate::pdf_loader::EnumerateOptions { want_direction },
                 );
                 let _ = sender.send(result);
             });
@@ -1756,6 +1781,13 @@ impl App {
                 pdf_password: (target.resolved_kind == CollectionResolvedKind::Pdf)
                     .then(|| self.pdf_open_password(&target.source_path))
                     .flatten(),
+                want_direction: target.resolved_kind == CollectionResolvedKind::Pdf
+                    && self.settings.follow_document_reading_direction
+                    && self.spread_db.as_ref().is_ok_and(|db| {
+                        db.get_state_with_fallback(&target.source_path, None)
+                            .mode
+                            .is_none()
+                    }),
                 target,
             })
             .collect::<Vec<_>>();
@@ -2160,7 +2192,7 @@ impl App {
                     self.restart_collection_navigation(ctx, request);
                 } else {
                     match receiver.try_recv() {
-                        Ok(Ok(pages)) if !pages.is_empty() => {
+                        Ok(Ok(pages)) if !pages.pages.is_empty() => {
                             self.pdf_current_password = Some(password.clone());
                             self.pdf_password_pending_save =
                                 save.then(|| (target.source_path.clone(), password));
@@ -2195,6 +2227,29 @@ impl App {
                                         target,
                                     },
                                 ));
+                        }
+                        Ok(Err(error))
+                            if matches!(
+                                crate::pdf_loader::typed_read_error(&error),
+                                Some(
+                                    crate::pdf_loader::PdfReadError::NotConverted
+                                        | crate::pdf_loader::PdfReadError::EpubUnavailable { .. }
+                                )
+                            ) =>
+                        {
+                            self.commit_collection_navigation(
+                                ctx,
+                                request,
+                                watch,
+                                prepared,
+                                CollectionNavigationPreflightReady {
+                                    target,
+                                    payload: CollectionNavigationPreflightPayload::PdfOpenFailure(
+                                        crate::pdf_loader::typed_read_error(&error).unwrap().into(),
+                                    ),
+                                    rejected: Vec::new(),
+                                },
+                            );
                         }
                         Ok(Ok(_))
                         | Ok(Err(_))
@@ -2954,9 +3009,10 @@ impl App {
                 format!("zip:{}", enumeration.entries.len())
             }
             CollectionNavigationPreflightPayload::PdfPages(pages) => {
-                format!("pdf:{}", pages.len())
+                format!("pdf:{}", pages.pages.len())
             }
             CollectionNavigationPreflightPayload::PdfPasswordRequired => "pdf-password".into(),
+            CollectionNavigationPreflightPayload::PdfOpenFailure(_) => "pdf-open-failure".into(),
             CollectionNavigationPreflightPayload::ConvertibleArchive(summary) => format!(
                 "convertible:{}+{}",
                 summary.image_count, summary.nested_archive_count
@@ -3101,6 +3157,11 @@ impl App {
         if is_outer_target && !matches!(action, CollectionNavigationAction::OuterGrid { .. }) {
             self.close_fullscreen_for_folder_nav_reopen();
         }
+        let epub_history_snapshot = matches!(
+            &ready.payload,
+            CollectionNavigationPreflightPayload::PdfOpenFailure(_)
+        )
+        .then(|| self.folder_nav_history_snapshot());
         let Some(landing) = self.install_collection_navigation_root(
             &mut request,
             Arc::clone(&prepared),
@@ -3138,10 +3199,42 @@ impl App {
                     FolderOpenOutcome::Loaded
                 }
                 CollectionNavigationPreflightPayload::PdfPages(pages) => {
-                    self.load_pdf_as_folder_prepared(ready.target.source_path.clone(), pages);
-                    // The preflight pages are delivered through a completed typed handle; poll
-                    // owns the normal PDF landing tail on the next frame.
-                    FolderOpenOutcome::Loaded
+                    let path = ready.target.source_path.clone();
+                    let owner = self
+                        .collection_grid_physical_load_owner(target_idx, &path)
+                        .map(super::OpenRequestOwner::CollectionGridPhysical);
+                    if let Some(owner) = owner {
+                        self.load_pdf_as_folder_prepared(path, pages, owner);
+                        // The completed typed handle keeps direction and pages together.
+                        FolderOpenOutcome::Loaded
+                    } else {
+                        FolderOpenOutcome::Ignored
+                    }
+                }
+                CollectionNavigationPreflightPayload::PdfOpenFailure(failure) => {
+                    let path = ready.target.source_path.clone();
+                    let owner = self
+                        .collection_grid_physical_load_owner(target_idx, &path)
+                        .map(super::OpenRequestOwner::CollectionGridPhysical);
+                    if let Some(owner) = owner {
+                        match self.route_pdf_open_failure(owner, &path, failure) {
+                            super::PdfOpenFailureRoute::ConversionDialogOpened => {
+                                if let Some(state) = self.epub_convert.as_mut() {
+                                    state.nav_history_rollback = epub_history_snapshot;
+                                }
+                                FolderOpenOutcome::ConversionDialogOpened
+                            }
+                            super::PdfOpenFailureRoute::Handled => {
+                                if let Some(snapshot) = epub_history_snapshot {
+                                    self.restore_folder_nav_history(snapshot);
+                                }
+                                FolderOpenOutcome::Ignored
+                            }
+                            super::PdfOpenFailureRoute::Unhandled => FolderOpenOutcome::Ignored,
+                        }
+                    } else {
+                        FolderOpenOutcome::Ignored
+                    }
                 }
                 _ => FolderOpenOutcome::Ignored,
             };
@@ -3154,7 +3247,12 @@ impl App {
                     CollectionNavigationAction::OuterFullscreen { .. }
                         | CollectionNavigationAction::Slideshow { .. }
                 );
-            if deferred_pdf {
+            if deferred_pdf
+                && matches!(
+                    outcome,
+                    FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened
+                )
+            {
                 let resume_slideshow = matches!(
                     action,
                     CollectionNavigationAction::Slideshow { .. }
@@ -3183,6 +3281,11 @@ impl App {
                     preserve_after_password_prompt: false,
                 });
             }
+            if matches!(outcome, FolderOpenOutcome::ConversionDialogOpened)
+                && let Some(state) = self.epub_convert.as_mut()
+            {
+                state.deferred_fullscreen = self.fs_nav_after_pdf_enumerate.take();
+            }
             match action {
                 CollectionNavigationAction::OuterGrid { .. } => {}
                 CollectionNavigationAction::OuterFullscreen {
@@ -3195,7 +3298,9 @@ impl App {
                             resume_slideshow,
                             history_trigger,
                         );
-                    } else if matches!(outcome, FolderOpenOutcome::ConversionDialogOpened) {
+                    } else if matches!(outcome, FolderOpenOutcome::ConversionDialogOpened)
+                        && self.epub_convert.is_none()
+                    {
                         let _ = self.attach_archive_convert_deferred_fullscreen(
                             restore_video_tile,
                             resume_slideshow,
@@ -3213,7 +3318,9 @@ impl App {
                             true,
                             history_trigger,
                         );
-                    } else if matches!(outcome, FolderOpenOutcome::ConversionDialogOpened) {
+                    } else if matches!(outcome, FolderOpenOutcome::ConversionDialogOpened)
+                        && self.epub_convert.is_none()
+                    {
                         let _ = self.attach_archive_convert_deferred_fullscreen(
                             restore_video_tile,
                             true,
@@ -5249,7 +5356,35 @@ mod tests {
                 resolved_kind: kind,
             },
             pdf_password: None,
+            want_direction: false,
         }
+    }
+
+    #[test]
+    fn epub_pdf_preflight_keeps_typed_open_failure_for_the_request_owner() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("book.epub");
+        std::fs::write(&source, b"not converted").unwrap();
+        let ready = preflight_candidates(
+            vec![candidate(source.clone(), CollectionResolvedKind::Pdf)],
+            1,
+            false,
+            crate::folder_tree::FolderTreeOptions::default(),
+            false,
+            &Arc::new(AtomicBool::new(false)),
+            CollectionId::new(),
+            1,
+        )
+        .unwrap()
+        .expect("typed EPUB failure must remain an open candidate");
+        assert_eq!(ready.target.source_path, source);
+        assert!(matches!(
+            ready.payload,
+            CollectionNavigationPreflightPayload::PdfOpenFailure(
+                crate::app::PdfOpenFailure::NotConverted
+                    | crate::app::PdfOpenFailure::EpubUnavailable(_)
+            )
+        ));
     }
 
     #[test]
@@ -5277,6 +5412,7 @@ mod tests {
                     resolved_kind: CollectionResolvedKind::Image,
                 },
                 pdf_password: None,
+                want_direction: false,
             },
             candidate(first, CollectionResolvedKind::Image),
             candidate(second.clone(), CollectionResolvedKind::Image),

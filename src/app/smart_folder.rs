@@ -942,12 +942,14 @@ enum SmartPhysicalPreflight {
         rx: mpsc::Receiver<Result<crate::zip_loader::ZipEnumeration, String>>,
     },
     ArchiveConvert,
+    EpubConvert,
 }
 
 enum SmartPhysicalReady {
     Folder(ScannedDir),
     PdfPages {
         pages: Vec<crate::pdf_loader::PdfPageEntry>,
+        direction: Option<crate::pdf_loader::PdfReadingDirection>,
         password: Option<String>,
         save_password: bool,
     },
@@ -970,6 +972,10 @@ enum SmartPhysicalPoll {
     PasswordRequired {
         path: PathBuf,
         invalid_password: bool,
+    },
+    OpenFailure {
+        path: PathBuf,
+        failure: super::PdfOpenFailure,
     },
     Cancelled,
     Failed(String),
@@ -1024,6 +1030,7 @@ impl SmartPhysicalPreflight {
                 match handle.rx.try_recv() {
                     Ok(Ok(result)) => SmartPhysicalPoll::Ready(SmartPhysicalReady::PdfPages {
                         pages: result.pages,
+                        direction: result.direction,
                         password,
                         save_password,
                     }),
@@ -1036,6 +1043,15 @@ impl SmartPhysicalPreflight {
                             SmartPhysicalPoll::PasswordRequired {
                                 path,
                                 invalid_password: password.is_some(),
+                            }
+                        } else if matches!(
+                            error,
+                            crate::pdf_loader::PdfReadError::NotConverted
+                                | crate::pdf_loader::PdfReadError::EpubUnavailable { .. }
+                        ) {
+                            SmartPhysicalPoll::OpenFailure {
+                                path,
+                                failure: error.into(),
                             }
                         } else {
                             SmartPhysicalPoll::Ready(SmartPhysicalReady::Error(
@@ -1088,6 +1104,7 @@ impl SmartPhysicalPreflight {
                 invalid_password,
             }),
             Self::ArchiveConvert => SmartPhysicalPoll::Waiting(Self::ArchiveConvert),
+            Self::EpubConvert => SmartPhysicalPoll::Waiting(Self::EpubConvert),
         }
     }
 }
@@ -1126,7 +1143,8 @@ impl SmartFolderTransition {
                 }
                 SmartPhysicalPreflight::Pdf { handle, .. } => handle.cancel(),
                 SmartPhysicalPreflight::PdfPassword { .. }
-                | SmartPhysicalPreflight::ArchiveConvert => {}
+                | SmartPhysicalPreflight::ArchiveConvert
+                | SmartPhysicalPreflight::EpubConvert => {}
             },
         }
     }
@@ -1211,6 +1229,14 @@ impl App {
         let Some(transition) = self.smart_folder_transition.take() else {
             return false;
         };
+        if self.epub_convert.as_ref().is_some_and(|state| {
+            matches!(&state.owner,
+                super::OpenRequestOwner::MainGridArchive(intent)
+                    if matches!(intent.smart_folder_owner,
+                        super::SmartGridArchiveOwner::Transition(id) if id == transition.request_id))
+        }) {
+            self.epub_convert = None;
+        }
         self.release_staged_smart_nav_lock(transition.request_id, &transition.intent);
         drop(transition);
         true
@@ -1287,7 +1313,17 @@ impl App {
                 root,
                 child: SmartPhysicalPreflight::PdfPassword { path, .. },
             } => {
-                let handle = crate::pdf_loader::enumerate_pages_async(&path, Some(&password));
+                let has_saved_spread = self
+                    .spread_db
+                    .as_ref()
+                    .is_ok_and(|db| db.get_state_with_fallback(&path, None).mode.is_some());
+                let want_direction =
+                    self.settings.follow_document_reading_direction && !has_saved_spread;
+                let handle = crate::pdf_loader::enumerate_pages_async_with_options(
+                    &path,
+                    Some(&password),
+                    crate::pdf_loader::EnumerateOptions { want_direction },
+                );
                 transition.phase = SmartFolderTransitionPhase::ChildPreflight {
                     root,
                     child: SmartPhysicalPreflight::Pdf {
@@ -1407,6 +1443,7 @@ impl App {
                 SmartPhysicalPreflight::PdfPassword { .. } => return None,
                 SmartPhysicalPreflight::Zip { .. } => "次の ZIP を読み込み中…".to_owned(),
                 SmartPhysicalPreflight::ArchiveConvert => "書庫を準備中…".to_owned(),
+                SmartPhysicalPreflight::EpubConvert => "本を変換中…".to_owned(),
             },
             SmartFolderTransitionPhase::RootConfirm(_)
             | SmartFolderTransitionPhase::RootReady(_)
@@ -1894,7 +1931,7 @@ impl App {
         if kind == SmartChildKind::ConvertibleArchive
             && self.settings.archive_file_handling_ignores_convertible()
         {
-            self.show_feedback_toast("設定により RAR / 7z / LZH アーカイブを無視しています".into());
+            self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
             return true;
         }
         if self
@@ -1997,6 +2034,56 @@ impl App {
                         if crate::folder_tree::path_eq(&source.logical_source, source_path)
                 )
         })
+    }
+
+    /// A converted EPUB resumes the exact Smart Folder PDF preflight that requested it.
+    pub(crate) fn supply_smart_epub_conversion(
+        &mut self,
+        source_path: &Path,
+        owner: &super::OpenRequestOwner,
+    ) -> bool {
+        let super::OpenRequestOwner::MainGridArchive(intent) = owner else {
+            return false;
+        };
+        let super::SmartGridArchiveOwner::Transition(request_id) = intent.smart_folder_owner else {
+            return false;
+        };
+        let Some(mut transition) = self.smart_folder_transition.take() else {
+            return false;
+        };
+        let valid = transition.request_id == request_id
+            && matches!(&transition.target,
+                SmartFolderTransitionTarget::Child { source, kind: SmartChildKind::Pdf, .. }
+                    if crate::folder_tree::path_eq(&source.logical_source, source_path));
+        if !valid {
+            self.smart_folder_transition = Some(transition);
+            return false;
+        }
+        let phase = std::mem::replace(&mut transition.phase, SmartFolderTransitionPhase::Retired);
+        let SmartFolderTransitionPhase::ChildPreflight {
+            root,
+            child: SmartPhysicalPreflight::EpubConvert,
+        } = phase
+        else {
+            transition.phase = phase;
+            self.smart_folder_transition = Some(transition);
+            return false;
+        };
+        let source = match &transition.target {
+            SmartFolderTransitionTarget::Child { source, .. } => source.clone(),
+            _ => unreachable!(),
+        };
+        match self.begin_smart_child_preflight(&source, SmartChildKind::Pdf) {
+            Ok(child) => {
+                transition.phase = SmartFolderTransitionPhase::ChildPreflight { root, child };
+                self.smart_folder_transition = Some(transition);
+                true
+            }
+            Err(message) => {
+                self.show_feedback_toast(message);
+                false
+            }
+        }
     }
 
     /// A converted cache path (or directly readable RAR) is a load alias for the original
@@ -2605,6 +2692,7 @@ impl App {
             }
             SmartPhysicalReady::PdfPages {
                 pages,
+                direction,
                 password,
                 save_password,
             } => {
@@ -2626,12 +2714,33 @@ impl App {
                     None,
                     authority,
                 );
+                if self.settings.follow_document_reading_direction {
+                    let defaults = super::SpreadRestoreDefaults::for_book(&self.settings);
+                    if let Err(error) = self.apply_spread_for_key_with_document_direction(
+                        &path, None, defaults, direction,
+                    ) {
+                        crate::logger::log(format!(
+                            "spread: failed to apply document direction: {error}"
+                        ));
+                    }
+                }
                 // The accepted rows are already final. Reuse the ordinary verification tail
                 // for password persistence, page-count cache, and deferred fullscreen without
                 // rebuilding the grid or enumerating the PDF again.
                 self.pdf_placeholder_count = Some(page_count);
                 let handle = crate::pdf_loader::completed_enumerate_handle(&path, Ok(pages));
-                self.pdf_enumerate_pending = Some((path, password, handle));
+                let owner = super::OpenRequestOwner::MainGridArchive(
+                    super::MainGridArchiveTransitionIntent {
+                        source_path: path.clone(),
+                        reading_history_return_from: None,
+                        suppress_rating_filter: false,
+                        suppress_facet_filter: false,
+                        smart_folder_owner: super::SmartGridArchiveOwner::Transition(request_id),
+                        collection_grid_owner: None,
+                        collection_navigation_continuation: None,
+                    },
+                );
+                self.pdf_enumerate_pending = Some((path, password, handle, owner, None));
                 true
             }
             SmartPhysicalReady::PdfWarm {
@@ -2661,7 +2770,18 @@ impl App {
                     authority,
                 );
                 self.pdf_placeholder_count = Some(page_count);
-                self.pdf_enumerate_pending = Some((path, password, handle));
+                let owner = super::OpenRequestOwner::MainGridArchive(
+                    super::MainGridArchiveTransitionIntent {
+                        source_path: path.clone(),
+                        reading_history_return_from: None,
+                        suppress_rating_filter: false,
+                        suppress_facet_filter: false,
+                        smart_folder_owner: super::SmartGridArchiveOwner::Transition(request_id),
+                        collection_grid_owner: None,
+                        collection_navigation_continuation: None,
+                    },
+                );
+                self.pdf_enumerate_pending = Some((path, password, handle, owner, None));
                 true
             }
             SmartPhysicalReady::ZipPrepared(prepared) => {
@@ -2839,8 +2959,32 @@ impl App {
             SmartChildKind::Pdf => {
                 let saved_password = self.pdf_passwords.get(&path);
                 let password = self.pdf_open_password(&path);
-                let warm = self.peek_pdf_meta_cache(&path, saved_password.is_some());
-                let handle = crate::pdf_loader::enumerate_pages_async(&path, password.as_deref());
+                let is_epub = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
+                let has_saved_spread = self
+                    .spread_db
+                    .as_ref()
+                    .is_ok_and(|db| db.get_state_with_fallback(&path, None).mode.is_some());
+                let want_direction =
+                    self.settings.follow_document_reading_direction && !has_saved_spread;
+                let warm = if super::pdf_meta_placeholder_allowed(
+                    &path,
+                    self.settings.follow_document_reading_direction,
+                    has_saved_spread,
+                ) {
+                    self.peek_pdf_meta_cache(&path, saved_password.is_some())
+                } else {
+                    None
+                };
+                let handle = crate::pdf_loader::enumerate_pages_async_with_options(
+                    &path,
+                    password.as_deref(),
+                    crate::pdf_loader::EnumerateOptions {
+                        want_direction: want_direction && !is_epub,
+                    },
+                );
                 Ok(SmartPhysicalPreflight::Pdf {
                     path,
                     password,
@@ -3365,6 +3509,31 @@ impl App {
                         invalid_password,
                     },
                 }),
+                SmartPhysicalPoll::OpenFailure { path, failure } => {
+                    let owner = super::OpenRequestOwner::MainGridArchive(
+                        super::MainGridArchiveTransitionIntent {
+                            source_path: path.clone(),
+                            reading_history_return_from: None,
+                            suppress_rating_filter: false,
+                            suppress_facet_filter: false,
+                            smart_folder_owner: super::SmartGridArchiveOwner::Transition(
+                                transition.request_id,
+                            ),
+                            collection_grid_owner: None,
+                            collection_navigation_continuation: None,
+                        },
+                    );
+                    if self.route_pdf_open_failure(owner, &path, failure)
+                        == super::PdfOpenFailureRoute::ConversionDialogOpened
+                    {
+                        Some(SmartFolderTransitionPhase::ChildPreflight {
+                            root,
+                            child: SmartPhysicalPreflight::EpubConvert,
+                        })
+                    } else {
+                        None
+                    }
+                }
                 SmartPhysicalPoll::Cancelled => None,
                 SmartPhysicalPoll::Failed(message) => {
                     self.show_feedback_toast(message);
@@ -8115,6 +8284,33 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epub_pdf_preflight_preserves_typed_failures() {
+        let path = PathBuf::from("C:/books/book.epub");
+        for error in [
+            crate::pdf_loader::PdfReadError::NotConverted,
+            crate::pdf_loader::PdfReadError::EpubUnavailable {
+                reason: "起動時の確認に失敗".into(),
+            },
+        ] {
+            let io_error = std::io::Error::new(error.kind(), error);
+            let handle = crate::pdf_loader::completed_enumerate_result_handle(&path, Err(io_error));
+            let result = SmartPhysicalPreflight::Pdf {
+                path: path.clone(),
+                password: None,
+                save_password: false,
+                handle,
+                warm: None,
+            }
+            .poll();
+            assert!(matches!(
+                result,
+                SmartPhysicalPoll::OpenFailure { path: source, failure: crate::app::PdfOpenFailure::NotConverted | crate::app::PdfOpenFailure::EpubUnavailable(_) }
+                    if source == path
+            ));
+        }
+    }
 
     fn rule(
         id: uuid::Uuid,

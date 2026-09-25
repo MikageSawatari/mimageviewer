@@ -396,6 +396,34 @@ pub(crate) enum FolderOpenOutcome {
     Ignored,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PdfOpenFailure {
+    PasswordRequired,
+    NotConverted,
+    EpubUnavailable(String),
+    Other(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PdfOpenFailureRoute {
+    ConversionDialogOpened,
+    Handled,
+    Unhandled,
+}
+
+impl From<crate::pdf_loader::PdfReadError> for PdfOpenFailure {
+    fn from(error: crate::pdf_loader::PdfReadError) -> Self {
+        match error {
+            crate::pdf_loader::PdfReadError::PasswordRequired => Self::PasswordRequired,
+            crate::pdf_loader::PdfReadError::NotConverted => Self::NotConverted,
+            crate::pdf_loader::PdfReadError::EpubUnavailable { reason } => {
+                Self::EpubUnavailable(reason.to_string())
+            }
+            crate::pdf_loader::PdfReadError::Other(error) => Self::Other(error.to_string()),
+        }
+    }
+}
+
 /// `App::persist_window_state_and_flush` を呼んだあと、このプロセスが続くかどうか。
 ///
 /// **待つ理由は「このあとプロセスが止まるので、積んだだけの書き込みが失われる」ことだけ**
@@ -546,6 +574,14 @@ pub(crate) enum OpenRequestOwner {
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
     DetachedGridArchive(DetachedGridArchiveOpenRequestOwner),
 }
+
+pub(crate) type PdfEnumeratePending = (
+    PathBuf,
+    Option<String>,
+    crate::pdf_loader::PdfEnumerateHandle,
+    OpenRequestOwner,
+    Option<FolderNavHistorySnapshot>,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GridContainerOpenMode {
@@ -10498,6 +10534,37 @@ impl SpreadRestoreDefaults {
     }
 }
 
+fn default_spread_for_document_direction(
+    mode: crate::settings::SpreadMode,
+    follow: bool,
+    direction: Option<crate::pdf_loader::PdfReadingDirection>,
+) -> crate::settings::SpreadMode {
+    if !follow {
+        return mode;
+    }
+    match direction {
+        Some(crate::pdf_loader::PdfReadingDirection::R2L) => {
+            mode.with_reading_direction(crate::settings::ReadingDirection::Rtl)
+        }
+        Some(crate::pdf_loader::PdfReadingDirection::L2R) => {
+            mode.with_reading_direction(crate::settings::ReadingDirection::Ltr)
+        }
+        None => mode,
+    }
+}
+
+pub(crate) fn pdf_meta_placeholder_allowed(
+    path: &std::path::Path,
+    follow: bool,
+    has_saved_spread: bool,
+) -> bool {
+    let is_epub = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
+    !is_epub && (!follow || has_saved_spread)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SyntheticFolderHistoryDispatch {
     NotSynthetic,
@@ -13298,6 +13365,7 @@ pub struct App {
     pub(crate) pinned_adjustment_refresh_keys: std::collections::HashSet<String>,
     /// 進行中の変換ダイアログ状態。None ならダイアログ非表示。
     pub(crate) archive_convert: Option<crate::ui_dialogs::archive_convert::ArchiveConvertState>,
+    pub(crate) epub_convert: Option<crate::ui_dialogs::epub_convert::EpubConvertState>,
     pub(crate) video_upscale: Option<crate::ui_dialogs::video_upscale::VideoUpscaleState>,
     pub(crate) show_video_upscale_tasks: bool,
     pub(crate) video_upscale_queue: crate::video::upscale::queue::TaskQueue,
@@ -14424,11 +14492,7 @@ pub struct App {
     ///
     /// `handle` を drop (新しい pending への置き換え含む) すると `PdfEnumerateHandle::Drop`
     /// が自動的に cancel を立て、pool dispatcher が pop 時に IPC 前で古いジョブを捨てる。
-    pub(crate) pdf_enumerate_pending: Option<(
-        PathBuf,
-        Option<String>,
-        crate::pdf_loader::PdfEnumerateHandle,
-    )>,
+    pub(crate) pdf_enumerate_pending: Option<PdfEnumeratePending>,
     /// Ctrl+↑↓ フォルダナビで非同期 PDF / ZIP に着地したときに保存する deferred reopen 状態。
     /// `poll_pdf_enumerate` / `poll_zip_enumerate` が items を埋めたあとで fullscreen を
     /// 開き直すために使う (poll 側でフラグを take して先頭/末尾画像を open_fullscreen する)。
@@ -16770,6 +16834,7 @@ impl App {
             edit_preview_refresh_pending: std::collections::HashMap::new(),
             pinned_adjustment_refresh_keys: std::collections::HashSet::new(),
             archive_convert: None,
+            epub_convert: None,
             video_upscale: None,
             show_video_upscale_tasks: false,
             video_upscale_queue,
@@ -18964,6 +19029,7 @@ impl App {
             self.metadata_transfer.is_some() => "metadata_transfer",
             self.cc.show => "cache_creator",
             self.archive_convert_dialog_visible() => "archive_convert",
+            self.epub_convert_dialog_visible() => "epub_convert",
             self.video_upscale.is_some() => "video_upscale",
             self.tq.show => "thumb_quality",
             self.settings_boot_problem_source.is_none() && !self.settings.first_setup_completed
@@ -21378,6 +21444,16 @@ impl App {
         fallback: Option<&std::path::Path>,
         defaults: SpreadRestoreDefaults,
     ) -> Result<(), String> {
+        self.apply_spread_for_key_with_document_direction(key, fallback, defaults, None)
+    }
+
+    fn apply_spread_for_key_with_document_direction(
+        &mut self,
+        key: &std::path::Path,
+        fallback: Option<&std::path::Path>,
+        defaults: SpreadRestoreDefaults,
+        document_direction: Option<crate::pdf_loader::PdfReadingDirection>,
+    ) -> Result<(), String> {
         let db = self.spread_db.as_ref().map_err(Clone::clone)?;
         let stored = db.get_state_with_fallback(key, fallback);
         let final_cover_preference =
@@ -21391,7 +21467,12 @@ impl App {
         self.final_cover_spread_preference = final_cover_preference;
         self.singleton_spread_endpoint_preferences = endpoint_preferences;
         self.page_alone_preferences = page_alone_preferences;
-        let stored_spread = stored.mode.unwrap_or(defaults.spread_mode);
+        let default_spread = default_spread_for_document_direction(
+            defaults.spread_mode,
+            self.settings.follow_document_reading_direction,
+            document_direction,
+        );
+        let stored_spread = stored.mode.unwrap_or(default_spread);
         self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
         self.reading_direction = stored.direction.unwrap_or(defaults.reading_direction);
         if stored_spread == crate::settings::SpreadMode::Vertical {
@@ -21851,6 +21932,7 @@ impl App {
         if !self.claim_open_request_owner(&path, &owner) {
             return FolderOpenOutcome::Ignored;
         }
+        self.cancel_superseded_epub_convert(&path, &owner);
         let format = path
             .extension()
             .and_then(|e| e.to_str())
@@ -21860,9 +21942,7 @@ impl App {
         {
             if self.settings.archive_file_handling_ignores_convertible() {
                 self.pending_auto_fs_open = false;
-                self.show_feedback_toast(
-                    "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
-                );
+                self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
                 return FolderOpenOutcome::Ignored;
             }
             if format == crate::archive_converter::ArchiveFormat::Rar {
@@ -21947,6 +22027,7 @@ impl App {
         if !self.claim_open_request_owner(&path, &owner) {
             return false;
         }
+        self.cancel_superseded_epub_convert(&path, &owner);
         self.load_folder_with_scan_claimed(path, pre_scan, owner, VisibleInstallAuthority::Ordinary)
     }
 
@@ -22169,6 +22250,13 @@ impl App {
         authority: VisibleInstallAuthority<'_>,
     ) -> bool {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        let pdf_open_history_snapshot = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("pdf") || extension.eq_ignore_ascii_case("epub")
+            })
+            .then(|| self.folder_nav_history_snapshot());
         let independent_navigation = !detached_physical
             && matches!(
                 &owner,
@@ -22383,7 +22471,7 @@ impl App {
                 }
                 return true;
             }
-            if ext == "pdf" {
+            if ext == "pdf" || ext == "epub" {
                 if !self.adopt_collection_surface_for_physical_load(
                     &path,
                     &owner,
@@ -22392,7 +22480,10 @@ impl App {
                     self.pending_auto_fs_open = false;
                     return false;
                 }
-                self.load_pdf_as_folder(path);
+                self.load_pdf_as_folder_owned(path, owner);
+                if let Some(pending) = self.pdf_enumerate_pending.as_mut() {
+                    pending.4 = pdf_open_history_snapshot;
+                }
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "nav",
@@ -26383,22 +26474,29 @@ impl App {
     }
 
     pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
-        self.load_pdf_as_folder_with_prepared_pages(pdf_path, None);
+        self.load_pdf_as_folder_owned(pdf_path, OpenRequestOwner::Navigation);
+    }
+
+    pub(crate) fn load_pdf_as_folder_owned(&mut self, pdf_path: PathBuf, owner: OpenRequestOwner) {
+        self.load_pdf_as_folder_with_prepared_pages(pdf_path, None, owner);
     }
 
     pub(in crate::app) fn load_pdf_as_folder_prepared(
         &mut self,
         pdf_path: PathBuf,
-        pages: Vec<crate::pdf_loader::PdfPageEntry>,
+        pages: crate::pdf_loader::PdfEnumerateResult,
+        owner: OpenRequestOwner,
     ) {
-        self.load_pdf_as_folder_with_prepared_pages(pdf_path, Some(pages));
+        self.load_pdf_as_folder_with_prepared_pages(pdf_path, Some(pages), owner);
     }
 
     fn load_pdf_as_folder_with_prepared_pages(
         &mut self,
         pdf_path: PathBuf,
-        prepared_pages: Option<Vec<crate::pdf_loader::PdfPageEntry>>,
+        prepared_pages: Option<crate::pdf_loader::PdfEnumerateResult>,
+        owner: OpenRequestOwner,
     ) {
+        self.cancel_superseded_epub_convert(&pdf_path, &owner);
         crate::logger::log(format!(
             "=== load_pdf_as_folder: {} ===",
             pdf_path.display()
@@ -26430,7 +26528,7 @@ impl App {
         let mut previous_pdf_enumerate = self.pdf_enumerate_pending.take();
         if previous_pdf_enumerate
             .as_ref()
-            .is_some_and(|(path, _, _)| !crate::path_key::eq_keep_drive(path, &pdf_path))
+            .is_some_and(|(path, _, _, _, _)| !crate::path_key::eq_keep_drive(path, &pdf_path))
         {
             previous_pdf_enumerate = None;
         }
@@ -26463,7 +26561,7 @@ impl App {
         let password: Option<String> = self.pdf_open_password(&pdf_path);
         if previous_pdf_enumerate
             .as_ref()
-            .is_some_and(|(_, previous_password, _)| previous_password != &password)
+            .is_some_and(|(_, previous_password, _, _, _)| previous_password != &password)
         {
             // 同じ path でも password が違えば別 request。旧 source はここで cancel する。
             previous_pdf_enumerate = None;
@@ -26485,14 +26583,39 @@ impl App {
         // 永続化されている。mtime/file_size 一致なら即座に N セルの placeholder grid に
         // 遷移して「キビキビ動く」体感を実現する (= PDFium 開封の 100ms〜1.3s を裏に隠す)。
         // 検証 enumerate は並行して必ず走らせ、結果を `poll_pdf_enumerate` で照合する。
-        let placeholder_built = self.try_apply_pdf_meta_cache(&pdf_path, saved_password.is_some());
+        let is_epub = pdf_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
+        let has_saved_spread = self
+            .spread_db
+            .as_ref()
+            .is_ok_and(|db| db.get_state_with_fallback(&pdf_path, None).mode.is_some());
+        let want_direction = self.settings.follow_document_reading_direction && !has_saved_spread;
+        let placeholder_built = if pdf_meta_placeholder_allowed(
+            &pdf_path,
+            self.settings.follow_document_reading_direction,
+            has_saved_spread,
+        ) {
+            self.try_apply_pdf_meta_cache(&pdf_path, saved_password.is_some())
+        } else {
+            None
+        };
 
         // ── 非同期でページ列挙をリクエスト (検証 + cache 更新) ──
         let handle = match prepared_pages {
-            Some(pages) => crate::pdf_loader::completed_enumerate_handle(&pdf_path, Ok(pages)),
-            None => crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref()),
+            Some(pages) => {
+                crate::pdf_loader::completed_enumerate_result_handle(&pdf_path, Ok(pages))
+            }
+            None => crate::pdf_loader::enumerate_pages_async_with_options(
+                &pdf_path,
+                password.as_deref(),
+                crate::pdf_loader::EnumerateOptions {
+                    want_direction: want_direction && !is_epub,
+                },
+            ),
         };
-        self.pdf_enumerate_pending = Some((pdf_path.clone(), password, handle));
+        self.pdf_enumerate_pending = Some((pdf_path.clone(), password, handle, owner, None));
         // 同じ key なら新 handle が既に waiter として登録済みなので、ここで旧 handle を
         // drop しても source request は継続する。
         drop(previous_pdf_enumerate);
@@ -26797,7 +26920,7 @@ impl App {
         if self.sidecar_restore_active() {
             return;
         }
-        let Some((ref pdf_path, _, ref handle)) = self.pdf_enumerate_pending else {
+        let Some((ref pdf_path, _, ref handle, _, _)) = self.pdf_enumerate_pending else {
             return;
         };
 
@@ -26845,7 +26968,8 @@ impl App {
             }
         };
 
-        let (pdf_path, password, _handle) = self.pdf_enumerate_pending.take().unwrap();
+        let (pdf_path, password, _handle, owner, history_snapshot) =
+            self.pdf_enumerate_pending.take().unwrap();
 
         // cancel 経由の Interrupted は late-arriving な stale 結果なので適用しない
         // (pool dispatcher が cancel を見て IPC 前に Err で返してくるパス)
@@ -26970,6 +27094,19 @@ impl App {
                         Vec::new(),
                         None,
                     );
+                    if self.settings.follow_document_reading_direction {
+                        let defaults = SpreadRestoreDefaults::for_book(&self.settings);
+                        if let Err(error) = self.apply_spread_for_key_with_document_direction(
+                            &pdf_path,
+                            None,
+                            defaults,
+                            pages.direction,
+                        ) {
+                            crate::logger::log(format!(
+                                "spread: failed to apply document direction: {error}"
+                            ));
+                        }
+                    }
                 }
 
                 // Ctrl+↑↓ フォルダナビから遷移してきた場合はここで fullscreen を開き直す。
@@ -26980,6 +27117,28 @@ impl App {
                 }
             }
             Err(e) => {
+                let failure = PdfOpenFailure::from(e.clone());
+                let route = self.route_pdf_open_failure(owner, &pdf_path, failure);
+                if route != PdfOpenFailureRoute::Unhandled {
+                    match route {
+                        PdfOpenFailureRoute::ConversionDialogOpened => {
+                            if let Some(state) = self.epub_convert.as_mut() {
+                                state.nav_history_rollback = history_snapshot;
+                                state.deferred_fullscreen = self.fs_nav_after_pdf_enumerate.take();
+                            }
+                        }
+                        PdfOpenFailureRoute::Handled => {
+                            if let Some(snapshot) = history_snapshot {
+                                self.restore_folder_nav_history(snapshot);
+                            }
+                            self.fs_nav_after_pdf_enumerate = None;
+                            self.finish_visible_container_fs_nav_failed();
+                        }
+                        PdfOpenFailureRoute::Unhandled => unreachable!(),
+                    }
+                    self.pdf_placeholder_count = None;
+                    return;
+                }
                 let err_msg = format!("{e}");
                 if matches!(e, crate::pdf_loader::PdfReadError::PasswordRequired) {
                     // 誤ったパスワードを DPAPI/セッションキャッシュに保存していた場合は破棄し、
@@ -27744,7 +27903,7 @@ impl App {
         // enumerate pending を無効化する。放置すると遅れて届いた結果を
         // `poll_pdf_enumerate` が適用して現在表示を古い PDF 仮想フォルダに戻す。
         // pending.Drop で自動 cancel されるので take するだけでよい。
-        if let Some((pending_path, _, _)) = self.pdf_enumerate_pending.as_ref() {
+        if let Some((pending_path, _, _, _, _)) = self.pdf_enumerate_pending.as_ref() {
             if pending_path != &source_path {
                 self.pdf_enumerate_pending = None;
                 self.fs_nav_after_pdf_enumerate = None;
@@ -78539,6 +78698,7 @@ impl eframe::App for App {
             self.similar_panel.preview.poll_background(ctx, &passwords);
         }
         self.update_frame(ctx, frame);
+        self.show_epub_convert_dialog(ctx);
         // `update_frame` has several native/fullscreen early returns. Recovery polling belongs
         // outside it so worker completions, writer fences, and the terminal continuation cannot
         // stall behind a presentation path. Running it after the frame also keeps the modal/input
@@ -78573,6 +78733,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.epub_convert = None;
         // A process exit that bypassed the ordinary close-event frame must still fence the exact
         // settings-family mutation before any settings save/flush in `on_exit_inner`.
         self.resolve_settings_family_operation_for_exit();

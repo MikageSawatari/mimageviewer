@@ -804,7 +804,14 @@ pub fn resolve_openable_path_detailed(path: &Path) -> Option<OpenablePathResolut
         });
     }
     let requested_is_file = path.is_file();
-    if requested_is_file && (is_virtual_folder(path) || is_convertible_archive_path(path)) {
+    if requested_is_file
+        && (is_virtual_folder(path)
+            || is_convertible_archive_path(path)
+            || path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("epub")))
+    {
         return Some(OpenablePathResolution {
             path: path.to_path_buf(),
             kind: OpenablePathKind::File,
@@ -1038,6 +1045,16 @@ mod tests {
         assert_eq!(detailed.path, tmp.path());
         assert_eq!(detailed.kind, OpenablePathKind::Directory);
         assert!(detailed.requested_is_file);
+    }
+
+    #[test]
+    fn epub_file_is_resolved_as_openable_without_parent_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let epub = temp.path().join("book.EPUB");
+        std::fs::write(&epub, b"epub").unwrap();
+        let resolved = resolve_openable_path_detailed(&epub).unwrap();
+        assert_eq!(resolved.path, epub);
+        assert_eq!(resolved.kind, OpenablePathKind::File);
     }
 
     #[test]

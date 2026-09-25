@@ -78,6 +78,7 @@ pub enum EpubConvertError {
     RenderFailed,
     Timeout,
     SourceBusy,
+    Unavailable(String),
     Cancelled,
     Protocol,
     InvalidPdf,
@@ -174,6 +175,7 @@ impl CancelToken {
 
 #[derive(Clone)]
 pub struct WorkerSpec {
+    pub operation: WorkerOperation,
     pub executable: PathBuf,
     pub input: PathBuf,
     pub output: PathBuf,
@@ -183,6 +185,19 @@ pub struct WorkerSpec {
     pub environment: Vec<(OsString, OsString)>,
     #[cfg(test)]
     pub native_test_args: Option<Vec<OsString>>,
+}
+
+#[derive(Clone, Copy)]
+pub enum WorkerOperation {
+    Inspect,
+    Convert,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpubInspectSummary {
+    pub layout: String,
+    pub direction: String,
+    pub spine_count: usize,
 }
 
 fn worker_environment() -> Vec<(OsString, OsString)> {
@@ -236,6 +251,108 @@ pub fn worker_executable() -> io::Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     Ok(std::env::current_exe()?.with_file_name("mimageviewer-epub-pdf.exe"))
+}
+
+/// Inspect is a separate, cancellable worker process and must run off the UI thread.
+pub fn inspect(
+    source: &Path,
+    cancel: &CancelToken,
+    timeout_secs: u32,
+) -> Result<EpubInspectSummary, EpubConvertError> {
+    inspect_at(source, cancel, timeout_secs, &NativeSpawner)
+}
+
+pub fn inspect_at<S: WorkerSpawner>(
+    source: &Path,
+    cancel: &CancelToken,
+    timeout_secs: u32,
+    spawner: &S,
+) -> Result<EpubInspectSummary, EpubConvertError> {
+    let spec = WorkerSpec {
+        operation: WorkerOperation::Inspect,
+        executable: worker_executable()?,
+        input: source.to_owned(),
+        output: PathBuf::new(),
+        work_dir: PathBuf::new(),
+        user_data_dir: PathBuf::new(),
+        timeout_secs,
+        environment: worker_environment(),
+        #[cfg(test)]
+        native_test_args: None,
+    };
+    let mut child = spawner.spawn(&spec)?;
+    let stdout = child.take_stdout()?;
+    let stderr = child.take_stderr()?;
+    let output_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        BufReader::new(stdout)
+            .take(32 * 1024 * 1024)
+            .read_to_end(&mut bytes)?;
+        Ok::<_, io::Error>(bytes)
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = BufReader::new(stderr)
+            .take(64 * 1024)
+            .read_to_end(&mut bytes);
+    });
+    let waited = child.wait(cancel, Duration::from_secs(timeout_secs as u64));
+    drop(child);
+    let output = output_thread
+        .join()
+        .map_err(|_| EpubConvertError::Protocol)??;
+    let _ = stderr_thread.join();
+    let code = waited?;
+    if cancel.is_cancelled() {
+        return Err(EpubConvertError::Cancelled);
+    }
+    match code {
+        2 => return Err(EpubConvertError::Drm),
+        3 => return Err(EpubConvertError::Invalid),
+        0 => {}
+        _ => return Err(EpubConvertError::RenderFailed),
+    }
+    #[derive(Deserialize)]
+    struct Inspected {
+        rendition: InspectedRendition,
+        direction: String,
+        spine: Vec<InspectedSpine>,
+        drm: String,
+    }
+    #[derive(Deserialize)]
+    struct InspectedRendition {
+        layout: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct InspectedSpine {
+        rendition: InspectedRendition,
+    }
+    let inspected: Inspected =
+        serde_json::from_slice(&output).map_err(|_| EpubConvertError::Protocol)?;
+    if inspected.drm != "none" {
+        return Err(EpubConvertError::Drm);
+    }
+    let package_fixed = inspected.rendition.layout.as_deref() == Some("pre-paginated");
+    let fixed_count = inspected
+        .spine
+        .iter()
+        .filter(|item| {
+            item.rendition.layout.as_deref() == Some("pre-paginated")
+                || (package_fixed && item.rendition.layout.is_none())
+        })
+        .count();
+    let layout = if fixed_count == 0 {
+        "reflow"
+    } else if fixed_count == inspected.spine.len() {
+        "fixed"
+    } else {
+        "mixed"
+    };
+    Ok(EpubInspectSummary {
+        layout: layout.to_owned(),
+        direction: inspected.direction,
+        spine_count: inspected.spine.len(),
+    })
 }
 
 pub fn convert(
@@ -302,6 +419,7 @@ pub fn convert_at<S: WorkerSpawner>(
     let part = reserved.part_path();
     let _part_cleanup = PartCleanup(part.to_owned());
     let spec = WorkerSpec {
+        operation: WorkerOperation::Convert,
         executable: worker_executable()?,
         input: source_copy,
         output: part.to_owned(),
@@ -745,19 +863,26 @@ mod windows_process {
         }
         .map_err(|error| io::Error::other(error.to_string()))?;
         let timeout = spec.timeout_secs.to_string();
-        let args: Vec<OsString> = vec![
-            spec.executable.as_os_str().to_os_string(),
-            OsString::from("convert"),
-            spec.input.as_os_str().to_os_string(),
-            spec.output.as_os_str().to_os_string(),
-            OsString::from("--work-dir"),
-            spec.work_dir.as_os_str().to_os_string(),
-            OsString::from("--user-data-dir"),
-            spec.user_data_dir.as_os_str().to_os_string(),
-            OsString::from("--progress-json"),
-            OsString::from("--timeout-secs"),
-            OsString::from(timeout),
-        ];
+        let args: Vec<OsString> = match spec.operation {
+            WorkerOperation::Inspect => vec![
+                spec.executable.as_os_str().to_os_string(),
+                OsString::from("inspect"),
+                spec.input.as_os_str().to_os_string(),
+            ],
+            WorkerOperation::Convert => vec![
+                spec.executable.as_os_str().to_os_string(),
+                OsString::from("convert"),
+                spec.input.as_os_str().to_os_string(),
+                spec.output.as_os_str().to_os_string(),
+                OsString::from("--work-dir"),
+                spec.work_dir.as_os_str().to_os_string(),
+                OsString::from("--user-data-dir"),
+                spec.user_data_dir.as_os_str().to_os_string(),
+                OsString::from("--progress-json"),
+                OsString::from("--timeout-secs"),
+                OsString::from(timeout),
+            ],
+        };
         #[cfg(test)]
         let args: Vec<OsString> = if let Some(test_args) = &spec.native_test_args {
             std::iter::once(args[0].clone())
@@ -944,6 +1069,49 @@ mod tests {
                 Ok(self.code)
             }
         }
+    }
+
+    struct InspectSpawner {
+        code: i32,
+        stdout: Vec<u8>,
+    }
+
+    impl WorkerSpawner for InspectSpawner {
+        fn spawn(&self, spec: &WorkerSpec) -> Result<Box<dyn WorkerChild>, EpubConvertError> {
+            assert!(matches!(spec.operation, WorkerOperation::Inspect));
+            assert_eq!(spec.input, Path::new("book.epub"));
+            Ok(Box::new(FakeChild {
+                stdout: Some(self.stdout.clone()),
+                code: self.code,
+                mode: FakeMode::Success,
+                killed: Arc::new(AtomicBool::new(false)),
+            }))
+        }
+    }
+
+    #[test]
+    fn inspect_fake_worker_reports_summary_and_rejects_drm() {
+        let spawner = InspectSpawner {
+            code: 0,
+            stdout: br#"{"rendition":{"layout":"pre-paginated"},"direction":"rtl","spine":[{"rendition":{"layout":null}},{"rendition":{"layout":null}}],"drm":"none"}"#.to_vec(),
+        };
+        let cancel = CancelToken::new().unwrap();
+        assert_eq!(
+            inspect_at(Path::new("book.epub"), &cancel, 5, &spawner).unwrap(),
+            EpubInspectSummary {
+                layout: "fixed".into(),
+                direction: "rtl".into(),
+                spine_count: 2,
+            }
+        );
+        let drm = InspectSpawner {
+            code: 2,
+            stdout: Vec::new(),
+        };
+        assert!(matches!(
+            inspect_at(Path::new("book.epub"), &cancel, 5, &drm),
+            Err(EpubConvertError::Drm)
+        ));
     }
 
     fn run(mode: FakeMode) -> (ConvertResult, tempfile::TempDir, Arc<AtomicBool>, PathBuf) {

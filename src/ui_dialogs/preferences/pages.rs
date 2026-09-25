@@ -9121,6 +9121,13 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 }
             });
     });
+    anchored(ui, state, "spread/document-direction", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.follow_document_reading_direction,
+            "PDF / EPUB の右開き指定に従う",
+        );
+        ui.small("本ごとに保存した見開き設定がある場合は、その設定を優先します。");
+    });
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
     });
