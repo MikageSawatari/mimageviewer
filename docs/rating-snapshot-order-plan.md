@@ -313,8 +313,12 @@ rebuild へ分ける。query、sort 変更、reload だけが通常の sorted re
 1. path key の書き込みを `rating_cache` へ反映する。
 2. Ctrl+G の `all_hits.stars` と drill 件数を更新する (membership-only rebuild)。
 3. Rating view の membership (★N から外れた行の除去、入った行の追加) を更新する。
-   評価条件を持つ Smart Folder も同じく membership-only に更新する (外れた行を除き、入った行を末尾へ足す。
+   評価条件を持つ Smart Folder も同じく membership-only に更新する (外れた行を隠し、入った行を末尾へ足す。
    survivor の順は変えない)。評価の書き込みを理由に Smart Folder を全体再 prepare して並べ直さない。
+   外れた行は `items` から取り除かず、rating filter で隠れた行と同じく `visible_indices`・Ctrl+↑↓ の移動先・
+   件数から外し、次の明示 reload / 開き直し / 定義 rebuild まで隠したままにする (R3 再レビューで決定)。
+   取り除くと後続 index がずれ、Ctrl+↑↓ の移動先一覧、Details の評価ヘッダ順、checked、動画サムネイルの
+   進行中作業がそれぞれ壊れたため。同じ session 中に再び条件を満たした行は元の位置で再表示される。
 4. rating filter / Rated・Unrated facet と Details state を更新する。
 5. selected が非表示になった場合は既存の nearest-visible policy、checked は既存の WYSIWYG policy。
 
