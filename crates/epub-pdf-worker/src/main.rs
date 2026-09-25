@@ -5,7 +5,7 @@ use epub_pdf_worker::{
     protocol::{Event, Phase},
     render::{self, Segment},
     report::{SourceImage, UserDataCleanup},
-    webview::Host,
+    webview::{Host, UserDataFolderIdentity},
 };
 use std::{
     fs,
@@ -88,7 +88,25 @@ fn write_json(path: &Path, report: &Report) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())
 }
-fn cleanup_user_data(dir: &Path) -> UserDataCleanup {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupMode {
+    Recursive,
+    EmptyOnly(&'static str),
+}
+
+fn cleanup_mode(identity: Option<&UserDataFolderIdentity>) -> CleanupMode {
+    match identity {
+        Some(UserDataFolderIdentity::VerifiedRequested) => CleanupMode::Recursive,
+        Some(UserDataFolderIdentity::Redirected(_)) => {
+            CleanupMode::EmptyOnly("WebView2 used a different user data folder")
+        }
+        Some(UserDataFolderIdentity::Unverifiable(_)) | None => {
+            CleanupMode::EmptyOnly("WebView2 user data folder was not verified")
+        }
+    }
+}
+
+fn cleanup_user_data(dir: &Path, mode: CleanupMode) -> UserDataCleanup {
     let start = Instant::now();
     let mut last = None;
     let path = dir.display().to_string();
@@ -99,18 +117,37 @@ fn cleanup_user_data(dir: &Path) -> UserDataCleanup {
                 deleted: true,
                 held_ms: start.elapsed().as_millis(),
                 error: None,
+                skipped_reason: None,
             };
         }
-        match fs::remove_dir_all(dir) {
+        let removal = match mode {
+            CleanupMode::Recursive => fs::remove_dir_all(dir),
+            CleanupMode::EmptyOnly(_) => fs::remove_dir(dir),
+        };
+        match removal {
             Ok(()) => {
                 return UserDataCleanup {
                     path,
                     deleted: true,
                     held_ms: start.elapsed().as_millis(),
                     error: None,
+                    skipped_reason: None,
                 };
             }
-            Err(e) => last = Some(e.to_string()),
+            Err(e) => {
+                if let CleanupMode::EmptyOnly(reason) = mode
+                    && fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+                {
+                    return UserDataCleanup {
+                        path,
+                        deleted: false,
+                        held_ms: start.elapsed().as_millis(),
+                        error: None,
+                        skipped_reason: Some(reason.into()),
+                    };
+                }
+                last = Some(e.to_string());
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -119,6 +156,10 @@ fn cleanup_user_data(dir: &Path) -> UserDataCleanup {
         deleted: false,
         held_ms: start.elapsed().as_millis(),
         error: last,
+        skipped_reason: match mode {
+            CleanupMode::Recursive => None,
+            CleanupMode::EmptyOnly(reason) => Some(reason.into()),
+        },
     }
 }
 struct Engine {
@@ -331,11 +372,15 @@ impl Engine {
         let host = self.host.as_ref().unwrap();
         r.webview_runtime = Some(host.version.clone());
         r.web_resource_filter = Some(host.request_filter.clone());
-        r.user_data_folder_redirected = host
-            .user_data_folder_redirected
-            .as_ref()
-            .map(|path| path.display().to_string());
-        r.user_data_folder_check_error = host.user_data_folder_check_error.clone();
+        match &host.user_data_folder_identity {
+            UserDataFolderIdentity::VerifiedRequested => {}
+            UserDataFolderIdentity::Redirected(path) => {
+                r.user_data_folder_redirected = Some(path.display().to_string());
+            }
+            UserDataFolderIdentity::Unverifiable(error) => {
+                r.user_data_folder_check_error = Some(error.clone());
+            }
+        }
         host.map_folder(&root).map_err(|e| (5, e))?;
         let mut part_files = Vec::<PathBuf>::new();
         let mut size_sources = Vec::<Option<String>>::new();
@@ -459,18 +504,28 @@ impl Engine {
         Ok(())
     }
     fn finish(mut self) -> UserDataCleanup {
+        let mode = cleanup_mode(
+            self.host
+                .as_ref()
+                .map(|host| &host.user_data_folder_identity),
+        );
         self.host.take();
         // Only the fresh requested path created by Engine::new belongs to us.
-        let cleanup = cleanup_user_data(&self.user_data);
+        let cleanup = cleanup_user_data(&self.user_data, mode);
         self.owns_user_data = false;
         cleanup
     }
 }
 impl Drop for Engine {
     fn drop(&mut self) {
+        let mode = cleanup_mode(
+            self.host
+                .as_ref()
+                .map(|host| &host.user_data_folder_identity),
+        );
         self.host.take();
         if self.owns_user_data {
-            let _ = cleanup_user_data(&self.user_data);
+            let _ = cleanup_user_data(&self.user_data, mode);
             self.owns_user_data = false;
         }
     }
@@ -611,4 +666,59 @@ fn main() {
         );
     }
     std::process::exit(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_mode_requires_verified_requested_identity() {
+        let requested = PathBuf::from(r"C:\requested");
+        assert_eq!(
+            cleanup_mode(Some(&UserDataFolderIdentity::VerifiedRequested)),
+            CleanupMode::Recursive
+        );
+        assert!(matches!(
+            cleanup_mode(Some(&UserDataFolderIdentity::Redirected(
+                requested.join("nested")
+            ))),
+            CleanupMode::EmptyOnly(_)
+        ));
+        assert!(matches!(
+            cleanup_mode(Some(&UserDataFolderIdentity::Redirected(PathBuf::from(
+                r"C:\elsewhere"
+            )))),
+            CleanupMode::EmptyOnly(_)
+        ));
+        assert!(matches!(
+            cleanup_mode(Some(&UserDataFolderIdentity::Unverifiable(
+                "query failed".into()
+            ))),
+            CleanupMode::EmptyOnly(_)
+        ));
+        assert!(matches!(cleanup_mode(None), CleanupMode::EmptyOnly(_)));
+    }
+
+    #[test]
+    fn redirected_cleanup_leaves_nonempty_requested_folder() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!(
+            "miv-epub-cleanup-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&folder).unwrap();
+        let content = folder.join("nested");
+        fs::create_dir(&content).unwrap();
+        fs::write(content.join("keep"), b"keep").unwrap();
+        let report = cleanup_user_data(&folder, CleanupMode::EmptyOnly("redirected"));
+        assert!(!report.deleted);
+        assert_eq!(report.skipped_reason.as_deref(), Some("redirected"));
+        assert_eq!(fs::read(content.join("keep")).unwrap(), b"keep");
+        assert!(cleanup_user_data(&content, CleanupMode::Recursive).deleted);
+        assert!(cleanup_user_data(&folder, CleanupMode::EmptyOnly("redirected")).deleted);
+    }
 }

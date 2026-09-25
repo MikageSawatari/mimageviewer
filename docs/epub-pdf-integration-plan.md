@@ -560,6 +560,7 @@ S2 へ引き継ぐ事項: 強制終了で残る `<out>.tmp-<pid>-<n>` と `.part
 この段階では変換 API の UI 接続、PDFium の `verify_converted_pdf`、`pdf_loader` の解決と固定表、グリッド・管理 UI は未実装 (S2b / S2c / S3)。実 WebView2 ワーカーの起動とネットワーク・Job 子孫の再実測は隔離環境外の検収で行う。
 `epub_cache.db` は新設かつ未リリースなので、既存データ用のスキーマ移行は設けない。
 進捗 JSON の serde 型はワーカーが独立 workspace package である構成を保つため、本体に同じフィールド名・列挙値を小さく複製する。S2a の fake worker テストには Windows の実 `CreateProcessW` / Job Object 経路を通るものを含める。
+独立レビューの追補では、`.alive` の共有モードから delete を除き、保持中の名前変更を防いだ。起動時掃除は `generation_ids` に記録した予定 PDF パスと完了状態を使い、retired 行と未完了予約だけを処理する。削除対象は再解析ポイントを辿らずに開き、ハンドル上の最終パスがキャッシュ内にあると確認して同じハンドルから削除する。全世代の走査は行わない。変換ランナーは `ConvertedPdfVerifier` の注入を必須とし、S2a の最小 PDF 確認はテスト専用とした。S2b の UI 接続には PDFium による検証器の実装が必要。
 
 ### D11 の反映 (2026-09-25)
 

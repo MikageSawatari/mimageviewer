@@ -47,6 +47,7 @@ pub struct UserDataCleanup {
     pub deleted: bool,
     pub held_ms: u128,
     pub error: Option<String>,
+    pub skipped_reason: Option<String>,
 }
 impl Report {
     pub fn new(path: &std::path::Path) -> Self {

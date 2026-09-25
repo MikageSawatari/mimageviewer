@@ -98,37 +98,29 @@ pub fn clear_webview_environment() {
     }
 }
 
-#[derive(Default)]
-struct UserDataFolderObservation {
-    redirected_to: Option<PathBuf>,
-    error: Option<String>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UserDataFolderIdentity {
+    VerifiedRequested,
+    Redirected(PathBuf),
+    Unverifiable(String),
 }
 
 fn observe_user_data_folder(
     requested: &Path,
     actual: Result<PathBuf, String>,
     same_identity: impl FnOnce(&Path, &Path) -> Result<bool, String>,
-) -> UserDataFolderObservation {
+) -> UserDataFolderIdentity {
     match actual {
         Ok(actual) => match same_identity(requested, &actual) {
-            Ok(true) => UserDataFolderObservation::default(),
-            Ok(false) => UserDataFolderObservation {
-                redirected_to: Some(actual),
-                error: None,
-            },
-            Err(error) => UserDataFolderObservation {
-                redirected_to: None,
-                error: Some(format!(
-                    "cannot compare requested {} with actual {}: {error}",
-                    requested.display(),
-                    actual.display()
-                )),
-            },
+            Ok(true) => UserDataFolderIdentity::VerifiedRequested,
+            Ok(false) => UserDataFolderIdentity::Redirected(actual),
+            Err(error) => UserDataFolderIdentity::Unverifiable(format!(
+                "cannot compare requested {} with actual {}: {error}",
+                requested.display(),
+                actual.display()
+            )),
         },
-        Err(error) => UserDataFolderObservation {
-            redirected_to: None,
-            error: Some(error),
-        },
+        Err(error) => UserDataFolderIdentity::Unverifiable(error),
     }
 }
 
@@ -186,8 +178,7 @@ pub struct Host {
     blocked: Rc<RefCell<BlockedRequests>>,
     pub request_filter: String,
     pub version: String,
-    pub user_data_folder_redirected: Option<PathBuf>,
-    pub user_data_folder_check_error: Option<String>,
+    pub user_data_folder_identity: UserDataFolderIdentity,
 }
 
 impl Host {
@@ -216,8 +207,9 @@ impl Host {
             blocked: Rc::new(RefCell::new(BlockedRequests::default())),
             request_filter: String::new(),
             version,
-            user_data_folder_redirected: None,
-            user_data_folder_check_error: None,
+            user_data_folder_identity: UserDataFolderIdentity::Unverifiable(
+                "UserDataFolder not queried".into(),
+            ),
         };
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
             .ok()
@@ -300,18 +292,18 @@ impl Host {
         })();
         let observation =
             observe_user_data_folder(user_data, actual, crate::paths::same_directory_identity);
-        if let Some(actual) = &observation.redirected_to {
-            eprintln!(
+        match &observation {
+            UserDataFolderIdentity::VerifiedRequested => {}
+            UserDataFolderIdentity::Redirected(actual) => eprintln!(
                 "WebView2 user data folder differs: requested {}, actual {}",
                 user_data.display(),
                 actual.display()
-            );
+            ),
+            UserDataFolderIdentity::Unverifiable(error) => {
+                eprintln!("WebView2 user data folder check: {error}");
+            }
         }
-        if let Some(error) = &observation.error {
-            eprintln!("WebView2 user data folder check: {error}");
-        }
-        h.user_data_folder_redirected = observation.redirected_to;
-        h.user_data_folder_check_error = observation.error;
+        h.user_data_folder_identity = observation;
 
         let (tx, rx) = mpsc::channel();
         let callback = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
@@ -640,8 +632,7 @@ mod tests {
         let requested = Path::new(r"C:\worker\requested");
         let actual = PathBuf::from(r"C:\policy\actual");
         let observation = observe_user_data_folder(requested, Ok(actual.clone()), |_, _| Ok(false));
-        assert_eq!(observation.redirected_to, Some(actual));
-        assert!(observation.error.is_none());
+        assert_eq!(observation, UserDataFolderIdentity::Redirected(actual));
     }
 
     #[test]
@@ -652,8 +643,9 @@ mod tests {
             Ok(actual.clone()),
             |_, _| Err("access denied".into()),
         );
-        assert!(observation.redirected_to.is_none());
-        let error = observation.error.unwrap();
+        let UserDataFolderIdentity::Unverifiable(error) = observation else {
+            panic!("identity check error must be diagnostic");
+        };
         assert!(error.contains(&actual.display().to_string()));
         assert!(error.contains("access denied"));
 
@@ -662,7 +654,9 @@ mod tests {
             Err("query unavailable".into()),
             |_, _| unreachable!(),
         );
-        assert!(observation.redirected_to.is_none());
-        assert_eq!(observation.error.as_deref(), Some("query unavailable"));
+        assert_eq!(
+            observation,
+            UserDataFolderIdentity::Unverifiable("query unavailable".into())
+        );
     }
 }

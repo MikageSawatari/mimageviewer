@@ -1,4 +1,7 @@
 //! Background-only EPUB conversion. S2b will own scheduling and call this API.
+//! A `ConvertedPdfVerifier` is mandatory: S2b must inject PDFium's
+//! `pdf_loader::verify_converted_pdf` before wiring this runner to the app.
+//! The S2a byte-level placeholder is available only to tests.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -94,6 +97,11 @@ impl From<epub_cache::CacheError> for EpubConvertError {
 }
 
 pub type ConvertResult = Result<PublishOutcome, EpubConvertError>;
+
+/// Verifies the finished worker output before it is promoted or published.
+pub trait ConvertedPdfVerifier: Send + Sync {
+    fn verify(&self, path: &Path, pages: usize) -> Result<(), EpubConvertError>;
+}
 
 #[derive(Clone)]
 pub struct CancelToken {
@@ -213,6 +221,7 @@ pub fn convert(
     cancel: &CancelToken,
     progress: &mpsc::Sender<ConvertProgress>,
     timeout_secs: u32,
+    verifier: &dyn ConvertedPdfVerifier,
 ) -> ConvertResult {
     let data_dir = crate::data_dir::get();
     convert_at(
@@ -226,6 +235,7 @@ pub fn convert(
         progress,
         timeout_secs,
         &NativeSpawner,
+        verifier,
     )
 }
 
@@ -243,6 +253,7 @@ pub fn convert_at<S: WorkerSpawner>(
     progress: &mpsc::Sender<ConvertProgress>,
     timeout_secs: u32,
     spawner: &S,
+    verifier: &dyn ConvertedPdfVerifier,
 ) -> ConvertResult {
     if !context.gate.authorizes(context.data_dir) {
         return Err(EpubConvertError::Cache(
@@ -253,7 +264,7 @@ pub fn convert_at<S: WorkerSpawner>(
     if timeout_secs == 0 {
         return Err(EpubConvertError::Invalid);
     }
-    let id = db.reserve_generation_id()?;
+    let id = db.reserve_generation_id(source)?;
     if cancel.is_cancelled() {
         return Err(EpubConvertError::Cancelled);
     }
@@ -303,7 +314,7 @@ pub fn convert_at<S: WorkerSpawner>(
     }
     let result = parsed?;
     let (pages, direction, profile) = validate_result(code, result)?;
-    verify_converted_pdf_stage2a(&part, pages)?;
+    verifier.verify(&part, pages)?;
     if cancel.is_cancelled() {
         return Err(EpubConvertError::Cancelled);
     }
@@ -510,7 +521,8 @@ fn validate_result(
     }
 }
 
-/// S2b replaces this minimal byte check with PDFium `verify_converted_pdf`.
+/// Test-only placeholder. Production callers must supply PDFium verification.
+#[cfg(test)]
 fn verify_converted_pdf_stage2a(path: &Path, pages: usize) -> Result<(), EpubConvertError> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -797,6 +809,25 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::AtomicBool;
 
+    struct TestPdfVerifier;
+    impl ConvertedPdfVerifier for TestPdfVerifier {
+        fn verify(&self, path: &Path, pages: usize) -> Result<(), EpubConvertError> {
+            verify_converted_pdf_stage2a(path, pages)
+        }
+    }
+
+    fn reserved_part(root: &Path) -> PathBuf {
+        let conn = rusqlite::Connection::open(root.join("epub_cache.db")).unwrap();
+        let file: String = conn
+            .query_row(
+                "SELECT pdf_file FROM generation_ids ORDER BY generation_id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        PathBuf::from(file).with_extension("pdf.part")
+    }
+
     #[derive(Clone, Copy)]
     enum FakeMode {
         Success,
@@ -915,6 +946,7 @@ mod tests {
             &tx,
             3,
             &fake,
+            &TestPdfVerifier,
         );
         (result, tmp, killed, temp_root)
     }
@@ -1019,7 +1051,7 @@ mod tests {
         assert!(fs::read_dir(temp_root).unwrap().next().is_none());
         let db = EpubCache::open_at(tmp.path()).unwrap();
         assert!(db.list_current().unwrap().is_empty());
-        assert!(!tmp.path().join("epub_cache").join("book.pdf.part").exists());
+        assert!(!reserved_part(tmp.path()).exists());
     }
 
     #[test]
@@ -1194,6 +1226,7 @@ exit 0
             &tx,
             5,
             &spawner,
+            &TestPdfVerifier,
         );
         assert!(
             matches!(result, Ok(PublishOutcome::Published)),
@@ -1232,6 +1265,7 @@ exit 0
             &tx,
             5,
             &spawner,
+            &TestPdfVerifier,
         );
         signal.join().unwrap();
         assert!(
@@ -1246,6 +1280,7 @@ exit 0
         );
         let db = EpubCache::open_at(tmp.path()).unwrap();
         assert!(db.list_current().unwrap().is_empty());
+        assert!(!reserved_part(tmp.path()).exists());
     }
 
     #[cfg(windows)]
@@ -1303,6 +1338,7 @@ exit 0
             &tx,
             5,
             &spawner,
+            &TestPdfVerifier,
         );
         assert!(
             matches!(result, Ok(PublishOutcome::Published)),
@@ -1344,6 +1380,7 @@ exit 0
                 &tx,
                 5,
                 &spawner,
+                &TestPdfVerifier,
             )
         });
         assert_eq!(
@@ -1364,6 +1401,50 @@ exit 0
         );
         let db = EpubCache::open_at(tmp.path()).unwrap();
         assert!(db.list_current().unwrap().is_empty());
+        assert!(!reserved_part(tmp.path()).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epub_convert_native_spawner_timeout_cleans_part_and_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("book.epub");
+        fs::write(&src, b"epub bytes").unwrap();
+        let script = script_spawner(tmp.path(), "hang", None).script;
+        let spawner = NativeScriptSpawner {
+            script,
+            mode: "hang",
+        };
+        let epub_cache::GateOutcome::Enabled { guard, .. } = epub_cache::startup_gate(tmp.path())
+        else {
+            panic!("gate disabled");
+        };
+        let (tx, rx) = mpsc::channel();
+        let result = convert_at(
+            ConvertContext {
+                gate: &guard,
+                data_dir: tmp.path(),
+                temp_root: &tmp.path().join("temp"),
+            },
+            &src,
+            &CancelToken::new().unwrap(),
+            &tx,
+            1,
+            &spawner,
+            &TestPdfVerifier,
+        );
+        assert!(
+            matches!(result, Err(EpubConvertError::Timeout)),
+            "{result:?}"
+        );
+        assert_eq!(rx.try_recv().unwrap().phase, Phase::Print);
+        assert!(!reserved_part(tmp.path()).exists());
+        assert!(
+            fs::read_dir(tmp.path().join("temp"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[cfg(windows)]

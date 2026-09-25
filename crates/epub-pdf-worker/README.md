@@ -26,8 +26,11 @@ WebView2 folder; it must not already exist, even if empty. If omitted, a unique 
 the input, output, output directory, or work directory. This containment
 pre-check compares path components without case (conservatively, it may reject
 an otherwise distinct path, but must not accept a containment risk). The worker
-creates and owns the user data folder, deletes it after success, failure, or a
-caught panic, and reports whether cleanup succeeded. The S2 host passes a fresh
+creates and owns the requested user data folder and reports whether cleanup succeeded.
+It deletes that folder recursively only when WebView2 confirms it used that
+folder. If WebView2 used another folder or identity could not be verified, it
+removes the requested folder only when empty and reports
+`user_data_cleanup.skipped_reason` when content remains. The S2 host passes a fresh
 path and will remove all
 `WEBVIEW2_*` variables before spawning the worker, and the worker clears them
 again before using the loader.
@@ -143,8 +146,8 @@ directory identity (volume serial and file ID from `FileIdInfo`). A different
 actual folder is logged and recorded as `user_data_folder_redirected` in the
 per-book report, and conversion continues. A failed folder query or identity
 comparison is recorded as `user_data_folder_check_error` and also does not stop
-conversion. Cleanup targets only the fresh folder the worker created at the
-requested path; it never targets the reported actual folder when redirected.
+conversion. Cleanup never recursively deletes a redirected or unverifiable
+folder; it never targets the reported actual folder when redirected.
 The new filter includes service-worker and shared-worker request sources; a
 fresh requested user data folder and disabled page scripts prevent book service
 workers from being registered when WebView2 uses that folder. Cross-origin
