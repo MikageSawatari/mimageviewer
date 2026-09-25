@@ -23,8 +23,9 @@ use webview2_com::{
 use windows::{
     Win32::{
         Foundation::{
-            E_NOINTERFACE, E_POINTER, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
-            GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+            APPMODEL_ERROR_NO_APPLICATION, E_FAIL, E_NOINTERFACE, E_POINTER, ERROR_FILE_NOT_FOUND,
+            ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT,
+            RECT, WPARAM,
         },
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
@@ -34,11 +35,14 @@ use windows::{
                 RRF_SUBKEY_WOW6464KEY, RegGetValueW,
             },
         },
-        UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG,
-            MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
-            RegisterClassW, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WNDCLASSW,
-            WS_OVERLAPPEDWINDOW,
+        UI::{
+            Shell::GetCurrentProcessExplicitAppUserModelID,
+            WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG,
+                MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW,
+                QS_ALLINPUT, RegisterClassW, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE,
+                WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            },
         },
     },
     core::{Interface, PCWSTR, PWSTR},
@@ -103,45 +107,58 @@ pub fn clear_webview_environment() {
     }
 }
 
-pub fn reject_policy_overrides() -> Result<(), String> {
-    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    let executable = executable
-        .file_name()
-        .ok_or("worker executable has no file name")?
-        .to_string_lossy();
-    for (hive, hive_name) in [(HKEY_LOCAL_MACHINE, "HKLM"), (HKEY_CURRENT_USER, "HKCU")] {
-        for policy in [
-            "AdditionalBrowserArguments",
-            "UserDataFolder",
-            "BrowserExecutableFolder",
-            "ReleaseChannelPreference",
-        ] {
-            let subkey = wide(&format!(
-                "Software\\Policies\\Microsoft\\Edge\\WebView2\\{policy}"
-            ));
-            for target in [executable.as_ref(), "*"] {
-                let value = wide(target);
-                for view in [RRF_SUBKEY_WOW6464KEY, RRF_SUBKEY_WOW6432KEY] {
-                    let mut bytes = 0;
-                    let result = unsafe {
-                        RegGetValueW(
-                            hive,
-                            PCWSTR(subkey.as_ptr()),
-                            PCWSTR(value.as_ptr()),
-                            RRF_RT_ANY | view,
-                            None,
-                            None,
-                            Some(&mut bytes),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PolicyHive {
+    Machine,
+    User,
+}
+
+impl PolicyHive {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Machine => "HKLM",
+            Self::User => "HKCU",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistryView {
+    View64,
+    View32,
+}
+
+const ENVIRONMENT_POLICIES: [&str; 4] = [
+    "AdditionalBrowserArguments",
+    "UserDataFolder",
+    "BrowserExecutableFolder",
+    "ReleaseChannelPreference",
+];
+
+fn scan_policy_overrides(
+    aumid: Option<&str>,
+    executable: &str,
+    mut read: impl FnMut(PolicyHive, RegistryView, &str, &str) -> Result<bool, String>,
+) -> Result<(), String> {
+    let mut value_names = Vec::new();
+    if let Some(aumid) = aumid.filter(|value| !value.is_empty()) {
+        value_names.push(aumid);
+    }
+    value_names.extend([executable, "*"]);
+    for policy in ENVIRONMENT_POLICIES {
+        for value_name in &value_names {
+            for hive in [PolicyHive::Machine, PolicyHive::User] {
+                for view in [RegistryView::View64, RegistryView::View32] {
+                    let found = read(hive, view, policy, value_name).map_err(|error| {
+                        format!(
+                            "WebView2 overridden: cannot inspect {} WebView2 {policy} policy value {value_name}: {error}",
+                            hive.label()
                         )
-                    };
-                    if result == ERROR_SUCCESS {
+                    })?;
+                    if found {
                         return Err(format!(
-                            "WebView2 overridden by {hive_name}\\Software\\Policies\\Microsoft\\Edge\\WebView2\\{policy} value {target}"
-                        ));
-                    }
-                    if result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND {
-                        return Err(format!(
-                            "WebView2 overridden: cannot inspect {hive_name} WebView2 {policy} policy value {target}: {result:?}"
+                            "WebView2 overridden by {}\\Software\\Policies\\Microsoft\\Edge\\WebView2\\{policy} value {value_name}",
+                            hive.label()
                         ));
                     }
                 }
@@ -149,6 +166,71 @@ pub fn reject_policy_overrides() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn registry_policy_value(
+    hive: PolicyHive,
+    view: RegistryView,
+    policy: &str,
+    value_name: &str,
+) -> Result<bool, String> {
+    let hive = match hive {
+        PolicyHive::Machine => HKEY_LOCAL_MACHINE,
+        PolicyHive::User => HKEY_CURRENT_USER,
+    };
+    let view = match view {
+        RegistryView::View64 => RRF_SUBKEY_WOW6464KEY,
+        RegistryView::View32 => RRF_SUBKEY_WOW6432KEY,
+    };
+    let subkey = wide(&format!(
+        "Software\\Policies\\Microsoft\\Edge\\WebView2\\{policy}"
+    ));
+    let value = wide(value_name);
+    let mut bytes = 0;
+    let result = unsafe {
+        RegGetValueW(
+            hive,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_ANY | view,
+            None,
+            None,
+            Some(&mut bytes),
+        )
+    };
+    if result == ERROR_SUCCESS {
+        Ok(true)
+    } else if result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND {
+        Ok(false)
+    } else {
+        Err(format!("{result:?}"))
+    }
+}
+
+fn explicit_app_user_model_id() -> Result<Option<String>, String> {
+    match unsafe { GetCurrentProcessExplicitAppUserModelID() } {
+        Ok(value) if value.is_null() => Ok(None),
+        Ok(value) => Ok(Some(take_pwstr(value)).filter(|value| !value.is_empty())),
+        Err(error)
+            if error.code() == E_FAIL
+                || error.code() == APPMODEL_ERROR_NO_APPLICATION.to_hresult() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(format!(
+            "WebView2 overridden: cannot read explicit AppUserModelID: {error}"
+        )),
+    }
+}
+
+pub fn reject_policy_overrides() -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let executable = executable
+        .file_name()
+        .ok_or("worker executable has no file name")?
+        .to_string_lossy();
+    let aumid = explicit_app_user_model_id()?;
+    scan_policy_overrides(aumid.as_deref(), &executable, registry_policy_value)
 }
 
 fn network_options() -> Result<ICoreWebView2EnvironmentOptions, String> {
@@ -309,8 +391,8 @@ impl Host {
         unsafe { environment7.UserDataFolder(&mut actual_ptr) }
             .map_err(|e| format!("WebView2 unsupported: UserDataFolder unavailable: {e}"))?;
         let actual = std::path::PathBuf::from(take_pwstr(actual_ptr));
-        if !crate::paths::same_normalized_path(user_data, &actual)
-            .map_err(|e| format!("WebView2 overridden: cannot compare user data folders: {e}"))?
+        if !crate::paths::same_directory_identity(user_data, &actual)
+            .map_err(|e| format!("WebView2 overridden: cannot identify user data folders: {e}"))?
         {
             return Err(format!(
                 "WebView2 overridden: requested user data folder {}, actual {}",
@@ -639,5 +721,88 @@ mod tests {
         assert!(!is_webview_environment_key(std::ffi::OsStr::new(
             "MIV_EPUB_PDF_TEST_PANIC"
         )));
+    }
+
+    #[test]
+    fn policy_lookup_orders_aumid_exe_wildcard_and_all_views() {
+        let mut calls = Vec::new();
+        scan_policy_overrides(
+            Some("Example.App"),
+            "worker.exe",
+            |hive, view, policy, name| {
+                calls.push((hive, view, policy.to_string(), name.to_string()));
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 4 * 3 * 2 * 2);
+        for (policy_index, policy) in ENVIRONMENT_POLICIES.iter().enumerate() {
+            for (name_index, name) in ["Example.App", "worker.exe", "*"].iter().enumerate() {
+                let start = (policy_index * 3 + name_index) * 4;
+                assert_eq!(calls[start].2, *policy);
+                assert_eq!(calls[start].3, *name);
+                assert_eq!(calls[start].0, PolicyHive::Machine);
+                assert_eq!(calls[start].1, RegistryView::View64);
+                assert_eq!(calls[start + 1].1, RegistryView::View32);
+                assert_eq!(calls[start + 2].0, PolicyHive::User);
+                assert_eq!(calls[start + 3].1, RegistryView::View32);
+            }
+        }
+    }
+
+    #[test]
+    fn policy_lookup_rejects_aumid_before_exe_and_each_policy() {
+        for policy_to_find in ENVIRONMENT_POLICIES {
+            let mut seen = Vec::new();
+            let error = scan_policy_overrides(
+                Some("Example.App"),
+                "worker.exe",
+                |hive, view, policy, name| {
+                    seen.push((policy.to_string(), name.to_string()));
+                    Ok(hive == PolicyHive::User
+                        && view == RegistryView::View32
+                        && policy == policy_to_find
+                        && name == "Example.App")
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains(policy_to_find));
+            assert!(error.contains("Example.App"));
+            assert!(
+                !seen
+                    .iter()
+                    .any(|(policy, name)| { policy == policy_to_find && name == "worker.exe" })
+            );
+        }
+    }
+
+    #[test]
+    fn policy_lookup_checks_exe_and_wildcard_without_aumid() {
+        let mut names = Vec::new();
+        let error = scan_policy_overrides(None, "worker.exe", |_, _, policy, name| {
+            names.push(name.to_string());
+            Ok(policy == "UserDataFolder" && name == "*")
+        })
+        .unwrap_err();
+        assert!(error.contains("UserDataFolder"));
+        assert!(error.contains("value *"));
+        assert!(names.contains(&"worker.exe".to_string()));
+        assert!(!names.contains(&"Example.App".to_string()));
+    }
+
+    #[test]
+    fn policy_lookup_fails_closed_when_registry_cannot_be_read() {
+        let error = scan_policy_overrides(Some("Example.App"), "worker.exe", |_, _, _, _| {
+            Err("access denied".into())
+        })
+        .unwrap_err();
+        assert!(error.contains("cannot inspect"));
+        assert!(error.contains("AdditionalBrowserArguments"));
+        assert!(error.contains("Example.App"));
+    }
+
+    #[test]
+    fn explicit_aumid_query_is_available() {
+        explicit_app_user_model_id().unwrap();
     }
 }

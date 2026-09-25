@@ -141,9 +141,8 @@ fn panic_after_user_data_creation_cleans_folder_and_reports_once() {
     }
 }
 
-#[cfg(debug_assertions)]
 #[test]
-fn panic_keeps_preexisting_empty_user_data_folder() {
+fn preexisting_empty_user_data_folder_is_invalid_and_preserved() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -163,10 +162,9 @@ fn panic_keeps_preexisting_empty_user_data_folder() {
         .arg("--user-data-dir")
         .arg(&user_data)
         .arg("--progress-json")
-        .env("MIV_EPUB_PDF_TEST_PANIC", "after_user_data")
         .output()
         .unwrap();
-    assert_final_result(&output, "render_failed", 5);
+    assert_final_result(&output, "invalid", 3);
     assert!(user_data.is_dir());
     fs::remove_dir_all(root).unwrap();
 }

@@ -149,36 +149,27 @@ impl Engine {
                 .as_millis()
         );
         let user_data = if let Some(dir) = user_data_dir {
-            let path = absolute(dir)?;
-            if path.exists()
-                && fs::read_dir(&path)
-                    .map_err(|e| e.to_string())?
-                    .next()
-                    .is_some()
-            {
-                return Err(format!(
-                    "user data directory is not empty: {}",
-                    path.display()
-                ));
-            }
-            path
+            absolute(dir)?
         } else {
             work_dir.join(format!("webview2-user-data-{run_id}"))
         };
         if let Some((input, out)) = convert {
             paths::validate_convert_paths(input, out, &work_dir, &user_data)?;
         }
-        let owns_user_data = !user_data.exists();
-        if owns_user_data {
-            if let Some(parent) = user_data.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            fs::create_dir(&user_data).map_err(|e| e.to_string())?;
+        if user_data.exists() {
+            return Err(format!(
+                "user data directory already exists: {}",
+                user_data.display()
+            ));
         }
+        if let Some(parent) = user_data.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::create_dir(&user_data).map_err(|e| format!("create user data directory: {e}"))?;
         let engine = Self {
             work_dir,
             user_data,
-            owns_user_data,
+            owns_user_data: true,
             host: None,
             unavailable: None,
             run_id,
@@ -466,18 +457,9 @@ impl Engine {
     }
     fn finish(mut self) -> UserDataCleanup {
         self.host.take();
-        if self.owns_user_data {
-            let cleanup = cleanup_user_data(&self.user_data);
-            self.owns_user_data = false;
-            cleanup
-        } else {
-            UserDataCleanup {
-                path: self.user_data.display().to_string(),
-                deleted: false,
-                held_ms: 0,
-                error: Some("pre-existing user data folder retained".into()),
-            }
-        }
+        let cleanup = cleanup_user_data(&self.user_data);
+        self.owns_user_data = false;
+        cleanup
     }
 }
 impl Drop for Engine {

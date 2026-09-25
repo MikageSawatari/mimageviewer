@@ -21,11 +21,14 @@ merges and verifies a unique temporary file named `<out>.tmp-<pid>-<n>` beside
 `<out>` before renaming; a failed
 or timed-out conversion leaves no partial output at the requested path. The
 input EPUB is opened only for reading. `--user-data-dir` selects a dedicated
-WebView2 folder; it must be absent or empty. If omitted, a unique folder below
+WebView2 folder; it must not already exist, even if empty. If omitted, a unique folder below
 `--work-dir` is used. The converter rejects a user data folder that contains
-the input, output, output directory, or work directory. The report records
-whether cleanup succeeded. An already existing empty user data folder is retained;
-only a folder created by the worker is deleted. The S2 host will remove all
+the input, output, output directory, or work directory. This containment
+pre-check compares path components without case (conservatively, it may reject
+an otherwise distinct path, but must not accept a containment risk). The worker
+creates and owns the user data folder, deletes it after success, failure, or a
+caught panic, and reports whether cleanup succeeded. The S2 host passes a fresh
+path and will remove all
 `WEBVIEW2_*` variables before spawning the worker, and the worker clears them
 again before using the loader.
 
@@ -133,13 +136,15 @@ variable, including `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`,
 `WEBVIEW2_USER_DATA_FOLDER`, `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`,
 `WEBVIEW2_RELEASE_CHANNEL_PREFERENCE`, and
 `WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER`. It checks both registry views under
-`HKLM` and `HKCU\Software\Policies\Microsoft\Edge\WebView2` for the worker
-exe name and `*` values in `AdditionalBrowserArguments`, `UserDataFolder`,
+`HKLM` and `HKCU\Software\Policies\Microsoft\Edge\WebView2` for the current
+process's explicit AppUserModelID, then the worker exe name, then `*` values
+in `AdditionalBrowserArguments`, `UserDataFolder`,
 `BrowserExecutableFolder`, and `ReleaseChannelPreference`. Any such policy
 causes exit 7 before conversion. After environment creation,
 `ICoreWebView2Environment7::UserDataFolder` must match the requested folder
-after path normalization. A mismatch also causes exit 7; the worker never
-deletes the unexpected folder.
+by directory identity (volume serial and file ID from `FileIdInfo`). A missing
+or inaccessible reported folder, or an identity mismatch, causes exit 7; the
+worker never deletes the unexpected folder.
 The new filter includes service-worker and shared-worker request sources; a
 fresh user data folder and disabled page scripts prevent book service workers
 from being registered. Cross-origin iframes are cancelled at navigation and

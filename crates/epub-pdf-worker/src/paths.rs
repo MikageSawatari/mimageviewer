@@ -2,7 +2,20 @@
 use std::{
     ffi::OsString,
     fs,
+    mem::size_of,
+    os::windows::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
+};
+use windows::{
+    Win32::{
+        Foundation::CloseHandle,
+        Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
+            GetFileInformationByHandleEx, OPEN_EXISTING,
+        },
+    },
+    core::PCWSTR,
 };
 
 fn normalized(path: &Path) -> Result<PathBuf, String> {
@@ -53,10 +66,36 @@ fn same_or_under(path: &Path, root: &Path) -> bool {
     path.len() >= root.len() && path.iter().zip(&root).all(|(a, b)| a == b)
 }
 
-pub fn same_normalized_path(left: &Path, right: &Path) -> Result<bool, String> {
-    let left = normalized(left)?;
-    let right = normalized(right)?;
-    Ok(same_or_under(&left, &right) && same_or_under(&right, &left))
+fn directory_file_id(path: &Path) -> Result<FILE_ID_INFO, String> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .map_err(|e| format!("open directory {}: {e}", path.display()))?;
+    let mut info = FILE_ID_INFO::default();
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    result.map_err(|e| format!("read directory identity {}: {e}", path.display()))?;
+    Ok(info)
+}
+
+pub fn same_directory_identity(left: &Path, right: &Path) -> Result<bool, String> {
+    Ok(directory_file_id(left)? == directory_file_id(right)?)
 }
 
 pub fn validate_convert_paths(
@@ -176,6 +215,15 @@ mod tests {
         assert!(
             validate_convert_paths(
                 &input,
+                &out,
+                &root.join("UserData/work"),
+                &root.join("userdata")
+            )
+            .is_err()
+        );
+        assert!(
+            validate_convert_paths(
+                &input,
                 &root.join("work/user-data/book.pdf"),
                 &work,
                 &root.join("work/user-data")
@@ -185,9 +233,15 @@ mod tests {
     }
 
     #[test]
-    fn compares_normalized_user_data_paths() {
-        let root = test_root("same-path");
-        assert!(same_normalized_path(&root.join("a/../data"), &root.join("data")).unwrap());
-        assert!(!same_normalized_path(&root.join("data"), &root.join("other")).unwrap());
+    fn compares_user_data_by_directory_identity() {
+        let root = test_root("file-id");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        assert!(same_directory_identity(&first, &root.join("first/.")).unwrap());
+        assert!(!same_directory_identity(&first, &second).unwrap());
+        assert!(same_directory_identity(&first, &root.join("missing")).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }
