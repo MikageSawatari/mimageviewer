@@ -5068,12 +5068,23 @@ mod tests {
     fn wait_for(app: &mut App, mut predicate: impl FnMut(&App) -> bool) {
         let ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !predicate(app) {
-            assert!(Instant::now() < deadline, "collection UI did not settle");
+        loop {
             app.poll_collection_ui(&ctx);
+            if predicate(app) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "collection UI did not settle");
             std::thread::sleep(Duration::from_millis(5));
         }
-        app.poll_collection_ui(&ctx);
+    }
+
+    fn assert_manager_read_slots_not_failed(app: &App) {
+        if let CollectionReadSlot::Failed { message } = &app.collection_ui.catalog_request {
+            panic!("catalog read failed during test setup: {message}");
+        }
+        if let CollectionReadSlot::Failed { message } = &app.collection_ui.snapshot_request {
+            panic!("snapshot read failed during test setup: {message}");
+        }
     }
 
     fn start_ready_app(
@@ -5099,7 +5110,10 @@ mod tests {
         let collection_id = created.collection_id();
         let revision = created.revision();
         wait_for(app, |app| {
+            assert_manager_read_slots_not_failed(app);
             app.collection_ui.operation.is_idle()
+                && matches!(app.collection_ui.catalog_request, CollectionReadSlot::Idle)
+                && matches!(app.collection_ui.snapshot_request, CollectionReadSlot::Idle)
                 && app.collection_ui.selected_id == Some(collection_id)
                 && app.collection_ui.snapshot.as_ref().is_some_and(|snapshot| {
                     snapshot.collection_id() == collection_id && snapshot.revision() >= revision
@@ -5222,11 +5236,14 @@ mod tests {
         let id = snapshot.collection_id();
         app.collection_ui.select_collection(Some(id));
         wait_for(&mut app, |app| {
-            app.collection_ui
-                .snapshot
-                .as_ref()
-                .is_some_and(|current| current.collection_id() == id)
-                && app.collection_ui.snapshot_request.is_none()
+            assert_manager_read_slots_not_failed(app);
+            matches!(app.collection_ui.catalog_request, CollectionReadSlot::Idle)
+                && matches!(app.collection_ui.snapshot_request, CollectionReadSlot::Idle)
+                && app
+                    .collection_ui
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|current| current.collection_id() == id)
         });
 
         app.collection_ui.phase = CollectionRuntimePhase::Starting;
