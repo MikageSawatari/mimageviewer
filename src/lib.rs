@@ -201,6 +201,7 @@ pub(crate) mod page_edit_write_epoch;
 mod process_memory_test_support;
 pub mod rar_loader;
 pub mod rating_db;
+mod rating_sort;
 pub mod rating_view;
 pub mod rating_write_worker;
 mod remote_ipc;

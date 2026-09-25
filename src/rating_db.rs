@@ -5,6 +5,7 @@
 //! 0 (未評価) 〜 5 の星数を記録する。キーは `App::rating_path_key` が返す
 //! 正規化キーを使う (`adjustment_db::normalize_path` と同じ規則で統一)。
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -112,6 +113,48 @@ pub struct RatingRow {
 /// レーティング DB ハンドル。
 pub struct RatingDb {
     conn: rusqlite::Connection,
+}
+
+/// Complete coverage for exactly the requested keys, even though different
+/// chunks may reflect different committed moments. An absent rating row means
+/// zero stars only when the key belongs to this requested set.
+#[derive(Debug)]
+pub(crate) struct CompleteRatingFacts {
+    requested_keys: HashSet<String>,
+    rated_values: HashMap<String, u8>,
+    write_generation: u64,
+}
+
+impl CompleteRatingFacts {
+    /// Only call this for a ratable row whose key was included in the request.
+    /// A missing request is a producer bug, not an unsupported item.
+    pub(crate) fn key_for_requested(&self, key: &str) -> crate::rating_sort::RatingSortKey {
+        assert!(
+            self.requested_keys.contains(key),
+            "rating sort key was not requested: {key}"
+        );
+        crate::rating_sort::RatingSortKey::supported(
+            self.rated_values.get(key).copied().unwrap_or(0),
+        )
+        .expect("database ratings are clamped to 0..=5")
+    }
+
+    /// Populate a display cache for every requested key, including confirmed
+    /// zero-star rows that have no record in the database.
+    pub(crate) fn iter_requested_ratings(&self) -> impl Iterator<Item = (&str, u8)> {
+        self.requested_keys.iter().map(|key| {
+            (
+                key.as_str(),
+                self.rated_values.get(key).copied().unwrap_or(0),
+            )
+        })
+    }
+
+    /// Opaque caller stamp captured before the read, for replaying later writes
+    /// over display caches without changing the installed order.
+    pub(crate) fn write_generation(&self) -> u64 {
+        self.write_generation
+    }
 }
 
 /// All connections, including worker and migration connections, publish through this epoch.
@@ -255,6 +298,107 @@ impl RatingDb {
             }
         }
         out
+    }
+
+    /// Reads all requested keys in short chunks. Unlike `get_many`, no failed
+    /// chunk or row can be mistaken for an unrated item. The caller must capture
+    /// `write_generation` before starting this read.
+    pub(crate) fn get_many_complete(
+        &self,
+        keys: &[String],
+        write_generation: u64,
+    ) -> Result<CompleteRatingFacts, rusqlite::Error> {
+        #[cfg(test)]
+        {
+            self.read_complete_chunks(keys, write_generation, None, None)
+        }
+        #[cfg(not(test))]
+        {
+            self.read_complete_chunks(keys, write_generation)
+        }
+    }
+
+    #[cfg(test)]
+    fn get_many_complete_with_hook(
+        &self,
+        keys: &[String],
+        write_generation: u64,
+        mut after_chunk: impl FnMut(usize),
+    ) -> Result<CompleteRatingFacts, rusqlite::Error> {
+        self.read_complete_chunks(keys, write_generation, Some(&mut after_chunk), None)
+    }
+
+    #[cfg(test)]
+    fn get_many_complete_with_row_hook(
+        &self,
+        keys: &[String],
+        write_generation: u64,
+        mut on_row: impl FnMut(usize, usize),
+    ) -> Result<CompleteRatingFacts, rusqlite::Error> {
+        self.read_complete_chunks(keys, write_generation, None, Some(&mut on_row))
+    }
+
+    fn read_complete_chunks(
+        &self,
+        keys: &[String],
+        write_generation: u64,
+        #[cfg(test)] mut after_chunk: Option<&mut dyn FnMut(usize)>,
+        #[cfg(test)] mut on_row: Option<&mut dyn FnMut(usize, usize)>,
+    ) -> Result<CompleteRatingFacts, rusqlite::Error> {
+        let requested_keys = keys.iter().cloned().collect();
+        let mut rated_values = HashMap::new();
+        if keys.is_empty() {
+            return Ok(CompleteRatingFacts {
+                requested_keys,
+                rated_values,
+                write_generation,
+            });
+        }
+
+        #[cfg(test)]
+        let mut chunk_index = 0;
+        for chunk in keys.chunks(500) {
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT path, stars FROM ratings WHERE path IN ({})",
+                placeholders
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                let path: String = row.get(0)?;
+                let stars: i32 = row.get(1)?;
+                Ok((path, stars.clamp(0, 5) as u8))
+            })?;
+            #[cfg(test)]
+            let mut row_index = 0;
+            for row in rows {
+                let (path, stars) = row?;
+                rated_values.insert(path, stars);
+                #[cfg(test)]
+                {
+                    if let Some(hook) = on_row.as_mut() {
+                        hook(chunk_index, row_index);
+                    }
+                    row_index += 1;
+                }
+            }
+            drop(stmt);
+            #[cfg(test)]
+            {
+                if let Some(hook) = after_chunk.as_mut() {
+                    hook(chunk_index);
+                }
+                chunk_index += 1;
+            }
+        }
+        Ok(CompleteRatingFacts {
+            requested_keys,
+            rated_values,
+            write_generation,
+        })
     }
 
     /// 互換 API。ユーザー操作として扱い、非ゼロ値には rated_at_ms を入れる。
@@ -507,6 +651,39 @@ fn source_path_from_rating_key(key: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    struct WriteBusyObserver {
+        first_busy_at: Option<Instant>,
+        first_busy_tx: Option<mpsc::Sender<Instant>>,
+    }
+
+    thread_local! {
+        static WRITE_BUSY_OBSERVER: RefCell<Option<WriteBusyObserver>> = RefCell::new(None);
+    }
+
+    /// Test-only observer for SQLite's actual SQLITE_BUSY callback. It retains
+    /// the same 750 ms deadline as RatingDb's production busy timeout.
+    fn measured_busy_handler(_previous_calls: i32) -> bool {
+        WRITE_BUSY_OBSERVER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let observer = slot
+                .as_mut()
+                .expect("busy observer installed on writer thread");
+            let first_busy = *observer.first_busy_at.get_or_insert_with(Instant::now);
+            if let Some(tx) = observer.first_busy_tx.take() {
+                let _ = tx.send(first_busy);
+            }
+            let remaining = Duration::from_millis(750).saturating_sub(first_busy.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            true
+        })
+    }
 
     fn db_with_schema(schema: &str) -> RatingDb {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -517,6 +694,212 @@ mod tests {
 
     fn empty_db() -> RatingDb {
         db_with_schema("")
+    }
+
+    #[test]
+    fn complete_facts_cover_chunk_boundaries_and_only_requested_keys() {
+        for count in [0, 1, 500, 501, 1001] {
+            let db = empty_db();
+            let keys: Vec<String> = (0..count)
+                .map(|index| format!("image-{index:04}"))
+                .collect();
+            let writes: Vec<_> = keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| (key.as_str(), (index % 6) as u8, None))
+                .collect();
+            db.set_user_ratings(&writes).unwrap();
+
+            let facts = db.get_many_complete(&keys, 123).unwrap();
+            assert_eq!(facts.requested_keys.len(), count);
+            assert_eq!(facts.write_generation(), 123);
+            let display_cache: HashMap<_, _> = facts.iter_requested_ratings().collect();
+            assert_eq!(display_cache.len(), count);
+            for (index, key) in keys.iter().enumerate() {
+                assert_eq!(
+                    facts.key_for_requested(key),
+                    crate::rating_sort::RatingSortKey::supported((index % 6) as u8).unwrap(),
+                );
+                assert_eq!(display_cache.get(key.as_str()), Some(&((index % 6) as u8)));
+            }
+            assert_eq!(
+                display_cache.values().filter(|&&stars| stars > 0).count(),
+                count - (count + 5) / 6
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "rating sort key was not requested")]
+    fn complete_facts_reject_unrequested_ratable_key() {
+        let facts = empty_db().get_many_complete(&["known".into()], 0).unwrap();
+        let _ = facts.key_for_requested("outside");
+    }
+
+    #[test]
+    fn complete_facts_deduplicate_requested_keys_across_chunks() {
+        let db = empty_db();
+        db.set("same", 4).unwrap();
+        let mut keys: Vec<String> = (0..500).map(|index| format!("missing-{index}")).collect();
+        keys.extend([
+            "same".to_string(),
+            "missing-0".to_string(),
+            "same".to_string(),
+        ]);
+
+        let facts = db.get_many_complete(&keys, 9).unwrap();
+        assert_eq!(facts.requested_keys.len(), 501);
+        let display_cache: HashMap<_, _> = facts.iter_requested_ratings().collect();
+        assert_eq!(display_cache.len(), 501);
+        assert_eq!(display_cache.get("same"), Some(&4));
+        assert_eq!(display_cache.get("missing-0"), Some(&0));
+        assert_eq!(
+            facts.key_for_requested("same"),
+            crate::rating_sort::RatingSortKey::supported(4).unwrap(),
+        );
+        assert_eq!(
+            facts.key_for_requested("missing-0"),
+            crate::rating_sort::RatingSortKey::supported(0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn complete_facts_propagate_prepare_and_row_errors() {
+        let db = empty_db();
+        db.conn.execute_batch("DROP TABLE ratings").unwrap();
+        assert!(db.get_many_complete(&["a".into()], 0).is_err());
+
+        let db = empty_db();
+        db.conn
+            .execute(
+                "INSERT INTO ratings (path, stars) VALUES ('bad', X'01')",
+                [],
+            )
+            .unwrap();
+        assert!(db.get_many_complete(&["bad".into()], 0).is_err());
+    }
+
+    #[test]
+    fn complete_facts_reject_a_later_chunk_failure() {
+        let db = empty_db();
+        let keys: Vec<String> = (0..501).map(|index| format!("item-{index}")).collect();
+        db.set("item-0", 3).unwrap();
+        assert!(
+            db.get_many_complete_with_hook(&keys, 0, |chunk_index| {
+                if chunk_index == 0 {
+                    db.conn.execute_batch("DROP TABLE ratings").unwrap();
+                }
+            })
+            .is_err(),
+        );
+    }
+
+    #[test]
+    fn complete_facts_allow_a_write_between_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rating.db");
+        let reader = RatingDb::open_at(&path).unwrap();
+        let writer = RatingDb::open_at(&path).unwrap();
+        reader
+            .set_user_ratings(&[("first", 1, None), ("last", 1, None)])
+            .unwrap();
+        let mut keys: Vec<String> = (0..501).map(|index| format!("missing-{index}")).collect();
+        keys[0] = "first".to_string();
+        keys[500] = "last".to_string();
+
+        let facts = reader
+            .get_many_complete_with_hook(&keys, 77, |chunk_index| {
+                if chunk_index == 0 {
+                    writer
+                        .set_user_ratings(&[("first", 5, None), ("last", 5, None)])
+                        .unwrap();
+                }
+            })
+            .unwrap();
+        assert_eq!(facts.write_generation(), 77);
+        assert_eq!(
+            facts.key_for_requested("first"),
+            crate::rating_sort::RatingSortKey::supported(1).unwrap(),
+        );
+        assert_eq!(
+            facts.key_for_requested("last"),
+            crate::rating_sort::RatingSortKey::supported(5).unwrap(),
+        );
+        assert_eq!(reader.get("first"), 5);
+        assert_eq!(reader.get("last"), 5);
+    }
+
+    /// Run with --ignored --nocapture. The regular suite must not have a
+    /// scheduling-sensitive threshold; report this measurement to design.
+    #[test]
+    #[ignore]
+    fn measure_rating_write_wait_during_50000_key_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rating.db");
+        let reader = RatingDb::open_at(&path).unwrap();
+        let writer = RatingDb::open_at(&path).unwrap();
+        let journal_mode: String = reader
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete");
+        let keys: Vec<String> = (0..50_000)
+            .map(|index| format!("image-{index:05}"))
+            .collect();
+        let writes: Vec<_> = keys.iter().map(|key| (key.as_str(), 3, None)).collect();
+        reader.set_user_ratings(&writes).unwrap();
+
+        let plain_start = Instant::now();
+        let plain_facts = reader.get_many_complete(&keys, 0).unwrap();
+        let plain_elapsed = plain_start.elapsed();
+        assert_eq!(plain_facts.requested_keys.len(), 50_000);
+
+        let (start_tx, start_rx) = mpsc::channel();
+        let (busy_tx, busy_rx) = mpsc::channel();
+        let writer_thread = std::thread::spawn(move || {
+            WRITE_BUSY_OBSERVER.with(|slot| {
+                *slot.borrow_mut() = Some(WriteBusyObserver {
+                    first_busy_at: None,
+                    first_busy_tx: Some(busy_tx),
+                });
+            });
+            writer
+                .conn
+                .busy_handler(Some(measured_busy_handler))
+                .unwrap();
+            start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let start = Instant::now();
+            let result = writer.set_user_ratings(&[("concurrent-user-write", 4, None)]);
+            WRITE_BUSY_OBSERVER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+            (Instant::now(), start.elapsed(), result)
+        });
+
+        let mut first_busy = None;
+        let concurrent_start = Instant::now();
+        let facts = reader
+            .get_many_complete_with_row_hook(&keys, 0, |chunk_index, row_index| {
+                if chunk_index == 0 && row_index == 0 {
+                    start_tx.send(()).unwrap();
+                    // This callback fires only after SQLite has really hit the
+                    // read cursor's lock. Keep that cursor open until then.
+                    first_busy = Some(busy_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+                }
+            })
+            .unwrap();
+        let concurrent_elapsed = concurrent_start.elapsed();
+        let (write_end, write_elapsed, write_result) = writer_thread.join().unwrap();
+        write_result.unwrap();
+        assert_eq!(facts.requested_keys.len(), 50_000);
+        let blocked_elapsed = write_end.duration_since(first_busy.unwrap());
+        eprintln!(
+            "rating 50000-key plain read: {:.3} ms; writer commit blocked: {:.3} ms; full write API: {:.3} ms; concurrent read: {:.3} ms",
+            plain_elapsed.as_secs_f64() * 1000.0,
+            blocked_elapsed.as_secs_f64() * 1000.0,
+            write_elapsed.as_secs_f64() * 1000.0,
+            concurrent_elapsed.as_secs_f64() * 1000.0,
+        );
     }
 
     #[test]
