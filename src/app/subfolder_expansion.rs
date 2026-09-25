@@ -1404,9 +1404,14 @@ fn spawn_subfolder_expansion_prepare(
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_w = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
+    #[cfg(test)]
+    let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
     std::thread::Builder::new()
         .name("subfolder-view-prepare".into())
         .spawn(move || {
+            #[cfg(test)]
+            let _test_epoch_scope =
+                test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
             let event =
                 match prepare_subfolder_expansion(snapshot, show_toast, options, &cancel_w, &tx) {
                     Ok(Some(prepared)) => SubfolderExpansionPrepareEvent::Done(Box::new(prepared)),
@@ -2489,7 +2494,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audit_subfolder_readers_with_foreign_writers() {
+        crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
+            phase_a_subfolder_mask_is_projected_after_accepted_prepare();
+            phase_a2_subfolder_external_write_rejects_stale_projection_and_reprepares();
+            prepare_materializes_folder_zip_pdf_image_and_video_grid_items();
+            prepare_excludes_removed_path_without_mutating_shared_snapshot();
+            resort_reuses_loaded_metadata_and_remaps_indexed_caches();
+        });
+    }
+
+    #[test]
     fn phase_a_subfolder_mask_is_projected_after_accepted_prepare() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let root = app.tmp.path().join("subfolder-root");
         let child = root.join("child");
@@ -2526,6 +2543,7 @@ mod tests {
 
     #[test]
     fn phase_a2_subfolder_external_write_rejects_stale_projection_and_reprepares() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let root = app.tmp.path().join("stale-subfolder-root");
         let image = root.join("masked.png");
@@ -2586,6 +2604,7 @@ mod tests {
 
     #[test]
     fn relative_place_labels_use_the_pressed_root() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\library");
         assert_eq!(
             relative_place_label(&root, &root).as_deref(),
@@ -2650,11 +2669,13 @@ mod tests {
 
     #[test]
     fn synthetic_path_is_registered_as_synthetic_view() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         assert!(is_synthetic_view_path(&subfolder_expansion_synthetic_path()));
     }
 
     #[test]
     fn depth_choice_maps_root_only_and_unlimited_to_walker_max_depth() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         assert_eq!(SubfolderExpansionDepthChoice::RootOnly.max_depth(), 0);
         assert_eq!(
             SubfolderExpansionDepthChoice::Unlimited.max_depth(),
@@ -2684,6 +2705,7 @@ mod tests {
 
     #[test]
     fn subfolder_expansion_button_action_matches_off_on_and_busy_states() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         assert_eq!(
             SubfolderExpansionButtonAction::for_state(false, false),
             SubfolderExpansionButtonAction::OpenDialog
@@ -2704,6 +2726,7 @@ mod tests {
 
     #[test]
     fn subfolder_expansion_view_label_shows_the_applied_scan_filter() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut filter = SubfolderExpansionScanFilter::default();
         filter.kinds.insert(crate::settings::FacetItemKind::Image);
         filter.size_preset = Some(crate::settings::FacetSizePreset::Range {
@@ -2741,6 +2764,7 @@ mod tests {
 
     #[test]
     fn scan_depth_limit_changes_how_many_tree_levels_are_collected() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let child = root.join("child");
@@ -2765,6 +2789,7 @@ mod tests {
 
     #[test]
     fn scan_kind_filter_excludes_non_matching_entries() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2796,6 +2821,7 @@ mod tests {
 
     #[test]
     fn scan_size_filter_excludes_non_matching_files() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2818,6 +2844,7 @@ mod tests {
 
     #[test]
     fn scan_size_range_filter_excludes_files_outside_the_range() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2850,6 +2877,7 @@ mod tests {
 
     #[test]
     fn scan_date_filter_excludes_non_matching_files() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2874,6 +2902,7 @@ mod tests {
 
     #[test]
     fn image_folder_book_ignores_size_and_date_filters() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let filter = SubfolderExpansionScanFilter {
             kinds: BTreeSet::new(),
             date_preset: Some(crate::settings::FacetDatePreset::Today),
@@ -2898,6 +2927,7 @@ mod tests {
 
     #[test]
     fn no_scan_filter_keeps_the_previous_entry_set() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2927,6 +2957,7 @@ mod tests {
 
     #[test]
     fn scan_option_uses_the_existing_effective_image_folder_book_setting() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut settings = crate::settings::Settings::default();
         settings.detached_viewer_open_images_in_window = false;
         settings.auto_fullscreen_zip_pdf = true;
@@ -2942,6 +2973,7 @@ mod tests {
 
     #[test]
     fn scan_never_descends_into_portable_metadata_bundle() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let bundle = root.join(crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME);
@@ -2963,6 +2995,7 @@ mod tests {
 
     #[test]
     fn scan_uses_checked_roots_only_when_multiple_roots_are_supplied() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let a = root.join("a");
@@ -3013,6 +3046,7 @@ mod tests {
 
     #[test]
     fn image_only_folder_is_expanded_to_individual_images_when_setting_is_off() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let book = root.join("book");
@@ -3033,6 +3067,7 @@ mod tests {
 
     #[test]
     fn image_only_folder_is_one_book_item_when_setting_is_on() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let book = root.join("book");
@@ -3049,6 +3084,7 @@ mod tests {
 
     #[test]
     fn zip_and_pdf_are_each_listed_once_without_enumerating_their_contents() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -3082,6 +3118,7 @@ mod tests {
 
     #[test]
     fn prepare_materializes_folder_zip_pdf_image_and_video_grid_items() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = [
             (SubfolderExpansionEntryKind::Folder, "folder"),
@@ -3161,6 +3198,7 @@ mod tests {
 
     #[test]
     fn image_folder_with_video_or_container_is_not_collapsed_as_a_book() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let mixed = root.join("mixed");
@@ -3197,6 +3235,7 @@ mod tests {
 
     #[test]
     fn same_name_zip_is_hidden_in_favor_of_image_folder_book_when_configured() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let book = root.join("volume");
@@ -3215,6 +3254,7 @@ mod tests {
 
     #[test]
     fn duplicate_filter_is_scoped_to_one_parent() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::app::folder_scan::ScanMediaKind;
         let a = PathBuf::from(r"C:\root\a\same.jpg");
         let b = PathBuf::from(r"C:\root\b\same.png");
@@ -3254,6 +3294,7 @@ mod tests {
 
     #[test]
     fn sort_entries_tiebreaks_same_name_by_relative_parent() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = vec![
             SubfolderExpansionEntry {
@@ -3276,6 +3317,7 @@ mod tests {
 
     #[test]
     fn subfolder_size_sort_uses_physical_sizes_and_keeps_synthetic_folders_separate() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = vec![
             SubfolderExpansionEntry {
@@ -3324,6 +3366,7 @@ mod tests {
 
     #[test]
     fn subfolder_sort_applies_name_and_numeric_desc() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = vec![
             SubfolderExpansionEntry {
@@ -3354,6 +3397,7 @@ mod tests {
 
     #[test]
     fn folder_grouped_order_keeps_each_relative_folder_together() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = vec![
             SubfolderExpansionEntry {
@@ -3402,6 +3446,7 @@ mod tests {
 
     #[test]
     fn flat_order_preserves_legacy_cross_folder_name_sort() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = vec![
             SubfolderExpansionEntry {
@@ -3450,6 +3495,7 @@ mod tests {
 
     #[test]
     fn prepare_excludes_removed_path_without_mutating_shared_snapshot() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let removed_path = root.join("a").join("removed.png");
         let kept_path = root.join("a").join("kept.png");
@@ -3509,6 +3555,7 @@ mod tests {
 
     #[test]
     fn resort_reuses_loaded_metadata_and_remaps_indexed_caches() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let a1 = root.join("a").join("1.png");
         let a2 = root.join("a").join("2.png");
@@ -3594,6 +3641,7 @@ mod tests {
 
     #[test]
     fn sort_stops_when_prepare_is_cancelled() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = vec![SubfolderExpansionEntry {
             path: root.join("a").join("1.png"),
@@ -3667,6 +3715,7 @@ mod tests {
 
     #[test]
     fn chunked_sort_matches_single_total_order_sort_and_reports_monotonic_progress() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = chunked_sort_test_entries(&root, 257);
         let display_order = crate::settings::GridDisplayOrder::default();
@@ -3707,6 +3756,7 @@ mod tests {
 
     #[test]
     fn chunked_sort_cancels_between_chunks_without_changing_comparator() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = chunked_sort_test_entries(&root, 96);
         let cancel = AtomicBool::new(false);
@@ -3734,6 +3784,7 @@ mod tests {
 
     #[test]
     fn chunked_sort_cancels_during_merge_without_panicking() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = chunked_sort_test_entries(&root, 96);
         let cancel = AtomicBool::new(false);
@@ -3766,6 +3817,7 @@ mod tests {
 
     #[test]
     fn snapshot_removal_drops_deleted_entries_and_video_overrides() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let kept_video = root.join("kept.mp4");
         let removed_video = root.join("removed.mp4");

@@ -159,10 +159,18 @@ fn migrate_thumb_pin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_migration_stamps_with_foreign_writers() {
+        crate::page_edit_write_epoch::with_foreign_scoped_writers(
+            migration_invalidates_page_and_rating_prepare_stamps,
+        );
+    }
     use std::path::PathBuf;
 
     #[test]
     fn migration_invalidates_page_and_rating_prepare_stamps() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let dir = tempfile::tempdir().unwrap();
         let zip = PathBuf::from(r"D:\Comics\legacy.zip");
         let old = crate::adjustment_db::zip_entry_key(&zip, "old.jpg");
@@ -183,6 +191,7 @@ mod tests {
     /// 旧キーの行が新キーへ移り、新キーに既存行がある場合は新が優先される。
     #[test]
     fn migrates_page_keys_and_prefers_existing_new_rows() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let dir = tempfile::tempdir().unwrap();
         let zip = PathBuf::from(r"D:\Comics\本.zip");
         let old_entry = "ﾓｼﾞﾊﾞｹ/p1.jpg"; // CP437 mojibake 相当 (中身は何でもよい)
@@ -259,6 +268,7 @@ mod tests {
     /// 代表サムネピンの source_entry も新名へ移行される。
     #[test]
     fn migrates_thumb_pin_source_entry() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let dir = tempfile::tempdir().unwrap();
         let zip = PathBuf::from(r"D:\Comics\本.zip");
         let db_path = dir.path().join("folder_thumb_pins.db");

@@ -1644,9 +1644,14 @@ impl App {
         let (sender, receiver) = std::sync::mpsc::channel();
         let collection_id = request.origin.collection_id;
         let request_sequence = request.origin.intent_sequence;
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawn = std::thread::Builder::new()
             .name("collection-navigation-prepare".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 let perf_start = crate::perf::is_enabled().then(std::time::Instant::now);
                 let result = super::collection_grid::prepare_collection_grid_install(
                     &snapshot,
@@ -3504,6 +3509,17 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn audit_collection_navigation_readers_with_foreign_writers() {
+        crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
+            navigation_reuses_exact_presentation_without_full_prepare_and_pin_mutation_invalidates_it();
+            external_page_write_prevents_retained_collection_navigation_reuse();
+            external_edit_during_preflight_restarts_navigation_instead_of_ending_it();
+            physical_child_carries_reusable_thumbnail_payload_back_to_root();
+            navigation_root_reuses_only_when_thumbnail_sources_are_identical();
+        });
+    }
+
     fn recv<T>(receiver: crossbeam_channel::Receiver<Result<T, CollectionStoreError>>) -> T {
         receiver
             .recv_timeout(Duration::from_secs(3))
@@ -3584,6 +3600,7 @@ mod tests {
 
     #[test]
     fn navigation_reuses_exact_presentation_without_full_prepare_and_pin_mutation_invalidates_it() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.mp3");
         let second = temp.path().join("second.mp3");
@@ -3808,6 +3825,7 @@ mod tests {
 
     #[test]
     fn external_page_write_prevents_retained_collection_navigation_reuse() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.jpg");
         let second = temp.path().join("second.jpg");
@@ -3933,6 +3951,7 @@ mod tests {
 
     #[test]
     fn external_edit_during_preflight_restarts_navigation_instead_of_ending_it() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.jpg");
         let second = temp.path().join("second.jpg");
@@ -4040,6 +4059,7 @@ mod tests {
 
     #[test]
     fn physical_child_carries_reusable_thumbnail_payload_back_to_root() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("book");
         let next_folder = temp.path().join("next");
@@ -4249,6 +4269,7 @@ mod tests {
 
     #[test]
     fn pin_blob_retention_budget_is_bounded_without_truncating_installed_payload() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use super::super::top_level_grid_view::{
             MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES, collection_pin_blob_sizes_fit_retention_budget,
         };
@@ -4332,6 +4353,7 @@ mod tests {
 
     #[test]
     fn navigation_read_waits_for_starting_and_busy_then_reuses_subscription() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
         let created = recv(client.create_collection("navigation read".into()).unwrap());
@@ -4451,6 +4473,7 @@ mod tests {
 
     #[test]
     fn repeated_automatic_intent_keeps_its_retry_deadline_and_exact_action_identity() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app_for_test();
         let collection_id = CollectionId::new();
         app.top_level_grid_view.begin(
@@ -4565,6 +4588,7 @@ mod tests {
 
     #[test]
     fn terminal_read_error_is_not_reported_as_a_collection_boundary() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app_for_test();
         app.top_level_grid_view.begin(
             TopLevelGridSurface::Collection(CollectionGridIdentity {
@@ -4625,6 +4649,7 @@ mod tests {
 
     #[test]
     fn latest_navigation_root_install_carries_prepared_thumbnail_sources() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("page.jpg");
         let sidecar = temp.path().join("video.jpg");
@@ -4707,6 +4732,7 @@ mod tests {
 
     #[test]
     fn identical_navigation_root_reuses_the_complete_grid_presentation() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.mp3");
         let second = temp.path().join("second.mp3");
@@ -4805,6 +4831,7 @@ mod tests {
 
     #[test]
     fn manual_media_navigation_routes_collection_before_its_display_order_argument() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.jpg");
         let second = temp.path().join("second.jpg");
@@ -4909,6 +4936,7 @@ mod tests {
 
     #[test]
     fn navigation_root_reuses_only_when_thumbnail_sources_are_identical() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.mp4");
         let second = temp.path().join("second.mp4");
@@ -5073,6 +5101,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn split_detached_collection_navigation_and_close_leave_the_main_grid_untouched() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.mp3");
         let second = temp.path().join("second.mp3");
@@ -5185,6 +5214,7 @@ mod tests {
 
     #[test]
     fn same_revision_changed_presentation_reinstalls_the_collection_root() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("page.jpg");
         std::fs::write(&image, b"image").unwrap();
@@ -5259,6 +5289,7 @@ mod tests {
 
     #[test]
     fn collection_preflight_is_finite_and_selects_the_required_existing_media() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::TempDir::new().unwrap();
         let missing = temp.path().join("missing.jpg");
         let first = temp.path().join("first.jpg");
@@ -5307,6 +5338,7 @@ mod tests {
 
     #[test]
     fn collection_preflight_observes_cancellation_before_filesystem_work() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let cancel = Arc::new(AtomicBool::new(true));
         let result = preflight_candidates(
             vec![candidate(
@@ -5326,6 +5358,7 @@ mod tests {
 
     #[test]
     fn pdf_password_wait_pauses_the_same_lease_and_cancel_releases_navigation_lock() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let pdf = temp.path().join("locked.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
@@ -5428,6 +5461,7 @@ mod tests {
 
     #[test]
     fn long_running_navigation_keeps_lock_and_history_then_adopts_exact_reply() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("page.png");
         std::fs::write(&image, b"image").unwrap();
@@ -5544,6 +5578,7 @@ mod tests {
 
     #[test]
     fn password_revision_restart_resumes_same_lease_before_read_admission() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let pdf = temp.path().join("locked.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
@@ -5662,6 +5697,7 @@ mod tests {
 
     #[test]
     fn collection_outer_repeats_use_a_bounded_signed_accumulator() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut pending = CollectionNavigationPending::AwaitingOuterContinuation {
             steps: 1,
             fullscreen: true,
@@ -5690,6 +5726,7 @@ mod tests {
 
     #[test]
     fn manual_repeats_queue_while_the_previous_landing_is_pending() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let target_path = PathBuf::from(r"C:\collection\target.jpg");
         let source =
             crate::collection_store::CollectionSourcePath::from_trusted(&target_path).unwrap();
@@ -5740,6 +5777,7 @@ mod tests {
 
     #[test]
     fn manual_landing_queue_uses_its_stamp_when_the_presenter_index_is_transient() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("target.jpg");
         std::fs::write(&image, b"image").unwrap();
@@ -5817,6 +5855,7 @@ mod tests {
 
     #[test]
     fn replacing_a_surface_retires_its_fullscreen_navigation_lock_once() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut view = super::super::top_level_grid_view::TopLevelGridView::default();
         let initial_sequence = view.collection_navigation_sequence();
         view.set_collection_navigation_pending(Some(
@@ -5838,6 +5877,7 @@ mod tests {
 
     #[test]
     fn commit_barrier_restarts_when_revision_changes_after_preflight() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("a.jpg");
         let second = temp.path().join("b.jpg");
@@ -5993,6 +6033,7 @@ mod tests {
 
     #[test]
     fn intent_sequence_rejects_a_fullscreen_index_aba() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = App::new_from_settings(crate::settings::Settings::default());
         let collection_id = CollectionId::new();
         app.top_level_grid_view.begin(
@@ -6038,6 +6079,7 @@ mod tests {
 
     #[test]
     fn root_grid_selection_change_rejects_an_inflight_outer_request() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
         let second = temp.path().join("second");
@@ -6120,6 +6162,7 @@ mod tests {
 
     #[test]
     fn transferred_archive_owner_is_rejected_after_its_intent_is_cancelled() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
         let second = temp.path().join("second.rar");
@@ -6196,6 +6239,7 @@ mod tests {
 
     #[test]
     fn transferred_archive_owner_allows_the_grid_watch_to_catch_up_to_its_exact_revision() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
         let second = temp.path().join("second.rar");
@@ -6288,6 +6332,7 @@ mod tests {
 
     #[test]
     fn collection_physical_zip_uses_child_dfs_before_resuming_outer_order() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let zip_path = temp.path().join("first.zip");
         let next = temp.path().join("second");
@@ -6370,6 +6415,7 @@ mod tests {
 
     #[test]
     fn detached_collection_zip_uses_child_dfs_before_resuming_outer_order() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let zip_path = temp.path().join("first.zip");
         let next = temp.path().join("second");
@@ -6457,6 +6503,7 @@ mod tests {
 
     #[test]
     fn collection_intents_derive_media_filter_tail_and_history_class() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let manual = CollectionNavigationAction::Manual {
             fs_idx: 2,
             delta: -1,

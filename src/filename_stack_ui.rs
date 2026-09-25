@@ -602,9 +602,14 @@ impl crate::app::App {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_source = Arc::clone(&source);
         let repaint = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawned = std::thread::Builder::new()
             .name("stack-script".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 #[cfg(test)]
                 if let Some(runs) = &worker_source.group_runs {
                     runs.fetch_add(1, Ordering::Relaxed);
@@ -757,9 +762,14 @@ impl crate::app::App {
         let rating_available = source.rating_available;
         let tags_available = source.tags_available;
         let (tx, rx) = std::sync::mpsc::channel();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawned = std::thread::Builder::new()
             .name("stack-group-read".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 let read = read_stack_candidate(
                     order,
                     availability,
@@ -1091,9 +1101,14 @@ impl crate::app::App {
         let worker_view = Arc::clone(&view);
         let repaint = ctx.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawned = std::thread::Builder::new()
             .name("stack-view-prepare".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 let (target_order, retained_order) = match orders {
                     Some(orders) => orders,
                     None => {
@@ -1859,6 +1874,7 @@ mod tests {
 
     #[test]
     fn a2_stack_subfolder_flat_uses_exact_page_key_for_fullscreen() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let dir = app.tmp.path().join("nested");
         std::fs::create_dir(&dir).unwrap();
@@ -1896,6 +1912,7 @@ mod tests {
 
     #[test]
     fn a2_stack_subfolder_aggregate_flat_round_trip_preserves_mask() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let dir = app.tmp.path().join("round-trip");
         std::fs::create_dir(&dir).unwrap();
@@ -1951,6 +1968,7 @@ mod tests {
 
     #[test]
     fn a2_stack_stale_return_shows_aggregate_and_blocks_grid_until_refresh() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let dir = app.tmp.path().join("stale-return");
         std::fs::create_dir(&dir).unwrap();
@@ -2004,6 +2022,7 @@ mod tests {
 
     #[test]
     fn a2_stack_normal_folder_flat_mask_control() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let dir = app.tmp.path().join("normal");
         std::fs::create_dir(&dir).unwrap();
@@ -2039,28 +2058,19 @@ mod tests {
         view: Arc<StackView>,
         ctx: &egui::Context,
     ) -> StackScriptPending {
-        // Production retries Ok(None) when another test's process-wide edit,
-        // rating, or tag write epoch overlaps this stable snapshot. This
-        // fixture needs an accepted candidate, not a particular attempt.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let read = loop {
-            let (items, metas) = view.materialize_aggregated();
-            let read = read_stack_candidate(
-                StackCandidateOrder::new(items, metas),
-                crate::app::page_edit_snapshot::PageEditAvailability::for_app(app),
-                app.rating_db.is_some(),
-                app.tags_db.is_some(),
-                &AtomicBool::new(false),
-            );
-            match &read.result {
-                Ok(Some(_)) => break read,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                Ok(None) => panic!("stack candidate stayed unstable for five seconds"),
-                Err(error) => panic!("stack candidate read failed: {error}"),
-            }
-        };
+        let (items, metas) = view.materialize_aggregated();
+        let read = read_stack_candidate(
+            StackCandidateOrder::new(items, metas),
+            crate::app::page_edit_snapshot::PageEditAvailability::for_app(app),
+            app.rating_db.is_some(),
+            app.tags_db.is_some(),
+            &AtomicBool::new(false),
+        );
+        match &read.result {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the isolated stack candidate unexpectedly became stale"),
+            Err(error) => panic!("stack candidate read failed: {error}"),
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Ok(Some(StackGroupReady {
             view: Arc::clone(&view),
@@ -2108,6 +2118,7 @@ mod tests {
 
     #[test]
     fn a2_stack_stale_grouping_after_write_rebases() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
         let folder = app.tmp.path().join("stale-group-write");
@@ -2142,6 +2153,7 @@ mod tests {
 
     #[test]
     fn a2_stack_stale_grouping_after_new_request_is_rejected() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
         let folder = app.tmp.path().join("stale-group-sequence");
@@ -2163,6 +2175,7 @@ mod tests {
 
     #[test]
     fn a2_stack_grouping_rebases_when_each_captured_setting_changes() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         for changed in 0..4 {
             let mut app = crate::app::setup_app_for_test();
             let ctx = egui::Context::default();
@@ -2197,6 +2210,7 @@ mod tests {
 
     #[test]
     fn a2_stack_large_extract_is_sliced_before_worker_grouping() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
         let folder = app.tmp.path().join("large-extract");
@@ -2235,6 +2249,7 @@ mod tests {
 
     #[test]
     fn a2_stack_failed_reads_reuse_grouping_with_bounded_wakes() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
         let folder = app.tmp.path().join("retry-grouping");
@@ -2327,6 +2342,7 @@ mod tests {
 
     #[test]
     fn a2_stack_stale_return_unblocks_after_sustained_failure_and_later_recovers() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
         let folder = app.tmp.path().join("stale-return-failure");
@@ -2428,6 +2444,56 @@ mod tests {
         );
         assert!(app.stack_script_pending.is_none());
         assert!(app.mask_pages.contains(&0));
+    }
+
+    fn with_foreign_epoch_writers(body: impl FnOnce()) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let temp = tempfile::tempdir().unwrap();
+            let _page = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            let _rating = crate::rating_db::RATING_WRITES.begin();
+            let _tag = crate::tags_db::TAG_WRITES.begin();
+            crate::mask_db::MaskDb::open_at(&temp.path().join("mask.db"))
+                .unwrap()
+                .set("foreign-page", &[true], &[], 1, 1)
+                .unwrap();
+            crate::rating_db::RatingDb::open_at(temp.path().join("rating.db"))
+                .unwrap()
+                .set("foreign-rating", 1)
+                .unwrap();
+            crate::tags_db::TagsDb::open_at(&temp.path().join("tags.db"))
+                .unwrap()
+                .set_item_tags("foreign-tag", ["writer"], "test")
+                .unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn audit_a2_stack_subfolder_round_trip_with_foreign_edit_rating_tag_writes() {
+        with_foreign_epoch_writers(a2_stack_subfolder_aggregate_flat_round_trip_preserves_mask);
+    }
+
+    #[test]
+    fn audit_a2_stack_stale_return_with_foreign_edit_rating_tag_writes() {
+        with_foreign_epoch_writers(
+            a2_stack_stale_return_unblocks_after_sustained_failure_and_later_recovers,
+        );
+    }
+
+    #[test]
+    fn audit_a2_stack_grouping_rebase_with_foreign_edit_rating_tag_writes() {
+        with_foreign_epoch_writers(a2_stack_grouping_rebases_when_each_captured_setting_changes);
     }
 
     fn image(path: &str) -> StackMember {

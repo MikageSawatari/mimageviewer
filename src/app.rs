@@ -31317,9 +31317,14 @@ impl App {
         let worker_order = std::sync::Arc::clone(&order);
         let (sender, receiver) = std::sync::mpsc::channel();
         let repaint = ctx.clone();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawned = std::thread::Builder::new()
             .name("page-edit-reconcile".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 let result = if let Some(keys) = changed_keys {
                     let keys = keys.into_iter().collect::<std::collections::HashSet<_>>();
                     worker_order
@@ -31558,9 +31563,14 @@ impl App {
         let (sender, receiver) = std::sync::mpsc::channel();
         let repaint = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context();
         let started_stamp = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawned = std::thread::Builder::new()
             .name("virtual-page-edit-prepare".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 let order = std::sync::Arc::new(builder.finish());
                 let result = page_edit_snapshot::PageEditSnapshot::load_and_project_order_stable(
                     order,
@@ -31629,9 +31639,14 @@ impl App {
         let (sender, receiver) = std::sync::mpsc::channel();
         let repaint = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context();
         let started_stamp = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawned = std::thread::Builder::new()
             .name("metadata-page-edit-reconcile".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 let result = page_edit_snapshot::PageEditSnapshot::load_and_project_order_stable(
                     worker_order,
                     availability,
@@ -81328,6 +81343,7 @@ mod rated_at_details_sort_tests {
 
     #[test]
     fn rated_at_details_sort_keeps_null_last_in_both_directions() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app_for_test();
         app.rating_view_rows = vec![
             row("thirty.jpg", Some(30)),
@@ -81362,6 +81378,7 @@ mod rated_at_details_sort_tests {
 
     #[test]
     fn rated_at_sort_is_visible_only_in_rating_view_and_resets_on_close() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app_for_test();
         app.settings.details_show_rated_at = true;
 
@@ -81382,6 +81399,7 @@ mod rated_at_details_sort_tests {
 
     #[test]
     fn reinstalling_same_rating_view_keeps_rated_at_sort() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app_for_test();
         app.rating_view_rows = vec![row("page.jpg", Some(10))];
         app.items_are_rating_view = true;
@@ -81401,6 +81419,7 @@ mod rated_at_details_sort_tests {
 
     #[test]
     fn true_rating_view_entry_does_not_restore_a_stale_rated_at_sort() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app_for_test();
         app.rating_view_rows = vec![row("page.jpg", Some(10))];
         app.items_are_rating_view = false;

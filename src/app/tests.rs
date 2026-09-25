@@ -74,6 +74,7 @@ fn rar_nav_main_ignore_setting_can_leave_open_rar_but_cannot_land_on_another() {
 
 #[test]
 fn phase_a2_compact_ten_thousand_page_keys_and_ui_acceptance() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = setup_app_for_test();
     let items = (0..10_000)
         .map(|index| {
@@ -145,6 +146,7 @@ fn phase_a2_compact_ten_thousand_page_keys_and_ui_acceptance() {
 
 #[test]
 fn phase_a2_hundred_thousand_keys_build_in_bounded_ui_batches() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = setup_app_for_test();
     app.items = (0..100_000)
         .map(|index| {
@@ -226,6 +228,7 @@ fn phase_a2_wait_for_mask(app: &mut App) {
 
 #[test]
 fn phase_a2_snapshot_lock_keeps_saved_virtual_page_edit() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("snapshot-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -254,6 +257,7 @@ fn phase_a2_snapshot_lock_keeps_saved_virtual_page_edit() {
 
 #[test]
 fn phase_a2_snapshot_lock_from_search_and_child_list_return_keep_edit() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("search-snapshot-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -282,6 +286,7 @@ fn phase_a2_snapshot_lock_from_search_and_child_list_return_keep_edit() {
 
 #[test]
 fn phase_a2_snapshot_lock_from_collection_keeps_edit() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("collection-snapshot-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -315,6 +320,7 @@ fn phase_a2_snapshot_lock_from_collection_keeps_edit() {
 
 #[test]
 fn phase_a2_idle_virtual_view_refreshes_after_external_page_write() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("late-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -331,6 +337,7 @@ fn phase_a2_idle_virtual_view_refreshes_after_external_page_write() {
 
 #[test]
 fn phase_a2_failed_full_reread_retries_without_another_write() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("failed-read.png");
     std::fs::write(&image, b"image").unwrap();
@@ -376,6 +383,7 @@ fn phase_a2_failed_full_reread_retries_without_another_write() {
 
 #[test]
 fn phase_a2_late_local_adjust_commit_and_delete_reconcile() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("late-local-adjust.png");
     std::fs::write(&image, b"image").unwrap();
@@ -429,6 +437,7 @@ fn phase_a2_late_local_adjust_commit_and_delete_reconcile() {
 
 #[test]
 fn phase_a2_rename_rebuilds_virtual_projection_for_new_key() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let old = app.tmp.path().join("old-name.png");
     let new = app.tmp.path().join("new-name.png");
@@ -450,6 +459,7 @@ fn phase_a2_rename_rebuilds_virtual_projection_for_new_key() {
 
 #[test]
 fn phase_a2_content_restore_keeps_virtual_owner_and_reloads_saved_edit() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("restored.png");
     std::fs::write(&image, b"image").unwrap();
@@ -467,6 +477,7 @@ fn phase_a2_content_restore_keeps_virtual_owner_and_reloads_saved_edit() {
 
 #[test]
 fn phase_a2_unrelated_restore_does_not_clear_virtual_projection() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("unrelated-restore.png");
     std::fs::write(&image, b"image").unwrap();
@@ -489,6 +500,7 @@ fn phase_a2_unrelated_restore_does_not_clear_virtual_projection() {
 
 #[test]
 fn phase_a2_metadata_import_updates_virtual_keyed_owner() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("imported.png");
     std::fs::write(&image, b"image").unwrap();
@@ -542,6 +554,7 @@ fn phase_a2_metadata_import_updates_virtual_keyed_owner() {
 
 #[test]
 fn phase_a2_metadata_import_writer_notification_refreshes_synthetic_view() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let root = app.tmp.path().join("import-book");
     std::fs::create_dir(&root).unwrap();
@@ -564,7 +577,10 @@ fn phase_a2_metadata_import_writer_notification_refreshes_synthetic_view() {
     // Production import hands off the idle tags connection before switching its
     // journal mode for the multi-store transaction.
     drop(app.tags_db.take());
+    let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture().unwrap();
     let imported = std::thread::spawn(move || {
+        let _test_epoch_scope =
+            crate::page_edit_write_epoch::TestEpochScope::enter(test_epoch_scope);
         crate::metadata_transfer::import_at(
             &data_dir,
             &root,
@@ -586,6 +602,7 @@ fn phase_a2_metadata_import_writer_notification_refreshes_synthetic_view() {
 #[test]
 #[cfg(windows)]
 fn phase_a2_sibling_write_refreshes_parked_bundle_on_remount() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("sibling-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -1764,6 +1781,7 @@ fn phase_b_search_batch(
 
 #[test]
 fn phase_b_search_streaming_result_projects_saved_mask() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let ctx = egui::Context::default();
     let stream = phase_b_search_stream(&mut app, &ctx);
@@ -1789,6 +1807,7 @@ fn phase_b_search_streaming_result_projects_saved_mask() {
 
 #[test]
 fn phase_b_search_rebuild_retains_done_and_new_page_edits() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, first) = phase_b_masked_image();
     let second = app.tmp.path().join("phase-b-second.png");
     std::fs::write(&second, b"image").unwrap();
@@ -1838,6 +1857,7 @@ fn phase_b_search_rebuild_retains_done_and_new_page_edits() {
 
 #[test]
 fn phase_b_query_change_discards_old_stream_and_prepare() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, first) = phase_b_masked_image();
     let ctx = egui::Context::default();
     let stream = phase_b_search_stream(&mut app, &ctx);
@@ -1879,6 +1899,7 @@ fn phase_b_query_change_discards_old_stream_and_prepare() {
 
 #[test]
 fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("phase-b-search-late-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -1929,7 +1950,17 @@ fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
 }
 
 #[test]
+fn audit_virtual_page_and_search_readers_with_foreign_writers() {
+    crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
+        phase_a2_compact_ten_thousand_page_keys_and_ui_acceptance();
+        phase_b_search_streaming_result_projects_saved_mask();
+        phase_b_search_rebases_after_no_snapshot_edit_commit();
+    });
+}
+
+#[test]
 fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let tag_key = crate::tags_db::item_key_for_path(&image);
     app.tags_db
@@ -2005,7 +2036,19 @@ fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
 }
 
 #[test]
+fn audit_rating_view_readers_with_foreign_writers() {
+    crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
+        phase_b_rating_list_projects_saved_mask_after_local_sort();
+        phase_b_rating_pending_result_rebases_after_shared_star_write();
+        phase_b_rating_pending_result_rebases_after_tag_write();
+        phase_b_rating_pending_result_rebases_after_book_page_copy();
+        phase_b_rating_rejects_edit_written_without_view_snapshot();
+    });
+}
+
+#[test]
 fn phase_b_rating_pending_result_rebases_after_shared_star_write() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let key = crate::adjustment_db::normalize_path(&image);
     let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
@@ -2048,6 +2091,7 @@ fn phase_b_rating_pending_result_rebases_after_shared_star_write() {
 
 #[test]
 fn phase_b_rating_pending_result_rebases_after_tag_write() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let key = crate::adjustment_db::normalize_path(&image);
     let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
@@ -2105,6 +2149,7 @@ fn phase_b_rating_pending_result_rebases_after_tag_write() {
 
 #[test]
 fn phase_b_rating_pending_result_rebases_after_book_page_copy() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let copied = app.tmp.path().join("phase-b-copied.png");
     std::fs::write(&copied, b"image").unwrap();
@@ -2154,6 +2199,7 @@ fn phase_b_rating_pending_result_rebases_after_book_page_copy() {
 
 #[test]
 fn phase_b_rating_rejects_edit_written_without_view_snapshot() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("phase-b-late-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -8426,6 +8472,8 @@ pub(crate) mod phase_c_support {
     /// 二重防御として drop 順自体を fix している。
     pub(crate) struct AppTestEnv {
         pub app: App,
+        // Keep the epoch scope alive through App::drop and its worker joins.
+        _epoch_scope: Option<crate::page_edit_write_epoch::TestEpochScope>,
         _guard: OverrideGuard,
         /// Test 本体から `app.tmp.path()` の形でアクセスできるよう公開している
         /// (App には `tmp` フィールドが無いので名前衝突しない)。
@@ -8536,6 +8584,11 @@ pub(crate) mod phase_c_support {
             settings,
             similar_feature_capability,
         };
+        // Tests that already own a scope retain it; otherwise every App fixture and its
+        // captured workers get a private epoch, including indirect grid/snapshot readers.
+        let epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture()
+            .is_none()
+            .then(crate::page_edit_write_epoch::TestEpochScope::fresh);
         let mut app = App::new_for_test(config);
         app.settings.first_setup_completed = true;
         // This shared fixture exercises navigation, context, and input behavior. Give it an
@@ -8551,6 +8604,7 @@ pub(crate) mod phase_c_support {
         app.settings.book_root = Some(tmp.path().join("books"));
         AppTestEnv {
             app,
+            _epoch_scope: epoch_scope,
             _guard: guard,
             tmp,
             _lock: lock,
@@ -12891,6 +12945,7 @@ mod phase_c_folder_nav_history_tests {
     /// 動画フォルダで列ヘッダを押してから戻るだけで、報告と同じ症状が出る。
     #[test]
     fn navigating_back_into_the_rating_list_also_takes_back_the_column_sort() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let real = app.tmp.path().join("before-rating-back");
         std::fs::create_dir_all(&real).unwrap();
@@ -12950,6 +13005,7 @@ mod phase_c_folder_nav_history_tests {
     /// ビューの既定ソートを入れ直すのと同じ場所で、列ソートの所有権も戻す。
     #[test]
     fn entering_the_rating_list_takes_back_a_column_sort_carried_in_from_another_folder() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
         app.settings.details_show_video_dimensions = true;
@@ -13049,6 +13105,7 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn location_menu_rating_view_records_previous_folder_for_back() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let real = app.tmp.path().join("before-rating-menu");
         std::fs::create_dir_all(&real).unwrap();
@@ -13076,6 +13133,7 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn rating_view_star_change_records_distinct_history_and_restores_previous_stars() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let real = app.tmp.path().join("before-rating-star-switch");
         std::fs::create_dir_all(&real).unwrap();
@@ -13314,6 +13372,7 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn folder_history_dispatch_restores_rating_view() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut rating_app = setup_app();
         rating_app.active_quick_folder_slot = None;
         rating_app.rating_view_stars = 4;
@@ -14428,6 +14487,7 @@ mod phase_c_drill_nav_tests {
     /// 「なし+★3」では未評価サブフォルダが (descendant 件数バッジつきで) 表示される。
     #[test]
     fn drilled_unrated_subfolder_hidden_when_unrated_filter_off() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
         let mut app = setup_app();
@@ -14788,6 +14848,7 @@ mod phase_c_drill_nav_tests {
 
     #[test]
     fn rating_view_refresh_reloads_to_restore_row() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let image = app.tmp.path().join("rated.jpg");
         std::fs::write(&image, b"image bytes").expect("write rated image");
@@ -15582,6 +15643,7 @@ mod phase_c_drill_nav_tests {
     /// 復帰してほしい (旧実装は selected=None で先頭に飛んでいた)。
     #[test]
     fn bs_back_to_aggregated_restores_cursor_on_previous_container() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
         let mut app = setup_app();
@@ -17346,6 +17408,7 @@ mod phase_c_drill_nav_tests {
     /// - フィルタ「★2 のみ」: 未評価 subfolder は visibility check で隠れる
     #[test]
     fn drilled_subfolder_badge_matches_normal_folder_semantics() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
         let mut app = setup_app();
@@ -17419,6 +17482,7 @@ mod phase_c_drill_nav_tests {
     /// フォールバックする。次の方向キーで idx 0 に飛ぶ事故を防ぐため。
     #[test]
     fn bs_back_falls_back_to_first_visible_when_target_missing() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::global_search::GlobalHit;
         let mut app = setup_app();
         app.global_search.active = true;
@@ -19039,6 +19103,7 @@ mod phase_c_drill_address_tests {
 
     #[test]
     fn streaming_progress_is_grouped_in_address_and_removed_after_done() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.query = "glasses -genshin".to_string();
@@ -19106,6 +19171,7 @@ mod phase_c_drill_address_tests {
 
     #[test]
     fn aggregated_streaming_address_shows_received_hits_before_rating_prepare() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.query = "glasses".to_string();
@@ -19163,6 +19229,7 @@ mod phase_c_drill_address_tests {
 
     #[test]
     fn pending_search_without_events_uses_delayed_backstop() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.query = "glasses".to_string();
@@ -19188,6 +19255,7 @@ mod phase_c_drill_address_tests {
 
     #[test]
     fn search_event_backlog_requests_immediate_drain_continuation() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.query = "glasses".to_string();
@@ -69710,6 +69778,7 @@ mod rating_view_navigation_tests {
 
     #[test]
     fn rating_view_back_from_opened_container_returns_to_result_grid() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let opened = app.tmp.path().join("books").join("a.zip");
         std::fs::create_dir_all(opened.parent().unwrap()).unwrap();

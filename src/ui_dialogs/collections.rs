@@ -5756,6 +5756,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn audit_collection_dialog_grid_prepare_ignores_foreign_scoped_writers() {
+        crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut app, _) = start_ready_app(&temp);
+            let collection = create_collection(&mut app, "Scoped grid prepare");
+            app.open_collection_grid(collection.collection_id(), None);
+            wait_for_collection_grid(&mut app, collection.collection_id());
+            app.shutdown_collection_runtime_for_exit();
+        });
+    }
+
     fn wait_for_collection_grid_revision(
         app: &mut App,
         collection_id: CollectionId,

@@ -1,6 +1,8 @@
 //! Process-wide publication stamp for page-edit DB writers and virtual-list readers.
 //!
 //! Two overlapping writers must never make a shared odd/even bit look quiescent.
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -34,6 +36,117 @@ pub(crate) struct EditWriteEpoch {
 
 pub(crate) static PAGE_EDIT_WRITES: EditWriteEpoch = EditWriteEpoch::new();
 
+#[cfg(test)]
+struct TestEpochs {
+    page: EditWriteEpoch,
+    rating: EditWriteEpoch,
+    tag: EditWriteEpoch,
+}
+
+/// One test's write publications, shared with its reader workers but not with other tests.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct TestEpochHandle(&'static TestEpochs);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_EPOCHS: Cell<Option<TestEpochHandle>> = const { Cell::new(None) };
+    static TEST_PROCESS_GLOBAL_READ_REASON: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestEpochScope {
+    previous: Option<TestEpochHandle>,
+}
+
+#[cfg(test)]
+impl TestEpochScope {
+    pub(crate) fn fresh() -> Self {
+        // The static API returns guards borrowing their epoch. Keep the small test instance
+        // alive for the test process so worker threads and guards may finish in either order.
+        let epochs = Box::leak(Box::new(TestEpochs {
+            page: EditWriteEpoch::new(),
+            rating: EditWriteEpoch::new(),
+            tag: EditWriteEpoch::new(),
+        }));
+        Self::enter(TestEpochHandle(epochs))
+    }
+
+    pub(crate) fn capture() -> Option<TestEpochHandle> {
+        TEST_EPOCHS.with(Cell::get)
+    }
+
+    pub(crate) fn enter(handle: TestEpochHandle) -> Self {
+        let previous = TEST_EPOCHS.with(|scope| scope.replace(Some(handle)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEpochScope {
+    fn drop(&mut self) {
+        TEST_EPOCHS.with(|scope| scope.set(self.previous));
+    }
+}
+
+/// Explicit exception for a test that intentionally reads the process-wide publication state.
+#[cfg(test)]
+pub(crate) struct TestProcessGlobalEpochRead {
+    previous: Option<&'static str>,
+}
+
+#[cfg(test)]
+impl TestProcessGlobalEpochRead {
+    pub(crate) fn for_reason(reason: &'static str) -> Self {
+        assert!(
+            !reason.is_empty(),
+            "a process-global epoch read needs a reason"
+        );
+        assert!(
+            TestEpochScope::capture().is_none(),
+            "a process-global epoch read cannot also use a private test scope"
+        );
+        let previous =
+            TEST_PROCESS_GLOBAL_READ_REASON.with(|current| current.replace(Some(reason)));
+        Self { previous }
+    }
+
+    fn is_active() -> bool {
+        TEST_PROCESS_GLOBAL_READ_REASON.with(|current| current.get().is_some())
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestProcessGlobalEpochRead {
+    fn drop(&mut self) {
+        TEST_PROCESS_GLOBAL_READ_REASON.with(|current| current.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_foreign_scoped_writers(body: impl FnOnce()) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let _writer_scope = TestEpochScope::fresh();
+        let _guards = [
+            &PAGE_EDIT_WRITES,
+            &crate::rating_db::RATING_WRITES,
+            &crate::tags_db::TAG_WRITES,
+        ]
+        .map(EditWriteEpoch::begin);
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    entered_rx.recv().unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 impl EditWriteEpoch {
     pub const fn new() -> Self {
         Self {
@@ -44,35 +157,74 @@ impl EditWriteEpoch {
         }
     }
 
+    fn owner(&self) -> &Self {
+        #[cfg(test)]
+        if let Some(scope) = TestEpochScope::capture() {
+            if std::ptr::eq(self, &PAGE_EDIT_WRITES) {
+                return &scope.0.page;
+            }
+            if std::ptr::eq(self, &crate::rating_db::RATING_WRITES) {
+                return &scope.0.rating;
+            }
+            if std::ptr::eq(self, &crate::tags_db::TAG_WRITES) {
+                return &scope.0.tag;
+            }
+        }
+        self
+    }
+
+    #[track_caller]
+    fn owner_for_read(&self) -> &Self {
+        #[cfg(test)]
+        if (std::ptr::eq(self, &PAGE_EDIT_WRITES)
+            || std::ptr::eq(self, &crate::rating_db::RATING_WRITES)
+            || std::ptr::eq(self, &crate::tags_db::TAG_WRITES))
+            && TestEpochScope::capture().is_none()
+            && !TestProcessGlobalEpochRead::is_active()
+        {
+            panic!(
+                "unscoped process-global write epoch read at {}; enter TestEpochScope or explicitly use TestProcessGlobalEpochRead::for_reason",
+                std::panic::Location::caller()
+            );
+        }
+        self.owner()
+    }
+
     pub fn begin(&self) -> EditWriteGuard<'_> {
-        self.active_writers.fetch_add(1, Ordering::SeqCst);
+        let owner = self.owner();
+        owner.active_writers.fetch_add(1, Ordering::SeqCst);
         EditWriteGuard {
-            owner: self,
+            owner,
             scope: WriteScope::Full,
         }
     }
 
     pub fn begin_for_key(&self, key: &str) -> EditWriteGuard<'_> {
         let scope = WriteScope::Keys(vec![key.to_owned()]);
-        self.active_writers.fetch_add(1, Ordering::SeqCst);
-        EditWriteGuard { owner: self, scope }
+        let owner = self.owner();
+        owner.active_writers.fetch_add(1, Ordering::SeqCst);
+        EditWriteGuard { owner, scope }
     }
 
     pub fn begin_for_keys(&self, keys: &[String]) -> EditWriteGuard<'_> {
         let scope = WriteScope::Keys(keys.to_vec());
-        self.active_writers.fetch_add(1, Ordering::SeqCst);
-        EditWriteGuard { owner: self, scope }
+        let owner = self.owner();
+        owner.active_writers.fetch_add(1, Ordering::SeqCst);
+        EditWriteGuard { owner, scope }
     }
 
     pub fn register_repaint_context(&self, ctx: &egui::Context) {
         *self
+            .owner()
             .repaint_context
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ctx.clone());
     }
 
+    #[track_caller]
     pub fn repaint_context(&self) -> Option<egui::Context> {
-        self.repaint_context
+        self.owner_for_read()
+            .repaint_context
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -80,12 +232,14 @@ impl EditWriteEpoch {
 
     /// A missing notice means overflow, injection, or a panicking publisher. The reader must
     /// re-prepare the entire installed order rather than guessing which key changed.
+    #[track_caller]
     pub fn notices_since(&self, completed: u64) -> Option<Vec<WriteNotice>> {
-        let notices = self
+        let owner = self.owner_for_read();
+        let notices = owner
             .notices
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let current = self.completed_writes.load(Ordering::SeqCst);
+        let current = owner.completed_writes.load(Ordering::SeqCst);
         if completed == current {
             return Some(Vec::new());
         }
@@ -106,16 +260,18 @@ impl EditWriteEpoch {
 
     /// `None` requests a full reread (unknown scope, missing notification, or too many keys).
     /// A bounded key set keeps the UI drain independent of the size of the write history.
+    #[track_caller]
     pub fn changed_keys_since(
         &self,
         completed: u64,
         expected_completed: u64,
     ) -> Option<Vec<String>> {
-        let notices = self
+        let owner = self.owner_for_read();
+        let notices = owner
             .notices
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let current = self.completed_writes.load(Ordering::SeqCst);
+        let current = owner.completed_writes.load(Ordering::SeqCst);
         if current != expected_completed {
             return None;
         }
@@ -145,12 +301,14 @@ impl EditWriteEpoch {
         (expected == current.wrapping_add(1)).then(|| keys.into_iter().collect())
     }
 
+    #[track_caller]
     pub fn sample(&self) -> WriteStamp {
+        let owner = self.owner_for_read();
         // Bracket the completion load so a writer that starts or finishes during
         // this sample cannot look quiescent at the acceptance boundary.
-        let active_before = self.active_writers.load(Ordering::SeqCst);
-        let completed_writes = self.completed_writes.load(Ordering::SeqCst);
-        let active_after = self.active_writers.load(Ordering::SeqCst);
+        let active_before = owner.active_writers.load(Ordering::SeqCst);
+        let completed_writes = owner.completed_writes.load(Ordering::SeqCst);
+        let active_after = owner.active_writers.load(Ordering::SeqCst);
         WriteStamp {
             active_writers: active_before.max(active_after),
             completed_writes,
@@ -163,6 +321,7 @@ impl EditWriteEpoch {
             && before.completed_writes == after.completed_writes
     }
 
+    #[track_caller]
     pub fn accepts(&self, prepared: WriteStamp) -> bool {
         let now = self.sample();
         prepared.active_writers == 0
@@ -209,6 +368,108 @@ impl Drop for EditWriteGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unscoped_process_global_read_reports_its_call_site() {
+        let reads: [fn(&EditWriteEpoch); 5] = [
+            |epoch| {
+                let _ = epoch.sample();
+            },
+            |epoch| {
+                let _ = epoch.accepts(WriteStamp {
+                    active_writers: 0,
+                    completed_writes: 0,
+                });
+            },
+            |epoch| {
+                let _ = epoch.notices_since(0);
+            },
+            |epoch| {
+                let _ = epoch.changed_keys_since(0, 0);
+            },
+            |epoch| {
+                let _ = epoch.repaint_context();
+            },
+        ];
+        for epoch in [
+            &PAGE_EDIT_WRITES,
+            &crate::rating_db::RATING_WRITES,
+            &crate::tags_db::TAG_WRITES,
+        ] {
+            for read in reads {
+                let panic = std::panic::catch_unwind(|| read(epoch)).unwrap_err();
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap();
+                assert!(message.contains("unscoped process-global write epoch read"));
+                assert!(message.contains(file!()), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_process_global_read_opt_in_requires_a_reason() {
+        assert!(std::panic::catch_unwind(|| TestProcessGlobalEpochRead::for_reason("")).is_err());
+        let _global = TestProcessGlobalEpochRead::for_reason(
+            "exercise the intentional process-global read exception itself",
+        );
+        let _ = PAGE_EDIT_WRITES.sample();
+    }
+
+    #[test]
+    fn test_scope_keeps_worker_writes_visible_to_its_reader() {
+        let _scope = TestEpochScope::fresh();
+        let epochs = [
+            &PAGE_EDIT_WRITES,
+            &crate::rating_db::RATING_WRITES,
+            &crate::tags_db::TAG_WRITES,
+        ];
+        let before = epochs.map(EditWriteEpoch::sample);
+        let worker_epochs = epochs;
+        let handle = TestEpochScope::capture().unwrap();
+        std::thread::spawn(move || {
+            let _scope = TestEpochScope::enter(handle);
+            for epoch in worker_epochs {
+                drop(epoch.begin());
+            }
+        })
+        .join()
+        .unwrap();
+        for (epoch, stamp) in epochs.into_iter().zip(before) {
+            assert!(!epoch.accepts(stamp));
+            assert_eq!(
+                epoch.notices_since(stamp.completed_writes).unwrap().len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn test_scope_ignores_another_tests_active_writers() {
+        let _reader_scope = TestEpochScope::fresh();
+        let epochs = [
+            &PAGE_EDIT_WRITES,
+            &crate::rating_db::RATING_WRITES,
+            &crate::tags_db::TAG_WRITES,
+        ];
+        let before = epochs.map(EditWriteEpoch::sample);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let _writer_scope = TestEpochScope::fresh();
+            let _guards = epochs.map(EditWriteEpoch::begin);
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv().unwrap();
+        for (epoch, stamp) in epochs.into_iter().zip(before) {
+            assert!(epoch.accepts(stamp));
+        }
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+    }
 
     #[test]
     fn writer_before_and_after_commit_rejects_stale_read() {

@@ -1510,9 +1510,14 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawn = std::thread::Builder::new()
             .name("collection-grid-prepare".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 let result = prepare_collection_grid_install(
                     &snapshot,
                     &display_order,
@@ -2517,6 +2522,15 @@ mod tests {
     };
     use crate::grid_item::ThumbnailState;
 
+    #[test]
+    fn audit_collection_grid_readers_with_foreign_writers() {
+        crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
+            phase_a_collection_mask_is_projected_for_accepted_revision();
+            phase_a_collection_install_projects_zip_page_key();
+            phase_a2_collection_prepare_rejects_external_edit_after_worker_read();
+        });
+    }
+
     fn recv<T>(receiver: crossbeam_channel::Receiver<Result<T, CollectionStoreError>>) -> T {
         receiver
             .recv_timeout(Duration::from_secs(3))
@@ -2609,6 +2623,7 @@ mod tests {
 
     #[test]
     fn phase_a_collection_mask_is_projected_for_accepted_revision() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("masked.png");
         std::fs::write(&image, b"image").unwrap();
@@ -2642,6 +2657,7 @@ mod tests {
 
     #[test]
     fn phase_a_collection_install_projects_zip_page_key() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let zip = temp.path().join("pages.zip");
         std::fs::write(&zip, b"zip").unwrap();
@@ -2686,6 +2702,7 @@ mod tests {
 
     #[test]
     fn phase_a2_collection_prepare_rejects_external_edit_after_worker_read() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("stale.png");
         std::fs::write(&image, b"image").unwrap();
@@ -2756,6 +2773,7 @@ mod tests {
 
     #[test]
     fn root_auto_aspect_restores_before_real_rows_and_excludes_unsampleable_items() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::auto_aspect_cache::CollectionAutoAspectCache;
         use crate::settings::ThumbAspect;
 
@@ -2906,6 +2924,7 @@ mod tests {
 
     #[test]
     fn root_order_controls_use_installed_revision_and_preserve_global_sort_and_header_contract() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::collection_store::CollectionOrderMode;
         use crate::settings::{DetailsSortKey, GridViewMode, SortOrder};
 
@@ -3075,6 +3094,7 @@ mod tests {
 
     #[test]
     fn standard_root_header_sort_only_reorders_rows_not_reader_or_spread() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::collection_store::CollectionOrderMode;
         use crate::settings::{DetailsSortKey, GridViewMode, SortOrder, SpreadMode};
         use crate::ui_fullscreen::SpreadPair;
@@ -3160,6 +3180,7 @@ mod tests {
 
     #[test]
     fn explicit_collection_open_participates_in_typed_back_forward_history() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let physical_a = temp.path().join("physical-a");
         let physical_b = temp.path().join("physical-b");
@@ -3258,6 +3279,7 @@ mod tests {
 
     #[test]
     fn failed_independent_folder_load_keeps_collection_surface_and_history_unchanged() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source.png");
         std::fs::write(&source, b"source").unwrap();
@@ -3284,6 +3306,7 @@ mod tests {
 
     #[test]
     fn deleted_mounted_root_is_not_recaptured_by_back_or_physical_navigation() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let physical_a = temp.path().join("physical-a");
         let physical_b = temp.path().join("physical-b");
@@ -3363,6 +3386,7 @@ mod tests {
 
     #[test]
     fn root_delete_resolution_is_checked_first_fail_closed_and_child_physical() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.png");
         let second = temp.path().join("second.png");
@@ -3441,6 +3465,7 @@ mod tests {
 
     #[test]
     fn navigation_materialization_preserves_and_remaps_local_search_filter() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("a.png");
         let second = temp.path().join("b.png");
@@ -3503,6 +3528,7 @@ mod tests {
 
     #[test]
     fn prepared_grid_keeps_missing_and_restores_entry_by_source_when_entry_id_is_recreated() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("visible.png");
         let folder = temp.path().join("book");
@@ -3565,6 +3591,7 @@ mod tests {
 
     #[test]
     fn collection_grid_loading_empty_failure_and_deleted_are_terminal_presentations() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
         let empty = recv(
@@ -3605,6 +3632,7 @@ mod tests {
 
     #[test]
     fn revision_refresh_remaps_selected_and_checked_entry_identity() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.png");
         let second = temp.path().join("second.png");
@@ -3711,6 +3739,7 @@ mod tests {
 
     #[test]
     fn physical_child_defers_revision_install_until_typed_collection_return() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("book");
         let child = folder.join("child.png");
@@ -3784,6 +3813,7 @@ mod tests {
 
     #[test]
     fn direct_page_close_from_collection_pdf_and_zip_restores_root_anchor() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let pdf = temp.path().join("book.pdf");
         let zip = temp.path().join("book.zip");
@@ -3907,6 +3937,7 @@ mod tests {
 
     #[test]
     fn ordinary_collection_navigation_does_not_close_fullscreen() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("page.png");
         std::fs::write(&source, b"image").unwrap();
@@ -3934,6 +3965,7 @@ mod tests {
 
     #[test]
     fn collection_parent_resolution_is_owned_by_the_mounted_viewer_context() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("book");
         let nested = folder.join("chapter");
@@ -3985,6 +4017,7 @@ mod tests {
 
     #[test]
     fn independent_physical_load_retires_root_watch_before_later_collection_revision() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source.png");
         let physical = temp.path().join("physical");
@@ -4059,6 +4092,7 @@ mod tests {
 
     #[test]
     fn failed_independent_scan_keeps_collection_root_surface_and_items_atomic() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source.png");
         std::fs::write(&source, b"source").unwrap();
@@ -4118,6 +4152,7 @@ mod tests {
 
     #[test]
     fn collection_location_jump_preserves_root_until_success_and_selects_exact_source() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("source-folder");
         std::fs::create_dir(&parent).unwrap();
@@ -4206,6 +4241,7 @@ mod tests {
 
     #[test]
     fn collection_location_jump_rejects_stale_revision_items_and_context() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("image.png");
         std::fs::write(&source, b"image").unwrap();
@@ -4284,6 +4320,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn collection_location_jump_scan_failure_keeps_root_and_missing_leaf_reports_exact_miss() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("image.png");
         std::fs::write(&source, b"image").unwrap();
@@ -4343,6 +4380,7 @@ mod tests {
 
     #[test]
     fn missing_placeholder_location_jump_uses_registered_exact_path_without_physical_capability() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("source-folder");
         std::fs::create_dir(&parent).unwrap();
@@ -4385,6 +4423,7 @@ mod tests {
 
     #[test]
     fn collection_location_jump_rejected_by_restore_keeps_root_and_notifies_origin() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("source-folder");
         std::fs::create_dir(&parent).unwrap();
@@ -4433,6 +4472,7 @@ mod tests {
 
     #[test]
     fn normal_folder_rescan_preserves_menu_on_identical_content_and_retires_it_on_change() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("folder");
         std::fs::create_dir(&folder).unwrap();
@@ -4466,6 +4506,7 @@ mod tests {
 
     #[test]
     fn grid_menu_owner_rejects_replaced_items_and_collection_install_preserves_sibling_menu() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let current = app.capture_grid_context_menu_owner(0);
         app.context_menu_idx = Some(current);
@@ -4488,6 +4529,7 @@ mod tests {
 
     #[test]
     fn root_load_owner_stales_on_wanted_revision_but_physical_continuation_does_not() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("book");
         let nested = root.join("nested");
@@ -4710,6 +4752,7 @@ mod tests {
 
     #[test]
     fn collection_video_workers_use_generation_owned_full_path_sidecars_and_cancel_on_refresh() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let left = temp.path().join("left");
         let right = temp.path().join("right");
@@ -4853,6 +4896,7 @@ mod tests {
 
     #[test]
     fn fullscreen_root_order_change_reports_viewer_deferred_until_close() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::collection_store::CollectionOrderMode;
         use crate::settings::SortOrder;
 
@@ -4942,6 +4986,7 @@ mod tests {
 
     #[test]
     fn fullscreen_leaf_defers_refresh_and_delete_presentation_until_close() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("visible.png");
         std::fs::write(&image, b"image").unwrap();
@@ -4993,6 +5038,7 @@ mod tests {
 
     #[test]
     fn deleting_another_collection_does_not_retire_current_grid() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let current_path = temp.path().join("current.png");
         let other_path = temp.path().join("other.png");
@@ -5031,6 +5077,7 @@ mod tests {
 
     #[test]
     fn source_delete_during_prepare_cancels_and_keeps_installed_binding_for_reclassification() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("visible.png");
         std::fs::write(&image, b"image").unwrap();
@@ -5085,6 +5132,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn metadata_import_pin_epoch_refreshes_all_context_presentations_without_rebinding_items() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let video = temp.path().join("clip.mp4");
         std::fs::write(&video, b"video").unwrap();
@@ -5259,6 +5307,7 @@ mod tests {
 
     #[test]
     fn prepare_result_from_a_previous_thumbnail_source_epoch_is_not_installed() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("image.png");
         std::fs::write(&image, b"image").unwrap();
@@ -5328,6 +5377,7 @@ mod tests {
 
     #[test]
     fn cloned_collection_session_reattaches_an_independent_revision_watch() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("visible.png");
         std::fs::write(&image, b"image").unwrap();
@@ -5401,6 +5451,7 @@ mod tests {
 
     #[test]
     fn stamped_remove_and_delete_invalidation_stay_with_the_owning_collection_surface() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("folder");
         let child = folder.join("child.png");
@@ -5454,6 +5505,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn remove_completion_routes_to_its_parked_viewer_context_only() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("shared.png");
         std::fs::write(&image, b"image").unwrap();
@@ -5520,6 +5572,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn source_invalidation_reaches_matching_parked_context_and_skips_sibling_collection() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let parked_image = temp.path().join("parked.png");
         let sibling_image = temp.path().join("sibling.png");
@@ -5594,6 +5647,7 @@ mod tests {
 
     #[test]
     fn root_read_waits_for_starting_and_busy_without_losing_its_watch_or_spinning() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
         let snapshot = collection_with_sources(&client, &[]);
@@ -5681,6 +5735,7 @@ mod tests {
 
     #[test]
     fn long_running_grid_reads_keep_installed_content_adopt_exact_replies_and_honor_cancel() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("page.png");
         std::fs::write(&image, b"image").unwrap();
@@ -5853,6 +5908,7 @@ mod tests {
     #[test]
     #[ignore = "optimized 10,000-entry collection read pipeline benchmark"]
     fn benchmark_collection_actor_and_root_prepare_with_10000_entries() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         const COUNT: usize = crate::collection_store::MAX_COLLECTION_ENTRIES;
         let temp = tempfile::tempdir().unwrap();
         let present_root = temp.path().join("present");
@@ -5960,6 +6016,7 @@ mod tests {
 
     #[test]
     fn source_scope_exact_and_tree_use_component_boundaries() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let exact = crate::delete_worker::DeleteSourceScope::Exact(PathBuf::from(r"C:\A\B"));
         assert!(source_scope_contains(&exact, Path::new(r"c:/a/b")));
         assert!(!source_scope_contains(&exact, Path::new(r"c:/a/b/c.png")));
@@ -5970,6 +6027,7 @@ mod tests {
 
     #[test]
     fn durable_source_migration_is_retired_only_after_actor_ack() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let old = temp.path().join("before.png");
         let new = temp.path().join("after.png");
