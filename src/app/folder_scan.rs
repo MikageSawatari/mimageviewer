@@ -107,6 +107,18 @@ pub(crate) struct MaterializedFolderListing {
     pub(crate) folder_sort: crate::settings::SortOrder,
     pub(crate) sort_ms: f64,
     pub(crate) duplicate_filter_ms: f64,
+    pub(crate) rating_order: FolderRatingOrder,
+}
+
+pub(crate) enum FolderRatingOrder {
+    Standard,
+    Prepared {
+        cache: std::collections::HashMap<usize, u8>,
+        write_generation: u64,
+        requested_count: usize,
+        read_ms: f64,
+    },
+    Failed,
 }
 
 /// Cross-folder sidecar discovery result for aggregate views.
@@ -184,6 +196,22 @@ pub(crate) fn materialize_local_folder_listing(
     scan: ScannedDir,
     settings: &crate::settings::Settings,
 ) -> MaterializedFolderListing {
+    materialize_local_folder_listing_with_order(
+        path,
+        scan,
+        settings,
+        crate::rating_sort::ListingOrderRequest::Standard(settings.sort_order),
+        |_| unreachable!("standard order never reads rating facts"),
+    )
+}
+
+pub(crate) fn materialize_local_folder_listing_with_order(
+    path: &std::path::Path,
+    scan: ScannedDir,
+    settings: &crate::settings::Settings,
+    request: crate::rating_sort::ListingOrderRequest,
+    read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
+) -> MaterializedFolderListing {
     let mut omitted = scan.omitted;
     let mut folders = Vec::with_capacity(scan.folders.len());
     let mut metas = Vec::with_capacity(scan.folders.len());
@@ -208,7 +236,12 @@ pub(crate) fn materialize_local_folder_listing(
     let folder_sort = if compiled {
         crate::settings::SortOrder::Numeric
     } else {
-        settings.sort_order
+        match request {
+            crate::rating_sort::ListingOrderRequest::Standard(sort) => sort,
+            crate::rating_sort::ListingOrderRequest::Rating(_) => {
+                crate::settings::SortOrder::FileName
+            }
+        }
     };
     let media_sort = super::folder_media_sort_order(
         folder_sort,
@@ -290,13 +323,88 @@ pub(crate) fn materialize_local_folder_listing(
         metas.push(Some((entry.mtime, entry.file_size)));
         sort_metas.push(entry.sort_meta);
     }
-    crate::grid_item::arrange_grid_items_with_sort_metadata(
-        &mut items,
-        &mut metas,
-        &mut sort_metas,
-        &settings.grid_display_order,
-        Some(media_sort),
-    );
+    // Candidate exclusion is complete. Rating facts are read once here, before
+    // the final arrangement and before any index (including video indices) is derived.
+    let rating_order = if let crate::rating_sort::ListingOrderRequest::Rating(spec) = request {
+        if compiled || media_sort != folder_sort {
+            crate::grid_item::arrange_grid_items_with_sort_metadata(
+                &mut items,
+                &mut metas,
+                &mut sort_metas,
+                &settings.grid_display_order,
+                Some(media_sort),
+            );
+            FolderRatingOrder::Standard
+        } else {
+            let item_keys = items
+                .iter()
+                .map(crate::rating_sort::physical_item_key)
+                .collect::<Vec<_>>();
+            let requested = item_keys
+                .iter()
+                .filter_map(Clone::clone)
+                .collect::<Vec<_>>();
+            let read_started = std::time::Instant::now();
+            let read_result = read_rating(&requested);
+            let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
+            match read_result {
+                Ok(facts) => {
+                    let mut rating_keys = item_keys
+                        .iter()
+                        .map(|key| match key {
+                            Some(key) => facts.key_for_requested(key),
+                            None => crate::rating_sort::RatingSortKey::Unsupported,
+                        })
+                        .collect::<Vec<_>>();
+                    crate::grid_item::arrange_grid_items_with_rating_keys(
+                        &mut items,
+                        &mut metas,
+                        &mut sort_metas,
+                        &mut rating_keys,
+                        &settings.grid_display_order,
+                        spec,
+                    );
+                    let values = facts
+                        .iter_requested_ratings()
+                        .map(|(key, stars)| (key.to_owned(), stars))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    let cache = items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, item)| {
+                            crate::rating_sort::physical_item_key(item)
+                                .map(|key| (idx, values[&key]))
+                        })
+                        .collect();
+                    FolderRatingOrder::Prepared {
+                        cache,
+                        write_generation: facts.write_generation(),
+                        requested_count: requested.len(),
+                        read_ms,
+                    }
+                }
+                Err(_) => {
+                    crate::grid_item::arrange_grid_items_with_sort_metadata(
+                        &mut items,
+                        &mut metas,
+                        &mut sort_metas,
+                        &settings.grid_display_order,
+                        Some(crate::settings::SortOrder::FileName),
+                    );
+                    FolderRatingOrder::Failed
+                }
+            }
+        }
+    } else {
+        crate::grid_item::arrange_grid_items_with_sort_metadata(
+            &mut items,
+            &mut metas,
+            &mut sort_metas,
+            &settings.grid_display_order,
+            Some(media_sort),
+        );
+        FolderRatingOrder::Standard
+    };
 
     MaterializedFolderListing {
         items,
@@ -309,6 +417,7 @@ pub(crate) fn materialize_local_folder_listing(
         folder_sort,
         sort_ms,
         duplicate_filter_ms,
+        rating_order,
     }
 }
 
@@ -1126,6 +1235,90 @@ mod page_count_tests {
         assert_eq!(listing.omitted.unsupported, 1, "notes.txt");
         assert_eq!(listing.omitted.system, 1, "Thumbs.db");
         assert_eq!(listing.items.len(), 1, "残るのは 001.png だけ");
+    }
+
+    #[test]
+    fn rating_order_reads_survivors_once_and_failure_uses_name_order() {
+        use crate::rating_sort::{
+            ListingOrderRequest, RatingSortDirection, RatingSortSpec, RatingSortUnratedPosition,
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = crate::rating_db::RatingDb::open_at(temp.path().join("ratings.db")).unwrap();
+        let path = |name: &str| temp.path().join(name);
+        let key = |name: &str| crate::adjustment_db::normalize_path(&path(name));
+        db.set_user_rating(&key("z.jpg"), 5, None).unwrap();
+        db.set_user_rating(&key("a.jpg"), 4, None).unwrap();
+        let scan = || ScannedDir {
+            folders: Vec::new(),
+            all_media: ["a.jpg", "z.jpg", "x.jpg", "x.png"]
+                .into_iter()
+                .map(|name| ScannedMediaEntry {
+                    path: path(name),
+                    kind: ScanMediaKind::Image,
+                    mtime: 0,
+                    file_size: 1,
+                    sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
+                })
+                .collect(),
+            omitted: OmittedFolderEntryCounts::default(),
+        };
+        let mut settings = crate::settings::Settings::default();
+        settings.skip_duplicate_images = true;
+        settings.image_ext_priority = vec!["png".into(), "jpg".into()];
+        let request = ListingOrderRequest::Rating(RatingSortSpec {
+            direction: RatingSortDirection::Desc,
+            unrated_position: RatingSortUnratedPosition::BelowAll,
+        });
+        let mut reads = 0;
+        let listing = materialize_local_folder_listing_with_order(
+            temp.path(),
+            scan(),
+            &settings,
+            request,
+            |keys| {
+                reads += 1;
+                assert_eq!(keys.len(), 3, "excluded x.jpg must not be requested");
+                assert!(!keys.contains(&key("x.jpg")));
+                db.get_many_complete(keys, 7)
+                    .map_err(|error| error.to_string())
+            },
+        );
+        assert_eq!(reads, 1);
+        assert_eq!(
+            listing
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["z.jpg", "a.jpg", "x.png"]
+        );
+        let FolderRatingOrder::Prepared {
+            cache,
+            write_generation,
+            ..
+        } = listing.rating_order
+        else {
+            panic!("complete facts expected")
+        };
+        assert_eq!(write_generation, 7);
+        assert_eq!(cache, [(0, 5), (1, 4), (2, 0)].into());
+
+        let failed = materialize_local_folder_listing_with_order(
+            temp.path(),
+            scan(),
+            &settings,
+            request,
+            |_| Err("injected".into()),
+        );
+        assert!(matches!(failed.rating_order, FolderRatingOrder::Failed));
+        assert_eq!(
+            failed
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["a.jpg", "x.png", "z.jpg"]
+        );
     }
 
     #[test]

@@ -163,6 +163,8 @@ pub(crate) use metadata_ops::{probe_image_dims_from_bytes, tag_item_path};
 thread_local! {
     pub(crate) static RATING_INSTALL_UI_PREWARMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static RATING_INSTALL_UI_TAG_PREWARMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Exercise the boundary between a complete read and installing its cache.
+    pub(crate) static RATING_AFTER_MATERIALIZE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&mut App)>>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(windows)]
 mod native_video;
@@ -10450,6 +10452,8 @@ impl PageOrderViewKind {
 pub(crate) enum GridSortLockReason {
     /// 本として表示中 / 閲覧履歴。ページ順そのものが固定されている。
     PageOrderFixed,
+    /// この一覧は固有の順序を持ち、一覧 sort は適用されない。
+    FixedOrder,
     /// 詳細一覧の列ヘッダが並びを所有している。
     DetailsHeaderSort,
     /// 手動順のコレクションでは列ヘッダが順序を上書きできない。
@@ -10475,6 +10479,7 @@ impl GridSortLockReason {
     pub(crate) fn short_label(self) -> &'static str {
         match self {
             Self::PageOrderFixed => "固定",
+            Self::FixedOrder => "並べ替え固定",
             Self::DetailsHeaderSort => "列ヘッダ",
             Self::CollectionManualOrder => "手動順",
             Self::CollectionShuffleOrder => "シャッフル",
@@ -10493,6 +10498,7 @@ impl GridSortLockReason {
             Self::PageOrderFixed => {
                 "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。"
             }
+            Self::FixedOrder => "この一覧は並べ替え固定です。",
             Self::DetailsHeaderSort => {
                 "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。"
             }
@@ -14404,7 +14410,7 @@ pub struct App {
     pub(crate) stack_request_sequence: u64,
     /// スタックを ON にした瞬間のカーソル画像パス。集約完了時にこの画像を含むスタックセルへ
     /// カーソルを移す (トグルで被写体が飛ばないように)。OFF 側は `select_after_load` で扱う。
-    pub(crate) stack_toggle_select_path: Option<std::path::PathBuf>,
+    pub(crate) stack_selection_target: Option<crate::filename_stack_ui::StackSelectionTarget>,
 
     // ── サブフォルダ展開ビュー (snapshot flat view) ───────────────
     /// サブ展開ビューの実 root。`current_folder` は synthetic path になるため、戻り先や
@@ -17221,7 +17227,7 @@ impl App {
             stack_script_error: None,
             stack_script_pending: None,
             stack_request_sequence: 0,
-            stack_toggle_select_path: None,
+            stack_selection_target: None,
             subfolder_expansion_root: None,
             subfolder_expansion_roots: Vec::new(),
             subfolder_expansion_saved_folder: None,
@@ -21263,8 +21269,12 @@ impl App {
                 self.bookmark_view_sort,
                 crate::bookmark_browser::BookmarkViewSort::Normal(_)
             ) {
-                self.bookmark_view_sort =
-                    crate::bookmark_browser::BookmarkViewSort::Normal(self.settings.sort_order);
+                if let crate::rating_sort::ListingOrderRequest::Standard(sort) =
+                    crate::rating_sort::ListingOrderRequest::from_settings(&self.settings)
+                {
+                    self.bookmark_view_sort =
+                        crate::bookmark_browser::BookmarkViewSort::Normal(sort);
+                }
             }
             self.install_bookmark_view_rows();
             return;
@@ -22345,6 +22355,25 @@ impl App {
                 return true;
             }
         }
+        if self.stack_mode_requested
+            && self.stack_selection_target.is_none()
+            && self
+                .stack_view
+                .as_ref()
+                .is_some_and(|view| crate::folder_tree::path_eq(&view.folder, &path))
+        {
+            self.stack_selection_target = self.selected.and_then(|idx| {
+                let view = self.stack_view.as_ref()?;
+                let key = if self.stack_showing_flat {
+                    view.group_key_at_flat_index(idx)
+                } else {
+                    view.group_key_at_aggregated_index(idx)
+                }?;
+                Some(crate::filename_stack_ui::StackSelectionTarget::GroupKey(
+                    key.to_owned(),
+                ))
+            });
+        }
         if matches!(
             self.top_level_grid_view.surface(),
             top_level_grid_view::TopLevelGridSurface::DriveList
@@ -22614,7 +22643,31 @@ impl App {
         // `start_loading_items` に引数として渡す。
         let folder_signature = signature_from_scan(&scan);
         let scan_ms = scan_t0.elapsed().as_secs_f64() * 1000.0;
-        let materialized = materialize_local_folder_listing(&path, scan, &self.settings);
+        let order_request = crate::rating_sort::ListingOrderRequest::from_settings(&self.settings);
+        let rating_generation_before_read = self.rating_session_write_generation;
+        let materialized = folder_scan::materialize_local_folder_listing_with_order(
+            &path,
+            scan,
+            &self.settings,
+            order_request,
+            |keys| {
+                self.rating_db
+                    .as_ref()
+                    .ok_or_else(|| "レーティング DB を利用できません".to_owned())?
+                    .get_many_complete(keys, rating_generation_before_read)
+                    .map_err(|error| error.to_string())
+            },
+        );
+        #[cfg(test)]
+        if matches!(
+            order_request,
+            crate::rating_sort::ListingOrderRequest::Rating(_)
+        ) {
+            let hook = RATING_AFTER_MATERIALIZE_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -22686,6 +22739,31 @@ impl App {
         }
 
         let folder_sort = materialized.folder_sort;
+        let (prepared_folder_rating, rating_order_failed) = match materialized.rating_order {
+            folder_scan::FolderRatingOrder::Standard => (None, false),
+            folder_scan::FolderRatingOrder::Prepared {
+                cache,
+                write_generation,
+                requested_count,
+                read_ms,
+            } => {
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "nav",
+                        "lf_rating_sort",
+                        None,
+                        lf_seq,
+                        &[
+                            ("count", serde_json::Value::from(requested_count)),
+                            ("read_ms", serde_json::Value::from(read_ms)),
+                            ("rating_sort", serde_json::Value::from(true)),
+                        ],
+                    );
+                }
+                (Some((cache, write_generation, read_ms)), false)
+            }
+            folder_scan::FolderRatingOrder::Failed => (None, true),
+        };
         self.video_thumb_overrides.clear();
         for (video, image) in materialized.video_thumb_overrides {
             self.video_thumb_overrides.insert(stem_lower(&video), image);
@@ -22756,6 +22834,40 @@ impl App {
         // キーを保持するので delete_missing が非代表メンバーを巻き添えで消さない)、ワーカー完了時に
         // start_loading_items へ渡すため消費前に複製しておく。
         let stack_on = self.stack_mode_requested;
+        let stack_rating_source = stack_on
+            .then(|| prepared_folder_rating.as_ref())
+            .flatten()
+            .map(|(cache, _, _)| {
+                crate::filename_stack_ui::StackRatingSource::Prepared(std::sync::Arc::new(
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, item)| {
+                            let key = crate::rating_sort::physical_item_key(item)?;
+                            let stars = *cache.get(&idx).expect("complete physical rating cache");
+                            Some((
+                                key,
+                                crate::rating_sort::RatingSortKey::supported(stars).unwrap(),
+                            ))
+                        })
+                        .collect::<std::collections::HashMap<_, _>>(),
+                ))
+            })
+            .unwrap_or_else(|| {
+                if rating_order_failed {
+                    crate::filename_stack_ui::StackRatingSource::ReadFailed
+                } else {
+                    crate::filename_stack_ui::StackRatingSource::Standard
+                }
+            });
+        let stack_order_request = if matches!(
+            stack_rating_source,
+            crate::filename_stack_ui::StackRatingSource::Prepared(_)
+        ) {
+            order_request
+        } else {
+            crate::rating_sort::ListingOrderRequest::Standard(folder_sort)
+        };
         let stack_async_prep = if stack_on {
             // スクリプト本文の読み込み (ファイル I/O) はワーカー側で行うので、ここでは
             // 「スクリプトを使うか」のフラグだけを渡す (UI スレッドの同期 read_to_string 回避)。
@@ -22763,9 +22875,10 @@ impl App {
             Some((
                 script_enabled,
                 self.settings.stack_separator,
-                crate::filename_stack_ui::StackListingSource::Normal(std::sync::Arc::new(
-                    listing_sort_metas,
-                )),
+                crate::filename_stack_ui::StackListingSource::Normal(
+                    std::sync::Arc::new(listing_sort_metas),
+                    stack_rating_source,
+                ),
                 existing_keys.clone(),
                 path.clone(),
             ))
@@ -22787,8 +22900,14 @@ impl App {
             None,
             None,
             None,
+            prepared_folder_rating,
             authority,
         );
+        if rating_order_failed {
+            self.show_feedback_toast(
+                "評価順を読み取れなかったため、名前順で表示しました".to_owned(),
+            );
+        }
         if let Some((script_enabled, separator, listing, stack_existing, stack_folder)) =
             stack_async_prep
         {
@@ -22800,7 +22919,7 @@ impl App {
                 stack_folder,
                 listing,
                 separator,
-                folder_sort,
+                stack_order_request,
                 stack_existing,
                 Some(folder_signature),
                 script_enabled,
@@ -25910,6 +26029,7 @@ impl App {
                     None,
                     None,
                     None,
+                    None,
                     authority,
                 );
                 self.set_empty_items_reason(
@@ -25949,6 +26069,7 @@ impl App {
             image_metas,
             existing_keys,
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -27634,6 +27755,7 @@ impl App {
             None,
             None,
             None,
+            None,
             VisibleInstallAuthority::Ordinary,
         );
     }
@@ -27668,6 +27790,7 @@ impl App {
             Some((edits.snapshot, edits.projection)),
             Some(pin_map),
             Some((rating_cache, tags_cache)),
+            None,
             VisibleInstallAuthority::Ordinary,
         );
     }
@@ -27688,6 +27811,7 @@ impl App {
             video_items,
             None,
             Some(metadata),
+            None,
             None,
             None,
             None,
@@ -27722,6 +27846,7 @@ impl App {
             Some((page_edits.snapshot, page_edits.projection)),
             Some(pin_map),
             Some((rating_cache, tags_cache)),
+            None,
             VisibleInstallAuthority::Ordinary,
         );
     }
@@ -27746,6 +27871,7 @@ impl App {
             std::collections::HashMap<usize, u8>,
             std::collections::HashMap<String, Vec<String>>,
         )>,
+        prepared_folder_rating: Option<(std::collections::HashMap<usize, u8>, u64, f64)>,
         authority: VisibleInstallAuthority<'_>,
     ) {
         // An earlier accepted load owns the sole restore continuation.  Results from sibling
@@ -28182,7 +28308,11 @@ impl App {
         // これにより rebuild_visible_indices や draw_cell からの初回 get_rating が
         // SQLite を叩かずに済む (大量フォルダで初フレームが詰まるのを防ぐ)。
         let prewarm_rating_t0 = std::time::Instant::now();
-        if let Some(prepared) = prepared_subfolder.as_mut() {
+        let prepared_rating_read_ms = prepared_folder_rating.as_ref().map(|(_, _, ms)| *ms);
+        if let Some((cache, generation, _)) = prepared_folder_rating {
+            self.rating_cache = cache;
+            self.overlay_rating_session_writes_since(generation);
+        } else if let Some(prepared) = prepared_subfolder.as_mut() {
             self.rating_cache = std::mem::take(&mut prepared.rating_cache);
         } else if let Some((rating_cache, _)) = prepared_rating_tags.as_mut() {
             self.rating_cache = std::mem::take(rating_cache);
@@ -28198,10 +28328,24 @@ impl App {
                 "sli_prewarm_rating",
                 None,
                 sli_seq,
-                &[(
-                    "ms",
-                    serde_json::Value::from(prewarm_rating_t0.elapsed().as_secs_f64() * 1000.0),
-                )],
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(
+                            prepared_rating_read_ms.unwrap_or_else(|| {
+                                prewarm_rating_t0.elapsed().as_secs_f64() * 1000.0
+                            }),
+                        ),
+                    ),
+                    ("count", serde_json::Value::from(self.items.len())),
+                    (
+                        "rating_sort",
+                        serde_json::Value::from(matches!(
+                            crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
+                            crate::rating_sort::ListingOrderRequest::Rating(_)
+                        )),
+                    ),
+                ],
             );
         }
         // タグバッジ用も同様に tags.db から一括 prewarm。
@@ -55475,6 +55619,16 @@ impl App {
     /// 何も起きない入口が残る (§1.143(a): メニューの「ソート順」は列ヘッダ並べ替え中でも
     /// 選べてしまい、選んでも表示は変わらなかった)。
     pub(crate) fn grid_sort_lock_reason(&self) -> Option<GridSortLockReason> {
+        use top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+        if matches!(
+            self.top_level_grid_view.surface(),
+            TopLevelGridSurface::Search(TopLevelSearchView::Favorite | TopLevelSearchView::Tag)
+                | TopLevelGridSurface::ReadingHistory
+                | TopLevelGridSurface::Snapshot
+                | TopLevelGridSurface::DriveList
+        ) {
+            return Some(GridSortLockReason::FixedOrder);
+        }
         if let Some(order) = self.collection_grid_root_order() {
             return match order {
                 Err(reason) => Some(reason),
@@ -56777,6 +56931,33 @@ impl App {
         }
         self.rating_session_write_seen_generation = current;
         changed
+    }
+
+    /// The R4 refresh control uses this surface rule; Snapshot has no reload
+    /// action in `reload_top_level_grid` and must never show an active refresh icon.
+    pub(crate) fn grid_sort_refresh_available(&self) -> bool {
+        !matches!(
+            self.top_level_grid_view.surface(),
+            top_level_grid_view::TopLevelGridSurface::Snapshot
+        )
+    }
+
+    /// A prepared rating order carries its own pre-read stamp. The context's
+    /// seen generation may already have advanced while that order was prepared.
+    fn overlay_rating_session_writes_since(&mut self, generation: u64) {
+        let updates = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, _)| {
+                let key = self.rating_path_key(idx)?;
+                let write = self.rating_session_writes.get(&key)?;
+                (write.generation > generation).then_some((idx, write.stars))
+            })
+            .collect::<Vec<_>>();
+        for (idx, stars) in updates {
+            self.rating_cache.insert(idx, stars);
+        }
     }
 
     /// 指定 idx のレーティング (0..=5) を取得する (キャッシュ + DB)。

@@ -30,6 +30,11 @@ use crate::ui_helpers::{
     PROGRESS_UPGRADE_COLOR,
 };
 
+#[cfg(test)]
+thread_local! {
+    static SORT_CONTROL_TEST_RESPONSES: std::cell::RefCell<Vec<(&'static str, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 const BOOK_REORDER_DEFAULT_TILE_PX: f32 = 78.0;
 const BOOK_REORDER_MIN_TILE_PX: f32 = 64.0;
 const BOOK_REORDER_MAX_TILE_PX: f32 = 132.0;
@@ -5773,6 +5778,62 @@ mod collection_order_mode_menu_tests {
     }
 }
 
+#[cfg(test)]
+mod fixed_sort_control_tests {
+    use super::*;
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    #[test]
+    fn reading_history_entry_renders_disabled_toolbar_and_menu_sort_controls() {
+        let mut app = crate::app::setup_app_for_test();
+        app.enter_reading_history_from_menu();
+        app.settings.show_toolbar_sort = true;
+        app.settings.toolbar_sort_display = crate::settings::ToolbarSectionDisplay::Dropdown;
+        let app = Rc::new(RefCell::new(app));
+        let render_app = Rc::clone(&app);
+        let fonts_set = Cell::new(false);
+        SORT_CONTROL_TEST_RESPONSES.with(|responses| responses.borrow_mut().clear());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1500.0, 500.0))
+            .build(move |ctx| {
+                if !fonts_set.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                render_app.borrow_mut().render_menubar(ctx);
+                render_app.borrow_mut().render_toolbar(ctx);
+            });
+        harness.run();
+        harness.run();
+        harness
+            .get_all_by_label("設定")
+            .into_iter()
+            .find(|node| !node.accesskit_node().is_disabled())
+            .expect("enabled Settings menu")
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("ソート順: 並べ替え固定")
+                .accesskit_node()
+                .is_disabled()
+        );
+        SORT_CONTROL_TEST_RESPONSES.with(|responses| {
+            let responses = responses.borrow();
+            assert!(responses.contains(&("toolbar", false)), "{responses:?}");
+            assert!(responses.contains(&("menu", false)), "{responses:?}");
+        });
+    }
+}
+
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────
 
@@ -6761,7 +6822,7 @@ impl App {
                                 if let Some(reason) = sort_lock {
                                     // 無効ウィジェットは通常の hover を sense しないため、
                                     // disabled 専用ツールチップで理由を出す。
-                                    ui.add_enabled(
+                                    let _response = ui.add_enabled(
                                         false,
                                         egui::Button::new(format!(
                                             "ソート順: {}",
@@ -6769,6 +6830,8 @@ impl App {
                                         )),
                                     )
                                     .on_disabled_hover_text(reason.tooltip());
+                                    #[cfg(test)]
+                                    SORT_CONTROL_TEST_RESPONSES.with(|responses| responses.borrow_mut().push(("menu", _response.enabled())));
                                 } else {
                                     ui.menu_button("ソート順", |ui| {
                                         if let Some(root) = root_order {
@@ -9401,6 +9464,8 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     })
                                 },
                             );
+                            #[cfg(test)]
+                            SORT_CONTROL_TEST_RESPONSES.with(|responses| responses.borrow_mut().push(("toolbar", combo.response.enabled())));
                             // 固定中はコンボが無効なので、disabled 専用ツールチップで
                             // 「固定」表示のホバー時に固定理由を出す。
                             let combo_id = combo.response.id;

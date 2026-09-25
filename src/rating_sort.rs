@@ -4,6 +4,74 @@ use std::cmp::Ordering;
 
 use crate::filename_sort::SortNameKey;
 
+/// Transient order captured by a listing producer. Public settings cannot contain
+/// Rating until the controls and persistence are introduced in R4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListingOrderRequest {
+    Standard(crate::settings::SortOrder),
+    Rating(RatingSortSpec),
+}
+
+impl ListingOrderRequest {
+    pub(crate) fn standard_fallback(self) -> crate::settings::SortOrder {
+        match self {
+            Self::Standard(sort) => sort,
+            Self::Rating(_) => crate::settings::SortOrder::FileName,
+        }
+    }
+    pub(crate) fn from_settings(settings: &crate::settings::Settings) -> Self {
+        #[cfg(test)]
+        if let Some(spec) = TEST_RATING_ORDER.with(|order| order.get()) {
+            return Self::Rating(spec);
+        }
+        Self::Standard(settings.sort_order)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RATING_ORDER: std::cell::Cell<Option<RatingSortSpec>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_rating_order<T>(spec: RatingSortSpec, f: impl FnOnce() -> T) -> T {
+    TEST_RATING_ORDER.with(|order| {
+        let previous = order.replace(Some(spec));
+        struct Restore<'a>(
+            &'a std::cell::Cell<Option<RatingSortSpec>>,
+            Option<RatingSortSpec>,
+        );
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(order, previous);
+        f()
+    })
+}
+
+/// Rating identity for a physical listing row; synthetic container keys need
+/// their owning viewer and are deliberately outside this producer.
+pub(crate) fn physical_item_key(item: &crate::grid_item::GridItem) -> Option<String> {
+    use crate::grid_item::GridItem;
+    if !item.accepts_rating() {
+        return None;
+    }
+    match item {
+        GridItem::Image(_) => crate::edit_source::page_key_for_grid_item(item),
+        GridItem::Folder(path)
+        | GridItem::ZipFile(path)
+        | GridItem::PdfFile(path)
+        | GridItem::Video(path)
+        | GridItem::Audio(path) => Some(crate::adjustment_db::normalize_path(path)),
+        GridItem::ConvertibleArchive { path, .. } => {
+            Some(crate::adjustment_db::normalize_path(path))
+        }
+        _ => None,
+    }
+}
+
 /// `Supported(Zero)` is an unrated item; `Unsupported` is outside the ratable domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RatingSortKey {

@@ -734,7 +734,7 @@ pub(in crate::app) struct ViewerContextBundle {
     stack_request_sequence: u64,
     stack_active_rule: Option<String>,
     stack_script_error: Option<String>,
-    stack_toggle_select_path: Option<PathBuf>,
+    stack_selection_target: Option<crate::filename_stack_ui::StackSelectionTarget>,
     items: Vec<GridItem>,
     items_generation: u64,
     visible_indices: Vec<usize>,
@@ -1388,7 +1388,7 @@ impl ViewerContextBundle {
             stack_request_sequence: 0,
             stack_active_rule: None,
             stack_script_error: None,
-            stack_toggle_select_path: None,
+            stack_selection_target: None,
             items: Vec::new(),
             items_generation: 0,
             visible_indices: Vec::new(),
@@ -1761,7 +1761,7 @@ impl App {
             stack_request_sequence,
             stack_active_rule,
             stack_script_error,
-            stack_toggle_select_path,
+            stack_selection_target,
             items,
             items_generation,
             visible_indices,
@@ -2026,7 +2026,7 @@ impl App {
         swap_field!(stack_request_sequence);
         swap_field!(stack_active_rule);
         swap_field!(stack_script_error);
-        swap_field!(stack_toggle_select_path);
+        swap_field!(stack_selection_target);
         swap_field!(items);
         swap_field!(items_generation);
         swap_field!(visible_indices);
@@ -2352,7 +2352,7 @@ impl App {
             stack_request_sequence,
             stack_active_rule,
             stack_script_error,
-            stack_toggle_select_path,
+            stack_selection_target,
             items,
             items_generation,
             visible_indices,
@@ -2622,7 +2622,7 @@ impl App {
             stack_request_sequence,
             stack_active_rule,
             stack_script_error,
-            stack_toggle_select_path,
+            stack_selection_target,
             items,
             items_generation,
             visible_indices,

@@ -2624,6 +2624,7 @@ impl App {
                     None,
                     None,
                     None,
+                    None,
                     authority,
                 );
                 // The accepted rows are already final. Reuse the ordinary verification tail
@@ -2658,6 +2659,7 @@ impl App {
                     None,
                     None,
                     None,
+                    None,
                     authority,
                 );
                 self.pdf_placeholder_count = Some(page_count);
@@ -2676,6 +2678,7 @@ impl App {
                     Vec::new(),
                     HashSet::new(),
                     Vec::new(),
+                    None,
                     None,
                     None,
                     None,

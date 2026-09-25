@@ -33366,7 +33366,10 @@ mod favorite_adjustment_defaults_tests {
         app.stack_showing_flat = true;
         app.stack_active_rule = Some("テストルール".to_string());
         app.stack_script_error = Some("テストエラー".to_string());
-        app.stack_toggle_select_path = Some(PathBuf::from(r"C:\stack\post_0.jpg"));
+        app.stack_selection_target =
+            Some(crate::filename_stack_ui::StackSelectionTarget::MemberPath(
+                PathBuf::from(r"C:\stack\post_0.jpg"),
+            ));
 
         let original = app.stash_mounted_and_start_fresh("test_flat_stack_context");
         app.stack_mode_requested = false;
@@ -33374,7 +33377,7 @@ mod favorite_adjustment_defaults_tests {
         app.stack_showing_flat = false;
         app.stack_active_rule = None;
         app.stack_script_error = None;
-        app.stack_toggle_select_path = None;
+        app.stack_selection_target = None;
 
         app.with_viewer_context(original, |mounted| {
             assert!(mounted.stack_mode_requested);
@@ -33382,8 +33385,10 @@ mod favorite_adjustment_defaults_tests {
             assert_eq!(mounted.stack_active_rule.as_deref(), Some("テストルール"));
             assert_eq!(mounted.stack_script_error.as_deref(), Some("テストエラー"));
             assert_eq!(
-                mounted.stack_toggle_select_path,
-                Some(PathBuf::from(r"C:\stack\post_0.jpg"))
+                mounted.stack_selection_target,
+                Some(crate::filename_stack_ui::StackSelectionTarget::MemberPath(
+                    PathBuf::from(r"C:\stack\post_0.jpg")
+                ))
             );
             let restored_stack_view = mounted.stack_view.as_ref().expect("stack view restored");
             assert_eq!(restored_stack_view.groups.len(), 2);
@@ -80226,6 +80231,308 @@ mod rating_write_failure_tests {
             }
             .history_trigger(),
             HistoryTrigger::UserChosen
+        );
+    }
+}
+
+#[cfg(test)]
+mod rating_folder_r2_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    fn rating_request() -> crate::rating_sort::RatingSortSpec {
+        crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+        }
+    }
+
+    #[test]
+    fn prepared_folder_cache_replays_writes_even_after_context_seen_generation_advanced() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("page.jpg");
+        app.items = vec![GridItem::Image(path.clone())];
+        app.rating_cache.insert(0, 1);
+        let before_read = app.rating_session_write_generation;
+        app.record_rating_session_write(crate::adjustment_db::normalize_path(&path), 5, true);
+        app.rating_session_write_seen_generation = app.rating_session_write_generation;
+        app.overlay_rating_session_writes_since(before_read);
+        assert_eq!(app.rating_cache.get(&0), Some(&5));
+    }
+
+    #[test]
+    fn installed_prepared_cache_replays_a_write_after_read_even_if_seen_advanced() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("rating-install-race");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("a.jpg");
+        std::fs::write(&path, b"image").unwrap();
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 1, None)
+            .unwrap();
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        RATING_AFTER_MATERIALIZE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |app| {
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&key, 5, None)
+                    .unwrap();
+                app.record_rating_session_write(key, 5, true);
+                app.rating_session_write_seen_generation = app.rating_session_write_generation;
+            }));
+        });
+        crate::rating_sort::with_test_rating_order(rating_request(), || {
+            app.load_folder_with_scan(folder, None)
+        });
+        assert_eq!(app.rating_cache.get(&0), Some(&5));
+        assert_eq!(
+            app.get_rating(0),
+            5,
+            "first visible badge uses installed cache"
+        );
+        assert_eq!(
+            app.visible_indices,
+            [0],
+            "first filter rebuild sees the write"
+        );
+        RATING_AFTER_MATERIALIZE_HOOK.with(|slot| assert!(slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn successful_rating_load_installs_complete_zero_cache_without_ui_prewarm() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("rating-complete-cache");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            std::fs::write(folder.join(name), b"image").unwrap();
+        }
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(
+                &crate::adjustment_db::normalize_path(&folder.join("b.jpg")),
+                4,
+                None,
+            )
+            .unwrap();
+        RATING_INSTALL_UI_PREWARMS.with(|calls| calls.set(0));
+        crate::rating_sort::with_test_rating_order(rating_request(), || {
+            app.load_folder_with_scan(folder, None)
+        });
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg", "c.jpg"]
+        );
+        assert_eq!(app.rating_cache.len(), 3);
+        assert_eq!(app.rating_cache.get(&0), Some(&4));
+        assert_eq!(app.rating_cache.get(&1), Some(&0));
+        assert_eq!(app.rating_cache.get(&2), Some(&0));
+        RATING_INSTALL_UI_PREWARMS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[test]
+    fn later_rating_chunk_failure_installs_the_standard_order_cache_and_filter() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("rating-later-chunk-failure");
+        std::fs::create_dir_all(&folder).unwrap();
+        for idx in 0..501 {
+            std::fs::write(folder.join(format!("p{idx:04}.jpg")), b"image").unwrap();
+        }
+        let db_path = app.tmp.path().join("rating-later-chunk.db");
+        app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
+        let rated = crate::adjustment_db::normalize_path(&folder.join("p0250.jpg"));
+        let corrupt = crate::adjustment_db::normalize_path(&folder.join("p0500.jpg"));
+        let db = app.rating_db.as_ref().unwrap();
+        db.set_user_rating(&rated, 5, None).unwrap();
+        db.set_user_rating(&corrupt, 2, None).unwrap();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("UPDATE ratings SET stars='bad' WHERE path=?1", [&corrupt])
+            .unwrap();
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        RATING_INSTALL_UI_PREWARMS.with(|calls| calls.set(0));
+        crate::rating_sort::with_test_rating_order(rating_request(), || {
+            app.load_folder_with_scan(folder.clone(), None)
+        });
+        assert_eq!(app.items[0].name(), "p0000.jpg");
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("評価順を読み取れなかった")
+        );
+        let fallback_cache = app.rating_cache.clone();
+        let fallback_visible = app.visible_indices.clone();
+        let fallback_order = app
+            .items
+            .iter()
+            .map(|item| item.name().into_owned())
+            .collect::<Vec<_>>();
+        RATING_INSTALL_UI_PREWARMS.with(|calls| assert_eq!(calls.get(), 1));
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.load_folder_with_scan(folder, None);
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            fallback_order
+        );
+        assert_eq!(app.rating_cache, fallback_cache);
+        assert_eq!(app.visible_indices, fallback_visible);
+        assert_eq!(app.visible_indices, [250]);
+        RATING_INSTALL_UI_PREWARMS.with(|calls| assert_eq!(calls.get(), 2));
+    }
+
+    #[test]
+    fn physical_rating_reload_restores_the_exact_selected_path() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("rating-selection");
+        std::fs::create_dir_all(&folder).unwrap();
+        let a = folder.join("a.jpg");
+        let b = folder.join("b.jpg");
+        std::fs::write(&a, b"image").unwrap();
+        std::fs::write(&b, b"image").unwrap();
+        let a_key = crate::adjustment_db::normalize_path(&a);
+        let b_key = crate::adjustment_db::normalize_path(&b);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&b_key, 5, None)
+            .unwrap();
+        crate::rating_sort::with_test_rating_order(rating_request(), || {
+            app.load_folder_with_scan(folder.clone(), None)
+        });
+        assert!(matches!(&app.items[0], GridItem::Image(path) if path == &b));
+        app.selected = Some(0);
+        app.preserve_cursor_hint_for_reload();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&a_key, 5, None)
+            .unwrap();
+        crate::rating_sort::with_test_rating_order(rating_request(), || {
+            app.load_folder_with_scan(folder, None)
+        });
+        assert!(matches!(&app.items[0], GridItem::Image(path) if path == &a));
+        assert!(
+            matches!(app.selected.and_then(|idx| app.items.get(idx)), Some(GridItem::Image(path)) if path == &b)
+        );
+    }
+
+    #[test]
+    fn failed_rating_read_opens_and_reloads_with_name_order_and_ordinary_prewarm() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("rating-read-failure");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in ["z.jpg", "a.jpg"] {
+            std::fs::write(folder.join(name), b"image").unwrap();
+        }
+        let db_path = app.tmp.path().join("broken-rating.db");
+        app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("DROP TABLE ratings;")
+            .unwrap();
+        RATING_INSTALL_UI_PREWARMS.with(|calls| calls.set(0));
+        for expected_prewarm in 1..=2 {
+            crate::rating_sort::with_test_rating_order(rating_request(), || {
+                app.load_folder_with_scan(folder.clone(), None)
+            });
+            assert_eq!(
+                app.items
+                    .iter()
+                    .map(|item| item.name().into_owned())
+                    .collect::<Vec<_>>(),
+                ["a.jpg", "z.jpg"]
+            );
+            assert!(
+                app.fs_feedback_toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.0.contains("評価順を読み取れなかった"))
+            );
+            assert_eq!(app.rating_cache.get(&0), Some(&0));
+            assert_eq!(app.rating_cache.get(&1), Some(&0));
+            RATING_INSTALL_UI_PREWARMS.with(|calls| assert_eq!(calls.get(), expected_prewarm));
+        }
+    }
+
+    #[test]
+    fn fixed_surfaces_share_sort_lock_and_snapshot_has_no_refresh() {
+        use crate::app::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+        let mut app = setup_app();
+        for surface in [
+            TopLevelGridSurface::Search(TopLevelSearchView::Favorite),
+            TopLevelGridSurface::Search(TopLevelSearchView::Tag),
+            TopLevelGridSurface::ReadingHistory,
+            TopLevelGridSurface::Snapshot,
+            TopLevelGridSurface::DriveList,
+        ] {
+            app.top_level_grid_view.replace_surface(surface.clone());
+            assert_eq!(
+                app.grid_sort_lock_reason(),
+                Some(GridSortLockReason::FixedOrder)
+            );
+            assert_eq!(
+                app.grid_sort_refresh_available(),
+                !matches!(surface, TopLevelGridSurface::Snapshot)
+            );
+        }
+    }
+
+    #[test]
+    fn real_fixed_view_entries_disable_the_shared_toolbar_and_menu_sort_predicate() {
+        let mut app = setup_app();
+        app.enter_reading_history_from_menu();
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(GridSortLockReason::FixedOrder)
+        );
+        app.open_bookmark_browser();
+        if let Some(pending) = app.bookmark_browser_pending.take() {
+            pending.cancel();
+        }
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            None,
+            "bookmark view retains its own selectable sort"
+        );
+        app.enter_drive_list_from_navigation(None);
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(GridSortLockReason::FixedOrder)
+        );
+    }
+
+    #[test]
+    fn bookmark_normal_sort_is_not_overwritten_by_internal_rating_request() {
+        let mut app = setup_app();
+        app.items_are_bookmark_view = true;
+        app.bookmark_browser_rows = vec![bookmark_grid_test_row(2), bookmark_grid_test_row(1)];
+        app.bookmark_view_sort =
+            crate::bookmark_browser::BookmarkViewSort::Normal(crate::settings::SortOrder::FileName);
+        app.settings.sort_order = crate::settings::SortOrder::DateDesc;
+        crate::rating_sort::with_test_rating_order(rating_request(), || {
+            app.apply_sort_change_reload()
+        });
+        assert_eq!(
+            app.bookmark_view_sort,
+            crate::bookmark_browser::BookmarkViewSort::Normal(crate::settings::SortOrder::FileName)
+        );
+        assert_eq!(
+            app.bookmark_browser_rows
+                .iter()
+                .map(|row| row.item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["marker-1.mp4", "marker-2.mp4"]
         );
     }
 }
