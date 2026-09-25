@@ -553,6 +553,9 @@ impl CollectionStoreDb {
         standard_sort: SortOrder,
     ) -> Result<super::CollectionSnapshot, CollectionStoreError> {
         self.last_mutation_applied = false;
+        if standard_sort.is_rating() {
+            return Err(CollectionStoreError::InvalidOrder);
+        }
         let tx = self.conn.unchecked_transaction()?;
         let prepared = match MutationGuard::collection(&tx, id, expected_revision)? {
             Err(error) => PreparedMutation::Reject(error),

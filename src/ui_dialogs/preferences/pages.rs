@@ -1420,6 +1420,26 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
+    anchored(ui, state, "thumbnail/rating-sort-unrated", |ui, state| {
+        use crate::rating_sort::RatingSortUnratedPosition;
+        ui.label(egui::RichText::new("評価順での未評価の位置").strong());
+        ui.radio_value(
+            &mut state.settings.rating_sort_unrated_position,
+            RatingSortUnratedPosition::BetweenThreeAndTwo,
+            "★3 と ★2 の間（既定）",
+        );
+        ui.radio_value(
+            &mut state.settings.rating_sort_unrated_position,
+            RatingSortUnratedPosition::BelowAll,
+            "すべての評価より下",
+        );
+        ui.small(
+            "低い順では、この並びを逆にします。評価を変えた後は一覧を更新すると並びが変わります。",
+        );
+    });
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
     anchored(ui, state, "thumbnail/category-order", |ui, state| {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("グリッドのカテゴリ表示順").strong());

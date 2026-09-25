@@ -2,7 +2,7 @@
 
 最終更新: 2026-09-25
 
-状態: 設計第5版 (独立レビューで ACCEPT)。R1 (`7c6a7d492`)・R2 (`c36bf45eb`)・R3 完了、R4 着手前。
+状態: 設計第5版 (独立レビューで ACCEPT)。R1 (`7c6a7d492`)・R2 (`c36bf45eb`)・R3 (`580c2873b`)・R4 実装完了。実機確認待ち。
 
 - 初版 (`d05fc1a76`、2026-09-15): 別セッションで作成。
 - 第2版 (`23d553814`): 独立レビュー 1 回目 (GPT-6 Sol / xhigh、REVISE) を反映。
@@ -356,12 +356,15 @@ thumbnail 表示の `visible_indices` は raw items index 順を保つため、f
 
 - Remote の物理フォルダ一覧は `ContainerService::recompute_folder_listing` で構築される。評価順のときは
   同じ worker で §2.2 の facts を読んでから応答順を決める。book / ZIP / PDF page の lock を評価で解除しない。
-- Remote へ返した container payload は一つの immutable snapshot とする。Remote から評価を書いた直後は現在
-  row の評価表示だけを更新し、client 側で自動 reorder しない。明示 reload、navigation、sort 変更による次の
-  list request が新しい snapshot を返す。Remote の書き込みは App の共有書き込み経路を通るので、PC 側の
+- Remote へ返した container payload は一つの immutable snapshot とする。Remote の物理フォルダ一覧は評価の
+  badge を持たない (`FolderListEntry` / `/api/list` に評価は無く、R4 で追加しないと決定)。Remote から評価を
+  書いても表示中の一覧の順は変えず、client 側で自動 reorder しない。明示 reload、navigation、sort 変更による
+  次の list request が新しい snapshot を返す。評価の読み取りに失敗した場合は、応答の任意の通知 field
+  (protocol v61) で client に名前順へ戻したことを示す。Remote の書き込みは App の共有書き込み経路を通るので、PC 側の
   context には §5.2 で反映される。
 - Remote の Collection、タグ一覧は §0.2 のとおり評価順を適用しない。Remote から見える Smart Folder 等の
-  一覧は、PC と同じ prepared snapshot を使う。
+  一覧は、Remote 側で独自に走査・準備した snapshot を、PC と同じ評価順の規則 (完全な facts、名前順への
+  fallback) で並べる。PC の prepared snapshot を共有しない。
 
 ## 7. 永続化、互換、UI
 

@@ -13630,6 +13630,10 @@ mod phase_c_folder_nav_history_tests {
             .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         });
 
         app.load_folder(real);
@@ -13763,6 +13767,10 @@ mod phase_c_folder_nav_history_tests {
             .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         });
         app.favsearch.active = true;
         app.favsearch.saved_folder = Some(crate::app::subfolder_expansion_synthetic_path());
@@ -15064,6 +15072,142 @@ mod phase_c_drill_nav_tests {
             .expect("rating view reload ok");
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].key, key);
+    }
+
+    #[test]
+    fn rating_view_reload_keeps_selected_rating_sort_and_reads_new_membership() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = app.tmp.path().join("b-rated.jpg");
+        std::fs::write(&first, b"image").unwrap();
+        let first_key = crate::adjustment_db::normalize_path(&first);
+        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+            .with_source_path(&first);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&first_key, 3, Some(&meta))
+            .unwrap();
+        app.settings.sort_order = crate::settings::SortOrder::RatingDesc;
+        app.enter_rating_view(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (!app.items_are_rating_view || app.rating_view_pending.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            app.poll_rating_view();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.items_are_rating_view);
+        let chosen =
+            crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::RatingDesc);
+        app.set_rating_view_sort(chosen);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.rating_view_pending.is_some() && std::time::Instant::now() < deadline {
+            app.poll_rating_view();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.rating_view_sort, chosen);
+
+        let second = app.tmp.path().join("a-rated.jpg");
+        std::fs::write(&second, b"image").unwrap();
+        let second_key = crate::adjustment_db::normalize_path(&second);
+        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+            .with_source_path(&second);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&second_key, 3, Some(&meta))
+            .unwrap();
+        app.reload_top_level_grid(&ctx);
+        assert_eq!(app.rating_view_sort, chosen);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.rating_view_pending.is_some() && std::time::Instant::now() < deadline {
+            app.poll_rating_view();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.rating_view_sort, chosen);
+        assert_eq!(
+            app.rating_view_rows
+                .iter()
+                .map(|row| row.key.as_str())
+                .collect::<Vec<_>>(),
+            [second_key.as_str(), first_key.as_str()]
+        );
+    }
+
+    #[test]
+    fn rating_view_refresh_uses_selected_sort_across_remote_global_sort_changes() {
+        use crate::settings::SortOrder;
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for (initial, changed, expected) in [
+            (
+                SortOrder::FileNameDesc,
+                SortOrder::RatingDesc,
+                ["b-rated.jpg", "a-rated.jpg"],
+            ),
+            (
+                SortOrder::RatingDesc,
+                SortOrder::FileNameDesc,
+                ["a-rated.jpg", "b-rated.jpg"],
+            ),
+        ] {
+            let mut app = setup_app();
+            for name in ["a-rated.jpg", "b-rated.jpg"] {
+                let path = app.tmp.path().join(name);
+                std::fs::write(&path, b"image").unwrap();
+                let key = crate::adjustment_db::normalize_path(&path);
+                let meta =
+                    crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+                        .with_source_path(&path);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&key, 3, Some(&meta))
+                    .unwrap();
+            }
+            app.settings.sort_order = initial;
+            app.enter_rating_view(3);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while (!app.items_are_rating_view || app.rating_view_pending.is_some())
+                && std::time::Instant::now() < deadline
+            {
+                app.poll_rating_view();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(app.items_are_rating_view);
+            let selected = crate::rating_view::RatingViewSort::Normal(initial);
+            app.set_rating_view_sort(selected);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.rating_view_pending.is_some() && std::time::Instant::now() < deadline {
+                app.poll_rating_view();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(app.rating_view_sort, selected);
+
+            app.reload_current_rating_view_preserving_sort();
+            assert!(app.rating_view_pending.is_some());
+            // Remote changes the global setting while this prepared view is still open.
+            app.settings.sort_order = changed;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.rating_view_pending.is_some() && std::time::Instant::now() < deadline {
+                app.poll_rating_view();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                app.rating_view_pending.is_none(),
+                "{initial:?} -> {changed:?}"
+            );
+            assert_eq!(app.rating_view_sort, selected);
+            assert_eq!(
+                app.rating_view_rows
+                    .iter()
+                    .map(|row| row.item.name().into_owned())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{initial:?} -> {changed:?}"
+            );
+        }
     }
 
     #[test]
@@ -16388,6 +16532,10 @@ mod phase_c_drill_nav_tests {
             .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         });
 
         app.install_new_items(vec![GridItem::Image(image)], vec![Some((1, 10))]);
@@ -16438,6 +16586,10 @@ mod phase_c_drill_nav_tests {
             .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         });
 
         app.reload_current_folder_preserving_override();
@@ -16487,6 +16639,10 @@ mod phase_c_drill_nav_tests {
             .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         });
 
         app.close_global_search();
@@ -16534,6 +16690,10 @@ mod phase_c_drill_nav_tests {
             .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         });
         app.tag_view.active = true;
         app.tag_view.saved_folder = Some(subfolder_expansion_synthetic_path());
@@ -16635,6 +16795,10 @@ mod phase_c_drill_nav_tests {
             .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         });
         app.rating_view_stars = 3;
         app.rating_view_saved_folder = Some(subfolder_expansion_synthetic_path());
@@ -76968,6 +77132,10 @@ mod smart_folder_transition_tests {
             .into(),
             video_thumb_overrides: std::collections::HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         });
         let definition = definition("Smart", smart_source);
         let id = definition.id;
@@ -77133,6 +77301,10 @@ fn subfolder_display_prepare_blocks_background_input() {
                 entries: std::sync::Arc::new(Vec::new()),
                 video_thumb_overrides: std::collections::HashMap::new(),
                 diag: subfolder_expansion::SubfolderExpansionDiag::default(),
+                stack_rating_source: Default::default(),
+                stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                    crate::settings::SortOrder::FileName,
+                ),
             },
             show_toast: false,
         });

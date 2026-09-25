@@ -1222,7 +1222,7 @@ impl super::App {
             TopLevelGridSurface::Search(TopLevelSearchView::Tag) => {
                 self.open_tag_view_with_query(Some(self.tag_view.query.clone()), false);
             }
-            TopLevelGridSurface::Rating { stars } => self.enter_rating_view(stars),
+            TopLevelGridSurface::Rating { .. } => self.reload_current_rating_view_preserving_sort(),
             TopLevelGridSurface::ReadingHistory => self.enter_reading_history(),
             TopLevelGridSurface::Bookmarks => self.enter_bookmark_view(),
             TopLevelGridSurface::DriveList => {

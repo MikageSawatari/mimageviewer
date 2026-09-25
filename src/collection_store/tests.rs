@@ -1609,7 +1609,7 @@ fn collection_standard_sort_roundtrips_every_list_sort_variant() {
     let collection_id = created.collection_id();
     let mut revision = created.revision();
 
-    for &sort in SortOrder::all() {
+    for &sort in SortOrder::collection_options() {
         let updated = db
             .set_order(collection_id, revision, CollectionOrderMode::Standard, sort)
             .unwrap();
@@ -1621,6 +1621,52 @@ fn collection_standard_sort_roundtrips_every_list_sort_variant() {
         assert_eq!(reopened.definition.standard_sort, sort, "{sort:?}");
         assert_eq!(reopened.revision(), revision);
     }
+}
+
+#[test]
+fn rating_sort_is_rejected_before_collection_noop_or_write_in_every_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = open_db(&temp);
+    let created = db.create_collection("Rating boundary").unwrap();
+    let before = collection_db_fingerprint(&temp.path().join("collection.db"));
+    for mode in [
+        CollectionOrderMode::Standard,
+        CollectionOrderMode::Manual,
+        CollectionOrderMode::Shuffle,
+    ] {
+        for sort in [SortOrder::RatingAsc, SortOrder::RatingDesc] {
+            assert!(matches!(
+                db.set_order(created.collection_id(), created.revision(), mode, sort),
+                Err(CollectionStoreError::InvalidOrder)
+            ));
+            assert_eq!(
+                collection_db_fingerprint(&temp.path().join("collection.db")),
+                before
+            );
+        }
+    }
+
+    drop(db);
+    let runtime = CollectionStoreRuntime::start_at(temp.path().join("collection.db")).unwrap();
+    wait_ready(&runtime);
+    let client = runtime.client();
+    for mode in [
+        CollectionOrderMode::Standard,
+        CollectionOrderMode::Manual,
+        CollectionOrderMode::Shuffle,
+    ] {
+        for sort in [SortOrder::RatingAsc, SortOrder::RatingDesc] {
+            assert!(matches!(
+                client.set_order(created.collection_id(), created.revision(), mode, sort),
+                Err(CollectionStoreError::InvalidOrder)
+            ));
+        }
+    }
+    runtime.shutdown_and_join();
+    assert_eq!(
+        collection_db_fingerprint(&temp.path().join("collection.db")),
+        before
+    );
 }
 
 #[test]

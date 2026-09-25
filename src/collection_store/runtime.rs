@@ -558,6 +558,9 @@ impl CollectionStoreClient {
         Receiver<Result<super::CollectionSnapshot, CollectionStoreError>>,
         CollectionStoreError,
     > {
+        if standard_sort.is_rating() {
+            return Err(CollectionStoreError::InvalidOrder);
+        }
         self.request(|reply| Command::SetOrder {
             id,
             expected_revision,

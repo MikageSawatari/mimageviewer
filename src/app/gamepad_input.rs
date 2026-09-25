@@ -3065,6 +3065,16 @@ impl App {
         };
         let sort_order = match grid_sort_target {
             RingPickerGridSortTarget::Collection(target) => target.standard_sort,
+            RingPickerGridSortTarget::Global if self.items_are_bookmark_view => {
+                match self.bookmark_view_sort {
+                    crate::bookmark_browser::BookmarkViewSort::Normal(sort)
+                        if !sort.is_rating() =>
+                    {
+                        sort
+                    }
+                    _ => crate::settings::SortOrder::FileName,
+                }
+            }
             RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Locked(_) => {
                 self.settings.sort_order
             }
@@ -3776,7 +3786,16 @@ impl App {
                 if matches!(picker.grid_sort_target, RingPickerGridSortTarget::Locked(_)) {
                     return;
                 }
-                picker.sort_order = cycle_value(SortOrder::all(), picker.sort_order, delta);
+                let options = if matches!(
+                    picker.grid_sort_target,
+                    RingPickerGridSortTarget::Collection(_)
+                ) || self.items_are_bookmark_view
+                {
+                    SortOrder::collection_options()
+                } else {
+                    SortOrder::all()
+                };
+                picker.sort_order = cycle_value(options, picker.sort_order, delta);
                 mark_picker_dirty(picker, row);
             }
             RingPickerRowId::GridThumbAspect => {
@@ -8172,6 +8191,32 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bookmark_picker_opens_on_its_supported_active_sort() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sort_order = crate::settings::SortOrder::RatingDesc;
+        app.items_are_bookmark_view = true;
+        app.bookmark_view_sort =
+            crate::bookmark_browser::BookmarkViewSort::Normal(crate::settings::SortOrder::DateDesc);
+        let picker = app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        assert_eq!(picker.sort_order, crate::settings::SortOrder::DateDesc);
+        app.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::CreatedAtDesc;
+        let picker = app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        assert_eq!(picker.sort_order, crate::settings::SortOrder::FileName);
+    }
+
+    #[test]
+    fn collection_picker_cycle_never_enters_rating_order() {
+        use crate::settings::SortOrder;
+        assert_eq!(
+            super::cycle_value(SortOrder::collection_options(), SortOrder::SizeDesc, 1),
+            SortOrder::FileName
+        );
+        assert_eq!(
+            super::cycle_value(SortOrder::all(), SortOrder::SizeDesc, 1),
+            SortOrder::RatingAsc
+        );
+    }
     use super::{
         GamepadFrameBatch, Instant, MouseMiddleInputSample, POST_FILTER_GROUPS, PadDir,
         RingPickerRatingTarget, RingPickerRowId, continuous_reading_stick_axis, cycle_rating,

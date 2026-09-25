@@ -4329,6 +4329,61 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn remote_rating_write_keeps_existing_folder_payload_until_explicit_reload() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("remote-rating-write-order");
+        std::fs::create_dir_all(&folder).unwrap();
+        let a = folder.join("a.png");
+        let b = folder.join("b.png");
+        std::fs::write(&a, b"image-a").unwrap();
+        std::fs::write(&b, b"image-b").unwrap();
+        app.settings.favorites = vec![crate::settings::FavoriteEntry::new(
+            "Ratings".to_owned(),
+            folder.clone(),
+        )];
+        app.settings.sort_order = crate::settings::SortOrder::RatingDesc;
+        app.settings.write_rating_to_xmp = false;
+        let a_address = mimageviewer_ipc::RemoteAddress::file(a.to_string_lossy().into_owned());
+        let b_address = mimageviewer_ipc::RemoteAddress::file(b.to_string_lossy().into_owned());
+        assert!(matches!(
+            app.persist_remote_rating(&a_address, 1),
+            RemoteWriteResponse::Success(_)
+        ));
+        assert!(matches!(
+            app.persist_remote_rating(&b_address, 5),
+            RemoteWriteResponse::Success(_)
+        ));
+        let engine = super::super::container::ContainerEngine::new(app.settings.clone());
+        let request = mimageviewer_ipc::FolderListRequest {
+            address: mimageviewer_ipc::RemoteAddress::file(folder.to_string_lossy().into_owned()),
+        };
+        let mimageviewer_ipc::FolderListResponse::Success(first) =
+            engine.folder_list(request.clone())
+        else {
+            panic!("first Remote folder payload failed");
+        };
+        let names = |payload: &mimageviewer_ipc::FolderListPayload| {
+            payload
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&first), ["b.png", "a.png"]);
+
+        assert!(matches!(
+            app.persist_remote_rating(&a_address, 5),
+            RemoteWriteResponse::Success(_)
+        ));
+        assert_eq!(names(&first), ["b.png", "a.png"]);
+        let mimageviewer_ipc::FolderListResponse::Success(reloaded) = engine.folder_list(request)
+        else {
+            panic!("explicit Remote folder reload failed");
+        };
+        assert_eq!(names(&reloaded), ["a.png", "b.png"]);
+    }
+
     fn active_session() -> (SessionHandle, RemoteSessionIdentity, u64) {
         let handle = SessionHandle::new();
         let response = handle.acquire(mimageviewer_ipc::SessionAcquireRequest {

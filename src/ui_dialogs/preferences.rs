@@ -2298,6 +2298,7 @@ impl App {
                     self.settings.archive_file_handling_resolved(),
                 );
                 let old_grid_display_order = self.settings.grid_display_order.clone();
+                let old_rating_sort_unrated_position = self.settings.rating_sort_unrated_position;
                 let old_show_hidden_files = self.settings.show_hidden_files;
                 let old_exif = self.settings.exif_hidden_tags.clone();
 
@@ -2625,9 +2626,12 @@ impl App {
                     old_show_hidden_files != self.settings.show_hidden_files;
                 let grid_display_order_changed =
                     old_grid_display_order != self.settings.grid_display_order;
+                let rating_sort_position_changed = old_rating_sort_unrated_position
+                    != self.settings.rating_sort_unrated_position
+                    && self.settings.sort_order.is_rating();
                 if duplicate_settings_changed || file_visibility_changed {
                     self.reload_current_folder_preserving_override();
-                } else if grid_display_order_changed {
+                } else if grid_display_order_changed || rating_sort_position_changed {
                     self.apply_sort_change_reload();
                 }
                 if old_exif != self.settings.exif_hidden_tags {

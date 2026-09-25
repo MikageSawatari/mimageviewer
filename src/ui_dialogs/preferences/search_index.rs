@@ -175,6 +175,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["場所", "表示状態", "見開き", "ソート", "リセット", "クリア"]
     ),
     entry!(
+        "thumbnail/rating-sort-unrated",
+        Thumbnail,
+        "評価順での未評価の位置",
+        ["評価", "未評価", "並び", "ソート", "レーティング", "星"]
+    ),
+    entry!(
         "thumbnail/category-order",
         Thumbnail,
         "グリッドのカテゴリ表示順",

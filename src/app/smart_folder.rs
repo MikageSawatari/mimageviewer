@@ -5006,7 +5006,10 @@ impl SmartFolderPresentation {
     ) -> Self {
         let from_state = |state: &crate::settings::FavoriteViewState| Self {
             sort: state.sort_order,
-            order_request: crate::rating_sort::ListingOrderRequest::Standard(state.sort_order),
+            order_request: crate::rating_sort::ListingOrderRequest::from_sort(
+                state.sort_order,
+                app.settings.rating_sort_unrated_position,
+            ),
             display: state.grid_display_order.normalized(),
             grouping,
         };
@@ -6447,10 +6450,13 @@ pub(crate) fn build_remote_smart_folder_entries(
     )
     .ok_or_else(|| "スマートフォルダの走査が中断されました".to_owned())?;
     let snapshot = scanned.snapshot;
-    let load_ratings = smart_folder_definition_uses_metadata(
-        &snapshot.definition,
-        SmartFolderMetadataDependency::Rating,
-    );
+    let request = crate::rating_sort::ListingOrderRequest::from_settings(settings);
+    let rating_order = matches!(request, crate::rating_sort::ListingOrderRequest::Rating(_));
+    let load_ratings = rating_order
+        || smart_folder_definition_uses_metadata(
+            &snapshot.definition,
+            SmartFolderMetadataDependency::Rating,
+        );
     let load_tags = smart_folder_definition_uses_metadata(
         &snapshot.definition,
         SmartFolderMetadataDependency::Tags,
@@ -6471,7 +6477,7 @@ pub(crate) fn build_remote_smart_folder_entries(
     let membership = evaluate_smart_folder_membership(
         &snapshot,
         &HashSet::new(),
-        false,
+        rating_order,
         load_ratings,
         load_tags,
         load_local_adjust,
@@ -6484,13 +6490,16 @@ pub(crate) fn build_remote_smart_folder_entries(
     )?
     .ok_or_else(|| "スマートフォルダの評価が中断されました".to_owned())?;
 
-    let sort = settings.sort_order;
     let display_order = settings.grid_display_order.normalized();
     let grouping = snapshot.definition.grouping;
-    let sort_keys = build_smart_entry_sort_keys(
+    if rating_order && (membership.rating_read_failed || membership.rating_facts.is_none()) {
+        return Err("評価順の読み込みに失敗しました".to_owned());
+    }
+    let sort_keys = build_smart_entry_sort_keys_for_request(
         &snapshot.entries,
         &membership.included,
-        sort,
+        request,
+        membership.rating_facts.as_ref(),
         &display_order,
     );
     let sorted_positions = super::recursive_snapshot_scan::cancelable_sorted_indices(
@@ -6501,7 +6510,7 @@ pub(crate) fn build_remote_smart_folder_entries(
             let b = &snapshot.entries[membership.included[b_position]];
             let ak = &sort_keys[a_position];
             let bk = &sort_keys[b_position];
-            let within = || compare_smart_entries_within_group(sort, a, ak, b, bk);
+            let within = || compare_smart_entries_for_request(request, a, ak, b, bk);
             ak.display_row
                 .cmp(&bk.display_row)
                 .then_with(|| match grouping {
@@ -9099,6 +9108,48 @@ mod tests {
     }
 
     #[test]
+    fn remote_smart_folder_uses_complete_rating_order_for_two_rows() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("remote-smart-rating");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.jpg");
+        let b = root.join("b.jpg");
+        std::fs::write(&a, b"image-a").unwrap();
+        std::fs::write(&b, b"image-b").unwrap();
+        let db =
+            crate::rating_db::RatingDb::open_at(crate::rating_db::RatingDb::db_path()).unwrap();
+        db.set(&crate::adjustment_db::normalize_path(&a), 1)
+            .unwrap();
+        db.set(&crate::adjustment_db::normalize_path(&b), 5)
+            .unwrap();
+        let mut definition = crate::settings::SmartFolderDefinition::new("remote rating");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root,
+            true,
+            false,
+            Default::default(),
+        ));
+        let settings = crate::settings::Settings {
+            sort_order: crate::settings::SortOrder::RatingDesc,
+            ..Default::default()
+        };
+        let entries = build_remote_smart_folder_entries(&settings, definition).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.rating).collect::<Vec<_>>(),
+            [Some(5), Some(1)]
+        );
+    }
+
+    #[test]
     fn rating_smart_prepare_overlays_batch_write_after_read_without_reordering() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
@@ -9913,6 +9964,43 @@ mod tests {
         );
         assert_eq!(app.settings.sort_order, SortOrder::FileName);
         assert!(app.favorite_view_states.contains_key(&id));
+    }
+
+    #[test]
+    fn saved_favorite_rating_sort_becomes_typed_smart_folder_transition_request() {
+        use crate::rating_sort::{
+            ListingOrderRequest, RatingSortDirection, RatingSortSpec, RatingSortUnratedPosition,
+        };
+        use crate::settings::{FavoriteEntry, FavoriteViewState, SortOrder};
+
+        let mut app = crate::app::setup_app_for_test();
+        let child = app.tmp.path().join("favorite-child");
+        let smart_root = smart_folder_synthetic_path(uuid::Uuid::new_v4());
+        app.settings.remember_favorite_view_state = true;
+        app.settings.rating_sort_unrated_position = RatingSortUnratedPosition::BelowAll;
+        let favorite = FavoriteEntry::new("smart root".into(), smart_root.clone());
+        let mut state = FavoriteViewState::from_settings(&app.settings);
+        state.sort_order = SortOrder::RatingAsc;
+        app.favorite_view_states.insert(favorite.id, state);
+        app.settings.favorites.push(favorite);
+        app.transition_favorite_view_for_path(Some(&child));
+        let preview = SmartFolderPresentation::for_location(
+            &app,
+            &smart_root,
+            crate::settings::SubfolderExpansionOrder::default(),
+        );
+        assert_eq!(
+            preview.order_request,
+            ListingOrderRequest::Rating(RatingSortSpec {
+                direction: RatingSortDirection::Asc,
+                unrated_position: RatingSortUnratedPosition::BelowAll,
+            })
+        );
+        app.transition_favorite_view_for_path(Some(&smart_root));
+        assert_eq!(
+            preview,
+            SmartFolderPresentation::current(&app, preview.grouping)
+        );
     }
 
     #[test]

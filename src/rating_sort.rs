@@ -4,8 +4,7 @@ use std::cmp::Ordering;
 
 use crate::filename_sort::SortNameKey;
 
-/// Transient order captured by a listing producer. Public settings cannot contain
-/// Rating until the controls and persistence are introduced in R4.
+/// Transient order captured by a listing producer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ListingOrderRequest {
     Standard(crate::settings::SortOrder),
@@ -24,7 +23,24 @@ impl ListingOrderRequest {
         if let Some(spec) = TEST_RATING_ORDER.with(|order| order.get()) {
             return Self::Rating(spec);
         }
-        Self::Standard(settings.sort_order)
+        Self::from_sort(settings.sort_order, settings.rating_sort_unrated_position)
+    }
+
+    pub(crate) fn from_sort(
+        sort: crate::settings::SortOrder,
+        unrated_position: RatingSortUnratedPosition,
+    ) -> Self {
+        match sort {
+            crate::settings::SortOrder::RatingAsc => Self::Rating(RatingSortSpec {
+                direction: RatingSortDirection::Asc,
+                unrated_position,
+            }),
+            crate::settings::SortOrder::RatingDesc => Self::Rating(RatingSortSpec {
+                direction: RatingSortDirection::Desc,
+                unrated_position,
+            }),
+            sort => Self::Standard(sort),
+        }
     }
 }
 
@@ -111,8 +127,8 @@ pub(crate) enum RatingSortDirection {
     Desc,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum RatingSortUnratedPosition {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RatingSortUnratedPosition {
     #[default]
     BetweenThreeAndTwo,
     BelowAll,
@@ -165,6 +181,32 @@ impl RatingSortSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_sort_selection_captures_direction_and_unrated_position() {
+        let mut settings = crate::settings::Settings::default();
+        assert_eq!(
+            ListingOrderRequest::from_settings(&settings),
+            ListingOrderRequest::Standard(crate::settings::SortOrder::FileName)
+        );
+        settings.sort_order = crate::settings::SortOrder::RatingDesc;
+        assert_eq!(
+            ListingOrderRequest::from_settings(&settings),
+            ListingOrderRequest::Rating(RatingSortSpec {
+                direction: RatingSortDirection::Desc,
+                unrated_position: RatingSortUnratedPosition::BetweenThreeAndTwo,
+            })
+        );
+        settings.sort_order = crate::settings::SortOrder::RatingAsc;
+        settings.rating_sort_unrated_position = RatingSortUnratedPosition::BelowAll;
+        assert_eq!(
+            ListingOrderRequest::from_settings(&settings),
+            ListingOrderRequest::Rating(RatingSortSpec {
+                direction: RatingSortDirection::Asc,
+                unrated_position: RatingSortUnratedPosition::BelowAll,
+            })
+        );
+    }
 
     #[test]
     fn rating_order_table_and_unsupported() {

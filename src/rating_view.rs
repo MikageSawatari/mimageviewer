@@ -22,12 +22,9 @@ impl Default for RatingViewSort {
 }
 
 impl RatingViewSort {
-    pub(crate) fn for_listing_order(
-        self,
-        request: crate::rating_sort::ListingOrderRequest,
-    ) -> Self {
-        match (self, request) {
-            (Self::Normal(_), crate::rating_sort::ListingOrderRequest::Rating(_)) => {
+    pub(crate) fn normalized_for_rating_view(self) -> Self {
+        match self {
+            Self::Normal(order) if order.is_rating() => {
                 Self::Normal(crate::settings::SortOrder::FileName)
             }
             _ => self,
@@ -92,7 +89,6 @@ pub(crate) struct RatingViewPreparedItems {
 
 pub(crate) struct RatingViewPrepareOptions {
     pub(crate) sort: RatingViewSort,
-    pub(crate) order_request: crate::rating_sort::ListingOrderRequest,
     pub(crate) intent: RatingViewBuildIntent,
     pub(crate) display_order: crate::settings::GridDisplayOrder,
     pub(crate) pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
@@ -116,7 +112,6 @@ pub struct RatingViewPending {
     pub(crate) context: crate::app::ViewerContextId,
     pub rating_write_generation: u64,
     pub sort: RatingViewSort,
-    pub(crate) order_request: crate::rating_sort::ListingOrderRequest,
     pub(crate) membership_only: bool,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<RatingViewBuildResult, String>>,
@@ -138,7 +133,6 @@ pub(crate) fn spawn_rating_view_build(
     options: RatingViewPrepareOptions,
 ) -> RatingViewPending {
     let options_sort = options.sort;
-    let order_request = options.order_request;
     let membership_only = matches!(options.intent, RatingViewBuildIntent::Membership { .. });
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
@@ -162,7 +156,6 @@ pub(crate) fn spawn_rating_view_build(
         context,
         rating_write_generation,
         sort: options_sort,
-        order_request,
         membership_only,
         cancel,
         rx,
@@ -216,7 +209,7 @@ fn prepare_rating_view(
     }
     let (mut items, mut image_metas) = sort_and_materialize_rows(
         &mut result.rows,
-        options.sort.for_listing_order(options.order_request),
+        options.sort.normalized_for_rating_view(),
         &options.display_order,
     );
     if let RatingViewBuildIntent::Membership { survivor_keys } = options.intent {
@@ -673,12 +666,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn rating_request_maps_normal_to_name_without_changing_rated_at() {
-        let spec = crate::rating_sort::RatingSortSpec {
-            direction: crate::rating_sort::RatingSortDirection::Desc,
-            unrated_position: Default::default(),
-        };
-        let request = crate::rating_sort::ListingOrderRequest::Rating(spec);
+    fn rating_view_normalizes_its_selected_rating_sort_only() {
         let mut rows = vec![
             RatingViewRow {
                 key: "b".into(),
@@ -695,7 +683,17 @@ mod tests {
         ];
         sort_rows(
             &mut rows,
-            RatingViewSort::Normal(crate::settings::SortOrder::DateDesc).for_listing_order(request),
+            RatingViewSort::Normal(crate::settings::SortOrder::DateDesc)
+                .normalized_for_rating_view(),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        sort_rows(
+            &mut rows,
+            RatingViewSort::Normal(crate::settings::SortOrder::RatingDesc)
+                .normalized_for_rating_view(),
         );
         assert_eq!(
             rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
@@ -703,7 +701,7 @@ mod tests {
         );
         sort_rows(
             &mut rows,
-            RatingViewSort::RatedAtDesc.for_listing_order(request),
+            RatingViewSort::RatedAtDesc.normalized_for_rating_view(),
         );
         assert_eq!(
             rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),

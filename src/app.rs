@@ -22920,7 +22920,6 @@ impl App {
             self.stack_mode_requested = true;
             self.spawn_stack_script_worker(
                 stack_folder.clone(),
-                stack_folder,
                 listing,
                 separator,
                 stack_order_request,
@@ -25187,8 +25186,6 @@ impl App {
         }
         let stale = pending.sequence != self.rating_view_request_sequence
             || pending.sort != self.rating_view_sort
-            || pending.order_request
-                != crate::rating_sort::ListingOrderRequest::from_settings(&self.settings)
             || pending.stars != self.rating_view_stars
             || pending.source_generation != self.items_generation;
         if stale {
@@ -25304,9 +25301,6 @@ impl App {
             crate::rating_view::RatingViewPrepareOptions {
                 intent,
                 sort: self.rating_view_sort,
-                order_request: crate::rating_sort::ListingOrderRequest::from_settings(
-                    &self.settings,
-                ),
                 display_order: self.settings.grid_display_order.clone(),
                 pin_db: self.folder_thumb_pin_db.clone(),
                 folder_thumb_sort: self.settings.folder_thumb_sort,
@@ -25414,9 +25408,7 @@ impl App {
         // Normal sort は従来どおり再配置し、rows も再配置後の順序へ揃え直す。
         let (items, image_metas) = crate::rating_view::sort_and_materialize_rows(
             &mut self.rating_view_rows,
-            self.rating_view_sort.for_listing_order(
-                crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
-            ),
+            self.rating_view_sort.normalized_for_rating_view(),
             &self.settings.grid_display_order,
         );
         let video_items: Vec<(usize, PathBuf, u64)> = items

@@ -1181,7 +1181,7 @@ mod tests {
             entry(&paths[1], CollectionResolvedKind::Image, 1),
             entry(&paths[2], CollectionResolvedKind::Unresolved, 2),
         ];
-        for &sort in SortOrder::all() {
+        for &sort in SortOrder::collection_options() {
             let snapshot = snapshot(base_entries.clone(), CollectionOrderMode::Standard, sort);
             let prepared = prepare_collection_export(
                 &snapshot,

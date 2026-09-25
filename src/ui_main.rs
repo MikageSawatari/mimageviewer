@@ -33,9 +33,36 @@ use crate::ui_helpers::{
 #[cfg(test)]
 thread_local! {
     static SORT_CONTROL_TEST_RESPONSES: std::cell::RefCell<Vec<(&'static str, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SORT_CONTROL_TEST_RELOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 const BOOK_REORDER_DEFAULT_TILE_PX: f32 = 78.0;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortControlDecision {
+    None,
+    Change,
+    Reload,
+}
+
+fn sort_control_decision(
+    clicked: bool,
+    selected_before_click: bool,
+    order: crate::settings::SortOrder,
+) -> SortControlDecision {
+    if !clicked {
+        SortControlDecision::None
+    } else if !selected_before_click {
+        SortControlDecision::Change
+    } else if order.is_rating() {
+        SortControlDecision::Reload
+    } else {
+        SortControlDecision::None
+    }
+}
+
+fn sort_order_visible_on_surface(order: crate::settings::SortOrder, collection: bool) -> bool {
+    !collection || !order.is_rating()
+}
 const BOOK_REORDER_MIN_TILE_PX: f32 = 64.0;
 const BOOK_REORDER_MAX_TILE_PX: f32 = 132.0;
 const BOOK_REORDER_THUMB_DECODE_PX: u32 = 360;
@@ -5784,6 +5811,112 @@ mod fixed_sort_control_tests {
     };
 
     #[test]
+    fn rating_sort_click_and_collection_choice_contract() {
+        use crate::settings::SortOrder;
+        assert_eq!(
+            sort_control_decision(true, true, SortOrder::RatingDesc),
+            SortControlDecision::Reload
+        );
+        assert_eq!(
+            sort_control_decision(true, true, SortOrder::DateDesc),
+            SortControlDecision::None
+        );
+        assert_eq!(
+            sort_control_decision(true, false, SortOrder::RatingAsc),
+            SortControlDecision::Change
+        );
+        assert_eq!(
+            sort_control_decision(false, false, SortOrder::RatingAsc),
+            SortControlDecision::None
+        );
+        assert!(
+            SortOrder::collection_options()
+                .iter()
+                .all(|order| !order.is_rating())
+        );
+        assert!(
+            SortOrder::all()
+                .iter()
+                .filter(|order| { sort_order_visible_on_surface(**order, true) })
+                .all(|order| !order.is_rating())
+        );
+        assert!(
+            SortOrder::all()
+                .iter()
+                .filter(|order| { sort_order_visible_on_surface(**order, false) })
+                .any(|order| order.is_rating())
+        );
+    }
+
+    #[test]
+    fn rating_sort_controls_each_dispatch_one_reload_for_selected_order() {
+        use crate::settings::{SortOrder, ToolbarSectionDisplay};
+
+        for control in ["button", "dropdown", "menu", "icon"] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join(format!("sort-click-{control}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("a.jpg"), b"image").unwrap();
+            app.settings.sort_order = SortOrder::RatingDesc;
+            app.settings.show_toolbar_sort = true;
+            app.settings.toolbar_sort_items = vec![SortOrder::RatingDesc];
+            app.settings.toolbar_sort_display = if control == "dropdown" {
+                ToolbarSectionDisplay::Dropdown
+            } else {
+                ToolbarSectionDisplay::Buttons
+            };
+            app.load_folder_with_scan(folder, None);
+            assert!(app.grid_sort_lock_reason().is_none());
+            let app = Rc::new(RefCell::new(app));
+            let render_app = Rc::clone(&app);
+            let fonts_set = Cell::new(false);
+            SORT_CONTROL_TEST_RELOADS.with(|count| count.set(0));
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1700.0, 500.0))
+                .build(move |ctx| {
+                    if !fonts_set.replace(true) {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    render_app.borrow_mut().render_menubar(ctx);
+                    render_app.borrow_mut().render_toolbar(ctx);
+                });
+            harness.run();
+            harness.run();
+            match control {
+                "button" => harness.get_by_label("評価↓").click(),
+                "dropdown" => {
+                    harness
+                        .get_all_by_role(egui::accesskit::Role::ComboBox)
+                        .into_iter()
+                        .find(|node| node.value().as_deref() == Some("評価↓"))
+                        .expect("rating sort combo")
+                        .click();
+                    harness.run();
+                    harness.get_all_by_label("評価↓").last().unwrap().click();
+                }
+                "menu" => {
+                    harness.get_all_by_label("設定").next().unwrap().click();
+                    harness.run();
+                    harness.get_by_label("ソート順 ⏵").click();
+                    harness.run();
+                    harness.get_by_label("✓ 評価（高い順）").click();
+                }
+                "icon" => harness.get_by_label("最新の情報に更新").click(),
+                _ => unreachable!(),
+            }
+            harness.run();
+            assert_eq!(
+                SORT_CONTROL_TEST_RELOADS.with(Cell::get),
+                1,
+                "{control} must dispatch exactly one reload"
+            );
+            assert_eq!(app.borrow().settings.sort_order, SortOrder::RatingDesc);
+        }
+    }
+
+    #[test]
     fn reading_history_entry_renders_disabled_toolbar_and_menu_sort_controls() {
         let mut app = crate::app::setup_app_for_test();
         app.enter_reading_history_from_menu();
@@ -5819,6 +5952,13 @@ mod fixed_sort_control_tests {
                 .accesskit_node()
                 .is_disabled()
         );
+        assert!(
+            !harness
+                .get_by_label("最新の情報に更新")
+                .accesskit_node()
+                .is_disabled(),
+            "fixed-order surfaces still provide the toolbar refresh action"
+        );
         SORT_CONTROL_TEST_RESPONSES.with(|responses| {
             let responses = responses.borrow();
             assert!(responses.contains(&("toolbar", false)), "{responses:?}");
@@ -5830,12 +5970,19 @@ mod fixed_sort_control_tests {
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────
 
+    fn reload_from_sort_control(&mut self, ctx: &egui::Context) {
+        #[cfg(test)]
+        SORT_CONTROL_TEST_RELOADS.with(|count| count.set(count.get() + 1));
+        self.reload_top_level_grid(ctx);
+    }
+
     /// メニューバーを描画し、ナビゲーション先とソート変更の有無を返す。
     pub(crate) fn render_menubar(&mut self, ctx: &egui::Context) -> (Option<PathBuf>, bool) {
         let mut fav_nav: Option<PathBuf> = None;
         let mut smart_folder_open: Option<uuid::Uuid> = None;
         let mut settings_changed = false;
         let mut sort_changed = false;
+        let mut sort_reload_requested = false;
         let sort_lock = self.grid_sort_lock_reason();
         let root_order = self.collection_grid_root_order().and_then(Result::ok);
         let rating_counts = self.rating_counts();
@@ -6498,7 +6645,7 @@ impl App {
                                                         ui.close();
                                                     }
                                                     ui.menu_button("通常ソート", |ui| {
-                                                        for &sort in crate::settings::SortOrder::all() {
+                                                        for &sort in crate::settings::SortOrder::collection_options() {
                                                             let checked = current.is_some_and(|d| d.mode == crate::collection_store::CollectionOrderMode::Standard && d.standard_sort == sort);
                                                             if ui
                                                                 .button(format!("{}{}", if checked { "✓ " } else { "  " }, sort.label()))
@@ -6841,9 +6988,16 @@ impl App {
                                             }
                                             ui.separator();
                                         }
-                                        for &order in crate::settings::SortOrder::all() {
+                                        for &order in if root_order.is_some() {
+                                            crate::settings::SortOrder::collection_options()
+                                        } else {
+                                            crate::settings::SortOrder::all()
+                                        } {
                                             let checked = if let Some(root) = root_order {
                                                 root.mode == crate::collection_store::CollectionOrderMode::Standard && root.standard_sort == order
+                                            } else if self.items_are_bookmark_view {
+                                                self.bookmark_view_sort
+                                                    == crate::bookmark_browser::BookmarkViewSort::Normal(order)
                                             } else if self.items_are_rating_view {
                                                 self.rating_view_sort
                                                     == crate::rating_view::RatingViewSort::Normal(order)
@@ -6851,10 +7005,21 @@ impl App {
                                                 self.settings.sort_order == order
                                             };
                                             let prefix = if checked { "✓ " } else { "  " };
-                                            let resp = ui
-                                                .button(format!("{prefix}{}", order.label()))
-                                                .on_hover_text(order.description());
-                                            if resp.clicked() {
+                                            let resp = ui.add_enabled(
+                                                !(self.items_are_bookmark_view && order.is_rating()),
+                                                egui::Button::new(format!("{prefix}{}", order.label())),
+                                            );
+                                            let resp = if self.items_are_bookmark_view && order.is_rating() {
+                                                resp.hover_tip_disabled("ブックマーク一覧では評価順を使えません")
+                                            } else {
+                                                resp.on_hover_text(order.description())
+                                            };
+                                            match sort_control_decision(resp.clicked(), checked, order) {
+                                                SortControlDecision::Reload => {
+                                                    sort_reload_requested = true;
+                                                    ui.close();
+                                                }
+                                                SortControlDecision::Change => {
                                                 if let Some(root) = root_order {
                                                     self.request_collection_grid_set_order(
                                                         root,
@@ -6872,6 +7037,8 @@ impl App {
                                                     sort_changed = true;
                                                 }
                                                 ui.close();
+                                                }
+                                                SortControlDecision::None => {}
                                             }
                                         }
                                         if self.items_are_rating_view {
@@ -7180,6 +7347,9 @@ impl App {
             self.settings.save();
             // ネスト ZIP は階層維持で再ソート、Ctrl+G は検索結果再ソート、通常は再ロード。
             self.apply_sort_change_reload();
+        }
+        if sort_reload_requested {
+            self.reload_from_sort_control(ctx);
         }
         if let Some(id) = smart_folder_open {
             let refresh =
@@ -8683,6 +8853,7 @@ impl App {
         let mut toolbar_fav_nav: Option<PathBuf> = None;
         let mut toolbar_smart_folder_open: Option<uuid::Uuid> = None;
         let mut toolbar_sort_changed = false;
+        let mut toolbar_sort_reload_requested = false;
         let mut toolbar_rating_changed = false;
         let mut toolbar_rating_assign_selection: Option<u8> = None;
         let mut toolbar_rating_assign_container: Option<u8> = None;
@@ -9248,6 +9419,9 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 }
                             }
                             for &order in &tb_sorts {
+                                if !sort_order_visible_on_surface(order, root_order.is_some()) {
+                                    continue;
+                                }
                                 let selected = if sort_disabled {
                                     false
                                 } else if let Some(root) = root_order {
@@ -9262,16 +9436,20 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     self.settings.sort_order == order
                                 };
                                 let resp = ui.add_enabled(
-                                    !sort_disabled,
+                                    !sort_disabled && !(self.items_are_bookmark_view && order.is_rating()),
                                     egui::Button::selectable(selected, order.short_label()),
                                 );
                                 // 固定中はボタンが無効なので、通常 hover ではなく disabled
                                 // 専用ツールチップで固定理由を出す。
                                 let resp = match sort_lock {
                                     Some(reason) => resp.hover_tip_disabled(reason.tooltip()),
+                                    None if self.items_are_bookmark_view && order.is_rating() =>
+                                        resp.hover_tip_disabled("ブックマーク一覧では評価順を使えません"),
                                     None => resp.on_hover_text(order.description()),
                                 };
-                                if resp.clicked() && !selected {
+                                match sort_control_decision(resp.clicked(), selected, order) {
+                                    SortControlDecision::Reload => toolbar_sort_reload_requested = true,
+                                    SortControlDecision::Change => {
                                     if let Some(root) = root_order {
                                         self.request_collection_grid_set_order(
                                             root,
@@ -9296,6 +9474,8 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                         self.settings.save();
                                         toolbar_sort_changed = true;
                                     }
+                                    }
+                                    SortControlDecision::None => {}
                                 }
                             }
                             if self.items_are_rating_view {
@@ -9380,6 +9560,9 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                             ui.separator();
                                         }
                                         for &order in &tb_sorts {
+                                            if !sort_order_visible_on_surface(order, root_order.is_some()) {
+                                                continue;
+                                            }
                                             let selected = if let Some(root) = root_order {
                                                 root.mode == crate::collection_store::CollectionOrderMode::Standard && root.standard_sort == order
                                             } else if self.items_are_bookmark_view {
@@ -9391,11 +9574,18 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                             } else {
                                                 self.settings.sort_order == order
                                             };
-                                            let resp = ui
-                                                .selectable_label(selected, order.short_label())
-                                                .on_hover_text(order.description());
-                                            if resp.clicked() && !selected
-                                            {
+                                            let resp = ui.add_enabled(
+                                                !(self.items_are_bookmark_view && order.is_rating()),
+                                                egui::Button::selectable(selected, order.short_label()),
+                                            );
+                                            let resp = if self.items_are_bookmark_view && order.is_rating() {
+                                                resp.hover_tip_disabled("ブックマーク一覧では評価順を使えません")
+                                            } else {
+                                                resp.on_hover_text(order.description())
+                                            };
+                                            match sort_control_decision(resp.clicked(), selected, order) {
+                                                SortControlDecision::Reload => toolbar_sort_reload_requested = true,
+                                                SortControlDecision::Change => {
                                                 if let Some(root) = root_order {
                                                     self.request_collection_grid_set_order(
                                                         root,
@@ -9420,6 +9610,8 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                                     self.settings.save();
                                                     toolbar_sort_changed = true;
                                                 }
+                                                }
+                                                SortControlDecision::None => {}
                                             }
                                         }
                                         if self.items_are_rating_view {
@@ -9498,6 +9690,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     // ソート候補を全部外したときの右クリック誘導 (Codex P3)。
                     if tb_sorts.is_empty() {
                         ui.label(egui::RichText::new("(右クリックでソートを選択)").weak());
+                    }
+                    if self.grid_sort_refresh_available() {
+                        let refresh = ui.button("⟳").on_hover_text("最新の情報に更新");
+                        refresh.widget_info(|| egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button, true, "最新の情報に更新"));
+                        if refresh.clicked() {
+                            toolbar_sort_reload_requested = true;
+                        }
                     }
                 }
                 TS::Rating => {
@@ -9961,6 +10161,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // 再ロードすると Ctrl+G ビューから抜けるため)、通常フォルダは再ロード。
         if toolbar_sort_changed {
             self.apply_sort_change_reload();
+        }
+        if toolbar_sort_reload_requested {
+            self.reload_from_sort_control(ctx);
         }
 
         // レーティングフィルタ変更: 設定を保存して visible_indices を再計算。

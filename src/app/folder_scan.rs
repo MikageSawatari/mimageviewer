@@ -200,8 +200,13 @@ pub(crate) fn materialize_local_folder_listing(
         path,
         scan,
         settings,
-        crate::rating_sort::ListingOrderRequest::Standard(settings.sort_order),
-        |_| unreachable!("standard order never reads rating facts"),
+        crate::rating_sort::ListingOrderRequest::from_settings(settings),
+        |keys| {
+            crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
+                .map_err(|error| error.to_string())?
+                .get_many_complete(keys, 0)
+                .map_err(|error| error.to_string())
+        },
     )
 }
 

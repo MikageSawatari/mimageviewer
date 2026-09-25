@@ -1359,9 +1359,16 @@ topbar の親フォルダ / ホームだけに `navigation-icon` を付け、40�
 
 GET /api/list の remote-web ローカル走査を廃止し、FolderListRequest /
 FolderListPayload を本体 IPC へ追加する。正本は
-app::folder_scan::materialize_local_folder_listing である。App::load_folder が直接使い、
+app::folder_scan::materialize_local_folder_listing_with_order である。App::load_folder が直接使い、
 remote container / folder list は ContainerEngine::recompute_folder_listing という scan wrapper
 から同じ関数を使う。remote-web は一覧の分類・sort・sidecar / 重複規則を持たない。
+
+評価順では ContainerEngine の worker が `RemoteListingSettings` に載る並び順と未評価位置を
+一緒に読み、rating.db の対象 key 全件を完全に読んでから一覧を確定する。評価の書き込みは
+表示中の一覧の行を移動しない。物理フォルダの一覧 payload は評価 badge を運ばない。明示 reload、navigation、sort 変更は
+新しい一覧を取得する。sort 候補とラベルは既存の `RemoteGridSortState` の動的配列で運ぶ。
+評価の完全読み取りに失敗した物理フォルダは名前順で表示し、一覧の通知欄へ理由を示す。
+この通知用に `FolderListPayload.sort_notice` を追加したため protocol v61 とする。
 
 FolderListEntry は address、thumbnail_address、name、RemoteEntryKind、size、
 mtime を運ぶ。動画と同名画像が video_thumb_use_sidecar_image により吸収された場合、動画の
@@ -1871,7 +1878,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-現行版は **v60**。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
+現行版は **v61**。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
 `{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
 catalog / snapshot / navigation を追加した。collection の session spread request と
 address-based `page_groups` を追加した版は v49。
