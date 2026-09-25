@@ -1664,12 +1664,16 @@ pub enum KeyAction {
     RatingItem4,
     RatingItem5,
     RatingItemClear,
+    RatingItemStepUp,
+    RatingItemStepDown,
     RatingContainer1,
     RatingContainer2,
     RatingContainer3,
     RatingContainer4,
     RatingContainer5,
     RatingContainerClear,
+    RatingContainerStepUp,
+    RatingContainerStepDown,
     FsContinuousScrollForward,
     FsContinuousScrollBack,
     FsSpreadShiftLeft,
@@ -2211,12 +2215,16 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::RatingItem4,
     KeyAction::RatingItem5,
     KeyAction::RatingItemClear,
+    KeyAction::RatingItemStepUp,
+    KeyAction::RatingItemStepDown,
     KeyAction::RatingContainer1,
     KeyAction::RatingContainer2,
     KeyAction::RatingContainer3,
     KeyAction::RatingContainer4,
     KeyAction::RatingContainer5,
     KeyAction::RatingContainerClear,
+    KeyAction::RatingContainerStepUp,
+    KeyAction::RatingContainerStepDown,
     KeyAction::FsContinuousScrollForward,
     KeyAction::FsContinuousScrollBack,
     KeyAction::FsSpreadShiftLeft,
@@ -3255,6 +3263,45 @@ const RATING_CONTAINER_ACTIONS: &[(KeyAction, u8)] = &[
     (KeyAction::RatingContainerClear, 0),
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RatingStepDirection {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RatingEdit {
+    Assign(u8),
+    Step(RatingStepDirection),
+}
+
+/// An unrated item uses 3 only as the starting point for one step.
+pub fn step_rating(current: u8, direction: RatingStepDirection) -> Option<u8> {
+    let base = if current == 0 { 3 } else { current.min(5) };
+    match direction {
+        RatingStepDirection::Up if base < 5 => Some(base + 1),
+        RatingStepDirection::Down if base > 1 => Some(base - 1),
+        _ => None,
+    }
+}
+
+fn rating_step_actions(container: bool) -> [(KeyAction, RatingStepDirection); 2] {
+    if container {
+        [
+            (KeyAction::RatingContainerStepUp, RatingStepDirection::Up),
+            (
+                KeyAction::RatingContainerStepDown,
+                RatingStepDirection::Down,
+            ),
+        ]
+    } else {
+        [
+            (KeyAction::RatingItemStepUp, RatingStepDirection::Up),
+            (KeyAction::RatingItemStepDown, RatingStepDirection::Down),
+        ]
+    }
+}
+
 const FAVORITE_LOCATION_ACTIONS: [KeyAction; 20] = [
     KeyAction::GridOpenFavorite1,
     KeyAction::GridOpenFavorite2,
@@ -4121,12 +4168,16 @@ impl KeyAction {
             RatingItem4 => "RatingItem4",
             RatingItem5 => "RatingItem5",
             RatingItemClear => "RatingItemClear",
+            RatingItemStepUp => "RatingItemStepUp",
+            RatingItemStepDown => "RatingItemStepDown",
             RatingContainer1 => "RatingContainer1",
             RatingContainer2 => "RatingContainer2",
             RatingContainer3 => "RatingContainer3",
             RatingContainer4 => "RatingContainer4",
             RatingContainer5 => "RatingContainer5",
             RatingContainerClear => "RatingContainerClear",
+            RatingContainerStepUp => "RatingContainerStepUp",
+            RatingContainerStepDown => "RatingContainerStepDown",
             FsContinuousScrollForward => "FsContinuousScrollForward",
             FsContinuousScrollBack => "FsContinuousScrollBack",
             FsSpreadShiftLeft => "FsSpreadShiftLeft",
@@ -4833,12 +4884,16 @@ impl KeyAction {
             RatingItem4 => "星4を付ける（アイテム）",
             RatingItem5 => "星5を付ける（アイテム）",
             RatingItemClear => "レーティングを解除する（アイテム）",
+            RatingItemStepUp => "評価を1段階上げる（アイテム）",
+            RatingItemStepDown => "評価を1段階下げる（アイテム）",
             RatingContainer1 => "星1を付ける（コンテナ）",
             RatingContainer2 => "星2を付ける（コンテナ）",
             RatingContainer3 => "星3を付ける（コンテナ）",
             RatingContainer4 => "星4を付ける（コンテナ）",
             RatingContainer5 => "星5を付ける（コンテナ）",
             RatingContainerClear => "レーティングを解除する（コンテナ）",
+            RatingContainerStepUp => "評価を1段階上げる（コンテナ）",
+            RatingContainerStepDown => "評価を1段階下げる（コンテナ）",
             FsContinuousScrollForward => "連結表示中に次の画面分へスクロールする",
             FsContinuousScrollBack => "連結表示中に前の画面分へスクロールする",
             FsSpreadShiftLeft => "見開き表示を左方向へ1ページずらす",
@@ -5342,9 +5397,22 @@ impl KeyAction {
             FsToggleMetadata | FsToggleWindowMode | FsBackToList | FsJumpFirst | FsJumpLast
             | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext | FsPanorama
             | FsPanoramaProjection => KeyContext::FsCommon,
-            RatingItem1 | RatingItem2 | RatingItem3 | RatingItem4 | RatingItem5
-            | RatingItemClear | RatingContainer1 | RatingContainer2 | RatingContainer3
-            | RatingContainer4 | RatingContainer5 | RatingContainerClear => KeyContext::Rating,
+            RatingItem1
+            | RatingItem2
+            | RatingItem3
+            | RatingItem4
+            | RatingItem5
+            | RatingItemClear
+            | RatingItemStepUp
+            | RatingItemStepDown
+            | RatingContainer1
+            | RatingContainer2
+            | RatingContainer3
+            | RatingContainer4
+            | RatingContainer5
+            | RatingContainerClear
+            | RatingContainerStepUp
+            | RatingContainerStepDown => KeyContext::Rating,
             FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsClose
@@ -5840,12 +5908,16 @@ impl KeyAction {
             | RatingItem4
             | RatingItem5
             | RatingItemClear
+            | RatingItemStepUp
+            | RatingItemStepDown
             | RatingContainer1
             | RatingContainer2
             | RatingContainer3
             | RatingContainer4
             | RatingContainer5
             | RatingContainerClear
+            | RatingContainerStepUp
+            | RatingContainerStepDown
             | FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsSpreadShiftLeft
@@ -6368,12 +6440,14 @@ impl KeyAction {
             RatingItem4 => ChordList::one(Chord::key(F4)),
             RatingItem5 => ChordList::one(Chord::key(F5)),
             RatingItemClear => ChordList::one(Chord::key(F6)),
+            RatingItemStepUp | RatingItemStepDown => ChordList::EMPTY,
             RatingContainer1 => ChordList::one(Chord::shift(F1)),
             RatingContainer2 => ChordList::one(Chord::shift(F2)),
             RatingContainer3 => ChordList::one(Chord::shift(F3)),
             RatingContainer4 => ChordList::one(Chord::shift(F4)),
             RatingContainer5 => ChordList::one(Chord::shift(F5)),
             RatingContainerClear => ChordList::one(Chord::shift(F6)),
+            RatingContainerStepUp | RatingContainerStepDown => ChordList::EMPTY,
             FsContinuousScrollForward => ChordList::one(Chord::key(PageDown)),
             FsContinuousScrollBack => ChordList::one(Chord::key(PageUp)),
             FsSpreadShiftLeft => ChordList::one(Chord::ctrl(Left)),
@@ -6786,7 +6860,7 @@ enum IniTemplateKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RatingKey {
     pub container: bool,
-    pub stars: u8,
+    pub edit: RatingEdit,
 }
 
 pub const GRID_ACTIVE_SCOPES: &[CommandScope] =
@@ -7530,11 +7604,26 @@ impl Keymap {
         )
     }
 
-    pub fn consume_rating_action(&self, ctx: &egui::Context, container: bool) -> Option<u8> {
+    pub fn consume_rating_action(
+        &self,
+        ctx: &egui::Context,
+        container: bool,
+    ) -> Option<RatingEdit> {
         rating_actions(container)
             .iter()
             .copied()
-            .find_map(|(action, stars)| self.consume_action(ctx, action).then_some(stars))
+            .find_map(|(action, stars)| {
+                self.consume_action(ctx, action)
+                    .then_some(RatingEdit::Assign(stars))
+            })
+            .or_else(|| {
+                rating_step_actions(container)
+                    .into_iter()
+                    .find_map(|(action, direction)| {
+                        self.consume_action(ctx, action)
+                            .then_some(RatingEdit::Step(direction))
+                    })
+            })
     }
 
     #[cfg(windows)]
@@ -7548,7 +7637,18 @@ impl Keymap {
         for container in [true, false] {
             for (action, stars) in rating_actions(container).iter().copied() {
                 if self.matches_vk_action(action, key) {
-                    return Some(RatingKey { container, stars });
+                    return Some(RatingKey {
+                        container,
+                        edit: RatingEdit::Assign(stars),
+                    });
+                }
+            }
+            for (action, direction) in rating_step_actions(container) {
+                if self.matches_vk_action(action, key) {
+                    return Some(RatingKey {
+                        container,
+                        edit: RatingEdit::Step(direction),
+                    });
                 }
             }
         }
@@ -12830,7 +12930,10 @@ mod tests {
 
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x71, 0x3c)]);
-        assert_eq!(keymap.consume_rating_action(&ctx, false), Some(2));
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, false),
+            Some(RatingEdit::Assign(2))
+        );
         let _ = ctx.end_pass();
 
         begin_key_pass(&ctx, egui::Key::Home, egui::Modifiers::NONE);
@@ -12929,6 +13032,34 @@ mod tests {
     }
 
     #[test]
+    fn rating_step_table_and_action_catalog() {
+        let expected_up = [Some(4), Some(2), Some(3), Some(4), Some(5), None];
+        let expected_down = [Some(2), None, Some(1), Some(2), Some(3), Some(4)];
+        for current in 0..=5 {
+            assert_eq!(
+                step_rating(current, RatingStepDirection::Up),
+                expected_up[current as usize]
+            );
+            assert_eq!(
+                step_rating(current, RatingStepDirection::Down),
+                expected_down[current as usize]
+            );
+        }
+        for action in [
+            KeyAction::RatingItemStepUp,
+            KeyAction::RatingItemStepDown,
+            KeyAction::RatingContainerStepUp,
+            KeyAction::RatingContainerStepDown,
+        ] {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(action.context(), KeyContext::Rating);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+        }
+    }
+
+    #[test]
     fn rating_actions_are_exact_and_customizable() {
         // consume_action consults the process-global Win32 key frame on Windows;
         // serialize against the native-frame tests and clear the frame so a
@@ -12943,7 +13074,10 @@ mod tests {
 
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::SHIFT);
         assert_eq!(keymap.consume_rating_action(&ctx, false), None);
-        assert_eq!(keymap.consume_rating_action(&ctx, true), Some(2));
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, true),
+            Some(RatingEdit::Assign(2))
+        );
         assert_eq!(ctx.input(|i| i.events.len()), 0);
         let _ = ctx.end_pass();
 
@@ -12960,8 +13094,27 @@ mod tests {
         let _ = ctx.end_pass();
 
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
-        assert_eq!(keymap.consume_rating_action(&ctx, false), Some(1));
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, false),
+            Some(RatingEdit::Assign(1))
+        );
         assert_eq!(ctx.input(|i| i.events.len()), 0);
+        let _ = ctx.end_pass();
+
+        let keymap = Keymap::from_ini_str(
+            "[Rating]\nRatingItemStepUp = Ctrl+F1\nRatingContainerStepDown = Alt+F2\n",
+        );
+        begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, false),
+            Some(RatingEdit::Step(RatingStepDirection::Up))
+        );
+        let _ = ctx.end_pass();
+        begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::ALT);
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, true),
+            Some(RatingEdit::Step(RatingStepDirection::Down))
+        );
         let _ = ctx.end_pass();
     }
 

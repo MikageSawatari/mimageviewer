@@ -338,12 +338,16 @@
 # RatingItem4 = F4 ; 星4を付ける（アイテム）
 # RatingItem5 = F5 ; 星5を付ける（アイテム）
 # RatingItemClear = F6 ; レーティングを解除する（アイテム）
+# RatingItemStepUp = none ; 評価を1段階上げる（アイテム）
+# RatingItemStepDown = none ; 評価を1段階下げる（アイテム）
 # RatingContainer1 = Shift+F1 ; 星1を付ける（コンテナ）
 # RatingContainer2 = Shift+F2 ; 星2を付ける（コンテナ）
 # RatingContainer3 = Shift+F3 ; 星3を付ける（コンテナ）
 # RatingContainer4 = Shift+F4 ; 星4を付ける（コンテナ）
 # RatingContainer5 = Shift+F5 ; 星5を付ける（コンテナ）
 # RatingContainerClear = Shift+F6 ; レーティングを解除する（コンテナ）
+# RatingContainerStepUp = none ; 評価を1段階上げる（コンテナ）
+# RatingContainerStepDown = none ; 評価を1段階下げる（コンテナ）
 
 [FsImage] ; 画像フルスクリーン
 # FsClose = Enter ; 画像フルスクリーンを閉じる

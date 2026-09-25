@@ -1454,6 +1454,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+
+**2026-09-25 §1.237 part A: rating step actions**
+
+`src/ui_fullscreen.rs` の既存 Rating key dispatch と `src/app/native_video.rs` の native key dispatch に、直接★指定と同じ context-local rating edit を接続。main / detached 共通の `App` 書き込み・session publication・Undo・表示更新経路を使用し、detached predicate、viewport identity、host、focus、lifecycle は変更しない。追加の detached 状態、時間窓、retry、repaint、reset は設けず、各 mounted context の既存 rating owner を使う機能追加なので §2 の症状パッチではない。
 **2026-09-25 §1.270: 別窓 RAR の物理ツリー移動**
 
 物理ツリーの既存 current path を着地可否と独立したソート起点として列挙し、Ignore、

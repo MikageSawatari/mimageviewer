@@ -40899,16 +40899,12 @@ impl App {
         // visible_indices の有無に関係なく処理する。
         {
             let shift_rating_key = self.keymap.consume_rating_action(ctx, true);
-            if let Some(stars) = shift_rating_key {
-                match self.set_current_folder_rating(stars) {
-                    Ok(true) => self.show_container_rating_toast(stars),
-                    Ok(false) => {}
-                    Err(error) => self.report_rating_write_error(&error),
-                }
+            if let Some(edit) = shift_rating_key {
+                self.apply_rating_edit_to_current_container(edit);
             }
             let rating_key = self.keymap.consume_rating_action(ctx, false);
-            if let Some(stars) = rating_key {
-                self.apply_rating_to_selection(stars);
+            if let Some(edit) = rating_key {
+                self.apply_rating_edit_to_selection(edit);
             }
         }
 
@@ -57607,6 +57603,72 @@ impl App {
         self.show_feedback_toast(msg);
     }
 
+    pub(crate) fn apply_rating_edit_to_current_container(
+        &mut self,
+        edit: crate::keymap::RatingEdit,
+    ) -> bool {
+        use crate::keymap::RatingEdit;
+        self.sync_current_context_rating_session_writes();
+        let stars = match edit {
+            RatingEdit::Assign(stars) => stars,
+            RatingEdit::Step(direction) => {
+                let before = self.current_folder_rating();
+                let Some(after) = crate::keymap::step_rating(before, direction) else {
+                    self.show_feedback_toast(Self::rating_step_bound_toast(direction));
+                    return false;
+                };
+                after
+            }
+        };
+        match self.set_current_folder_rating(stars) {
+            Ok(true) => {
+                self.show_container_rating_toast(stars);
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                self.report_rating_write_error(&error);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn apply_rating_edit_to_fullscreen_item(
+        &mut self,
+        idx: usize,
+        edit: crate::keymap::RatingEdit,
+    ) -> bool {
+        use crate::keymap::RatingEdit;
+        let stars = match edit {
+            RatingEdit::Assign(stars) => stars,
+            RatingEdit::Step(direction) => {
+                let before = self.get_rating(idx);
+                let Some(after) = crate::keymap::step_rating(before, direction) else {
+                    self.show_feedback_toast(Self::rating_step_bound_toast(direction));
+                    return false;
+                };
+                after
+            }
+        };
+        if !self.set_rating(idx, stars) {
+            return false;
+        }
+        self.rebuild_visible_indices();
+        if stars == 0 {
+            self.show_feedback_toast("[★解除]".to_string());
+        } else {
+            self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
+        }
+        true
+    }
+
+    fn rating_step_bound_toast(direction: crate::keymap::RatingStepDirection) -> String {
+        match direction {
+            crate::keymap::RatingStepDirection::Up => "[これ以上上げられません]".to_string(),
+            crate::keymap::RatingStepDirection::Down => "[これ以上下げられません]".to_string(),
+        }
+    }
+
     /// 現在一覧表示中のコンテナにレーティングを設定する (Shift+F1〜F6 用)。
     /// 合成パス (検索結果ビュー等) はスキップして `Ok(false)` を返す。
     /// Ctrl+G 検索中は `current_folder` が検索前のフォルダを指したままなので、
@@ -58299,10 +58361,19 @@ impl App {
     }
 
     pub(crate) fn apply_rating_to_selection(&mut self, stars: u8) {
+        self.apply_rating_edit_to_selection(crate::keymap::RatingEdit::Assign(stars));
+    }
+
+    pub(crate) fn apply_rating_edit_to_selection(&mut self, edit: crate::keymap::RatingEdit) {
+        use crate::keymap::RatingEdit;
         if self.items_are_drive_list {
             return;
         }
-        let stars = stars.min(5);
+        let edit = match edit {
+            RatingEdit::Assign(stars) => RatingEdit::Assign(stars.min(5)),
+            step => step,
+        };
+        self.sync_current_context_rating_session_writes();
         let targets = self.ratable_targets();
         if targets.is_empty() {
             return;
@@ -58312,15 +58383,21 @@ impl App {
         let mut pending_records: Vec<(usize, u8, u8)> = Vec::with_capacity(targets.len());
         for &idx in &targets {
             let before = self.rating_cache.get(&idx).copied().unwrap_or(0);
-            pending_records.push((idx, before, stars));
+            let after = match edit {
+                RatingEdit::Assign(stars) => Some(stars),
+                RatingEdit::Step(direction) => crate::keymap::step_rating(before, direction),
+            };
+            if let Some(after) = after {
+                pending_records.push((idx, before, after));
+            }
         }
         let mut successful_targets = Vec::with_capacity(targets.len());
         let mut undo_records = Vec::with_capacity(targets.len());
         let mut first_error = None;
-        for record @ (idx, _, _) in pending_records {
-            match self.set_rating_result(idx, stars) {
+        for record @ (idx, _, after) in pending_records {
+            match self.set_rating_result(idx, after) {
                 Ok(true) => {
-                    successful_targets.push(idx);
+                    successful_targets.push((idx, after));
                     undo_records.push(record);
                 }
                 Ok(false) => {}
@@ -58329,28 +58406,43 @@ impl App {
                 }
             }
         }
+        let had_error = first_error.is_some();
         if let Some(error) = first_error {
             self.report_rating_write_error(&error);
         }
         if successful_targets.is_empty() {
+            if let RatingEdit::Step(direction) = edit
+                && !had_error
+            {
+                self.show_feedback_toast(Self::rating_step_bound_toast(direction));
+            }
             return;
         }
-        let summary = if successful_targets.len() > 1 {
-            if stars == 0 {
+        let summary = match edit {
+            RatingEdit::Assign(stars) if successful_targets.len() > 1 && stars == 0 => {
                 format!("★解除を {} 件に適用", successful_targets.len())
-            } else {
+            }
+            RatingEdit::Assign(stars) if successful_targets.len() > 1 => {
                 format!("★{stars} を {} 件に付与", successful_targets.len())
             }
-        } else if stars == 0 {
-            "★解除".to_string()
-        } else {
-            format!("★{stars}")
+            RatingEdit::Assign(0) => "★解除".to_string(),
+            RatingEdit::Assign(stars) => format!("★{stars}"),
+            RatingEdit::Step(direction) => {
+                let verb = match direction {
+                    crate::keymap::RatingStepDirection::Up => "上げる",
+                    crate::keymap::RatingStepDirection::Down => "下げる",
+                };
+                format!("評価を1段階{verb} ({} 件)", successful_targets.len())
+            }
         };
-        self.capture_rating_undo(undo_records, summary);
+        self.capture_rating_undo(undo_records, summary.clone());
+        if matches!(edit, RatingEdit::Step(_)) {
+            self.show_feedback_toast(format!("[{summary}]"));
+        }
         let rating_view_changes: Vec<(String, u8)> = if self.items_are_rating_view {
             successful_targets
                 .iter()
-                .filter_map(|&idx| self.rating_path_key(idx).map(|key| (key, stars)))
+                .filter_map(|&(idx, after)| self.rating_path_key(idx).map(|key| (key, after)))
                 .collect()
         } else {
             Vec::new()
@@ -58358,15 +58450,20 @@ impl App {
         let bulk = successful_targets.len() > 1;
         if bulk {
             crate::logger::log(format!(
-                "[RATING] Bulk apply {stars} stars to {} items",
+                "[RATING] Bulk {summary} to {} items",
                 successful_targets.len(),
             ));
-            self.checked.clear();
         } else {
             crate::logger::log(format!(
-                "[RATING] Set {stars} stars on idx {}",
-                successful_targets[0]
+                "[RATING] {summary} on idx {}",
+                successful_targets[0].0
             ));
+        }
+        // A checked step can change just one item when the others are already at the bound.
+        // Keep direct-set's existing bulk-only clear rule; the no-change return above leaves
+        // checked targets intact when every step target is at its bound.
+        if bulk || (matches!(edit, RatingEdit::Step(_)) && !self.checked.is_empty()) {
+            self.checked.clear();
         }
         // Ctrl+G ヒットの stars はバッチ受信時の snapshot。レーティング変更後に
         // drilled view のサブフォルダ件数 / 枝刈りが古いまま残らないよう、
@@ -58377,7 +58474,12 @@ impl App {
         // ページ一覧が検索 drilled view の合成 items に置き換わる事故になる
         // (Codex P2)。
         if self.global_search.active {
-            self.refresh_global_search_hit_stars(&successful_targets);
+            self.refresh_global_search_hit_stars(
+                &successful_targets
+                    .iter()
+                    .map(|&(idx, _)| idx)
+                    .collect::<Vec<_>>(),
+            );
         }
         if self.items_are_rating_view {
             self.refresh_rating_view_after_rating_changes(&rating_view_changes);

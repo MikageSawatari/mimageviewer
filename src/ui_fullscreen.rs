@@ -29238,26 +29238,14 @@ impl App {
         // (フォルダ / ZIP / PDF) にレーティング / 解除。
         // current_folder がそのまま親コンテナなので、そちらに書き込めば一覧画面で★絞り込みできる。
         let container_rating_key = self.keymap.consume_rating_action(ctx, true);
-        if let Some(stars) = container_rating_key {
-            match self.set_current_folder_rating(stars) {
-                Ok(true) => self.show_container_rating_toast(stars),
-                Ok(false) => {}
-                Err(error) => self.report_rating_write_error(&error),
-            }
+        if let Some(edit) = container_rating_key {
+            self.apply_rating_edit_to_current_container(edit);
         }
 
         // レーティング 1〜5 / 解除 (既定: F1〜F6)
         let rating_key = self.keymap.consume_rating_action(ctx, false);
-        if let Some(stars) = rating_key {
-            if self.set_rating(fs_idx, stars) {
-                // レーティング変更でフィルタ境界を跨ぐ可能性があるので visible_indices 再計算。
-                self.rebuild_visible_indices();
-                if stars == 0 {
-                    self.show_feedback_toast("[★解除]".to_string());
-                } else {
-                    self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
-                }
-            }
+        if let Some(edit) = rating_key {
+            self.apply_rating_edit_to_fullscreen_item(fs_idx, edit);
         }
         if key_p_pin {
             self.toggle_folder_pin_for_idx(fs_idx);

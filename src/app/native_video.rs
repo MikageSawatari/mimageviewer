@@ -1015,6 +1015,8 @@ enum NativeVideoFixedKeyAction {
     MouseForward,
     RatingItem(u8),
     RatingContainer(u8),
+    RatingItemStep(crate::keymap::RatingStepDirection),
+    RatingContainerStep(crate::keymap::RatingStepDirection),
     ComparisonUnsupported,
 }
 
@@ -1037,6 +1039,8 @@ impl NativeVideoFixedKeyAction {
             Self::MouseForward => "mouse_forward".to_string(),
             Self::RatingItem(stars) => format!("rating_item_{stars}"),
             Self::RatingContainer(stars) => format!("rating_container_{stars}"),
+            Self::RatingItemStep(direction) => format!("rating_item_step_{direction:?}"),
+            Self::RatingContainerStep(direction) => format!("rating_container_step_{direction:?}"),
             Self::ComparisonUnsupported => "comparison_unsupported".to_string(),
         }
     }
@@ -11684,24 +11688,26 @@ impl App {
         let mut hud_activity = true;
         if let Some(rating_key) = self.keymap.native_video_rating_action(&key) {
             if rating_key.container {
-                match self.set_current_folder_rating(rating_key.stars) {
-                    Ok(true) => self.show_container_rating_toast(rating_key.stars),
-                    Ok(false) => hud_activity = false,
-                    Err(error) => {
-                        self.report_rating_write_error(&error);
-                        hud_activity = false;
-                    }
-                }
+                hud_activity = self.apply_rating_edit_to_current_container(rating_key.edit);
             } else {
-                self.apply_native_video_rating_key(fs_idx, rating_key.stars);
+                hud_activity = self.apply_rating_edit_to_fullscreen_item(fs_idx, rating_key.edit);
             }
             if hud_activity {
                 self.request_native_video_hud_repaint(ctx);
             }
-            let action = if rating_key.container {
-                NativeVideoFixedKeyAction::RatingContainer(rating_key.stars)
-            } else {
-                NativeVideoFixedKeyAction::RatingItem(rating_key.stars)
+            let action = match (rating_key.container, rating_key.edit) {
+                (true, crate::keymap::RatingEdit::Assign(stars)) => {
+                    NativeVideoFixedKeyAction::RatingContainer(stars)
+                }
+                (false, crate::keymap::RatingEdit::Assign(stars)) => {
+                    NativeVideoFixedKeyAction::RatingItem(stars)
+                }
+                (true, crate::keymap::RatingEdit::Step(direction)) => {
+                    NativeVideoFixedKeyAction::RatingContainerStep(direction)
+                }
+                (false, crate::keymap::RatingEdit::Step(direction)) => {
+                    NativeVideoFixedKeyAction::RatingItemStep(direction)
+                }
             };
             return NativeVideoKeyOutcome::FixedAction(action);
         }
@@ -12521,19 +12527,6 @@ impl App {
                     ("count", serde_json::Value::from(count)),
                 ],
             );
-        }
-    }
-
-    #[cfg(windows)]
-    fn apply_native_video_rating_key(&mut self, fs_idx: usize, stars: u8) {
-        if !self.set_rating(fs_idx, stars) {
-            return;
-        }
-        self.rebuild_visible_indices();
-        if stars == 0 {
-            self.show_feedback_toast("[★解除]".to_string());
-        } else {
-            self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
         }
     }
 

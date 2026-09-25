@@ -5050,6 +5050,361 @@ fn grid_selection_rating_records_one_batched_undo_entry() {
 }
 
 #[test]
+fn rating_step_grid_single_unrated_and_bound_are_distinct() {
+    use crate::keymap::{RatingEdit, RatingStepDirection};
+    let mut app = phase_c_support::setup_app();
+    let path = app.tmp.path().join("step-single.jpg");
+    app.items = vec![GridItem::Image(path)];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    let key = app.rating_path_key(0).unwrap();
+
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    app.apply_meta_undo();
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+    app.apply_meta_redo();
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+
+    app.rating_db.as_ref().unwrap().set(&key, 5).unwrap();
+    app.rating_cache.insert(0, 5);
+    let generation = app.rating_session_write_generation;
+    let undo_count = app.meta_undo.undo_len();
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    assert_eq!(app.rating_session_write_generation, generation);
+    assert_eq!(app.meta_undo.undo_len(), undo_count);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
+
+    app.rating_db.as_ref().unwrap().set(&key, 1).unwrap();
+    app.rating_cache.insert(0, 1);
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Down));
+    assert_eq!(app.rating_session_write_generation, generation);
+    assert_eq!(app.meta_undo.undo_len(), undo_count);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 1);
+}
+
+#[test]
+fn rating_step_checked_targets_use_individual_values_and_one_undo() {
+    use crate::keymap::{RatingEdit, RatingStepDirection};
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..4)
+        .map(|n| GridItem::Image(app.tmp.path().join(format!("step-{n}.jpg"))))
+        .collect();
+    app.image_metas = vec![None; 4];
+    app.thumbnails = vec![ThumbnailState::Pending; 4];
+    app.visible_indices = vec![0, 1, 2, 3];
+    app.selected = Some(0);
+    app.checked.extend([0, 1, 2, 3]);
+    let keys: Vec<_> = (0..4)
+        .map(|idx| app.rating_path_key(idx).unwrap())
+        .collect();
+    for (idx, rating) in [(0, 0), (1, 1), (2, 4), (3, 5)] {
+        app.rating_cache.insert(idx, rating);
+        if rating != 0 {
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set(&keys[idx], rating)
+                .unwrap();
+        }
+    }
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    for (key, expected) in keys.iter().zip([4, 2, 5, 5]) {
+        assert_eq!(app.rating_db.as_ref().unwrap().get(key), expected);
+    }
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected rating undo");
+    };
+    assert_eq!(changes.len(), 3);
+    app.apply_meta_undo();
+    for (key, expected) in keys.iter().zip([0, 1, 4, 5]) {
+        assert_eq!(app.rating_db.as_ref().unwrap().get(key), expected);
+    }
+    app.apply_meta_redo();
+    for (key, expected) in keys.iter().zip([4, 2, 5, 5]) {
+        assert_eq!(app.rating_db.as_ref().unwrap().get(key), expected);
+    }
+
+    app.checked.extend([0, 1, 2, 3]);
+    for (idx, key) in keys.iter().enumerate() {
+        app.rating_db.as_ref().unwrap().set(key, 5).unwrap();
+        app.rating_cache.insert(idx, 5);
+    }
+    let generation = app.rating_session_write_generation;
+    let undo_count = app.meta_undo.undo_len();
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    assert_eq!(app.rating_session_write_generation, generation);
+    assert_eq!(app.meta_undo.undo_len(), undo_count);
+}
+
+#[test]
+fn rating_step_fullscreen_and_container_keep_separate_keys() {
+    use crate::keymap::{RatingEdit, RatingStepDirection};
+    let mut app = phase_c_support::setup_app();
+    let pdf = app.tmp.path().join("step-book.pdf");
+    app.current_folder = Some(pdf.clone());
+    app.items = vec![GridItem::PdfPage {
+        pdf_path: pdf,
+        page_num: 0,
+        content_type: None,
+    }];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.fullscreen_idx = Some(0);
+    let page_key = app.rating_path_key(0).unwrap();
+    let container_key = app.current_container_rating_key_and_source().unwrap().0;
+
+    assert!(
+        app.apply_rating_edit_to_fullscreen_item(0, RatingEdit::Step(RatingStepDirection::Down))
+    );
+    assert!(app.apply_rating_edit_to_current_container(RatingEdit::Step(RatingStepDirection::Up)));
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&page_key), 2);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 4);
+    assert_eq!(app.meta_undo.undo_len(), 2);
+    app.apply_meta_undo();
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 0);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&page_key), 2);
+}
+
+#[test]
+fn rating_step_grid_key_handler_single_records_rating_and_undo() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.keymap = crate::keymap::Keymap::from_ini_str("[Rating]\nRatingItemStepUp = F13\n");
+    app.items = vec![GridItem::Image(
+        app.tmp.path().join("step-grid-key-single.jpg"),
+    )];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    let key = app.rating_path_key(0).unwrap();
+
+    let ctx = egui::Context::default();
+    ctx.begin_pass(viewport_raw_input(
+        egui::ViewportId::ROOT,
+        vec![fullscreen_fixed_key_event(egui::Key::F13)],
+    ));
+    let _ = app.handle_keyboard(&ctx);
+    let _ = ctx.end_pass();
+
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected rating undo from grid key handler");
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (&changes[0].path_key, changes[0].before, changes[0].after),
+        (&key, 0, 4)
+    );
+}
+
+#[test]
+fn rating_step_grid_key_handler_checked_multi_records_one_undo() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.keymap = crate::keymap::Keymap::from_ini_str("[Rating]\nRatingItemStepUp = F13\n");
+    app.items = (0..4)
+        .map(|idx| GridItem::Image(app.tmp.path().join(format!("step-grid-key-{idx}.jpg"))))
+        .collect();
+    app.image_metas = vec![None; 4];
+    app.thumbnails = vec![ThumbnailState::Pending; 4];
+    app.visible_indices = vec![0, 1, 2, 3];
+    app.selected = Some(0);
+    app.checked.extend([0, 1, 2, 3]);
+    let keys: Vec<_> = (0..4)
+        .map(|idx| app.rating_path_key(idx).unwrap())
+        .collect();
+    for (idx, rating) in [(0, 0), (1, 1), (2, 4), (3, 5)] {
+        app.rating_cache.insert(idx, rating);
+        if rating != 0 {
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set(&keys[idx], rating)
+                .unwrap();
+        }
+    }
+
+    let ctx = egui::Context::default();
+    ctx.begin_pass(viewport_raw_input(
+        egui::ViewportId::ROOT,
+        vec![fullscreen_fixed_key_event(egui::Key::F13)],
+    ));
+    let _ = app.handle_keyboard(&ctx);
+    let _ = ctx.end_pass();
+
+    for (key, expected) in keys.iter().zip([4, 2, 5, 5]) {
+        assert_eq!(app.rating_db.as_ref().unwrap().get(key), expected);
+    }
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected rating undo from checked grid key handler");
+    };
+    let mut recorded = changes
+        .iter()
+        .map(|change| (change.path_key.clone(), change.before, change.after))
+        .collect::<Vec<_>>();
+    recorded.sort();
+    let mut expected = vec![
+        (keys[0].clone(), 0, 4),
+        (keys[1].clone(), 1, 2),
+        (keys[2].clone(), 4, 5),
+    ];
+    expected.sort();
+    assert_eq!(recorded, expected);
+    assert!(app.checked.is_empty());
+}
+
+#[test]
+fn rating_step_grid_key_handler_partial_bound_clears_checks_but_all_bound_keeps_them() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.keymap = crate::keymap::Keymap::from_ini_str("[Rating]\nRatingItemStepUp = F13\n");
+    app.items = (0..2)
+        .map(|idx| GridItem::Image(app.tmp.path().join(format!("step-bound-key-{idx}.jpg"))))
+        .collect();
+    app.image_metas = vec![None; 2];
+    app.thumbnails = vec![ThumbnailState::Pending; 2];
+    app.visible_indices = vec![0, 1];
+    app.selected = Some(0);
+    app.checked.extend([0, 1]);
+    let keys: Vec<_> = (0..2)
+        .map(|idx| app.rating_path_key(idx).unwrap())
+        .collect();
+    for (idx, rating) in [(0, 4), (1, 5)] {
+        app.rating_cache.insert(idx, rating);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set(&keys[idx], rating)
+            .unwrap();
+    }
+
+    let press_step_up = |app: &mut App| {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(viewport_raw_input(
+            egui::ViewportId::ROOT,
+            vec![fullscreen_fixed_key_event(egui::Key::F13)],
+        ));
+        let _ = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+    };
+    press_step_up(&mut app);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[0]), 5);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[1]), 5);
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected rating undo from partially bounded grid step");
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (&changes[0].path_key, changes[0].before, changes[0].after),
+        (&keys[0], 4, 5)
+    );
+    assert!(
+        app.checked.is_empty(),
+        "a successful checked step clears checks"
+    );
+
+    app.checked.extend([0, 1]);
+    let write_generation = app.rating_session_write_generation;
+    press_step_up(&mut app);
+    assert_eq!(app.checked.len(), 2, "an all-bound step keeps checks");
+    assert!(app.checked.contains(&0));
+    assert!(app.checked.contains(&1));
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[0]), 5);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[1]), 5);
+    assert_eq!(app.rating_session_write_generation, write_generation);
+    assert_eq!(app.meta_undo.undo_len(), 1);
+}
+
+#[test]
+fn rating_step_still_fullscreen_key_handler_item_and_container_record_undo() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.keymap = crate::keymap::Keymap::from_ini_str(
+        "[Rating]\nRatingItemStepDown = F13\nRatingContainerStepUp = F14\n",
+    );
+    app.current_folder = Some(app.tmp.path().to_path_buf());
+    app.items = vec![GridItem::Image(
+        app.tmp.path().join("step-fullscreen-key.jpg"),
+    )];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.fullscreen_idx = Some(0);
+    let item_key = app.rating_path_key(0).unwrap();
+    let container_key = app.current_container_rating_key_and_source().unwrap().0;
+
+    let ctx = egui::Context::default();
+    for key in [egui::Key::F13, egui::Key::F14] {
+        ctx.begin_pass(viewport_raw_input(
+            egui::ViewportId::ROOT,
+            vec![fullscreen_fixed_key_event(key)],
+        ));
+        let _ = app.handle_fs_key_input(&ctx, 0, false);
+        let _ = ctx.end_pass();
+    }
+
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 2);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 4);
+    assert_eq!(app.meta_undo.undo_len(), 2);
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected container rating undo from fullscreen key handler");
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (&changes[0].path_key, changes[0].before, changes[0].after),
+        (&container_key, 0, 4)
+    );
+    app.apply_meta_undo();
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected item rating undo from fullscreen key handler");
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (&changes[0].path_key, changes[0].before, changes[0].after),
+        (&item_key, 0, 2)
+    );
+}
+
+#[test]
+fn rating_step_respects_xmp_setting_and_filter_membership() {
+    use crate::keymap::{RatingEdit, RatingStepDirection};
+    let mut app = phase_c_support::setup_app();
+    let path = app.tmp.path().join("step-filter.jpg");
+    app.items = vec![GridItem::Image(path)];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    app.settings.rating_filter = [false, false, false, false, true, false];
+    app.settings.write_rating_to_xmp = false;
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    assert!(app.rating_write_handle.is_none());
+    assert_eq!(app.visible_indices, vec![0]);
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    assert!(app.visible_indices.is_empty());
+
+    app.settings.rating_filter = [true; 6];
+    app.rebuild_visible_indices();
+    app.settings.write_rating_to_xmp = true;
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Down));
+    assert!(app.rating_write_handle.is_some());
+}
+
+#[test]
 fn metadata_panel_container_and_page_stars_record_isolated_undo_entries() {
     let mut app = phase_c_support::setup_app();
     let pdf = app.tmp.path().join("two-rating-rows.pdf");
@@ -44824,6 +45179,26 @@ mod native_video_rating_key_tests {
     }
 
     #[test]
+    fn native_video_custom_step_keys_use_item_and_container_rating_paths() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let folder = PathBuf::from(r"C:\clips");
+        app.current_folder = Some(folder.clone());
+        let idx = push_video(&mut app, folder.join("step.mp4"));
+        app.fullscreen_idx = Some(idx);
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Rating]\nRatingItemStepUp = F7\nRatingContainerStepDown = Shift+F7\n",
+        );
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x76, false));
+        assert_eq!(app.get_rating(idx), 4);
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x76, true));
+        let container_key = crate::adjustment_db::normalize_path(&folder);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 2);
+        assert_eq!(app.meta_undo.undo_len(), 2);
+    }
+
+    #[test]
     fn native_video_i_and_tab_toggle_side_panel_mode() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -45033,6 +45408,40 @@ mod native_video_rating_key_tests {
         app.poll_bookmark_browser(&egui::Context::default());
         assert_eq!(app.items_generation, generation_before);
         assert_eq!(app.rating_cache.get(&0), Some(&2));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn rating_step_in_detached_context_updates_main_rating_cache() {
+        let mut app = setup_app();
+        let path = PathBuf::from(r"C:\pics\detached-step.jpg");
+        let row = bookmark_image_rating_row(path.clone());
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.items = vec![row.item.clone()];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.rating_cache.insert(0, 2);
+        app.rating_db.as_ref().unwrap().set(&key, 2).unwrap();
+
+        app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+            detached.items = vec![row.item.clone()];
+            detached.thumbnails = vec![ThumbnailState::Pending];
+            detached.visible_indices = vec![0];
+            detached.rating_cache.insert(0, 2);
+            detached.fullscreen_idx = Some(0);
+            detached.viewer_presentation = ViewerPresentation::DetachedWindow;
+            detached.detached_viewer_independent_active = true;
+        });
+
+        app.with_active_viewer_context(|active| {
+            active.apply_rating_edit_to_fullscreen_item(
+                0,
+                crate::keymap::RatingEdit::Step(crate::keymap::RatingStepDirection::Up),
+            )
+        })
+        .expect("detached context");
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);
+        assert_eq!(app.rating_cache.get(&0), Some(&3));
     }
 
     #[test]
