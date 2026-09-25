@@ -2963,17 +2963,17 @@ impl App {
                     .extension()
                     .and_then(|ext| ext.to_str())
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
-                let has_saved_spread = self
-                    .spread_db
-                    .as_ref()
-                    .is_ok_and(|db| db.get_state_with_fallback(&path, None).mode.is_some());
-                let want_direction =
-                    self.settings.follow_document_reading_direction && !has_saved_spread;
-                let warm = if super::pdf_meta_placeholder_allowed(
+                let (want_direction, allow_placeholder) = super::pdf_open_direction_policy(
                     &path,
                     self.settings.follow_document_reading_direction,
-                    has_saved_spread,
-                ) {
+                    || {
+                        self.spread_db.as_ref().is_ok_and(|db| {
+                            let stored = db.get_state_with_fallback(&path, None);
+                            stored.mode.is_some() || stored.direction.is_some()
+                        })
+                    },
+                );
+                let warm = if allow_placeholder {
                     self.peek_pdf_meta_cache(&path, saved_password.is_some())
                 } else {
                     None

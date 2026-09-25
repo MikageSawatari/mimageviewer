@@ -191,6 +191,260 @@ fn document_direction_changes_only_unsaved_default_and_placeholder_policy() {
 }
 
 #[test]
+fn epub_d10_restore_keeps_single_direction_and_saved_spread() {
+    use crate::pdf_loader::PdfReadingDirection;
+    use crate::settings::{ReadingDirection, SpreadMode};
+
+    let mut app = setup_app_for_test();
+    let dir = TempDir::new().unwrap();
+    app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&dir.path().join("spread.db")).unwrap());
+    let path = dir.path().join("book.epub");
+    app.settings.follow_document_reading_direction = true;
+    app.settings.default_spread_mode = SpreadMode::Single;
+    app.settings.default_reading_direction = ReadingDirection::Ltr;
+    let defaults = SpreadRestoreDefaults::for_book(&app.settings);
+    app.apply_spread_for_key_with_document_direction(
+        &path,
+        None,
+        defaults,
+        Some(PdfReadingDirection::R2L),
+    )
+    .unwrap();
+    assert_eq!(
+        (app.spread_mode, app.reading_direction),
+        (SpreadMode::Single, ReadingDirection::Rtl)
+    );
+
+    app.settings.default_spread_mode = SpreadMode::LtrCover;
+    let defaults = SpreadRestoreDefaults::for_book(&app.settings);
+    app.apply_spread_for_key_with_document_direction(
+        &path,
+        None,
+        defaults,
+        Some(PdfReadingDirection::R2L),
+    )
+    .unwrap();
+    assert_eq!(
+        (app.spread_mode, app.reading_direction),
+        (SpreadMode::RtlCover, ReadingDirection::Rtl)
+    );
+    assert_eq!(app.settings.default_spread_mode, SpreadMode::LtrCover);
+
+    app.spread_db
+        .as_ref()
+        .unwrap()
+        .set_presentation_state(
+            &path,
+            SpreadMode::Ltr,
+            crate::settings::ReadingFlow::Paged,
+            ReadingDirection::Ltr,
+            (
+                SpreadMode::LtrCover,
+                app.settings.default_reading_flow,
+                ReadingDirection::Ltr,
+            ),
+        )
+        .unwrap();
+    app.apply_spread_for_key_with_document_direction(
+        &path,
+        None,
+        defaults,
+        Some(PdfReadingDirection::R2L),
+    )
+    .unwrap();
+    assert_eq!(
+        (app.spread_mode, app.reading_direction),
+        (SpreadMode::Ltr, ReadingDirection::Ltr)
+    );
+
+    app.settings.follow_document_reading_direction = false;
+    app.settings.default_spread_mode = SpreadMode::Single;
+    let defaults = SpreadRestoreDefaults::for_book(&app.settings);
+    app.apply_spread_for_key_with_document_direction(
+        &dir.path().join("off.epub"),
+        None,
+        defaults,
+        Some(PdfReadingDirection::R2L),
+    )
+    .unwrap();
+    assert_eq!(
+        (app.spread_mode, app.reading_direction),
+        (SpreadMode::Single, ReadingDirection::Ltr)
+    );
+    app.settings.default_spread_mode = SpreadMode::LtrCover;
+    app.settings.default_reading_direction = ReadingDirection::Rtl;
+    let defaults = SpreadRestoreDefaults::for_book(&app.settings);
+    app.apply_spread_for_key_with_document_direction(
+        &dir.path().join("off-mismatch.epub"),
+        None,
+        defaults,
+        Some(PdfReadingDirection::R2L),
+    )
+    .unwrap();
+    assert_eq!(
+        (app.spread_mode, app.reading_direction),
+        (SpreadMode::LtrCover, ReadingDirection::Ltr)
+    );
+}
+
+#[test]
+fn epub_d10_off_pdf_open_policy_skips_spread_lookup() {
+    let pdf = Path::new("C:/books/book.pdf");
+    let mut app = setup_app_for_test();
+    app.settings.follow_document_reading_direction = false;
+    app.spread_db = Err("この経路では参照しない".into());
+    app.load_pdf_as_folder_owned(pdf.to_path_buf(), OpenRequestOwner::Navigation);
+    assert!(
+        app.pdf_enumerate_pending
+            .as_ref()
+            .is_some_and(|pending| pending.0 == pdf)
+    );
+
+    let mut calls = 0;
+    let policy = pdf_open_direction_policy(pdf, false, || {
+        calls += 1;
+        false
+    });
+    assert_eq!(policy, (false, true));
+    assert_eq!(calls, 0);
+    let policy = pdf_open_direction_policy(pdf, true, || {
+        calls += 1;
+        false
+    });
+    assert_eq!(policy, (true, false));
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn epub_failure_replacement_restores_previous_request_history_and_address() {
+    use crate::settings::ArchiveFileHandling;
+    let mut app = setup_app_for_test();
+    app.settings
+        .set_archive_file_handling(ArchiveFileHandling::Ask);
+    let old = Path::new("C:/books/old.epub");
+    let new = Path::new("C:/books/new.epub");
+    let previous = PathBuf::from("C:/books/previous.pdf");
+    app.current_folder = Some(previous.clone());
+    app.address = old.to_string_lossy().into_owned();
+    let snapshot = app.folder_nav_history_snapshot();
+    assert_eq!(
+        app.route_pdf_open_failure(
+            OpenRequestOwner::Navigation,
+            old,
+            PdfOpenFailure::NotConverted
+        ),
+        PdfOpenFailureRoute::ConversionDialogOpened
+    );
+    app.epub_convert.as_mut().unwrap().nav_history_rollback = Some(snapshot);
+    app.epub_convert.as_mut().unwrap().deferred_fullscreen = Some(DeferredFsReopen {
+        history_trigger: HistoryTrigger::UserChosen,
+        resume_slideshow: false,
+        target: DeferredFsTarget::None,
+        resume_to_last_page: false,
+        from_explicit_open: false,
+        preserve_after_password_prompt: false,
+    });
+    app.fs_nav_locked_gen = Some(7);
+    app.recent_folders
+        .push(PathBuf::from("C:/books/intermediate"));
+    assert_eq!(
+        app.route_pdf_open_failure(
+            OpenRequestOwner::Navigation,
+            new,
+            PdfOpenFailure::NotConverted
+        ),
+        PdfOpenFailureRoute::ConversionDialogOpened
+    );
+    assert_eq!(app.address, previous.to_string_lossy());
+    assert!(app.recent_folders.is_empty());
+    assert!(app.fs_nav_locked_gen.is_none());
+    assert_eq!(app.epub_convert.as_ref().unwrap().src_path, new);
+}
+
+#[test]
+fn epub_published_stale_smart_owner_does_not_reopen_current_view() {
+    let mut app = setup_app_for_test();
+    let other = PathBuf::from("C:/books/current.pdf");
+    app.load_pdf_as_folder_owned(other.clone(), OpenRequestOwner::Navigation);
+    let path = PathBuf::from("C:/books/stale.epub");
+    let owner = OpenRequestOwner::MainGridArchive(MainGridArchiveTransitionIntent {
+        source_path: path.clone(),
+        reading_history_return_from: None,
+        suppress_rating_filter: false,
+        suppress_facet_filter: false,
+        smart_folder_owner: SmartGridArchiveOwner::UnclaimedSmart,
+        collection_grid_owner: None,
+        collection_navigation_continuation: None,
+    });
+    app.epub_convert = Some(
+        crate::ui_dialogs::epub_convert::EpubConvertState::completed_for_test(
+            path,
+            owner,
+            crate::epub_cache::PublishOutcome::Published,
+        ),
+    );
+    let ctx = egui::Context::default();
+    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    assert!(app.epub_convert.is_none());
+    assert_eq!(app.pdf_enumerate_pending.as_ref().unwrap().0, other);
+}
+
+#[test]
+fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() {
+    use super::top_level_grid_view::{
+        CollectionGridPhysicalLoadOrigin, CollectionGridPhysicalLoadOwner,
+        CollectionGridRequestStamp, CollectionGridViewportAnchor,
+    };
+    let mut app = setup_app_for_test();
+    let other = PathBuf::from("C:/books/current.pdf");
+    app.load_pdf_as_folder_owned(other.clone(), OpenRequestOwner::Navigation);
+    let path = PathBuf::from("C:/books/stale.epub");
+    let source_key = crate::collection_store::CollectionSourcePath::from_trusted(&path)
+        .unwrap()
+        .key()
+        .clone();
+    let owner = OpenRequestOwner::CollectionGridPhysical(CollectionGridPhysicalLoadOwner {
+        stamp: CollectionGridRequestStamp {
+            context_id: app.projected_viewer_context_id(),
+            surface_generation: 0,
+            collection_id: crate::collection_store::CollectionId::new(),
+        },
+        accepted_revision: 0,
+        wanted_revision: 0,
+        anchor: CollectionGridViewportAnchor {
+            entry_id: crate::collection_store::CollectionEntryId::new(),
+            source_key,
+        },
+        root_source_path: path.clone(),
+        target_path: path.clone(),
+        origin: CollectionGridPhysicalLoadOrigin::Root {
+            items_generation: 0,
+        },
+    });
+    let mut state = crate::ui_dialogs::epub_convert::EpubConvertState::completed_for_test(
+        path,
+        owner,
+        crate::epub_cache::PublishOutcome::Published,
+    );
+    state.nav_history_rollback = Some(app.folder_nav_history_snapshot());
+    state.deferred_fullscreen = Some(DeferredFsReopen {
+        history_trigger: HistoryTrigger::UserChosen,
+        resume_slideshow: false,
+        target: DeferredFsTarget::None,
+        resume_to_last_page: false,
+        from_explicit_open: false,
+        preserve_after_password_prompt: false,
+    });
+    app.epub_convert = Some(state);
+    let ctx = egui::Context::default();
+    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    let pending = app.pdf_enumerate_pending.as_ref().unwrap();
+    assert_eq!(pending.0, other);
+    assert!(pending.4.is_none());
+    assert!(app.fs_nav_after_pdf_enumerate.is_none());
+}
+
+#[test]
 fn epub_failure_route_preserves_owner_and_archive_handling_policy() {
     use crate::settings::ArchiveFileHandling;
     use crate::ui_dialogs::epub_convert::EpubConvertPhase;

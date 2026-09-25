@@ -10626,6 +10626,26 @@ pub(crate) fn pdf_meta_placeholder_allowed(
     !is_epub && (!follow || has_saved_spread)
 }
 
+/// Decide the PDF open policy without consulting spread.db on the default OFF path.
+pub(crate) fn pdf_open_direction_policy(
+    path: &Path,
+    follow: bool,
+    saved_spread: impl FnOnce() -> bool,
+) -> (bool, bool) {
+    let is_epub = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
+    if is_epub {
+        return (false, false);
+    }
+    if !follow {
+        return (false, true);
+    }
+    let saved = saved_spread();
+    (!saved, pdf_meta_placeholder_allowed(path, follow, saved))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SyntheticFolderHistoryDispatch {
     NotSynthetic,
@@ -21546,14 +21566,44 @@ impl App {
         self.final_cover_spread_preference = final_cover_preference;
         self.singleton_spread_endpoint_preferences = endpoint_preferences;
         self.page_alone_preferences = page_alone_preferences;
-        let default_spread = default_spread_for_document_direction(
-            defaults.spread_mode,
-            self.settings.follow_document_reading_direction,
-            document_direction,
-        );
-        let stored_spread = stored.mode.unwrap_or(default_spread);
+        let applied_document_direction = if self.settings.follow_document_reading_direction
+            && stored.mode.is_none()
+            && stored.direction.is_none()
+        {
+            document_direction.map(|direction| match direction {
+                crate::pdf_loader::PdfReadingDirection::R2L => {
+                    crate::settings::ReadingDirection::Rtl
+                }
+                crate::pdf_loader::PdfReadingDirection::L2R => {
+                    crate::settings::ReadingDirection::Ltr
+                }
+            })
+        } else {
+            None
+        };
+        // A saved mode fixes its own direction. A direction-only row rotates the default mode.
+        // Single has no embedded direction and keeps the saved/document/default direction.
+        let preferred_direction = stored
+            .direction
+            .or(applied_document_direction)
+            .unwrap_or(defaults.reading_direction);
+        let stored_spread = stored.mode.unwrap_or_else(|| {
+            if stored.direction.is_some() {
+                defaults
+                    .spread_mode
+                    .with_reading_direction(preferred_direction)
+            } else {
+                default_spread_for_document_direction(
+                    defaults.spread_mode,
+                    self.settings.follow_document_reading_direction,
+                    document_direction,
+                )
+            }
+        });
         self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
-        self.reading_direction = stored.direction.unwrap_or(defaults.reading_direction);
+        self.reading_direction = stored_spread
+            .reading_direction()
+            .unwrap_or(preferred_direction);
         if stored_spread == crate::settings::SpreadMode::Vertical {
             self.spread_mode = crate::settings::SpreadMode::Single;
             self.reading_flow = crate::settings::ReadingFlow::Vertical;
@@ -21561,9 +21611,6 @@ impl App {
             self.spread_mode = stored_spread;
         }
         self.spread_shift_anchor_idx = None;
-        // 読み順の対応表は `SpreadMode::reading_direction` が正本。ここへ写すと、
-        // モードを足したとき保存済みの本を開く経路だけ古いままになる。
-        self.update_reading_direction_from_spread_mode(self.spread_mode);
         Ok(())
     }
 
@@ -22296,6 +22343,30 @@ impl App {
                     return false;
                 }
                 true
+            }
+        }
+    }
+
+    /// Read-only half of the open claim, used before accepting a late conversion result.
+    pub(crate) fn open_request_owner_is_current(
+        &self,
+        path: &Path,
+        owner: &OpenRequestOwner,
+    ) -> bool {
+        if !self.snapshot_scope_allows_open(path, owner) {
+            return false;
+        }
+        match owner {
+            OpenRequestOwner::Navigation => true,
+            OpenRequestOwner::CollectionGridPhysical(collection) => {
+                self.collection_grid_physical_load_owner_is_current(collection, path)
+            }
+            OpenRequestOwner::MainGridArchive(_) => {
+                self.main_grid_archive_transition_is_current(owner)
+            }
+            OpenRequestOwner::Bookmark(bookmark) => self.bookmark_open_owner_is_current(bookmark),
+            OpenRequestOwner::DetachedGridArchive(detached) => {
+                self.detached_grid_archive_open_owner_is_current(detached)
             }
         }
     }
@@ -26721,16 +26792,17 @@ impl App {
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
-        let has_saved_spread = self
-            .spread_db
-            .as_ref()
-            .is_ok_and(|db| db.get_state_with_fallback(&pdf_path, None).mode.is_some());
-        let want_direction = self.settings.follow_document_reading_direction && !has_saved_spread;
-        let placeholder_built = if pdf_meta_placeholder_allowed(
+        let (want_direction, allow_placeholder) = pdf_open_direction_policy(
             &pdf_path,
             self.settings.follow_document_reading_direction,
-            has_saved_spread,
-        ) {
+            || {
+                self.spread_db.as_ref().is_ok_and(|db| {
+                    let stored = db.get_state_with_fallback(&pdf_path, None);
+                    stored.mode.is_some() || stored.direction.is_some()
+                })
+            },
+        );
+        let placeholder_built = if allow_placeholder {
             self.try_apply_pdf_meta_cache(&pdf_path, saved_password.is_some())
         } else {
             None
