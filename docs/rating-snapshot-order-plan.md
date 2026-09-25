@@ -2,7 +2,7 @@
 
 最終更新: 2026-09-25
 
-状態: 実装前設計 第5版。R1 実装中。
+状態: 実装前設計 第5版 (独立レビュー 5 回目の指摘で rolling read と読み取り失敗時の表示を追記)。R1 実装中。
 
 - 初版 (`d05fc1a76`、2026-09-15): 別セッションで作成。
 - 第2版 (`23d553814`): 独立レビュー 1 回目 (GPT-6 Sol / xhigh、REVISE) を反映。
@@ -25,7 +25,8 @@
 
 ## 0. 決定と対象
 
-評価昇順 / 降順は、一覧を開くか明示的に更新した時点の評価を一度だけ読んで並べる。
+評価昇順 / 降順は、一覧を開くか明示的に更新したときに評価を一度だけ読んで並べる (読み取り中の評価変更の
+扱いは §2.2 の rolling read)。
 表示中に評価を変更しても行を移動しない。ファイルメニューの「最新の情報に更新」、割り当てた
 `GridReload`、sort横の更新アイコン、選択中と同じ評価sortの再選択、一覧の開き直し、または
 並べ替え条件の明示変更で評価を読み直し、その時点で再び並べる。
@@ -147,8 +148,11 @@ RatingSortKey = Supported(u8 /* 0..=5, 0 = 未評価 */) | Unsupported
 - `RatingDb` に fallible な一括読み取りを追加する。既存 `get_many` と同じく 500 件程度の chunk ごとに短い
   読み取りを行い (chunk をまたぐ transaction は張らない)、どの chunk / row が失敗しても `Err` を返す。
   既存 `get_many` の挙動は既存呼び出し元のために残す。
-- chunk をまたぐ一貫性は要求しない。読み取り中に書かれた key は、並びの上では書き込み前・後どちらの値で
-  並んでもよい (どちらも「表示後の評価変更」の規則に収まる)。表示する評価は §3.2 の書き込み世代による重ね合わせで
+- chunk をまたぐ一貫性は要求しない (**rolling read**)。読み取り中に書かれた key は、並びの上では書き込み前・後
+  どちらの値で並んでもよい。複数項目をまとめて変える書き込み (チェックした項目への一括評価等) が chunk の間に
+  入った場合、前の chunk の項目は変更前、後の chunk の項目は変更後の値で並ぶことがあり、並びがどの一時点の評価とも
+  一致しないことを**許容する**。読み取り中の書き込みは、利用者から見ると「一覧を開いている途中の評価変更」であり、
+  表示後の評価変更と同じく並びへの反映を保証しない。次の reload で揃う。表示する評価は §3.2 の書き込み世代による重ね合わせで
   正しくなる。一つの transaction で全 chunk を読む案は、R1 の測定 (50,000 key、dev test profile、3 回) で
   UI thread の書き込みを 110〜134 ms 待たせたため採らない。
 - 結果は `CompleteRatingFacts` (対象 key 集合 + 値 map + 読み取り前の書き込み世代) として型で区別する。
@@ -163,6 +167,13 @@ RatingSortKey = Supported(u8 /* 0..=5, 0 = 未評価 */) | Unsupported
 名前順で install する。reload で既存一覧を保持する案は、folder load が materialize より前に出ていく context の
 状態 (open request、pending、Undo、ZIP 状態、destination) を変えるため、prepare / commit 境界の作り直しが
 必要になり、DB 読み取り失敗という稀な場合のためには見合わないので採らない。
+
+失敗時の badge と rating filter は、**評価順以外の sort で一覧を開いたときの既存経路とまったく同じ**にする
+(物理フォルダなら install 後の `prewarm_rating_cache`、他の producer ならそれぞれの既存の読み取り)。
+並べ替えだけが名前順になり、評価の表示と絞り込みは今日の非評価順と同じ挙動になる。その既存経路には
+「`get_many` が失敗した chunk を無言で読み飛ばす」「cache に無い項目は `get_rating` が UI thread で point read する」
+という既存の負債があるが、本計画はこれを変えず増やしもしない (§9.3)。test: 失敗時の install が非評価順の
+install と同じ cache / filter 経路を通り、評価順用の facts を部分的に使わないこと。
 
 **書き込み待ちの受入条件 (R1)**: `RatingDb` は journal mode を明示しておらず (既定の rollback journal)、
 利用者の書き込みは UI thread から同期で行い、busy timeout は 750 ms である。worker (Ctrl+G、Smart Folder、
@@ -418,6 +429,8 @@ Collection actor が閉じて**すべての Collection が開けなくなる** (
 - rating filter で row が消える / 現れる場合の survivor 順、newcomer 末尾、selected / checked の既存 policy。
 - thumbnail / Details 切替、Details 評価ヘッダ、別ヘッダ sort。
 - facts の読み取り失敗: open / reload とも名前順で install して通知。
+- chunk の間に複数項目の一括評価が入る場合: 各項目は変更前・後どちらかの値で並び、最初の描画の badge は全項目が
+  変更後の値になる (worker 側 producer、barrier)。
 
 ### 9.2 surface
 
