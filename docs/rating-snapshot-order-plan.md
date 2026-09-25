@@ -2,7 +2,7 @@
 
 最終更新: 2026-09-25
 
-状態: 実装前設計 第4版。R1 実装中。
+状態: 実装前設計 第5版。R1 実装中。
 
 - 初版 (`d05fc1a76`、2026-09-15): 別セッションで作成。
 - 第2版 (`23d553814`): 独立レビュー 1 回目 (GPT-6 Sol / xhigh、REVISE) を反映。
@@ -12,7 +12,10 @@
      (「★順に並べ直す」の一回きり操作は別件、§0.3)。
   2. 通常フォルダは、既存の UI thread 一括読み取り (`prewarm_rating_cache`) を並べ替えの前に移して使う
      (§4.1。新しい読み取りは増やさないが、既存の同期読み取りを worker へ移すこともしない)。
-- 第4版 (本版): 独立レビュー 3 回目 (REVISE) の指摘を反映。物理フォルダの読み取り位置 (§4.1)、
+- 第5版 (本版): 独立レビュー 4 回目と R1 の測定を反映。一括読み取りは chunk 単位 (一つの transaction は
+  書き込みを 110〜134 ms 待たせた)、読み取り失敗は open / reload とも名前順で続行、R2〜R3 用の
+  `ListingOrderRequest` (§7.1)、ブックマークの sort を写す経路の訂正 (§7.3)。
+- 第4版 (`96079bda6`): 独立レビュー 3 回目 (REVISE) の指摘を反映。物理フォルダの読み取り位置 (§4.1)、
   prepared 結果が持つ書き込み世代 (§2.2 / §3.2)、ブックマークは評価順だけを外す (§0.2 / §7.3)、
   Rating view を R3 へ移す (§5.4 / §8)、Collection の書き込み境界 (§7.2)、Snapshot surface の更新アイコン (§7.3)。
 
@@ -141,8 +144,13 @@ RatingSortKey = Supported(u8 /* 0..=5, 0 = 未評価 */) | Unsupported
 
 評価順の比較には、対象 key 全件について「読めた」ことが保証された facts だけを使う。
 
-- `RatingDb` に fallible な一括読み取りを追加する。一つの read transaction の中で全 chunk を読み、
-  どの chunk / row が失敗しても `Err` を返す。既存 `get_many` の挙動は既存呼び出し元のために残す。
+- `RatingDb` に fallible な一括読み取りを追加する。既存 `get_many` と同じく 500 件程度の chunk ごとに短い
+  読み取りを行い (chunk をまたぐ transaction は張らない)、どの chunk / row が失敗しても `Err` を返す。
+  既存 `get_many` の挙動は既存呼び出し元のために残す。
+- chunk をまたぐ一貫性は要求しない。読み取り中に書かれた key は、並びの上では書き込み前・後どちらの値で
+  並んでもよい (どちらも「表示後の評価変更」の規則に収まる)。表示する評価は §3.2 の書き込み世代による重ね合わせで
+  正しくなる。一つの transaction で全 chunk を読む案は、R1 の測定 (50,000 key、dev test profile、3 回) で
+  UI thread の書き込みを 110〜134 ms 待たせたため採らない。
 - 結果は `CompleteRatingFacts` (対象 key 集合 + 値 map + 読み取り前の書き込み世代) として型で区別する。
   map に無い key を 0 と解釈してよいのは、この型の中だけである。書き込み世代は、呼び出し側が読み取りの
   **前**に取った `rating_session_write_generation` を不透明な stamp として受け取り、そのまま保持する (§3.2)。
@@ -151,17 +159,18 @@ RatingSortKey = Supported(u8 /* 0..=5, 0 = 未評価 */) | Unsupported
   facts を持たない producer が評価順を comparator へ渡したら debug test で落ちる経路にする
   (無言で全件未評価扱いにしない)。
 
-読み取り失敗時: 既存一覧を保持できる reload では保持して通知する。初回 navigation では一覧を開けなくしない
-ため、評価順を適用できなかったことを通知し、決定的な名前順で install する。
+読み取り失敗時: open / reload とも一覧を開けなくしない。評価順を適用できなかったことを通知し、決定的な
+名前順で install する。reload で既存一覧を保持する案は、folder load が materialize より前に出ていく context の
+状態 (open request、pending、Undo、ZIP 状態、destination) を変えるため、prepare / commit 境界の作り直しが
+必要になり、DB 読み取り失敗という稀な場合のためには見合わないので採らない。
 
 **書き込み待ちの受入条件 (R1)**: `RatingDb` は journal mode を明示しておらず (既定の rollback journal)、
 利用者の書き込みは UI thread から同期で行い、busy timeout は 750 ms である。worker (Ctrl+G、Smart Folder、
-サブフォルダ展開、Remote) が一つの read transaction で大量の key を読む間、UI thread の書き込みが待たされうる。
-R1 で、reader が read transaction を保持している間に writer が commit を試みるよう barrier で競合を**確実に**
-起こし、書き込みが待たされた時間を測る test を置く。50,000 key の通常の読み取り時間とは分けて報告する。
-共有 CI での壁時計の assert だけを正しさの test にしない (測定は `#[ignore]` で手動実行)。書き込みの待ちが
-1 フレーム (16 ms) を超える場合は、WAL 化や書き込みの worker 化を実装者が独断で入れず、測定値を添えて
-設計担当へ返す。
+サブフォルダ展開、Remote) が一括読み取りをしている間、UI thread の書き込みは読み取り中の chunk 1 つ分だけ
+待たされうる。R1 で、reader が chunk の読み取り中に writer が commit を試みるよう barrier で競合を確実に起こし、
+50,000 key の読み取りと並行した書き込みの待ち時間を測る test を置く (`#[ignore]` で手動実行。共有 CI での
+壁時計の assert だけを正しさの test にしない)。待ちが 1 フレーム (16 ms) を超える場合は、WAL 化や書き込みの
+worker 化を実装者が独断で入れず、測定値を添えて設計担当へ返す。
 
 ## 3. snapshot の所有と寿命
 
@@ -190,7 +199,8 @@ thumbnail / details 切替、fullscreen open / close、Smart Folder resident roo
 第2版の「読み取り後に書き込みがあれば結果を捨てて作り直す」は、★増減のキーリピート等で一覧がいつまでも
 install されない恐れがあった。次の規則に置き換える。
 
-- **snapshot の時点は、§2.2 の read transaction である。** その時点の評価で並べた順をそのまま install する。
+- **snapshot は §2.2 の一括読み取りで読んだ値である。** 読んだ値で並べた順をそのまま install する。
+  読み取り中に書かれた key の並びは、書き込み前・後どちらの値でもよい (§2.2)。
 - 読み取り後、install 前に commit された書き込みは「表示後の評価変更」と同じ扱いにする。install 直後、
   最初の描画より前に cache / filter / membership へ反映し、順序へは反映しない。これで install は必ず一度で終わる。
 - この反映は、**その prepared 結果が持つ書き込み世代 (§2.2) より新しい ledger entry** を重ねる。context の
@@ -222,16 +232,15 @@ install 前 / install 後の書き込み) は、制御可能な barrier を使�
 
 **物理フォルダの流れ (利用者決定 2)**: `start_loading_items_inner` の時点では遅い。materialize
 (`src/app/folder_scan.rs`) が既に folder / media の並べ替え、重複除外、category 配置を終え、その順で動画の index
-などが振られている。また `start_loading_items_inner` は prewarm より前に出ていく context の状態を変えるので、
-そこで読み取りに失敗しても「reload では既存一覧を保持する」を守れない。したがって次のようにする。
+などが振られている。そこで後から並べ替えると、それらの index と揃えた sort metadata が古くなる。
+したがって次のようにする。
 
 1. 評価順のときだけ、物理フォルダの materialize / adoption の境界で、候補の除外が済んだ後、最終の並べ替えと
    index の導出の**前**に、UI thread で一回の完全な一括読み取り (§2.2) を行う。
 2. その facts で最終の並べ替えを行い、並んだ items、揃った sort metadata、評価 cache を一組にして
    `start_loading_items_inner` へ渡す。同関数は渡された cache を使い、後段の `prewarm_rating_cache()` を呼ばない
    (二度読みしない)。
-3. reload で読み取りに失敗した場合は、出ていく context の状態を一切変える前に止め、既存一覧を保持して通知する。
-   初回 open の失敗は名前順で続行して通知する (§2.2)。
+3. 読み取りに失敗した場合は、open / reload とも名前順で続行して通知する (§2.2)。
 4. main と detached は同じ folder load 経路に合流しているので、detached も同じ処理を通る。sibling の
    items / pending / generation に触れない。
 
@@ -335,6 +344,12 @@ thumbnail 表示の `visible_indices` は raw items index 順を保つため、f
 - R1〜R3 では評価順を内部の `RatingSortSpec` だけで扱い、`SortOrder` の公開 serde variant は足さない。
   Remote の入力 (`remote_ipc/mod.rs` の parse は `SortOrder` の全 variant を受け付ける)、保存済み settings、
   ゲームパッドの picker (`SortOrder::all()` を巡回) から、途中段階で評価順が入り込まないようにするため。
+- R2〜R3 で producer に評価順を渡すため、保存しない一時的な並べ方の要求型を置く。
+  `ListingOrderRequest = Standard(SortOrder) | Rating(RatingSortSpec)` (serde を付けない)。物理フォルダの
+  materialize、ファイル名スタックの group / member 並べ、Ctrl+G / Smart Folder / サブフォルダ展開の prepare は、
+  `settings.sort_order` を直接読まずにこの型を受け取る。App 側は一つの関数 (`ListingOrderRequest::from_settings`
+  相当) で要求を作り、R4 までは常に `Standard` を返す。R2〜R3 の test はこの関数の cfg(test) 上書き、または
+  prepare / materialize 関数へ `Rating` を直接渡して評価順の経路を駆動する。R4 は公開 variant をこの型へ写すだけにする。
 - R4 で `SortOrder::RatingAsc / RatingDesc` と `RatingSortUnratedPosition` (既定 `BetweenThreeAndTwo`、
   serde default 付きの新 field) を公開する。Remote は既存の settings snapshot 経由で読む。
 - ツールバーの sort 候補は、既定の 8 件構成のままの利用者だけを 10 件へ拡張する独立の one-time marker を
@@ -370,13 +385,13 @@ Collection actor が閉じて**すべての Collection が開けなくなる** (
 - 固定順の一覧 (Ctrl+S、タグ、閲覧履歴、★固定、ドライブ) は `grid_sort_lock_reason()` に「並べ替え固定」を
   表す lock 理由を加え、ツールバーとメニューの両方が同じ述語を見る。lock 中も更新アイコンは reload として使える。
 - ブックマーク一覧は lock しない。既存の通常 sort と登録時刻順は選べるまま、評価順の選択肢だけを使えなくして
-  理由を示す。全体の `settings.sort_order` を `BookmarkViewSort::Normal` へ写す UI 以外の経路 (ブックマーク一覧へ
-  入るとき) でも評価順を汎用 comparator へ渡さないよう、評価順から `BookmarkViewSort::Normal` への変換を型で
-  失敗させ、ブックマーク一覧の既定の並べ方を使う。
+  理由を示す。ブックマーク一覧を開くときは既存どおり `CreatedAtDesc` に戻る。全体の sort を変えたときに
+  `apply_sort_change_reload` が `BookmarkViewSort::Normal` の一覧へ全体の `settings.sort_order` を写す経路では、
+  評価順から `BookmarkViewSort::Normal` への変換を型で失敗させ、ブックマーク一覧の並べ方を変えない。
 - `TopLevelGridSurface::Snapshot` は reload が何もしないので、この surface では更新アイコンを出さない
   (または無効にする)。
-- test: 固定一覧とブックマーク一覧での menu、toolbar、更新アイコン、同値 click、全体が評価順のまま
-  ブックマーク一覧へ入る経路。
+- test: 固定一覧とブックマーク一覧での menu、toolbar、更新アイコン、同値 click、`Normal` のブックマーク一覧を
+  表示中に全体の sort を評価順へ変える経路 (`apply_sort_change_reload`)。
 - 新しい KeyAction は追加しない (既存 `GridReload` を使う)。
 
 ## 8. 実装段階と見積もり
@@ -385,8 +400,8 @@ Collection actor が閉じて**すべての Collection が開けなくなる** (
 
 | 段階 | 内容 | 受入条件と focused test |
 | --- | --- | --- |
-| R1 | `RatingSortKey`、`RatingSortSpec`、純粋比較、fallible な単一 transaction 一括読み取りと `CompleteRatingFacts` (書き込み世代の stamp を含む)、書き込み遅延の測定 test | 0–5 / Unsupported の全 table、tie、chunk 失敗、書き込み中の一貫 snapshot、barrier で競合を起こした書き込み遅延が 16 ms 以内 (超えたら設計担当へ返す) |
-| R2 | 物理フォルダ (main / detached、open / reload / Ctrl+↑↓ / BS) の評価順 install (§4.1 の読み取り位置)、ファイル名スタックの専用配置、§7.3 の lock 理由とブックマークの評価順除外、Snapshot の更新アイコン | main と detached、sibling 不変、exact selection、reload の読み取り失敗で出ていく context が不変、install 直後の書き込み反映、スタックの §4.2 test、失敗時の通知と名前順、固定一覧の lock、ブックマークの既存 sort 維持 |
+| R1 | `RatingSortKey`、`RatingSortSpec`、純粋比較、fallible な chunk 単位の一括読み取りと `CompleteRatingFacts` (書き込み世代の stamp を含む)、書き込み遅延の測定 test | 0–5 / Unsupported の全 table、tie、chunk 失敗、barrier で競合を起こした書き込み遅延が 16 ms 以内 (超えたら設計担当へ返す) |
+| R2 | `ListingOrderRequest` (§7.1)、物理フォルダ (main / detached、open / reload / Ctrl+↑↓ / BS) の評価順 install (§4.1 の読み取り位置)、ファイル名スタックの専用配置、§7.3 の lock 理由とブックマークの評価順除外、Snapshot の更新アイコン | main と detached、sibling 不変、exact selection、install 直後の書き込み反映、スタックの §4.2 test、読み取り失敗時の通知と名前順、固定一覧の lock、ブックマークの既存 sort 維持 |
 | R3 | Ctrl+G、Smart Folder、サブフォルダ展開、Rating view (§5.4)、Details、§5.2 の context publication、Ctrl+G membership-only rebuild | producer ごとの sort、書き込み / Undo / hydration 後に survivor 順不変、filter / Details ヘッダ、worker の前後境界 (barrier)、main + detached 2窓 (うち1つ parked) で別窓からの書き込み |
 | R4 | Remote 物理 / 特殊一覧、公開 (settings / ツールバー 8→10 / menu / Remote / ゲームパッド)、未評価位置の設定 UI、同値 click と更新アイコン、Collection 選択肢からの除外と書き込み境界の拒否、旧版互換 test、マニュアル・spec・keymap 説明 | control ごとに dispatch が 1 回だけ、8→10 と custom の migration、settings の旧版保護、collection.db に評価順が入らない、Remote の明示 reload、書き込み後に client が並べ替えない、`cargo fmt --check`、glyph check、`test-full.ps1`、`build-dev.ps1` |
 
@@ -402,7 +417,7 @@ Collection actor が閉じて**すべての Collection が開けなくなる** (
 - XMP hydration、metadata import、別 context / Remote からの書き込み後に badge / filter は更新され、順序は不変。
 - rating filter で row が消える / 現れる場合の survivor 順、newcomer 末尾、selected / checked の既存 policy。
 - thumbnail / Details 切替、Details 評価ヘッダ、別ヘッダ sort。
-- facts の読み取り失敗: reload では既存一覧を保持して通知、初回 open では名前順で install して通知。
+- facts の読み取り失敗: open / reload とも名前順で install して通知。
 
 ### 9.2 surface
 
