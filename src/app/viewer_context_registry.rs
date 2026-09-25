@@ -3915,8 +3915,13 @@ mod tests {
         );
         let stashed = app.stash_mounted_and_start_fresh("epub_test_stash");
         assert!(app.epub_convert.is_none());
+        // A Smart request in the fresh main context cannot supersede the stashed viewer's
+        // conversion. Exercise the actual dialog poll after mounting that viewer again.
+        app.smart_folder_transition_sequence += 1;
         let retained = app
             .with_viewer_context(stashed, |app| {
+                let ctx = egui::Context::default();
+                let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
                 app.epub_convert
                     .as_ref()
                     .is_some_and(|state| state.src_path == path)

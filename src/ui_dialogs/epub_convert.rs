@@ -36,6 +36,10 @@ enum EpubConvertMsg {
 pub(crate) struct EpubConvertState {
     pub(crate) src_path: PathBuf,
     pub(crate) owner: OpenRequestOwner,
+    // Existing viewer-context surface identity and Smart staged-request identity. Item
+    // refreshes do not supersede an open, but another top-level surface or staged Smart open does.
+    pub(crate) surface_generation: u64,
+    pub(crate) smart_transition_sequence: u64,
     pub(crate) nav_history_rollback: Option<FolderNavHistorySnapshot>,
     pub(crate) deferred_fullscreen: Option<crate::app::DeferredFsReopen>,
     pub(crate) phase: EpubConvertPhase,
@@ -51,16 +55,29 @@ impl Drop for EpubConvertState {
 
 #[cfg(test)]
 impl EpubConvertState {
+    pub(crate) fn fake_published_sender_for_test(&mut self) -> impl FnOnce() + use<> {
+        let (tx, rx) = mpsc::channel();
+        self.rx = rx;
+        self.phase = EpubConvertPhase::Converting(None);
+        move || {
+            let _ = tx.send(EpubConvertMsg::ConvertDone(Ok(PublishOutcome::Published)));
+        }
+    }
+
     pub(crate) fn completed_for_test(
         src_path: PathBuf,
         owner: OpenRequestOwner,
         outcome: PublishOutcome,
+        surface_generation: u64,
+        smart_transition_sequence: u64,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         tx.send(EpubConvertMsg::ConvertDone(Ok(outcome))).unwrap();
         Self {
             src_path,
             owner,
+            surface_generation,
+            smart_transition_sequence,
             nav_history_rollback: None,
             deferred_fullscreen: None,
             phase: EpubConvertPhase::Converting(None),
@@ -201,6 +218,8 @@ impl App {
                 let mut state = EpubConvertState {
                     src_path: logical.to_owned(),
                     owner,
+                    surface_generation: self.top_level_grid_view.generation(),
+                    smart_transition_sequence: self.smart_folder_transition_sequence,
                     nav_history_rollback: None,
                     deferred_fullscreen: None,
                     phase: EpubConvertPhase::Scanning,
@@ -236,10 +255,13 @@ impl App {
         })
     }
 
-    pub(crate) fn cancel_superseded_epub_convert(&mut self, path: &Path, owner: &OpenRequestOwner) {
-        if self.epub_convert.as_ref().is_some_and(|state| {
-            !crate::folder_tree::path_eq(&state.src_path, path) || &state.owner != owner
-        }) {
+    pub(crate) fn cancel_superseded_epub_convert(
+        &mut self,
+        _path: &Path,
+        _owner: &OpenRequestOwner,
+    ) {
+        // Every accepted later open is a new request, including a reload of the same path.
+        if self.epub_convert.is_some() {
             self.cancel_current_epub_convert();
         }
     }
@@ -251,7 +273,9 @@ impl App {
         let rollback = state.nav_history_rollback.take();
         let deferred = state.deferred_fullscreen.take();
         let source = state.src_path.clone();
+        let owner = state.owner.clone();
         drop(state);
+        self.abort_smart_archive_open_for_owner(&owner);
         if let Some(snapshot) = rollback {
             self.restore_folder_nav_history(snapshot);
         }
@@ -267,6 +291,14 @@ impl App {
     }
 
     pub(crate) fn show_epub_convert_dialog(&mut self, ctx: &egui::Context) {
+        if self
+            .epub_convert
+            .as_ref()
+            .is_some_and(|state| !self.epub_conversion_owner_is_current(state))
+        {
+            self.cancel_current_epub_convert();
+            return;
+        }
         let Some(mut state) = self.epub_convert.take() else {
             return;
         };
@@ -289,10 +321,10 @@ impl App {
                 ))) => {
                     let path = state.src_path.clone();
                     let owner = state.owner.clone();
-                    if !matches!(owner, OpenRequestOwner::CollectionGridPhysical(_))
-                        && !self.open_request_owner_is_current(&path, &owner)
-                    {
+                    if !self.epub_conversion_owner_is_current(&state) {
                         // The cache publication is valid, but this view no longer owns the open.
+                        self.epub_convert = Some(state);
+                        self.cancel_current_epub_convert();
                         return;
                     }
                     let rollback = state.nav_history_rollback.take();
@@ -409,18 +441,8 @@ impl App {
             state.phase = EpubConvertPhase::Error(message);
         }
         if close {
-            let rollback = state.nav_history_rollback.take();
-            let owner = state.owner.clone();
-            let state_path = state.src_path.clone();
-            if state.deferred_fullscreen.take().is_some() {
-                self.finish_visible_container_fs_nav_failed();
-            }
-            drop(state);
-            self.abort_smart_archive_open_for_owner(&owner);
-            self.restore_address_after_epub_open_aborted(&state_path);
-            if let Some(snapshot) = rollback {
-                self.restore_folder_nav_history(snapshot);
-            }
+            self.epub_convert = Some(state);
+            self.cancel_current_epub_convert();
         } else {
             if matches!(
                 state.phase,
@@ -446,6 +468,8 @@ mod tests {
             EpubConvertState {
                 src_path: PathBuf::from("C:/books/book.epub"),
                 owner: OpenRequestOwner::Navigation,
+                surface_generation: 0,
+                smart_transition_sequence: 0,
                 nav_history_rollback: None,
                 deferred_fullscreen: None,
                 phase,

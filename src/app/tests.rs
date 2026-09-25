@@ -381,12 +381,90 @@ fn epub_published_stale_smart_owner_does_not_reopen_current_view() {
             path,
             owner,
             crate::epub_cache::PublishOutcome::Published,
+            app.top_level_grid_view.generation(),
+            app.smart_folder_transition_sequence,
         ),
     );
     let ctx = egui::Context::default();
     let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
     assert!(app.epub_convert.is_none());
     assert_eq!(app.pdf_enumerate_pending.as_ref().unwrap().0, other);
+}
+
+#[test]
+fn epub_navigation_published_after_collection_root_open_cannot_replace_root() {
+    let mut app = setup_app_for_test();
+    let temp = TempDir::new().unwrap();
+    app.settings
+        .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+    let path = temp.path().join("old.epub");
+    std::fs::write(&path, b"test").unwrap();
+    assert_eq!(
+        app.route_pdf_open_failure(
+            OpenRequestOwner::Navigation,
+            &path,
+            PdfOpenFailure::NotConverted,
+        ),
+        PdfOpenFailureRoute::ConversionDialogOpened,
+    );
+    let publish = app
+        .epub_convert
+        .as_mut()
+        .unwrap()
+        .fake_published_sender_for_test();
+    let collection_id = crate::collection_store::CollectionId::new();
+    app.open_collection_grid(collection_id, None);
+    publish();
+    let ctx = egui::Context::default();
+    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    assert!(app.epub_convert.is_none());
+    assert!(matches!(
+        app.top_level_grid_view.surface(),
+        top_level_grid_view::TopLevelGridSurface::Collection(identity)
+            if identity.collection_id == collection_id
+    ));
+    assert!(app.pdf_enumerate_pending.is_none());
+}
+
+#[test]
+fn epub_navigation_published_after_smart_root_request_cannot_replace_request() {
+    let mut app = setup_app_for_test();
+    let temp = TempDir::new().unwrap();
+    app.settings
+        .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+    let path = temp.path().join("old.epub");
+    let source = temp.path().join("smart-source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(&path, b"test").unwrap();
+    let mut definition = crate::settings::SmartFolderDefinition::new("Next");
+    definition.rules.push(crate::settings::SmartFolderRule::new(
+        source,
+        true,
+        Default::default(),
+    ));
+    let id = definition.id;
+    app.settings.smart_folders.push(definition);
+    assert_eq!(
+        app.route_pdf_open_failure(
+            OpenRequestOwner::Navigation,
+            &path,
+            PdfOpenFailure::NotConverted,
+        ),
+        PdfOpenFailureRoute::ConversionDialogOpened,
+    );
+    let publish = app
+        .epub_convert
+        .as_mut()
+        .unwrap()
+        .fake_published_sender_for_test();
+    app.open_smart_folder_staged(id, false);
+    assert!(app.smart_folder_transition.is_some());
+    publish();
+    let ctx = egui::Context::default();
+    let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+    assert!(app.epub_convert.is_none());
+    assert!(app.smart_folder_transition.is_some());
+    assert!(app.pdf_enumerate_pending.is_none());
 }
 
 #[test]
@@ -425,6 +503,8 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
         path,
         owner,
         crate::epub_cache::PublishOutcome::Published,
+        app.top_level_grid_view.generation(),
+        app.smart_folder_transition_sequence,
     );
     state.nav_history_rollback = Some(app.folder_nav_history_snapshot());
     state.deferred_fullscreen = Some(DeferredFsReopen {

@@ -22371,6 +22371,27 @@ impl App {
         }
     }
 
+    /// The surface generation belongs to the mounted viewer context. Smart transition IDs are
+    /// App-global, so only a main-context EPUB request may use that sequence for supersession.
+    pub(crate) fn epub_conversion_owner_is_current(
+        &self,
+        state: &crate::ui_dialogs::epub_convert::EpubConvertState,
+    ) -> bool {
+        if self.top_level_grid_view.generation() != state.surface_generation
+            || (self.projected_viewer_context_id() == self.viewer_context_main()
+                && self.smart_folder_transition_sequence != state.smart_transition_sequence)
+        {
+            return false;
+        }
+        if let OpenRequestOwner::MainGridArchive(intent) = &state.owner
+            && let SmartGridArchiveOwner::Transition(request_id) = intent.smart_folder_owner
+        {
+            return self.smart_epub_conversion_request_is_current(request_id, &state.src_path);
+        }
+        matches!(state.owner, OpenRequestOwner::CollectionGridPhysical(_))
+            || self.open_request_owner_is_current(&state.src_path, &state.owner)
+    }
+
     /// Adopt a physical destination only after its visible load has proved usable.
     ///
     /// Independent navigation retires a mounted collection at this boundary. A collection-owned
