@@ -44,6 +44,26 @@ pub enum Status {
 }
 
 impl Event {
+    pub fn failure(exit_code: i32, message: String) -> Self {
+        let status = match exit_code {
+            2 => Status::Drm,
+            3 => Status::Invalid,
+            4 => Status::Webview2Missing,
+            6 => Status::Timeout,
+            _ => Status::RenderFailed,
+        };
+        Self::Result {
+            status,
+            exit_code,
+            page_count: 0,
+            direction: "default".into(),
+            layout: "unknown".into(),
+            profile: crate::render::REFLOW_PROFILE.into(),
+            blocked_requests: 0,
+            message,
+        }
+    }
+
     pub fn from_report(report: &crate::Report) -> Self {
         let status = match report.exit_code {
             0 => Status::Success,

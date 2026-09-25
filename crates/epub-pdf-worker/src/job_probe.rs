@@ -8,7 +8,7 @@ use std::{
     mem::{size_of, zeroed},
     os::windows::process::CommandExt,
     path::Path,
-    process::Command,
+    process::{Child, Command},
     thread,
     time::{Duration, Instant},
 };
@@ -40,9 +40,12 @@ struct Summary {
     mode: String,
     converter_pid: u32,
     job_pids: BTreeSet<u32>,
+    pre_cancel_job_pids: BTreeSet<u32>,
     webview_pids: BTreeSet<u32>,
     webview_outside_job: BTreeSet<u32>,
     gone: bool,
+    pre_cancel_alive: bool,
+    termination_ms: Option<u128>,
     success: bool,
     message: String,
 }
@@ -51,6 +54,14 @@ struct OwnedHandle(HANDLE);
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+struct OwnerGuard(Child);
+impl Drop for OwnerGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -229,6 +240,47 @@ fn wait_gone(summary: &mut Summary, timeout: Duration) -> Result<(), String> {
     }
 }
 
+fn verify_live_members(
+    summary: &Summary,
+    live: &HashMap<u32, Process>,
+    members: &BTreeSet<u32>,
+) -> Result<(), String> {
+    if summary.webview_pids.is_empty() {
+        return Err("no WebView2 process was observed".into());
+    }
+    if !summary.webview_outside_job.is_empty() {
+        return Err(format!(
+            "WebView2 PIDs outside Job: {:?}",
+            summary.webview_outside_job
+        ));
+    }
+    if !live.contains_key(&summary.converter_pid) {
+        return Err("converter already exited before cancel".into());
+    }
+    if !members.contains(&summary.converter_pid) {
+        return Err("converter not in Job before cancel".into());
+    }
+    for pid in &summary.webview_pids {
+        if !live.contains_key(pid) {
+            return Err(format!("WebView2 PID {pid} already exited before cancel"));
+        }
+        if !members.contains(pid) {
+            return Err(format!("WebView2 PID {pid} not in Job before cancel"));
+        }
+    }
+    Ok(())
+}
+
+fn check_before_cancel(summary: &mut Summary, job: HANDLE) -> Result<(), String> {
+    let live = snapshot()?;
+    let members = job_members(job)?;
+    verify_live_members(summary, &live, &members)?;
+    summary.pre_cancel_job_pids = members.clone();
+    summary.job_pids.extend(members);
+    summary.pre_cancel_alive = true;
+    Ok(())
+}
+
 fn start_converter(
     input: &Path,
     output_dir: &Path,
@@ -327,6 +379,8 @@ fn run_owner(input: &Path, output_dir: &Path, state: Option<&Path>, timeout: Dur
             }
             thread::sleep(Duration::from_millis(100));
         }
+        observe(&mut summary, job.0, &mut ancestry)?;
+        check_before_cancel(&mut summary, job.0)?;
         if let Some(path) = state {
             summary.message = "ready".into();
             fs::write(
@@ -338,8 +392,11 @@ fn run_owner(input: &Path, output_dir: &Path, state: Option<&Path>, timeout: Dur
                 thread::sleep(Duration::from_secs(1));
             }
         }
+        let stopped_at = Instant::now();
         drop(job);
-        wait_gone(&mut summary, Duration::from_secs(20))?;
+        let gone = wait_gone(&mut summary, Duration::from_secs(20));
+        summary.termination_ms = Some(stopped_at.elapsed().as_millis());
+        gone?;
         summary.success = !summary.webview_pids.is_empty()
             && summary.webview_outside_job.is_empty()
             && summary.gone;
@@ -363,15 +420,17 @@ fn run_parent_kill(input: &Path, output_dir: &Path, timeout: Duration) -> Summar
     };
     let result = (|| -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let mut owner = Command::new(exe)
-            .arg("owner")
-            .arg(input)
-            .arg(output_dir)
-            .arg(&state)
-            .arg(timeout.as_secs().to_string())
-            .creation_flags(CREATE_NO_WINDOW.0)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        let mut owner = OwnerGuard(
+            Command::new(exe)
+                .arg("owner")
+                .arg(input)
+                .arg(output_dir)
+                .arg(&state)
+                .arg(timeout.as_secs().to_string())
+                .creation_flags(CREATE_NO_WINDOW.0)
+                .spawn()
+                .map_err(|e| e.to_string())?,
+        );
         let deadline = Instant::now() + timeout;
         let mut ready = false;
         while Instant::now() < deadline {
@@ -384,7 +443,7 @@ fn run_parent_kill(input: &Path, output_dir: &Path, timeout: Duration) -> Summar
                     break;
                 }
             }
-            if let Some(status) = owner.try_wait().map_err(|e| e.to_string())? {
+            if let Some(status) = owner.0.try_wait().map_err(|e| e.to_string())? {
                 return Err(format!("owner exited early: {status}"));
             }
             thread::sleep(Duration::from_millis(100));
@@ -397,15 +456,23 @@ fn run_parent_kill(input: &Path, output_dir: &Path, timeout: Duration) -> Summar
                 &processes,
                 &HashMap::new(),
             ));
+            verify_live_members(&summary, &processes, &summary.pre_cancel_job_pids)?;
+            if owner.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+                return Err("owner already exited before parent-kill".into());
+            }
         }
+        let stopped_at = Instant::now();
         owner
+            .0
             .kill()
             .map_err(|e| format!("TerminateProcess(owner): {e}"))?;
-        owner.wait().map_err(|e| e.to_string())?;
+        owner.0.wait().map_err(|e| e.to_string())?;
         if !ready {
             return Err("owner did not observe WebView2 before deadline".into());
         }
-        wait_gone(&mut summary, Duration::from_secs(20))?;
+        let gone = wait_gone(&mut summary, Duration::from_secs(20));
+        summary.termination_ms = Some(stopped_at.elapsed().as_millis());
+        gone?;
         summary.success = !summary.webview_pids.is_empty()
             && summary.webview_outside_job.is_empty()
             && summary.gone;
@@ -477,5 +544,35 @@ mod tests {
     fn quotes_windows_arguments() {
         assert_eq!(quote(r#"C:\a b\"#), r#""C:\a b\\""#);
         assert_eq!(quote(r#"a"b"#), r#""a\"b""#);
+    }
+
+    #[test]
+    fn cancellation_requires_live_job_members() {
+        let mut summary = Summary {
+            converter_pid: 10,
+            ..Summary::default()
+        };
+        let converter = Process {
+            parent: 1,
+            name: "mimageviewer-epub-pdf.exe".into(),
+        };
+        let webview = Process {
+            parent: 10,
+            name: "msedgewebview2.exe".into(),
+        };
+        let live = HashMap::from([(10, converter), (11, webview)]);
+        assert!(verify_live_members(&summary, &live, &BTreeSet::from([10, 11])).is_err());
+        summary.webview_pids.insert(11);
+        assert!(
+            verify_live_members(&summary, &HashMap::new(), &BTreeSet::from([10, 11]))
+                .unwrap_err()
+                .contains("converter already exited")
+        );
+        assert!(
+            verify_live_members(&summary, &live, &BTreeSet::from([10]))
+                .unwrap_err()
+                .contains("not in Job")
+        );
+        assert!(verify_live_members(&summary, &live, &BTreeSet::from([10, 11])).is_ok());
     }
 }

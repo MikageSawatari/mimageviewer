@@ -1,6 +1,7 @@
 use epub_pdf_worker::{
     Report,
     package::{self, EpubErrorKind},
+    paths::{self, OutputTemp},
     protocol::{Event, Phase},
     render::{self, Segment},
     report::{SourceImage, UserDataCleanup},
@@ -8,6 +9,7 @@ use epub_pdf_worker::{
 };
 use std::{
     fs,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -129,7 +131,12 @@ struct Engine {
     progress_json: bool,
 }
 impl Engine {
-    fn new(dir: &Path, user_data_dir: Option<&Path>, progress_json: bool) -> Result<Self, String> {
+    fn new(
+        dir: &Path,
+        user_data_dir: Option<&Path>,
+        progress_json: bool,
+        convert: Option<(&Path, &Path)>,
+    ) -> Result<Self, String> {
         let work_dir = absolute(dir)?;
         fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
         let run_id = format!(
@@ -157,6 +164,9 @@ impl Engine {
         } else {
             work_dir.join(format!("webview2-user-data-{run_id}"))
         };
+        if let Some((input, out)) = convert {
+            paths::validate_convert_paths(input, out, &work_dir, &user_data)?;
+        }
         Ok(Self {
             work_dir,
             user_data,
@@ -190,9 +200,6 @@ impl Engine {
             host.reset_blocked();
         }
         self.sequence += 1;
-        let temp_out = self
-            .work_dir
-            .join(format!("merged-{}-{}.pdf", self.run_id, self.sequence));
         let same_file = fs::canonicalize(input)
             .ok()
             .zip(fs::canonicalize(out).ok())
@@ -200,18 +207,17 @@ impl Engine {
         let result = if same_file {
             Err((3, "input and output refer to the same file".into()))
         } else {
-            self.process_inner(input, &temp_out, force_iframe, deadline, &mut report)
-        }
-        .and_then(|()| {
-            if Instant::now() >= deadline {
-                return Err((6, "WebView2 timeout before output publication".into()));
-            }
-            if let Some(parent) = out.parent() {
-                fs::create_dir_all(parent).map_err(|e| (5, e.to_string()))?;
-            }
-            fs::rename(&temp_out, out).map_err(|e| (5, format!("publish PDF: {e}")))
-        });
-        let _ = fs::remove_file(&temp_out);
+            OutputTemp::new(out, &self.run_id, self.sequence)
+                .map_err(|e| (5, e))
+                .and_then(|temp| {
+                    self.process_inner(input, temp.path(), force_iframe, deadline, &mut report)?;
+                    if Instant::now() >= deadline {
+                        return Err((6, "WebView2 timeout before output publication".into()));
+                    }
+                    temp.publish(out)
+                        .map_err(|e| (5, format!("publish PDF: {e}")))
+                })
+        };
         if let Some(host) = &self.host {
             (report.blocked_requests, report.blocked_request_count) = host.blocked_requests();
         }
@@ -317,6 +323,7 @@ impl Engine {
         self.progress(Phase::Init, 1, 1);
         let host = self.host.as_ref().unwrap();
         r.webview_runtime = Some(host.version.clone());
+        r.web_resource_filter = Some(host.request_filter.clone());
         host.map_folder(&root).map_err(|e| (5, e))?;
         let mut part_files = Vec::<PathBuf>::new();
         let mut size_sources = Vec::<Option<String>>::new();
@@ -454,7 +461,7 @@ fn classify_webview_error(e: String) -> (i32, String) {
     };
     (code, e)
 }
-fn run() -> Result<i32, String> {
+fn run() -> Result<(i32, Option<Event>), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [cmd, input] if cmd == "inspect" => match package::inspect_file(Path::new(input)) {
@@ -463,17 +470,22 @@ fn run() -> Result<i32, String> {
                     "{}",
                     serde_json::to_string_pretty(&p).map_err(|e| e.to_string())?
                 );
-                Ok(0)
+                Ok((0, None))
             }
             Err(e) => {
                 eprintln!("{e}");
-                Ok(if e.kind == EpubErrorKind::Drm { 2 } else { 3 })
+                Ok((if e.kind == EpubErrorKind::Drm { 2 } else { 3 }, None))
             }
         },
         [cmd, input, out, rest @ ..] if cmd == "convert" => {
             let o = options(rest)?;
             let work = o.work_dir.ok_or("convert requires --work-dir")?;
-            let mut engine = Engine::new(&work, o.user_data_dir.as_deref(), o.progress_json)?;
+            let mut engine = Engine::new(
+                &work,
+                o.user_data_dir.as_deref(),
+                o.progress_json,
+                Some((Path::new(input), Path::new(out))),
+            )?;
             let mut r = engine.process(
                 Path::new(input),
                 Path::new(out),
@@ -487,15 +499,10 @@ fn run() -> Result<i32, String> {
             if let Err(error) = write_json(&report, &r) {
                 eprintln!("report {}: {error}", report.display());
             }
-            if o.progress_json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&Event::from_report(&r)).map_err(|e| e.to_string())?
-                );
-            } else {
+            if !o.progress_json {
                 println!("{}: {} (report {})", r.file, r.status, report.display());
             }
-            Ok(r.exit_code)
+            Ok((r.exit_code, Some(Event::from_report(&r))))
         }
         [cmd, input, out, rest @ ..] if cmd == "batch" => {
             let o = options(rest)?;
@@ -522,7 +529,7 @@ fn run() -> Result<i32, String> {
                 .map(|x| x.path().to_path_buf())
                 .collect::<Vec<_>>();
             files.sort();
-            let mut engine = Engine::new(&out_dir.join("_work"), None, false)?;
+            let mut engine = Engine::new(&out_dir.join("_work"), None, false, None)?;
             let mut reports = Vec::new();
             for (n, file) in files.iter().enumerate() {
                 let stem = file.file_stem().unwrap_or_default().to_string_lossy();
@@ -545,20 +552,36 @@ fn run() -> Result<i32, String> {
             .map_err(|e| e.to_string())?;
             fs::write(out_dir.join("summary.md"), render::summarize(&all))
                 .map_err(|e| e.to_string())?;
-            Ok(all
-                .iter()
-                .find(|r| r.exit_code != 0)
-                .map_or(0, |r| r.exit_code))
+            Ok((
+                all.iter()
+                    .find(|r| r.exit_code != 0)
+                    .map_or(0, |r| r.exit_code),
+                None,
+            ))
         }
         _ => Err(USAGE.into()),
     }
 }
 fn main() {
-    match run() {
-        Ok(code) => std::process::exit(code),
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(3)
+    let progress_json = std::env::args_os().any(|arg| arg == "--progress-json");
+    let (code, result) = match catch_unwind(AssertUnwindSafe(run)) {
+        Ok(Ok((code, result))) => (code, result),
+        Ok(Err(error)) => {
+            eprintln!("{error}");
+            (3, Some(Event::failure(3, error)))
         }
+        Err(_) => {
+            let message = "converter panicked".to_string();
+            eprintln!("{message}");
+            (5, Some(Event::failure(5, message)))
+        }
+    };
+    if progress_json {
+        let result = result.unwrap_or_else(|| Event::failure(code, String::new()));
+        println!(
+            "{}",
+            serde_json::to_string(&result).expect("result protocol serialisation")
+        );
     }
+    std::process::exit(code)
 }

@@ -140,7 +140,9 @@ fn normalize_path(path: &str, allow_parent: bool) -> Result<String, EpubError> {
 /// `http:`, `data:`, `//host/...` etc. point outside the archive. They are not archive paths:
 /// the parser skips them instead of rejecting the book (the renderer blocks the request).
 fn is_external_href(href: &str) -> bool {
-    let href = href.trim();
+    // Chromium treats backslashes as separators in special-scheme URLs.
+    let normalized = href.trim().replace('\\', "/");
+    let href = normalized.as_str();
     if href.starts_with("//") {
         return true;
     }
@@ -653,6 +655,8 @@ mod tests {
         assert!(is_external_href("HTTPS://example.invalid/a.png"));
         assert!(is_external_href("data:image/png;base64,AAAA"));
         assert!(is_external_href("//example.invalid/a.png"));
+        assert!(is_external_href("\\\\example.invalid/a.png"));
+        assert!(is_external_href("\\/example.invalid/a.png"));
         assert!(!is_external_href("a.jpg"));
         assert!(!is_external_href("img/a%3Ab.jpg"));
         assert!(!is_external_href("../img/a.jpg"));

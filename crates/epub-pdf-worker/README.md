@@ -17,11 +17,13 @@ cargo build -p epub-pdf-worker
 `summary.json` / `summary.md`. One failed book does not stop later books. The
 batch process returns the first nonzero book code after writing the summary.
 `convert` writes the complete PDF exactly to the requested output path. It
-merges and verifies a temporary file in `--work-dir` before renaming; a failed
+merges and verifies a unique temporary file beside `<out>` before renaming; a failed
 or timed-out conversion leaves no partial output at the requested path. The
 input EPUB is opened only for reading. `--user-data-dir` selects a dedicated
 WebView2 folder; it must be absent or empty. If omitted, a unique folder below
-`--work-dir` is used. The report records whether cleanup succeeded.
+`--work-dir` is used. The converter rejects a user data folder that contains
+the input, output, output directory, or work directory. The report records
+whether cleanup succeeded.
 
 `--progress-json` applies to `convert`. It makes stdout a line-delimited JSON
 stream with no human messages. Phases are `parse`, `extract`, `init`, `print`,
@@ -36,6 +38,8 @@ stream with no human messages. Phases are `parse`, `extract`, `init`, `print`,
 because reflow pagination is not known in advance. Other phases use 0/1 and
 1/1. Result statuses are `success`, `drm`, `invalid`, `webview2_missing`,
 `render_failed`, and `timeout`. `blocked_requests` counts blocked attempts.
+When `--progress-json` is present, argument errors and panics also produce
+exactly one final `result` line. Panics use `render_failed` / exit code 5.
 The detailed per-book report contains up to 200 distinct blocked URLs and the
 total attempt count, plus `book_script_ran`.
 
@@ -65,8 +69,8 @@ executable. The WebView2 Runtime is still required. Build offline with
 
 The parser uses `quick-xml` 0.41 and `zip` 2. Package reading rejects zip-slip
 paths and unsupported encryption. Fixed spine items are printed in spine order
-with named CSS pages matching each measured item size. Reflow items use a
-the named `reflow-v1` profile: 720 × 1024 CSS px with 32 px page margins.
+with named CSS pages matching each measured item size. Reflow items use the
+named `reflow-v1` profile: 720 × 1024 CSS px with 32 px page margins.
 Book CSS is retained. The renderer uses WebView2 virtual host folder mapping
 and `Page.printToPDF`. Fixed runs are bounded to 50 items
 per print document to limit Chromium memory use. The PDFs are merged by
@@ -80,13 +84,44 @@ matching dimensions and FlateDecode. This is a byte-level fidelity screen,
 not a visual comparison. Image and layout quality must be checked separately
 by rendering PDF pages.
 
-All WebView2 resource contexts are filtered. Only the mapped
+All WebView2 resource contexts and request source kinds are filtered when
+`ICoreWebView2_22` is available. Older runtimes use the legacy filter. The
+per-book report's `web_resource_filter` identifies the selected scope. Only the mapped
 `https://epub.invalid` origin is allowed; other requests receive a synthetic
 403 response and cross-origin navigations are cancelled. Page scripts are
 disabled. Host readiness and script probes use CDP `Runtime.evaluate` rather
 than `ExecuteScript`, whose interaction with disabled page scripts is not
 specified by the locally available bindings. Runtime behavior still needs an
 outside-sandbox check.
+
+The WebView2 environment receives these browser arguments before a controller
+is created:
+
+| Argument | Reason |
+| --- | --- |
+| `--host-resolver-rules="MAP * ~NOTFOUND"` | Fail DNS resolution for arbitrary host names. |
+| `--disable-background-networking` | Suppress Chromium background services. |
+| `--dns-prefetch-disable` | Suppress speculative DNS lookups. |
+| `--disable-preconnect` | Request suppression of speculative TCP preconnects, including IP literal hints; confirm on Runtime 153 with a connection trace. |
+| `--no-pings` | Suppress hyperlink auditing pings. |
+| `--disable-sync` | Disable account synchronization. |
+| `--disable-component-update` | Disable component update checks. |
+| `--disable-extensions` | Disable extension activity. |
+| `--no-first-run` | Skip first-run browser activity. |
+
+The virtual host maps to a local folder through
+`SetVirtualHostNameToFolderMapping`; the local WebView2 bindings expose the
+folder mapping but do not document DNS behavior. Successful conversion with
+the resolver rule, together with a DNS/network trace, is the required runtime
+confirmation that this mapping does not resolve `epub.invalid` externally.
+The new filter includes service-worker and shared-worker request sources; a
+fresh user data folder and disabled page scripts prevent book service workers
+from being registered. Cross-origin iframes are cancelled at navigation and
+their resources receive 403. Page scripts cannot initiate WebSockets while
+disabled. WebSocket handshakes are not guaranteed to raise
+`WebResourceRequested`; the resolver rule blocks hostnames, while a direct-IP
+WebSocket would require script execution. Confirm zero DNS and connection
+attempts with an external trace, including declarative preconnects.
 
 For the outside-sandbox network and script check, run both synthetic books and
 inspect each JSON report's `blocked_requests`, `blocked_request_count`, and
@@ -97,6 +132,29 @@ network trace; the report alone records blocked attempts, not packets.
 .\target\debug\mimageviewer-epub-pdf.exe convert C:\home\mimageviewer_testdata_epub\synthetic\probe_net_script_reflow.epub .\target\epub-probe\reflow.pdf.part --work-dir .\target\epub-probe\reflow-work --user-data-dir .\target\epub-probe\reflow-user-data --report .\target\epub-probe\reflow.json --progress-json
 .\target\debug\mimageviewer-epub-pdf.exe convert C:\home\mimageviewer_testdata_epub\synthetic\probe_net_script_fixed.epub .\target\epub-probe\fixed.pdf.part --work-dir .\target\epub-probe\fixed-work --user-data-dir .\target\epub-probe\fixed-user-data --report .\target\epub-probe\fixed.json --progress-json
 ```
+
+To test connection hints that may run before `WebResourceRequested`, make a
+disposable variant of the reflow probe. This adds a direct-IP preconnect and a
+DNS-prefetch hint without changing the source EPUB:
+
+```powershell
+New-Item -ItemType Directory -Force .\target\epub-probe | Out-Null
+@'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as source, zipfile.ZipFile(sys.argv[2], 'w') as target:
+    for entry in source.infolist():
+        data = source.read(entry.filename)
+        if entry.filename == 'OEBPS/p1.xhtml':
+            data = data.replace(b'</head>', b'<link rel="preconnect" href="http://127.0.0.1:8765"/><link rel="dns-prefetch" href="//mimageviewer-net-probe.invalid"/></head>')
+        target.writestr(entry, data)
+'@ | python - C:\home\mimageviewer_testdata_epub\synthetic\probe_net_script_reflow.epub .\target\epub-probe\preconnect.epub
+.\target\debug\mimageviewer-epub-pdf.exe convert .\target\epub-probe\preconnect.epub .\target\epub-probe\preconnect.pdf.part --work-dir .\target\epub-probe\preconnect-work --user-data-dir .\target\epub-probe\preconnect-user-data --report .\target\epub-probe\preconnect.json --progress-json
+```
+
+Capture DNS queries and TCP connection attempts from the converter and its
+WebView2 descendants while that conversion runs. Also confirm the mapped book
+still prints with the resolver rule enabled. A local HTTP server's request
+log alone cannot detect a preconnect that opened a socket without sending HTTP.
 
 ## Job Object acceptance probe (not shipped)
 
@@ -115,5 +173,8 @@ restricted sandbox while the 300-page book is converting:
 
 `parent-kill` relaunches the probe as an intermediate owner, terminates that
 owner, then checks that its converter and every observed WebView2 PID vanished.
-The summary includes `job_pids`, `webview_pids`, `webview_outside_job`, `gone`,
-and `success`. Probe outputs are disposable.
+Immediately before closing the Job or killing the owner, the probe requires
+the converter and every observed WebView2 PID to be alive and in the Job.
+The summary includes `job_pids`, `pre_cancel_job_pids`, `webview_pids`,
+`webview_outside_job`, `pre_cancel_alive`, `termination_ms`, `gone`, and
+`success`. Probe outputs are disposable.

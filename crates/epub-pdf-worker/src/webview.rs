@@ -9,18 +9,22 @@ use std::{
     time::{Duration, Instant},
 };
 use webview2_com::{
-    CallDevToolsProtocolMethodCompletedHandler, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler,
+    CallDevToolsProtocolMethodCompletedHandler, CoreWebView2EnvironmentOptions,
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
         COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+        COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
         CreateCoreWebView2EnvironmentWithOptions, GetAvailableCoreWebView2BrowserVersionString,
-        ICoreWebView2, ICoreWebView2_3, ICoreWebView2Controller, ICoreWebView2Environment,
+        ICoreWebView2, ICoreWebView2_3, ICoreWebView2_22, ICoreWebView2Controller,
+        ICoreWebView2Environment, ICoreWebView2EnvironmentOptions,
     },
     NavigationStartingEventHandler, WebResourceRequestedEventHandler, take_pwstr,
 };
 use windows::{
     Win32::{
-        Foundation::{E_POINTER, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{
+            E_NOINTERFACE, E_POINTER, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+        },
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
             LibraryLoader::GetModuleHandleW,
@@ -49,9 +53,13 @@ fn pump() {
     }
 }
 
-fn wait_for_messages(deadline: Instant) {
+fn wait_timeout_ms(deadline: Instant) -> u32 {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let millis = remaining.as_millis().min(u32::MAX as u128) as u32;
+    remaining.as_millis().min(60_000) as u32
+}
+
+fn wait_for_messages(deadline: Instant) {
+    let millis = wait_timeout_ms(deadline);
     unsafe { MsgWaitForMultipleObjectsEx(None, millis, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
     pump();
 }
@@ -71,6 +79,15 @@ fn wait<T>(rx: Receiver<windows::core::Result<T>>, deadline: Instant) -> Result<
 }
 
 pub const MAX_RECORDED_BLOCKED_URLS: usize = 200;
+pub const BROWSER_NETWORK_ARGUMENTS: &str = "--host-resolver-rules=\"MAP * ~NOTFOUND\" --disable-background-networking --dns-prefetch-disable --disable-preconnect --no-pings --disable-sync --disable-component-update --disable-extensions --no-first-run";
+
+fn network_options() -> Result<ICoreWebView2EnvironmentOptions, String> {
+    let options: ICoreWebView2EnvironmentOptions = CoreWebView2EnvironmentOptions::default().into();
+    let args = wide(BROWSER_NETWORK_ARGUMENTS);
+    unsafe { options.SetAdditionalBrowserArguments(PCWSTR(args.as_ptr())) }
+        .map_err(|e| format!("SetAdditionalBrowserArguments: {e}"))?;
+    Ok(options)
+}
 
 #[derive(Default)]
 struct BlockedRequests {
@@ -116,6 +133,7 @@ pub struct Host {
     webview: Option<ICoreWebView2>,
     webview3: Option<ICoreWebView2_3>,
     blocked: Rc<RefCell<BlockedRequests>>,
+    pub request_filter: String,
     pub version: String,
 }
 
@@ -143,6 +161,7 @@ impl Host {
             webview: None,
             webview3: None,
             blocked: Rc::new(RefCell::new(BlockedRequests::default())),
+            request_filter: String::new(),
             version,
         };
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
@@ -193,11 +212,12 @@ impl Host {
             },
         ));
         let ud = wide(&user_data.to_string_lossy());
+        let options = network_options()?;
         unsafe {
             CreateCoreWebView2EnvironmentWithOptions(
                 PCWSTR::null(),
                 PCWSTR(ud.as_ptr()),
-                None,
+                &options,
                 &callback,
             )
         }
@@ -248,7 +268,7 @@ impl Host {
         let settings = unsafe { h.view().Settings() }.map_err(|e| format!("Settings: {e}"))?;
         unsafe { settings.SetIsScriptEnabled(false) }
             .map_err(|e| format!("SetIsScriptEnabled: {e}"))?;
-        h.install_request_guard()?;
+        h.request_filter = h.install_request_guard()?;
         Ok(h)
     }
 
@@ -256,15 +276,33 @@ impl Host {
         self.webview.as_ref().unwrap()
     }
 
-    fn install_request_guard(&self) -> Result<(), String> {
+    fn install_request_guard(&self) -> Result<String, String> {
         let filter = wide("*");
-        unsafe {
-            self.view().AddWebResourceRequestedFilter(
-                PCWSTR(filter.as_ptr()),
-                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
-            )
-        }
-        .map_err(|e| format!("AddWebResourceRequestedFilter: {e}"))?;
+        let view22 = match self.view().cast::<ICoreWebView2_22>() {
+            Ok(view) => Some(view),
+            Err(error) if error.code() == E_NOINTERFACE => None,
+            Err(error) => return Err(format!("ICoreWebView2_22: {error}")),
+        };
+        let scope = if let Some(view22) = view22 {
+            unsafe {
+                view22.AddWebResourceRequestedFilterWithRequestSourceKinds(
+                    PCWSTR(filter.as_ptr()),
+                    COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                    COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+                )
+            }
+            .map_err(|e| format!("AddWebResourceRequestedFilterWithRequestSourceKinds: {e}"))?;
+            "all_source_kinds"
+        } else {
+            unsafe {
+                self.view().AddWebResourceRequestedFilter(
+                    PCWSTR(filter.as_ptr()),
+                    COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                )
+            }
+            .map_err(|e| format!("AddWebResourceRequestedFilter: {e}"))?;
+            "legacy_document_only"
+        };
         let blocked = self.blocked.clone();
         let environment = self.environment.as_ref().unwrap().clone();
         let handler = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
@@ -314,7 +352,7 @@ impl Host {
                 .add_FrameNavigationStarting(&navigation, &mut token)
         }
         .map_err(|e| format!("add_FrameNavigationStarting: {e}"))?;
-        Ok(())
+        Ok(scope.into())
     }
 
     pub fn reset_blocked(&self) {
@@ -483,5 +521,22 @@ mod tests {
         b.record("http://example.invalid/0".into());
         assert_eq!(b.count, 301);
         assert_eq!(b.urls.len(), MAX_RECORDED_BLOCKED_URLS);
+    }
+
+    #[test]
+    fn message_wait_is_always_finite() {
+        assert_eq!(
+            wait_timeout_ms(Instant::now() + Duration::from_secs(172_800)),
+            60_000
+        );
+        assert!(wait_timeout_ms(Instant::now()) < u32::MAX);
+    }
+
+    #[test]
+    fn browser_options_carry_network_arguments() {
+        let options = network_options().unwrap();
+        let mut arguments = PWSTR::null();
+        unsafe { options.AdditionalBrowserArguments(&mut arguments) }.unwrap();
+        assert_eq!(take_pwstr(arguments), BROWSER_NETWORK_ARGUMENTS);
     }
 }

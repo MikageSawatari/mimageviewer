@@ -1,4 +1,5 @@
 pub mod package;
+pub mod paths;
 pub mod protocol;
 pub mod render;
 pub mod report;

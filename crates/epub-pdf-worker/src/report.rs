@@ -27,6 +27,7 @@ pub struct Report {
     pub pdf_images: Vec<PdfImage>,
     pub image_fidelity: Option<String>,
     pub webview_runtime: Option<String>,
+    pub web_resource_filter: Option<String>,
     pub print_to_pdf_comparison: Option<String>,
     pub user_data_cleanup: Option<UserDataCleanup>,
 }
@@ -71,6 +72,7 @@ impl Report {
             pdf_images: Vec::new(),
             image_fidelity: None,
             webview_runtime: None,
+            web_resource_filter: None,
             print_to_pdf_comparison: None,
             user_data_cleanup: None,
         }
