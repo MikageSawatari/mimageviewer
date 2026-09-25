@@ -355,6 +355,12 @@ active normal `RatingAsc/Desc` の表示 key はユーザー rating write の se
 
 ## 7. 評価を1段階上げる / 下げる
 
+> §1.237 part A の確定範囲: アイテムとコンテナの両方に StepUp / StepDown を追加する。
+> 評価ソートは別作業へ延期する。以下の当初案の「コンテナ評価の増減は追加しない」は
+> この決定で置き換える。現行の直接指定は対象ごとに `set_rating_result` を呼び、成功行を
+> 一つの Undo entry と finalizer に集める。下記の atomic batch は後続の構造案であり、
+> part A はこの既存の成功行契約を共用する。
+
 ### 7.1 純粋な step 規則
 
 ```text
@@ -368,9 +374,10 @@ Undo record を作らない。0 は操作計算時だけ3を基準にする。�
 
 ### 7.2 KeyAction と入口
 
-`KeyAction::RatingItemIncrease` / `RatingItemDecrease` を Rating context、`ALL_ACTIONS`、表示名、INI docs、
+`KeyAction::RatingItemStepUp` / `RatingItemStepDown` と
+`RatingContainerStepUp` / `RatingContainerStepDown` を Rating context、`ALL_ACTIONS`、表示名、INI docs、
 customization UI、parse / roundtrip tests に追加する。新操作の初期 chord は `ChordList::EMPTY`、文書表記は
-`none` とする。コンテナ評価の増減は今回追加しない。
+`none` とする。
 
 次の入口を同じ typed `RatingEdit::Step(direction)` へ変換する。
 

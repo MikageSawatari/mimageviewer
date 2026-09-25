@@ -1567,6 +1567,7 @@ mod tests {
 
     #[test]
     fn smart_folder_scope_never_accepts_sibling_escape() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let id = uuid::Uuid::new_v4();
         let root = PathBuf::from(r"C:\books\entry");
         let mut state = SmartFolderViewState::root(id, vec![root.clone()]);
@@ -1578,6 +1579,7 @@ mod tests {
 
     #[test]
     fn smart_folder_parent_returns_root_without_filesystem_escape() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let id = uuid::Uuid::new_v4();
         let root = PathBuf::from(r"C:\books\entry");
         let mut state = SmartFolderViewState::root(id, vec![root.clone()]);
@@ -1592,6 +1594,7 @@ mod tests {
 
     #[test]
     fn smart_folder_entry_order_moves_between_root_entries() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let id = uuid::Uuid::new_v4();
         let first = PathBuf::from(r"C:\books\first");
         let second = PathBuf::from(r"D:\library\second");
@@ -1609,6 +1612,7 @@ mod tests {
 
     #[test]
     fn smart_root_navigation_uses_one_display_order_for_folders_and_books() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use super::super::smart_folder::SmartChildKind;
         let id = uuid::Uuid::new_v4();
         let folder = PathBuf::from(r"C:\books\folder");
@@ -1672,6 +1676,7 @@ mod tests {
 
     #[test]
     fn smart_folder_refresh_reorders_retained_scope_and_drops_deleted_or_renamed_scope() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let id = uuid::Uuid::new_v4();
         let first = PathBuf::from(r"C:\books\first");
         let second = PathBuf::from(r"D:\library\second");
@@ -1688,6 +1693,7 @@ mod tests {
 
     #[test]
     fn smart_folder_enters_most_specific_root_for_a_descendant() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let id = uuid::Uuid::new_v4();
         let parent = PathBuf::from(r"C:\books");
         let entry = parent.join("series");
@@ -1701,6 +1707,7 @@ mod tests {
 
     #[test]
     fn direct_top_level_transition_transfers_one_return_owner() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let origin = TopLevelGridRestore::Folder(PathBuf::from(r"D:\origin"));
         let mut view = TopLevelGridView::default();
         let first = view.begin(
@@ -1721,6 +1728,7 @@ mod tests {
 
     #[test]
     fn retiring_collection_surface_cancels_only_its_preparing_worker() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let first_id = crate::collection_store::CollectionId::new();
         let sibling_id = crate::collection_store::CollectionId::new();
         let first_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1780,6 +1788,7 @@ mod tests {
 
     #[test]
     fn thumbnail_epoch_invalidation_preserves_unstarted_reads_and_terminal_states() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let collection_id = crate::collection_store::CollectionId::new();
         let identity = CollectionGridIdentity { collection_id };
         let mut session = CollectionGridSession::new(identity);
@@ -1850,6 +1859,7 @@ mod tests {
 
     #[test]
     fn thumbnail_epoch_invalidation_cancels_only_an_already_preparing_payload() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let collection_id = crate::collection_store::CollectionId::new();
         let mut session = CollectionGridSession::new(CollectionGridIdentity { collection_id });
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1885,6 +1895,7 @@ mod tests {
 
     #[test]
     fn bookmark_synthetic_path_restores_bookmark_surface() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         // `bookmark_view_synthetic_path` reads the process-global data dir, and this test
         // reads it twice -- once to build the restore and once to compare. Another test
         // swapping `set_test_override` in between makes the two disagree, so take the

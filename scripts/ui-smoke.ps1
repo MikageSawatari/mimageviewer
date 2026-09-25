@@ -5,6 +5,9 @@ Runs an isolated, diagnostic portable UI smoke scenario after explicit user appr
 .PARAMETER InteractiveApproved
 Confirms that the user explicitly approved the scenario and expected duration.
 Automation must not pass this switch until that approval has been obtained.
+
+.PARAMETER Scenario
+MultiWindowRarNav checks Ctrl+Up/Down across direct RAR, ZIP, and CBR in one detached window.
 #>
 # Run an isolated, diagnostic portable UI smoke scenario.
 #
@@ -18,10 +21,11 @@ Automation must not pass this switch until that approval has been obtained.
 # described scenario and its expected duration.
 # MultiWindowStills switches windows through test-script activation requests;
 # it does not test OS click routing between windows.
+# MultiWindowRarNav targets one detached window and sends test-script Ctrl key input.
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -676,7 +680,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')
+    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -762,6 +766,36 @@ if ($script:archiveErrors.Count -gt 0) {
     $candidateFixtureGeneratorPdfDependencyPath = $null
 
     switch ($Scenario) {
+    'MultiWindowRarNav' {
+        $scenarioRoot = Join-Path $dataDir 'multi-window-rar-nav'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\multi-window-rar-nav.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $sourceFixtureDir = Join-Path $repoRoot 'testdata\archives\multiwindow-rar-nav'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\portable-smoke\data\multi-window-rar-nav') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $dataDir 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        if (-not (Test-Path -LiteralPath $candidateScriptPath -PathType Leaf)) {
+            throw "[ui-smoke] RAR navigation scenario script not found: $candidateScriptPath"
+        }
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        foreach ($name in @('01-direct.rar', '02-solid.rar', '06-control.zip', '08-direct.cbr')) {
+            $source = Join-Path $sourceFixtureDir $name
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                throw "[ui-smoke] RAR navigation fixture not found: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $candidateFixtureDir $name)
+        }
+        Assert-NoReparseTree $candidateFixtureDir 'multi-window-rar-nav-fixture'
+        if (@(Get-ChildItem -LiteralPath $candidateFixtureDir -File).Count -ne 4) {
+            throw '[ui-smoke] RAR navigation fixture must contain exactly four archives'
+        }
+        $settingsJson = '{"detached_viewer_open_images_in_window":true,"default_spread_mode":"Single","default_reading_flow":"Paged"}'
+        [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
+    }
     'MultiWindowStills' {
         $scenarioRoot = Join-Path $targetRoot 'ui-smoke\multi-window-stills'
         $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\multi-window-stills.rhai'
@@ -793,7 +827,7 @@ if ($script:archiveErrors.Count -gt 0) {
             -not (Test-Path -LiteralPath (Join-Path $zipFolder 'mimageviewer.dat') -PathType Leaf)) {
             throw '[ui-smoke] stills fixture lacks folder/ZIP pages or sidecars'
         }
-        $settingsJson = '{"detached_viewer_open_images_in_window":true,"auto_fullscreen_image_folders":true,"default_spread_mode":"LtrCover","default_reading_flow":"Paged","singleton_spread_placement_enabled":true,"sidecar_backup_enabled":true}'
+        $settingsJson = '{"detached_viewer_open_images_in_window":true,"auto_fullscreen_image_folders":true,"default_spread_mode":"LtrCover","default_reading_flow":"Paged","singleton_spread_first_enabled":true,"singleton_spread_last_enabled":true,"sidecar_backup_enabled":true}'
         [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
     'MultiWindowPdf' {
@@ -1338,7 +1372,7 @@ $arguments = @(
         throw '[ui-smoke] scenario inputs could not be preserved before launch'
     }
 
-    if ($Scenario -eq 'MultiWindowStills') {
+    if ($Scenario -in @('MultiWindowStills', 'MultiWindowRarNav')) {
         Assert-UiSmokeInputDesktop
     }
 

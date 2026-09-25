@@ -3250,11 +3250,43 @@ pub(crate) struct PdfPasswordRequest {
 /// ヒット先が通常ディレクトリだった場合の事前スキャン結果を載せる。
 /// 事前スキャンがあれば UI スレッドの `load_folder` は `read_dir` をスキップできる。
 pub(crate) struct FolderNavThreadResult {
-    outcome: Option<crate::folder_tree::FolderNavOutcome>,
+    target: Option<FolderNavTarget>,
+    hit_image_folder: bool,
+}
+
+/// One worker result owns the navigation destination and its pre-scan.
+pub(crate) struct FolderNavTarget {
+    route: FolderNavRoute,
     smart_kind: Option<smart_folder::SmartChildKind>,
-    /// `outcome.path` がディレクトリなら scan 成否を保持する。ZIP/PDF ファイルは
-    /// 専用ローダーに委譲するため `NotNeeded`。
     scanned: FolderNavScanResult,
+}
+
+pub(crate) enum FolderNavRoute {
+    /// The full-feature owner retains its established conversion/open routing.
+    FullFeature(PathBuf),
+    /// A detached worker proved the backing and classification before sending.
+    Detached(crate::folder_tree::FolderNavLanding),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZipCacheRouting {
+    Lookup,
+    ProvenBacking,
+}
+
+impl FolderNavRoute {
+    fn logical_source(&self) -> &Path {
+        match self {
+            Self::FullFeature(path) => path,
+            Self::Detached(landing) => &landing.logical_source,
+        }
+    }
+}
+
+impl FolderNavTarget {
+    fn logical_source(&self) -> &Path {
+        self.route.logical_source()
+    }
 }
 
 pub(crate) enum FolderNavScanResult {
@@ -5374,9 +5406,7 @@ fn resolve_converted_archive_candidate_with(
 /// `poll_folder_nav` がワーカー完了を検知したときに返す情報。
 pub(crate) struct FolderNavResult {
     /// DFS が見つけた次フォルダ (None なら DFS が尽きた)。
-    pub path: Option<PathBuf>,
-    /// Captured by the worker from the Smart root row or nested DFS candidate.
-    pub smart_kind: Option<smart_folder::SmartChildKind>,
+    pub target: Option<FolderNavTarget>,
     /// `folder_should_stop` をパスしたフォルダ (= 画像/動画/ZIP/PDF あり) か。
     /// `false` のときは skip_limit 尽きまたは DFS 末端でのフォールバック、または
     /// 結果自体が `None` (path も None)。Fullscreen モードの後処理は false なら
@@ -5392,9 +5422,6 @@ pub(crate) struct FolderNavResult {
     /// App 上の accumulator を従来どおり clear する。この値だけは完了した folder-nav
     /// request 自身が所有し、適用成功後に次の DFS へ引き渡す。
     pub queued_steps: i32,
-    /// DFS スレッドで事前走査した `path` の中身、または走査失敗。
-    /// 失敗を空一覧として `load_folder` へ適用して catalog を削除しない。
-    pub scanned: FolderNavScanResult,
 }
 
 /// 非同期メタデータ読み込み (フルスクリーン表示対象画像の AI/EXIF/XMP) の状態。
@@ -6007,9 +6034,19 @@ fn navigate_smart_folder_scope(
                 current,
                 |path| {
                     let next = if forward {
-                        next_folder_dfs(path, tree_opts)
+                        crate::folder_tree::next_folder_dfs_with_context(
+                            path,
+                            tree_opts,
+                            Some(cancel),
+                            None,
+                        )
                     } else {
-                        prev_folder_dfs(path, tree_opts)
+                        crate::folder_tree::prev_folder_dfs_with_context(
+                            path,
+                            tree_opts,
+                            Some(cancel),
+                            None,
+                        )
                     }?;
                     crate::search_index_db::is_under(&next, entry_root).then_some(next)
                 },
@@ -6072,9 +6109,19 @@ fn navigate_smart_folder_scope(
                 return None;
             }
             let next = if forward {
-                next_folder_dfs(&cursor, tree_opts)
+                crate::folder_tree::next_folder_dfs_with_context(
+                    &cursor,
+                    tree_opts,
+                    Some(cancel),
+                    None,
+                )
             } else {
-                prev_folder_dfs(&cursor, tree_opts)
+                crate::folder_tree::prev_folder_dfs_with_context(
+                    &cursor,
+                    tree_opts,
+                    Some(cancel),
+                    None,
+                )
             };
             let Some(next) = next.filter(|next| crate::search_index_db::is_under(next, entry_root))
             else {
@@ -6108,7 +6155,12 @@ fn navigate_smart_folder_scope(
             let mut cursor = if forward {
                 root.to_path_buf()
             } else {
-                crate::folder_tree::last_descendant_dir(root, tree_opts)
+                crate::folder_tree::last_descendant_dir_with_context(
+                    root,
+                    tree_opts,
+                    Some(cancel),
+                    None,
+                )
             };
             loop {
                 if cancel.load(Ordering::Relaxed) {
@@ -6121,9 +6173,19 @@ fn navigate_smart_folder_scope(
                     break;
                 }
                 let next = if forward {
-                    next_folder_dfs(&cursor, tree_opts)
+                    crate::folder_tree::next_folder_dfs_with_context(
+                        &cursor,
+                        tree_opts,
+                        Some(cancel),
+                        None,
+                    )
                 } else {
-                    prev_folder_dfs(&cursor, tree_opts)
+                    crate::folder_tree::prev_folder_dfs_with_context(
+                        &cursor,
+                        tree_opts,
+                        Some(cancel),
+                        None,
+                    )
                 };
                 let Some(next) = next.filter(|next| crate::search_index_db::is_under(next, root))
                 else {
@@ -6187,8 +6249,7 @@ fn smart_folder_nav_target_kind(
 use eframe::egui;
 
 use crate::folder_tree::{
-    FolderNavOutcome, is_apple_double, navigate_folder_with_skip, next_folder_dfs,
-    next_sibling_folder, prev_folder_dfs, prev_sibling_folder, walk_dirs_recursive,
+    FolderNavOutcome, is_apple_double, navigate_folder_with_skip, walk_dirs_recursive,
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
@@ -16209,11 +16270,29 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_video_pins", 0, t);
 
         let t = std::time::Instant::now();
-        let folder_thumb_pin_db = crate::folder_thumb_pins::FolderThumbPinDb::open()
-            .map(std::sync::Arc::new)
-            .map_err(|e| crate::logger::log(format!("folder_thumb_pin_db open failed: {e}")))
-            .ok();
-        crate::perf::emit_ms("startup", "db_open_folder_thumb_pins", 0, t);
+        let opened_folder_thumb_pins =
+            crate::folder_thumb_pins::FolderThumbPinDb::open_with_migration_info()
+                .map_err(|e| crate::logger::log(format!("folder_thumb_pin_db open failed: {e}")))
+                .ok();
+        let migration_ran = opened_folder_thumb_pins
+            .as_ref()
+            .map(|(_, migrated)| *migrated);
+        let folder_thumb_pin_db = opened_folder_thumb_pins.map(|(db, _)| std::sync::Arc::new(db));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "startup",
+                "db_open_folder_thumb_pins",
+                None,
+                0,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(t.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("migration_ran", serde_json::Value::from(migration_ran)),
+                ],
+            );
+        }
 
         let t = std::time::Instant::now();
         let video_bookmark_db = crate::video_bookmarks::VideoBookmarkDb::open().ok();
@@ -21852,9 +21931,44 @@ impl App {
 
     fn load_folder_nav_target(
         &mut self,
-        path: PathBuf,
+        route: FolderNavRoute,
         pre_scan: Option<ScannedDir>,
     ) -> FolderOpenOutcome {
+        use crate::folder_tree::FolderNavLandingKind;
+        let path = match route {
+            FolderNavRoute::Detached(landing) => {
+                // The pending receiver is bundle-owned; apply a proven backing only while
+                // that same detached context is mounted.
+                if !self.navigation_scope.is_detached_physical()
+                    || !self.snapshot_scope_allows_open(
+                        &landing.logical_source,
+                        &OpenRequestOwner::Navigation,
+                    )
+                {
+                    return FolderOpenOutcome::Ignored;
+                }
+                match landing.kind {
+                    FolderNavLandingKind::DirectRar | FolderNavLandingKind::ConversionCacheHit => {
+                        self.load_zip_as_folder_proven_navigation_backing(landing.backing_path);
+                        self.archive_source_override = Some(landing.logical_source.clone());
+                        self.address = landing.logical_source.to_string_lossy().to_string();
+                        return FolderOpenOutcome::Loaded;
+                    }
+                    FolderNavLandingKind::Folder | FolderNavLandingKind::NativeZipPdf => {
+                        return if self.load_folder_with_scan_owned(
+                            landing.logical_source,
+                            pre_scan,
+                            OpenRequestOwner::Navigation,
+                        ) {
+                            FolderOpenOutcome::Loaded
+                        } else {
+                            FolderOpenOutcome::Ignored
+                        };
+                    }
+                }
+            }
+            FolderNavRoute::FullFeature(path) => path,
+        };
         if path.is_file() && crate::folder_tree::is_convertible_archive_path(&path) {
             self.load_folder_or_convert_archive(path)
         } else {
@@ -25395,7 +25509,24 @@ impl App {
     }
 
     pub(crate) fn load_zip_as_folder_with_input_seq(&mut self, zip_path: PathBuf, input_seq: u64) {
-        self.load_zip_as_folder_with_prepared_enumeration(zip_path, input_seq, None);
+        self.load_zip_as_folder_with_prepared_enumeration(
+            zip_path,
+            input_seq,
+            None,
+            ZipCacheRouting::Lookup,
+        );
+    }
+
+    fn load_zip_as_folder_proven_navigation_backing(&mut self, zip_path: PathBuf) {
+        // Detached navigation already validated the source/cache pair and playable ZIP
+        // pages on its worker. Re-entering the ordinary lookup here would perform
+        // metadata and archive-cache I/O on the UI thread.
+        self.load_zip_as_folder_with_prepared_enumeration(
+            zip_path,
+            self.input_seq,
+            None,
+            ZipCacheRouting::ProvenBacking,
+        );
     }
 
     pub(in crate::app) fn load_zip_as_folder_prepared(
@@ -25407,6 +25538,7 @@ impl App {
             zip_path,
             self.input_seq,
             Some(enumeration),
+            ZipCacheRouting::Lookup,
         );
     }
 
@@ -25415,6 +25547,7 @@ impl App {
         zip_path: PathBuf,
         input_seq: u64,
         prepared: Option<crate::zip_loader::ZipEnumeration>,
+        cache_routing: ZipCacheRouting,
     ) {
         crate::logger::log(format!(
             "=== load_zip_as_folder: {} ===",
@@ -25445,7 +25578,8 @@ impl App {
         // キャッシュ ZIP 自身を開く内側の再帰呼び出しでは lookup が miss するので
         // 無限再帰にはならない。lookup は mtime+size 検証付き (元 ZIP が更新されたら
         // miss して通常経路 → 列挙で再検出 → 再変換提案)。
-        if prepared.is_none()
+        if cache_routing == ZipCacheRouting::Lookup
+            && prepared.is_none()
             && !crate::rar_loader::is_rar_path(&zip_path)
             && !self.settings.archive_file_handling_ignores_convertible()
             && let Some(cached) = self.try_archive_cache_lookup(&zip_path)
@@ -29771,11 +29905,12 @@ impl App {
             if !matches!(resolved.kind, ResolvedKind::Video) {
                 continue;
             }
-            let Some(base_key) = container_cache_base_key(
-                item,
+            let Some(base_key) = crate::thumb_loader::folder_thumb_cache_key_for_path(
+                container_path,
                 use_full_path_keys,
-                Some(self.settings.folder_thumb_sort),
+                self.settings.folder_thumb_sort,
                 self.settings.folder_thumb_depth,
+                crate::catalog::FolderThumbProvenance::Seeded,
             ) else {
                 continue;
             };
@@ -29854,8 +29989,13 @@ impl App {
             if already_seeded {
                 continue;
             }
-            match cat.save_thumb_bytes(&pinned_key, resolved.mtime, resolved.file_size, None, &webp)
-            {
+            match cat.save_seeded_folder_bytes(
+                &pinned_key,
+                resolved.mtime,
+                resolved.file_size,
+                None,
+                &webp,
+            ) {
                 Ok(true) => {}
                 Ok(false) => {
                     crate::logger::log(format!(
@@ -29887,6 +30027,8 @@ impl App {
                         jpeg_data: webp,
                         source_dims: None,
                         layout_dims: None,
+                        folder_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
+                        selection_proof: None,
                     },
                 );
             }
@@ -29933,6 +30075,8 @@ impl App {
                             jpeg_data: webp,
                             source_dims: None,
                             layout_dims: None,
+                            folder_provenance: None,
+                            selection_proof: None,
                         })
                     }
                     FileKind::ZipFile => {
@@ -30049,20 +30193,23 @@ impl App {
                 };
                 let key = crate::path_key::normalize_keep_drive(path);
                 let source = self.folder_pin_map.get(&key)?.clone();
-                let base_key = container_cache_base_key(
-                    item,
+                let base_key = crate::thumb_loader::folder_thumb_cache_key_for_path(
+                    path,
                     true,
-                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_sort,
                     self.settings.folder_thumb_depth,
+                    crate::catalog::FolderThumbProvenance::Seeded,
                 )?;
                 Some((path.clone(), source, base_key))
             }) else {
                 continue;
             };
             let prefix = drive_list_pinned_cache_key_prefix(&base_key, &source);
-            let Some(entry) = self.drive_list_pin_seed_entry(&container_path, &source) else {
+            let Some(mut entry) = self.drive_list_pin_seed_entry(&container_path, &source) else {
                 continue;
             };
+            entry.folder_provenance = Some(crate::catalog::FolderThumbProvenance::Seeded);
+            entry.selection_proof = None;
             let key = drive_list_pinned_cache_key(&prefix, entry.mtime, entry.file_size);
             let already_cached = cache_map
                 .read()
@@ -30076,7 +30223,7 @@ impl App {
             if already_cached {
                 continue;
             }
-            match target_cat.save_thumb_bytes(
+            match target_cat.save_seeded_folder_bytes(
                 &key,
                 entry.mtime,
                 entry.file_size,
@@ -31328,9 +31475,14 @@ impl App {
         let worker_order = std::sync::Arc::clone(&order);
         let (sender, receiver) = std::sync::mpsc::channel();
         let repaint = ctx.clone();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawned = std::thread::Builder::new()
             .name("page-edit-reconcile".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 let result = if let Some(keys) = changed_keys {
                     let keys = keys.into_iter().collect::<std::collections::HashSet<_>>();
                     worker_order
@@ -31569,9 +31721,14 @@ impl App {
         let (sender, receiver) = std::sync::mpsc::channel();
         let repaint = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context();
         let started_stamp = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawned = std::thread::Builder::new()
             .name("virtual-page-edit-prepare".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 let order = std::sync::Arc::new(builder.finish());
                 let result = page_edit_snapshot::PageEditSnapshot::load_and_project_order_stable(
                     order,
@@ -31640,9 +31797,14 @@ impl App {
         let (sender, receiver) = std::sync::mpsc::channel();
         let repaint = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context();
         let started_stamp = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let spawned = std::thread::Builder::new()
             .name("metadata-page-edit-reconcile".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 let result = page_edit_snapshot::PageEditSnapshot::load_and_project_order_stable(
                     worker_order,
                     availability,
@@ -40910,16 +41072,12 @@ impl App {
         // visible_indices の有無に関係なく処理する。
         {
             let shift_rating_key = self.keymap.consume_rating_action(ctx, true);
-            if let Some(stars) = shift_rating_key {
-                match self.set_current_folder_rating(stars) {
-                    Ok(true) => self.show_container_rating_toast(stars),
-                    Ok(false) => {}
-                    Err(error) => self.report_rating_write_error(&error),
-                }
+            if let Some(edit) = shift_rating_key {
+                self.apply_rating_edit_to_current_container(edit);
             }
             let rating_key = self.keymap.consume_rating_action(ctx, false);
-            if let Some(stars) = rating_key {
-                self.apply_rating_to_selection(stars);
+            if let Some(edit) = rating_key {
+                self.apply_rating_edit_to_selection(edit);
             }
         }
 
@@ -41671,11 +41829,16 @@ impl App {
         // 値をスナップショットして worker thread に move する。
         let detached_physical = self.navigation_scope.is_detached_physical();
         let mut tree_opts = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
-        if detached_physical {
+        if detached_physical
+            && tree_opts.archive_policy
+                != crate::folder_tree::NavigationArchivePolicy::IgnoreConvertible
+        {
             // A detached physical viewer must not open a conversion dialog owned
             // by the main window. Native still containers remain eligible.
-            tree_opts.include_convertible_archives = false;
+            tree_opts.archive_policy =
+                crate::folder_tree::NavigationArchivePolicy::DetachedReadable;
         }
+        let archive_cache_db = self.archive_cache_db.clone();
         let show_hidden_files = self.settings.show_hidden_files;
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -41709,6 +41872,9 @@ impl App {
         };
 
         std::thread::spawn(move || {
+            let cache = archive_cache_db.as_deref();
+            let decisions = crate::folder_tree::FolderNavDecisionMemo::default();
+            let memo = Some(&decisions);
             let t0 = std::time::Instant::now();
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -41738,22 +41904,38 @@ impl App {
                     None
                 } else {
                     let path = if forward {
-                        next_sibling_folder(&current, tree_opts)
+                        crate::folder_tree::next_sibling_folder_with_memo(
+                            &current,
+                            tree_opts,
+                            Some(&cancel_w),
+                            cache,
+                            memo,
+                        )
                     } else {
-                        prev_sibling_folder(&current, tree_opts)
+                        crate::folder_tree::prev_sibling_folder_with_memo(
+                            &current,
+                            tree_opts,
+                            Some(&cancel_w),
+                            cache,
+                            memo,
+                        )
                     };
                     path.map(|path| FolderNavOutcome {
                         hit_image_folder: if still_only {
-                            crate::folder_tree::folder_has_still_image_with_options(
+                            crate::folder_tree::folder_has_still_image_with_memo(
                                 &path,
                                 Some(&cancel_w),
                                 tree_opts,
+                                cache,
+                                memo,
                             )
                         } else {
-                            crate::folder_tree::folder_should_stop_with_options(
+                            crate::folder_tree::folder_should_stop_with_memo(
                                 &path,
                                 Some(&cancel_w),
                                 tree_opts,
+                                cache,
+                                memo,
                             )
                         },
                         path,
@@ -41762,15 +41944,23 @@ impl App {
             } else if forward {
                 navigate_folder_with_skip(
                     &current,
-                    |p| next_folder_dfs(p, tree_opts),
+                    |p| {
+                        crate::folder_tree::next_folder_dfs_with_memo(
+                            p,
+                            tree_opts,
+                            Some(&cancel_w),
+                            cache,
+                            memo,
+                        )
+                    },
                     |path, cancel| {
                         if still_only {
-                            crate::folder_tree::folder_has_still_image_with_options(
-                                path, cancel, tree_opts,
+                            crate::folder_tree::folder_has_still_image_with_memo(
+                                path, cancel, tree_opts, cache, memo,
                             )
                         } else {
-                            crate::folder_tree::folder_should_stop_with_options(
-                                path, cancel, tree_opts,
+                            crate::folder_tree::folder_should_stop_with_memo(
+                                path, cancel, tree_opts, cache, memo,
                             )
                         }
                     },
@@ -41780,15 +41970,23 @@ impl App {
             } else {
                 navigate_folder_with_skip(
                     &current,
-                    |p| prev_folder_dfs(p, tree_opts),
+                    |p| {
+                        crate::folder_tree::prev_folder_dfs_with_memo(
+                            p,
+                            tree_opts,
+                            Some(&cancel_w),
+                            cache,
+                            memo,
+                        )
+                    },
                     |path, cancel| {
                         if still_only {
-                            crate::folder_tree::folder_has_still_image_with_options(
-                                path, cancel, tree_opts,
+                            crate::folder_tree::folder_has_still_image_with_memo(
+                                path, cancel, tree_opts, cache, memo,
                             )
                         } else {
-                            crate::folder_tree::folder_should_stop_with_options(
-                                path, cancel, tree_opts,
+                            crate::folder_tree::folder_should_stop_with_memo(
+                                path, cancel, tree_opts, cache, memo,
                             )
                         }
                     },
@@ -41809,7 +42007,9 @@ impl App {
                     let scan_t0 = std::time::Instant::now();
                     let scan = scan_directory_with_convertible_archives(
                         &o.path,
-                        tree_opts.include_convertible_archives,
+                        tree_opts
+                            .archive_policy
+                            .includes_convertible_in_directory_scan(),
                         show_hidden_files,
                     );
                     if crate::perf::is_enabled() {
@@ -41892,11 +42092,29 @@ impl App {
                         smart_folder_nav_target_kind(state, &outcome.path, &scanned)
                     })
                 });
-                let _ = tx.send(FolderNavThreadResult {
-                    outcome,
-                    smart_kind,
-                    scanned,
+                let target = outcome.as_ref().and_then(|outcome| {
+                    let route = if detached_physical {
+                        FolderNavRoute::Detached(decisions.resolve(
+                            &outcome.path,
+                            tree_opts,
+                            Some(&cancel_w),
+                            cache,
+                        )?)
+                    } else {
+                        FolderNavRoute::FullFeature(outcome.path.clone())
+                    };
+                    Some(FolderNavTarget {
+                        route,
+                        smart_kind,
+                        scanned,
+                    })
                 });
+                if !cancel_w.load(Ordering::Relaxed) {
+                    let _ = tx.send(FolderNavThreadResult {
+                        target,
+                        hit_image_folder: outcome.as_ref().is_some_and(|o| o.hit_image_folder),
+                    });
+                }
             }
         });
 
@@ -42763,18 +42981,12 @@ impl App {
                 let pending = self.folder_nav_pending.take().unwrap();
                 let queued_steps = std::mem::take(&mut self.pending_folder_nav_steps);
                 self.pending_folder_nav_mode = FolderNavMode::Grid;
-                let (path, hit_image_folder) = match thread_result.outcome {
-                    Some(o) => (Some(o.path), o.hit_image_folder),
-                    None => (None, false),
-                };
                 Some(FolderNavResult {
-                    path,
-                    smart_kind: thread_result.smart_kind,
-                    hit_image_folder,
+                    target: thread_result.target,
+                    hit_image_folder: thread_result.hit_image_folder,
                     forward: pending.forward,
                     mode: pending.mode,
                     queued_steps,
-                    scanned: thread_result.scanned,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -42783,13 +42995,11 @@ impl App {
                 let queued_steps = std::mem::take(&mut self.pending_folder_nav_steps);
                 self.pending_folder_nav_mode = FolderNavMode::Grid;
                 Some(FolderNavResult {
-                    path: None,
-                    smart_kind: None,
+                    target: None,
                     hit_image_folder: false,
                     forward: pending.forward,
                     mode: pending.mode,
                     queued_steps,
-                    scanned: FolderNavScanResult::NotNeeded,
                 })
             }
         }
@@ -43105,7 +43315,7 @@ impl App {
                 &[
                     ("forward", serde_json::Value::from(result.forward)),
                     ("mode", serde_json::Value::from(apply_mode_tag)),
-                    ("found", serde_json::Value::from(result.path.is_some())),
+                    ("found", serde_json::Value::from(result.target.is_some())),
                     (
                         "hit_image_folder",
                         serde_json::Value::from(result.hit_image_folder),
@@ -43134,11 +43344,15 @@ impl App {
                 }
             };
         if let FolderNavMode::SmartFolder { state, fullscreen } = &result.mode {
-            let probe = result.path.as_deref().unwrap_or_else(|| {
-                // An empty worker result still belongs to the captured root order.
-                // The synthetic path cannot be a deleted physical entry.
-                Path::new("")
-            });
+            let probe = result
+                .target
+                .as_ref()
+                .map(FolderNavTarget::logical_source)
+                .unwrap_or_else(|| {
+                    // An empty worker result still belongs to the captured root order.
+                    // The synthetic path cannot be a deleted physical entry.
+                    Path::new("")
+                });
             if !self.smart_folder_navigation_target_current(state, probe) {
                 self.clear_pending_folder_nav_steps();
                 if *fullscreen {
@@ -43152,7 +43366,7 @@ impl App {
                 return;
             }
         }
-        let Some(path) = result.path else {
+        let Some(target) = result.target else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
                 FolderNavMode::SiblingGrid => {
@@ -43328,7 +43542,10 @@ impl App {
             return;
         }
         // DFS スレッドで事前スキャン済みなら UI スレッドの read_dir を省ける。
-        let scanned = match result.scanned {
+        let path = target.logical_source().to_path_buf();
+        let smart_kind = target.smart_kind;
+        let route = target.route;
+        let scanned = match target.scanned {
             FolderNavScanResult::NotNeeded => None,
             FolderNavScanResult::Ready(scan) => Some(scan),
             FolderNavScanResult::Failed(error) => {
@@ -43346,7 +43563,7 @@ impl App {
         match result.mode {
             FolderNavMode::Grid | FolderNavMode::SiblingGrid => {
                 if !matches!(
-                    self.load_folder_nav_target(path, scanned),
+                    self.load_folder_nav_target(route, scanned),
                     FolderOpenOutcome::Loaded
                 ) {
                     continue_burst = false;
@@ -43359,7 +43576,7 @@ impl App {
                 let restore_video_tile = fullscreen && self.video_tile_mode_active;
                 #[cfg(not(windows))]
                 let restore_video_tile = false;
-                let Some(kind) = result.smart_kind else {
+                let Some(kind) = smart_kind else {
                     self.clear_pending_folder_nav_steps();
                     self.finish_unbound_smart_folder_navigation_sequence();
                     self.release_fs_nav_lock();
@@ -43404,7 +43621,7 @@ impl App {
                 // 注: close_fullscreen は slideshow_playing=false にするが、SlideshowNext は
                 // resume_slideshow フラグ (= reopen 側で再開) で復帰するので問題ない。
                 self.close_fullscreen_for_folder_nav_reopen();
-                let open_outcome = self.load_folder_nav_target(path, scanned);
+                let open_outcome = self.load_folder_nav_target(route, scanned);
                 if !matches!(open_outcome, FolderOpenOutcome::Loaded) {
                     let deferred_conversion =
                         matches!(open_outcome, FolderOpenOutcome::ConversionDialogOpened)
@@ -43467,7 +43684,7 @@ impl App {
                     if fullscreen {
                         self.close_fullscreen_for_folder_nav_reopen();
                     }
-                    let open_outcome = self.load_folder_nav_target(path.clone(), scanned);
+                    let open_outcome = self.load_folder_nav_target(route, scanned);
                     if !matches!(open_outcome, FolderOpenOutcome::Loaded) {
                         self.clear_pending_folder_nav_steps();
                         self.release_fs_nav_lock();
@@ -43595,7 +43812,7 @@ impl App {
             .copied()
             .find_map(|i| pick_virtual(i, &self.items))?;
         if !matches!(
-            self.load_folder_nav_target(virtual_path, None),
+            self.load_folder_nav_target(FolderNavRoute::FullFeature(virtual_path), None),
             FolderOpenOutcome::Loaded
         ) {
             return None;
@@ -57559,6 +57776,72 @@ impl App {
         self.show_feedback_toast(msg);
     }
 
+    pub(crate) fn apply_rating_edit_to_current_container(
+        &mut self,
+        edit: crate::keymap::RatingEdit,
+    ) -> bool {
+        use crate::keymap::RatingEdit;
+        self.sync_current_context_rating_session_writes();
+        let stars = match edit {
+            RatingEdit::Assign(stars) => stars,
+            RatingEdit::Step(direction) => {
+                let before = self.current_folder_rating();
+                let Some(after) = crate::keymap::step_rating(before, direction) else {
+                    self.show_feedback_toast(Self::rating_step_bound_toast(direction));
+                    return false;
+                };
+                after
+            }
+        };
+        match self.set_current_folder_rating(stars) {
+            Ok(true) => {
+                self.show_container_rating_toast(stars);
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                self.report_rating_write_error(&error);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn apply_rating_edit_to_fullscreen_item(
+        &mut self,
+        idx: usize,
+        edit: crate::keymap::RatingEdit,
+    ) -> bool {
+        use crate::keymap::RatingEdit;
+        let stars = match edit {
+            RatingEdit::Assign(stars) => stars,
+            RatingEdit::Step(direction) => {
+                let before = self.get_rating(idx);
+                let Some(after) = crate::keymap::step_rating(before, direction) else {
+                    self.show_feedback_toast(Self::rating_step_bound_toast(direction));
+                    return false;
+                };
+                after
+            }
+        };
+        if !self.set_rating(idx, stars) {
+            return false;
+        }
+        self.rebuild_visible_indices();
+        if stars == 0 {
+            self.show_feedback_toast("[★解除]".to_string());
+        } else {
+            self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
+        }
+        true
+    }
+
+    fn rating_step_bound_toast(direction: crate::keymap::RatingStepDirection) -> String {
+        match direction {
+            crate::keymap::RatingStepDirection::Up => "[これ以上上げられません]".to_string(),
+            crate::keymap::RatingStepDirection::Down => "[これ以上下げられません]".to_string(),
+        }
+    }
+
     /// 現在一覧表示中のコンテナにレーティングを設定する (Shift+F1〜F6 用)。
     /// 合成パス (検索結果ビュー等) はスキップして `Ok(false)` を返す。
     /// Ctrl+G 検索中は `current_folder` が検索前のフォルダを指したままなので、
@@ -58251,10 +58534,19 @@ impl App {
     }
 
     pub(crate) fn apply_rating_to_selection(&mut self, stars: u8) {
+        self.apply_rating_edit_to_selection(crate::keymap::RatingEdit::Assign(stars));
+    }
+
+    pub(crate) fn apply_rating_edit_to_selection(&mut self, edit: crate::keymap::RatingEdit) {
+        use crate::keymap::RatingEdit;
         if self.items_are_drive_list {
             return;
         }
-        let stars = stars.min(5);
+        let edit = match edit {
+            RatingEdit::Assign(stars) => RatingEdit::Assign(stars.min(5)),
+            step => step,
+        };
+        self.sync_current_context_rating_session_writes();
         let targets = self.ratable_targets();
         if targets.is_empty() {
             return;
@@ -58264,15 +58556,21 @@ impl App {
         let mut pending_records: Vec<(usize, u8, u8)> = Vec::with_capacity(targets.len());
         for &idx in &targets {
             let before = self.rating_cache.get(&idx).copied().unwrap_or(0);
-            pending_records.push((idx, before, stars));
+            let after = match edit {
+                RatingEdit::Assign(stars) => Some(stars),
+                RatingEdit::Step(direction) => crate::keymap::step_rating(before, direction),
+            };
+            if let Some(after) = after {
+                pending_records.push((idx, before, after));
+            }
         }
         let mut successful_targets = Vec::with_capacity(targets.len());
         let mut undo_records = Vec::with_capacity(targets.len());
         let mut first_error = None;
-        for record @ (idx, _, _) in pending_records {
-            match self.set_rating_result(idx, stars) {
+        for record @ (idx, _, after) in pending_records {
+            match self.set_rating_result(idx, after) {
                 Ok(true) => {
-                    successful_targets.push(idx);
+                    successful_targets.push((idx, after));
                     undo_records.push(record);
                 }
                 Ok(false) => {}
@@ -58281,28 +58579,43 @@ impl App {
                 }
             }
         }
+        let had_error = first_error.is_some();
         if let Some(error) = first_error {
             self.report_rating_write_error(&error);
         }
         if successful_targets.is_empty() {
+            if let RatingEdit::Step(direction) = edit
+                && !had_error
+            {
+                self.show_feedback_toast(Self::rating_step_bound_toast(direction));
+            }
             return;
         }
-        let summary = if successful_targets.len() > 1 {
-            if stars == 0 {
+        let summary = match edit {
+            RatingEdit::Assign(stars) if successful_targets.len() > 1 && stars == 0 => {
                 format!("★解除を {} 件に適用", successful_targets.len())
-            } else {
+            }
+            RatingEdit::Assign(stars) if successful_targets.len() > 1 => {
                 format!("★{stars} を {} 件に付与", successful_targets.len())
             }
-        } else if stars == 0 {
-            "★解除".to_string()
-        } else {
-            format!("★{stars}")
+            RatingEdit::Assign(0) => "★解除".to_string(),
+            RatingEdit::Assign(stars) => format!("★{stars}"),
+            RatingEdit::Step(direction) => {
+                let verb = match direction {
+                    crate::keymap::RatingStepDirection::Up => "上げる",
+                    crate::keymap::RatingStepDirection::Down => "下げる",
+                };
+                format!("評価を1段階{verb} ({} 件)", successful_targets.len())
+            }
         };
-        self.capture_rating_undo(undo_records, summary);
+        self.capture_rating_undo(undo_records, summary.clone());
+        if matches!(edit, RatingEdit::Step(_)) {
+            self.show_feedback_toast(format!("[{summary}]"));
+        }
         let rating_view_changes: Vec<(String, u8)> = if self.items_are_rating_view {
             successful_targets
                 .iter()
-                .filter_map(|&idx| self.rating_path_key(idx).map(|key| (key, stars)))
+                .filter_map(|&(idx, after)| self.rating_path_key(idx).map(|key| (key, after)))
                 .collect()
         } else {
             Vec::new()
@@ -58310,15 +58623,20 @@ impl App {
         let bulk = successful_targets.len() > 1;
         if bulk {
             crate::logger::log(format!(
-                "[RATING] Bulk apply {stars} stars to {} items",
+                "[RATING] Bulk {summary} to {} items",
                 successful_targets.len(),
             ));
-            self.checked.clear();
         } else {
             crate::logger::log(format!(
-                "[RATING] Set {stars} stars on idx {}",
-                successful_targets[0]
+                "[RATING] {summary} on idx {}",
+                successful_targets[0].0
             ));
+        }
+        // A checked step can change just one item when the others are already at the bound.
+        // Keep direct-set's existing bulk-only clear rule; the no-change return above leaves
+        // checked targets intact when every step target is at its bound.
+        if bulk || (matches!(edit, RatingEdit::Step(_)) && !self.checked.is_empty()) {
+            self.checked.clear();
         }
         // Ctrl+G ヒットの stars はバッチ受信時の snapshot。レーティング変更後に
         // drilled view のサブフォルダ件数 / 枝刈りが古いまま残らないよう、
@@ -58329,7 +58647,12 @@ impl App {
         // ページ一覧が検索 drilled view の合成 items に置き換わる事故になる
         // (Codex P2)。
         if self.global_search.active {
-            self.refresh_global_search_hit_stars(&successful_targets);
+            self.refresh_global_search_hit_stars(
+                &successful_targets
+                    .iter()
+                    .map(|&(idx, _)| idx)
+                    .collect::<Vec<_>>(),
+            );
         }
         if self.items_are_rating_view {
             self.refresh_rating_view_after_rating_changes(&rating_view_changes);
@@ -79169,8 +79492,13 @@ fn make_drive_list_pin_load_request(
         ));
         return None;
     }
-    let base_key =
-        container_cache_base_key(item, true, Some(folder_thumb_sort), folder_thumb_depth)?;
+    let base_key = crate::thumb_loader::folder_thumb_cache_key_for_path(
+        container_path,
+        true,
+        folder_thumb_sort,
+        folder_thumb_depth,
+        crate::catalog::FolderThumbProvenance::Seeded,
+    )?;
     let cache_key_prefix = drive_list_pinned_cache_key_prefix(&base_key, source);
     Some(LoadRequest {
         idx,
@@ -79178,6 +79506,7 @@ fn make_drive_list_pin_load_request(
         cache_key_override: Some(base_key.clone()),
         folder_thumb_sort: Some(folder_thumb_sort),
         folder_thumb_depth,
+        folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
         pinned_only: Some(crate::thumb_loader::PinnedOnlyRequest { cache_key_prefix }),
         ..Default::default()
     })
@@ -79539,6 +79868,7 @@ fn make_load_request(
                 req,
                 path,
                 &base_key,
+                use_full_path_keys,
                 ContainerKindForPin::ConvertibleArchive,
                 pin_map,
                 converted_archive_cache_paths,
@@ -79568,6 +79898,7 @@ fn make_load_request(
                 req,
                 p,
                 &base_key,
+                use_full_path_keys,
                 ContainerKindForPin::ZipFile,
                 pin_map,
                 converted_archive_cache_paths,
@@ -79596,6 +79927,7 @@ fn make_load_request(
                 req,
                 p,
                 &base_key,
+                use_full_path_keys,
                 ContainerKindForPin::PdfFile,
                 pin_map,
                 converted_archive_cache_paths,
@@ -79616,12 +79948,14 @@ fn make_load_request(
                 cache_key_override: Some(base_key.clone()),
                 folder_thumb_sort,
                 folder_thumb_depth,
+                folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 ..base
             };
             Some(apply_folder_thumb_pin(
                 req,
                 p,
                 &base_key,
+                use_full_path_keys,
                 ContainerKindForPin::Folder,
                 pin_map,
                 converted_archive_cache_paths,
@@ -79714,9 +80048,28 @@ pub(crate) fn folder_thumb_existing_keys_for(
                 root_metadata,
             )
         {
+            let pinned_base_key = if matches!(item, GridItem::Folder(_)) {
+                crate::thumb_loader::folder_thumb_cache_key_for_path(
+                    container_path,
+                    use_full_path_keys,
+                    folder_thumb_sort.unwrap_or(crate::settings::SortOrder::Numeric),
+                    folder_thumb_depth,
+                    if matches!(
+                        resolved.kind,
+                        crate::folder_thumb_pins::ResolvedKind::Folder
+                    ) {
+                        crate::catalog::FolderThumbProvenance::AutoSelected
+                    } else {
+                        crate::catalog::FolderThumbProvenance::Seeded
+                    },
+                )
+                .unwrap_or_else(|| base_key.clone())
+            } else {
+                base_key.clone()
+            };
             keys.push(format!(
                 "{}{}{}",
-                base_key,
+                pinned_base_key,
                 crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
                 resolved.source_id,
             ));
@@ -79744,9 +80097,28 @@ pub(crate) fn folder_thumb_existing_keys_for(
         if let Some(resolved) =
             resolve_pin_target_cascaded(container_path, source, pin_db, folder_thumb_depth as usize)
         {
+            let pinned_base_key = if matches!(item, GridItem::Folder(_)) {
+                crate::thumb_loader::folder_thumb_cache_key_for_path(
+                    container_path,
+                    use_full_path_keys,
+                    folder_thumb_sort.unwrap_or(crate::settings::SortOrder::Numeric),
+                    folder_thumb_depth,
+                    if matches!(
+                        resolved.kind,
+                        crate::folder_thumb_pins::ResolvedKind::Folder
+                    ) {
+                        crate::catalog::FolderThumbProvenance::AutoSelected
+                    } else {
+                        crate::catalog::FolderThumbProvenance::Seeded
+                    },
+                )
+                .unwrap_or_else(|| base_key.clone())
+            } else {
+                base_key.clone()
+            };
             keys.push(format!(
                 "{}{}{}",
-                base_key,
+                pinned_base_key,
                 crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
                 resolved.source_id,
             ));
@@ -79895,6 +80267,7 @@ fn apply_folder_thumb_pin(
     base_req: LoadRequest,
     container: &std::path::Path,
     base_key: &str,
+    use_full_path_keys: bool,
     container_kind: ContainerKindForPin,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     converted_archive_cache_paths: &std::collections::HashMap<String, ConvertedArchiveSourceState>,
@@ -79953,9 +80326,30 @@ fn apply_folder_thumb_pin(
     use crate::folder_thumb_pins::ResolvedKind;
     use crate::thumb_loader::ResolveStrategy;
 
+    let folder_provenance = matches!(container_kind, ContainerKindForPin::Folder).then_some(
+        if matches!(resolved.kind, ResolvedKind::Folder) {
+            crate::catalog::FolderThumbProvenance::AutoSelected
+        } else {
+            crate::catalog::FolderThumbProvenance::Seeded
+        },
+    );
+    let effective_base_key = if let Some(provenance) = folder_provenance {
+        crate::thumb_loader::folder_thumb_cache_key_for_path(
+            container,
+            use_full_path_keys,
+            base_req
+                .folder_thumb_sort
+                .unwrap_or(crate::settings::SortOrder::Numeric),
+            base_req.folder_thumb_depth,
+            provenance,
+        )
+        .unwrap_or_else(|| base_key.to_owned())
+    } else {
+        base_key.to_owned()
+    };
     let pinned_key = format!(
         "{}{}{}",
-        base_key,
+        effective_base_key,
         crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
         resolved.source_id,
     );
@@ -80027,6 +80421,7 @@ fn apply_folder_thumb_pin(
             resolve_override: None,
             folder_thumb_sort: base_req.folder_thumb_sort,
             folder_thumb_depth: base_req.folder_thumb_depth,
+            folder_thumb_provenance: folder_provenance,
             idx: base_req.idx,
             source_policy: LoadSourcePolicy::CacheOrSource,
             priority: base_req.priority,
@@ -80117,6 +80512,7 @@ fn apply_folder_thumb_pin(
         // base_req から継承するので Folder → Folder の pin で sort/depth が消えない。
         folder_thumb_sort: base_req.folder_thumb_sort,
         folder_thumb_depth: base_req.folder_thumb_depth,
+        folder_thumb_provenance: folder_provenance,
         idx: base_req.idx,
         source_policy: base_req.source_policy,
         priority: base_req.priority,
@@ -80675,6 +81071,7 @@ impl App {
             .get(idx)
             .map(|item| crate::gpu_lanczos::TestPaintProvenance {
                 context: self.projected_viewer_context_id(),
+                items_generation: self.items_generation,
                 item: item.perf_key(),
                 page: idx,
             })
@@ -81106,6 +81503,7 @@ mod rated_at_details_sort_tests {
 
     #[test]
     fn rated_at_details_sort_keeps_null_last_in_both_directions() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app_for_test();
         app.rating_view_rows = vec![
             row("thirty.jpg", Some(30)),
@@ -81140,6 +81538,7 @@ mod rated_at_details_sort_tests {
 
     #[test]
     fn rated_at_sort_is_visible_only_in_rating_view_and_resets_on_close() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app_for_test();
         app.settings.details_show_rated_at = true;
 
@@ -81160,6 +81559,7 @@ mod rated_at_details_sort_tests {
 
     #[test]
     fn reinstalling_same_rating_view_keeps_rated_at_sort() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app_for_test();
         app.rating_view_rows = vec![row("page.jpg", Some(10))];
         app.items_are_rating_view = true;
@@ -81179,6 +81579,7 @@ mod rated_at_details_sort_tests {
 
     #[test]
     fn true_rating_view_entry_does_not_restore_a_stale_rated_at_sort() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app_for_test();
         app.rating_view_rows = vec![row("page.jpg", Some(10))];
         app.items_are_rating_view = false;

@@ -2310,6 +2310,9 @@ impl App {
 
                 // 動画ループモード変更を検出してフルスクリーン中の player に反映する
                 let old_loop_mode = self.settings.video_loop_mode;
+                let old_video_seek_preview_size = self.settings.video_seek_preview_size;
+                let old_video_seek_preview_size_values =
+                    self.settings.video_seek_preview_size_values;
 
                 // AI バックエンド設定変更を検出してホットリロードトリガに使う
                 let old_ai_backend = self.settings.ai_backend.clone();
@@ -2531,6 +2534,26 @@ impl App {
                 }
                 self.settings.save();
                 creative_lut_transaction.commit();
+
+                // Settings are global; every live native presenter receives the new display
+                // size through the same snapshot used at presenter creation.
+                #[cfg(windows)]
+                if old_video_seek_preview_size != self.settings.video_seek_preview_size
+                    || old_video_seek_preview_size_values
+                        != self.settings.video_seek_preview_size_values
+                {
+                    let state = self.native_bar_lock_state();
+                    for (_, entry) in &self.fs_cache {
+                        if let crate::fs_animation::FsCacheEntry::Video { player, .. } = entry {
+                            player.set_native_bar_lock_state(state);
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                let _ = (
+                    old_video_seek_preview_size,
+                    old_video_seek_preview_size_values,
+                );
 
                 if let Some(service) = &self.edit_preview_cache {
                     if !self.settings.edit_preview_cache_enabled {
@@ -4245,6 +4268,7 @@ mod tests {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         draw_still_seek_strip_settings(ui, &mut settings);
+                        draw_still_seek_preview_size_settings(ui, &mut settings);
                     });
             });
         });
@@ -4255,7 +4279,7 @@ mod tests {
     #[test]
     fn preferences_still_seek_strip_height_settings_snapshot_regular_width() {
         still_seek_strip_height_settings_snapshot(
-            egui::vec2(520.0, 430.0),
+            egui::vec2(520.0, 660.0),
             "preferences_still_seek_strip_height_regular",
         );
     }
@@ -4263,7 +4287,7 @@ mod tests {
     #[test]
     fn preferences_still_seek_strip_height_settings_snapshot_narrow_width() {
         still_seek_strip_height_settings_snapshot(
-            egui::vec2(280.0, 500.0),
+            egui::vec2(280.0, 720.0),
             "preferences_still_seek_strip_height_narrow",
         );
     }
@@ -4284,6 +4308,7 @@ mod tests {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         draw_video_seek_strip_height_settings(ui, &mut settings);
+                        draw_video_seek_preview_size_settings(ui, &mut settings);
                     });
             });
         });
@@ -4294,7 +4319,7 @@ mod tests {
     #[test]
     fn preferences_video_seek_strip_height_settings_snapshot_regular_width() {
         video_seek_strip_height_settings_snapshot(
-            egui::vec2(520.0, 430.0),
+            egui::vec2(520.0, 620.0),
             "preferences_video_seek_strip_height_regular",
         );
     }
@@ -4302,7 +4327,7 @@ mod tests {
     #[test]
     fn preferences_video_seek_strip_height_settings_snapshot_narrow_width() {
         video_seek_strip_height_settings_snapshot(
-            egui::vec2(280.0, 500.0),
+            egui::vec2(280.0, 680.0),
             "preferences_video_seek_strip_height_narrow",
         );
     }

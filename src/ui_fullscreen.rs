@@ -5113,6 +5113,87 @@ struct StillSeekPreviewPage {
     rotation: crate::rotation_db::Rotation,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct StillSeekPreviewLayout {
+    bubble_rect: egui::Rect,
+    image_bounds: egui::Rect,
+    pane_width: f32,
+}
+
+fn still_seek_preview_layout(
+    full_rect: egui::Rect,
+    panel_top: f32,
+    pointer_x: f32,
+    page_sizes: &[Option<egui::Vec2>],
+    size: crate::settings::StillSeekPreviewSize,
+    values: crate::settings::StillSeekPreviewSizeValues,
+) -> Option<StillSeekPreviewLayout> {
+    let pane_count = page_sizes.len().max(1);
+    let gap_count = (pane_count - 1) as f32;
+    // 180pt is the legacy image-box height; the 240pt width limit follows it proportionally.
+    let scale = values.points(size) / STILL_SEEK_PREVIEW_MAX_HEIGHT;
+    let per_pane_max_width = (STILL_SEEK_PREVIEW_MAX_WIDTH * scale
+        - STILL_SEEK_PREVIEW_PANE_GAP * gap_count)
+        / pane_count as f32;
+    let pane_size = page_sizes
+        .iter()
+        .filter_map(|page| *page)
+        .map(|page_size| {
+            let fit = (per_pane_max_width / page_size.x.max(1.0))
+                .min(STILL_SEEK_PREVIEW_MAX_HEIGHT * scale / page_size.y.max(1.0));
+            page_size * fit
+        })
+        .fold(egui::Vec2::ZERO, |acc, page_size| {
+            egui::vec2(acc.x.max(page_size.x), acc.y.max(page_size.y))
+        });
+    let pane_size = if pane_size == egui::Vec2::ZERO {
+        egui::vec2((160.0 * scale).min(per_pane_max_width), 100.0 * scale)
+    } else {
+        pane_size
+    };
+    // The bubble has 6pt image padding on each side, 34pt of label/padding below the image,
+    // and 8pt screen margins. The top HUD can be visible at the same time as the seek row.
+    let max_image_width = full_rect.width() - 28.0;
+    let max_image_height = panel_top - 10.0 - (full_rect.top() + TOP_BAR_HEIGHT + 8.0) - 34.0;
+    let max_pane_width =
+        (max_image_width - STILL_SEEK_PREVIEW_PANE_GAP * gap_count) / pane_count as f32;
+    if max_pane_width <= 0.0 || max_image_height <= 0.0 {
+        return None;
+    }
+    let fit = (max_pane_width / pane_size.x)
+        .min(max_image_height / pane_size.y)
+        .min(1.0);
+    let pane_size = pane_size * fit;
+    let image_size = egui::vec2(
+        pane_size.x * pane_count as f32 + STILL_SEEK_PREVIEW_PANE_GAP * gap_count,
+        pane_size.y,
+    );
+    let bubble_size = image_size + egui::vec2(12.0, 34.0);
+    if bubble_size.x < 24.0 {
+        return None;
+    }
+    let min_left = full_rect.left() + 8.0;
+    let left =
+        (pointer_x - bubble_size.x * 0.5).clamp(min_left, full_rect.right() - bubble_size.x - 8.0);
+    let bubble_rect = egui::Rect::from_min_size(
+        egui::pos2(left, panel_top - 10.0 - bubble_size.y),
+        bubble_size,
+    );
+    let image_bounds = egui::Rect::from_min_max(
+        bubble_rect.min + egui::vec2(6.0, 6.0),
+        egui::pos2(bubble_rect.right() - 6.0, bubble_rect.bottom() - 24.0),
+    );
+    // Match the former pane geometry after the bubble rect has been positioned; deriving
+    // this from the final bounds also avoids a floating-point shift at the default size.
+    let pane_width =
+        (image_bounds.width() - STILL_SEEK_PREVIEW_PANE_GAP * gap_count) / pane_count as f32;
+    Some(StillSeekPreviewLayout {
+        bubble_rect,
+        image_bounds,
+        pane_width,
+    })
+}
+
 enum StillSeekSpreadPreparation {
     Single,
     Ready(Arc<Vec<SpreadDisplayUnit>>),
@@ -5144,44 +5225,22 @@ fn paint_still_seek_preview(
     pointer_x: f32,
     textures: &[Option<StillSeekPreviewPage>],
     label: &str,
+    size: crate::settings::StillSeekPreviewSize,
+    values: crate::settings::StillSeekPreviewSizeValues,
 ) {
-    let pane_count = textures.len().max(1);
-    // 1 枚あたりの幅は、全体が最大幅に収まるように分け合う。見開きでも吹き出しが
-    // 横に伸びて画面からはみ出さないようにする。
-    let per_pane_max_width = (STILL_SEEK_PREVIEW_MAX_WIDTH
-        - STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32)
-        / pane_count as f32;
-    let pane_size = textures
+    let page_sizes: Vec<_> = textures
         .iter()
-        .filter_map(|tex| tex.as_ref())
         .map(|page| {
-            let size = rotated_display_size(page.texture.size_vec2(), page.rotation);
-            let scale = (per_pane_max_width / size.x.max(1.0))
-                .min(STILL_SEEK_PREVIEW_MAX_HEIGHT / size.y.max(1.0));
-            size * scale
+            page.as_ref()
+                .map(|page| rotated_display_size(page.texture.size_vec2(), page.rotation))
         })
-        .fold(egui::Vec2::ZERO, |acc, size| {
-            egui::vec2(acc.x.max(size.x), acc.y.max(size.y))
-        });
-    let pane_size = if pane_size == egui::Vec2::ZERO {
-        // まだ 1 枚も読めていないときの見た目。読み込み後に伸縮しすぎないよう、
-        // 1 枚版の従来サイズを枚数ぶん並べた大きさにする。
-        egui::vec2(160.0_f32.min(per_pane_max_width), 100.0)
-    } else {
-        pane_size
+        .collect();
+    let Some(layout) =
+        still_seek_preview_layout(full_rect, panel_top, pointer_x, &page_sizes, size, values)
+    else {
+        return;
     };
-    let desired_image_size = egui::vec2(
-        pane_size.x * pane_count as f32 + STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32,
-        pane_size.y,
-    );
-    let bubble_size = desired_image_size + egui::vec2(12.0, 34.0);
-    let min_left = full_rect.left() + 8.0;
-    let max_left = (full_rect.right() - bubble_size.x - 8.0).max(min_left);
-    let left = (pointer_x - bubble_size.x * 0.5).clamp(min_left, max_left);
-    let bubble_rect = egui::Rect::from_min_size(
-        egui::pos2(left, panel_top - 10.0 - bubble_size.y),
-        bubble_size,
-    );
+    let bubble_rect = layout.bubble_rect;
     let background = egui::Color32::from_rgba_unmultiplied(12, 14, 18, 244);
     painter.rect_filled(bubble_rect, 6.0, background);
     painter.rect_stroke(
@@ -5200,12 +5259,8 @@ fn paint_still_seek_preview(
         background,
         egui::Stroke::NONE,
     ));
-    let image_bounds = egui::Rect::from_min_max(
-        bubble_rect.min + egui::vec2(6.0, 6.0),
-        egui::pos2(bubble_rect.right() - 6.0, bubble_rect.bottom() - 24.0),
-    );
-    let pane_width = (image_bounds.width() - STILL_SEEK_PREVIEW_PANE_GAP * (pane_count - 1) as f32)
-        / pane_count as f32;
+    let image_bounds = layout.image_bounds;
+    let pane_width = layout.pane_width;
     for (pane, texture) in textures.iter().enumerate() {
         let left = image_bounds.left() + (pane_width + STILL_SEEK_PREVIEW_PANE_GAP) * pane as f32;
         let pane_bounds = egui::Rect::from_min_size(
@@ -5244,7 +5299,7 @@ fn paint_still_seek_preview(
             egui::Color32::from_gray(170),
         );
     }
-    painter.text(
+    painter.with_clip_rect(bubble_rect).text(
         egui::pos2(bubble_rect.center().x, bubble_rect.bottom() - 12.0),
         egui::Align2::CENTER_CENTER,
         label,
@@ -9917,11 +9972,27 @@ impl App {
                     return None;
                 }
                 let mut pages = screen_pages.to_vec();
-                if self.spread_mode.is_rtl() {
+                let supplement_side = pages
+                    .iter()
+                    .any(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+                    .then(|| {
+                        if pages[0].role == SpreadPageRole::Navigation {
+                            SingletonSpreadPlacement::Left
+                        } else {
+                            SingletonSpreadPlacement::Right
+                        }
+                    });
+                if supplement_side.is_some() {
+                    pages.sort_by_key(|page| page.role != SpreadPageRole::Navigation);
+                } else if self.spread_mode.is_rtl() {
                     pages.reverse();
                 }
-                SpreadDisplayComposition::from_presentation_pages(navigation_anchor_idx, pages)
-                    .map(|composition| (composition, transform))
+                SpreadDisplayComposition::from_presentation_pages(navigation_anchor_idx, pages).map(
+                    |mut composition| {
+                        composition.supplemented_navigation_side = supplement_side;
+                        (composition, transform)
+                    },
+                )
             }
             FullscreenPageLayoutKind::Empty | FullscreenPageLayoutKind::Continuous => None,
         }
@@ -13774,6 +13845,9 @@ pub(crate) struct SpreadDisplayComposition {
     navigation_anchor_idx: usize,
     pages: Vec<SpreadPageOccurrence>,
     singleton_placement: SingletonSpreadPlacement,
+    /// A forced final page keeps its physical side when the cover fills the
+    /// companion slot. Reading order still keeps the navigation page first.
+    supplemented_navigation_side: Option<SingletonSpreadPlacement>,
 }
 
 impl SpreadDisplayComposition {
@@ -13813,6 +13887,7 @@ impl SpreadDisplayComposition {
             navigation_anchor_idx,
             pages,
             singleton_placement: SingletonSpreadPlacement::Center,
+            supplemented_navigation_side: None,
         })
     }
 
@@ -13852,6 +13927,14 @@ impl SpreadDisplayComposition {
         &self,
         spread_mode: SpreadMode,
     ) -> Vec<SpreadPageOccurrence> {
+        if let Some(side) = self.supplemented_navigation_side {
+            debug_assert_eq!(self.pages.len(), 2);
+            return if side == SingletonSpreadPlacement::Right {
+                vec![self.pages[1], self.pages[0]]
+            } else {
+                self.pages.clone()
+            };
+        }
         if self.pages.len() == 2 && spread_mode.is_rtl() {
             self.pages.iter().rev().copied().collect()
         } else {
@@ -13925,7 +14008,6 @@ fn compose_spread_navigation_unit(
     if final_cover_enabled
         && complete_book_eligible
         && spread_mode.has_cover()
-        && !base.singleton_placement.has_white_companion()
         && is_last_unit
         && first_unit_pages.len() == 1
         && last_unit_pages.len() == 1
@@ -13933,6 +14015,10 @@ fn compose_spread_navigation_unit(
     {
         let cover_idx = first_unit_pages[0];
         if cover_idx != navigation_anchor_idx {
+            if base.singleton_placement.has_white_companion() {
+                base.supplemented_navigation_side = Some(base.singleton_placement.side());
+                base.singleton_placement = SingletonSpreadPlacement::Center;
+            }
             base.pages.push(SpreadPageOccurrence {
                 idx: cover_idx,
                 role: SpreadPageRole::FrontCoverSupplement,
@@ -16103,6 +16189,8 @@ pub fn draw_still_seek_strip_snapshot_fixture(ui: &mut egui::Ui) {
         full_rect.center().x + 40.0,
         &[None, None],
         "20-21 / 128",
+        crate::settings::StillSeekPreviewSize::Large,
+        crate::settings::StillSeekPreviewSizeValues::default(),
     );
 }
 
@@ -21459,6 +21547,8 @@ impl App {
                 preview_pointer_x.unwrap_or(full_rect.center().x),
                 &textures,
                 &label,
+                self.settings.still_seek_preview_size,
+                self.settings.still_seek_preview_size_values,
             );
         }
         if !primary_down && self.fs_seek_drag_active {
@@ -27196,6 +27286,23 @@ impl App {
             .spread_pair(self.spread_mode)
     }
 
+    /// Export and capture use navigation pages. A cover supplement occupies a
+    /// visible slot but is never part of the saved output.
+    fn resolve_visible_spread_output_pair(&mut self, idx: usize) -> SpreadPair {
+        if self
+            .resolve_visible_spread_presentation_in_reading_order(idx)
+            .is_some_and(|pages| {
+                pages
+                    .iter()
+                    .any(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+            })
+        {
+            SpreadPair::Single
+        } else {
+            self.resolve_visible_spread_pair(idx)
+        }
+    }
+
     /// Role-aware pages in the reader's order for the spread currently on screen.
     ///
     /// The layout stores screen order, while `BothPages` external-tool launches retain the
@@ -27211,7 +27318,12 @@ impl App {
                 .iter()
                 .any(|page| page.role == SpreadPageRole::Navigation && page.idx == idx)
         {
-            if self.spread_mode.is_rtl() {
+            if pages
+                .iter()
+                .any(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+            {
+                pages.sort_by_key(|page| page.role != SpreadPageRole::Navigation);
+            } else if self.spread_mode.is_rtl() {
                 pages.reverse();
             }
             return Some(pages.into_iter().collect());
@@ -29185,26 +29297,14 @@ impl App {
         // (フォルダ / ZIP / PDF) にレーティング / 解除。
         // current_folder がそのまま親コンテナなので、そちらに書き込めば一覧画面で★絞り込みできる。
         let container_rating_key = self.keymap.consume_rating_action(ctx, true);
-        if let Some(stars) = container_rating_key {
-            match self.set_current_folder_rating(stars) {
-                Ok(true) => self.show_container_rating_toast(stars),
-                Ok(false) => {}
-                Err(error) => self.report_rating_write_error(&error),
-            }
+        if let Some(edit) = container_rating_key {
+            self.apply_rating_edit_to_current_container(edit);
         }
 
         // レーティング 1〜5 / 解除 (既定: F1〜F6)
         let rating_key = self.keymap.consume_rating_action(ctx, false);
-        if let Some(stars) = rating_key {
-            if self.set_rating(fs_idx, stars) {
-                // レーティング変更でフィルタ境界を跨ぐ可能性があるので visible_indices 再計算。
-                self.rebuild_visible_indices();
-                if stars == 0 {
-                    self.show_feedback_toast("[★解除]".to_string());
-                } else {
-                    self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
-                }
-            }
+        if let Some(edit) = rating_key {
+            self.apply_rating_edit_to_fullscreen_item(fs_idx, edit);
         }
         if key_p_pin {
             self.toggle_folder_pin_for_idx(fs_idx);
@@ -44199,7 +44299,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Result<crate::capture::CapturePixelWork, String> {
-        match self.resolve_visible_spread_pair(idx) {
+        match self.resolve_visible_spread_output_pair(idx) {
             SpreadPair::Single => self
                 .prepare_capture_pixel_job(ctx, idx)
                 .map(crate::capture::CapturePixelWork::Single),
@@ -45287,7 +45387,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> Result<ExportDialogTarget, String> {
-        match self.resolve_visible_spread_pair(fs_idx) {
+        match self.resolve_visible_spread_output_pair(fs_idx) {
             SpreadPair::Single => self.prepare_single_export_dialog_target(ctx, fs_idx),
             SpreadPair::Double { left, right } => {
                 self.prepare_spread_export_dialog_target(ctx, left, right)
@@ -66802,7 +66902,7 @@ mod tests {
             1,
             FsCacheEntry::Static {
                 tex,
-                pixels: std::sync::Arc::new(pixels),
+                pixels: std::sync::Arc::new(pixels.clone()),
                 source_dims: Some([32, 48]),
                 load_seq: 1,
                 animation: crate::fs_animation::StaticAnimationState::Still,
@@ -66824,6 +66924,51 @@ mod tests {
         let capture = app.prepare_capture_pixel_work(&ctx, 1).unwrap();
         assert!(matches!(
             capture,
+            crate::capture::CapturePixelWork::Single(_)
+        ));
+
+        app.settings.last_page_alone_enabled = true;
+        app.settings.final_cover_spread_enabled = true;
+        app.fullscreen_idx = Some(2);
+        for idx in [0, 2] {
+            let tex = ctx.load_texture(
+                format!("page-alone-assisted-{idx}"),
+                pixels.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels: std::sync::Arc::new(pixels.clone()),
+                    source_dims: Some([32, 48]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+        }
+        let assisted = app.capture_fs_display_unit(2).expect("assisted final unit");
+        assert_eq!(assisted.pages.len(), 2);
+        assert_eq!(
+            assisted.singleton_placement,
+            SingletonSpreadPlacement::Center
+        );
+        assert_eq!(assisted.pages[0].idx(), 0);
+        assert_eq!(assisted.pages[1].idx(), 2);
+        assert_eq!(
+            assisted.pages[0].occurrence.role,
+            SpreadPageRole::FrontCoverSupplement
+        );
+        assert_eq!(
+            app.resolve_visible_spread_pair(2),
+            SpreadPair::Double { left: 0, right: 2 }
+        );
+        assert!(matches!(
+            app.prepare_export_dialog_target(&ctx, 2).unwrap().composite,
+            crate::export_dialog::ExportComposite::Single(_)
+        ));
+        assert!(matches!(
+            app.prepare_capture_pixel_work(&ctx, 2).unwrap(),
             crate::capture::CapturePixelWork::Single(_)
         ));
     }
@@ -68085,47 +68230,79 @@ mod tests {
             }
         }
 
-        for (count, choice, has_supplement) in [
-            (2, 1, false),
-            (3, 1, false),
-            (5, 1, false),
-            (4, 2, false),
-            (2, 0, true),
-            (4, 0, true),
-        ] {
+        // Per row: 00, 10, 01, 11. A side means the final navigation page
+        // receives the cover on its other side when assist is ON.
+        let final_sides = [
+            [None, None, None, None],
+            [Some(false), Some(true), Some(true), Some(true)],
+            [None, Some(false), Some(false), Some(true)],
+            [Some(false), None, Some(true), Some(false)],
+            [None, Some(false), Some(false), Some(true)],
+        ];
+        for (count_offset, row) in final_sides.into_iter().enumerate() {
+            let count = count_offset + 1;
             let nav = (1..=count).collect::<Vec<_>>();
-            let settings = PageAloneSettings {
-                after_cover: choice & 1 != 0,
-                last: choice & 2 != 0,
-            };
-            let units = build_spread_display_units_with_page_alone(
-                &nav,
-                SpreadMode::LtrCover,
-                None,
-                settings,
-                |_, _| false,
-                |_| true,
-            );
-            let final_composition = resolve_spread_display_composition(
-                &units,
-                units.len() - 1,
-                SpreadMode::LtrCover,
-                true,
-                false,
-                true,
-            )
-            .unwrap();
-            assert_eq!(
-                final_composition.pages.len() == 2,
-                has_supplement,
-                "assist count={count} choice={choice}"
-            );
-            assert_eq!(
-                final_composition
-                    .singleton_placement()
-                    .has_white_companion(),
-                !has_supplement
-            );
+            for (choice, right_in_ltr) in row.into_iter().enumerate() {
+                let settings = PageAloneSettings {
+                    after_cover: choice & 1 != 0,
+                    last: choice & 2 != 0,
+                };
+                for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+                    let units = build_spread_display_units_with_page_alone(
+                        &nav,
+                        mode,
+                        None,
+                        settings,
+                        |_, _| false,
+                        |_| true,
+                    );
+                    for assist in [false, true] {
+                        for (unit_pos, unit) in units.iter().enumerate() {
+                            let composition = resolve_spread_display_composition(
+                                &units, unit_pos, mode, assist, false, true,
+                            )
+                            .unwrap();
+                            assert_eq!(composition.navigation_pages(), unit.pages);
+                            assert_eq!(composition.navigation_anchor_idx(), unit.anchor_idx());
+                            let supplement = composition
+                                .pages_in_screen_order(mode)
+                                .into_iter()
+                                .filter(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+                                .collect::<Vec<_>>();
+                            let expected_side = assist.then_some(right_in_ltr).flatten();
+                            assert_eq!(
+                                supplement.len(),
+                                usize::from(unit_pos + 1 == units.len() && expected_side.is_some()),
+                                "count={count} choice={choice} mode={mode:?} assist={assist} unit={unit_pos}"
+                            );
+                            if unit_pos + 1 == units.len() {
+                                if let Some(right) = expected_side {
+                                    let right = right ^ mode.is_rtl();
+                                    let screen = composition.pages_in_screen_order(mode);
+                                    assert_eq!(
+                                        screen[usize::from(right)].idx,
+                                        unit.anchor_idx(),
+                                        "final real page keeps its natural side"
+                                    );
+                                    assert_eq!(
+                                        composition.singleton_placement(),
+                                        SingletonSpreadPlacement::Center,
+                                        "the cover replaces white"
+                                    );
+                                }
+                            } else if matches!(
+                                unit.formation,
+                                SpreadDisplayUnitFormation::Singleton(
+                                    SpreadDisplaySingletonCause::ForcedAfterCover(_)
+                                        | SpreadDisplaySingletonCause::ForcedBoundary(_)
+                                )
+                            ) {
+                                assert!(composition.singleton_placement().has_white_companion());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -68158,14 +68335,31 @@ mod tests {
             expected.extend((4..=33).step_by(2).map(|first| vec![first, first + 1]));
             expected.extend([vec![34], vec![36]]);
             assert_eq!(pages, expected);
-            let forced = [1, units.len() - 2, units.len() - 1];
-            for at in forced {
+            for at in [1, units.len() - 2] {
                 let composition =
                     resolve_spread_display_composition(&units, at, mode, true, false, true)
                         .unwrap();
                 assert!(composition.singleton_placement().has_white_companion());
                 assert_eq!(composition.pages.len(), 1);
             }
+            let last = resolve_spread_display_composition(
+                &units,
+                units.len() - 1,
+                mode,
+                true,
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(last.navigation_pages(), vec![36]);
+            assert_eq!(last.pages_in_reading_order()[1].idx, 1);
+            assert_eq!(
+                last.pages_in_reading_order()[1].role,
+                SpreadPageRole::FrontCoverSupplement
+            );
+            assert_eq!(last.singleton_placement(), SingletonSpreadPlacement::Center);
+            let screen = last.pages_in_screen_order(mode);
+            assert_eq!(screen[usize::from(mode.is_rtl())].idx, 36);
         }
         let short = [0, 1, 2, 3, 4];
         for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
@@ -68228,6 +68422,92 @@ mod tests {
         assert!(
             white_companion_rect_for_real(real, SingletonSpreadPlacement::Right, 4.0).is_none()
         );
+    }
+
+    #[test]
+    fn forced_final_landscape_or_nonpairable_uses_the_ordinary_assist_gate() {
+        let nav = [0, 1, 2];
+        for (settings, blocked_idx) in [
+            (
+                crate::settings::PageAloneSettings {
+                    after_cover: true,
+                    last: true,
+                },
+                1,
+            ),
+            (
+                crate::settings::PageAloneSettings {
+                    after_cover: false,
+                    last: true,
+                },
+                2,
+            ),
+        ] {
+            for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+                for nonpairable in [false, true] {
+                    for forced in [false, true] {
+                        let units = build_spread_display_units_with_page_alone(
+                            &nav[..=blocked_idx],
+                            mode,
+                            None,
+                            if forced {
+                                settings
+                            } else {
+                                crate::settings::PageAloneSettings::default()
+                            },
+                            |_, idx| !nonpairable && idx == blocked_idx,
+                            |idx| !nonpairable || idx != blocked_idx,
+                        );
+                        for assist in [false, true] {
+                            let last = resolve_spread_display_composition(
+                                &units,
+                                units.len() - 1,
+                                mode,
+                                assist,
+                                false,
+                                true,
+                            )
+                            .unwrap();
+                            assert_eq!(last.navigation_pages(), vec![blocked_idx]);
+                            let screen = last.pages_in_screen_order(mode);
+                            assert_eq!(screen.len(), if assist { 2 } else { 1 });
+                            if forced {
+                                if assist {
+                                    let side = match units.last().unwrap().formation {
+                                        SpreadDisplayUnitFormation::Singleton(
+                                            SpreadDisplaySingletonCause::ForcedAfterCover(side)
+                                            | SpreadDisplaySingletonCause::ForcedLast(side)
+                                            | SpreadDisplaySingletonCause::ForcedBoundary(side),
+                                        ) => side,
+                                        other => {
+                                            panic!("expected forced final singleton: {other:?}")
+                                        }
+                                    };
+                                    assert_eq!(
+                                        last.singleton_placement(),
+                                        SingletonSpreadPlacement::Center
+                                    );
+                                    assert_eq!(
+                                        screen
+                                            [usize::from(side == SingletonSpreadPlacement::Right)]
+                                        .idx,
+                                        blocked_idx,
+                                        "forced page keeps its natural side with the cover attached"
+                                    );
+                                    assert_eq!(
+                                        screen[usize::from(side == SingletonSpreadPlacement::Left)]
+                                            .role,
+                                        SpreadPageRole::FrontCoverSupplement
+                                    );
+                                } else {
+                                    assert!(last.singleton_placement().has_white_companion());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -69699,7 +69979,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_page_alone_groups_keep_real_addresses_and_white_slot_side() {
+    fn remote_page_alone_groups_replace_final_white_with_cover_presentation() {
         let items = (0..5)
             .map(|idx| GridItem::Image(PathBuf::from(format!("c:/book/{idx}.png"))))
             .collect::<Vec<_>>();
@@ -69707,17 +69987,13 @@ mod tests {
             after_cover: true,
             last: true,
         };
-        for (mode, after, last) in [
+        for (mode, after, real_screen_pos) in [
             (
                 SpreadMode::LtrCover,
                 SingletonSpreadPlacement::RightWhite,
-                SingletonSpreadPlacement::RightWhite,
+                1,
             ),
-            (
-                SpreadMode::RtlCover,
-                SingletonSpreadPlacement::LeftWhite,
-                SingletonSpreadPlacement::LeftWhite,
-            ),
+            (SpreadMode::RtlCover, SingletonSpreadPlacement::LeftWhite, 0),
         ] {
             let groups = build_remote_spread_page_groups_with_page_alone(
                 &items,
@@ -69745,8 +70021,22 @@ mod tests {
                 ]
             );
             assert_eq!(groups[1].singleton_placement, after);
-            assert_eq!(groups[3].singleton_placement, last);
-            assert!(groups.iter().all(|group| group.presentation.is_none()));
+            assert_eq!(
+                groups[3].singleton_placement,
+                SingletonSpreadPlacement::Center
+            );
+            assert!(groups[..3].iter().all(|group| group.presentation.is_none()));
+            let presentation = groups[3].presentation.as_ref().unwrap();
+            assert_eq!(presentation[real_screen_pos].idx, 4);
+            assert_eq!(
+                presentation[real_screen_pos].role,
+                SpreadPageRole::Navigation
+            );
+            assert_eq!(presentation[1 - real_screen_pos].idx, 0);
+            assert_eq!(
+                presentation[1 - real_screen_pos].role,
+                SpreadPageRole::FrontCoverSupplement
+            );
             let incomplete = build_remote_spread_page_groups_with_page_alone(
                 &items,
                 mode,

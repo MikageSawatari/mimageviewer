@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const CATALOG_VERSION: &str = "2";
@@ -47,6 +48,115 @@ pub struct CacheEntry {
     /// raster の整数丸めに依存しないレイアウト寸法。PDF page box を 1/1000 point で
     /// 保持する。通常画像と旧エントリは NULL。
     pub layout_dims: Option<(u32, u32)>,
+    pub folder_provenance: Option<FolderThumbProvenance>,
+    pub selection_proof: Option<FolderSelectionProof>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FolderThumbProvenance {
+    AutoSelected,
+    Seeded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogRevision {
+    pub instance_id: String,
+    pub revision: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CatalogProofState {
+    Present(CatalogRevision),
+    Absent,
+    Unverifiable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogProofDependency {
+    pub directory: PathBuf,
+    pub state: CatalogProofState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSelectionWinner {
+    pub path: PathBuf,
+    pub mtime: i64,
+    pub file_size: i64,
+    pub archive_row_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSelectionProof {
+    pub directories: Vec<CatalogProofDependency>,
+    /// Required in serialized v3 proofs. Older proofs that lack this field
+    /// cannot silently deserialize as "no pin dependency".
+    pub pin_store: PinStoreProof,
+    pub winner: FolderSelectionWinner,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PinStoreProof {
+    NotConsulted,
+    Observed(CatalogProofState),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogFileStamp {
+    db: FileComponentStamp,
+    wal: WalFileStamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileComponentStamp {
+    created: Option<std::time::SystemTime>,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WalFileStamp {
+    Absent,
+    Present(FileComponentStamp),
+    Unverifiable,
+}
+
+impl FileComponentStamp {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            created: metadata.created().ok(),
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        }
+    }
+}
+
+impl CatalogFileStamp {
+    fn from_path(db_path: &Path, metadata: &std::fs::Metadata) -> Self {
+        let mut wal_name = db_path.as_os_str().to_os_string();
+        wal_name.push("-wal");
+        let wal = match std::fs::metadata(PathBuf::from(wal_name)) {
+            Ok(metadata) => WalFileStamp::Present(FileComponentStamp::from_metadata(&metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => WalFileStamp::Absent,
+            Err(_) => WalFileStamp::Unverifiable,
+        };
+        Self {
+            db: FileComponentStamp::from_metadata(metadata),
+            wal,
+        }
+    }
+}
+
+// Failed legacy initialization is memoized by path and file identity/stamp for
+// this process. The selection worker is the sole caller of this path.
+fn failed_legacy_initializations() -> &'static Mutex<HashMap<PathBuf, CatalogFileStamp>> {
+    static FAILED: OnceLock<Mutex<HashMap<PathBuf, CatalogFileStamp>>> = OnceLock::new();
+    FAILED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn legacy_init_attempts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static ATTEMPTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    ATTEMPTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn valid_dims(width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)> {
@@ -90,6 +200,7 @@ pub fn decode_thumb_dims(data: &[u8]) -> Option<(u32, u32)> {
 pub struct CatalogDb {
     conn: Mutex<Connection>,
     has_layout_dims_columns: bool,
+    has_folder_proof_columns: bool,
 }
 
 /// journal mode の変更は排他ロックを要求するため、**`busy_timeout` が効かない**。SQLite は
@@ -127,6 +238,135 @@ fn journal_mode_is_wal(conn: &Connection) -> rusqlite::Result<bool> {
 }
 
 impl CatalogDb {
+    /// Open one existing catalog for a folder-representative selection. Legacy
+    /// catalogs receive only the additive revision schema, without migrations or
+    /// thumbnail-row changes. A failed initialization remains readable but its
+    /// revision state is Unverifiable.
+    pub fn open_for_folder_selection(
+        cache_dir: &Path,
+        folder_path: &Path,
+    ) -> Result<Option<Self>, String> {
+        let db_path = db_path_for(cache_dir, folder_path);
+        let metadata = match std::fs::metadata(&db_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let db = Self::open_read_only_at_path(&db_path).map_err(|error| error.to_string())?;
+        if matches!(db.revision_state(), CatalogProofState::Present(_)) {
+            failed_legacy_initializations()
+                .lock()
+                .unwrap()
+                .remove(&db_path);
+            return Ok(Some(db));
+        }
+        let stamp = CatalogFileStamp::from_path(&db_path, &metadata);
+        if failed_legacy_initializations()
+            .lock()
+            .unwrap()
+            .get(&db_path)
+            == Some(&stamp)
+        {
+            return Ok(Some(db));
+        }
+        #[cfg(test)]
+        {
+            *legacy_init_attempts()
+                .lock()
+                .unwrap()
+                .entry(db_path.clone())
+                .or_default() += 1;
+        }
+        let initialization = (|| -> rusqlite::Result<()> {
+            let conn = Connection::open(&db_path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(2))?;
+            init_folder_selection_revision_schema(&conn)
+        })();
+        if initialization.is_ok() {
+            failed_legacy_initializations()
+                .lock()
+                .unwrap()
+                .remove(&db_path);
+            return Self::open_read_only_at_path(&db_path)
+                .map(Some)
+                .map_err(|error| error.to_string());
+        }
+        crate::logger::log(format!(
+            "folder selection legacy catalog initialization failed: {}: {}",
+            db_path.display(),
+            initialization.unwrap_err()
+        ));
+        // Initialization can partially alter the schema before failing. Store
+        // the post-attempt stamp so that this very attempt cannot trigger an
+        // immediate retry on the next failed proof validation.
+        let after = std::fs::metadata(&db_path)
+            .map(|metadata| CatalogFileStamp::from_path(&db_path, &metadata))
+            .unwrap_or(stamp);
+        failed_legacy_initializations()
+            .lock()
+            .unwrap()
+            .insert(db_path, after);
+        Ok(Some(db))
+    }
+
+    pub fn revision_state(&self) -> CatalogProofState {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT instance_id, revision, ready FROM folder_selection_revision WHERE singleton = 1",
+            [],
+            |row| {
+                let instance_id: String = row.get(0)?;
+                let revision: i64 = row.get(1)?;
+                let ready: i64 = row.get(2)?;
+                Ok((ready == 1).then(|| CatalogRevision {
+                    instance_id,
+                    revision,
+                }))
+            },
+        )
+        .ok()
+        .flatten()
+        .map(CatalogProofState::Present)
+        .unwrap_or(CatalogProofState::Unverifiable)
+    }
+
+    /// One candidate stamp and the catalog revision from the same short SQLite
+    /// snapshot. The resolver calls this only as it reaches a candidate, which
+    /// lets it check cancellation and stop before later rows are queried.
+    pub fn load_stamp_snapshot(
+        &self,
+        key: &str,
+    ) -> rusqlite::Result<(CatalogProofState, Option<(i64, i64)>)> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let stamp = tx
+            .query_row(
+                "SELECT mtime, file_size FROM thumbnails WHERE filename = ?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let revision = tx
+            .query_row(
+                "SELECT instance_id, revision, ready FROM folder_selection_revision WHERE singleton = 1",
+                [],
+                |row| {
+                    let instance_id: String = row.get(0)?;
+                    let revision: i64 = row.get(1)?;
+                    let ready: i64 = row.get(2)?;
+                    Ok((ready == 1).then(|| CatalogRevision {
+                        instance_id,
+                        revision,
+                    }))
+                },
+            )
+            .ok()
+            .flatten()
+            .map(CatalogProofState::Present)
+            .unwrap_or(CatalogProofState::Unverifiable);
+        tx.commit()?;
+        Ok((revision, stamp))
+    }
     /// cache_dir 配下の適切な場所に DB を開く（なければ作成）。
     /// サブディレクトリも自動作成する。
     pub fn open(cache_dir: &Path, folder_path: &Path) -> rusqlite::Result<Self> {
@@ -142,6 +382,7 @@ impl CatalogDb {
         Ok(Self {
             conn: Mutex::new(conn),
             has_layout_dims_columns: true,
+            has_folder_proof_columns: true,
         })
     }
 
@@ -158,13 +399,20 @@ impl CatalogDb {
         if !db_path.try_exists().unwrap_or(false) {
             return Ok(None);
         }
-        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::open_read_only_at_path(&db_path).map(Some)
+    }
+
+    fn open_read_only_at_path(db_path: &Path) -> rusqlite::Result<Self> {
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let has_layout_dims_columns = thumbnail_column_exists(&conn, "layout_width")?
             && thumbnail_column_exists(&conn, "layout_height")?;
-        Ok(Some(Self {
+        let has_folder_proof_columns = thumbnail_column_exists(&conn, "folder_provenance")?
+            && thumbnail_column_exists(&conn, "selection_proof")?;
+        Ok(Self {
             conn: Mutex::new(conn),
             has_layout_dims_columns,
-        }))
+            has_folder_proof_columns,
+        })
     }
 
     /// filename -> 元画像の寸法を、thumbnail の blob を読まずに返す。
@@ -202,9 +450,14 @@ impl CatalogDb {
         } else {
             "NULL, NULL"
         };
+        let proof_columns = if self.has_folder_proof_columns {
+            "folder_provenance, selection_proof"
+        } else {
+            "NULL, NULL"
+        };
         let sql = format!(
             "SELECT filename, mtime, file_size, thumb_data, source_width, source_height, \
-                    {layout_columns} FROM thumbnails"
+                    {layout_columns}, {proof_columns} FROM thumbnails"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut map = HashMap::new();
@@ -218,10 +471,23 @@ impl CatalogDb {
                 row.get::<_, Option<u32>>(5)?,
                 row.get::<_, Option<u32>>(6)?,
                 row.get::<_, Option<u32>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         for item in iter.flatten() {
-            let (filename, mtime, file_size, jpeg_data, src_w, src_h, layout_w, layout_h) = item;
+            let (
+                filename,
+                mtime,
+                file_size,
+                jpeg_data,
+                src_w,
+                src_h,
+                layout_w,
+                layout_h,
+                provenance,
+                proof,
+            ) = item;
             let source_dims = match (src_w, src_h) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
                 _ => None,
@@ -234,6 +500,9 @@ impl CatalogDb {
                     jpeg_data,
                     source_dims,
                     layout_dims: valid_dims(layout_w, layout_h),
+                    folder_provenance: provenance
+                        .and_then(|value| serde_json::from_str(&value).ok()),
+                    selection_proof: proof.and_then(|value| serde_json::from_str(&value).ok()),
                 },
             );
         }
@@ -249,9 +518,14 @@ impl CatalogDb {
         } else {
             "NULL, NULL"
         };
+        let proof_columns = if self.has_folder_proof_columns {
+            "folder_provenance, selection_proof"
+        } else {
+            "NULL, NULL"
+        };
         let sql = format!(
             "SELECT mtime, file_size, thumb_data, source_width, source_height, \
-                    {layout_columns} FROM thumbnails WHERE filename = ?1"
+                    {layout_columns}, {proof_columns} FROM thumbnails WHERE filename = ?1"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut iter = stmt.query_map(params![filename], |row| {
@@ -263,10 +537,13 @@ impl CatalogDb {
                 row.get::<_, Option<u32>>(4)?,
                 row.get::<_, Option<u32>>(5)?,
                 row.get::<_, Option<u32>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })?;
         if let Some(item) = iter.next() {
-            let (mtime, file_size, jpeg_data, src_w, src_h, layout_w, layout_h) = item?;
+            let (mtime, file_size, jpeg_data, src_w, src_h, layout_w, layout_h, provenance, proof) =
+                item?;
             let source_dims = match (src_w, src_h) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
                 _ => None,
@@ -277,6 +554,8 @@ impl CatalogDb {
                 jpeg_data,
                 source_dims,
                 layout_dims: valid_dims(layout_w, layout_h),
+                folder_provenance: provenance.and_then(|value| serde_json::from_str(&value).ok()),
+                selection_proof: proof.and_then(|value| serde_json::from_str(&value).ok()),
             }));
         }
         Ok(None)
@@ -295,9 +574,14 @@ impl CatalogDb {
         } else {
             "NULL, NULL"
         };
+        let proof_columns = if self.has_folder_proof_columns {
+            "folder_provenance, selection_proof"
+        } else {
+            "NULL, NULL"
+        };
         let sql = format!(
             "SELECT filename, mtime, file_size, thumb_data, source_width, source_height, \
-                    {layout_columns} FROM thumbnails \
+                    {layout_columns}, {proof_columns} FROM thumbnails \
              WHERE substr(filename, 1, ?1) = ?2 \
              ORDER BY mtime DESC, file_size DESC, filename DESC \
              LIMIT 1"
@@ -313,10 +597,23 @@ impl CatalogDb {
                 row.get::<_, Option<u32>>(5)?,
                 row.get::<_, Option<u32>>(6)?,
                 row.get::<_, Option<u32>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         if let Some(item) = iter.next() {
-            let (filename, mtime, file_size, jpeg_data, src_w, src_h, layout_w, layout_h) = item?;
+            let (
+                filename,
+                mtime,
+                file_size,
+                jpeg_data,
+                src_w,
+                src_h,
+                layout_w,
+                layout_h,
+                provenance,
+                proof,
+            ) = item?;
             let source_dims = match (src_w, src_h) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
                 _ => None,
@@ -329,6 +626,9 @@ impl CatalogDb {
                     jpeg_data,
                     source_dims,
                     layout_dims: valid_dims(layout_w, layout_h),
+                    folder_provenance: provenance
+                        .and_then(|value| serde_json::from_str(&value).ok()),
+                    selection_proof: proof.and_then(|value| serde_json::from_str(&value).ok()),
                 },
             )));
         }
@@ -375,19 +675,65 @@ impl CatalogDb {
         layout_dims: Option<(u32, u32)>,
         jpeg_data: &[u8],
     ) -> rusqlite::Result<()> {
+        self.save_with_folder_proof(
+            filename,
+            mtime,
+            file_size,
+            width,
+            height,
+            source_dims,
+            layout_dims,
+            jpeg_data,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_with_folder_proof(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        width: u32,
+        height: u32,
+        source_dims: Option<(u32, u32)>,
+        layout_dims: Option<(u32, u32)>,
+        jpeg_data: &[u8],
+        provenance: Option<FolderThumbProvenance>,
+        proof: Option<&FolderSelectionProof>,
+    ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         let src_w: Option<u32> = source_dims.map(|(w, _)| w);
         let src_h: Option<u32> = source_dims.map(|(_, h)| h);
         let layout_w: Option<u32> = layout_dims.map(|(w, _)| w);
         let layout_h: Option<u32> = layout_dims.map(|(_, h)| h);
+        let provenance_json = provenance
+            .map(|value| serde_json::to_string(&value))
+            .transpose()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let proof_json = proof
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         conn.execute(
             "INSERT OR REPLACE INTO thumbnails \
-             (filename, mtime, file_size, width, height, thumb_data, source_width, source_height, \
-              layout_width, layout_height) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              (filename, mtime, file_size, width, height, thumb_data, source_width, source_height, \
+               layout_width, layout_height, folder_provenance, selection_proof) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                filename, mtime, file_size, width, height, jpeg_data, src_w, src_h, layout_w,
-                layout_h
+                filename,
+                mtime,
+                file_size,
+                width,
+                height,
+                jpeg_data,
+                src_w,
+                src_h,
+                layout_w,
+                layout_h,
+                provenance_json,
+                proof_json
             ],
         )?;
         Ok(())
@@ -444,6 +790,60 @@ impl CatalogDb {
             source_dims,
             layout_dims,
             jpeg_data,
+        )?;
+        Ok(true)
+    }
+
+    pub fn save_auto_folder_bytes(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        source_dims: Option<(u32, u32)>,
+        layout_dims: Option<(u32, u32)>,
+        data: &[u8],
+        proof: Option<&FolderSelectionProof>,
+    ) -> rusqlite::Result<bool> {
+        let Some((width, height)) = decode_thumb_dims(data) else {
+            return Ok(false);
+        };
+        self.save_with_folder_proof(
+            filename,
+            mtime,
+            file_size,
+            width,
+            height,
+            source_dims,
+            layout_dims,
+            data,
+            Some(FolderThumbProvenance::AutoSelected),
+            proof,
+        )?;
+        Ok(true)
+    }
+
+    pub fn save_seeded_folder_bytes(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        source_dims: Option<(u32, u32)>,
+        data: &[u8],
+    ) -> rusqlite::Result<bool> {
+        let Some((width, height)) = decode_thumb_dims(data) else {
+            return Ok(false);
+        };
+        self.save_with_folder_proof(
+            filename,
+            mtime,
+            file_size,
+            width,
+            height,
+            source_dims,
+            None,
+            data,
+            Some(FolderThumbProvenance::Seeded),
+            None,
         )?;
         Ok(true)
     }
@@ -694,7 +1094,9 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              source_width   INTEGER,
              source_height  INTEGER,
              layout_width   INTEGER,
-             layout_height  INTEGER
+              layout_height  INTEGER,
+              folder_provenance TEXT,
+              selection_proof TEXT
          );
          CREATE TABLE IF NOT EXISTS pdf_meta (
              filename          TEXT    NOT NULL PRIMARY KEY,
@@ -713,6 +1115,9 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              PRIMARY KEY(filename, kind)
          );",
     )?;
+    // Trigger ownership is at the catalog layer. Install before any migration or
+    // delete_missing can mutate thumbnail rows.
+    init_folder_selection_revision_schema(conn)?;
     // 非破壊マイグレーション。open ごとの ALTER 失敗ログを避け、並行 open が同時に
     // missing を観測した場合だけ duplicate column を idempotent success として扱う。
     add_thumbnail_column_if_missing(
@@ -735,6 +1140,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "layout_height",
         "ALTER TABLE thumbnails ADD COLUMN layout_height INTEGER",
     )?;
+    add_thumbnail_column_if_missing(
+        conn,
+        "folder_provenance",
+        "ALTER TABLE thumbnails ADD COLUMN folder_provenance TEXT",
+    )?;
+    add_thumbnail_column_if_missing(
+        conn,
+        "selection_proof",
+        "ALTER TABLE thumbnails ADD COLUMN selection_proof TEXT",
+    )?;
 
     // バージョン不一致（スキーマ変更）の場合は全削除して再生成
     let version: Option<String> = conn
@@ -750,6 +1165,98 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn init_folder_selection_revision_schema(conn: &Connection) -> rusqlite::Result<()> {
+    if folder_selection_revision_ready(conn)? {
+        return Ok(());
+    }
+    // Serialize first-time setup in this process. The ready marker is set only
+    // after all triggers exist; interrupted setup is retried on the next open.
+    static INIT: Mutex<()> = Mutex::new(());
+    let _guard = INIT.lock().unwrap_or_else(|error| error.into_inner());
+    if folder_selection_revision_ready(conn)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS folder_selection_revision (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             instance_id TEXT NOT NULL,
+             revision INTEGER NOT NULL,
+             ready INTEGER NOT NULL DEFAULT 0
+         );",
+    )?;
+    let has_ready = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('folder_selection_revision') WHERE name = 'ready' LIMIT 1",
+            [], |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_ready {
+        match conn.execute(
+            "ALTER TABLE folder_selection_revision ADD COLUMN ready INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("duplicate column name") => {}
+            Err(error) => return Err(error),
+        }
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO folder_selection_revision (singleton, instance_id, revision, ready)
+         VALUES (1, ?1, 0, 0)",
+        [uuid::Uuid::new_v4().to_string()],
+    )?;
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS folder_selection_revision_insert
+         AFTER INSERT ON thumbnails
+         WHEN NEW.filename LIKE 'zipthumb:%' OR NEW.filename LIKE 'pdfthumb:%'
+              OR (NEW.filename LIKE 'folderthumb:%' AND instr(NEW.filename, '#pin:') > 0)
+         BEGIN
+             UPDATE folder_selection_revision SET revision = revision + 1 WHERE singleton = 1;
+         END;
+         CREATE TRIGGER IF NOT EXISTS folder_selection_revision_update
+         AFTER UPDATE ON thumbnails
+         WHEN NEW.filename LIKE 'zipthumb:%' OR NEW.filename LIKE 'pdfthumb:%'
+              OR OLD.filename LIKE 'zipthumb:%' OR OLD.filename LIKE 'pdfthumb:%'
+              OR (NEW.filename LIKE 'folderthumb:%' AND instr(NEW.filename, '#pin:') > 0)
+              OR (OLD.filename LIKE 'folderthumb:%' AND instr(OLD.filename, '#pin:') > 0)
+         BEGIN
+             UPDATE folder_selection_revision SET revision = revision + 1 WHERE singleton = 1;
+         END;
+         CREATE TRIGGER IF NOT EXISTS folder_selection_revision_delete
+         AFTER DELETE ON thumbnails
+         WHEN OLD.filename LIKE 'zipthumb:%' OR OLD.filename LIKE 'pdfthumb:%'
+              OR (OLD.filename LIKE 'folderthumb:%' AND instr(OLD.filename, '#pin:') > 0)
+         BEGIN
+             UPDATE folder_selection_revision SET revision = revision + 1 WHERE singleton = 1;
+         END;",
+    )?;
+    conn.execute(
+        "UPDATE folder_selection_revision SET ready = 1 WHERE singleton = 1 AND ready = 0",
+        [],
+    )?;
+    Ok(())
+}
+
+fn folder_selection_revision_ready(conn: &Connection) -> rusqlite::Result<bool> {
+    match conn.query_row(
+        "SELECT ready FROM folder_selection_revision WHERE singleton = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(ready) => Ok(ready == 1),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(error)
+            if error.to_string().contains("no such table")
+                || error.to_string().contains("no such column") =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Released catalogs store PDF thumbnail raster pixels in `source_*`, but do not
@@ -1014,7 +1521,348 @@ mod tests {
         CatalogDb {
             conn: Mutex::new(conn),
             has_layout_dims_columns: true,
+            has_folder_proof_columns: true,
         }
+    }
+
+    fn revision(db: &CatalogDb) -> CatalogRevision {
+        match db.revision_state() {
+            CatalogProofState::Present(value) => value,
+            state => panic!("expected catalog revision, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn folder_selection_revision_triggers_cover_archive_and_child_pin_rows() {
+        let db = open_in_memory();
+        let initial = revision(&db);
+        let mut expected = initial.revision;
+        for key in [
+            "zipthumb:book.zip",
+            "zipthumb:C:\\books\\book.cbz#pin:page",
+            "pdfthumb:book.pdf",
+            "pdfthumb:C:\\books\\book.pdf#pin:page",
+            "folderthumb:auto-v2:numeric:d3:child#pin:video",
+            "folderthumb:auto-v3:numeric:d3:C:\\child#pin:folder",
+        ] {
+            db.save(key, 1, 2, 1, 1, None, b"bytes").unwrap();
+            expected += 1;
+            assert_eq!(revision(&db).revision, expected, "insert {key}");
+            db.save(key, 2, 3, 1, 1, None, b"bytes2").unwrap();
+            expected += 1;
+            assert_eq!(revision(&db).revision, expected, "replace {key}");
+            db.delete_one(key).unwrap();
+            expected += 1;
+            assert_eq!(revision(&db).revision, expected, "delete {key}");
+        }
+        db.save(
+            "folderthumb:auto-v3:numeric:d3:parent",
+            1,
+            2,
+            1,
+            1,
+            None,
+            b"bytes",
+        )
+        .unwrap();
+        db.save("image.jpg", 1, 2, 1, 1, None, b"bytes").unwrap();
+        assert_eq!(
+            revision(&db).revision,
+            expected,
+            "automatic rows must not churn revision"
+        );
+    }
+
+    #[test]
+    fn folder_proof_without_pin_provenance_cannot_deserialize_as_no_dependency() {
+        let proof = FolderSelectionProof {
+            directories: Vec::new(),
+            pin_store: PinStoreProof::NotConsulted,
+            winner: FolderSelectionWinner {
+                path: PathBuf::from("cover.jpg"),
+                mtime: 1,
+                file_size: 2,
+                archive_row_key: None,
+            },
+        };
+        let mut value = serde_json::to_value(&proof).unwrap();
+        value.as_object_mut().unwrap().remove("pin_store");
+        assert!(serde_json::from_value::<FolderSelectionProof>(value).is_err());
+        assert_eq!(
+            serde_json::from_str::<FolderSelectionProof>(&serde_json::to_string(&proof).unwrap())
+                .unwrap(),
+            proof
+        );
+    }
+
+    #[test]
+    fn folder_selection_revision_covers_delete_missing_and_recreated_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let folder = temp.path().join("folder");
+        let db = CatalogDb::open(&cache, &folder).unwrap();
+        let first_instance = revision(&db).instance_id;
+        db.save("zipthumb:book.zip", 1, 2, 1, 1, None, b"bytes")
+            .unwrap();
+        let before = revision(&db).revision;
+        db.delete_missing(&HashSet::new()).unwrap();
+        assert_eq!(revision(&db).revision, before + 1);
+        drop(db);
+        assert_eq!(delete_all_cache(&cache), 1);
+        let reopened = CatalogDb::open(&cache, &folder).unwrap();
+        assert_ne!(revision(&reopened).instance_id, first_instance);
+    }
+
+    #[test]
+    fn folder_selection_identity_detects_age_and_current_folder_cache_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let folder = temp.path().join("folder");
+        let db = CatalogDb::open(&cache, &folder).unwrap();
+        let first = revision(&db);
+        drop(db);
+        assert_eq!(delete_old_cache(&cache, 0), 1);
+        assert!(
+            CatalogDb::open_for_folder_selection(&cache, &folder)
+                .unwrap()
+                .is_none()
+        );
+        let recreated = CatalogDb::open(&cache, &folder).unwrap();
+        assert_ne!(revision(&recreated).instance_id, first.instance_id);
+        drop(recreated);
+        // Cache manager's current-folder mode removes this exact hashed file.
+        std::fs::remove_file(db_path_for(&cache, &folder)).unwrap();
+        assert!(
+            CatalogDb::open_for_folder_selection(&cache, &folder)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn folder_selection_non_not_found_open_failure_is_not_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let folder = temp.path().join("folder");
+        let path = db_path_for(&cache, &folder);
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(CatalogDb::open_for_folder_selection(&cache, &folder).is_err());
+    }
+
+    #[test]
+    fn folder_selection_initializes_released_catalog_without_rewriting_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let folder = temp.path().join("folder");
+        let path = db_path_for(&cache, &folder);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thumbnails (
+            filename TEXT NOT NULL PRIMARY KEY, mtime INTEGER NOT NULL,
+            file_size INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+            thumb_data BLOB NOT NULL, source_width INTEGER, source_height INTEGER
+        );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO thumbnails VALUES ('zipthumb:book.zip', 1, 2, 1, 1, X'01', NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = CatalogDb::open_for_folder_selection(&cache, &folder)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(db.revision_state(), CatalogProofState::Present(_)));
+        assert_eq!(
+            db.load_stamp_snapshot("zipthumb:book.zip").unwrap().1,
+            Some((1, 2))
+        );
+        assert_eq!(
+            db.load_one("zipthumb:book.zip").unwrap().unwrap().jpeg_data,
+            vec![1]
+        );
+        drop(db);
+        let writable = CatalogDb::open(&cache, &folder).unwrap();
+        // Opening an old schema may prune released rows; triggers were installed
+        // before that migration. Exercise a fresh row through the public writer.
+        writable
+            .save("zipthumb:book.zip", 1, 2, 1, 1, None, b"bytes")
+            .unwrap();
+        let before = revision(&writable).revision;
+        writable.delete_one("zipthumb:book.zip").unwrap();
+        assert_eq!(revision(&writable).revision, before + 1);
+    }
+
+    #[test]
+    fn incomplete_revision_setup_is_repaired_before_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let folder = temp.path().join("folder");
+        let path = db_path_for(&cache, &folder);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thumbnails (
+            filename TEXT NOT NULL PRIMARY KEY, mtime INTEGER NOT NULL,
+            file_size INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+            thumb_data BLOB NOT NULL, source_width INTEGER, source_height INTEGER
+        );
+        CREATE TABLE folder_selection_revision (
+            singleton INTEGER PRIMARY KEY, instance_id TEXT NOT NULL, revision INTEGER NOT NULL
+        );
+        INSERT INTO folder_selection_revision VALUES (1, 'old-instance', 12);
+        INSERT INTO thumbnails VALUES ('zipthumb:book.zip', 1, 2, 1, 1, X'01', NULL, NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let db = CatalogDb::open_for_folder_selection(&cache, &folder)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            revision(&db),
+            CatalogRevision {
+                instance_id: "old-instance".to_owned(),
+                revision: 12,
+            }
+        );
+        assert!(db.load_one("zipthumb:book.zip").unwrap().is_some());
+        drop(db);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute(
+                "DELETE FROM thumbnails WHERE filename = 'zipthumb:book.zip'",
+                [],
+            )
+            .unwrap();
+        drop(writer);
+        let db = CatalogDb::open_for_folder_selection(&cache, &folder)
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision(&db).revision, 13);
+    }
+
+    #[test]
+    fn failed_legacy_initialization_is_memoized_until_catalog_file_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let folder = temp.path().join("folder");
+        let path = db_path_for(&cache, &folder);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thumbnails (
+                filename TEXT PRIMARY KEY, mtime INTEGER, file_size INTEGER,
+                thumb_data BLOB
+            );
+            CREATE TABLE folder_selection_revision (wrong INTEGER);",
+        )
+        .unwrap();
+        drop(conn);
+        for _ in 0..3 {
+            let db = CatalogDb::open_for_folder_selection(&cache, &folder)
+                .unwrap()
+                .unwrap();
+            assert_eq!(db.revision_state(), CatalogProofState::Unverifiable);
+        }
+        assert_eq!(legacy_init_attempts().lock().unwrap().get(&path), Some(&1));
+
+        // Replace the failed legacy file. Its different identity and size must
+        // permit exactly one new initialization attempt.
+        std::fs::remove_file(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thumbnails (
+                filename TEXT PRIMARY KEY, mtime INTEGER, file_size INTEGER,
+                thumb_data BLOB
+            );
+            INSERT INTO thumbnails VALUES ('zipthumb:book.zip', 1, 2, zeroblob(20000));",
+        )
+        .unwrap();
+        drop(conn);
+        let db = CatalogDb::open_for_folder_selection(&cache, &folder)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(db.revision_state(), CatalogProofState::Present(_)));
+        assert_eq!(legacy_init_attempts().lock().unwrap().get(&path), Some(&2));
+    }
+
+    #[test]
+    fn failed_legacy_initialization_retries_after_wal_only_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let folder = temp.path().join("folder");
+        let path = db_path_for(&cache, &folder);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE thumbnails (
+                 filename TEXT PRIMARY KEY, mtime INTEGER, file_size INTEGER,
+                 thumb_data BLOB
+             );
+             CREATE TABLE folder_selection_revision (wrong INTEGER);",
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let db = CatalogDb::open_for_folder_selection(&cache, &folder)
+                .unwrap()
+                .unwrap();
+            assert_eq!(db.revision_state(), CatalogProofState::Unverifiable);
+        }
+        assert_eq!(legacy_init_attempts().lock().unwrap().get(&path), Some(&1));
+        let before = CatalogFileStamp::from_path(&path, &std::fs::metadata(&path).unwrap());
+        writer
+            .execute(
+                "INSERT INTO thumbnails VALUES ('zipthumb:book.zip', 1, 2, zeroblob(10000))",
+                [],
+            )
+            .unwrap();
+        let after = CatalogFileStamp::from_path(&path, &std::fs::metadata(&path).unwrap());
+        assert_eq!(
+            before.db, after.db,
+            "the main db file should not have changed"
+        );
+        assert_ne!(
+            before.wal, after.wal,
+            "the WAL must identify the changed catalog"
+        );
+        let db = CatalogDb::open_for_folder_selection(&cache, &folder)
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.revision_state(), CatalogProofState::Unverifiable);
+        assert_eq!(legacy_init_attempts().lock().unwrap().get(&path), Some(&2));
+    }
+
+    #[test]
+    fn malformed_legacy_revision_is_unverifiable_but_rows_remain_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let folder = temp.path().join("folder");
+        let path = db_path_for(&cache, &folder);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thumbnails (
+            filename TEXT NOT NULL PRIMARY KEY, mtime INTEGER NOT NULL,
+            file_size INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+            thumb_data BLOB NOT NULL, source_width INTEGER, source_height INTEGER
+        );
+        CREATE TABLE folder_selection_revision (wrong INTEGER);
+        INSERT INTO thumbnails VALUES ('pdfthumb:book.pdf', 1, 2, 1, 1, X'01', NULL, NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let db = CatalogDb::open_for_folder_selection(&cache, &folder)
+            .unwrap()
+            .unwrap();
+        let (state, stamps) = db.load_stamp_snapshot("pdfthumb:book.pdf").unwrap();
+        assert_eq!(state, CatalogProofState::Unverifiable);
+        assert_eq!(stamps, Some((1, 2)));
+        assert!(db.load_one("pdfthumb:book.pdf").unwrap().is_some());
     }
 
     // -- db_path_for --

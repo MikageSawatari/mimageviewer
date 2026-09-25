@@ -285,9 +285,14 @@ impl SearchPageEditPrepare {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let repaint = ctx.clone();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         std::thread::Builder::new()
             .name("search-page-edit-prepare".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 search_prepare_worker(command_rx, output_tx, worker_cancel, repaint, available);
             })
             .map_err(|error| format!("検索結果の準備 worker を起動できません: {error}"))?;
@@ -3258,6 +3263,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn ten_thousand_result_stream_prepare_acceptance_has_bounded_cost() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
         app.begin_search_page_edit_prepare_for_test(&ctx);
@@ -3337,6 +3343,28 @@ mod tests {
         assert_eq!(final_metrics.lookup_passes, initial.lookup_passes);
         assert!(final_metrics.stale_rejections >= 1);
         assert!(final_metrics.ui_accept_ms < 5_000.0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audit_ten_thousand_result_stream_with_foreign_page_edit_writer() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let _guard = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let result = std::panic::catch_unwind(
+            ten_thousand_result_stream_prepare_acceptance_has_bounded_cost,
+        );
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     fn zip_hit(zip: &str, entry: &str) -> String {

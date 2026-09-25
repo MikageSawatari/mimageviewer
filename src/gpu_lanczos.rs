@@ -158,6 +158,7 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TestPaintProvenance {
     pub(crate) context: crate::app::ViewerContextId,
+    pub(crate) items_generation: u64,
     pub(crate) item: String,
     pub(crate) page: usize,
 }

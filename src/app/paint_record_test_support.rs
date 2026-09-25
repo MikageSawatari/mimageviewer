@@ -218,6 +218,7 @@ mod tests {
         );
         let proof = |item: &str| TestPaintProvenance {
             context: crate::app::ViewerContextId::for_test(7),
+            items_generation: 1,
             item: item.to_owned(),
             page: 0,
         };

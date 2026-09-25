@@ -806,12 +806,15 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   表紙あり見開きでは「表紙の次のページを単独で表示」「最終ページを単独で表示」を別々に指定できる。
   全体既定は両方 OFF、本別は全体に従う / ON / OFF。強制された実ページと、その境界で余った
   実ページは自然な左右へ置き、反対側を実ページの表示トリム・回転後の可視寸法に合わせた白い矩形で
-  埋める。白は表示専用で実ページ・編集対象・保存画像を増やさない。強制単独表示は末尾表紙補助より
-  優先し、通常の端数には従来の補助を適用する。強制対象の横長ページも片側へ置く。
+  埋める。白は表示専用で実ページ・編集対象・保存画像を増やさない。末尾の実1ページunitに
+  末尾表紙補助が適用できる場合は、強制単独・強制境界の余り・通常の端数のいずれも空き側に
+  白ではなく表紙を添える。途中の強制単独は白を保つ。強制対象の横長ページも片側へ置く。
+  補助の適格判定は通常の最終単独ページと共有し、横長・非ペア対象を強制単独だけ除外しない。
   表紙なし見開き・単ページ・横長分割、または完全な本と確定できない列では構成を変えない。
   シークバーは再構成後の実ページ単位の表示 unit に従って目盛り・クリック着地を決め、ラベルと
   ページ番号は実ページだけを数える。読書位置・ブックマーク・実ページ index は変えず、
-  Ctrl+E とキャプチャでは白い面を出力しない。F12 の休止窓と Remote でも白を表示する。
+  Ctrl+E とキャプチャでは白い面と添えた表紙を出力せず、実際に読んでいるページだけを保存する。
+  F12 の休止窓と Remote でも同じ構成を表示する。
   ZIP の章区切りは、連結モードでも画像テクスチャ化せず、前後ページと同じサイズの区切りページとして表示する。
   連結読みのホイール・矢印/D-pad・左スティック速度も画面サイズ比 (%) で調整できる。
   左ドラッグは連結方向だけをスクロールし、Ctrl+左ドラッグは軸固定を解除して直交方向にもパンする。
@@ -1944,6 +1947,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `still_seek_strip_locked` | bool | false | 静止画のサムネイル列を固定表示する。ON は下部ページシークバー固定を含意し、列表示中はバーと列を画像フィット範囲から除外する。列を閉じると OFF になる |
 | `still_seek_strip_visible` | bool | false | 静止画ページシークバーの source page サムネイル列を表示する |
 | `still_seek_strip_height` | enum | `large` | 静止画サムネイル列の高さ。`large` 104pt / `medium` 72pt / `small` 48pt / `smallest` 36pt |
+| `still_seek_preview_size` | enum | `large` | 静止画シーク位置プレビューの大きさ。`smallest` / `small` / `medium` / `large` / `maximum`。列の高さ・表示方針とは独立 |
+| `still_seek_preview_size_values` | object | 最小 90 / 小 117 / 中 144 / 大 180 / 最大 360 | 各段階の画像枠の高さ (px 相当)。大 180 が従来値で、幅の上限は高さ × 240/180。保存値は保持し描画時だけ 45〜540 に制限 |
 | `still_seek_hover_preview_mode` | enum | `always` | 静止画シークの hover preview。`always` / `hide_with_thumbnail_strip` / `never` |
 | `still_seek_bar_with_strip` | enum | `show` | 静止画サムネイル列表示中の通常シークバー。`show` / `hide` |
 | `fullscreen_top_bar_locked` | bool | false | 静止画フルスクリーンの上部情報バーを固定表示する。ON のときは上端のバー領域を画像フィット範囲から除外する |
@@ -2011,6 +2016,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `video_seek_bar_locked` | bool | false | 動画の下部シークバーを固定表示する。ON のときは下端のバー領域と共通余白を映像フィット範囲から除外する。上部・静止画設定とは独立 |
 | `video_seek_strip_span` | enum | `window` | シークストリップが動画のどこを写すか。`window` = 再生位置の周辺、`whole` = 動画全体を帯の横幅へ収める。表示内容 (場面 / 波形) と直交し、行き来しても保つ |
 | `video_seek_strip_height` | enum | `large` | シークストリップの高さ。`large` 104pt / `medium` 72pt / `small` 48pt / `smallest` 36pt。低いほど全体表示で一度に並ぶ枚数が増える |
+| `video_seek_preview_size` | enum | `large` | 動画シーク位置プレビューの大きさ。`smallest` / `small` / `medium` / `large` / `maximum`。静止画・列の高さ・表示方針とは独立 |
+| `video_seek_preview_size_values` | object | 最小 176 / 小 229 / 中 282 / 大 352 / 最大 704 | 各段階のプレビュー画像幅の上限 (px 相当)。大 352 が従来の 300〜352pt 規則の上限で、下限も選択値 / 352 に比例。保存値は保持し描画時だけ 88〜1056 に制限 |
 | `video_seek_strip_cycle` | object | 4 つとも true | `Shift+S` の巡回に含める表示 (`thumbnails_window` / `thumbnails_whole` / `waveform_window` / `waveform_whole`)。機能の非表示ではなく、外した表示も右下メニューから選べる。全解除は読み込み時に `thumbnails_window` だけ有効へ正規化する |
 | `video_seek_strip_locked` | bool | false | 動画のシークストリップを固定表示する。ON は下部シークバー固定と `video_seek_strip_state` の表示状態 (なしなら `video_seek_strip_last_choice` から復元) を含意し、ストリップ表示中だけその高さを映像フィット範囲から除外する。利用者が自分でストリップを閉じると OFF になる |
 | `video_seek_hover_preview_mode` | enum | `always` | 動画シークの hover preview。`always` / `hide_with_thumbnail_strip` / `never`。波形表示は thumbnail strip と数えない |
@@ -2206,6 +2213,9 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 - 付与:
   - F1〜F5（★1〜★5）、F6 で解除。グリッドでは選択/チェック済み (`ratable_targets` = `accepts_rating`) に、フルスクリーンでは表示中ページに適用
   - Shift+F1〜F5 / Shift+F6: 現在一覧表示中のコンテナ (フォルダ / ZIP / PDF / 変換済み RAR・7z・LZH / ネスト ZIP の本) にコンテナ★を付与 / 解除。グリッド・フルスクリーン両方で動作
+  - `KeyContext::Rating` の `RatingItemStepUp` / `RatingItemStepDown` は F1〜F6 と同じ対象の★を 1 段階上げる / 下げる。`RatingContainerStepUp` / `RatingContainerStepDown` は Shift+F1〜F6 と同じコンテナ★を 1 段階上げる / 下げる。4 操作とも既定キー割り当てはない
+  - ステップ操作では未評価 (0) を一時的に★3 とみなし、上げると★4、下げると★2 にする。評価済みは★を ±1 する。★5 から上げる / ★1 から下げる操作は書き込み・Undo 記録を行わない。★の解除は既存の解除操作で行い、未評価をステップ操作で明示的な★3 に変えない
+  - 複数対象のステップ操作は対象ごとの現在の★から計算し、上限 / 下限の対象を除いた変更全体を 1 件の Undo に記録する。チェック済みで 1 件以上変更したらチェックをクリアし、全対象が上限 / 下限で変更がなければ書き込まずチェックを保持する
   - チェック済みアイテムがある場合は一括適用（適用後チェックはクリア）
 - キー (`rating_path_key`):
   - ページ単位: `App::page_path_key` と同じ形式 (`normalize_path(path)::entry` / `::page_N`)

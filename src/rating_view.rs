@@ -118,9 +118,14 @@ pub(crate) fn spawn_rating_view_build(
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
+    #[cfg(test)]
+    let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
     std::thread::Builder::new()
         .name("rating-view-build".to_string())
         .spawn(move || {
+            #[cfg(test)]
+            let _test_epoch_scope =
+                test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
             let result = prepare_rating_view(db_path, stars, options, &cancel_worker);
             let _ = tx.send(result);
         })
@@ -697,6 +702,7 @@ mod tests {
     /// §1.142: ★時刻順の間はカテゴリ再配置を通さず、`sort_rows` の結果がそのまま出る。
     #[test]
     fn rated_at_sort_is_not_regrouped_by_category() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let display_order = crate::settings::GridDisplayOrder::default();
         let mut expected = mixed_rows();
         sort_rows(&mut expected, RatingViewSort::RatedAtDesc);
@@ -718,6 +724,7 @@ mod tests {
     /// 昇順でも同じ。NULL は昇順でも末尾に残る。
     #[test]
     fn rated_at_ascending_sort_is_not_regrouped_by_category() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let display_order = crate::settings::GridDisplayOrder::default();
         let mut expected = mixed_rows();
         sort_rows(&mut expected, RatingViewSort::RatedAtAsc);
@@ -735,6 +742,7 @@ mod tests {
     /// `Normal` は従来どおりカテゴリ順 (1 行目 = フォルダ + アーカイブ)。
     #[test]
     fn normal_sort_still_groups_by_category() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let display_order = crate::settings::GridDisplayOrder::default();
         let mut rows = mixed_rows();
         let (items, _) = sort_and_materialize_rows(
@@ -753,6 +761,7 @@ mod tests {
 
     #[test]
     fn normal_size_sort_distinguishes_real_zero_and_virtual_unknown() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut rows = vec![
             RatingViewRow {
                 key: "virtual".into(),
@@ -786,6 +795,7 @@ mod tests {
 
     #[test]
     fn normal_sort_applies_name_and_numeric_desc() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let base = vec![
             RatingViewRow {
                 key: "two".into(),
@@ -824,6 +834,7 @@ mod tests {
 
     #[test]
     fn restores_explicit_pdf_page_without_index_conversion() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let pdf = temp.path().join("Book.pdf");
         std::fs::write(&pdf, b"pdf").unwrap();
@@ -843,6 +854,7 @@ mod tests {
 
     #[test]
     fn restores_legacy_zip_image_key() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let zip = temp.path().join("Book.zip");
         write_zip_entries(&zip, &["Dir/Page.JPG"]);
@@ -858,6 +870,7 @@ mod tests {
 
     #[test]
     fn skips_ambiguous_legacy_zip_image_key() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let zip = temp.path().join("Book.zip");
         write_zip_entries(&zip, &["Dir/Page.JPG", "dir/page.jpg"]);
@@ -869,6 +882,7 @@ mod tests {
 
     #[test]
     fn rated_at_sort_keeps_null_last() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let a = temp.path().join("a.jpg");
         let b = temp.path().join("b.jpg");

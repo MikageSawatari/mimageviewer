@@ -455,6 +455,7 @@ pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) page_index: Option<usize>,
     pub(crate) items_generation: u64,
     pub(crate) item_identity: String,
+    pub(crate) selected_item_identity: String,
     pub(crate) page_ready: bool,
     pub(crate) viewport_rendered: bool,
     pub(crate) viewport_revision: u64,
@@ -528,6 +529,10 @@ impl TestScriptWindowSnapshot {
             saturating_rhai_int(self.items_generation).into(),
         );
         map.insert("item_identity".into(), self.item_identity.clone().into());
+        map.insert(
+            "selected_item_identity".into(),
+            self.selected_item_identity.clone().into(),
+        );
         map.insert("page_ready".into(), self.page_ready.into());
         map.insert("viewport_rendered".into(), self.viewport_rendered.into());
         map.insert(
@@ -3514,6 +3519,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn multi_window_rar_nav_script_parses() {
+        rhai::Engine::new()
+            .compile(include_str!(
+                "../scripts/ui-smoke/multi-window-rar-nav.rhai"
+            ))
+            .expect("RAR navigation smoke script syntax");
+    }
+
     /// A hold must last as long as it was asked to, even when something wakes the condvar.
     ///
     /// Without the loop this returned on the first notify and a twenty-second burst finished in
@@ -4794,6 +4808,7 @@ mod tests {
             page_index: Some(page_index),
             items_generation: generation,
             item_identity: item.to_string(),
+            selected_item_identity: String::new(),
             page_ready: true,
             viewport_rendered: false,
             viewport_revision: 0,

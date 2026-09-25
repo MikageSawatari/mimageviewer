@@ -8,7 +8,73 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[test]
+fn rar_nav_main_ignore_setting_can_leave_open_rar_but_cannot_land_on_another() {
+    let mut app = setup_app_for_test();
+    let root = app.tmp.path().join("rar-main-ignore-nav");
+    std::fs::create_dir(&root).unwrap();
+    let fixtures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/archives/multiwindow-rar-nav");
+    for name in [
+        "01-direct.rar",
+        "02-solid.rar",
+        "06-control.zip",
+        "08-direct.cbr",
+    ] {
+        std::fs::copy(fixtures.join(name), root.join(name)).unwrap();
+    }
+    let images = root.join("10-images");
+    std::fs::create_dir(&images).unwrap();
+    std::fs::write(images.join("page.jpg"), b"page").unwrap();
+    let opened = root.join("01-direct.rar");
+    app.current_folder = Some(opened.clone());
+    app.archive_source_override = Some(opened.clone());
+    app.items = vec![GridItem::ZipImage {
+        zip_path: opened.clone(),
+        entry_name: "page.jpg".into(),
+    }];
+    app.settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
+    let take_result = |app: &mut App| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(result) = app.poll_folder_nav() {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder nav worker stalled"
+            );
+            std::thread::yield_now();
+        }
+    };
+    app.start_folder_nav(opened, true, FolderNavMode::Grid);
+    let first = take_result(&mut app);
+    assert_eq!(
+        first.target.as_ref().unwrap().logical_source(),
+        root.join("06-control.zip").as_path()
+    );
+    app.start_folder_nav(root.join("06-control.zip"), true, FolderNavMode::Grid);
+    let second = take_result(&mut app);
+    assert_eq!(
+        second.target.as_ref().unwrap().logical_source(),
+        images.as_path()
+    );
+    app.start_folder_nav(
+        root.join("01-direct.rar"),
+        true,
+        FolderNavMode::SlideshowNext,
+    );
+    let slideshow = take_result(&mut app);
+    assert!(matches!(slideshow.mode, FolderNavMode::SlideshowNext));
+    assert_eq!(
+        slideshow.target.as_ref().unwrap().logical_source(),
+        root.join("06-control.zip").as_path()
+    );
+    assert!(slideshow.hit_image_folder);
+}
+
+#[test]
 fn phase_a2_compact_ten_thousand_page_keys_and_ui_acceptance() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = setup_app_for_test();
     let items = (0..10_000)
         .map(|index| {
@@ -233,6 +299,7 @@ fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
 
 #[test]
 fn phase_a2_hundred_thousand_keys_build_in_bounded_ui_batches() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = setup_app_for_test();
     app.items = (0..100_000)
         .map(|index| {
@@ -314,6 +381,7 @@ fn phase_a2_wait_for_mask(app: &mut App) {
 
 #[test]
 fn phase_a2_snapshot_lock_keeps_saved_virtual_page_edit() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("snapshot-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -342,6 +410,7 @@ fn phase_a2_snapshot_lock_keeps_saved_virtual_page_edit() {
 
 #[test]
 fn phase_a2_snapshot_lock_from_search_and_child_list_return_keep_edit() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("search-snapshot-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -370,6 +439,7 @@ fn phase_a2_snapshot_lock_from_search_and_child_list_return_keep_edit() {
 
 #[test]
 fn phase_a2_snapshot_lock_from_collection_keeps_edit() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("collection-snapshot-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -403,6 +473,7 @@ fn phase_a2_snapshot_lock_from_collection_keeps_edit() {
 
 #[test]
 fn phase_a2_idle_virtual_view_refreshes_after_external_page_write() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("late-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -419,6 +490,7 @@ fn phase_a2_idle_virtual_view_refreshes_after_external_page_write() {
 
 #[test]
 fn phase_a2_failed_full_reread_retries_without_another_write() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("failed-read.png");
     std::fs::write(&image, b"image").unwrap();
@@ -464,6 +536,7 @@ fn phase_a2_failed_full_reread_retries_without_another_write() {
 
 #[test]
 fn phase_a2_late_local_adjust_commit_and_delete_reconcile() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("late-local-adjust.png");
     std::fs::write(&image, b"image").unwrap();
@@ -517,6 +590,7 @@ fn phase_a2_late_local_adjust_commit_and_delete_reconcile() {
 
 #[test]
 fn phase_a2_rename_rebuilds_virtual_projection_for_new_key() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let old = app.tmp.path().join("old-name.png");
     let new = app.tmp.path().join("new-name.png");
@@ -538,6 +612,7 @@ fn phase_a2_rename_rebuilds_virtual_projection_for_new_key() {
 
 #[test]
 fn phase_a2_content_restore_keeps_virtual_owner_and_reloads_saved_edit() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("restored.png");
     std::fs::write(&image, b"image").unwrap();
@@ -555,6 +630,7 @@ fn phase_a2_content_restore_keeps_virtual_owner_and_reloads_saved_edit() {
 
 #[test]
 fn phase_a2_unrelated_restore_does_not_clear_virtual_projection() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("unrelated-restore.png");
     std::fs::write(&image, b"image").unwrap();
@@ -577,6 +653,7 @@ fn phase_a2_unrelated_restore_does_not_clear_virtual_projection() {
 
 #[test]
 fn phase_a2_metadata_import_updates_virtual_keyed_owner() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("imported.png");
     std::fs::write(&image, b"image").unwrap();
@@ -630,6 +707,7 @@ fn phase_a2_metadata_import_updates_virtual_keyed_owner() {
 
 #[test]
 fn phase_a2_metadata_import_writer_notification_refreshes_synthetic_view() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let root = app.tmp.path().join("import-book");
     std::fs::create_dir(&root).unwrap();
@@ -652,7 +730,10 @@ fn phase_a2_metadata_import_writer_notification_refreshes_synthetic_view() {
     // Production import hands off the idle tags connection before switching its
     // journal mode for the multi-store transaction.
     drop(app.tags_db.take());
+    let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture().unwrap();
     let imported = std::thread::spawn(move || {
+        let _test_epoch_scope =
+            crate::page_edit_write_epoch::TestEpochScope::enter(test_epoch_scope);
         crate::metadata_transfer::import_at(
             &data_dir,
             &root,
@@ -674,6 +755,7 @@ fn phase_a2_metadata_import_writer_notification_refreshes_synthetic_view() {
 #[test]
 #[cfg(windows)]
 fn phase_a2_sibling_write_refreshes_parked_bundle_on_remount() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("sibling-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -1852,6 +1934,7 @@ fn phase_b_search_batch(
 
 #[test]
 fn phase_b_search_streaming_result_projects_saved_mask() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let ctx = egui::Context::default();
     let stream = phase_b_search_stream(&mut app, &ctx);
@@ -1877,6 +1960,7 @@ fn phase_b_search_streaming_result_projects_saved_mask() {
 
 #[test]
 fn phase_b_search_rebuild_retains_done_and_new_page_edits() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, first) = phase_b_masked_image();
     let second = app.tmp.path().join("phase-b-second.png");
     std::fs::write(&second, b"image").unwrap();
@@ -1926,6 +2010,7 @@ fn phase_b_search_rebuild_retains_done_and_new_page_edits() {
 
 #[test]
 fn phase_b_query_change_discards_old_stream_and_prepare() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, first) = phase_b_masked_image();
     let ctx = egui::Context::default();
     let stream = phase_b_search_stream(&mut app, &ctx);
@@ -1967,6 +2052,7 @@ fn phase_b_query_change_discards_old_stream_and_prepare() {
 
 #[test]
 fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("phase-b-search-late-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -2017,7 +2103,17 @@ fn phase_b_search_rebases_after_no_snapshot_edit_commit() {
 }
 
 #[test]
+fn audit_virtual_page_and_search_readers_with_foreign_writers() {
+    crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
+        phase_a2_compact_ten_thousand_page_keys_and_ui_acceptance();
+        phase_b_search_streaming_result_projects_saved_mask();
+        phase_b_search_rebases_after_no_snapshot_edit_commit();
+    });
+}
+
+#[test]
 fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let tag_key = crate::tags_db::item_key_for_path(&image);
     app.tags_db
@@ -2093,7 +2189,19 @@ fn phase_b_rating_list_projects_saved_mask_after_local_sort() {
 }
 
 #[test]
+fn audit_rating_view_readers_with_foreign_writers() {
+    crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
+        phase_b_rating_list_projects_saved_mask_after_local_sort();
+        phase_b_rating_pending_result_rebases_after_shared_star_write();
+        phase_b_rating_pending_result_rebases_after_tag_write();
+        phase_b_rating_pending_result_rebases_after_book_page_copy();
+        phase_b_rating_rejects_edit_written_without_view_snapshot();
+    });
+}
+
+#[test]
 fn phase_b_rating_pending_result_rebases_after_shared_star_write() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let key = crate::adjustment_db::normalize_path(&image);
     let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
@@ -2136,6 +2244,7 @@ fn phase_b_rating_pending_result_rebases_after_shared_star_write() {
 
 #[test]
 fn phase_b_rating_pending_result_rebases_after_tag_write() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let key = crate::adjustment_db::normalize_path(&image);
     let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
@@ -2193,6 +2302,7 @@ fn phase_b_rating_pending_result_rebases_after_tag_write() {
 
 #[test]
 fn phase_b_rating_pending_result_rebases_after_book_page_copy() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (mut app, image) = phase_b_masked_image();
     let copied = app.tmp.path().join("phase-b-copied.png");
     std::fs::write(&copied, b"image").unwrap();
@@ -2242,6 +2352,7 @@ fn phase_b_rating_pending_result_rebases_after_book_page_copy() {
 
 #[test]
 fn phase_b_rating_rejects_edit_written_without_view_snapshot() {
+    let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
     let image = app.tmp.path().join("phase-b-late-mask.png");
     std::fs::write(&image, b"image").unwrap();
@@ -3258,6 +3369,8 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
                 jpeg_data: vec![0],
                 source_dims: None,
                 layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
             },
         )])));
     app.current_color_cache_map = Some(std::sync::Arc::clone(&cache_map));
@@ -5133,6 +5246,361 @@ fn grid_selection_rating_records_one_batched_undo_entry() {
         }
         other => panic!("expected rating undo, got {other:?}"),
     }
+}
+
+#[test]
+fn rating_step_grid_single_unrated_and_bound_are_distinct() {
+    use crate::keymap::{RatingEdit, RatingStepDirection};
+    let mut app = phase_c_support::setup_app();
+    let path = app.tmp.path().join("step-single.jpg");
+    app.items = vec![GridItem::Image(path)];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    let key = app.rating_path_key(0).unwrap();
+
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    app.apply_meta_undo();
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+    app.apply_meta_redo();
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+
+    app.rating_db.as_ref().unwrap().set(&key, 5).unwrap();
+    app.rating_cache.insert(0, 5);
+    let generation = app.rating_session_write_generation;
+    let undo_count = app.meta_undo.undo_len();
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    assert_eq!(app.rating_session_write_generation, generation);
+    assert_eq!(app.meta_undo.undo_len(), undo_count);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
+
+    app.rating_db.as_ref().unwrap().set(&key, 1).unwrap();
+    app.rating_cache.insert(0, 1);
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Down));
+    assert_eq!(app.rating_session_write_generation, generation);
+    assert_eq!(app.meta_undo.undo_len(), undo_count);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 1);
+}
+
+#[test]
+fn rating_step_checked_targets_use_individual_values_and_one_undo() {
+    use crate::keymap::{RatingEdit, RatingStepDirection};
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..4)
+        .map(|n| GridItem::Image(app.tmp.path().join(format!("step-{n}.jpg"))))
+        .collect();
+    app.image_metas = vec![None; 4];
+    app.thumbnails = vec![ThumbnailState::Pending; 4];
+    app.visible_indices = vec![0, 1, 2, 3];
+    app.selected = Some(0);
+    app.checked.extend([0, 1, 2, 3]);
+    let keys: Vec<_> = (0..4)
+        .map(|idx| app.rating_path_key(idx).unwrap())
+        .collect();
+    for (idx, rating) in [(0, 0), (1, 1), (2, 4), (3, 5)] {
+        app.rating_cache.insert(idx, rating);
+        if rating != 0 {
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set(&keys[idx], rating)
+                .unwrap();
+        }
+    }
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    for (key, expected) in keys.iter().zip([4, 2, 5, 5]) {
+        assert_eq!(app.rating_db.as_ref().unwrap().get(key), expected);
+    }
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected rating undo");
+    };
+    assert_eq!(changes.len(), 3);
+    app.apply_meta_undo();
+    for (key, expected) in keys.iter().zip([0, 1, 4, 5]) {
+        assert_eq!(app.rating_db.as_ref().unwrap().get(key), expected);
+    }
+    app.apply_meta_redo();
+    for (key, expected) in keys.iter().zip([4, 2, 5, 5]) {
+        assert_eq!(app.rating_db.as_ref().unwrap().get(key), expected);
+    }
+
+    app.checked.extend([0, 1, 2, 3]);
+    for (idx, key) in keys.iter().enumerate() {
+        app.rating_db.as_ref().unwrap().set(key, 5).unwrap();
+        app.rating_cache.insert(idx, 5);
+    }
+    let generation = app.rating_session_write_generation;
+    let undo_count = app.meta_undo.undo_len();
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    assert_eq!(app.rating_session_write_generation, generation);
+    assert_eq!(app.meta_undo.undo_len(), undo_count);
+}
+
+#[test]
+fn rating_step_fullscreen_and_container_keep_separate_keys() {
+    use crate::keymap::{RatingEdit, RatingStepDirection};
+    let mut app = phase_c_support::setup_app();
+    let pdf = app.tmp.path().join("step-book.pdf");
+    app.current_folder = Some(pdf.clone());
+    app.items = vec![GridItem::PdfPage {
+        pdf_path: pdf,
+        page_num: 0,
+        content_type: None,
+    }];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.fullscreen_idx = Some(0);
+    let page_key = app.rating_path_key(0).unwrap();
+    let container_key = app.current_container_rating_key_and_source().unwrap().0;
+
+    assert!(
+        app.apply_rating_edit_to_fullscreen_item(0, RatingEdit::Step(RatingStepDirection::Down))
+    );
+    assert!(app.apply_rating_edit_to_current_container(RatingEdit::Step(RatingStepDirection::Up)));
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&page_key), 2);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 4);
+    assert_eq!(app.meta_undo.undo_len(), 2);
+    app.apply_meta_undo();
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 0);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&page_key), 2);
+}
+
+#[test]
+fn rating_step_grid_key_handler_single_records_rating_and_undo() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.keymap = crate::keymap::Keymap::from_ini_str("[Rating]\nRatingItemStepUp = F13\n");
+    app.items = vec![GridItem::Image(
+        app.tmp.path().join("step-grid-key-single.jpg"),
+    )];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    let key = app.rating_path_key(0).unwrap();
+
+    let ctx = egui::Context::default();
+    ctx.begin_pass(viewport_raw_input(
+        egui::ViewportId::ROOT,
+        vec![fullscreen_fixed_key_event(egui::Key::F13)],
+    ));
+    let _ = app.handle_keyboard(&ctx);
+    let _ = ctx.end_pass();
+
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected rating undo from grid key handler");
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (&changes[0].path_key, changes[0].before, changes[0].after),
+        (&key, 0, 4)
+    );
+}
+
+#[test]
+fn rating_step_grid_key_handler_checked_multi_records_one_undo() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.keymap = crate::keymap::Keymap::from_ini_str("[Rating]\nRatingItemStepUp = F13\n");
+    app.items = (0..4)
+        .map(|idx| GridItem::Image(app.tmp.path().join(format!("step-grid-key-{idx}.jpg"))))
+        .collect();
+    app.image_metas = vec![None; 4];
+    app.thumbnails = vec![ThumbnailState::Pending; 4];
+    app.visible_indices = vec![0, 1, 2, 3];
+    app.selected = Some(0);
+    app.checked.extend([0, 1, 2, 3]);
+    let keys: Vec<_> = (0..4)
+        .map(|idx| app.rating_path_key(idx).unwrap())
+        .collect();
+    for (idx, rating) in [(0, 0), (1, 1), (2, 4), (3, 5)] {
+        app.rating_cache.insert(idx, rating);
+        if rating != 0 {
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set(&keys[idx], rating)
+                .unwrap();
+        }
+    }
+
+    let ctx = egui::Context::default();
+    ctx.begin_pass(viewport_raw_input(
+        egui::ViewportId::ROOT,
+        vec![fullscreen_fixed_key_event(egui::Key::F13)],
+    ));
+    let _ = app.handle_keyboard(&ctx);
+    let _ = ctx.end_pass();
+
+    for (key, expected) in keys.iter().zip([4, 2, 5, 5]) {
+        assert_eq!(app.rating_db.as_ref().unwrap().get(key), expected);
+    }
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected rating undo from checked grid key handler");
+    };
+    let mut recorded = changes
+        .iter()
+        .map(|change| (change.path_key.clone(), change.before, change.after))
+        .collect::<Vec<_>>();
+    recorded.sort();
+    let mut expected = vec![
+        (keys[0].clone(), 0, 4),
+        (keys[1].clone(), 1, 2),
+        (keys[2].clone(), 4, 5),
+    ];
+    expected.sort();
+    assert_eq!(recorded, expected);
+    assert!(app.checked.is_empty());
+}
+
+#[test]
+fn rating_step_grid_key_handler_partial_bound_clears_checks_but_all_bound_keeps_them() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.keymap = crate::keymap::Keymap::from_ini_str("[Rating]\nRatingItemStepUp = F13\n");
+    app.items = (0..2)
+        .map(|idx| GridItem::Image(app.tmp.path().join(format!("step-bound-key-{idx}.jpg"))))
+        .collect();
+    app.image_metas = vec![None; 2];
+    app.thumbnails = vec![ThumbnailState::Pending; 2];
+    app.visible_indices = vec![0, 1];
+    app.selected = Some(0);
+    app.checked.extend([0, 1]);
+    let keys: Vec<_> = (0..2)
+        .map(|idx| app.rating_path_key(idx).unwrap())
+        .collect();
+    for (idx, rating) in [(0, 4), (1, 5)] {
+        app.rating_cache.insert(idx, rating);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set(&keys[idx], rating)
+            .unwrap();
+    }
+
+    let press_step_up = |app: &mut App| {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(viewport_raw_input(
+            egui::ViewportId::ROOT,
+            vec![fullscreen_fixed_key_event(egui::Key::F13)],
+        ));
+        let _ = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+    };
+    press_step_up(&mut app);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[0]), 5);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[1]), 5);
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected rating undo from partially bounded grid step");
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (&changes[0].path_key, changes[0].before, changes[0].after),
+        (&keys[0], 4, 5)
+    );
+    assert!(
+        app.checked.is_empty(),
+        "a successful checked step clears checks"
+    );
+
+    app.checked.extend([0, 1]);
+    let write_generation = app.rating_session_write_generation;
+    press_step_up(&mut app);
+    assert_eq!(app.checked.len(), 2, "an all-bound step keeps checks");
+    assert!(app.checked.contains(&0));
+    assert!(app.checked.contains(&1));
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[0]), 5);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&keys[1]), 5);
+    assert_eq!(app.rating_session_write_generation, write_generation);
+    assert_eq!(app.meta_undo.undo_len(), 1);
+}
+
+#[test]
+fn rating_step_still_fullscreen_key_handler_item_and_container_record_undo() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.keymap = crate::keymap::Keymap::from_ini_str(
+        "[Rating]\nRatingItemStepDown = F13\nRatingContainerStepUp = F14\n",
+    );
+    app.current_folder = Some(app.tmp.path().to_path_buf());
+    app.items = vec![GridItem::Image(
+        app.tmp.path().join("step-fullscreen-key.jpg"),
+    )];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.fullscreen_idx = Some(0);
+    let item_key = app.rating_path_key(0).unwrap();
+    let container_key = app.current_container_rating_key_and_source().unwrap().0;
+
+    let ctx = egui::Context::default();
+    for key in [egui::Key::F13, egui::Key::F14] {
+        ctx.begin_pass(viewport_raw_input(
+            egui::ViewportId::ROOT,
+            vec![fullscreen_fixed_key_event(key)],
+        ));
+        let _ = app.handle_fs_key_input(&ctx, 0, false);
+        let _ = ctx.end_pass();
+    }
+
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&item_key), 2);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 4);
+    assert_eq!(app.meta_undo.undo_len(), 2);
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected container rating undo from fullscreen key handler");
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (&changes[0].path_key, changes[0].before, changes[0].after),
+        (&container_key, 0, 4)
+    );
+    app.apply_meta_undo();
+    let crate::undo_stack::UndoEntry::Rating { changes, .. } = app.meta_undo.peek_undo().unwrap()
+    else {
+        panic!("expected item rating undo from fullscreen key handler");
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (&changes[0].path_key, changes[0].before, changes[0].after),
+        (&item_key, 0, 2)
+    );
+}
+
+#[test]
+fn rating_step_respects_xmp_setting_and_filter_membership() {
+    use crate::keymap::{RatingEdit, RatingStepDirection};
+    let mut app = phase_c_support::setup_app();
+    let path = app.tmp.path().join("step-filter.jpg");
+    app.items = vec![GridItem::Image(path)];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    app.settings.rating_filter = [false, false, false, false, true, false];
+    app.settings.write_rating_to_xmp = false;
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    assert!(app.rating_write_handle.is_none());
+    assert_eq!(app.visible_indices, vec![0]);
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Up));
+    assert!(app.visible_indices.is_empty());
+
+    app.settings.rating_filter = [true; 6];
+    app.rebuild_visible_indices();
+    app.settings.write_rating_to_xmp = true;
+    app.apply_rating_edit_to_selection(RatingEdit::Step(RatingStepDirection::Down));
+    assert!(app.rating_write_handle.is_some());
 }
 
 #[test]
@@ -8157,6 +8625,8 @@ pub(crate) mod phase_c_support {
     /// 二重防御として drop 順自体を fix している。
     pub(crate) struct AppTestEnv {
         pub app: App,
+        // Keep the epoch scope alive through App::drop and its worker joins.
+        _epoch_scope: Option<crate::page_edit_write_epoch::TestEpochScope>,
         _guard: OverrideGuard,
         /// Test 本体から `app.tmp.path()` の形でアクセスできるよう公開している
         /// (App には `tmp` フィールドが無いので名前衝突しない)。
@@ -8267,6 +8737,11 @@ pub(crate) mod phase_c_support {
             settings,
             similar_feature_capability,
         };
+        // Tests that already own a scope retain it; otherwise every App fixture and its
+        // captured workers get a private epoch, including indirect grid/snapshot readers.
+        let epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture()
+            .is_none()
+            .then(crate::page_edit_write_epoch::TestEpochScope::fresh);
         let mut app = App::new_for_test(config);
         app.settings.first_setup_completed = true;
         // This shared fixture exercises navigation, context, and input behavior. Give it an
@@ -8282,6 +8757,7 @@ pub(crate) mod phase_c_support {
         app.settings.book_root = Some(tmp.path().join("books"));
         AppTestEnv {
             app,
+            _epoch_scope: epoch_scope,
             _guard: guard,
             tmp,
             _lock: lock,
@@ -11473,9 +11949,8 @@ mod folder_pane_open_nav_tests {
         assert!(
             nav_tx
                 .send(FolderNavThreadResult {
-                    outcome: None,
-                    smart_kind: None,
-                    scanned: FolderNavScanResult::NotNeeded,
+                    target: None,
+                    hit_image_folder: false,
                 })
                 .is_err(),
             "the previous tree-order worker must no longer have an apply receiver"
@@ -12623,6 +13098,7 @@ mod phase_c_folder_nav_history_tests {
     /// 動画フォルダで列ヘッダを押してから戻るだけで、報告と同じ症状が出る。
     #[test]
     fn navigating_back_into_the_rating_list_also_takes_back_the_column_sort() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let real = app.tmp.path().join("before-rating-back");
         std::fs::create_dir_all(&real).unwrap();
@@ -12682,6 +13158,7 @@ mod phase_c_folder_nav_history_tests {
     /// ビューの既定ソートを入れ直すのと同じ場所で、列ソートの所有権も戻す。
     #[test]
     fn entering_the_rating_list_takes_back_a_column_sort_carried_in_from_another_folder() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
         app.settings.details_show_video_dimensions = true;
@@ -12781,6 +13258,7 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn location_menu_rating_view_records_previous_folder_for_back() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let real = app.tmp.path().join("before-rating-menu");
         std::fs::create_dir_all(&real).unwrap();
@@ -12808,6 +13286,7 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn rating_view_star_change_records_distinct_history_and_restores_previous_stars() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let real = app.tmp.path().join("before-rating-star-switch");
         std::fs::create_dir_all(&real).unwrap();
@@ -13046,6 +13525,7 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn folder_history_dispatch_restores_rating_view() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut rating_app = setup_app();
         rating_app.active_quick_folder_slot = None;
         rating_app.rating_view_stars = 4;
@@ -14160,6 +14640,7 @@ mod phase_c_drill_nav_tests {
     /// 「なし+★3」では未評価サブフォルダが (descendant 件数バッジつきで) 表示される。
     #[test]
     fn drilled_unrated_subfolder_hidden_when_unrated_filter_off() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
         let mut app = setup_app();
@@ -14520,6 +15001,7 @@ mod phase_c_drill_nav_tests {
 
     #[test]
     fn rating_view_refresh_reloads_to_restore_row() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let image = app.tmp.path().join("rated.jpg");
         std::fs::write(&image, b"image bytes").expect("write rated image");
@@ -15314,6 +15796,7 @@ mod phase_c_drill_nav_tests {
     /// 復帰してほしい (旧実装は selected=None で先頭に飛んでいた)。
     #[test]
     fn bs_back_to_aggregated_restores_cursor_on_previous_container() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
         let mut app = setup_app();
@@ -17078,6 +17561,7 @@ mod phase_c_drill_nav_tests {
     /// - フィルタ「★2 のみ」: 未評価 subfolder は visibility check で隠れる
     #[test]
     fn drilled_subfolder_badge_matches_normal_folder_semantics() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
         let mut app = setup_app();
@@ -17151,6 +17635,7 @@ mod phase_c_drill_nav_tests {
     /// フォールバックする。次の方向キーで idx 0 に飛ぶ事故を防ぐため。
     #[test]
     fn bs_back_falls_back_to_first_visible_when_target_missing() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::global_search::GlobalHit;
         let mut app = setup_app();
         app.global_search.active = true;
@@ -18356,6 +18841,8 @@ fn begin_detached_bookmark_media_test(
                 jpeg_data: Vec::new(),
                 source_dims: None,
                 layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
             },
         )]),
     )));
@@ -18769,6 +19256,7 @@ mod phase_c_drill_address_tests {
 
     #[test]
     fn streaming_progress_is_grouped_in_address_and_removed_after_done() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.query = "glasses -genshin".to_string();
@@ -18836,6 +19324,7 @@ mod phase_c_drill_address_tests {
 
     #[test]
     fn aggregated_streaming_address_shows_received_hits_before_rating_prepare() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.query = "glasses".to_string();
@@ -18893,6 +19382,7 @@ mod phase_c_drill_address_tests {
 
     #[test]
     fn pending_search_without_events_uses_delayed_backstop() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.query = "glasses".to_string();
@@ -18918,6 +19408,7 @@ mod phase_c_drill_address_tests {
 
     #[test]
     fn search_event_backlog_requests_immediate_drain_continuation() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.query = "glasses".to_string();
@@ -27885,6 +28376,8 @@ mod favorite_adjustment_defaults_tests {
                 jpeg_data: webp,
                 source_dims: Some((2, 2)),
                 layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
             },
         )]));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -29171,6 +29664,8 @@ mod favorite_adjustment_defaults_tests {
                 jpeg_data: webp,
                 source_dims: Some((2, 2)),
                 layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
             },
         )]));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -29405,6 +29900,70 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn folder_request_and_cleanup_share_typed_pin_keys() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        let app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(folder.join("child")).unwrap();
+        std::fs::write(folder.join("cover.jpg"), b"not decoded").unwrap();
+        let item = GridItem::Folder(folder.clone());
+        for (source, provenance, version) in [
+            (
+                FolderPinSource::File {
+                    rel: "child".to_owned(),
+                    kind: FileKind::Folder,
+                },
+                crate::catalog::FolderThumbProvenance::AutoSelected,
+                "auto-v3",
+            ),
+            (
+                FolderPinSource::File {
+                    rel: "cover.jpg".to_owned(),
+                    kind: FileKind::Image,
+                },
+                crate::catalog::FolderThumbProvenance::Seeded,
+                "auto-v2",
+            ),
+        ] {
+            let pins = std::collections::HashMap::from([(
+                crate::path_key::normalize_keep_drive(&folder),
+                source,
+            )]);
+            let req = make_load_request(
+                &item,
+                0,
+                1,
+                2,
+                false,
+                None,
+                Some(crate::settings::SortOrder::Numeric),
+                3,
+                &pins,
+                &std::collections::HashMap::new(),
+                None,
+                Some(&folder),
+                app.folder_thumb_pin_db.as_deref(),
+                app.video_pin_db.as_ref(),
+                false,
+            )
+            .unwrap();
+            let key = req.cache_key_override.unwrap();
+            assert_eq!(req.folder_thumb_provenance, Some(provenance));
+            assert!(key.contains(version), "{key}");
+            let keep = folder_thumb_existing_keys_for(
+                &item,
+                Some((1, 2)),
+                &pins,
+                app.folder_thumb_pin_db.as_deref(),
+                Some(crate::settings::SortOrder::Numeric),
+                3,
+                false,
+            );
+            assert!(keep.contains(&key), "cleanup must preserve {key}");
+        }
+    }
+
+    #[test]
     fn folder_pin_to_zip_file_cascades_to_the_zips_pinned_page() {
         let app = setup_app();
         let folder = app.tmp.path().join("shelf");
@@ -29458,6 +30017,11 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(req.edit_preview_validate_container);
         let pinned_key = req.cache_key_override.clone().unwrap();
+        assert_eq!(
+            req.folder_thumb_provenance,
+            Some(crate::catalog::FolderThumbProvenance::Seeded)
+        );
+        assert!(pinned_key.contains("auto-v2"), "{pinned_key}");
         assert!(pinned_key.contains("#pin:cascade:"), "{pinned_key}");
         assert!(pinned_key.contains(":zipentry||chapter/page02.jpg|-|"));
 
@@ -33035,6 +33599,169 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    #[test]
+    fn late_folder_thumbnail_result_stays_with_its_viewer_context() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = app.tmp.path().join("first-folder");
+        let second = app.tmp.path().join("second-folder");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let prepare = |app: &mut App, folder: PathBuf| {
+            app.items = vec![GridItem::Folder(folder)];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.keep_set.insert(0);
+            app.keep_range = (0, 1);
+            app.requested.insert(0, false);
+        };
+        let send = |app: &mut App, red: u8| {
+            app.tx
+                .send(crate::thumb_loader::ThumbMsg {
+                    idx: 0,
+                    image: Some(egui::ColorImage::new(
+                        [2, 2],
+                        vec![egui::Color32::from_rgb(red, 10, 20); 4],
+                    )),
+                    origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                    from_edit_preview: false,
+                    edit_preview_adjustment: None,
+                    source_dims: Some((2, 2)),
+                    layout_dims: None,
+                    canceled: false,
+                    finalized: false,
+                    input_seq: 0,
+                    items_gen: app.items_generation,
+                })
+                .unwrap();
+        };
+        prepare(&mut app, first);
+        send(&mut app, 90);
+        let owner = app.stash_mounted_and_start_fresh("test_late_folder_thumb_owner");
+        prepare(&mut app, second);
+        send(&mut app, 180);
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+        app.with_viewer_context(owner, |mounted| {
+            assert!(matches!(mounted.thumbnails[0], ThumbnailState::Pending));
+            mounted.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+            assert!(matches!(
+                mounted.thumbnails[0],
+                ThumbnailState::Loaded { .. }
+            ));
+        })
+        .unwrap();
+        assert!(
+            matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
+            "the sibling's thumbnail must remain intact"
+        );
+    }
+
+    #[test]
+    fn smart_collection_and_rating_folder_requests_reach_shared_resolver() {
+        let app = setup_app();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let smart = super::smart_folder::smart_folder_synthetic_path(uuid::Uuid::new_v4());
+        let rating = super::rating_view_synthetic_path();
+        for (name, parent, full_path_key) in [
+            ("smart", smart, true),
+            ("collection", app.tmp.path().join("collection-source"), true),
+            ("rating", rating, true),
+        ] {
+            let folder = app.tmp.path().join(format!("{name}-library"));
+            std::fs::create_dir_all(&folder).unwrap();
+            let archive = folder.join("10-book.cbz");
+            std::fs::write(&archive, b"invalid archive bytes").unwrap();
+            let blue = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                8,
+                8,
+                image::Rgba([20, 40, 220, 255]),
+            ));
+            let webp = crate::catalog::encode_thumb_webp(&blue, 8, 80.0).unwrap().0;
+            let archive_meta = std::fs::metadata(&archive).unwrap();
+            crate::catalog::CatalogDb::open(&cache_dir, &folder)
+                .unwrap()
+                .save_thumb_bytes(
+                    "zipthumb:10-book.cbz",
+                    crate::ui_helpers::mtime_secs(&archive_meta),
+                    archive_meta.len() as i64,
+                    Some((8, 8)),
+                    &webp,
+                )
+                .unwrap();
+            let folder_meta = std::fs::metadata(&folder).unwrap();
+            let mut request = make_load_request(
+                &GridItem::Folder(folder.clone()),
+                0,
+                crate::ui_helpers::mtime_secs(&folder_meta),
+                0,
+                false,
+                None,
+                Some(crate::settings::SortOrder::Numeric),
+                3,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                None,
+                Some(&parent),
+                app.folder_thumb_pin_db.as_deref(),
+                None,
+                full_path_key,
+            )
+            .unwrap();
+            assert_eq!(
+                request.folder_thumb_provenance,
+                Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            );
+            assert!(
+                request
+                    .cache_key_override
+                    .as_deref()
+                    .unwrap()
+                    .contains("auto-v3")
+            );
+            request.force_cache = true;
+            let catalog = Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent).unwrap());
+            let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let done = Arc::new(AtomicUsize::new(0));
+            let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+            let keep_start = Arc::new(AtomicUsize::new(0));
+            let keep_end = Arc::new(AtomicUsize::new(1));
+            crate::thumb_loader::process_load_request(
+                &request,
+                &cache_map,
+                &tx,
+                Some(&catalog),
+                64,
+                75,
+                64,
+                CacheDecision::from_settings(&app.settings),
+                &done,
+                &stats,
+                None,
+                &keep_start,
+                &keep_end,
+                None,
+                app.folder_thumb_pin_db.as_deref(),
+                None,
+                None,
+            );
+            let image = rx
+                .try_iter()
+                .find_map(|message| message.image)
+                .unwrap_or_else(|| panic!("{name} did not resolve archive WebP"));
+            let pixel = image.pixels[0].to_srgba_unmultiplied();
+            assert!(pixel[2] > pixel[0], "{name} should use the cached archive");
+            let key = request.cache_key_override.as_deref().unwrap();
+            let row = catalog.load_one(key).unwrap().unwrap();
+            assert_eq!(
+                row.folder_provenance,
+                Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+            );
+            assert!(row.selection_proof.is_some());
+        }
+    }
+
     /// PDF を仮想フォルダとして開いた直後、親フォルダ catalog の `pdfthumb:foo.pdf`
     /// が PDF 自身の catalog に `page_0000` として seed されることを確認する回帰
     /// テスト。これによって PDFium による初回 1 ページ目レンダリング (200-500ms)
@@ -33184,6 +33911,8 @@ mod favorite_adjustment_defaults_tests {
                 jpeg_data: webp_bytes.clone(),
                 source_dims: Some((400, 400)),
                 layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
             },
         );
 
@@ -44671,6 +45400,26 @@ mod native_video_rating_key_tests {
     }
 
     #[test]
+    fn native_video_custom_step_keys_use_item_and_container_rating_paths() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let folder = PathBuf::from(r"C:\clips");
+        app.current_folder = Some(folder.clone());
+        let idx = push_video(&mut app, folder.join("step.mp4"));
+        app.fullscreen_idx = Some(idx);
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Rating]\nRatingItemStepUp = F7\nRatingContainerStepDown = Shift+F7\n",
+        );
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x76, false));
+        assert_eq!(app.get_rating(idx), 4);
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x76, true));
+        let container_key = crate::adjustment_db::normalize_path(&folder);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 2);
+        assert_eq!(app.meta_undo.undo_len(), 2);
+    }
+
+    #[test]
     fn native_video_i_and_tab_toggle_side_panel_mode() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -44880,6 +45629,40 @@ mod native_video_rating_key_tests {
         app.poll_bookmark_browser(&egui::Context::default());
         assert_eq!(app.items_generation, generation_before);
         assert_eq!(app.rating_cache.get(&0), Some(&2));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn rating_step_in_detached_context_updates_main_rating_cache() {
+        let mut app = setup_app();
+        let path = PathBuf::from(r"C:\pics\detached-step.jpg");
+        let row = bookmark_image_rating_row(path.clone());
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.items = vec![row.item.clone()];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.rating_cache.insert(0, 2);
+        app.rating_db.as_ref().unwrap().set(&key, 2).unwrap();
+
+        app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+            detached.items = vec![row.item.clone()];
+            detached.thumbnails = vec![ThumbnailState::Pending];
+            detached.visible_indices = vec![0];
+            detached.rating_cache.insert(0, 2);
+            detached.fullscreen_idx = Some(0);
+            detached.viewer_presentation = ViewerPresentation::DetachedWindow;
+            detached.detached_viewer_independent_active = true;
+        });
+
+        app.with_active_viewer_context(|active| {
+            active.apply_rating_edit_to_fullscreen_item(
+                0,
+                crate::keymap::RatingEdit::Step(crate::keymap::RatingStepDirection::Up),
+            )
+        })
+        .expect("detached context");
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);
+        assert_eq!(app.rating_cache.get(&0), Some(&3));
     }
 
     #[test]
@@ -52777,9 +53560,8 @@ mod still_window_mode_key_tests {
         let (detached_tx, detached_rx) = mpsc::channel::<FolderNavThreadResult>();
         detached_tx
             .send(FolderNavThreadResult {
-                outcome: None,
-                smart_kind: None,
-                scanned: FolderNavScanResult::NotNeeded,
+                target: None,
+                hit_image_folder: false,
             })
             .unwrap();
         app.build_active_context_for_test(Some(13), DetachedSource::Image, |context| {
@@ -53532,9 +54314,8 @@ mod still_window_mode_key_tests {
         let (result_tx, result_rx) = mpsc::channel::<FolderNavThreadResult>();
         result_tx
             .send(FolderNavThreadResult {
-                outcome: None,
-                smart_kind: None,
-                scanned: FolderNavScanResult::NotNeeded,
+                target: None,
+                hit_image_folder: false,
             })
             .unwrap();
         let pdf = PathBuf::from(r"C:\books\current.pdf");
@@ -62849,10 +63630,19 @@ mod still_window_mode_key_tests {
         app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
         let result = wait_folder_nav_result(&mut app);
 
-        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
+        assert_eq!(
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.expected_next.as_path())
+        );
         assert_ne!(
-            result.path.as_ref(),
-            Some(&fixture.cache_wrong_next),
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.cache_wrong_next.as_path()),
             "変換キャッシュ ZIP の物理パスを起点にすると archive_cache 側へ逸れる"
         );
         assert!(result.hit_image_folder);
@@ -62868,8 +63658,20 @@ mod still_window_mode_key_tests {
         app.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
         let result = wait_folder_nav_result(&mut app);
 
-        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
-        assert_ne!(result.path.as_ref(), Some(&fixture.cache_wrong_next));
+        assert_eq!(
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.expected_next.as_path())
+        );
+        assert_ne!(
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.cache_wrong_next.as_path())
+        );
         assert!(result.hit_image_folder);
     }
 
@@ -62882,8 +63684,20 @@ mod still_window_mode_key_tests {
         app.chain_folder_nav_if_pending(1, FolderNavMode::Fullscreen);
         let result = wait_folder_nav_result(&mut app);
 
-        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
-        assert_ne!(result.path.as_ref(), Some(&fixture.cache_wrong_next));
+        assert_eq!(
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.expected_next.as_path())
+        );
+        assert_ne!(
+            result
+                .target
+                .as_ref()
+                .map(super::FolderNavTarget::logical_source),
+            Some(fixture.cache_wrong_next.as_path())
+        );
         assert!(result.hit_image_folder);
     }
 
@@ -69117,6 +69931,7 @@ mod rating_view_navigation_tests {
 
     #[test]
     fn rating_view_back_from_opened_container_returns_to_result_grid() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let opened = app.tmp.path().join("books").join("a.zip");
         std::fs::create_dir_all(opened.parent().unwrap()).unwrap();
@@ -71462,8 +72277,11 @@ mod smart_folder_transition_tests {
         app.open_smart_folder_staged(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
         let make_result = |state| super::FolderNavResult {
-            path: Some(second.clone()),
-            smart_kind: Some(super::smart_folder::SmartChildKind::Pdf),
+            target: Some(super::FolderNavTarget {
+                route: super::FolderNavRoute::FullFeature(second.clone()),
+                smart_kind: Some(super::smart_folder::SmartChildKind::Pdf),
+                scanned: super::FolderNavScanResult::NotNeeded,
+            }),
             hit_image_folder: true,
             forward: true,
             mode: super::FolderNavMode::SmartFolder {
@@ -71471,7 +72289,6 @@ mod smart_folder_transition_tests {
                 fullscreen: false,
             },
             queued_steps: 0,
-            scanned: super::FolderNavScanResult::NotNeeded,
         };
         let captured = app.top_level_grid_view.smart_folder().unwrap().clone();
         let mut reversed = captured.navigation_entries.as_ref().clone();
@@ -82150,6 +82967,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
                 maximum: 240,
                 ..Default::default()
             },
+            seek_preview_size: crate::settings::VideoSeekPreviewSize::Large,
+            seek_preview_size_values: crate::settings::VideoSeekPreviewSizeValues::default(),
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Never,
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Hide,
         };
@@ -82243,6 +83062,8 @@ mod native_bar_lock_reaches_the_presenter_at_birth {
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
             seek_strip_height_values:
                 crate::video::seek_strip_layout::SeekStripHeightValues::default(),
+            seek_preview_size: crate::settings::VideoSeekPreviewSize::default(),
+            seek_preview_size_values: crate::settings::VideoSeekPreviewSizeValues::default(),
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::default(),
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::default(),
         };

@@ -838,6 +838,11 @@ tolerance_secs)` とし、許容値は worker global ではなく要求ごとに
 物理 bar 幅で同じ式、marker warmup と永続化用 pin/bookmark は 0.0 を渡す。0.0 の cache
 lookup に限っては平均 frame rate から求めた 1 frame 幅を同一 frame 再利用として認めるが、
 backward seek の着地点を早期採用する許容は 0.0 のままなので marker の抽出精度を粗くしない。
+desktop の `video_seek_preview_size` / `video_seek_preview_size_values` は native overlay の
+表示レイアウトだけへ渡す。既定の最小 176 / 小 229 / 中 282 / 大 352 / 最大 704pt は
+従来の画像幅上限 352pt の 0.5 / 0.65 / 0.8 / 1 / 2 倍 (整数丸め) で、
+旧 300〜352pt の下限・上限を選択値 / 352 に比例させる。
+320×180 の preview source、decode 要求、cache、および Remote の Web UI 寸法は変えない。
 
 cache は実 frame PTS を整数 nanosecond key にした `BTreeMap` で、要求範囲を range 検索する。
 範囲内に過去側の frame があれば target に最も近い過去側を優先し、無ければ未来側を選ぶ。

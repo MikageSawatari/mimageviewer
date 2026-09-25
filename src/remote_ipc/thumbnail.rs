@@ -305,6 +305,8 @@ impl ThumbnailEngine {
             cache_key_override: Some(cache_key),
             folder_thumb_sort: is_folder.then_some(self.settings.folder_thumb_sort),
             folder_thumb_depth: self.settings.folder_thumb_depth,
+            folder_thumb_provenance: is_folder
+                .then_some(crate::catalog::FolderThumbProvenance::AutoSelected),
             ..Default::default()
         };
         if is_folder {
@@ -577,7 +579,20 @@ fn apply_supported_folder_pin(
         // ZIP / PDF / 動画は今回の縦串増分の明示的な非スコープ。
         _ => return,
     };
-    let Some(base_key) = request.cache_key_override.as_deref() else {
+    let provenance = if matches!(resolved.kind, ResolvedKind::Folder) {
+        crate::catalog::FolderThumbProvenance::AutoSelected
+    } else {
+        crate::catalog::FolderThumbProvenance::Seeded
+    };
+    let Some(base_key) = crate::thumb_loader::folder_thumb_cache_key_for_path(
+        container,
+        container
+            .parent()
+            .is_some_and(crate::path_key::is_drive_or_share_root),
+        request.folder_thumb_sort.unwrap_or_default(),
+        request.folder_thumb_depth,
+        provenance,
+    ) else {
         return;
     };
     request.cache_key_override = Some(format!(
@@ -589,6 +604,7 @@ fn apply_supported_folder_pin(
     request.mtime = resolved.mtime;
     request.file_size = resolved.file_size;
     request.resolve_override = Some(strategy);
+    request.folder_thumb_provenance = Some(provenance);
 }
 
 fn color_image_to_dynamic(image: &egui::ColorImage) -> Option<image::DynamicImage> {
@@ -651,6 +667,133 @@ fn error_response(code: ThumbnailErrorCode, message: impl Into<String>) -> Thumb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_folder_pins_use_typed_seeded_and_auto_keys() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("folder");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(root.join("cover.jpg"), b"not decoded").unwrap();
+        let db = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&temp.path().join("pins.db"))
+            .unwrap();
+        let make_request = || crate::thumb_loader::LoadRequest {
+            path: root.clone(),
+            cache_key_override: crate::thumb_loader::folder_thumb_auto_cache_key_for_path(
+                &root,
+                false,
+                crate::settings::SortOrder::Numeric,
+                3,
+            ),
+            folder_thumb_sort: Some(crate::settings::SortOrder::Numeric),
+            folder_thumb_depth: 3,
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            ..Default::default()
+        };
+        db.set(
+            &root,
+            &FolderPinSource::File {
+                rel: "cover.jpg".to_owned(),
+                kind: FileKind::Image,
+            },
+        )
+        .unwrap();
+        let mut image_pin = make_request();
+        apply_supported_folder_pin(&mut image_pin, &root, Some(&db));
+        assert_eq!(
+            image_pin.folder_thumb_provenance,
+            Some(crate::catalog::FolderThumbProvenance::Seeded)
+        );
+        assert!(
+            image_pin
+                .cache_key_override
+                .as_deref()
+                .unwrap()
+                .contains("auto-v2")
+        );
+
+        db.set(
+            &root,
+            &FolderPinSource::File {
+                rel: "child".to_owned(),
+                kind: FileKind::Folder,
+            },
+        )
+        .unwrap();
+        let mut folder_pin = make_request();
+        apply_supported_folder_pin(&mut folder_pin, &root, Some(&db));
+        assert_eq!(
+            folder_pin.folder_thumb_provenance,
+            Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+        );
+        assert!(
+            folder_pin
+                .cache_key_override
+                .as_deref()
+                .unwrap()
+                .contains("auto-v3")
+        );
+    }
+
+    #[test]
+    fn remote_folder_round_trip_reselects_after_archive_tile_write() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("library");
+        let child = root.join("20-child");
+        std::fs::create_dir_all(&child).unwrap();
+        let red = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([230, 20, 20, 255]),
+        ));
+        red.save(child.join("cover.png")).unwrap();
+        let archive = root.join("10-book.cbz");
+        std::fs::write(&archive, b"invalid archive bytes").unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.cache_policy = crate::settings::CachePolicy::Always;
+        settings.folder_thumb_sort = crate::settings::SortOrder::Numeric;
+        let engine = ThumbnailEngine::new(settings);
+        let context = WorkerContext::open();
+        let resolved = resolve_existing(root.to_string_lossy().as_ref()).unwrap();
+        let first = engine
+            .generate_catalog_resolved(&resolved, 64, &context)
+            .unwrap();
+        let pixel = image::load_from_memory(&first)
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(0, 0)
+            .0;
+        assert!(pixel[0] > pixel[2], "initial representative should be red");
+
+        let blue = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([20, 20, 230, 255]),
+        ));
+        let webp = crate::catalog::encode_thumb_webp(&blue, 8, 80.0).unwrap().0;
+        let meta = std::fs::metadata(&archive).unwrap();
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
+        catalog
+            .save_thumb_bytes(
+                "zipthumb:10-book.cbz",
+                crate::ui_helpers::mtime_secs(&meta),
+                meta.len() as i64,
+                Some((8, 8)),
+                &webp,
+            )
+            .unwrap();
+        let second = engine
+            .generate_catalog_resolved(&resolved, 64, &context)
+            .unwrap();
+        let pixel = image::load_from_memory(&second)
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(0, 0)
+            .0;
+        assert!(pixel[2] > pixel[0], "new archive tile should win on reload");
+    }
 
     fn worker_context_with_video_pin(
         video_pin_db: Option<crate::video_pins::VideoPinDb>,

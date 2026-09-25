@@ -510,36 +510,103 @@ fn native_seek_preview_layout(
     target_x: f32,
     hud_rect: egui::Rect,
     strip_rect: Option<egui::Rect>,
-) -> NativeSeekPreviewLayout {
+    top_hud_visible: bool,
+    size: crate::settings::VideoSeekPreviewSize,
+    values: crate::settings::VideoSeekPreviewSizeValues,
+) -> Option<NativeSeekPreviewLayout> {
     let anchor_y = strip_rect.map_or(hud_rect.min.y, |rect| rect.min.y);
-    let desired_image_width = (overlay_width * 0.30).clamp(300.0, 352.0);
-    let horizontal_image_width = (overlay_width - SEEK_PREVIEW_SCREEN_MARGIN * 2.0).max(1.0);
-    let available_total_height =
-        (anchor_y - SEEK_PREVIEW_GAP - SEEK_PREVIEW_SCREEN_MARGIN).max(1.0);
-    let vertical_image_width =
-        ((available_total_height - SEEK_PREVIEW_ACTION_BAR_HEIGHT).max(1.0)) * (16.0 / 9.0);
-    let image_width = desired_image_width
-        .min(horizontal_image_width)
+    // 352pt is the legacy upper end of the responsive 300..=352pt width rule.
+    // Each editable preset scales both ends of that rule by the same ratio.
+    let scale = values.points(size) / 352.0;
+    // Keep the popup below the top HUD even while it is only hover-visible. Its background
+    // extends 2pt beyond the preview rect, so the 8pt screen margin also covers that stroke.
+    let top_limit = if top_hud_visible { HUD_TOP_HEIGHT } else { 0.0 } + SEEK_PREVIEW_SCREEN_MARGIN;
+    let available_total_height = anchor_y - SEEK_PREVIEW_GAP - top_limit;
+    let horizontal_width = overlay_width - SEEK_PREVIEW_SCREEN_MARGIN * 2.0;
+    // Keep every part of the former layout at the untouched default, including its fixed
+    // 38pt action row and height-limited image. Only use the new fit when that popup would
+    // cross a screen/HUD/strip boundary or leave the two action targets unusable.
+    if size == crate::settings::VideoSeekPreviewSize::Large && values.large == 352 {
+        let desired_image_width = (overlay_width * 0.30).clamp(300.0, 352.0);
+        let horizontal_image_width = (overlay_width - SEEK_PREVIEW_SCREEN_MARGIN * 2.0).max(1.0);
+        let legacy_available_height =
+            (anchor_y - SEEK_PREVIEW_GAP - SEEK_PREVIEW_SCREEN_MARGIN).max(1.0);
+        let vertical_image_width =
+            ((legacy_available_height - SEEK_PREVIEW_ACTION_BAR_HEIGHT).max(1.0)) * (16.0 / 9.0);
+        let image_width = desired_image_width
+            .min(horizontal_image_width)
+            .min(vertical_image_width);
+        let image_size = egui::vec2(image_width, image_width * 9.0 / 16.0);
+        let preview_size = egui::vec2(image_size.x, image_size.y + SEEK_PREVIEW_ACTION_BAR_HEIGHT);
+        let preview_x = (target_x - preview_size.x * 0.5).clamp(
+            SEEK_PREVIEW_SCREEN_MARGIN,
+            (overlay_width - preview_size.x - SEEK_PREVIEW_SCREEN_MARGIN)
+                .max(SEEK_PREVIEW_SCREEN_MARGIN),
+        );
+        let preview_y =
+            (anchor_y - preview_size.y - SEEK_PREVIEW_GAP).max(SEEK_PREVIEW_SCREEN_MARGIN);
+        let preview_rect =
+            egui::Rect::from_min_size(egui::pos2(preview_x, preview_y), preview_size);
+        let image_rect = egui::Rect::from_min_size(preview_rect.min, image_size);
+        let action_rect = egui::Rect::from_min_max(
+            egui::pos2(preview_rect.min.x, image_rect.max.y),
+            preview_rect.max,
+        );
+        let allowed = egui::Rect::from_min_max(
+            egui::pos2(SEEK_PREVIEW_SCREEN_MARGIN, top_limit),
+            egui::pos2(
+                overlay_width - SEEK_PREVIEW_SCREEN_MARGIN,
+                anchor_y - SEEK_PREVIEW_GAP,
+            ),
+        );
+        if allowed.contains_rect(preview_rect) && action_rect.width() >= 60.0 {
+            return Some(NativeSeekPreviewLayout {
+                preview_rect,
+                image_rect,
+                action_rect,
+            });
+        }
+    }
+    // A 30pt floor leaves room for two 24pt action targets at the smallest preset.
+    let desired_action_height = (SEEK_PREVIEW_ACTION_BAR_HEIGHT * scale).max(30.0);
+    if available_total_height <= 31.0 || horizontal_width < 66.0 {
+        return None;
+    }
+    let desired_image_width = (overlay_width * 0.30).clamp(300.0, 352.0) * scale;
+    let group_fit = (horizontal_width / desired_image_width)
+        .min(available_total_height / (desired_image_width * 9.0 / 16.0 + desired_action_height))
+        .min(1.0);
+    let action_height = (desired_action_height * group_fit).max(30.0);
+    let vertical_image_width = (available_total_height - action_height) * (16.0 / 9.0);
+    let image_width = (desired_image_width * group_fit)
+        .min(horizontal_width)
         .min(vertical_image_width);
     let image_size = egui::vec2(image_width, image_width * 9.0 / 16.0);
-    let preview_size = egui::vec2(image_size.x, image_size.y + SEEK_PREVIEW_ACTION_BAR_HEIGHT);
+    // On a very short window, keep room for two usable 24pt action targets while the 16:9
+    // image continues to shrink in both dimensions.
+    let preview_size = egui::vec2(image_size.x.max(66.0), image_size.y + action_height);
     let preview_x = (target_x - preview_size.x * 0.5).clamp(
         SEEK_PREVIEW_SCREEN_MARGIN,
-        (overlay_width - preview_size.x - SEEK_PREVIEW_SCREEN_MARGIN)
-            .max(SEEK_PREVIEW_SCREEN_MARGIN),
+        overlay_width - preview_size.x - SEEK_PREVIEW_SCREEN_MARGIN,
     );
-    let preview_y = (anchor_y - preview_size.y - SEEK_PREVIEW_GAP).max(SEEK_PREVIEW_SCREEN_MARGIN);
+    let preview_y = anchor_y - preview_size.y - SEEK_PREVIEW_GAP;
     let preview_rect = egui::Rect::from_min_size(egui::pos2(preview_x, preview_y), preview_size);
-    let image_rect = egui::Rect::from_min_size(preview_rect.min, image_size);
+    let image_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            preview_rect.center().x - image_size.x * 0.5,
+            preview_rect.min.y,
+        ),
+        image_size,
+    );
     let action_rect = egui::Rect::from_min_max(
         egui::pos2(preview_rect.min.x, image_rect.max.y),
         preview_rect.max,
     );
-    NativeSeekPreviewLayout {
+    Some(NativeSeekPreviewLayout {
         preview_rect,
         image_rect,
         action_rect,
-    }
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -554,10 +621,14 @@ struct NativeSeekPreviewVisualState {
 }
 
 fn native_seek_preview_action_rects(action_rect: egui::Rect) -> [egui::Rect; 2] {
-    let action_size = 24.0;
-    let action_gap = 6.0;
+    let scale = (action_rect.height() / SEEK_PREVIEW_ACTION_BAR_HEIGHT)
+        .max(1.0)
+        .min(action_rect.width() / 60.0);
+    let action_size = 24.0 * scale;
+    let action_gap = 6.0 * scale;
+    let action_top = (4.0 * scale).min((action_rect.height() - action_size).max(0.0));
     let pin_rect = egui::Rect::from_min_size(
-        action_rect.min + egui::vec2(6.0, 4.0),
+        action_rect.min + egui::vec2(6.0 * scale, action_top),
         egui::vec2(action_size, action_size),
     );
     let bookmark_rect = egui::Rect::from_min_size(
@@ -628,7 +699,7 @@ fn paint_native_seek_preview(
     draw_overlay_pin_icon(
         painter,
         pin_rect.center(),
-        24.0 * 0.34,
+        pin_rect.width() * 0.34,
         if state.pin_active {
             egui::Color32::from_rgb(180, 255, 180)
         } else {
@@ -644,23 +715,28 @@ fn paint_native_seek_preview(
     draw_overlay_bookmark_icon(
         painter,
         bookmark_rect.center(),
-        24.0 * 0.32,
+        bookmark_rect.width() * 0.32,
         if state.bookmark_active {
             egui::Color32::from_rgb(255, 245, 145)
         } else {
             egui::Color32::from_rgb(255, 220, 80)
         },
     );
-    painter.text(
-        egui::pos2(
-            layout.action_rect.max.x - 8.0,
-            layout.action_rect.center().y,
-        ),
-        egui::Align2::RIGHT_CENTER,
-        format_overlay_time(state.target_secs),
-        crate::ui_fonts::hud_text_font(13.0),
-        egui::Color32::from_rgb(245, 245, 245),
-    );
+    if layout.action_rect.width() >= 140.0 {
+        painter.text(
+            egui::pos2(
+                layout.action_rect.max.x - 8.0,
+                layout.action_rect.center().y,
+            ),
+            egui::Align2::RIGHT_CENTER,
+            format_overlay_time(state.target_secs),
+            crate::ui_fonts::hud_text_font(
+                (13.0 * (layout.action_rect.height() / SEEK_PREVIEW_ACTION_BAR_HEIGHT))
+                    .clamp(11.0, 20.0),
+            ),
+            egui::Color32::from_rgb(245, 245, 245),
+        );
+    }
 }
 
 fn native_seek_hud_painters(ui: &egui::Ui, hud_rect: egui::Rect) -> (egui::Painter, egui::Painter) {
@@ -2398,6 +2474,8 @@ struct NativeEguiOverlay {
     /// 要求は、すべてここから解決した 1 つの [`SeekStripLayout`] を見る。**
     seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
     seek_strip_height_values: crate::video::seek_strip_layout::SeekStripHeightValues,
+    seek_preview_size: crate::settings::VideoSeekPreviewSize,
+    seek_preview_size_values: crate::settings::VideoSeekPreviewSizeValues,
     seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode,
     seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip,
     /// App settings から同期される、左右パネル共通の表示モード。
@@ -8728,6 +8806,8 @@ impl NativeEguiOverlay {
             seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
             seek_strip_height_values:
                 crate::video::seek_strip_layout::SeekStripHeightValues::default(),
+            seek_preview_size: crate::settings::VideoSeekPreviewSize::default(),
+            seek_preview_size_values: crate::settings::VideoSeekPreviewSizeValues::default(),
             seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode::Always,
             seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip::Show,
             side_panel_mode: FsSidePanelMode::Hover,
@@ -9739,6 +9819,8 @@ impl NativeEguiOverlay {
             && self.fixed_bar_gap_px == lock.fixed_bar_gap_px
             && self.seek_strip_height == lock.seek_strip_height
             && self.seek_strip_height_values == lock.seek_strip_height_values
+            && self.seek_preview_size == lock.seek_preview_size
+            && self.seek_preview_size_values == lock.seek_preview_size_values
             && self.seek_hover_preview_mode == lock.seek_hover_preview_mode
             && self.seek_bar_with_strip == lock.seek_bar_with_strip
         {
@@ -9751,6 +9833,8 @@ impl NativeEguiOverlay {
         self.fixed_bar_gap_px = lock.fixed_bar_gap_px;
         self.seek_strip_height = lock.seek_strip_height;
         self.seek_strip_height_values = lock.seek_strip_height_values;
+        self.seek_preview_size = lock.seek_preview_size;
+        self.seek_preview_size_values = lock.seek_preview_size_values;
         self.seek_hover_preview_mode = lock.seek_hover_preview_mode;
         self.seek_bar_with_strip = lock.seek_bar_with_strip;
         self.dirty = true;
@@ -11598,6 +11682,8 @@ impl NativeEguiOverlay {
         let top_bar_locked = self.top_bar_locked;
         let bottom_lock = self.bottom_lock;
         let seek_hover_preview_mode = self.seek_hover_preview_mode;
+        let seek_preview_size = self.seek_preview_size;
+        let seek_preview_size_values = self.seek_preview_size_values;
         let vst3_panel_visible = vst3_panel.as_ref().is_some_and(|panel| panel.visible);
         let hud_dimmed = self.hud_dimmed;
         let perf_latest = self.perf_latest;
@@ -13209,144 +13295,153 @@ impl NativeEguiOverlay {
                                 |kind| kind == NativeOverlayTimelineMarkerKind::Bookmark,
                             );
                             let strip_rect = seek_strip_visible.then_some(seek_strip_layout.rect);
-                            let preview_layout = native_seek_preview_layout(
+                            if let Some(preview_layout) = native_seek_preview_layout(
                                 overlay_width_points,
                                 x,
                                 hud_rect,
                                 strip_rect,
-                            );
-                            let preview_rect = preview_layout.preview_rect;
-                            let action_rect = preview_layout.action_rect;
-                            // 動画 HUD 2 段化リデザイン (実機フィードバック反映 #1):
-                            // corridor の下端は **seek_row (シーク行) 底辺** まで。
-                            // 旧 1 段の名残で hud_rect.max.y まで伸ばすと、controls 行に
-                            // カーソルを降ろした瞬間も「まだ corridor 内」と判定されて
-                            // hover preview が居座り、下のボタン (frame step / camera / 音量
-                            // 等) を押しに行くときに preview が被さってしまう。
-                            // corridor を seek_row 内に限定することで、controls 行に
-                            // カーソルが入った瞬間 preview を即座に隠す。
-                            let preview_corridor_rect = egui::Rect::from_min_max(
-                                egui::pos2(preview_rect.min.x - 8.0, preview_rect.max.y),
-                                egui::pos2(preview_rect.max.x + 8.0, seek_row_rect.max.y),
-                            );
-                            let pointer_in_preview = pointer_pos.is_some_and(|pos| {
-                                preview_rect.expand(8.0).contains(pos)
-                                    || preview_corridor_rect.contains(pos)
-                            });
-                            if !seek_resp.hovered()
-                                && !strip_preview_active
-                                && !pointer_in_preview
-                            {
+                                bar_visibility.top_bar_visible,
+                                seek_preview_size,
+                                seek_preview_size_values,
+                            ) {
+                                let preview_rect = preview_layout.preview_rect;
+                                let action_rect = preview_layout.action_rect;
+                                // 動画 HUD 2 段化リデザイン (実機フィードバック反映 #1):
+                                // corridor の下端は **seek_row (シーク行) 底辺** まで。
+                                // 旧 1 段の名残で hud_rect.max.y まで伸ばすと、controls 行に
+                                // カーソルを降ろした瞬間も「まだ corridor 内」と判定されて
+                                // hover preview が居座り、下のボタン (frame step / camera / 音量
+                                // 等) を押しに行くときに preview が被さってしまう。
+                                // corridor を seek_row 内に限定することで、controls 行に
+                                // カーソルが入った瞬間 preview を即座に隠す。
+                                let preview_corridor_rect = egui::Rect::from_min_max(
+                                    egui::pos2(preview_rect.min.x - 8.0, preview_rect.max.y),
+                                    egui::pos2(preview_rect.max.x + 8.0, seek_row_rect.max.y),
+                                );
+                                let pointer_in_preview = pointer_pos.is_some_and(|pos| {
+                                    preview_rect.expand(8.0).contains(pos)
+                                        || preview_corridor_rect.contains(pos)
+                                });
+                                if !seek_resp.hovered()
+                                    && !strip_preview_active
+                                    && !pointer_in_preview
+                                {
+                                    set_seek_preview_target(
+                                        &mut hover_preview_target_secs,
+                                        &mut hover_preview_anchor_x,
+                                        None,
+                                    );
+                                } else {
+                                    // 実機修正 (2026-05-12 P1 #2): 実描画 rect を記録。
+                                    // `compute_hud_regions` が region 計算で読む。
+                                    last_drawn_preview_rect = Some(preview_rect);
+                                    let request_due = last_thumbnail_request_secs
+                                        .map(|previous| (previous - target).abs() >= 0.25)
+                                        .unwrap_or(true)
+                                        || last_thumbnail_request_at
+                                            .map(|last| last.elapsed() >= Duration::from_millis(250))
+                                            .unwrap_or(true);
+                                    if request_due {
+                                        last_thumbnail_request_secs = Some(target);
+                                        last_thumbnail_request_at = Some(Instant::now());
+                                        commands.push(NativeOverlayCommand::RequestSeekThumbnail {
+                                            target_secs: target,
+                                            bar_width_points: bar_rect.width() as f64,
+                                            pixels_per_point: self.pixels_per_point as f64,
+                                        });
+                                    }
+                                    // 動画 HUD 2 段化リデザイン (Phase 3): hover カーソル縦線は
+                                    // **シーク行内のみ** に描く (旧 1 段では HUD 全体に伸びていた)。
+                                    // 2 段化後に HUD 全体へ伸ばすとコントロール行のボタン上に線が
+                                    // 重なって視認性が下がる。
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(x, seek_row_rect.min.y + 4.0),
+                                            egui::pos2(x, seek_row_rect.max.y - 4.0),
+                                        ],
+                                        egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 88, 88)),
+                                    );
+
+                                    let thumbnail_matches =
+                                        hover_thumbnail.as_ref().is_some_and(|thumb| {
+                                            crate::video::thumbnail::is_within_tolerance(
+                                                target,
+                                                thumb.target_secs,
+                                                thumb.match_tolerance_secs,
+                                            )
+                                        });
+                                    let [pin_rect, bookmark_rect] =
+                                        native_seek_preview_action_rects(action_rect);
+                                    let pin_resp = ui.interact(
+                                        pin_rect,
+                                        egui::Id::new("native_video_hover_pin"),
+                                        egui::Sense::click(),
+                                    );
+                                    let bookmark_resp = ui.interact(
+                                        bookmark_rect,
+                                        egui::Id::new("native_video_hover_bookmark"),
+                                        egui::Sense::click(),
+                                    );
+                                    paint_native_seek_preview(
+                                        &preview_painter,
+                                        preview_layout,
+                                        NativeSeekPreviewVisualState {
+                                            thumbnail: hover_texture_id.zip(hover_thumbnail.as_ref()).map(
+                                                |(texture_id, thumb)| {
+                                                    (
+                                                        texture_id,
+                                                        egui::vec2(
+                                                            thumb.width as f32,
+                                                            thumb.height as f32,
+                                                        ),
+                                                    )
+                                                },
+                                            ),
+                                            thumbnail_matches,
+                                            pin_hovered: pin_resp.hovered(),
+                                            pin_active: hover_preview_pinned,
+                                            bookmark_hovered: bookmark_resp.hovered(),
+                                            bookmark_active: hover_preview_bookmarked,
+                                            target_secs: target,
+                                        },
+                                    );
+                                    let pin_resp = pin_resp.hover_tip_dark(
+                                        native_label_with_shortcut(
+                                            if hover_preview_pinned {
+                                                "この位置でピン留めを上書き"
+                                            } else {
+                                                "この位置をピン留め"
+                                            },
+                                            shortcut_labels.and_then(|s| s.pin.as_deref()),
+                                        ),
+                                    );
+                                    if pin_resp.clicked() {
+                                        commands.push(NativeOverlayCommand::SetPinAt {
+                                            target_secs: target,
+                                        });
+                                    }
+                                    let bookmark_resp = bookmark_resp.hover_tip_dark(
+                                        native_label_with_shortcut(
+                                            if hover_preview_bookmarked {
+                                                "ブックマーク済み"
+                                            } else {
+                                                "ブックマークを追加"
+                                            },
+                                            shortcut_labels.and_then(|s| s.bookmark.as_deref()),
+                                        ),
+                                    );
+                                    if bookmark_resp.clicked() {
+                                        commands.push(NativeOverlayCommand::AddBookmarkAt {
+                                            target_secs: target,
+                                        });
+                                    }
+                                }
+                            } else {
                                 set_seek_preview_target(
                                     &mut hover_preview_target_secs,
                                     &mut hover_preview_anchor_x,
                                     None,
                                 );
-                            } else {
-                                // 実機修正 (2026-05-12 P1 #2): 実描画 rect を記録。
-                                // `compute_hud_regions` が region 計算で読む。
-                                last_drawn_preview_rect = Some(preview_rect);
-                                let request_due = last_thumbnail_request_secs
-                                    .map(|previous| (previous - target).abs() >= 0.25)
-                                    .unwrap_or(true)
-                                    || last_thumbnail_request_at
-                                        .map(|last| last.elapsed() >= Duration::from_millis(250))
-                                        .unwrap_or(true);
-                                if request_due {
-                                    last_thumbnail_request_secs = Some(target);
-                                    last_thumbnail_request_at = Some(Instant::now());
-                                    commands.push(NativeOverlayCommand::RequestSeekThumbnail {
-                                        target_secs: target,
-                                        bar_width_points: bar_rect.width() as f64,
-                                        pixels_per_point: self.pixels_per_point as f64,
-                                    });
-                                }
-                                // 動画 HUD 2 段化リデザイン (Phase 3): hover カーソル縦線は
-                                // **シーク行内のみ** に描く (旧 1 段では HUD 全体に伸びていた)。
-                                // 2 段化後に HUD 全体へ伸ばすとコントロール行のボタン上に線が
-                                // 重なって視認性が下がる。
-                                painter.line_segment(
-                                    [
-                                        egui::pos2(x, seek_row_rect.min.y + 4.0),
-                                        egui::pos2(x, seek_row_rect.max.y - 4.0),
-                                    ],
-                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 88, 88)),
-                                );
-
-                                let thumbnail_matches =
-                                    hover_thumbnail.as_ref().is_some_and(|thumb| {
-                                        crate::video::thumbnail::is_within_tolerance(
-                                            target,
-                                            thumb.target_secs,
-                                            thumb.match_tolerance_secs,
-                                        )
-                                    });
-                                let [pin_rect, bookmark_rect] =
-                                    native_seek_preview_action_rects(action_rect);
-                                let pin_resp = ui.interact(
-                                    pin_rect,
-                                    egui::Id::new("native_video_hover_pin"),
-                                    egui::Sense::click(),
-                                );
-                                let bookmark_resp = ui.interact(
-                                    bookmark_rect,
-                                    egui::Id::new("native_video_hover_bookmark"),
-                                    egui::Sense::click(),
-                                );
-                                paint_native_seek_preview(
-                                    &preview_painter,
-                                    preview_layout,
-                                    NativeSeekPreviewVisualState {
-                                        thumbnail: hover_texture_id.zip(hover_thumbnail.as_ref()).map(
-                                            |(texture_id, thumb)| {
-                                                (
-                                                    texture_id,
-                                                    egui::vec2(
-                                                        thumb.width as f32,
-                                                        thumb.height as f32,
-                                                    ),
-                                                )
-                                            },
-                                        ),
-                                        thumbnail_matches,
-                                        pin_hovered: pin_resp.hovered(),
-                                        pin_active: hover_preview_pinned,
-                                        bookmark_hovered: bookmark_resp.hovered(),
-                                        bookmark_active: hover_preview_bookmarked,
-                                        target_secs: target,
-                                    },
-                                );
-                                let pin_resp = pin_resp.hover_tip_dark(
-                                    native_label_with_shortcut(
-                                        if hover_preview_pinned {
-                                            "この位置でピン留めを上書き"
-                                        } else {
-                                            "この位置をピン留め"
-                                        },
-                                        shortcut_labels.and_then(|s| s.pin.as_deref()),
-                                    ),
-                                );
-                                if pin_resp.clicked() {
-                                    commands.push(NativeOverlayCommand::SetPinAt {
-                                        target_secs: target,
-                                    });
-                                }
-                                let bookmark_resp = bookmark_resp.hover_tip_dark(
-                                    native_label_with_shortcut(
-                                        if hover_preview_bookmarked {
-                                            "ブックマーク済み"
-                                        } else {
-                                            "ブックマークを追加"
-                                        },
-                                        shortcut_labels.and_then(|s| s.bookmark.as_deref()),
-                                    ),
-                                );
-                                if bookmark_resp.clicked() {
-                                    commands.push(NativeOverlayCommand::AddBookmarkAt {
-                                        target_secs: target,
-                                    });
-                                }
-
                             }
                         }
 
@@ -15379,7 +15474,11 @@ mod tests {
                 screen_rect.center().x,
                 hud_rect,
                 strip_rect,
-            );
+                false,
+                crate::settings::VideoSeekPreviewSize::Large,
+                crate::settings::VideoSeekPreviewSizeValues::default(),
+            )
+            .unwrap();
             assert!(layout.preview_rect.max.y < hud_rect.min.y);
 
             // `Area` intentionally makes its first frame an invisible sizing pass. Prime the
@@ -15591,14 +15690,26 @@ mod tests {
             egui::vec2(overlay_size.x, HUD_BOTTOM_HEIGHT),
         );
         let strip_rect = test_strip_layout(overlay_size).rect;
-        let without_strip =
-            super::native_seek_preview_layout(overlay_size.x, overlay_size.x * 0.5, hud_rect, None);
+        let without_strip = super::native_seek_preview_layout(
+            overlay_size.x,
+            overlay_size.x * 0.5,
+            hud_rect,
+            None,
+            false,
+            crate::settings::VideoSeekPreviewSize::Large,
+            crate::settings::VideoSeekPreviewSizeValues::default(),
+        )
+        .unwrap();
         let with_strip = super::native_seek_preview_layout(
             overlay_size.x,
             overlay_size.x * 0.5,
             hud_rect,
             Some(strip_rect),
-        );
+            false,
+            crate::settings::VideoSeekPreviewSize::Large,
+            crate::settings::VideoSeekPreviewSizeValues::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             without_strip.preview_rect.max.y,
@@ -15624,12 +15735,254 @@ mod tests {
             short_size.x * 0.5,
             short_hud,
             Some(short_strip),
-        );
+            false,
+            crate::settings::VideoSeekPreviewSize::Large,
+            crate::settings::VideoSeekPreviewSizeValues::default(),
+        )
+        .unwrap();
         assert_eq!(
             short_layout.preview_rect.max.y,
             short_strip.min.y - super::SEEK_PREVIEW_GAP
         );
         assert!(!short_layout.preview_rect.intersects(short_strip));
+    }
+
+    #[test]
+    fn seek_preview_size_steps_scale_image_and_action_row_from_legacy_default() {
+        use crate::settings::{VideoSeekPreviewSize, VideoSeekPreviewSizeValues};
+
+        let hud = egui::Rect::from_min_size(
+            egui::pos2(0.0, 900.0 - HUD_BOTTOM_HEIGHT),
+            egui::vec2(1200.0, HUD_BOTTOM_HEIGHT),
+        );
+        let values = VideoSeekPreviewSizeValues::default();
+        for step in VideoSeekPreviewSize::ALL {
+            let scale = values.points(step) / 352.0;
+            let layout =
+                super::native_seek_preview_layout(1200.0, 600.0, hud, None, false, step, values)
+                    .unwrap();
+            assert_eq!(layout.image_rect.width(), values.points(step));
+            assert_eq!(layout.image_rect.height(), values.points(step) * 9.0 / 16.0);
+            assert!(
+                (layout.action_rect.height()
+                    - (super::SEEK_PREVIEW_ACTION_BAR_HEIGHT * scale).max(30.0))
+                .abs()
+                    < 0.001
+            );
+            for target in super::native_seek_preview_action_rects(layout.action_rect) {
+                assert!(layout.action_rect.contains_rect(target));
+                assert!(target.width() >= 24.0);
+            }
+        }
+        // Large reproduces both endpoints of the former responsive rule exactly.
+        let legacy_min = super::native_seek_preview_layout(
+            800.0,
+            400.0,
+            hud,
+            None,
+            false,
+            VideoSeekPreviewSize::Large,
+            values,
+        )
+        .unwrap();
+        assert_eq!(legacy_min.image_rect.width(), 300.0);
+        let mut custom = values;
+        custom.large = 528;
+        let custom_layout = super::native_seek_preview_layout(
+            800.0,
+            400.0,
+            hud,
+            None,
+            false,
+            VideoSeekPreviewSize::Large,
+            custom,
+        )
+        .unwrap();
+        assert_eq!(custom_layout.image_rect.width(), 450.0);
+    }
+
+    // The complete pre-1.249 formula, kept independent of the production branch so a change
+    // to either its fixed row or its height-limited image is observable.
+    fn old_seek_preview_layout_oracle(
+        overlay_width: f32,
+        target_x: f32,
+        hud_rect: egui::Rect,
+        strip_rect: Option<egui::Rect>,
+    ) -> super::NativeSeekPreviewLayout {
+        let anchor_y = strip_rect.map_or(hud_rect.min.y, |rect| rect.min.y);
+        let desired_image_width = (overlay_width * 0.30).clamp(300.0, 352.0);
+        let horizontal_image_width =
+            (overlay_width - super::SEEK_PREVIEW_SCREEN_MARGIN * 2.0).max(1.0);
+        let available_total_height =
+            (anchor_y - super::SEEK_PREVIEW_GAP - super::SEEK_PREVIEW_SCREEN_MARGIN).max(1.0);
+        let vertical_image_width =
+            ((available_total_height - super::SEEK_PREVIEW_ACTION_BAR_HEIGHT).max(1.0))
+                * (16.0 / 9.0);
+        let image_width = desired_image_width
+            .min(horizontal_image_width)
+            .min(vertical_image_width);
+        let image_size = egui::vec2(image_width, image_width * 9.0 / 16.0);
+        let preview_size = egui::vec2(
+            image_size.x,
+            image_size.y + super::SEEK_PREVIEW_ACTION_BAR_HEIGHT,
+        );
+        let preview_x = (target_x - preview_size.x * 0.5).clamp(
+            super::SEEK_PREVIEW_SCREEN_MARGIN,
+            (overlay_width - preview_size.x - super::SEEK_PREVIEW_SCREEN_MARGIN)
+                .max(super::SEEK_PREVIEW_SCREEN_MARGIN),
+        );
+        let preview_y = (anchor_y - preview_size.y - super::SEEK_PREVIEW_GAP)
+            .max(super::SEEK_PREVIEW_SCREEN_MARGIN);
+        let preview_rect =
+            egui::Rect::from_min_size(egui::pos2(preview_x, preview_y), preview_size);
+        let image_rect = egui::Rect::from_min_size(preview_rect.min, image_size);
+        let action_rect = egui::Rect::from_min_max(
+            egui::pos2(preview_rect.min.x, image_rect.max.y),
+            preview_rect.max,
+        );
+        super::NativeSeekPreviewLayout {
+            preview_rect,
+            image_rect,
+            action_rect,
+        }
+    }
+
+    #[test]
+    fn default_seek_preview_matches_old_formula_where_it_fits_across_viewports() {
+        use crate::settings::{VideoSeekPreviewSize, VideoSeekPreviewSizeValues};
+
+        let values = VideoSeekPreviewSizeValues::default();
+        let mut compared = 0;
+        for width in [80.0, 90.0, 320.0, 420.0, 800.0, 1200.0, 1920.0] {
+            for height in [240.0, 360.0, 500.0, 900.0] {
+                let hud_y = height - HUD_BOTTOM_HEIGHT;
+                let hud = egui::Rect::from_min_size(
+                    egui::pos2(0.0, hud_y),
+                    egui::vec2(width, HUD_BOTTOM_HEIGHT),
+                );
+                for strip_top in [None, Some(200.0_f32.min(hud_y)), Some(hud_y * 0.55)] {
+                    let strip = strip_top.map(|y| {
+                        egui::Rect::from_min_max(egui::pos2(0.0, y), egui::pos2(width, hud_y))
+                    });
+                    let anchor_y = strip_top.unwrap_or(hud_y);
+                    for top_hud_visible in [false, true] {
+                        let top_limit = if top_hud_visible { HUD_TOP_HEIGHT } else { 0.0 }
+                            + super::SEEK_PREVIEW_SCREEN_MARGIN;
+                        let allowed = egui::Rect::from_min_max(
+                            egui::pos2(super::SEEK_PREVIEW_SCREEN_MARGIN, top_limit),
+                            egui::pos2(
+                                width - super::SEEK_PREVIEW_SCREEN_MARGIN,
+                                anchor_y - super::SEEK_PREVIEW_GAP,
+                            ),
+                        );
+                        for x in [0.0, width * 0.5, width] {
+                            let old = old_seek_preview_layout_oracle(width, x, hud, strip);
+                            let new = super::native_seek_preview_layout(
+                                width,
+                                x,
+                                hud,
+                                strip,
+                                top_hud_visible,
+                                VideoSeekPreviewSize::Large,
+                                values,
+                            );
+                            if allowed.contains_rect(old.preview_rect)
+                                && old.action_rect.width() >= 60.0
+                            {
+                                assert_eq!(
+                                    new,
+                                    Some(old),
+                                    "width={width}, height={height}, strip={strip_top:?}, top={top_hud_visible}, x={x}"
+                                );
+                                for target in
+                                    super::native_seek_preview_action_rects(old.action_rect)
+                                {
+                                    assert!(old.action_rect.contains_rect(target));
+                                    assert!(target.width() >= 24.0 - 0.001);
+                                }
+                                let old_pin = egui::Rect::from_min_size(
+                                    old.action_rect.min + egui::vec2(6.0, 4.0),
+                                    egui::vec2(24.0, 24.0),
+                                );
+                                let old_bookmark = egui::Rect::from_min_size(
+                                    egui::pos2(old_pin.max.x + 6.0, old_pin.min.y),
+                                    egui::vec2(24.0, 24.0),
+                                );
+                                assert_eq!(
+                                    super::native_seek_preview_action_rects(old.action_rect),
+                                    [old_pin, old_bookmark]
+                                );
+                                compared += 1;
+                            } else if let Some(new) = new {
+                                assert!(allowed.contains_rect(new.preview_rect));
+                                assert!((new.image_rect.aspect_ratio() - 16.0 / 9.0).abs() < 0.001);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 50);
+        let hud =
+            egui::Rect::from_min_size(egui::pos2(0.0, 436.0), egui::vec2(800.0, HUD_BOTTOM_HEIGHT));
+        let strip = egui::Rect::from_min_max(egui::pos2(0.0, 200.0), egui::pos2(800.0, 436.0));
+        let old = old_seek_preview_layout_oracle(800.0, 400.0, hud, Some(strip));
+        assert_eq!(
+            old.action_rect.height(),
+            super::SEEK_PREVIEW_ACTION_BAR_HEIGHT
+        );
+        assert_eq!(
+            super::native_seek_preview_layout(
+                800.0,
+                400.0,
+                hud,
+                Some(strip),
+                false,
+                VideoSeekPreviewSize::Large,
+                values,
+            ),
+            Some(old),
+        );
+    }
+
+    #[test]
+    fn seek_preview_large_size_clamps_to_narrow_available_rect_without_overlapping_chrome() {
+        use crate::settings::{VideoSeekPreviewSize, VideoSeekPreviewSizeValues};
+
+        let width = 420.0;
+        let hud =
+            egui::Rect::from_min_size(egui::pos2(0.0, 360.0), egui::vec2(width, HUD_BOTTOM_HEIGHT));
+        let strip = egui::Rect::from_min_size(egui::pos2(0.0, 240.0), egui::vec2(width, 120.0));
+        for step in VideoSeekPreviewSize::ALL {
+            for x in [0.0, width * 0.5, width] {
+                let layout = super::native_seek_preview_layout(
+                    width,
+                    x,
+                    hud,
+                    Some(strip),
+                    true,
+                    step,
+                    VideoSeekPreviewSizeValues::default(),
+                )
+                .unwrap();
+                let allowed = egui::Rect::from_min_max(
+                    egui::pos2(
+                        super::SEEK_PREVIEW_SCREEN_MARGIN,
+                        HUD_TOP_HEIGHT + super::SEEK_PREVIEW_SCREEN_MARGIN,
+                    ),
+                    egui::pos2(
+                        width - super::SEEK_PREVIEW_SCREEN_MARGIN,
+                        strip.min.y - super::SEEK_PREVIEW_GAP,
+                    ),
+                );
+                assert!(
+                    allowed.contains_rect(layout.preview_rect),
+                    "{step:?}: {layout:?}"
+                );
+                assert!((layout.image_rect.aspect_ratio() - 16.0 / 9.0).abs() < 0.001);
+                assert!(!layout.preview_rect.intersects(strip));
+            }
+        }
     }
 
     /// 実機報告 2026-08-26: ストリップを hover するとプレビューがポインタから離れた場所に出て、
@@ -15661,8 +16014,26 @@ mod tests {
             egui::pos2(0.0, 1080.0 - HUD_BOTTOM_HEIGHT),
             egui::vec2(overlay_width, HUD_BOTTOM_HEIGHT),
         );
-        let left = super::native_seek_preview_layout(overlay_width, 400.0, hud_rect, None);
-        let right = super::native_seek_preview_layout(overlay_width, 1500.0, hud_rect, None);
+        let left = super::native_seek_preview_layout(
+            overlay_width,
+            400.0,
+            hud_rect,
+            None,
+            false,
+            crate::settings::VideoSeekPreviewSize::Large,
+            crate::settings::VideoSeekPreviewSizeValues::default(),
+        )
+        .unwrap();
+        let right = super::native_seek_preview_layout(
+            overlay_width,
+            1500.0,
+            hud_rect,
+            None,
+            false,
+            crate::settings::VideoSeekPreviewSize::Large,
+            crate::settings::VideoSeekPreviewSizeValues::default(),
+        )
+        .unwrap();
         assert_eq!(left.preview_rect.center().x, 400.0);
         assert_eq!(right.preview_rect.center().x, 1500.0);
         assert!(left.preview_rect.center().x < right.preview_rect.center().x);

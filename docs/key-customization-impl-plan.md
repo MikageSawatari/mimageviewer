@@ -386,8 +386,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 10. **OS/egui 由来の clipboard / D&D は固定**: `Event::Copy` / `Event::Cut`、
     Win32 クリップボード paste、ファイル D&D は keyboard keymap の範囲外。対象にするなら
     Grid の別フェーズで明示的に設計する。
-11. **レーティング F1-F6** は `[Rating]` コンテキストの `RatingItem1..5/Clear` と
-   `RatingContainer1..5/Clear` に集約する。グリッド / 画像フルスクリーン / native 動画の
+11. **レーティング F1-F6** は `[Rating]` コンテキストの `RatingItem1..5/Clear/StepUp/StepDown` と
+   `RatingContainer1..5/Clear/StepUp/StepDown` に集約する。StepUp/StepDown は既定キーなし。グリッド / 画像フルスクリーン / native 動画の
    入口は `Keymap::consume_rating_action` / `native_video_rating_action` を使い、保存処理は既存の
    `set_rating` / `set_current_folder_rating` 経路を共有する。
 12. **生 Event::Key / OS 状態参照経路** (pipeline debug=pipeline_debug.rs:104 など) は特殊。
@@ -511,7 +511,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   GridPin `P` (P) / GridCompareX `X` (P)
 - GridApplyErase1/2 `F7/F8` / GridApplyConceal1/2 `F9/F10` /
   GridDeleteEraseMask `Shift+F7/F8` / GridDeleteConcealMask `Shift+F9/F10` (P)
-- RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`
+- RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`。
+  RatingItemStepUp/StepDown・RatingContainerStepUp/StepDown は `none`
   (専用 `[Rating]` グループ。グリッド / 画像フルスクリーン / 動画フルスクリーンで共有)
 - GridCopyFiles / GridCutFiles は Shell clipboard 実行経路を保ったまま keymap 化済み。
   Paste `Ctrl+V`、D&D、右クリック操作そのものは OS/clipboard/マウス経路を含むため固定。

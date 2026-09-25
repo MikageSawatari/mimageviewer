@@ -1601,6 +1601,7 @@ mod tests {
             page_index: Some(page_index),
             items_generation: 7,
             item_identity: item_identity.to_string(),
+            selected_item_identity: String::new(),
             page_ready: true,
             viewport_rendered: true,
             viewport_revision: 1,

@@ -7655,6 +7655,11 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         });
 
         ui.add_space(8.0);
+        anchored(ui, state, "video/seek-preview-size", |ui, state| {
+            draw_video_seek_preview_size_settings(ui, &mut state.settings);
+        });
+
+        ui.add_space(8.0);
         anchored(ui, state, "video/seek-strip-cycle", |ui, state| {
             let s = &mut state.settings;
             ui.label("シークストリップをキーで切り替えるときに通す表示");
@@ -8447,7 +8452,7 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(4.0);
         ui.label(
         "フォルダの代表画像を探すとき、サブフォルダを何階層まで探索するか。\n\
-         1 以上ではサブフォルダ内の画像を直接の子ファイルより優先します。0 にすると直接の子ファイルのみ使用します。",
+         直下の画像を設定した順序で優先します。画像がない場合だけ、子フォルダと作成済みサムネイルのある ZIP/PDF を設定した深さまで探します。0 では直下の画像のみ使用します。",
     );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -8972,6 +8977,124 @@ pub(super) fn draw_video_seek_strip_height_settings(
     );
 }
 
+pub(super) fn draw_video_seek_preview_size_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    let size = &mut settings.video_seek_preview_size;
+    let draw = |ui: &mut egui::Ui| {
+        ui.label("シーク位置プレビューの大きさ");
+        egui::ComboBox::from_id_salt("video_seek_preview_size")
+            .selected_text(size.label())
+            .show_ui(ui, |ui| {
+                for step in crate::settings::VideoSeekPreviewSize::ALL {
+                    ui.selectable_value(size, step, step.label());
+                }
+            });
+    };
+    if ui.available_width() < 320.0 {
+        ui.vertical(draw);
+    } else {
+        ui.horizontal(draw);
+    }
+    ui.label("各段階の画像幅の上限（100% 表示時の px 相当）");
+    let values = &mut settings.video_seek_preview_size_values;
+    for (preset, value) in [
+        (
+            crate::settings::VideoSeekPreviewSize::Maximum,
+            &mut values.maximum,
+        ),
+        (
+            crate::settings::VideoSeekPreviewSize::Large,
+            &mut values.large,
+        ),
+        (
+            crate::settings::VideoSeekPreviewSize::Medium,
+            &mut values.medium,
+        ),
+        (
+            crate::settings::VideoSeekPreviewSize::Small,
+            &mut values.small,
+        ),
+        (
+            crate::settings::VideoSeekPreviewSize::Smallest,
+            &mut values.smallest,
+        ),
+    ] {
+        ui.horizontal(|ui| {
+            ui.label(preset.label());
+            ui.add(
+                egui::DragValue::new(value)
+                    .range(
+                        crate::settings::VIDEO_SEEK_PREVIEW_WIDTH_MIN_POINTS
+                            ..=crate::settings::VIDEO_SEEK_PREVIEW_WIDTH_MAX_POINTS,
+                    )
+                    .suffix(" px"),
+            );
+        });
+    }
+    ui.small("各段階は個別に変更でき、シークストリップの高さや静止画の値には影響しません。画面が狭いときは収まる大きさに縮みます。");
+}
+
+pub(super) fn draw_still_seek_preview_size_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    let size = &mut settings.still_seek_preview_size;
+    let draw = |ui: &mut egui::Ui| {
+        ui.label("シーク位置プレビューの大きさ");
+        egui::ComboBox::from_id_salt("still_seek_preview_size")
+            .selected_text(size.label())
+            .show_ui(ui, |ui| {
+                for step in crate::settings::StillSeekPreviewSize::ALL {
+                    ui.selectable_value(size, step, step.label());
+                }
+            });
+    };
+    if ui.available_width() < 320.0 {
+        ui.vertical(draw);
+    } else {
+        ui.horizontal(draw);
+    }
+    ui.label("各段階の画像枠の高さ（100% 表示時の px 相当）");
+    let values = &mut settings.still_seek_preview_size_values;
+    for (preset, value) in [
+        (
+            crate::settings::StillSeekPreviewSize::Maximum,
+            &mut values.maximum,
+        ),
+        (
+            crate::settings::StillSeekPreviewSize::Large,
+            &mut values.large,
+        ),
+        (
+            crate::settings::StillSeekPreviewSize::Medium,
+            &mut values.medium,
+        ),
+        (
+            crate::settings::StillSeekPreviewSize::Small,
+            &mut values.small,
+        ),
+        (
+            crate::settings::StillSeekPreviewSize::Smallest,
+            &mut values.smallest,
+        ),
+    ] {
+        ui.horizontal(|ui| {
+            ui.label(preset.label());
+            ui.add(
+                egui::DragValue::new(value)
+                    .range(
+                        crate::settings::STILL_SEEK_PREVIEW_HEIGHT_MIN_POINTS
+                            ..=crate::settings::STILL_SEEK_PREVIEW_HEIGHT_MAX_POINTS,
+                    )
+                    .suffix(" px"),
+            );
+        });
+    }
+    ui.small("各段階は個別に変更でき、サムネイル列の高さや動画の値には影響しません。画面が狭いときは収まる大きさに縮みます。");
+}
+
 pub(super) fn draw_still_seek_strip_settings(
     ui: &mut egui::Ui,
     settings: &mut crate::settings::Settings,
@@ -9225,6 +9348,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     });
     anchored(ui, state, "spread/seek-strip", |ui, state| {
         draw_still_seek_strip_settings(ui, &mut state.settings);
+    });
+    anchored(ui, state, "spread/seek-preview-size", |ui, state| {
+        draw_still_seek_preview_size_settings(ui, &mut state.settings);
     });
     anchored(ui, state, "spread/seek-preview", |ui, state| {
         let s = &mut state.settings;

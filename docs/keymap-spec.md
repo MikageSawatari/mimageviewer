@@ -25,9 +25,10 @@ OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対
 `Settings.ring_shortcuts` で厳選アクションだけを差し替えられる。
 これは `KeyAction` / コマンド設定の完全カスタマイズではなく、マウス・ゲームパッド用の
 固定入力レイヤーで扱う。
-レーティングは専用の `[Rating]` グループ (`RatingItem1..5/Clear`、
-`RatingContainer1..5/Clear`) で、グリッド / 画像フルスクリーン / 動画フルスクリーンが
+レーティングは専用の `[Rating]` グループ (`RatingItem1..5/Clear/StepUp/StepDown`、
+`RatingContainer1..5/Clear/StepUp/StepDown`) で、グリッド / 画像フルスクリーン / 動画フルスクリーンが
 同じ割り当てを共有する。v2.2.0 からは物理キー寄りの `KeySlot` を正本にし、通常の数字キーとテンキー数字を別キーとして扱う。互換性のため、従来の数字キー既定操作は `1` と `Numpad1` のように両方を既定割り当てにする。
+`StepUp/StepDown` は標準キーなし。未評価は操作時だけ ★3 を基準にし、上げると ★4、下げると ★2 を保存する。★5 から上げる / ★1 から下げる操作は書き込み・Undo を作らない。チェック済み項目は各自の現在値から一括で変化し、1 回の Undo で戻せる。コンテナ用は直接指定と同じく現在開いているフォルダ / ZIP / PDF 本体が対象。
 本体 <kbd>Enter</kbd> と `NumpadEnter` も別スロットであり、押下操作、KeyHold、native 動画、
 操作カスタマイズの「押して入力」の全経路で相互に発火しない。Windows では両者が
 `VK_RETURN` を共有するため、Win32 `WM_KEYDOWN/WM_KEYUP` の extended bit を物理種別の

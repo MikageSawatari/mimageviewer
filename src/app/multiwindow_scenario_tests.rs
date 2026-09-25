@@ -1244,6 +1244,356 @@ fn multiwindow_scenario_a_zip_sidecar_restore_reaches_paint() {
         .expect("scenario thread");
 }
 
+fn run_multiwindow_rar_tree_nav(
+    start_name: &str,
+    forward: bool,
+    expected_name: &str,
+    cache_solid: bool,
+    pending_main_conversion: bool,
+) {
+    let mut app = setup_app_for_test();
+    let mut driver = ScenarioDriver::new();
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+    app.startup_done = true;
+    app.startup_init = None;
+    app.settings.detached_viewer_open_images_in_window = true;
+    app.settings.auto_fullscreen_image_folders = true;
+    app.settings.auto_fullscreen_zip_pdf = true;
+    app.settings.archive_file_handling = crate::settings::ArchiveFileHandling::Convert;
+    app.settings.sidecar_backup_enabled = false;
+    app.settings.tag_sidecar_backup_enabled = false;
+
+    let root = app.tmp.path().join("rar-tree-nav");
+    std::fs::create_dir(&root).unwrap();
+    let fixtures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/archives/multiwindow-rar-nav");
+    for name in [
+        "01-direct.rar",
+        "02-solid.rar",
+        "06-control.zip",
+        "08-direct.cbr",
+    ] {
+        std::fs::copy(fixtures.join(name), root.join(name)).unwrap();
+    }
+    if cache_solid {
+        let source = root.join("02-solid.rar");
+        let cached = app.tmp.path().join("solid-nav-cache.zip");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        crate::archive_converter::convert_to_zip(
+            &source,
+            &cached,
+            crate::archive_converter::ArchiveFormat::Rar,
+            &cancel,
+            None,
+        )
+        .expect("solid RAR fixture converts to cache ZIP");
+        assert!(crate::zip_loader::first_image_entry(&cached, None).is_some());
+        let meta = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .expect("test archive cache")
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&meta),
+                meta.len() as i64,
+                crate::archive_converter::ArchiveFormat::Rar,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+    }
+    let images = root.join("10-images");
+    std::fs::create_dir(&images).unwrap();
+    save_portrait(&images.join("page.png"), [30, 70, 110]);
+
+    let start = root.join(start_name);
+
+    let descriptor = if start_name == "02-solid.rar" {
+        // A converted RAR is a supported detached reader: its page list is backed by a ZIP,
+        // while effective_folder() retains the original RAR as the DFS starting position.
+        assert_eq!(
+            crate::rar_loader::inspect_for_direct_read(&start)
+                .expect("solid RAR fixture header")
+                .decision,
+            crate::rar_loader::RarDirectReadDecision::Solid,
+        );
+        let backing = app.tmp.path().join("solid-converted.zip");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        crate::archive_converter::convert_to_zip(
+            &start,
+            &backing,
+            crate::archive_converter::ArchiveFormat::Rar,
+            &cancel,
+            None,
+        )
+        .expect("solid RAR fixture converts to a cache ZIP");
+        ViewerContextDescriptor::Zip {
+            path: backing,
+            entry_name: None,
+            archive_source_override: Some(start.clone()),
+        }
+    } else if start_name.ends_with(".rar") || start_name.ends_with(".cbr") {
+        assert_eq!(
+            crate::rar_loader::inspect_for_direct_read(&start)
+                .expect("RAR fixture header")
+                .decision,
+            crate::rar_loader::RarDirectReadDecision::Direct,
+        );
+        ViewerContextDescriptor::Zip {
+            path: start.clone(),
+            entry_name: None,
+            archive_source_override: Some(start.clone()),
+        }
+    } else if start_name.ends_with(".zip") {
+        ViewerContextDescriptor::Zip {
+            path: start.clone(),
+            entry_name: None,
+            archive_source_override: None,
+        }
+    } else {
+        ViewerContextDescriptor::BookFolder {
+            path: start.clone(),
+        }
+    };
+    assert!(app.start_active_detached_book_context(descriptor, &driver.ctx, None, None));
+
+    let open_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        driver.root(&mut app);
+        let ready = app
+            .with_active_viewer_context(|owner| {
+                owner.fullscreen_idx.is_some()
+                    && owner.sidecar_restore.is_none()
+                    && owner
+                        .effective_folder()
+                        .is_some_and(|path| crate::folder_tree::path_eq(&path, &start))
+            })
+            .unwrap_or(false);
+        if ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < open_deadline,
+            "detached start {start_name} did not reach fullscreen: active={:?} convert={} state={:?}",
+            app.with_active_viewer_context(|owner| (
+                owner.effective_folder(),
+                owner.fullscreen_idx,
+                owner.sidecar_restore.is_some(),
+                owner.zip_enumerate_pending.is_some(),
+                owner.folder_pane_open_pending.is_some(),
+            )),
+            app.archive_convert.is_some(),
+            app.active_detached_session
+                .map(|session| session.content_phase),
+        );
+        std::thread::yield_now();
+    }
+    let window_id = app.active_detached_window_id().expect("separate window id");
+    let detached_start_generation = app
+        .with_active_viewer_context(|owner| owner.items_generation)
+        .expect("detached start generation");
+    let main_id = app.viewer_context_main();
+    let main_before = app
+        .with_viewer_context(main_id, |main| {
+            (
+                main.current_folder.clone(),
+                main.address.clone(),
+                main.items.clone(),
+                main.selected,
+                main.items_generation,
+            )
+        })
+        .expect("main context remains mountable");
+    let _main_conversion_sender = if pending_main_conversion {
+        let (tx, rx) = mpsc::channel();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: app.tmp.path().join("pending-main.7z"),
+            input_seq: 0,
+            format: crate::archive_converter::ArchiveFormat::SevenZ,
+            password: None,
+            password_input: String::new(),
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+            pending_nav: None,
+            pending_direct_nav: None,
+            allow_direct_read: false,
+            fallback_cached_zip: None,
+            completion:
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+            pending_sibling_output: None,
+            nav_history_rollback: None,
+            auto_fullscreen: false,
+            deferred_fullscreen: None,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
+        });
+        Some(tx)
+    } else {
+        None
+    };
+    driver.focus(App::detached_image_window_viewport_id(window_id));
+    app.with_active_viewer_context(|owner| {
+        let from = owner.fullscreen_idx.expect("opened page");
+        owner.handle_fullscreen_ctrl_nav_context(&driver.ctx, from, forward, false);
+        assert!(
+            owner.folder_nav_pending.is_some(),
+            "Ctrl navigation must start DFS"
+        );
+    })
+    .expect("detached context mounts for Ctrl navigation");
+    wait_until(
+        "detached RAR navigation worker result applied",
+        std::time::Duration::from_secs(20),
+        || {
+            driver.root(&mut app);
+            app.with_active_viewer_context(|owner| owner.folder_nav_pending.is_none())
+                .unwrap_or(false)
+        },
+    );
+
+    assert_eq!(app.active_detached_window_id(), Some(window_id));
+    app.with_viewer_context(main_id, |main| {
+        assert_eq!(main.current_folder, main_before.0);
+        assert_eq!(main.address, main_before.1);
+        assert_eq!(main.items, main_before.2);
+        assert_eq!(main.selected, main_before.3);
+        assert_eq!(main.items_generation, main_before.4);
+    })
+    .expect("main context remains mountable after detached navigation");
+    let expected = root.join(expected_name);
+    app.with_active_viewer_context(|owner| {
+        assert_eq!(
+            owner.effective_folder().as_deref(),
+            Some(expected.as_path()),
+            "detached Ctrl tree navigation from {start_name} toward {expected_name}"
+        );
+        if !pending_main_conversion {
+            assert!(
+                owner.archive_convert.is_none(),
+                "navigation must not request conversion"
+            );
+        }
+    })
+    .expect("detached context remains mounted");
+    if pending_main_conversion {
+        let state = app
+            .archive_convert
+            .as_ref()
+            .expect("main conversion stays pending");
+        assert_eq!(state.src_path, app.tmp.path().join("pending-main.7z"));
+        assert!(!state.cancel.load(Ordering::Relaxed));
+    }
+    if expected_name.ends_with(".rar") || expected_name.ends_with(".cbr") {
+        let viewport = App::detached_image_window_viewport_id(window_id);
+        wait_until(
+            "detached archive landing enumerates and paints its first page",
+            std::time::Duration::from_secs(20),
+            || {
+                let frame = driver.root(&mut app);
+                let expected_paint = app
+                    .with_active_viewer_context(|owner| {
+                        let index = owner.fullscreen_idx?;
+                        if owner.zip_enumerate_pending.is_some()
+                            || owner.effective_folder().as_deref() != Some(expected.as_path())
+                            || owner.items_generation == detached_start_generation
+                        {
+                            return None;
+                        }
+                        Some((
+                            owner.projected_viewer_context_id(),
+                            owner.items_generation,
+                            owner.items.get(index)?.perf_key(),
+                            index,
+                        ))
+                    })
+                    .flatten();
+                expected_paint.is_some_and(|(context, generation, item, page)| {
+                    records_for(&frame, viewport).iter().any(|record| {
+                        record.provenance.context == context
+                            && record.provenance.items_generation == generation
+                            && record.provenance.item == item
+                            && record.provenance.page == page
+                    })
+                })
+            },
+        );
+        app.with_viewer_context(main_id, |main| {
+            assert_eq!(main.current_folder, main_before.0);
+            assert_eq!(main.address, main_before.1);
+            assert_eq!(main.items, main_before.2);
+            assert_eq!(main.selected, main_before.3);
+            assert_eq!(main.items_generation, main_before.4);
+        })
+        .expect("main context survives archive paint");
+    }
+}
+
+#[test]
+fn multiwindow_rar_nav_direct_forward_skips_solid() {
+    std::thread::spawn(|| {
+        run_multiwindow_rar_tree_nav("01-direct.rar", true, "06-control.zip", false, false)
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_rar_nav_cbr_backward_reaches_zip() {
+    std::thread::spawn(|| {
+        run_multiwindow_rar_tree_nav("08-direct.cbr", false, "06-control.zip", false, false)
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_rar_nav_zip_forward_reaches_direct_cbr() {
+    std::thread::spawn(|| {
+        run_multiwindow_rar_tree_nav("06-control.zip", true, "08-direct.cbr", false, false)
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_rar_nav_image_folder_backward_reaches_direct_cbr() {
+    std::thread::spawn(|| {
+        run_multiwindow_rar_tree_nav("10-images", false, "08-direct.cbr", false, false)
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_rar_nav_converted_solid_start_reaches_zip() {
+    std::thread::spawn(|| {
+        run_multiwindow_rar_tree_nav("02-solid.rar", true, "06-control.zip", false, false)
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_rar_nav_validated_cache_hit_lands_on_solid_archive() {
+    std::thread::spawn(|| {
+        run_multiwindow_rar_tree_nav("01-direct.rar", true, "02-solid.rar", true, false)
+    })
+    .join()
+    .expect("scenario thread");
+}
+
+#[test]
+fn multiwindow_rar_nav_keeps_main_conversion_request_and_grid() {
+    std::thread::spawn(|| {
+        run_multiwindow_rar_tree_nav("06-control.zip", true, "08-direct.cbr", false, true)
+    })
+    .join()
+    .expect("scenario thread");
+}
+
 /// The collection order is A (folder one/2), B (folder two/1), C (folder
 /// one/1). Each physical folder also has unregistered neighbours.
 fn collection_order_fixture(
