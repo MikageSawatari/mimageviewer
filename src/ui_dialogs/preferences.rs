@@ -2291,6 +2291,7 @@ impl App {
                 let old_dup = (
                     self.settings.skip_zip_if_folder_exists,
                     self.settings.skip_archive_if_zip_exists,
+                    self.settings.skip_epub_if_pdf_exists,
                     self.settings.skip_image_if_video_exists,
                     self.settings.skip_duplicate_images,
                     self.settings.image_ext_priority.clone(),
@@ -2614,6 +2615,7 @@ impl App {
                 let new_dup = (
                     self.settings.skip_zip_if_folder_exists,
                     self.settings.skip_archive_if_zip_exists,
+                    self.settings.skip_epub_if_pdf_exists,
                     self.settings.skip_image_if_video_exists,
                     self.settings.skip_duplicate_images,
                     self.settings.image_ext_priority.clone(),
@@ -4092,6 +4094,40 @@ mod tests {
             });
         harness.run();
         harness.snapshot("preferences_parallelism_pdf_count");
+    }
+
+    #[test]
+    fn preferences_duplicate_files_epub_option_snapshot() {
+        use egui_kittest::Harness;
+
+        let mut state = PreferencesState::from_settings(
+            &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::None,
+            None,
+            disabled_trt_worker_snapshot(),
+            false,
+            0,
+            0,
+            0,
+        );
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(780.0, 300.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(ui.available_width());
+                    page_duplicate_files(ui, &mut state);
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_duplicate_files_epub_option");
     }
 
     #[test]

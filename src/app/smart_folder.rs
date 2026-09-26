@@ -2369,12 +2369,7 @@ impl App {
                 root_entry,
                 current,
             } => {
-                let extension = root_entry
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                let kind = match classify_entry_kind(&extension, true) {
+                let kind = match classify_entry_kind(root_entry, true) {
                     Some(SmartFolderEntryKind::Pdf) => SmartChildKind::Pdf,
                     Some(SmartFolderEntryKind::Zip) => SmartChildKind::Zip,
                     Some(SmartFolderEntryKind::Archive) => SmartChildKind::ConvertibleArchive,
@@ -3720,6 +3715,7 @@ struct SmartFolderScanOptions {
     include_convertible_archives: bool,
     skip_zip_if_folder_exists: bool,
     skip_archive_if_zip_exists: bool,
+    skip_epub_if_pdf_exists: bool,
     skip_image_if_video_exists: bool,
     skip_duplicate_images: bool,
     video_thumb_use_sidecar_image: bool,
@@ -3733,6 +3729,7 @@ impl From<&crate::settings::Settings> for SmartFolderScanOptions {
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
             skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
+            skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             skip_duplicate_images: settings.skip_duplicate_images,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
@@ -3866,9 +3863,12 @@ fn passes_cheap_filter_values(
 }
 
 fn classify_entry_kind(
-    extension: &str,
+    path: &Path,
     include_convertible_archives: bool,
 ) -> Option<SmartFolderEntryKind> {
+    let extension = path.extension()?.to_str()?;
+    let extension = extension.to_ascii_lowercase();
+    let extension = extension.as_str();
     if crate::folder_tree::is_recognized_image_ext(extension) {
         Some(SmartFolderEntryKind::Image)
     } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension) {
@@ -3877,7 +3877,7 @@ fn classify_entry_kind(
         Some(SmartFolderEntryKind::Audio)
     } else if crate::folder_tree::is_zip_extension(extension) {
         Some(SmartFolderEntryKind::Zip)
-    } else if extension == "pdf" {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         Some(SmartFolderEntryKind::Pdf)
     } else if include_convertible_archives
         && crate::archive_converter::ArchiveFormat::from_extension(extension).is_some()
@@ -3986,6 +3986,9 @@ fn normalize_smart_folder_candidates(
             &mut container_metas,
         );
     }
+    if options.skip_epub_if_pdf_exists {
+        super::folder_scan::filter_epub_pdf_duplicates(&mut containers, &mut container_metas);
+    }
 
     let keep_paths = media
         .iter()
@@ -4063,11 +4066,7 @@ fn scan_one_directory(
             if !entry_kind.is_file() || crate::folder_tree::is_apple_double(&path) {
                 continue;
             }
-            let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-                continue;
-            };
-            let extension = extension.to_ascii_lowercase();
-            let Some(kind) = classify_entry_kind(&extension, options.include_convertible_archives)
+            let Some(kind) = classify_entry_kind(&path, options.include_convertible_archives)
             else {
                 continue;
             };
@@ -8600,6 +8599,7 @@ mod tests {
             include_convertible_archives: true,
             skip_zip_if_folder_exists: false,
             skip_archive_if_zip_exists: false,
+            skip_epub_if_pdf_exists: false,
             skip_image_if_video_exists: false,
             skip_duplicate_images: false,
             video_thumb_use_sidecar_image: true,
@@ -9283,6 +9283,8 @@ mod tests {
         std::fs::write(root.join("book.v1.7z"), b"archive").unwrap();
         std::fs::write(root.join("native.zip"), b"zip").unwrap();
         std::fs::write(root.join("native.rar"), b"archive").unwrap();
+        std::fs::write(root.join("sibling.EPUB"), b"epub").unwrap();
+        std::fs::write(root.join("SIBLING.pdf"), b"pdf").unwrap();
         std::fs::write(root.join("cover.jpg"), b"jpg").unwrap();
         std::fs::write(root.join("cover.png"), b"png").unwrap();
 
@@ -9297,8 +9299,18 @@ mod tests {
         let mut options = unfiltered_scan_options();
         options.skip_zip_if_folder_exists = true;
         options.skip_archive_if_zip_exists = true;
+        options.skip_epub_if_pdf_exists = true;
         options.skip_duplicate_images = true;
         options.image_ext_priority = vec!["jpg".into(), "png".into()];
+        let mut unfiltered_options = options.clone();
+        unfiltered_options.skip_epub_if_pdf_exists = false;
+        let unfiltered = run_test_scan(definition.clone(), unfiltered_options);
+        assert!(unfiltered.snapshot.entries.iter().any(|entry| {
+            entry
+                .path
+                .file_name()
+                .is_some_and(|name| name == "sibling.EPUB")
+        }));
         let result = run_test_scan(definition, options);
         let names = result
             .snapshot
@@ -9313,6 +9325,8 @@ mod tests {
         assert!(!names.contains("book.v1.7z"));
         assert!(names.contains("native.zip"));
         assert!(!names.contains("native.rar"));
+        assert!(names.contains("SIBLING.pdf"));
+        assert!(!names.contains("sibling.EPUB"));
         assert!(names.contains("cover.jpg"));
         assert!(!names.contains("cover.png"));
     }

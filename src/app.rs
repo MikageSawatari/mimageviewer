@@ -6247,7 +6247,7 @@ fn smart_folder_nav_target_kind(
         return Some(smart_folder::SmartChildKind::Folder);
     }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    if crate::folder_tree::is_pdf_extension(&extension) {
+    if crate::folder_tree::is_paged_document_path(path) {
         Some(smart_folder::SmartChildKind::Pdf)
     } else if crate::folder_tree::is_zip_extension(&extension) {
         Some(smart_folder::SmartChildKind::Zip)
@@ -21434,10 +21434,7 @@ impl App {
                     // PDF は enumerate 順固定で全項目が同じ Image カテゴリなので、
                     // sort / category order のどちらも materialize 結果を変えない。
                     // ファイル path を directory scan worker へ渡してエラーにしない。
-                    if path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+                    if crate::folder_tree::is_paged_document_path(&path)
                         && self
                             .items
                             .iter()
@@ -22489,12 +22486,7 @@ impl App {
         authority: VisibleInstallAuthority<'_>,
     ) -> bool {
         let detached_physical = self.navigation_scope.is_detached_physical();
-        let pdf_open_history_snapshot = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("pdf") || extension.eq_ignore_ascii_case("epub")
-            })
+        let pdf_open_history_snapshot = crate::folder_tree::is_paged_document_path(&path)
             .then(|| self.folder_nav_history_snapshot());
         let independent_navigation = !detached_physical
             && matches!(
@@ -22713,7 +22705,7 @@ impl App {
                 }
                 return true;
             }
-            if ext == "pdf" || ext == "epub" {
+            if crate::folder_tree::is_paged_document_path(&path) {
                 if !self.adopt_collection_surface_for_physical_load(
                     &path,
                     &owner,
@@ -26735,6 +26727,13 @@ impl App {
     /// 「保存しない」を選んだ PDF を開けなくなる。開く経路と外部ツールの実体化が
     /// **同じ順序**で解決するよう、綴りは 1 か所に置く (Codex Sol 指摘 #10)。
     pub(crate) fn pdf_open_password(&self, pdf_path: &Path) -> Option<String> {
+        if !pdf_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| crate::folder_tree::is_pdf_extension(&ext.to_ascii_lowercase()))
+        {
+            return None;
+        }
         self.pdf_passwords
             .get(pdf_path)
             .or_else(|| self.pdf_current_password.clone())
@@ -26831,7 +26830,11 @@ impl App {
         // メタキャッシュの placeholder gate には `saved_password.is_some()` を使う
         // こと (= Codex P1 対策。session password の居座りで他 PDF の保護を bypass
         // しないため)。
-        let saved_password: Option<String> = self.pdf_passwords.get(&pdf_path);
+        let saved_password: Option<String> = pdf_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .filter(|ext| crate::folder_tree::is_pdf_extension(&ext.to_ascii_lowercase()))
+            .and_then(|_| self.pdf_passwords.get(&pdf_path));
         let password: Option<String> = self.pdf_open_password(&pdf_path);
         if previous_pdf_enumerate
             .as_ref()
@@ -27491,7 +27494,14 @@ impl App {
                     return;
                 }
                 let err_msg = format!("{e}");
-                if matches!(e, crate::pdf_loader::PdfReadError::PasswordRequired) {
+                if matches!(e, crate::pdf_loader::PdfReadError::PasswordRequired)
+                    && pdf_path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| {
+                            crate::folder_tree::is_pdf_extension(&ext.to_ascii_lowercase())
+                        })
+                {
                     // 誤ったパスワードを DPAPI/セッションキャッシュに保存していた場合は破棄し、
                     // ユーザーに再入力してもらう。DPAPI も破棄しないと、次の load_pdf_as_folder が
                     // また stale を拾って無限ループになる。
@@ -43359,7 +43369,7 @@ impl App {
         source: &'static str,
     ) -> Option<crate::ui_main::AddressBarNav> {
         let Some(idx) = self.selected else {
-            self.show_feedback_toast("ZIP/PDF/対応アーカイブを選択してください".into());
+            self.show_feedback_toast("ZIP/PDF/EPUB/対応アーカイブを選択してください".into());
             return None;
         };
         self.open_grid_container_with_mode(ctx, idx, mode, source)
@@ -43389,14 +43399,14 @@ impl App {
             return None;
         }
         let Some(item) = self.items.get(idx).cloned() else {
-            self.show_feedback_toast("ZIP/PDF/対応アーカイブを選択してください".into());
+            self.show_feedback_toast("ZIP/PDF/EPUB/対応アーカイブを選択してください".into());
             return None;
         };
         if !matches!(
             item,
             GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::ConvertibleArchive { .. }
         ) {
-            self.show_feedback_toast("ZIP/PDF/対応アーカイブを選択してください".into());
+            self.show_feedback_toast("ZIP/PDF/EPUB/対応アーカイブを選択してください".into());
             return None;
         }
         if !self.guard_reading_history_open(idx) {
@@ -56655,12 +56665,9 @@ impl App {
     /// 横断一覧は合成パスで読み込まれるため false になり、`PdfPage` 行は
     /// `Page N` の名前照合で拾われる。
     pub(crate) fn grid_is_pdf_pages(&self) -> bool {
-        self.current_folder.as_deref().is_some_and(|folder| {
-            folder
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|ext| crate::folder_tree::is_pdf_extension(&ext.to_ascii_lowercase()))
-        })
+        self.current_folder
+            .as_deref()
+            .is_some_and(crate::folder_tree::is_paged_document_path)
     }
 
     /// グリッドが ZIP 内エントリで構成されているか (= ZIP を開いている)。
@@ -57068,7 +57075,7 @@ impl App {
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
         let mut meta = if let Some((_, right)) = key.split_once("::") {
-            if ext == "pdf" {
+            if crate::folder_tree::is_paged_document_path(source_path) {
                 let page_num = right.strip_prefix("page_")?.parse::<u32>().ok()?;
                 let mut meta =
                     RatingMeta::new(RatingItemKind::PdfPage).with_source_path(source_path);
@@ -57093,7 +57100,7 @@ impl App {
             RatingMeta::new(RatingItemKind::Video).with_source_path(source_path)
         } else if crate::folder_tree::is_zip_extension(&ext) {
             RatingMeta::new(RatingItemKind::ZipFile).with_source_path(source_path)
-        } else if ext == "pdf" {
+        } else if crate::folder_tree::is_paged_document_path(source_path) {
             RatingMeta::new(RatingItemKind::PdfFile).with_source_path(source_path)
         } else if let Some(format) = crate::archive_converter::ArchiveFormat::from_extension(&ext) {
             let mut meta =
@@ -79737,7 +79744,7 @@ fn archive_rating_kind_for_path(path: &std::path::Path) -> crate::rating_db::Rat
         .unwrap_or_default();
     if crate::folder_tree::is_zip_extension(&ext) {
         RatingItemKind::ZipFile
-    } else if ext == "pdf" {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         RatingItemKind::PdfFile
     } else if crate::archive_converter::ArchiveFormat::from_extension(&ext).is_some() {
         RatingItemKind::ConvertibleArchive

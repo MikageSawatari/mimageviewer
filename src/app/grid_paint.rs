@@ -202,9 +202,19 @@ pub(crate) fn bottom_left_content<'a>(
             container_label = Some("ZIP");
             filename = Some(item_name);
         }
-        GridItem::PdfFile(_) => {
+        GridItem::PdfFile(path) => {
             container_kind = Some(BottomContainerKind::Format(FormatBadgeKind::Pdf));
-            container_label = Some("PDF");
+            container_label = Some(
+                if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                {
+                    "EPUB"
+                } else {
+                    "PDF"
+                },
+            );
             filename = Some(item_name);
         }
         GridItem::ConvertibleArchive { format, .. } => {
@@ -1458,6 +1468,7 @@ mod bottom_left_content_tests {
     fn archive_types_always_show_a_format_badge() {
         let zip = GridItem::ZipFile(PathBuf::from("c:/x.zip"));
         let pdf = GridItem::PdfFile(PathBuf::from("c:/x.pdf"));
+        let epub = GridItem::PdfFile(PathBuf::from("c:/x.EPUB"));
         let archive = GridItem::ConvertibleArchive {
             path: PathBuf::from("c:/x.7z"),
             format: crate::archive_converter::ArchiveFormat::SevenZ,
@@ -1471,6 +1482,7 @@ mod bottom_left_content_tests {
                 for (item, label, kind) in [
                     (&zip, "ZIP", FormatBadgeKind::Zip),
                     (&pdf, "PDF", FormatBadgeKind::Pdf),
+                    (&epub, "EPUB", FormatBadgeKind::Pdf),
                     (&archive, "7z", FormatBadgeKind::Archive),
                 ] {
                     let content = bottom_left_content(item, &thumb, "x", *indicator);

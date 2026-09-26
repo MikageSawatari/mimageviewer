@@ -418,7 +418,7 @@ impl App {
                             if let Some((mt, fs)) = meta() {
                                 zip_files.push((p, mt, fs));
                             }
-                        } else if (ext_lower == "pdf" || ext_lower == "epub")
+                        } else if crate::folder_tree::is_paged_document_path(&p)
                             && let Some((mt, fs)) = meta()
                         {
                             pdf_files.push((p, mt, fs));

@@ -930,6 +930,47 @@ fn epub_openable_path_uses_the_pdf_enumeration_route() {
 }
 
 #[test]
+fn unconverted_epub_grid_open_routes_to_owned_conversion_dialog() {
+    let mut app = setup_app_for_test();
+    app.settings
+        .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("grid-book.epub");
+    std::fs::write(&source, b"not converted yet").unwrap();
+    let scan = scan_directory_with_settings(dir.path(), &app.settings).unwrap();
+    let listing = materialize_local_folder_listing(dir.path(), scan, &app.settings);
+    let idx = listing
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::PdfFile(path) if path == &source))
+        .unwrap();
+    app.items = listing.items;
+    app.selected = Some(idx);
+    let ctx = egui::Context::default();
+    let nav = app.open_grid_container_with_mode(&ctx, idx, GridContainerOpenMode::PageList, "test");
+    assert!(
+        matches!(nav, Some(crate::ui_main::AddressBarNav::Direct(ref path)) if path == &source)
+    );
+    assert!(app.load_folder_with_scan_owned(source.clone(), None, OpenRequestOwner::Navigation));
+    let error = std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        crate::pdf_loader::PdfReadError::NotConverted,
+    );
+    let handle = crate::pdf_loader::completed_enumerate_result_handle(&source, Err(error));
+    app.pdf_enumerate_pending = Some((
+        source.clone(),
+        None,
+        handle,
+        OpenRequestOwner::Navigation,
+        None,
+    ));
+    app.poll_pdf_enumerate();
+    let dialog = app.epub_convert.as_ref().expect("conversion dialog");
+    assert_eq!(dialog.owner, OpenRequestOwner::Navigation);
+    assert_eq!(dialog.src_path, source);
+}
+
+#[test]
 fn epub_thumbnail_requests_defer_stamp_while_pdf_requests_keep_file_attributes() {
     let pins = std::collections::HashMap::new();
     let converted = std::collections::HashMap::new();
@@ -960,6 +1001,25 @@ fn epub_thumbnail_requests_defer_stamp_while_pdf_requests_keep_file_attributes()
             assert_eq!((request.mtime, request.file_size), (123, 456));
         }
     }
+}
+
+#[test]
+fn epub_rating_keys_use_pdf_book_and_page_routes() {
+    let app = setup_app_for_test();
+    let source = Path::new("C:/books/book.epub");
+    assert_eq!(
+        archive_rating_kind_for_path(source),
+        crate::rating_db::RatingItemKind::PdfFile
+    );
+    let book = app
+        .rating_meta_for_key_and_source("c:/books/book.epub", source)
+        .unwrap();
+    assert_eq!(book.kind, crate::rating_db::RatingItemKind::PdfFile);
+    let page = app
+        .rating_meta_for_key_and_source("c:/books/book.epub::page_0000", source)
+        .unwrap();
+    assert_eq!(page.kind, crate::rating_db::RatingItemKind::PdfPage);
+    assert_eq!(page.page_num, Some(0));
 }
 
 #[test]
@@ -36650,6 +36710,14 @@ mod favorite_adjustment_defaults_tests {
         ];
         assert!(app.grid_is_pdf_pages());
         assert!(!app.grid_is_zip_entries());
+
+        app.current_folder = Some(PathBuf::from("c:/book.epub"));
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from("c:/book.epub"),
+            page_num: 0,
+            content_type: None,
+        }];
+        assert!(app.grid_is_pdf_pages());
 
         app.current_folder = Some(PathBuf::from("c:/book.zip"));
         app.items = vec![GridItem::ZipImage {
@@ -80965,6 +81033,11 @@ fn the_saved_password_wins_over_the_password_of_the_pdf_that_happens_to_be_open(
         app.pdf_open_password(&open_pdf).as_deref(),
         Some("session-of-open"),
         "保存していない PDF は、セッション値で開けなくならない"
+    );
+    assert_eq!(
+        app.pdf_open_password(Path::new(r"C:\books\book.epub")),
+        None,
+        "EPUB に別 PDF のセッションパスワードを渡さない"
     );
 }
 

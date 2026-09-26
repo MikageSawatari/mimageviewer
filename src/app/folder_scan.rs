@@ -263,6 +263,13 @@ pub(crate) fn materialize_local_folder_listing(
                 &mut sort_metas,
             ));
     }
+    if settings.skip_epub_if_pdf_exists {
+        same_name = same_name.saturating_add(filter_epub_pdf_duplicates_with_sort_metadata(
+            &mut folders,
+            &mut metas,
+            &mut sort_metas,
+        ));
+    }
     let video_thumb_overrides = if settings.skip_image_if_video_exists {
         let filtered =
             filter_video_image_duplicates(&mut all_media, settings.video_thumb_use_sidecar_image);
@@ -574,7 +581,7 @@ where
                     display_meta: Some((mtime, file_size)),
                     sort_meta,
                 });
-            } else if ext_lower == "pdf" {
+            } else if crate::folder_tree::is_paged_document_path(&p) {
                 folders.push(ScannedFolderEntry {
                     item: GridItem::PdfFile(p),
                     display_meta: Some((mtime, file_size)),
@@ -852,6 +859,63 @@ fn filter_convertible_archive_duplicates_with_sort_metadata(
     keep.iter().filter(|keep| !**keep).count()
 }
 
+/// 同じ一覧に同名 PDF がある場合だけ EPUB を隠す。双方とも論理パスを保持する。
+pub(crate) fn filter_epub_pdf_duplicates(
+    folders: &mut Vec<GridItem>,
+    folder_metas: &mut Vec<Option<(i64, i64)>>,
+) -> usize {
+    let mut sort_metas = vec![crate::settings::ListingSortMetadata::new(0, None); folders.len()];
+    filter_epub_pdf_duplicates_with_sort_metadata(folders, folder_metas, &mut sort_metas)
+}
+
+/// 通常一覧では整列用 metadata も同じ位置で間引く。
+fn filter_epub_pdf_duplicates_with_sort_metadata(
+    folders: &mut Vec<GridItem>,
+    folder_metas: &mut Vec<Option<(i64, i64)>>,
+    sort_metas: &mut Vec<crate::settings::ListingSortMetadata>,
+) -> usize {
+    assert_eq!(folders.len(), folder_metas.len());
+    assert_eq!(folders.len(), sort_metas.len());
+    let pdf_stems: std::collections::HashSet<String> = folders
+        .iter()
+        .filter_map(|item| match item {
+            GridItem::PdfFile(path)
+                if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")) =>
+            {
+                Some(super::stem_lower(path))
+            }
+            _ => None,
+        })
+        .collect();
+    if pdf_stems.is_empty() {
+        return 0;
+    }
+    let keep: Vec<bool> = folders
+        .iter()
+        .map(|item| match item {
+            GridItem::PdfFile(path)
+                if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
+            {
+                !pdf_stems.contains(&super::stem_lower(path))
+            }
+            _ => true,
+        })
+        .collect();
+    let mut iter = keep.iter();
+    folders.retain(|_| *iter.next().unwrap());
+    let mut iter = keep.iter();
+    folder_metas.retain(|_| *iter.next().unwrap());
+    let mut iter = keep.iter();
+    sort_metas.retain(|_| *iter.next().unwrap());
+    keep.iter().filter(|keep| !**keep).count()
+}
+
 /// 同名ステムの画像を拡張子優先順で 1 件へ絞る。一覧と画像フォルダのページ数で共有する。
 pub(crate) fn filter_image_ext_duplicates(
     all_media: &mut Vec<ScannedMediaEntry>,
@@ -993,6 +1057,46 @@ pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
 #[cfg(test)]
 mod page_count_tests {
     use super::*;
+
+    #[test]
+    fn epub_is_paged_grid_item_and_same_name_pdf_wins_only_when_enabled() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for name in [
+            "Book.EPUB",
+            "book.PDF",
+            "other.epub",
+            "comic.zip",
+            "archive.rar",
+        ] {
+            std::fs::write(temp.path().join(name), b"source").unwrap();
+        }
+        let mut settings = crate::settings::Settings::default();
+        let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
+        assert!(scan.folders.iter().any(|entry| matches!(&entry.item, GridItem::PdfFile(path) if path.file_name().unwrap() == "Book.EPUB")));
+        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        assert_eq!(listing.omitted.same_name, 1);
+        assert!(!listing.items.iter().any(|item| matches!(item, GridItem::PdfFile(path) if path.file_name().unwrap() == "Book.EPUB")));
+        assert!(listing.items.iter().any(|item| matches!(item, GridItem::PdfFile(path) if path.file_name().unwrap() == "book.PDF")));
+        assert!(listing.items.iter().any(|item| matches!(item, GridItem::PdfFile(path) if path.file_name().unwrap() == "other.epub")));
+        assert!(
+            listing
+                .items
+                .iter()
+                .any(|item| matches!(item, GridItem::ZipFile(_)))
+        );
+        assert!(
+            listing
+                .items
+                .iter()
+                .any(|item| matches!(item, GridItem::ConvertibleArchive { .. }))
+        );
+
+        settings.skip_epub_if_pdf_exists = false;
+        let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
+        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        assert!(listing.items.iter().any(|item| matches!(item, GridItem::PdfFile(path) if path.file_name().unwrap() == "Book.EPUB")));
+        assert!(listing.items.iter().any(|item| matches!(item, GridItem::PdfFile(path) if path.file_name().unwrap() == "book.PDF")));
+    }
 
     fn options(skip_duplicate_images: bool) -> ImageFolderPageCountOptions {
         ImageFolderPageCountOptions {

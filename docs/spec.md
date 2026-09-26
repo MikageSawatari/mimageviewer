@@ -749,6 +749,10 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   「変換済みアーカイブキャッシュ管理」の EPUB 欄には元ファイル名、ページ数、保存サイズ、
   最終利用日時、削除予約の状態を表示する。選択または全件の削除は次回起動時に有効になり、
   この実行中は閲覧を続けられる。RAR/7z の容量上限と合計には EPUB を含めない。
+  EPUB は通常フォルダ・スマートフォルダ・サブ展開・検索・コレクション・★一覧で PDF と同じ本の行に表示する。
+  未変換なら書類アイコンと EPUB バッジ、変換済みなら先頭ページをサムネイルにする。
+  一覧から開いた未変換 EPUB はファイル処理設定に応じて変換確認へ進む。
+  同じフォルダに同名 PDF がある場合は既定で EPUB を一覧から隠す (設定で解除可能)。
   見開きでは画面に表示される向きが横長 (幅 > 高さ) のページを単独表示し、次のページから
   ペアを組み直す。画面に表示される向きには保存済みの 90° 単位回転を含み、90° / 270° では
   元寸法の幅と高さを入れ替えて判定する。本体と mIV Remote は同じ判定を使い、寸法未確定の
@@ -2107,8 +2111,9 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `slideshow_continuous_scroll_secs` | f32 | 0.2 | 縦/横連結読み中スライドショーの1回のスクロール時間（秒）。0 の場合は即時スクロール |
 | `slideshow_continuous_scroll_percent` | u32 | 50 | 縦/横連結読み中スライドショーの1回のスクロール量。現在の表示領域の幅または高さに対する % で指定する |
 | `slideshow_end_action` | SlideshowEndAction | LoopFolder | スライドショーがフォルダ末尾に達したときの動作。`LoopFolder`=フォルダ内で先頭へループ / `NextFolder`=次の静止画フォルダへ進む（無ければ停止） / `Stop`=末尾で停止 |
-| `skip_zip_if_folder_exists` | bool | true | 同名フォルダがある ZIP/PDF/RAR/7z/LZH をグリッドから非表示にする（フォルダツリー走査からも除外） |
+| `skip_zip_if_folder_exists` | bool | true | 同名フォルダがある ZIP/PDF/EPUB/RAR/7z/LZH をグリッドから非表示にする（フォルダツリー走査からも除外） |
 | `skip_archive_if_zip_exists` | bool | true | 同じフォルダに同名の ZIP/CBZ がある RAR/7z/LZH をグリッドと Ctrl+↑↓ の候補から非表示にする |
+| `skip_epub_if_pdf_exists` | bool | true | 同じフォルダに同名の PDF がある EPUB をグリッド・スマートフォルダ・Ctrl+↑↓ の候補から非表示にする。名前の大小文字は区別しない |
 | `skip_image_if_video_exists` | bool | true | 同名動画がある画像をスキップ（画像は動画サムネイルとして使用） |
 | `skip_duplicate_images` | bool | true | 同名で複数拡張子がある画像を優先度でフィルタ |
 | `image_ext_priority` | Vec\<String\> | [png, bmp, gif, ...] | 画像拡張子の優先度リスト（先頭が最優先） |

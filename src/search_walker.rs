@@ -310,7 +310,7 @@ fn walk_dir_recursive(
         if ext == "zip" {
             continue;
         }
-        let kind = if ext == "pdf" {
+        let kind = if folder_tree::is_paged_document_path(&path) {
             CandidateKind::Pdf
         } else if folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
             CandidateKind::Video
@@ -451,15 +451,16 @@ mod tests {
         // ZIP はアイテム索引の対象外なので候補にならない (§3.2)
         make_file(&root, "archive.zip", b"PK");
         make_file(&root, "doc.pdf", b"%PDF");
+        make_file(&root, "book.epub", b"epub");
         make_file(&root, "clip.mp4", b"fake mp4");
         make_file(&root, "song.MP3", b"fake mp3");
 
         let r = scan_sync(fav, &root, &db);
         assert_eq!(
-            r.total_scanned, 5,
-            "jpg+png+pdf+mp4+mp3 の 5 つ (zip/txt は除外)"
+            r.total_scanned, 6,
+            "jpg+png+pdf+epub+mp4+mp3 の 6 つ (zip/txt は除外)"
         );
-        assert_eq!(r.to_ingest.len(), 5);
+        assert_eq!(r.to_ingest.len(), 6);
         assert_eq!(r.unchanged, 0);
         assert!(r.to_delete.is_empty());
 

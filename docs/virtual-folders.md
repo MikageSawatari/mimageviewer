@@ -3,13 +3,14 @@
 ## EPUB → PDF 読み取り境界とオープン導線 (S2b / S2c-1)
 
 S2b は `pdf_loader` の読み取り経路を用意した。S2c-1 では、アドレスバー・起動引数・復元先に指定された
-`.epub` を PDF 系の本として開く。フォルダ一覧での EPUB 分類と同名スキップは S3 で扱う。
+`.epub` を PDF 系の本として開く。S3a では通常フォルダ・スマートフォルダ・サブ展開などの一覧でも
+`PdfFile` として分類し、元 EPUB パスを保つ。同じフォルダに同名 PDF がある場合は設定に従って EPUB を隠す。
 未変換の場合はファイル処理設定に従い、確認、直接変換、または無視する。確認時は別プロセスで内容を調べ、
 レイアウト、開き方向、章数を表示する。保護された EPUB は変換を提示せず理由を表示する。
 変換中の進捗と取消はダイアログが所有し、公開または既存世代の採用後は元 EPUB パスを開き直す。
 元ファイルが変換中に変わった場合は再試行を提示する。変換器の制限時間は 600 秒。
-開いた本の `PdfPage` と履歴・保存キーは元 EPUB の論理パスを保持する。S3 で追加する一覧タイルの
-`PdfFile` も同じ論理パスを使う。
+開いた本の `PdfPage` と履歴・保存キーは元 EPUB の論理パスを保持する。一覧タイルの
+`PdfFile` も同じ論理パスを使い、未変換時はアイコンと EPUB バッジ、変換済みなら第 1 ページを表示する。
 `pdf_loader::resolve_read_target` は論理パスを変換世代の PDF パスへ解決する。EPUB の初回解決は背景スレッドで行い、
 PDFium の open admission・worker 文書キャッシュ・列挙合流にはその実ファイルのパスを渡す。
 表示や perf のキーは論理パスのままにする。通常 PDF の解決はパスをそのまま返し、stat を追加しない。
@@ -75,7 +76,7 @@ placeholder は採用後も同じ enumerate handle で検証する。取消・�
 | `Video(PathBuf)` | 通常フォルダ内 | 動画ファイル |
 | `Audio(PathBuf)` | 通常フォルダ内 | 音声ファイル |
 | `ZipFile(PathBuf)` | 通常フォルダ内 | ZIP アーカイブ (未展開)。`.zip` と別名 `.cbz` を含む (`folder_tree::is_zip_extension` で判定) |
-| `PdfFile(PathBuf)` | 通常フォルダ内 | PDF ドキュメント (未展開) |
+| `PdfFile(PathBuf)` | 通常フォルダ内 | PDF または EPUB の本 (元の論理パスを保持) |
 | `ConvertibleArchive { path, format }` | 通常フォルダ内 | RAR/7z/LZH 等。RAR は worker 判定で直接閲覧または ZIP 変換キャッシュ、7z/LZH は ZIP 変換キャッシュ経由で開く |
 | `ZipImage { zip_path, entry_name }` | ZIP を開いた中 | ZIP 内の画像エントリ。`entry_name` はネストでも `"outer/ch01.zip/p.jpg"` のフルパス |
 | `ZipDir { zip_path, dir_prefix, is_archive, representative }` | ネスト ZIP を開いた中 (v1.3.0) | 「入れる」子ディレクトリ / 内側アーカイブ。Enter で降りる。仮想コンテナで実パスなし |

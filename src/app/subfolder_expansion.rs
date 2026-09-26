@@ -738,7 +738,7 @@ fn scan_one_directory(
 
         let entry_kind = if crate::folder_tree::is_zip_extension(&ext_lower) {
             Some(SubfolderExpansionEntryKind::Zip)
-        } else if ext_lower == "pdf" {
+        } else if crate::folder_tree::is_paged_document_path(&path) {
             Some(SubfolderExpansionEntryKind::Pdf)
         } else {
             None
@@ -3091,6 +3091,7 @@ mod tests {
         std::fs::write(root.join("book.zip"), b"not opened by scan").unwrap();
         std::fs::write(root.join("comic.cbz"), b"not opened by scan").unwrap();
         std::fs::write(root.join("document.pdf"), b"not opened by scan").unwrap();
+        std::fs::write(root.join("book.epub"), b"not opened by scan").unwrap();
 
         let result = scan_test_root(&root, test_scan_options(true));
         let kinds = result
@@ -3099,7 +3100,7 @@ mod tests {
             .map(|entry| entry.kind)
             .collect::<Vec<_>>();
 
-        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.entries.len(), 4);
         assert_eq!(
             kinds
                 .iter()
@@ -3112,7 +3113,7 @@ mod tests {
                 .iter()
                 .filter(|kind| **kind == SubfolderExpansionEntryKind::Pdf)
                 .count(),
-            1
+            2
         );
     }
 

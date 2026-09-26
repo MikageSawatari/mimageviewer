@@ -689,7 +689,7 @@ pub(crate) fn inspect_collection_source(path: &Path) -> CollectionSourcePreparat
         CollectionResolvedKind::Audio
     } else if crate::folder_tree::is_zip_extension(&extension) {
         CollectionResolvedKind::Zip
-    } else if crate::folder_tree::is_pdf_extension(&extension) {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         CollectionResolvedKind::Pdf
     } else if crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some() {
         CollectionResolvedKind::ConvertibleArchive
@@ -1036,10 +1036,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let image = temp.path().join("image.png");
         let unsupported = temp.path().join("notes.txt");
+        let epub = temp.path().join("book.EPUB");
         let folder = temp.path().join("folder");
         let missing = temp.path().join("missing.jpg");
         std::fs::write(&image, b"source-bytes").unwrap();
         std::fs::write(&unsupported, b"not-media").unwrap();
+        std::fs::write(&epub, b"epub").unwrap();
         std::fs::create_dir(&folder).unwrap();
 
         let cancel = AtomicBool::new(false);
@@ -1050,12 +1052,13 @@ mod tests {
                 folder.clone(),
                 missing.clone(),
                 unsupported.clone(),
+                epub.clone(),
             ],
             &cancel,
             |done, total| progress.push((done, total)),
         );
 
-        assert_eq!(progress, vec![(1, 4), (2, 4), (3, 4), (4, 4)]);
+        assert_eq!(progress, vec![(1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]);
         assert_eq!(std::fs::read(&image).unwrap(), b"source-bytes");
         assert_eq!(std::fs::read(&unsupported).unwrap(), b"not-media");
         assert_eq!(
@@ -1074,6 +1077,10 @@ mod tests {
             prepared[3].result,
             Err(CollectionPrepareError::Unsupported(ref path)) if path == &unsupported
         ));
+        assert_eq!(
+            prepared[4].result.as_ref().unwrap().resolved_kind(),
+            CollectionResolvedKind::Pdf
+        );
     }
 
     #[test]

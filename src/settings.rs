@@ -4515,6 +4515,8 @@ pub struct Settings {
     /// 同名の ZIP/CBZ がある場合、RAR/7z/LZH 側をスキップする
     #[serde(default = "default_true")]
     pub skip_archive_if_zip_exists: bool,
+    #[serde(default = "default_true")]
+    pub skip_epub_if_pdf_exists: bool,
     /// 同名の動画と画像がある場合、画像をスキップする（動画サムネイルで代替）
     #[serde(default = "default_true")]
     pub skip_image_if_video_exists: bool,
@@ -7087,6 +7089,7 @@ impl Default for Settings {
             exif_hidden_tags: default_exif_hidden_tags(),
             skip_zip_if_folder_exists: true,
             skip_archive_if_zip_exists: true,
+            skip_epub_if_pdf_exists: true,
             skip_image_if_video_exists: true,
             skip_duplicate_images: true,
             image_ext_priority: default_image_ext_priority(),

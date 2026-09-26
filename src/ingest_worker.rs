@@ -354,9 +354,14 @@ impl<'a> IngestSession<'a> {
         let info_text = match crate::pdf_loader::get_document_info(&cand.abs_path, None) {
             Ok(info) => info.as_search_text(),
             Err(e) => {
-                crate::logger::log(format!(
-                    "build_doc_for_pdf: get_document_info failed (falling back to name-only): {e}"
-                ));
+                if !matches!(
+                    crate::pdf_loader::typed_read_error(&e),
+                    Some(crate::pdf_loader::PdfReadError::NotConverted)
+                ) {
+                    crate::logger::log(format!(
+                        "build_doc_for_pdf: get_document_info failed (falling back to name-only): {e}"
+                    ));
+                }
                 String::new()
             }
         };

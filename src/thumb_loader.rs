@@ -562,7 +562,7 @@ impl CacheDecision {
                 if self.webp_always && ext == "webp" {
                     return true;
                 }
-                if self.pdf_always && ext == "pdf" {
+                if self.pdf_always && crate::folder_tree::is_paged_document_path(path) {
                     return true;
                 }
                 if self.zip_always && ext == "zip" {
@@ -3209,7 +3209,7 @@ fn archive_tile_key(path: &Path, parent: &Path) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     let prefix = if crate::folder_tree::is_zip_extension(&ext) {
         CACHE_KEY_ZIP
-    } else if ext == "pdf" || ext == "epub" {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         CACHE_KEY_PDF
     } else {
         return None;
@@ -3284,7 +3284,8 @@ fn resolve_folder_thumb_image_inner(
                 images.push((path, sort_mtime));
             } else if remaining_depth > 0
                 && ext.as_deref().is_some_and(|ext| {
-                    crate::folder_tree::is_zip_extension(ext) || ext == "pdf" || ext == "epub"
+                    crate::folder_tree::is_zip_extension(ext)
+                        || crate::folder_tree::is_paged_document_path(&path)
                 })
             {
                 let stamp = if is_epub_path(&path) {
@@ -4851,6 +4852,10 @@ mod tests {
 
     #[test]
     fn cache_decision_auto_webp_always_caches() {
+        let mut paged = make_decision(CachePolicy::Auto, 25, 100_000_000);
+        paged.pdf_always = true;
+        assert!(paged.should_cache(Path::new("book.EPUB"), 100, 0.0, 0.0));
+        assert!(paged.should_cache(Path::new("book.pdf"), 100, 0.0, 0.0));
         let d = make_decision(CachePolicy::Auto, 25, 100_000_000);
         let webp = PathBuf::from("img.webp");
         // .webp は常にキャッシュ (size/time 関係なし)
@@ -6215,6 +6220,47 @@ mod tests {
             (fresh.mtime, fresh.file_size)
         );
         assert_ne!(stamped.cache_key_override, fresh.cache_key_override);
+    }
+
+    #[test]
+    fn unconverted_epub_tile_uses_icon_fallback_without_recording_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("unconverted.epub");
+        std::fs::write(&source, b"epub without a conversion").unwrap();
+        let req = LoadRequest {
+            idx: 0,
+            path: source,
+            pdf_page: Some(0),
+            pdf_stamp_policy: PdfStampPolicy::ResolveInWorker,
+            ..Default::default()
+        };
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        process_load_request(
+            &req,
+            &cache_map,
+            &tx,
+            None,
+            64,
+            75,
+            64,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let message = rx.try_recv().expect("icon fallback result");
+        assert!(message.image.is_none());
+        assert!(!message.canceled);
+        assert_eq!(stats.lock().unwrap().count_failed, 0);
     }
 
     #[test]

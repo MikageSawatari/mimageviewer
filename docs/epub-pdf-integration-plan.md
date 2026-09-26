@@ -529,6 +529,69 @@ x64 で `+crt-static` なので VC runtime 検査の追加設定は不要 (`chec
 
 ## 9. 段階の記録
 
+### S3a 一覧・分類・D5 (2026-09-26)
+
+EPUB の論理パスを `PdfFile` / `PdfPage` に保持する。一覧・検索・評価・コレクションが
+「ページを持つ本か」を問う場合は `folder_tree::is_paged_document_path` を使う。
+`ArchiveFormat` / `from_extension` / `CONVERTIBLE` は変更しない。S3a に共通の変換入力型は
+不要だったため `ConvertSource` は S3b へ送る。同名 PDF 優先は既定 ON で、候補集合内の
+stem を大文字小文字を区別せず比較する。設定は `settings_kv` の通常 bool であり、
+公開済み DB の schema を変えない。Remote の閲覧判定は S4 で扱う。
+
+分類監査表。判定 (a) はページを持つ本、(b) は実 PDF 専用、(c) は Remote / S4、
+(d) は別の問いまたは既に EPUB 対応済み。行番号は S3a の実装時点。テスト欄の「共通」は
+同じ `is_paged_document_path` の実経路を通るテストを指す。UI からの重複 reload 回避の
+ように分岐単体をテストしても状態の新しい不変条件が増えない箇所は、その理由を記す。
+
+| 箇所 | 実際の問い | 判定・検証 |
+| --- | --- | --- |
+| `folder_tree.rs:174,189` | 論理パスがページ本か、仮想フォルダーか | (a) 共通述語。`paged_document_navigation_skips_same_name_epub_with_pdf` |
+| `folder_tree.rs:503` | DFS で本ファイルへ立ち寄るか | (a) 同上の `folder_should_stop` assertion |
+| `app/folder_scan.rs:584` | 物理フォルダーのファイルを本タイルにするか | (a) `epub_is_paged_grid_item_and_same_name_pdf_wins_only_when_enabled` |
+| `app/smart_folder.rs:3880` | スマートフォルダーの候補を本にするか | (a) `scan_applies_container_and_image_duplicate_settings_per_directory` |
+| `app/subfolder_expansion.rs:741` | 再帰結果を本 1 項目にするか | (a) `zip_and_pdf_are_each_listed_once_without_enumerating_their_contents` |
+| `collection_store/prepare.rs:692` | コレクションの実ファイルを本にするか | (a) `classifier_preserves_sources_and_distinguishes_missing_and_unsupported` |
+| `tag_view.rs:488` | タグ結果の実ファイルを本にするか | (a) `tag_view_classifies_audio_without_folder_fallback` |
+| `rating_view.rs:450,486` | 評価済み本 / ページキーを復元するか | (a) `restores_explicit_pdf_page_without_index_conversion` |
+| `app.rs:57078,57103,79747` | ★の本 / ページとコンテナ評価の種別を復元するか | (a) `epub_rating_keys_use_pdf_book_and_page_routes`。履歴は同じ `PdfFile` variant からキーを得るので別の拡張子判定は無い |
+| `app.rs:56670` | 現在の一覧がページ列か | (a) `grid_container_kind_checks_follow_what_is_open` |
+| `app.rs:6250` | スマートフォルダーから開く子の種別は本か | (a) 既存 `epub_valid_smart_pdf_child_published_restarts_pdf_preflight` の owner 経路 |
+| `app.rs:22173` | 仮想フォルダーを開いたとき自動全画面へ進むか | (a) `is_virtual_folder` の共通述語を使用。`paged_document_navigation_skips_same_name_epub_with_pdf` で仮想フォルダー分類を検証。全画面遷移は UI 結合状態なので単体テストを増やさない |
+| `app.rs:21437` | ソート変更でページ列の物理フォルダー再走査を避けるか | (a) 共通述語。別の単体テストは reload の UI 状態を複製するだけなので追加しない |
+| `app.rs:22489,22708` | 開く要求が PDF 系の列挙と履歴 snapshot を使うか | (a) `unconverted_epub_grid_open_routes_to_owned_conversion_dialog`、既存 `epub_openable_path_uses_the_pdf_enumeration_route` |
+| `app/cache_ops.rs:421` | フォルダー代表の候補はページ本か | (a) 共通述語の再利用。候補選別は非同期バッチ worker 内の単純分岐で、独立した単体テストは述語だけの再検査になる。世代境界は既存 `epub_batch_parent_row_requires_generation_while_pdf_keeps_presence_check` と S2c-2 の代表ピンテストで検証 |
+| `thumb_loader.rs:565,3212,3288` | 本のサムネイルキャッシュ・ピンの候補か | (a) `cache_decision_auto_webp_always_caches`、`unconverted_epub_tile_uses_icon_fallback_without_recording_failure`、既存の世代スタンプ / ピン test 群 |
+| `global_search_ui.rs:672,1158` | Ctrl+G の代表 / 行はページ本か | (a) `build_drilled_items_classifies_pdf_zip_and_image_by_extension`、`build_flat_items_sorts_classifies_and_skips_zip` |
+| `name_bulk_indexer.rs:362` | Ctrl+S の本名索引候補か | (a) `bulk_collects_folders_zips_pdfs_and_ignores_other_files` |
+| `search_walker.rs:313` | Ctrl+G の初回走査候補か | (a) `new_files_go_to_ingest` (EPUB を追加した混在 fixture) |
+| `indexer_supervisor.rs:928` | Ctrl+G の差分更新候補か | (a) `build_candidate_from_path_rejects_zip` の EPUB assertion |
+| `metadata_transfer.rs:1422` | 持ち運び用メタデータの本 / ページ種別か | (a) `epub_transfer_uses_paged_book_metadata_kind` |
+| `ui_main.rs:4614,4629` | 詳細欄に何の形式と表示するか | (d) EPUB / EPUB ページを個別表示。`shared_builder_formats_zip_and_pdf_container_fields` |
+| `app/grid_paint.rs:211` | タイルの形式バッジは何か | (d) EPUB バッジ、PDF と同じアイコン・描画。`archive_types_always_show_a_format_badge` |
+| `app.rs:26733,26836,27502` | PDF 専用の保存 / セッションパスワードと入力ダイアログか | (b) EPUB を除外。`the_saved_password_wins_over_the_password_of_the_pdf_that_happens_to_be_open` の EPUB assertion、既存の typed failure tests |
+| `delete_worker.rs:444,464` | 削除前に PDF パスワードのハッシュキーを集めるか | (b) EPUB には PDF パスワードが無い。既存 `collect_pdf_paths_for_delete` test |
+| `rename_key_migration.rs:2305` | 単一 PDF 改名で PDF パスワードを移すか | (b) EPUB は別の同定 / 世代。既存 rename migration tests |
+| `catalog.rs:1296` | 旧 PDF layout 寸法の行を移行するか | (b) PDF 旧 catalog 専用。EPUB 世代行は別 stamp。既存 catalog migration tests |
+| `app.rs:27737,27743,27773` | 旧 PDF の親サムネ seed と writeback を使うか | (b) EPUB は冒頭で除外し、100 ms の prefetch grace のみ共有。既存 `epub_virtual_folder_seed_and_parent_writeback_are_explicitly_excluded` |
+| `similar_index.rs:5704` | 旧 mtime/size による PDF 類似索引を生成できるか | (d) 世代 stamp の無い類似索引に EPUB を入れると旧ページを有効扱いする。S2c-2 からの意図的除外を維持 |
+| `content_identity.rs:115,796` | 台帳に保存する**元ファイル**種別は何か | (d) EPUB は `ContentKind::Epub` として S2c-2 で実装済み。既存 content identity tests |
+| `app.rs:22493,22713` (旧行) | 開く対象がページ本か | (d) S2c-1 から PDF / EPUB とも通過。S3a で共通述語へ移動し、上記の現行行へ統合 |
+| `bin/bench_scroll.rs:137,165`、`bin/bench_dupe.rs:1808` | PDF 専用の診断ベンチ入力か | (d) 製品の一覧 / 操作経路ではないため既存対象を維持 |
+| `remote_ipc/container.rs:2804,3139,3300,4384,4460,5643,5671,6356,7041,7063` | Remote の PDF ページ / subresource / location か | (c) S4。コアの Remote 分岐はこの段階で変更しない |
+| `remote_ipc/thumbnail.rs:644` | Remote 用のコンテナ代表か | (c) S4 |
+| `crates/remote-web/src/store.rs:304,312,690`、`web/app.js:3577,6580,6594,7062` | Remote が受け取る entry 種別と遷移先か | (c) S4。`store.rs:690` が現行の拡張子分類点 |
+
+`PdfFile` variant を直接見るレーティング、タグ、コレクション、履歴、しおり、代表ピンの
+消費側は追加分岐が不要。上記の分類入口と、S2c-2 の論理パス / 世代スタンプの既存テストを
+通る。Remote 以外のファイルを stat する処理は worker 側に置き、フォルダー走査の
+ファイル / ディレクトリ判定は引き続き `entry.file_type()` を使う。
+
+回帰テストの負例は、共通述語を一時的に PDF 専用へ戻して分類・検索・評価・開く経路を、
+D5 の通常一覧 / ツリーのフィルタを無効化して重複表示を、それぞれ検出した。
+サムネイルの worker 解決、世代スタンプ、EPUB バッジ、詳細欄、PDF パスワード境界、
+設定 DB の読み出し、環境設定 snapshot も各々の処理を一時的に戻して失敗を確認した。
+差し替えは各実行後に元のバイト列へ復元した。
+
 ### S1 変換器の仕上げ (2026-09-25、**独立レビュー 4 回目で承認**)
 
 実装: Codex Sol (同一セッションで 4 往復)。実機の確認は検収側 (ClaudeCode) がサンドボックス外で実施 (Codex のサンドボックス内では

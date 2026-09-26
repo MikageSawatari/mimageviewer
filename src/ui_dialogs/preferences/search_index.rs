@@ -528,7 +528,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "duplicate/archive-folder",
         DuplicateFiles,
-        "同名の ZIP/PDF/RAR/7z/LZH ファイルとフォルダがある場合、アーカイブ側をスキップ",
+        "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
         ["重複", "同名", "archive"]
     ),
     entry!(
@@ -536,6 +536,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         DuplicateFiles,
         "同名の ZIP/CBZ と RAR/7z/LZH がある場合、ZIP/CBZ だけ表示",
         ["重複", "優先", "archive"]
+    ),
+    entry!(
+        "duplicate/epub-pdf",
+        DuplicateFiles,
+        "同名の EPUB と PDF がある場合、PDF だけ表示",
+        ["重複", "優先", "本"]
     ),
     entry!(
         "duplicate/video-image",

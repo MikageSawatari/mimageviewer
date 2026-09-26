@@ -8601,7 +8601,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         let s = &mut state.settings;
         ui.checkbox(
             &mut s.skip_zip_if_folder_exists,
-            "同名の ZIP/PDF/RAR/7z/LZH ファイルとフォルダがある場合、アーカイブ側をスキップ",
+            "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
         );
     });
     ui.add_space(4.0);
@@ -8610,6 +8610,13 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         ui.checkbox(
             &mut s.skip_archive_if_zip_exists,
             "同名の ZIP/CBZ と RAR/7z/LZH がある場合、ZIP/CBZ だけ表示",
+        );
+    });
+    ui.add_space(4.0);
+    anchored(ui, state, "duplicate/epub-pdf", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.skip_epub_if_pdf_exists,
+            "同名の EPUB と PDF がある場合、PDF だけ表示",
         );
     });
     ui.add_space(4.0);
