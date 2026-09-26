@@ -126,6 +126,9 @@ enum TrayCommand {
     SetPausedCheck(bool),
     /// ツールチップを更新 ("mImageViewer — インデックス一時停止中" 等)
     SetTooltip(String),
+    /// Drive the tray icon's Open closure from an unattended disposable smoke run.
+    #[cfg(feature = "test-script")]
+    OpenForSmoke,
     /// スレッド終了
     Shutdown,
 }
@@ -264,6 +267,13 @@ impl TrayController {
     /// ツールチップを更新。「mImageViewer — インデックス一時停止中」等の表示に使う。
     pub fn set_tooltip(&self, text: String) {
         let _ = self.cmd_tx.send(TrayCommand::SetTooltip(text));
+    }
+
+    #[cfg(feature = "test-script")]
+    pub(crate) fn open_for_smoke(&self) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(TrayCommand::OpenForSmoke)
+            .map_err(|error| format!("tray Open smoke command could not be queued: {error}"))
     }
 
     /// トレイ「終了」メニューが押されたか。`App::maybe_intercept_close` が判定用に読む。
@@ -643,6 +653,8 @@ fn run_tray_thread(
                         crate::logger::log(format!("tray: set_tooltip failed: {e}"));
                     }
                 }
+                #[cfg(feature = "test-script")]
+                TrayCommand::OpenForSmoke => do_show_window(),
                 TrayCommand::Shutdown => {
                     MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
                     TrayIconEvent::set_event_handler(None::<fn(TrayIconEvent)>);
@@ -788,5 +800,13 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2, "同値でも command 2 通は積まれる");
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn smoke_open_routes_to_the_tray_thread() {
+        let (ctrl, cmd_rx, _event_tx) = TrayController::new_for_test();
+        ctrl.open_for_smoke().unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TrayCommand::OpenForSmoke)));
     }
 }

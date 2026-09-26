@@ -881,6 +881,8 @@ pub(crate) fn collection_sort_popup_snapshot(ctx: &egui::Context) -> TestScriptC
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestScriptSnapshot {
     pub(crate) is_fullscreen: bool,
+    pub(crate) always_on_top: bool,
+    pub(crate) window_visible: bool,
     pub(crate) fs_idx: i64,
     pub(crate) items_generation: i64,
     pub(crate) folder_load_requests: i64,
@@ -942,12 +944,67 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) passthrough_unavailable: String,
     pub(crate) keymap_level_observations: Vec<KeymapLevelObservation>,
     pub(crate) windows: Vec<TestScriptWindowSnapshot>,
+    pub(crate) host_styles: Vec<TestScriptHostStyle>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TestScriptHostStyle {
+    pub(crate) role: String,
+    pub(crate) window_id: Option<u64>,
+    pub(crate) presentation: TestScriptWindowPresentation,
+    pub(crate) viewport: String,
+    pub(crate) viewport_id: Option<egui::ViewportId>,
+    pub(crate) hwnd: u64,
+    pub(crate) backend_token: Option<u64>,
+    pub(crate) topmost: bool,
+    pub(crate) noactivate: bool,
+    pub(crate) minimized: bool,
+    pub(crate) visible: bool,
+    pub(crate) owner_hwnd: u64,
+    pub(crate) foreground_hwnd: u64,
+}
+
+impl TestScriptHostStyle {
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("role".into(), self.role.clone().into());
+        map.insert(
+            "window_id".into(),
+            self.window_id
+                .map(|id| Dynamic::from(saturating_rhai_int(id)))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert("presentation".into(), self.presentation.as_str().into());
+        map.insert("viewport".into(), self.viewport.clone().into());
+        map.insert("hwnd".into(), format!("0x{:x}", self.hwnd).into());
+        map.insert(
+            "backend_token".into(),
+            self.backend_token
+                .map(|token| Dynamic::from(saturating_rhai_int(token)))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert("topmost".into(), self.topmost.into());
+        map.insert("noactivate".into(), self.noactivate.into());
+        map.insert("minimized".into(), self.minimized.into());
+        map.insert("visible".into(), self.visible.into());
+        map.insert(
+            "owner_hwnd".into(),
+            format!("0x{:x}", self.owner_hwnd).into(),
+        );
+        map.insert(
+            "foreground_hwnd".into(),
+            format!("0x{:x}", self.foreground_hwnd).into(),
+        );
+        map
+    }
 }
 
 impl Default for TestScriptSnapshot {
     fn default() -> Self {
         Self {
             is_fullscreen: false,
+            always_on_top: false,
+            window_visible: true,
             fs_idx: -1,
             items_generation: 0,
             folder_load_requests: 0,
@@ -999,6 +1056,7 @@ impl Default for TestScriptSnapshot {
             passthrough_unavailable: String::new(),
             keymap_level_observations: Vec::new(),
             windows: Vec::new(),
+            host_styles: Vec::new(),
         }
     }
 }
@@ -1015,6 +1073,8 @@ impl TestScriptSnapshot {
             };
         }
         insert!(is_fullscreen);
+        insert!(always_on_top);
+        insert!(window_visible);
         insert!(fs_idx);
         insert!(items_generation);
         insert!(folder_load_requests);
@@ -1082,6 +1142,14 @@ impl TestScriptSnapshot {
         insert!(has_next_page);
         insert!(reading_flow);
         insert!(upload_deferral_streak);
+        map.insert(
+            "host_styles".into(),
+            self.host_styles
+                .iter()
+                .map(|style| Dynamic::from_map(style.to_rhai_map()))
+                .collect::<rhai::Array>()
+                .into(),
+        );
         insert!(passthrough_unavailable);
         map.insert(
             "windows".into(),
@@ -1187,6 +1255,9 @@ enum UiCommand {
         kind: SortPopupPointerKind,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    DetailsPreviewPointer {
+        reply: mpsc::SyncSender<Result<(egui::Pos2, f32), String>>,
+    },
     ValidateSelectedOwner {
         expected_identity: TestScriptWindowIdentity,
         reply: mpsc::SyncSender<Result<(), String>>,
@@ -1213,6 +1284,15 @@ pub(crate) enum UiSmokeAction {
     OpenThumbnailPreferences,
     OpenFirstSmartFolder,
     OpenSeededCollection,
+    AlwaysOnTopOn,
+    AlwaysOnTopOff,
+    MinimizeRoot,
+    RestoreRoot,
+    HideToTray,
+    RestoreFromTray,
+    CloseFullscreen,
+    ToggleDetachedMode,
+    EnableIndependentWindows,
 }
 
 pub(crate) const SEEDED_COLLECTION_SMOKE_ID: &str = "80f58851-997b-4b80-90bc-f50bb1d2523e";
@@ -1257,6 +1337,7 @@ struct WidgetClick {
 struct WidgetClickDriver {
     requested: Option<WidgetPointerRequest>,
     active: Option<WidgetClick>,
+    details_preview_move: Option<mpsc::SyncSender<Result<(egui::Pos2, f32), String>>>,
 }
 
 thread_local! {
@@ -1345,6 +1426,23 @@ fn register_sort_popup_pointer_row(label: &str, response: &egui::Response, clip:
     });
 }
 
+/// Publish the actual visible preview cell, so the worker can move the OS pointer to it.
+/// No synthetic egui event is injected for this path.
+pub(crate) fn register_details_preview_pointer(response: &egui::Response, clip: egui::Rect) {
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let mut driver = driver.borrow_mut();
+        let Some(reply) = driver.details_preview_move.as_ref() else {
+            return;
+        };
+        let point = response.rect.center();
+        if !response.interact_rect.contains(point) || !clip.contains(point) {
+            return;
+        }
+        let _ = reply.send(Ok((point, response.ctx.pixels_per_point())));
+        driver.details_preview_move = None;
+    });
+}
+
 /// Called by the synthetic-input plugin before egui processes the root pass.
 pub(crate) fn append_widget_click_events(input: &mut egui::RawInput) {
     if input.viewport_id != egui::ViewportId::ROOT
@@ -1387,6 +1485,109 @@ fn widget_click_in_progress() -> bool {
         let driver = driver.borrow();
         driver.requested.is_some() || driver.active.is_some()
     })
+}
+
+/// Move the real Windows pointer through SendInput to a rect reported by the Details widget.
+/// The runner worker performs the OS call; the UI thread only publishes geometry.
+#[cfg(all(any(feature = "test-script", test), windows))]
+fn send_real_pointer_move(hwnd_raw: u64, point: egui::Pos2, ppp: f32) -> Result<(), String> {
+    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        SetThreadDpiAwarenessContext,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, GetSystemMetrics, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+
+    struct DpiGuard(DPI_AWARENESS_CONTEXT);
+    impl Drop for DpiGuard {
+        fn drop(&mut self) {
+            unsafe { SetThreadDpiAwarenessContext(self.0) };
+        }
+    }
+    if !point.x.is_finite() || !point.y.is_finite() || !ppp.is_finite() || ppp <= 0.0 {
+        return Err("Details preview pointer geometry is invalid".into());
+    }
+    let previous =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    if previous.0.is_null() {
+        return Err("SetThreadDpiAwarenessContext failed for Details pointer move".into());
+    }
+    let _dpi = DpiGuard(previous);
+    let hwnd = HWND(hwnd_raw as usize as *mut _);
+    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return Err("root host is hidden before Details pointer move".into());
+    }
+    let mut client = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client) }
+        .map_err(|error| format!("GetClientRect failed for Details pointer move: {error}"))?;
+    let mut target = POINT {
+        x: (point.x * ppp).round() as i32,
+        y: (point.y * ppp).round() as i32,
+    };
+    if target.x < client.left
+        || target.x >= client.right
+        || target.y < client.top
+        || target.y >= client.bottom
+    {
+        return Err("Details preview cell is outside the root client area".into());
+    }
+    if !unsafe { ClientToScreen(hwnd, &mut target).as_bool() } {
+        return Err("ClientToScreen failed for Details pointer move".into());
+    }
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if width <= 1
+        || height <= 1
+        || target.x < left
+        || target.x >= left + width
+        || target.y < top
+        || target.y >= top + height
+    {
+        return Err("Details preview cell is outside the virtual desktop".into());
+    }
+    let scaled = |value: i32, origin: i32, extent: i32| -> i32 {
+        let numerator = i64::from(value - origin) * 65_535;
+        ((numerator + i64::from(extent - 1) / 2) / i64::from(extent - 1)) as i32
+    };
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: scaled(target.x, left, width),
+                dy: scaled(target.y, top, height),
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inserted = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if inserted != 1 {
+        return Err(format!(
+            "SendInput inserted {inserted} of 1 Details pointer events"
+        ));
+    }
+    crate::logger::log(format!(
+        "[test-script] Details preview real pointer moved to screen=({}, {}) root=0x{hwnd_raw:x}",
+        target.x, target.y
+    ));
+    Ok(())
+}
+
+#[cfg(all(any(feature = "test-script", test), not(windows)))]
+fn send_real_pointer_move(_hwnd_raw: u64, _point: egui::Pos2, _ppp: f32) -> Result<(), String> {
+    Err("Details preview real pointer move requires Windows".into())
 }
 
 pub(crate) fn take_smoke_action(action: UiSmokeAction) -> bool {
@@ -1568,6 +1769,49 @@ impl RunnerBridge {
             .find(|window| window.role == "root")
             .ok_or_else(|| "select_root could not find the root window".to_string())?;
         self.select_window_snapshot(window)
+    }
+
+    #[cfg(any(feature = "test-script", test))]
+    fn move_details_preview_pointer(&self, timeout: Duration) -> Result<(), String> {
+        if timeout.is_zero() {
+            return Err("move_details_preview_pointer timeout_ms must be greater than zero".into());
+        }
+        let root = self
+            .latest_snapshot()?
+            .windows
+            .into_iter()
+            .find(|window| window.role == "root")
+            .and_then(|window| window.identity)
+            .ok_or("move_details_preview_pointer has no live root host")?;
+        let (reply, received) = mpsc::sync_channel(1);
+        self.send(UiCommand::DetailsPreviewPointer { reply })?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("move_details_preview_pointer timeout is too large")?;
+        let (point, pixels_per_point) = loop {
+            self.interrupt.check()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for a visible Details preview cell".into());
+            }
+            match received.recv_timeout(remaining.min(WAIT_POLL_INTERVAL)) {
+                Ok(result) => break result?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Details preview geometry channel disconnected".into());
+                }
+            }
+        };
+        if !eframe::miv_test_script_window_witness::is_current(
+            egui::ViewportId::ROOT,
+            root.hwnd(),
+            root.backend_token(),
+        )
+        .map_err(str::to_owned)?
+        {
+            return Err("root host changed before Details pointer move".into());
+        }
+        send_real_pointer_move(root.hwnd(), point, pixels_per_point)
     }
 
     fn select_window(&self, window_id: u64, context_serial: u64) -> Result<Map, String> {
@@ -2176,6 +2420,7 @@ fn parse_navigation_key(name: &str) -> Result<SyntheticNavigationKey, Box<EvalAl
         "end" => SyntheticNavigationKey::End,
         "enter" => SyntheticNavigationKey::Enter,
         "escape" | "esc" => SyntheticNavigationKey::Escape,
+        "f12" => SyntheticNavigationKey::F12,
         _ => {
             return Err(rhai_error(format!(
                 "unsupported synthetic navigation key: {name}"
@@ -2279,6 +2524,31 @@ fn wait_interruptibly(
 }
 
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
+    let always_on_top_bridge = bridge.clone();
+    engine.register_fn(
+        "always_on_top_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            let action = match name.as_str() {
+                "on" => UiSmokeAction::AlwaysOnTopOn,
+                "off" => UiSmokeAction::AlwaysOnTopOff,
+                "minimize_root" => UiSmokeAction::MinimizeRoot,
+                "restore_root" => UiSmokeAction::RestoreRoot,
+                "hide_to_tray" => UiSmokeAction::HideToTray,
+                "restore_from_tray" => UiSmokeAction::RestoreFromTray,
+                "close_fullscreen" => UiSmokeAction::CloseFullscreen,
+                "toggle_detached_mode" => UiSmokeAction::ToggleDetachedMode,
+                "enable_independent_windows" => UiSmokeAction::EnableIndependentWindows,
+                _ => {
+                    return Err(rhai_error(format!(
+                        "unknown always-on-top smoke action: {name}"
+                    )));
+                }
+            };
+            always_on_top_bridge
+                .send(UiCommand::SmokeAction(action))
+                .map_err(rhai_error)
+        },
+    );
     let rating_sort_bridge = bridge.clone();
     engine.register_fn(
         "rating_sort_smoke",
@@ -2376,6 +2646,23 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                         }
                     }
                 }
+            },
+        );
+    }
+    // Keep the opt-in production API available to unit tests as well, so the
+    // ordinary lib suite exercises its registration and missing-host error.
+    #[cfg(any(feature = "test-script", test))]
+    {
+        let preview_bridge = bridge.clone();
+        engine.register_fn(
+            "move_details_preview_pointer",
+            move |timeout_ms: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+                preview_bridge
+                    .move_details_preview_pointer(checked_duration(
+                        timeout_ms,
+                        "move_details_preview_pointer timeout_ms",
+                    )?)
+                    .map_err(rhai_error)
             },
         );
     }
@@ -2814,6 +3101,9 @@ enum PendingActionDispatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetedActionPhase {
     AwaitingDetachedOwner,
+    // Focus must be applied in an earlier backend pass than an action which may
+    // open another host. Otherwise a late source Focus steals that host's focus.
+    AwaitingFocus,
     AwaitingPass,
 }
 
@@ -3067,6 +3357,47 @@ impl UiRuntime {
                 });
             }
         }
+        if let Ok(snapshot) = self.snapshot.read() {
+            for style in &snapshot.host_styles {
+                if style.role == "detached"
+                    && let (Some(viewport_id), Some(window_id)) =
+                        (style.viewport_id, style.window_id)
+                    && seen.insert(viewport_id)
+                {
+                    targets.push(capture::Target {
+                        viewport_id,
+                        role: format!("detached-{window_id}"),
+                        hwnd: Some(style.hwnd),
+                        availability: availability(viewport_id),
+                        presentation: style.presentation,
+                    });
+                }
+                if style.role == "fullscreen"
+                    && let Some(viewport_id) = style.viewport_id
+                    && seen.insert(viewport_id)
+                {
+                    targets.push(capture::Target {
+                        viewport_id,
+                        role: "fullscreen".into(),
+                        hwnd: Some(style.hwnd),
+                        availability: availability(viewport_id),
+                        presentation: TestScriptWindowPresentation::ActiveImmediate,
+                    });
+                }
+                if style.role == "preview"
+                    && let Some(viewport_id) = style.viewport_id
+                    && seen.insert(viewport_id)
+                {
+                    targets.push(capture::Target {
+                        viewport_id,
+                        role: "preview".into(),
+                        hwnd: Some(style.hwnd),
+                        availability: availability(viewport_id),
+                        presentation: TestScriptWindowPresentation::ActiveImmediate,
+                    });
+                }
+            }
+        }
         Ok(targets)
     }
 
@@ -3278,6 +3609,7 @@ impl UiRuntime {
         action: KeyAction,
         selection: TestScriptActionSelection,
         applied: mpsc::SyncSender<Result<(), String>>,
+        target_focused: bool,
     ) -> Option<egui::ViewportId> {
         match selection {
             TestScriptActionSelection::LegacyImplicit => {
@@ -3307,7 +3639,11 @@ impl UiRuntime {
                 };
                 let phase = match (&owner, window.residence.as_str()) {
                     (TestScriptWindowIdentity::Root { .. }, "mounted" | "at_rest") => {
-                        TargetedActionPhase::AwaitingPass
+                        if target_focused {
+                            TargetedActionPhase::AwaitingPass
+                        } else {
+                            TargetedActionPhase::AwaitingFocus
+                        }
                     }
                     (TestScriptWindowIdentity::Detached { .. }, "mounted" | "at_rest") => {
                         TargetedActionPhase::AwaitingDetachedOwner
@@ -3323,7 +3659,7 @@ impl UiRuntime {
                     }
                 };
                 let focus =
-                    (phase == TargetedActionPhase::AwaitingPass).then(|| owner.viewport_id());
+                    (phase == TargetedActionPhase::AwaitingFocus).then(|| owner.viewport_id());
                 crate::logger::log(format!(
                     "[test-script] run_action action={} target_mode=targeted owner={} phase={phase:?}",
                     action.ini_name(),
@@ -3349,7 +3685,7 @@ impl UiRuntime {
                 } => Some(owner.clone()),
                 PendingActionDispatch::LegacyImplicit
                 | PendingActionDispatch::Targeted {
-                    phase: TargetedActionPhase::AwaitingPass,
+                    phase: TargetedActionPhase::AwaitingFocus | TargetedActionPhase::AwaitingPass,
                     ..
                 } => None,
             })
@@ -3376,7 +3712,7 @@ impl UiRuntime {
                 if let PendingActionDispatch::Targeted { phase, .. } =
                     &mut self.pending_actions[index].dispatch
                 {
-                    *phase = TargetedActionPhase::AwaitingPass;
+                    *phase = TargetedActionPhase::AwaitingFocus;
                 }
                 crate::logger::log(format!(
                     "[test-script] action target ready owner={}",
@@ -3394,6 +3730,33 @@ impl UiRuntime {
                 ));
             }
         }
+    }
+
+    fn promote_focused_action_targets(
+        &mut self,
+        is_focused: impl Fn(&TestScriptWindowIdentity) -> bool,
+    ) -> Vec<egui::ViewportId> {
+        let mut ready = Vec::new();
+        for pending in &mut self.pending_actions {
+            let PendingActionDispatch::Targeted { owner, phase } = &mut pending.dispatch else {
+                continue;
+            };
+            if *phase == TargetedActionPhase::AwaitingFocus
+                && self
+                    .authoritative_windows
+                    .iter()
+                    .any(|window| window.identity.as_ref() == Some(owner))
+                && is_focused(owner)
+            {
+                *phase = TargetedActionPhase::AwaitingPass;
+                crate::logger::log(format!(
+                    "[test-script] run_action focus ready owner={}",
+                    owner.describe()
+                ));
+                ready.push(owner.viewport_id());
+            }
+        }
+        ready
     }
 
     fn expire_unconsumed_legacy_actions(&mut self, frame: u64) {
@@ -3595,6 +3958,33 @@ fn start_inner(path: PathBuf, run_dir: PathBuf, ctx: &egui::Context) -> Result<(
     Ok(())
 }
 
+pub(crate) fn action_target_is_focused(
+    ctx: &egui::Context,
+    owner: &TestScriptWindowIdentity,
+) -> bool {
+    if ctx.input_for(owner.viewport_id(), |input| input.viewport().focused) != Some(true) {
+        return false;
+    }
+    if !eframe::miv_test_script_window_witness::is_current(
+        owner.viewport_id(),
+        owner.hwnd(),
+        owner.backend_token(),
+    )
+    .unwrap_or(false)
+    {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        unsafe { GetForegroundWindow().0 as usize as u64 == owner.hwnd() }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn action_matches_owner(
     dispatch: &PendingActionDispatch,
     owner: Option<&TestScriptWindowIdentity>,
@@ -3606,7 +3996,7 @@ fn action_matches_owner(
             phase: TargetedActionPhase::AwaitingPass,
         } => owner == Some(target),
         PendingActionDispatch::Targeted {
-            phase: TargetedActionPhase::AwaitingDetachedOwner,
+            phase: TargetedActionPhase::AwaitingDetachedOwner | TargetedActionPhase::AwaitingFocus,
             ..
         } => false,
     }
@@ -3871,6 +4261,13 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
     if let Err(error) = runtime.publish_snapshot(snapshot) {
         runtime.fail_environment(error, frame);
     }
+    // A Focus command queued by RunAction reaches the backend only after this
+    // root pass. Promote requests from earlier passes before draining new ones.
+    for viewport_id in
+        runtime.promote_focused_action_targets(|owner| action_target_is_focused(ctx, owner))
+    {
+        ctx.request_repaint_of(viewport_id);
+    }
     if let Some(capture) = runtime.capture.as_mut() {
         capture.begin_root_frame(&runtime.authoritative_windows);
     }
@@ -3929,7 +4326,15 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                 if runtime.finish.is_some() {
                     let _ = applied.send(Err("script is already finishing".to_string()));
                 } else {
-                    if let Some(viewport_id) = runtime.queue_action(action, selection, applied) {
+                    let target_focused = match &selection {
+                        TestScriptActionSelection::Targeted(owner) => {
+                            action_target_is_focused(ctx, owner)
+                        }
+                        TestScriptActionSelection::LegacyImplicit => true,
+                    };
+                    if let Some(viewport_id) =
+                        runtime.queue_action(action, selection, applied, target_focused)
+                    {
                         ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
                         ctx.request_repaint_of(viewport_id);
                     }
@@ -3959,6 +4364,24 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                 ) {
                     let _ = reply.send(Err(message));
                 } else {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            }
+            UiCommand::DetailsPreviewPointer { reply } => {
+                if runtime.finish.is_some() {
+                    let _ = reply.send(Err("script is already finishing".to_string()));
+                } else {
+                    WIDGET_CLICK_DRIVER.with(|driver| {
+                        let mut driver = driver.borrow_mut();
+                        if driver.details_preview_move.is_some() {
+                            let _ =
+                                reply
+                                    .send(Err("another Details preview pointer move is pending"
+                                        .to_string()));
+                        } else {
+                            driver.details_preview_move = Some(reply);
+                        }
+                    });
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
             }
@@ -4535,6 +4958,142 @@ mod tests {
         let mut engine = rhai::Engine::new();
         engine.set_max_expr_depths(64, 64);
         engine.compile(script).unwrap();
+    }
+
+    #[test]
+    fn always_on_top_smoke_script_parses_without_launching_the_app() {
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine
+            .compile(include_str!("../scripts/ui-smoke/always-on-top.rhai"))
+            .unwrap();
+        engine
+            .compile(include_str!(
+                "../scripts/ui-smoke/always-on-top-restart.rhai"
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn always_on_top_literal_calls_execute_in_the_runner() {
+        let scenario = include_str!("../scripts/ui-smoke/always-on-top.rhai");
+        let call_lines = |name: &str| -> Vec<&str> {
+            let prefix = format!("{name}(\"");
+            scenario
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with(&prefix))
+                .collect()
+        };
+        let keys = call_lines("tap_key");
+        let actions = call_lines("run_action");
+        let smoke = call_lines("always_on_top_smoke");
+        let captures = call_lines("capture");
+        assert_eq!(
+            keys,
+            [
+                "tap_key(\"F12\");",
+                "tap_key(\"F12\");",
+                "tap_key(\"Right\");"
+            ]
+        );
+        assert!(!actions.is_empty() && !smoke.is_empty() && !captures.is_empty());
+
+        let source = keys
+            .iter()
+            .chain(actions.iter())
+            .chain(smoke.iter())
+            .chain(captures.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source(source, bridge).unwrap();
+        let (mut key_downs, mut action_count, mut smoke_count, mut capture_count) = (0, 0, 0, 0);
+        loop {
+            match rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("runner command")
+            {
+                UiCommand::Key(SyntheticKeyCommand {
+                    kind: SyntheticKeyCommandKind::Down { .. },
+                    ..
+                }) => key_downs += 1,
+                UiCommand::RunAction { applied, .. } => {
+                    action_count += 1;
+                    applied.send(Ok(())).unwrap();
+                }
+                UiCommand::SmokeAction(_) => smoke_count += 1,
+                UiCommand::Capture { reply, .. } => {
+                    capture_count += 1;
+                    reply.send(Ok(())).unwrap();
+                }
+                UiCommand::Finished(outcome) => {
+                    assert_eq!(
+                        outcome.kind,
+                        ScriptOutcomeKind::Success,
+                        "{}",
+                        outcome.message
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(key_downs, keys.len());
+        assert_eq!(action_count, actions.len());
+        assert_eq!(smoke_count, smoke.len());
+        assert_eq!(capture_count, captures.len());
+    }
+
+    #[test]
+    fn details_preview_move_primitive_is_registered_with_the_runner() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("move_details_preview_pointer(1);".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("no live root host")
+        ));
+    }
+
+    #[test]
+    fn details_preview_pointer_uses_the_visible_widget_rect() {
+        let (reply, received) = mpsc::sync_channel(1);
+        WIDGET_CLICK_DRIVER.with(|driver| driver.borrow_mut().details_preview_move = Some(reply));
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::vec2(60.0, 24.0), egui::Sense::hover());
+                super::register_details_preview_pointer(
+                    &response,
+                    egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(rect.center().x - 1.0, rect.max.y),
+                    ),
+                );
+                assert!(
+                    received.try_recv().is_err(),
+                    "clipped preview must not be targeted"
+                );
+                super::register_details_preview_pointer(&response, ui.clip_rect());
+                let (point, ppp) = received.try_recv().unwrap().unwrap();
+                assert_eq!(point, rect.center());
+                assert_eq!(ppp, ctx.pixels_per_point());
+            });
+        });
+        WIDGET_CLICK_DRIVER.with(|driver| assert!(driver.borrow().details_preview_move.is_none()));
     }
 
     #[test]
@@ -5659,6 +6218,49 @@ mod tests {
             .unwrap();
         assert_eq!(targets[1].availability, capture::Availability::Absent);
         assert_eq!(targets[2].availability, capture::Availability::Registered);
+
+        // A parked still host may outlive its context binding. The backend
+        // style witness keeps it in capture("all") even without a window snapshot.
+        let parked_id = egui::ViewportId::from_hash_of(("test-window", 3_u64));
+        runtime
+            .snapshot
+            .write()
+            .unwrap()
+            .host_styles
+            .push(TestScriptHostStyle {
+                role: "detached".into(),
+                window_id: Some(3),
+                presentation: TestScriptWindowPresentation::PassiveDeferredFrozen,
+                viewport: format!("{parked_id:?}"),
+                viewport_id: Some(parked_id),
+                hwnd: 0x3030,
+                backend_token: Some(3),
+                topmost: true,
+                noactivate: false,
+                minimized: false,
+                visible: true,
+                owner_hwnd: 0,
+                foreground_hwnd: 0,
+            });
+        let native_viewports = std::collections::HashSet::from([
+            egui::ViewportId::ROOT,
+            first.viewport_id(),
+            second.viewport_id(),
+            parked_id,
+        ]);
+        let targets = runtime
+            .capture_targets(
+                CaptureScope::All,
+                &TestScriptActionSelection::LegacyImplicit,
+                &native_viewports,
+            )
+            .unwrap();
+        assert_eq!(targets.len(), 4);
+        assert_eq!(targets[3].role, "detached-3");
+        assert_eq!(
+            targets[3].presentation,
+            TestScriptWindowPresentation::PassiveDeferredFrozen
+        );
     }
 
     #[test]
@@ -5836,6 +6438,7 @@ mod tests {
                 action,
                 TestScriptActionSelection::Targeted(owner.clone()),
                 applied,
+                false,
             ),
             None,
             "detached owner is resolved by App before a pass is eligible"
@@ -5850,6 +6453,18 @@ mod tests {
             action
         ));
         runtime.finish_targeted_detached_owner(&owner, Ok(()));
+        assert!(!peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.promote_focused_action_targets(|candidate| candidate == &sibling);
+        assert!(!peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.promote_focused_action_targets(|candidate| candidate == &owner);
         assert!(!peek_pending_action_from(
             &mut runtime.pending_actions,
             Some(&sibling),
@@ -5888,6 +6503,69 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_open_action_never_queues_source_focus_in_its_dispatch_pass() {
+        let owner = root_identity(11, 0x503);
+        let action = KeyAction::GridOpenSelected;
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(
+                owner.clone(),
+                17,
+                0,
+                "still::selected",
+            )])
+            .unwrap();
+
+        // An already focused root dispatches immediately without a Focus command.
+        let (applied, acknowledged) = mpsc::sync_channel(1);
+        assert_eq!(
+            runtime.queue_action(
+                action,
+                TestScriptActionSelection::Targeted(owner.clone()),
+                applied,
+                true,
+            ),
+            None
+        );
+        assert!(consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        assert_eq!(acknowledged.try_recv().unwrap(), Ok(()));
+
+        // If the root is unfocused, its Focus belongs to an earlier pass.
+        let (applied, acknowledged) = mpsc::sync_channel(1);
+        assert_eq!(
+            runtime.queue_action(
+                action,
+                TestScriptActionSelection::Targeted(owner.clone()),
+                applied,
+                false,
+            ),
+            Some(egui::ViewportId::ROOT)
+        );
+        assert!(!consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.promote_focused_action_targets(|_| false);
+        assert!(!consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.promote_focused_action_targets(|candidate| candidate == &owner);
+        assert!(consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        assert_eq!(acknowledged.try_recv().unwrap(), Ok(()));
+    }
+
+    #[test]
     fn root_frame_expiry_does_not_expire_a_detached_target_before_its_pass() {
         let owner = window_identity(7, 11, 14);
         let action = KeyAction::FsClose;
@@ -5900,6 +6578,7 @@ mod tests {
             action,
             TestScriptActionSelection::Targeted(owner.clone()),
             applied,
+            false,
         );
 
         runtime.expire_unconsumed_legacy_actions(2);
@@ -5909,6 +6588,7 @@ mod tests {
             Err(mpsc::TryRecvError::Empty)
         ));
         runtime.finish_targeted_detached_owner(&owner, Ok(()));
+        runtime.promote_focused_action_targets(|candidate| candidate == &owner);
         runtime.finish_target_pass(&owner, true, 2);
         let error = acknowledgement
             .recv_timeout(Duration::from_secs(1))
@@ -5931,6 +6611,7 @@ mod tests {
             action,
             TestScriptActionSelection::Targeted(owner.clone()),
             applied,
+            false,
         );
 
         runtime
@@ -5972,6 +6653,7 @@ mod tests {
             action,
             TestScriptActionSelection::Targeted(old_owner),
             applied,
+            false,
         );
 
         runtime
@@ -5997,7 +6679,12 @@ mod tests {
         let owner = window_identity(7, 11, 14);
         let mut runtime = local_runtime();
         let (applied, acknowledgement) = mpsc::sync_channel(1);
-        runtime.queue_action(action, TestScriptActionSelection::LegacyImplicit, applied);
+        runtime.queue_action(
+            action,
+            TestScriptActionSelection::LegacyImplicit,
+            applied,
+            true,
+        );
 
         assert!(consume_pending_action_from(
             &mut runtime.pending_actions,

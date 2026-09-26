@@ -191,8 +191,9 @@ impl Painter {
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
-            log::warn!("No window - clearing all surfaces");
-            self.surfaces.clear();
+            // Viewport recreation retires only that viewport's window. Other
+            // viewports share this painter and must retain their surfaces.
+            self.surfaces.remove(&viewport_id);
         }
         Ok(())
     }
@@ -220,8 +221,7 @@ impl Painter {
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
-            log::warn!("No window - clearing all surfaces");
-            self.surfaces.clear();
+            self.surfaces.remove(&viewport_id);
         }
         Ok(())
     }

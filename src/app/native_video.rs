@@ -8219,7 +8219,8 @@ impl App {
     #[cfg(windows)]
     fn native_video_help_includes_row(row: &CommandDisplayRow) -> bool {
         match row.spec.action {
-            KeyAction::ToggleDetachedViewerMode
+            KeyAction::ToggleAlwaysOnTop
+            | KeyAction::ToggleDetachedViewerMode
             | KeyAction::FsToggleWindowMode
             | KeyAction::FsBackToList
             | KeyAction::FsCtrlNavPrev
@@ -11831,6 +11832,15 @@ impl App {
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStart)
             }
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::ToggleAlwaysOnTop, &key) =>
+            {
+                self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
+                hud_activity = false;
+                NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+            }
             // F12: detached viewer mode toggle. Keep this as a keymap action
             // so a future remap works when the native video HWND has focus.
             _ if !key.repeat
@@ -15225,6 +15235,31 @@ mod native_video_display_mode_toggle_tests {
 #[cfg(all(test, windows))]
 mod configurable_video_seek_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn rebound_always_on_top_native_key_toggles_once_per_press() {
+        let (mut app, idx) = setup_seek_app();
+        let ctx = egui::Context::default();
+        app.keymap = crate::keymap::Keymap::from_ini_str("[Global]\nToggleAlwaysOnTop = F16\n");
+        let first = native_key(0x7f, false, false);
+        assert!(matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, first),
+            NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+        ));
+        assert!(app.settings.always_on_top);
+        let mut repeat = first;
+        repeat.repeat = true;
+        assert!(!matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, repeat),
+            NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+        ));
+        assert!(app.settings.always_on_top);
+        assert!(matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, first),
+            NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+        ));
+        assert!(!app.settings.always_on_top);
+    }
 
     fn native_key(
         virtual_key: u32,

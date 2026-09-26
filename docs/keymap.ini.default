@@ -58,6 +58,7 @@
 # GlobalMetadataSearch = Ctrl+G ; 全フォルダのメタデータを検索する
 # GlobalOpenFolder = Ctrl+O ; フォルダを開くダイアログを表示する
 # ToggleDetachedViewerMode = F12 ; 画像・動画ビューアの別ウィンドウモードを切り替える
+# ToggleAlwaysOnTop = none ; 常に最前面を切り替える
 # HelpShowContextShortcuts = ? ; 現在のコンテキストで使えるショートカット一覧を表示する
 
 [Grid] ; サムネイル一覧

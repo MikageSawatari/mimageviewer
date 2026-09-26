@@ -2090,6 +2090,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `rating_filter` | `[bool; 6]` | `[true; 6]` | レーティングフィルタ（index 0=未評価, 1〜5=★の数）。全 true ならフィルタなし |
 | `window_pos` / `window_size` | Option | None | 通常ウィンドウの位置・サイズ（自動保存）。最大化中は更新しないので、最大化を解いたときに戻る矩形として残る |
 | `window_maximized` | bool | false | 前回終了時（トレイ退避を含む）に最大化していたか（自動保存）。復元矩形を潰さないよう `window_pos` / `window_size` とは別に持つ |
+| `always_on_top` | bool | false | 設定メニュー先頭の「常に最前面」。ON 中は main と閲覧用 top-level host（独立フルスクリーン・別ウィンドウを含む）を最前面にする。既定は OFF、再起動後も保持する。操作カスタマイズの `ToggleAlwaysOnTop` にキーを割り当て可能。切替自体は他アプリからフォーカスを奪わない |
 | `startup_window_state` | StartupWindowState | RememberLast | 起動時のウィンドウ状態。`RememberLast`=前回終了時が最大化なら最大化、`Normal`=常に通常ウィンドウ、`Maximized`=常に最大化。位置・サイズはどの選択でも復元する。`--window-size` 指定時はこの設定より優先して通常ウィンドウで起動する。v3.2.0 以前の設定には field も `window_maximized` も無いため、更新直後の初回起動は通常ウィンドウになる |
 
 ### 8.5 メタデータ・検索設定（v0.3 追加）

@@ -7,7 +7,7 @@ use crate::keymap::{
     BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
     Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, ModKind,
     ReservedBindingKind, TopMenuId, menu_command_can_be_hidden, menu_command_spec,
-    menu_commands_for_parent, parse_chord_for_action,
+    menu_commands_for_parent, parse_chord_for_action, pin_settings_always_on_top_command,
 };
 use crate::ring_shortcut::{
     MouseGestureDirection, RightDragContext, RightDragMode, RingActionId, RingDirection,
@@ -4557,6 +4557,7 @@ fn key_trigger_label(trigger: KeyTrigger) -> &'static str {
 pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "menu/layout", |ui, state| {
         ui.small("メニューバーの上位メニューと固定項目の表示順を変更します。登録済みお気に入り、タグ一覧、更新確認など状態で変わる項目は固定位置に残ります。");
+        ui.small("設定の「常に最前面」は先頭固定です。表示・非表示を切り替えられます。");
         ui.add_space(8.0);
 
         let layout_snapshot = state.settings.menu_layout.clone();
@@ -4646,7 +4647,12 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                                 ui.label(label);
 
                                 if ui
-                                    .add_enabled(command_index > 0, egui::Button::new("↑").small())
+                                    .add_enabled(
+                                        command_index > 0
+                                            && command != MenuCommandId::SettingsAlwaysOnTop
+                                            && !(top == TopMenuId::Settings && command_index == 1),
+                                        egui::Button::new("↑").small(),
+                                    )
                                     .on_hover_text("上へ")
                                     .clicked()
                                 {
@@ -4655,7 +4661,8 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                                 }
                                 if ui
                                     .add_enabled(
-                                        command_index + 1 < command_order.len(),
+                                        command_index + 1 < command_order.len()
+                                            && command != MenuCommandId::SettingsAlwaysOnTop,
                                         egui::Button::new("↓").small(),
                                     )
                                     .on_hover_text("下へ")
@@ -5104,7 +5111,9 @@ fn apply_menu_layout_edit(layout: &mut MenuLayoutSettings, edit: MenuLayoutEdit)
         }
         MenuLayoutEdit::MoveCommand(parent, index, delta) => {
             let mut order = menu_layout_command_order(layout, parent);
-            if move_index(&mut order, index, delta) {
+            let target = index as i32 + delta;
+            let crosses_pinned = parent == TopMenuId::Settings && (index == 0 || target == 0);
+            if !crosses_pinned && move_index(&mut order, index, delta) {
                 write_menu_layout_command_order(layout, parent, &order);
             }
         }
@@ -5118,6 +5127,38 @@ fn apply_menu_layout_edit(layout: &mut MenuLayoutSettings, edit: MenuLayoutEdit)
             write_menu_layout_hidden(layout, &hidden);
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn always_on_top_menu_editor_keeps_fixed_slot_and_allows_visibility_change() {
+    let mut layout = MenuLayoutSettings::default();
+    let original = menu_layout_command_order(&layout, TopMenuId::Settings);
+    assert_eq!(original[0], MenuCommandId::SettingsAlwaysOnTop);
+
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::MoveCommand(TopMenuId::Settings, 0, 1),
+    );
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::MoveCommand(TopMenuId::Settings, 1, -1),
+    );
+    assert_eq!(
+        menu_layout_command_order(&layout, TopMenuId::Settings),
+        original
+    );
+
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::SetCommandVisible(MenuCommandId::SettingsAlwaysOnTop, false),
+    );
+    assert!(menu_layout_hidden_set(&layout).contains(&MenuCommandId::SettingsAlwaysOnTop));
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::SetCommandVisible(MenuCommandId::SettingsAlwaysOnTop, true),
+    );
+    assert!(!menu_layout_hidden_set(&layout).contains(&MenuCommandId::SettingsAlwaysOnTop));
 }
 
 fn move_index<T>(items: &mut [T], index: usize, delta: i32) -> bool {
@@ -5178,6 +5219,7 @@ fn menu_layout_command_order(layout: &MenuLayoutSettings, parent: TopMenuId) -> 
             out.push(spec.id);
         }
     }
+    pin_settings_always_on_top_command(parent, &mut out);
     out
 }
 

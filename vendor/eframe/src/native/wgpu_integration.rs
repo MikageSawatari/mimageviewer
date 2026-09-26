@@ -1506,6 +1506,32 @@ fn handle_viewport_output(
 
             viewport.deferred_commands.append(&mut commands);
 
+            // Diagnostic smoke builds need the command application order, not just
+            // the app's request order: an immediate child can release Focus while
+            // its parent pass still has a queued Focus command of its own.
+            #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+            let focus_commands = viewport
+                .deferred_commands
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command,
+                        egui::ViewportCommand::Focus
+                            | egui::ViewportCommand::Visible(_)
+                            | egui::ViewportCommand::WindowLevel(_)
+                    )
+                })
+                .map(|command| format!("{command:?}"))
+                .collect::<Vec<_>>();
+            #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+            if !focus_commands.is_empty() {
+                egui_wgpu::atlas_diag::log_line(format!(
+                    "[focus-probe] before viewport={viewport_id:?} commands={focus_commands:?} \
+                     has_focus={}",
+                    window.has_focus()
+                ));
+            }
+
             egui_winit::process_viewport_commands(
                 egui_ctx,
                 &mut viewport.info,
@@ -1513,6 +1539,13 @@ fn handle_viewport_output(
                 window,
                 &mut viewport.actions_requested,
             );
+            #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+            if !focus_commands.is_empty() {
+                egui_wgpu::atlas_diag::log_line(format!(
+                    "[focus-probe] after viewport={viewport_id:?} has_focus={}",
+                    window.has_focus()
+                ));
+            }
             #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
             if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
                 let queued = viewport
