@@ -1125,6 +1125,29 @@ mod page_count_tests {
     }
 
     #[test]
+    fn sibling_output_temp_is_absent_from_real_folder_scan() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let shelf = temp.path().join("shelf");
+        std::fs::create_dir(&shelf).unwrap();
+        std::fs::write(shelf.join("book.pdf"), b"PDF").unwrap();
+        let mut cache = crate::epub_cache::EpubCache::open_at(&temp.path().join("data")).unwrap();
+        let reserved = cache
+            .reserve_sibling_output(&shelf.join("new-book.pdf"))
+            .unwrap();
+        let _held_temp = reserved.create_file().unwrap();
+        let token = "a".repeat(64);
+        let old_temp = shelf.join(format!(".miv-part-{token}.pdf"));
+        let new_temp = shelf.join(format!(".miv-part-{token}.tmp"));
+        std::fs::write(&old_temp, b"temporary").unwrap();
+        std::fs::write(&new_temp, b"temporary").unwrap();
+        let scan = scan_directory_with_convertible_archives(&shelf, true, true).unwrap();
+        assert_eq!(scan.folders.len(), 1);
+        assert!(
+            matches!(&scan.folders[0].item, GridItem::PdfFile(path) if path == &shelf.join("book.pdf"))
+        );
+    }
+
+    #[test]
     fn image_folder_page_count_accepts_images_and_ignores_unrelated_files() {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::write(temp.path().join("001.jpg"), b"not decoded during scan").unwrap();

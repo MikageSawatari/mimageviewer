@@ -432,6 +432,27 @@ mod tests {
         assert_eq!(count, 5);
     }
 
+    #[test]
+    fn bulk_index_ignores_sibling_output_temp_during_save() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        mkdir(&root);
+        touch(&root.join("book.pdf"));
+        let mut cache = crate::epub_cache::EpubCache::open_at(&tmp.path().join("data")).unwrap();
+        let reserved = cache
+            .reserve_sibling_output(&root.join("new-book.pdf"))
+            .unwrap();
+        let _held_temp = reserved.create_file().unwrap();
+        let token = "a".repeat(64);
+        touch(&root.join(format!(".miv-part-{token}.pdf")));
+        touch(&root.join(format!(".miv-part-{token}.tmp")));
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let summary = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+        assert_eq!(summary.entries_written, 1);
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
+    }
+
     /// `.cbz` は他の全経路でネイティブ ZIP として開けるコンテナなのに、名前索引の
     /// 分類だけが拡張子 `zip` の厳密一致だったため Ctrl+S に出てこなかった
     /// (docs/item-kind-capability-matrix.md §6-12)。大文字混じりも同じに扱う。

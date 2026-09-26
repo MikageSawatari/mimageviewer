@@ -5,13 +5,14 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::epub_cache::{
     self, EpubCache, GenerationRow, PublishOutcome, ReservedOutput, SourceGuard, WriteDenyingSource,
@@ -644,6 +645,10 @@ pub fn save_sibling_at<S: WorkerSpawner>(
         let guard = WriteDenyingSource::open(source).map_err(map_source_open)?;
         (pages, false, state, guard)
     };
+    // Hold the finished work file write-denied before PDFium verifies its path. The
+    // copy below reads from this same handle, so verification and publication see
+    // one immutable byte sequence.
+    let mut verified_work_file = open_work_pdf_for_verification(output.part_path())?;
     verifier.verify_sibling(&output, pages, cancel)?;
     if cancel.is_cancelled() {
         return Err(EpubConvertError::Cancelled);
@@ -679,22 +684,35 @@ pub fn save_sibling_at<S: WorkerSpawner>(
             }
             return Err(error.into());
         }
-        copy_pdf_to_open_file(output.part_path(), &mut destination_file, cancel)?;
+        let result = (|| {
+            copy_verified_pdf_to_sibling_file(
+                &mut verified_work_file,
+                &mut destination_file,
+                cancel,
+            )?;
+            if cancel.is_cancelled() {
+                return Err(EpubConvertError::Cancelled);
+            }
+            if guard.state()? != expected_state {
+                return Err(EpubConvertError::SourceChanged);
+            }
+            epub_cache::publish_sibling_file(&destination_file, reserved.temp_path(), &destination)
+                .map_err(|error| {
+                    if destination.exists() {
+                        EpubConvertError::ExistingPdf
+                    } else {
+                        EpubConvertError::Io(error)
+                    }
+                })
+        })();
+        if result.is_err()
+            && let Err(error) =
+                epub_cache::discard_unrecorded_sibling_file(&destination_file, reserved.temp_path())
+        {
+            crate::logger::log(format!("epub sibling temp removal failed: {error:?}"));
+        }
         drop(destination_file);
-        if cancel.is_cancelled() {
-            return Err(EpubConvertError::Cancelled);
-        }
-        if guard.state()? != expected_state {
-            return Err(EpubConvertError::SourceChanged);
-        }
-        crate::archive_converter::replace_file_atomic(reserved.temp_path(), &destination, true)
-            .map_err(|error| {
-                if destination.exists() {
-                    EpubConvertError::ExistingPdf
-                } else {
-                    EpubConvertError::Io(error)
-                }
-            })
+        result
     })();
     if reserved.was_created()
         && let Err(error) = cache.finish_sibling_output(&reserved)
@@ -751,6 +769,66 @@ fn copy_pdf_to_open_file(
     }
     output.flush()?;
     Ok(())
+}
+
+fn open_work_pdf_for_verification(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.share_mode(0x0000_0001); // allow readers, deny writes and rename/delete
+    }
+    options.open(path)
+}
+
+/// The verified work PDF and the published bytes are checked through the retained temp handle.
+fn copy_verified_pdf_to_sibling_file(
+    input: &mut File,
+    output: &mut File,
+    cancel: &CancelToken,
+) -> Result<(), EpubConvertError> {
+    input.seek(SeekFrom::Start(0))?;
+    let mut work_hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(EpubConvertError::Cancelled);
+        }
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        work_hash.update(&buffer[..read]);
+        output.write_all(&buffer[..read])?;
+    }
+    output.flush()?;
+    output.sync_all()?;
+    output.seek(SeekFrom::Start(0))?;
+    let mut destination_hash = Sha256::new();
+    loop {
+        if cancel.is_cancelled() {
+            return Err(EpubConvertError::Cancelled);
+        }
+        let read = output.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        destination_hash.update(&buffer[..read]);
+    }
+    #[cfg(test)]
+    if FAIL_NEXT_SIBLING_READBACK_HASH.with(|flag| flag.replace(false)) {
+        destination_hash.update(b"injected mismatch");
+    }
+    if work_hash.finalize() != destination_hash.finalize() {
+        return Err(EpubConvertError::InvalidPdf);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_SIBLING_READBACK_HASH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn copy_source(
@@ -1558,6 +1636,14 @@ mod tests {
         .unwrap();
         assert!(saved.reused_cache);
         assert!(saved.path.exists());
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            assert_eq!(
+                fs::metadata(&saved.path).unwrap().file_attributes() & 0x2,
+                0
+            );
+        }
         assert_eq!(
             EpubCache::open_at(tmp.path())
                 .unwrap()
@@ -1750,6 +1836,56 @@ mod tests {
     struct PublishRaceVerifier {
         destination: PathBuf,
     }
+
+    #[cfg(windows)]
+    struct WorkFileLockVerifier;
+    #[cfg(windows)]
+    impl ConvertedPdfVerifier for WorkFileLockVerifier {
+        fn verify(
+            &self,
+            _: &ReservedOutput,
+            _: usize,
+            _: &CancelToken,
+        ) -> Result<(), EpubConvertError> {
+            unreachable!()
+        }
+        fn verify_sibling(
+            &self,
+            output: &SiblingOutput,
+            pages: usize,
+            cancel: &CancelToken,
+        ) -> Result<(), EpubConvertError> {
+            assert!(
+                OpenOptions::new()
+                    .write(true)
+                    .open(output.part_path())
+                    .is_err()
+            );
+            TestPdfVerifier.verify_sibling(output, pages, cancel)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sibling_save_holds_verified_work_file_write_denied_through_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        fs::write(&source, b"source EPUB bytes").unwrap();
+        let fake = FakeSpawner {
+            mode: FakeMode::Success,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        let saved = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &WorkFileLockVerifier,
+            &CancelToken::new().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(saved.path).unwrap(), b"%PDF-1.4\nfake");
+    }
     impl ConvertedPdfVerifier for PublishRaceVerifier {
         fn verify(
             &self,
@@ -1803,6 +1939,39 @@ mod tests {
                 .unwrap()
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn sibling_save_readback_hash_mismatch_removes_temp_without_publishing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        fs::write(&source, b"source EPUB bytes").unwrap();
+        let fake = FakeSpawner {
+            mode: FakeMode::Success,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        FAIL_NEXT_SIBLING_READBACK_HASH.with(|flag| flag.set(true));
+        let result = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        );
+        assert!(
+            matches!(result, Err(EpubConvertError::InvalidPdf)),
+            "{result:?}"
+        );
+        assert!(!source.with_extension("pdf").exists());
+        assert_eq!(
+            fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".miv-part-"))
                 .count(),
             0
         );

@@ -176,7 +176,14 @@ pub struct ReservedSiblingOutput {
     destination: PathBuf,
     temp_path: PathBuf,
     token: String,
-    identity: Option<FileIdentity>,
+    ownership: SiblingOwnership,
+}
+
+#[derive(Debug)]
+enum SiblingOwnership {
+    Reserved,
+    Created(FileIdentity),
+    Unprovable,
 }
 
 impl ReservedSiblingOutput {
@@ -185,17 +192,25 @@ impl ReservedSiblingOutput {
     }
 
     pub fn was_created(&self) -> bool {
-        self.identity.is_some()
+        !matches!(self.ownership, SiblingOwnership::Reserved)
     }
 
     pub fn create_file(&self) -> io::Result<File> {
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        options.read(true).write(true).create_new(true);
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt as _;
-            // DELETE lets the creator discard its own handle if recording fails.
-            options.access_mode(0x4000_0000 | 0x0001_0000);
+            // The creator retains read/write/delete access, but other handles may only read.
+            options.access_mode(0x8000_0000 | 0x4000_0000 | 0x0001_0000);
+            options.share_mode(0x0000_0001);
+            // Hidden is best effort: some shares reject it, so retry create_new without it.
+            options.attributes(0x0000_0002);
+            match options.open(&self.temp_path) {
+                Ok(file) => return Ok(file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Err(error),
+                Err(_) => options.attributes(0x0000_0080),
+            };
         }
         options.open(&self.temp_path)
     }
@@ -213,7 +228,7 @@ struct RecordedSiblingRow {
     identity: Option<Vec<u8>>,
 }
 
-fn file_identity(file: &File) -> io::Result<FileIdentity> {
+fn file_identity(file: &File) -> io::Result<Option<FileIdentity>> {
     #[cfg(windows)]
     {
         use std::mem::size_of;
@@ -232,10 +247,10 @@ fn file_identity(file: &File) -> io::Result<FileIdentity> {
             )
         }
         .map_err(|error| io::Error::other(error.to_string()))?;
-        let mut bytes = Vec::with_capacity(24);
-        bytes.extend_from_slice(&info.VolumeSerialNumber.to_le_bytes());
-        bytes.extend_from_slice(&info.FileId.Identifier);
-        Ok(FileIdentity(bytes))
+        Ok(file_id_info_identity(
+            info.VolumeSerialNumber,
+            &info.FileId.Identifier,
+        ))
     }
     #[cfg(not(windows))]
     {
@@ -244,8 +259,32 @@ fn file_identity(file: &File) -> io::Result<FileIdentity> {
         let mut bytes = Vec::with_capacity(16);
         bytes.extend_from_slice(&metadata.dev().to_le_bytes());
         bytes.extend_from_slice(&metadata.ino().to_le_bytes());
-        Ok(FileIdentity(bytes))
+        Ok(Some(FileIdentity(bytes)))
     }
+}
+
+#[cfg(windows)]
+fn file_id_info_identity(volume_serial: u64, file_id: &[u8; 16]) -> Option<FileIdentity> {
+    // MS-FSCC: an all-zero 128-bit ID means this filesystem could not provide one.
+    if file_id.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(24);
+    bytes.extend_from_slice(&volume_serial.to_le_bytes());
+    bytes.extend_from_slice(file_id);
+    Some(FileIdentity(bytes))
+}
+
+fn recorded_identity(bytes: &[u8]) -> Option<FileIdentity> {
+    #[cfg(windows)]
+    if bytes.len() != 24 || bytes[8..].iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    #[cfg(not(windows))]
+    if bytes.len() != 16 {
+        return None;
+    }
+    Some(FileIdentity(bytes.to_vec()))
 }
 
 fn now() -> i64 {
@@ -393,7 +432,7 @@ impl EpubCache {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let temp_path = parent.join(format!(".miv-part-{token}.pdf"));
+        let temp_path = parent.join(format!(".miv-part-{token}.tmp"));
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO outstanding_sibling_outputs(destination,temp_file,reserved_at,token,phase) VALUES (?1,?2,?3,?4,'reserved')",
@@ -406,7 +445,7 @@ impl EpubCache {
             destination,
             temp_path,
             token,
-            identity: None,
+            ownership: SiblingOwnership::Reserved,
         })
     }
 
@@ -416,17 +455,39 @@ impl EpubCache {
         reserved: &mut ReservedSiblingOutput,
         file: &File,
     ) -> Result<(), CacheError> {
-        let identity = file_identity(file)?;
+        let identity = match file_identity(file) {
+            Ok(identity) => identity,
+            Err(error) => {
+                crate::logger::log(format!("epub sibling file identity unavailable: {error}"));
+                None
+            }
+        };
+        self.mark_sibling_created_with_identity(reserved, identity)
+    }
+
+    fn mark_sibling_created_with_identity(
+        &mut self,
+        reserved: &mut ReservedSiblingOutput,
+        identity: Option<FileIdentity>,
+    ) -> Result<(), CacheError> {
+        let phase = if identity.is_some() {
+            "created"
+        } else {
+            "unprovable"
+        };
         let updated = self.conn.execute(
-            "UPDATE outstanding_sibling_outputs SET phase='created',file_identity=?3 WHERE id=?1 AND token=?2 AND phase='reserved'",
-            params![reserved.id, reserved.token, identity.0],
+            "UPDATE outstanding_sibling_outputs SET phase=?3,file_identity=?4 WHERE id=?1 AND token=?2 AND phase='reserved'",
+            params![reserved.id, reserved.token, phase, identity.as_ref().map(|id| &id.0)],
         )?;
         if updated != 1 {
             return Err(CacheError::InvalidState(
                 "sibling output reservation missing or changed",
             ));
         }
-        reserved.identity = Some(identity);
+        reserved.ownership = match identity {
+            Some(identity) => SiblingOwnership::Created(identity),
+            None => SiblingOwnership::Unprovable,
+        };
         Ok(())
     }
 
@@ -435,7 +496,7 @@ impl EpubCache {
         &mut self,
         reserved: &ReservedSiblingOutput,
     ) -> Result<(), CacheError> {
-        if reserved.identity.is_some() {
+        if reserved.was_created() {
             return Err(CacheError::InvalidState(
                 "created sibling cannot be abandoned",
             ));
@@ -477,7 +538,10 @@ impl EpubCache {
         if recorded.destination != reserved.destination.to_string_lossy()
             || recorded.temp_file != reserved.temp_path.to_string_lossy()
             || recorded.token != reserved.token
-            || !matches!(recorded.phase.as_str(), "reserved" | "created")
+            || !matches!(
+                recorded.phase.as_str(),
+                "reserved" | "created" | "unprovable"
+            )
         {
             return Err(CacheError::InvalidState(
                 "sibling output reservation missing or changed",
@@ -487,14 +551,19 @@ impl EpubCache {
             let identity = recorded.identity.ok_or(CacheError::InvalidState(
                 "created sibling has no file identity",
             ))?;
-            if reserved
-                .identity
-                .as_ref()
-                .is_some_and(|value| value.0 != identity)
+            let Some(identity) = recorded_identity(&identity) else {
+                // Old/unsupported filesystem IDs prove nothing: leave the random-named file.
+                self.conn.execute(
+                    "DELETE FROM outstanding_sibling_outputs WHERE id=?1",
+                    [reserved.id],
+                )?;
+                return Ok(());
+            };
+            if matches!(&reserved.ownership, SiblingOwnership::Created(value) if value != &identity)
             {
                 return Err(CacheError::InvalidState("created sibling identity changed"));
             }
-            delete_sibling_file(reserved, &FileIdentity(identity))?;
+            delete_sibling_file(reserved, &identity)?;
         }
         self.conn.execute(
             "DELETE FROM outstanding_sibling_outputs WHERE id=?1",
@@ -752,7 +821,10 @@ impl EpubCache {
                         destination: PathBuf::from(row.get::<_, String>(1)?),
                         temp_path: PathBuf::from(row.get::<_, String>(2)?),
                         token: row.get(3)?,
-                        identity: row.get::<_, Option<Vec<u8>>>(4)?.map(FileIdentity),
+                        ownership: match row.get::<_, Option<Vec<u8>>>(4)? {
+                            Some(bytes) => recorded_identity(&bytes).map_or(SiblingOwnership::Unprovable, SiblingOwnership::Created),
+                            None => SiblingOwnership::Reserved,
+                        },
                     })
                 },
             ).optional();
@@ -920,7 +992,8 @@ fn delete_sibling_file(
             .extension()
             .is_none_or(|ext| !ext.eq_ignore_ascii_case("pdf"))
         || path.parent() != Some(parent)
-        || path != &parent.join(format!(".miv-part-{}.pdf", reserved.token))
+        || (path != &parent.join(format!(".miv-part-{}.tmp", reserved.token))
+            && path != &parent.join(format!(".miv-part-{}.pdf", reserved.token)))
     {
         return Err(CacheError::UnsafePath(path.clone()));
     }
@@ -938,7 +1011,7 @@ fn delete_sibling_file(
         match fs::symlink_metadata(path) {
             Ok(meta) if meta.is_file() && !reparse(&meta) => {
                 let file = File::open(path)?;
-                if &file_identity(&file)? != identity {
+                if file_identity(&file)?.as_ref() != Some(identity) {
                     return Err(CacheError::InvalidState("sibling file identity mismatch"));
                 }
                 fs::remove_file(path).map_err(Into::into)
@@ -977,6 +1050,68 @@ pub fn discard_unrecorded_sibling_file(file: &File, path: &Path) -> Result<(), C
     {
         fs::remove_file(path).map_err(Into::into)
     }
+}
+
+/// Publish the still-open destination temp handle without replacing an existing PDF.
+#[cfg(windows)]
+pub fn publish_sibling_file(file: &File, _temp_path: &Path, destination: &Path) -> io::Result<()> {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO, FILE_RENAME_INFO, FileBasicInfo, FileRenameInfo,
+        SetFileInformationByHandle,
+    };
+
+    let handle = HANDLE(file.as_raw_handle());
+    // The temp is hidden while in progress; the final PDF must be visible.
+    let basic = FILE_BASIC_INFO {
+        FileAttributes: FILE_ATTRIBUTE_NORMAL.0,
+        ..Default::default()
+    };
+    unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileBasicInfo,
+            (&raw const basic).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .map_err(|error| io::Error::other(error.to_string()))?;
+
+    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    let name_bytes = name.len().checked_mul(size_of::<u16>()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sibling destination name too long",
+        )
+    })?;
+    let name_bytes = u32::try_from(name_bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sibling destination name too long",
+        )
+    })?;
+    let total = offset_of!(FILE_RENAME_INFO, FileName) + name_bytes as usize;
+    let mut storage = vec![0_u64; total.div_ceil(size_of::<u64>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = HANDLE::default();
+        (*info).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        SetFileInformationByHandle(handle, FileRenameInfo, info.cast(), total as u32)
+    }
+    .map_err(|error| io::Error::other(error.to_string()))
+}
+
+#[cfg(not(windows))]
+pub fn publish_sibling_file(_file: &File, temp_path: &Path, destination: &Path) -> io::Result<()> {
+    // Windows is the supported production platform; this preserves no-replace semantics in tests.
+    fs::hard_link(temp_path, destination)?;
+    let _ = fs::remove_file(temp_path);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1020,7 +1155,7 @@ fn delete_sibling_file_by_handle(path: &Path, identity: &FileIdentity) -> Result
     if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT.0 | FILE_ATTRIBUTE_DIRECTORY.0) != 0 {
         return Err(CacheError::UnsafePath(path.to_owned()));
     }
-    if &file_identity(&file)? != identity {
+    if file_identity(&file)?.as_ref() != Some(identity) {
         return Err(CacheError::InvalidState("sibling file identity mismatch"));
     }
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
@@ -2079,6 +2214,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sibling_zero_file_id_is_unprovable_and_gate_never_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        let mut reserved = db
+            .reserve_sibling_output(&tmp.path().join("book.pdf"))
+            .unwrap();
+        let file = reserved.create_file().unwrap();
+        assert_eq!(file_id_info_identity(17, &[0; 16]), None);
+        db.mark_sibling_created_with_identity(&mut reserved, file_id_info_identity(17, &[0; 16]))
+            .unwrap();
+        assert!(reserved.was_created());
+        let phase: String = db
+            .conn
+            .query_row(
+                "SELECT phase FROM outstanding_sibling_outputs WHERE id=?1",
+                [reserved.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "unprovable");
+        drop(file);
+        drop(db);
+        assert!(matches!(
+            startup_gate(tmp.path()),
+            GateOutcome::Enabled { .. }
+        ));
+        wait_for_sibling_rows_to_clear(tmp.path());
+        assert!(reserved.temp_path().exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sibling_temp_denies_concurrent_write_until_handle_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        let reserved = db
+            .reserve_sibling_output(&tmp.path().join("book.pdf"))
+            .unwrap();
+        let file = reserved.create_file().unwrap();
+        assert!(
+            OpenOptions::new()
+                .write(true)
+                .open(reserved.temp_path())
+                .is_err()
+        );
+        discard_unrecorded_sibling_file(&file, reserved.temp_path()).unwrap();
+        drop(file);
+        db.abandon_sibling_reservation(&reserved).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sibling_handle_publish_never_replaces_pdf_created_after_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        let destination = tmp.path().join("book.pdf");
+        let mut reserved = db.reserve_sibling_output(&destination).unwrap();
+        let mut file = reserved.create_file().unwrap();
+        db.mark_sibling_created(&mut reserved, &file).unwrap();
+        use std::io::Write as _;
+        file.write_all(b"verified PDF bytes").unwrap();
+        fs::write(&destination, b"another writer's PDF").unwrap();
+        assert!(publish_sibling_file(&file, reserved.temp_path(), &destination).is_err());
+        discard_unrecorded_sibling_file(&file, reserved.temp_path()).unwrap();
+        drop(file);
+        db.finish_sibling_output(&reserved).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"another writer's PDF");
+        assert!(!reserved.temp_path().exists());
     }
 
     #[test]
