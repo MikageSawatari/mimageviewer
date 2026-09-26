@@ -202,9 +202,9 @@ struct AudioTrackSelectionState {
 3. seek 成功なら、video overflow 破棄 → video `Flush` → audio `Flush { .., replace_setup }` を送る。
    audio `Flush` の送信結果を見る (現状は捨てている `decoder.rs:3054`)。
    - 送信成功: ここで初めて `audio_stream_idx_for_demux` と audio time base を差し替え、`applied = desired` を書く。
-   - 送信失敗 (audio decode thread が終了している): 切り替えの失敗ではなく、既存の「audio packet の送信先が
-     disconnect した」場合 (`decoder.rs:3287-3290`、demux は `break 'outer` で終了) と同じ終端として扱う。
-     audio worker が無い状態で再生を続ける経路は作らない。
+   - 送信失敗 (audio decode thread が終了している): 切り替えの失敗ではなく、§5.3.1 の「音声 lane の喪失」として
+     扱う (routing を外し、映像があれば映像を続ける)。selection には `last_failure = {.., reason: WorkerGone}` を
+     記録し、以後の切り替えは `Rejected` にする。
 4. 条件を満たし `desired.stream == applied.stream` (元のトラックへ戻した等) は `AudioSetup` を
    作らず、3 の送信成功時に `applied.gen = desired.gen` だけ進める。
 5. 以降は通常の seek と同じ (`notify_seek_completed` → `SeekCompleted`)。
@@ -233,7 +233,8 @@ demux が**旧 routing・旧位置**で読んだ packet が**新しい serial** 
   かかわらず** `demux_serial` をその要求の serial に進める。video が無い (audio-only) なら audio の `Flush` だけ、
   audio が無いなら video の `Flush` だけが条件。seek 失敗時も既存どおり trim なしの `Flush` を送って再開するので、
   同じ規則で進める。
-- `Flush` の送信失敗 (disconnect) は既存の終端 (`break 'outer`) へ進み、`demux_serial` は進めない。
+- `Flush` の送信失敗は、cancel が立っていれば既存の終端 (`break 'outer`)。cancel が無い audio lane の切断は
+  §5.3.1 の「音声 lane の喪失」として扱い、存在する lane (= video) の `Flush` が受理されれば `demux_serial` を進める。
 - `SeekCompleted` の再送 (`pending_seek_completed`) は event lane 側の仕組みで、`demux_serial` とは独立。
 - 初期値は open 時の serial (0)。
 
@@ -243,6 +244,19 @@ demux が**旧 routing・旧位置**で読んだ packet が**新しい serial** 
   decode thread は control を優先受信する (`select_biased!`) ので、新世代の packet を見る前に必ず `Flush` を処理する。
 - video 側も同じ規則にする (旧位置の frame が新世代として表示される同型の競合を同時に塞ぐ)。
 - この変更は既存の seek 全体に効くので、S2 の最初に単独で入れ、既存の seek テストを通してから切り替えを載せる。
+
+### 5.3.1 音声 lane の喪失 (cancel を伴わない audio の切断)
+
+- 現状、PC の音声出力を開けないと `VideoPlayer::open` は `audio_rx` を捨てて「映像のみ再生」にする
+  (`mod.rs:8728-8754`) が、audio decode thread は `audio_tx` の切断で終わり、demux は次の音声 packet の送信で切断を
+  `Cancelled` と扱って終了する (`decoder.rs` の `send_audio_packet_with_video_drain`)。音声が続く素材では映像も止まる
+  既存の不具合で、§5.3 で audio `Flush` の失敗を終端にすると seek でも同じ停止が起きる (S2 区切り A の独立レビュー P1)。
+- 規則: **cancel が立っていない audio lane の切断 (packet 送信・`Flush` 送信のどちらでも) は「音声 lane の喪失」とし、
+  demux は音声の routing を外して (`audio_stream_idx_for_demux = None` 相当) 映像を続ける。映像 lane が無い素材
+  (音声のみ) では終端。** cancel が立っている場合は従来どおり終端。
+- 音声 lane を外した後は、以後の seek の `Flush` 条件も video だけになる (§5.3 の「存在する lane」)。
+- 音声出力を開けなかった player は selection を持たない (§7.4) ので、切り替えは起きない。切り替え中に audio decode
+  thread が終わった場合は §5.2 の `WorkerGone`。
 
 ### 5.4 most-recent-wins の保証
 
