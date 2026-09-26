@@ -1,6 +1,6 @@
 # 動画の複数音声トラック選択 設計 (backlog §1.251)
 
-- 状態: 設計案 第6版 (独立レビュー5回目 REVISE を反映)
+- 状態: 設計案 第7版 (独立レビュー6回目 REVISE を反映)
 - 出典: [next-release-backlog.md §1.251](next-release-backlog.md) (>>429)
 - 担当: 設計・検収 = ClaudeCode Opus / 実装 = Codex Sol / 独立レビュー = 別の Sol
 - 関連: [video-architecture.md](video-architecture.md) (decoder 3-thread 構成・seek 調停・audio.rs・Norm)、
@@ -824,8 +824,13 @@ UI より先に入れる (UI から切り替えられるようになった時点
 - Remote の配信の Norm gain もこの段で移す。現在は headless player の単一 gain (`VideoPlayer::normalize_gain()`) を
   `RemoteStreamStartInputs` に写して transcode に渡している (`mod.rs:9457`、`remote_ipc/ui.rs:1062`) が、S3 で単一
   gain を表に置き換えるので、§9A.3 の「generation の worker 内で、開いているトラックについて lookup する」方式を
-  この段で入れる (開始時のトラックは `opened_audio_stream_index`)。S3 の受け入れ時点で既存の Remote の Norm が
-  維持されていることをテストで示す。S6 はトラックの切り替えだけを足す。
+  この段で入れる。
+- 同じ段で、transcode が配るトラックも明示する: `ClocklessTranscodeOptions.audio_stream_index` (§9A.2) をこの段で
+  足し、transcode の独自の `best(Audio)` をやめる。session は開始時にこの値を 1 つ決め (headless player の
+  `opened_audio_stream_index`)、**配る stream と Norm の lookup の対象を同じ値から取る**。S3 の時点では
+  `opened_audio_stream_index` は既定トラックなので挙動は現状と同じ。S5 で保存済みの選択により headless player が
+  非既定トラックを開くようになっても、配信音声と gain は同じトラックのまま一致する。
+- S3 の受け入れ時点で既存の Remote の Norm が維持されていることをテストで示す。S6 はトラックの切り替えだけを足す。
 
 - 6.1 (Norm: 追加テーブル、scanner の stream 指定、App の Norm 状態の key 拡張、トラック確定待ち、snap、
   worker での lookup) と 6.2 (波形・音楽解析の全 key への stream index)。
@@ -863,7 +868,8 @@ UI より先に入れる (UI から切り替えられるようになった時点
   codec 不一致で既定へ、language / channels / title の不一致で既定へ、保存時に無かった項目は比較しない)、保存の
   契機 (`Requested` が確定したとき・`Unchanged` のとき。失敗・保留・古い generation は保存しない)、保存トラックを
   開けなかったときの既定での再 open と `open_notice` の通知 1 回 (切り替え失敗の表示と重ならない)、ファイル削除・
-  リネームで map が再生位置と同じく破棄・移行される。title の往復と、title が変わったファイルで既定へ戻ること。
+  リネームで map が再生位置と同じく破棄・移行される。保存済みの非既定トラックで Remote を始めると、配信音声と
+  Norm gain が同じ (保存した) トラックになる。title の往復と、title が変わったファイルで既定へ戻ること。
   選択の確定直後、次の tick の前に close・evict・source swap・teardown・Remote 取得の全閉じが起きても選択が保存される。
 
 ### S6: mIV Remote
