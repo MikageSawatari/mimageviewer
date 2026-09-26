@@ -17293,6 +17293,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         ui.id().with(("details_preview_icon", idx)),
                         egui::Sense::hover(),
                     );
+                    #[cfg(feature = "test-script")]
+                    if !display_only {
+                        crate::test_script::register_details_preview_pointer(
+                            &response,
+                            ui.clip_rect(),
+                        );
+                    }
                     if response.hovered() {
                         hovered_preview_rect = Some(col_rect);
                     }

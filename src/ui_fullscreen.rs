@@ -19426,6 +19426,18 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn passive_detached_registration_windows(
+        windows: Vec<crate::app::DetachedImageWindowSnapshot>,
+        active_window_id: Option<u64>,
+    ) -> impl Iterator<Item = crate::app::DetachedImageWindowSnapshot> {
+        // The active immediate renderer and the passive snapshot can overlap
+        // during handoff. Only one builder may own the native ViewportId.
+        windows
+            .into_iter()
+            .filter(move |window| Some(window.id) != active_window_id)
+    }
+
+    #[cfg(windows)]
     pub(crate) fn render_detached_image_windows(&mut self, ctx: &egui::Context) {
         // Active -> Passive handoff は OS window を閉じず同じ ViewportId を引き継ぐ。
         // active 静止画が auto-hide 中だった場合の window 単位 cursor flag を、passive
@@ -19485,17 +19497,11 @@ impl App {
         self.test_script_publish_window_snapshots();
 
         let windows = self.detached_image_windows.clone();
-        let mut deferred_windows = Vec::new();
-        let mut parked_live_windows = Vec::new();
         let active_window_id = self
             .active_detached_session
             .map(|session| session.window_id);
-        for window in windows {
-            // An active session owns this ViewportId until its handoff completes.
-            // Registering the passive snapshot as well would give one native host two builders.
-            if active_window_id == Some(window.id) {
-                continue;
-            }
+        let (mut deferred_windows, mut parked_live_windows) = (Vec::new(), Vec::new());
+        for window in Self::passive_detached_registration_windows(windows, active_window_id) {
             if self.detached_window_state_is_parked_live(window.id) {
                 parked_live_windows.push(window);
             } else {
@@ -27918,6 +27924,7 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::End => KeyName::End,
                     crate::key_input::SyntheticNavigationKey::Enter => KeyName::Enter,
                     crate::key_input::SyntheticNavigationKey::Escape => KeyName::Esc,
+                    crate::key_input::SyntheticNavigationKey::F12 => KeyName::F12,
                 };
                 crate::test_script::KeymapLevelObservation {
                     frame_nr: observation.frame_nr,

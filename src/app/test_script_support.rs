@@ -51,6 +51,8 @@ fn test_script_native_host_style(
     let foreground = unsafe { GetForegroundWindow() };
     Some(crate::test_script::TestScriptHostStyle {
         role: role.to_owned(),
+        window_id: None,
+        presentation: TestScriptWindowPresentation::Other,
         viewport,
         viewport_id: None,
         hwnd,
@@ -86,6 +88,17 @@ fn test_script_egui_host_style(
     )?;
     style.viewport_id = Some(viewport_id);
     Some(style)
+}
+
+fn test_script_detached_host_ids(
+    parked_or_live: impl IntoIterator<Item = u64>,
+    active: Option<u64>,
+) -> Vec<u64> {
+    let mut ids = parked_or_live.into_iter().collect::<Vec<_>>();
+    ids.extend(active);
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,11 +148,31 @@ impl App {
         if let Some(root) = test_script_egui_host_style("root", egui::ViewportId::ROOT) {
             styles.push(root);
         }
-        for window in self.test_script_window_snapshots() {
-            if window.role == "detached"
-                && window.identity.is_some()
-                && let Some(style) = test_script_egui_host_style("detached", window.viewport_id)
-            {
+        let detached_ids = test_script_detached_host_ids(
+            self.detached_image_windows.iter().map(|window| window.id),
+            self.active_detached_window_id(),
+        );
+        for window_id in detached_ids {
+            let viewport_id = Self::detached_image_window_viewport_id(window_id);
+            if let Some(mut style) = test_script_egui_host_style("detached", viewport_id) {
+                style.window_id = Some(window_id);
+                style.presentation = match self.detached_window_state(window_id) {
+                    Some(DetachedWindowState::Parked)
+                        if self
+                            .detached_image_windows
+                            .iter()
+                            .any(|w| w.id == window_id) =>
+                    {
+                        TestScriptWindowPresentation::PassiveDeferredFrozen
+                    }
+                    Some(DetachedWindowState::ParkedLive) => {
+                        TestScriptWindowPresentation::ParkedLiveImmediate
+                    }
+                    Some(DetachedWindowState::Active) => {
+                        TestScriptWindowPresentation::ActiveImmediate
+                    }
+                    _ => TestScriptWindowPresentation::Other,
+                };
                 styles.push(style);
             }
         }
@@ -459,7 +492,9 @@ impl App {
         if self.active_detached_window_id() == Some(window_id) {
             if test_script_active_detached_target_matches(self, window_id, viewport_id, &owner) {
                 crate::test_script::finish_targeted_detached_owner(&owner, Ok(()));
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                if !crate::test_script::action_target_is_focused(ctx, &owner) {
+                    ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                }
                 ctx.request_repaint_of(viewport_id);
             } else {
                 crate::test_script::finish_targeted_detached_owner(
@@ -513,7 +548,9 @@ impl App {
             .and_then(|_| self.test_script_window_identity(window_id, viewport_id));
         if committed && actual_owner.as_ref() == Some(&owner) {
             crate::test_script::finish_targeted_detached_owner(&owner, Ok(()));
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            if !crate::test_script::action_target_is_focused(ctx, &owner) {
+                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            }
             ctx.request_repaint_of(viewport_id);
         } else {
             crate::test_script::finish_targeted_detached_owner(
@@ -684,6 +721,15 @@ fn test_script_media_kind(item: &GridItem) -> &'static str {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn host_probe_keeps_unbound_parked_id_and_deduplicates_active_handoff() {
+        assert_eq!(test_script_detached_host_ids([7, 9], Some(9)), vec![7, 9]);
+        assert_eq!(
+            test_script_detached_host_ids([7, 9], Some(11)),
+            vec![7, 9, 11]
+        );
+    }
 
     #[test]
     fn frozen_capture_presentation_requires_parked_at_rest_passive_view() {

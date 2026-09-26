@@ -345,7 +345,7 @@ function Register-UiSmokeScreenshots {
         if ([string]$record.status -eq 'skipped') {
             if ([string]$record.path -or
                 [string]$record.label -notmatch '^[A-Za-z0-9_-]{1,48}$' -or
-                [string]$record.viewport -notmatch '^(root|detached-[0-9]+-[0-9]+)$' -or
+                [string]$record.viewport -notmatch '^(root|fullscreen|preview|detached-[0-9]+(?:-[0-9]+)?)$' -or
                 [string]::IsNullOrWhiteSpace([string]$record.reason) -or
                 [long]$record.frame -lt 0 -or [long]$record.timestamp_ms -le 0) {
                 throw '[screenshot] invalid skipped manifest record'
@@ -356,7 +356,7 @@ function Register-UiSmokeScreenshots {
             throw "[screenshot] invalid manifest status: $($record.status)"
         }
         $relative = [string]$record.path
-        if ($relative -notmatch '^screenshots/[0-9]{2,}-[A-Za-z0-9_-]+-(root|detached-[0-9]+-[0-9]+)\.png$' -or
+        if ($relative -notmatch '^screenshots/[0-9]{2,}-[A-Za-z0-9_-]+-(root|fullscreen|preview|detached-[0-9]+(?:-[0-9]+)?)\.png$' -or
             -not $seen.Add($relative)) {
             throw "[screenshot] invalid or duplicate manifest path: $relative"
         }
@@ -598,6 +598,10 @@ function Save-UiSmokeEvidence {
         prepare_exit_code = $script:prepareExitCode
         app_pid = $script:startedPid
         app_exit_code = $script:appExitCode
+        primary_app_pid = $script:primaryAppPid
+        primary_app_exit_code = $script:primaryAppExitCode
+        restart_app_pid = $script:restartAppPid
+        restart_app_exit_code = $script:restartAppExitCode
         runner_exit_code = $script:runExitCode
         exit_code = $script:runExitCode
         timed_out = $script:timedOut
@@ -1688,6 +1692,61 @@ $arguments = @(
             $script:failureMessage = "application exited with code $processExitCode"
         }
         Write-UiSmokeEvent "exit: $processExitCode"
+        if ($Scenario -eq 'AlwaysOnTop' -and $processExitCode -eq 0) {
+            $script:primaryAppPid = $script:startedPid
+            $script:primaryAppExitCode = $processExitCode
+            $restartScript = Join-Path $PSScriptRoot 'ui-smoke\always-on-top-restart.rhai'
+            if (-not (Test-Path -LiteralPath $restartScript -PathType Leaf)) {
+                throw '[ui-smoke] always-on-top restart script is missing'
+            }
+            $runsRoot = Join-Path $targetRoot 'ui-smoke-runs'
+            $restartRunDir = Join-Path $runsRoot ((Split-Path -Leaf $script:runDir) + '-restart')
+            Assert-NoReparsePath $runsRoot $repoRoot 'restart-runs-root'
+            New-Item -ItemType Directory -Path $restartRunDir -ErrorAction Stop | Out-Null
+            $restartOverridePath = Join-Path $script:runDir 'inputs\restart-settings-override.json'
+            [System.IO.File]::WriteAllText($restartOverridePath, '{}', (New-Object System.Text.UTF8Encoding($false)))
+            Try-AddUiSmokeEvidenceFile $restartScript 'inputs/restart-scenario.rhai' 'restart-scenario-script'
+            Try-RegisterUiSmokeEvidenceFile $restartOverridePath 'inputs/restart-settings-override.json' 'restart-settings-override'
+            $restartArguments = @(
+                '--perf-log',
+                '--data-dir', $dataDir,
+                '--test-script', $restartScript,
+                '--test-evidence-dir', $restartRunDir,
+                '--settings-override', $restartOverridePath,
+                $fixtureDir
+            )
+            Write-UiSmokeEvent 'always-on-top: restarting with the same disposable profile and an empty override'
+            $script:process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $restartArguments) -PassThru
+            $script:startedPid = $script:process.Id
+            $script:restartAppPid = $script:startedPid
+            Write-UiSmokeEvent "restart PID: $($script:startedPid)"
+            while (-not $script:process.HasExited -and
+                -not (Test-UiSmokeDeadlineReached $scenarioClock.ElapsedMilliseconds $timeoutMilliseconds)) {
+                Start-Sleep -Milliseconds 100
+                $script:process.Refresh()
+            }
+            if (-not $script:process.HasExited) {
+                $script:timedOut = $true
+                $script:runExitCode = 124
+                $script:runPhase = 'timed-out'
+                $script:failureMessage = 'always-on-top restart exceeded the scenario deadline'
+            }
+            else {
+                $script:process.WaitForExit()
+                $script:appExitCode = [int]$script:process.ExitCode
+                $script:restartAppExitCode = $script:appExitCode
+                $script:runExitCode = $script:appExitCode
+                $script:runPhase = if ($script:appExitCode -eq 0) { 'completed' } else { 'application-failed' }
+                if ($script:appExitCode -ne 0) {
+                    $script:failureMessage = "always-on-top restart exited with code $($script:appExitCode)"
+                }
+                Write-UiSmokeEvent "restart exit: $($script:appExitCode)"
+            }
+            if ((Get-Content -LiteralPath $marker -Raw -Encoding ASCII).Trim() -ne $expectedMarker) {
+                throw '[ui-smoke] disposable marker changed during the restart'
+            }
+            Try-AddUiSmokeEvidenceDirectory $restartRunDir 'restart' 'restart-run'
+        }
         if ($Scenario -eq 'RatingSort' -and $processExitCode -eq 0) {
             & python $candidateFixtureGeneratorPath $candidateFixtureDir --verify-settings $dataDir
             if ($LASTEXITCODE -ne 0) {

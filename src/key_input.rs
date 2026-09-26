@@ -45,7 +45,7 @@ impl PhysicalKeySlot {
     }
 }
 
-/// Navigation keys supported by the initial synthetic-input timeline.
+/// Navigation keys and F12 supported by the synthetic-input timeline.
 ///
 /// Printable keys, JIS symbols, numpad-specific keys, clipboard shortcuts,
 /// text events, and IME events are intentionally not representable here.
@@ -61,6 +61,7 @@ pub enum SyntheticNavigationKey {
     End,
     Enter,
     Escape,
+    F12,
 }
 
 impl SyntheticNavigationKey {
@@ -77,6 +78,7 @@ impl SyntheticNavigationKey {
             Self::End => "End",
             Self::Enter => "Enter",
             Self::Escape => "Escape",
+            Self::F12 => "F12",
         }
     }
 
@@ -92,6 +94,7 @@ impl SyntheticNavigationKey {
             Self::End => PhysicalKeySlot::new(0x23, true),
             Self::Enter => PhysicalKeySlot::new(0x0D, false),
             Self::Escape => PhysicalKeySlot::new(0x1B, false),
+            Self::F12 => PhysicalKeySlot::new(0x7B, false),
         }
     }
 
@@ -107,6 +110,7 @@ impl SyntheticNavigationKey {
             Self::End => 0x4F,
             Self::Enter => 0x1C,
             Self::Escape => 0x01,
+            Self::F12 => 0x58,
         }
     }
 
@@ -122,6 +126,7 @@ impl SyntheticNavigationKey {
             Self::End => egui::Key::End,
             Self::Enter => egui::Key::Enter,
             Self::Escape => egui::Key::Escape,
+            Self::F12 => egui::Key::F12,
         }
     }
 }

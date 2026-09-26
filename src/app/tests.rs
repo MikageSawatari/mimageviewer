@@ -1001,6 +1001,57 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
 
 #[test]
 #[cfg(windows)]
+fn synthetic_f12_reaches_the_fullscreen_detached_handler() {
+    let _serial = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.items
+        .push(GridItem::Image(PathBuf::from(r"C:\pics\synthetic-f12.jpg")));
+    app.fullscreen_idx = Some(0);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
+
+    let ctx = egui::Context::default();
+    crate::key_input::install_synthetic_input_plugin(&ctx);
+    crate::key_input::arm_test_synthetic_input(1, egui::ViewportId::ROOT);
+    let key_time = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    crate::key_input::enqueue_test_synthetic_command(crate::key_input::SyntheticKeyCommand::down(
+        key_time,
+        crate::key_input::SyntheticNavigationKey::F12,
+        crate::key_input::SyntheticModifiers::default(),
+    ));
+    crate::key_input::enqueue_test_synthetic_command(crate::key_input::SyntheticKeyCommand::up(
+        key_time,
+        crate::key_input::SyntheticNavigationKey::F12,
+    ));
+    let mut input = egui::RawInput {
+        time: Some(1.0),
+        focused: true,
+        ..Default::default()
+    };
+    input
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .focused = Some(true);
+    ctx.begin_pass(input);
+    assert!(ctx.input(|i| i.events.iter().any(|event| matches!(
+        event,
+        egui::Event::Key {
+            key: egui::Key::F12,
+            pressed: true,
+            ..
+        }
+    ))));
+    let _ = app.handle_fs_key_input(&ctx, 0, false);
+    let _ = ctx.end_pass();
+
+    assert!(app.settings.detached_viewer_enabled);
+    assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+    assert!(app.detached_viewer_window_id().is_some());
+}
+
+#[test]
+#[cfg(windows)]
 fn f12_round_trip_recreates_detached_host_with_borderless_mode_and_restore_placement() {
     const OLD_WINDOW: u64 = 12;
 
@@ -3303,6 +3354,25 @@ fn contextless_test_window(ctx: &egui::Context, id: u64) -> DetachedImageWindowS
         focused_last_frame: false,
         initial_placement_applied: true,
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn active_detached_host_is_registered_once_when_passive_snapshot_remains() {
+    let ctx = egui::Context::default();
+    let active_id = 71;
+    let passive_ids = App::passive_detached_registration_windows(
+        vec![
+            contextless_test_window(&ctx, active_id),
+            contextless_test_window(&ctx, 72),
+        ],
+        Some(active_id),
+    )
+    .map(|window| window.id)
+    .collect::<Vec<_>>();
+    let active_registrations = 1 + passive_ids.iter().filter(|&&id| id == active_id).count();
+    assert_eq!(active_registrations, 1);
+    assert_eq!(passive_ids, vec![72]);
 }
 
 #[test]

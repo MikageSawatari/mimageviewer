@@ -76452,6 +76452,19 @@ impl App {
                 ctx.request_repaint_of(egui::ViewportId::ROOT);
             }
             if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::RestoreFromTray,
+            ) {
+                if let Some(controller) = self.tray_controller.as_ref() {
+                    if let Err(error) = controller.open_for_smoke() {
+                        crate::logger::log(format!("[test-script] {error}"));
+                    }
+                } else {
+                    crate::logger::log(
+                        "[test-script] tray restore requested without a tray controller",
+                    );
+                }
+            }
+            if crate::test_script::take_smoke_action(
                 crate::test_script::UiSmokeAction::CloseFullscreen,
             ) {
                 self.close_fullscreen_to_completion(ctx);

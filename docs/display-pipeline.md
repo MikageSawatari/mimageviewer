@@ -106,6 +106,11 @@ Esc / BS で閉じてグリッドへ戻った直後、一部のサムネが**真
 `texture_backlog` は frame ごとの upload 上限だけを表す。回帰は caller の 4 early-return site、
 painter の no-surface delivery、viewport cleanup 中にも thumbnail upload を遅らせないテストで固定する。
 
+2026-09-27: 同じ shared painter の `set_window(viewport_id, None)` は、その viewport の
+surface だけを破棄する。fullscreen host の再生成時に全 surface を消すと、visible な root は
+egui pass を続けても `SurfaceAbsent` となり screenshot と表示更新が失われる。texture delta の
+共有 renderer への配送契約は維持する。
+
 ### 1.3 ワーカー側の流れ
 
 `thumb_loader.rs::process_load_request`:
