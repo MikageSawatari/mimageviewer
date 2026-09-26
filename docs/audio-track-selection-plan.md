@@ -1,6 +1,6 @@
 # 動画の複数音声トラック選択 設計 (backlog §1.251)
 
-- 状態: 設計案 第3版 (独立レビュー2回目 REVISE と、利用者決定「選択の記憶・Remote 対応」を反映)
+- 状態: 設計案 第4版 (独立レビュー3回目 REVISE と、利用者決定「Remote の再生位置の書き戻し・受け付け時の全閉じ」を反映)
 - 出典: [next-release-backlog.md §1.251](next-release-backlog.md) (>>429)
 - 担当: 設計・検収 = ClaudeCode Opus / 実装 = Codex Sol / 独立レビュー = 別の Sol
 - 関連: [video-architecture.md](video-architecture.md) (decoder 3-thread 構成・seek 調停・audio.rs・Norm)、
@@ -26,7 +26,11 @@
 - 詳細表示 (一覧の詳細列・`probe_audio_details`) はファイル単位の情報として既定トラックのまま。
 - 字幕。字幕機能は存在しない。本機能の状態は字幕と共有しない。
 - 開いた時点で既定トラックの音声初期化に失敗した動画での、別トラックへの切り替え (§7.4)。
-- Remote で見た再生位置の PC への書き戻し (既存の未実装事項。§11)。
+
+範囲に加えたもの (利用者決定 2026-09-26):
+
+- **Remote で見た再生位置の PC への書き戻し** (§9B)。そのために、Remote 接続を受け付けた時点で PC の閲覧
+  ウィンドウをすべて閉じる。
 
 ## 2. 現状 (コード確認 2026-09-26)
 
@@ -110,15 +114,20 @@ pub struct AudioTrackInfo {
 
 // VideoInfo
 pub audio_tracks: Vec<AudioTrackInfo>,        // 再生可能 (decoder が見つかる) 音声 stream のみ、stream 順
-pub default_audio_stream_index: Option<usize>, // open 時に best(Audio) で選ばれ、実際に開いた stream
+pub default_audio_stream_index: Option<usize>, // 常に best(Audio) の結果 (実際に開いたかどうかとは無関係)
 ```
 
 - 列挙は demux thread が open 時に行う (`info_tx` 送出の前)。decoder が見つからない stream は列挙しない
   (backlog の「再生可能な音声 stream」)。
 - 取得できない情報は `None` にする。言語名への変換 (「jpn」→「日本語」) は UI 層の固定表で行い、表に無い
   code はそのまま表示する。推測で埋めない。
-- 既存の `audio_codec` / `audio_bit_rate_bps` は「既定トラック (open 時に開いたもの)」の意味のまま残す。
-  HUD の右パネルは選択中トラックの情報を `audio_tracks` から引く (§8.3)。
+- 「既定トラック」は常に `best(Audio)` の結果を指す (表示の「(既定)」と Norm の旧テーブル互換読みに使う)。
+  実際に開いた / 鳴っているトラックは selection の `applied` で表す (§4.2)。
+- 既存の `audio_codec` / `audio_bit_rate_bps` は、実装どおり「open 時に開いた `AudioSetup` のトラック」の値として
+  残す (保存された選択で非既定トラックを開いた場合はそのトラックの値)。HUD の右パネルは `applied` のトラックの
+  情報を `audio_tracks` から引く (§8.3)。
+- 初期トラックの決定は純粋関数 `resolve_initial_audio_track(tracks, default, saved_choice) -> Option<usize>` に
+  置き、demux (ローカル再生) と Remote の配信開始 (§9A) の両方がこれを使う。音声出力 device の成否に依存しない。
 
 ### 4.2 選択状態 (動的) — 単一 owner `AudioTrackSelection`
 
@@ -158,7 +167,8 @@ struct AudioTrackSelectionState {
 
 1. `stream_index` が `audio_tracks` に無い、または selection が無い player なら何もせず `Rejected` を返す。
 2. `desired.stream == stream_index` かつ失敗状態でないなら no-op (`Unchanged`)。
-3. `desired = (desired.gen + 1, stream_index)` を書く。
+3. Norm が全体 ON なら、表に `stream_index` の値が無ければ `Pending` を書く (§6.1 の遷移 1。seek の公開より前)。
+   その後で `desired = (desired.gen + 1, stream_index)` を書く。
 4. 末尾の保留条件 (§7.3) に当たるなら seek は発行しない。`Deferred` を返す。
 5. それ以外は、**3 の後で**、位置を保つ seek を 1 回発行する:
    - 基準位置: 一時停止中 (frame-step pause を含む) は `last_displayed_pts_secs()`、それ以外は
@@ -313,38 +323,57 @@ gain は「その音声がどのトラックのものか」で決まる値にす
   | `Pending` | Norm ON で、このトラックの gain がまだ決まっていない | **このトラックの frame だけ** processed にしない (raw に保持)。他のトラックの frame は通常どおり処理する |
   | `Gain(g)` | 測定済み (確定 / 仮) または未測定で unity と決めた | g |
 
-- pump は処理する frame のトラックが直前に処理したトラックと異なるとき、ramp せずにそのトラックの gain へ snap する。
-  同じトラックの gain 変更 (手動 ON/OFF、仮 → 確定) は既存どおり 4 秒 ramp。
-- `Pending` のトラックの frame が止まっている間は `BufferReady` が出ないので、切り替えの seek 後の engine は
-  Buffering で待つ (既存の preroll suspension と同じ効果を、そのトラックに限って得る)。旧トラックの frame
-  (末尾の drain、切り替え失敗時の再開) は影響を受けない。
+- snap と ramp:
+  - 処理する frame のトラックが直前に処理したトラックと異なるとき、ramp せずにそのトラックの gain へ snap する。
+  - あるトラックが `Pending` から `Gain` になって最初に処理する frame も snap する。既存の「scan 待ち
+    (グローバル suspension) の解除時は最初の gain へ snap する」(`audio.rs:1535-1547`) もそのまま維持する。
+  - それ以外の同じトラックの gain 変更 (手動 ON/OFF、仮 → 確定) は既存どおり 4 秒 ramp。
+- `Pending` のトラックの frame が raw の先頭を塞いでいる間は `BufferReady` を出さない。既存の pump は processed が
+  0 でも demux が EOF なら `BufferReady` を出す (`audio.rs:1821-1842`) が、raw の先頭が `Pending` で止まっている
+  間はこの EOF 例外も抑止する (短い素材の末尾で待機を抜けて、未処理の音を捨てたまま Playing にしない)。
+  旧トラックの frame (末尾の drain、切り替え失敗時の再開) は影響を受けない。
+- `Pending` で raw に保持する量は既存の raw 先読み上限 (5 秒) に従い、上限に達すれば既存どおり bounded queue の
+  back-pressure が decoder / demux へ返る (新しい上限は作らない)。
 - 既存のグローバル `audio_preroll_suspended` と未測定 scan の仕組みは、そのまま「scan 待ち」専用として残す。
   トラック切り替えのためにグローバル suspension は使わない。
 
-遷移 (所有者は App の Norm owner。表の書き込みは player の API 経由だけ):
+遷移 (表の書き込みは player の API 経由だけ。lookup の起動・結果の適用は App の Norm owner):
 
-1. `select_audio_track(S)` が `Requested` / `Deferred` を返し、Norm が全体 ON で、表に S の値が無いとき:
-   S = `Pending` にし、S の測定値 lookup を worker で始める (file metadata + SQLite。UI thread で I/O しない)。
-   S が既に `Pending` / `Gain` なら何もしない (lookup を重複させない。再選択・`Unchanged` で何も解除しない)。
-   `Rejected` / `Unchanged` は表を変えない。
-2. lookup 結果 (player identity, file path, S) が届いたら、S がまだ `Pending` のときだけ適用する
-   (Norm OFF への切り替え等で表が作り直されていれば捨てる):
+1. **`Pending` は seek の公開より前に立てる。** `VideoPlayer::select_audio_track(S, norm)` は `norm` に
+   「Norm が全体 ON か」と現在の table epoch を受け取り、`Rejected` / `Unchanged` の判定を済ませた後、seek を
+   発行する**前に**、表に S の値が無ければ S = `Pending{request}` を書く (`request` は後述)。その後で `desired` を
+   書き、seek を発行する。戻り値に「lookup が必要か (`request`)」を含め、App はそれを見て worker を起動する。
+   - S が既に `Pending` / `Gain` なら何もしない (lookup を重複させない。再選択・`Unchanged` で何も解除しない)。
+   - `Rejected` / `Unchanged` は表を変えない。
+   - `Deferred` (末尾) でも `Pending` を立てる (S の frame は次の seek まで来ないので、旧トラックの drain は止まらない)。
+2. **open 時も同じ規則にする。** Norm が全体 ON なら、player は開いたトラック (`applied`) を `Pending` で始め、
+   App は `VideoInfo` を受け取った時点で同じ lookup を起動する。既存の open 時の同期 lookup
+   (`app.rs:58971-58990`、path 単位・UI thread)・「未測定なら autoplay を一時 false」・open 時の初期 gain の
+   受け渡しは、この非同期解決に置き換える (open 時にはまだどのトラックを開くか確定していないため、path 単位の
+   lookup では保存された非既定トラックに正しい gain を結び付けられない)。置き換え後の遷移は、既存の Norm の
+   テスト (open 時の測定済み即時適用・未測定の deferred scan・キャッシュ hit の grid 再開) の期待と対応付けて
+   維持を示す。保存したトラックを開けず既定トラックで開き直した場合も、開いたトラックについて同じ規則で解決する。
+3. **lookup の要求と結果の照合。** `request = (table_epoch, request_seq, stream, target_lufs_milli)`。
+   `table_epoch` は Norm OFF で表を空にするたびに進む。lookup 結果は `request` をそのまま持って返り、App は
+   player の表の S が同じ `request` の `Pending` のときだけ適用する (OFF → ON で再び `Pending` になった S に、
+   OFF 前の結果や別の目標 LUFS の結果を適用しない)。適用内容:
    - 測定済み → S = `Gain(g)`。
    - 未測定 → 既存の未測定経路に S を渡す。scan を始める条件 (play intent・fullscreen・S の自動 scan 抑止なし・
      S の UI 状態が `OnUnmeasured`) を満たす場合は、既存どおりグローバル preroll suspension を立てて scan を
      始めてから S = `Gain(1.0)` にする (suspension が先なので unity の音は出ない)。scan を始めない / 始められない
      (一時停止中・抑止中・開始失敗) 場合は S = `Gain(1.0)` にし、S の UI 状態を `OnUnmeasured` にする。
+     「トラック確定待ち」から既存経路へ渡すため、S の UI 状態は lookup 結果の適用時にまず `OnUnmeasured` に
+     してから既存の開始条件を評価する。
    - lookup 失敗 (I/O エラー等) → ログを残して S = `Gain(1.0)`、UI 状態は `OnUnmeasured`。
    どの分岐でも S は `Pending` のまま残らない。
-3. scan の完了・仮結果は、その scan の対象トラック (scan state が持つ stream index) の値だけを更新する。
+4. scan の完了・仮結果は、その scan の対象トラック (scan state が持つ stream index) の値だけを更新する。
    別トラックの値・再生 intent は触らない (既存の「仮 gain 適用後のバックグラウンド scan は再生 intent を
    再度横取りしない」も維持)。
-4. 選択されたトラックと別のトラックを対象にした**ブロッキング中の** scan (仮結果の前、グローバル suspension を
+5. 選択されたトラックと別のトラックを対象にした**ブロッキング中の** scan (仮結果の前、グローバル suspension を
    持っている) は、選択時に既存の cancel 経路で止める (既存の cancel 経路が再生 intent と suspension を戻す)。
-   仮結果適用後のバックグラウンド scan は続けてよい (完了は 3 のとおり対象トラックの値だけを更新する)。
-5. Norm 全体 OFF: 表を空にする (全トラック unity、`Pending` も解消)。届いた lookup 結果は 2 の条件で捨てる。
-   Norm 全体 ON: 既存の ON 経路を `applied` のトラックについて行う。
-6. open 時: 既存の初期 gain の受け渡し (`VideoPlayer::open` の initial gain) は「既定トラックの値」として表に入れる。
+   仮結果適用後のバックグラウンド scan は続けてよい (完了は 4 のとおり対象トラックの値だけを更新する)。
+6. Norm 全体 OFF: 表を空にし `table_epoch` を進める (全トラック unity、`Pending` も解消)。
+   Norm 全体 ON: `applied` のトラックについて 1 と同じく `Pending` → lookup を行う。
 
 - 「トラック確定待ち」のための App の bool / Option は足さない。状態は player の表と、既存の per-fs_idx Norm 状態
   (stream index を key に含めたもの) だけにある。
@@ -468,7 +497,7 @@ seek を取り出していなければ要求は上書きされ (latest-value)、
 ### 8.3 右パネル (動画メタデータ)
 
 - 「音声」行を選択中トラック (`applied`) の codec / channels / 言語 / title に切り替える。bitrate は既定トラック
-  しか取れていないので、既定トラック選択時だけ表示する。
+  しか取れていないので、`applied` が open 時に開いたトラックのときだけ表示する。
 - トラックが 2 本以上ある場合は「音声トラック: N 本」を添える。
 
 ### 8.4 keymap
@@ -494,30 +523,43 @@ Remote で続きを見るときも、同じトラックで始める。
   行ごと消える (`save_video_resume_position`)。トラックの選択は見終わった後も (次に開いたときも) 有効であるべきで、
   寿命が違う。
 - 読み書きは再生位置と同じ `COMPLEX_FIELDS` 方式 (起動時に全件読み込み、`save_full` で DELETE + 明示列 INSERT)。
-  新しい表なので既存データの移行は無い。旧版は `reject_newer_app_version` で新しい DB を開かないので、旧版が
-  この表を壊すことも無い。
+  新しい表なので既存データの移行は無い。
+- 旧版との関係: リリース済みの v4.1.0 と開発中の版は同じ版番号なので、`reject_newer_app_version` による旧版の
+  起動拒否には頼れない。旧版がこの DB を開いても安全である根拠は、旧版の settings.db 処理が既知の表だけを明示列で
+  読み書きし、知らない表には触れないこと (実装者がコードで確認し、S5 の報告に根拠の行を示す)。
 - 件数の上限は再生位置と同じく設けない。環境設定「保存済み位置の管理」の「動画・音声の再生位置をすべてクリア」
   で、この表も一緒にクリアする (文言も「再生位置と音声トラックの選択」に合わせる)。
+- path のライフサイクルは再生位置の map と同じ owner で処理する: ファイル削除時の破棄
+  (`purge_video_resume_positions_for_removed_paths`、`app.rs:32641`) とリネーム時の移行
+  (`migrate_video_resume_positions_for_renamed_path`、`app.rs:34820`) に、この map も含める。
 
 ### 9.2 いつ保存するか
 
-- 利用者の選択が**確定したとき** (`applied` が変わり、そのトラックが利用者の選択によるもの) に、App (core の
-  UI thread、唯一の書き手) がメモリ上の表を更新する。ディスクへは既存どおり次の `Settings::save()` で書く。
-  失敗した選択・保留中の選択は保存しない。
-- 既定トラックを選び直した場合も、その選択を保存する (明示の選択として扱い、既定の変化に左右されない)。
-- Remote での選択も同じ表を更新する (§9A.3)。書き手は core のまま (Remote plan §2.1 の不変条件)。
+保存の契機は「利用者の明示の選択が成功したとき」で、次の 2 つ (書き手は core の UI thread の App だけ。Remote plan
+§2.1 の不変条件どおり):
+
+- `select_audio_track` が `Requested` を返した選択が、その generation で `applied` になったとき
+  (App は毎 tick、player の selection snapshot の `applied.gen` を「最後に保存した generation」と比べる。最後に保存
+  した generation は player が持つ)。失敗・保留中・古い generation は保存しない。
+- `select_audio_track` が `Unchanged` を返したとき (いま鳴っているトラックを明示的に選び直した。既定トラックを
+  選び直した場合を含む)。その時点の `applied` のトラックを保存する。
+- Remote での選択は §9A.3 の確定時点で保存する。
+- メモリ上の map を更新し、ディスクへは既存どおり次の `Settings::save()` で書く。
 
 ### 9.3 開くときの初期トラック
 
 - `VideoPlayer::open` に `initial_audio_track: Option<AudioTrackChoice>` を渡す。demux は open 時にトラックを
-  列挙した後、保存された選択に**一致するトラック**があればそれを開く。一致の条件は `stream_index` が同じで、
-  codec が同じ、かつ保存時に language / channels があればそれも同じこと (ファイルが作り直されて index の意味が
-  変わった場合を拾う)。
+  列挙した後、`resolve_initial_audio_track` (§4.1) で開くトラックを決める。
+- 一致規則: 保存された選択の `stream_index` のトラックがあり、codec が同じで、保存時に language / channels /
+  title があればそれぞれ同じこと。保存時に無かった項目は比較しない。
+  - ファイル identity (size / mtime) は比較しない。再生位置も path だけで引いており、同じ構成のファイル (再
+    エンコード等) で同じ index・codec・言語・チャンネル数・title を持つトラックは、利用者にとって同じトラックと
+    みなしてよい。構成が変わった場合は上の項目のいずれかが変わって一致しない。
 - 一致しない / 無い → 既定トラック (`best(Audio)`) で開く。保存された行は消さない (次の選択で上書きされる)。
-- 一致したが開けなかった (decoder open 失敗) → 既定トラックで開き直し、selection の `last_failure` に
-  「保存したトラックを開けなかった」(generation 0) を記録する。App はこれを 1 回トーストで通知する。
-- `default_audio_stream_index` は常に `best(Audio)` の結果 (表示の「(既定)」と Norm の旧テーブル互換読みに使う)。
-  `applied` の初期値は実際に開いたトラック。
+- 一致したが開けなかった (decoder open 失敗) → 既定トラックで開き直す。これは切り替えの失敗 (`last_failure`) とは
+  別の、open 時 1 回だけの通知 `open_notice: Option<SavedTrackUnavailable>` として selection に持つ (初期状態
+  `desired = applied = (0, 既定)` は「確定」で、失敗表示とは重ならない)。App はこれを 1 回トーストで通知する。
+- `applied` の初期値は実際に開いたトラック。
 - source swap・通常 open・タイル・遅延 open・Remote の headless player のすべてが `build_video_player_for_open` を
   通るので、そこで表を引いて渡す (メモリ上の HashMap の参照だけで I/O は無い)。
 
@@ -528,50 +570,144 @@ Remote で続きを見るときも、同じトラックで始める。
 - Remote の動画は core の時計なし transcode (`clockless_transcode.rs`) が再生器とは別にファイルを開き、
   `best(Audio)` の 1 本だけを AAC にして fMP4 / HLS で配る (`clockless_transcode.rs:1522-1526`)。PC と Remote の
   トラックは今は偶然一致しているだけ。
-- 開始位置は PC 側の再生位置の表から取る (headless player 経由)。Remote から再生位置は書き戻さない。
+- 開始位置は PC 側の再生位置の表から取る (headless player 経由)。Remote から再生位置は書き戻さない (§9B で対応)。
 - 画質変更は `RemoteVideoStreamingSession::change_quality` が現在位置から新しい generation の transcode を始める。
-  古い generation への要求は 409 で拒否され、client は新しい generation の playlist に付け替える。
+  配信リソース (playlist / segment) の古い generation への要求は 409 で拒否される (`session.rs:440-448`)。
+  一方、control 自体は session ID だけで照合され generation を見ない (`http.rs:1495-1500`、`ui.rs:1731-1744`)。
 - protocol は `crates/remote-ipc` の `PROTOCOL_VERSION = 61` で、完全一致を要求する。
 
 ### 9A.2 開始時
 
 - transcode の選択: `ClocklessTranscodeOptions` に `audio_stream_index: usize` を足し、`best(Audio)` の独自選択を
   やめる。値は session が持つ「選択中トラック」。
-- 開始時の選択中トラック: headless player を §9.3 と同じ `initial_audio_track` で開き、その `applied` を使う
-  (PC と同じ一致規則を 1 か所で持つ)。
+- 開始時の選択中トラック: headless player の `VideoInfo.audio_tracks` / `default_audio_stream_index` と §9.1 の
+  保存された選択から、§4.1 の `resolve_initial_audio_track` で決める。headless player の selection (音声出力
+  device の成否に依存する) は使わない。PC に音声出力 device が無くても Remote は選択どおりに始まる。
+  start の要求に `audio_track: Option<usize>` があれば (§9A.3 の 409 後の再開)、それが `audio_tracks` に含まれる
+  ときに限り保存された選択より優先する。
 - `VideoStreamStartPayload` / `VideoStreamStatePayload` に `audio_tracks: Vec<RemoteAudioTrack>` と
   `audio_track: Option<usize>` (選択中の stream_index) を足す。`RemoteAudioTrack` は stream_index と、core が作った
   表示ラベル `label` (§8.1 と同じ関数) と `is_default`。client は言語表などを持たない (表示文言の owner を core の
   1 つにする)。
-- protocol version を 62 へ上げる (payload と control action の追加)。
+- protocol version を 62 へ上げる (payload・control action・start の要求の追加)。
 
 ### 9A.3 Remote での切り替え
 
-- `VideoStreamControlAction::AudioTrack { stream_index, position_secs }` を足す (`http.rs` は `serde(flatten)` で
-  そのまま通る)。
-- core の `apply_remote_video_control` (UI thread) は、`stream_index` がその stream の `audio_tracks` に含まれる
-  ことを確かめ、session の `change_audio_track(stream_index, position_secs)` を呼ぶ。実装は `change_quality` と
-  同じ形 (選択中トラックを更新して新 generation を始め、始められなければ元に戻す)。
-- 新 generation の開始に成功したら §9.2 の表を更新する (Remote での選択も「そのファイルの選択」として記憶)。
-- most-recent-wins: 各切り替えが新しい generation を作り、古い generation の要求は既存どおり 409 で拒否される。
-  最後の control が最後の generation になる。transcode worker の新旧は既存の process-wide resource lease で
-  直列化される。
+- `VideoStreamControlAction::AudioTrack { stream_index, position_secs, expected_generation }` を足す。
+- core の `apply_remote_video_control` (UI thread) は、session ID に加えて `expected_generation` が session の現在の
+  generation と一致することを確かめ、一致しなければ `stream_generation_mismatch` (409) で拒否する。遅れて届いた
+  古い操作が新しい選択を上書きしない。`stream_index` がその stream の `audio_tracks` に含まれることも確かめる。
+- 検証を通ったら session の `change_audio_track(stream_index, position_secs)` を呼ぶ。`change_quality` と同じ形で、
+  選択中トラックを更新して新 generation を始め、始められなければ元に戻す。
+- **選択の確定と記憶は、その generation が Ready になり、その generation の音声 stream が選択と一致した時点**。
+  `start_new_generation` は worker を spawn した時点で成功を返し、stream の open・Ready は後から起こるため、
+  spawn の成功では記憶しない。確定前に次の切り替えで置き換えられた generation、失敗した generation は記憶しない。
+  generation が失敗した場合は既存の配信失敗の扱い (配信の停止と client のエラー表示) に従い、利用者が再開すると
+  最後に確定したトラック (記憶された選択) で始まる。
+- client は切り替えの操作に番号を付け、最新の操作以外の応答 (成功・409 とも) を捨てる。
+- 409 のとき (session が入れ替わった等) は、画質変更と同じく `restartAt` で新しい session を始めるが、start の要求に
+  選んだ `audio_track` を渡す (§9A.2)。現行の start は quality しか渡さないので追加する。
+- 古い generation の transcode worker と新しい worker は既存の process-wide resource lease で直列化される。
 - Remote の Norm gain: 現在は session 開始時に path 単位で 1 回引いた値を全 generation が使う
   (`app.rs:58971-58982`)。これをトラック単位にする。gain の解決は **generation の worker の中で** 行う
-  (worker はどうせファイルを開くので、DB の lookup もそこで行い、UI thread で I/O しない)。規則は §6.1 の DB 規則
-  (追加テーブル優先、既定トラックだけ旧テーブル互換読み)。未測定なら unity (Remote は scan しない現状どおり)。
+  (UI thread で I/O しない)。worker は App が持つ `AudioNormalizeDb` の接続とは別の読み取り専用接続を開き、
+  session 開始時に取った設定の snapshot (Norm が全体 ON か、目標 LUFS) を使う。規則は §6.1 の DB 規則 (追加
+  テーブル優先、既定トラックだけ旧テーブル互換読み)。未測定なら unity (Remote は scan しない現状どおり)。
 - client (`crates/remote-web/web/video-stream.mjs`): 「操作」ページの画質の並びの隣にトラックの並びを置く
   (トラックが 2 本以上のときだけ)。押すと `MEDIA_AUDIO_TRACK` command → `POST /api/video/control
-  {action: "audio_track", stream_index, position_secs: currentPosition()}` → 既存の `refreshGeneration()`。409 の
-  ときは画質変更と同じ fallback (`restartAt`)。選択中の表示は server の state (`audio_track`) で更新する
-  (`setMediaState` / `applyServerState`)。
-- PC 側で再生中の player には影響しない (Remote の所有中は PC 側は一時停止で、制御が戻ると §9.3 の表を引いて
-  開き直す既存経路に乗るので、Remote で選んだトラックで再開する)。
+  {action: "audio_track", stream_index, position_secs: currentPosition(), expected_generation}` → 既存の
+  `refreshGeneration()`。選択中の表示は server の state (`audio_track`) で更新する (`setMediaState` /
+  `applyServerState`)。
+- PC 側: Remote の受け付け時に PC の閲覧ウィンドウはすべて閉じる (§9B.2)。所有終了後に PC で開くと、§9.3 の
+  記憶された選択 (Remote で選んだもの) で始まる。
 
-### 9A.4 対象外
+## 9B. Remote で見た再生位置の PC への書き戻し
 
-- Remote で見た再生位置の PC への書き戻しは既存の未実装事項で、本機能の範囲外 (backlog に起票する)。
-  トラックの選択は core が control を受けた時点で記憶するので、書き戻しが無くてもトラックは PC に戻る。
+利用者決定 (2026-09-26): Remote で見進めた位置を PC の再生位置へ書き戻す。書き戻しと競合するローカルの
+閲覧状態を残さないため、**Remote 接続を受け付けた時点で、ローカルの閲覧ウィンドウをすべて閉じる**。
+
+### 9B.1 現状の競合 (コード確認 2026-09-26)
+
+再生位置の書き手はすべて「ローカルの `VideoPlayer` の位置」を無条件に書く (変化の有無を見ない)。Remote 所有中も
+ローカルの player は一時停止のまま `fs_cache` に残るので、Remote が位置を書いても次の経路で古い位置に戻される。
+
+- `poll_video` の 5 秒周期の保存 (`app.rs:75839-76287`): 一時停止中の player も毎回書く。Remote 所有中は
+  `poll_remote_session` が 1 秒ごとに repaint するので、この保存は動き続ける。main・active detached・ParkedLive の
+  各 context で動く。
+- Remote 終了時の `reload_after_remote_session_release` → `close_fullscreen` → `save_all_video_resume_positions`
+  (`remote_ipc/ui.rs:3650`、`app.rs:61022`)。
+- detached / ParkedLive の player は Remote 終了後も残り、teardown・終了時の保存で書く。
+- 静止画・本のページ位置も、Remote の既存の読書位置の書き込み (`persist_remote_reading_progress`) と、ローカルに
+  残った閲覧ウィンドウの状態が同じ形で競合し得る。
+
+個々の書き手に「Remote が触った key は書かない」条件を足す方式は、書き手が多く (上記 + teardown・トレイ・
+終了・source swap・evict)、静止画側にも同型の経路があり、漏れが残りやすい。
+
+### 9B.2 受け付け時にすべて閉じる
+
+- Remote の所有が確定した時点 (`poll_remote_session` の `acquisition_changed`、`pause_local_progress_for_remote_session`
+  の位置) で、現在の「一時停止 + 保存」の代わりに次を行う:
+  1. 既存どおり全 context の再生位置を保存する (`save_all_video_resume_positions` /
+     `save_detached_video_resume_positions_for_exit`)。これは Remote が書き込みを始める前なので正しい。
+  2. すべての別ウィンドウ (active detached、passive / ParkedLive、メディア窓) を、表示モード変更で使っている既存の
+     `close_all_detached_viewers_for_mode_change` で閉じる (保存付きの teardown を通る)。
+  3. main のフルスクリーンが開いていれば `close_fullscreen` で閉じる。
+  4. 既存のスライドショー停止・保留中の source swap / 連続移動の破棄はそのまま。
+- 不変条件: **Remote の所有中 (phase が `Local` 以外) は、ローカルに閲覧中の player・閲覧ウィンドウが存在しない。**
+  所有中にローカルで閲覧を開く経路があれば、それも止める (実装者が経路を列挙して確認し、テストで固定する)。
+- Remote 終了時: 閉じたものを復元しない。`reload_after_remote_session_release` の「フルスクリーンだったら閉じて
+  あとで開き直す」経路は、上の不変条件により所有終了時にフルスクリーンが存在しないので働かない。一覧の再読み込み
+  (外部変更の反映) は残す。利用者が次に開いたときに、Remote が書いた位置とトラックで始まる。
+- 利用者への見え方: Remote 接続を受け付けると PC の閲覧ウィンドウが閉じ、「リモート接続中」ダイアログだけになる。
+  切断後は一覧に戻る。マニュアルに書く。
+- detached 経路への影響: 既存の terminal close を Remote 受け付けからも呼ぶ構造変更で、症状パッチではない。
+  CLAUDE.md の detached ルールに従い、独立レビューでその合意を取り、detached-rework-plan §11 に記録する。
+
+### 9B.3 端末からの位置の報告
+
+- 新しい書き込み `RemoteWriteRequest::RecordVideoProgress { address, position_secs, duration_secs, ended }` を
+  足す (既存の `RecordReadingProgress` と同じ書き込みレーン: HTTP `/api/write` → remote service → IPC → core の
+  UI thread の FIFO。所有権の検査・応答あり。`DrainingRemote` 中は既存どおり拒否)。
+- client (`video-stream.mjs`) が送る契機:
+  - 再生中は 5 秒ごと (PC の周期保存と同じ間隔)。
+  - 一時停止したとき、シークが確定したとき、画質・トラックを切り替えたとき。
+  - viewer を離れるとき (`destroy()`: 戻る、前後の動画へ移動、一覧へ)。
+  - ページが隠れたとき (`visibilitychange` → hidden)。ページの破棄に備えて keepalive で送る。
+  - 再生終了 (`ended`) で `ended: true`。
+  - 送信は既存の読書位置と同じく promise の列で直列化し、端末内で順序を保つ。
+- 位置は `currentPosition()` (端末で実際に再生している位置)。transcode は再生より先行しているので、headless
+  player や transcode の位置は使わない。
+- 利用者が「切断する」を押す、または端末側から終了する場合、端末は最後の位置を送ってから所有を手放す
+  (client の切断処理で書き込みの完了を待つ)。PC 側から切断された場合は `DrainingRemote` で書き込みが拒否され、
+  最後の報告以降 (最大 5 秒) の進みは残らない。これは既知の制限としてマニュアルと設計に書く。
+
+### 9B.4 core での適用
+
+- `address` を検証 (既存の `validate_write_request`) し、動画・音声ファイルであることを確かめる。
+- `apply_media_resume_updates` を `MediaResumeUpdate { path, key, position, duration, at_eof: ended }` で呼ぶ。
+  PC と同じ規則 (`save_video_resume_position`: 先頭 3 秒未満・末尾 5 秒以内・EOF で削除) と読書履歴の進捗更新が
+  1 か所で適用される。再生位置のサムネイル (`maybe_schedule_video_resume_thumbnail`) も同じ入口から予約される。
+- 読書履歴: 進捗の更新は既存行にしか効かない (`update_media_progress` は UPDATE のみ)。Remote で動画の配信を
+  始めたとき、PC で開いたときと同じ `record_reading_history` で履歴の行を作る (Remote での視聴も視聴として
+  履歴に残す)。
+- ディスクへの保存は PC と同じく次の `Settings::save()` / 終了時。Remote 終了時 (所有が `Local` に戻ったとき) に
+  `Settings::save()` を 1 回行う (長い Remote 利用中の PC の異常終了で失わないよう、区切りで保存する)。
+  保存は既存の保存経路 (latest-value writer 等) の規則に従い、UI thread で同期 I/O を増やさない。
+
+### 9B.5 開始位置 (既存どおり)
+
+- Remote の開始位置は既存どおり PC 側の再生位置の表から取る (headless player を `from_grid=true` で開く)。
+  「一覧から開いたときは先頭から」の設定が ON なら先頭から始まる (PC で一覧から開いたときと同じ意味)。
+
+### 9B.6 テスト
+
+- 不変条件: Remote の所有開始で全 context の player と閲覧ウィンドウが閉じ、保存が 1 回走り、所有中に
+  ローカルの閲覧を開けない。所有終了でフルスクリーンの復元が走らない。
+- 書き戻し: `RecordVideoProgress` が map と読書履歴を更新する。末尾・先頭・EOF の削除規則。所有中でない
+  (Draining・Local) 書き込みは拒否。Remote が書いた位置が、所有終了後に PC で開いたときの開始位置になる
+  (所有終了の経路で古い位置に戻されない: 旧経路の `close_fullscreen` 保存・周期保存の両方を含むシナリオ)。
+- client: 報告の契機 (周期・一時停止・seek 確定・離脱・hidden・ended) と直列化。既存の JS テストの仕組みで。
+- 静止画: Remote で本のページ位置を書いた後、所有終了で PC 側の古い閲覧状態に戻されない。
 
 ## 10. 段階と受け入れ条件
 
@@ -634,6 +770,14 @@ UI より先に入れる (UI から切り替えられるようになった時点
   選択で drain が止まらない、ブロッキング中の別トラック scan が選択で cancel される)、
   scan 中のトラック変更で旧 scan が cancel される、抑止が stream 単位、波形・音楽解析の key に stream index が
   入り別トラックの結果が再利用されない (永続キャッシュ・LRU とも)。
+  - `Pending` が seek の公開より前に立つ (選択 → seek 公開 → pump 処理の順を seam で止め、新トラックの frame が
+    unity で処理されないこと)。
+  - lookup 結果の照合 (Norm OFF → ON 後に OFF 前の結果を捨てる、目標 LUFS 違いの結果を捨てる)。
+  - pump: `Pending` が raw の先頭を塞いでいる間は EOF でも `BufferReady` を出さない (短い素材の末尾で)、
+    `Pending` → `Gain` と scan 待ち解除の最初の gain は snap、同じトラックの変更は ramp。
+  - open 時の非同期解決: 既存の Norm テスト (測定済みの即時適用・未測定の deferred scan・キャッシュ hit の grid
+    再開) の期待を維持、保存した非既定トラックで開いたときにそのトラックの測定値で最初の音が出る、保存した
+    トラックを開けず既定で開き直したときは既定トラックの測定値。
 
 ### S4: UI と操作
 
@@ -646,19 +790,31 @@ UI より先に入れる (UI から切り替えられるようになった時点
 
 - §9 (表・`initial_audio_track`・一致規則・保存の契機・環境設定のクリア)。
 - テスト: settings.db の往復 (表の読み書き、クリアで消える、旧 DB に表が無くても起動する)、一致規則 (index 一致 +
-  codec 不一致で既定へ、language / channels の不一致で既定へ、保存時に無かった項目は比較しない)、確定時だけ保存
-  (失敗・保留は保存しない)、保存トラックを開けなかったときの既定での再 open と通知 1 回。
+  codec 不一致で既定へ、language / channels / title の不一致で既定へ、保存時に無かった項目は比較しない)、保存の
+  契機 (`Requested` が確定したとき・`Unchanged` のとき。失敗・保留・古い generation は保存しない)、保存トラックを
+  開けなかったときの既定での再 open と `open_notice` の通知 1 回 (切り替え失敗の表示と重ならない)、ファイル削除・
+  リネームで map が再生位置と同じく破棄・移行される。
 
 ### S6: mIV Remote
 
 - §9A (transcode の stream 指定、session の `change_audio_track`、payload と control action、protocol 62、
   worker 内の Norm gain 解決、client の並びと command、選択の記憶)。
 - テスト: transcode が指定 stream を encode する (素材の sine 周波数を出力 AAC の decode で判定)、
-  `change_audio_track` が新 generation を作り失敗時に元へ戻す、古い generation への要求が 409、control の
-  `stream_index` 検証、選択が §9 の表に入る、開始時に保存された選択で始まる、protocol の往復 (serde)、
+  `change_audio_track` が新 generation を作り開始できなければ元へ戻す、`expected_generation` 不一致の control が
+  409 で拒否され新しい選択を上書きしない、control の `stream_index` 検証、選択の記憶は generation の Ready 後だけ
+  (spawn 直後・失敗・置換された generation では記憶しない)、開始時に保存された選択で始まる、start の要求の
+  `audio_track` が優先される、PC に音声出力 device が無い (headless player の selection が無い) 状態でも選択どおり
+  に始まる、worker 内の Norm gain 解決 (別接続・設定 snapshot・追加テーブル優先)、protocol の往復 (serde)、
   client 側は既存の JS テストの仕組みがあればそれで command と state 反映を試験する (無ければ理由を報告)。
 
-### S7: 実アプリのシナリオと文書
+### S7: Remote 所有時の全閉じと再生位置の書き戻し
+
+- §9B (受け付け時の全閉じ、所有中の不変条件、`RecordVideoProgress`、client の報告契機と直列化、読書履歴の行、
+  所有終了時の保存)。detached 経路に触れるので、独立レビューで構造的変更であることの合意を取り、
+  detached-rework-plan §11 に記録する。
+- テスト: §9B.6。
+
+### S8: 実アプリのシナリオと文書
 
 - ui-smoke: `AudioTracks` シナリオ (`scripts/ui-smoke/audio-tracks.rhai`)。`multi.mkv` を開き、HUD の音声ボタン →
   2 行目を選択 (native HUD の名前付き control を `native_ui_smoke.rs` の既存方式で追加)、snapshot の
@@ -667,7 +823,7 @@ UI より先に入れる (UI から切り替えられるようになった時点
   切り替え、音声モードでの切り替え、開き直しで保存したトラックから始まることを含める。`capture(label)` で
   egui 側 (音声モード HUD) を保存する。
 - Remote の実機確認は、Remote の PIN 入力を利用者が行う必要があるため利用者に依頼する (PC で選んだトラックで
-  Remote が始まる、Remote で切り替えると PC に戻ったときもそのトラック)。
+  Remote が始まる、Remote で切り替えると PC に戻ったときもそのトラック、Remote で見進めた位置から PC で再開する、Remote 受け付け時に PC の閲覧ウィンドウが閉じる)。
   - 実行は使い捨てコピー (`target\portable-smoke`) で、毎回利用者の了承と時間帯を確認してから。
 - 文書: マニュアルの動画ページと Remote のページ、`docs/spec.md`、`docs/web-remote-video-streaming-plan.md`、
   `htdocs/mimageviewer/privacy.html` の「端末内に保存されるデータ」(選択の保存を追記)、`docs/video-architecture.md` (seek 調停・Flush・Norm の節)、
@@ -677,8 +833,6 @@ UI より先に入れる (UI から切り替えられるようになった時点
 
 - 詳細表示 (一覧): ファイル単位の情報で、再生中の選択とは無関係。
 - 開いた時点で音声が無効な player での切り替え: §7.4。
-- Remote の再生位置の書き戻し: 既存の未実装事項 (Remote plan §10.2 の「端末が playhead を報告する」は未実装)。
-  トラックの記憶とは独立に、backlog の別項目として扱う。
 
 ## 12. 判断済みの事項
 
