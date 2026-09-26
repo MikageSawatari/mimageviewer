@@ -181,6 +181,15 @@ fn with_identity_epub_coverage<T>(
     if descriptor.file == "content_identity.db"
         && descriptor.table == "edit_origin"
         && descriptor.column == "file_key"
+        // Exact PDF/image keys and their `::` page families cannot contain an
+        // EPUB ledger key. Folder ranges can, even when their name has a dot.
+        && paths.iter().any(|path| {
+            path.is_dir()
+                || path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_none_or(|ext| ext.eq_ignore_ascii_case("epub"))
+        })
     {
         crate::pdf_loader::with_epub_pin_coverage(paths, action)
     } else {
@@ -1159,12 +1168,33 @@ pub(crate) fn copy_stores_at(
     data_dir: &Path,
     mappings: &[StoreCopyPathMapping],
 ) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, true)
+}
+
+/// EPUB restore promotes its ledger row under the book guard after copying.
+/// Copying edit_origin here would recursively enter the EPUB range guard.
+pub(crate) fn copy_restore_stores_without_identity_at(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, false)
+}
+
+fn copy_stores_impl(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    include_identity: bool,
+) -> StoreCopyReport {
     let mut report = StoreCopyReport::default();
     // A prepared virtual list must not observe a mixture of copied stores.
     let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
     let _rating_write = crate::rating_db::RATING_WRITES.begin();
     let _tag_write = crate::tags_db::TAG_WRITES.begin();
-    for descriptor in STORES.iter().copied().filter(|store| store.unique) {
+    for descriptor in STORES
+        .iter()
+        .copied()
+        .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
+    {
         let normalized = mappings
             .iter()
             .filter_map(|mapping| match mapping {
@@ -2111,6 +2141,47 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+
+    #[test]
+    fn pdf_and_image_store_copy_does_not_wait_for_epub_range() {
+        let data = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(data.path().join("content_identity.db")).unwrap();
+        db.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let range = data.path().to_path_buf();
+        let holder = std::thread::spawn(move || {
+            crate::pdf_loader::with_epub_pin_coverage(&[range], || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let data_path = data.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let mut errors = Vec::new();
+            for extension in ["pdf", "png"] {
+                let old = data_path.join(format!("old.{extension}"));
+                let new = data_path.join(format!("new.{extension}"));
+                let migrated = run_at(&data_path, &old, &new);
+                errors.extend(migrated.errors);
+                let report = copy_stores_at(&data_path, &[StoreCopyPathMapping::exact(old, new)]);
+                errors.extend(report.errors);
+            }
+            done_tx.send(errors).unwrap();
+        });
+        let completed = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "PDF store copy waited for an EPUB range operation"
+        );
+        assert!(completed.unwrap().is_empty());
+    }
 
     fn open(dir: &Path, file: &str) -> rusqlite::Connection {
         rusqlite::Connection::open(dir.join(file)).unwrap()

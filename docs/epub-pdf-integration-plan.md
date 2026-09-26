@@ -709,8 +709,8 @@ master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` �
 | auto-aspect の最初の seed | `app.rs:18305-18405` は UI の `image_metas` / 要求属性で WebP を比較 | EPUB は UI で解決せず seed を省略し、worker サムネ結果の sample を使う |
 | ピンの source ID と代表 WebP | `folder_thumb_pins.rs:640-759,814-947` は target の stat を ID に埋め込み、`app.rs:80000-80135` 等が要求キーへ写す | EPUB leaf では世代 stamp を source ID と要求の照合属性へ使う。UI での解決を避けるため worker 側で確定させる |
 | フォルダ代表選定・seed | `thumb_loader.rs:2755-2805` は選定元の stat / ピン ID を使う | 通常の代表選定は worker stamp を使う。ドライブ一覧の間接ピン seed は別経路なので下記で扱う |
-| ドライブ一覧の間接ピン seed | `app.rs:30256-30455` は子フォルダの代表行を読み、selection proof を捨てて一覧へコピー。`thumb_loader.rs:1066` は直接 EPUB ピンだけ世代照合 | 子の代表 proof が EPUB、またはピン行の source ID が EPUB なら seed せず、読込済みの旧 seed も破棄。通常の非 EPUB seed は維持 |
-| 仮想フォルダの親子 seed / writeback | `app.rs:27709-27870` は `.pdf` / ZIP だけを対象にし、親 WebP 行を仮想 catalog へコピー、ページ 0 完成時に元ファイル stat で親へ書き戻す | EPUB は明示的に対象外。世代照合を伴わない UI の catalog I/O を追加せず、親とページ 0 が別々に描画される追加コストを受け入れる |
+| ドライブ一覧の間接ピン seed | `app.rs:30259-30495` は子フォルダの代表行を読み、selection proof を捨てて一覧へコピー。`thumb_loader.rs:1066-1177` は worker で子ピン ID と EPUB 世代を照合 | UI は proof の EPUB パス、または EPUB を指す子ピン source ID を要求へ保持する。worker は現行子ピン経路の ID と世代を検証する。正しい世代行は表示し、旧世代・変更済みピンなら固定ドライブアイコンへ戻す。画像と通常 PDF の子ピン lookup は従来どおり。`.epub` を含む画像名は画像として扱う |
+| 仮想フォルダの親子 seed / writeback | `app.rs:27709-27870` は `.pdf` / ZIP だけを対象にし、親 WebP 行を仮想 catalog へコピー、ページ 0 完成時に元ファイル stat で親へ書き戻す | EPUB は明示的に対象外。親とページ 0 が別々に描画される追加コストを受け入れる。PDFium の 100 ms 先読み抑制は EPUB にも適用 |
 | 詳細の `DetailsLazyMeta` メモリ hit | `app.rs:54491-54497,5541-5545` は `image_metas` の元属性で比較 | 実行中の固定世代は不変で、このメモリ表は再起動で破棄されるため変更不要。永続 `pdf_meta` は別行で世代照合 |
 | 外部渡し用 PDF ページ PNG | `materializer.rs:274-292,548-634,1202-1217` は論理ファイルの時刻とサイズを再利用判定に使う | EPUB ページは世代 stamp で再利用し、描画も同一 target。実ファイルの直接渡しは元 EPUB のまま |
 | 外部渡しの結合見開き | `materializer.rs:558-566,937-951` は単一元ファイルが無く空 stamp を使い、再利用が常に miss | EPUB の左右ページも毎回合成するため stale な見開き cache hit は起きない。変更不要 |
@@ -744,8 +744,8 @@ master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` �
 | auto-aspect 初期 seed | `app.rs:18381` で EPUB の元属性 hit を省略 | `epub_auto_aspect_seed_ignores_source_metadata_cache_hit` |
 | ピン source ID | `folder_thumb_pins.rs:738-765` の保留印を `thumb_loader.rs:369` が確定 | `epub_page_pin_source_id_waits_for_worker_generation` と thumbnail 要求テスト |
 | フォルダ代表・seed | `thumb_loader.rs:2719,2791,2950,3124` が共通世代抽出を使用 | 共通世代抽出テスト。ドライブ一覧 seed は次行 |
-| ドライブ一覧の間接ピン seed | `app.rs:30256-30455` で EPUB 代表を seed せず旧 seed を除去 | `drive_list_indirect_epub_cover_is_not_seeded_after_reconversion` |
-| 仮想フォルダの親子 seed / writeback | `app.rs:27721` の対象分岐は PDF / ZIP のみ | `epub_virtual_folder_seed_and_parent_writeback_are_explicitly_excluded`。親とページ 0 の追加描画コストあり |
+| ドライブ一覧の間接ピン seed | `app.rs:30259-30495,79852` が proof または子ピン source ID を渡し、`thumb_loader.rs:1066-1177` が現行子ピンと EPUB 世代を照合 | `drive_list_indirect_epub_cover_matches_current_generation_after_reconversion`、`drive_list_folder_pin_seeds_image_named_cover_epub_png` |
+| 仮想フォルダの親子 seed / writeback | `app.rs:27721` の対象分岐は PDF / ZIP のみ。EPUB は 100 ms 先読み抑制だけ適用 | `epub_virtual_folder_seed_and_parent_writeback_are_explicitly_excluded`。親とページ 0 の追加描画コストあり |
 | `DetailsLazyMeta` メモリ hit | `app.rs:54491,5541` の元属性比較 | 固定世代は実行中不変、表は再起動で破棄。変更不要 |
 | 外部渡し PNG | `materializer.rs:274,555-635` の世代 stamp と同一 target | `epub_materializer_stamp_changes_with_generation_not_source_attributes` |
 | 外部渡しの結合見開き | `materializer.rs:558-566,937-951` は空 stamp で毎回 miss | 再利用されないことを既存 `lookup_reusable` 判定で確認 |
@@ -777,6 +777,16 @@ master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` �
 | 空になった編集 origin の clear / 差し戻し (`content_identity.rs:548-595`) | 対象 EPUB キーの本ロック内で flag を更新 |
 | 共通 STORES の rename / purge / restore copy (`rename_key_migration.rs:1490-1770`) | `edit_origin.file_key` の対象 exact / 子孫パスを範囲 lease で保護して transaction を実行 |
 
-ドライブ一覧から子フォルダを指すピンは、子の代表 proof の勝者またはピン source ID が EPUB の場合、旧行を一覧へ seed せず、読み込んだ一覧 seed も除去する。直接 EPUB ピンは従来どおり worker 世代照合を使う。EPUB ページを指すピンの UI 要求作成では stat を呼ばず、worker 解決印だけを作る。通常 PDF ピンの stat は維持する。キャッシュ管理画面を閉じた際は、アーカイブと EPUB の全削除確認状態を共に消す。
+ドライブ一覧から子フォルダを指すピンの当初の旧行除去は、cache-only 要求で正しい新世代行まで空欄にしたため、次の round 2 で修正した。EPUB ページを指すピンの UI 要求作成では stat を呼ばず、worker 解決印だけを作る。通常 PDF ピンの stat は維持する。キャッシュ管理画面を閉じた際は、アーカイブと EPUB の全削除確認状態を共に消す。
+
+#### S2c-2 独立レビュー fix round 2
+
+- ドライブ一覧の seed は EPUB でも維持する。UI は既読の親代表選定証明の EPUB パス、または型付き source ID の拡張子が EPUB である子ピン ID を要求へ渡す。cache-only worker が子ピン DB を辿り、ID が現行ピン経路と一致した行だけを採用し、固定世代 stamp も照合する。新世代行なら表紙を表示し、旧世代行や子ピン変更後の行は従来の固定ドライブアイコンへ戻す (`app.rs:30259-30495,79852-79911`、`thumb_loader.rs:1066-1177`)。画像・通常 PDF は従来の worker lookup を維持し、`cover.epub.png` は画像である。
+- 復元候補は検出時の未固定 EPUB 元状態を保持する。復元 worker は本単位の固定ガード内で来歴・元台帳・復元先状態をコピー前に検査し、各 edit store のコピーと台帳昇格まで保持する (`content_identity.rs:298-306,1729-1738`、`content_identity/restore.rs:147-250`)。この経路の edit_origin コピーは台帳昇格と重複するため省き、ガードの再入も避ける (`rename_key_migration.rs:1176`)。
+- 存在しない EPUB ページへのピンは UI で stat せず要求を作り、worker の世代解決失敗時に元のフォルダ自動代表要求を実行する (`app.rs:80915-80951`、`thumb_loader.rs:1215`)。普通の PDF ピンは従来どおり UI で存在確認する。
+- `edit_origin` の PDF・画像 exact key の移行とコピーは EPUB 範囲ガードを取らない。EPUB キーが入り得るフォルダ範囲は引き続き保護する (`rename_key_migration.rs:176`)。
+- EPUB 仮想フォルダの親子 seed/writeback は除外したまま、PDFium の 100 ms 先読み抑制だけ適用する (`app.rs:27713-27765`)。PDF 側の設定時点は保持する。キャッシュ管理画面の閉じるボタン経路で EPUB 全削除確認を消す (`ui_dialogs/archive_cache_manager.rs:45-80`)。
+
+実経路テストは `drive_list_indirect_epub_cover_matches_current_generation_after_reconversion` (旧世代のみ・現世代行あり・子の明示ピン・子ピン変更後)、`restore_candidates_rechecks_epub_before_copying_edits` (内容同定で候補作成後、置換と固定を行って `restore_candidates_at`)、`missing_epub_page_pin_falls_back_to_folder_representative_in_worker` (`apply_folder_thumb_pin` → `process_load_request`)、`pdf_and_image_store_copy_does_not_wait_for_epub_range` (`run_at` と `copy_stores_at`)、`drive_list_folder_pin_seeds_image_named_cover_epub_png`、`epub_virtual_folder_seed_and_parent_writeback_are_explicitly_excluded`、`window_close_branch_clears_epub_delete_all_confirmation` (egui のタイトルバー閉じる操作) を追加・拡張した。7 箇所を同時に旧動作相当へ一時差し戻したビルドで各テストが失敗し、さらに現行子ピン ID 照合を単独で除くと子ピン変更後の検査が失敗した。差し戻しは `finally` で byte 単位に復元した。
 
 再起動を模した旧世代 2 ページ→新世代 5 ページの fixture で、実際の `process_load_request`、`process_meta_only_with` (列挙だけ fake)、`load_details_page_count_with_pdf_enumerator` (cache hit、PDFium を呼べば失敗)、`MaterializeSession::materialize` (再利用 hit) を通した。4 つの worker 本体を元 EPUB stat に差し戻し、stamp helper は残した負例では各テストが失敗する。固定ロック、stage-0 来歴、復元先の固定判定、範囲 lease、間接 seed、UI pin stat、仮想フォルダ除外、確認状態も個別の旧動作へ差し戻した負例で各テストが失敗した。

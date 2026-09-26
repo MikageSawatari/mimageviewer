@@ -150,7 +150,11 @@ pub(crate) fn restore_candidates_at(
     declined: &[DeclinedRestore],
     load_sidecar_bases: bool,
 ) -> ContentRestoreReport {
-    let mappings = selected
+    let ordinary = selected
+        .iter()
+        .filter(|selection| selection.candidate.target_kind != ContentKind::Epub)
+        .collect::<Vec<_>>();
+    let mappings = ordinary
         .iter()
         .flat_map(|selection| {
             restore_copy_mappings(data_dir, &selection.candidate, &selection.source)
@@ -166,9 +170,70 @@ pub(crate) fn restore_candidates_at(
         ..ContentRestoreReport::default()
     };
 
-    apply_batch_ledger_updates(data_dir, selected, declined, &mut report);
+    apply_batch_ledger_updates(data_dir, &ordinary, declined, &mut report);
 
-    match load_restore_runtime_updates(data_dir, selected) {
+    let mut accepted = ordinary;
+    for selection in selected
+        .iter()
+        .filter(|selection| selection.candidate.target_kind == ContentKind::Epub)
+    {
+        let Some(expected) = selection.candidate.epub_source_state else {
+            continue;
+        };
+        let result =
+            crate::pdf_loader::with_epub_pin_guard(&selection.candidate.target_path, || {
+                if super::capture_epub_provenance(&selection.candidate.target_path)?
+                    != super::EpubProvenance::Unpinned(expected)
+                {
+                    return Ok(None);
+                }
+                let db = ContentIdentityDb::open_at(&data_dir.join("content_identity.db"))
+                    .map_err(|error| error.to_string())?;
+                let source_entry = db
+                    .ledger_entry(&selection.source.file_key)?
+                    .ok_or_else(|| "restore source ledger row is missing".to_string())?;
+                if source_entry.full_hash.as_deref() != Some(selection.candidate.full_hash.as_str())
+                {
+                    return Err("restore source hash changed".into());
+                }
+                if db
+                    .ledger_entry(&selection.candidate.target_key)?
+                    .is_some_and(|entry| entry.has_restorable_content)
+                {
+                    return Ok(None);
+                }
+                let mappings =
+                    restore_copy_mappings(data_dir, &selection.candidate, &selection.source);
+                let copied = crate::rename_key_migration::copy_restore_stores_without_identity_at(
+                    data_dir, &mappings,
+                );
+                if !copied.errors.is_empty() {
+                    return Err(copied.errors.join("; "));
+                }
+                let (entry, changed) = mark_restored_origin_inner(
+                    &db,
+                    &selection.candidate,
+                    &selection.source,
+                    Some(expected),
+                )?;
+                Ok(Some((entry, changed, copied)))
+            });
+        match result {
+            Ok(Some((entry, changed, copied))) => {
+                report.database_opens += copied.database_opens + 1;
+                report.rows += copied.rows + usize::from(changed);
+                report.ledger_entries.push(entry);
+                accepted.push(selection);
+            }
+            Ok(None) => {}
+            Err(error) => report.errors.push(format!(
+                "content_identity target={}: {error}",
+                selection.candidate.target_path.display()
+            )),
+        }
+    }
+
+    match load_restore_runtime_updates(data_dir, &accepted) {
         Ok((sidecar_mirrors, presence, database_opens)) => {
             report.database_opens += database_opens;
             report.sidecar_mirrors = sidecar_mirrors;
@@ -196,7 +261,7 @@ fn load_restore_sidecar_bases(
 
 fn apply_batch_ledger_updates(
     data_dir: &Path,
-    selected: &[SelectedRestore],
+    selected: &[&SelectedRestore],
     declined: &[DeclinedRestore],
     report: &mut ContentRestoreReport,
 ) {
@@ -512,7 +577,7 @@ fn sidecar_mask_from_row(
 
 fn load_restore_runtime_updates(
     data_dir: &Path,
-    selected: &[SelectedRestore],
+    selected: &[&SelectedRestore],
 ) -> Result<(Vec<RestoreSidecarMirror>, RestorePresence, usize), String> {
     let families = selected
         .iter()
@@ -747,6 +812,7 @@ mod tests {
             target_kind: ContentKind::Epub,
             full_hash: "full".into(),
             sources: vec![restore_source.clone()],
+            epub_source_state: None,
         };
         assert!(
             mark_restored_origin(&db, &candidate, &restore_source)
@@ -754,6 +820,79 @@ mod tests {
                 .is_none()
         );
         assert!(db.ledger_entry(&candidate.target_key).unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_candidates_rechecks_epub_before_copying_edits() {
+        let data = tempfile::tempdir().unwrap();
+        let origin = data.path().join("origin.png");
+        let epub = data.path().join("book.epub");
+        let original_bytes = b"source";
+        std::fs::write(&origin, original_bytes).unwrap();
+        std::fs::write(&epub, original_bytes).unwrap();
+        let db = ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
+        let origin_key = crate::path_key::normalize_keep_drive(&origin);
+        let target_key = crate::path_key::normalize_keep_drive(&epub);
+        let head = super::super::stage1_head_hash(
+            &mut std::io::Cursor::new(original_bytes),
+            original_bytes.len() as u64,
+        )
+        .unwrap();
+        let full =
+            super::super::stage2_full_hash(&mut std::io::Cursor::new(original_bytes)).unwrap();
+        db.upsert(
+            &ContentIdentitySource::from_path(&origin).unwrap(),
+            &RecordedFileState {
+                file_key: origin_key.clone(),
+                size: 6,
+                hashed_mtime: 1,
+            },
+            &head,
+            &full,
+            1,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        let rotations = rusqlite::Connection::open(data.path().join("rotation.db")).unwrap();
+        rotations
+            .execute_batch("CREATE TABLE rotations (path TEXT PRIMARY KEY, angle INTEGER NOT NULL)")
+            .unwrap();
+        rotations
+            .execute(
+                "INSERT INTO rotations(path, angle) VALUES (?1, 90)",
+                [&origin_key],
+            )
+            .unwrap();
+        let origin_entry = db.ledger_entry(&origin_key).unwrap().unwrap();
+        let detection = super::super::DetectionTarget {
+            source: ContentIdentitySource::from_path(&epub).unwrap(),
+            file_key: target_key.clone(),
+            size: original_bytes.len() as u64,
+            origins: vec![origin_entry],
+        };
+        let (candidate, observed) =
+            super::super::detect_target(&db, detection, &std::sync::atomic::AtomicBool::new(false))
+                .unwrap()
+                .unwrap();
+        let candidate = candidate.expect("matching EPUB must create a restore candidate");
+        assert!(candidate.epub_source_state.is_some());
+        let source = candidate.sources[0].clone();
+
+        // Replacement and pin happen after detection but before restore.
+        std::fs::write(&epub, b"replacement with different content").unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 44, 4096);
+        let selection = SelectedRestore { candidate, source };
+        let report = restore_candidates_at(data.path(), &[selection], &[], false);
+        assert!(report.ledger_entries.is_empty());
+        assert_eq!(db.ledger_entry(&target_key).unwrap(), Some(observed));
+        let copied: i64 = rotations
+            .query_row(
+                "SELECT COUNT(*) FROM rotations WHERE path = ?1",
+                [&target_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied, 0, "stale restore must not copy any edit rows");
     }
     use crate::content_identity::{
         ContentIdentitySource, ObservationRole, RecordedFileState, stage0_target,
@@ -775,6 +914,7 @@ mod tests {
                 target_kind: kind,
                 full_hash: full_hash.to_string(),
                 sources: Vec::new(),
+                epub_source_state: None,
             },
             RestoreSourceCandidate {
                 file_key: source_key,

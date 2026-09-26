@@ -9195,6 +9195,7 @@ fn content_restore_prompt_is_held_without_blocking_input_during_fullscreen() {
     let mut app = setup_app_for_test();
     app.settings.first_setup_completed = true;
     app.set_content_restore_candidates(vec![crate::content_identity::RestoreCandidate {
+        epub_source_state: None,
         target_key: "c:/copied/target.png".to_string(),
         target_path: std::path::PathBuf::from("C:/copied/target.png"),
         target_kind: crate::content_identity::ContentKind::Image,
@@ -9247,6 +9248,7 @@ fn content_identity_folder_switch_cancels_worker_and_stale_result_is_not_applied
         items_generation: 8,
         folder_key: crate::path_key::normalize_keep_drive(&old_folder),
         candidates: vec![crate::content_identity::RestoreCandidate {
+            epub_source_state: None,
             target_key: "old-target".to_string(),
             target_path: old_folder.join("target.png"),
             target_kind: crate::content_identity::ContentKind::Image,
@@ -9269,6 +9271,7 @@ fn content_identity_folder_switch_cancels_worker_and_stale_result_is_not_applied
         crate::content_identity::ContentIdentityBackfillPending::for_test();
     app.content_identity_backfill_pending = Some(backfill);
     app.set_content_restore_candidates(vec![crate::content_identity::RestoreCandidate {
+        epub_source_state: None,
         target_key: "pending".to_string(),
         target_path: current_folder.join("pending.png"),
         target_kind: crate::content_identity::ContentKind::Image,
@@ -12362,7 +12365,7 @@ mod phase_c_key_tests {
     }
 
     #[test]
-    fn drive_list_folder_pin_seeds_cached_folder_tile_thumb() {
+    fn drive_list_folder_pin_seeds_image_named_cover_epub_png() {
         let mut app = setup_app();
         let drive_root = app.tmp.path().join("drive-root");
         let pinned_folder = drive_root.join("PinnedFolder");
@@ -12390,7 +12393,7 @@ mod phase_c_key_tests {
             )
             .unwrap();
         let pinned_parent_key = format!(
-            "{}{}image|cover.jpg|-|-|111|4096",
+            "{}{}image|cover.epub.png|-|-|111|4096",
             parent_key,
             crate::thumb_loader::CACHE_KEY_PIN_SUFFIX
         );
@@ -12426,9 +12429,14 @@ mod phase_c_key_tests {
             app.settings.folder_thumb_sort,
             app.settings.folder_thumb_depth,
             &app.folder_pin_map,
+            &app.drive_list_seed_proofs,
             app.folder_thumb_pin_db.as_deref(),
         )
         .expect("drive-list folder pin should create a cache-only request");
+        assert!(
+            req.pinned_only.as_ref().unwrap().seed_proof.is_none(),
+            "cover.epub.png is an image and needs no EPUB worker resolution"
+        );
         let prefix = req
             .pinned_only
             .as_ref()
@@ -12449,7 +12457,7 @@ mod phase_c_key_tests {
     }
 
     #[test]
-    fn drive_list_indirect_epub_cover_is_not_seeded_after_reconversion() {
+    fn drive_list_indirect_epub_cover_matches_current_generation_after_reconversion() {
         struct Source(crate::epub_cache::SourceState);
         impl crate::epub_cache::SourceGuard for Source {
             fn state(&self) -> std::io::Result<crate::epub_cache::SourceState> {
@@ -12492,6 +12500,7 @@ mod phase_c_key_tests {
         let _old_pin = crate::pdf_loader::pin_epub_for_test(&epub, old.generation_id, 9);
         drop(_old_pin); // a new run has a new pinned table
         let current = publish(b"replacement with more pages", 5);
+        let _current_pin = crate::pdf_loader::pin_epub_for_test(&epub, current.generation_id, 9);
         assert_ne!(old.generation_id, current.generation_id);
         assert_ne!(old.page_count, current.page_count);
 
@@ -12566,13 +12575,213 @@ mod phase_c_key_tests {
             parent.load_one(&key).unwrap().unwrap(),
         );
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
+        let load = |app: &AppTestEnv,
+                    map: &std::sync::Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >| {
+            let req = make_drive_list_pin_load_request(
+                &app.items[0],
+                0,
+                app.settings.folder_thumb_sort,
+                app.settings.folder_thumb_depth,
+                &app.folder_pin_map,
+                &app.drive_list_seed_proofs,
+                app.folder_thumb_pin_db.as_deref(),
+            )
+            .unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::thumb_loader::process_load_request(
+                &req,
+                map,
+                &tx,
+                None,
+                64,
+                75,
+                64,
+                CacheDecision::without_thumbnail(),
+                &std::sync::Arc::new(AtomicUsize::new(0)),
+                &std::sync::Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+                None,
+                &std::sync::Arc::new(AtomicUsize::new(0)),
+                &std::sync::Arc::new(AtomicUsize::new(1)),
+                None,
+                app.folder_thumb_pin_db.as_deref(),
+                None,
+                None,
+            );
+            rx.try_recv().unwrap().image.is_some()
+        };
         assert!(
-            map.read()
-                .unwrap()
-                .keys()
-                .all(|key| !key.starts_with(&prefix))
+            !load(&app, &map),
+            "only the old generation must use the drive icon"
         );
-        assert!(target.load_latest_with_prefix(&prefix).unwrap().is_none());
+
+        let current_proof = crate::catalog::FolderSelectionProof {
+            winner: crate::catalog::FolderSelectionWinner {
+                path: epub.clone(),
+                mtime: current.generation_id,
+                file_size: current.pdf_size as i64,
+                archive_row_key: None,
+            },
+            ..proof
+        };
+        parent
+            .save_with_folder_proof(
+                &key,
+                current.generation_id,
+                current.pdf_size as i64,
+                4,
+                4,
+                None,
+                None,
+                &old_webp,
+                Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+                Some(&current_proof),
+            )
+            .unwrap();
+        app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
+        assert!(
+            load(&app, &map),
+            "current generation's cached cover must be shown"
+        );
+
+        // The child page pin has no selection proof. The worker follows its
+        // typed route, then validates the cache-only row against that EPUB.
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &child,
+                &crate::folder_thumb_pins::FolderPinSource::PdfPage {
+                    pdf_rel: "book.epub".into(),
+                    page: 0,
+                },
+            )
+            .unwrap();
+        let child_pin_key = format!(
+            "{}{}pdfpage|book.epub|-|0|generation-pending|generation-pending",
+            key,
+            crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+        );
+        parent
+            .save(
+                &child_pin_key,
+                old.generation_id,
+                old.pdf_size as i64,
+                4,
+                4,
+                None,
+                &old_webp,
+            )
+            .unwrap();
+        map.write()
+            .unwrap()
+            .retain(|cached_key, _| !cached_key.starts_with(&prefix));
+        app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
+        assert!(
+            !load(&app, &map),
+            "old child-pinned EPUB row must fall back"
+        );
+        parent
+            .save(
+                &child_pin_key,
+                current.generation_id,
+                current.pdf_size as i64,
+                4,
+                4,
+                None,
+                &old_webp,
+            )
+            .unwrap();
+        app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
+        assert!(load(&app, &map), "current child-pinned EPUB row must show");
+
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]))
+            .save(child.join("replacement.png"))
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &child,
+                &crate::folder_thumb_pins::FolderPinSource::File {
+                    rel: "replacement.png".into(),
+                    kind: crate::folder_thumb_pins::FileKind::Image,
+                },
+            )
+            .unwrap();
+        app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
+        assert!(
+            !load(&app, &map),
+            "a child pin changed to an image must not reuse its old EPUB row"
+        );
+    }
+
+    #[test]
+    fn missing_epub_page_pin_falls_back_to_folder_representative_in_worker() {
+        let app = setup_app();
+        let folder = app.tmp.path().join("missing-epub-pin");
+        std::fs::create_dir(&folder).unwrap();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([20, 60, 120, 255]))
+            .save(folder.join("cover.png"))
+            .unwrap();
+        let base_key = crate::thumb_loader::folder_thumb_cache_key_for_path(
+            &folder,
+            false,
+            app.settings.folder_thumb_sort,
+            3,
+            crate::catalog::FolderThumbProvenance::AutoSelected,
+        )
+        .unwrap();
+        let base = LoadRequest {
+            path: folder.clone(),
+            cache_key_override: Some(base_key.clone()),
+            folder_thumb_sort: Some(app.settings.folder_thumb_sort),
+            folder_thumb_depth: 3,
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            ..Default::default()
+        };
+        let pins = std::collections::HashMap::from([(
+            crate::path_key::normalize_keep_drive(&folder),
+            crate::folder_thumb_pins::FolderPinSource::PdfPage {
+                pdf_rel: "moved.epub".into(),
+                page: 0,
+            },
+        )]);
+        let req = apply_folder_thumb_pin(
+            base,
+            &folder,
+            &base_key,
+            false,
+            ContainerKindForPin::Folder,
+            &pins,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+        );
+        assert!(req.epub_pin_fallback.is_some());
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::thumb_loader::process_load_request(
+            &req,
+            &std::sync::RwLock::new(std::collections::HashMap::new()),
+            &tx,
+            None,
+            64,
+            75,
+            64,
+            CacheDecision::without_thumbnail(),
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(rx.try_recv().unwrap().image.is_some());
     }
 
     #[test]
@@ -12591,6 +12800,10 @@ mod phase_c_key_tests {
         app.setup_virtual_folder_seed_and_writeback(&epub, &target, &map);
         assert!(app.virtual_folder_writeback.is_none());
         assert!(map.read().unwrap().is_empty());
+        assert!(
+            app.pdf_prefetch_grace_until.is_some(),
+            "EPUB pages need the same PDFium prefetch grace as PDF pages"
+        );
     }
 
     #[test]
@@ -12645,6 +12858,7 @@ mod phase_c_key_tests {
             app.settings.folder_thumb_sort,
             app.settings.folder_thumb_depth,
             &app.folder_pin_map,
+            &app.drive_list_seed_proofs,
             app.folder_thumb_pin_db.as_deref(),
         )
         .expect("drive-list folder pin should create a cache-only request");

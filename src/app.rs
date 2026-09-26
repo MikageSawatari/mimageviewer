@@ -13854,6 +13854,10 @@ pub struct App {
     /// 同期参照する (per-frame DB アクセス回避)。キーは `normalize_keep_drive(container)`。
     pub(crate) folder_pin_map:
         std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    /// Current drive-list seed's provenance, keyed by the pinned tile prefix.
+    /// It comes from the already-read parent catalog row, without source stat.
+    drive_list_seed_proofs:
+        std::collections::HashMap<String, crate::thumb_loader::DriveListSeedProof>,
     /// 現在ロード済み items の変換対象アーカイブごとの判定状態。
     /// キーは元アーカイブの `normalize_keep_drive(path)`。候補は `Pending` から
     /// `Direct` / `CachedZip` / `Unavailable` のいずれかへ 1 件ずつ遷移する。
@@ -17088,6 +17092,7 @@ impl App {
             video_chapter_thumb_db,
             folder_thumb_pin_db,
             folder_pin_map: std::collections::HashMap::new(),
+            drive_list_seed_proofs: std::collections::HashMap::new(),
             converted_archive_cache_paths: std::collections::HashMap::new(),
             converted_archive_pin_root_states: std::collections::HashMap::new(),
             converted_archive_cache_paths_pending: None,
@@ -27718,7 +27723,13 @@ impl App {
             .extension()
             .and_then(|e| e.to_str())
             .map(|s| s.to_ascii_lowercase());
-        let (parent_prefix, target_key, target_idx, is_pdf) = match ext.as_deref() {
+        // EPUB has no parent seed/writeback, but still renders through PDFium.
+        if ext.as_deref() == Some("epub") {
+            self.pdf_prefetch_grace_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
+            return;
+        }
+        let (parent_prefix, target_key, target_idx) = match ext.as_deref() {
             Some("pdf") => {
                 // 最初の PdfPage の idx (通常 0)。
                 let Some(target_idx) = self
@@ -27732,7 +27743,6 @@ impl App {
                     crate::thumb_loader::CACHE_KEY_PDF,
                     crate::grid_item::pdf_page_cache_key(0),
                     target_idx,
-                    true,
                 )
             }
             Some("zip") | Some("cbz") => {
@@ -27744,19 +27754,13 @@ impl App {
                 else {
                     return;
                 };
-                (
-                    crate::thumb_loader::CACHE_KEY_ZIP,
-                    entry_name,
-                    target_idx,
-                    false,
-                )
+                (crate::thumb_loader::CACHE_KEY_ZIP, entry_name, target_idx)
             }
             _ => return,
         };
 
-        // PDF/ZIP 開いた直後の prefetch 抑制 (= worker thrash 防止) を仕掛ける。
-        // PDF だけに適用 (ZIP は decode が軽いので大した負荷にならない)。
-        if is_pdf {
+        // Keep the plain-PDF timing and early-return behaviour unchanged.
+        if ext.as_deref() == Some("pdf") {
             self.pdf_prefetch_grace_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
         }
@@ -30257,9 +30261,9 @@ impl App {
         &mut self,
         container: &std::path::Path,
         source: &crate::folder_thumb_pins::FolderPinSource,
-    ) -> Option<(crate::catalog::CacheEntry, bool)> {
+    ) -> Option<(crate::catalog::CacheEntry, Option<String>)> {
         use crate::folder_thumb_pins::{FileKind, FolderPinSource};
-        let mut pinned_key_is_epub = false;
+        let mut child_pin_source_id = None;
         let entry = match source {
             FolderPinSource::File { rel, kind } => {
                 let fname = direct_pin_rel_file_name(rel)?;
@@ -30338,7 +30342,8 @@ impl App {
                             .ok()
                             .flatten()
                             .map(|(key, entry)| {
-                                pinned_key_is_epub = key.to_ascii_lowercase().contains(".epub");
+                                child_pin_source_id =
+                                    key.strip_prefix(&pinned_prefix).map(str::to_owned);
                                 entry
                             });
                         pinned_entry.or(base_entry)
@@ -30386,7 +30391,7 @@ impl App {
                     .flatten()
             }
         };
-        entry.map(|entry| (entry, pinned_key_is_epub))
+        entry.map(|entry| (entry, child_pin_source_id))
     }
 
     fn seed_drive_list_pin_thumbs_from_catalog(
@@ -30396,6 +30401,7 @@ impl App {
         >,
         drive_list_catalog: Option<&Arc<crate::catalog::CatalogDb>>,
     ) {
+        self.drive_list_seed_proofs.clear();
         if self.folder_pin_map.is_empty() {
             return;
         }
@@ -30422,7 +30428,7 @@ impl App {
                 continue;
             };
             let prefix = drive_list_pinned_cache_key_prefix(&base_key, &source);
-            let Some((mut entry, pinned_key_is_epub)) =
+            let Some((mut entry, child_pin_source_id)) =
                 self.drive_list_pin_seed_entry(&container_path, &source)
             else {
                 if matches!(
@@ -30440,38 +30446,23 @@ impl App {
                 }
                 continue;
             };
-            // A child folder's representative can be an EPUB page. Its old
-            // WebP row is not proof of the current converted generation, and
-            // dropping selection_proof here used to make it appear valid.
-            let indirect_epub = pinned_key_is_epub
-                || entry.selection_proof.as_ref().is_some_and(|proof| {
-                    proof
-                        .winner
-                        .path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            let seed_proof = child_pin_source_id
+                .filter(|source_id| child_pin_source_id_is_epub(source_id))
+                .map(crate::thumb_loader::DriveListSeedProof::ChildPinSourceId)
+                .or_else(|| {
+                    entry
+                        .selection_proof
+                        .as_ref()
+                        .map(|proof| proof.winner.path.clone())
+                        .filter(|path| {
+                            pdf_stamp_policy_for_path(path)
+                                == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+                        })
+                        .map(crate::thumb_loader::DriveListSeedProof::EpubPath)
                 });
-            let direct_epub = match &source {
-                crate::folder_thumb_pins::FolderPinSource::File {
-                    rel,
-                    kind: crate::folder_thumb_pins::FileKind::PdfFile,
-                } => container_path.join(rel),
-                crate::folder_thumb_pins::FolderPinSource::PdfPage { pdf_rel, .. } => {
-                    container_path.join(pdf_rel)
-                }
-                _ => std::path::PathBuf::new(),
-            }
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
-            if direct_epub || indirect_epub {
-                // Also evict an earlier drive-list seed already loaded into
-                // memory; the cache-only worker must not display it this run.
-                if let Ok(mut map) = cache_map.write() {
-                    map.retain(|key, _| !key.starts_with(&prefix));
-                }
-                continue;
+            if let Some(seed_proof) = seed_proof {
+                self.drive_list_seed_proofs
+                    .insert(prefix.clone(), seed_proof);
             }
             entry.folder_provenance = Some(crate::catalog::FolderThumbProvenance::Seeded);
             entry.selection_proof = None;
@@ -39580,6 +39571,7 @@ impl App {
                     self.settings.folder_thumb_sort,
                     self.settings.folder_thumb_depth,
                     &self.folder_pin_map,
+                    &self.drive_list_seed_proofs,
                     self.folder_thumb_pin_db.as_deref(),
                 )
             })
@@ -40045,6 +40037,7 @@ impl App {
                         self.settings.folder_thumb_sort,
                         self.settings.folder_thumb_depth,
                         &self.folder_pin_map,
+                        &self.drive_list_seed_proofs,
                         self.folder_thumb_pin_db.as_deref(),
                     )
                 })
@@ -79862,6 +79855,20 @@ fn drive_list_pinned_cache_key(prefix: &str, mtime: i64, file_size: i64) -> Stri
     format!("{prefix}{mtime}|{file_size}")
 }
 
+/// The pin source ID has typed fields (`kind|relative path|entry|page|mtime|size`).
+/// Cascades prefix the kind with a route hash. Only EPUB page/file rows need
+/// worker pin revalidation; ordinary PDF and image rows keep their old lookup.
+fn child_pin_source_id_is_epub(source_id: &str) -> bool {
+    let fields = source_id.split('|').collect::<Vec<_>>();
+    if fields.len() != 6 {
+        return false;
+    }
+    let kind = fields[0].rsplit(':').next().unwrap_or_default();
+    matches!(kind, "pdfpage" | "pdffile")
+        && pdf_stamp_policy_for_path(std::path::Path::new(fields[1]))
+            == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+}
+
 fn direct_pin_rel_file_name(rel: &str) -> Option<String> {
     let path = std::path::Path::new(rel);
     if path.components().count() != 1 {
@@ -79876,6 +79883,10 @@ fn make_drive_list_pin_load_request(
     folder_thumb_sort: crate::settings::SortOrder,
     folder_thumb_depth: u32,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    drive_list_seed_proofs: &std::collections::HashMap<
+        String,
+        crate::thumb_loader::DriveListSeedProof,
+    >,
     _pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) -> Option<LoadRequest> {
     let GridItem::Folder(container_path) = item else {
@@ -79899,19 +79910,26 @@ fn make_drive_list_pin_load_request(
         crate::catalog::FolderThumbProvenance::Seeded,
     )?;
     let cache_key_prefix = drive_list_pinned_cache_key_prefix(&base_key, source);
-    let epub_source = match source {
-        crate::folder_thumb_pins::FolderPinSource::File {
-            rel,
-            kind: crate::folder_thumb_pins::FileKind::PdfFile,
-        } => Some(container_path.join(rel)),
-        crate::folder_thumb_pins::FolderPinSource::PdfPage { pdf_rel, .. } => {
-            Some(container_path.join(pdf_rel))
-        }
-        _ => None,
-    }
-    .filter(|path| {
-        pdf_stamp_policy_for_path(path) == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
-    });
+    let seed_proof = drive_list_seed_proofs
+        .get(&cache_key_prefix)
+        .cloned()
+        .or_else(|| {
+            match source {
+                crate::folder_thumb_pins::FolderPinSource::File {
+                    rel,
+                    kind: crate::folder_thumb_pins::FileKind::PdfFile,
+                } => Some(container_path.join(rel)),
+                crate::folder_thumb_pins::FolderPinSource::PdfPage { pdf_rel, .. } => {
+                    Some(container_path.join(pdf_rel))
+                }
+                _ => None,
+            }
+            .filter(|path| {
+                pdf_stamp_policy_for_path(path)
+                    == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+            })
+            .map(crate::thumb_loader::DriveListSeedProof::EpubPath)
+        });
     Some(LoadRequest {
         idx,
         path: container_path.clone(),
@@ -79921,7 +79939,8 @@ fn make_drive_list_pin_load_request(
         folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
         pinned_only: Some(crate::thumb_loader::PinnedOnlyRequest {
             cache_key_prefix,
-            epub_source,
+            seed_proof,
+            source: source.clone(),
         }),
         ..Default::default()
     })
@@ -80859,6 +80878,7 @@ fn apply_folder_thumb_pin(
             items_gen: base_req.items_gen,
             context_epoch: base_req.context_epoch,
             pinned_only: None,
+            epub_pin_fallback: None,
             force_cache: false,
         };
     }
@@ -80924,6 +80944,11 @@ fn apply_folder_thumb_pin(
         ResolvedKind::Video => unreachable!("Video pin handled above"),
     };
 
+    let epub_pin_fallback = (matches!(container_kind, ContainerKindForPin::Folder)
+        && pdf_page.is_some()
+        && pdf_stamp_policy_for_path(&resolved.abs_path)
+            == crate::thumb_loader::PdfStampPolicy::ResolveInWorker)
+        .then(|| Box::new(base_req.clone()));
     LoadRequest {
         path: request_path,
         relative_page_provenance: None,
@@ -80955,6 +80980,7 @@ fn apply_folder_thumb_pin(
         items_gen: base_req.items_gen,
         context_epoch: base_req.context_epoch,
         pinned_only: None,
+        epub_pin_fallback,
         force_cache: false,
     }
 }

@@ -301,6 +301,9 @@ pub(crate) struct RestoreCandidate {
     pub(crate) target_kind: ContentKind,
     pub(crate) full_hash: String,
     pub(crate) sources: Vec<RestoreSourceCandidate>,
+    /// The unpinned source observed when detection branched. A later pin or
+    /// replacement must invalidate the restore before any store copy.
+    pub(crate) epub_source_state: Option<crate::epub_cache::SourceState>,
 }
 
 #[derive(Clone, Debug)]
@@ -1729,6 +1732,10 @@ fn detect_target_with_opener<R: Read + Seek>(
             target_kind: target.source.kind,
             full_hash,
             sources,
+            epub_source_state: match epub_provenance {
+                Some(EpubProvenance::Unpinned(state)) => Some(state),
+                _ => None,
+            },
         })
     };
     Ok(Some((candidate, update)))
@@ -2159,6 +2166,7 @@ mod tests {
         .unwrap();
 
         let mut candidates = vec![RestoreCandidate {
+            epub_source_state: None,
             target_key: "target".to_string(),
             target_path: dir.path().join("target.png"),
             target_kind: ContentKind::Image,
@@ -2234,6 +2242,7 @@ mod tests {
         .unwrap();
 
         let mut candidates = vec![RestoreCandidate {
+            epub_source_state: None,
             target_key: "target".to_string(),
             target_path: dir.path().join("target.png"),
             target_kind: ContentKind::Image,
@@ -2294,6 +2303,7 @@ mod tests {
         .unwrap();
 
         let mut candidates = vec![RestoreCandidate {
+            epub_source_state: None,
             target_key: "target".to_string(),
             target_path: dir.path().join("target.png"),
             target_kind: ContentKind::Image,

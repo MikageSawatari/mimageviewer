@@ -113,7 +113,18 @@ pub enum ResolveStrategy {
 #[derive(Clone)]
 pub struct PinnedOnlyRequest {
     pub cache_key_prefix: String,
-    pub epub_source: Option<std::path::PathBuf>,
+    pub seed_proof: Option<DriveListSeedProof>,
+    /// The typed root pin. Child pin lookups run in this worker.
+    pub source: crate::folder_thumb_pins::FolderPinSource,
+}
+
+#[derive(Clone)]
+pub enum DriveListSeedProof {
+    /// The parent catalog proof or direct root pin names an EPUB page.
+    EpubPath(std::path::PathBuf),
+    /// The seeded row came from an EPUB child pin key. The worker checks that
+    /// the child's current pin route still has this identity before using it.
+    ChildPinSourceId(String),
 }
 /// Ctrl+G アグリゲートビューの「代表サムネ」用キャッシュキープレフィックス (v0.8.1)。
 /// filename 単体だと別コンテナ同士の同名画像 (例: `cover.jpg`) でキャッシュ衝突し、
@@ -435,6 +446,10 @@ pub struct LoadRequest {
     /// 明示ピンだけを解決する特殊要求。未解決 / Folder leaf はアイコン fallback
     /// に倒し、通常フォルダ代表探索には進ませない。
     pub pinned_only: Option<PinnedOnlyRequest>,
+    /// The original automatic folder request. Only an EPUB page pin carries
+    /// this; a missing conversion/source is resolved on the worker and then
+    /// follows the same auto-representative path as an unresolved PDF pin.
+    pub epub_pin_fallback: Option<Box<LoadRequest>>,
     /// CachePolicy に関係なく、このリクエストの結果を catalog に保存する。
     /// ドライブ直下フォルダの明示ピン代表など、後段の cache-only 表示がユーザーの
     /// 明示操作に依存する場合だけ UI 側で true にする。
@@ -1062,8 +1077,19 @@ fn send_pinned_only_cached(
     cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     tx: &mpsc::Sender<ThumbMsg>,
     gen_done: &Arc<AtomicUsize>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) -> bool {
-    let epub_stamp = if let Some(source) = pin.epub_source.as_ref() {
+    let epub_source = match pin.seed_proof.as_ref() {
+        Some(DriveListSeedProof::EpubPath(path)) => Some(path.clone()),
+        Some(DriveListSeedProof::ChildPinSourceId(expected)) => {
+            let Some(target) = drive_list_child_pin_target(req, pin, expected, pin_db) else {
+                return false;
+            };
+            (target.pdf_page.is_some() && is_epub_path(&target.abs_path)).then_some(target.abs_path)
+        }
+        None => None,
+    };
+    let epub_stamp = if let Some(source) = epub_source.as_ref() {
         let Ok(read) = crate::pdf_loader::resolve_read_target(source) else {
             return false;
         };
@@ -1124,6 +1150,34 @@ fn send_pinned_only_cached(
     true
 }
 
+/// A pinned child row is usable only while the child's current pin route
+/// matches the catalog key from which that row was seeded.
+fn drive_list_child_pin_target(
+    req: &LoadRequest,
+    pin: &PinnedOnlyRequest,
+    expected_source_id: &str,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+) -> Option<crate::folder_thumb_pins::ResolvedPinTarget> {
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+    let FolderPinSource::File {
+        rel,
+        kind: FileKind::Folder,
+    } = &pin.source
+    else {
+        return None;
+    };
+    let child = req.path.join(rel);
+    let db = pin_db?;
+    let child_pin = db.lookup(&child)?;
+    let target = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+        &child,
+        &child_pin,
+        |path| db.lookup(path),
+        req.folder_thumb_depth.saturating_sub(1) as usize,
+    )?;
+    (target.source_id == expected_source_id).then_some(target)
+}
+
 /// 段階 B: 1 つの `LoadRequest` を処理する。
 ///
 /// - 通常: `cache_map` を参照しキャッシュヒットしていれば WebP を復号して送信する
@@ -1157,23 +1211,49 @@ pub fn process_load_request(
     adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
 ) {
     if let Some(pin) = req.pinned_only.as_ref() {
-        if !send_pinned_only_cached(req, pin, cache_map, tx, gen_done) {
+        if !send_pinned_only_cached(req, pin, cache_map, tx, gen_done, pin_db) {
             send_thumb_failed(req, tx, gen_done);
         }
         return;
     }
 
+    let fallback_or_fail = || {
+        if let Some(fallback) = req.epub_pin_fallback.as_deref() {
+            process_load_request(
+                fallback,
+                cache_map,
+                tx,
+                catalog,
+                thumb_px,
+                thumb_quality,
+                display_px,
+                cache_decision,
+                gen_done,
+                stats,
+                cancel,
+                keep_start,
+                keep_end,
+                still_seek_thumbnail_pages,
+                pin_db,
+                edit_preview_db,
+                adjustment_db,
+            );
+        } else {
+            send_thumb_failed(req, tx, gen_done);
+        }
+    };
+
     let resolved_request = if req.pdf_stamp_policy == PdfStampPolicy::ResolveInWorker {
         match crate::pdf_loader::resolve_read_target(&req.path) {
             Ok(read) => {
                 let Some(stamped) = stamp_resolved_pdf_request(req, &read) else {
-                    send_thumb_failed(req, tx, gen_done);
+                    fallback_or_fail();
                     return;
                 };
                 Some((stamped, read))
             }
             Err(_) => {
-                send_thumb_failed(req, tx, gen_done);
+                fallback_or_fail();
                 return;
             }
         }

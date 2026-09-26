@@ -568,6 +568,52 @@ mod tests {
     }
 
     #[test]
+    fn window_close_branch_clears_epub_delete_all_confirmation() {
+        let mut env = crate::app::tests::phase_c_support::setup_app();
+        let app = &mut *env;
+        app.show_archive_cache_manager = true;
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts_with_settings(&ctx, &app.settings.ui_font);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let _ = ctx.run(input(), |ctx| app.show_archive_cache_manager_dialog(ctx));
+        }
+        let rect = ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("変換済みアーカイブ・EPUB 管理")))
+            .expect("manager window must be laid out");
+        let style = ctx.style();
+        let frame = egui::Frame::window(&style);
+        let heading = egui::TextStyle::Heading.resolve(&style);
+        let title_inner_height = ctx.fonts_mut(|fonts| fonts.row_height(&heading));
+        let title_height =
+            title_inner_height.max(style.spacing.interact_size.y) + frame.inner_margin.sum().y;
+        let close = egui::pos2(
+            rect.right() - frame.stroke.width - title_height * 0.5,
+            rect.top() + frame.stroke.width + title_height * 0.5,
+        );
+        app.epub_cache_confirm_delete_all = true;
+        for pressed in [true, false] {
+            let mut frame = input();
+            frame.events.push(egui::Event::PointerMoved(close));
+            frame.events.push(egui::Event::PointerButton {
+                pos: close,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let _ = ctx.run(frame, |ctx| app.show_archive_cache_manager_dialog(ctx));
+        }
+        assert!(!app.show_archive_cache_manager);
+        assert!(!app.epub_cache_confirm_delete_all);
+    }
+
+    #[test]
     fn archive_cache_scroll_area_uses_the_full_dialog_width() {
         let ctx = egui::Context::default();
         let mut inner_width = 0.0;
