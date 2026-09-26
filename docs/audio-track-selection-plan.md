@@ -1,6 +1,6 @@
 # 動画の複数音声トラック選択 設計 (backlog §1.251)
 
-- 状態: 設計案 第5版 (独立レビュー4回目 REVISE を反映)
+- 状態: 設計案 第6版 (独立レビュー5回目 REVISE を反映)
 - 出典: [next-release-backlog.md §1.251](next-release-backlog.md) (>>429)
 - 担当: 設計・検収 = ClaudeCode Opus / 実装 = Codex Sol / 独立レビュー = 別の Sol
 - 関連: [video-architecture.md](video-architecture.md) (decoder 3-thread 構成・seek 調停・audio.rs・Norm)、
@@ -344,8 +344,11 @@ gain は「その音声がどのトラックのものか」で決まる値にす
 遷移 (表の書き込みは player の API 経由だけ。lookup の起動・結果の適用は App の Norm owner):
 
 1. **切り替え時。** 表に S の明示の値が無ければ、Norm ON の既定値 `Pending` がそのまま効く (seek の公開より前から
-   止まっている)。`VideoPlayer::select_audio_track(S)` は戻り値に「S が未解決か (lookup が要るか)」を含め、App は
-   それを見て worker を起動する。
+   止まっている。既定値は最初の frame の gate)。`VideoPlayer::select_audio_track(S)` は戻り値に「S が未解決か」を
+   含め、App はそれを見て lookup を起動する。
+   - lookup を起動するとき、App は表の S に明示の `Pending{request}` を書く (トラックごとの最新の要求と、実行中で
+     あることの記録)。S に既に実行中の `Pending{request}` があれば新しい lookup は起動しない (A → B → A のように
+     同じトラックを選び直しても lookup は重複しない)。
    - S が既に解決済み (`Gain`) なら lookup しない。再選択・`Unchanged` で表は変わらない (何も解除しない)。
    - `Deferred` (末尾) でも同じ (S の frame は次の seek まで来ないので、旧トラックの drain は止まらない)。
 2. **open 時も同じ規則にする (動画と音声ファイル / 音楽ビューの両方)。** Norm ON で開いた player の表は既定値
@@ -359,8 +362,9 @@ gain は「その音声がどのトラックのものか」で決まる値にす
    保存したトラックを開けず既定トラックで開き直した場合も、実際に開いたトラックについて同じ規則で解決する。
 3. **lookup の要求と結果の照合。** `request = (table_epoch, request_seq, stream, target_lufs_milli)`。
    `table_epoch` は Norm の ON / OFF で表を作り直すたびに進む。lookup 結果は `request` をそのまま持って返り、App は
-   player の表の `table_epoch` と目標 LUFS が一致し、S の値が lookup 結果より新しい情報 (scan の結果) で上書きされて
-   いないときだけ適用する (OFF → ON で再び未解決になった S に、OFF 前の結果や別の目標 LUFS の結果を適用しない)。
+   player の表の S の値が**同じ `request` の `Pending{request}` と完全に一致するときだけ**適用する。OFF → ON で
+   作り直された表、別の目標 LUFS、後から起動された別の要求、すでに scan 等で解決された値には適用しない
+   (古い lookup が後から完了しても新しい値を上書きしない)。
    適用内容:
    - 測定済み → S = `Gain(g)`。
    - 未測定 → 既存の未測定経路に S を渡す。scan を始める条件 (play intent・fullscreen・S の自動 scan 抑止なし・
@@ -378,9 +382,12 @@ gain は「その音声がどのトラックのものか」で決まる値にす
    持っている) は、選択時に既存の cancel 経路で止める (既存の cancel 経路が再生 intent と suspension を戻す)。
    仮結果適用後のバックグラウンド scan は続けてよい (完了は 4 のとおり対象トラックの値だけを更新する)。
 6. Norm 全体 OFF: 明示の値を空にし、既定値を `Gain(1.0)` にして `table_epoch` を進める (`Pending` も解消)。
-   Norm 全体 ON (再生の途中): 鳴っているトラック (`applied`) の音を止めないよう、そのトラックに明示の値
-   `Gain(1.0)` を書いてから既定値を `Pending` にし、`table_epoch` を進めて `applied` の lookup を起動する。結果は
-   同じトラックの gain 変更なので既存どおり ramp で適用する (既存の ON 経路の挙動を維持)。
+   Norm 全体 ON (再生の途中): **既存の ON 経路をそのまま使う**。鳴っているトラック (`applied`) は既知なので、
+   既存どおり同じ操作の中で測定値を引き、測定済みなら ramp で適用、未測定なら同じ操作の中で scan を始める
+   (再生中なら preroll を止めて一時停止する既存の挙動)。書き込み先が単一の gain から「表の `applied` の値」に
+   なるだけで、未補正の音が流れる時間は現状から増えない。その後、既定値を `Pending` にして `table_epoch` を進める
+   (他のトラックは切り替え時に解決する)。この lookup は既存の ON 操作の UI thread I/O で、本機能で新たに足す
+   ものではない (§12)。
 
 - 「トラック確定待ち」のための App の bool / Option は足さない。状態は player の表と、既存の per-fs_idx Norm 状態
   (stream index を key に含めたもの) だけにある。
@@ -667,15 +674,27 @@ Remote で続きを見るときも、同じトラックで始める。
      source swap の保留、detached の遅延 open、PDF / ZIP の列挙完了で開く予定の要求など (実装者が列挙し、S7 の
      報告に一覧を示す)。
   3. 閉鎖を要求する: すべての別ウィンドウ (active detached、passive / ParkedLive、メディア窓) を
-     `close_all_detached_viewers_for_mode_change` で、main のフルスクリーンを `close_fullscreen` で。
+     `close_all_detached_viewers_for_mode_change` で、main のフルスクリーンを `close_fullscreen_to_completion` で。
+     両 helper は、現在ログを残して続行している失敗 (active context の close 失敗、passive context の retire 失敗
+     `app.rs:45903` / `46831` 等) を型付きの結果として呼び出し元へ返すようにする (既存の呼び出し元 = 表示モード
+     変更の挙動は変えず、結果を使うのは取得 barrier だけ)。
   4. 閉鎖の完了を**型付きの結果**で判定する (`LocalViewerCloseState::{Closed, InProgress, Failed(reason)}`)。
-     判定は戻り値の「窓があったか」ではなく、実際の状態から行う: 全 viewer context の `fs_cache` に player が無い、
-     `fullscreen_idx` が無い、detached の runtime / window / session が無い、presentation transition が遷移中でない。
+     判定は helper の戻り値の「窓があったか」ではなく、実際の状態から行う:
+     - root 以外の viewer context が 1 つも残っていない (画像だけを持つ context も含む。player の有無ではなく
+       context の有無で見る)。
+     - main の `fullscreen_idx` が無く、`fs_cache` に player が無く、fullscreen viewport の非表示が完了している
+       (`ui_fullscreen.rs:21892` の完了判定)。
+     - detached の runtime / window / session が無い。
+     - presentation transition が遷移中でなく、積まれて未実行の transition effect も無い。
+     - helper から型付きの失敗が返っていない。
+     結果:
      - `Closed` → `finish_acquire` へ進む。
-     - `InProgress` (transition の完了待ち等) → 次のフレームで 3 から再評価する。時間での打ち切りはしない
-       (detached §2 の「時間窓で判断しない」)。
-     - `Failed` (context の retire 失敗など、既存経路がログを残して続行している失敗) → 取得を中止する (既存の
-       取得失敗の経路で Remote へエラーを返し、phase を `Local` へ戻す)。
+     - `InProgress` (transition の完了待ち等) → 次のフレームで 3 から再評価する。
+     - `Failed` → 取得を中止する (既存の取得失敗の経路で Remote へエラーを返し、phase を `Local` へ戻す)。
+  5. 進まない場合の保険: 既存の取得 barrier の watchdog (静止しない worker 用の 30 秒の中止経路、
+     `remote_ipc/ui.rs:26` / `956`) を閉鎖待ちにも適用し、期限内に `Closed` にならなければ取得を失敗として終える。
+     経過時間は「閉じた証拠」には使わず、取得を諦める判断にだけ使う (detached §2 の時間窓禁止は「時間の経過で
+     状態を推定しない」ことで、この使い方とは矛盾しない)。
 - **不変条件の成立時点は「取得 barrier の完了 (`finish_acquire`) 後」**。`AcquiringRemote` の間は閉鎖の途中で
   あり得る。`RemoteActive` と `DrainingRemote` の間は、ローカルに閲覧中の player・閲覧ウィンドウが存在しない。
 - **共通の open 境界で所有者を検査する。** ローカルの閲覧を開く入口 (`open_fullscreen`、detached の open、音楽
@@ -736,8 +755,10 @@ Remote で続きを見るときも、同じトラックで始める。
 
 ### 9B.6 テスト
 
-- 取得 barrier: 全 context (main fullscreen / active detached / ParkedLive / メディア窓 / 音楽ビュー) が閉じてから
-  `finish_acquire` される。`InProgress` の間は取得が完了しない。`Failed` で取得が中止され phase が `Local` に戻る。
+- 取得 barrier: 全 context (main fullscreen / active detached / ParkedLive / メディア窓 / 音楽ビュー / 画像だけの
+  context) が閉じてから `finish_acquire` される。`InProgress` の間は取得が完了しない (transition 中・未実行の effect・
+  fullscreen viewport の非表示待ち)。helper の型付き失敗で取得が中止され phase が `Local` に戻る。閉鎖が進まない
+  場合は watchdog で取得が失敗として終わる。
   保存が 1 回走る。
 - 再オープンの防止: Local 復帰 → fullscreen 復元待ち → 再取得で、旧 restore が失効して開かない。PDF / ZIP の
   列挙完了が取得後に届いても閲覧が開かない。所有中に共通 open 境界が拒否する。
@@ -800,6 +821,12 @@ Remote で続きを見るときも、同じトラックで始める。
 
 UI より先に入れる (UI から切り替えられるようになった時点で、Norm と波形が正しいトラックを見ているようにする)。
 
+- Remote の配信の Norm gain もこの段で移す。現在は headless player の単一 gain (`VideoPlayer::normalize_gain()`) を
+  `RemoteStreamStartInputs` に写して transcode に渡している (`mod.rs:9457`、`remote_ipc/ui.rs:1062`) が、S3 で単一
+  gain を表に置き換えるので、§9A.3 の「generation の worker 内で、開いているトラックについて lookup する」方式を
+  この段で入れる (開始時のトラックは `opened_audio_stream_index`)。S3 の受け入れ時点で既存の Remote の Norm が
+  維持されていることをテストで示す。S6 はトラックの切り替えだけを足す。
+
 - 6.1 (Norm: 追加テーブル、scanner の stream 指定、App の Norm 状態の key 拡張、トラック確定待ち、snap、
   worker での lookup) と 6.2 (波形・音楽解析の全 key への stream index)。
 - テスト: DB の新旧テーブルの読み分け (新規保存は追加テーブル、既定トラックだけ旧行を読む、非既定では旧行を
@@ -815,10 +842,12 @@ UI より先に入れる (UI から切り替えられるようになった時点
   - lookup 結果の照合 (Norm OFF → ON 後に OFF 前の結果を捨てる、目標 LUFS 違いの結果を捨てる)。
   - pump: `Pending` が raw の先頭を塞いでいる間は EOF でも `BufferReady` を出さない (短い素材の末尾で)、
     `Pending` → `Gain` と scan 待ち解除の最初の gain は snap、同じトラックの変更は ramp。
+  - lookup の所有: 同じトラックの選び直しで lookup が重複しない、逆順に完了した古い lookup が新しい値を上書きしない。
   - open 時の非同期解決: 既存の Norm テスト (測定済みの即時適用・未測定の deferred scan・キャッシュ hit の grid
     再開) の期待を維持、保存した非既定トラックで開いたときにそのトラックの測定値で最初の音が出る、保存した
     トラックを開けず既定で開き直したときは既定トラックの測定値。音声ファイル / 音楽ビューの open も同じ。
-  - Norm を再生の途中で ON にしても、鳴っているトラックの音は止まらず ramp で測定値へ移る。OFF で全トラック unity。
+  - Norm を再生の途中で ON にしたときの既存の挙動 (測定済み → ramp、未測定 → 同じ操作で scan) が維持される。
+    OFF で全トラック unity。
 
 ### S4: UI と操作
 
@@ -881,7 +910,8 @@ UI より先に入れる (UI から切り替えられるようになった時点
 
 1. 同じトラックのままの seek では resampler を reset しない (既存 seek と同じ)。トラックを替える seek では
    `AudioSetup` ごと差し替えるので、旧トラックのサンプルは swr の delay にも残らない。
-2. Norm の測定値 lookup は UI thread で行わない (§6.1 の worker)。既存の open 時 lookup も UI thread で
-   `std::fs::metadata` を伴うが、それは本機能の範囲外の既存事項として backlog に記録する。
+2. 切り替え時と open 時の Norm の測定値 lookup は UI thread で行わない (§6.1 の worker)。open 時の既存の同期
+   lookup はこの worker に置き換わる。再生途中に Norm を ON にする操作の既存の同期 lookup (UI thread で
+   `std::fs::metadata` と SQLite) は挙動を保つために残し、既存事項として backlog に記録する。
 3. `AudioSetup` の構築は demux thread で行い、所要時間を perf event で計測する (S2 の受け入れで素材ごとに記録)。
 4. 切り替えの seek で HUD の「シーク中...」が出る場合があるが、通常の seek と同じ表示のままにする。
