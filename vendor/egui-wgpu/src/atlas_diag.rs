@@ -39,7 +39,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// How many events to keep. A frame produces at most a handful of font-atlas deltas, so this
 /// covers several seconds of history - far more than the ~5 resync generations we need to see.
@@ -290,6 +290,16 @@ static LEDGER: Mutex<Ledger> = Mutex::new(Ledger {
 /// Where dumps go. The host application installs this; without it the ledger still records but
 /// has nowhere to report, so nothing is lost by leaving it unset in tests.
 static SINK: Mutex<Option<fn(String)>> = Mutex::new(None);
+static CAPTURE_PROBE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_capture_probe(active: bool) {
+    CAPTURE_PROBE.store(active, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn capture_probe_active() -> bool {
+    CAPTURE_PROBE.load(Ordering::Relaxed)
+}
 
 /// Hands out a stable small number per `Renderer`, so a dump says which renderer it means.
 static NEXT_RENDERER_ID: AtomicU64 = AtomicU64::new(0);

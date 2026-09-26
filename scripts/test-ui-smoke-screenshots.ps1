@@ -90,6 +90,16 @@ try {
         $script:failureMessage -ne 'one or more evidence files could not be collected') {
         throw 'broken evidence from an otherwise successful run must still fail'
     }
+
+    [System.IO.File]::WriteAllText(
+        (Join-Path $shotsDir 'manifest.jsonl'),
+        '{"status":"skipped","label":"two-detached","viewport":"detached-1-1","reason":"native viewport is minimized","frame":8,"timestamp_ms":1001}')
+    $script:evidenceEntries = New-Object System.Collections.ArrayList
+    Register-UiSmokeScreenshots
+    if ($script:evidenceEntries.Count -ne 1 -or
+        $script:evidenceEntries[0].path -ne 'screenshots/manifest.jsonl') {
+        throw 'skipped screenshot must be recorded by the manifest without a PNG'
+    }
 }
 finally {
     if (Test-Path -LiteralPath $probeRoot) {
@@ -103,4 +113,4 @@ finally {
     }
 }
 
-Write-Host '[ui-smoke-screenshots-test] PASS original-failure=1 broken-manifest=1 success-disposition=1'
+Write-Host '[ui-smoke-screenshots-test] PASS original-failure=1 broken-manifest=1 success-disposition=1 skipped=1'

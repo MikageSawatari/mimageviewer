@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::{TestScriptWindowPresentation, TestScriptWindowSnapshot};
 use eframe::egui;
 use image::ImageEncoder;
 
@@ -17,11 +18,29 @@ pub(super) const EXPLICIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const FAILURE_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_CAPTURES: u64 = 64;
 const MAX_PIXELS: usize = 64 * 1024 * 1024;
+const PARKED_FROZEN_SKIP_REASON: &str = "parked frozen view (not re-rendered by egui)";
 
 #[derive(Clone, Debug)]
 pub(super) struct Target {
     pub viewport_id: egui::ViewportId,
     pub role: String,
+    /// The already-verified detached host. Root paints with its normal egui wake.
+    pub hwnd: Option<u64>,
+    pub availability: Availability,
+    pub presentation: TestScriptWindowPresentation,
+}
+
+/// Derived from eframe's native viewport table in the current root input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Availability {
+    Registered,
+    Absent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Readiness {
+    Renderable,
+    Skipped(&'static str),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -63,6 +82,8 @@ pub(super) struct Coordinator {
     next_shot: u64,
     shots: HashMap<u64, Shot>,
     batches: HashMap<u64, Batch>,
+    probe_epoch: u64,
+    pass_epoch: HashMap<egui::ViewportId, (u64, &'static str)>,
     write_tx: mpsc::Sender<WriteResult>,
     write_rx: mpsc::Receiver<WriteResult>,
 }
@@ -94,6 +115,48 @@ fn validate_run_dir_under(runs_root: &Path, run_dir: &Path) -> Result<PathBuf, S
         ));
     }
     Ok(run)
+}
+
+fn native_readiness(target: &Target) -> Result<Readiness, String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow, IsWindowVisible};
+
+    if target.presentation == TestScriptWindowPresentation::PassiveDeferredFrozen {
+        return Ok(Readiness::Skipped(PARKED_FROZEN_SKIP_REASON));
+    }
+    if target.availability == Availability::Absent {
+        return Ok(Readiness::Skipped(
+            "viewport absent from eframe native render registry",
+        ));
+    }
+    let Some(raw) = target.hwnd else {
+        return Ok(Readiness::Renderable);
+    };
+    let hwnd = HWND(raw as *mut _);
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return Err(format!(
+            "capture host is no longer a window: {}",
+            target.role
+        ));
+    }
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return Ok(Readiness::Skipped("native viewport is hidden"));
+    }
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        return Ok(Readiness::Skipped("native viewport is minimized"));
+    }
+    Ok(Readiness::Renderable)
+}
+
+fn request_capture_repaint(ctx: &egui::Context, target: &Target) -> Result<(), String> {
+    if eframe::miv_test_script_window_witness::capture_probe_detail_allowed() {
+        crate::logger::log(format!(
+            "[capture-probe] repaint_request role={} viewport={:?} source=root_context",
+            target.role, target.viewport_id
+        ));
+    }
+    ctx.request_repaint_of(target.viewport_id);
+    Ok(())
 }
 
 impl Coordinator {
@@ -129,6 +192,8 @@ impl Coordinator {
             next_shot: 0,
             shots: HashMap::new(),
             batches: HashMap::new(),
+            probe_epoch: 0,
+            pass_epoch: HashMap::new(),
             write_tx,
             write_rx,
         })
@@ -141,6 +206,27 @@ impl Coordinator {
         targets: Vec<Target>,
         timeout: Duration,
         reply: Option<mpsc::SyncSender<Result<(), String>>>,
+    ) -> Result<u64, String> {
+        self.request_with_repaint(
+            ctx,
+            label,
+            targets,
+            timeout,
+            reply,
+            native_readiness,
+            request_capture_repaint,
+        )
+    }
+
+    fn request_with_repaint(
+        &mut self,
+        ctx: &egui::Context,
+        label: &str,
+        targets: Vec<Target>,
+        timeout: Duration,
+        reply: Option<mpsc::SyncSender<Result<(), String>>>,
+        readiness: impl Fn(&Target) -> Result<Readiness, String>,
+        mut repaint: impl FnMut(&egui::Context, &Target) -> Result<(), String>,
     ) -> Result<u64, String> {
         if label.is_empty()
             || label.len() > 48
@@ -158,6 +244,13 @@ impl Coordinator {
                 "capture limit of {MAX_CAPTURES} checkpoints reached"
             ));
         }
+        // Determine capture eligibility before publishing commands. Residence
+        // alone is insufficient: only the App's parked frozen presentation is
+        // skipped, while other registered viewports retain timeout failures.
+        let targets = targets
+            .into_iter()
+            .map(|target| readiness(&target).map(|state| (target, state)))
+            .collect::<Result<Vec<_>, _>>()?;
         self.next_batch += 1;
         let batch_id = self.next_batch;
         self.batches.insert(
@@ -169,7 +262,41 @@ impl Coordinator {
                 deadline: Instant::now() + timeout,
             },
         );
-        for target in targets {
+        eframe::miv_test_script_window_witness::set_capture_probe(true);
+        for (target, state) in targets {
+            if eframe::miv_test_script_window_witness::capture_probe_detail_allowed() {
+                crate::logger::log(format!(
+                    "[capture-probe] target batch={batch_id} role={} viewport={:?} hwnd={:?} availability={:?} presentation={:?} readiness={:?}",
+                    target.role,
+                    target.viewport_id,
+                    target.hwnd,
+                    target.availability,
+                    target.presentation,
+                    state
+                ));
+            }
+            if let Readiness::Skipped(reason) = state {
+                let output = Arc::clone(&self.output);
+                let tx = self.write_tx.clone();
+                let wake_ctx = ctx.clone();
+                let role = target.role;
+                let label = label.to_owned();
+                let frame = ctx.cumulative_frame_nr();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("test-script-screenshot-skip".into())
+                    .spawn(move || {
+                        let result = output.write_skipped(&label, &role, reason, frame);
+                        let _ = tx.send(WriteResult { batch_id, result });
+                        wake_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    })
+                {
+                    let _ = self.write_tx.send(WriteResult {
+                        batch_id,
+                        result: Err(format!("cannot spawn screenshot manifest writer: {error}")),
+                    });
+                }
+                continue;
+            }
             self.next_shot += 1;
             let shot_id = self.next_shot;
             let file_name = format!("{batch_id:02}-{label}-{}.png", target.role);
@@ -178,7 +305,7 @@ impl Coordinator {
                 Shot {
                     batch_id,
                     viewport_id: target.viewport_id,
-                    role: target.role,
+                    role: target.role.clone(),
                     label: label.to_owned(),
                     file_name,
                 },
@@ -190,7 +317,22 @@ impl Coordinator {
                     shot_id,
                 })),
             );
-            ctx.request_repaint_of(target.viewport_id);
+            if eframe::miv_test_script_window_witness::capture_probe_detail_allowed() {
+                crate::logger::log(format!(
+                    "[capture-probe] issue batch={batch_id} shot={shot_id} role={} viewport={:?} run_nonce={} command=Screenshot",
+                    target.role, target.viewport_id, self.run_nonce
+                ));
+            }
+            if let Err(error) = repaint(ctx, &target) {
+                self.shots.remove(&shot_id);
+                let _ = self.write_tx.send(WriteResult {
+                    batch_id,
+                    result: Err(format!(
+                        "capture repaint for {} failed: {error}",
+                        target.role
+                    )),
+                });
+            }
         }
         // A missing screenshot event must wake the root viewport so poll() can
         // expire the batch even when no other input arrives.
@@ -198,7 +340,84 @@ impl Coordinator {
         Ok(batch_id)
     }
 
+    pub(super) fn begin_root_frame(&mut self, windows: &[TestScriptWindowSnapshot]) {
+        let previous_epoch = self.probe_epoch;
+        self.probe_epoch = self.probe_epoch.wrapping_add(1);
+        if self.batches.is_empty() {
+            return;
+        }
+        for (shot_id, shot) in &self.shots {
+            if !eframe::miv_test_script_window_witness::capture_probe_detail_allowed() {
+                continue;
+            }
+            let window = windows
+                .iter()
+                .find(|window| window.viewport_id == shot.viewport_id);
+            let pass = self.pass_epoch.get(&shot.viewport_id).copied();
+            let passed = pass.is_some_and(|(epoch, _)| epoch == previous_epoch);
+            crate::logger::log(format!(
+                "[capture-probe] pending frame={} batch={} shot={} role={} viewport={:?} expected={} residence={} presentation={:?} backend_token={:?} hwnd={:?} pass_previous_frame={} pass_kind={}",
+                self.probe_epoch,
+                shot.batch_id,
+                shot_id,
+                shot.role,
+                shot.viewport_id,
+                window
+                    .and_then(|window| window.identity.as_ref())
+                    .map(|identity| identity.describe())
+                    .unwrap_or_else(|| "missing".into()),
+                window
+                    .map(|window| window.residence.as_str())
+                    .unwrap_or("missing"),
+                window.map(|window| window.presentation),
+                window.and_then(|window| window.backend_token),
+                window.and_then(|window| window.hwnd),
+                passed,
+                pass.map(|(_, kind)| kind).unwrap_or("none")
+            ));
+        }
+        self.note_pass(egui::ViewportId::ROOT, "root");
+    }
+
+    pub(super) fn note_pass(&mut self, viewport_id: egui::ViewportId, kind: &'static str) {
+        if self.batches.is_empty() {
+            return;
+        }
+        self.pass_epoch
+            .insert(viewport_id, (self.probe_epoch, kind));
+        if eframe::miv_test_script_window_witness::capture_probe_detail_allowed() {
+            crate::logger::log(format!(
+                "[capture-probe] app_pass frame={} viewport={viewport_id:?} kind={kind} witness={:?}",
+                self.probe_epoch,
+                eframe::miv_test_script_window_witness::active()
+            ));
+        }
+    }
+
+    pub(super) fn pending_viewport(&self, viewport_id: egui::ViewportId) -> bool {
+        self.shots
+            .values()
+            .any(|shot| shot.viewport_id == viewport_id)
+    }
+
     pub(super) fn receive_events(&mut self, ctx: &egui::Context) {
+        if !self.batches.is_empty() {
+            let arrival_viewport = ctx.viewport_id();
+            ctx.input(|input| {
+                for event in &input.events {
+                    if let egui::Event::Screenshot { viewport_id, user_data, image } = event {
+                        let token = user_data.data.as_ref().and_then(|data| data.downcast_ref::<CaptureToken>());
+                        let batch = token.and_then(|token| self.shots.get(&token.shot_id)).map(|shot| shot.batch_id);
+                        if eframe::miv_test_script_window_witness::capture_probe_detail_allowed() {
+                            crate::logger::log(format!(
+                                "[capture-probe] event frame={} arrival={:?} viewport={viewport_id:?} token={token:?} batch={batch:?} image_size={:?}",
+                                self.probe_epoch, arrival_viewport, image.size
+                            ));
+                        }
+                    }
+                }
+            });
+        }
         let events = ctx.input(|input| {
             input
                 .events
@@ -287,12 +506,29 @@ impl Coordinator {
             } else {
                 Err(batch.errors.join("; "))
             };
+            crate::logger::log(format!(
+                "[capture-probe] outcome batch={id} status={} remaining={} errors={}",
+                if result.is_ok() { "ok" } else { "error" },
+                batch.remaining,
+                batch.errors.len()
+            ));
             if let Err(error) = &result {
                 crate::logger::log(format!("[test-script] screenshot batch {id}: {error}"));
             }
             if let Some(reply) = batch.reply {
                 let _ = reply.send(result);
             }
+        }
+        if self.batches.is_empty() {
+            if eframe::miv_test_script_window_witness::capture_probe_active() {
+                let (emitted, suppressed) =
+                    eframe::miv_test_script_window_witness::capture_probe_detail_counts();
+                crate::logger::log(format!(
+                    "[capture-probe] summary detail_emitted={emitted} detail_suppressed={suppressed} limit={} outcome=all_batches_finished",
+                    eframe::miv_test_script_window_witness::CAPTURE_PROBE_DETAIL_LIMIT
+                ));
+            }
+            eframe::miv_test_script_window_witness::set_capture_probe(false);
         }
     }
 
@@ -301,7 +537,42 @@ impl Coordinator {
     }
 }
 
+impl Drop for Coordinator {
+    fn drop(&mut self) {
+        eframe::miv_test_script_window_witness::set_capture_probe(false);
+    }
+}
+
 impl Output {
+    fn write_skipped(
+        &self,
+        label: &str,
+        role: &str,
+        reason: &str,
+        frame: u64,
+    ) -> Result<(), String> {
+        no_reparse(&self.dir)?;
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let record = serde_json::json!({
+            "status": "skipped",
+            "label": label,
+            "viewport": role,
+            "reason": reason,
+            "frame": frame,
+            "timestamp_ms": timestamp_ms,
+        });
+        let mut manifest = self
+            .manifest
+            .lock()
+            .map_err(|_| "screenshot manifest lock is poisoned".to_string())?;
+        writeln!(manifest, "{record}")
+            .and_then(|_| manifest.flush())
+            .map_err(|error| format!("cannot record skipped screenshot: {error}"))
+    }
+
     fn write(&self, shot: &Shot, image: &egui::ColorImage, frame: u64) -> Result<(), String> {
         no_reparse(&self.dir)?;
         let [width, height] = image.size;
@@ -387,9 +658,34 @@ mod tests {
             next_shot: 0,
             shots: HashMap::new(),
             batches: HashMap::new(),
+            probe_epoch: 0,
+            pass_epoch: HashMap::new(),
             write_tx,
             write_rx,
         }
+    }
+
+    #[test]
+    fn deferred_capture_repaint_wakes_the_exact_viewport_from_root_context() {
+        let ctx = egui::Context::default();
+        let deferred = egui::ViewportId::from_hash_of("deferred-capture-repaint");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&requests);
+        ctx.set_request_repaint_callback(move |info| {
+            observed.lock().unwrap().push(info.viewport_id);
+        });
+        request_capture_repaint(
+            &ctx,
+            &Target {
+                viewport_id: deferred,
+                role: "detached-1-1".into(),
+                hwnd: Some(101),
+                availability: Availability::Registered,
+                presentation: TestScriptWindowPresentation::Other,
+            },
+        )
+        .unwrap();
+        assert_eq!(*requests.lock().unwrap(), vec![deferred]);
     }
 
     #[test]
@@ -463,6 +759,9 @@ mod tests {
                     vec![Target {
                         viewport_id: egui::ViewportId::ROOT,
                         role: "root".into(),
+                        hwnd: None,
+                        availability: Availability::Registered,
+                        presentation: TestScriptWindowPresentation::Root,
                     }],
                     Duration::from_secs(2),
                     Some(reply.clone()),
@@ -497,7 +796,384 @@ mod tests {
     }
 
     #[test]
-    fn missing_screenshot_response_times_out_with_an_error() {
+    fn immediate_detached_viewport_capture_round_trips_with_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("screenshots");
+        let mut capture = test_coordinator(dir.clone());
+        let ctx = egui::Context::default();
+        let detached = egui::ViewportId::from_hash_of("detached-pdf-test");
+        ctx.set_embed_viewports(false);
+        egui::Context::set_immediate_viewport_renderer(|ctx, mut viewport| {
+            (viewport.viewport_ui_cb)(ctx);
+        });
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(100.0, 100.0),
+            )),
+            ..Default::default()
+        };
+        let (reply, received) = mpsc::sync_channel(1);
+        let repainted = Arc::new(Mutex::new(Vec::new()));
+        let output = ctx.run(raw.clone(), |ctx| {
+            ctx.show_viewport_immediate(detached, egui::ViewportBuilder::default(), |_, class| {
+                assert!(class == egui::ViewportClass::Immediate);
+            });
+            capture
+                .request_with_repaint(
+                    ctx,
+                    "pdf",
+                    vec![
+                        Target {
+                            viewport_id: egui::ViewportId::ROOT,
+                            role: "root".into(),
+                            hwnd: None,
+                            availability: Availability::Registered,
+                            presentation: TestScriptWindowPresentation::Root,
+                        },
+                        Target {
+                            viewport_id: detached,
+                            role: "detached-1-7".into(),
+                            hwnd: Some(123),
+                            availability: Availability::Registered,
+                            presentation: TestScriptWindowPresentation::ActiveImmediate,
+                        },
+                    ],
+                    Duration::from_secs(2),
+                    Some(reply.clone()),
+                    |_| Ok(Readiness::Renderable),
+                    |ctx, target| {
+                        repainted
+                            .lock()
+                            .unwrap()
+                            .push((target.viewport_id, target.hwnd));
+                        ctx.request_repaint_of(target.viewport_id);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            *repainted.lock().unwrap(),
+            vec![(egui::ViewportId::ROOT, None), (detached, Some(123))],
+            "each screenshot must request an explicit repaint of its exact host"
+        );
+        let child = output.viewport_output.get(&detached).unwrap();
+        assert!(
+            child
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Screenshot(_)))
+        );
+        assert!(
+            output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .unwrap()
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Screenshot(_)))
+        );
+
+        // wgpu returns completed screenshots to the root input queue, each
+        // carrying the viewport id of the surface that was painted.
+        let mut response = raw;
+        for (viewport_id, shot_id) in [(egui::ViewportId::ROOT, 1), (detached, 2)] {
+            response.events.push(egui::Event::Screenshot {
+                viewport_id,
+                user_data: egui::UserData::new(CaptureToken {
+                    run_nonce: capture.run_nonce,
+                    shot_id,
+                }),
+                image: Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::GREEN; 4])),
+            });
+        }
+        let _ = ctx.run(response, |ctx| capture.receive_events(ctx));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            capture.poll();
+            if let Ok(result) = received.try_recv() {
+                result.unwrap();
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "multiwindow capture did not reply"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(dir.join("01-pdf-root.png").is_file());
+        assert!(dir.join("01-pdf-detached-1-7.png").is_file());
+        assert_eq!(
+            fs::read_to_string(dir.join("manifest.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn renderable_deferred_viewport_delivers_its_screenshot_in_the_child_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("screenshots");
+        let mut capture = test_coordinator(dir.clone());
+        let ctx = egui::Context::default();
+        let first = egui::ViewportId::from_hash_of("parked-first");
+        let second = egui::ViewportId::from_hash_of("active-second");
+        ctx.set_embed_viewports(false);
+        egui::Context::set_immediate_viewport_renderer(|ctx, mut viewport| {
+            (viewport.viewport_ui_cb)(ctx);
+        });
+        let mut raw = egui::RawInput::default();
+        raw.viewports.insert(first, Default::default());
+        raw.viewports.insert(second, Default::default());
+        let (reply, received) = mpsc::sync_channel(1);
+        let repainted = Arc::new(Mutex::new(Vec::new()));
+        let output = ctx.run(raw.clone(), |ctx| {
+            ctx.show_viewport_deferred(first, egui::ViewportBuilder::default(), |_, class| {
+                assert!(class == egui::ViewportClass::Deferred);
+            });
+            ctx.show_viewport_immediate(second, egui::ViewportBuilder::default(), |_, class| {
+                assert!(class == egui::ViewportClass::Immediate);
+            });
+            capture
+                .request_with_repaint(
+                    ctx,
+                    "two-detached",
+                    vec![
+                        Target {
+                            viewport_id: first,
+                            role: "detached-1-1".into(),
+                            hwnd: Some(101),
+                            availability: Availability::Registered,
+                            presentation: TestScriptWindowPresentation::Other,
+                        },
+                        Target {
+                            viewport_id: second,
+                            role: "detached-2-2".into(),
+                            hwnd: Some(202),
+                            availability: Availability::Registered,
+                            presentation: TestScriptWindowPresentation::ActiveImmediate,
+                        },
+                    ],
+                    Duration::from_secs(2),
+                    Some(reply.clone()),
+                    |_| Ok(Readiness::Renderable),
+                    |ctx, target| {
+                        repainted.lock().unwrap().push(target.viewport_id);
+                        ctx.request_repaint_of(target.viewport_id);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            *repainted.lock().unwrap(),
+            vec![first, second],
+            "the deferred target must request its own repaint at issue time"
+        );
+        assert!(output.viewport_output.get(&first).unwrap().class == egui::ViewportClass::Deferred);
+        assert!(
+            output
+                .viewport_output
+                .get(&first)
+                .unwrap()
+                .viewport_ui_cb
+                .is_some()
+        );
+        assert!(
+            output
+                .viewport_output
+                .get(&second)
+                .unwrap()
+                .viewport_ui_cb
+                .is_none()
+        );
+
+        // eframe drains the screenshot channel into the next native viewport
+        // input. The passive deferred child can be that next viewport.
+        let run_nonce = capture.run_nonce;
+        let token = |shot_id| egui::UserData::new(CaptureToken { run_nonce, shot_id });
+        let image = Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::GREEN; 4]));
+        let mut child_input = raw.clone();
+        child_input.viewport_id = first;
+        child_input.events.push(egui::Event::Screenshot {
+            viewport_id: first,
+            user_data: token(1),
+            image: image.clone(),
+        });
+        let _ = ctx.run(child_input, |ctx| capture.receive_events(ctx));
+        let mut root_input = raw;
+        root_input.events.push(egui::Event::Screenshot {
+            viewport_id: second,
+            user_data: token(2),
+            image,
+        });
+        let _ = ctx.run(root_input, |ctx| capture.receive_events(ctx));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            capture.poll();
+            if let Ok(result) = received.try_recv() {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline, "deferred capture did not reply");
+            std::thread::yield_now();
+        }
+        assert!(dir.join("01-two-detached-detached-1-1.png").is_file());
+        assert!(dir.join("01-two-detached-detached-2-2.png").is_file());
+    }
+
+    #[test]
+    fn frozen_parked_view_is_skipped_without_queuing_a_screenshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("screenshots");
+        let mut capture = test_coordinator(dir.clone());
+        let ctx = egui::Context::default();
+        let frozen = egui::ViewportId::from_hash_of("frozen-parked-view");
+        let (reply, received) = mpsc::sync_channel(1);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            capture
+                .request(
+                    ctx,
+                    "frozen",
+                    vec![Target {
+                        viewport_id: frozen,
+                        role: "detached-1-1".into(),
+                        hwnd: Some(101),
+                        availability: Availability::Registered,
+                        presentation: TestScriptWindowPresentation::PassiveDeferredFrozen,
+                    }],
+                    Duration::from_secs(2),
+                    Some(reply.clone()),
+                )
+                .unwrap();
+        });
+        assert!(
+            output
+                .viewport_output
+                .get(&frozen)
+                .is_none_or(|viewport| viewport.commands.is_empty())
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            capture.poll();
+            if let Ok(result) = received.try_recv() {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline, "frozen skip did not finish");
+            std::thread::yield_now();
+        }
+        let record: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(dir.join("manifest.jsonl"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(record["status"], "skipped");
+        assert_eq!(record["reason"], PARKED_FROZEN_SKIP_REASON);
+        assert_eq!(record["viewport"], "detached-1-1");
+    }
+
+    #[test]
+    fn hidden_viewport_records_a_skip_without_waiting_for_a_screenshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("screenshots");
+        let mut capture = test_coordinator(dir.clone());
+        let ctx = egui::Context::default();
+        let detached = egui::ViewportId::from_hash_of("hidden-detached");
+        let (reply, received) = mpsc::sync_channel(1);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            capture
+                .request_with_repaint(
+                    ctx,
+                    "hidden",
+                    vec![Target {
+                        viewport_id: detached,
+                        role: "detached-1-7".into(),
+                        hwnd: Some(123),
+                        availability: Availability::Registered,
+                        presentation: TestScriptWindowPresentation::ActiveImmediate,
+                    }],
+                    Duration::from_secs(2),
+                    Some(reply.clone()),
+                    |_| Ok(Readiness::Skipped("native viewport is hidden")),
+                    |_, _| panic!("skipped viewport must not request a screenshot repaint"),
+                )
+                .unwrap();
+        });
+        assert!(
+            output
+                .viewport_output
+                .get(&detached)
+                .is_none_or(|child| child.commands.is_empty())
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            capture.poll();
+            if let Ok(result) = received.try_recv() {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline, "skip writer did not reply");
+            std::thread::yield_now();
+        }
+        let manifest = fs::read_to_string(dir.join("manifest.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(manifest.trim()).unwrap();
+        assert_eq!(record["status"], "skipped");
+        assert_eq!(record["reason"], "native viewport is hidden");
+        assert_eq!(record["viewport"], "detached-1-7");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn absent_native_viewport_is_skipped_before_touching_its_old_hwnd() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("screenshots");
+        let mut capture = test_coordinator(dir.clone());
+        let ctx = egui::Context::default();
+        let (reply, received) = mpsc::sync_channel(1);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            capture
+                .request(
+                    ctx,
+                    "parked",
+                    vec![Target {
+                        viewport_id: egui::ViewportId::from_hash_of("retired-first"),
+                        role: "detached-1-1".into(),
+                        hwnd: Some(123),
+                        availability: Availability::Absent,
+                        presentation: TestScriptWindowPresentation::Other,
+                    }],
+                    Duration::from_secs(2),
+                    Some(reply.clone()),
+                )
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            capture.poll();
+            if let Ok(result) = received.try_recv() {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline, "absent viewport did not resolve");
+            std::thread::yield_now();
+        }
+        let manifest = fs::read_to_string(dir.join("manifest.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(manifest.trim()).unwrap();
+        assert_eq!(record["status"], "skipped");
+        assert_eq!(
+            record["reason"],
+            "viewport absent from eframe native render registry"
+        );
+    }
+
+    #[test]
+    fn renderable_deferred_without_screenshot_response_times_out() {
         let temp = tempfile::tempdir().unwrap();
         let mut capture = test_coordinator(temp.path().join("screenshots"));
         let ctx = egui::Context::default();
@@ -508,8 +1184,11 @@ mod tests {
                     ctx,
                     "missing",
                     vec![Target {
-                        viewport_id: egui::ViewportId::ROOT,
-                        role: "root".into(),
+                        viewport_id: egui::ViewportId::from_hash_of("renderable-deferred"),
+                        role: "detached-1-1".into(),
+                        hwnd: None,
+                        availability: Availability::Registered,
+                        presentation: TestScriptWindowPresentation::Other,
                     }],
                     Duration::ZERO,
                     Some(reply.clone()),

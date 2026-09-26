@@ -19504,6 +19504,22 @@ impl App {
                 })
                 .flatten();
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
+            #[cfg(feature = "test-script")]
+            if eframe::miv_test_script_window_witness::capture_probe_active()
+                && crate::test_script::capture_pending_for(viewport_id)
+                && eframe::miv_test_script_window_witness::capture_probe_detail_allowed()
+            {
+                crate::logger::log(format!(
+                    "[capture-probe] app_presentation frame={} window_id={} viewport={viewport_id:?} state={:?} bundle={:?} presentation=passive_deferred viewport_class=Deferred host={}",
+                    self.frame_counter,
+                    window.id,
+                    self.detached_window_state(window.id),
+                    self.locate_window_context(window.id),
+                    self.detached_window_hwnd_alive_for_window_id(window.id)
+                        .map(Self::win32_hwnd_debug_state)
+                        .unwrap_or_else(|| "none".into())
+                ));
+            }
             let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
             if !self.deferred_detached_window_registration_allowed(
                 window.id,
@@ -19547,6 +19563,8 @@ impl App {
             let shared = self.deferred_detached_image_window_shared(view);
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_deferred(viewport_id, builder, move |vp_ctx, _class| {
+                #[cfg(feature = "test-script")]
+                crate::test_script::receive_screenshot_events(vp_ctx, "deferred");
                 if sidecar_restore_presentation.is_some() {
                     App::consume_sidecar_restore_viewport_input(vp_ctx);
                 }
@@ -19675,6 +19693,25 @@ impl App {
         }
 
         for window in parked_live_windows {
+            #[cfg(feature = "test-script")]
+            {
+                let viewport_id = Self::detached_image_window_viewport_id(window.id);
+                if eframe::miv_test_script_window_witness::capture_probe_active()
+                    && crate::test_script::capture_pending_for(viewport_id)
+                    && eframe::miv_test_script_window_witness::capture_probe_detail_allowed()
+                {
+                    crate::logger::log(format!(
+                        "[capture-probe] app_presentation frame={} window_id={} viewport={viewport_id:?} state={:?} bundle={:?} presentation=parked_live viewport_class=Immediate host={}",
+                        self.frame_counter,
+                        window.id,
+                        self.detached_window_state(window.id),
+                        self.locate_window_context(window.id),
+                        self.detached_window_hwnd_alive_for_window_id(window.id)
+                            .map(Self::win32_hwnd_debug_state)
+                            .unwrap_or_else(|| "none".into())
+                    ));
+                }
+            }
             let sidecar_restore_presentation = self
                 .sidecar_restore_blocks_window(window.id)
                 .then(|| {
@@ -19750,6 +19787,8 @@ impl App {
                 .flatten();
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+                #[cfg(feature = "test-script")]
+                crate::test_script::receive_screenshot_events(vp_ctx, "parked_live_immediate");
                 if sidecar_restore_presentation.is_some() {
                     Self::consume_sidecar_restore_viewport_input(vp_ctx);
                 }
@@ -22764,7 +22803,7 @@ impl App {
                 #[cfg(all(windows, feature = "test-script"))]
                 {
                     if !embedded {
-                        crate::test_script::receive_screenshot_events(ctx);
+                        crate::test_script::receive_screenshot_events(ctx, "active_immediate");
                     }
                     test_script_current_item_paint =
                         eframe::miv_test_script_window_witness::active()

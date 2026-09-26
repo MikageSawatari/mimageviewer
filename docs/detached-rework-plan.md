@@ -1455,10 +1455,73 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-27 smoke screenshot の frozen parked capture 判定**
+
+計装した MultiWindowPdf run `20260926T152033476Z-227256-MultiWindowPdf-7e5d76c3` では、
+先行別窓 `detached-1-1` は `Parked` / `AtRest`、visible、非最小化で、eframe の
+Deferred viewport に Screenshot action が queue されたが、その後の native pass が
+一度もなく timeout した。test-script は command 発行時に対象 ViewportId へ egui の
+`request_repaint_of` を既に送っていた。eframe の action queue 境界で当該 window に
+`request_redraw` する案も実窓 run `20260926T153506671Z-221916-MultiWindowPdf-dea8c081`
+で反証された (redraw 要求後も Deferred pass は 0)。この無効な renderer 変更は撤去する。
+capture harness は App の `Parked` / `AtRest` と passive frozen view の組から導く typed
+presentation の場合だけ、`parked frozen view (not re-rendered by egui)` を manifest に
+`status=skipped` と記録し、Screenshot を発行しない。active / その他の描画対象は従来の
+capture と timeout 失敗を維持する。detached の状態遷移、host、viewport の生成・終了、
+  描画内容は変更しない。2026-09-27 00:55 JST の隔離 portable 実窓確認では
+  MultiWindowPdf / MultiWindowStills / MultiWindowRarNav / RatingSort /
+  RatingSortCollection の 5 scenario がすべて exit 0。証跡は
+  `target/ui-smoke-runs/20260926T155430402Z-211364-MultiWindowPdf-062bab16`
+  からの連続 5 run にある。PDF manifest の `two-detached` は先行窓を
+  `status=skipped` / `parked frozen view (not re-rendered by egui)` と記録し、
+  root と active 別窓の PNG を取得した。レビュー後、`test-script` 専用
+  capture probe の App / eframe 詳細行を capture session あたり 128 行に制限し、
+  終了時に出力・抑制行数を記録する。detached の振る舞いは変更しない。
+
+**2026-09-26 smoke screenshot 第 3 回失敗の限定診断**
+
+`20260926T144546234Z-175420-MultiWindowPdf-1d955946` でも先行別窓
+`detached-1-1` の batch 2 capture だけが timeout した。repaint と passive deferred
+callback の input 処理だけでは説明できないため、追加の挙動修正は行わず、
+`test-script` capture 中に限る `[capture-probe]` を App、eframe、egui-wgpu に追加した。
+対象 identity と residence、描画 presentation、各 frame の viewport pass、Screenshot
+command の output/queue/painter 境界、wgpu の readback 完成、event の配送先を記録する。
+プローブは batch 終了時に無効になり、通常 build では有効にならない。detached の
+状態遷移、host、viewport の生成・終了、描画内容は変更しない。実窓の再実行結果に
+基づいて欠落境界を特定する。
+
+**2026-09-26 smoke screenshot の passive deferred 配送修正**
+
+MultiWindowPdf 再実行 `20260926T135827388Z-22136-MultiWindowPdf-9e598672` で、active
+immediate 別窓の PNG は取得できたが、2 窓目を開いた後の先行別窓 (passive deferred)
+だけが timeout した。HWND の `InvalidateRect` も試したが、次の実窓 run
+`20260926T141955613Z-185920-MultiWindowPdf-c7477a1b` で同じ timeout となり、
+HWND `InvalidateRect` での解決仮説は棄却した。ログでは window 1 が `pause_active_context` で
+`AtRest` に移り、window 2 が mounted active になる。製品コードは window 1 の凍結表示を
+`show_viewport_deferred` で登録しており、egui 描画の対象である。eframe は screenshot
+応答を次に描画する native viewport の input に入れるが、test-script は root と active
+immediate の input だけを読んでいた。passive deferred の callback でも同じ応答処理を
+行い、capture 対象は eframe の native viewport 登録表と既存の identity を突き合わせる。
+表に無い窓・非表示・最小化窓は理由付き skip、表示可能な窓の timeout は失敗を維持する。
+誤った仮説に基づく `InvalidateRect` は撤去した。製品の detached 状態、host/park/focus、
+viewport 生成・終了には触れない。実窓再確認は別途必要。
+
+**2026-09-26 smoke screenshot の immediate viewport 配送修正**
+
+MultiWindowPdf 実アプリ run `20260926T131312679Z-225084-MultiWindowPdf-3b245082` で
+main の PNG だけ保存され、別窓 PDF の Screenshot event が 5 秒以内に届かなかった。
+原因は `vendor/eframe` の native backend で、root は保留された Screenshot command を
+paint へ渡す一方、immediate child は wgpu paint に空の capture list を渡し、glow でも
+paint 後の readback を行わなかったこと。両 backend の immediate paint 境界で
+その viewport の Screenshot command を消費し、同じ viewport ID を持つ event を返す。
+App の detached 判定、viewport 生成/終了、host/park/focus、context 状態は変更しない。
+描画済みの同一 surface に対応する command を処理する修正で、§2 の時間窓・再試行・
+症状隠しは追加しない。実窓再確認は別途必要。
+
 **2026-09-26 実アプリ smoke の viewport スクリーンショット証跡**
 
 `portable,test-script` のみで egui の viewport Screenshot 応答を受け、main と別窓の画像を
-run ごとの証跡へ保存する。別窓の描画 callback では届いた Screenshot event を診断 runner に
+run ごとの証跡へ保存する。egui callback は viewport ID 付き Screenshot event を診断 runner に
 渡すだけで、PNG 化・ファイル I/O は worker が行う。capture 対象は既存の window identity と
 viewport ID の read-only snapshot から選ぶ。detached の述語、host/park/focus lifecycle、
 viewport 生成・終了、App の context 状態には変更を加えない。既存の別窓症状を判定で

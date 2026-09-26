@@ -205,6 +205,11 @@ impl CaptureState {
         };
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             if let Err(err) = result {
+                if crate::atlas_diag::capture_probe_active() {
+                    crate::atlas_diag::log_line(format!(
+                        "[capture-probe] wgpu_capture_image viewport={viewport_id:?} produced=false map_error={err}"
+                    ));
+                }
                 log::error!("Failed to map buffer for reading: {err}");
                 return;
             }
@@ -227,7 +232,7 @@ impl CaptureState {
             }
             buffer.unmap();
 
-            tx.send((
+            let sent = tx.send((
                 viewport_id,
                 data,
                 ColorImage::new(
@@ -235,7 +240,13 @@ impl CaptureState {
                     pixels,
                 ),
             ))
-            .ok();
+            .is_ok();
+            if crate::atlas_diag::capture_probe_active() {
+                crate::atlas_diag::log_line(format!(
+                    "[capture-probe] wgpu_capture_image viewport={viewport_id:?} produced=true size={}x{} delivered_to_channel={sent}",
+                    tex_extent.width, tex_extent.height
+                ));
+            }
             ctx.request_repaint();
         });
     }

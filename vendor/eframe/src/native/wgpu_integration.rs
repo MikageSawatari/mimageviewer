@@ -755,6 +755,29 @@ impl WgpuWinitRunning<'_> {
                 .collect();
 
             painter.handle_screenshots(&mut raw_input.events);
+            #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+            if crate::miv_test_script_window_witness::capture_probe_active() {
+                for event in &raw_input.events {
+                    if let egui::Event::Screenshot {
+                        viewport_id: image_viewport,
+                        image,
+                        ..
+                    } = event
+                    {
+                        if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+                            egui_wgpu::atlas_diag::log_line(format!(
+                                "[capture-probe] eframe_image_ready arrival={viewport_id:?} image_viewport={image_viewport:?} image_size={:?}",
+                                image.size
+                            ));
+                        }
+                    }
+                }
+                if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+                    egui_wgpu::atlas_diag::log_line(format!(
+                        "[capture-probe] eframe_pass viewport={viewport_id:?} class=root_or_deferred"
+                    ));
+                }
+            }
 
             (viewport_ui_cb, raw_input)
         };
@@ -839,15 +862,16 @@ impl WgpuWinitRunning<'_> {
 
         let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
-        let mut screenshot_commands = vec![];
-        viewport.actions_requested.retain(|cmd| {
-            if let ActionRequested::Screenshot(info) = cmd {
-                screenshot_commands.push(info.clone());
-                false
-            } else {
-                true
-            }
-        });
+        let screenshot_commands = take_screenshot_requests(&mut viewport.actions_requested);
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        let screenshot_commands_count = screenshot_commands.len();
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+            egui_wgpu::atlas_diag::log_line(format!(
+                "[capture-probe] painter_request viewport={viewport_id:?} class=root_or_deferred count={}",
+                screenshot_commands.len()
+            ));
+        }
         #[cfg(all(test, target_os = "windows"))]
         render_phase_test_gate::before_surface_acquire();
         let vsync_secs = painter.paint_and_update_textures(
@@ -858,6 +882,13 @@ impl WgpuWinitRunning<'_> {
             &textures_delta,
             screenshot_commands,
         );
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+            egui_wgpu::atlas_diag::log_line(format!(
+                "[capture-probe] painter_return viewport={viewport_id:?} class=root_or_deferred request_count={} image_delivery=async",
+                screenshot_commands_count
+            ));
+        }
         #[cfg(all(test, target_os = "windows"))]
         render_phase_test_gate::after_paint();
 
@@ -1205,6 +1236,13 @@ fn render_immediate_viewport(
     let input_ms = t_all.elapsed().as_secs_f64() * 1000.0;
     let egui_ctx = shared.borrow().egui_ctx.clone();
     #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+    if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+        egui_wgpu::atlas_diag::log_line(format!(
+            "[capture-probe] eframe_pass viewport={:?} class=immediate",
+            ids.this
+        ));
+    }
+    #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
     let callback_window = shared
         .borrow()
         .viewports
@@ -1296,14 +1334,34 @@ fn render_immediate_viewport(
         })
         .sum();
     let t_paint = Instant::now();
+    // Screenshot commands addressed to an immediate child are queued by
+    // handle_viewport_output just like root commands. Forward them with this
+    // child's paint so egui-wgpu can return Event::Screenshot(viewport_id).
+    let screenshot_commands = take_screenshot_requests(&mut viewport.actions_requested);
+    #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+    let screenshot_commands_count = screenshot_commands.len();
+    #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+    if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+        egui_wgpu::atlas_diag::log_line(format!(
+            "[capture-probe] painter_request viewport={:?} class=immediate count={screenshot_commands_count}",
+            ids.this
+        ));
+    }
     painter.paint_and_update_textures(
         ids.this,
         pixels_per_point,
         [0.0, 0.0, 0.0, 0.0],
         &clipped_primitives,
         &textures_delta,
-        vec![],
+        screenshot_commands,
     );
+    #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+    if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+        egui_wgpu::atlas_diag::log_line(format!(
+            "[capture-probe] painter_return viewport={:?} class=immediate request_count={screenshot_commands_count} image_delivery=async",
+            ids.this
+        ));
+    }
     let paint_ms = t_paint.elapsed().as_secs_f64() * 1000.0;
 
     let t_platform = Instant::now();
@@ -1335,6 +1393,42 @@ fn render_immediate_viewport(
             ids.this.0.value(),
             clipped_primitives.len(),
         ));
+    }
+}
+
+fn take_screenshot_requests(actions: &mut Vec<ActionRequested>) -> Vec<egui::UserData> {
+    let mut screenshots = Vec::new();
+    actions.retain(|action| {
+        if let ActionRequested::Screenshot(data) = action {
+            screenshots.push(data.clone());
+            false
+        } else {
+            true
+        }
+    });
+    screenshots
+}
+
+#[cfg(test)]
+mod screenshot_request_tests {
+    use super::*;
+
+    #[test]
+    fn immediate_viewport_paint_receives_its_queued_screenshot_command() {
+        let mut actions = vec![
+            ActionRequested::Copy,
+            ActionRequested::Screenshot(egui::UserData::new(17_u64)),
+        ];
+        let screenshots = take_screenshot_requests(&mut actions);
+        assert_eq!(screenshots.len(), 1);
+        assert_eq!(
+            screenshots[0]
+                .data
+                .as_ref()
+                .and_then(|data| data.downcast_ref::<u64>()),
+            Some(&17)
+        );
+        assert!(matches!(actions.as_slice(), [ActionRequested::Copy]));
     }
 }
 
@@ -1388,6 +1482,25 @@ fn handle_viewport_output(
         let viewport =
             initialize_or_update_viewport(viewports, ids, class, builder, viewport_ui_cb, painter);
 
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+            let screenshot_count = commands
+                .iter()
+                .filter(|command| matches!(command, egui::ViewportCommand::Screenshot(_)))
+                .count();
+            let class_name = match class {
+                ViewportClass::Root => "root",
+                ViewportClass::Deferred => "deferred",
+                ViewportClass::Immediate => "immediate",
+                ViewportClass::Embedded => "embedded",
+            };
+            egui_wgpu::atlas_diag::log_line(format!(
+                "[capture-probe] eframe_output viewport={viewport_id:?} class={class_name} screenshot_commands={screenshot_count} native_window={} deferred_commands={}",
+                viewport.window.is_some(),
+                viewport.deferred_commands.len()
+            ));
+        }
+
         if let Some(window) = viewport.window.as_ref() {
             let old_inner_size = window.inner_size();
 
@@ -1400,6 +1513,17 @@ fn handle_viewport_output(
                 window,
                 &mut viewport.actions_requested,
             );
+            #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+            if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
+                let queued = viewport
+                    .actions_requested
+                    .iter()
+                    .filter(|action| matches!(action, ActionRequested::Screenshot(_)))
+                    .count();
+                egui_wgpu::atlas_diag::log_line(format!(
+                    "[capture-probe] eframe_queued viewport={viewport_id:?} screenshot_actions={queued} native_window=true"
+                ));
+            }
 
             // For Wayland : https://github.com/emilk/egui/issues/4196
             if cfg!(target_os = "linux") {
@@ -1413,6 +1537,16 @@ fn handle_viewport_output(
                     painter.on_window_resized(viewport_id, width, height);
                 }
             }
+        }
+        #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
+        if viewport.window.is_none()
+            && crate::miv_test_script_window_witness::capture_probe_detail_allowed()
+        {
+            egui_wgpu::atlas_diag::log_line(format!(
+                "[capture-probe] eframe_queued viewport={viewport_id:?} screenshot_actions=0 native_window=false deferred_commands={} discarded_input_commands={}",
+                viewport.deferred_commands.len(),
+                commands.len()
+            ));
         }
     }
 

@@ -342,6 +342,19 @@ function Register-UiSmokeScreenshots {
     foreach ($line in (Get-Content -LiteralPath $manifestPath -Encoding UTF8)) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         $record = $line | ConvertFrom-Json
+        if ([string]$record.status -eq 'skipped') {
+            if ([string]$record.path -or
+                [string]$record.label -notmatch '^[A-Za-z0-9_-]{1,48}$' -or
+                [string]$record.viewport -notmatch '^(root|detached-[0-9]+-[0-9]+)$' -or
+                [string]::IsNullOrWhiteSpace([string]$record.reason) -or
+                [long]$record.frame -lt 0 -or [long]$record.timestamp_ms -le 0) {
+                throw '[screenshot] invalid skipped manifest record'
+            }
+            continue
+        }
+        if ([string]$record.status) {
+            throw "[screenshot] invalid manifest status: $($record.status)"
+        }
         $relative = [string]$record.path
         if ($relative -notmatch '^screenshots/[0-9]{2,}-[A-Za-z0-9_-]+-(root|detached-[0-9]+-[0-9]+)\.png$' -or
             -not $seen.Add($relative)) {
