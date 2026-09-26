@@ -175,26 +175,35 @@ const PURGE_EXACT_BATCH_SIZE: usize = 500;
 
 fn with_identity_epub_coverage<T>(
     descriptor: &StoreDescriptor,
-    paths: &[PathBuf],
+    coverage: &[(PathBuf, IdentityCoverageShape)],
     action: impl FnOnce() -> T,
 ) -> T {
-    if descriptor.file == "content_identity.db"
-        && descriptor.table == "edit_origin"
-        && descriptor.column == "file_key"
-        // Exact PDF/image keys and their `::` page families cannot contain an
-        // EPUB ledger key. Folder ranges can, even when their name has a dot.
-        && paths.iter().any(|path| {
-            path.is_dir()
+    let paths = coverage
+        .iter()
+        .filter(|(path, shape)| {
+            matches!(shape, IdentityCoverageShape::Prefix)
                 || path
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .is_none_or(|ext| ext.eq_ignore_ascii_case("epub"))
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
         })
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    if !paths.is_empty()
+        && descriptor.file == "content_identity.db"
+        && descriptor.table == "edit_origin"
+        && descriptor.column == "file_key"
     {
-        crate::pdf_loader::with_epub_pin_coverage(paths, action)
+        crate::pdf_loader::with_epub_pin_coverage(&paths, action)
     } else {
         action()
     }
+}
+
+#[derive(Clone, Copy)]
+enum IdentityCoverageShape {
+    Exact,
+    Prefix,
 }
 
 /// 移行結果。`rows` = 書き換えた行数合計 (sidecar / パスワードは 1 件 = 1)。
@@ -1332,6 +1341,17 @@ pub fn run(old_path: &Path, new_path: &Path) -> RenameMigrationReport {
 
 /// data_dir を差し替え可能にしたテスト用エントリポイント。
 pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrationReport {
+    run_at_with_shape(data_dir, old_path, new_path, false)
+}
+
+/// `tree` comes from the queued rename operation, not a filesystem query:
+/// the old path can already have been removed when this worker runs.
+pub(crate) fn run_at_with_shape(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    tree: bool,
+) -> RenameMigrationReport {
     let mut report = RenameMigrationReport {
         rows: 0,
         errors: Vec::new(),
@@ -1369,6 +1389,7 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
             descriptor,
             old_key,
             new_key,
+            tree,
             &mut report,
         );
     }
@@ -1549,7 +1570,12 @@ fn purge_store(
         return;
     }
     report.db_open_count += 1;
-    let coverage = removed_keys.iter().map(PathBuf::from).collect::<Vec<_>>();
+    // Purge executes exact and descendant-prefix DELETEs even after the
+    // original folder has disappeared. The SQL operation defines its scope.
+    let coverage = removed_keys
+        .iter()
+        .map(|key| (PathBuf::from(key), IdentityCoverageShape::Prefix))
+        .collect::<Vec<_>>();
     let result = with_identity_epub_coverage(descriptor, &coverage, || {
         (|| -> Result<usize, rusqlite::Error> {
             let mut conn = rusqlite::Connection::open(&db_path)?;
@@ -1629,12 +1655,21 @@ fn migrate_store(
     descriptor: &StoreDescriptor,
     old_key: &str,
     new_key: &str,
+    tree: bool,
     report: &mut RenameMigrationReport,
 ) {
     if !db_path.exists() {
         return;
     }
-    let coverage = [PathBuf::from(old_key), PathBuf::from(new_key)];
+    let shape = if tree {
+        IdentityCoverageShape::Prefix
+    } else {
+        IdentityCoverageShape::Exact
+    };
+    let coverage = [
+        (PathBuf::from(old_key), shape),
+        (PathBuf::from(new_key), shape),
+    ];
     let result = with_identity_epub_coverage(descriptor, &coverage, || {
         (|| -> Result<usize, rusqlite::Error> {
             let mut conn = rusqlite::Connection::open(db_path)?;
@@ -1793,13 +1828,22 @@ fn copy_store(
         .flat_map(|mapping| match mapping {
             NormalizedStoreCopyMapping::Exact {
                 old_key, new_key, ..
-            } => [PathBuf::from(old_key), PathBuf::from(new_key)],
+            } => [
+                (PathBuf::from(old_key), IdentityCoverageShape::Exact),
+                (PathBuf::from(new_key), IdentityCoverageShape::Exact),
+            ],
             NormalizedStoreCopyMapping::Prefix {
                 old_prefix,
                 new_prefix,
             } => [
-                PathBuf::from(old_prefix.trim_end_matches("::")),
-                PathBuf::from(new_prefix.trim_end_matches("::")),
+                (
+                    PathBuf::from(old_prefix.trim_end_matches("::")),
+                    IdentityCoverageShape::Prefix,
+                ),
+                (
+                    PathBuf::from(new_prefix.trim_end_matches("::")),
+                    IdentityCoverageShape::Prefix,
+                ),
             ],
         })
         .collect::<Vec<_>>();

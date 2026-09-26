@@ -744,7 +744,7 @@ master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` �
 | auto-aspect 初期 seed | `app.rs:18381` で EPUB の元属性 hit を省略 | `epub_auto_aspect_seed_ignores_source_metadata_cache_hit` |
 | ピン source ID | `folder_thumb_pins.rs:738-765` の保留印を `thumb_loader.rs:369` が確定 | `epub_page_pin_source_id_waits_for_worker_generation` と thumbnail 要求テスト |
 | フォルダ代表・seed | `thumb_loader.rs:2719,2791,2950,3124` が共通世代抽出を使用 | 共通世代抽出テスト。ドライブ一覧 seed は次行 |
-| ドライブ一覧の間接ピン seed | `app.rs:30259-30495,79852` が proof または子ピン source ID を渡し、`thumb_loader.rs:1066-1177` が現行子ピンと EPUB 世代を照合 | `drive_list_indirect_epub_cover_matches_current_generation_after_reconversion`、`drive_list_folder_pin_seeds_image_named_cover_epub_png` |
+| ドライブ一覧の間接ピン | `app.rs:30259-30495` の UI seed は子 Folder 行を選ばない。`thumb_loader.rs:1160-1280` の cache-only worker が現行子ピンから書込側と同じ完全一致キーを作り、親 catalog を読む | 子ピン・設定深さ・EPUB 世代をキーと整数列の双方で確認。未固定の自動代表は auto key と EPUB 選定証明の世代を確認。`drive_list_indirect_epub_cover_matches_current_generation_after_reconversion`、`drive_list_child_grandchild_epub_pin_uses_configured_depth_one`、`drive_list_folder_pin_seeds_image_named_cover_epub_png` |
 | 仮想フォルダの親子 seed / writeback | `app.rs:27721` の対象分岐は PDF / ZIP のみ。EPUB は 100 ms 先読み抑制だけ適用 | `epub_virtual_folder_seed_and_parent_writeback_are_explicitly_excluded`。親とページ 0 の追加描画コストあり |
 | `DetailsLazyMeta` メモリ hit | `app.rs:54491,5541` の元属性比較 | 固定世代は実行中不変、表は再起動で破棄。変更不要 |
 | 外部渡し PNG | `materializer.rs:274,555-635` の世代 stamp と同一 target | `epub_materializer_stamp_changes_with_generation_not_source_attributes` |
@@ -790,3 +790,13 @@ master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` �
 実経路テストは `drive_list_indirect_epub_cover_matches_current_generation_after_reconversion` (旧世代のみ・現世代行あり・子の明示ピン・子ピン変更後)、`restore_candidates_rechecks_epub_before_copying_edits` (内容同定で候補作成後、置換と固定を行って `restore_candidates_at`)、`missing_epub_page_pin_falls_back_to_folder_representative_in_worker` (`apply_folder_thumb_pin` → `process_load_request`)、`pdf_and_image_store_copy_does_not_wait_for_epub_range` (`run_at` と `copy_stores_at`)、`drive_list_folder_pin_seeds_image_named_cover_epub_png`、`epub_virtual_folder_seed_and_parent_writeback_are_explicitly_excluded`、`window_close_branch_clears_epub_delete_all_confirmation` (egui のタイトルバー閉じる操作) を追加・拡張した。7 箇所を同時に旧動作相当へ一時差し戻したビルドで各テストが失敗し、さらに現行子ピン ID 照合を単独で除くと子ピン変更後の検査が失敗した。差し戻しは `finally` で byte 単位に復元した。
 
 再起動を模した旧世代 2 ページ→新世代 5 ページの fixture で、実際の `process_load_request`、`process_meta_only_with` (列挙だけ fake)、`load_details_page_count_with_pdf_enumerator` (cache hit、PDFium を呼べば失敗)、`MaterializeSession::materialize` (再利用 hit) を通した。4 つの worker 本体を元 EPUB stat に差し戻し、stamp helper は残した負例では各テストが失敗する。固定ロック、stage-0 来歴、復元先の固定判定、範囲 lease、間接 seed、UI pin stat、仮想フォルダ除外、確認状態も個別の旧動作へ差し戻した負例で各テストが失敗した。
+
+#### S2c-2 独立レビュー fix round 3
+
+子 Folder の代表行は UI が catalog の「最新」キーを読み、その source ID を文字列分解する方式を廃止した。実際の書込は `apply_folder_thumb_pin` が選んだ `Seeded` / `AutoSelected` の base key、pin 連鎖の source ID、EPUB 世代 suffix を使う。ドライブ一覧の cache-only worker も `pinned_folder_row_key` で同じキーを組み立て、**現行の**子ピンを設定値そのままの深さで解決して、親 catalog のその一行を完全一致で読む。UI は子 Folder 行を seed しない。行が無い、stamp が違う、WebP が壊れている場合は従来のドライブアイコンへ戻る。非 EPUB の画像・PDF 子ピンも同じ書込キーを読むため代表画像の選択と cache-only 性質は同じだが、既存 WebP の lookup は UI seed から worker の read-only catalog lookup へ移る。直接の画像・PDF ピンは従来の seed 経路を維持する。
+
+`edit_origin` の範囲 lease は `path.is_dir()` を使わない。purge は exact と子孫 prefix の SQL 操作なので、削除後の名前に拡張子があっても prefix として保護する。rename は永続ジョブの `tree`、copy は `Exact` / `VirtualPrefix` の型で区別し、exact は EPUB の拡張子のときだけ取得する。これにより削除済み `books.v2/` の purge と、来歴確認後に停止した EPUB backfill 書込が直列化される。PDF・画像の exact rename/copy は EPUB lease を待たない。
+
+回帰テストは、実書込要求で生成した `|generation:...` キーを親 catalog に置き、`process_load_request` まで通す。旧世代のみ→アイコン、新世代行→表示、子ピンを画像へ変更→アイコン、同一世代のページ 1→0→ページ 0 表示、深さ 1 の子→孫→EPUB 表示を確認する。`drive_list_plain_pdf_child_pin_reads_the_writer_key` は通常 PDF の書込要求が作る suffix 無しの同一キーを worker が読んで WebP を表示する。`deleted_dotted_folder_purge_waits_for_checked_epub_backfill_write` は `write_if_provenance_valid` の確認後・書込前に停止し、実 `purge_removed_paths_at` の完了順と最終台帳を確認する。
+
+負例ではソースの対象関数だけを一時変更し、各 `cargo test --lib <filter>` 後に元の bytes を復元した。「最新行を先に選ぶ・stamp 照合を後回しにする」旧方式で旧世代、画像への pin 変更、同一世代のページ変更の 3 件が個別に失敗した。世代 suffix をキーから省くと新世代行の表示が失敗し、cascade 深さを `depth - 1` に戻すと深さ 1 の経路が失敗した。範囲判定を削除後の `path.is_dir()` に戻すと `books.v2` purge の順序検査が失敗した。さらに `app.rs` / `thumb_loader.rs` / `rename_key_migration.rs` の実装本体を `ee8c38ff9` に一時差し替え、追加テストの compile に必要なキー helper と stamper の `pub(crate)` 露出だけ補って、上記 6 テストを個別に実行した。**6 件とも assertion で失敗**し、`finally` で元の bytes に復元した。compile / harness の失敗ではない。

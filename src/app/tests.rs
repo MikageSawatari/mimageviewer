@@ -12369,6 +12369,19 @@ mod phase_c_key_tests {
         let mut app = setup_app();
         let drive_root = app.tmp.path().join("drive-root");
         let pinned_folder = drive_root.join("PinnedFolder");
+        std::fs::create_dir_all(&pinned_folder).unwrap();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([48, 96, 160, 255]))
+            .save(pinned_folder.join("cover.epub.png"))
+            .unwrap();
+        let child_source = crate::folder_thumb_pins::FolderPinSource::File {
+            rel: "cover.epub.png".to_string(),
+            kind: crate::folder_thumb_pins::FileKind::Image,
+        };
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(&pinned_folder, &child_source)
+            .unwrap();
         let source = crate::folder_thumb_pins::FolderPinSource::File {
             rel: "PinnedFolder".to_string(),
             kind: crate::folder_thumb_pins::FileKind::Folder,
@@ -12376,12 +12389,12 @@ mod phase_c_key_tests {
 
         let cache_dir = crate::catalog::default_cache_dir();
         let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &drive_root).unwrap();
-        let folder_item = GridItem::Folder(pinned_folder);
-        let parent_key = container_cache_base_key(
-            &folder_item,
-            false,
-            Some(app.settings.folder_thumb_sort),
+        let parent_key = crate::thumb_loader::folder_thumb_cache_key_for_path(
+            &pinned_folder,
+            crate::path_key::is_drive_or_share_root(&drive_root),
+            app.settings.folder_thumb_sort,
             app.settings.folder_thumb_depth,
+            crate::catalog::FolderThumbProvenance::Seeded,
         )
         .unwrap();
         let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([48, 96, 160, 255]));
@@ -12392,16 +12405,20 @@ mod phase_c_key_tests {
                 image::ImageFormat::WebP,
             )
             .unwrap();
-        let pinned_parent_key = format!(
-            "{}{}image|cover.epub.png|-|-|111|4096",
-            parent_key,
-            crate::thumb_loader::CACHE_KEY_PIN_SUFFIX
-        );
+        let resolved = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+            &pinned_folder,
+            &child_source,
+            |_| None,
+            app.settings.folder_thumb_depth as usize,
+        )
+        .unwrap();
+        let pinned_parent_key =
+            crate::thumb_loader::pinned_folder_row_key(&parent_key, &resolved.source_id, None);
         parent_db
             .save(
                 &pinned_parent_key,
-                111,
-                4096,
+                resolved.mtime,
+                resolved.file_size,
                 4,
                 4,
                 Some((80, 60)),
@@ -12437,27 +12454,152 @@ mod phase_c_key_tests {
             req.pinned_only.as_ref().unwrap().seed_proof.is_none(),
             "cover.epub.png is an image and needs no EPUB worker resolution"
         );
-        let prefix = req
-            .pinned_only
-            .as_ref()
-            .expect("drive-list requests use pinned-only")
-            .cache_key_prefix
-            .clone();
-        let drive_list_key = drive_list_pinned_cache_key(&prefix, 111, 4096);
-        let seeded = drive_list_db
-            .load_one(&drive_list_key)
-            .unwrap()
-            .expect("drive-list catalog should receive the cached folder tile thumb");
-        assert_eq!(seeded.jpeg_data, webp_bytes);
-        assert_eq!(seeded.source_dims, Some((80, 60)));
-        assert!(
-            cache_map.read().unwrap().contains_key(&drive_list_key),
-            "worker の cache-only lookup 用 map にも seed される"
+        assert!(cache_map.read().unwrap().is_empty());
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::thumb_loader::process_load_request(
+            &req,
+            &cache_map,
+            &tx,
+            Some(&drive_list_db),
+            64,
+            75,
+            64,
+            CacheDecision::without_thumbnail(),
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(AtomicUsize::new(1)),
+            None,
+            app.folder_thumb_pin_db.as_deref(),
+            None,
+            None,
         );
+        let shown = rx.try_recv().unwrap();
+        assert!(shown.image.is_some());
+        assert_eq!(shown.source_dims, Some((80, 60)));
     }
 
     #[test]
-    fn drive_list_indirect_epub_cover_matches_current_generation_after_reconversion() {
+    fn drive_list_plain_pdf_child_pin_reads_the_writer_key() {
+        let mut app = setup_app();
+        let drive = app.tmp.path().join("drive-plain-pdf");
+        let child = drive.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("book.pdf"), b"%PDF-1.4\n").unwrap();
+        let page_pin = crate::folder_thumb_pins::FolderPinSource::PdfPage {
+            pdf_rel: "book.pdf".into(),
+            page: 0,
+        };
+        let pins = std::sync::Arc::clone(app.folder_thumb_pin_db.as_ref().unwrap());
+        pins.set(&child, &page_pin).unwrap();
+        let auto_key = crate::thumb_loader::folder_thumb_cache_key_for_path(
+            &child,
+            crate::path_key::is_drive_or_share_root(&drive),
+            app.settings.folder_thumb_sort,
+            app.settings.folder_thumb_depth,
+            crate::catalog::FolderThumbProvenance::AutoSelected,
+        )
+        .unwrap();
+        let writer = apply_folder_thumb_pin(
+            LoadRequest {
+                path: child.clone(),
+                cache_key_override: Some(auto_key.clone()),
+                folder_thumb_sort: Some(app.settings.folder_thumb_sort),
+                folder_thumb_depth: app.settings.folder_thumb_depth,
+                ..Default::default()
+            },
+            &child,
+            &auto_key,
+            false,
+            ContainerKindForPin::Folder,
+            &std::collections::HashMap::from([(
+                crate::path_key::normalize_keep_drive(&child),
+                page_pin,
+            )]),
+            &std::collections::HashMap::new(),
+            Some(pins.as_ref()),
+            None,
+            None,
+        );
+        assert_eq!(
+            writer.pdf_stamp_policy,
+            crate::thumb_loader::PdfStampPolicy::CallerFileAttributes
+        );
+        let writer_key = writer.cache_key_override.unwrap();
+        assert!(!writer_key.contains("|generation:"));
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent = crate::catalog::CatalogDb::open(&cache_dir, &drive).unwrap();
+        let mut webp = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([32, 96, 144, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut webp),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        parent
+            .save(
+                &writer_key,
+                writer.mtime,
+                writer.file_size,
+                4,
+                4,
+                None,
+                &webp,
+            )
+            .unwrap();
+        app.items = vec![GridItem::Folder(drive.clone())];
+        app.image_metas = vec![None];
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive),
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "child".into(),
+                kind: crate::folder_thumb_pins::FileKind::Folder,
+            },
+        );
+        let drive_catalog = std::sync::Arc::new(
+            crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
+        );
+        let map = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&drive_catalog));
+        let req = make_drive_list_pin_load_request(
+            &app.items[0],
+            0,
+            app.settings.folder_thumb_sort,
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            &app.drive_list_seed_proofs,
+            Some(pins.as_ref()),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::thumb_loader::process_load_request(
+            &req,
+            &map,
+            &tx,
+            Some(&drive_catalog),
+            64,
+            75,
+            64,
+            CacheDecision::without_thumbnail(),
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(AtomicUsize::new(1)),
+            None,
+            Some(pins.as_ref()),
+            None,
+            None,
+        );
+        assert_eq!(rx.try_recv().unwrap().image.unwrap().pixels[0].r(), 32);
+    }
+
+    fn assert_drive_list_indirect_epub_case(case: &str) {
         struct Source(crate::epub_cache::SourceState);
         impl crate::epub_cache::SourceGuard for Source {
             fn state(&self) -> std::io::Result<crate::epub_cache::SourceState> {
@@ -12498,6 +12640,7 @@ mod phase_c_key_tests {
         };
         let old = publish(b"first source", 2);
         let _old_pin = crate::pdf_loader::pin_epub_for_test(&epub, old.generation_id, 9);
+        let old_read = crate::pdf_loader::resolve_read_target(&epub).unwrap();
         drop(_old_pin); // a new run has a new pinned table
         let current = publish(b"replacement with more pages", 5);
         let _current_pin = crate::pdf_loader::pin_epub_for_test(&epub, current.generation_id, 9);
@@ -12609,10 +12752,10 @@ mod phase_c_key_tests {
                 None,
                 None,
             );
-            rx.try_recv().unwrap().image.is_some()
+            rx.try_recv().unwrap().image
         };
         assert!(
-            !load(&app, &map),
+            load(&app, &map).is_none(),
             "only the old generation must use the drive icon"
         );
 
@@ -12641,31 +12784,58 @@ mod phase_c_key_tests {
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
         assert!(
-            load(&app, &map),
+            load(&app, &map).is_some(),
             "current generation's cached cover must be shown"
         );
+        // A pinned child may have only its pinned writer row after catalog
+        // cleanup; the auto row is not a valid substitute for that pin.
+        if matches!(case, "new_generation" | "page_switch") {
+            parent.delete_one(&key).unwrap();
+        }
 
         // The child page pin has no selection proof. The worker follows its
         // typed route, then validates the cache-only row against that EPUB.
+        let page_zero = crate::folder_thumb_pins::FolderPinSource::PdfPage {
+            pdf_rel: "book.epub".into(),
+            page: 0,
+        };
         app.folder_thumb_pin_db
             .as_ref()
             .unwrap()
-            .set(
-                &child,
-                &crate::folder_thumb_pins::FolderPinSource::PdfPage {
-                    pdf_rel: "book.epub".into(),
-                    page: 0,
-                },
-            )
+            .set(&child, &page_zero)
             .unwrap();
-        let child_pin_key = format!(
-            "{}{}pdfpage|book.epub|-|0|generation-pending|generation-pending",
-            key,
-            crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+        let writer_base = LoadRequest {
+            path: child.clone(),
+            cache_key_override: Some(key.clone()),
+            folder_thumb_sort: Some(app.settings.folder_thumb_sort),
+            folder_thumb_depth: app.settings.folder_thumb_depth,
+            ..Default::default()
+        };
+        let writer_pins = std::collections::HashMap::from([(
+            crate::path_key::normalize_keep_drive(&child),
+            page_zero.clone(),
+        )]);
+        let writer_req = apply_folder_thumb_pin(
+            writer_base,
+            &child,
+            &key,
+            false,
+            ContainerKindForPin::Folder,
+            &writer_pins,
+            &std::collections::HashMap::new(),
+            app.folder_thumb_pin_db.as_deref(),
+            None,
+            None,
         );
+        let old_child_pin_key =
+            crate::thumb_loader::stamp_resolved_pdf_request(&writer_req, &old_read)
+                .unwrap()
+                .cache_key_override
+                .unwrap();
+        assert!(old_child_pin_key.contains("|generation:"));
         parent
             .save(
-                &child_pin_key,
+                &old_child_pin_key,
                 old.generation_id,
                 old.pdf_size as i64,
                 4,
@@ -12678,13 +12848,19 @@ mod phase_c_key_tests {
             .unwrap()
             .retain(|cached_key, _| !cached_key.starts_with(&prefix));
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
-        assert!(
-            !load(&app, &map),
-            "old child-pinned EPUB row must fall back"
-        );
+        if case == "old_generation" {
+            assert!(load(&app, &map).is_none(), "old EPUB row must fall back");
+            return;
+        }
+        let current_read = crate::pdf_loader::resolve_read_target(&epub).unwrap();
+        let current_child_pin_key =
+            crate::thumb_loader::stamp_resolved_pdf_request(&writer_req, &current_read)
+                .unwrap()
+                .cache_key_override
+                .unwrap();
         parent
             .save(
-                &child_pin_key,
+                &current_child_pin_key,
                 current.generation_id,
                 current.pdf_size as i64,
                 4,
@@ -12694,7 +12870,83 @@ mod phase_c_key_tests {
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
-        assert!(load(&app, &map), "current child-pinned EPUB row must show");
+
+        // The current generation has two valid page rows. The selected page's
+        // writer key must win, irrespective of lexical key order.
+        let page_one = crate::folder_thumb_pins::FolderPinSource::PdfPage {
+            pdf_rel: "book.epub".into(),
+            page: 1,
+        };
+        let page_one_pins = std::collections::HashMap::from([(
+            crate::path_key::normalize_keep_drive(&child),
+            page_one.clone(),
+        )]);
+        let page_one_writer = apply_folder_thumb_pin(
+            LoadRequest {
+                path: child.clone(),
+                cache_key_override: Some(key.clone()),
+                folder_thumb_sort: Some(app.settings.folder_thumb_sort),
+                folder_thumb_depth: app.settings.folder_thumb_depth,
+                ..Default::default()
+            },
+            &child,
+            &key,
+            false,
+            ContainerKindForPin::Folder,
+            &page_one_pins,
+            &std::collections::HashMap::new(),
+            app.folder_thumb_pin_db.as_deref(),
+            None,
+            None,
+        );
+        let page_one_key =
+            crate::thumb_loader::stamp_resolved_pdf_request(&page_one_writer, &current_read)
+                .unwrap()
+                .cache_key_override
+                .unwrap();
+        let mut page_one_webp = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([240, 20, 30, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut page_one_webp),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        parent
+            .save(
+                &page_one_key,
+                current.generation_id,
+                current.pdf_size as i64,
+                4,
+                4,
+                None,
+                &page_one_webp,
+            )
+            .unwrap();
+        if case == "new_generation" {
+            assert_eq!(load(&app, &map).unwrap().pixels[0].r(), 70);
+            return;
+        }
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(&child, &page_one)
+            .unwrap();
+        if case == "page_switch" {
+            assert_eq!(load(&app, &map).unwrap().pixels[0].r(), 240);
+        }
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(&child, &page_zero)
+            .unwrap();
+        if case == "page_switch" {
+            assert_eq!(load(&app, &map).unwrap().pixels[0].r(), 70);
+            return;
+        }
 
         image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]))
             .save(child.join("replacement.png"))
@@ -12712,9 +12964,165 @@ mod phase_c_key_tests {
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
         assert!(
-            !load(&app, &map),
+            load(&app, &map).is_none(),
             "a child pin changed to an image must not reuse its old EPUB row"
         );
+    }
+
+    #[test]
+    fn drive_list_indirect_old_epub_generation_uses_icon() {
+        assert_drive_list_indirect_epub_case("old_generation");
+    }
+
+    #[test]
+    fn drive_list_indirect_epub_cover_matches_current_generation_after_reconversion() {
+        assert_drive_list_indirect_epub_case("new_generation");
+    }
+
+    #[test]
+    fn drive_list_child_pin_change_from_epub_to_image_uses_icon() {
+        assert_drive_list_indirect_epub_case("pin_change");
+    }
+
+    #[test]
+    fn drive_list_child_same_generation_page_switch_selects_page_zero() {
+        assert_drive_list_indirect_epub_case("page_switch");
+    }
+
+    #[test]
+    fn drive_list_child_grandchild_epub_pin_uses_configured_depth_one() {
+        let mut app = setup_app();
+        app.settings.folder_thumb_depth = 1;
+        let drive = app.tmp.path().join("depth-one-drive");
+        let child = drive.join("child");
+        let grandchild = child.join("grandchild");
+        std::fs::create_dir_all(&grandchild).unwrap();
+        let epub = grandchild.join("book.epub");
+        std::fs::write(&epub, b"source").unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 901, 19);
+        let read = crate::pdf_loader::resolve_read_target(&epub).unwrap();
+        let child_source = crate::folder_thumb_pins::FolderPinSource::File {
+            rel: "grandchild".into(),
+            kind: crate::folder_thumb_pins::FileKind::Folder,
+        };
+        let page_zero = crate::folder_thumb_pins::FolderPinSource::PdfPage {
+            pdf_rel: "book.epub".into(),
+            page: 0,
+        };
+        let page_one = crate::folder_thumb_pins::FolderPinSource::PdfPage {
+            pdf_rel: "book.epub".into(),
+            page: 1,
+        };
+        let pins = std::sync::Arc::clone(app.folder_thumb_pin_db.as_ref().unwrap());
+        pins.set(&child, &child_source).unwrap();
+        pins.set(&grandchild, &page_zero).unwrap();
+        let base_key = crate::thumb_loader::folder_thumb_cache_key_for_path(
+            &child,
+            crate::path_key::is_drive_or_share_root(&drive),
+            app.settings.folder_thumb_sort,
+            1,
+            crate::catalog::FolderThumbProvenance::AutoSelected,
+        )
+        .unwrap();
+        let make_writer_key = |page: &crate::folder_thumb_pins::FolderPinSource| {
+            pins.set(&grandchild, page).unwrap();
+            let pin_map = std::collections::HashMap::from([(
+                crate::path_key::normalize_keep_drive(&child),
+                child_source.clone(),
+            )]);
+            let request = apply_folder_thumb_pin(
+                LoadRequest {
+                    path: child.clone(),
+                    cache_key_override: Some(base_key.clone()),
+                    folder_thumb_sort: Some(app.settings.folder_thumb_sort),
+                    folder_thumb_depth: 1,
+                    ..Default::default()
+                },
+                &child,
+                &base_key,
+                false,
+                ContainerKindForPin::Folder,
+                &pin_map,
+                &std::collections::HashMap::new(),
+                Some(pins.as_ref()),
+                None,
+                None,
+            );
+            crate::thumb_loader::stamp_resolved_pdf_request(&request, &read)
+                .unwrap()
+                .cache_key_override
+                .unwrap()
+        };
+        let page_one_key = make_writer_key(&page_one);
+        let page_zero_key = make_writer_key(&page_zero);
+        assert_ne!(page_zero_key, page_one_key);
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent = crate::catalog::CatalogDb::open(&cache_dir, &drive).unwrap();
+        let webp = |red| {
+            let mut data = Vec::new();
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                4,
+                4,
+                image::Rgba([red, 20, 30, 255]),
+            ))
+            .write_to(
+                &mut std::io::Cursor::new(&mut data),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+            data
+        };
+        parent
+            .save(&page_one_key, 901, 19, 4, 4, None, &webp(240))
+            .unwrap();
+        parent
+            .save(&page_zero_key, 901, 19, 4, 4, None, &webp(40))
+            .unwrap();
+        app.items = vec![GridItem::Folder(drive.clone())];
+        app.image_metas = vec![None];
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive),
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "child".into(),
+                kind: crate::folder_thumb_pins::FileKind::Folder,
+            },
+        );
+        let drive_list_db = std::sync::Arc::new(
+            crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
+        );
+        let map = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&drive_list_db));
+        let req = make_drive_list_pin_load_request(
+            &app.items[0],
+            0,
+            app.settings.folder_thumb_sort,
+            1,
+            &app.folder_pin_map,
+            &app.drive_list_seed_proofs,
+            Some(pins.as_ref()),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::thumb_loader::process_load_request(
+            &req,
+            &map,
+            &tx,
+            Some(&drive_list_db),
+            64,
+            75,
+            64,
+            CacheDecision::without_thumbnail(),
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(AtomicUsize::new(1)),
+            None,
+            Some(pins.as_ref()),
+            None,
+            None,
+        );
+        assert_eq!(rx.try_recv().unwrap().image.unwrap().pixels[0].r(), 40);
     }
 
     #[test]
@@ -12862,14 +13270,29 @@ mod phase_c_key_tests {
             app.folder_thumb_pin_db.as_deref(),
         )
         .expect("drive-list folder pin should create a cache-only request");
-        let prefix = req.pinned_only.unwrap().cache_key_prefix;
-        let drive_list_key = drive_list_pinned_cache_key(&prefix, 222, 0);
-        let seeded = drive_list_db
-            .load_one(&drive_list_key)
-            .unwrap()
-            .expect("drive-aware root folder tile should seed");
-        assert_eq!(seeded.jpeg_data, webp_bytes);
-        assert_eq!(seeded.source_dims, Some((100, 50)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::thumb_loader::process_load_request(
+            &req,
+            &cache_map,
+            &tx,
+            Some(&drive_list_db),
+            64,
+            75,
+            64,
+            CacheDecision::without_thumbnail(),
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(AtomicUsize::new(1)),
+            None,
+            app.folder_thumb_pin_db.as_deref(),
+            None,
+            None,
+        );
+        let shown = rx.try_recv().unwrap();
+        assert!(shown.image.is_some());
+        assert_eq!(shown.source_dims, Some((100, 50)));
     }
 
     #[test]

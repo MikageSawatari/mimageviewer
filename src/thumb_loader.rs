@@ -122,9 +122,21 @@ pub struct PinnedOnlyRequest {
 pub enum DriveListSeedProof {
     /// The parent catalog proof or direct root pin names an EPUB page.
     EpubPath(std::path::PathBuf),
-    /// The seeded row came from an EPUB child pin key. The worker checks that
-    /// the child's current pin route still has this identity before using it.
-    ChildPinSourceId(String),
+}
+
+/// One key builder for folder-pin writes and cache-only child reads. The
+/// generation suffix is added only after the EPUB target has been resolved.
+pub(crate) fn pinned_folder_row_key(
+    base_key: &str,
+    source_id: &str,
+    generation: Option<(i64, i64)>,
+) -> String {
+    let key = format!("{base_key}{CACHE_KEY_PIN_SUFFIX}{source_id}");
+    generation.map_or(key.clone(), |pair| pin_key_with_generation(&key, pair))
+}
+
+fn pin_key_with_generation(key: &str, (mtime, size): (i64, i64)) -> String {
+    format!("{key}|generation:{mtime}:{size}")
 }
 /// Ctrl+G アグリゲートビューの「代表サムネ」用キャッシュキープレフィックス (v0.8.1)。
 /// filename 単体だと別コンテナ同士の同名画像 (例: `cover.jpg`) でキャッシュ衝突し、
@@ -377,7 +389,7 @@ pub enum PdfStampPolicy {
     ResolveInWorker,
 }
 
-fn stamp_resolved_pdf_request(
+pub(crate) fn stamp_resolved_pdf_request(
     req: &LoadRequest,
     read: &crate::pdf_loader::ReadTarget,
 ) -> Option<LoadRequest> {
@@ -388,7 +400,7 @@ fn stamp_resolved_pdf_request(
     if let Some(key) = stamped.cache_key_override.as_mut()
         && key.contains(CACHE_KEY_PIN_SUFFIX)
     {
-        key.push_str(&format!("|generation:{mtime}:{file_size}"));
+        *key = pin_key_with_generation(key, (mtime, file_size));
     }
     Some(stamped)
 }
@@ -1079,16 +1091,17 @@ fn send_pinned_only_cached(
     gen_done: &Arc<AtomicUsize>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) -> bool {
-    let epub_source = match pin.seed_proof.as_ref() {
-        Some(DriveListSeedProof::EpubPath(path)) => Some(path.clone()),
-        Some(DriveListSeedProof::ChildPinSourceId(expected)) => {
-            let Some(target) = drive_list_child_pin_target(req, pin, expected, pin_db) else {
-                return false;
-            };
-            (target.pdf_page.is_some() && is_epub_path(&target.abs_path)).then_some(target.abs_path)
-        }
-        None => None,
-    };
+    if let crate::folder_thumb_pins::FolderPinSource::File {
+        rel,
+        kind: crate::folder_thumb_pins::FileKind::Folder,
+    } = &pin.source
+    {
+        return send_pinned_child_folder_cached(req, rel, tx, gen_done, pin_db);
+    }
+    let epub_source = pin
+        .seed_proof
+        .as_ref()
+        .map(|DriveListSeedProof::EpubPath(path)| path.clone());
     let epub_stamp = if let Some(source) = epub_source.as_ref() {
         let Ok(read) = crate::pdf_loader::resolve_read_target(source) else {
             return false;
@@ -1150,32 +1163,112 @@ fn send_pinned_only_cached(
     true
 }
 
-/// A pinned child row is usable only while the child's current pin route
-/// matches the catalog key from which that row was seeded.
-fn drive_list_child_pin_target(
+/// The child writer's exact catalog key is the authority for a drive-list
+/// child tile. Neither lexical newest-row order nor a stored key's text is a
+/// substitute for the current child pin route.
+fn send_pinned_child_folder_cached(
     req: &LoadRequest,
-    pin: &PinnedOnlyRequest,
-    expected_source_id: &str,
+    rel: &str,
+    tx: &mpsc::Sender<ThumbMsg>,
+    gen_done: &Arc<AtomicUsize>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
-) -> Option<crate::folder_thumb_pins::ResolvedPinTarget> {
-    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
-    let FolderPinSource::File {
-        rel,
-        kind: FileKind::Folder,
-    } = &pin.source
-    else {
-        return None;
-    };
+) -> bool {
     let child = req.path.join(rel);
-    let db = pin_db?;
-    let child_pin = db.lookup(&child)?;
-    let target = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+    let Some(sort) = req.folder_thumb_sort else {
+        return false;
+    };
+    let use_full_path = crate::path_key::is_drive_or_share_root(&req.path);
+    let source = pin_db.and_then(|db| db.lookup(&child));
+    let resolved = source.as_ref().and_then(|source| {
+        crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+            &child,
+            source,
+            |path| pin_db.and_then(|db| db.lookup(path)),
+            req.folder_thumb_depth as usize,
+        )
+    });
+    // An unresolved active pin must not accidentally select a stale auto row.
+    if source.is_some() && resolved.is_none() {
+        return false;
+    }
+    let provenance = if resolved
+        .as_ref()
+        .is_some_and(|target| matches!(target.kind, crate::folder_thumb_pins::ResolvedKind::Folder))
+        || source.is_none()
+    {
+        crate::catalog::FolderThumbProvenance::AutoSelected
+    } else {
+        crate::catalog::FolderThumbProvenance::Seeded
+    };
+    let Some(base_key) = folder_thumb_cache_key_for_path(
         &child,
-        &child_pin,
-        |path| db.lookup(path),
-        req.folder_thumb_depth.saturating_sub(1) as usize,
-    )?;
-    (target.source_id == expected_source_id).then_some(target)
+        use_full_path,
+        sort,
+        req.folder_thumb_depth,
+        provenance,
+    ) else {
+        return false;
+    };
+    let generation = if let Some(target) = resolved.as_ref()
+        && target.pdf_page.is_some()
+        && is_epub_path(&target.abs_path)
+    {
+        let Ok(read) = crate::pdf_loader::resolve_read_target(&target.abs_path) else {
+            return false;
+        };
+        let Some(pair) = read.stamp.generation_catalog_pair() else {
+            return false;
+        };
+        Some(pair)
+    } else {
+        None
+    };
+    let key = resolved.as_ref().map_or_else(
+        || base_key.clone(),
+        |target| pinned_folder_row_key(&base_key, &target.source_id, generation),
+    );
+    let Ok(Some(catalog)) = crate::catalog::CatalogDb::open_existing_read_only(
+        &crate::catalog::default_cache_dir(),
+        &req.path,
+    ) else {
+        return false;
+    };
+    let Ok(Some(entry)) = catalog.load_one(&key) else {
+        return false;
+    };
+    if let Some(target) = resolved.as_ref() {
+        let (mtime, size) = generation.unwrap_or((target.mtime, target.file_size));
+        if entry.mtime != mtime || entry.file_size != size {
+            return false;
+        }
+    } else if let Some(proof) = entry.selection_proof.as_ref()
+        && is_epub_path(&proof.winner.path)
+    {
+        let Ok(read) = crate::pdf_loader::resolve_read_target(&proof.winner.path) else {
+            return false;
+        };
+        if read.stamp.generation_catalog_pair() != Some((entry.mtime, entry.file_size)) {
+            return false;
+        }
+    }
+    let Some(image) = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data) else {
+        return false;
+    };
+    let _ = tx.send(ThumbMsg {
+        idx: req.idx,
+        image: Some(image),
+        origin: ThumbLoadOrigin::FinalCache,
+        from_edit_preview: false,
+        edit_preview_adjustment: None,
+        source_dims: entry.source_dims,
+        layout_dims: entry.layout_dims,
+        canceled: false,
+        finalized: false,
+        input_seq: req.input_seq,
+        items_gen: req.items_gen,
+    });
+    gen_done.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// 段階 B: 1 つの `LoadRequest` を処理する。
@@ -2885,14 +2978,14 @@ fn load_cached_pinned_folder_thumb(
         configured_depth,
         crate::catalog::FolderThumbProvenance::Seeded,
     )?;
-    let mut cache_key = format!("{base_key}{CACHE_KEY_PIN_SUFFIX}{}", resolved.source_id);
-    let (mtime, size) = if resolved.pdf_page.is_some() && is_epub_path(&resolved.abs_path) {
-        let (mtime, size, _) = pdf_derived_stamp(&resolved.abs_path)?;
-        cache_key.push_str(&format!("|generation:{mtime}:{size}"));
-        (mtime, size)
-    } else {
-        (resolved.mtime, resolved.file_size)
-    };
+    let (mtime, size, generation) =
+        if resolved.pdf_page.is_some() && is_epub_path(&resolved.abs_path) {
+            let (mtime, size, _) = pdf_derived_stamp(&resolved.abs_path)?;
+            (mtime, size, Some((mtime, size)))
+        } else {
+            (resolved.mtime, resolved.file_size, None)
+        };
+    let cache_key = pinned_folder_row_key(&base_key, &resolved.source_id, generation);
     context.cached_candidate(parent_folder, &cache_key, &resolved.abs_path, mtime, size)
 }
 

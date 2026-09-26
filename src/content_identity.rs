@@ -4224,6 +4224,77 @@ mod tests {
     }
 
     #[test]
+    fn deleted_dotted_folder_purge_waits_for_checked_epub_backfill_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("books.v2");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("book.epub");
+        std::fs::write(&path, b"source").unwrap();
+        let source = ContentIdentitySource::from_path(&path).unwrap();
+        let state = RecordedFileState {
+            file_key: crate::path_key::normalize_keep_drive(&path),
+            size: 6,
+            hashed_mtime: 1,
+        };
+        let db_path = tmp.path().join("content_identity.db");
+        drop(ContentIdentityDb::open_at(&db_path).unwrap());
+        std::fs::remove_dir_all(&folder).unwrap();
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_db_path = db_path.clone();
+        let writer = std::thread::spawn(move || {
+            let db = ContentIdentityDb::open_at(&writer_db_path).unwrap();
+            write_if_provenance_valid(
+                &source,
+                || Ok(true), // backfill's already checked branch provenance
+                || {
+                    checked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+                || {
+                    db.upsert(
+                        &source,
+                        &state,
+                        "head",
+                        "full",
+                        1,
+                        ObservationRole::DetectionCache,
+                    )
+                },
+            )
+            .unwrap();
+        });
+        checked_rx.recv().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let purge_root = tmp.path().to_path_buf();
+        let purge = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let report =
+                crate::rename_key_migration::purge_removed_paths_at(&purge_root, &[folder], &[]);
+            done_tx.send(report.errors).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(250));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        purge.join().unwrap();
+        assert!(
+            early.is_err(),
+            "purge must wait for the checked ledger write"
+        );
+        assert!(done_rx.recv().unwrap().is_empty());
+        assert!(
+            ContentIdentityDb::open_at(&db_path)
+                .unwrap()
+                .ledger_entry(&crate::path_key::normalize_keep_drive(&path))
+                .unwrap()
+                .is_none(),
+            "a delayed backfill must not recreate the purged EPUB row"
+        );
+    }
+
+    #[test]
     fn epub_stage0_detection_does_not_write_source_hash_after_pin() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("stage0.epub");

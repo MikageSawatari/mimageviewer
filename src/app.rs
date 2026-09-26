@@ -30261,10 +30261,9 @@ impl App {
         &mut self,
         container: &std::path::Path,
         source: &crate::folder_thumb_pins::FolderPinSource,
-    ) -> Option<(crate::catalog::CacheEntry, Option<String>)> {
+    ) -> Option<crate::catalog::CacheEntry> {
         use crate::folder_thumb_pins::{FileKind, FolderPinSource};
-        let mut child_pin_source_id = None;
-        let entry = match source {
+        match source {
             FolderPinSource::File { rel, kind } => {
                 let fname = direct_pin_rel_file_name(rel)?;
                 let use_full_path_key = crate::path_key::is_drive_or_share_root(container);
@@ -30325,28 +30324,9 @@ impl App {
                         cat.load_one(&key).ok().flatten()
                     }
                     FileKind::Folder => {
-                        let folder_path = container.join(rel);
-                        let folder_item = GridItem::Folder(folder_path);
-                        let key = container_cache_base_key(
-                            &folder_item,
-                            use_full_path_key,
-                            Some(self.settings.folder_thumb_sort),
-                            self.settings.folder_thumb_depth,
-                        )?;
-                        let cat = self.get_or_open_catalog(container)?;
-                        let base_entry = cat.load_one(&key).ok().flatten();
-                        let pinned_prefix =
-                            format!("{}{}", key, crate::thumb_loader::CACHE_KEY_PIN_SUFFIX);
-                        let pinned_entry = cat
-                            .load_latest_with_prefix(&pinned_prefix)
-                            .ok()
-                            .flatten()
-                            .map(|(key, entry)| {
-                                child_pin_source_id =
-                                    key.strip_prefix(&pinned_prefix).map(str::to_owned);
-                                entry
-                            });
-                        pinned_entry.or(base_entry)
+                        // Current child pin and generation are resolved in the
+                        // cache-only worker. No UI seed can prove this row key.
+                        None
                     }
                 }
             }
@@ -30390,8 +30370,7 @@ impl App {
                     .ok()
                     .flatten()
             }
-        };
-        entry.map(|entry| (entry, child_pin_source_id))
+        }
     }
 
     fn seed_drive_list_pin_thumbs_from_catalog(
@@ -30428,9 +30407,7 @@ impl App {
                 continue;
             };
             let prefix = drive_list_pinned_cache_key_prefix(&base_key, &source);
-            let Some((mut entry, child_pin_source_id)) =
-                self.drive_list_pin_seed_entry(&container_path, &source)
-            else {
+            let Some(mut entry) = self.drive_list_pin_seed_entry(&container_path, &source) else {
                 if matches!(
                     source,
                     crate::folder_thumb_pins::FolderPinSource::File {
@@ -30446,20 +30423,15 @@ impl App {
                 }
                 continue;
             };
-            let seed_proof = child_pin_source_id
-                .filter(|source_id| child_pin_source_id_is_epub(source_id))
-                .map(crate::thumb_loader::DriveListSeedProof::ChildPinSourceId)
-                .or_else(|| {
-                    entry
-                        .selection_proof
-                        .as_ref()
-                        .map(|proof| proof.winner.path.clone())
-                        .filter(|path| {
-                            pdf_stamp_policy_for_path(path)
-                                == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
-                        })
-                        .map(crate::thumb_loader::DriveListSeedProof::EpubPath)
-                });
+            let seed_proof = entry
+                .selection_proof
+                .as_ref()
+                .map(|proof| proof.winner.path.clone())
+                .filter(|path| {
+                    pdf_stamp_policy_for_path(path)
+                        == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+                })
+                .map(crate::thumb_loader::DriveListSeedProof::EpubPath);
             if let Some(seed_proof) = seed_proof {
                 self.drive_list_seed_proofs
                     .insert(prefix.clone(), seed_proof);
@@ -34595,11 +34567,17 @@ impl App {
             let (tx, rx) = std::sync::mpsc::channel();
             let worker_old = old_path;
             let worker_new = new_path;
+            let worker_tree = job.mappings[0].tree;
             match std::thread::Builder::new()
                 .name("rename-key-migration".into())
                 .spawn(move || {
                     let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::rename_key_migration::run_at(&data_dir, &worker_old, &worker_new)
+                        crate::rename_key_migration::run_at_with_shape(
+                            &data_dir,
+                            &worker_old,
+                            &worker_new,
+                            worker_tree,
+                        )
                     }))
                     .unwrap_or_else(|_| {
                         crate::rename_key_migration::RenameMigrationReport {
@@ -79855,20 +79833,6 @@ fn drive_list_pinned_cache_key(prefix: &str, mtime: i64, file_size: i64) -> Stri
     format!("{prefix}{mtime}|{file_size}")
 }
 
-/// The pin source ID has typed fields (`kind|relative path|entry|page|mtime|size`).
-/// Cascades prefix the kind with a route hash. Only EPUB page/file rows need
-/// worker pin revalidation; ordinary PDF and image rows keep their old lookup.
-fn child_pin_source_id_is_epub(source_id: &str) -> bool {
-    let fields = source_id.split('|').collect::<Vec<_>>();
-    if fields.len() != 6 {
-        return false;
-    }
-    let kind = fields[0].rsplit(':').next().unwrap_or_default();
-    matches!(kind, "pdfpage" | "pdffile")
-        && pdf_stamp_policy_for_path(std::path::Path::new(fields[1]))
-            == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
-}
-
 fn direct_pin_rel_file_name(rel: &str) -> Option<String> {
     let path = std::path::Path::new(rel);
     if path.components().count() != 1 {
@@ -80795,12 +80759,8 @@ fn apply_folder_thumb_pin(
     } else {
         base_key.to_owned()
     };
-    let pinned_key = format!(
-        "{}{}{}",
-        effective_base_key,
-        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-        resolved.source_id,
-    );
+    let pinned_key =
+        crate::thumb_loader::pinned_folder_row_key(&effective_base_key, &resolved.source_id, None);
     // ネスト時の解決経路を確認するための診断ログ。Folder/ZipFile/PdfFile pin の挙動を
     // 切り分けやすくする。`mimageviewer.log` の grep `folder_thumb_pin: apply` で
     // すべての pin 適用箇所を一覧できる。
