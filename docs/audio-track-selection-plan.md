@@ -1,6 +1,6 @@
 # 動画の複数音声トラック選択 設計 (backlog §1.251)
 
-- 状態: 設計案 (独立レビュー前)
+- 状態: 設計案 第2版 (独立レビュー1回目 REVISE を反映)
 - 出典: [next-release-backlog.md §1.251](next-release-backlog.md) (>>429)
 - 担当: 設計・検収 = ClaudeCode Opus / 実装 = Codex Sol / 独立レビュー = 別の Sol
 - 関連: [video-architecture.md](video-architecture.md) (decoder 3-thread 構成・seek 調停・audio.rs・Norm)、
@@ -154,42 +154,68 @@ struct AudioTrackSelectionState {
 1. `stream_index` が `audio_tracks` に無い、または selection が無い player なら何もせず `Rejected` を返す。
 2. `desired.stream == stream_index` かつ失敗状態でないなら no-op (`Unchanged`)。
 3. `desired = (desired.gen + 1, stream_index)` を書く。
-4. engine の published state が `Eof` なら seek は発行しない (§7.3)。`Deferred` を返す。
-5. それ以外は、**3 の後で**、位置を保つ seek を既存の user seek 経路で 1 回発行する:
+4. demux が末尾に達している (`clock.is_eof_reached()`。engine の `Eof` 確定前の末尾 drain 中も含む) なら
+   seek は発行しない (§7.3)。`Deferred` を返す。
+5. それ以外は、**3 の後で**、位置を保つ seek を 1 回発行する:
    - 基準位置: 一時停止中 (frame-step pause を含む) は `last_displayed_pts_secs()`、それ以外は
      `user_seek_base_secs()` (coalesce 中の pending target を優先、無ければ `position()`)。
    - 再生状態: `seek_with_play_state(base, self.intent_playing())`。一時停止中は一時停止のまま、再生中は再生のまま。
-   - coalesce によって `request_seek` がすぐに出ない場合も、後で発行される seek が 3 の値を読むので
-     取りこぼさない (§5.3)。
+     `seek_with_play_state` は coalesce を挟まず即時に `request_seek` する。coalesce 待ちの pending target が
+     あれば基準位置としてそれを使い、その pending は clear する (同じ位置への seek を 2 回出さない)。
 6. `Requested` を返す。UI thread はここで終わり、decoder の終了・作成・完了を待たない。
 
 速度・音量・mute・Norm の ON/OFF・ループ設定は `AvClock` / `EngineActor` / App が持っており、この手順は触らない。
 
 ### 5.2 demux thread (seek 要求の取り出し時)
 
-`take_seek_request()` で要求を取り出した直後、`av_seek_frame` の前に selection を読む:
+`take_seek_request()` で要求を取り出した直後に selection を読み、次の順で処理する。**routing と `applied` の
+確定は、seek と `Flush` の受理が両方成立した後に限る。**
 
 1. `desired.gen > applied.gen` かつ `desired.stream != applied.stream` なら、`input.stream(desired.stream)` から
-   新しい `AudioSetup` を組む (open 時と同じ関数を stream 指定で呼べるように分離する)。
-   - 成功: `audio_stream_idx_for_demux` と time base をその場で差し替え、`applied = desired` とし、
-     新 `AudioSetup` を `AudioControlMsg::Flush` に載せる (下記)。
-   - 失敗: routing は変えない。`last_failure = Some({gen: desired.gen, stream, reason})` を書く。seek 自体は
-     そのまま続ける (UI 側はすでに buffer を clear しているので、旧トラックで同じ位置から再開する)。
-2. `desired.gen > applied.gen` かつ `desired.stream == applied.stream` (元のトラックへ戻した等) なら
-   `AudioSetup` は作らず `applied.gen = desired.gen` だけ進める。
-3. 以降は通常の seek と同じ (`av_seek_frame` → video overflow 破棄 → `Flush` 送出 →
-   `notify_seek_completed` → `SeekCompleted`)。
+   新しい `AudioSetup` を組む (open 時と同じ関数を stream 指定で呼べるように分離する)。この時点では routing も
+   `applied` も変えない。構築時間は perf event に残す。
+   - 構築失敗: `last_failure = Some({gen: desired.gen, stream, reason: SetupFailed})`。以降は通常の seek として
+     続ける (旧トラックのまま同じ位置から再開する)。
+2. `av_seek_frame` (既存の backward → forward fallback)。
+   - seek 失敗: 1 で組んだ `AudioSetup` を捨て、`last_failure = Some({.., reason: SeekFailed})`。既存の
+     seek 失敗経路 (trim なしの `Flush`・`clear_seek_target_override`) をそのまま通る。旧トラックの routing のまま、
+     demux の位置は変わらない。
+3. seek 成功なら、video overflow 破棄 → video `Flush` → audio `Flush { .., replace_setup }` を送る。
+   audio `Flush` の送信結果を見る (現状は捨てている `decoder.rs:3054`)。
+   - 送信成功: ここで初めて `audio_stream_idx_for_demux` と audio time base を差し替え、`applied = desired` を書く。
+   - 送信失敗 (audio decode thread が終了している): routing を変えず、`last_failure = {.., reason: WorkerGone}`。
+4. `desired.gen > applied.gen` かつ `desired.stream == applied.stream` (元のトラックへ戻した等) は `AudioSetup` を
+   作らず、3 の送信成功時に `applied.gen = desired.gen` だけ進める。
+5. 以降は通常の seek と同じ (`notify_seek_completed` → `SeekCompleted`)。
 
 `AudioControlMsg::Flush` に `replace_setup: Option<Box<AudioSetup>>` を追加する。audio decode thread は
 `Flush` 受信時、`replace_setup` があれば旧 `AudioSetup` (avcodec context・resampler・fast downmix) を drop して
-差し替えてから、既存の flush 処理 (serial / trim 下限 / target / `next_audio_pts_secs` の更新) を行う。
-旧 serial の packet は既存どおり serial 不一致で捨てるので、旧トラックの packet が新 decoder に入ることはない。
+差し替えてから、既存の flush 処理 (serial / trim 下限 / target / `next_audio_pts_secs` の更新 / EOF drain 状態・
+保留中 packet の破棄) を行う。旧トラックの packet が新 decoder に入らないことは §5.3 の serial 規則で保証する。
 
 `AudioSetup` の構築を demux thread で行う理由: 成否を routing 変更の前に確定でき、失敗時に audio decode
-thread 側が「decoder の無い状態」を持たずに済む。構築は codec open と swr init のみ (数 ms) で、demux thread を
-一時的に止めるだけで UI thread は止めない。
+thread 側が「decoder の無い状態」を持たずに済む。構築は codec open と swr init のみだが所要時間は未測定なので、
+perf event で計測し、S2 の受け入れ試験で素材ごとの値を記録する。UI thread は止めない。
 
-### 5.3 most-recent-wins の保証
+### 5.3 packet の世代番号は demux が処理済みの seek 世代から付ける (既存の競合の修正)
+
+現状、demux は packet に `clock.current_seek_serial()` (live serial) を付ける (`decoder.rs:3272`)。
+`request_seek` は serial を進めてから seek 要求を公開する (`clock.rs:613` → 要求の mutex) ため、その隙間に
+demux が**旧 routing・旧位置**で読んだ packet が**新しい serial** を持って queue に入り得る。audio decode thread
+は `Flush` を優先受信した後、その packet を新世代として受け入れる。通常の seek では旧位置の音が一瞬混ざる
+程度だが、トラック切り替えでは旧トラック (別 codec) の packet が新 decoder に入る。
+
+修正: demux が保持する「処理済み seek 世代」(`demux_serial`) を導入し、packet (audio / video とも) にはこれを
+付ける。`demux_serial` は demux が seek 要求を処理して両 `Flush` を送った後にだけ、その要求の serial に更新する。
+
+- seek 要求の公開前に読まれた packet は旧 `demux_serial` を持ち、decode thread の既存判定
+  (`serial != current || serial != live` で破棄、`decoder.rs:5613`) で捨てられる。
+- `demux_serial` の新しい packet は、同じ世代の `Flush` を control channel へ送った後にしか queue に入らない。
+  decode thread は control を優先受信する (`select_biased!`) ので、新世代の packet を見る前に必ず `Flush` を処理する。
+- video 側も同じ規則にする (旧位置の frame が新世代として表示される同型の競合を同時に塞ぐ)。
+- この変更は既存の seek 全体に効くので、S2 の最初に単独で入れ、既存の seek テストを通してから切り替えを載せる。
+
+### 5.4 most-recent-wins の保証
 
 - `desired` は latest-value。連続選択 A → B → C は途中の値を上書きし、demux が次に seek 要求を取り出したときの
   値 (C) だけが反映される。
@@ -206,17 +232,17 @@ thread 側が「decoder の無い状態」を持たずに済む。構築は code
   する)。UI は「失敗」状態として選択中の行に失敗表示を出し、実際に鳴っているのは `applied` のトラックである
   ことを示す。次の選択で通常どおり上書きされる。
 
-### 5.4 旧トラックのデータが残らない境界 (段ごと)
+### 5.5 旧トラックのデータが残らない境界 (段ごと)
 
 | 段 | 境界の仕組み (既存 / 追加) |
 |---|---|
-| demux → audio packet queue | 既存: packet は取り出し時の `seek_serial` を持ち、audio decode thread は serial 不一致を捨てる。送信待ち中の旧 packet は `SeekPending` で破棄 |
+| demux → audio packet queue | 修正: packet は demux の処理済み seek 世代を持つ (§5.3)。audio decode thread は serial 不一致を捨てる (既存)。送信待ち中の旧 packet は `SeekPending` で破棄 (既存) |
 | avcodec decoder | 追加: `Flush.replace_setup` で旧 context ごと drop。差し替えない場合は既存の `decoder.flush()` |
-| resampler / fast downmix | 追加: `AudioSetup` ごと差し替え (旧 swr の delay に残ったサンプルも一緒に捨てる)。差し替えない場合は既存どおり (§12 の既知事項) |
+| resampler / fast downmix | 追加: `AudioSetup` ごと差し替え (旧 swr の delay に残ったサンプルも一緒に捨てる)。fast downmix は状態を持たない変換。同じトラックのままの seek は既存どおり swr を保持する (同じトラックの数 ms の delay が残るのは既存 seek と同じで、本機能の境界ではない) |
 | audio_tx (decoded frame) | 既存: `AudioFrame.seek_serial` を pump が clock serial と比べて捨てる |
 | pump raw / processed | 既存: UI thread の `clear_audio_output_buffer` と、pump の新世代検出での clear |
 | VST / limiter / time stretcher | 既存: pump が新世代の最初の frame で reset |
-| Norm gain ramp | 追加: §6.1。新トラックの gain へ ramp せず snap する |
+| Norm gain | 追加: §6.1。新トラックの gain が確定するまで processed を作らず、確定後は ramp せず snap する |
 | cpal callback | 既存: `pump_seek_serial < clock_serial` の間は silence |
 | A/V clock | 既存: `notify_seek_completed` と `BufferReady` による Audio anchor の張り直し |
 | engine readiness | 既存: `handle_seek_request` の latch 再初期化 |
@@ -227,50 +253,103 @@ thread 側が「decoder の無い状態」を持たずに済む。構築は code
 
 測定値はトラックごとに異なるので、選択中トラックの測定値を使う。
 
-- DB: 既存テーブル `audio_normalize` の意味を「既定トラック (FFmpeg が `best(Audio)` で選ぶ stream) の測定値」と
-  明文化し、変更しない。既定以外のトラックは**追加の新テーブル**
-  `audio_normalize_track (path_lower, file_size, mtime_ms, target_lufs_milli, stream_index, gain_db,
-  integrated_lufs, true_peak_db, scanned_at, PRIMARY KEY(...5 列))` に保存する。
-  - 既存テーブルの主キーを変える移行は行わない。旧版へ戻したときに旧版の `ON CONFLICT (4 列)` が失敗する
-    ため (downgrade で Norm が壊れる)。新テーブルは旧版から見えないだけで害が無い。
-  - key の規則は 1 つ: 「トラックが既定トラックなら `audio_normalize`、それ以外は `audio_normalize_track`」。
-    判定は `stream_index == default_audio_stream_index` だけで行う。
-  - `clear_all` / `count` は両テーブルを対象にする。
-- scanner: `normalize_scanner` に対象 stream index を渡せるようにし、`best(Audio)` の独自選択をやめる
-  (既定トラックでも open 時に確定した index を渡す)。
-- App: `NormalizeScanState` に対象 stream index を持たせ、完了時の stale 判定を (file path, stream index) で
-  行う。scan 中にトラックが替わったら既存の「別動画の scan が残っている」場合と同じく旧 scan を cancel する。
-- 切り替え時: Norm が全体 ON のとき、UI thread は `select_audio_track` の**前**に新トラックの測定値を引く。
-  - 測定済み: gain を新しい値にし、pump の ramp を新世代で snap させる (`AvClock` の normalize gain に
-    「次の世代の最初の chunk から snap」する指示を足す。ramp の既存挙動 = 手動 ON/OFF 時の 4 秒 ramp は変えない)。
-  - 未測定: 既存の「未測定動画の再生 intent」経路 (`maybe_start_normalize_scan_for_play_intent`) を新トラックで
-    通す。一時停止中は scan を始めない (既存規則どおり play intent で始まる)。
-  - DB lookup の I/O は既存の open 時 lookup と同じ扱い (§12 の既知事項)。
+#### DB (リリース済み `audio_normalize.db`)
+
+- 既存テーブル `audio_normalize` の主キーは変えない。変えると旧版へ戻したときに旧版の
+  `ON CONFLICT (4 列)` が失敗し、downgrade で Norm が壊れる。
+- 追加テーブル `audio_normalize_track (path_lower, file_size, mtime_ms, target_lufs_milli, stream_index,
+  gain_db, integrated_lufs, true_peak_db, scanned_at, PRIMARY KEY(5 列))` を作る (`CREATE TABLE IF NOT EXISTS`、
+  旧版からは見えないだけで害が無い)。
+- 規則は 1 つ:
+  - **新規保存は常に `audio_normalize_track` へ、stream index を明示して書く** (既定トラックも含む)。
+    `best(Audio)` の選択は FFmpeg の版で変わり得るので、「既定トラック」を永続 identity にしない。
+  - **読み出しは `audio_normalize_track` を先に引く。無く、かつ対象 stream が open 時に開いた既定トラック
+    (`default_audio_stream_index`) のときだけ、旧 `audio_normalize` の行を後方互換として使う。** 旧行は
+    「その行を書いた版が `best(Audio)` で選んだトラック」の測定値で、この互換読みはその前提に依存することを
+    コメントに残す。旧テーブルへは書かない。
+- `clear_all` / `count` は両テーブルを対象にする。
+
+#### scanner と App の状態
+
+- `normalize_scanner` に対象 stream index を渡し、`best(Audio)` の独自選択をやめる (既定トラックでも open 時に
+  確定した index を渡す)。
+- App の Norm 状態 (per fs_idx の `normalize_ui_states` / `NormalizeScanState`、provisional 結果、自動 scan 抑止) の
+  key を (fs_idx, file path) から (fs_idx, file path, stream index) に広げる。scan の provisional / 完了 / 抑止は
+  すべて stream index 一致で照合し、不一致は stale として捨てる。scan 中に `applied` のトラックが替わったら
+  既存の「別動画の scan が残っている」場合と同じく旧 scan を cancel する。
+
+#### 切り替え時の gain — `applied` に結び付ける
+
+gain は「実際に鳴っているトラック」(`applied`) の測定値でなければならない。切り替えが失敗して旧トラックが鳴り
+続けるのに新トラックの gain を当てる、あるいは新トラックの音を旧 gain で鳴らす、のどちらも起こさない。
+
+Norm が全体 ON のとき:
+
+1. App の Norm owner は `select_audio_track` を呼ぶ**前**に既存の `audio_preroll_suspended` を立てる
+   (pump は processed を作らず、cpal callback は silence。既存の未測定 scan 待ちと同じ仕組み。`BufferReady` も
+   出ないので engine は Buffering で待つ)。先に立てるのは、seek 発行から suspension までの間に新トラックの
+   processed が旧 gain で作られる隙間を作らないため。
+   - 戻り値が `Requested` / `Deferred` なら、その player の Norm 状態を「トラック確定待ち (desired generation,
+     stream)」にする。`Deferred` (末尾) は次の seek で `applied` が変わるまで待つ (末尾では pump に処理する音が
+     無いので suspension は害が無い)。
+   - `Rejected` / `Unchanged` なら suspension を直ちに解き、状態は変えない。
+2. 同時に、測定値の lookup を worker で始める (file metadata 取得 + SQLite。UI thread で I/O しない)。
+   結果は (fs_idx, file path, stream index, desired generation) を持って返る。
+3. App は毎 tick、selection の snapshot と lookup 結果を突き合わせる:
+   - 同じ generation で `applied` が新トラックに確定し、lookup 済み:
+     - 測定済み → gain をその値にして pump に「次の chunk から snap」を指示し、suspension を解く。
+     - 未測定 → 既存の未測定経路 (`maybe_start_normalize_scan_for_play_intent`、play intent が無ければ scan は
+       始めず unity gain で解く) へ新トラックで渡す。suspension の扱いはその既存経路に従う。
+   - 同じ generation の失敗 (`last_failure.gen == gen`) → gain は変えず (旧トラックの値のまま)、suspension を解く。
+   - generation が古くなった (より新しい選択が来た) → その結果を捨てる。新しい選択の 1〜3 が引き継ぐ。
+4. Norm OFF のときは何もしない (gain は unity のまま)。
+
+- snap: 既存の `NormalizeGainRamp` は手動 ON/OFF・仮→確定の差を 4 秒 ramp する。トラック切り替えでは別の音源に
+  なるので ramp しない。`AvClock` の normalize gain 更新に「snap」種別を足し、pump は次の chunk から新 gain を
+  そのまま使う。既存の ramp 経路は変えない。
+- 「トラック確定待ち」は既存の Norm 状態 enum の 1 状態として足し、App に別の bool / Option を足さない。
+- 自動 scan 抑止 (cancel / 失敗後) は stream 単位で持つ。あるトラックの抑止は別トラックに及ばない。
 
 ### 6.2 seek strip 波形・音声モードの解析
 
-- `audio_decode::AudioRangeDecoder::open` と音楽解析の decode 入口に stream index 指定を追加し、呼び出し側は
-  player の `applied.stream` を渡す。
-- 波形 session の identity (現状: owner fs index / 動画パス / source epoch / items generation) に
-  `audio stream index` を加える。トラックが確定 (`applied` が変わる) したら既存の identity 不一致経路で worker を
-  作り直す。切り替え中 (desired ≠ applied) は旧波形を表示し続け、確定時に差し替える。
-- 失敗表示時 (routing は旧トラック) は `applied` を見るので波形は旧トラックのまま正しい。
+波形と音楽解析は、decoder の入口だけでなく**結果を保存・再利用するすべての key** がファイル単位なので、
+その全部に stream index を通す。1 か所でも漏れると別トラックの結果が再利用される。
+
+| 対象 | 現状の key | 変更 |
+|---|---|---|
+| decode 入口 `audio_decode::AudioRangeDecoder::open` / 音楽解析の `decode_audio_file_progressive` 等 | 内部で `best(Audio)` | stream index を必須引数にし、呼び出し側は player の `applied.stream` を渡す |
+| 波形 session identity (owner fs index / 動画パス / source epoch / items generation) と holdover | 同左 | stream index を加える |
+| `WaveFileIdentity` (path / size / mtime、`seek_strip_wave.rs:49`) と worker 内 LRU | ファイル単位 | stream index を加える |
+| 波形の永続キャッシュ `video_wave_chunks` (`tile_thumb_cache.rs:194`、リリース済み) | path / bin 幅 / chunk / mtime / size | Norm と同じ規則: 新規保存は stream index を持つ追加テーブルへ。読み出しは追加テーブル優先、既定トラックに限り旧テーブルを後方互換で読む |
+| 音楽解析 LRU `MusicAnalysisKey` (path / size / mtime、`app.rs:11241`)、進行中結果、spectrum PCM、seek strip への完成解析受け渡し | ファイル単位 | stream index を加える |
+
+- 切り替え中 (desired ≠ applied) は旧トラックの波形・解析を表示し続け、`applied` が変わった時点で既存の
+  identity 不一致経路で worker を作り直す。失敗時 (routing は旧トラック) は `applied` を見るので旧トラックのまま正しい。
+- 実装者は上表以外にファイル単位の key で音声解析結果を保存・再利用している箇所が無いかを grep で確認し、
+  あれば同じ扱いにして報告する。
 
 ## 7. ライフサイクル上の扱い
 
 ### 7.1 再生中 / 一時停止中 / seek 直後
 
-§5.1 のとおり、play intent を保って seek を 1 回発行するだけ。seek 直後 (前の seek がまだ表示されていない) は
-既存の coalesce に従い、後続の seek で `desired` が反映される。
+§5.1 のとおり、play intent を保って seek を 1 回発行するだけ。seek 直後 (前の seek がまだ表示されていない、
+または coalesce 待ちの pending target がある) は、その target を基準位置にして即時に seek する。demux がまだ前の
+seek を取り出していなければ要求は上書きされ (latest-value)、取り出した後なら次の seek として処理される。
+どちらでも切り替えは最後の seek の取り出し時に反映される。
 
 ### 7.2 連続切り替え
 
-§5.3。seek 要求は coalesce され、`AudioSetup` の構築は demux が取り出した要求 1 回ごとに最大 1 回。
+§5.4。seek 要求は latest-value で上書きされ、`AudioSetup` の構築は demux が取り出した要求 1 回ごとに最大 1 回。
 
 ### 7.3 再生終了 (EOF) と重なった場合
 
-- engine が `Eof` の間に選択された場合、seek は発行せず `desired` だけ更新する (表示は「切り替え中」)。
-  末尾への seek は既存の「シーク中...固着」経路 (`seek_eof_stuck_since`) を踏むため避ける。
+- 判定は engine の `Eof` ではなく demux の末尾到達 (`clock.is_eof_reached()`) で行う。demux の EOF 通知
+  (`decoder.rs:3318`) から engine の `Eof` 確定 (`mod.rs:10874` 以降、末尾音声の drain と quiet 判定の後) までの
+  間も「末尾」として扱う。この間に seek すると末尾の音声を切り、末尾への seek は既存の「シーク中...固着」経路
+  (`seek_eof_stuck_since`) も踏むため。
+- 末尾到達中に選択された場合、seek は発行せず `desired` だけ更新する (表示は「切り替え中」)。
+- 一時停止中 (frame-step pause を含む) で demux が末尾に達していない場合は、通常どおり表示中の PTS へ seek する
+  (末尾付近でも、利用者がその位置へ seek したのと同じ扱い)。
 - 次に seek が発生したとき (利用者の seek、ループ再生の先頭 seek、再生ボタンによる先頭からの再開) に demux が
   反映する。
 - demux が EOF idle wait 中に `desired` だけ変わっても起床は不要 (seek 要求で起床する既存の設計どおり)。
@@ -301,6 +380,14 @@ thread 側が「decoder の無い状態」を持たずに済む。構築は code
   - これは detached 経路の述語に variant を 1 つ加える変更なので、CLAUDE.md「Detached viewer リワーク中の
     ルール」に従い、独立レビューで「症状パッチではなく、新しい HUD 操作の分類を既存規則どおり加えるだけの
     構造的変更」であることに合意を取り、[detached-rework-plan.md](detached-rework-plan.md) §11 に記録する。
+  - ParkedLive の窓では、HUD command は source epoch の検査 (`native_video.rs:5459`) より前に活性化へ変換される
+    (`native_video.rs:5360`)。変換後は command 自体を実行しないので、旧 source の選択 event が別の player の
+    stream を切り替えることは無い。活性化は「利用者がその窓の HUD をクリックした」事実への応答で、source epoch に
+    依らず正しい。この順序は既存の全 HUD command に共通で、本機能では変えない。
+  - 活性化でない通常経路では、`SelectAudioTrack` は source epoch 検査の**後**で処理する。`NavigateItem` のような
+    epoch 不一致の許容例外には入れない (stream index は source ごとの値で、旧 source の index を新 source に
+    適用してはならない)。handler はさらに `stream_index` が現在の player の `audio_tracks` に含まれることを確認する
+    (§5.1 の `Rejected`)。
 - 同時に生きる decoder は 1 本 (`MAX_LIVE_VIDEO_DECODE_THREADS=1`) で、本機能は decoder を増やさない。
 
 ### 7.7 動画→音声モード
@@ -328,7 +415,7 @@ thread 側が「decoder の無い状態」を持たずに済む。構築は code
   - `(既定)` は `stream_index == default_audio_stream_index` の行だけ。
   - 導出状態が「切り替え中」の行には「(切り替え中)」、「失敗」の行には「(切り替えできません)」を添える。
 - 選択 → `NativeOverlayCommand::SelectAudioTrack { stream_index }` → `NativeVideoOutputEvent::SelectAudioTrack` →
-  App の handler → `VideoPlayer::select_audio_track` (Norm が ON なら §6.1 の lookup を先に行う)。
+  App の handler → (Norm が ON なら §6.1 の Norm owner の手順を通して) `VideoPlayer::select_audio_track`。
 - 失敗時は App が既存のトーストで 1 回通知する (「音声トラックを切り替えられませんでした」)。
 
 ### 8.2 音声モード HUD (egui)
@@ -378,35 +465,47 @@ thread 側が「decoder の無い状態」を持たずに済む。構築は code
 
 ### S2: 切り替えの中核
 
-- `AudioTrackSelection`、`VideoPlayer::select_audio_track`、demux の差し替え、`Flush.replace_setup`、
-  失敗経路、EOF の保留。
+- 最初に §5.3 (packet の世代番号を demux の処理済み seek 世代から付ける) を単独で入れ、既存の seek テストを
+  通してからコミットする (既存 seek 全体に効く修正のため)。
+- 続いて `AudioTrackSelection`、`VideoPlayer::select_audio_track`、demux の差し替え (§5.2 の確定順序)、
+  `Flush.replace_setup`、失敗経路 (SetupFailed / SeekFailed / WorkerGone)、末尾の保留 (§7.3)、構築時間の perf event。
+- この段では UI から呼ばない (§5 の API とテストだけ)。
 - テスト (lib、実 decoder を headless で動かす。GPU は使わない):
   - 切り替え後に pump / `AudioFrame` へ届く音声の周波数が新トラックのもの (零交差数で判定)、serial が新しい。
   - 旧トラックの周波数を持つ frame が切り替え後の世代に 1 つも無い。
-  - 一時停止中の切り替えで一時停止が保たれ、位置が変わらない。
-  - seek 直後 (前の seek 未表示) の切り替え、連続 3 回の切り替えで最後の選択だけが `applied` になる。
-  - 切り替えの seek の後に通常 seek を重ねても切り替えが反映される。
-  - EOF 中の選択は seek を出さず、次の seek で反映される。
-  - `AudioSetup` 構築失敗 (テスト用に失敗を注入する seam) で routing が変わらず、失敗が desired.gen で記録され、
-    後から来た古い失敗が新しい選択の表示を上書きしない。
+  - **serial 公開前の packet 競合**: `request_seek` が serial を進めた後、要求の公開前に demux が旧 routing で
+    packet を読む割り込み順を、テスト用 seam で固定して再現し、その packet が新世代として decode されないこと。
+  - 一時停止中の切り替えで一時停止が保たれ、位置が変わらない。frame-step pause 中も同じ。
+  - seek 直後 (前の seek 未表示・coalesce 待ち) の切り替え、連続 3 回の切り替えで最後の選択だけが `applied` になる。
+  - 切り替えの seek の後に通常 seek を重ねても切り替えが反映される。frame-step seek・ループの先頭 seek でも同じ。
+  - 末尾到達中 (demux EOF 済み・engine の `Eof` 確定前の drain 中を含む) の選択は seek を出さず、次の seek で反映される。
+  - `AudioSetup` 構築失敗・`av_seek_frame` 失敗・audio `Flush` 送信失敗 (それぞれテスト用の注入 seam) で routing と
+    `applied` が変わらず、失敗が desired.gen と理由つきで記録され、後から来た古い失敗が新しい選択の表示を上書きしない。
   - 速度・音量・mute が切り替えで変わらない。
+  - 異なる sample rate / channel 数 / time base のトラック間 (素材の 3 本) で、切り替え後の audio PTS と
+    A/V clock が連続している (切り替え前後の位置差が seek 誤差の範囲)。
   - 導出状態 (§4.2) の純粋関数テスト。
-- 作ったテストのうち周波数判定・most-recent-wins・失敗 generation は、対象処理を一時的に外すと落ちることを
-  実装者が確かめ、報告に書く。
+- 作ったテストのうち周波数判定・serial 競合・most-recent-wins・失敗 generation は、対象処理を一時的に外すと
+  落ちることを実装者が確かめ、報告に書く。
 
-### S3: UI と操作
+### S3: 解析系の追従
 
-- 8.1〜8.4。`NativeVideoOutputEvent` の追加と ParkedLive 分類 (§7.6、§11 記録)。
-- テスト: App handler-level (event → `select_audio_track`、fs_idx 不一致で無視、ParkedLive で活性化扱い)、
-  行ラベル生成、keymap の表とiniの整合 (既存テスト)、UI スナップショット (音声モード HUD の選択 UI、
-  変更があれば `UPDATE_SNAPSHOTS`)。
+UI より先に入れる (UI から切り替えられるようになった時点で、Norm と波形が正しいトラックを見ているようにする)。
 
-### S4: 解析系の追従
+- 6.1 (Norm: 追加テーブル、scanner の stream 指定、App の Norm 状態の key 拡張、トラック確定待ち、snap、
+  worker での lookup) と 6.2 (波形・音楽解析の全 key への stream index)。
+- テスト: DB の新旧テーブルの読み分け (新規保存は追加テーブル、既定トラックだけ旧行を読む、非既定では旧行を
+  読まない)・`clear_all`/`count`、scanner が指定 stream を測る (sine の振幅をトラックごとに変えて LUFS 差で判定)、
+  Norm の確定待ち (成功 → snap、未測定 → 既存経路、失敗 → 旧 gain のまま解除、古い generation の結果を捨てる)、
+  scan 中のトラック変更で旧 scan が cancel される、抑止が stream 単位、波形・音楽解析の key に stream index が
+  入り別トラックの結果が再利用されない (永続キャッシュ・LRU とも)。
 
-- 6.1 (Norm、新テーブル、scanner の stream 指定、snap) と 6.2 (波形・音声モード解析の stream 指定と identity)。
-- テスト: DB の新旧テーブルの読み分け・`clear_all`/`count`、scanner が指定 stream を測る (sine の振幅を
-  トラックごとに変えて LUFS 差で判定)、scan 中のトラック変更で旧 scan が cancel される、波形 identity の変化で
-  worker が作り直される。
+### S4: UI と操作
+
+- 8.1〜8.4。`NativeVideoOutputEvent` の追加と ParkedLive 分類 (§7.6、detached-rework-plan §11 に記録)。
+- テスト: App handler-level (event → Norm owner → `select_audio_track`、fs_idx 不一致で無視、source epoch 不一致で
+  無視、`stream_index` が現在の player に無ければ無視、ParkedLive で活性化扱い)、失敗トーストが generation ごとに
+  1 回、行ラベル生成、keymap の表と ini の整合 (既存テスト)、UI スナップショット (音声モード HUD の選択 UI)。
 
 ### S5: 実アプリのシナリオと文書
 
@@ -427,13 +526,11 @@ thread 側が「decoder の無い状態」を持たずに済む。構築は code
 - 詳細表示 (一覧): ファイル単位の情報で、再生中の選択とは無関係。
 - 開いた時点で音声が無効な player での切り替え: §7.4。
 
-## 12. 既知事項・確認したい点 (レビューで判断を求める)
+## 12. 判断済みの事項
 
-1. 同じトラックへ戻す等、`AudioSetup` を差し替えない seek では resampler は reset されない (既存の seek と同じ)。
-   既存どおりで良いか。
-2. §6.1 の切り替え時の Norm DB lookup は UI thread で行う (既存の open 時 lookup と同じ場所・同じ I/O)。
-   既存が UI thread なのか worker なのかを実装者が確認し、UI thread なら既存と同等 (1ms 級) として許容するか。
-3. `AudioSetup` を demux thread で構築する間、video packet の供給も止まる (数 ms)。seek と同じタイミングなので
-   許容と考える。
-4. 切り替えの seek は `seek_with_play_state` を使うので、HUD の「シーク中...」表示 (150ms 超で表示) が
-   出る場合がある。専用の文言にするかどうか (本設計では既存のまま)。
+1. 同じトラックのままの seek では resampler を reset しない (既存 seek と同じ)。トラックを替える seek では
+   `AudioSetup` ごと差し替えるので、旧トラックのサンプルは swr の delay にも残らない。
+2. Norm の測定値 lookup は UI thread で行わない (§6.1 の worker)。既存の open 時 lookup も UI thread で
+   `std::fs::metadata` を伴うが、それは本機能の範囲外の既存事項として backlog に記録する。
+3. `AudioSetup` の構築は demux thread で行い、所要時間を perf event で計測する (S2 の受け入れで素材ごとに記録)。
+4. 切り替えの seek で HUD の「シーク中...」が出る場合があるが、通常の seek と同じ表示のままにする。
