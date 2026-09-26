@@ -3,6 +3,7 @@ use lopdf::{Document, Object, StringFormat, dictionary};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
@@ -156,7 +157,7 @@ pub fn merge_pdf(
     files: &[PathBuf],
     out: &Path,
     rtl: bool,
-    title: Option<&str>,
+    title: &str,
     author: Option<&str>,
 ) -> Result<(), String> {
     if files.is_empty() {
@@ -174,6 +175,9 @@ pub fn merge_pdf(
             .get(b"Root")
             .and_then(Object::as_reference)
             .map_err(|e| e.to_string())?;
+        // The printed part's Info is unrelated to its pages; never embed its
+        // Chromium title as an orphan object in the merged PDF.
+        let printed_info = doc.trailer.get(b"Info").and_then(Object::as_reference).ok();
         let pages = doc
             .get_object(catalog)
             .and_then(Object::as_dict)
@@ -183,7 +187,7 @@ pub fn merge_pdf(
         roots.push(pages);
         count += doc.get_pages().len();
         for (id, obj) in doc.objects {
-            if id != catalog {
+            if id != catalog && Some(id) != printed_info {
                 merged.objects.insert(id, obj);
             }
         }
@@ -207,16 +211,12 @@ pub fn merge_pdf(
         .insert(new_catalog, Object::Dictionary(catalog));
     merged.trailer.set("Root", new_catalog);
     let mut info = lopdf::Dictionary::new();
-    if let Some(title) = title {
-        info.set("Title", info_text(title));
-    }
+    info.set("Title", info_text(title));
     if let Some(author) = author {
         info.set("Author", info_text(author));
     }
-    if !info.is_empty() {
-        let info_id = merged.add_object(info);
-        merged.trailer.set("Info", info_id);
-    }
+    let info_id = merged.add_object(info);
+    merged.trailer.set("Info", info_id);
     merged.save(out).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -225,13 +225,27 @@ pub fn merge_pdf_for_package(
     files: &[PathBuf],
     out: &Path,
     package: &crate::package::Package,
+    input: &Path,
 ) -> Result<(), String> {
+    let fallback: Cow<'_, str> = input
+        .file_stem()
+        .filter(|stem| !stem.is_empty())
+        .map(|stem| stem.to_string_lossy())
+        .unwrap_or(Cow::Borrowed("EPUB"));
+    let title = package
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(fallback.as_ref());
     merge_pdf(
         files,
         out,
         package.direction == "rtl",
-        package.title.as_deref(),
-        package.creator.as_deref(),
+        title,
+        package
+            .creator
+            .as_deref()
+            .filter(|author| !author.trim().is_empty()),
     )
 }
 pub fn inspect_pdf(
@@ -422,6 +436,27 @@ pub fn summarize(reports: &[crate::Report]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn package_with_metadata(metadata: &str) -> Package {
+        use std::io::{Cursor, Write};
+        use zip::{ZipWriter, write::SimpleFileOptions};
+        let opf = format!(
+            r#"<package><metadata>{metadata}</metadata><manifest><item id="p" href="p.xhtml" media-type="application/xhtml+xml"/></manifest><spine page-progression-direction="rtl"><itemref idref="p"/></spine></package>"#
+        );
+        let mut epub = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut epub);
+            for (name, bytes) in [
+                ("META-INF/container.xml", br#"<container><rootfiles><rootfile full-path="OPS/content.opf"/></rootfiles></container>"#.as_slice()),
+                ("OPS/content.opf", opf.as_bytes()),
+                ("OPS/p.xhtml", br#"<html><body>page</body></html>"#.as_slice()),
+            ] {
+                zip.start_file(name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        crate::package::inspect_bytes(&epub.into_inner()).unwrap()
+    }
     fn one_page(path: &Path, width: i64, height: i64) {
         let mut d = Document::with_version("1.7");
         let pages = d.new_object_id();
@@ -440,6 +475,113 @@ mod tests {
         d.trailer.set("Root", catalog);
         d.save(path).unwrap();
     }
+    fn printed_page(path: &Path, title: &str) {
+        one_page(path, 300, 400);
+        let mut doc = Document::load(path).unwrap();
+        let info = doc.add_object(dictionary! {
+            "Title" => title,
+            "Author" => "Chromium-generated author",
+            "Creator" => "Chromium printToPDF"
+        });
+        doc.trailer.set("Info", info);
+        doc.save(path).unwrap();
+    }
+    fn assert_no_print_url_in_info(path: &Path) {
+        let doc = Document::load(path).unwrap();
+        let titles = doc
+            .objects
+            .values()
+            .filter_map(|object| object.as_dict().ok())
+            .filter_map(|dict| dict.get(b"Title").ok())
+            .filter_map(|value| value.as_str().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles.len(),
+            1,
+            "printed parts left their Info dictionaries behind"
+        );
+        for title in titles {
+            assert!(
+                !title
+                    .windows(b"epub.invalid".len())
+                    .any(|part| part == b"epub.invalid")
+            );
+        }
+        // lopdf ignores unreachable objects while loading, but the bytes of an
+        // imported Chromium Info dictionary can still be present in the PDF.
+        let raw = fs::read(path).unwrap();
+        for leaked in [
+            b"epub.invalid".as_slice(),
+            b"Chromium-generated author".as_slice(),
+            b"Chromium printToPDF".as_slice(),
+        ] {
+            assert!(!raw.windows(leaked.len()).any(|part| part == leaked));
+        }
+    }
+    #[test]
+    fn merge_fixed_print_parts_drop_chromium_info() {
+        let dir = std::env::temp_dir().join(format!("epub-pdf-fixed-info-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("fixed-1.pdf");
+        let b = dir.join("fixed-2.pdf");
+        let out = dir.join("merged.pdf");
+        printed_page(&a, "epub.invalid/_miv_print_1%2Ehtml");
+        printed_page(&b, "epub.invalid/_miv_print_2%2Ehtml");
+        let package = package_with_metadata(
+            r#"<dc:title xmlns:dc="x">本の題名</dc:title><dc:creator xmlns:dc="x">著者</dc:creator><meta property="rendition:layout">pre-paginated</meta>"#,
+        );
+        merge_pdf_for_package(
+            &[a.clone(), b.clone()],
+            &out,
+            &package,
+            Path::new("book.epub"),
+        )
+        .unwrap();
+        let doc = Document::load(&out).unwrap();
+        let info = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
+        let info = doc.get_object(info).unwrap().as_dict().unwrap();
+        assert_eq!(info_text_value(info.get(b"Title").unwrap()), "本の題名");
+        assert_eq!(info_text_value(info.get(b"Author").unwrap()), "著者");
+        assert_no_print_url_in_info(&out);
+        for file in [a, b, out] {
+            fs::remove_file(file).unwrap();
+        }
+        fs::remove_dir(dir).unwrap();
+    }
+    fn info_text_value(value: &Object) -> String {
+        let bytes = value.as_str().unwrap();
+        assert_eq!(&bytes[..2], &[0xfe, 0xff]);
+        let units = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&units).unwrap()
+    }
+    #[test]
+    fn merge_without_opf_title_uses_epub_stem_and_no_author() {
+        let dir = std::env::temp_dir().join(format!("epub-pdf-stem-info-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("part.pdf");
+        let out = dir.join("saved.pdf");
+        printed_page(&part, "epub.invalid/_miv_print_1%2Ehtml");
+        let package = package_with_metadata("");
+        merge_pdf_for_package(
+            std::slice::from_ref(&part),
+            &out,
+            &package,
+            Path::new("書名なし.epub"),
+        )
+        .unwrap();
+        let doc = Document::load(&out).unwrap();
+        let info = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
+        let info = doc.get_object(info).unwrap().as_dict().unwrap();
+        assert_eq!(info_text_value(info.get(b"Title").unwrap()), "書名なし");
+        assert!(info.get(b"Author").is_err());
+        assert_no_print_url_in_info(&out);
+        fs::remove_file(part).unwrap();
+        fs::remove_file(out).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
     #[test]
     fn merge_keeps_order_boxes_and_rtl() {
         let dir = std::env::temp_dir().join(format!("epub-pdf-merge-{}", std::process::id()));
@@ -449,14 +591,7 @@ mod tests {
         let out = dir.join("merged.pdf");
         one_page(&a, 300, 400);
         one_page(&b, 500, 600);
-        merge_pdf(
-            &[a.clone(), b.clone()],
-            &out,
-            true,
-            Some("書名"),
-            Some("著者"),
-        )
-        .unwrap();
+        merge_pdf(&[a.clone(), b.clone()], &out, true, "書名", Some("著者")).unwrap();
         assert_eq!(
             pdf_sizes(&out).unwrap(),
             vec![(300.0, 400.0), (500.0, 600.0)]
@@ -492,29 +627,22 @@ mod tests {
 
     #[test]
     fn merge_uses_title_and_first_creator_from_opf() {
-        use std::io::{Cursor, Write};
-        use zip::{ZipWriter, write::SimpleFileOptions};
-        let mut epub = Cursor::new(Vec::new());
-        {
-            let mut zip = ZipWriter::new(&mut epub);
-            for (name, bytes) in [
-                ("META-INF/container.xml", br#"<container><rootfiles><rootfile full-path="OPS/content.opf"/></rootfiles></container>"#.as_slice()),
-                ("OPS/content.opf", r#"<package><metadata><dc:title xmlns:dc="x">本の題名</dc:title><dc:creator xmlns:dc="x">第一著者</dc:creator><dc:creator xmlns:dc="x">第二著者</dc:creator></metadata><manifest><item id="p" href="p.xhtml" media-type="application/xhtml+xml"/></manifest><spine page-progression-direction="rtl"><itemref idref="p"/></spine></package>"#.as_bytes()),
-                ("OPS/p.xhtml", br#"<html><body>page</body></html>"#.as_slice()),
-            ] {
-                zip.start_file(name, SimpleFileOptions::default()).unwrap();
-                zip.write_all(bytes).unwrap();
-            }
-            zip.finish().unwrap();
-        }
-        let package = crate::package::inspect_bytes(&epub.into_inner()).unwrap();
+        let package = package_with_metadata(
+            r#"<dc:title xmlns:dc="x">本の題名</dc:title><dc:creator xmlns:dc="x">第一著者</dc:creator><dc:creator xmlns:dc="x">第二著者</dc:creator>"#,
+        );
         let dir =
             std::env::temp_dir().join(format!("epub-pdf-package-info-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let part = dir.join("page.pdf");
         let out = dir.join("book.pdf");
         one_page(&part, 300, 400);
-        merge_pdf_for_package(&[part.clone()], &out, &package).unwrap();
+        merge_pdf_for_package(
+            std::slice::from_ref(&part),
+            &out,
+            &package,
+            Path::new("book.epub"),
+        )
+        .unwrap();
         let doc = Document::load(&out).unwrap();
         let info_id = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
         let info = doc.get_object(info_id).unwrap().as_dict().unwrap();

@@ -967,4 +967,5 @@ EPUB 以外の台帳・編集行には今回の per-book ガードがない。�
 - ZIP/RAR を `ArchiveFormat` によって分類する既存バッチとは EPUB の入力型を共有しないため、`ConvertSource` は導入しない。
 - 実経路の回帰テストでは、現行世代の再利用と古い世代の再変換、キャッシュ外パスの除外、PDF 検証後の上書き禁止、取消・書込失敗時の `.part` 除去、通常コピーで扱う設定の複写と内容同定・しおり・コレクションの非複写、ダイアログの所有権と案内、バッチ結果・停止・D5 再走査、PDF Info を確認する。実装条件を一時的に外す感度確認でも対応するテストの失敗を確認した。
 - S3b の自動検証: `cargo test -p mimageviewer --lib` は 9,299 成功・47 ignored、`cargo test -p epub-pdf-worker` は 37 成功。core check、fmt、glyph lint、開発用 core・remote・EPUB worker の build-dev も成功。共通 `test-full.ps1` は、この worktree に release 版 core・remote がなく launcher の build script で停止したため、S3b の合否には上記の指定ゲートを用いる。実際の WebView2 による 27 冊変換と画面操作は設計担当の実機確認に残す。
+- S3b 実機検証で固定ページの PDF に印刷用 URL を持つ Chromium の古い Info 辞書が残ることが判明した。merge は最終 trailer を新しい書誌 Info へ向けていたが、各印刷パートの Info オブジェクトも出力へ複写していた。merge 時に元 Info を除外し、OPF に書名がないときは EPUB のファイル名 (拡張子を除く) を `/Title` にする。著者がなければ `/Author` は置かない。固定パート複数と書名なし単一パートの実 merge テストで、印刷用 URL が出力の Info に残らないことを確認する。
 - S5 TODO: 明示保存した PDF と EPUB 内の書誌情報についてプライバシー文言を更新する。`privacy.html` は S3b で編集しない。
