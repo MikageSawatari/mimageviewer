@@ -7,6 +7,7 @@
 
 #![cfg_attr(all(test, not(feature = "test-script")), allow(dead_code))]
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -681,6 +682,150 @@ fn optional_rhai_usize(value: Option<usize>) -> Dynamic {
         .unwrap_or_else(|| Dynamic::from(-1_i64))
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestScriptSortPopupRow {
+    pub(crate) label: String,
+    pub(crate) disabled: bool,
+    pub(crate) visible: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestScriptCollectionSortPopup {
+    pub(crate) open: bool,
+    pub(crate) needs_scrolling: bool,
+    pub(crate) within_screen: bool,
+    pub(crate) rows: Vec<TestScriptSortPopupRow>,
+    pub(crate) rendered_tooltip: Option<String>,
+}
+
+impl TestScriptCollectionSortPopup {
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("open".into(), self.open.into());
+        map.insert("needs_scrolling".into(), self.needs_scrolling.into());
+        map.insert("within_screen".into(), self.within_screen.into());
+        map.insert(
+            "tooltip_open".into(),
+            self.rendered_tooltip.is_some().into(),
+        );
+        map.insert(
+            "tooltip_text".into(),
+            Dynamic::from(self.rendered_tooltip.clone().unwrap_or_default()),
+        );
+        map.insert(
+            "rows".into(),
+            self.rows
+                .iter()
+                .map(|row| {
+                    let mut value = Map::new();
+                    value.insert("label".into(), Dynamic::from(row.label.clone()));
+                    value.insert("disabled".into(), row.disabled.into());
+                    value.insert("visible".into(), row.visible.into());
+                    Dynamic::from_map(value)
+                })
+                .collect::<rhai::Array>()
+                .into(),
+        );
+        map
+    }
+}
+
+#[derive(Default)]
+struct CollectionSortPopupFrame {
+    frame_nr: u64,
+    snapshot: TestScriptCollectionSortPopup,
+}
+
+thread_local! {
+    static COLLECTION_SORT_POPUP_FRAME: RefCell<CollectionSortPopupFrame> =
+        RefCell::new(CollectionSortPopupFrame::default());
+}
+
+pub(crate) fn begin_collection_sort_popup(ctx: &egui::Context) {
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        return;
+    }
+    COLLECTION_SORT_POPUP_FRAME.with(|observed| {
+        let mut observed = observed.borrow_mut();
+        observed.frame_nr = ctx.cumulative_frame_nr();
+        observed.snapshot = TestScriptCollectionSortPopup {
+            open: true,
+            within_screen: true,
+            ..Default::default()
+        };
+    });
+}
+
+pub(crate) fn record_collection_sort_popup_row(
+    label: &str,
+    response: &egui::Response,
+    clip: egui::Rect,
+) {
+    let ctx = &response.ctx;
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        return;
+    }
+    let row = response.rect;
+    let visible = row.left() >= clip.left() - 1.0
+        && row.right() <= clip.right() + 1.0
+        && row.top() >= clip.top() - 1.0
+        && row.bottom() <= clip.bottom() + 1.0;
+    let screen = ctx.viewport_rect();
+    let within_screen = row.left() >= screen.left() - 1.0
+        && row.right() <= screen.right() + 1.0
+        && row.top() >= screen.top() - 1.0
+        && row.bottom() <= screen.bottom() + 1.0;
+    COLLECTION_SORT_POPUP_FRAME.with(|observed| {
+        let mut observed = observed.borrow_mut();
+        if observed.frame_nr != ctx.cumulative_frame_nr() || observed.snapshot.rows.len() >= 16 {
+            return;
+        }
+        observed.snapshot.needs_scrolling |= !visible;
+        observed.snapshot.within_screen &= within_screen;
+        observed.snapshot.rows.push(TestScriptSortPopupRow {
+            label: label.to_owned(),
+            disabled: !response.enabled(),
+            visible,
+        });
+    });
+    register_sort_popup_pointer_row(label, response, clip);
+}
+
+/// Called only from the real disabled tooltip's content closure, after its
+/// text label was laid out inside the open popup.
+pub(crate) fn record_collection_sort_tooltip_rendered(
+    ui: &egui::Ui,
+    label: &egui::Response,
+    text: &str,
+) {
+    let ctx = ui.ctx();
+    if ctx.viewport_id() != egui::ViewportId::ROOT
+        || !ui.is_rect_visible(label.rect)
+        || !label.rect.intersects(ctx.viewport_rect())
+    {
+        return;
+    }
+    COLLECTION_SORT_POPUP_FRAME.with(|observed| {
+        let mut observed = observed.borrow_mut();
+        if observed.snapshot.open && observed.frame_nr == ctx.cumulative_frame_nr() {
+            observed.snapshot.rendered_tooltip = Some(text.to_owned());
+        }
+    });
+}
+
+pub(crate) fn collection_sort_popup_snapshot(ctx: &egui::Context) -> TestScriptCollectionSortPopup {
+    COLLECTION_SORT_POPUP_FRAME.with(|observed| {
+        let observed = observed.borrow();
+        if observed.snapshot.open
+            && observed.frame_nr.saturating_add(1) >= ctx.cumulative_frame_nr()
+        {
+            observed.snapshot.clone()
+        } else {
+            TestScriptCollectionSortPopup::default()
+        }
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestScriptSnapshot {
     pub(crate) is_fullscreen: bool,
@@ -699,6 +844,12 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) item_names: Vec<String>,
     pub(crate) item_ratings: Vec<i64>,
     pub(crate) sort_order: String,
+    pub(crate) collection_root_visible: bool,
+    pub(crate) collection_id: String,
+    pub(crate) collection_order_mode: String,
+    pub(crate) collection_standard_sort: String,
+    pub(crate) collection_revision: i64,
+    pub(crate) collection_sort_popup: TestScriptCollectionSortPopup,
     pub(crate) rating_sort_unrated_position: String,
     pub(crate) preferences_open: bool,
     pub(crate) preferences_page: String,
@@ -750,6 +901,12 @@ impl Default for TestScriptSnapshot {
             item_names: Vec::new(),
             item_ratings: Vec::new(),
             sort_order: String::new(),
+            collection_root_visible: false,
+            collection_id: String::new(),
+            collection_order_mode: String::new(),
+            collection_standard_sort: String::new(),
+            collection_revision: -1,
+            collection_sort_popup: TestScriptCollectionSortPopup::default(),
             rating_sort_unrated_position: String::new(),
             preferences_open: false,
             preferences_page: String::new(),
@@ -821,6 +978,15 @@ impl TestScriptSnapshot {
                 .into(),
         );
         insert!(sort_order);
+        insert!(collection_root_visible);
+        insert!(collection_id);
+        insert!(collection_order_mode);
+        insert!(collection_standard_sort);
+        insert!(collection_revision);
+        map.insert(
+            "collection_sort_popup".into(),
+            Dynamic::from_map(self.collection_sort_popup.to_rhai_map()),
+        );
         insert!(rating_sort_unrated_position);
         insert!(preferences_open);
         insert!(preferences_page);
@@ -941,9 +1107,14 @@ enum UiCommand {
         selection: TestScriptActionSelection,
         applied: mpsc::SyncSender<Result<(), String>>,
     },
-    RatingSortSmoke(RatingSortSmokeAction),
+    SmokeAction(UiSmokeAction),
     ClickWidget {
         label: String,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    SortPopupPointer {
+        label: String,
+        kind: SortPopupPointerKind,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
     ValidateSelectedOwner {
@@ -956,15 +1127,35 @@ enum UiCommand {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RatingSortSmokeAction {
+pub(crate) enum UiSmokeAction {
     OpenThumbnailPreferences,
     OpenFirstSmartFolder,
+    OpenSeededCollection,
 }
 
 #[derive(Clone, Copy)]
 enum WidgetClickPhase {
     Down,
     Up,
+    Hover,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortPopupPointerKind {
+    Hover,
+    Click,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WidgetPointerRequestKind {
+    ClickEnabled,
+    SortPopup(SortPopupPointerKind),
+}
+
+struct WidgetPointerRequest {
+    label: String,
+    kind: WidgetPointerRequestKind,
+    reply: mpsc::SyncSender<Result<(), String>>,
 }
 
 struct WidgetClick {
@@ -974,58 +1165,94 @@ struct WidgetClick {
 
 #[derive(Default)]
 struct WidgetClickDriver {
-    requested: Option<(String, mpsc::SyncSender<Result<(), String>>)>,
+    requested: Option<WidgetPointerRequest>,
     active: Option<WidgetClick>,
 }
 
-static WIDGET_CLICK_DRIVER: OnceLock<Mutex<WidgetClickDriver>> = OnceLock::new();
-
-fn widget_click_driver() -> &'static Mutex<WidgetClickDriver> {
-    WIDGET_CLICK_DRIVER.get_or_init(|| Mutex::new(WidgetClickDriver::default()))
+thread_local! {
+    static WIDGET_CLICK_DRIVER: RefCell<WidgetClickDriver> =
+        RefCell::new(WidgetClickDriver::default());
 }
 
 fn request_widget_click(
     label: String,
     reply: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
-    let mut driver = widget_click_driver()
-        .lock()
-        .map_err(|_| "widget click driver is poisoned".to_string())?;
-    if driver.requested.is_some() || driver.active.is_some() {
-        return Err("another widget click is still in progress".to_string());
-    }
-    driver.requested = Some((label, reply));
-    Ok(())
+    request_widget_pointer(label, WidgetPointerRequestKind::ClickEnabled, reply)
+}
+
+fn request_widget_pointer(
+    label: String,
+    kind: WidgetPointerRequestKind,
+    reply: mpsc::SyncSender<Result<(), String>>,
+) -> Result<(), String> {
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let mut driver = driver.borrow_mut();
+        if driver.requested.is_some() || driver.active.is_some() {
+            return Err("another widget click is still in progress".to_string());
+        }
+        driver.requested = Some(WidgetPointerRequest { label, kind, reply });
+        Ok(())
+    })
 }
 
 /// Register the actual interactive rectangle; a pending click scrolls its widget into view.
 /// The button/radio handler still sees an ordinary egui pointer press and release.
 pub(crate) fn register_clickable_widget(label: &str, response: &egui::Response) {
-    let Ok(mut driver) = widget_click_driver().lock() else {
-        return;
-    };
-    if !driver
-        .requested
-        .as_ref()
-        .is_some_and(|(requested, _)| requested == label)
-    {
-        return;
-    }
-    if !response.interact_rect.contains(response.rect.center()) {
-        response.scroll_to_me(Some(egui::Align::Center));
-        return;
-    }
-    if !response.enabled() {
-        return;
-    }
-    let point = response.rect.center();
-    let (_, reply) = driver.requested.take().expect("matching request exists");
-    if reply.send(Ok(())).is_ok() {
-        driver.active = Some(WidgetClick {
-            point,
-            phase: WidgetClickPhase::Down,
-        });
-    }
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let mut driver = driver.borrow_mut();
+        if !driver.requested.as_ref().is_some_and(|request| {
+            request.label == label && request.kind == WidgetPointerRequestKind::ClickEnabled
+        }) {
+            return;
+        }
+        if !response.interact_rect.contains(response.rect.center()) {
+            response.scroll_to_me(Some(egui::Align::Center));
+            return;
+        }
+        if !response.enabled() {
+            return;
+        }
+        let point = response.rect.center();
+        let request = driver.requested.take().expect("matching request exists");
+        if request.reply.send(Ok(())).is_ok() {
+            driver.active = Some(WidgetClick {
+                point,
+                phase: WidgetClickPhase::Down,
+            });
+        }
+    });
+}
+
+/// Sort rows may be disabled. This diagnostic pointer path still sends ordinary
+/// egui pointer events, leaving the production response to reject the click.
+fn register_sort_popup_pointer_row(label: &str, response: &egui::Response, clip: egui::Rect) {
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let mut driver = driver.borrow_mut();
+        let Some(request) = driver.requested.as_ref() else {
+            return;
+        };
+        if request.label != label {
+            return;
+        }
+        let WidgetPointerRequestKind::SortPopup(kind) = request.kind else {
+            return;
+        };
+        let point = response.rect.center();
+        if !clip.contains(point) {
+            return;
+        }
+        let request = driver.requested.take().expect("matching request exists");
+        if request.reply.send(Ok(())).is_ok() {
+            driver.active = Some(WidgetClick {
+                point,
+                phase: match kind {
+                    SortPopupPointerKind::Hover => WidgetClickPhase::Hover,
+                    SortPopupPointerKind::Click => WidgetClickPhase::Down,
+                },
+            });
+        }
+    });
 }
 
 /// Called by the synthetic-input plugin before egui processes the root pass.
@@ -1042,43 +1269,45 @@ pub(crate) fn append_widget_click_events(input: &mut egui::RawInput) {
     {
         return;
     }
-    let Ok(mut driver) = widget_click_driver().lock() else {
-        return;
-    };
-    let Some(click) = driver.active.as_mut() else {
-        return;
-    };
-    let point = click.point;
-    let pressed = matches!(click.phase, WidgetClickPhase::Down);
-    input.events.push(egui::Event::PointerMoved(point));
-    input.events.push(egui::Event::PointerButton {
-        pos: point,
-        button: egui::PointerButton::Primary,
-        pressed,
-        modifiers: egui::Modifiers::NONE,
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let mut driver = driver.borrow_mut();
+        let Some(click) = driver.active.as_mut() else {
+            return;
+        };
+        let point = click.point;
+        let pressed = matches!(click.phase, WidgetClickPhase::Down);
+        input.events.push(egui::Event::PointerMoved(point));
+        if !matches!(click.phase, WidgetClickPhase::Hover) {
+            input.events.push(egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        match click.phase {
+            WidgetClickPhase::Down => click.phase = WidgetClickPhase::Up,
+            WidgetClickPhase::Up | WidgetClickPhase::Hover => driver.active = None,
+        }
     });
-    if pressed {
-        click.phase = WidgetClickPhase::Up;
-    } else {
-        driver.active = None;
-    }
 }
 
 fn widget_click_in_progress() -> bool {
-    widget_click_driver()
-        .lock()
-        .is_ok_and(|driver| driver.requested.is_some() || driver.active.is_some())
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let driver = driver.borrow();
+        driver.requested.is_some() || driver.active.is_some()
+    })
 }
 
-pub(crate) fn take_rating_sort_smoke_action(action: RatingSortSmokeAction) -> bool {
+pub(crate) fn take_smoke_action(action: UiSmokeAction) -> bool {
     let Ok(mut guard) = runtime().lock() else {
         return false;
     };
     let Some(runtime) = guard.as_mut() else {
         return false;
     };
-    if runtime.rating_sort_smoke_actions.front() == Some(&action) {
-        runtime.rating_sort_smoke_actions.pop_front();
+    if runtime.smoke_actions.front() == Some(&action) {
+        runtime.smoke_actions.pop_front();
         true
     } else {
         false
@@ -1937,8 +2166,8 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
         "rating_sort_smoke",
         move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
             let action = match name.as_str() {
-                "open_thumbnail_preferences" => RatingSortSmokeAction::OpenThumbnailPreferences,
-                "open_first_smart_folder" => RatingSortSmokeAction::OpenFirstSmartFolder,
+                "open_thumbnail_preferences" => UiSmokeAction::OpenThumbnailPreferences,
+                "open_first_smart_folder" => UiSmokeAction::OpenFirstSmartFolder,
                 _ => {
                     return Err(rhai_error(format!(
                         "unknown rating-sort smoke action: {name}"
@@ -1946,8 +2175,22 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                 }
             };
             rating_sort_bridge
-                .send(UiCommand::RatingSortSmoke(action))
+                .send(UiCommand::SmokeAction(action))
                 .map_err(rhai_error)
+        },
+    );
+    let collection_sort_bridge = bridge.clone();
+    engine.register_fn(
+        "collection_sort_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            match name.as_str() {
+                "open_seeded_collection" => collection_sort_bridge
+                    .send(UiCommand::SmokeAction(UiSmokeAction::OpenSeededCollection))
+                    .map_err(rhai_error),
+                _ => Err(rhai_error(format!(
+                    "unknown Collection sort smoke action: {name}"
+                ))),
+            }
         },
     );
     let click_widget_bridge = bridge.clone();
@@ -1980,6 +2223,44 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
             }
         },
     );
+    for (name, kind) in [
+        ("hover_sort_row", SortPopupPointerKind::Hover),
+        ("click_sort_row", SortPopupPointerKind::Click),
+    ] {
+        let sort_pointer_bridge = bridge.clone();
+        engine.register_fn(
+            name,
+            move |label: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+                let (reply, received) = mpsc::sync_channel(1);
+                sort_pointer_bridge
+                    .send(UiCommand::SortPopupPointer {
+                        label: label.to_string(),
+                        kind,
+                        reply,
+                    })
+                    .map_err(rhai_error)?;
+                let started = Instant::now();
+                loop {
+                    sort_pointer_bridge.interrupt.check().map_err(rhai_error)?;
+                    if started.elapsed() >= Duration::from_secs(10) {
+                        return Err(rhai_error(format!(
+                            "{name} timed out waiting for visible sort row: {label}"
+                        )));
+                    }
+                    match received.recv_timeout(WAIT_POLL_INTERVAL) {
+                        Ok(Ok(())) => return Ok(()),
+                        Ok(Err(message)) => return Err(rhai_error(message)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(rhai_error(
+                                "sort row pointer acknowledgement disconnected",
+                            ));
+                        }
+                    }
+                }
+            },
+        );
+    }
     let select_root_bridge = bridge.clone();
     engine.register_fn("select_root", move || -> Result<Map, Box<EvalAltResult>> {
         select_root_bridge.select_root().map_err(rhai_error)
@@ -2464,7 +2745,7 @@ struct UiRuntime {
     snapshot: Arc<RwLock<TestScriptSnapshot>>,
     interrupt: Arc<InterruptState>,
     pending_actions: VecDeque<PendingAction>,
-    rating_sort_smoke_actions: VecDeque<RatingSortSmokeAction>,
+    smoke_actions: VecDeque<UiSmokeAction>,
     last_frame: Option<u64>,
     finish: Option<FinishState>,
     cancel_requested: bool,
@@ -2489,7 +2770,7 @@ impl UiRuntime {
             snapshot,
             interrupt,
             pending_actions: VecDeque::new(),
-            rating_sort_smoke_actions: VecDeque::new(),
+            smoke_actions: VecDeque::new(),
             last_frame: None,
             finish: None,
             cancel_requested: false,
@@ -3347,15 +3628,28 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                     }
                 }
             }
-            UiCommand::RatingSortSmoke(action) => {
+            UiCommand::SmokeAction(action) => {
                 if runtime.finish.is_none() {
-                    runtime.rating_sort_smoke_actions.push_back(action);
+                    runtime.smoke_actions.push_back(action);
                 }
             }
             UiCommand::ClickWidget { label, reply } => {
                 if runtime.finish.is_some() {
                     let _ = reply.send(Err("script is already finishing".to_string()));
                 } else if let Err(message) = request_widget_click(label, reply.clone()) {
+                    let _ = reply.send(Err(message));
+                } else {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            }
+            UiCommand::SortPopupPointer { label, kind, reply } => {
+                if runtime.finish.is_some() {
+                    let _ = reply.send(Err("script is already finishing".to_string()));
+                } else if let Err(message) = request_widget_pointer(
+                    label,
+                    WidgetPointerRequestKind::SortPopup(kind),
+                    reply.clone(),
+                ) {
                     let _ = reply.send(Err(message));
                 } else {
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -3820,6 +4114,145 @@ mod tests {
         let mut engine = rhai::Engine::new();
         engine.set_max_expr_depths(64, 64);
         engine.compile(script).unwrap();
+    }
+
+    #[test]
+    fn collection_sort_smoke_script_parses_without_launching_the_app() {
+        let script = include_str!("../scripts/ui-smoke/rating-sort-collection.rhai");
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine.compile(script).unwrap();
+    }
+
+    #[test]
+    fn disabled_sort_row_receives_pointer_events_without_a_click() {
+        let (reply, received) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_pointer(
+            "評価↑".to_string(),
+            super::WidgetPointerRequestKind::SortPopup(super::SortPopupPointerKind::Click),
+            reply,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let render = |mut input: egui::RawInput| {
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            ));
+            ctx.begin_pass(input);
+            let mut clicked = false;
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                let response = ui.add_enabled(false, egui::Button::new("評価↑"));
+                super::register_sort_popup_pointer_row("評価↑", &response, ui.clip_rect());
+                clicked = response.clicked();
+            });
+            let _ = ctx.end_pass();
+            clicked
+        };
+        assert!(!render(egui::RawInput {
+            time: Some(0.0),
+            focused: true,
+            ..Default::default()
+        }));
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        for time in [0.01, 0.02] {
+            let mut input = egui::RawInput {
+                time: Some(time),
+                focused: true,
+                ..Default::default()
+            };
+            super::append_widget_click_events(&mut input);
+            assert_eq!(input.events.len(), 2);
+            assert!(!render(input));
+        }
+    }
+
+    #[test]
+    fn disabled_sort_row_hover_uses_a_pointer_move_without_a_click() {
+        let (reply, received) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_pointer(
+            "評価↑".to_string(),
+            super::WidgetPointerRequestKind::SortPopup(super::SortPopupPointerKind::Hover),
+            reply,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let render = |mut input: egui::RawInput| {
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            ));
+            ctx.begin_pass(input);
+            let mut contains_pointer = false;
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                let response = ui.add_enabled(false, egui::Button::new("評価↑"));
+                super::register_sort_popup_pointer_row("評価↑", &response, ui.clip_rect());
+                contains_pointer = response.contains_pointer();
+                assert!(!response.clicked());
+            });
+            let _ = ctx.end_pass();
+            contains_pointer
+        };
+        assert!(!render(egui::RawInput {
+            time: Some(0.0),
+            focused: true,
+            ..Default::default()
+        }));
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let mut input = egui::RawInput {
+            time: Some(0.01),
+            focused: true,
+            ..Default::default()
+        };
+        super::append_widget_click_events(&mut input);
+        assert_eq!(input.events.len(), 1);
+        assert!(matches!(input.events[0], egui::Event::PointerMoved(_)));
+        assert!(render(input));
+    }
+
+    #[test]
+    fn collection_sort_popup_readback_tracks_visible_disabled_rows_and_expires() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::begin_collection_sort_popup(ctx);
+                let manual = ui.button("手動");
+                let rating = ui.add_enabled(false, egui::Button::new("評価↑"));
+                let clip = egui::Rect::from_min_max(
+                    manual.rect.min - egui::vec2(1.0, 1.0),
+                    manual.rect.max + egui::vec2(1.0, 1.0),
+                );
+                super::record_collection_sort_popup_row("手動", &manual, clip);
+                super::record_collection_sort_popup_row("評価↑", &rating, clip);
+            });
+        });
+        let observed = super::collection_sort_popup_snapshot(&ctx);
+        assert!(observed.open);
+        assert!(observed.needs_scrolling);
+        assert!(observed.within_screen);
+        assert_eq!(observed.rows.len(), 2);
+        assert!(observed.rows[0].visible);
+        assert!(!observed.rows[0].disabled);
+        assert!(!observed.rows[1].visible);
+        assert!(observed.rows[1].disabled);
+        assert!(observed.rendered_tooltip.is_none());
+        for _ in 0..2 {
+            let _ = ctx.run(input.clone(), |_| {});
+        }
+        assert!(!super::collection_sort_popup_snapshot(&ctx).open);
     }
 
     use super::InterruptState;

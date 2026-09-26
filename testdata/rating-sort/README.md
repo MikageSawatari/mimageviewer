@@ -6,6 +6,11 @@ runner copies them into `target/portable-smoke/data/rating-sort/fixture` and
 seeds ratings in that disposable data directory. The source files contain no
 user data.
 
+The `RatingSortCollection` smoke reuses these tracked images. Its separate
+fixture script seeds a disposable `collection.db` with the three image paths
+and verifies that clicking a disabled rating choice leaves the Collection
+record and manual item order unchanged.
+
 Regenerate the images with:
 
 ```powershell

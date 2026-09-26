@@ -485,6 +485,13 @@ Root が評価順で 1 回で確定、を確かめる。実行は利用者の了
   「Preferences OK and order」で FAIL (並び `01-one ★5, 02-unrated 未評価, 03-two ★2`) し、検出できることを確認。
   同じ build で `MultiWindowStills` / `MultiWindowPdf` / `MultiWindowRarNav` も PASS。
 
+Collection の残件には短い兄弟シナリオ `scripts/ui-smoke.ps1 -Scenario RatingSortCollection` を追加した。
+追跡済みの同じ PNG 3 枚から使い捨て `collection.db` を seed し、Collection root で
+ソート popup の全 12 行と非スクロール、評価順の無効表示・hover 理由、無効行の実 pointer click 後の
+UI 順序と DB の不変を確かめる。hover 理由は実際に開いた tooltip の描画クロージャ内で
+作られたラベルから読む。`portable,test-script` 限定の readback を使う。
+実アプリでの実行は利用者の了承した検証枠に残す。
+
 ## 10. 完了条件
 
 - 利用者が評価を変えても、評価順の既存行が移動しない (どの窓・Remote から書いても)。

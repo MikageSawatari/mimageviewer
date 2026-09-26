@@ -6038,6 +6038,20 @@ mod fixed_sort_control_tests {
                 .expect("collection sort combo")
                 .click();
             harness.run();
+            #[cfg(all(windows, feature = "test-script"))]
+            {
+                let popup = crate::test_script::collection_sort_popup_snapshot(&harness.ctx);
+                assert!(popup.open);
+                assert!(!popup.needs_scrolling);
+                assert!(popup.within_screen);
+                assert_eq!(popup.rows.len(), 12);
+                assert!(popup.rows.iter().all(|row| row.visible));
+                assert_eq!(popup.rows[0].label, "手動");
+                assert_eq!(popup.rows[1].label, "シャッフル（再選択で並べ直す）");
+                assert_eq!(popup.rows[10].label, "評価↑");
+                assert_eq!(popup.rows[11].label, "評価↓");
+                assert!(popup.rows[10].disabled && popup.rows[11].disabled);
+            }
             let row = harness.get_by_label(label);
             assert!(
                 row.accesskit_node().is_disabled(),
@@ -6045,6 +6059,14 @@ mod fixed_sort_control_tests {
             );
             row.hover();
             harness.run();
+            #[cfg(all(windows, feature = "test-script"))]
+            {
+                let popup = crate::test_script::collection_sort_popup_snapshot(&harness.ctx);
+                assert_eq!(
+                    popup.rendered_tooltip.as_deref(),
+                    Some("コレクションでは評価順を使えません。手動の並べ替えで順番を変えられます")
+                );
+            }
             assert!(
                 harness
                     .get_by_label(
@@ -9826,13 +9848,22 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     .selected_text(text)
                                     .show_ui(ui, |ui| {
                                         apply_toolbar_style(ui);
+                                        #[cfg(all(windows, feature = "test-script"))]
+                                        if root_order.is_some() {
+                                            crate::test_script::begin_collection_sort_popup(ui.ctx());
+                                        }
                                         if let Some(root) = root_order {
                                             for (mode, label) in [
                                                 (crate::collection_store::CollectionOrderMode::Manual, "手動"),
                                                 (crate::collection_store::CollectionOrderMode::Shuffle, "シャッフル（再選択で並べ直す）"),
                                             ] {
                                                 let selected = root.mode == mode;
-                                                if ui.selectable_label(selected, label).clicked()
+                                                let resp = ui.selectable_label(selected, label);
+                                                #[cfg(all(windows, feature = "test-script"))]
+                                                crate::test_script::record_collection_sort_popup_row(
+                                                    label, &resp, ui.clip_rect(),
+                                                );
+                                                if resp.clicked()
                                                     && (!selected || mode == crate::collection_store::CollectionOrderMode::Shuffle)
                                                 {
                                                     self.request_collection_grid_set_order(
@@ -9863,10 +9894,35 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                                 egui::Button::selectable(selected, order.short_label()),
                                             );
                                             let resp = if let Some(reason) = disabled_reason {
-                                                resp.hover_tip_disabled(reason)
+                                                #[cfg(all(windows, feature = "test-script"))]
+                                                {
+                                                    if root_order.is_some() {
+                                                        crate::ui_helpers::hover_tip_disabled_observed(
+                                                            resp,
+                                                            reason,
+                                                            |ui, label, text| {
+                                                                crate::test_script::record_collection_sort_tooltip_rendered(
+                                                                    ui, label, text,
+                                                                );
+                                                            },
+                                                        )
+                                                    } else {
+                                                        resp.hover_tip_disabled(reason)
+                                                    }
+                                                }
+                                                #[cfg(not(all(windows, feature = "test-script")))]
+                                                {
+                                                    resp.hover_tip_disabled(reason)
+                                                }
                                             } else {
                                                 resp.on_hover_text(order.description())
                                             };
+                                            #[cfg(all(windows, feature = "test-script"))]
+                                            if root_order.is_some() {
+                                                crate::test_script::record_collection_sort_popup_row(
+                                                    order.short_label(), &resp, ui.clip_rect(),
+                                                );
+                                            }
                                             match sort_control_decision(resp.clicked(), selected, order) {
                                                 SortControlDecision::Reload => toolbar_sort_reload_requested = true,
                                                 SortControlDecision::Change => {
@@ -9935,6 +9991,12 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                             );
                             #[cfg(test)]
                             SORT_CONTROL_TEST_RESPONSES.with(|responses| responses.borrow_mut().push(("toolbar", combo.response.enabled())));
+                            #[cfg(all(windows, feature = "test-script"))]
+                            if root_order.is_some() {
+                                crate::test_script::register_clickable_widget(
+                                    "collection_sort_combo", &combo.response,
+                                );
+                            }
                             // 固定中はコンボが無効なので、disabled 専用ツールチップで
                             // 「固定」表示のホバー時に固定理由を出す。
                             let combo_id = combo.response.id;

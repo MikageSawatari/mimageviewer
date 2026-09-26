@@ -76342,19 +76342,36 @@ impl App {
             if crate::test_script::ui_update(ctx, snapshot) {
                 ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
             }
-            if crate::test_script::take_rating_sort_smoke_action(
-                crate::test_script::RatingSortSmokeAction::OpenThumbnailPreferences,
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::OpenThumbnailPreferences,
             ) {
                 self.open_preferences_page(
                     crate::ui_dialogs::preferences::PreferencesPage::Thumbnail,
                 );
             }
-            if crate::test_script::take_rating_sort_smoke_action(
-                crate::test_script::RatingSortSmokeAction::OpenFirstSmartFolder,
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::OpenFirstSmartFolder,
             ) {
                 if let Some(id) = self.settings.smart_folders.first().map(|folder| folder.id) {
                     self.open_smart_folder_staged(id, false);
                 }
+            }
+            if self
+                .collection_store_client_for_read()
+                .ok()
+                .flatten()
+                .is_some()
+                && crate::test_script::take_smoke_action(
+                    crate::test_script::UiSmokeAction::OpenSeededCollection,
+                )
+            {
+                // The diagnostic runner seeds this exact ID only under portable-smoke/data.
+                let id = uuid::Uuid::parse_str("80f58851-997b-4b80-90bc-f50bb1d2523e")
+                    .expect("fixed smoke Collection ID");
+                self.open_collection_grid(
+                    crate::collection_store::CollectionId::from_uuid(id),
+                    None,
+                );
             }
         }
         self.edit_preview_repaint_ctx = Some(ctx.clone());

@@ -27903,6 +27903,7 @@ impl App {
             .len()
             .saturating_add(self.texture_backlog.len())
             .saturating_add(self.fs_upload_backlog.len());
+        let collection_root_order = self.collection_grid_root_order().and_then(Result::ok);
 
         crate::test_script::TestScriptSnapshot {
             is_fullscreen: fs_idx.is_some(),
@@ -27929,6 +27930,18 @@ impl App {
                 .map(|index| i64::from(self.rating_cache.get(&index).copied().unwrap_or(0)))
                 .collect(),
             sort_order: format!("{:?}", self.settings.sort_order),
+            collection_root_visible: collection_root_order.is_some(),
+            collection_id: collection_root_order.map_or_else(String::new, |root| {
+                root.content.stamp.collection_id.to_string()
+            }),
+            collection_order_mode: collection_root_order
+                .map_or_else(String::new, |root| format!("{:?}", root.mode)),
+            collection_standard_sort: collection_root_order
+                .map_or_else(String::new, |root| format!("{:?}", root.standard_sort)),
+            collection_revision: collection_root_order.map_or(-1, |root| {
+                i64::try_from(root.content.expected_revision).unwrap_or(i64::MAX)
+            }),
+            collection_sort_popup: crate::test_script::collection_sort_popup_snapshot(ctx),
             rating_sort_unrated_position: format!(
                 "{:?}",
                 self.settings.rating_sort_unrated_position
