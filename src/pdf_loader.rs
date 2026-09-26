@@ -4539,6 +4539,37 @@ pub struct PdfDocumentInfo {
     pub keywords: Option<String>,
 }
 
+#[cfg(test)]
+static TEST_DOCUMENT_INFO: OnceLock<Mutex<HashMap<String, PdfDocumentInfo>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct TestDocumentInfoPin(String);
+
+#[cfg(test)]
+impl Drop for TestDocumentInfoPin {
+    fn drop(&mut self) {
+        TEST_DOCUMENT_INFO
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pin_document_info_for_test(
+    logical: &Path,
+    info: PdfDocumentInfo,
+) -> TestDocumentInfoPin {
+    let key = epub_cache::src_key(logical);
+    TEST_DOCUMENT_INFO
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(key.clone(), info);
+    TestDocumentInfoPin(key)
+}
+
 impl PdfDocumentInfo {
     /// 検索用テキストを 1 本の文字列にして返す (空白区切り、空フィールドは省略)。
     /// `search_norm::normalize_for_match` は呼ばない (呼び出し側で行う)。
@@ -4580,6 +4611,16 @@ pub fn get_document_info(
     pdf_path: &Path,
     password: Option<&str>,
 ) -> std::io::Result<PdfDocumentInfo> {
+    #[cfg(test)]
+    if let Some(info) = TEST_DOCUMENT_INFO
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(&epub_cache::src_key(pdf_path))
+        .cloned()
+    {
+        return Ok(info);
+    }
     let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
     let pool = get_pool();
     let req = encode_get_info_request(&read.read_path, password);

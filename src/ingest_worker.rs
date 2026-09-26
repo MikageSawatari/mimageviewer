@@ -343,8 +343,19 @@ impl<'a> IngestSession<'a> {
         self.build_doc(cand, Container::Fs, IndexKind::Audio, norms)
     }
 
-    /// PDF から IndexDoc を組み立てる (§16 step 17)。
+    /// PDF の Info 辞書、または EPUB のファイル名だけから IndexDoc を組み立てる。
     fn build_doc_for_pdf(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
+        // EPUB 内のタイトル・著者は今回の索引対象外。変換済みであっても
+        // 生成 PDF の Info 辞書を読まず、元ファイル名だけを登録する。
+        if cand
+            .abs_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+        {
+            let norms = crate::ingest_text::build_per_source_for_filename(&cand.abs_path);
+            return self.build_doc(cand, Container::Fs, IndexKind::Pdf, norms);
+        }
         let name = cand
             .abs_path
             .file_name()
@@ -354,14 +365,9 @@ impl<'a> IngestSession<'a> {
         let info_text = match crate::pdf_loader::get_document_info(&cand.abs_path, None) {
             Ok(info) => info.as_search_text(),
             Err(e) => {
-                if !matches!(
-                    crate::pdf_loader::typed_read_error(&e),
-                    Some(crate::pdf_loader::PdfReadError::NotConverted)
-                ) {
-                    crate::logger::log(format!(
-                        "build_doc_for_pdf: get_document_info failed (falling back to name-only): {e}"
-                    ));
-                }
+                crate::logger::log(format!(
+                    "build_doc_for_pdf: get_document_info failed (falling back to name-only): {e}"
+                ));
                 String::new()
             }
         };
@@ -530,6 +536,70 @@ mod tests {
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, key);
+    }
+
+    #[test]
+    fn ingest_converted_epub_uses_filename_without_generated_pdf_metadata() {
+        let (tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
+        let sem = GlobalIoSemaphore::new(2);
+        let cancel = AtomicBool::new(false);
+        let logical = tmp.path().join("sunflower_book.epub");
+        fs::write(&logical, b"test epub source").unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&logical, 1, 42);
+        let _info = crate::pdf_loader::pin_document_info_for_test(
+            &logical,
+            crate::pdf_loader::PdfDocumentInfo {
+                title: Some("SecretMetadataTitle".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::pdf_loader::get_document_info(&logical, None)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("SecretMetadataTitle"),
+            "fixture の生成 PDF に検索可能な Info タイトルがあること",
+        );
+        let mut cand = make_image_file(tmp.path(), "sunflower_book.epub");
+        cand.kind = CandidateKind::Pdf;
+        let key = cand.key.clone();
+        let stats = session
+            .apply(
+                vec![cand],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert_eq!(stats.ingested_ok, 1);
+        assert_eq!(stats.ingested_failed, 0);
+        assert_eq!(meta.get(&key).unwrap().unwrap().status, FileStatus::Ok);
+        fts.reload_reader().unwrap();
+        let favs = [fav];
+        let search = |word: &str| {
+            let q = fts_index::build_bigram_and_query(
+                fts.fields(),
+                &[word],
+                &crate::fts_index::QueryFilters {
+                    favorite_ids: Some(&favs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            fts_index::search_page(&fts.searcher(), fts.fields(), &q, 0, 10).unwrap()
+        };
+        assert_eq!(search("sunflower_book")[0].0, key);
+        assert!(search("SecretMetadataTitle").is_empty());
     }
 
     #[test]

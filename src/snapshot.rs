@@ -229,33 +229,31 @@ mod unc_tests {
 /// 本関数は **fullscreen で開かれた任意 path** から container/inner を逆算するために使う。
 ///
 /// 戻り値:
-/// - `Some((container, inner))` = path が `<container>.zip/<inner>` 形式
-/// - `None` = 通常 path (= 拡張子 `.zip` / `.pdf` の境界が path 中に無い)
+/// - `Some((container, inner))` = path が ZIP / CBZ / PDF / EPUB の内側を指す
+/// - `None` = 通常 path (= 本/書庫の path component 境界が無い)
 ///
 /// ⚠ ZipImage / PdfPage は GridItem 側で既に container と inner が分かれているので、
 /// その場合は `snapshot_key_from_grid_item` で直接 `SnapshotKey::Archive` を構築する。
 /// 本関数はあくまで「raw な path から逆算」用。
 pub fn split_archive_path(path: &Path) -> Option<(PathBuf, String)> {
-    let s = path.to_string_lossy().to_string();
     // forward slash 統一 (= 検索しやすくするため)
-    let unified = s.replace('\\', "/");
-    // 拡張子 `.zip` / `.cbz` / `.pdf` の境界を探す (= 大文字小文字混在対応で小文字化済みを使う)。
-    // CBZ は実体が ZIP でトップレベルをネイティブに開くため、内側画像の path は
-    // `<...>.cbz/<entry>` 形式になる。これを ZIP/PDF と同じく container/inner に分割する。
-    let lower = unified.to_lowercase();
-    // 複数境界が混在 (例: ネストした `a.cbz/b.zip/img`) しても**最も外側 (= 最左)** で
-    // 分割する。どの needle も `.XXX/` の 5 文字なので container_end は idx + 4 で共通。
-    let leftmost = [".zip/", ".cbz/", ".pdf/"]
-        .iter()
-        .filter_map(|needle| lower.find(needle))
-        .min();
-    if let Some(idx) = leftmost {
-        let container_end = idx + 4;
-        let container_str = &unified[..container_end];
-        let inner_str = &unified[container_end + 1..];
-        return Some((PathBuf::from(container_str), inner_str.to_string()));
-    }
-    None
+    let unified = path.to_string_lossy().replace('\\', "/");
+    // 各 component の末尾を型で調べ、ネストしていても最も外側の本/書庫で分割する。
+    // 名前の途中に `.pdf` などが含まれるだけのフォルダーは境界にしない。
+    unified.match_indices('/').find_map(|(idx, _)| {
+        let container = Path::new(&unified[..idx]);
+        let is_zip = container
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| crate::folder_tree::is_zip_extension(&ext.to_ascii_lowercase()));
+        if (is_zip || crate::folder_tree::is_paged_document_path(container))
+            && idx + 1 < unified.len()
+        {
+            Some((container.to_path_buf(), unified[idx + 1..].to_string()))
+        } else {
+            None
+        }
+    })
 }
 
 /// 任意 path から `SnapshotKey` を構築する (= 完全一致 lookup / owner_entry 用)。
@@ -631,6 +629,14 @@ mod tests {
         let (container, inner) = split_archive_path(Path::new(r"E:\doc.pdf\p:42")).unwrap();
         assert_eq!(container, PathBuf::from(r"E:\doc.pdf"));
         assert_eq!(inner, "p:42");
+    }
+
+    #[test]
+    fn split_archive_path_detects_epub_page_at_component_boundary() {
+        let (container, inner) = split_archive_path(Path::new(r"E:\book.EPUB\p:2")).unwrap();
+        assert_eq!(container, PathBuf::from(r"E:\book.EPUB"));
+        assert_eq!(inner, "p:2");
+        assert!(split_archive_path(Path::new(r"E:\book.epub.notes\p:2")).is_none());
     }
 
     #[test]

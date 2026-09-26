@@ -4097,6 +4097,26 @@ mod tests {
     }
 
     #[test]
+    fn preferences_selects_epub_association_from_selected_book() {
+        let state = PreferencesState::from_settings(
+            &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::RealFile(PathBuf::from(r"E:\books\book.EPUB")),
+            None,
+            disabled_trt_worker_snapshot(),
+            false,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(state.external_tool_association_ext, "epub");
+        assert!(
+            pages::association_extension_groups()
+                .iter()
+                .any(|(_, extensions)| extensions.contains(&"epub"))
+        );
+    }
+
+    #[test]
     fn preferences_duplicate_files_epub_option_snapshot() {
         use egui_kittest::Harness;
 

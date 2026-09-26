@@ -143,6 +143,20 @@ separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 新しい lookup 経路を追加するときも同じ正規化を通すこと。
 `!` を separator に戻してはいけない (通常ファイル名と衝突する。INDEX_VERSION=4 で廃止)。
 
+### EPUB 行の互換性 (S3a)
+
+Ctrl+S の EPUB は既存の `search_index.db` の `PdfFile`、Ctrl+G の EPUB は既存の
+`fts_meta.db` / Tantivy の `Pdf` として追加する。既存行・列・kind 値・索引の schema は
+変えず、`fts_meta::INDEX_VERSION` は 10 のままにする。全利用者へ索引再構築を強制しない。
+前方互換では新しい EPUB 行だけが増え、移行は不要。
+
+旧 v4.1.0 へ戻したときの読取経路も確認した。Ctrl+S は `PdfFile` 行を本タイルとして復元するが、
+開くと旧 `load_folder_with_scan_claimed` が `.epub` を PDF 仮想フォルダーと判定せず、
+通常ディレクトリ走査のエラーを表示する。元ファイルと利用者データへの書込はない。
+Ctrl+G は `Pdf` 行のパスを旧 `grid_item_from_fs_hit_path` で再分類するため、EPUB は画像タイルに
+なり、画像として開くと読み込みエラーになる。この差は表示だけで、変換・元ファイルへの書込や
+自動再試行は起きない。旧版へのロールバック時の EPUB 行は利用できないが、既存行は変わらない。
+
 ---
 
 ## 4. インデクサパイプライン
@@ -152,6 +166,13 @@ separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 画像 / PDF / 動画 / 音声を、ファイル名・タグ・EXIF・AI プロンプト等で横断検索する
 ための索引。Ctrl+G が使う。Ctrl+F (現在地フィルタ) はこの索引を使わず、
 表示中アイテムを on-demand に判定する (§5.2)。
+
+EPUB は Ctrl+S / Ctrl+G とも元ファイル名を検索対象にし、検索結果と同定には元 EPUB の
+パスを保持する (`IndexDoc.path` 等)。パスの親ディレクトリ名は検索語にしない。
+`ingest_worker::build_doc_for_pdf` は EPUB を
+拡張子で明示的に分岐し、未変換・変換済みのどちらでも生成 PDF の Info 辞書を呼ばない。
+EPUB 内のタイトル・著者も索引しない。取込失敗として記録・ログ出力せず、通常の `Pdf` 行を
+登録する。Ctrl+F も EPUB はファイル名だけで判定し、生成 PDF の Info 辞書を読まない。
 
 ```
 App 起動

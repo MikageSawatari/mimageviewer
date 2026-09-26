@@ -1957,38 +1957,54 @@ pub(super) fn run_metadata_search(
                 true
             }
             GridItem::PdfFile(path) => {
-                // PDF: ファイル名 + PDF document info を 1 つの hay にまとめて判定する
-                // (§4.1.1)。filename と title をまたぐクエリや exclude トークンを
-                // 正しく扱うため、Image/Video と同じ combined-hay 方式にする
-                // (2 つの hay を別々に matches すると "scan invoice" や
-                // "scan -draft" を取りこぼす — Codex P2)。まずファイル名だけで
-                // 部分判定し、結論が出れば document info の IPC を省く。
-                let name = item.name();
-                let name_hay: &str = if use_name { &name } else { "" };
-                if use_pdf_meta {
-                    match crate::search_query::decide_partial_with_mode(tokens, name_hay, mode) {
-                        crate::search_query::PartialResult::Decided(true) => {
-                            matches.insert(idx);
-                        }
-                        crate::search_query::PartialResult::Decided(false) => {}
-                        crate::search_query::PartialResult::NeedsMore => {
-                            // 保護 PDF でパスワード未保存なら get_document_info は
-                            // 失敗 → doc_text 空 = ファイル名のみで判定 (= 非マッチ)。
-                            let password = pdf_passwords.get(path);
-                            let doc_text =
-                                crate::pdf_loader::get_document_info(path, password.as_deref())
-                                    .map(|info| info.as_search_text())
-                                    .unwrap_or_default();
-                            let hay = hay_of(&doc_text, name_hay, None);
-                            if crate::search_query::matches_with_mode(tokens, &hay, mode) {
+                // EPUB は変換済みでも内部タイトル・著者を検索しない。
+                // 元ファイル名だけを対象にし、PDF Info の worker 要求も出さない。
+                if path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+                {
+                    if use_name
+                        && crate::search_query::matches_with_mode(tokens, &item.name(), mode)
+                    {
+                        matches.insert(idx);
+                    }
+                } else {
+                    // PDF: ファイル名 + PDF document info を 1 つの hay にまとめて判定する
+                    // (§4.1.1)。filename と title をまたぐクエリや exclude トークンを
+                    // 正しく扱うため、Image/Video と同じ combined-hay 方式にする
+                    // (2 つの hay を別々に matches すると "scan invoice" や
+                    // "scan -draft" を取りこぼす — Codex P2)。まずファイル名だけで
+                    // 部分判定し、結論が出れば document info の IPC を省く。
+                    let name = item.name();
+                    let name_hay: &str = if use_name { &name } else { "" };
+                    if use_pdf_meta {
+                        match crate::search_query::decide_partial_with_mode(tokens, name_hay, mode)
+                        {
+                            crate::search_query::PartialResult::Decided(true) => {
                                 matches.insert(idx);
                             }
+                            crate::search_query::PartialResult::Decided(false) => {}
+                            crate::search_query::PartialResult::NeedsMore => {
+                                // 保護 PDF でパスワード未保存なら get_document_info は
+                                // 失敗 → doc_text 空 = ファイル名のみで判定 (= 非マッチ)。
+                                let password = pdf_passwords.get(path);
+                                let doc_text =
+                                    crate::pdf_loader::get_document_info(path, password.as_deref())
+                                        .map(|info| info.as_search_text())
+                                        .unwrap_or_default();
+                                let hay = hay_of(&doc_text, name_hay, None);
+                                if crate::search_query::matches_with_mode(tokens, &hay, mode) {
+                                    matches.insert(idx);
+                                }
+                            }
                         }
+                    } else if use_name
+                        && crate::search_query::matches_with_mode(tokens, name_hay, mode)
+                    {
+                        // PDF メタが検索対象外 → ファイル名のみで照合。
+                        matches.insert(idx);
                     }
-                } else if use_name && crate::search_query::matches_with_mode(tokens, name_hay, mode)
-                {
-                    // PDF メタが検索対象外 → ファイル名のみで照合。
-                    matches.insert(idx);
                 }
                 true
             }
@@ -2219,6 +2235,47 @@ pub(super) fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_folder_filter_searches_epub_name_but_not_generated_pdf_info() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logical = tmp.path().join("sunflower_book.epub");
+        std::fs::write(&logical, b"epub source").unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&logical, 1, 42);
+        let _info = crate::pdf_loader::pin_document_info_for_test(
+            &logical,
+            crate::pdf_loader::PdfDocumentInfo {
+                title: Some("SecretMetadataTitle".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::pdf_loader::get_document_info(&logical, None)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("SecretMetadataTitle"),
+        );
+        let items = [GridItem::PdfFile(logical)];
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let run = |query: &str| {
+            let result = run_metadata_search(
+                &crate::search_query::parse(query),
+                &items,
+                &std::collections::HashMap::new(),
+                None,
+                &passwords,
+                &crate::fts_index::SearchTarget::All,
+                crate::search_query::MatchMode::And,
+                &AtomicBool::new(false),
+                None,
+            );
+            let SearchThreadResult::Done { matches, .. } = result;
+            matches
+        };
+        assert!(run("sunflower_book").contains(&0));
+        assert!(run("SecretMetadataTitle").is_empty());
+    }
 
     #[test]
     fn epub_details_page_count_uses_generation_and_pdf_keeps_source_stamp() {

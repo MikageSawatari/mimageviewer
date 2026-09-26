@@ -1111,7 +1111,7 @@ pub(super) fn association_extension_groups() -> [(&'static str, &'static [&'stat
         ("画像", crate::folder_tree::SUPPORTED_EXTENSIONS),
         ("動画", crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS),
         ("音声", crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS),
-        ("書庫 / PDF", &["zip", "cbz", "pdf"]),
+        ("書庫 / PDF / EPUB", &["zip", "cbz", "pdf", "epub"]),
     ]
 }
 
