@@ -1,6 +1,6 @@
 # 動画の複数音声トラック選択 設計 (backlog §1.251)
 
-- 状態: 設計案 第7版 (独立レビュー6回目 REVISE を反映)
+- 状態: 第7版で独立レビュー ACCEPT (2026-09-27)。実装は §10 の段階順に進める
 - 出典: [next-release-backlog.md §1.251](next-release-backlog.md) (>>429)
 - 担当: 設計・検収 = ClaudeCode Opus / 実装 = Codex Sol / 独立レビュー = 別の Sol
 - 関連: [video-architecture.md](video-architecture.md) (decoder 3-thread 構成・seek 調停・audio.rs・Norm)、
