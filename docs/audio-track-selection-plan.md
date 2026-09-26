@@ -255,6 +255,15 @@ demux が**旧 routing・旧位置**で読んだ packet が**新しい serial** 
   demux は音声の routing を外して (`audio_stream_idx_for_demux = None` 相当) 映像を続ける。映像 lane が無い素材
   (音声のみ) では終端。** cancel が立っている場合は従来どおり終端。
 - 音声 lane を外した後は、以後の seek の `Flush` 条件も video だけになる (§5.3 の「存在する lane」)。
+- engine への通知: 音声 lane を外した demux は、engine の既存の `AudioEvent::AudioInactive` 遷移 (`actor.rs:697-704`、
+  現在は本番の送り手が無い) へ event lane 経由で通知する。event lane が満杯なら `SeekCompleted` と同じく保留して
+  再送し、取りこぼさない。engine は `has_audio=false` として readiness を映像だけに作り直し、以後の seek で
+  `BufferReady` を待たない。`AvClock` も既存の `mark_audio_inactive` で wall clock に移す。
+- 音声出力側の後始末: audio pump は入力 channel の切断で終わるとき、`raw_pending` / processed の残りを破棄し、
+  音声 buffer の会計 (`AudioBookkeeping`) を 0 として公表する。残量が残ったままだと EOF・ループの quiet 判定
+  (`mod.rs:10910-10922`) が成立しない。
+- テストは実 engine を通す: 再生中に音声 lane を失った後の seek が Playing に戻る (Buffering に固着しない)、
+  event lane が満杯のときも `AudioInactive` が届く、`raw_pending` が残った状態から EOF / ループへ進む。
 - 音声出力を開けなかった player は selection を持たない (§7.4) ので、切り替えは起きない。切り替え中に audio decode
   thread が終わった場合は §5.2 の `WorkerGone`。
 
