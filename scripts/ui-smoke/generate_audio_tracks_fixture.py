@@ -54,9 +54,21 @@ def generate(output: Path) -> None:
         "-c:a", "aac", "-b:a", "48k", "-shortest",
     )
     run_ffmpeg(
+        output / "short-audio.mp4",
+        "-f", "lavfi", "-i", VIDEO_SOURCE,
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+        "-map", "0:v", "-map", "1:a", *VIDEO_OPTIONS,
+        "-c:a", "aac", "-b:a", "48k",
+    )
+    run_ffmpeg(
         output / "silent.mp4",
         "-f", "lavfi", "-i", VIDEO_SOURCE,
         "-map", "0:v", *VIDEO_OPTIONS, "-an",
+    )
+    run_ffmpeg(
+        output / "audio-only.flac",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+        "-c:a", "flac",
     )
 
 

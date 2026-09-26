@@ -1,6 +1,6 @@
 # 複数音声トラックのテスト素材
 
-`scripts/ui-smoke/generate_audio_tracks_fixture.py` が、システムの `ffmpeg` と lavfi の合成映像・音声だけから生成した素材です。私有素材は含みません。S1 のトラック列挙テストと、後続段階の切り替え・音量正規化テストに使います。各動画は 160×90、10 fps、6 秒の MPEG-4 映像です。
+`scripts/ui-smoke/generate_audio_tracks_fixture.py` が、システムの `ffmpeg` と lavfi の合成映像・音声だけから生成した素材です。私有素材は含みません。S1 のトラック列挙テストと、後続段階の切り替え・音量正規化テストに使います。映像付き素材は 160×90、10 fps、6 秒の MPEG-4 映像です。`audio-only.flac` は音声のみです。
 
 | ファイル | 音声の順 | 周波数 | channels | sample rate | codec | language | title | default | 音量設定 |
 | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- |
@@ -8,9 +8,12 @@
 | `multi.mkv` | 2 | 880 Hz | 6 | 44100 Hz | ac3 | eng | English 880Hz | はい | sine に 0 dB |
 | `multi.mkv` | 3 | 1320 Hz | 1 | 32000 Hz | flac | なし | なし | いいえ | sine に -6 dB |
 | `single.mp4` | 1 | 440 Hz | 1 | 48000 Hz | aac | なし | なし | はい | sine 既定 |
+| `short-audio.mp4` | 1 | 440 Hz | 1 | 48000 Hz | aac | なし | なし | はい | sine 既定 |
 | `silent.mp4` | なし | — | — | — | — | — | — | — | — |
+| `audio-only.flac` | 1 | 440 Hz | 1 | 48000 Hz | flac | なし | なし | いいえ | sine 既定 |
 
 `sine` の既定ピークは約 -18 dBFS です。`multi.mkv` は入力に異なる gain をかけ、後続の LUFS 差のテストでも区別できるようにしています。
+`short-audio.mp4` は映像が 6 秒、音声が 1 秒です。音声 lane 切断後も映像が進み、seek できることを確認します。
 
 PowerShell でリポジトリのルートから再生成:
 

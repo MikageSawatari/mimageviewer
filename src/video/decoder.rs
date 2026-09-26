@@ -223,6 +223,7 @@ enum DemuxPacketSend {
     Sent,
     Cancelled,
     SeekPending,
+    AudioDisconnected,
 }
 
 // Packet sends are back-pressure points, but seek/flush is control traffic.
@@ -323,7 +324,13 @@ fn send_audio_packet_with_video_drain(
             std::time::Duration::from_millis(DEMUX_PACKET_SEND_TIMEOUT_MS),
         ) {
             Ok(()) => return DemuxPacketSend::Sent,
-            Err(SendTimeoutError::Disconnected(_)) => return DemuxPacketSend::Cancelled,
+            Err(SendTimeoutError::Disconnected(_)) => {
+                return if cancel.load(Ordering::Acquire) {
+                    DemuxPacketSend::Cancelled
+                } else {
+                    DemuxPacketSend::AudioDisconnected
+                };
+            }
             Err(SendTimeoutError::Timeout(returned)) => {
                 msg = returned;
                 if !pending_video_packets.is_empty() {
@@ -1339,6 +1346,131 @@ enum AudioControlMsg {
         seek_target_secs: Option<f64>,
         trim_before_secs: Option<f64>,
     },
+}
+
+/// The serial of the last seek whose Flush was accepted by every existing
+/// decoder lane. A UI seek can advance the live clock serial before its request
+/// is published, so the live serial must never label packets read by demux.
+struct DemuxSerial(u64);
+
+#[derive(Debug, PartialEq, Eq)]
+enum SeekFlushResult {
+    Accepted,
+    AudioLost,
+    Terminated,
+}
+
+fn retry_audio_inactive(
+    pending: &mut Option<crate::video::engine::EngineEvent>,
+    engine_event_tx: &crate::video::EngineEventSender,
+) {
+    let Some(event) = pending.take() else {
+        return;
+    };
+    if let Err(crossbeam_channel::TrySendError::Full(event)) = engine_event_tx.try_send(event) {
+        *pending = Some(event);
+    }
+}
+
+fn detach_audio_lane(
+    audio_stream_idx: &mut Option<usize>,
+    audio_time_base: &mut Option<(f64, f64)>,
+    clock: &AvClock,
+    pending_audio_inactive: &mut Option<crate::video::engine::EngineEvent>,
+    engine_event_tx: &crate::video::EngineEventSender,
+) {
+    *audio_stream_idx = None;
+    *audio_time_base = None;
+    let current_pts = clock.now_secs();
+    clock.mark_audio_lane_lost();
+    clock.set_fallback_anchor(current_pts);
+    clock.reset_audio_bookkeeping_only();
+    *pending_audio_inactive = Some(crate::video::engine::EngineEvent::Audio(
+        crate::video::engine::state::AudioEvent::AudioInactive,
+    ));
+    retry_audio_inactive(pending_audio_inactive, engine_event_tx);
+}
+
+struct AudioWorkerExitGuard(Arc<AvClock>);
+
+impl Drop for AudioWorkerExitGuard {
+    fn drop(&mut self) {
+        self.0.note_audio_worker_exit();
+    }
+}
+
+fn video_packet_msg(
+    packet: ffmpeg_the_third::Packet,
+    serial: &DemuxSerial,
+    clock: &AvClock,
+) -> VideoPacketMsg {
+    VideoPacketMsg::Packet {
+        serial: serial.packet_serial(clock),
+        packet,
+    }
+}
+
+fn audio_packet_msg(
+    packet: ffmpeg_the_third::Packet,
+    serial: &DemuxSerial,
+    clock: &AvClock,
+) -> AudioPacketMsg {
+    AudioPacketMsg::Packet {
+        serial: serial.packet_serial(clock),
+        packet,
+    }
+}
+
+fn packet_matches_seek(serial: u64, decoder_serial: u64, clock: &AvClock) -> bool {
+    serial == decoder_serial && serial == clock.current_seek_serial()
+}
+
+impl DemuxSerial {
+    fn packet_serial(&self, clock: &AvClock) -> u64 {
+        debug_assert!(self.0 <= clock.current_seek_serial());
+        self.0
+    }
+
+    fn send_seek_flushes(
+        &mut self,
+        serial: u64,
+        video: Option<(&Sender<VideoControlMsg>, VideoControlMsg)>,
+        audio: Option<(&Sender<AudioControlMsg>, AudioControlMsg)>,
+        cancel: &AtomicBool,
+    ) -> SeekFlushResult {
+        let has_video = video.is_some();
+        if let Some((tx, msg)) = video {
+            if !send_demux_msg_cancel_aware(
+                tx,
+                msg,
+                cancel,
+                "video",
+                "flush",
+                VIDEO_CONTROL_QUEUE_CAP,
+            ) {
+                return SeekFlushResult::Terminated;
+            }
+        }
+        if let Some((tx, msg)) = audio {
+            if !send_demux_msg_cancel_aware(
+                tx,
+                msg,
+                cancel,
+                "audio",
+                "flush",
+                AUDIO_CONTROL_QUEUE_CAP,
+            ) {
+                if cancel.load(Ordering::Acquire) || !has_video {
+                    return SeekFlushResult::Terminated;
+                }
+                self.0 = serial;
+                return SeekFlushResult::AudioLost;
+            }
+        }
+        // This is independent of seek success and of SeekCompleted delivery.
+        self.0 = serial;
+        SeekFlushResult::Accepted
+    }
 }
 
 enum AudioDecodeInput {
@@ -2723,8 +2855,8 @@ fn run_decoder(
     // Keep this packet queue shallow. Audio prefill belongs in AudioBuffer
     // raw_pending; seek Flush is carried by audio_ctl_tx so it can cut ahead
     // of old compressed packets.
-    let audio_stream_idx_for_demux: Option<usize> = audio_setup.as_ref().map(|a| a.stream_idx);
-    let audio_time_base_for_demux: Option<(f64, f64)> = audio_setup
+    let mut audio_stream_idx_for_demux: Option<usize> = audio_setup.as_ref().map(|a| a.stream_idx);
+    let mut audio_time_base_for_demux: Option<(f64, f64)> = audio_setup
         .as_ref()
         .map(|a| (a.time_base_num, a.time_base_den));
     let (audio_pkt_tx, audio_pkt_rx) = bounded::<AudioPacketMsg>(AUDIO_PACKET_QUEUE_CAP);
@@ -2744,6 +2876,7 @@ fn run_decoder(
             std::thread::Builder::new()
                 .name("video-audio-decode".into())
                 .spawn(move || {
+                    let _exit_guard = AudioWorkerExitGuard(Arc::clone(&clock_a));
                     run_audio_decode(
                         setup,
                         audio_pkt_rx,
@@ -2900,15 +3033,36 @@ fn run_decoder(
     // (「シーク中」表示 + 無音のまま、次の seek まで回復しない)。native FirstFrameReady の
     // pending 再送と同じ考え方でループ先頭から再送する (review-v2.3.0 P2-7)。
     let mut pending_seek_completed: Option<(u64, f64)> = None;
+    // AudioInactive is a one-shot readiness change; a full engine event lane
+    // must not lose it, including while demux is idle at EOF.
+    let mut pending_audio_inactive: Option<crate::video::engine::EngineEvent> = None;
+    // Both decode workers start at open serial 0. Requests made while opening
+    // are still pending and must be handled before any packet gets their serial.
+    let mut demux_serial = DemuxSerial(0);
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
             break;
         }
+        if audio_stream_idx_for_demux.is_some() && clock.audio_worker_exited() {
+            if video_stream_idx.is_none() {
+                break 'outer;
+            }
+            detach_audio_lane(
+                &mut audio_stream_idx_for_demux,
+                &mut audio_time_base_for_demux,
+                &clock,
+                &mut pending_audio_inactive,
+                &engine_event_tx,
+            );
+        }
+        retry_audio_inactive(&mut pending_audio_inactive, &engine_event_tx);
         // 前回失敗した SeekCompleted を再送。新しい seek が始まっていたら (serial が進んで
         // いたら) demux はこの後その seek を処理して新しい SeekCompleted を送るので、stale な
         // pending は捨てる。
-        if let Some((pending_serial, pending_pts)) = pending_seek_completed {
+        if pending_audio_inactive.is_none()
+            && let Some((pending_serial, pending_pts)) = pending_seek_completed
+        {
             if pending_serial != clock.current_seek_serial() {
                 pending_seek_completed = None;
             } else if engine_event_tx
@@ -3016,10 +3170,18 @@ fn run_decoder(
             // `pts <= now + lead_tol` で処理できる。mIV はすべての seek で preroll
             // trim (= drop_before_secs) を行い、target 前の keyframe preview は表示しない。
             // これにより 1 秒 seek などで映像が「逆方向へ跳ねる」見え方を避ける。
-            let mut seek_result = backward(&mut input);
+            #[cfg(test)]
+            let injected_seek_failure = clock.take_demux_seek_failure_for_test();
+            #[cfg(not(test))]
+            let injected_seek_failure = false;
+            let mut seek_result = if injected_seek_failure {
+                Err(ffmpeg::Error::from(-22))
+            } else {
+                backward(&mut input)
+            };
             // backward が失敗したら forward を retry (= EOF 近傍など、target 以前に
             // keyframe が無い場合)。
-            if seek_result.is_err() {
+            if seek_result.is_err() && !injected_seek_failure {
                 crate::logger::log(format!(
                     "backward seek failed at {target_secs:.3}s, retry as forward"
                 ));
@@ -3109,37 +3271,48 @@ fn run_decoder(
                 pending_video_packet_bytes = 0;
                 next_video_overflow_log_bytes = 0;
             }
-            // audio-only では video decode thread が無い (video_ctl_rx は drop 済み)。
-            // gate せずに送ると disconnect を cancel と誤解して demux が break してしまう。
-            if video_stream_idx.is_some()
-                && !send_demux_msg_cancel_aware(
-                    &video_ctl_tx,
-                    VideoControlMsg::Flush {
-                        serial,
-                        trim_before_secs: video_trim_before,
-                        frame_step,
-                    },
-                    &cancel,
-                    "video",
-                    "flush",
-                    VIDEO_CONTROL_QUEUE_CAP,
-                )
-            {
-                break 'outer;
-            }
-            if audio_stream_idx_for_demux.is_some() {
-                let _ = send_demux_msg_cancel_aware(
-                    &audio_ctl_tx,
-                    AudioControlMsg::Flush {
-                        serial,
-                        seek_target_secs: seek_target_for_flush,
-                        trim_before_secs: audio_trim_before,
-                    },
-                    &cancel,
-                    "audio",
-                    "flush",
-                    AUDIO_CONTROL_QUEUE_CAP,
-                );
+            // Only existing lanes participate (audio-only/video-only). An audio
+            // disconnect without cancel removes that lane after video Flush succeeds.
+            let flush_result = demux_serial.send_seek_flushes(
+                serial,
+                video_stream_idx.map(|_| {
+                    (
+                        &video_ctl_tx,
+                        VideoControlMsg::Flush {
+                            serial,
+                            trim_before_secs: video_trim_before,
+                            frame_step,
+                        },
+                    )
+                }),
+                audio_stream_idx_for_demux.map(|_| {
+                    (
+                        &audio_ctl_tx,
+                        AudioControlMsg::Flush {
+                            serial,
+                            seek_target_secs: seek_target_for_flush,
+                            trim_before_secs: audio_trim_before,
+                        },
+                    )
+                }),
+                &cancel,
+            );
+            match flush_result {
+                SeekFlushResult::Accepted => {}
+                SeekFlushResult::AudioLost => {
+                    if cancel.load(Ordering::Acquire) {
+                        break 'outer;
+                    }
+                    detach_audio_lane(
+                        &mut audio_stream_idx_for_demux,
+                        &mut audio_time_base_for_demux,
+                        &clock,
+                        &mut pending_audio_inactive,
+                        &engine_event_tx,
+                    );
+                    crate::logger::log("[demux] audio lane lost during Flush; continuing video");
+                }
+                SeekFlushResult::Terminated => break 'outer,
             }
             // 成功時のみ anchor を target に進める。失敗時に target を anchor すると
             // demux 位置とクロックが食い違い、anchor < frame_pts な audio set_audio_pts
@@ -3157,17 +3330,22 @@ fn run_decoder(
             // 解除されない。lane 満杯 (Full) で送れなかったら pending に退避して
             // ループ先頭から再送する (review-v2.3.0 P2-7)。Disconnected は engine 側の
             // teardown 中なので再送しない。
-            match engine_event_tx.try_send(crate::video::engine::EngineEvent::Decoder(
+            let completed = crate::video::engine::EngineEvent::Decoder(
                 crate::video::engine::state::DecoderEvent::SeekCompleted {
                     epoch: serial,
                     actual_pts: display_target_secs,
                 },
-            )) {
-                Err(crossbeam_channel::TrySendError::Full(_)) => {
-                    pending_seek_completed = Some((serial, display_target_secs));
-                }
-                _ => {
-                    pending_seek_completed = None;
+            );
+            if pending_audio_inactive.is_some() {
+                pending_seek_completed = Some((serial, display_target_secs));
+            } else {
+                match engine_event_tx.try_send(completed) {
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        pending_seek_completed = Some((serial, display_target_secs));
+                    }
+                    _ => {
+                        pending_seek_completed = None;
+                    }
                 }
             }
         }
@@ -3183,6 +3361,8 @@ fn run_decoder(
             break 'outer;
         }
 
+        #[cfg(test)]
+        clock.wait_at_demux_packet_gate_for_test();
         let packet_iter = input.packets();
         // ※ packets() は &mut input を取るので毎ループ作り直す形になる。
         //    ffmpeg-the-third 3.x では packets() のアイテムが Result<(Stream, Packet), Error>
@@ -3212,7 +3392,7 @@ fn run_decoder(
                 let packet_pts =
                     packet_timestamp(&packet).map(|pts| (pts as f64) * video_tb_num / video_tb_den);
                 let packet_size = packet.size();
-                let seek_serial = clock.current_seek_serial();
+                let seek_serial = demux_serial.packet_serial(&clock);
                 let queue_len_before = video_pkt_tx.len();
                 if !pending_video_packets.is_empty()
                     && !drain_pending_video_packets(
@@ -3254,6 +3434,7 @@ fn run_decoder(
                                     pending_video_packet_bytes.saturating_sub(size_bytes);
                                 continue 'outer;
                             }
+                            DemuxPacketSend::AudioDisconnected => unreachable!(),
                         }
                         pending_video_packet_bytes =
                             pending_video_packet_bytes.saturating_sub(size_bytes);
@@ -3301,10 +3482,7 @@ fn run_decoder(
                 let send_t0 = std::time::Instant::now();
                 match send_demux_packet_seek_aware(
                     &video_pkt_tx,
-                    VideoPacketMsg::Packet {
-                        serial: seek_serial,
-                        packet,
-                    },
+                    video_packet_msg(packet, &demux_serial, &clock),
                     &clock,
                     &cancel,
                     "video",
@@ -3314,6 +3492,7 @@ fn run_decoder(
                     // video decode thread が既に終了している → 自分も exit。
                     DemuxPacketSend::Cancelled => break 'outer,
                     DemuxPacketSend::SeekPending => continue 'outer,
+                    DemuxPacketSend::AudioDisconnected => unreachable!(),
                 }
                 let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
                 if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {
@@ -3345,15 +3524,12 @@ fn run_decoder(
                     let packet_pts = audio_time_base_for_demux.and_then(|(tb_num, tb_den)| {
                         packet_timestamp(&packet).map(|pts| (pts as f64) * tb_num / tb_den)
                     });
-                    let seek_serial = clock.current_seek_serial();
+                    let seek_serial = demux_serial.packet_serial(&clock);
                     let queue_len_before = audio_pkt_tx.len();
                     let send_t0 = std::time::Instant::now();
                     match send_audio_packet_with_video_drain(
                         &audio_pkt_tx,
-                        AudioPacketMsg::Packet {
-                            serial: seek_serial,
-                            packet,
-                        },
+                        audio_packet_msg(packet, &demux_serial, &clock),
                         &clock,
                         &cancel,
                         &mut pending_video_packets,
@@ -3361,11 +3537,28 @@ fn run_decoder(
                         &video_pkt_tx,
                     ) {
                         DemuxPacketSend::Sent => {}
-                        // audio decode thread が既に終了している (= disconnect)。
-                        // VideoPlayer の shutdown 経路 → 自分も exit。
+                        // cancel or video drain failure keeps the terminal path.
                         DemuxPacketSend::Cancelled => break 'outer,
                         DemuxPacketSend::SeekPending => continue 'outer,
+                        DemuxPacketSend::AudioDisconnected => {
+                            if cancel.load(Ordering::Acquire) || video_stream_idx.is_none() {
+                                break 'outer;
+                            }
+                            detach_audio_lane(
+                                &mut audio_stream_idx_for_demux,
+                                &mut audio_time_base_for_demux,
+                                &clock,
+                                &mut pending_audio_inactive,
+                                &engine_event_tx,
+                            );
+                            crate::logger::log(
+                                "[demux] audio lane lost during packet send; continuing video",
+                            );
+                            continue 'outer;
+                        }
                     }
+                    #[cfg(test)]
+                    clock.wait_after_audio_packet_for_test();
                     let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
                     if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {
                         emit_demux_packet_send_wait(
@@ -3425,6 +3618,36 @@ fn run_decoder(
                 if cancel.load(Ordering::Acquire) {
                     crate::logger::log(format!("video decoder finished: {}", path.display()));
                     break 'outer;
+                }
+                if audio_stream_idx_for_demux.is_some() && clock.audio_worker_exited() {
+                    if video_stream_idx.is_none() {
+                        break 'outer;
+                    }
+                    detach_audio_lane(
+                        &mut audio_stream_idx_for_demux,
+                        &mut audio_time_base_for_demux,
+                        &clock,
+                        &mut pending_audio_inactive,
+                        &engine_event_tx,
+                    );
+                }
+                retry_audio_inactive(&mut pending_audio_inactive, &engine_event_tx);
+                if pending_audio_inactive.is_none() {
+                    if let Some((pending_serial, pending_pts)) = pending_seek_completed {
+                        if pending_serial != clock.current_seek_serial() {
+                            pending_seek_completed = None;
+                        } else if engine_event_tx
+                            .try_send(crate::video::engine::EngineEvent::Decoder(
+                                crate::video::engine::state::DecoderEvent::SeekCompleted {
+                                    epoch: pending_serial,
+                                    actual_pts: pending_pts,
+                                },
+                            ))
+                            .is_ok()
+                        {
+                            pending_seek_completed = None;
+                        }
+                    }
                 }
                 if clock.peek_seek_request_pending() {
                     clock.clear_eof_reached();
@@ -3780,7 +4003,7 @@ fn run_video_decode(
                 }
                 VideoDecodeInput::Packet(VideoPacketMsg::Packet { serial, packet }) => {
                     let live_seek_serial = clock.current_seek_serial();
-                    if serial != current_seek_serial || serial != live_seek_serial {
+                    if !packet_matches_seek(serial, current_seek_serial, &clock) {
                         stale_drop_burst_count = stale_drop_burst_count.saturating_add(1);
                         if crate::perf::is_enabled() {
                             let reason = if serial != live_seek_serial {
@@ -5686,7 +5909,7 @@ fn run_audio_decode(
             }
             AudioDecodeInput::Packet(AudioPacketMsg::Packet { serial, packet }) => {
                 let live_seek_serial = clock.current_seek_serial();
-                if serial != current_seek_serial || serial != live_seek_serial {
+                if !packet_matches_seek(serial, current_seek_serial, &clock) {
                     if crate::perf::is_enabled() {
                         crate::perf::event(
                             "audio",
@@ -8077,9 +8300,11 @@ fn try_gpu_blit_path(
 
 #[cfg(test)]
 mod audio_track_fixture_tests {
-    use super::{AudioTrackInfo, VideoInfo, enumerate_audio_tracks, spawn};
+    use super::{AudioTrackInfo, DecodeHandles, VideoInfo, enumerate_audio_tracks, spawn};
     use crate::video::clock::AvClock;
-    use crate::video::engine::actor::state_code;
+    use crate::video::engine::EngineEvent;
+    use crate::video::engine::actor::{EngineActor, OpenOptions, state_code};
+    use crate::video::engine::state::{AudioEvent, DecoderEvent};
     use crate::video::{EngineEventSender, VideoUiWake};
     use crossbeam_channel::bounded;
     use ffmpeg_the_third::media::Type as MediaType;
@@ -8092,6 +8317,73 @@ mod audio_track_fixture_tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata/audio-tracks")
             .join(name)
+    }
+
+    fn spawn_headless(
+        name: &str,
+        clock: Arc<AvClock>,
+        cancel: Arc<AtomicBool>,
+        state: Arc<AtomicU8>,
+        event_tx: crossbeam_channel::Sender<EngineEvent>,
+    ) -> DecodeHandles {
+        spawn(
+            fixture_path(name),
+            clock,
+            cancel,
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            state,
+            EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::VideoDynamicState::default()),
+        )
+    }
+
+    fn wait_video_frame(
+        video_rx: &crossbeam_channel::Receiver<super::VideoFrame>,
+        serial: u64,
+        min_pts: f64,
+    ) -> super::VideoFrame {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match video_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(frame) if frame.seek_serial == serial && frame.pts_secs >= min_pts => {
+                    return frame;
+                }
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    panic!("video lane disconnected before serial={serial} pts={min_pts}")
+                }
+            }
+        }
+        panic!("video frame missing: serial={serial} pts={min_pts}");
+    }
+
+    fn start_actor_playing(actor: &mut EngineActor, info: &VideoInfo, handles: &DecodeHandles) {
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: info.duration_secs,
+            has_audio: info.has_audio,
+            has_video: info.has_video,
+        });
+        let video = wait_video_frame(&handles.video_rx, 0, 0.0);
+        let audio = handles
+            .audio_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("initial audio frame");
+        actor.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 0,
+            pts: audio.pts_secs.max(0.0),
+            wall_now: std::time::Instant::now(),
+        });
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: 0,
+            pts: video.pts_secs,
+        });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
     }
 
     fn open_fixture_info(name: &str) -> VideoInfo {
@@ -8202,6 +8494,522 @@ mod audio_track_fixture_tests {
         assert_eq!(info.default_audio_stream_index, None);
         assert_eq!(info.opened_audio_stream_index, None);
         assert!(!info.has_audio);
+    }
+
+    #[test]
+    fn audio_only_decoder_seek_delivers_new_serial_pcm() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        let (event_tx, _event_rx) = bounded(64);
+        let handles = spawn(
+            fixture_path("audio-only.flac"),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::VideoDynamicState::default()),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(!info.has_video);
+        assert!(info.has_audio);
+        clock.request_seek(2.0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut first_post_seek = None;
+        while std::time::Instant::now() < deadline {
+            let frame = match handles.audio_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(frame) => frame,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    panic!("audio decoder disconnected during seek")
+                }
+            };
+            if frame.seek_serial == 1 {
+                first_post_seek = Some(frame);
+                break;
+            }
+        }
+        let frame = first_post_seek.expect("audio-only seek did not yield post-seek PCM");
+        assert!(frame.pts_secs >= 1.99, "unexpected PTS: {}", frame.pts_secs);
+        assert!(!frame.samples.is_empty());
+        cancel.store(true, Ordering::Release);
+        drop(handles);
+    }
+
+    #[test]
+    fn audio_loss_retries_inactive_on_full_lane_then_seek_returns_to_playing() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(OpenOptions::default(), seek_serial, Arc::clone(&clock));
+        actor.begin_loading();
+        let (event_tx, event_rx) = bounded(1);
+        let handles = spawn_headless(
+            "single.mp4",
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            actor.published_state_handle(),
+            event_tx.clone(),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(info.has_video && info.has_audio);
+        start_actor_playing(&mut actor, &info, &handles);
+        event_tx
+            .try_send(EngineEvent::Decoder(DecoderEvent::FirstFrameReady {
+                epoch: 0,
+                pts: 0.0,
+            }))
+            .unwrap();
+        drop(handles.audio_rx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !clock.audio_lane_lost() && std::time::Instant::now() < deadline {
+            while handles.video_rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(clock.audio_lane_lost(), "demux did not detach audio lane");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            EngineEvent::Decoder(DecoderEvent::FirstFrameReady { epoch: 0, .. })
+        ));
+        let inactive = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(
+            inactive,
+            EngineEvent::Audio(AudioEvent::AudioInactive)
+        ));
+        actor.handle_audio_event(AudioEvent::AudioInactive);
+        assert!(!actor.readiness_snapshot().audio_required);
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+
+        actor.handle_seek_request(2.0);
+        assert_eq!(actor.published_state_code(), state_code::SEEKING);
+        let completed = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let EngineEvent::Decoder(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts,
+        }) = completed
+        else {
+            panic!("expected actual seek completion");
+        };
+        actor.handle_decoder_event(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts,
+        });
+        assert_eq!(actor.published_state_code(), state_code::BUFFERING);
+        let frame = wait_video_frame(&handles.video_rx, 1, 1.99);
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: 1,
+            pts: frame.pts_secs,
+        });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+        cancel.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn audio_output_loss_with_short_audio_seeks_after_video_reaches_tail() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(OpenOptions::default(), seek_serial, Arc::clone(&clock));
+        actor.begin_loading();
+        let (event_tx, event_rx) = bounded(64);
+        let handles = spawn_headless(
+            "short-audio.mp4",
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            actor.published_state_handle(),
+            event_tx,
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        start_actor_playing(&mut actor, &info, &handles);
+        drop(handles.audio_rx);
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            EngineEvent::Audio(AudioEvent::AudioInactive)
+        ));
+        actor.handle_audio_event(AudioEvent::AudioInactive);
+        wait_video_frame(&handles.video_rx, 0, 4.5);
+        actor.handle_seek_request(0.5);
+        let completed = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let EngineEvent::Decoder(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts,
+        }) = completed
+        else {
+            panic!("expected seek completion after short audio");
+        };
+        actor.handle_decoder_event(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts,
+        });
+        let frame = wait_video_frame(&handles.video_rx, 1, 0.49);
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: 1,
+            pts: frame.pts_secs,
+        });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+        cancel.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn audio_output_loss_ends_audio_only_demux() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        let (entered, release) = clock.gate_next_demux_packet_for_test();
+        let (event_tx, _event_rx) = bounded(64);
+        let handles = spawn_headless(
+            "audio-only.flac",
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            event_tx,
+        );
+        assert!(
+            !handles
+                .info_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .has_video
+        );
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(handles.audio_rx);
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !clock.audio_worker_exited() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(clock.audio_worker_exited());
+        clock.request_seek(0.5);
+        assert!(matches!(
+            handles.info_rx.recv_timeout(Duration::from_secs(10)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+        assert!(!cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_seek_flush_packet_and_seek_completed_retry_use_real_demux() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        let (entered, release) = clock.gate_next_demux_packet_for_test();
+        let (event_tx, event_rx) = bounded(1);
+        let handles = spawn_headless(
+            "audio-only.flac",
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            event_tx.clone(),
+        );
+        handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (packet_sent, resume_demux) = clock.gate_after_audio_packet_for_test();
+        event_tx
+            .try_send(EngineEvent::Decoder(DecoderEvent::SeekCompleted {
+                epoch: 0,
+                actual_pts: 0.0,
+            }))
+            .unwrap();
+        clock.fail_next_demux_seek_for_test();
+        clock.request_seek(2.0);
+        release.send(()).unwrap();
+        packet_sent.recv_timeout(Duration::from_secs(10)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let frame = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "new-serial PCM missing after failed seek"
+            );
+            let frame = handles
+                .audio_rx
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap();
+            if frame.seek_serial == 1 {
+                break frame;
+            }
+        };
+        assert!(
+            frame.pts_secs < 1.0,
+            "failed seek moved demux: {}",
+            frame.pts_secs
+        );
+        assert_eq!(frame.seek_target_secs, None);
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            EngineEvent::Decoder(DecoderEvent::SeekCompleted { epoch: 0, .. })
+        ));
+        resume_demux.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let retried = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SeekCompleted was not retried"
+            );
+            while handles.audio_rx.try_recv().is_ok() {}
+            match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(EngineEvent::Decoder(DecoderEvent::SeekCompleted { epoch: 1, .. })) => {
+                    break true;
+                }
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break false,
+            }
+        };
+        assert!(retried);
+        cancel.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod demux_serial_tests {
+    use super::{
+        AudioControlMsg, AudioDecodeInput, AudioPacketMsg, DemuxSerial, SeekFlushResult,
+        VideoControlMsg, VideoDecodeInput, VideoPacketMsg, audio_packet_msg, packet_matches_seek,
+        recv_audio_decode_input, recv_video_decode_input_with_timeout, video_packet_msg,
+    };
+    use crate::video::clock::AvClock;
+    use crossbeam_channel::bounded;
+    use ffmpeg_the_third::media::Type as MediaType;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::Duration;
+
+    fn clock() -> AvClock {
+        AvClock::new(1.0, Arc::new(AtomicU64::new(0)))
+    }
+
+    fn audio_flush(serial: u64, trim: Option<f64>) -> AudioControlMsg {
+        AudioControlMsg::Flush {
+            serial,
+            seek_target_secs: trim,
+            trim_before_secs: trim,
+        }
+    }
+
+    #[test]
+    fn packet_read_between_live_serial_and_seek_publication_stays_stale() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tracks/multi.mkv");
+        let mut input = ffmpeg_the_third::format::input(&path).unwrap();
+        let clock = clock();
+        let cancel = AtomicBool::new(false);
+        let mut demux_serial = DemuxSerial(0);
+        let (video_pkt_tx, video_pkt_rx) = bounded(1);
+        let (audio_pkt_tx, audio_pkt_rx) = bounded(1);
+        let (video_ctl_tx, video_ctl_rx) = bounded(1);
+        let (audio_ctl_tx, audio_ctl_rx) = bounded(1);
+
+        // The hook fixes the actual interleaving: the live serial is 1, the
+        // request is still unpublished, and demux reads old-position packets.
+        clock.request_seek_before_publish_for_test(2.0, || {
+            assert_eq!(clock.current_seek_serial(), 1);
+            assert!(!clock.peek_seek_request_pending());
+            let mut saw_video = false;
+            let mut saw_audio = false;
+            for item in input.packets() {
+                let (stream, packet) = item.unwrap();
+                match stream.parameters().medium() {
+                    MediaType::Video if !saw_video => {
+                        video_pkt_tx
+                            .send(video_packet_msg(packet, &demux_serial, &clock))
+                            .unwrap();
+                        saw_video = true;
+                    }
+                    MediaType::Audio if !saw_audio => {
+                        audio_pkt_tx
+                            .send(audio_packet_msg(packet, &demux_serial, &clock))
+                            .unwrap();
+                        saw_audio = true;
+                    }
+                    _ => {}
+                }
+                if saw_video && saw_audio {
+                    break;
+                }
+            }
+            assert!(saw_video && saw_audio);
+        });
+        let req = clock.take_seek_request().unwrap();
+        assert_eq!(req.serial, 1);
+        assert_eq!(
+            demux_serial.send_seek_flushes(
+                req.serial,
+                Some((
+                    &video_ctl_tx,
+                    VideoControlMsg::Flush {
+                        serial: req.serial,
+                        trim_before_secs: Some(2.0),
+                        frame_step: None,
+                    },
+                )),
+                Some((&audio_ctl_tx, audio_flush(req.serial, Some(2.0)))),
+                &cancel,
+            ),
+            SeekFlushResult::Accepted
+        );
+
+        assert!(matches!(
+            recv_video_decode_input_with_timeout(
+                &video_ctl_rx,
+                &video_pkt_rx,
+                Duration::from_millis(100)
+            )
+            .unwrap()
+            .unwrap(),
+            VideoDecodeInput::Control(VideoControlMsg::Flush { serial: 1, .. })
+        ));
+        assert!(matches!(
+            recv_audio_decode_input(&audio_ctl_rx, &audio_pkt_rx).unwrap(),
+            AudioDecodeInput::Control(AudioControlMsg::Flush { serial: 1, .. })
+        ));
+        let VideoPacketMsg::Packet {
+            serial: video_serial,
+            ..
+        } = video_pkt_rx.recv().unwrap()
+        else {
+            panic!("expected video packet");
+        };
+        let AudioPacketMsg::Packet {
+            serial: audio_serial,
+            ..
+        } = audio_pkt_rx.recv().unwrap()
+        else {
+            panic!("expected audio packet");
+        };
+        assert_eq!((video_serial, audio_serial), (0, 0));
+        assert!(!packet_matches_seek(video_serial, 1, &clock));
+        assert!(!packet_matches_seek(audio_serial, 1, &clock));
+        assert_eq!(demux_serial.packet_serial(&clock), 1);
+    }
+
+    #[test]
+    fn audio_only_seek_advances_after_audio_flush() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tracks/audio-only.flac");
+        let mut input = ffmpeg_the_third::format::input(&path).unwrap();
+        assert!(input.streams().best(MediaType::Video).is_none());
+        assert!(input.streams().best(MediaType::Audio).is_some());
+        let clock = clock();
+        let cancel = AtomicBool::new(false);
+        let mut demux_serial = DemuxSerial(0);
+        let (audio_ctl_tx, audio_ctl_rx) = bounded(2);
+
+        clock.request_seek(2.0);
+        let req = clock.take_seek_request().unwrap();
+        input.seek(2_000_000, 2_000_000..).unwrap();
+        assert_eq!(
+            demux_serial.send_seek_flushes(
+                req.serial,
+                None,
+                Some((&audio_ctl_tx, audio_flush(req.serial, Some(2.0)))),
+                &cancel,
+            ),
+            SeekFlushResult::Accepted
+        );
+        assert_eq!(demux_serial.packet_serial(&clock), 1);
+        assert!(matches!(
+            audio_ctl_rx.recv().unwrap(),
+            AudioControlMsg::Flush { serial: 1, .. }
+        ));
+        let (stream, _) = input.packets().next().unwrap().unwrap();
+        assert_eq!(stream.parameters().medium(), MediaType::Audio);
+        assert!(packet_matches_seek(
+            demux_serial.packet_serial(&clock),
+            1,
+            &clock
+        ));
+    }
+
+    #[test]
+    fn audio_flush_disconnect_keeps_video_seek_and_advances_serial() {
+        let clock = clock();
+        let cancel = AtomicBool::new(false);
+        let mut demux_serial = DemuxSerial(0);
+        let (video_ctl_tx, video_ctl_rx) = bounded(1);
+        let (audio_ctl_tx, audio_ctl_rx) = bounded(1);
+        drop(audio_ctl_rx);
+        clock.request_seek(1.0);
+        let req = clock.take_seek_request().unwrap();
+        assert_eq!(
+            demux_serial.send_seek_flushes(
+                req.serial,
+                Some((
+                    &video_ctl_tx,
+                    VideoControlMsg::Flush {
+                        serial: req.serial,
+                        trim_before_secs: Some(1.0),
+                        frame_step: None,
+                    },
+                )),
+                Some((&audio_ctl_tx, audio_flush(req.serial, Some(1.0)))),
+                &cancel,
+            ),
+            SeekFlushResult::AudioLost
+        );
+        assert!(matches!(
+            video_ctl_rx.recv().unwrap(),
+            VideoControlMsg::Flush { serial: 1, .. }
+        ));
+        assert_eq!(demux_serial.packet_serial(&clock), 1);
+    }
+
+    #[test]
+    fn audio_only_flush_disconnect_and_cancel_still_terminate() {
+        let clock = clock();
+        let (audio_ctl_tx, audio_ctl_rx) = bounded(1);
+        drop(audio_ctl_rx);
+        let mut serial = DemuxSerial(0);
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            serial.send_seek_flushes(
+                1,
+                None,
+                Some((&audio_ctl_tx, audio_flush(1, Some(1.0)))),
+                &cancel,
+            ),
+            SeekFlushResult::Terminated
+        );
+        assert_eq!(serial.packet_serial(&clock), 0);
+
+        let (video_ctl_tx, video_ctl_rx) = bounded(1);
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            serial.send_seek_flushes(
+                1,
+                Some((
+                    &video_ctl_tx,
+                    VideoControlMsg::Flush {
+                        serial: 1,
+                        trim_before_secs: Some(1.0),
+                        frame_step: None,
+                    },
+                )),
+                Some((&audio_ctl_tx, audio_flush(1, Some(1.0)))),
+                &cancel,
+            ),
+            SeekFlushResult::Terminated
+        );
+        assert!(video_ctl_rx.is_empty());
+        assert_eq!(serial.packet_serial(&clock), 0);
     }
 }
 

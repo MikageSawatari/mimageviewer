@@ -110,6 +110,25 @@ pub struct AvClock {
     /// take/request の両方が Mutex を取り、整合性のある (target, serial)
     /// ペアを観測できるようにする。
     seek_request: Mutex<Option<SeekRequest>>,
+    #[cfg(test)]
+    demux_packet_gate: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    demux_after_audio_packet_gate: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    fail_next_demux_seek: AtomicBool,
+    /// Audio decode worker の終了通知。出力 channel に未読 frame が残り、pump が
+    /// 逆圧中でも lane の喪失を検知できるようにする。
+    audio_worker_exited: AtomicBool,
     /// 直近のシーク要求の世代。`request_seek` のたびに +1。
     /// 音声 RT コールバック (`fill_output`) と UI の `tick` がポーリングで読むので
     /// atomic で公開する。Mutex を取らずに「自分が処理中の世代より新しい seek が
@@ -146,6 +165,9 @@ pub struct AvClock {
     /// false なら `now_secs()` はフォールバック wall clock を使う (= MasterClock の
     /// `ClockSource::Wall`)。
     audio_active: AtomicBool,
+    /// Demux が audio routing を永久に外したことを worker / engine に公開する。
+    /// `audio_active` は通常の preroll 中も false なので、lane 喪失とは別の状態。
+    audio_lane_lost: AtomicBool,
     /// 測定前の音量ノーマライズなど、再生開始前に audio-pump の処理済み先読みを一時停止する。
     /// true の間は audio-pump が raw→processed 変換を止め、解除後に現行 gain で preroll する。
     audio_preroll_suspended: AtomicBool,
@@ -245,6 +267,13 @@ impl AvClock {
             master_clock,
             playing: AtomicBool::new(false),
             seek_request: Mutex::new(None),
+            #[cfg(test)]
+            demux_packet_gate: Mutex::new(None),
+            #[cfg(test)]
+            demux_after_audio_packet_gate: Mutex::new(None),
+            #[cfg(test)]
+            fail_next_demux_seek: AtomicBool::new(false),
+            audio_worker_exited: AtomicBool::new(false),
             seek_serial,
             seek_target_override_bits: AtomicU64::new(SEEK_NONE),
             seek_override_serial: AtomicU64::new(0),
@@ -253,6 +282,7 @@ impl AvClock {
             playback_speed_update_lock: Mutex::new(()),
             audio_tx_accounting_epoch: AtomicU64::new(0),
             audio_active: AtomicBool::new(false),
+            audio_lane_lost: AtomicBool::new(false),
             audio_preroll_suspended: AtomicBool::new(false),
             eof_reached: AtomicBool::new(false),
             decode_failed: AtomicBool::new(false),
@@ -518,6 +548,15 @@ impl AvClock {
         self.audio_active.store(false, Ordering::Release);
     }
 
+    pub(super) fn mark_audio_lane_lost(&self) {
+        self.audio_lane_lost.store(true, Ordering::Release);
+        self.mark_audio_inactive();
+    }
+
+    pub(super) fn audio_lane_lost(&self) -> bool {
+        self.audio_lane_lost.load(Ordering::Acquire)
+    }
+
     pub fn is_audio_active(&self) -> bool {
         self.audio_active.load(Ordering::Acquire)
     }
@@ -606,6 +645,83 @@ impl AvClock {
     /// へ移動し、video/audio とも target まで preroll trim してから再開する。
     /// keyframe preview は表示しないため、細かい相対 seek でも映像が逆方向に跳ねない。
     pub fn request_seek(&self, target_secs: f64) {
+        self.request_seek_with_before_publish(target_secs, || {});
+    }
+
+    /// Test seam for the interval where the live serial has advanced but the
+    /// seek request is not yet visible to demux.
+    #[cfg(test)]
+    pub(super) fn request_seek_before_publish_for_test(
+        &self,
+        target_secs: f64,
+        before_publish: impl FnOnce(),
+    ) {
+        self.request_seek_with_before_publish(target_secs, before_publish);
+    }
+
+    #[cfg(test)]
+    pub(super) fn gate_next_demux_packet_for_test(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.demux_packet_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_at_demux_packet_gate_for_test(&self) {
+        if let Some((entered_tx, release_rx)) = self.demux_packet_gate.lock().unwrap().take() {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn gate_after_audio_packet_for_test(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.demux_after_audio_packet_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_after_audio_packet_for_test(&self) {
+        if let Some((entered_tx, release_rx)) =
+            self.demux_after_audio_packet_gate.lock().unwrap().take()
+        {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_demux_seek_for_test(&self) {
+        self.fail_next_demux_seek.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_demux_seek_failure_for_test(&self) -> bool {
+        self.fail_next_demux_seek.swap(false, Ordering::AcqRel)
+    }
+
+    pub(super) fn note_audio_worker_exit(&self) {
+        self.audio_worker_exited.store(true, Ordering::Release);
+    }
+
+    pub(super) fn audio_worker_exited(&self) -> bool {
+        self.audio_worker_exited.load(Ordering::Acquire)
+    }
+
+    fn request_seek_with_before_publish(&self, target_secs: f64, before_publish: impl FnOnce()) {
         let clamped = target_secs.max(0.0);
         // post-EOF seek サポート: tick が EOF を見て pause しないように先にクリア。
         // decoder の EOF wait ループも peek_seek_request_pending で起床する。
@@ -615,6 +731,7 @@ impl AvClock {
             .store(new_serial, Ordering::Release);
         self.seek_target_override_bits
             .store(clamped.to_bits(), Ordering::Release);
+        before_publish();
         let mut guard = self.seek_request.lock().unwrap();
         *guard = Some(SeekRequest {
             target_secs: clamped,

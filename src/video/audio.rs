@@ -1267,7 +1267,16 @@ fn run_pump(
     let mut last_seen_stale_clear_seq: u64 = 0;
     let mut last_seen_pdc_change_seq: u64 = 0;
 
+    let mut input_disconnected = false;
     while !cancel.load(Ordering::Acquire) {
+        // The receiver can still contain queued frames while raw back-pressure
+        // prevents recv() from observing a disconnected sender. The decode
+        // worker's exit publication covers that case without consuming audio
+        // ahead of the normal back-pressure limit.
+        if clock.audio_worker_exited() {
+            input_disconnected = true;
+            break;
+        }
         // ── frame 受信 (timeout 付き、Codex 助言): audio_rx 到着を待たず自律 refill ──
         let raw_backpressure_secs = if engine_state.load(Ordering::Acquire) == state_code::PLAYING {
             RAW_BACKPRESSURE_PLAYING_SECS
@@ -1290,7 +1299,10 @@ fn run_pump(
                 recv(shutdown_rx) -> _ => return,
                 recv(rx) -> msg => match msg {
                     Ok(f) => Some(f),
-                    Err(_) => break,
+                    Err(_) => {
+                        input_disconnected = true;
+                        break;
+                    }
                 },
                 default(std::time::Duration::from_millis(REFILL_TICK_MS)) => None,
             }
@@ -2277,6 +2289,21 @@ fn run_pump(
             }
         }
     }
+    if input_disconnected {
+        // No producer can refill these queues. Publishing zero is required for
+        // the EOF/loop quiet gate, including when raw back-pressure was active.
+        let mut buf = buffer.lock().unwrap();
+        buf.processed.clear();
+        buf.raw_pending.clear();
+        buf.drain_offset_in_first = 0;
+        buf.pdc_latency_secs = 0.0;
+        buf.pdc_latency_secs_applied = 0.0;
+        buf.next_pts_secs = clock.now_secs();
+        publish_buffer_secs(&buf, &clock);
+        drop(buf);
+        clock.reset_audio_bookkeeping_only();
+        clock.mark_audio_inactive();
+    }
     // ── 終了時の silence flush (= 既存) ──
     // T20 (Codex P2 2026-05-16): cancel が立っているときは flush_silence をスキップする。
     // `flush_silence(480, 10)` は 10 反復で各反復 200ms timeout = 最大 2 秒ブロック。
@@ -2702,6 +2729,227 @@ mod tests {
             seek_serial: 0,
             pdc_latency_secs_at_process: 0.0,
         }
+    }
+
+    fn disconnected_pump_releases_eof_gate(loop_enabled: bool) {
+        use crate::video::engine::EngineEvent;
+        use crate::video::engine::actor::{EngineActor, OpenOptions};
+        use crate::video::engine::state::{AudioEvent, DecoderEvent};
+
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(
+            OpenOptions {
+                loop_enabled,
+                ..OpenOptions::default()
+            },
+            seek_serial,
+            Arc::clone(&clock),
+        );
+        actor.begin_loading();
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 1.0,
+            has_audio: true,
+            has_video: true,
+        });
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(32);
+        let (_shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, event_rx) = bounded(64);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let pump = {
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            let clock = Arc::clone(&clock);
+            let state = actor.published_state_handle();
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                );
+            })
+        };
+        for index in 0..20 {
+            audio_tx
+                .send(AudioFrame {
+                    samples: vec![0.0; 9_600],
+                    pts_secs: index as f64 * 0.1,
+                    seek_serial: 0,
+                    duration_secs: 0.1,
+                    queued_wall_secs: 0.0,
+                    audio_tx_accounting_epoch: 0,
+                    seek_target_secs: None,
+                })
+                .unwrap();
+        }
+        let ready = event_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let EngineEvent::Audio(AudioEvent::BufferReady {
+            epoch,
+            pts,
+            wall_now,
+        }) = ready
+        else {
+            panic!("expected pump BufferReady");
+        };
+        actor.handle_audio_event(AudioEvent::BufferReady {
+            epoch,
+            pts,
+            wall_now,
+        });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while clock.audio_raw_pending_secs() <= 0.1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(clock.audio_raw_pending_secs() > 0.1);
+
+        drop(audio_tx);
+        pump.join().unwrap();
+        assert!(buffer.lock().unwrap().raw_pending.is_empty());
+        assert!(buffer.lock().unwrap().processed.is_empty());
+        assert_eq!(clock.audio_raw_pending_secs(), 0.0);
+        assert_eq!(clock.audio_processed_secs(), 0.0);
+        assert_eq!(clock.audio_tx_queued_secs(), 0.0);
+        assert!(!clock.is_audio_active());
+        actor.handle_audio_event(AudioEvent::AudioInactive);
+        clock.notify_eof_reached();
+        let quiet = clock.is_eof_reached()
+            && clock.audio_processed_secs() < 0.020
+            && clock.audio_raw_pending_secs() < 0.020
+            && clock.audio_tx_queued_secs() < 0.020;
+        assert!(quiet, "EOF/loop quiet gate must open after pump disconnect");
+        actor.handle_decoder_event(DecoderEvent::EofReached {
+            epoch: 0,
+            duration_secs: 1.0,
+        });
+        assert_eq!(
+            actor.published_state_code(),
+            if loop_enabled {
+                state_code::SEEKING
+            } else {
+                state_code::EOF
+            }
+        );
+    }
+
+    #[test]
+    fn disconnected_pump_with_raw_pending_allows_eof() {
+        disconnected_pump_releases_eof_gate(false);
+    }
+
+    #[test]
+    fn disconnected_pump_with_raw_pending_allows_loop_seek() {
+        disconnected_pump_releases_eof_gate(true);
+    }
+
+    #[test]
+    fn exited_decode_worker_clears_raw_backpressure_without_receiving_queued_frames() {
+        use crate::video::engine::actor::{EngineActor, OpenOptions};
+        use crate::video::engine::state::DecoderEvent;
+
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(OpenOptions::default(), seek_serial, Arc::clone(&clock));
+        actor.begin_loading();
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 6.0,
+            has_audio: true,
+            has_video: true,
+        });
+
+        let buffer = make_buffer(48_000);
+        let frame = AudioFrame {
+            samples: vec![0.0; 576_000],
+            pts_secs: 0.0,
+            seek_serial: 0,
+            duration_secs: 6.0,
+            queued_wall_secs: 0.0,
+            audio_tx_accounting_epoch: 0,
+            seek_target_secs: None,
+        };
+        buffer.lock().unwrap().raw_pending.push_back(frame);
+        publish_buffer_secs(&buffer.lock().unwrap(), &clock);
+        assert!(clock.audio_raw_pending_secs() > 5.0);
+        let (audio_tx, audio_rx) = bounded(1);
+        audio_tx
+            .send(AudioFrame {
+                samples: vec![0.0; 9_600],
+                pts_secs: 6.0,
+                seek_serial: 0,
+                duration_secs: 0.1,
+                queued_wall_secs: 0.0,
+                audio_tx_accounting_epoch: 0,
+                seek_target_secs: None,
+            })
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, _event_rx) = bounded(64);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let (done_tx, done_rx) = bounded(1);
+        clock.note_audio_worker_exit();
+        let pump = {
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            let clock = Arc::clone(&clock);
+            let state = actor.published_state_handle();
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    make_diag(),
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                );
+                done_tx.send(()).unwrap();
+            })
+        };
+        let exited = done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        if !exited {
+            cancel.store(true, Ordering::Release);
+            shutdown_tx.send(()).unwrap();
+        }
+        pump.join().unwrap();
+        assert!(
+            exited,
+            "pump stayed behind raw back-pressure after worker exit"
+        );
+        assert!(buffer.lock().unwrap().raw_pending.is_empty());
+        assert_eq!(clock.audio_raw_pending_secs(), 0.0);
+        drop(audio_tx);
     }
 
     #[test]
