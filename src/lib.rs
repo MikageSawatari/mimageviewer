@@ -1238,6 +1238,7 @@ pub fn run() -> eframe::Result {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
+        .with_window_level(crate::settings::viewer_window_level(saved.always_on_top))
         .with_inner_size(size)
         .with_min_inner_size(MIN_INNER_SIZE)
         .with_icon(icon);

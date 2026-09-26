@@ -858,6 +858,8 @@ pub(crate) fn collection_sort_popup_snapshot(ctx: &egui::Context) -> TestScriptC
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestScriptSnapshot {
     pub(crate) is_fullscreen: bool,
+    pub(crate) always_on_top: bool,
+    pub(crate) window_visible: bool,
     pub(crate) fs_idx: i64,
     pub(crate) items_generation: i64,
     pub(crate) folder_load_requests: i64,
@@ -919,12 +921,58 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) passthrough_unavailable: String,
     pub(crate) keymap_level_observations: Vec<KeymapLevelObservation>,
     pub(crate) windows: Vec<TestScriptWindowSnapshot>,
+    pub(crate) host_styles: Vec<TestScriptHostStyle>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TestScriptHostStyle {
+    pub(crate) role: String,
+    pub(crate) viewport: String,
+    pub(crate) viewport_id: Option<egui::ViewportId>,
+    pub(crate) hwnd: u64,
+    pub(crate) backend_token: Option<u64>,
+    pub(crate) topmost: bool,
+    pub(crate) noactivate: bool,
+    pub(crate) minimized: bool,
+    pub(crate) visible: bool,
+    pub(crate) owner_hwnd: u64,
+    pub(crate) foreground_hwnd: u64,
+}
+
+impl TestScriptHostStyle {
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("role".into(), self.role.clone().into());
+        map.insert("viewport".into(), self.viewport.clone().into());
+        map.insert("hwnd".into(), format!("0x{:x}", self.hwnd).into());
+        map.insert(
+            "backend_token".into(),
+            self.backend_token
+                .map(|token| Dynamic::from(saturating_rhai_int(token)))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert("topmost".into(), self.topmost.into());
+        map.insert("noactivate".into(), self.noactivate.into());
+        map.insert("minimized".into(), self.minimized.into());
+        map.insert("visible".into(), self.visible.into());
+        map.insert(
+            "owner_hwnd".into(),
+            format!("0x{:x}", self.owner_hwnd).into(),
+        );
+        map.insert(
+            "foreground_hwnd".into(),
+            format!("0x{:x}", self.foreground_hwnd).into(),
+        );
+        map
+    }
 }
 
 impl Default for TestScriptSnapshot {
     fn default() -> Self {
         Self {
             is_fullscreen: false,
+            always_on_top: false,
+            window_visible: true,
             fs_idx: -1,
             items_generation: 0,
             folder_load_requests: 0,
@@ -976,6 +1024,7 @@ impl Default for TestScriptSnapshot {
             passthrough_unavailable: String::new(),
             keymap_level_observations: Vec::new(),
             windows: Vec::new(),
+            host_styles: Vec::new(),
         }
     }
 }
@@ -992,6 +1041,8 @@ impl TestScriptSnapshot {
             };
         }
         insert!(is_fullscreen);
+        insert!(always_on_top);
+        insert!(window_visible);
         insert!(fs_idx);
         insert!(items_generation);
         insert!(folder_load_requests);
@@ -1059,6 +1110,14 @@ impl TestScriptSnapshot {
         insert!(has_next_page);
         insert!(reading_flow);
         insert!(upload_deferral_streak);
+        map.insert(
+            "host_styles".into(),
+            self.host_styles
+                .iter()
+                .map(|style| Dynamic::from_map(style.to_rhai_map()))
+                .collect::<rhai::Array>()
+                .into(),
+        );
         insert!(passthrough_unavailable);
         map.insert(
             "windows".into(),
@@ -1190,6 +1249,14 @@ pub(crate) enum UiSmokeAction {
     OpenThumbnailPreferences,
     OpenFirstSmartFolder,
     OpenSeededCollection,
+    AlwaysOnTopOn,
+    AlwaysOnTopOff,
+    MinimizeRoot,
+    RestoreRoot,
+    HideToTray,
+    CloseFullscreen,
+    ToggleDetachedMode,
+    EnableIndependentWindows,
 }
 
 pub(crate) const SEEDED_COLLECTION_SMOKE_ID: &str = "80f58851-997b-4b80-90bc-f50bb1d2523e";
@@ -2256,6 +2323,30 @@ fn wait_interruptibly(
 }
 
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
+    let always_on_top_bridge = bridge.clone();
+    engine.register_fn(
+        "always_on_top_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            let action = match name.as_str() {
+                "on" => UiSmokeAction::AlwaysOnTopOn,
+                "off" => UiSmokeAction::AlwaysOnTopOff,
+                "minimize_root" => UiSmokeAction::MinimizeRoot,
+                "restore_root" => UiSmokeAction::RestoreRoot,
+                "hide_to_tray" => UiSmokeAction::HideToTray,
+                "close_fullscreen" => UiSmokeAction::CloseFullscreen,
+                "toggle_detached_mode" => UiSmokeAction::ToggleDetachedMode,
+                "enable_independent_windows" => UiSmokeAction::EnableIndependentWindows,
+                _ => {
+                    return Err(rhai_error(format!(
+                        "unknown always-on-top smoke action: {name}"
+                    )));
+                }
+            };
+            always_on_top_bridge
+                .send(UiCommand::SmokeAction(action))
+                .map_err(rhai_error)
+        },
+    );
     let rating_sort_bridge = bridge.clone();
     engine.register_fn(
         "rating_sort_smoke",
@@ -3018,6 +3109,19 @@ impl UiRuntime {
                     viewport_id: *viewport_id,
                     role: format!("detached-{window_id}-{context_serial}"),
                 });
+            }
+        }
+        if let Ok(snapshot) = self.snapshot.read() {
+            for style in &snapshot.host_styles {
+                if style.role == "fullscreen"
+                    && let Some(viewport_id) = style.viewport_id
+                    && seen.insert(viewport_id)
+                {
+                    targets.push(capture::Target {
+                        viewport_id,
+                        role: "fullscreen".into(),
+                    });
+                }
             }
         }
         Ok(targets)
@@ -4444,6 +4548,14 @@ mod tests {
     #[test]
     fn collection_sort_smoke_script_parses_without_launching_the_app() {
         let script = include_str!("../scripts/ui-smoke/rating-sort-collection.rhai");
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine.compile(script).unwrap();
+    }
+
+    #[test]
+    fn always_on_top_smoke_script_parses_without_launching_the_app() {
+        let script = include_str!("../scripts/ui-smoke/always-on-top.rhai");
         let mut engine = rhai::Engine::new();
         engine.set_max_expr_depths(64, 64);
         engine.compile(script).unwrap();

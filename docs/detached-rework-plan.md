@@ -1455,6 +1455,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-27 §1.250 常に最前面**
+
+`Settings.always_on_top` を唯一の希望状態とし、active / loading / holdover / cleanup と passive / parked の閲覧用 viewport builder に `Normal` または `AlwaysOnTop` を明示する。root への切替 command と、子 host の builder diff を別の発行 owner にして二重送信を避ける。同一 ViewportId を active session が所有する間は passive snapshot を重ねて登録せず、handoff 後に passive が所有する。別の detached 状態 flag、時間待ち、Focus、個別 HWND への症状的な `SetWindowPos` は追加しない。これは他機能の level 設定が viewport builder 経路へ到達する構造変更であり、§2 の同一 host ownership を維持する。復帰時の再 assert は style 実測で欠落が確認された edge に限り、現時点では追加していない。設計は [always-on-top-plan.md](always-on-top-plan.md) を参照。
+
 **2026-09-26 実アプリ smoke の viewport スクリーンショット証跡**
 
 `portable,test-script` のみで egui の viewport Screenshot 応答を受け、main と別窓の画像を

@@ -17352,15 +17352,17 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn build_detached_image_window_builder(
+    pub(crate) fn build_detached_image_window_builder(
         window: &crate::app::DetachedImageWindowSnapshot,
         placement: crate::settings::DetachedViewerWindowPlacement,
         apply_initial_placement: bool,
         visible: bool,
         ui_scale: f32,
+        always_on_top: bool,
     ) -> egui::ViewportBuilder {
         let builder = egui::ViewportBuilder::default()
             .with_title(window.title.clone())
+            .with_window_level(crate::settings::viewer_window_level(always_on_top))
             .with_decorations(true)
             .with_transparent(false)
             .with_taskbar(true)
@@ -19485,7 +19487,15 @@ impl App {
         let windows = self.detached_image_windows.clone();
         let mut deferred_windows = Vec::new();
         let mut parked_live_windows = Vec::new();
+        let active_window_id = self
+            .active_detached_session
+            .map(|session| session.window_id);
         for window in windows {
+            // An active session owns this ViewportId until its handoff completes.
+            // Registering the passive snapshot as well would give one native host two builders.
+            if active_window_id == Some(window.id) {
+                continue;
+            }
             if self.detached_window_state_is_parked_live(window.id) {
                 parked_live_windows.push(window);
             } else {
@@ -19538,6 +19548,7 @@ impl App {
                 apply_initial_placement,
                 self.window_visible,
                 self.settings.ui_scale_factor,
+                self.settings.always_on_top,
             );
             let view = self.deferred_detached_image_window_view(
                 window,
@@ -19712,6 +19723,7 @@ impl App {
                 apply_initial_placement,
                 self.window_visible,
                 self.settings.ui_scale_factor,
+                self.settings.always_on_top,
             );
             let mut viewport_close_requested = false;
             let mut bar_close_requested = false;
@@ -27030,6 +27042,9 @@ impl App {
                 // 静止画 fullscreen の属性だけを合わせ、geometry は触らない。
                 egui::ViewportBuilder::default()
                     .with_decorations(false)
+                    .with_window_level(crate::settings::viewer_window_level(
+                        self.settings.always_on_top,
+                    ))
                     .with_transparent(true)
                     .with_taskbar(true)
             }
@@ -27067,6 +27082,9 @@ impl App {
 
         let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
+            .with_window_level(crate::settings::viewer_window_level(
+                self.settings.always_on_top,
+            ))
             .with_decorations(!borderless)
             .with_transparent(false)
             .with_taskbar(true);
@@ -27200,6 +27218,9 @@ impl App {
 
         egui::ViewportBuilder::default()
             .with_decorations(false)
+            .with_window_level(crate::settings::viewer_window_level(
+                self.settings.always_on_top,
+            ))
             .with_transparent(transparent)
             .with_taskbar(taskbar)
             .with_position(position)
@@ -27918,6 +27939,8 @@ impl App {
         };
 
         crate::test_script::TestScriptSnapshot {
+            always_on_top: self.settings.always_on_top,
+            window_visible: self.window_visible,
             is_fullscreen: fs_idx.is_some(),
             fs_idx: fs_idx.map_or(-1, |idx| idx as i64),
             items_generation: self.items_generation as i64,
@@ -28032,6 +28055,7 @@ impl App {
                 .unwrap_or_default(),
             keymap_level_observations,
             windows: self.test_script_window_snapshots(),
+            host_styles: self.test_script_host_styles(),
         }
     }
 
@@ -28134,6 +28158,16 @@ impl App {
                 self.show_feedback_toast("範囲コピーをキャンセルしました".to_string());
                 ctx.request_repaint();
             }
+            return action;
+        }
+
+        if !self.ime_input_active(ctx)
+            && !self.is_overlay_edit_mode_active()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::ToggleAlwaysOnTop)
+        {
+            self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
             return action;
         }
 
@@ -46425,6 +46459,14 @@ impl App {
 
         if self
             .keymap
+            .consume_action_no_repeat(ctx, KeyAction::ToggleAlwaysOnTop)
+        {
+            self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
+            return;
+        }
+
+        if self
+            .keymap
             .consume_action_no_repeat(ctx, KeyAction::ToggleDetachedViewerMode)
         {
             self.toggle_detached_viewer_mode();
@@ -47719,6 +47761,50 @@ mod tests {
     mod still_seek_menu;
     mod still_seek_rotation;
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn active_and_inactive_viewer_builders_follow_saved_window_level() {
+        let mut app = crate::app::setup_app_for_test();
+        for enabled in [false, true] {
+            app.settings.always_on_top = enabled;
+            let expected = Some(crate::settings::viewer_window_level(enabled));
+
+            app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
+            assert_eq!(
+                app.build_fullscreen_viewport_builder().window_level,
+                expected
+            );
+            assert_eq!(
+                app.build_still_fullscreen_viewport_builder().window_level,
+                expected
+            );
+            assert_eq!(
+                app.build_inactive_fullscreen_viewport_builder(0)
+                    .window_level,
+                expected
+            );
+
+            app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+            assert_eq!(
+                app.build_detached_viewer_viewport_builder(
+                    0,
+                    Some(true),
+                    DetachedViewportBuilderVisibility::Preserve,
+                    false,
+                    None,
+                    "window_level_test",
+                )
+                .window_level,
+                expected
+            );
+            assert_eq!(
+                app.build_inactive_fullscreen_viewport_builder(0)
+                    .window_level,
+                expected
+            );
+        }
+    }
 
     #[cfg(all(windows, feature = "test-script"))]
     #[test]

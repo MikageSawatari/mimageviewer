@@ -25,7 +25,7 @@ MultiWindowRarNav checks Ctrl+Up/Down across direct RAR, ZIP, and CBR in one det
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AlwaysOnTop')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -732,7 +732,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection')
+    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AlwaysOnTop')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -818,6 +818,45 @@ if ($script:archiveErrors.Count -gt 0) {
     $candidateFixtureGeneratorPdfDependencyPath = $null
 
     switch ($Scenario) {
+    'AlwaysOnTop' {
+        $scenarioRoot = Join-Path $targetRoot 'ui-smoke\always-on-top'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\always-on-top.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_multi_window_stills_fixture.py'
+        $candidateFixtureGeneratorDependencyPath = Join-Path $PSScriptRoot 'page-turn\generate_fixture.py'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\always-on-top') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        foreach ($path in @($candidateScriptPath, $candidateFixtureGeneratorPath, $candidateFixtureGeneratorDependencyPath)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "[ui-smoke] always-on-top input not found: $path"
+            }
+        }
+        $generatedStillsDir = Join-Path $scenarioRoot 'generated-stills'
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        New-Item -ItemType Directory -Path $generatedStillsDir -Force | Out-Null
+        & python $candidateFixtureGeneratorPath $generatedStillsDir
+        if ($LASTEXITCODE -ne 0) { throw '[ui-smoke] still fixture generator failed' }
+        Copy-Item -LiteralPath (Join-Path $generatedStillsDir 'a-folder\page-000.png') -Destination (Join-Path $candidateFixtureDir '00-still.png')
+        Copy-Item -LiteralPath (Join-Path $generatedStillsDir 'a-folder\page-001.png') -Destination (Join-Path $candidateFixtureDir '01-still.png')
+        $ffmpegCommand = Get-Command -Name 'ffmpeg.exe' -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $videoPath = Join-Path $candidateFixtureDir 'zz-video.mp4'
+        & $ffmpegCommand.Source @('-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=10', '-t', '90', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', $videoPath)
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $videoPath -PathType Leaf)) {
+            throw '[ui-smoke] video fixture generator failed'
+        }
+        Assert-NoReparseTree $candidateFixtureDir 'always-on-top-fixture'
+        $fixtureNames = @(Get-ChildItem -LiteralPath $candidateFixtureDir -File | ForEach-Object Name | Sort-Object)
+        if (($fixtureNames -join ',') -ne '00-still.png,01-still.png,zz-video.mp4') {
+            throw '[ui-smoke] always-on-top fixture must contain exactly two PNGs and one MP4'
+        }
+        $settingsJson = '{"always_on_top":false,"minimize_to_tray_on_close":true,"detached_viewer_open_images_in_window":false,"default_spread_mode":"Single","default_reading_flow":"Paged"}'
+        [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
+    }
     'RatingSortCollection' {
         $scenarioRoot = Join-Path $dataDir 'rating-sort-collection'
         $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\rating-sort-collection.rhai'

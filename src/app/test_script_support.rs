@@ -6,6 +6,64 @@
 
 use super::{App, ContextResidence, FsCacheEntry, GridItem};
 
+fn test_script_native_host_style(
+    role: &str,
+    viewport: String,
+    hwnd: u64,
+    backend_token: Option<u64>,
+) -> Option<crate::test_script::TestScriptHostStyle> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GW_OWNER, GWL_EXSTYLE, GetForegroundWindow, GetWindow, GetWindowLongPtrW, IsIconic,
+        IsWindow, IsWindowVisible, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+    };
+
+    if hwnd == 0 || !unsafe { IsWindow(Some(HWND(hwnd as usize as *mut _))) }.as_bool() {
+        return None;
+    }
+    let native = HWND(hwnd as usize as *mut _);
+    let ex_style = unsafe { GetWindowLongPtrW(native, GWL_EXSTYLE) } as u32;
+    let owner = unsafe { GetWindow(native, GW_OWNER) }.unwrap_or_default();
+    let foreground = unsafe { GetForegroundWindow() };
+    Some(crate::test_script::TestScriptHostStyle {
+        role: role.to_owned(),
+        viewport,
+        viewport_id: None,
+        hwnd,
+        backend_token,
+        topmost: ex_style & WS_EX_TOPMOST.0 != 0,
+        noactivate: ex_style & WS_EX_NOACTIVATE.0 != 0,
+        minimized: unsafe { IsIconic(native) }.as_bool(),
+        visible: unsafe { IsWindowVisible(native) }.as_bool(),
+        owner_hwnd: owner.0 as usize as u64,
+        foreground_hwnd: foreground.0 as usize as u64,
+    })
+}
+
+fn test_script_egui_host_style(
+    role: &str,
+    viewport_id: egui::ViewportId,
+) -> Option<crate::test_script::TestScriptHostStyle> {
+    let witness = eframe::miv_test_script_window_witness::latest(viewport_id)?;
+    let current = eframe::miv_test_script_window_witness::is_current(
+        viewport_id,
+        witness.hwnd(),
+        witness.token(),
+    )
+    .ok()?;
+    if !current {
+        return None;
+    }
+    let mut style = test_script_native_host_style(
+        role,
+        format!("{viewport_id:?}"),
+        witness.hwnd(),
+        Some(witness.token()),
+    )?;
+    style.viewport_id = Some(viewport_id);
+    Some(style)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestScriptActivePaintOwner {
     Root,
@@ -48,6 +106,54 @@ fn test_script_active_paint_owner(
 }
 
 impl App {
+    pub(crate) fn test_script_host_styles(&self) -> Vec<crate::test_script::TestScriptHostStyle> {
+        let mut styles = Vec::new();
+        if let Some(root) = test_script_egui_host_style("root", egui::ViewportId::ROOT) {
+            styles.push(root);
+        }
+        for window in self.test_script_window_snapshots() {
+            if window.role == "detached"
+                && window.identity.is_some()
+                && let Some(style) = test_script_egui_host_style("detached", window.viewport_id)
+            {
+                styles.push(style);
+            }
+        }
+        let fullscreen_id = self.fullscreen_viewport_id();
+        if self.fs_viewport_shown
+            && !styles
+                .iter()
+                .any(|style| style.viewport == format!("{fullscreen_id:?}"))
+            && let Some(style) = test_script_egui_host_style("fullscreen", fullscreen_id)
+        {
+            styles.push(style);
+        }
+        let preview_id = egui::ViewportId::from_hash_of("details_thumbnail_tooltip");
+        if self.details_hover_thumb_viewport_open
+            && let Some(style) = test_script_egui_host_style("preview", preview_id)
+        {
+            styles.push(style);
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) =
+            self.fullscreen_idx.and_then(|idx| self.fs_cache.get(&idx))
+        {
+            if let Some(style) = test_script_native_host_style(
+                "presenter",
+                String::new(),
+                player.native_presenter_hwnd(),
+                None,
+            ) {
+                styles.push(style);
+            }
+            if let Some(style) =
+                test_script_native_host_style("hud", String::new(), player.native_hud_hwnd(), None)
+            {
+                styles.push(style);
+            }
+        }
+        styles
+    }
+
     pub(crate) fn test_script_pointer_show_owner(
         &self,
         window_id: u64,

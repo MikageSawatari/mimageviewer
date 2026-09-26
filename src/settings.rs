@@ -14,6 +14,14 @@ pub const PDF_WORKER_COUNT_MIN: u32 = 3;
 pub const PDF_WORKER_COUNT_MAX: u32 = 10;
 pub const PDF_WORKER_COUNT_DEFAULT: u32 = 5;
 
+pub fn viewer_window_level(always_on_top: bool) -> egui::WindowLevel {
+    if always_on_top {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    }
+}
+
 fn default_ui_scale_factor() -> f32 {
     1.0
 }
@@ -4203,6 +4211,9 @@ pub struct Settings {
     /// 復元先が最大化サイズで潰れて戻れなくなる (detached 側の §1.115 と同じ根)。
     #[serde(default)]
     pub window_maximized: bool,
+    /// Keep the main and viewer host windows above other applications when requested.
+    #[serde(default)]
+    pub always_on_top: bool,
     /// 起動時にメインウィンドウを最大化するか。既定は従来どおり通常ウィンドウ。
     #[serde(default)]
     pub startup_window_state: StartupWindowState,
@@ -7062,6 +7073,7 @@ impl Default for Settings {
             window_pos: None,
             window_size: None,
             window_maximized: false,
+            always_on_top: false,
             startup_window_state: StartupWindowState::default(),
             parallelism: Parallelism::default(),
             pdf_worker_count: default_pdf_worker_count(),
@@ -9663,6 +9675,7 @@ impl Settings {
         // 最大化 flag は環境設定に出さない実行時状態。`startup_window_state` の方は
         // 利用者が編集する設定なので、ここで live 値へ巻き戻してはいけない。
         self.window_maximized = src.window_maximized;
+        self.always_on_top = src.always_on_top;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
         // お気に入り表示 overlay は runtime 状態。環境設定を開いている間に viewer context
@@ -9876,6 +9889,38 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn always_on_top_defaults_off_roundtrips_and_survives_preferences_merge() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!old.always_on_top);
+        assert_eq!(viewer_window_level(false), egui::WindowLevel::Normal);
+        assert_eq!(viewer_window_level(true), egui::WindowLevel::AlwaysOnTop);
+
+        let mut live = Settings {
+            always_on_top: true,
+            ..Settings::default()
+        };
+        let saved = serde_json::to_string(&live).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&saved)
+                .unwrap()
+                .always_on_top
+        );
+        let mut draft = Settings::default();
+        draft.overwrite_non_preferences_from(&mut live);
+        assert!(draft.always_on_top);
+
+        let mut previous =
+            egui::ViewportBuilder::default().with_window_level(viewer_window_level(false));
+        let (commands, _) = previous
+            .patch(egui::ViewportBuilder::default().with_window_level(viewer_window_level(true)));
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)
+        ));
+    }
 
     #[test]
     fn page_alone_key_action_writes_opposite_effective_value() {

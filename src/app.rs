@@ -69627,6 +69627,32 @@ impl App {
         ));
     }
 
+    pub(crate) fn set_always_on_top(
+        &mut self,
+        ctx: &egui::Context,
+        enabled: bool,
+        surface: ActionSurface,
+    ) {
+        if self.settings.always_on_top == enabled {
+            return;
+        }
+        self.settings.always_on_top = enabled;
+        // The root is created once. Child host commands come only from their builder diff.
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::WindowLevel(crate::settings::viewer_window_level(enabled)),
+        );
+        self.show_feedback_toast_on(
+            format!("常に最前面 {}", if enabled { "ON" } else { "OFF" }),
+            surface,
+        );
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+
+    pub(crate) fn toggle_always_on_top(&mut self, ctx: &egui::Context, surface: ActionSurface) {
+        self.set_always_on_top(ctx, !self.settings.always_on_top, surface);
+    }
+
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
         #[cfg(windows)]
         self.log_detached_image_window_debug(format!(
@@ -76393,6 +76419,53 @@ impl App {
                     ));
                 }
             }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::AlwaysOnTopOn,
+            ) {
+                self.set_always_on_top(ctx, true, ActionSurface::MainWindow);
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::AlwaysOnTopOff,
+            ) {
+                self.set_always_on_top(ctx, false, ActionSurface::MainWindow);
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::MinimizeRoot,
+            ) {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Minimized(true),
+                );
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            if crate::test_script::take_smoke_action(crate::test_script::UiSmokeAction::RestoreRoot)
+            {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Minimized(false),
+                );
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            if crate::test_script::take_smoke_action(crate::test_script::UiSmokeAction::HideToTray)
+            {
+                self.hide_to_tray(ctx);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::CloseFullscreen,
+            ) {
+                self.close_fullscreen_to_completion(ctx);
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::ToggleDetachedMode,
+            ) {
+                self.toggle_detached_viewer_mode();
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::EnableIndependentWindows,
+            ) {
+                self.settings.detached_viewer_open_images_in_window = true;
+            }
         }
         self.edit_preview_repaint_ctx = Some(ctx.clone());
         if self
@@ -77907,6 +77980,20 @@ impl App {
         }
 
         // ── F12: 画像・動画ビューア別ウィンドウモード ───────────────
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && !self.tag_view.has_focus
+            && !main_viewer_blocked
+            && !self.any_dialog_open()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::ToggleAlwaysOnTop)
+        {
+            self.toggle_always_on_top(ctx, ActionSurface::MainWindow);
+        }
+
         if !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus

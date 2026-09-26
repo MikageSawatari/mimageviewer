@@ -6569,6 +6569,9 @@ impl App {
             .keymap
             .menu_command_label(MenuCommandId::TagsManagePinned);
         let tag_view_menu_label = self.keymap.menu_command_label(MenuCommandId::TagsTagView);
+        let settings_always_on_top_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsAlwaysOnTop);
         let settings_thumbnail_cache_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SettingsThumbnailCache);
@@ -7370,6 +7373,19 @@ impl App {
                         TopMenuId::Settings => {
                             let settings_menu_commands = &resolved_top_menu.commands;
                             let response = ui.menu_button(TopMenuId::Settings.label(), |ui| {
+                                if settings_menu_commands
+                                    .contains(&MenuCommandId::SettingsAlwaysOnTop)
+                                {
+                                    let mut checked = self.settings.always_on_top;
+                                    if ui
+                                        .checkbox(&mut checked, &settings_always_on_top_menu_label)
+                                        .changed()
+                                    {
+                                        self.set_always_on_top(ctx, checked, crate::app::ActionSurface::MainWindow);
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                }
                                 ui.menu_button("サムネイル列数", |ui| {
                                     for cols in
                                         crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS
@@ -7561,6 +7577,9 @@ impl App {
                                 });
                                 ui.separator();
                                 for &command in settings_menu_commands {
+                                    if command == MenuCommandId::SettingsAlwaysOnTop {
+                                        continue;
+                                    }
                                     match command {
                                         MenuCommandId::SettingsThumbnailCache => {
                                             if ui

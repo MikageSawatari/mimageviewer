@@ -22077,6 +22077,75 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn always_on_top_toggle_has_one_root_command_and_origin_feedback() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.toggle_always_on_top(ctx, crate::app::ActionSurface::MainWindow);
+        });
+        assert!(app.settings.always_on_top);
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)
+        ));
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(crate::app::ActionSurface::MainWindow)
+        );
+
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.set_always_on_top(ctx, true, crate::app::ActionSurface::Viewer);
+        });
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .is_empty()
+        );
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
+        });
+        assert!(!app.settings.always_on_top);
+        assert!(matches!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .as_slice(),
+            [egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::Normal
+            )]
+        ));
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(crate::app::ActionSurface::Viewer)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn passive_detached_builder_explicitly_follows_window_level() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window = contextless_test_window(&ctx, 91);
+        let placement = app.detached_viewer_window_placement();
+        for enabled in [false, true] {
+            app.settings.always_on_top = enabled;
+            let builder = App::build_detached_image_window_builder(
+                &window,
+                placement,
+                false,
+                true,
+                app.settings.ui_scale_factor,
+                app.settings.always_on_top,
+            );
+            assert_eq!(
+                builder.window_level,
+                Some(crate::settings::viewer_window_level(enabled))
+            );
+        }
+    }
+
+    #[test]
     fn fullscreen_spread_zip_pages_share_container_tag_target() {
         let mut app = setup_app();
         let zip = PathBuf::from(r"D:\comics\book.zip");

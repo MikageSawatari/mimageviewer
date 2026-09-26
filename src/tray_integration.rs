@@ -275,7 +275,7 @@ impl App {
     /// サイズ保存について: hide の直前に `GetWindowPlacement` で rect を丸ごと捕獲しておき、
     /// 復帰時に `SetWindowPlacement` で完全復元する。eframe/winit の DPI 丸めを完全に
     /// バイパスできるため、マルチモニタ DPI 環境でも開閉でサイズが変わらない。
-    fn hide_to_tray(&mut self, ctx: &egui::Context) {
+    pub(crate) fn hide_to_tray(&mut self, ctx: &egui::Context) {
         if !self.window_visible {
             return;
         }
