@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const USAGE: &str = "usage:\n  mimageviewer-epub-pdf inspect <in.epub>\n  mimageviewer-epub-pdf convert <in.epub> <out> --work-dir <dir> [--user-data-dir <dir>] [--progress-json] [--report <file.json>] [--timeout-secs N] [--force-iframe]\n  mimageviewer-epub-pdf batch <dir-with-epubs> <out-dir> [--timeout-secs N]";
+const USAGE: &str = "usage:\n  mimageviewer-epub-pdf inspect <in.epub>\n  mimageviewer-epub-pdf convert <in.epub> <out> --work-dir <dir> [--user-data-dir <dir>] [--source-stem <original-stem>] [--progress-json] [--report <file.json>] [--timeout-secs N] [--force-iframe]\n  mimageviewer-epub-pdf batch <dir-with-epubs> <out-dir> [--timeout-secs N]";
 struct Options {
     timeout_secs: u64,
     force_iframe: bool,
@@ -23,6 +23,7 @@ struct Options {
     report: Option<PathBuf>,
     user_data_dir: Option<PathBuf>,
     progress_json: bool,
+    source_stem: Option<String>,
 }
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -32,6 +33,7 @@ fn options(args: &[String]) -> Result<Options, String> {
         report: None,
         user_data_dir: None,
         progress_json: false,
+        source_stem: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -62,6 +64,14 @@ fn options(args: &[String]) -> Result<Options, String> {
                 ));
             }
             "--progress-json" => o.progress_json = true,
+            "--source-stem" => {
+                i += 1;
+                let stem = args.get(i).ok_or("missing source stem")?;
+                if stem.is_empty() || stem.contains(['/', '\\']) {
+                    return Err("invalid source stem".into());
+                }
+                o.source_stem = Some(stem.clone());
+            }
             "--force-iframe" => o.force_iframe = true,
             x => return Err(format!("unknown option: {x}")),
         }
@@ -283,6 +293,7 @@ impl Engine {
         out: &Path,
         timeout_secs: u64,
         force_iframe: bool,
+        source_stem: Option<&str>,
     ) -> Report {
         let start = Instant::now();
         let deadline = start + Duration::from_secs(timeout_secs);
@@ -301,7 +312,14 @@ impl Engine {
             OutputTemp::new(out, std::process::id(), self.sequence)
                 .map_err(|e| (5, e))
                 .and_then(|temp| {
-                    self.process_inner(input, temp.path(), force_iframe, deadline, &mut report)?;
+                    self.process_inner(
+                        input,
+                        temp.path(),
+                        force_iframe,
+                        source_stem,
+                        deadline,
+                        &mut report,
+                    )?;
                     if Instant::now() >= deadline {
                         return Err((6, "WebView2 timeout before output publication".into()));
                     }
@@ -330,6 +348,7 @@ impl Engine {
         input: &Path,
         out: &Path,
         force_iframe: bool,
+        source_stem: Option<&str>,
         deadline: Instant,
         r: &mut Report,
     ) -> Result<(), (i32, String)> {
@@ -516,7 +535,8 @@ impl Engine {
         }
         let t = Instant::now();
         self.progress(Phase::Merge, 0, 1);
-        render::merge_pdf_for_package(&part_files, out, &package, input).map_err(|e| (5, e))?;
+        render::merge_pdf_for_package(&part_files, out, &package, input, source_stem)
+            .map_err(|e| (5, e))?;
         self.progress(Phase::Merge, 1, 1);
         r.timings.insert("merge_ms".into(), t.elapsed().as_millis());
         self.progress(Phase::Verify, 0, 1);
@@ -617,6 +637,7 @@ fn run() -> Result<(i32, Option<Event>), String> {
                 Path::new(out),
                 o.timeout_secs,
                 o.force_iframe,
+                o.source_stem.as_deref(),
             );
             r.user_data_cleanup = Some(engine.finish());
             let report = o
@@ -637,6 +658,7 @@ fn run() -> Result<(i32, Option<Event>), String> {
                 || o.report.is_some()
                 || o.user_data_dir.is_some()
                 || o.progress_json
+                || o.source_stem.is_some()
             {
                 return Err("batch accepts only --timeout-secs".into());
             }
@@ -661,7 +683,7 @@ fn run() -> Result<(i32, Option<Event>), String> {
                 let stem = file.file_stem().unwrap_or_default().to_string_lossy();
                 let name = format!("{n:03}_{stem}");
                 let pdf = out_dir.join(format!("{name}.pdf"));
-                let r = engine.process(file, &pdf, o.timeout_secs, false);
+                let r = engine.process(file, &pdf, o.timeout_secs, false, None);
                 println!("{}: {}", file.display(), r.status);
                 reports.push((name, r));
             }
@@ -715,6 +737,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convert_protocol_accepts_original_source_stem() {
+        let parsed = options(&["--source-stem".into(), "MyNovel".into()]).unwrap();
+        assert_eq!(parsed.source_stem.as_deref(), Some("MyNovel"));
+        assert!(options(&["--source-stem".into(), "".into()]).is_err());
+    }
 
     #[test]
     fn print_progress_counts_completed_spine_and_keeps_pdf_pages_separate() {

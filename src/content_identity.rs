@@ -4094,6 +4094,7 @@ mod tests {
             direction: "rtl".into(),
             profile: "test".into(),
             created_at: 1,
+            output_version: crate::epub_cache::CONVERTER_OUTPUT_VERSION,
         };
         assert_eq!(
             cache.publish(&row, &Guard(src_state)).unwrap(),

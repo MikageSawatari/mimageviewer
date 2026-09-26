@@ -3466,6 +3466,38 @@ fn fullscreen_overflow_panel_holds_no_input_and_closes_at_file_boundary() {
     assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
 }
 
+#[test]
+fn epub_batch_modal_blocks_grid_keyboard_and_click_open() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.keymap = crate::keymap::Keymap::from_ini_str("[Rating]\nRatingItemStepUp = F13\n");
+    app.items = vec![GridItem::Image(
+        app.tmp.path().join("batch-blocks-grid.jpg"),
+    )];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    let rating_key = app.rating_path_key(0).unwrap();
+    app.epub_batch_convert = Some(
+        crate::ui_dialogs::epub_batch_convert::EpubBatchPending::completed_for_test(
+            PathBuf::from("book.epub"),
+            crate::ui_dialogs::epub_batch_convert::EpubBatchResult::Skipped,
+        ),
+    );
+    let ctx = egui::Context::default();
+    assert_eq!(app.modal_dialog_block_reason(), Some("epub_batch_convert"));
+    assert!(!app.grid_open_from_click_allowed());
+    assert!(app.shortcuts_blocked_by_text_input(&ctx));
+    ctx.begin_pass(viewport_raw_input(
+        egui::ViewportId::ROOT,
+        vec![fullscreen_fixed_key_event(egui::Key::F13)],
+    ));
+    let _ = app.handle_keyboard(&ctx);
+    let _ = ctx.end_pass();
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&rating_key), 0);
+}
+
 /// A panel that is only drawn in fullscreen must not outlive fullscreen.
 ///
 /// It holds the keyboard while it is open - including the Esc that would close it - so leaving
@@ -12980,6 +13012,7 @@ mod phase_c_key_tests {
                 direction: "ltr".into(),
                 profile: "test".into(),
                 created_at: 1,
+                output_version: crate::epub_cache::CONVERTER_OUTPUT_VERSION,
             };
             assert_eq!(
                 generations.publish(&row, &Source(source)).unwrap(),

@@ -1551,6 +1551,16 @@ pub(crate) fn epub_temp_root() -> PathBuf {
     }
 }
 
+/// Remove work directories left by a crashed sibling-PDF save. The worker output
+/// lives in the data directory; only dead PID owners are eligible for cleanup.
+pub(crate) fn cleanup_epub_sibling_work_startup(data_dir: &Path) {
+    cleanup_startup_directories(
+        &data_dir.join("epub_sibling_work"),
+        std::process::id(),
+        pid_is_alive,
+    );
+}
+
 fn startup_cleanup_candidates<I, F>(entries: I, current_pid: u32, mut alive: F) -> Vec<PathBuf>
 where
     I: IntoIterator<Item = PathBuf>,

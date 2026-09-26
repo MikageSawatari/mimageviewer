@@ -19187,6 +19187,7 @@ impl App {
             self.context_menu_idx.is_some() => "grid_context_menu",
             self.delete_pending.is_some() => "delete_pending",
             self.batch_convert.is_some() => "batch_convert",
+            self.epub_batch_convert.is_some() => "epub_batch_convert",
             self.subfolder_expansion_pending.is_some() => "subfolder_expansion_pending",
             self.subfolder_expansion_confirm_pending.is_some()
                 => "subfolder_expansion_confirm_pending",

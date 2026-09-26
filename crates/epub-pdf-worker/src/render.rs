@@ -388,11 +388,17 @@ pub fn merge_pdf_for_package(
     out: &Path,
     package: &crate::package::Package,
     input: &Path,
+    source_stem: Option<&str>,
 ) -> Result<(), String> {
-    let fallback: Cow<'_, str> = input
-        .file_stem()
+    let fallback: Cow<'_, str> = source_stem
         .filter(|stem| !stem.is_empty())
-        .map(|stem| stem.to_string_lossy())
+        .map(Cow::Borrowed)
+        .or_else(|| {
+            input
+                .file_stem()
+                .filter(|stem| !stem.is_empty())
+                .map(|stem| stem.to_string_lossy())
+        })
         .unwrap_or(Cow::Borrowed("EPUB"));
     let title = package
         .title
@@ -824,6 +830,7 @@ mod tests {
             &out,
             &package,
             Path::new("book.epub"),
+            None,
         )
         .unwrap();
         let doc = Document::load(&out).unwrap();
@@ -859,6 +866,7 @@ mod tests {
             &out,
             &package,
             Path::new("書名なし.epub"),
+            None,
         )
         .unwrap();
         let doc = Document::load(&out).unwrap();
@@ -866,6 +874,31 @@ mod tests {
         let info = doc.get_object(info).unwrap().as_dict().unwrap();
         assert_eq!(info_text_value(info.get(b"Title").unwrap()), "書名なし");
         assert!(info.get(b"Author").is_err());
+        assert_no_print_url_in_info(&out);
+        fs::remove_file(part).unwrap();
+        fs::remove_file(out).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+    #[test]
+    fn merge_without_opf_title_uses_original_stem_when_input_is_source_copy() {
+        let dir =
+            std::env::temp_dir().join(format!("epub-pdf-original-stem-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("part.pdf");
+        let out = dir.join("saved.pdf");
+        printed_page(&part, "epub.invalid/_miv_print_1%2Ehtml");
+        merge_pdf_for_package(
+            &[part.clone()],
+            &out,
+            &package_with_metadata(""),
+            Path::new("source.epub"),
+            Some("MyNovel"),
+        )
+        .unwrap();
+        let doc = Document::load(&out).unwrap();
+        let info = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
+        let info = doc.get_object(info).unwrap().as_dict().unwrap();
+        assert_eq!(info_text_value(info.get(b"Title").unwrap()), "MyNovel");
         assert_no_print_url_in_info(&out);
         fs::remove_file(part).unwrap();
         fs::remove_file(out).unwrap();
@@ -930,6 +963,7 @@ mod tests {
             &out,
             &package,
             Path::new("book.epub"),
+            None,
         )
         .unwrap();
         let doc = Document::load(&out).unwrap();

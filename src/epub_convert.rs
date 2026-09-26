@@ -3,7 +3,7 @@
 //! `pdf_loader::verify_converted_pdf` before wiring this runner to the app.
 //! The S2a byte-level placeholder is available only to tests.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -111,8 +111,8 @@ pub struct SavedPdf {
     pub user_data_errors: Vec<String>,
 }
 
-/// A sibling `.part` created exclusively by the save operation. The PDF verifier
-/// accepts this token so logical EPUB paths cannot bypass generation resolution.
+/// A finished PDF in the parent-owned work directory. The verifier accepts this
+/// token so logical EPUB paths cannot bypass generation resolution.
 pub struct SiblingOutput {
     part_path: PathBuf,
 }
@@ -120,31 +120,6 @@ pub struct SiblingOutput {
 impl SiblingOutput {
     pub fn part_path(&self) -> &Path {
         &self.part_path
-    }
-
-    fn create(destination: &Path) -> io::Result<Self> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let folder = destination
-            .parent()
-            .ok_or_else(|| io::Error::other("PDF destination has no folder"))?;
-        for _ in 0..100 {
-            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-            let part_path =
-                folder.join(format!(".miv-epub-{}-{sequence}.part", std::process::id()));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&part_path)
-            {
-                Ok(_) => return Ok(Self { part_path }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "EPUB PDF temp name exhaustion",
-        ))
     }
 }
 
@@ -244,6 +219,8 @@ pub struct WorkerSpec {
     pub executable: PathBuf,
     pub input: PathBuf,
     pub output: PathBuf,
+    /// Original EPUB file stem; the copied worker input is always `source.epub`.
+    pub source_stem: Option<OsString>,
     pub work_dir: PathBuf,
     pub user_data_dir: PathBuf,
     pub timeout_secs: u32,
@@ -339,6 +316,7 @@ pub fn inspect_at<S: WorkerSpawner>(
         executable: worker_executable()?,
         input: source.to_owned(),
         output: PathBuf::new(),
+        source_stem: None,
         work_dir: PathBuf::new(),
         user_data_dir: PathBuf::new(),
         timeout_secs,
@@ -488,6 +466,7 @@ pub fn convert_at<S: WorkerSpawner>(
     let (pages, direction, profile) = run_worker_to_part(
         source_copy,
         part,
+        source.file_stem().map(OsStr::to_os_string),
         &temp,
         cancel,
         progress,
@@ -515,6 +494,7 @@ pub fn convert_at<S: WorkerSpawner>(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64,
+        output_version: epub_cache::CONVERTER_OUTPUT_VERSION,
     };
     // Open before BEGIN IMMEDIATE. The guard denies writes until publish commits.
     let guard = WriteDenyingSource::open(source).map_err(map_source_open)?;
@@ -524,6 +504,7 @@ pub fn convert_at<S: WorkerSpawner>(
 fn run_worker_to_part<S: WorkerSpawner>(
     source_copy: PathBuf,
     part: &Path,
+    source_stem: Option<OsString>,
     temp: &TempFolder,
     cancel: &CancelToken,
     progress: &mpsc::Sender<ConvertProgress>,
@@ -535,6 +516,7 @@ fn run_worker_to_part<S: WorkerSpawner>(
         executable: worker_executable()?,
         input: source_copy,
         output: part.to_owned(),
+        source_stem,
         work_dir: temp.path.join("work"),
         user_data_dir: temp.path.join("ud"),
         timeout_secs,
@@ -623,15 +605,20 @@ pub fn save_sibling_at<S: WorkerSpawner>(
     if cancel.is_cancelled() {
         return Err(EpubConvertError::Cancelled);
     }
-    let output = SiblingOutput::create(&destination)?;
-    let _part_cleanup = PartCleanup(output.part_path.clone());
-
-    let cache = EpubCache::open_at(context.data_dir)?;
+    let mut cache = EpubCache::open_at(context.data_dir)?;
+    let temp = TempFolder::create(&context.data_dir.join("epub_sibling_work"))?;
+    let output = SiblingOutput {
+        part_path: temp.path.join("finished.pdf"),
+    };
     let source_guard = WriteDenyingSource::open(source).map_err(map_source_open)?;
     let source_state = source_guard.state()?;
     let cached = cache
         .current_generation(&epub_cache::src_key(source))?
-        .filter(|row| row.src_state == source_state && row.page_count > 0)
+        .filter(|row| {
+            row.src_state == source_state
+                && row.page_count > 0
+                && row.output_version == epub_cache::CONVERTER_OUTPUT_VERSION
+        })
         .filter(|row| cache.validate_generation_pdf(row).is_ok())
         .filter(|row| {
             fs::metadata(&row.pdf_file)
@@ -642,12 +629,12 @@ pub fn save_sibling_at<S: WorkerSpawner>(
         (row.page_count as usize, true, source_state, source_guard)
     } else {
         drop(source_guard);
-        let temp = TempFolder::create(context.temp_root)?;
         let source_copy = temp.path.join("source.epub");
         let (state, _, _) = copy_source(source, &source_copy, cancel)?;
         let (pages, _, _) = run_worker_to_part(
             source_copy,
             output.part_path(),
+            source.file_stem().map(OsStr::to_os_string),
             &temp,
             cancel,
             progress,
@@ -664,15 +651,34 @@ pub fn save_sibling_at<S: WorkerSpawner>(
     if guard.state()? != expected_state {
         return Err(EpubConvertError::SourceChanged);
     }
-    crate::archive_converter::replace_file_atomic(output.part_path(), &destination, true).map_err(
-        |error| {
-            if destination.exists() {
-                EpubConvertError::ExistingPdf
-            } else {
-                EpubConvertError::Io(error)
-            }
-        },
-    )?;
+    let reserved = cache.reserve_sibling_output(&destination)?;
+    let publish = (|| {
+        copy_cached_pdf(output.part_path(), reserved.temp_path(), cancel)?;
+        if cancel.is_cancelled() {
+            return Err(EpubConvertError::Cancelled);
+        }
+        if guard.state()? != expected_state {
+            return Err(EpubConvertError::SourceChanged);
+        }
+        crate::archive_converter::replace_file_atomic(reserved.temp_path(), &destination, true)
+            .map_err(|error| {
+                if destination.exists() {
+                    EpubConvertError::ExistingPdf
+                } else {
+                    EpubConvertError::Io(error)
+                }
+            })
+    })();
+    let cleanup = cache.finish_sibling_output(&reserved);
+    if let Err(error) = cleanup {
+        if publish.is_ok() {
+            return Err(error.into());
+        }
+        crate::logger::log(format!(
+            "epub sibling cleanup deferred to startup gate: {error:?}"
+        ));
+    }
+    publish?;
     drop(guard);
     let mappings = [
         crate::rename_key_migration::StoreCopyPathMapping::exact(source, &destination),
@@ -697,7 +703,7 @@ fn copy_cached_pdf(
     let mut input = File::open(source)?;
     let mut output = OpenOptions::new()
         .write(true)
-        .truncate(true)
+        .create_new(true)
         .open(destination)?;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -1105,7 +1111,7 @@ mod windows_process {
         }
         .map_err(|error| io::Error::other(error.to_string()))?;
         let timeout = spec.timeout_secs.to_string();
-        let args: Vec<OsString> = match spec.operation {
+        let mut args: Vec<OsString> = match spec.operation {
             WorkerOperation::Inspect => vec![
                 spec.executable.as_os_str().to_os_string(),
                 OsString::from("inspect"),
@@ -1125,6 +1131,12 @@ mod windows_process {
                 OsString::from(timeout),
             ],
         };
+        if matches!(spec.operation, WorkerOperation::Convert) {
+            if let Some(stem) = &spec.source_stem {
+                args.push(OsString::from("--source-stem"));
+                args.push(stem.clone());
+            }
+        }
         #[cfg(test)]
         let args: Vec<OsString> = if let Some(test_args) = &spec.native_test_args {
             std::iter::once(args[0].clone())
@@ -1286,6 +1298,7 @@ mod tests {
     impl WorkerSpawner for FakeSpawner {
         fn spawn(&self, spec: &WorkerSpec) -> Result<Box<dyn WorkerChild>, EpubConvertError> {
             assert_eq!(spec.input.file_name().unwrap(), "source.epub");
+            assert_eq!(spec.source_stem.as_deref(), self.source.file_stem());
             assert!(spec.work_dir.starts_with(spec.input.parent().unwrap()));
             assert!(spec.user_data_dir.starts_with(spec.input.parent().unwrap()));
             assert!(spec.environment.iter().all(|(name, _)| {
@@ -1296,6 +1309,16 @@ mod tests {
             }));
             if !matches!(self.mode, FakeMode::Failure(_) | FakeMode::NoResult) {
                 fs::write(&spec.output, b"%PDF-1.4\nfake").unwrap();
+            }
+            if matches!(
+                self.mode,
+                FakeMode::Cancel | FakeMode::CrashAfterOutput | FakeMode::Failure(6)
+            ) {
+                fs::write(
+                    format!("{}.tmp-worker", spec.output.display()),
+                    b"worker residue",
+                )
+                .unwrap();
             }
             if matches!(self.mode, FakeMode::Stale) {
                 fs::write(&self.source, b"changed source").unwrap();
@@ -1513,6 +1536,48 @@ mod tests {
     }
 
     #[test]
+    fn sibling_save_reconverts_old_output_version_but_keeps_old_generation_viewable() {
+        let (converted, tmp, _, _) = run(FakeMode::Success);
+        assert!(converted.is_ok());
+        let source = tmp.path().join("book.epub");
+        let conn = rusqlite::Connection::open(tmp.path().join("epub_cache.db")).unwrap();
+        conn.execute("UPDATE generations SET output_version=0", [])
+            .unwrap();
+        drop(conn);
+        let old = EpubCache::open_at(tmp.path())
+            .unwrap()
+            .current_generation(&epub_cache::src_key(&source))
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.output_version, 0);
+        assert!(old.pdf_file.exists());
+        let fake = FakeSpawner {
+            mode: FakeMode::Success,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        let saved = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        )
+        .unwrap();
+        assert!(!saved.reused_cache);
+        assert!(saved.path.exists());
+        assert_eq!(
+            EpubCache::open_at(tmp.path())
+                .unwrap()
+                .current_generation(&epub_cache::src_key(&source))
+                .unwrap()
+                .unwrap()
+                .generation_id,
+            old.generation_id
+        );
+    }
+
+    #[test]
     fn sibling_save_without_generation_converts_without_cache_row_and_cleans_part() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("book.epub");
@@ -1539,6 +1604,15 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let conn = rusqlite::Connection::open(tmp.path().join("epub_cache.db")).unwrap();
+        let outstanding: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outstanding_sibling_outputs",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outstanding, 0);
         assert_eq!(
             fs::read_dir(tmp.path())
                 .unwrap()
@@ -1547,6 +1621,37 @@ mod tests {
                 .count(),
             0
         );
+    }
+    #[test]
+    fn sibling_save_passes_original_stem_to_worker_after_copying_source() {
+        struct WorkSpawner(FakeSpawner, PathBuf);
+        impl WorkerSpawner for WorkSpawner {
+            fn spawn(&self, spec: &WorkerSpec) -> Result<Box<dyn WorkerChild>, EpubConvertError> {
+                assert!(spec.output.starts_with(self.1.join("epub_sibling_work")));
+                self.0.spawn(spec)
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("MyNovel.epub");
+        fs::write(&source, b"source EPUB bytes").unwrap();
+        let fake = WorkSpawner(
+            FakeSpawner {
+                mode: FakeMode::Success,
+                source: source.clone(),
+                killed: Arc::new(AtomicBool::new(false)),
+            },
+            tmp.path().to_owned(),
+        );
+        let saved = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.path, source.with_extension("pdf"));
+        assert!(!saved.reused_cache);
     }
 
     #[test]
@@ -1700,6 +1805,46 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn sibling_save_cancel_timeout_and_worker_kill_leave_no_destination_temps() {
+        for mode in [
+            FakeMode::Cancel,
+            FakeMode::Failure(6),
+            FakeMode::CrashAfterOutput,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let source = tmp.path().join("book.epub");
+            fs::write(&source, b"source EPUB bytes").unwrap();
+            let fake = FakeSpawner {
+                mode,
+                source: source.clone(),
+                killed: Arc::new(AtomicBool::new(false)),
+            };
+            assert!(
+                save_with(
+                    tmp.path(),
+                    &source,
+                    &fake,
+                    &TestPdfVerifier,
+                    &CancelToken::new().unwrap()
+                )
+                .is_err()
+            );
+            assert!(!source.with_extension("pdf").exists());
+            let leftovers: Vec<_> = fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| {
+                    name.contains(".miv-part-")
+                        || name.contains(".tmp-worker")
+                        || name.ends_with(".part")
+                })
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
     }
 
     #[test]

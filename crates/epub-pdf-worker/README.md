@@ -19,8 +19,13 @@ batch process returns the first nonzero book code after writing the summary.
 `convert` writes the complete PDF exactly to the requested output path. It
 merges and verifies a unique temporary file named `<out>.tmp-<pid>-<n>` beside
 `<out>` before renaming; a failed
-or timed-out conversion leaves no partial output at the requested path. The
-input EPUB is opened only for reading. `--user-data-dir` selects a dedicated
+or timed-out conversion leaves no partial output at the requested path.
+The host passes `--source-stem <original-stem>` when it first copies an EPUB to
+`source.epub` in its private work directory. When the package has no title, the
+worker uses this stem for PDF `/Title`; standalone calls without the argument
+use the input file stem. For sibling save, the host passes an output path under
+its data directory's `epub_sibling_work`, then verifies and publishes the PDF itself.
+The input EPUB is opened only for reading. `--user-data-dir` selects a dedicated
 WebView2 folder; it must not already exist, even if empty. If omitted, a unique folder below
 `--work-dir` is used. The converter rejects a user data folder that contains
 the input, output, output directory, or work directory. This containment

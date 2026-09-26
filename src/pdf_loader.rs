@@ -5918,6 +5918,7 @@ mod tests {
             direction: "rtl".into(),
             profile: "reflow-v1".into(),
             created_at: 1,
+            output_version: epub_cache::CONVERTER_OUTPUT_VERSION,
         };
         assert!(matches!(
             db.publish(&row, &TestSource(state)),

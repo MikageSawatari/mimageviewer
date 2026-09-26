@@ -672,6 +672,7 @@ mod tests {
             direction: "ltr".into(),
             profile: "test".into(),
             created_at: 1,
+            output_version: crate::epub_cache::CONVERTER_OUTPUT_VERSION,
         };
         assert_eq!(
             epub.publish(&row, &Stable(source_state)).unwrap(),
