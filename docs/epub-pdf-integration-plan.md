@@ -630,7 +630,7 @@ Ctrl+S は従来の `PdfFile`、Ctrl+G は従来の `Pdf` kind で EPUB の新�
 Ctrl+S に残った EPUB 行は本タイルになるが、開くと旧 `.pdf` 限定判定から通常ディレクトリ走査へ進み、
 読取失敗を表示する。Ctrl+G の EPUB 行は旧拡張子分類で画像タイルになり、クリックすると画像読取に
 失敗する。**その失敗より前に**旧 `open_fullscreen` が `record_book_resume` を呼び、検索元フォルダーの
-読書位置を `book_resume.db` に上書きし得る。旧版の索引走査は EPUB を候補から外して行を削除する。
+読書位置を `book_resume.db` に上書きし得る。旧版の索引走査は通常 EPUB を候補から外して行を削除する (Susie プラグインが `.epub` を画像拡張子として申告する構成では残り得る)。
 現行版に戻すと次の走査で EPUB を候補に含め、欠けた Ctrl+G 行は `search_walker::scan` →
 `IngestSession::apply`、Ctrl+S 行は `name_bulk_indexer` が再登録する。版上げ無しで復旧することを
 現行コードと既存の `new_files_go_to_ingest` / 名前索引の EPUB テストで確認した。
@@ -951,3 +951,9 @@ EPUB 以外の台帳・編集行には今回の per-book ガードがない。�
 固定・backfill・移行が待つ (UI スレッドは待たない)。(3) Shell 削除から purge までの窓は非 EPUB 行では master から既存で範囲外。
 別課題へ切り出したもの: 並列テストで `RECORD_SEQUENCE` を共有する既存の不安定テスト。残る P3: `shell_delete_keeps_epub_backfill_out_until_purge_finishes`
 の開始通知は高負荷時に退行を見逃し得る (テストの限界)。実機確認 (再変換後の表示・キャッシュ管理画面・先出しの計測) は未実施。
+
+### S3a 検収 (2026-09-26)
+
+独立レビュー 3 回目で承認 (`3277fde39`)。1〜2 回目の指摘は修正 1〜2 で対応した。設計判断: 検索索引の `INDEX_VERSION` は
+据え置き (旧版へ戻した場合の影響は上記のとおり)、EPUB はファイル名・パスでのみ検索対象 (書誌情報の索引は後の課題)。
+全ライブラリテスト 9,278 件成功 (レビュー担当が再実行)。実機確認 (一覧表示・D5・★固定・外部アプリ設定) は未実施。

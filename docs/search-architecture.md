@@ -157,7 +157,8 @@ v4.1.0 へ戻すと、残っている Ctrl+G の `Pdf` 行は旧 `grid_item_from
 Ctrl+S に `PdfFile` 行が残っている間は本タイルとして表示されるが、開くと旧版の `.pdf` 限定判定を
 通らず通常ディレクトリ走査のエラーになる。
 
-旧版の索引走査は `.epub` を候補に含めないため、後続の差分処理で新しい EPUB 行を削除する。
+旧版の索引走査は通常 `.epub` を候補に含めないため、後続の差分処理で新しい EPUB 行を削除する
+(Susie プラグインが `.epub` を画像拡張子として申告する構成では画像候補として残り得る)。
 現行版へ戻した後は、`search_walker::walk_dir_recursive` が EPUB を `CandidateKind::Pdf` として集め、
 DB に行が無ければ `scan` が `to_ingest` に入れ、`IngestSession::apply` が同じ `Pdf` kind で再登録する。
 Ctrl+S も `name_bulk_indexer::classify_name_index_kind` が EPUB を `PdfFile` として次の走査で再登録する。
