@@ -277,6 +277,11 @@ pub enum ThumbLoadOrigin {
     /// 編集 preview、drive-list、再帰 pin 伝播など、WebP 自体を完成ソースとして扱う画像。
     /// `from_cache()` は true を返すが、idle quality-upgrade へ再投入しない。
     FinalCache,
+    /// Drive-list child row shown while its current writer key is checked.
+    /// The request remains pending until validation finishes.
+    DriveListChildSeed,
+    /// No current child row exists; discard a provisional seed and show the drive icon.
+    DriveListChildMiss,
     /// 永続 edit-preview cache から読んだ完成画像。`epoch` は DB row read の直前に
     /// snapshot し、whole-cache clear 後に遅着した結果を UI 側で破棄する。
     EditPreviewCache { epoch: u64 },
@@ -286,14 +291,21 @@ impl ThumbLoadOrigin {
     pub fn from_cache(self) -> bool {
         matches!(
             self,
-            Self::UpgradeableCache | Self::FinalCache | Self::EditPreviewCache { .. }
+            Self::UpgradeableCache
+                | Self::FinalCache
+                | Self::DriveListChildSeed
+                | Self::EditPreviewCache { .. }
         )
     }
 
     pub fn blocks_idle_upgrade(self) -> bool {
         matches!(
             self,
-            Self::SourceIntrinsic | Self::FinalCache | Self::EditPreviewCache { .. }
+            Self::SourceIntrinsic
+                | Self::FinalCache
+                | Self::DriveListChildSeed
+                | Self::DriveListChildMiss
+                | Self::EditPreviewCache { .. }
         )
     }
 
@@ -1083,6 +1095,27 @@ fn send_thumb_failed(req: &LoadRequest, tx: &mpsc::Sender<ThumbMsg>, gen_done: &
     gen_done.fetch_add(1, Ordering::Relaxed);
 }
 
+fn send_pinned_child_miss(
+    req: &LoadRequest,
+    tx: &mpsc::Sender<ThumbMsg>,
+    gen_done: &Arc<AtomicUsize>,
+) {
+    let _ = tx.send(ThumbMsg {
+        idx: req.idx,
+        image: None,
+        origin: ThumbLoadOrigin::DriveListChildMiss,
+        from_edit_preview: false,
+        edit_preview_adjustment: None,
+        source_dims: None,
+        layout_dims: None,
+        canceled: false,
+        finalized: false,
+        input_seq: req.input_seq,
+        items_gen: req.items_gen,
+    });
+    gen_done.fetch_add(1, Ordering::Relaxed);
+}
+
 fn send_pinned_only_cached(
     req: &LoadRequest,
     pin: &PinnedOnlyRequest,
@@ -1096,7 +1129,37 @@ fn send_pinned_only_cached(
         kind: crate::folder_thumb_pins::FileKind::Folder,
     } = &pin.source
     {
-        return send_pinned_child_folder_cached(req, rel, tx, gen_done, pin_db);
+        // Keep the pre-EPUB first-frame seed: it can be shown before the
+        // child pin, PDF generation, and exact writer key are resolved. The
+        // following exact lookup is authoritative and replaces or rejects it.
+        let preview = cache_map.read().ok().and_then(|map| {
+            map.iter()
+                .filter(|(key, _)| key.starts_with(&pin.cache_key_prefix))
+                .max_by_key(|(_, entry)| (entry.mtime, entry.file_size))
+                .map(|(_, entry)| entry.clone())
+        });
+        let preview = preview.and_then(|entry| {
+            crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data).map(|image| {
+                let _ = tx.send(ThumbMsg {
+                    idx: req.idx,
+                    image: Some(image),
+                    origin: ThumbLoadOrigin::DriveListChildSeed,
+                    from_edit_preview: false,
+                    edit_preview_adjustment: None,
+                    source_dims: entry.source_dims,
+                    layout_dims: entry.layout_dims,
+                    canceled: false,
+                    finalized: false,
+                    input_seq: req.input_seq,
+                    items_gen: req.items_gen,
+                });
+                entry
+            })
+        });
+        if !send_pinned_child_folder_cached(req, rel, preview.as_ref(), tx, gen_done, pin_db) {
+            send_pinned_child_miss(req, tx, gen_done);
+        }
+        return true;
     }
     let epub_source = pin
         .seed_proof
@@ -1169,6 +1232,7 @@ fn send_pinned_only_cached(
 fn send_pinned_child_folder_cached(
     req: &LoadRequest,
     rel: &str,
+    preview: Option<&crate::catalog::CacheEntry>,
     tx: &mpsc::Sender<ThumbMsg>,
     gen_done: &Arc<AtomicUsize>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
@@ -1187,14 +1251,12 @@ fn send_pinned_child_folder_cached(
             req.folder_thumb_depth as usize,
         )
     });
-    // An unresolved active pin must not accidentally select a stale auto row.
-    if source.is_some() && resolved.is_none() {
-        return false;
-    }
+    // The folder writer falls back to its automatic representative when a pin
+    // target disappears. Read that exact auto row in the cache-only path too.
     let provenance = if resolved
         .as_ref()
         .is_some_and(|target| matches!(target.kind, crate::folder_thumb_pins::ResolvedKind::Folder))
-        || source.is_none()
+        || resolved.is_none()
     {
         crate::catalog::FolderThumbProvenance::AutoSelected
     } else {
@@ -1250,6 +1312,31 @@ fn send_pinned_child_folder_cached(
         if read.stamp.generation_catalog_pair() != Some((entry.mtime, entry.file_size)) {
             return false;
         }
+    }
+    if preview.is_some_and(|seed| {
+        seed.mtime == entry.mtime
+            && seed.file_size == entry.file_size
+            && seed.source_dims == entry.source_dims
+            && seed.layout_dims == entry.layout_dims
+            && seed.jpeg_data == entry.jpeg_data
+    }) {
+        // The UI may already have uploaded the seed. Complete the request
+        // without creating another texture for the identical current row.
+        let _ = tx.send(ThumbMsg {
+            idx: req.idx,
+            image: None,
+            origin: ThumbLoadOrigin::DriveListChildSeed,
+            from_edit_preview: false,
+            edit_preview_adjustment: None,
+            source_dims: None,
+            layout_dims: None,
+            canceled: false,
+            finalized: true,
+            input_seq: req.input_seq,
+            items_gen: req.items_gen,
+        });
+        gen_done.fetch_add(1, Ordering::Relaxed);
+        return true;
     }
     let Some(image) = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data) else {
         return false;

@@ -12425,6 +12425,24 @@ mod phase_c_key_tests {
                 &webp_bytes,
             )
             .unwrap();
+        let auto_key = container_cache_base_key(
+            &GridItem::Folder(pinned_folder.clone()),
+            crate::path_key::is_drive_or_share_root(&drive_root),
+            Some(app.settings.folder_thumb_sort),
+            app.settings.folder_thumb_depth,
+        )
+        .unwrap();
+        parent_db
+            .save(
+                &auto_key,
+                resolved.mtime,
+                resolved.file_size,
+                4,
+                4,
+                Some((80, 60)),
+                &webp_bytes,
+            )
+            .unwrap();
 
         app.items = vec![GridItem::Folder(drive_root.clone())];
         app.image_metas = vec![None];
@@ -12440,7 +12458,7 @@ mod phase_c_key_tests {
 
         app.seed_drive_list_pin_thumbs_from_catalog(&cache_map, Some(&drive_list_db));
 
-        let req = make_drive_list_pin_load_request(
+        let mut req = make_drive_list_pin_load_request(
             &app.items[0],
             0,
             app.settings.folder_thumb_sort,
@@ -12450,11 +12468,16 @@ mod phase_c_key_tests {
             app.folder_thumb_pin_db.as_deref(),
         )
         .expect("drive-list folder pin should create a cache-only request");
+        req.items_gen = app.items_generation;
         assert!(
             req.pinned_only.as_ref().unwrap().seed_proof.is_none(),
             "cover.epub.png is an image and needs no EPUB worker resolution"
         );
-        assert!(cache_map.read().unwrap().is_empty());
+        assert_eq!(
+            cache_map.read().unwrap().len(),
+            1,
+            "a cached image child must be seeded before the worker runs"
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         crate::thumb_loader::process_load_request(
             &req,
@@ -12475,9 +12498,43 @@ mod phase_c_key_tests {
             None,
             None,
         );
-        let shown = rx.try_recv().unwrap();
-        assert!(shown.image.is_some());
-        assert_eq!(shown.source_dims, Some((80, 60)));
+        let mut events = rx.try_iter();
+        let seed = events.next().unwrap();
+        let validated = events.next().unwrap();
+        assert!(events.next().is_none());
+        assert_eq!(
+            seed.origin,
+            crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed
+        );
+        assert!(seed.image.is_some());
+        assert_eq!(seed.source_dims, Some((80, 60)));
+        assert!(
+            validated.finalized,
+            "identical current row needs no second image"
+        );
+        assert!(validated.image.is_none());
+
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.requested.insert(0, false);
+        let ctx = egui::Context::default();
+        app.tx.send(seed).unwrap();
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        let first_texture = match &app.thumbnails[0] {
+            ThumbnailState::Loaded { tex, .. } => tex.id(),
+            _ => panic!("seed should be visible"),
+        };
+        app.tx.send(validated).unwrap();
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        let validated_texture = match &app.thumbnails[0] {
+            ThumbnailState::Loaded { tex, .. } => tex.id(),
+            _ => panic!("validated seed should remain visible"),
+        };
+        assert_eq!(
+            first_texture, validated_texture,
+            "identical row must not re-upload"
+        );
     }
 
     #[test]
@@ -12552,6 +12609,9 @@ mod phase_c_key_tests {
                 &webp,
             )
             .unwrap();
+        parent
+            .save(&auto_key, writer.mtime, writer.file_size, 4, 4, None, &webp)
+            .unwrap();
         app.items = vec![GridItem::Folder(drive.clone())];
         app.image_metas = vec![None];
         app.folder_pin_map.insert(
@@ -12566,6 +12626,11 @@ mod phase_c_key_tests {
         );
         let map = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&drive_catalog));
+        assert_eq!(
+            map.read().unwrap().len(),
+            1,
+            "a cached plain-PDF child must be seeded before the worker runs"
+        );
         let req = make_drive_list_pin_load_request(
             &app.items[0],
             0,
@@ -12597,6 +12662,140 @@ mod phase_c_key_tests {
             None,
         );
         assert_eq!(rx.try_recv().unwrap().image.unwrap().pixels[0].r(), 32);
+    }
+
+    #[test]
+    fn drive_list_missing_child_image_pin_uses_cached_auto_representative() {
+        let mut app = setup_app();
+        let drive = app.tmp.path().join("drive-missing-child-pin");
+        let child = drive.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &child,
+                &crate::folder_thumb_pins::FolderPinSource::File {
+                    rel: "moved.png".into(),
+                    kind: crate::folder_thumb_pins::FileKind::Image,
+                },
+            )
+            .unwrap();
+        let base_key = crate::thumb_loader::folder_thumb_cache_key_for_path(
+            &child,
+            crate::path_key::is_drive_or_share_root(&drive),
+            app.settings.folder_thumb_sort,
+            app.settings.folder_thumb_depth,
+            crate::catalog::FolderThumbProvenance::AutoSelected,
+        )
+        .unwrap();
+        let mut webp = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([17, 54, 91, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut webp),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &drive)
+            .unwrap()
+            .save(&base_key, 1, 4, 4, 4, None, &webp)
+            .unwrap();
+        let root_pin = crate::folder_thumb_pins::FolderPinSource::File {
+            rel: "child".into(),
+            kind: crate::folder_thumb_pins::FileKind::Folder,
+        };
+        app.items = vec![GridItem::Folder(drive.clone())];
+        app.folder_pin_map
+            .insert(crate::path_key::normalize_keep_drive(&drive), root_pin);
+        let req = make_drive_list_pin_load_request(
+            &app.items[0],
+            0,
+            app.settings.folder_thumb_sort,
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            &app.drive_list_seed_proofs,
+            app.folder_thumb_pin_db.as_deref(),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::thumb_loader::process_load_request(
+            &req,
+            &std::sync::RwLock::new(std::collections::HashMap::new()),
+            &tx,
+            None,
+            64,
+            75,
+            64,
+            CacheDecision::without_thumbnail(),
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(AtomicUsize::new(1)),
+            None,
+            app.folder_thumb_pin_db.as_deref(),
+            None,
+            None,
+        );
+        assert_eq!(rx.try_recv().unwrap().image.unwrap().pixels[0].r(), 17);
+    }
+
+    #[test]
+    fn drive_list_child_miss_discards_seed_waiting_for_texture_budget() {
+        let mut app = setup_app();
+        app.items = (0..9)
+            .map(|idx| GridItem::Folder(app.tmp.path().join(format!("drive-{idx}"))))
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; 9];
+        app.keep_set = (0..9).collect();
+        app.keep_range = (0, 9);
+        app.requested.insert(8, false);
+        let message = |idx, image, origin| crate::thumb_loader::ThumbMsg {
+            idx,
+            image,
+            origin,
+            from_edit_preview: false,
+            edit_preview_adjustment: None,
+            source_dims: None,
+            layout_dims: None,
+            canceled: false,
+            finalized: false,
+            input_seq: 0,
+            items_gen: app.items_generation,
+        };
+        for idx in 0..8 {
+            app.tx
+                .send(message(
+                    idx,
+                    Some(egui::ColorImage::filled([2, 2], egui::Color32::LIGHT_BLUE)),
+                    crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                ))
+                .unwrap();
+        }
+        app.tx
+            .send(message(
+                8,
+                Some(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
+                crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed,
+            ))
+            .unwrap();
+        app.tx
+            .send(message(
+                8,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::DriveListChildMiss,
+            ))
+            .unwrap();
+        let ctx = egui::Context::default();
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(app.thumbnails[8], ThumbnailState::Failed));
+        assert!(app.texture_backlog.iter().all(|msg| msg.idx != 8));
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(app.thumbnails[8], ThumbnailState::Failed));
     }
 
     fn assert_drive_list_indirect_epub_case(case: &str) {
@@ -12722,7 +12921,7 @@ mod phase_c_key_tests {
                     map: &std::sync::Arc<
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >| {
-            let req = make_drive_list_pin_load_request(
+            let mut req = make_drive_list_pin_load_request(
                 &app.items[0],
                 0,
                 app.settings.folder_thumb_sort,
@@ -12732,6 +12931,7 @@ mod phase_c_key_tests {
                 app.folder_thumb_pin_db.as_deref(),
             )
             .unwrap();
+            req.items_gen = app.items_generation;
             let (tx, rx) = std::sync::mpsc::channel();
             crate::thumb_loader::process_load_request(
                 &req,
@@ -12752,11 +12952,33 @@ mod phase_c_key_tests {
                 None,
                 None,
             );
-            rx.try_recv().unwrap().image
+            let mut seed = None;
+            let mut displayed = None;
+            let mut finalized = false;
+            let messages = rx.try_iter().collect::<Vec<_>>();
+            for msg in &messages {
+                if msg.finalized {
+                    finalized = true;
+                    continue;
+                }
+                let red = msg.image.as_ref().map(|image| image.pixels[0].r());
+                if msg.origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed {
+                    seed = red;
+                }
+                displayed = Some(red);
+            }
+            (
+                seed,
+                displayed.expect("drive-list worker must finish the child request"),
+                finalized,
+                messages,
+            )
         };
-        assert!(
-            load(&app, &map).is_none(),
-            "only the old generation must use the drive icon"
+        let (seed, final_red, _, _) = load(&app, &map);
+        assert_eq!(seed, Some(70), "the old row is shown provisionally");
+        assert_eq!(
+            final_red, None,
+            "the old generation must end at the drive icon"
         );
 
         let current_proof = crate::catalog::FolderSelectionProof {
@@ -12783,9 +13005,11 @@ mod phase_c_key_tests {
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
-        assert!(
-            load(&app, &map).is_some(),
-            "current generation's cached cover must be shown"
+        let (_, final_red, _, _) = load(&app, &map);
+        assert_eq!(
+            final_red,
+            Some(70),
+            "current generation's cover must be shown"
         );
         // A pinned child may have only its pinned writer row after catalog
         // cleanup; the auto row is not a valid substitute for that pin.
@@ -12849,7 +13073,7 @@ mod phase_c_key_tests {
             .retain(|cached_key, _| !cached_key.starts_with(&prefix));
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
         if case == "old_generation" {
-            assert!(load(&app, &map).is_none(), "old EPUB row must fall back");
+            assert_eq!(load(&app, &map).1, None, "old EPUB row must fall back");
             return;
         }
         let current_read = crate::pdf_loader::resolve_read_target(&epub).unwrap();
@@ -12927,7 +13151,90 @@ mod phase_c_key_tests {
             )
             .unwrap();
         if case == "new_generation" {
-            assert_eq!(load(&app, &map).unwrap().pixels[0].r(), 70);
+            assert_eq!(load(&app, &map).1, Some(70));
+            // Capture an old-generation first-frame seed, then publish the
+            // current row before the worker checks the exact writer key.
+            parent.delete_one(&current_child_pin_key).unwrap();
+            let old_proof = crate::catalog::FolderSelectionProof {
+                winner: crate::catalog::FolderSelectionWinner {
+                    path: epub.clone(),
+                    mtime: old.generation_id,
+                    file_size: old.pdf_size as i64,
+                    archive_row_key: None,
+                },
+                ..current_proof.clone()
+            };
+            parent
+                .save_with_folder_proof(
+                    &key,
+                    old.generation_id,
+                    old.pdf_size as i64,
+                    4,
+                    4,
+                    None,
+                    None,
+                    &old_webp,
+                    Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+                    Some(&old_proof),
+                )
+                .unwrap();
+            map.write()
+                .unwrap()
+                .retain(|cached_key, _| !cached_key.starts_with(&prefix));
+            app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
+            let mut new_webp = Vec::new();
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                4,
+                4,
+                image::Rgba([88, 80, 90, 255]),
+            ))
+            .write_to(
+                &mut std::io::Cursor::new(&mut new_webp),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+            parent
+                .save(
+                    &current_child_pin_key,
+                    current.generation_id,
+                    current.pdf_size as i64,
+                    4,
+                    4,
+                    None,
+                    &new_webp,
+                )
+                .unwrap();
+            let (seed, final_red, finalized, messages) = load(&app, &map);
+            assert_eq!(seed, Some(70), "old cover should be provisional");
+            assert_eq!(
+                final_red,
+                Some(88),
+                "current generation replaces the old cover"
+            );
+            assert!(!finalized, "different rows require a replacement image");
+            assert_eq!(messages.len(), 2);
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.keep_set.insert(0);
+            app.keep_range = (0, 1);
+            app.requested.insert(0, false);
+            let ctx = egui::Context::default();
+            let mut messages = messages.into_iter();
+            app.tx.send(messages.next().unwrap()).unwrap();
+            app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+            let seed_tex = match &app.thumbnails[0] {
+                ThumbnailState::Loaded { tex, .. } => tex.id(),
+                _ => panic!("old-generation seed should appear provisionally"),
+            };
+            app.tx.send(messages.next().unwrap()).unwrap();
+            app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+            let current_tex = match &app.thumbnails[0] {
+                ThumbnailState::Loaded { tex, origin, .. } => {
+                    assert_eq!(*origin, crate::thumb_loader::ThumbLoadOrigin::FinalCache);
+                    tex.id()
+                }
+                _ => panic!("current-generation row should replace the seed"),
+            };
+            assert_ne!(seed_tex, current_tex);
             return;
         }
         app.folder_thumb_pin_db
@@ -12936,7 +13243,7 @@ mod phase_c_key_tests {
             .set(&child, &page_one)
             .unwrap();
         if case == "page_switch" {
-            assert_eq!(load(&app, &map).unwrap().pixels[0].r(), 240);
+            assert_eq!(load(&app, &map).1, Some(240));
         }
         app.folder_thumb_pin_db
             .as_ref()
@@ -12944,7 +13251,7 @@ mod phase_c_key_tests {
             .set(&child, &page_zero)
             .unwrap();
         if case == "page_switch" {
-            assert_eq!(load(&app, &map).unwrap().pixels[0].r(), 70);
+            assert_eq!(load(&app, &map).1, Some(70));
             return;
         }
 
@@ -12963,9 +13270,10 @@ mod phase_c_key_tests {
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
-        assert!(
-            load(&app, &map).is_none(),
-            "a child pin changed to an image must not reuse its old EPUB row"
+        assert_eq!(
+            load(&app, &map).1,
+            None,
+            "a child pin changed to an image must not keep its old EPUB row"
         );
     }
 

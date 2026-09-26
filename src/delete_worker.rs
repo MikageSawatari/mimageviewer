@@ -96,10 +96,17 @@ pub fn spawn(
 
     let cancel_worker = Arc::clone(&cancel);
     let tx_worker = tx.clone();
+    let worker_scopes = source_scopes.clone();
     let spawn_result = std::thread::Builder::new()
         .name("delete-worker".into())
         .spawn(move || {
-            run_worker(paths, hwnd.unwrap_or_default(), cancel_worker, tx_worker);
+            run_worker(
+                paths,
+                worker_scopes,
+                hwnd.unwrap_or_default(),
+                cancel_worker,
+                tx_worker,
+            );
         });
     if let Err(e) = spawn_result {
         let message = format!("削除 worker を開始できません: {e}");
@@ -134,6 +141,7 @@ pub fn spawn(
 
 fn run_worker(
     paths: Vec<PathBuf>,
+    source_scopes: Vec<DeleteSourceScope>,
     hwnd: isize,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DeleteMsg>,
@@ -141,8 +149,9 @@ fn run_worker(
     let data_dir = crate::data_dir::get();
     let purge_data_dir = data_dir.clone();
     let has_pdf_passwords = crate::pdf_passwords::PdfPasswordStore::has_entries_at(&data_dir);
-    run_worker_with_recycler(
+    run_worker_with_recycler_scoped(
         paths,
+        source_scopes,
         hwnd,
         cancel,
         tx,
@@ -150,7 +159,7 @@ fn run_worker(
         recycle_chunk,
         collect_pdf_paths_for_delete,
         |succeeded, pdf_paths| {
-            crate::rename_key_migration::purge_removed_paths_at(
+            crate::rename_key_migration::purge_removed_scopes_at(
                 &purge_data_dir,
                 succeeded,
                 pdf_paths,
@@ -162,8 +171,9 @@ fn run_worker(
     );
 }
 
-fn run_worker_with_recycler<F, C, P, J>(
+fn run_worker_with_recycler_scoped<F, C, P, J>(
     paths: Vec<PathBuf>,
+    source_scopes: Vec<DeleteSourceScope>,
     hwnd: isize,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DeleteMsg>,
@@ -175,7 +185,7 @@ fn run_worker_with_recycler<F, C, P, J>(
 ) where
     F: FnMut(isize, &[PathBuf]) -> DeleteChunkOutcome,
     C: FnMut(&[PathBuf], &AtomicBool) -> Vec<PathBuf>,
-    P: FnMut(&[PathBuf], &[PathBuf]) -> crate::rename_key_migration::PurgeReport,
+    P: FnMut(&[DeleteSourceScope], &[PathBuf]) -> crate::rename_key_migration::PurgeReport,
     J: FnMut(&[PathBuf], &[PathBuf]) -> bool,
 {
     let mut succeeded_for_purge = Vec::new();
@@ -264,7 +274,19 @@ fn run_worker_with_recycler<F, C, P, J>(
     if !succeeded_for_purge.is_empty() {
         let purge_started = std::time::Instant::now();
         let mut attempts = 1usize;
-        let mut report = purge(&succeeded_for_purge, &pdf_paths_for_purge);
+        let succeeded_scopes = source_scopes
+            .iter()
+            .filter(|scope| {
+                let scoped_path = match scope {
+                    DeleteSourceScope::Exact(path) | DeleteSourceScope::Tree(path) => path,
+                };
+                succeeded_for_purge
+                    .iter()
+                    .any(|path| crate::folder_tree::path_eq(path, scoped_path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut report = purge(&succeeded_scopes, &pdf_paths_for_purge);
         store_mutations.merge(report.store_mutations);
         let mut rows = report.rows;
         let mut db_open_count = report.db_open_count;
@@ -273,7 +295,7 @@ fn run_worker_with_recycler<F, C, P, J>(
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50 * retry));
-            report = purge(&succeeded_for_purge, &pdf_paths_for_purge);
+            report = purge(&succeeded_scopes, &pdf_paths_for_purge);
             store_mutations.merge(report.store_mutations);
             attempts += 1;
             rows += report.rows;
@@ -338,6 +360,50 @@ fn run_worker_with_recycler<F, C, P, J>(
             store_mutations,
         });
     }
+}
+
+#[cfg(test)]
+fn run_worker_with_recycler<F, C, P, J>(
+    paths: Vec<PathBuf>,
+    hwnd: isize,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<DeleteMsg>,
+    collect_pdf_paths: bool,
+    recycle: F,
+    collect_pdfs: C,
+    mut purge: P,
+    journal_failure: J,
+) where
+    F: FnMut(isize, &[PathBuf]) -> DeleteChunkOutcome,
+    C: FnMut(&[PathBuf], &AtomicBool) -> Vec<PathBuf>,
+    P: FnMut(&[PathBuf], &[PathBuf]) -> crate::rename_key_migration::PurgeReport,
+    J: FnMut(&[PathBuf], &[PathBuf]) -> bool,
+{
+    let scopes = paths
+        .iter()
+        .cloned()
+        .map(DeleteSourceScope::Exact)
+        .collect();
+    run_worker_with_recycler_scoped(
+        paths,
+        scopes,
+        hwnd,
+        cancel,
+        tx,
+        collect_pdf_paths,
+        recycle,
+        collect_pdfs,
+        |scopes, pdf_paths| {
+            let paths = scopes
+                .iter()
+                .map(|scope| match scope {
+                    DeleteSourceScope::Exact(path) | DeleteSourceScope::Tree(path) => path.clone(),
+                })
+                .collect::<Vec<_>>();
+            purge(&paths, pdf_paths)
+        },
+        journal_failure,
+    );
 }
 
 fn path_matches_removed(path: &std::path::Path, removed: &[PathBuf]) -> bool {
@@ -1017,6 +1083,93 @@ mod worker_tests {
         assert_eq!(batch_counts(&messages[0]), (1, 1));
         assert_eq!(db.get(&succeeded_key), 0);
         assert_eq!(db.get(&failed_key), 4);
+    }
+
+    #[test]
+    fn delete_worker_passes_exact_and_tree_scope_to_epub_ledger_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(temp.path().join("content_identity.db")).unwrap();
+        conn.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)")
+            .unwrap();
+        drop(conn);
+
+        let run = |scope: DeleteSourceScope| {
+            let data_dir = temp.path().to_path_buf();
+            let removed = match &scope {
+                DeleteSourceScope::Exact(path) | DeleteSourceScope::Tree(path) => path.clone(),
+            };
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let (tx, _rx) = mpsc::channel();
+                run_worker_with_recycler_scoped(
+                    vec![removed],
+                    vec![scope],
+                    0,
+                    Arc::new(AtomicBool::new(false)),
+                    tx,
+                    false,
+                    |_hwnd, paths| DeleteChunkOutcome {
+                        succeeded: paths.to_vec(),
+                        failed: Vec::new(),
+                        shell_aborted: false,
+                        retryable: false,
+                    },
+                    |_paths, _cancel| Vec::new(),
+                    |scopes, pdf_paths| {
+                        let report = crate::rename_key_migration::purge_removed_scopes_at(
+                            &data_dir, scopes, pdf_paths,
+                        );
+                        assert!(report.errors.is_empty(), "{:?}", report.errors);
+                        report
+                    },
+                    |_paths, _pdf_paths| false,
+                );
+                done_tx.send(()).unwrap();
+            });
+            (worker, done_rx)
+        };
+        let hold = |book: PathBuf| {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                crate::pdf_loader::with_epub_pin_guard(&book, || {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+            });
+            ready_rx.recv().unwrap();
+            (holder, release_tx)
+        };
+
+        let file = temp.path().join("cover.png");
+        let (holder, release) = hold(file.join("child.epub"));
+        let (worker, done) = run(DeleteSourceScope::Exact(file));
+        let exact_finished = done.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            exact_finished,
+            "a non-EPUB file must not wait on EPUB range coverage"
+        );
+
+        let folder = temp.path().join("deleted.books.v2");
+        let (holder, release) = hold(folder.join("child.epub"));
+        let (worker, done) = run(DeleteSourceScope::Tree(folder));
+        let tree_finished_early = done
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        release.send(()).unwrap();
+        if !tree_finished_early {
+            done.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            !tree_finished_early,
+            "a deleted folder must cover EPUB descendants"
+        );
     }
 
     #[test]

@@ -1452,14 +1452,41 @@ pub(crate) fn purge_removed_paths_at(
     removed: &[PathBuf],
     pdf_paths: &[PathBuf],
 ) -> PurgeReport {
+    let scopes = removed
+        .iter()
+        .cloned()
+        .map(crate::delete_worker::DeleteSourceScope::Tree)
+        .collect::<Vec<_>>();
+    purge_removed_scopes_at(data_dir, &scopes, pdf_paths)
+}
+
+/// The delete request retains whether each path was a file or a tree before
+/// Shell moves it. A file key needs EPUB pin coverage only if it is EPUB;
+/// a tree covers possible EPUB descendants even after the directory is gone.
+pub(crate) fn purge_removed_scopes_at(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+) -> PurgeReport {
     let mut report = PurgeReport::default();
-    if removed.is_empty() {
+    if scopes.is_empty() {
         return report;
     }
 
-    let keep_drive_keys = normalized_removed_keys(removed, StoreKeyNormalization::KeepDrive);
+    let removed = scopes
+        .iter()
+        .map(|scope| match scope {
+            crate::delete_worker::DeleteSourceScope::Exact(path)
+            | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let keep_drive_keys = normalized_removed_keys(&removed, StoreKeyNormalization::KeepDrive);
     let drive_stripped_keys =
-        normalized_removed_keys(removed, StoreKeyNormalization::DriveStripped);
+        normalized_removed_keys(&removed, StoreKeyNormalization::DriveStripped);
+    let keep_drive_coverage = normalized_removed_coverage(scopes, StoreKeyNormalization::KeepDrive);
+    let drive_stripped_coverage =
+        normalized_removed_coverage(scopes, StoreKeyNormalization::DriveStripped);
     let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
     let rating_write = crate::rating_db::RATING_WRITES.begin();
     let tag_write = crate::tags_db::TAG_WRITES.begin();
@@ -1468,7 +1495,11 @@ pub(crate) fn purge_removed_paths_at(
             StoreKeyNormalization::KeepDrive => &keep_drive_keys,
             StoreKeyNormalization::DriveStripped => &drive_stripped_keys,
         };
-        purge_store(data_dir, descriptor, keys, &mut report);
+        let coverage = match descriptor.normalization {
+            StoreKeyNormalization::KeepDrive => &keep_drive_coverage,
+            StoreKeyNormalization::DriveStripped => &drive_stripped_coverage,
+        };
+        purge_store(data_dir, descriptor, keys, coverage, &mut report);
     }
     drop(rating_write);
     drop(tag_write);
@@ -1478,7 +1509,7 @@ pub(crate) fn purge_removed_paths_at(
         Ok(rows) => report.rows += rows,
         Err(error) => report.errors.push(format!("pdf_passwords.json: {error}")),
     }
-    purge_sidecar_backups(removed, &mut report);
+    purge_sidecar_backups(&removed, &mut report);
     report
 }
 
@@ -1544,6 +1575,30 @@ fn normalized_removed_keys(
     keys
 }
 
+fn normalized_removed_coverage(
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    normalization: StoreKeyNormalization,
+) -> Vec<(PathBuf, IdentityCoverageShape)> {
+    scopes
+        .iter()
+        .filter_map(|scope| {
+            let (path, shape) = match scope {
+                crate::delete_worker::DeleteSourceScope::Exact(path) => {
+                    (path, IdentityCoverageShape::Exact)
+                }
+                crate::delete_worker::DeleteSourceScope::Tree(path) => {
+                    (path, IdentityCoverageShape::Prefix)
+                }
+            };
+            let key = match normalization {
+                StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(path),
+                StoreKeyNormalization::DriveStripped => crate::path_key::normalize(path),
+            };
+            (!key.is_empty()).then(|| (PathBuf::from(key), shape))
+        })
+        .collect()
+}
+
 /// BINARY collation で `prefix` から始まる文字列の排他的 upper bound を返す。
 ///
 /// UTF-8 の辞書順は Unicode code point 順を保つため、最後の scalar value を次へ進めれば
@@ -1563,6 +1618,7 @@ fn purge_store(
     data_dir: &Path,
     descriptor: &StoreDescriptor,
     removed_keys: &[String],
+    coverage: &[(PathBuf, IdentityCoverageShape)],
     report: &mut PurgeReport,
 ) {
     let db_path = data_dir.join(descriptor.file);
@@ -1570,13 +1626,7 @@ fn purge_store(
         return;
     }
     report.db_open_count += 1;
-    // Purge executes exact and descendant-prefix DELETEs even after the
-    // original folder has disappeared. The SQL operation defines its scope.
-    let coverage = removed_keys
-        .iter()
-        .map(|key| (PathBuf::from(key), IdentityCoverageShape::Prefix))
-        .collect::<Vec<_>>();
-    let result = with_identity_epub_coverage(descriptor, &coverage, || {
+    let result = with_identity_epub_coverage(descriptor, coverage, || {
         (|| -> Result<usize, rusqlite::Error> {
             let mut conn = rusqlite::Connection::open(&db_path)?;
             conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -2647,7 +2697,7 @@ mod tests {
             table_availability: StoreTableAvailability::Required,
         };
         let mut report = PurgeReport::default();
-        purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
+        purge_store(dir.path(), &descriptor, &removed_keys, &[], &mut report);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, legacy_changed);
         assert_eq!(
@@ -2712,7 +2762,7 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let mut report = PurgeReport::default();
-        purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
+        purge_store(dir.path(), &descriptor, &removed_keys, &[], &mut report);
         let elapsed = started.elapsed();
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);

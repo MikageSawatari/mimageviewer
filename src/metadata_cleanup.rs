@@ -1333,4 +1333,60 @@ mod tests {
         assert_eq!(rating.get(&key), 0);
         assert!(!data_dir.join(DELETE_PURGE_JOURNAL_FILE).exists());
     }
+
+    #[test]
+    fn restored_delete_purge_journal_conservatively_covers_epub_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let files = temp.path().join("files");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&files).unwrap();
+        let removed_file = files.join("gone.png");
+        let db = rusqlite::Connection::open(data_dir.join("content_identity.db")).unwrap();
+        db.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)")
+            .unwrap();
+        drop(db);
+        assert!(journal_failed_delete_purge(
+            &data_dir,
+            std::slice::from_ref(&removed_file),
+            &[],
+        ));
+        assert_eq!(
+            load_delete_purge_journal_unlocked(&data_dir).unwrap().len(),
+            1
+        );
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let covered_book = removed_file.join("child.epub");
+        let holder = std::thread::spawn(move || {
+            crate::pdf_loader::with_epub_pin_guard(&covered_book, || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        ready_rx.recv().unwrap();
+        let retry_data = data_dir.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let retry = std::thread::spawn(move || {
+            done_tx
+                .send(retry_delete_purge_journal_at(&retry_data))
+                .unwrap();
+        });
+        let early_report = done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .ok();
+        release_tx.send(()).unwrap();
+        let finished_early = early_report.is_some();
+        let report = early_report.unwrap_or_else(|| {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        });
+        holder.join().unwrap();
+        retry.join().unwrap();
+        assert!(!finished_early, "unknown restored scope must wait as Tree");
+        assert_eq!(report.purged, 1);
+        assert_eq!(report.remaining, 0);
+    }
 }

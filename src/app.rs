@@ -30324,9 +30324,24 @@ impl App {
                         cat.load_one(&key).ok().flatten()
                     }
                     FileKind::Folder => {
-                        // Current child pin and generation are resolved in the
-                        // cache-only worker. No UI seed can prove this row key.
-                        None
+                        let folder_path = container.join(rel);
+                        let folder_item = GridItem::Folder(folder_path);
+                        let key = container_cache_base_key(
+                            &folder_item,
+                            use_full_path_key,
+                            Some(self.settings.folder_thumb_sort),
+                            self.settings.folder_thumb_depth,
+                        )?;
+                        let cat = self.get_or_open_catalog(container)?;
+                        let base_entry = cat.load_one(&key).ok().flatten();
+                        let pinned_prefix =
+                            format!("{}{}", key, crate::thumb_loader::CACHE_KEY_PIN_SUFFIX);
+                        let pinned_entry = cat
+                            .load_latest_with_prefix(&pinned_prefix)
+                            .ok()
+                            .flatten()
+                            .map(|(_, entry)| entry);
+                        pinned_entry.or(base_entry)
                     }
                 }
             }
@@ -30408,19 +30423,6 @@ impl App {
             };
             let prefix = drive_list_pinned_cache_key_prefix(&base_key, &source);
             let Some(mut entry) = self.drive_list_pin_seed_entry(&container_path, &source) else {
-                if matches!(
-                    source,
-                    crate::folder_thumb_pins::FolderPinSource::File {
-                        kind: crate::folder_thumb_pins::FileKind::Folder,
-                        ..
-                    }
-                ) {
-                    // No current child row means a prior indirect seed has no
-                    // representative proof to validate against.
-                    if let Ok(mut map) = cache_map.write() {
-                        map.retain(|key, _| !key.starts_with(&prefix));
-                    }
-                }
                 continue;
             };
             let seed_proof = entry
@@ -39013,7 +39015,9 @@ impl App {
                         // source origin: from-source 経路。cache save 完了後の
                         //   第 2 シグナル (canceled=true) 到着まで `requested` を保持。
                         //   cache save 進行中の再エンキュー + 二重レンダを防ぐ。
-                        if from_cache {
+                        if from_cache
+                            && origin != crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed
+                        {
                             self.requested.remove(&i);
                         }
                         let [w, h] = color_image.size;
@@ -39186,6 +39190,16 @@ impl App {
                     }
                 }
                 None => {
+                    if origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildMiss {
+                        // Validation can finish while the provisional seed is
+                        // still waiting for this frame's texture budget.
+                        self.texture_backlog.retain(|queued| {
+                            !(queued.idx == i
+                                && queued.items_gen == msg_items_gen
+                                && queued.origin
+                                    == crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed)
+                        });
+                    }
                     self.requested.remove(&i);
                     self.pending_finalize.remove(&i);
                     self.thumbnails[i] = ThumbnailState::Failed;
@@ -40604,6 +40618,8 @@ impl App {
                         } => undersized && evaluated_display_px < current_display_px,
                         crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic
                         | crate::thumb_loader::ThumbLoadOrigin::FinalCache
+                        | crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed
+                        | crate::thumb_loader::ThumbLoadOrigin::DriveListChildMiss
                         | crate::thumb_loader::ThumbLoadOrigin::EditPreviewCache { .. } => false,
                     };
                     !*from_edit_preview && origin_needs_upgrade
