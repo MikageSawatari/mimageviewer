@@ -60,8 +60,20 @@ fn sort_control_decision(
     }
 }
 
-fn sort_order_visible_on_surface(order: crate::settings::SortOrder, collection: bool) -> bool {
-    !collection || !order.is_rating()
+fn sort_order_disabled_reason(
+    order: crate::settings::SortOrder,
+    collection: bool,
+    bookmark: bool,
+) -> Option<&'static str> {
+    if !order.is_rating() {
+        None
+    } else if collection {
+        Some("コレクションでは評価順を使えません。手動の並べ替えで順番を変えられます")
+    } else if bookmark {
+        Some("ブックマーク一覧では評価順を使えません")
+    } else {
+        None
+    }
 }
 const BOOK_REORDER_MIN_TILE_PX: f32 = 64.0;
 const BOOK_REORDER_MAX_TILE_PX: f32 = 132.0;
@@ -1631,9 +1643,10 @@ fn sort_combo_popup_style() -> egui::style::StyleModifier {
     })
 }
 
-/// Height of the sort popup's scroll viewport, in egui points. The menu has
-/// one selectable row per visible sort and two more rows plus a separator for
-/// each context-specific group. Only a short screen should need scrolling.
+/// Height of the sort popup's scroll viewport, in egui points. Count the actual
+/// selectable rows and separators, including context-specific rows. A custom UI
+/// font can make a button taller than `interact_size`, so use its measured height.
+/// Only a short screen should need scrolling.
 fn sort_combo_popup_height(
     ui: &egui::Ui,
     standard_rows: usize,
@@ -1645,7 +1658,11 @@ fn sort_combo_popup_height(
         usize::from(collection_rows) + usize::from(rating_rows) + usize::from(bookmark_rows);
     let rows = standard_rows + 2 * groups;
     let spacing = ui.spacing();
-    let row_height = spacing.interact_size.y;
+    let row_height = spacing
+        .interact_size
+        .y
+        .max(ui.text_style_height(&egui::TextStyle::Button) + 2.0 * spacing.button_padding.y)
+        .ceil();
     let desired = rows as f32 * row_height
         + (rows + groups).saturating_sub(1) as f32 * spacing.item_spacing.y
         + groups as f32 * 6.0 // egui::Separator's default height
@@ -5863,16 +5880,22 @@ mod fixed_sort_control_tests {
                 .all(|order| !order.is_rating())
         );
         assert!(
-            SortOrder::all()
-                .iter()
-                .filter(|order| { sort_order_visible_on_surface(**order, true) })
-                .all(|order| !order.is_rating())
+            sort_order_disabled_reason(SortOrder::RatingAsc, true, false)
+                .unwrap()
+                .contains("コレクションでは評価順を使えません")
         );
         assert!(
-            SortOrder::all()
-                .iter()
-                .filter(|order| { sort_order_visible_on_surface(**order, false) })
-                .any(|order| order.is_rating())
+            sort_order_disabled_reason(SortOrder::RatingDesc, false, true)
+                .unwrap()
+                .contains("ブックマーク一覧では評価順を使えません")
+        );
+        assert_eq!(
+            sort_order_disabled_reason(SortOrder::DateDesc, true, false),
+            None
+        );
+        assert_eq!(
+            sort_order_disabled_reason(SortOrder::RatingDesc, false, false),
+            None
         );
     }
 
@@ -5941,6 +5964,231 @@ mod fixed_sort_control_tests {
                 "{control} must dispatch exactly one reload"
             );
             assert_eq!(app.borrow().settings.sort_order, SortOrder::RatingDesc);
+        }
+    }
+
+    #[test]
+    fn collection_sort_dropdown_disables_rating_without_writing_collection() {
+        use crate::collection_store::CollectionStoreRuntime;
+        use crate::settings::{SortOrder, ToolbarSectionDisplay};
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("collection.db");
+        let runtime = CollectionStoreRuntime::start_at(db_path.clone()).unwrap();
+        let client = runtime.client();
+        let mut app = crate::app::setup_app_for_test();
+        app.install_collection_runtime(runtime);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(app.collection_store_client_for_read(), Ok(Some(_))) {
+            assert!(Instant::now() < deadline);
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let created = client
+            .create_collection("Sort popup".into())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        app.open_collection_grid(created.collection_id(), None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .collection_grid_root_order()
+            .is_none_or(|order| order.is_err())
+        {
+            assert!(Instant::now() < deadline);
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.settings.show_toolbar_sort = true;
+        app.settings.toolbar_sort_items = SortOrder::all().to_vec();
+        app.settings.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
+        let initial_sort = app
+            .collection_grid_root_order()
+            .unwrap()
+            .unwrap()
+            .standard_sort;
+        let initial_db = std::fs::read(&db_path).unwrap();
+        let wal_path = db_path.with_extension("db-wal");
+        let initial_wal = std::fs::read(&wal_path).ok();
+        let app = Rc::new(RefCell::new(app));
+        let render_app = Rc::clone(&app);
+        let fonts_set = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1700.0, 500.0))
+            .build(move |ctx| {
+                if !fonts_set.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                render_app.borrow_mut().render_menubar(ctx);
+                render_app.borrow_mut().render_toolbar(ctx);
+            });
+        harness.run();
+        harness.run();
+        for label in ["評価↑", "評価↓"] {
+            harness
+                .get_all_by_role(egui::accesskit::Role::ComboBox)
+                .into_iter()
+                .find(|node| node.value().as_deref() == Some("手動"))
+                .expect("collection sort combo")
+                .click();
+            harness.run();
+            let row = harness.get_by_label(label);
+            assert!(
+                row.accesskit_node().is_disabled(),
+                "{label} must be disabled"
+            );
+            row.hover();
+            harness.run();
+            assert!(
+                harness
+                    .get_by_label(
+                        "コレクションでは評価順を使えません。手動の並べ替えで順番を変えられます"
+                    )
+                    .rect()
+                    .is_positive()
+            );
+            harness.get_by_label(label).click();
+            harness.run();
+        }
+        app.borrow_mut().settings.toolbar_sort_display = ToolbarSectionDisplay::Buttons;
+        harness.run();
+        for label in ["評価↑", "評価↓"] {
+            let row = harness.get_by_label(label);
+            assert!(row.accesskit_node().is_disabled());
+            row.hover();
+            harness.run();
+            assert!(
+                harness
+                    .get_by_label(
+                        "コレクションでは評価順を使えません。手動の並べ替えで順番を変えられます"
+                    )
+                    .rect()
+                    .is_positive()
+            );
+            harness.get_by_label(label).click();
+            harness.run();
+        }
+        harness
+            .get_all_by_label("設定")
+            .find(|node| !node.accesskit_node().is_disabled())
+            .expect("Settings menu")
+            .click();
+        harness.run();
+        harness.get_by_label("ソート順 ⏵").click();
+        harness.run();
+        for label in ["  評価（低い順）", "  評価（高い順）"] {
+            let row = harness.get_by_label(label);
+            assert!(row.accesskit_node().is_disabled());
+            row.hover();
+            harness.run();
+            assert!(
+                harness
+                    .get_by_label(
+                        "コレクションでは評価順を使えません。手動の並べ替えで順番を変えられます"
+                    )
+                    .rect()
+                    .is_positive()
+            );
+        }
+        harness
+            .get_all_by_label("設定")
+            .find(|node| !node.accesskit_node().is_disabled())
+            .expect("Settings menu")
+            .click();
+        harness.run();
+        harness
+            .get_all_by_label("コレクション")
+            .find(|node| !node.accesskit_node().is_disabled())
+            .expect("Collections menu")
+            .click();
+        harness.run();
+        harness.get_by_label("現在のコレクションの並び順 ⏵").click();
+        harness.run();
+        harness.get_by_label("通常ソート ⏵").click();
+        harness.run();
+        for label in ["  評価（低い順）", "  評価（高い順）"] {
+            let row = harness.get_by_label(label);
+            assert!(row.accesskit_node().is_disabled());
+            row.hover();
+            harness.run();
+            assert!(
+                harness
+                    .get_by_label(
+                        "コレクションでは評価順を使えません。手動の並べ替えで順番を変えられます"
+                    )
+                    .rect()
+                    .is_positive()
+            );
+        }
+        assert_eq!(
+            app.borrow()
+                .collection_grid_root_order()
+                .unwrap()
+                .unwrap()
+                .standard_sort,
+            initial_sort
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), initial_db);
+        assert_eq!(std::fs::read(&wal_path).ok(), initial_wal);
+        let unchanged = client
+            .load_collection(created.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.revision(), created.revision());
+        drop(harness);
+        app.borrow_mut().shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn bookmark_sort_dropdown_shows_disabled_rating_hover_reason() {
+        use crate::settings::{SortOrder, ToolbarSectionDisplay};
+        let mut app = crate::app::setup_app_for_test();
+        app.items_are_bookmark_view = true;
+        app.settings.show_toolbar_sort = true;
+        app.settings.toolbar_sort_items = SortOrder::all().to_vec();
+        app.settings.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
+        let current_text = app.bookmark_view_sort.short_label().to_string();
+        let app = Rc::new(RefCell::new(app));
+        let render_app = Rc::clone(&app);
+        let fonts_set = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1700.0, 500.0))
+            .build(move |ctx| {
+                if !fonts_set.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                render_app.borrow_mut().render_toolbar(ctx);
+            });
+        harness.run();
+        harness.run();
+        let combo = harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| node.value().as_deref() == Some(current_text.as_str()))
+            .expect("bookmark sort combo");
+        combo.click();
+        harness.run();
+        for label in ["評価↑", "評価↓"] {
+            let row = harness.get_by_label(label);
+            assert!(row.accesskit_node().is_disabled());
+            row.hover();
+            harness.run();
+            assert!(
+                harness
+                    .get_by_label("ブックマーク一覧では評価順を使えません")
+                    .rect()
+                    .is_positive()
+            );
         }
     }
 
@@ -6673,11 +6921,19 @@ impl App {
                                                         ui.close();
                                                     }
                                                     ui.menu_button("通常ソート", |ui| {
-                                                        for &sort in crate::settings::SortOrder::collection_options() {
+                                                        for &sort in crate::settings::SortOrder::all() {
                                                             let checked = current.is_some_and(|d| d.mode == crate::collection_store::CollectionOrderMode::Standard && d.standard_sort == sort);
-                                                            if ui
-                                                                .button(format!("{}{}", if checked { "✓ " } else { "  " }, sort.label()))
-                                                                .clicked()
+                                                            let disabled_reason = sort_order_disabled_reason(sort, true, false);
+                                                            let resp = ui.add_enabled(
+                                                                disabled_reason.is_none(),
+                                                                egui::Button::new(format!("{}{}", if checked { "✓ " } else { "  " }, sort.label())),
+                                                            );
+                                                            let resp = if let Some(reason) = disabled_reason {
+                                                                resp.hover_tip_disabled(reason)
+                                                            } else {
+                                                                resp.on_hover_text(sort.description())
+                                                            };
+                                                            if resp.clicked()
                                                             {
                                                                 self.request_collection_grid_set_order(
                                                                     current.unwrap(),
@@ -7016,11 +7272,7 @@ impl App {
                                             }
                                             ui.separator();
                                         }
-                                        for &order in if root_order.is_some() {
-                                            crate::settings::SortOrder::collection_options()
-                                        } else {
-                                            crate::settings::SortOrder::all()
-                                        } {
+                                        for &order in crate::settings::SortOrder::all() {
                                             let checked = if let Some(root) = root_order {
                                                 root.mode == crate::collection_store::CollectionOrderMode::Standard && root.standard_sort == order
                                             } else if self.items_are_bookmark_view {
@@ -7033,12 +7285,13 @@ impl App {
                                                 self.settings.sort_order == order
                                             };
                                             let prefix = if checked { "✓ " } else { "  " };
+                                            let disabled_reason = sort_order_disabled_reason(order, root_order.is_some(), self.items_are_bookmark_view);
                                             let resp = ui.add_enabled(
-                                                !(self.items_are_bookmark_view && order.is_rating()),
+                                                disabled_reason.is_none(),
                                                 egui::Button::new(format!("{prefix}{}", order.label())),
                                             );
-                                            let resp = if self.items_are_bookmark_view && order.is_rating() {
-                                                resp.hover_tip_disabled("ブックマーク一覧では評価順を使えません")
+                                            let resp = if let Some(reason) = disabled_reason {
+                                                resp.hover_tip_disabled(reason)
                                             } else {
                                                 resp.on_hover_text(order.description())
                                             };
@@ -9447,9 +9700,6 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 }
                             }
                             for &order in &tb_sorts {
-                                if !sort_order_visible_on_surface(order, root_order.is_some()) {
-                                    continue;
-                                }
                                 let selected = if sort_disabled {
                                     false
                                 } else if let Some(root) = root_order {
@@ -9463,16 +9713,17 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 } else {
                                     self.settings.sort_order == order
                                 };
+                                let disabled_reason = sort_order_disabled_reason(order, root_order.is_some(), self.items_are_bookmark_view);
                                 let resp = ui.add_enabled(
-                                    !sort_disabled && !(self.items_are_bookmark_view && order.is_rating()),
+                                    !sort_disabled && disabled_reason.is_none(),
                                     egui::Button::selectable(selected, order.short_label()),
                                 );
                                 // 固定中はボタンが無効なので、通常 hover ではなく disabled
                                 // 専用ツールチップで固定理由を出す。
                                 let resp = match sort_lock {
                                     Some(reason) => resp.hover_tip_disabled(reason.tooltip()),
-                                    None if self.items_are_bookmark_view && order.is_rating() =>
-                                        resp.hover_tip_disabled("ブックマーク一覧では評価順を使えません"),
+                                    None if disabled_reason.is_some() =>
+                                        resp.hover_tip_disabled(disabled_reason.unwrap()),
                                     None => resp.on_hover_text(order.description()),
                                 };
                                 match sort_control_decision(resp.clicked(), selected, order) {
@@ -9540,12 +9791,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
                             let sort_popup_height = sort_combo_popup_height(
                                 ui,
-                                tb_sorts
-                                    .iter()
-                                    .filter(|&&order| {
-                                        sort_order_visible_on_surface(order, root_order.is_some())
-                                    })
-                                    .count(),
+                                tb_sorts.len(),
                                 root_order.is_some(),
                                 self.items_are_rating_view,
                                 self.items_are_bookmark_view,
@@ -9600,9 +9846,6 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                             ui.separator();
                                         }
                                         for &order in &tb_sorts {
-                                            if !sort_order_visible_on_surface(order, root_order.is_some()) {
-                                                continue;
-                                            }
                                             let selected = if let Some(root) = root_order {
                                                 root.mode == crate::collection_store::CollectionOrderMode::Standard && root.standard_sort == order
                                             } else if self.items_are_bookmark_view {
@@ -9614,12 +9857,13 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                             } else {
                                                 self.settings.sort_order == order
                                             };
+                                            let disabled_reason = sort_order_disabled_reason(order, root_order.is_some(), self.items_are_bookmark_view);
                                             let resp = ui.add_enabled(
-                                                !(self.items_are_bookmark_view && order.is_rating()),
+                                                disabled_reason.is_none(),
                                                 egui::Button::selectable(selected, order.short_label()),
                                             );
-                                            let resp = if self.items_are_bookmark_view && order.is_rating() {
-                                                resp.hover_tip_disabled("ブックマーク一覧では評価順を使えません")
+                                            let resp = if let Some(reason) = disabled_reason {
+                                                resp.hover_tip_disabled(reason)
                                             } else {
                                                 resp.on_hover_text(order.description())
                                             };
@@ -24713,9 +24957,10 @@ mod toolbar_wrap_tests {
     fn sort_popup_shows_all_ten_rows_or_fits_a_short_screen() {
         use egui_kittest::{Harness, kittest::Queryable};
 
-        for (screen_size, all_rows_expected) in [
-            (egui::vec2(600.0, 480.0), true),
-            (egui::vec2(360.0, 150.0), false),
+        for (screen_size, font_size, all_rows_expected) in [
+            (egui::vec2(600.0, 480.0), 14.0, true),
+            (egui::vec2(600.0, 480.0), 22.0, true),
+            (egui::vec2(360.0, 150.0), 14.0, false),
         ] {
             let combo_id = std::sync::Arc::new(std::sync::Mutex::new(None));
             let observed_id = combo_id.clone();
@@ -24725,6 +24970,10 @@ mod toolbar_wrap_tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.spacing_mut().interact_size.y = 22.0;
                     ui.spacing_mut().button_padding.y = 1.0;
+                    ui.style_mut().text_styles.insert(
+                        egui::TextStyle::Button,
+                        egui::FontId::proportional(font_size),
+                    );
                     let orders = crate::settings::SortOrder::all();
                     let height = sort_combo_popup_height(ui, orders.len(), false, false, false);
                     let combo = egui::ComboBox::from_id_salt("ten-sort-rows")
@@ -24734,6 +24983,10 @@ mod toolbar_wrap_tests {
                         .selected_text("ソート")
                         .show_ui(ui, |ui| {
                             ui.spacing_mut().interact_size.y = 22.0;
+                            ui.style_mut().text_styles.insert(
+                                egui::TextStyle::Button,
+                                egui::FontId::proportional(font_size),
+                            );
                             observed_rows.lock().unwrap().clear();
                             for &order in orders {
                                 let row = ui.selectable_label(false, order.short_label());
@@ -24785,6 +25038,112 @@ mod toolbar_wrap_tests {
                 }
             } else {
                 let geometry = row_geometry.lock().unwrap();
+                assert!(
+                    geometry
+                        .last()
+                        .is_some_and(|(row, clip)| row.bottom() > clip.bottom()),
+                    "short screen should use the popup's scroll viewport"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collection_sort_popup_shows_manual_shuffle_and_all_standard_rows_or_fits_screen() {
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+
+        for (screen_size, font_size, all_rows_expected) in [
+            (egui::vec2(600.0, 480.0), 14.0, true),
+            (egui::vec2(600.0, 480.0), 22.0, true),
+            (egui::vec2(360.0, 150.0), 14.0, false),
+        ] {
+            let combo_id = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let observed_id = combo_id.clone();
+            let row_geometry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed_rows = row_geometry.clone();
+            let mut harness = Harness::builder().with_size(screen_size).build(move |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.spacing_mut().interact_size.y = 22.0;
+                    ui.spacing_mut().button_padding.y = 1.0;
+                    ui.style_mut().text_styles.insert(
+                        egui::TextStyle::Button,
+                        egui::FontId::proportional(font_size),
+                    );
+                    let orders = crate::settings::SortOrder::all();
+                    let height = sort_combo_popup_height(ui, orders.len(), true, false, false);
+                    let combo = egui::ComboBox::from_id_salt("collection-sort-rows")
+                        .width(100.0)
+                        .height(height)
+                        .popup_style(sort_combo_popup_style())
+                        .selected_text("手動")
+                        .show_ui(ui, |ui| {
+                            ui.spacing_mut().interact_size.y = 22.0;
+                            ui.style_mut().text_styles.insert(
+                                egui::TextStyle::Button,
+                                egui::FontId::proportional(font_size),
+                            );
+                            observed_rows.lock().unwrap().clear();
+                            for label in ["手動", "シャッフル（再選択で並べ直す）"]
+                            {
+                                let row = ui.selectable_label(false, label);
+                                observed_rows
+                                    .lock()
+                                    .unwrap()
+                                    .push((row.rect, ui.clip_rect()));
+                            }
+                            ui.separator();
+                            for &order in orders {
+                                let row = ui.add_enabled(
+                                    !order.is_rating(),
+                                    egui::Button::selectable(false, order.short_label()),
+                                );
+                                observed_rows
+                                    .lock()
+                                    .unwrap()
+                                    .push((row.rect, ui.clip_rect()));
+                            }
+                        });
+                    *observed_id.lock().unwrap() = Some(combo.response.id);
+                });
+            });
+            harness.run();
+            let popup_id = combo_id.lock().unwrap().expect("sort combo").with("popup");
+            egui::Popup::open_id(&harness.ctx, popup_id);
+            harness.run();
+            harness.run();
+            let popup_rect = harness
+                .ctx
+                .memory(|memory| memory.area_rect(popup_id))
+                .unwrap();
+            assert!(
+                popup_rect.top() >= -1.0,
+                "popup above screen: {popup_rect:?}"
+            );
+            assert!(
+                popup_rect.bottom() <= screen_size.y + 1.0,
+                "popup below screen: {popup_rect:?} / {screen_size:?}"
+            );
+            let geometry = row_geometry.lock().unwrap();
+            assert_eq!(geometry.len(), 12);
+            if all_rows_expected {
+                assert!(
+                    geometry
+                        .iter()
+                        .all(|(row, clip)| row.bottom() <= clip.bottom() + 1.0),
+                    "a collection sort row is outside the scroll viewport: {geometry:?}"
+                );
+                assert!(
+                    geometry.last().unwrap().0.bottom() <= popup_rect.bottom(),
+                    "last row is clipped by popup: {geometry:?} / {popup_rect:?}"
+                );
+                for &order in crate::settings::SortOrder::all() {
+                    let node = harness.get_by_label(order.short_label());
+                    assert_eq!(node.accesskit_node().is_disabled(), order.is_rating());
+                }
+            } else {
                 assert!(
                     geometry
                         .last()
