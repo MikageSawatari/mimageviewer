@@ -439,14 +439,15 @@
 
 - 出典: >>429。動画などを見ながら別アプリを操作できるよう、ウィンドウの「常に最前面」が欲しいとの要望。
 - 利用者向け仕様:
-  - メニューバーの「表示」にチェック付きの「常に最前面」を追加する。HUDには専用アイコンを増やさない。
+  - メニューバーの既存「設定」メニュー先頭に、チェック付きの「常に最前面」と区切り線を追加する。
+    現行メニューに「表示」はなく、一項目だけの上位メニューを増やさない。HUDには専用アイコンを増やさない。
   - 操作カスタマイズへ「常に最前面を切り替える」を追加し、既定キーは割り当てない。切り替え時は
     ON / OFF が分かるフィードバックを出す。
   - 設定は再起動後も保持し、既定は OFF。ON は mImageViewer の main と閲覧用 top-level windowへ
     一貫して適用し、設定変更だけでフォーカスを奪わない。
 - 実装方針:
   - egui 0.33 の `ViewportCommand::WindowLevel` / `WindowLevel::AlwaysOnTop` を使い、root と現在 mount 済みの
-    detached viewportへ適用する。新しく作る viewport builderも同じ設定を継承する。
+    fullscreen / detached viewportへ適用する。新しく作る viewport builderも同じ設定を継承する。
   - native video presenter / HUD は hostとの既存の相対 z-orderを維持する。他のmIV windowまで不必要に
     前へ出す `Focus` や `SetForegroundWindow` の代用にはしない。
   - [detached viewer の既存方針](detached-viewer-implementation-plan.md)「常に最前面にはしない」は、
