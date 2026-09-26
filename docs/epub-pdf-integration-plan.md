@@ -979,3 +979,12 @@ EPUB 以外の台帳・編集行には今回の per-book ガードがない。�
 - 修正 3 の検証: `sibling_zero_file_id_is_unprovable_and_gate_never_deletes` はゼロ ID 判定を外すと失敗した。一時名の除外を外すと `sibling_output_temp_names_are_internal_even_without_hidden_attribute`・実フォルダ走査・一括名前索引の 3 テストが失敗した。保存先共有制限、再読込ハッシュ比較、置換禁止、検証前の作業 PDF 共有制限を個別に外すと、それぞれ `sibling_temp_denies_concurrent_write_until_handle_publish`、`sibling_save_readback_hash_mismatch_removes_temp_without_publishing`、`sibling_handle_publish_never_replaces_pdf_created_after_temp`、`sibling_save_holds_verified_work_file_write_denied_through_publish` が失敗した。復元後、保存関連 67 テストと全 lib 9,323 成功・47 ignored、EPUB worker 43 成功。core check、fmt、glyph lint、`build-dev.ps1` による core・Remote・EPUB worker 配置と PE 依存検査も成功。ビルドの既定待機は別 worktree の MSBuild ノードが残ったため中断し、既存手順の `-WaitForOtherBuildsMinutes 0` で完了した。実 WebView2 の 27 冊再実行と GUI 操作は設計担当の確認待ち。
 - 修正 1 の検証: `cargo test -p mimageviewer --lib` は 9,308 成功・47 ignored、`cargo test -p epub-pdf-worker` は 43 成功。core check、fmt、glyph lint、`build-dev.ps1` による core・Remote・EPUB worker と PE 依存検査も成功した。別 worktree の MSBuild 待機ノードが残ったため、ビルドはスクリプトの `-WaitForOtherBuildsMinutes 0` を指定して実行した。保存先 worker 出力の旧経路は取消テストで失敗し、出力版・起動時回収・モーダルの判定を一時的に外すと対応する 6 テストが失敗した。書名代替値を旧処理へ戻すと `/Title=source` で失敗した。実 WebView2 の 27 冊再実行は設計担当の確認待ち。
 - S5 TODO: 明示保存した PDF と EPUB 内の書誌情報についてプライバシー文言を更新する。`privacy.html` は S3b で編集しない。
+
+### S3b 検収 (2026-09-27)
+
+独立レビュー 4 回目で承認 (`4345f8597`)。1〜3 回目の指摘は修正 1〜3 で対応した。設計判断: 利用者データのコピー範囲は
+mIV の通常のファイルコピーと同じ (しおり・コレクション登録・内容同定は EPUB に残る)。保存は現行出力版の世代だけを再利用し、
+保存先の一時ファイルは乱数名 `.miv-part-<token>.tmp`・ファイル同一性で所有を証明できたものだけを起動後に回収
+(証明できないものは残す)。検証済みの内容を同じハンドルで照合して置換なしで公開する。設計担当の実 WebView2 27 冊変換 (run10):
+状態・ページ数不変、全出力に OPF の書名、`epub.invalid` 0、外部リンク 80 維持。検収時の全ライブラリテスト 9,323 件・変換器
+テスト成功。残る課題: EPUB 内リンクの PDF 内 GoTo 化、EPUB の書誌情報の検索索引。実機確認は未実施。
