@@ -4295,6 +4295,81 @@ mod tests {
     }
 
     #[test]
+    fn exact_plain_file_purge_cannot_delete_later_epub_ledger_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let removed = tmp.path().join("cover.png");
+        std::fs::create_dir(&removed).unwrap();
+        let path = removed.join("book.epub");
+        std::fs::write(&path, b"source").unwrap();
+        let source = ContentIdentitySource::from_path(&path).unwrap();
+        let state = RecordedFileState {
+            file_key: crate::path_key::normalize_keep_drive(&path),
+            size: 6,
+            hashed_mtime: 1,
+        };
+        let db_path = tmp.path().join("content_identity.db");
+        drop(ContentIdentityDb::open_at(&db_path).unwrap());
+
+        let (purge_entered_tx, purge_entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let purge_dir = tmp.path().to_path_buf();
+        let purge = std::thread::spawn(move || {
+            crate::rename_key_migration::purge_exact_identity_with_before_sql_for_test(
+                &purge_dir,
+                &removed,
+                || {
+                    purge_entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        purge_entered_rx.recv().unwrap();
+
+        let (write_entered_tx, write_entered_rx) = std::sync::mpsc::channel();
+        let writer_path = db_path.clone();
+        let writer = std::thread::spawn(move || {
+            let db = ContentIdentityDb::open_at(&writer_path).unwrap();
+            write_if_provenance_valid(
+                &source,
+                || Ok(true),
+                || {
+                    write_entered_tx.send(()).unwrap();
+                },
+                || {
+                    db.upsert(
+                        &source,
+                        &state,
+                        "head",
+                        "full",
+                        1,
+                        ObservationRole::DetectionCache,
+                    )
+                },
+            )
+            .unwrap();
+        });
+        let wrote_during_purge = write_entered_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok();
+        release_tx.send(()).unwrap();
+        let report = purge.join().unwrap();
+        writer.join().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            !wrote_during_purge,
+            "an Exact delete also covers key/slash EPUB descendants"
+        );
+        assert!(
+            ContentIdentityDb::open_at(&db_path)
+                .unwrap()
+                .ledger_entry(&crate::path_key::normalize_keep_drive(&path))
+                .unwrap()
+                .is_some(),
+            "the post-purge ledger write must survive"
+        );
+    }
+
+    #[test]
     fn epub_stage0_detection_does_not_write_source_hash_after_pin() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("stage0.epub");

@@ -1298,18 +1298,20 @@ fn send_pinned_child_folder_cached(
     let Ok(Some(entry)) = catalog.load_one(&key) else {
         return false;
     };
+    if provenance == crate::catalog::FolderThumbProvenance::AutoSelected {
+        // The ordinary child-folder read owns auto-row proof validation:
+        // winner state, pin revision, and every folder/catalog dependency.
+        let mut child_request = req.clone();
+        child_request.path = child;
+        child_request.cache_key_override = Some(key.clone());
+        child_request.folder_thumb_provenance = Some(provenance);
+        if !folder_cached_row_usable(&child_request, &entry, pin_db) {
+            return false;
+        }
+    }
     if let Some(target) = resolved.as_ref() {
         let (mtime, size) = generation.unwrap_or((target.mtime, target.file_size));
         if entry.mtime != mtime || entry.file_size != size {
-            return false;
-        }
-    } else if let Some(proof) = entry.selection_proof.as_ref()
-        && is_epub_path(&proof.winner.path)
-    {
-        let Ok(read) = crate::pdf_loader::resolve_read_target(&proof.winner.path) else {
-            return false;
-        };
-        if read.stamp.generation_catalog_pair() != Some((entry.mtime, entry.file_size)) {
             return false;
         }
     }

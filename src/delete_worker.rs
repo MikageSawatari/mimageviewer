@@ -1086,7 +1086,7 @@ mod worker_tests {
     }
 
     #[test]
-    fn delete_worker_passes_exact_and_tree_scope_to_epub_ledger_guard() {
+    fn delete_worker_guards_exact_descendants_without_waiting_for_unrelated_keys() {
         let temp = tempfile::tempdir().unwrap();
         let conn = rusqlite::Connection::open(temp.path().join("content_identity.db")).unwrap();
         conn.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)")
@@ -1143,14 +1143,31 @@ mod worker_tests {
 
         let file = temp.path().join("cover.png");
         let (holder, release) = hold(file.join("child.epub"));
-        let (worker, done) = run(DeleteSourceScope::Exact(file));
-        let exact_finished = done.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+        let (worker, done) = run(DeleteSourceScope::Exact(temp.path().join("other.png")));
+        let unrelated_finished = done.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
         release.send(()).unwrap();
         holder.join().unwrap();
         worker.join().unwrap();
         assert!(
-            exact_finished,
-            "a non-EPUB file must not wait on EPUB range coverage"
+            unrelated_finished,
+            "a non-overlapping Exact delete must not wait"
+        );
+
+        let (holder, release) = hold(file.join("child.epub"));
+        let (worker, done) = run(DeleteSourceScope::Exact(file));
+        let exact_finished_early = done
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        release.send(()).unwrap();
+        if !exact_finished_early {
+            done.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            !exact_finished_early,
+            "an Exact delete must cover its slash descendants"
         );
 
         let folder = temp.path().join("deleted.books.v2");

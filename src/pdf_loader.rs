@@ -191,18 +191,72 @@ static EPUB_PIN_COORD: OnceLock<(Mutex<EpubPinCoordState>, Condvar)> = OnceLock:
 #[derive(Default)]
 struct EpubPinCoordState {
     active_books: HashMap<String, usize>,
-    active_range: Option<Vec<String>>,
+    active_ranges: Vec<(u64, Vec<EpubKeyMatch>)>,
+    next_range_id: u64,
 }
 
 fn epub_pin_coord() -> &'static (Mutex<EpubPinCoordState>, Condvar) {
     EPUB_PIN_COORD.get_or_init(|| (Mutex::new(EpubPinCoordState::default()), Condvar::new()))
 }
 
-fn key_is_within(key: &str, root: &str) -> bool {
-    key == root
-        || key
-            .strip_prefix(root)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+#[derive(Clone, Debug)]
+enum EpubKeyMatch {
+    Exact(String),
+    Prefix(String),
+}
+
+impl EpubKeyMatch {
+    fn contains(&self, key: &str) -> bool {
+        match self {
+            Self::Exact(exact) => key == exact,
+            Self::Prefix(prefix) => key.starts_with(prefix),
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Exact(a), Self::Exact(b)) => a == b,
+            (Self::Exact(exact), Self::Prefix(prefix))
+            | (Self::Prefix(prefix), Self::Exact(exact)) => exact.starts_with(prefix),
+            (Self::Prefix(a), Self::Prefix(b)) => a.starts_with(b) || b.starts_with(a),
+        }
+    }
+}
+
+/// The exact normalized ledger keys a store operation may read or write.
+/// SQL's `key/…` and `key::…` families are distinct from the exact key.
+pub(crate) enum EpubPinCoverage {
+    Exact(PathBuf),
+    PathAndDescendants(PathBuf),
+    VirtualDescendants(PathBuf),
+}
+
+impl EpubPinCoverage {
+    fn append_matches(&self, result: &mut Vec<EpubKeyMatch>) {
+        let (path, exact, slash, virtual_entries) = match self {
+            Self::Exact(path) => (path, true, false, false),
+            Self::PathAndDescendants(path) => (path, true, true, true),
+            Self::VirtualDescendants(path) => (path, false, false, true),
+        };
+        let key = epub_cache::src_key(path);
+        if key.is_empty() {
+            return;
+        }
+        if exact {
+            result.push(EpubKeyMatch::Exact(key.clone()));
+        }
+        if slash {
+            result.push(EpubKeyMatch::Prefix(format!("{key}/")));
+        }
+        if virtual_entries {
+            result.push(EpubKeyMatch::Prefix(format!("{key}::")));
+        }
+    }
+}
+
+fn ranges_overlap(a: &[EpubKeyMatch], b: &[EpubKeyMatch]) -> bool {
+    a.iter()
+        .any(|left| b.iter().any(|right| left.overlaps(right)))
 }
 
 struct EpubBookLease(String);
@@ -231,9 +285,9 @@ fn enter_epub_book(key: &str) -> EpubBookLease {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     while state
-        .active_range
-        .as_ref()
-        .is_some_and(|roots| roots.iter().any(|root| key_is_within(key, root)))
+        .active_ranges
+        .iter()
+        .any(|(_, range)| range.iter().any(|member| member.contains(key)))
     {
         state = changed
             .wait(state)
@@ -243,7 +297,7 @@ fn enter_epub_book(key: &str) -> EpubBookLease {
     EpubBookLease(key.to_owned())
 }
 
-struct EpubRangeLease;
+struct EpubRangeLease(u64);
 
 impl Drop for EpubRangeLease {
     fn drop(&mut self) {
@@ -251,39 +305,59 @@ impl Drop for EpubRangeLease {
         let mut state = mutex
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.active_range = None;
+        state.active_ranges.retain(|(id, _)| *id != self.0);
         changed.notify_all();
     }
 }
 
-/// Generic rename/copy/purge transactions may rewrite a whole folder of EPUB
-/// ledger keys. A range lease blocks only books below those paths, not unrelated
-/// books. Never invoke this while holding an individual book guard.
+/// A store operation may rewrite exact keys, slash descendants and virtual
+/// entries below these paths. Only overlapping leases and books wait. Never
+/// invoke this while holding an individual book guard.
 pub(crate) fn with_epub_pin_coverage<T>(paths: &[PathBuf], action: impl FnOnce() -> T) -> T {
-    let roots = paths
+    let coverage = paths
         .iter()
-        .map(|path| epub_cache::src_key(path))
+        .cloned()
+        .map(EpubPinCoverage::PathAndDescendants)
         .collect::<Vec<_>>();
-    if roots.is_empty() {
+    with_epub_pin_ranges(&coverage, action)
+}
+
+pub(crate) fn with_epub_pin_ranges<T>(
+    coverage: &[EpubPinCoverage],
+    action: impl FnOnce() -> T,
+) -> T {
+    let mut range = Vec::new();
+    for item in coverage {
+        item.append_matches(&mut range);
+    }
+    if range.is_empty() {
         return action();
     }
     let (mutex, changed) = epub_pin_coord();
     let mut state = mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    while state.active_range.is_some()
+    while state
+        .active_ranges
+        .iter()
+        .any(|(_, active)| ranges_overlap(&range, active))
         || state
             .active_books
             .keys()
-            .any(|book| roots.iter().any(|root| key_is_within(book, root)))
+            .any(|book| range.iter().any(|member| member.contains(book)))
     {
         state = changed
             .wait(state)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
-    state.active_range = Some(roots);
+    state.next_range_id = state
+        .next_range_id
+        .checked_add(1)
+        .expect("range ID exhausted");
+    let id = state.next_range_id;
+    state.active_ranges.push((id, range));
     drop(state);
-    let _lease = EpubRangeLease;
+    let _lease = EpubRangeLease(id);
     action()
 }
 
@@ -5916,6 +5990,92 @@ mod tests {
             .unwrap();
         holder.join().unwrap();
         migrator.join().unwrap();
+    }
+
+    #[test]
+    fn epub_ledger_key_ranges_normalize_case_and_separators() {
+        let mut range = Vec::new();
+        EpubPinCoverage::PathAndDescendants(PathBuf::from(r"C:\Books\Cover.PNG"))
+            .append_matches(&mut range);
+        assert!(
+            range
+                .iter()
+                .any(|member| member.contains("c:/books/cover.png"))
+        );
+        assert!(
+            range
+                .iter()
+                .any(|member| member.contains("c:/books/cover.png/book.epub"))
+        );
+        assert!(
+            range
+                .iter()
+                .any(|member| member.contains("c:/books/cover.png::page_0"))
+        );
+        assert!(
+            !range
+                .iter()
+                .any(|member| member.contains("c:/books/cover.pngx/book.epub"))
+        );
+    }
+
+    #[test]
+    fn nonoverlapping_epub_ledger_ranges_run_concurrently() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            with_epub_pin_coverage(&[first], || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        ready_rx.recv().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let second_range = std::thread::spawn(move || {
+            with_epub_pin_coverage(&[second], || entered_tx.send(()).unwrap());
+        });
+        let entered_before_release = entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        second_range.join().unwrap();
+        assert!(entered_before_release, "unrelated ranges must not wait");
+    }
+
+    #[test]
+    fn overlapping_epub_ledger_ranges_wait_for_each_other() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("cover.png");
+        let nested = first.join("book.epub");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            with_epub_pin_coverage(&[first], || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        ready_rx.recv().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let second_range = std::thread::spawn(move || {
+            with_epub_pin_coverage(&[nested], || entered_tx.send(()).unwrap());
+        });
+        let entered_before_release = entered_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        release_tx.send(()).unwrap();
+        if !entered_before_release {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        holder.join().unwrap();
+        second_range.join().unwrap();
+        assert!(!entered_before_release, "overlapping ranges must wait");
     }
 
     #[test]

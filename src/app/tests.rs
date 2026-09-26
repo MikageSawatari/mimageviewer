@@ -12670,6 +12670,10 @@ mod phase_c_key_tests {
         let drive = app.tmp.path().join("drive-missing-child-pin");
         let child = drive.join("child");
         std::fs::create_dir_all(&child).unwrap();
+        let winner = child.join("cover.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([17, 54, 91, 255]))
+            .save(&winner)
+            .unwrap();
         app.folder_thumb_pin_db
             .as_ref()
             .unwrap()
@@ -12689,21 +12693,47 @@ mod phase_c_key_tests {
             crate::catalog::FolderThumbProvenance::AutoSelected,
         )
         .unwrap();
-        let mut webp = Vec::new();
-        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            4,
-            4,
-            image::Rgba([17, 54, 91, 255]),
-        ))
-        .write_to(
-            &mut std::io::Cursor::new(&mut webp),
-            image::ImageFormat::WebP,
-        )
-        .unwrap();
-        crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &drive)
-            .unwrap()
-            .save(&base_key, 1, 4, 4, 4, None, &webp)
-            .unwrap();
+        let parent = std::sync::Arc::new(
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &drive).unwrap(),
+        );
+        let writer_request = LoadRequest {
+            path: child.clone(),
+            mtime: crate::ui_helpers::mtime_secs(&std::fs::metadata(&child).unwrap()),
+            file_size: 0,
+            cache_key_override: Some(base_key.clone()),
+            folder_thumb_sort: Some(app.settings.folder_thumb_sort),
+            folder_thumb_depth: app.settings.folder_thumb_depth,
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            force_cache: true,
+            ..Default::default()
+        };
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        crate::thumb_loader::process_load_request(
+            &writer_request,
+            &std::sync::RwLock::new(std::collections::HashMap::new()),
+            &writer_tx,
+            Some(&parent),
+            64,
+            75,
+            64,
+            CacheDecision::without_thumbnail(),
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &std::sync::Arc::new(AtomicUsize::new(0)),
+            &std::sync::Arc::new(AtomicUsize::new(1)),
+            None,
+            app.folder_thumb_pin_db.as_deref(),
+            None,
+            None,
+        );
+        assert!(writer_rx.try_iter().any(|msg| msg.image.is_some()));
+        let row = parent.load_one(&base_key).unwrap().unwrap();
+        assert_eq!(
+            row.folder_provenance,
+            Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+        );
+        assert_eq!(row.selection_proof.as_ref().unwrap().winner.path, winner);
         let root_pin = crate::folder_thumb_pins::FolderPinSource::File {
             rel: "child".into(),
             kind: crate::folder_thumb_pins::FileKind::Folder,
@@ -12721,27 +12751,38 @@ mod phase_c_key_tests {
             app.folder_thumb_pin_db.as_deref(),
         )
         .unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        crate::thumb_loader::process_load_request(
-            &req,
-            &std::sync::RwLock::new(std::collections::HashMap::new()),
-            &tx,
-            None,
-            64,
-            75,
-            64,
-            CacheDecision::without_thumbnail(),
-            &std::sync::Arc::new(AtomicUsize::new(0)),
-            &std::sync::Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
-            None,
-            &std::sync::Arc::new(AtomicUsize::new(0)),
-            &std::sync::Arc::new(AtomicUsize::new(1)),
-            None,
-            app.folder_thumb_pin_db.as_deref(),
-            None,
-            None,
+        let load = || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::thumb_loader::process_load_request(
+                &req,
+                &std::sync::RwLock::new(std::collections::HashMap::new()),
+                &tx,
+                None,
+                64,
+                75,
+                64,
+                CacheDecision::without_thumbnail(),
+                &std::sync::Arc::new(AtomicUsize::new(0)),
+                &std::sync::Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+                None,
+                &std::sync::Arc::new(AtomicUsize::new(0)),
+                &std::sync::Arc::new(AtomicUsize::new(1)),
+                None,
+                app.folder_thumb_pin_db.as_deref(),
+                None,
+                None,
+            );
+            rx.try_iter().collect::<Vec<_>>()
+        };
+        assert!(load()[0].image.is_some(), "valid auto row must be shown");
+        std::fs::remove_file(&winner).unwrap();
+        let stale = load();
+        assert!(stale.iter().all(|msg| msg.image.is_none()));
+        assert!(
+            stale.iter().any(|msg| {
+                msg.origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildMiss
+            })
         );
-        assert_eq!(rx.try_recv().unwrap().image.unwrap().pixels[0].r(), 17);
     }
 
     #[test]
