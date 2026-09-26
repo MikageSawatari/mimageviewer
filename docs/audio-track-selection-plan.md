@@ -781,7 +781,7 @@ Remote で続きを見るときも、同じトラックで始める。
   ffmpeg の lavfi だけで作る (私有素材を使わない):
   - `multi.mkv`: testsrc2 映像 6 秒 + 音声 3 本。周波数で識別できる sine
     (440 Hz / 880 Hz / 1320 Hz)、channels (2 / 6 / 1)、sample rate (48000 / 44100 / 32000)、codec
-    (aac / ac3 / opus)、language (jpn / eng / 無し)、title (有 / 有 / 無し)、disposition default は 2 本目。
+    (aac / ac3 / flac。Opus は仕様上 48 kHz 固定で 32 kHz を作れないため flac)、language (jpn / eng / 無し)、title (有 / 有 / 無し)、disposition default は 2 本目。
   - `single.mp4` (音声 1 本)、`silent.mp4` (音声なし)。
   - サイズは各 数百 KB 以下。`.gitignore` の `/testdata/*` に `!/testdata/audio-tracks/` を加えて追跡する。
 - `VideoInfo.audio_tracks` / `default_audio_stream_index` の列挙。
