@@ -96,7 +96,7 @@ C を採用する理由:
 pub struct AudioTrackInfo {
     /// AVStream index。選択 command と routing の同一性に使う唯一の key。
     pub stream_index: usize,
-    /// 音声 stream の中での 1 始まりの順番 (表示用)。
+    /// 音声 stream の中での 1 始まりの順番 (表示用。decoder の無い stream も数える = 他のプレイヤーの番号と揃う)。
     pub ordinal: usize,
     /// metadata "language"。無い / "und" / 空は None。
     pub language: Option<String>,

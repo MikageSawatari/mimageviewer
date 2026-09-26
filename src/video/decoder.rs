@@ -1508,6 +1508,26 @@ impl DeinterlaceStatusSnapshot {
     }
 }
 
+/// Open 時に demux が列挙した、decoder のある音声 stream。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioTrackInfo {
+    /// AVStream index。選択と packet routing の key。
+    pub stream_index: usize,
+    /// 音声 stream 中の 1 始まりの順番 (再生不可の stream も数える)。
+    pub ordinal: usize,
+    /// metadata の language。未指定、空、und は None。
+    pub language: Option<String>,
+    /// metadata の title。handler_name 等からは推測しない。
+    pub title: Option<String>,
+    /// decoder 名ではなく codec 名。
+    pub codec: String,
+    /// codecpar の値。0 は未知として None。
+    pub channels: Option<u32>,
+    pub sample_rate: Option<u32>,
+    /// AV_DISPOSITION_DEFAULT が立っているか。
+    pub disposition_default: bool,
+}
+
 /// デコード開始時に分かる動画情報。UI の HUD で利用。
 #[derive(Clone, Debug)]
 pub struct VideoInfo {
@@ -1527,6 +1547,12 @@ pub struct VideoInfo {
     /// 0 のときは未知 (Opus / FLAC や VBR 設定でコンテナに記録されていないケース)。
     pub audio_bit_rate_bps: i64,
     pub has_audio: bool,
+    /// decoder が見つかる音声 stream のみを stream 順に列挙。
+    pub audio_tracks: Vec<AudioTrackInfo>,
+    /// 常に best(Audio) の stream index。開けたかどうかとは独立。
+    pub default_audio_stream_index: Option<usize>,
+    /// demux が open 時に実際に開いた stream。音声出力 device の成否とは独立。
+    pub opened_audio_stream_index: Option<usize>,
     /// timed playable video stream を持つか。audio-only ファイル (映像トラック無し /
     /// 添付画像 = cover art のみ) では false。false のとき width/height/avg_fps は 0、
     /// video_codec/video_decoder は "none"。engine 側の readiness gate
@@ -1809,6 +1835,48 @@ fn send_video_info(
     }
 }
 
+/// Input の stream metadata だけを読む。音声 setup / 出力 device には触れない。
+fn enumerate_audio_tracks(input: &ffmpeg_the_third::format::context::Input) -> Vec<AudioTrackInfo> {
+    use ffmpeg_the_third::codec::decoder;
+    use ffmpeg_the_third::format::stream::Disposition;
+    use ffmpeg_the_third::media::Type as MediaType;
+
+    let mut audio_ordinal = 0;
+    input
+        .streams()
+        .filter_map(|stream| {
+            let params = stream.parameters();
+            if params.medium() != MediaType::Audio {
+                return None;
+            }
+            audio_ordinal += 1;
+            let codec_id = params.id();
+            decoder::find(codec_id)?;
+            let metadata = stream.metadata();
+            let language = metadata
+                .get("language")
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("und"))
+                .map(str::to_owned);
+            let title = metadata
+                .get("title")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            Some(AudioTrackInfo {
+                stream_index: stream.index(),
+                ordinal: audio_ordinal,
+                language,
+                title,
+                codec: codec_id.name().to_owned(),
+                channels: Some(params.ch_layout().channels()).filter(|&value| value != 0),
+                sample_rate: Some(params.sample_rate()).filter(|&value| value != 0),
+                disposition_default: stream.disposition().contains(Disposition::DEFAULT),
+            })
+        })
+        .collect()
+}
+
 /// 動画オープン (= prepare) フェーズ中だけ demux thread の CPU 優先度を
 /// `THREAD_PRIORITY_ABOVE_NORMAL` に上げる RAII ガード。Drop で元の優先度に戻す。
 ///
@@ -2005,6 +2073,8 @@ fn run_decoder(
         open_phase_t0.elapsed().as_secs_f64() * 1000.0
     ));
 
+    let audio_tracks = enumerate_audio_tracks(&input);
+
     // ── 動画ストリーム選択 (任意) ──
     //
     // audio-only 対応 (2026-07-02): 映像トラックが無ければ `None` (= 素の音声ファイル)。
@@ -2189,7 +2259,9 @@ fn run_decoder(
     let has_video = video_setup.is_some();
 
     // ── 音声ストリーム選択 (任意) ──
-    let audio_setup = match input.streams().best(MediaType::Audio) {
+    let selected_audio_stream = input.streams().best(MediaType::Audio);
+    let default_audio_stream_index = selected_audio_stream.as_ref().map(|s| s.index());
+    let audio_setup = match selected_audio_stream {
         Some(audio_stream) => {
             let idx = audio_stream.index();
             let tb = audio_stream.time_base();
@@ -2305,6 +2377,7 @@ fn run_decoder(
     };
 
     let has_audio = audio_setup.is_some();
+    let opened_audio_stream_index = audio_setup.as_ref().map(|setup| setup.stream_idx);
     if !has_audio {
         // 音声無し動画: 最初から fallback wall clock を使う
         clock.mark_audio_inactive();
@@ -2459,6 +2532,9 @@ fn run_decoder(
         audio_codec: audio_setup.as_ref().map(|a| a.codec_name.clone()),
         audio_bit_rate_bps: audio_setup.as_ref().map(|a| a.bit_rate_bps).unwrap_or(0),
         has_audio,
+        audio_tracks,
+        default_audio_stream_index,
+        opened_audio_stream_index,
         has_video,
         hw_decode_active: vi_hw_active,
         gpu_path_active,
@@ -7997,6 +8073,136 @@ fn try_gpu_blit_path(
         pts_secs,
         seek_serial: current_seek_serial,
     })
+}
+
+#[cfg(test)]
+mod audio_track_fixture_tests {
+    use super::{AudioTrackInfo, VideoInfo, enumerate_audio_tracks, spawn};
+    use crate::video::clock::AvClock;
+    use crate::video::engine::actor::state_code;
+    use crate::video::{EngineEventSender, VideoUiWake};
+    use crossbeam_channel::bounded;
+    use ffmpeg_the_third::media::Type as MediaType;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    fn fixture_path(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks")
+            .join(name)
+    }
+
+    fn open_fixture_info(name: &str) -> VideoInfo {
+        let path = fixture_path(name);
+        let input = ffmpeg_the_third::format::input(&path).expect("open committed fixture");
+        let tracks = enumerate_audio_tracks(&input);
+        let default_index = input.streams().best(MediaType::Audio).map(|s| s.index());
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, seek_serial));
+        let (event_tx, _event_rx) = bounded(64);
+        let engine_event_tx = EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default()));
+        let handles = spawn(
+            path,
+            clock,
+            Arc::clone(&cancel),
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            engine_event_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::VideoDynamicState::default()),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("demux info timeout")
+            .expect("demux open failed");
+        cancel.store(true, Ordering::Release);
+        drop(handles);
+
+        // Both the isolated Input reader and demux's published VideoInfo must agree.
+        assert_eq!(info.audio_tracks, tracks);
+        assert_eq!(info.default_audio_stream_index, default_index);
+        info
+    }
+
+    #[test]
+    fn multi_mkv_lists_three_audio_tracks_and_opens_best() {
+        let info = open_fixture_info("multi.mkv");
+        assert_eq!(
+            info.audio_tracks,
+            vec![
+                AudioTrackInfo {
+                    stream_index: 1,
+                    ordinal: 1,
+                    language: Some("jpn".into()),
+                    title: Some("日本語 440Hz".into()),
+                    codec: "aac".into(),
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    disposition_default: false,
+                },
+                AudioTrackInfo {
+                    stream_index: 2,
+                    ordinal: 2,
+                    language: Some("eng".into()),
+                    title: Some("English 880Hz".into()),
+                    codec: "ac3".into(),
+                    channels: Some(6),
+                    sample_rate: Some(44_100),
+                    disposition_default: true,
+                },
+                AudioTrackInfo {
+                    stream_index: 3,
+                    ordinal: 3,
+                    language: None,
+                    title: None,
+                    codec: "flac".into(),
+                    channels: Some(1),
+                    sample_rate: Some(32_000),
+                    disposition_default: false,
+                },
+            ]
+        );
+        assert_eq!(info.default_audio_stream_index, Some(2));
+        assert_eq!(info.opened_audio_stream_index, Some(2));
+        assert_eq!(info.audio_codec.as_deref(), Some("ac3"));
+        assert!(info.has_audio);
+    }
+
+    #[test]
+    fn single_mp4_lists_and_opens_its_only_audio_track() {
+        let info = open_fixture_info("single.mp4");
+        assert_eq!(info.audio_tracks.len(), 1);
+        let track = &info.audio_tracks[0];
+        assert_eq!(track.stream_index, 1);
+        assert_eq!(track.ordinal, 1);
+        assert_eq!(track.language, None);
+        assert_eq!(track.title, None);
+        assert_eq!(track.codec, "aac");
+        assert_eq!(track.channels, Some(1));
+        assert_eq!(track.sample_rate, Some(48_000));
+        assert!(track.disposition_default);
+        assert_eq!(info.default_audio_stream_index, Some(1));
+        assert_eq!(info.opened_audio_stream_index, Some(1));
+        assert!(info.has_audio);
+    }
+
+    #[test]
+    fn silent_mp4_has_no_audio_tracks_or_opened_audio() {
+        let info = open_fixture_info("silent.mp4");
+        assert!(info.audio_tracks.is_empty());
+        assert_eq!(info.default_audio_stream_index, None);
+        assert_eq!(info.opened_audio_stream_index, None);
+        assert!(!info.has_audio);
+    }
 }
 
 #[cfg(test)]
