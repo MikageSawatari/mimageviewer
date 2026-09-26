@@ -566,7 +566,7 @@ stem を大文字小文字を区別せず比較する。設定は `settings_kv` 
 | `search_walker.rs:313` | Ctrl+G の初回走査候補か | (a) `new_files_go_to_ingest` (EPUB を追加した混在 fixture) |
 | `indexer_supervisor.rs:928` | Ctrl+G の差分更新候補か | (a) `build_candidate_from_path_rejects_zip` の EPUB assertion |
 | `metadata_transfer.rs:1422` | 持ち運び用メタデータの本 / ページ種別か | (a) `epub_transfer_uses_paged_book_metadata_kind` |
-| `snapshot.rs:238` | フルスクリーンの擬似パスを本 / ZIP の所有者と内側ページへ分けるか | (a) component ごとの拡張子を `is_paged_document_path` で判定。`split_archive_path_detects_epub_page_at_component_boundary` と実ナビ `snapshot_epub_page_list_navigates_from_current_page` |
+| `snapshot.rs:238` | フルスクリーンの擬似パスを本 / ZIP の所有者と内側ページへ分けるか | (a) 末尾の `p:N` の直前だけを `is_paged_document_path` で判定。ZIP / CBZ は従来どおり最も外側。`split_archive_path_uses_the_book_immediately_before_the_page`、実ナビ `snapshot_pdf_pages_inside_epub_named_folder_keep_their_owner` |
 | `app/snapshot_ops.rs:1206,1231,2132` | 現在の PDF / EPUB ページから★固定リストの所有行を得るか | (a) `PdfPage` の擬似パスは Windows の `p:` ドライブ解釈を避けて構築し、上記の実ナビテストで検証 |
 | `global_search_ui.rs:647` / `zip_loader.rs:964` | ZIP hit の専用区切り / ネスト ZIP entry の区切りか | (d) 前者は U+001F、後者は ZIP / CBZ の内側専用。PDF / EPUB の擬似パスは受け取らないため変更不要 |
 | `ingest_worker.rs:347` / `app/metadata_ops.rs:1959` | PDF Info と EPUB の内部タイトル・著者を検索するか | (d) EPUB は元ファイル名だけ。`ingest_converted_epub_uses_filename_without_generated_pdf_metadata`、`current_folder_filter_searches_epub_name_but_not_generated_pdf_info` |
@@ -605,14 +605,6 @@ D5 の通常一覧 / ツリーのフィルタを無効化して重複表示を�
 両方を直し、擬似パスの分割は本 / ZIP の component の拡張子で型判定する。同類の splitter は
 上表の ZIP 専用 2 箇所だけで、EPUB ページは受け取らない。
 
-公開済み検索ストアの互換性判断: **`fts_meta::INDEX_VERSION` は 10 のまま**。
-Ctrl+S は従来の `PdfFile`、Ctrl+G は従来の `Pdf` kind で EPUB の新規行だけを追加し、
-既存行・schema は変えないため移行も全件再構築も不要。v4.1.0 のコードで戻り動作を確認した。
-Ctrl+S は EPUB 行を本タイルに戻すが、開くと旧 `.pdf` 限定判定から通常ディレクトリ走査へ進み、
-読取失敗を表示する。Ctrl+G は旧拡張子分類で画像タイルになり、画像読取エラーになる。
-どちらも元 EPUB や利用者データへの書込・自動再試行を行わない。旧版から EPUB の新規行は
-開けないが、既存行は不変。詳細は `docs/search-architecture.md` §3。
-
 EPUB の検索語は元ファイル名のみ、結果の同定パスは元 EPUB。内部のタイトル・著者や変換後 PDF の
 Info 辞書は索引も Ctrl+F も対象外にする。取込は EPUB を先に明示分岐し、未変換を失敗ログにしない。
 PDF の Info 読取分岐は維持する。外部アプリの関連付け候補には `.epub` を追加した。
@@ -622,6 +614,28 @@ PDF の Info 読取分岐は維持する。外部アプリの関連付け候補�
 `PathBuf::push("p:1")` を戻しても実ナビが失敗した。取込と Ctrl+F の EPUB 専用分岐をそれぞれ
 無効にすると、生成 PDF にだけあるタイトルがヒットして失敗した。関連付け候補から EPUB を外すと
 初期値が JPG に戻って失敗した。差し替えたファイルはすべて元のバイト列へ復元した。
+
+#### S3a 独立レビュー修正 2
+
+`.epub` / `.pdf` で終わる実フォルダー内の本では、左側から最初に見つけた拡張子は
+本の境界ではない。`p:N` を右端で確認し、その直前の component だけを PDF / EPUB の本とする。
+`shelf.epub/book.pdf/p:1`、`shelf.pdf/book.epub/p:1`、`book.epub/p:1` を分割テストで検証し、
+最初の経路は★固定ページ一覧の実ナビテストでも検証した。最初の経路の両テストは
+`1c36286b3` の分割実装へ戻すと所有者の assertion で失敗した。ZIP / CBZ 内画像は最も外側で
+分ける従来の規則を維持する。
+
+公開済み検索ストアの互換性判断: **`fts_meta::INDEX_VERSION` は 10 のまま**。
+Ctrl+S は従来の `PdfFile`、Ctrl+G は従来の `Pdf` kind で EPUB の新規行だけを追加し、
+既存行・schema は変えないため移行も全件再構築も不要。v4.1.0 のコードで戻り動作を確認した。
+Ctrl+S に残った EPUB 行は本タイルになるが、開くと旧 `.pdf` 限定判定から通常ディレクトリ走査へ進み、
+読取失敗を表示する。Ctrl+G の EPUB 行は旧拡張子分類で画像タイルになり、クリックすると画像読取に
+失敗する。**その失敗より前に**旧 `open_fullscreen` が `record_book_resume` を呼び、検索元フォルダーの
+読書位置を `book_resume.db` に上書きし得る。旧版の索引走査は EPUB を候補から外して行を削除する。
+現行版に戻すと次の走査で EPUB を候補に含め、欠けた Ctrl+G 行は `search_walker::scan` →
+`IngestSession::apply`、Ctrl+S 行は `name_bulk_indexer` が再登録する。版上げ無しで復旧することを
+現行コードと既存の `new_files_go_to_ingest` / 名前索引の EPUB テストで確認した。
+全利用者へ強制再構築を課すより稀なダウングレード時のこの制約を受け入れる。詳細は
+`docs/search-architecture.md` §3。
 
 ### S1 変換器の仕上げ (2026-09-25、**独立レビュー 4 回目で承認**)
 

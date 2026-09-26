@@ -150,12 +150,19 @@ Ctrl+S の EPUB は既存の `search_index.db` の `PdfFile`、Ctrl+G の EPUB �
 変えず、`fts_meta::INDEX_VERSION` は 10 のままにする。全利用者へ索引再構築を強制しない。
 前方互換では新しい EPUB 行だけが増え、移行は不要。
 
-旧 v4.1.0 へ戻したときの読取経路も確認した。Ctrl+S は `PdfFile` 行を本タイルとして復元するが、
-開くと旧 `load_folder_with_scan_claimed` が `.epub` を PDF 仮想フォルダーと判定せず、
-通常ディレクトリ走査のエラーを表示する。元ファイルと利用者データへの書込はない。
-Ctrl+G は `Pdf` 行のパスを旧 `grid_item_from_fs_hit_path` で再分類するため、EPUB は画像タイルに
-なり、画像として開くと読み込みエラーになる。この差は表示だけで、変換・元ファイルへの書込や
-自動再試行は起きない。旧版へのロールバック時の EPUB 行は利用できないが、既存行は変わらない。
+v4.1.0 へ戻すと、残っている Ctrl+G の `Pdf` 行は旧 `grid_item_from_fs_hit_path` で
+**画像タイル**に再分類される。クリックすると画像としての読込に失敗するが、その前に
+`open_fullscreen` が `record_book_resume` を呼ぶ。読書位置の記録が有効なら、検索元フォルダーの
+保存済み位置を `book_resume.db` で上書きし得る。これは表示だけの差ではない。
+Ctrl+S に `PdfFile` 行が残っている間は本タイルとして表示されるが、開くと旧版の `.pdf` 限定判定を
+通らず通常ディレクトリ走査のエラーになる。
+
+旧版の索引走査は `.epub` を候補に含めないため、後続の差分処理で新しい EPUB 行を削除する。
+現行版へ戻した後は、`search_walker::walk_dir_recursive` が EPUB を `CandidateKind::Pdf` として集め、
+DB に行が無ければ `scan` が `to_ingest` に入れ、`IngestSession::apply` が同じ `Pdf` kind で再登録する。
+Ctrl+S も `name_bulk_indexer::classify_name_index_kind` が EPUB を `PdfFile` として次の走査で再登録する。
+`INDEX_VERSION` を上げなくても復旧する。索引の再登録は対象のお気に入りの次の走査時であり、
+利用者ごとの自動索引設定で走査が無効なら、その設定に従う。
 
 ---
 

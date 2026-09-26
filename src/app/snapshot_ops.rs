@@ -2943,6 +2943,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn snapshot_pdf_pages_inside_epub_named_folder_keep_their_owner() {
+        let ctx = egui::Context::default();
+        let book = PathBuf::from(r"E:\test\shelf.epub\book.pdf");
+        let mut app = test_app_with_items(
+            (0..3)
+                .map(|page_num| GridItem::PdfPage {
+                    pdf_path: book.clone(),
+                    page_num,
+                    content_type: None,
+                })
+                .collect(),
+        );
+        app.current_folder = Some(book);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen));
+        assert_eq!(
+            app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
+            Some(1),
+        );
+        assert!(app.snapshot_navigate(
+            &ctx,
+            true,
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert_eq!(app.fullscreen_idx, Some(2));
+    }
+
     /// Codex follow-up (スライドショー経路): snapshot スライドショーの直接 leaf 送りでも
     /// nav lock が解除されること。`snapshot_advance_for_slideshow` も fullscreen から holdover
     /// を取って呼ばれるので、手動 Ctrl+↑↓ と同じ wrapper で release する。

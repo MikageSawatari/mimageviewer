@@ -238,17 +238,26 @@ mod unc_tests {
 pub fn split_archive_path(path: &Path) -> Option<(PathBuf, String)> {
     // forward slash 統一 (= 検索しやすくするため)
     let unified = path.to_string_lossy().replace('\\', "/");
-    // 各 component の末尾を型で調べ、ネストしていても最も外側の本/書庫で分割する。
-    // 名前の途中に `.pdf` などが含まれるだけのフォルダーは境界にしない。
+    // PDF / EPUB のページは末尾の `p:<u32>` の直前だけが本。
+    // それより前の `.pdf` / `.epub` は実フォルダー名かもしれない。
+    if let Some((book, page)) = unified.rsplit_once('/') {
+        if page
+            .strip_prefix("p:")
+            .and_then(|number| number.parse::<u32>().ok())
+            .is_some()
+            && crate::folder_tree::is_paged_document_path(Path::new(book))
+        {
+            return Some((PathBuf::from(book), page.to_string()));
+        }
+    }
+    // ZIP / CBZ 内の画像は従来どおり最も外側の書庫で分割する。
     unified.match_indices('/').find_map(|(idx, _)| {
         let container = Path::new(&unified[..idx]);
         let is_zip = container
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| crate::folder_tree::is_zip_extension(&ext.to_ascii_lowercase()));
-        if (is_zip || crate::folder_tree::is_paged_document_path(container))
-            && idx + 1 < unified.len()
-        {
+        if is_zip && idx + 1 < unified.len() {
             Some((container.to_path_buf(), unified[idx + 1..].to_string()))
         } else {
             None
@@ -637,6 +646,19 @@ mod tests {
         assert_eq!(container, PathBuf::from(r"E:\book.EPUB"));
         assert_eq!(inner, "p:2");
         assert!(split_archive_path(Path::new(r"E:\book.epub.notes\p:2")).is_none());
+    }
+
+    #[test]
+    fn split_archive_path_uses_the_book_immediately_before_the_page() {
+        for (path, expected_book) in [
+            (r"E:\shelf.epub\book.pdf\p:1", r"E:\shelf.epub\book.pdf"),
+            (r"E:\shelf.pdf\book.epub\p:1", r"E:\shelf.pdf\book.epub"),
+            (r"E:\book.epub\p:1", r"E:\book.epub"),
+        ] {
+            let (book, page) = split_archive_path(Path::new(path)).unwrap();
+            assert_eq!(book, PathBuf::from(expected_book), "{path}");
+            assert_eq!(page, "p:1", "{path}");
+        }
     }
 
     #[test]
