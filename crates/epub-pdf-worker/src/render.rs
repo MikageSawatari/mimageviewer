@@ -1,10 +1,10 @@
 use crate::package::{Package, SpineItem};
-use lopdf::{Document, Object, StringFormat, dictionary};
+use lopdf::{Document, Object, ObjectId, StringFormat, dictionary};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -13,6 +13,7 @@ pub const REFLOW_PROFILE: &str = "reflow-v1";
 pub const REFLOW_WIDTH: u32 = 720;
 pub const REFLOW_HEIGHT: u32 = 1024;
 pub const REFLOW_MARGIN: u32 = 32;
+const VIRTUAL_HOST: &str = "epub.invalid";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Segment {
@@ -143,7 +144,7 @@ pub fn virtual_url(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/");
-    format!("https://epub.invalid/{encoded}")
+    format!("https://{VIRTUAL_HOST}/{encoded}")
 }
 fn info_text(value: &str) -> Object {
     let mut bytes = vec![0xfe, 0xff];
@@ -151,6 +152,160 @@ fn info_text(value: &str) -> Object {
         bytes.extend_from_slice(&unit.to_be_bytes());
     }
     Object::String(bytes, StringFormat::Literal)
+}
+
+fn internal_virtual_host_uri(uri: &[u8]) -> bool {
+    let decoded;
+    let uri = if uri.starts_with(&[0xfe, 0xff]) {
+        if !(uri.len() - 2).is_multiple_of(2) {
+            return false;
+        }
+        let units = uri[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        let Ok(text) = String::from_utf16(&units) else {
+            return false;
+        };
+        decoded = text;
+        decoded.as_bytes()
+    } else {
+        uri
+    };
+    let authority = if let Some(rest) = uri.strip_prefix(b"//") {
+        rest
+    } else {
+        let Some(marker) = uri.windows(3).position(|part| part == b"://") else {
+            return false;
+        };
+        let scheme = &uri[..marker];
+        if !scheme.first().is_some_and(u8::is_ascii_alphabetic)
+            || !scheme
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.'))
+        {
+            return false;
+        }
+        &uri[marker + 3..]
+    };
+    let authority = authority
+        .split(|byte| matches!(byte, b'/' | b'?' | b'#'))
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .rsplit(|byte| *byte == b'@')
+        .next()
+        .unwrap_or_default()
+        .split(|byte| *byte == b':')
+        .next()
+        .unwrap_or_default();
+    host.strip_suffix(b".")
+        .unwrap_or(host)
+        .eq_ignore_ascii_case(VIRTUAL_HOST.as_bytes())
+}
+
+fn internal_virtual_link(doc: &Document, annot: &Object) -> bool {
+    let Ok((_, annot)) = doc.dereference(annot) else {
+        return false;
+    };
+    let Ok(annot) = annot.as_dict() else {
+        return false;
+    };
+    if annot.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Link") {
+        return false;
+    }
+    let Ok(action) = annot.get(b"A") else {
+        return false;
+    };
+    let Ok((_, action)) = doc.dereference(action) else {
+        return false;
+    };
+    let Ok(action) = action.as_dict() else {
+        return false;
+    };
+    if action.get(b"S").and_then(Object::as_name).ok() != Some(b"URI") {
+        return false;
+    }
+    let Ok(uri) = action.get(b"URI") else {
+        return false;
+    };
+    doc.dereference(uri)
+        .ok()
+        .and_then(|(_, uri)| uri.as_str().ok())
+        .is_some_and(internal_virtual_host_uri)
+}
+
+fn remove_internal_virtual_links(doc: &mut Document) -> Result<bool, String> {
+    let mut changed = false;
+    for page_id in doc.get_pages().into_values() {
+        let page = doc
+            .get_object(page_id)
+            .and_then(Object::as_dict)
+            .map_err(|error| error.to_string())?;
+        let Ok(annots) = page.get(b"Annots") else {
+            continue;
+        };
+        let annots = annots.clone();
+        let (array_id, array) = doc
+            .dereference(&annots)
+            .map_err(|error| error.to_string())?;
+        let array = array.as_array().map_err(|error| error.to_string())?;
+        let kept = array
+            .iter()
+            .filter(|annot| !internal_virtual_link(doc, annot))
+            .cloned()
+            .collect::<Vec<_>>();
+        if kept.len() == array.len() {
+            continue;
+        }
+        changed = true;
+        if kept.is_empty() {
+            doc.get_object_mut(page_id)
+                .and_then(Object::as_dict_mut)
+                .map_err(|error| error.to_string())?
+                .remove(b"Annots");
+        } else if let Some(array_id) = array_id {
+            *doc.get_object_mut(array_id)
+                .map_err(|error| error.to_string())? = Object::Array(kept);
+        } else {
+            doc.get_object_mut(page_id)
+                .and_then(Object::as_dict_mut)
+                .map_err(|error| error.to_string())?
+                .set("Annots", kept);
+        }
+    }
+    Ok(changed)
+}
+
+fn push_references(object: &Object, ids: &mut Vec<ObjectId>) {
+    let mut pending = vec![object];
+    while let Some(object) = pending.pop() {
+        match object {
+            Object::Reference(id) => ids.push(*id),
+            Object::Array(items) => pending.extend(items),
+            Object::Dictionary(dict) => pending.extend(dict.iter().map(|(_, value)| value)),
+            Object::Stream(stream) => {
+                pending.extend(stream.dict.iter().map(|(_, value)| value));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn prune_unreachable_after_link_removal(doc: &mut Document) {
+    let mut pending = Vec::new();
+    for (_, value) in doc.trailer.iter() {
+        push_references(value, &mut pending);
+    }
+    let mut reachable = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if reachable.insert(id)
+            && let Some(object) = doc.objects.get(&id)
+        {
+            push_references(object, &mut pending);
+        }
+    }
+    doc.objects.retain(|id, _| reachable.contains(id));
 }
 
 pub fn merge_pdf(
@@ -166,8 +321,10 @@ pub fn merge_pdf(
     let mut merged = Document::with_version("1.7");
     let mut roots = Vec::new();
     let mut count = 0;
+    let mut removed_internal_links = false;
     for file in files {
         let mut doc = Document::load(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        removed_internal_links |= remove_internal_virtual_links(&mut doc)?;
         doc.renumber_objects_with(merged.max_id + 1);
         merged.max_id = doc.max_id;
         let catalog = doc
@@ -217,6 +374,11 @@ pub fn merge_pdf(
     }
     let info_id = merged.add_object(info);
     merged.trailer.set("Info", info_id);
+    if removed_internal_links {
+        // Prune after replacing the source catalogs too, so no dropped source
+        // structure can retain an internal Link or its /A action dictionary.
+        prune_unreachable_after_link_removal(&mut merged);
+    }
     merged.save(out).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -485,6 +647,133 @@ mod tests {
         });
         doc.trailer.set("Info", info);
         doc.save(path).unwrap();
+    }
+    fn linked_page(path: &Path, links: &[(&str, bool)], indirect_annots: bool) {
+        one_page(path, 300, 400);
+        let mut doc = Document::load(path).unwrap();
+        let page = doc.get_pages()[&1];
+        let content = doc.add_object(lopdf::Stream::new(dictionary! {}, b"q Q".to_vec()));
+        let mut annots = Vec::new();
+        for (uri, indirect_action) in links {
+            let action = dictionary! {
+                "Type" => "Action", "S" => "URI",
+                "URI" => Object::String(uri.as_bytes().to_vec(), StringFormat::Literal)
+            };
+            let action = if *indirect_action {
+                Object::Reference(doc.add_object(action))
+            } else {
+                Object::Dictionary(action)
+            };
+            let annot = doc.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => "Link",
+                "Rect" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+                "A" => action
+            });
+            annots.push(Object::Reference(annot));
+        }
+        let annots = if indirect_annots {
+            Object::Reference(doc.add_object(Object::Array(annots)))
+        } else {
+            Object::Array(annots)
+        };
+        doc.get_object_mut(page)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Annots", annots);
+        doc.get_object_mut(page)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Contents", content);
+        doc.save(path).unwrap();
+    }
+    fn link_uris(path: &Path) -> Vec<String> {
+        let doc = Document::load(path).unwrap();
+        let page = doc.get_pages()[&1];
+        let page = doc.get_object(page).unwrap().as_dict().unwrap();
+        let Ok(annots) = page.get(b"Annots") else {
+            return Vec::new();
+        };
+        let (_, annots) = doc.dereference(annots).unwrap();
+        annots
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|annot| {
+                let (_, annot) = doc.dereference(annot).unwrap();
+                let action = annot.as_dict().unwrap().get(b"A").unwrap();
+                let (_, action) = doc.dereference(action).unwrap();
+                String::from_utf8(
+                    action
+                        .as_dict()
+                        .unwrap()
+                        .get(b"URI")
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+    #[test]
+    fn merge_removes_internal_uri_links_and_their_actions() {
+        let dir =
+            std::env::temp_dir().join(format!("epub-pdf-internal-links-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("part.pdf");
+        let out = dir.join("merged.pdf");
+        linked_page(
+            &part,
+            &[
+                (
+                    "https://epub.invalid/OEBPS/xhtml/introduction.xhtml#start",
+                    false,
+                ),
+                ("https://epub.invalid:443/OEBPS/xhtml/next.xhtml", true),
+            ],
+            true,
+        );
+        merge_pdf(std::slice::from_ref(&part), &out, false, "Book", None).unwrap();
+        assert!(link_uris(&out).is_empty());
+        let merged = Document::load(&out).unwrap();
+        assert_eq!(
+            merged.get_page_content(merged.get_pages()[&1]).unwrap(),
+            b"q Q"
+        );
+        assert!(
+            !fs::read(&out)
+                .unwrap()
+                .windows(b"epub.invalid".len())
+                .any(|part| part == b"epub.invalid")
+        );
+        fs::remove_file(part).unwrap();
+        fs::remove_file(out).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+    #[test]
+    fn merge_keeps_external_uri_links() {
+        let dir =
+            std::env::temp_dir().join(format!("epub-pdf-external-links-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("part.pdf");
+        let out = dir.join("merged.pdf");
+        let links = [
+            ("https://example.com/?next=epub.invalid", false),
+            ("https://epub.invalid/OPS/chapter.xhtml#top", false),
+            ("https://epub.invalid.evil/book", true),
+        ];
+        linked_page(&part, &links, false);
+        merge_pdf(std::slice::from_ref(&part), &out, false, "Book", None).unwrap();
+        assert_eq!(
+            link_uris(&out),
+            [links[0].0.to_owned(), links[2].0.to_owned()]
+        );
+        fs::remove_file(part).unwrap();
+        fs::remove_file(out).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
     fn assert_no_print_url_in_info(path: &Path) {
         let doc = Document::load(path).unwrap();
