@@ -106,6 +106,23 @@
   A/B クイックフォルダ、削除済みコレクションの prune。
 - 規模 / 優先度: Small〜Medium / P2 (§1.280 と同時に)。
 
+### 1.286 新しいデータフォルダの初回起動で「編集内容の復元を利用できません」が出ることがある (2026-09-26)
+
+- 出典: 実アプリ smoke のスクリーンショット (`target/ui-smoke-runs/20260926T131244746Z-*-RatingSortCollection-*/screenshots/`)
+  に通知「コピー・移動したファイルの編集内容の復元を利用できません」が写っていた。観測は smoke のスクリーンショットと
+  ログから。利用者の実環境のログ (`%APPDATA%\mimageviewer\logs`) には同じ行が無い。
+- ログ: `content_identity: ledger unusable: detection index load failed: [create edit_origin: ]database is locked`
+  (起動 0.75〜0.82 秒)。使い捨てデータ (`target/portable-smoke/data`、毎回作り直し) の smoke 実行のうち、
+  2026-09-24 以降の多くの回 (MultiWindowStills / Pdf / RarNav / RatingSort / RatingSortCollection) で出ている。
+  §1.237B より前から出ており、評価順の変更とは関係しない。
+- 推測 (未確認): `content_identity.db` が無い状態で、台帳の作成と検出 index の読み込みが別接続で並走し、
+  schema 作成中の lock に busy timeout 無しで当たっている。新規インストールや、データフォルダを作り直した
+  利用者の初回起動で、この機能が無効になり通知が出る可能性がある。
+- 方針候補: schema 作成を 1 か所 (1 接続) に集約して他の open をその完了後にする、または読み込み側にも
+  busy timeout を設定する。失敗を機能無効として確定する前に、どの接続が lock を持っていたかをログに出す。
+  回帰テスト: 空のデータフォルダで ledger と検出 index を同時に開く。
+- 規模 / 優先度: Small / P2 (初回起動の見た目に出るため)。
+
 ### 1.285 起動直後にコレクションを開くと、起動時のフォルダ読み込みがあとから画面を置き換える (2026-09-26)
 
 - 出典: §1.237B の実アプリ smoke `RatingSortCollection` の初回 2 回の失敗 (2026-09-26 17:51 / 17:54)。
