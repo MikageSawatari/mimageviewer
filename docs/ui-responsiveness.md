@@ -101,6 +101,11 @@ Rust に GC は無く、`Vec` の確保はそのまま `HeapAlloc` へ行く。
 
 perf ログ有効時のみ動作し、無効時は時計を読まない:
 
+- EPUB の本を開く時間は `epub_open.begin` から同じ論理キーの `epub_open.first_display` まで。
+  後者の `placeholder=true/false` で固定済み世代のページ数 cache 先出しと列挙待ちを分ける。
+  stamp 解決・管理画面の DB 一覧と削除予約は worker に置き、UI の `image_metas` は表示専用。
+  列挙完了後の EPUB `pdf_meta` 保存も `epub-pdf-meta` worker が行い、UI は cold catalog を開かない。
+
 - `frame.begin` の `prev_update_ms` / `prev_update_cycles_per_ms` — フレーム全体の実行率
 - `frame.begin` の `prev_outside_ms` — eframe の描画と present (= 自分のコードの外)
 - `ui.update_breakdown` (23 段) / `ui.fs_render_breakdown` (56 段) — 各段の `_ms` と `_cycles`

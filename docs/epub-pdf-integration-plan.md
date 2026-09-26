@@ -683,3 +683,76 @@ EPUB の中断と同じ復元を行う。通常フォルダ load の走査取消
 master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` の取消を通らず、フレームの優先判定にも一覧
 操作が無い) と確認し、EPUB とは別の課題として切り出した。実機: 利用者がアドレスバーからの EPUB 変換・閲覧・
 取消とボタン配置を確認。設計担当が moby-dick.epub で進捗 (142 項目・464 ページ・約 30 秒) を確認。
+
+### S2c-2 派生データ・鮮度判定の全経路調査 (2026-09-26、実装前)
+
+以下は §3.4 の表を出発点に、`mtime`/`file_size`、`image_metas`、
+`pdf_meta`、ピン、バッチ生成、スマートフォルダ、内容同定、類似索引まで
+読み書きの**項目**を照合した一覧。EPUB の `stamp` は世代 ID と世代 PDF サイズの
+整数ペアを指す。表示専用の `image_metas` は元 EPUB の属性を保つ。
+
+| 派生データ / 処理 | 現在の照合・保存点 | EPUB に必要な判定と変更 |
+| --- | --- | --- |
+| 親一覧の `pdf_meta` placeholder | `app.rs:27039-27115` は論理ファイルを stat し、warm catalog の行と比較 | 固定表に既にある世代の stamp だけで照合。未固定は省略。D10 の方向待ちを優先。通常 PDF は従来の stat を維持 |
+| スマート子の warm placeholder | `app/smart_folder.rs:3005-3037` が上記 peek を呼ぶ | 同じ判定を共有。固定済みだけ表示 |
+| 列挙後の親 `pdf_meta` 保存 | `app.rs:27268-27302` は列挙ページ 0 の属性を使用 | `PdfEnumerateResult.stamp` から世代ペアを保存。`pages` の元 EPUB 属性は表示専用 |
+| `pdf_meta` の catalog 行 | `catalog.rs:901-1024` が `(mtime,file_size)` で比較・更新 | スキーマを変えず、EPUB 行の整数ペアに世代 stamp を格納 |
+| サムネイルの UI 要求 | `app.rs:79861-80142` の `make_load_request` は `image_metas` とピン stat を転記 | EPUB の `PdfFile` / `PdfPage` と EPUB ページを指すピンは worker 解決印を持つ。元属性を cache hit に使わない |
+| サムネイルのメモリ hit | `thumb_loader.rs:1219-1231` は要求の属性と `cache_map` を比較 | EPUB は同じ `ReadTarget` の stamp で比較 |
+| サムネイルの生成・catalog 保存 | `thumb_loader.rs:1725-1755,3101-3245` は要求属性で保存、render は再解決 | EPUB は照合済みの target で render して同じ stamp を保存 |
+| サムネイル catalog 行 | `catalog.rs:21-33,692` の `mtime,file_size` | スキーマを変えず EPUB 行を世代ペアで保存。PDF ページと親タイルの両方 |
+| サムネ cache hit 後の `pdf_meta` catch-up | `thumb_loader.rs:2229-2270,2025-2097` は要求属性または論理 stat を用いる | worker の一解決 stamp で hit、列挙、保存 |
+| 隣接本の先読み | `thumb_loader.rs:2110-2224` は論理 stat と親 WebP / `pdf_meta` の属性比較 | 一解決 stamp で両行を照合し、同じ target で render して保存 |
+| バッチキャッシュ生成 | `app/cache_ops.rs:608-798` はフォルダ走査値で列挙・行比較・render・保存 | EPUB を対象にする際は一解決 stamp を両 catalog と全ページに通す。対象外にするだけでは本の一括生成が欠ける |
+| 詳細欄のページ数 | `app/metadata_ops.rs:1406-1467` は走査時の属性で親 `pdf_meta` を照合 | worker で解決した stamp を使って列挙と保存まで通す |
+| 編集済みページのプレビュー | `app.rs:62862-62986` が表示属性を保存要求へ渡し、`edit_preview_cache.rs:1231-1280` がコンテナ size を保存。`thumb_loader.rs:1210-1225` はコンテナ属性を比較 | 保存 worker と読込 worker の両方で世代 stamp を使用。既存整数列の EPUB 行のみ意味を変える |
+| auto-aspect の最初の seed | `app.rs:18305-18405` は UI の `image_metas` / 要求属性で WebP を比較 | EPUB は UI で解決せず seed を省略し、worker サムネ結果の sample を使う |
+| ピンの source ID と代表 WebP | `folder_thumb_pins.rs:640-759,814-947` は target の stat を ID に埋め込み、`app.rs:80000-80135` 等が要求キーへ写す | EPUB leaf では世代 stamp を source ID と要求の照合属性へ使う。UI での解決を避けるため worker 側で確定させる |
+| フォルダ代表選定・seed | `thumb_loader.rs:2755-2805`, `app.rs:30075-30110` は選定元の stat / ピン ID を使う | EPUB が代表 source なら上記 worker stamp に従い、元 EPUB の stat を鮮度に使わない |
+| 外部渡し用 PDF ページ PNG | `materializer.rs:274-292,548-634,1202-1217` は論理ファイルの時刻とサイズを再利用判定に使う | EPUB ページは世代 stamp で再利用し、描画も同一 target。実ファイルの直接渡しは元 EPUB のまま |
+| 内容同定台帳 | `content_identity.rs:56-77,100-155,1763-1868` は元ファイル hash、種類は PDF | `Epub` 種別を追加。固定済みは世代表のハッシュ・元サイズ・元時刻、未固定は元 EPUB。遅れた backfill は書込直前に来歴を再照合 |
+| 保持ラスタ / final AI | `app.rs:65221-65261` は実行中のページ ID | I7 で世代が固定されるため追加 stamp 不要 |
+| PDF ワーカー文書 cache / 列挙合流 | `pdf_loader.rs:4335-4354,5160-5210` は実読込パスで cache / 合流 | 世代ごとに物理パスが異なり既に分離。変更不要 |
+| 類似画像索引 | `similar_index.rs:5712-5765,6390-6394` は `.pdf` のみ走査し元属性で再利用 | 現段階では EPUB を明示的に索引対象から除外。ページ数変更で stale EPUB 行が生じず、投入と世代 stamp は別段階で設計 |
+| Remote ページ数・`PdfIdentity` | `remote_ipc/container.rs:6126-6193` は論理 stat / `pdf_meta` | S4 の対象。現段階では変更せず、Remote から EPUB を開く経路は S4 まで未対応 |
+
+### S2c-2 実装記録
+
+`ReadTarget::stamp` をサムネイル要求、`pdf_meta` 補完、隣接先読み、バッチ生成、詳細のページ数、外部渡し用ページへ通し、EPUB の派生行は既存の `(mtime, file_size)` 整数列へ `(generation_id, generation_pdf_size)` を保存する。通常 PDF の属性取得と照合は従来経路を維持する。UI で構築した EPUB のサムネイル要求は型付きの worker 解決印を持ち、`image_metas` は表示用の元 EPUB 属性のままにする。編集プレビューは保存 worker と読込 worker の両方で世代を解決し、auto-aspect の UI 初期 seed は EPUB のみ省略する。
+
+上の全経路調査表から実装・テストへの対応 (行番号は S2c-2 完了時点):
+
+| 派生データ / 経路 | 実装・変更不要の根拠 | 回帰確認 |
+| --- | --- | --- |
+| `pdf_meta` placeholder | `app.rs:27061,27101` は固定表 `pdf_loader.rs:214` を照合 | `epub_pdf_meta_placeholder_uses_only_a_pinned_generation` |
+| スマート子の warm placeholder | `app/smart_folder.rs:3005` が同じ `peek_pdf_meta_cache` を使う | 同じ先出し判定テスト |
+| 列挙後の `pdf_meta` 保存 | `app.rs:27328,76425` の worker に列挙 stamp を渡す | `epub_pdf_meta_worker_replaces_page_count_with_new_generation_stamp` |
+| `pdf_meta` catalog 行 | `catalog.rs:901-1024` の既存整数列 | `epub_cache_directory_wipe_keeps_ids_and_invalidates_derived_rows` |
+| UI のタイル・ページ要求 | `app.rs:80018,80030` の型付き worker 解決印 | `epub_thumbnail_requests_defer_stamp_while_pdf_requests_keep_file_attributes` |
+| メモリ thumbnail hit | `thumb_loader.rs:369,1166` で先に世代ペアへ置換 | `epub_thumb_request_replaces_display_metadata_with_generation_identity` |
+| thumbnail 生成・保存 | `thumb_loader.rs:1166,1725,6158` が同一 target と世代ペアを通す | 同じ要求テストと `epub_cache_directory_wipe_keeps_ids_and_invalidates_derived_rows` |
+| thumbnail catalog 行 | `catalog.rs:21-33,692` の既存整数列 | 世代 ID 消去・再発番のテスト |
+| `pdf_meta` catch-up | `thumb_loader.rs:2093,2182,2201` の共通世代抽出 | `epub_catchup_neighbor_and_folder_resolution_share_generation_stamp` |
+| 隣接本先読み | `thumb_loader.rs:2182,2201,2215` の同一 target | 同じ共通世代抽出テスト |
+| バッチキャッシュ生成 | `app/cache_ops.rs:4,609-850` の親行比較と同一 target | `epub_batch_parent_row_requires_generation_while_pdf_keeps_presence_check` |
+| 詳細のページ数 | `app/metadata_ops.rs:453,1406-1475` | `epub_details_page_count_uses_generation_and_pdf_keeps_source_stamp` |
+| 編集プレビュー | `edit_preview_cache.rs:1210,1231-1300` で保存、`thumb_loader.rs:1210` で照合 | `epub_preview_save_and_load_use_generation_in_existing_integer_columns` |
+| auto-aspect 初期 seed | `app.rs:18381` で EPUB の元属性 hit を省略 | `epub_auto_aspect_seed_ignores_source_metadata_cache_hit` |
+| ピン source ID | `folder_thumb_pins.rs:738-765` の保留印を `thumb_loader.rs:369` が確定 | `epub_page_pin_source_id_waits_for_worker_generation` と thumbnail 要求テスト |
+| フォルダ代表・seed | `thumb_loader.rs:2719,2791,2950,3124` が共通世代抽出を使用 | 共通世代抽出テスト |
+| 外部渡し PNG | `materializer.rs:274,555-635` の世代 stamp と同一 target | `epub_materializer_stamp_changes_with_generation_not_source_attributes` |
+| 内容同定台帳 | `content_identity.rs:56-77,767-785,1811-1940` | EPUB 種別、固定世代、backfill 来歴、FILETIME の各テスト |
+| 保持ラスタ / final AI | `app.rs:65221-65261` は実行中の論理ページ。I7 により世代固定で変更不要 | `pdf_loader::tests::epub_resolver_pins_first_generation_across_retire_and_republish` |
+| PDF worker 文書 cache | `pdf_loader.rs:4335-4354` は実ファイルパス。世代ごとに物理パスが異なり変更不要 | 同じ固定世代テスト |
+| 類似画像索引 | `similar_index.rs:5698-5715` は `.pdf` のみで EPUB を除外 | 対象外 (ページ索引投入は別段階) |
+| Remote ページ数・`PdfIdentity` | `remote_ipc/container.rs:6126-6193` | S4。コードは変更しない |
+
+`pdf_meta` の先出しは実行中の固定表をメモリで読むだけとし、未固定の EPUB と D10 の綴じ方向待ちは列挙結果を待つ。列挙後の EPUB `pdf_meta` 保存は短命 worker が cold catalog の open を含めて行う。`epub_open.begin` と `epub_open.first_display` (`placeholder` 属性) で先出し有無別の初回表示時間を比較できる。Remote のページ数・`PdfIdentity` は S4 の対象で変更しない。類似画像索引は現段階で EPUB を投入しないため、元 EPUB の属性で変換ページを再利用することはない。
+
+内容同定の `ContentKind::Epub` は論理 EPUB パスに付ける。固定済みは不変の世代表から元ファイルのサイズ、完全精度の FILETIME、SHA-256、先頭ハッシュを読み、未固定は元 EPUB を読む。FILETIME から台帳の Unix nanoseconds への変換は既存の範囲制限を明示的に適用し、未固定 EPUB は範囲外時刻の衝突を避けるため毎回 hash する。非同期 backfill は分岐時の固定 ID または未固定の元状態を保存し、書込直前に再確認する。`content_identity.db` はリリース済みなのでスキーマを変えず、EPUB 行の `kind` には旧版が読める `pdf` を保存して、論理 `.epub` キーの読み出し時に `Epub` へ戻す。サムネイル catalog、`pdf_meta`、編集プレビューのリリース済み列にもスキーマ変更はない。EPUB 専用の `epub_cache.db` だけを拡張した。
+
+キャッシュ管理画面は EPUB の現在世代と削除予約を別 worker で取得・更新する。選択・全件削除は I8 の削除予約を追加し、実行中のファイルと固定世代を保つ。RAR/7z/LZH の容量計算と上限には接続しない。
+
+回帰テストは `epub_cache::tests` の世代 ID・再起動・極端時刻・`Stale`・先勝ち・削除予約、`content_identity::tests` の固定世代値と backfill 来歴、`app::tests` の UI 要求・先出し・`pdf_meta` 保存・auto-aspect、`thumb_loader::tests` の要求と catch-up/隣接/代表共通 stamp、`app::metadata_ops::tests` の詳細ページ数、`materializer::tests` の外部渡し stamp、`folder_thumb_pins::tests` の source ID、`edit_preview_cache::tests` の保存・再利用、`archive_cache::tests` の容量除外に追加した。実 PDFium 描画を必要とするページ画像自体の再変換後確認と Remote は、それぞれ利用者の実機確認・S4 に残す。
+
+負例は一時的なコード差し替え後に絞り込みテストを実行して確認し、各実行の `finally` で元のファイルを byte 単位で復元した。元ファイル属性へのフォールバック、世代 ID 固定、元時刻の飽和、来歴チェック除去、編集プレビューの元属性保存、削除予約漏れ、容量への EPUB 加算、固定表の無視、古いページ数の保存、auto-aspect の早期 hit、バッチの行存在判定、ピン ID の元属性使用、詳細・外部渡しの元属性使用は、それぞれ対応するテストを失敗させた。

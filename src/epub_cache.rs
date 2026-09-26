@@ -89,6 +89,13 @@ pub struct GenerationRow {
     pub created_at: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CurrentGenerationEntry {
+    pub generation: GenerationRow,
+    pub retired: bool,
+    pub last_access_at: i64,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum PublishOutcome {
     Published,
@@ -315,6 +322,31 @@ impl EpubCache {
         Ok(())
     }
 
+    /// Retire the generation the user actually selected, never a later publish.
+    pub fn retire_generation(&mut self, id: i64) -> Result<bool, CacheError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO retired SELECT generation_id, ?2 FROM current WHERE generation_id=?1",
+            params![id, now()],
+        )?;
+        tx.commit()?;
+        Ok(inserted != 0)
+    }
+
+    pub fn retire_all_current(&mut self) -> Result<usize, CacheError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO retired SELECT generation_id, ?1 FROM current",
+            [now()],
+        )?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     pub fn detach_missing(&mut self, key: &str, id: i64) -> Result<(), CacheError> {
         let tx = self
             .conn
@@ -338,13 +370,27 @@ impl EpubCache {
             [key], decode_generation).optional().map_err(Into::into)
     }
 
+    pub fn touch_current(&self, key: &str, id: i64) -> Result<(), CacheError> {
+        self.conn.execute(
+            "UPDATE current SET last_access_at=?3 WHERE src_path_key=?1 AND generation_id=?2",
+            params![key, id, now()],
+        )?;
+        Ok(())
+    }
+
     pub fn generation(&self, id: i64) -> Result<Option<GenerationRow>, CacheError> {
         generation_in(&self.conn, id).map_err(Into::into)
     }
 
-    pub fn list_current(&self) -> Result<Vec<(GenerationRow, bool)>, CacheError> {
-        let mut stmt = self.conn.prepare("SELECT g.*, r.generation_id IS NOT NULL FROM current c JOIN generations g ON g.generation_id=c.generation_id LEFT JOIN retired r ON r.generation_id=g.generation_id ORDER BY c.last_access_at DESC")?;
-        let rows = stmt.query_map([], |row| Ok((decode_generation(row)?, row.get(13)?)))?;
+    pub fn list_current(&self) -> Result<Vec<CurrentGenerationEntry>, CacheError> {
+        let mut stmt = self.conn.prepare("SELECT g.*, r.generation_id IS NOT NULL, c.last_access_at FROM current c JOIN generations g ON g.generation_id=c.generation_id LEFT JOIN retired r ON r.generation_id=g.generation_id ORDER BY c.last_access_at DESC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CurrentGenerationEntry {
+                generation: decode_generation(row)?,
+                retired: row.get(13)?,
+                last_access_at: row.get(14)?,
+            })
+        })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -947,6 +993,19 @@ mod tests {
         assert_eq!(db.generation(a.generation_id).unwrap(), Some(a.clone()));
         assert!(retired(&db, a.generation_id));
         assert!(db.current_generation(&a.src_path_key).unwrap().is_none());
+        drop(db);
+        assert!(matches!(
+            startup_gate(tmp.path()),
+            GateOutcome::Enabled { .. }
+        ));
+        assert!(!a.pdf_file.exists());
+        assert!(
+            EpubCache::open_at(tmp.path())
+                .unwrap()
+                .generation(a.generation_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -965,7 +1024,24 @@ mod tests {
             PublishOutcome::Adopted(Box::new(a.clone()))
         );
         assert!(retired(&db, b.generation_id));
-        assert_eq!(db.current_generation(&a.src_path_key).unwrap(), Some(a));
+        assert_eq!(
+            db.current_generation(&a.src_path_key).unwrap(),
+            Some(a.clone())
+        );
+        drop(db);
+        assert!(matches!(
+            startup_gate(tmp.path()),
+            GateOutcome::Enabled { .. }
+        ));
+        assert!(a.pdf_file.exists());
+        assert!(!b.pdf_file.exists());
+        assert!(
+            EpubCache::open_at(tmp.path())
+                .unwrap()
+                .generation(b.generation_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1030,11 +1106,28 @@ mod tests {
         );
         let db = EpubCache::open_at(&root).unwrap();
         let current = db.current_generation(&src_key(&src)).unwrap().unwrap();
+        let losers: Vec<_> = results
+            .iter()
+            .filter(|(row, _)| row.generation_id != current.generation_id)
+            .map(|(row, _)| row.clone())
+            .collect();
         for (row, outcome) in results {
             if row.generation_id != current.generation_id {
                 assert!(matches!(outcome, PublishOutcome::Adopted(_)));
                 assert!(retired(&db, row.generation_id));
             }
+        }
+        drop(db);
+        assert!(matches!(
+            startup_gate(tmp.path()),
+            GateOutcome::Enabled { .. }
+        ));
+        let db = EpubCache::open_at(tmp.path()).unwrap();
+        assert!(current.pdf_file.exists());
+        for loser in losers {
+            assert!(!loser.pdf_file.exists());
+            assert!(db.generation(loser.generation_id).unwrap().is_none());
+            assert!(!retired(&db, loser.generation_id));
         }
     }
 
@@ -1076,6 +1169,124 @@ mod tests {
         db.conn.execute("DELETE FROM generations", []).unwrap();
         db.conn.execute("DELETE FROM generation_ids", []).unwrap();
         assert!(db.reserve_output(&src).unwrap().generation_id() > a.generation_id);
+    }
+
+    #[test]
+    fn epub_cache_directory_wipe_keeps_ids_and_invalidates_derived_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        let mut cache = EpubCache::open_at(tmp.path()).unwrap();
+        let first = candidate(&mut cache, tmp.path(), &source, state(1));
+        cache.publish(&first, &FakeGuard(state(1))).unwrap();
+        let catalogs = tmp.path().join("thumbs");
+        let catalog = crate::catalog::CatalogDb::open(&catalogs, tmp.path()).unwrap();
+        catalog
+            .set_pdf_meta(
+                "book.epub",
+                first.generation_id,
+                first.pdf_size as i64,
+                3,
+                false,
+            )
+            .unwrap();
+        catalog
+            .save_with_layout_dims(
+                "pdfthumb:book.epub",
+                first.generation_id,
+                first.pdf_size as i64,
+                1,
+                1,
+                None,
+                None,
+                b"old",
+            )
+            .unwrap();
+
+        fs::remove_dir_all(tmp.path().join("epub_cache")).unwrap();
+        drop(cache);
+        // Simulate the next run: the payload folder is gone, but the ID ledger remains.
+        let mut cache = EpubCache::open_at(tmp.path()).unwrap();
+        let mut second = candidate(&mut cache, tmp.path(), &source, state(2));
+        second.page_count = 8;
+        cache.publish(&second, &FakeGuard(state(2))).unwrap();
+        assert!(second.generation_id > first.generation_id);
+        assert_eq!(
+            cache.current_generation(&first.src_path_key).unwrap(),
+            Some(second.clone())
+        );
+        assert_eq!(
+            catalog
+                .get_pdf_meta("book.epub", second.generation_id, second.pdf_size as i64)
+                .unwrap(),
+            None
+        );
+        let thumb = catalog.load_one("pdfthumb:book.epub").unwrap().unwrap();
+        assert_ne!(
+            (thumb.mtime, thumb.file_size),
+            (second.generation_id, second.pdf_size as i64)
+        );
+        assert_eq!(
+            catalog
+                .get_pdf_meta("book.epub", first.generation_id, first.pdf_size as i64)
+                .unwrap(),
+            Some((3, false))
+        );
+    }
+
+    #[test]
+    fn epub_cache_manager_retires_selected_and_all_without_removing_live_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = EpubCache::open_at(tmp.path()).unwrap();
+        let a_src = tmp.path().join("a.epub");
+        let b_src = tmp.path().join("b.epub");
+        let a = candidate(&mut cache, tmp.path(), &a_src, state(1));
+        let b = candidate(&mut cache, tmp.path(), &b_src, state(2));
+        cache.publish(&a, &FakeGuard(state(1))).unwrap();
+        cache.publish(&b, &FakeGuard(state(2))).unwrap();
+        let rows = cache.list_current().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| !row.retired && row.last_access_at > 0)
+        );
+        assert!(cache.retire_generation(a.generation_id).unwrap());
+        assert!(!cache.retire_generation(a.generation_id).unwrap());
+        assert_eq!(cache.retire_all_current().unwrap(), 1);
+        let rows = cache.list_current().unwrap();
+        assert!(rows.iter().all(|row| row.retired));
+        assert!(a.pdf_file.exists() && b.pdf_file.exists());
+        assert_eq!(cache.current_generation(&a.src_path_key).unwrap(), Some(a));
+        assert_eq!(cache.current_generation(&b.src_path_key).unwrap(), Some(b));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epub_source_state_distinguishes_out_of_unix_nanosecond_range_times() {
+        use std::fs::FileTimes;
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        fs::write(&source, b"same size").unwrap();
+        let file = File::options().write(true).open(&source).unwrap();
+        let old = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(11_000_000_000))
+            .unwrap();
+        file.set_times(FileTimes::new().set_modified(old)).unwrap();
+        let before_old = source_state(&file.metadata().unwrap());
+        file.set_times(FileTimes::new().set_modified(old + Duration::from_secs(2)))
+            .unwrap();
+        let after_old = source_state(&file.metadata().unwrap());
+        assert_eq!(before_old.size, after_old.size);
+        assert_ne!(before_old, after_old);
+
+        let future = UNIX_EPOCH + Duration::from_secs(10_000_000_000);
+        file.set_times(FileTimes::new().set_modified(future))
+            .unwrap();
+        let before_future = source_state(&file.metadata().unwrap());
+        file.set_times(FileTimes::new().set_modified(future + Duration::from_secs(2)))
+            .unwrap();
+        let after_future = source_state(&file.metadata().unwrap());
+        assert_eq!(before_future.size, after_future.size);
+        assert_ne!(before_future, after_future);
     }
 
     #[test]

@@ -110,8 +110,10 @@ pub enum ResolveStrategy {
 /// Drive-list thumbnails are cache-only: the UI thread checks the local pin DB
 /// and asks the worker to use an already-cataloged pinned thumbnail. Missing
 /// cache falls back to the fixed drive icon instead of touching the drive.
+#[derive(Clone)]
 pub struct PinnedOnlyRequest {
     pub cache_key_prefix: String,
+    pub epub_source: Option<std::path::PathBuf>,
 }
 /// Ctrl+G アグリゲートビューの「代表サムネ」用キャッシュキープレフィックス (v0.8.1)。
 /// filename 単体だと別コンテナ同士の同名画像 (例: `cover.jpg`) でキャッシュ衝突し、
@@ -357,7 +359,30 @@ impl LoadSourcePolicy {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PdfStampPolicy {
+    #[default]
+    CallerFileAttributes,
+    ResolveInWorker,
+}
+
+fn stamp_resolved_pdf_request(
+    req: &LoadRequest,
+    read: &crate::pdf_loader::ReadTarget,
+) -> Option<LoadRequest> {
+    let (mtime, file_size) = read.stamp.generation_catalog_pair()?;
+    let mut stamped = req.clone();
+    stamped.mtime = mtime;
+    stamped.file_size = file_size;
+    if let Some(key) = stamped.cache_key_override.as_mut()
+        && key.contains(CACHE_KEY_PIN_SUFFIX)
+    {
+        key.push_str(&format!("|generation:{mtime}:{file_size}"));
+    }
+    Some(stamped)
+}
+
+#[derive(Clone, Default)]
 pub struct LoadRequest {
     pub idx: usize,
     /// 通常画像ならファイルパス、ZIP 画像なら ZIP ファイルのパス
@@ -367,6 +392,8 @@ pub struct LoadRequest {
     pub relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     pub mtime: i64,
     pub file_size: i64,
+    /// EPUB requests carry no cache identity from `image_metas`; resolve on the worker.
+    pub pdf_stamp_policy: PdfStampPolicy,
     /// 非破壊編集プレビューのページキー。編集済み画像系アイテムだけに設定する。
     pub edit_preview_key: Option<String>,
     /// ZIP/PDF 内ページを親コンテナの手動代表として読む要求。
@@ -1036,9 +1063,24 @@ fn send_pinned_only_cached(
     tx: &mpsc::Sender<ThumbMsg>,
     gen_done: &Arc<AtomicUsize>,
 ) -> bool {
+    let epub_stamp = if let Some(source) = pin.epub_source.as_ref() {
+        let Ok(read) = crate::pdf_loader::resolve_read_target(source) else {
+            return false;
+        };
+        let Some(stamp) = read.stamp.generation_catalog_pair() else {
+            return false;
+        };
+        Some(stamp)
+    } else {
+        None
+    };
     let cached = cache_map.read().ok().and_then(|map| {
         map.iter()
-            .filter(|(key, _)| key.starts_with(&pin.cache_key_prefix))
+            .filter(|(key, entry)| {
+                key.starts_with(&pin.cache_key_prefix)
+                    && epub_stamp
+                        .is_none_or(|(mtime, size)| entry.mtime == mtime && entry.file_size == size)
+            })
             .max_by_key(|(_, entry)| (entry.mtime, entry.file_size))
             .map(|(key, entry)| {
                 (
@@ -1121,6 +1163,28 @@ pub fn process_load_request(
         return;
     }
 
+    let resolved_request = if req.pdf_stamp_policy == PdfStampPolicy::ResolveInWorker {
+        match crate::pdf_loader::resolve_read_target(&req.path) {
+            Ok(read) => {
+                let Some(stamped) = stamp_resolved_pdf_request(req, &read) else {
+                    send_thumb_failed(req, tx, gen_done);
+                    return;
+                };
+                Some((stamped, read))
+            }
+            Err(_) => {
+                send_thumb_failed(req, tx, gen_done);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let epub_read = resolved_request.as_ref().map(|(_, read)| read);
+    let req = resolved_request
+        .as_ref()
+        .map_or(req, |(stamped, _)| stamped);
+
     // 内部関数向けに `&CatalogDb` を取り出しておく (= 既存シグネチャ互換)
     let catalog_ref: Option<&crate::catalog::CatalogDb> = catalog.map(|a| a.as_ref());
     // カタログキーを共通 helper で組み立て (auto_aspect の seed フェーズと共有)。
@@ -1145,7 +1209,9 @@ pub fn process_load_request(
         // epoch while holding the same connection mutex after DELETE succeeds, so a successful
         // pre-clear read is always distinguishable when its message reaches the UI later.
         let epoch = db.epoch();
-        let preview = if req.edit_preview_validate_container {
+        let preview = if req.pdf_stamp_policy == PdfStampPolicy::ResolveInWorker {
+            db.load_for_container(item_key, req.mtime, req.file_size, display_px)
+        } else if req.edit_preview_validate_container {
             std::fs::metadata(&req.path).ok().and_then(|meta| {
                 db.load_for_container(
                     item_key,
@@ -1728,6 +1794,7 @@ pub fn process_load_request(
         preloaded_zip_bytes,
         verified_source_bytes,
         req.pdf_page,
+        epub_read,
         req.pdf_password.as_deref(),
         req.cache_key_override.as_deref(),
         req.idx,
@@ -2030,18 +2097,9 @@ fn process_meta_only(path: &Path, catalog: &crate::catalog::CatalogDb, cancel: &
     let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
         return;
     };
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Some((mtime, file_size, epub_read)) = pdf_derived_stamp(path) else {
         return;
     };
-    let Some(mtime) = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-    else {
-        return;
-    };
-    let file_size = meta.len() as i64;
 
     // pdf_meta が既に populate 済みなら skip (= enqueue から処理開始までの間に他経路が
     // 書き込んだケース)
@@ -2065,7 +2123,19 @@ fn process_meta_only(path: &Path, catalog: &crate::catalog::CatalogDb, cancel: &
     // `bump_catchup_epoch` によるフォルダ移動キャンセルが、走行中の MetaOnly enumerate も
     // Interrupted で抜けさせる (旧実装: cancel 非対応の `enumerate_pages` を呼んでいて
     // 走行中の MetaOnly は完走するまで PDF worker を占有していた)。
-    match crate::pdf_loader::enumerate_pages_with_cancel(path, None, Some(Arc::clone(cancel))) {
+    let result = if let Some(read) = epub_read.as_ref() {
+        crate::pdf_loader::enumerate_pages_with_read_target(
+            path,
+            read,
+            None,
+            Some(Arc::clone(cancel)),
+            crate::pdf_loader::EnumerateOptions::default(),
+        )
+        .map(|result| result.pages)
+    } else {
+        crate::pdf_loader::enumerate_pages_with_cancel(path, None, Some(Arc::clone(cancel)))
+    };
+    match result {
         Ok(entries) => {
             if let Err(e) = catalog.set_pdf_meta(
                 filename,
@@ -2107,6 +2177,40 @@ fn is_password_required_error(msg: &str) -> bool {
     msg.contains("Password") || msg.contains("password")
 }
 
+/// Called on a background worker. EPUB uses one pinned generation for the whole
+/// derived-data operation; plain PDFs keep their existing file-stat behavior.
+fn pdf_derived_stamp(path: &Path) -> Option<(i64, i64, Option<crate::pdf_loader::ReadTarget>)> {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    {
+        let read = crate::pdf_loader::resolve_read_target(path).ok()?;
+        return resolved_epub_derived_stamp(read);
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some((mtime, meta.len() as i64, None))
+}
+
+fn resolved_epub_derived_stamp(
+    read: crate::pdf_loader::ReadTarget,
+) -> Option<(i64, i64, Option<crate::pdf_loader::ReadTarget>)> {
+    let (mtime, size) = read.stamp.generation_catalog_pair()?;
+    Some((mtime, size, Some(read)))
+}
+
+fn is_epub_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+}
+
 /// 実作業: neighbor prefetch (render page 0 + pdf_meta + WebP サムネ)
 fn process_neighbor_prefetch(
     path: &Path,
@@ -2118,18 +2222,9 @@ fn process_neighbor_prefetch(
     if cancel.load(Ordering::Relaxed) {
         return;
     }
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Some((mtime, file_size, epub_read)) = pdf_derived_stamp(path) else {
         return;
     };
-    let Some(mtime) = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-    else {
-        return;
-    };
-    let file_size = meta.len() as i64;
     let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
         return;
     };
@@ -2167,16 +2262,31 @@ fn process_neighbor_prefetch(
     // 抜けて Normal 枠を即座に解放する。
     // neighbor prefetch は background なので epoch=0 (UI nav の bump で巻き込まれない)
     // + AbortOnCancel (background は cancel=フォルダ移動意図、harvest 不要)
-    let res = match crate::pdf_loader::render_page(
-        path,
-        0,
-        thumb_px,
-        None,
-        Some(Arc::clone(cancel)),
-        crate::pdf_loader::JobPriority::Normal,
-        0,
-        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-    ) {
+    let render = if let Some(read) = epub_read.as_ref() {
+        crate::pdf_loader::render_page_with_read_target(
+            path,
+            read,
+            0,
+            thumb_px,
+            None,
+            Some(Arc::clone(cancel)),
+            crate::pdf_loader::JobPriority::Normal,
+            0,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+        )
+    } else {
+        crate::pdf_loader::render_page(
+            path,
+            0,
+            thumb_px,
+            None,
+            Some(Arc::clone(cancel)),
+            crate::pdf_loader::JobPriority::Normal,
+            0,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+        )
+    };
+    let res = match render {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("{e}");
@@ -2611,9 +2721,12 @@ fn folder_cached_row_usable_in_cache_dir_with_pins(
                         };
                         current == dependency.state
                     });
-                    pins_valid
-                        && dependencies_valid
-                        && std::fs::metadata(&proof.winner.path).is_ok_and(|metadata| {
+                    let winner_valid = if is_epub_path(&proof.winner.path) {
+                        pdf_derived_stamp(&proof.winner.path).is_some_and(|(mtime, size, _)| {
+                            mtime == proof.winner.mtime && size == proof.winner.file_size
+                        })
+                    } else {
+                        std::fs::metadata(&proof.winner.path).is_ok_and(|metadata| {
                             crate::ui_helpers::mtime_secs(&metadata) == proof.winner.mtime
                                 && (if metadata.is_dir() {
                                     0
@@ -2621,6 +2734,8 @@ fn folder_cached_row_usable_in_cache_dir_with_pins(
                                     metadata.len() as i64
                                 }) == proof.winner.file_size
                         })
+                    };
+                    pins_valid && dependencies_valid && winner_valid
                 });
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -2677,14 +2792,15 @@ fn load_cached_pinned_folder_thumb(
         configured_depth,
         crate::catalog::FolderThumbProvenance::Seeded,
     )?;
-    let cache_key = format!("{base_key}{CACHE_KEY_PIN_SUFFIX}{}", resolved.source_id);
-    context.cached_candidate(
-        parent_folder,
-        &cache_key,
-        &resolved.abs_path,
-        resolved.mtime,
-        resolved.file_size,
-    )
+    let mut cache_key = format!("{base_key}{CACHE_KEY_PIN_SUFFIX}{}", resolved.source_id);
+    let (mtime, size) = if resolved.pdf_page.is_some() && is_epub_path(&resolved.abs_path) {
+        let (mtime, size, _) = pdf_derived_stamp(&resolved.abs_path)?;
+        cache_key.push_str(&format!("|generation:{mtime}:{size}"));
+        (mtime, size)
+    } else {
+        (resolved.mtime, resolved.file_size)
+    };
+    context.cached_candidate(parent_folder, &cache_key, &resolved.abs_path, mtime, size)
 }
 
 /// フォルダ内をスキャンして代表画像、または再利用可能な pin WebP を返す。
@@ -2765,13 +2881,28 @@ fn select_folder_thumb_image_with_cache_dir(
         result_label,
     ));
     let proof = result.as_ref().and_then(|resolution| {
-        let (path, archive_row_key) = match resolution {
-            FolderThumbResolution::Image(path) => (path.as_path(), None),
-            FolderThumbResolution::CachedPinned(cached) => {
-                (cached.source_path.as_path(), Some(cached.cache_key.clone()))
-            }
+        let (path, archive_row_key, epub_stamp) = match resolution {
+            FolderThumbResolution::Image(path) => (path.as_path(), None, None),
+            FolderThumbResolution::CachedPinned(cached) => (
+                cached.source_path.as_path(),
+                Some(cached.cache_key.clone()),
+                is_epub_path(&cached.source_path)
+                    .then_some((cached.source_mtime, cached.source_file_size)),
+            ),
         };
-        let metadata = std::fs::metadata(path).ok()?;
+        let stamp = if let Some(stamp) = epub_stamp {
+            stamp
+        } else {
+            let metadata = std::fs::metadata(path).ok()?;
+            (
+                crate::ui_helpers::mtime_secs(&metadata),
+                if metadata.is_dir() {
+                    0
+                } else {
+                    metadata.len() as i64
+                },
+            )
+        };
         Some(crate::catalog::FolderSelectionProof {
             directories: context.dependencies,
             pin_store: context.pin_store.map_or(
@@ -2780,12 +2911,8 @@ fn select_folder_thumb_image_with_cache_dir(
             ),
             winner: crate::catalog::FolderSelectionWinner {
                 path: path.to_path_buf(),
-                mtime: crate::ui_helpers::mtime_secs(&metadata),
-                file_size: if metadata.is_dir() {
-                    0
-                } else {
-                    metadata.len() as i64
-                },
+                mtime: stamp.0,
+                file_size: stamp.1,
                 archive_row_key,
             },
         })
@@ -2807,7 +2934,7 @@ fn archive_tile_key(path: &Path, parent: &Path) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     let prefix = if crate::folder_tree::is_zip_extension(&ext) {
         CACHE_KEY_ZIP
-    } else if ext == "pdf" {
+    } else if ext == "pdf" || ext == "epub" {
         CACHE_KEY_PDF
     } else {
         return None;
@@ -2881,16 +3008,21 @@ fn resolve_folder_thumb_image_inner(
             {
                 images.push((path, sort_mtime));
             } else if remaining_depth > 0
-                && ext
-                    .as_deref()
-                    .is_some_and(|ext| crate::folder_tree::is_zip_extension(ext) || ext == "pdf")
+                && ext.as_deref().is_some_and(|ext| {
+                    crate::folder_tree::is_zip_extension(ext) || ext == "pdf" || ext == "epub"
+                })
             {
-                let stamp = entry.metadata().ok().map(|metadata| {
-                    (
-                        crate::ui_helpers::mtime_secs(&metadata),
-                        metadata.len() as i64,
-                    )
-                });
+                let stamp = if is_epub_path(&path) {
+                    // Resolve only when this candidate reaches the cache lookup below.
+                    None
+                } else {
+                    entry.metadata().ok().map(|metadata| {
+                        (
+                            crate::ui_helpers::mtime_secs(&metadata),
+                            metadata.len() as i64,
+                        )
+                    })
+                };
                 children.push(FolderCandidate {
                     path,
                     sort_mtime,
@@ -2935,7 +3067,7 @@ fn resolve_folder_thumb_image_inner(
         .collect();
     keyed_children
         .sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.sort_mtime, bk, b.sort_mtime));
-    let mut children: Vec<FolderCandidate> = keyed_children
+    let children: Vec<FolderCandidate> = keyed_children
         .into_iter()
         .map(|(candidate, _)| candidate)
         .collect();
@@ -2987,6 +3119,23 @@ fn resolve_folder_thumb_image_inner(
             });
             if let Some(pin) = candidate.pin.as_ref() {
                 candidate.expected_stamp = Some((pin.mtime, pin.file_size));
+            }
+        }
+        if !candidate.is_dir {
+            let target = candidate
+                .pin
+                .as_ref()
+                .map_or(candidate.path.as_path(), |pin| pin.abs_path.as_path());
+            if is_epub_path(target) {
+                let Some((mtime, size, _)) = pdf_derived_stamp(target) else {
+                    continue;
+                };
+                candidate.expected_stamp = Some((mtime, size));
+                if let Some(key) = candidate.cache_key.as_mut()
+                    && key.contains(CACHE_KEY_PIN_SUFFIX)
+                {
+                    key.push_str(&format!("|generation:{mtime}:{size}"));
+                }
             }
         }
         if context.cancelled() {
@@ -3108,6 +3257,7 @@ pub fn load_one_cached(
     // Some のとき通常ファイル path を decoder へ渡してはならない。
     verified_source_bytes: Option<Vec<u8>>,
     pdf_page: Option<u32>,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
     pdf_password: Option<&str>,
     cache_key_override: Option<&str>,
     idx: usize,
@@ -3200,16 +3350,30 @@ pub fn load_one_cached(
             crate::pdf_loader::JobPriority::Normal
         };
         let render_started = std::time::Instant::now();
-        let render_result = crate::pdf_loader::render_page(
-            path,
-            page_num,
-            thumbnail_pdf_render_target(display_px),
-            pdf_password,
-            cancel.map(Arc::clone),
-            pdf_priority,
-            context_epoch,
-            cancel_policy,
-        );
+        let render_result = if let Some(read) = epub_read {
+            crate::pdf_loader::render_page_with_read_target(
+                path,
+                read,
+                page_num,
+                thumbnail_pdf_render_target(display_px),
+                pdf_password,
+                cancel.map(Arc::clone),
+                pdf_priority,
+                context_epoch,
+                cancel_policy,
+            )
+        } else {
+            crate::pdf_loader::render_page(
+                path,
+                page_num,
+                thumbnail_pdf_render_target(display_px),
+                pdf_password,
+                cancel.map(Arc::clone),
+                pdf_priority,
+                context_epoch,
+                cancel_policy,
+            )
+        };
         render_ms = Some(render_started.elapsed().as_secs_f64() * 1000.0);
         render_result
             .map(|res| {
@@ -4280,6 +4444,7 @@ mod tests {
 
         load_one_cached(
             &img_path,
+            None,
             None,
             None,
             None,
@@ -5747,6 +5912,47 @@ mod tests {
             page_layout
         );
     }
+
+    #[test]
+    fn epub_thumb_request_replaces_display_metadata_with_generation_identity() {
+        let path = Path::new("book.epub");
+        let read = crate::pdf_loader::generation_target_for_test(path, 17, 4096);
+        let req = LoadRequest {
+            path: path.to_path_buf(),
+            pdf_page: Some(0),
+            mtime: 123,
+            file_size: 456,
+            pdf_stamp_policy: PdfStampPolicy::ResolveInWorker,
+            cache_key_override: Some("pdfthumb:book.epub#pin:pdfpage".into()),
+            ..Default::default()
+        };
+        let stamped = stamp_resolved_pdf_request(&req, &read).unwrap();
+        assert_eq!((stamped.mtime, stamped.file_size), (17, 4096));
+        assert_eq!(
+            stamped.cache_key_override.as_deref(),
+            Some("pdfthumb:book.epub#pin:pdfpage|generation:17:4096")
+        );
+        assert_eq!((req.mtime, req.file_size), (123, 456));
+        let new_generation = crate::pdf_loader::generation_target_for_test(path, 18, 4096);
+        let fresh = stamp_resolved_pdf_request(&req, &new_generation).unwrap();
+        assert_ne!(
+            (stamped.mtime, stamped.file_size),
+            (fresh.mtime, fresh.file_size)
+        );
+        assert_ne!(stamped.cache_key_override, fresh.cache_key_override);
+    }
+
+    #[test]
+    fn epub_catchup_neighbor_and_folder_resolution_share_generation_stamp() {
+        let path = Path::new("book.epub");
+        let first = crate::pdf_loader::generation_target_for_test(path, 17, 4096);
+        let second = crate::pdf_loader::generation_target_for_test(path, 18, 4096);
+        let (mtime, size, read) = resolved_epub_derived_stamp(first.clone()).unwrap();
+        assert_eq!((mtime, size), (17, 4096));
+        assert_eq!(read, Some(first));
+        let (next_mtime, next_size, _) = resolved_epub_derived_stamp(second).unwrap();
+        assert_ne!((mtime, size), (next_mtime, next_size));
+    }
 }
 
 /// 画像1枚をデコード・エンコード・カタログ保存する。成功時は WebP バイト数を返す。
@@ -5951,6 +6157,7 @@ pub fn build_and_save_one_zip(
 /// バッチキャッシュ作成用。
 pub fn build_and_save_one_pdf(
     pdf_path: &Path,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
     page_num: u32,
     password: Option<&str>,
     catalog: &crate::catalog::CatalogDb,
@@ -5962,16 +6169,30 @@ pub fn build_and_save_one_pdf(
     // バッチキャッシュ作成は Normal 優先度 + 非 UI 経路なので epoch=0:
     // フルスクリーン操作より優先されない、かつ UI nav の bump で巻き込まれない
     // + AbortOnCancel (bulk は cancel=明示中断意図)
-    let res = crate::pdf_loader::render_page(
-        pdf_path,
-        page_num,
-        thumb_px,
-        password,
-        None,
-        crate::pdf_loader::JobPriority::Normal,
-        0,
-        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-    )
+    let res = if let Some(read) = epub_read {
+        crate::pdf_loader::render_page_with_read_target(
+            pdf_path,
+            read,
+            page_num,
+            thumb_px,
+            password,
+            None,
+            crate::pdf_loader::JobPriority::Normal,
+            0,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+        )
+    } else {
+        crate::pdf_loader::render_page(
+            pdf_path,
+            page_num,
+            thumb_px,
+            password,
+            None,
+            crate::pdf_loader::JobPriority::Normal,
+            0,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+        )
+    }
     .ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);
     encode_and_save_with_geometry(

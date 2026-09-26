@@ -271,6 +271,17 @@ struct FileStamp {
     size: u64,
 }
 
+fn generation_file_stamp(read: &crate::pdf_loader::ReadTarget) -> Result<FileStamp, String> {
+    let (id, size) = read
+        .stamp
+        .generation_catalog_pair()
+        .ok_or_else(|| "EPUB の世代を確認できません".to_string())?;
+    Ok(FileStamp {
+        modified_ns: Some(u128::try_from(id).map_err(|_| "EPUB の世代 ID が不正です")?),
+        size: size as u64,
+    })
+}
+
 fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| format!("対象を確認できません: {}: {error}", path.display()))?;
@@ -551,9 +562,29 @@ impl MaterializeSession {
         // 常に miss させる** (`lookup_reusable` が `modified_ns.is_some()` を要求する)。
         // 左右 2 source の stamp を単一 source 用 cache key へ不完全に畳まず、見開きは
         // 当面つねに worker で decode・合成し直す。
-        let source_stamp = match request.source.source_path() {
-            Some(path) => file_stamp(path)?,
-            None => FileStamp::default(),
+        let epub_read = if let MaterializeSource::PdfPage { pdf_path, .. } = &request.source {
+            if pdf_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                Some(
+                    crate::pdf_loader::resolve_read_target(pdf_path)
+                        .map_err(|error| format!("EPUB を読み取れません: {error:?}"))?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let source_stamp = if let Some(read) = epub_read.as_ref() {
+            generation_file_stamp(read)?
+        } else {
+            match request.source.source_path() {
+                Some(path) => file_stamp(path)?,
+                None => FileStamp::default(),
+            }
         };
 
         let edit_fingerprint = loaded_edits
@@ -610,6 +641,7 @@ impl MaterializeSession {
                             loaded_edits.as_ref(),
                             pdf_render_long_edge,
                             cancel,
+                            epub_read.as_ref(),
                         )?
                     };
                     check_current(&self.inner, cancel, generation)?;
@@ -899,6 +931,7 @@ fn render_materialize_source(
     edits: Option<&LoadedMaterializePageEdits>,
     pdf_render_long_edge: u32,
     cancel: &Arc<AtomicBool>,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
 ) -> Result<egui::ColorImage, String> {
     match source {
         MaterializeSource::MergedSpread { left, right, .. } => {
@@ -911,8 +944,10 @@ fn render_materialize_source(
                 }
                 None => (None, None),
             };
-            let left = render_materialize_page(left, left_edits, pdf_render_long_edge, cancel)?;
-            let right = render_materialize_page(right, right_edits, pdf_render_long_edge, cancel)?;
+            let left =
+                render_materialize_page(left, left_edits, pdf_render_long_edge, cancel, None)?;
+            let right =
+                render_materialize_page(right, right_edits, pdf_render_long_edge, cancel, None)?;
             crate::capture::combine_spread_color_images(&left, &right)
         }
         _ => {
@@ -923,7 +958,7 @@ fn render_materialize_source(
                 }
                 None => None,
             };
-            render_materialize_page(source, edits, pdf_render_long_edge, cancel)
+            render_materialize_page(source, edits, pdf_render_long_edge, cancel, epub_read)
         }
     }
 }
@@ -933,12 +968,14 @@ fn render_materialize_page(
     edits: Option<&LoadedPageEdits>,
     pdf_render_long_edge: u32,
     cancel: &Arc<AtomicBool>,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
 ) -> Result<egui::ColorImage, String> {
     let source = composite_source(source)?;
-    let image = crate::books::decode_composite_source_for_materialization(
+    let image = crate::books::decode_composite_source_for_materialization_with_target(
         &source,
         pdf_render_long_edge,
         Arc::clone(cancel),
+        epub_read,
     )?;
     match edits {
         Some(edits) if edits.requires_composite => {
@@ -2036,12 +2073,13 @@ mod tests {
             left: loaded_stage(crate::bake_stage::BakeStage::Edits),
             right: loaded_stage(crate::bake_stage::BakeStage::Edits),
         };
-        let plain = render_materialize_source(&source, Some(&edits), 4096, &cancel).unwrap();
+        let plain = render_materialize_source(&source, Some(&edits), 4096, &cancel, None).unwrap();
         let display = LoadedMaterializePageEdits::Spread {
             left: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
             right: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
         };
-        let adjusted = render_materialize_source(&source, Some(&display), 4096, &cancel).unwrap();
+        let adjusted =
+            render_materialize_source(&source, Some(&display), 4096, &cancel, None).unwrap();
 
         assert_eq!(plain.size, adjusted.size);
         assert_ne!(plain.pixels, adjusted.pixels);
@@ -2154,6 +2192,24 @@ mod tests {
                 .session()
                 .ensure_current(&AtomicBool::new(false), current)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn epub_materializer_stamp_changes_with_generation_not_source_attributes() {
+        let path = Path::new("book.epub");
+        let first = crate::pdf_loader::generation_target_for_test(path, 17, 4096);
+        let second = crate::pdf_loader::generation_target_for_test(path, 18, 4096);
+        assert_eq!(
+            generation_file_stamp(&first).unwrap(),
+            FileStamp {
+                modified_ns: Some(17),
+                size: 4096,
+            }
+        );
+        assert_ne!(
+            generation_file_stamp(&first).unwrap(),
+            generation_file_stamp(&second).unwrap()
         );
     }
 

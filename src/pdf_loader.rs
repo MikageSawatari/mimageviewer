@@ -45,6 +45,19 @@ pub enum DocumentStamp {
     },
 }
 
+impl DocumentStamp {
+    /// Existing catalog integer columns carry the generation identity for EPUB.
+    /// The PDF branch keeps its existing caller-supplied file attributes.
+    pub fn generation_catalog_pair(&self) -> Option<(i64, i64)> {
+        match self {
+            Self::Generation { id, pdf_size } => {
+                i64::try_from(*pdf_size).ok().map(|size| (*id, size))
+            }
+            Self::File { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadTarget {
     pub read_path: ResolvedReadPath,
@@ -197,6 +210,66 @@ fn epub_pinned() -> &'static Mutex<HashMap<String, ReadTarget>> {
     EPUB_PINNED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Memory-only lookup; safe for the placeholder decision on the UI thread.
+pub fn pinned_epub_target(logical: &Path) -> Option<ReadTarget> {
+    if !is_epub(logical) {
+        return None;
+    }
+    epub_pinned()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&epub_cache::src_key(logical))
+        .cloned()
+}
+
+#[cfg(test)]
+pub(crate) struct TestEpubPin(String);
+
+#[cfg(test)]
+impl Drop for TestEpubPin {
+    fn drop(&mut self) {
+        epub_pinned().lock().unwrap().remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pin_epub_for_test(logical: &Path, id: i64, pdf_size: u64) -> TestEpubPin {
+    let key = epub_cache::src_key(logical);
+    epub_pinned().lock().unwrap().insert(
+        key.clone(),
+        generation_target_for_test(logical, id, pdf_size),
+    );
+    TestEpubPin(key)
+}
+
+#[cfg(test)]
+pub(crate) fn pin_epub_with_source_for_test(
+    logical: &Path,
+    id: i64,
+    pdf_size: u64,
+    source: epub_cache::SourceState,
+) -> TestEpubPin {
+    let guard = pin_epub_for_test(logical, id, pdf_size);
+    if let Some(target) = epub_pinned()
+        .lock()
+        .unwrap()
+        .get_mut(&epub_cache::src_key(logical))
+    {
+        target.display_source_state = Some(source);
+    }
+    guard
+}
+
+#[cfg(test)]
+pub(crate) fn generation_target_for_test(logical: &Path, id: i64, pdf_size: u64) -> ReadTarget {
+    ReadTarget {
+        read_path: ResolvedReadPath::from_resolution(logical.with_extension("generated.pdf")),
+        stamp: DocumentStamp::Generation { id, pdf_size },
+        display_source_state: None,
+        epub_direction: None,
+    }
+}
+
 /// Returns a target only when deciding it requires no filesystem or database I/O.
 /// The pinned-table lock covers only an in-memory lookup, never source or DB I/O.
 fn read_target_without_io(logical: &Path) -> Option<Result<ReadTarget, PdfReadError>> {
@@ -313,6 +386,9 @@ fn resolve_epub_at(
             }
             Err(error) => return Err(error.into()),
         }
+        db.touch_current(&key, row.generation_id).map_err(|error| {
+            PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
+        })?;
         Ok(ReadTarget {
             read_path: ResolvedReadPath::from_resolution(row.pdf_file),
             stamp: DocumentStamp::Generation {
@@ -4333,6 +4409,17 @@ pub fn enumerate_pages_with_options(
     options: EnumerateOptions,
 ) -> std::io::Result<PdfEnumerateResult> {
     let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
+    enumerate_pages_with_read_target(pdf_path, &read, password, cancel, options)
+}
+
+/// Worker-only enumeration using the target already used for a cache lookup.
+pub fn enumerate_pages_with_read_target(
+    pdf_path: &Path,
+    read: &ReadTarget,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+    options: EnumerateOptions,
+) -> std::io::Result<PdfEnumerateResult> {
     let pool = get_pool();
     let worker_options = enumerate_worker_options(&read, options);
     let req = encode_enumerate_request(&read.read_path, password, worker_options);
@@ -4438,6 +4525,39 @@ pub fn render_page(
 ) -> std::io::Result<RenderResult> {
     render_page_target(
         pdf_path,
+        page_num,
+        PdfRenderTarget::LongEdge(target_px),
+        password,
+        cancel,
+        priority,
+        context_epoch,
+        cancel_policy,
+    )
+}
+
+/// Render an EPUB page after its cache lookup has already resolved the generation.
+/// The worker must pass the very same target used for that lookup and its save.
+#[allow(clippy::too_many_arguments)]
+pub fn render_page_with_read_target(
+    logical: &Path,
+    read: &ReadTarget,
+    page_num: u32,
+    target_px: u32,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+    priority: JobPriority,
+    context_epoch: u64,
+    cancel_policy: CancelWaitPolicy,
+) -> std::io::Result<RenderResult> {
+    if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "cancelled",
+        ));
+    }
+    render_page_resolved_target(
+        logical,
+        read,
         page_num,
         PdfRenderTarget::LongEdge(target_px),
         password,
@@ -4557,6 +4677,31 @@ fn render_page_target(
 
     let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
 
+    render_page_resolved_target(
+        pdf_path,
+        &read,
+        page_num,
+        target,
+        password,
+        cancel,
+        priority,
+        context_epoch,
+        cancel_policy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_page_resolved_target(
+    pdf_path: &Path,
+    read: &ReadTarget,
+    page_num: u32,
+    target: PdfRenderTarget,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+    priority: JobPriority,
+    context_epoch: u64,
+    cancel_policy: CancelWaitPolicy,
+) -> std::io::Result<RenderResult> {
     let perf_enabled = crate::perf::is_enabled();
     let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);
     let t0 = std::time::Instant::now();

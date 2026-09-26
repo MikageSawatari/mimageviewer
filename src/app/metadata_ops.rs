@@ -450,6 +450,17 @@ impl From<()> for DetailsPageCountError {
     }
 }
 
+fn details_pdf_catalog_stamp(
+    read: Option<&crate::pdf_loader::ReadTarget>,
+    source_mtime: i64,
+    source_size: i64,
+) -> Result<(i64, i64), DetailsPageCountError> {
+    match read {
+        Some(read) => read.stamp.generation_catalog_pair().ok_or(().into()),
+        None => Ok((source_mtime, source_size)),
+    }
+}
+
 fn record_details_meta_worker_exit(generation: u64, exit: DetailsMetaWorkerExit) {
     match exit {
         DetailsMetaWorkerExit::Completed => {}
@@ -1407,6 +1418,20 @@ fn load_details_page_count(
             // DPAPI 復号は metadata worker 上で行う。UI thread は暗号化ストアと
             // credential revision の snapshot だけを渡す。
             let pdf_password = config.pdf_passwords.get(path);
+            let epub_read = if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                Some(crate::pdf_loader::resolve_read_target(path).map_err(|_| ())?)
+            } else {
+                None
+            };
+            let (stamp_mtime, stamp_size) = details_pdf_catalog_stamp(
+                epub_read.as_ref(),
+                target.source_mtime,
+                target.source_size,
+            )?;
             if let Some(catalog) = catalog {
                 let cached = {
                     let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
@@ -1414,7 +1439,7 @@ fn load_details_page_count(
                             DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfCatalogRead),
                         ));
                     };
-                    catalog.get_pdf_meta(key, target.source_mtime, target.source_size)
+                    catalog.get_pdf_meta(key, stamp_mtime, stamp_size)
                 };
                 if let Ok(Some((count, password_required))) = cached {
                     if password_required && pdf_password.is_none() {
@@ -1431,12 +1456,24 @@ fn load_details_page_count(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfEnumerate),
                     ));
                 };
-                crate::pdf_loader::enumerate_pages_with_cancel(
-                    path,
-                    pdf_password.as_deref(),
-                    Some(Arc::clone(cancel)),
-                )
-                .map_err(|_| ())?
+                if let Some(read) = epub_read.as_ref() {
+                    crate::pdf_loader::enumerate_pages_with_read_target(
+                        path,
+                        read,
+                        pdf_password.as_deref(),
+                        Some(Arc::clone(cancel)),
+                        crate::pdf_loader::EnumerateOptions::default(),
+                    )
+                    .map(|result| result.pages)
+                    .map_err(|_| ())?
+                } else {
+                    crate::pdf_loader::enumerate_pages_with_cancel(
+                        path,
+                        pdf_password.as_deref(),
+                        Some(Arc::clone(cancel)),
+                    )
+                    .map_err(|_| ())?
+                }
             };
             if cancel.load(Ordering::Relaxed) {
                 return Err(DetailsPageCountError::Cancelled(
@@ -1455,8 +1492,8 @@ fn load_details_page_count(
                 };
                 let _ = catalog.set_pdf_meta(
                     key,
-                    target.source_mtime,
-                    target.source_size,
+                    stamp_mtime,
+                    stamp_size,
                     count,
                     pdf_password.is_some(),
                 );
@@ -2155,6 +2192,19 @@ pub(super) fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epub_details_page_count_uses_generation_and_pdf_keeps_source_stamp() {
+        let read = crate::pdf_loader::generation_target_for_test(Path::new("book.epub"), 17, 4096);
+        assert_eq!(
+            details_pdf_catalog_stamp(Some(&read), 123, 456).unwrap(),
+            (17, 4096)
+        );
+        assert_eq!(
+            details_pdf_catalog_stamp(None, 123, 456).unwrap(),
+            (123, 456)
+        );
+    }
 
     /// pass 2 は 1 項目のうちに複数の file を読む。取消を見ずに読みを続けると、
     /// 取り消した検索の worker が残り、次の検索の pool と並んで走ってしまう。

@@ -183,11 +183,19 @@ fn document_direction_changes_only_unsaved_default_and_placeholder_policy() {
         true,
         true
     ));
-    assert!(!pdf_meta_placeholder_allowed(
+    assert!(pdf_meta_placeholder_allowed(
         std::path::Path::new("book.epub"),
         false,
         true
     ));
+    assert_eq!(
+        pdf_open_direction_policy(std::path::Path::new("book.epub"), true, || false),
+        (false, false)
+    );
+    assert_eq!(
+        pdf_open_direction_policy(std::path::Path::new("book.epub"), true, || true),
+        (false, true)
+    );
 }
 
 #[test]
@@ -919,6 +927,140 @@ fn epub_openable_path_uses_the_pdf_enumeration_route() {
     assert!(app.pdf_enumerate_pending.as_ref().is_some_and(|pending| {
         pending.0 == source && pending.3 == OpenRequestOwner::Navigation
     }));
+}
+
+#[test]
+fn epub_thumbnail_requests_defer_stamp_while_pdf_requests_keep_file_attributes() {
+    let pins = std::collections::HashMap::new();
+    let converted = std::collections::HashMap::new();
+    for (path, expected) in [
+        (
+            std::path::PathBuf::from("book.epub"),
+            crate::thumb_loader::PdfStampPolicy::ResolveInWorker,
+        ),
+        (
+            std::path::PathBuf::from("book.pdf"),
+            crate::thumb_loader::PdfStampPolicy::CallerFileAttributes,
+        ),
+    ] {
+        for item in [
+            GridItem::PdfFile(path.clone()),
+            GridItem::PdfPage {
+                pdf_path: path.clone(),
+                page_num: 0,
+                content_type: None,
+            },
+        ] {
+            let request = make_load_request(
+                &item, 0, 123, 456, false, None, None, 0, &pins, &converted, None, None, None,
+                None, false,
+            )
+            .unwrap();
+            assert_eq!(request.pdf_stamp_policy, expected);
+            assert_eq!((request.mtime, request.file_size), (123, 456));
+        }
+    }
+}
+
+#[test]
+fn epub_pdf_meta_placeholder_uses_only_a_pinned_generation() {
+    let mut app = setup_app_for_test();
+    let tmp = TempDir::new().unwrap();
+    let book = tmp.path().join("book.epub");
+    std::fs::write(&book, b"source").unwrap();
+    let source = crate::epub_cache::source_state(&std::fs::metadata(&book).unwrap());
+    let catalog = app.get_or_open_catalog(tmp.path()).unwrap();
+    catalog
+        .set_pdf_meta("book.epub", 17, 4096, 8, false)
+        .unwrap();
+    assert!(app.peek_pdf_meta_cache(&book, false).is_none());
+    {
+        let _pin = crate::pdf_loader::pin_epub_with_source_for_test(&book, 17, 4096, source);
+        assert_eq!(app.peek_pdf_meta_cache(&book, false).unwrap().0, 8);
+    }
+    assert!(app.peek_pdf_meta_cache(&book, false).is_none());
+    let _new_generation = crate::pdf_loader::pin_epub_with_source_for_test(&book, 18, 4096, source);
+    assert!(app.peek_pdf_meta_cache(&book, false).is_none());
+}
+
+#[test]
+fn epub_pdf_meta_worker_replaces_page_count_with_new_generation_stamp() {
+    let tmp = TempDir::new().unwrap();
+    let catalog = std::sync::Arc::new(
+        crate::catalog::CatalogDb::open(&tmp.path().join("thumbs"), tmp.path()).unwrap(),
+    );
+    for (id, pages) in [(17, 3), (18, 8)] {
+        let catalog = std::sync::Arc::clone(&catalog);
+        let folder = tmp.path().to_path_buf();
+        std::thread::spawn(move || {
+            write_epub_pdf_meta_row(
+                &folder,
+                Some(catalog),
+                "book.epub",
+                id,
+                4096,
+                pages,
+                false,
+                false,
+            )
+            .unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+    assert_eq!(catalog.get_pdf_meta("book.epub", 17, 4096).unwrap(), None);
+    assert_eq!(
+        catalog.get_pdf_meta("book.epub", 18, 4096).unwrap(),
+        Some((8, false))
+    );
+}
+
+#[test]
+fn epub_auto_aspect_seed_ignores_source_metadata_cache_hit() {
+    let mut app = setup_app_for_test();
+    app.settings.thumb_aspect_auto = true;
+    let epub = GridItem::PdfPage {
+        pdf_path: std::path::PathBuf::from("book.epub"),
+        page_num: 0,
+        content_type: None,
+    };
+    app.items = vec![epub.clone()];
+    app.image_metas = vec![Some((123, 456))];
+    let request = make_load_request(
+        &epub,
+        0,
+        123,
+        456,
+        false,
+        None,
+        None,
+        0,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let key = crate::thumb_loader::cache_key_for_request(&request)
+        .unwrap()
+        .into_owned();
+    let map = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([(
+        key,
+        crate::catalog::CacheEntry {
+            mtime: 123,
+            file_size: 456,
+            jpeg_data: Vec::new(),
+            source_dims: Some((100, 200)),
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        },
+    )])));
+    app.reset_and_seed_auto_aspect_with_collection_seed(&map, None, Some(1));
+    assert!(app.auto_aspect.samples.is_empty());
 }
 
 #[test]

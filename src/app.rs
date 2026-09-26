@@ -10627,15 +10627,11 @@ fn default_spread_for_document_direction(
 }
 
 pub(crate) fn pdf_meta_placeholder_allowed(
-    path: &std::path::Path,
+    _path: &std::path::Path,
     follow: bool,
     has_saved_spread: bool,
 ) -> bool {
-    let is_epub = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
-    !is_epub && (!follow || has_saved_spread)
+    !follow || has_saved_spread
 }
 
 /// Decide the PDF open policy without consulting spread.db on the default OFF path.
@@ -10649,7 +10645,11 @@ pub(crate) fn pdf_open_direction_policy(
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
     if is_epub {
-        return (false, false);
+        return if follow {
+            (false, saved_spread())
+        } else {
+            (false, true)
+        };
     }
     if !follow {
         return (false, true);
@@ -13443,6 +13443,7 @@ pub struct App {
     pub(crate) cache_maint_pending: Option<crate::cache_maintenance::CacheMaintPending>,
     /// 変換済みアーカイブキャッシュ管理ダイアログのロード / 削除ワーカーのハンドル。
     pub(crate) archive_cache_maint_pending: Option<crate::cache_maintenance::ArchiveMaintPending>,
+    pub(crate) epub_cache_maint_pending: Option<crate::cache_maintenance::EpubMaintPending>,
 
     // ── 変換済みアーカイブキャッシュ (v0.7.0) ───────────────────
     /// RAR / 7z / LZH → ZIP 変換キャッシュ DB。初期化失敗時は None。
@@ -13486,6 +13487,10 @@ pub struct App {
     pub(crate) archive_cache_manager_result: Option<String>,
     /// 「すべて削除」確認ステップ
     pub(crate) archive_cache_confirm_delete_all: bool,
+    pub(crate) epub_cache_rows: Option<Vec<crate::epub_cache::CurrentGenerationEntry>>,
+    pub(crate) epub_cache_selection: std::collections::HashSet<i64>,
+    pub(crate) epub_cache_confirm_delete_all: bool,
+    pub(crate) epub_cache_manager_result: Option<String>,
 
     // ── 最後に選択した有効なサムネイル画質サンプル ──
     pub(crate) last_selected_thumb_sample: Option<ThumbSampleSource>,
@@ -16939,6 +16944,7 @@ impl App {
             cache_manager_confirm_delete_all: false,
             cache_maint_pending: None,
             archive_cache_maint_pending: None,
+            epub_cache_maint_pending: None,
             archive_cache_db,
             edit_preview_cache,
             edit_preview_repaint_ctx: None,
@@ -16960,6 +16966,10 @@ impl App {
             archive_cache_selection: std::collections::HashSet::new(),
             archive_cache_manager_result: None,
             archive_cache_confirm_delete_all: false,
+            epub_cache_rows: None,
+            epub_cache_selection: std::collections::HashSet::new(),
+            epub_cache_confirm_delete_all: false,
+            epub_cache_manager_result: None,
             last_selected_thumb_sample: None,
             tq: ThumbQualityState {
                 fs_divider: 0.5,
@@ -18366,6 +18376,11 @@ impl App {
                 ) else {
                     continue;
                 };
+                // EPUB's display metadata is not its cache identity. The worker will
+                // seed this sample after resolving the pinned generation.
+                if req.pdf_stamp_policy == crate::thumb_loader::PdfStampPolicy::ResolveInWorker {
+                    continue;
+                }
                 let Some(key) = crate::thumb_loader::cache_key_for_request(&req) else {
                     continue;
                 };
@@ -26782,6 +26797,13 @@ impl App {
         self.zip_enumerate_pending = None;
         // 直前の cache-hit の placeholder 情報はクリア (= 新規 nav の出発点)。
         self.pdf_placeholder_count = None;
+        if pdf_stamp_policy_for_path(&pdf_path)
+            == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+            && crate::perf::is_enabled()
+        {
+            let key = crate::grid_item::pdf_file_perf_key(&pdf_path);
+            crate::perf::event("epub_open", "begin", Some(&key), self.input_seq, &[]);
+        }
         // 自動 1 ページ目フルスクリーン (環境設定 ON で grid から PDF を開いた) の予約を、
         // enumerate 完了で先頭ページを開く既存 deferred 機構へ載せ替える。folder-nav は
         // pending_auto_fs_open=false なのでここでは触らない (reopen が後段で set する)。
@@ -27057,6 +27079,19 @@ impl App {
             Vec::new(),
             None,
         );
+        if pdf_stamp_policy_for_path(pdf_path)
+            == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+            && crate::perf::is_enabled()
+        {
+            let key = crate::grid_item::pdf_file_perf_key(pdf_path);
+            crate::perf::event(
+                "epub_open",
+                "first_display",
+                Some(&key),
+                self.input_seq,
+                &[("placeholder", serde_json::Value::from(true))],
+            );
+        }
         Some(page_count)
     }
 
@@ -27071,14 +27106,29 @@ impl App {
         let filename = pdf_path.file_name()?.to_str()?.to_string();
         let parent = pdf_path.parent()?.to_path_buf();
 
-        // stat は同期 I/O だが ~1ms。catalog open より軽量。
-        let meta = std::fs::metadata(pdf_path).ok()?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)?;
-        let file_size = meta.len();
+        let is_epub = pdf_stamp_policy_for_path(pdf_path)
+            == crate::thumb_loader::PdfStampPolicy::ResolveInWorker;
+        let (lookup_mtime, lookup_size, mtime, file_size) = if is_epub {
+            // The pinned table is memory-only. An unpinned book needs DB and source I/O,
+            // so it waits for the normal background enumeration instead.
+            let read = crate::pdf_loader::pinned_epub_target(pdf_path)?;
+            let (id, size) = read.stamp.generation_catalog_pair()?;
+            let source = read.display_source_state?;
+            const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+            let display_mtime =
+                (source.mtime_ticks.saturating_sub(FILETIME_UNIX_EPOCH) / 10_000_000) as i64;
+            (id, size, display_mtime, source.size)
+        } else {
+            // Preserve the existing plain-PDF stat and catalog matching path.
+            let meta = std::fs::metadata(pdf_path).ok()?;
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)?;
+            let file_size = meta.len();
+            (mtime, file_size as i64, mtime, file_size)
+        };
 
         // 親フォルダの catalog DB を **warm hit 経由のみ** で取得する (review #6 対応)。
         // ここは UI スレッドの「Enter→placeholder 即表示」hot path なので、
@@ -27089,7 +27139,7 @@ impl App {
         let (page_count, password_required) = {
             let catalog = self.peek_warm_catalog(&parent)?;
             catalog
-                .get_pdf_meta(&filename, mtime, file_size as i64)
+                .get_pdf_meta(&filename, lookup_mtime, lookup_size)
                 .ok()??
         };
 
@@ -27277,18 +27327,52 @@ impl App {
                 //      新規行が初めて作成される。
                 let saved_pw_now = self.pdf_passwords.get(&pdf_path).is_some();
                 let session_only = password.is_some() && !saved_pw_now;
-                if let (Some(parent), Some(filename), Some(page0)) = (
+                let catalog_stamp = if pdf_stamp_policy_for_path(&pdf_path)
+                    == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+                {
+                    pages
+                        .stamp
+                        .as_ref()
+                        .and_then(crate::pdf_loader::DocumentStamp::generation_catalog_pair)
+                } else {
+                    pages
+                        .pages
+                        .first()
+                        .map(|page0| (page0.mtime, page0.file_size as i64))
+                };
+                if let (Some(parent), Some(filename), Some((page0_mtime, page0_size))) = (
                     pdf_path.parent().map(|p| p.to_path_buf()),
                     pdf_path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .map(|s| s.to_string()),
-                    pages.pages.first(),
+                    catalog_stamp,
                 ) {
-                    let page0_mtime = page0.mtime;
-                    let page0_size = page0.file_size as i64;
-                    // 親フォルダ catalog は LRU 経由で取得 (Codex P2)
-                    if let Some(cat) = self.get_or_open_catalog(&parent) {
+                    if pdf_stamp_policy_for_path(&pdf_path)
+                        == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+                    {
+                        let warm = self.peek_warm_catalog(&parent);
+                        let spawn = std::thread::Builder::new()
+                            .name("epub-pdf-meta".into())
+                            .spawn(move || {
+                                if let Err(error) = write_epub_pdf_meta_row(
+                                    &parent,
+                                    warm,
+                                    &filename,
+                                    page0_mtime,
+                                    page0_size,
+                                    actual_count,
+                                    saved_pw_now,
+                                    session_only,
+                                ) {
+                                    crate::logger::log(format!("epub pdf meta: {error}"));
+                                }
+                            });
+                        if let Err(error) = spawn {
+                            crate::logger::log(format!("epub pdf meta worker: {error}"));
+                        }
+                    } else if let Some(cat) = self.get_or_open_catalog(&parent) {
+                        // 通常 PDF は既存の LRU と書き込み経路を維持する。
                         let result = if session_only {
                             cat.set_pdf_meta_thumb(&filename, page0_mtime, page0_size, actual_count)
                         } else {
@@ -27342,6 +27426,20 @@ impl App {
                         Vec::new(),
                         None,
                     );
+                    if placeholder_count.is_none()
+                        && pdf_stamp_policy_for_path(&pdf_path)
+                            == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+                        && crate::perf::is_enabled()
+                    {
+                        let key = crate::grid_item::pdf_file_perf_key(&pdf_path);
+                        crate::perf::event(
+                            "epub_open",
+                            "first_display",
+                            Some(&key),
+                            self.input_seq,
+                            &[("placeholder", serde_json::Value::from(false))],
+                        );
+                    }
                     if self.settings.follow_document_reading_direction {
                         let defaults = SpreadRestoreDefaults::for_book(&self.settings);
                         if let Err(error) = self.apply_spread_for_key_with_document_direction(
@@ -76323,6 +76421,41 @@ impl App {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_epub_pdf_meta_row(
+    parent: &Path,
+    warm: Option<Arc<crate::catalog::CatalogDb>>,
+    filename: &str,
+    generation_id: i64,
+    generation_size: i64,
+    page_count: u32,
+    password_required: bool,
+    session_only: bool,
+) -> Result<(), String> {
+    let catalog = match warm {
+        Some(catalog) => catalog,
+        None => Arc::new(
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), parent)
+                .map_err(|error| error.to_string())?,
+        ),
+    };
+    if session_only {
+        catalog
+            .set_pdf_meta_thumb(filename, generation_id, generation_size, page_count)
+            .map_err(|error| error.to_string())
+    } else {
+        catalog
+            .set_pdf_meta(
+                filename,
+                generation_id,
+                generation_size,
+                page_count,
+                password_required,
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
 // -----------------------------------------------------------------------
 // eframe::App 実装
 // -----------------------------------------------------------------------
@@ -77059,6 +77192,7 @@ impl App {
         self.poll_cache_maint_pending();
         self.poll_metadata_cleanup(ctx);
         self.poll_archive_cache_maint_pending();
+        self.poll_epub_cache_maint_pending();
         self.poll_converted_archive_cache_paths(ctx);
         self.ensure_folder_rating_counter();
         self.poll_folder_rating_counts();
@@ -79712,6 +79846,19 @@ fn make_drive_list_pin_load_request(
         crate::catalog::FolderThumbProvenance::Seeded,
     )?;
     let cache_key_prefix = drive_list_pinned_cache_key_prefix(&base_key, source);
+    let epub_source = match source {
+        crate::folder_thumb_pins::FolderPinSource::File {
+            rel,
+            kind: crate::folder_thumb_pins::FileKind::PdfFile,
+        } => Some(container_path.join(rel)),
+        crate::folder_thumb_pins::FolderPinSource::PdfPage { pdf_rel, .. } => {
+            Some(container_path.join(pdf_rel))
+        }
+        _ => None,
+    }
+    .filter(|path| {
+        pdf_stamp_policy_for_path(path) == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+    });
     Some(LoadRequest {
         idx,
         path: container_path.clone(),
@@ -79719,7 +79866,10 @@ fn make_drive_list_pin_load_request(
         folder_thumb_sort: Some(folder_thumb_sort),
         folder_thumb_depth,
         folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
-        pinned_only: Some(crate::thumb_loader::PinnedOnlyRequest { cache_key_prefix }),
+        pinned_only: Some(crate::thumb_loader::PinnedOnlyRequest {
+            cache_key_prefix,
+            epub_source,
+        }),
         ..Default::default()
     })
 }
@@ -79865,6 +80015,18 @@ fn pinned_edit_preview_target(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn pdf_stamp_policy_for_path(path: &std::path::Path) -> crate::thumb_loader::PdfStampPolicy {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    {
+        crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+    } else {
+        crate::thumb_loader::PdfStampPolicy::CallerFileAttributes
+    }
+}
+
 fn make_load_request(
     item: &GridItem,
     idx: usize,
@@ -80050,6 +80212,7 @@ fn make_load_request(
         } => Some(LoadRequest {
             path: pdf_path.clone(),
             pdf_page: Some(*page_num),
+            pdf_stamp_policy: pdf_stamp_policy_for_path(pdf_path),
             pdf_password: pdf_password.map(String::from),
             ..base
         }),
@@ -80129,6 +80292,7 @@ fn make_load_request(
             let req = LoadRequest {
                 path: p.clone(),
                 pdf_page: Some(0),
+                pdf_stamp_policy: pdf_stamp_policy_for_path(p),
                 pdf_password: pdf_password.map(String::from),
                 cache_key_override: Some(base_key.clone()),
                 folder_thumb_sort,
@@ -80621,6 +80785,7 @@ fn apply_folder_thumb_pin(
             zip_entry: None,
             zip_dir_prefix: None,
             pdf_page: None,
+            pdf_stamp_policy: crate::thumb_loader::PdfStampPolicy::CallerFileAttributes,
             pdf_password: pdf_password.map(String::from),
             cache_key_override: Some(pinned_key),
             // mtime/size は target 動画のもの。seed_folder_video_pin_thumbs が同じ
@@ -80712,6 +80877,11 @@ fn apply_folder_thumb_pin(
         zip_entry,
         zip_dir_prefix,
         pdf_page,
+        pdf_stamp_policy: if pdf_page.is_some() {
+            pdf_stamp_policy_for_path(&resolved.abs_path)
+        } else {
+            crate::thumb_loader::PdfStampPolicy::CallerFileAttributes
+        },
         pdf_password: pdf_password.map(String::from),
         cache_key_override: Some(pinned_key),
         mtime: resolved.mtime,

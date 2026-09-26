@@ -737,14 +737,29 @@ where
         _ => "-".to_string(),
     };
     let rel_part = source.rel();
+    // The UI cannot resolve an EPUB generation. Use a typed pending identity;
+    // the thumbnail worker appends the pinned generation stamp before lookup.
+    let epub_pending = pdf_page.is_some()
+        && abs_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
+    let (identity_mtime, identity_size) = if epub_pending {
+        (
+            "generation-pending".to_string(),
+            "generation-pending".to_string(),
+        )
+    } else {
+        (mtime.to_string(), file_size.to_string())
+    };
     let source_id = format!(
         "{kind}|{rel}|{entry}|{page}|{mtime}|{size}",
         kind = source.db_kind(),
         rel = rel_part,
         entry = entry_part,
         page = page_part,
-        mtime = mtime,
-        size = file_size,
+        mtime = identity_mtime,
+        size = identity_size,
     );
 
     Some(ResolvedPinTarget {
@@ -1659,6 +1674,26 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn epub_page_pin_source_id_waits_for_worker_generation() {
+        let folder = Path::new("C:/books");
+        let epub = FolderPinSource::PdfPage {
+            pdf_rel: "book.epub".into(),
+            page: 3,
+        };
+        let before = resolve_pin_target_via(folder, &epub, &|_| Some((1, 2))).unwrap();
+        let after = resolve_pin_target_via(folder, &epub, &|_| Some((7, 8))).unwrap();
+        assert_eq!(before.source_id, after.source_id);
+        assert!(before.source_id.contains("generation-pending"));
+        let pdf = FolderPinSource::PdfPage {
+            pdf_rel: "book.pdf".into(),
+            page: 3,
+        };
+        let pdf_before = resolve_pin_target_via(folder, &pdf, &|_| Some((1, 2))).unwrap();
+        let pdf_after = resolve_pin_target_via(folder, &pdf, &|_| Some((7, 8))).unwrap();
+        assert_ne!(pdf_before.source_id, pdf_after.source_id);
     }
 
     #[test]

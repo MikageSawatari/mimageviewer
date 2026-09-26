@@ -1,5 +1,56 @@
 use super::*;
 
+#[inline]
+fn batch_pdf_parent_present(
+    cache_map: &std::collections::HashMap<String, crate::catalog::CacheEntry>,
+    key: &str,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
+    mtime: i64,
+    file_size: i64,
+) -> bool {
+    if epub_read.is_some() {
+        cache_map
+            .get(key)
+            .is_some_and(|entry| entry.mtime == mtime && entry.file_size == file_size)
+    } else {
+        cache_map.contains_key(key)
+    }
+}
+
+#[cfg(test)]
+mod epub_stamp_tests {
+    use super::*;
+
+    #[test]
+    fn epub_batch_parent_row_requires_generation_while_pdf_keeps_presence_check() {
+        let key = "book.epub".to_string();
+        let map = std::collections::HashMap::from([(
+            key.clone(),
+            crate::catalog::CacheEntry {
+                mtime: 17,
+                file_size: 4096,
+                jpeg_data: Vec::new(),
+                source_dims: None,
+                layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
+            },
+        )]);
+        let first = crate::pdf_loader::generation_target_for_test(Path::new("book.epub"), 17, 4096);
+        let second =
+            crate::pdf_loader::generation_target_for_test(Path::new("book.epub"), 18, 4096);
+        assert!(batch_pdf_parent_present(&map, &key, Some(&first), 17, 4096));
+        assert!(!batch_pdf_parent_present(
+            &map,
+            &key,
+            Some(&second),
+            18,
+            4096
+        ));
+        assert!(batch_pdf_parent_present(&map, &key, None, 18, 4096));
+    }
+}
+
 impl App {
     // -------------------------------------------------------------------
     // サムネイル画質設定ダイアログ (A/B 比較)
@@ -367,10 +418,10 @@ impl App {
                             if let Some((mt, fs)) = meta() {
                                 zip_files.push((p, mt, fs));
                             }
-                        } else if ext_lower == "pdf" {
-                            if let Some((mt, fs)) = meta() {
-                                pdf_files.push((p, mt, fs));
-                            }
+                        } else if (ext_lower == "pdf" || ext_lower == "epub")
+                            && let Some((mt, fs)) = meta()
+                        {
+                            pdf_files.push((p, mt, fs));
                         }
                     }
                 }
@@ -609,6 +660,28 @@ impl App {
                         if cancel.load(Ordering::Relaxed) {
                             break;
                         }
+                        let epub_read = if pdf_path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                        {
+                            match crate::pdf_loader::resolve_read_target(pdf_path) {
+                                Ok(read) => Some(read),
+                                Err(_) => continue,
+                            }
+                        } else {
+                            None
+                        };
+                        let (resolved_mtime, resolved_size) = if let Some(read) = epub_read.as_ref()
+                        {
+                            let Some(stamp) = read.stamp.generation_catalog_pair() else {
+                                continue;
+                            };
+                            stamp
+                        } else {
+                            (*pdf_mtime, *pdf_file_size)
+                        };
+                        let (pdf_mtime, pdf_file_size) = (&resolved_mtime, &resolved_size);
                         let pdf_fname = match pdf_path.file_name().and_then(|n| n.to_str()) {
                             Some(n) => n.to_string(),
                             None => continue,
@@ -621,7 +694,18 @@ impl App {
                         if batch_pdf {
                             // enumerate_pages がパスワード不正時に Err を返すので
                             // 事前のパスワード判定は不要
-                            let pages = match crate::pdf_loader::enumerate_pages(pdf_path, pw_ref) {
+                            let pages = match if let Some(read) = epub_read.as_ref() {
+                                crate::pdf_loader::enumerate_pages_with_read_target(
+                                    pdf_path,
+                                    read,
+                                    pw_ref,
+                                    None,
+                                    crate::pdf_loader::EnumerateOptions::default(),
+                                )
+                                .map(|result| result.pages)
+                            } else {
+                                crate::pdf_loader::enumerate_pages(pdf_path, pw_ref)
+                            } {
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
@@ -677,6 +761,7 @@ impl App {
                                 }
                                 if let Some(bytes) = crate::thumb_loader::build_and_save_one_pdf(
                                     pdf_path,
+                                    epub_read.as_ref(),
                                     page_num,
                                     pw_ref,
                                     &pdf_catalog,
@@ -690,20 +775,42 @@ impl App {
                             }
 
                             // 先頭1ページを親フォルダの DB にも保存
-                            if page_count > 0 && !cache_map.contains_key(&folder_key) {
+                            let parent_present = batch_pdf_parent_present(
+                                &cache_map,
+                                &folder_key,
+                                epub_read.as_ref(),
+                                *pdf_mtime,
+                                *pdf_file_size,
+                            );
+                            if page_count > 0 && !parent_present {
                                 // bulk cache creator は background なので epoch=0
                                 // + AbortOnCancel (cancel = ユーザ明示中断意図)
-                                if let Ok(res) = crate::pdf_loader::render_page(
-                                    pdf_path,
-                                    0,
-                                    thumb_px,
-                                    pw_ref,
-                                    None,
-                                    crate::pdf_loader::JobPriority::Normal,
-                                    0,
-                                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-                                ) {
-                                    if let Some(bytes) = encode_and_save_with_source_dims(
+                                let rendered = if let Some(read) = epub_read.as_ref() {
+                                    crate::pdf_loader::render_page_with_read_target(
+                                        pdf_path,
+                                        read,
+                                        0,
+                                        thumb_px,
+                                        pw_ref,
+                                        None,
+                                        crate::pdf_loader::JobPriority::Normal,
+                                        0,
+                                        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                                    )
+                                } else {
+                                    crate::pdf_loader::render_page(
+                                        pdf_path,
+                                        0,
+                                        thumb_px,
+                                        pw_ref,
+                                        None,
+                                        crate::pdf_loader::JobPriority::Normal,
+                                        0,
+                                        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                                    )
+                                };
+                                if let Ok(res) = rendered
+                                    && let Some(bytes) = encode_and_save_with_source_dims(
                                         &res.image,
                                         res.page_size_points.catalog_layout_dims(),
                                         &folder_key,
@@ -712,9 +819,9 @@ impl App {
                                         *pdf_file_size,
                                         thumb_px,
                                         thumb_quality,
-                                    ) {
-                                        size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
-                                    }
+                                    )
+                                {
+                                    size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                 }
                             }
                         } else {
@@ -734,9 +841,18 @@ impl App {
                                     .flatten()
                                     .is_none();
                                 if meta_missing {
-                                    if let Ok(pages) =
+                                    if let Ok(pages) = if let Some(read) = epub_read.as_ref() {
+                                        crate::pdf_loader::enumerate_pages_with_read_target(
+                                            pdf_path,
+                                            read,
+                                            pw_ref,
+                                            None,
+                                            crate::pdf_loader::EnumerateOptions::default(),
+                                        )
+                                        .map(|result| result.pages)
+                                    } else {
                                         crate::pdf_loader::enumerate_pages(pdf_path, pw_ref)
-                                    {
+                                    } {
                                         let password_required = password.is_some();
                                         if let Err(e) = catalog.set_pdf_meta(
                                             filename,
@@ -752,21 +868,41 @@ impl App {
                                     }
                                 }
                             }
-                            if cache_map.contains_key(&folder_key) {
+                            if batch_pdf_parent_present(
+                                &cache_map,
+                                &folder_key,
+                                epub_read.as_ref(),
+                                *pdf_mtime,
+                                *pdf_file_size,
+                            ) {
                                 continue;
                             }
                             // render_page がパスワード不正時に Err を返すのでそのままスキップ
                             // bulk cache creator は background なので epoch=0 + AbortOnCancel
-                            if let Ok(res) = crate::pdf_loader::render_page(
-                                pdf_path,
-                                0,
-                                thumb_px,
-                                pw_ref,
-                                None,
-                                crate::pdf_loader::JobPriority::Normal,
-                                0,
-                                crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-                            ) {
+                            if let Ok(res) = if let Some(read) = epub_read.as_ref() {
+                                crate::pdf_loader::render_page_with_read_target(
+                                    pdf_path,
+                                    read,
+                                    0,
+                                    thumb_px,
+                                    pw_ref,
+                                    None,
+                                    crate::pdf_loader::JobPriority::Normal,
+                                    0,
+                                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                                )
+                            } else {
+                                crate::pdf_loader::render_page(
+                                    pdf_path,
+                                    0,
+                                    thumb_px,
+                                    pw_ref,
+                                    None,
+                                    crate::pdf_loader::JobPriority::Normal,
+                                    0,
+                                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                                )
+                            } {
                                 // PDF メタキャッシュにも page_count を投入する
                                 // (Codex P3 対応)。`password_required` は確信できる場合
                                 // (= この PDF 固有の保存パスワードあり) のみ true。
