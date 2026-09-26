@@ -10,10 +10,45 @@ let expected_rows = [
 ];
 let reason = "コレクションでは評価順を使えません。手動の並べ替えで順番を変えられます";
 
+fn collection_state(s) {
+    "runtime=" + s.collection_runtime_phase
+        + " error=" + s.collection_runtime_error
+        + " seeded_id_present=" + s.collection_seeded_id_present.to_debug()
+        + " surface=" + s.grid_surface
+        + " startup_pending=" + s.startup_open_pending.to_debug()
+        + " folder=" + s.current_folder_path
+        + " names=" + s.item_names.to_debug()
+        + " collection_id=" + s.collection_id
+        + " revision=" + s.collection_revision.to_debug()
+}
+
+fn wait_collection(check, timeout_ms, label) {
+    try {
+        wait_until(check, timeout_ms);
+    } catch (error) {
+        log("collection-sort: " + label + " timed out: " + collection_state(snapshot()));
+        throw error;
+    }
+}
+
+// The runner also supplies this fixture as a startup path. Wait until that
+// asynchronous folder open has installed its list before replacing it.
+wait_collection(|s| s.collection_runtime_phase == "Ready"
+    || s.collection_runtime_phase == "Failed", 10000, "Collection runtime");
+let runtime = snapshot();
+if runtime.collection_runtime_phase != "Ready" || !runtime.collection_seeded_id_present {
+    fail("seeded Collection is unavailable: " + collection_state(runtime));
+}
+wait_collection(|s| !s.startup_open_pending && s.grid_surface == "Folder"
+    && s.folder_load_requests >= 1 && s.item_names == expected_names,
+    30000, "startup fixture");
+log("collection-sort: startup fixture ready: " + collection_state(snapshot()));
+
 collection_sort_smoke("open_seeded_collection");
-wait_until(|s| s.collection_root_visible && s.collection_id == expected_id
+wait_collection(|s| s.collection_root_visible && s.collection_id == expected_id
     && s.collection_order_mode == "Manual" && s.collection_standard_sort == "FileName"
-    && s.collection_revision == 1 && s.item_names == expected_names, 30000);
+    && s.collection_revision == 1 && s.item_names == expected_names,
+    30000, "Collection root");
 let before = snapshot();
 log("collection-sort: root ready names=" + before.item_names.to_debug());
 

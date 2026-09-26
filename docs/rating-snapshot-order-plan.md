@@ -490,7 +490,12 @@ Collection の残件には短い兄弟シナリオ `scripts/ui-smoke.ps1 -Scenar
 ソート popup の全 12 行と非スクロール、評価順の無効表示・hover 理由、無効行の実 pointer click 後の
 UI 順序と DB の不変を確かめる。hover 理由は実際に開いた tooltip の描画クロージャ内で
 作られたラベルから読む。`portable,test-script` 限定の readback を使う。
-実アプリでの実行は利用者の了承した検証枠に残す。
+2026-09-26 17:51 の了承済み初回実行は、Collection open (`perf` 0.788s) の後に
+起動引数の fixture folder open (0.831s) が表示を置き換え、最初の root 待機で失敗した。
+DB v2 の起動・catalog は成功していた。シナリオは actor Ready と起動 folder の一覧確定を
+待ってから Collection を開き、失敗時には runtime 状態・エラー・表示面・folder を記録する。
+同バッチで PASS した RatingSort にも検出 DB lock と IPC pipe の警告があり、この失敗の原因ではない。
+修正版の実アプリ再実行は次の了承済み検証枠に残す。
 
 ## 10. 完了条件
 

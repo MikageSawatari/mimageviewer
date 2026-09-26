@@ -844,6 +844,12 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) item_names: Vec<String>,
     pub(crate) item_ratings: Vec<i64>,
     pub(crate) sort_order: String,
+    pub(crate) collection_runtime_phase: String,
+    pub(crate) collection_runtime_error: String,
+    pub(crate) collection_seeded_id_present: bool,
+    pub(crate) grid_surface: String,
+    pub(crate) current_folder_path: String,
+    pub(crate) startup_open_pending: bool,
     pub(crate) collection_root_visible: bool,
     pub(crate) collection_id: String,
     pub(crate) collection_order_mode: String,
@@ -901,6 +907,12 @@ impl Default for TestScriptSnapshot {
             item_names: Vec::new(),
             item_ratings: Vec::new(),
             sort_order: String::new(),
+            collection_runtime_phase: String::new(),
+            collection_runtime_error: String::new(),
+            collection_seeded_id_present: false,
+            grid_surface: String::new(),
+            current_folder_path: String::new(),
+            startup_open_pending: false,
             collection_root_visible: false,
             collection_id: String::new(),
             collection_order_mode: String::new(),
@@ -978,6 +990,12 @@ impl TestScriptSnapshot {
                 .into(),
         );
         insert!(sort_order);
+        insert!(collection_runtime_phase);
+        insert!(collection_runtime_error);
+        insert!(collection_seeded_id_present);
+        insert!(grid_surface);
+        insert!(current_folder_path);
+        insert!(startup_open_pending);
         insert!(collection_root_visible);
         insert!(collection_id);
         insert!(collection_order_mode);
@@ -1131,6 +1149,14 @@ pub(crate) enum UiSmokeAction {
     OpenThumbnailPreferences,
     OpenFirstSmartFolder,
     OpenSeededCollection,
+}
+
+pub(crate) const SEEDED_COLLECTION_SMOKE_ID: &str = "80f58851-997b-4b80-90bc-f50bb1d2523e";
+
+pub(crate) fn seeded_collection_smoke_id() -> crate::collection_store::CollectionId {
+    crate::collection_store::CollectionId::from_uuid(
+        uuid::Uuid::parse_str(SEEDED_COLLECTION_SMOKE_ID).expect("fixed smoke Collection ID"),
+    )
 }
 
 #[derive(Clone, Copy)]

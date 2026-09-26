@@ -27904,6 +27904,15 @@ impl App {
             .saturating_add(self.texture_backlog.len())
             .saturating_add(self.fs_upload_backlog.len());
         let collection_root_order = self.collection_grid_root_order().and_then(Result::ok);
+        let (collection_runtime_phase, collection_runtime_error, collection_seeded_id_present) =
+            self.collection_smoke_runtime_status();
+        let grid_surface = match self.top_level_grid_view.surface() {
+            crate::app::top_level_grid_view::TopLevelGridSurface::Folder => "Folder".to_string(),
+            crate::app::top_level_grid_view::TopLevelGridSurface::Collection(identity) => {
+                format!("Collection({})", identity.collection_id.as_uuid())
+            }
+            other => format!("{other:?}"),
+        };
 
         crate::test_script::TestScriptSnapshot {
             is_fullscreen: fs_idx.is_some(),
@@ -27930,6 +27939,17 @@ impl App {
                 .map(|index| i64::from(self.rating_cache.get(&index).copied().unwrap_or(0)))
                 .collect(),
             sort_order: format!("{:?}", self.settings.sort_order),
+            collection_runtime_phase,
+            collection_runtime_error,
+            collection_seeded_id_present,
+            grid_surface,
+            current_folder_path: self
+                .current_folder
+                .as_ref()
+                .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+            startup_open_pending: !self.initialized
+                || self.startup_open_path.is_some()
+                || self.startup_open_path_resolve_pending.is_some(),
             collection_root_visible: collection_root_order.is_some(),
             collection_id: collection_root_order.map_or_else(String::new, |root| {
                 root.content.stamp.collection_id.to_string()

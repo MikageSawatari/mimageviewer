@@ -76313,6 +76313,34 @@ impl App {
 // -----------------------------------------------------------------------
 
 impl App {
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn open_seeded_collection_for_smoke(&mut self) -> Result<(), String> {
+        if !self.initialized
+            || self.startup_open_path.is_some()
+            || self.startup_open_path_resolve_pending.is_some()
+        {
+            return Err("startup folder open is still pending".into());
+        }
+        match self.collection_store_client_for_read() {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err("Collection runtime is inert".into()),
+            Err(error) => return Err(format!("Collection runtime is unavailable: {error}")),
+        }
+        let id = crate::test_script::seeded_collection_smoke_id();
+        if self.collection_catalog_revision(id).is_none() {
+            return Err(format!(
+                "seeded Collection {} is missing from the ready catalog",
+                crate::test_script::SEEDED_COLLECTION_SMOKE_ID
+            ));
+        }
+        self.open_collection_grid(id, None);
+        crate::logger::log(format!(
+            "[test-script] opened seeded Collection {}",
+            crate::test_script::SEEDED_COLLECTION_SMOKE_ID
+        ));
+        Ok(())
+    }
+
     /// [`eframe::App::update`] の本体。
     ///
     /// **早期 return を複数持つ。** frame の最後に必ず走らせたい処理は、ここではなく
@@ -76356,22 +76384,14 @@ impl App {
                     self.open_smart_folder_staged(id, false);
                 }
             }
-            if self
-                .collection_store_client_for_read()
-                .ok()
-                .flatten()
-                .is_some()
-                && crate::test_script::take_smoke_action(
-                    crate::test_script::UiSmokeAction::OpenSeededCollection,
-                )
-            {
-                // The diagnostic runner seeds this exact ID only under portable-smoke/data.
-                let id = uuid::Uuid::parse_str("80f58851-997b-4b80-90bc-f50bb1d2523e")
-                    .expect("fixed smoke Collection ID");
-                self.open_collection_grid(
-                    crate::collection_store::CollectionId::from_uuid(id),
-                    None,
-                );
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::OpenSeededCollection,
+            ) {
+                if let Err(error) = self.open_seeded_collection_for_smoke() {
+                    crate::logger::log(format!(
+                        "[test-script] seeded Collection open rejected: {error}"
+                    ));
+                }
             }
         }
         self.edit_preview_repaint_ctx = Some(ctx.clone());
