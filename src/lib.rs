@@ -927,11 +927,14 @@ pub fn run() -> eframe::Result {
         std::process::exit(2);
     }
     #[cfg(all(feature = "test-script", windows))]
-    let test_script_path = {
+    let (test_script_path, test_evidence_dir) = {
         let args = std::env::args_os().collect::<Vec<_>>();
-        match test_script::cli_script_path_from(&args) {
-            Ok(path) => path,
-            Err(error) => {
+        match (
+            test_script::cli_script_path_from(&args),
+            test_script::cli_capture_dir_from(&args),
+        ) {
+            (Ok(path), Ok(dir)) => (path, dir),
+            (Err(error), _) | (_, Err(error)) => {
                 write_to_parent_console(&format!("error: {error}\n"));
                 std::process::exit(2);
             }
@@ -1496,7 +1499,14 @@ pub fn run() -> eframe::Result {
             #[cfg(all(feature = "test-script", windows))]
             if let Some(path) = test_script_path.clone() {
                 app.prepare_test_script_run();
-                test_script::start(path, &cc.egui_ctx).map_err(std::io::Error::other)?;
+                test_script::start(
+                    path,
+                    test_evidence_dir
+                        .clone()
+                        .expect("validated test-script evidence directory"),
+                    &cc.egui_ctx,
+                )
+                .map_err(std::io::Error::other)?;
             }
             emit_startup("creator_exit", None);
             Ok(Box::new(app))
@@ -1698,6 +1708,10 @@ fn absolutize_startup_open_path(path: std::path::PathBuf) -> std::path::PathBuf 
 }
 
 fn cli_flag_takes_value(flag: &str) -> bool {
+    #[cfg(all(feature = "test-script", windows))]
+    if flag == "--test-evidence-dir" {
+        return true;
+    }
     matches!(
         flag,
         "--data-dir"

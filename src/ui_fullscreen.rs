@@ -22763,6 +22763,9 @@ impl App {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
                 #[cfg(all(windows, feature = "test-script"))]
                 {
+                    if !embedded {
+                        crate::test_script::receive_screenshot_events(ctx);
+                    }
                     test_script_current_item_paint =
                         eframe::miv_test_script_window_witness::active()
                             .map(|witness| (ctx.viewport_id(), witness, None));

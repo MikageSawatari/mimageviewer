@@ -21,6 +21,7 @@ fn wait_rating(check, label) {
 
 wait_rating(|s| s.sort_order == "RatingDesc" && s.items_len == 3
     && names(s, ["02-unrated.png", "03-two.png", "01-one.png"]), "initial order");
+capture("initial-order");
 select_root();
 run_action("GridMoveLast");
 let initial = snapshot();
@@ -38,6 +39,7 @@ wait_rating(|s| s.items_generation > initial.items_generation
     && names(s, ["01-one.png", "02-unrated.png", "03-two.png"]),
     "sort refresh");
 let refreshed = snapshot();
+capture("after-refresh");
 if refreshed.items_generation != initial.items_generation + 1 {
     fail("sort refresh installed more than one folder load");
 }
@@ -57,6 +59,7 @@ wait_rating(|s| s.preferences_open && s.preferences_page == "Thumbnail",
 click_widget("すべての評価より下");
 wait_rating(|s| s.preferences_draft_unrated_position == "BelowAll",
     "Preferences unrated radio");
+capture("preferences-before-ok");
 let before_ok = snapshot().items_generation;
 click_widget("OK");
 wait_rating(|s| !s.preferences_open
@@ -66,6 +69,7 @@ wait_rating(|s| !s.preferences_open
 if snapshot().items_generation != before_ok + 1 {
     fail("Preferences OK did not apply exactly one rating-sort reload");
 }
+capture("preferences-after-ok");
 
 rating_sort_smoke("open_first_smart_folder");
 wait_rating(|s| s.smart_folder_name == "RatingSortSmoke"
@@ -74,6 +78,7 @@ wait_rating(|s| s.smart_folder_name == "RatingSortSmoke"
     && names(s, ["01-one.png", "03-two.png", "02-unrated.png"]),
     "Smart Folder settlement");
 let settled = snapshot();
+capture("smart-folder-settled");
 sleep(3000);
 let after_settle = snapshot();
 if after_settle.smart_folder_busy || !after_settle.smart_folder_root_visible

@@ -6018,7 +6018,7 @@ mod fixed_sort_control_tests {
         let render_app = Rc::clone(&app);
         let fonts_set = Cell::new(false);
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(1700.0, 500.0))
+            .with_size(egui::vec2(1280.0, 800.0))
             .build(move |ctx| {
                 if !fonts_set.replace(true) {
                     crate::ui_fonts::configure_fonts(ctx);
@@ -6050,6 +6050,9 @@ mod fixed_sort_control_tests {
                 assert_eq!(popup.rows[1].label, "シャッフル（再選択で並べ直す）");
                 assert_eq!(popup.rows[10].label, "評価↑");
                 assert_eq!(popup.rows[11].label, "評価↓");
+                assert!(!popup.sort_control_locked);
+                assert!(popup.popup_ui_enabled);
+                assert!(popup.rows[..10].iter().all(|row| !row.disabled));
                 assert!(popup.rows[10].disabled && popup.rows[11].disabled);
             }
             let row = harness.get_by_label(label);
@@ -9850,7 +9853,9 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                         apply_toolbar_style(ui);
                                         #[cfg(all(windows, feature = "test-script"))]
                                         if root_order.is_some() {
-                                            crate::test_script::begin_collection_sort_popup(ui.ctx());
+                                            crate::test_script::begin_collection_sort_popup(
+                                                ui.ctx(), sort_disabled, ui.is_enabled(),
+                                            );
                                         }
                                         if let Some(root) = root_order {
                                             for (mode, label) in [
@@ -25212,6 +25217,118 @@ mod toolbar_wrap_tests {
                         .is_some_and(|(row, clip)| row.bottom() > clip.bottom()),
                     "short screen should use the popup's scroll viewport"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn collection_popup_first_frame_fits_right_edge_at_150_percent_dpi() {
+        use egui_kittest::Harness;
+        let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = rows.clone();
+        let id = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_id = id.clone();
+        let fonts_set = std::cell::Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(853.0, 533.0))
+            .with_pixels_per_point(1.5)
+            .build(move |ctx| {
+                if !fonts_set.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::TopBottomPanel::top("probe").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(700.0);
+                        let h = sort_combo_popup_height(ui, 10, true, false, false);
+                        let combo = egui::ComboBox::from_id_salt("probe_combo")
+                            .width(100.0)
+                            .height(h)
+                            .popup_style(sort_combo_popup_style())
+                            .selected_text("手動")
+                            .show_ui(ui, |ui| {
+                                let family = egui::FontFamily::Name(std::sync::Arc::<str>::from(
+                                    crate::ui_fonts::TOOLBAR_TEXT_FAMILY_NAME,
+                                ));
+                                let button_size =
+                                    ui.style().text_styles[&egui::TextStyle::Button].size;
+                                ui.style_mut().text_styles.insert(
+                                    egui::TextStyle::Button,
+                                    egui::FontId::new(button_size, family),
+                                );
+                                ui.spacing_mut().interact_size.y = 22.0;
+                                ui.spacing_mut().button_padding.y = 1.0;
+                                observed.lock().unwrap().clear();
+                                for label in ["手動", "シャッフル（再選択で並べ直す）"]
+                                {
+                                    let r = ui.selectable_label(false, label);
+                                    observed.lock().unwrap().push((
+                                        label.to_owned(),
+                                        r.rect,
+                                        ui.clip_rect(),
+                                        r.enabled(),
+                                    ));
+                                }
+                                ui.separator();
+                                for &order in crate::settings::SortOrder::all() {
+                                    let r = ui.add_enabled(
+                                        !order.is_rating(),
+                                        egui::Button::selectable(false, order.short_label()),
+                                    );
+                                    observed.lock().unwrap().push((
+                                        order.short_label().to_owned(),
+                                        r.rect,
+                                        ui.clip_rect(),
+                                        r.enabled(),
+                                    ));
+                                }
+                            });
+                        *observed_id.lock().unwrap() = Some(combo.response.id);
+                    });
+                });
+            });
+        harness.run();
+        harness.run();
+        let combo_id = id.lock().unwrap().unwrap();
+        let popup_id = combo_id.with("popup");
+        let point = harness.ctx.read_response(combo_id).unwrap().rect.center();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(point));
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(point));
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        for _ in 0..2 {
+            harness.run();
+            let rect = harness.ctx.memory(|m| m.area_rect(popup_id)).unwrap();
+            assert!(rect.left() >= -1.0 && rect.right() <= 854.0, "{rect:?}");
+            let rows = rows.lock().unwrap();
+            assert_eq!(rows.len(), 12);
+            for (index, (label, row, clip, enabled)) in rows.iter().enumerate() {
+                assert!(
+                    row.left() >= clip.left() - 1.0
+                        && row.right() <= clip.right() + 1.0
+                        && row.top() >= clip.top() - 1.0
+                        && row.bottom() <= clip.bottom() + 1.0,
+                    "{label}: row={row:?} clip={clip:?}"
+                );
+                assert_eq!(*enabled, index < 10, "{label}");
             }
         }
     }

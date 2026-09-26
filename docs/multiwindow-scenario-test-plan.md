@@ -363,4 +363,15 @@ async decode が `FsCacheEntry::Failed` で終端し、crash / 半端な owner �
 | 20260924T213402061Z | MultiWindowPdf | **exit 0** | 同上 |
 
 証跡は各 run の `target/ui-smoke-runs/<run>/`。窓の切り替えは test-script の activation 要求で、OS のクリック経路は含まない。
+`capture("label")` は選択中の mIV viewport（未選択なら main）、`capture("label", "all")` は
+main と現在開いている別窓を保存する。画像は `screenshots/NN-<label>-<viewport>.png`、
+寸法・viewport・フレーム・時刻は `screenshots/manifest.jsonl` と `evidence-index.json` に記録する。
+`MultiWindowPdf` は最初の別窓表示時と 2 窓表示時に all capture を行う。
+スクリプト失敗時は終了前に全 mIV viewport の `failure` capture を 1.5 秒の deadline で試みる。
+描画が止まって deadline を観測する次フレームが来ない場合も、撮影要求より前に起動した
+6 秒の process watchdog が元の失敗コードとメッセージを保持して終了する。
+壊れた screenshot manifest は `archive_errors` に追記し、既に失敗した scenario の
+exit code と failure message を上書きしない。egui viewport の描画結果だけを取得し、
+デスクトップや他アプリの画面は含めない。画像の保存は UI thread 外で行う。
+この archive 優先順位の runner 回帰は `scripts/test-ui-smoke-screenshots.ps1` で確認する。
 `MultiWindowPdf` の出力には入力デスクトップ preflight の行が出ていない。preflight が新シナリオだけに入っている可能性があり、T2 で確認する。

@@ -1455,6 +1455,15 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-26 実アプリ smoke の viewport スクリーンショット証跡**
+
+`portable,test-script` のみで egui の viewport Screenshot 応答を受け、main と別窓の画像を
+run ごとの証跡へ保存する。別窓の描画 callback では届いた Screenshot event を診断 runner に
+渡すだけで、PNG 化・ファイル I/O は worker が行う。capture 対象は既存の window identity と
+viewport ID の read-only snapshot から選ぶ。detached の述語、host/park/focus lifecycle、
+viewport 生成・終了、App の context 状態には変更を加えない。既存の別窓症状を判定で
+隠すパッチではなく、表示結果を記録するテスト専用の観測経路である。
+
 **2026-09-26 §1.237B R3: rating publication at context swap**
 
 `swap_viewer_context_bundle` の rating cache 同期を、mount 中の書き込みと同じ

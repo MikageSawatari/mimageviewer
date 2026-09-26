@@ -23,6 +23,7 @@ use crate::key_input::{
 };
 use crate::keymap::{KeyAction, KeyTrigger};
 
+mod capture;
 pub(crate) mod pointer_input;
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
@@ -687,6 +688,9 @@ pub(crate) struct TestScriptSortPopupRow {
     pub(crate) label: String,
     pub(crate) disabled: bool,
     pub(crate) visible: bool,
+    pub(crate) visible_x: bool,
+    pub(crate) visible_y: bool,
+    pub(crate) geometry: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -694,6 +698,9 @@ pub(crate) struct TestScriptCollectionSortPopup {
     pub(crate) open: bool,
     pub(crate) needs_scrolling: bool,
     pub(crate) within_screen: bool,
+    pub(crate) sort_control_locked: bool,
+    pub(crate) popup_ui_enabled: bool,
+    pub(crate) viewport: String,
     pub(crate) rows: Vec<TestScriptSortPopupRow>,
     pub(crate) rendered_tooltip: Option<String>,
 }
@@ -704,6 +711,12 @@ impl TestScriptCollectionSortPopup {
         map.insert("open".into(), self.open.into());
         map.insert("needs_scrolling".into(), self.needs_scrolling.into());
         map.insert("within_screen".into(), self.within_screen.into());
+        map.insert(
+            "sort_control_locked".into(),
+            self.sort_control_locked.into(),
+        );
+        map.insert("popup_ui_enabled".into(), self.popup_ui_enabled.into());
+        map.insert("viewport".into(), self.viewport.clone().into());
         map.insert(
             "tooltip_open".into(),
             self.rendered_tooltip.is_some().into(),
@@ -721,6 +734,9 @@ impl TestScriptCollectionSortPopup {
                     value.insert("label".into(), Dynamic::from(row.label.clone()));
                     value.insert("disabled".into(), row.disabled.into());
                     value.insert("visible".into(), row.visible.into());
+                    value.insert("visible_x".into(), row.visible_x.into());
+                    value.insert("visible_y".into(), row.visible_y.into());
+                    value.insert("geometry".into(), row.geometry.clone().into());
                     Dynamic::from_map(value)
                 })
                 .collect::<rhai::Array>()
@@ -741,7 +757,11 @@ thread_local! {
         RefCell::new(CollectionSortPopupFrame::default());
 }
 
-pub(crate) fn begin_collection_sort_popup(ctx: &egui::Context) {
+pub(crate) fn begin_collection_sort_popup(
+    ctx: &egui::Context,
+    sort_control_locked: bool,
+    popup_ui_enabled: bool,
+) {
     if ctx.viewport_id() != egui::ViewportId::ROOT {
         return;
     }
@@ -751,6 +771,13 @@ pub(crate) fn begin_collection_sort_popup(ctx: &egui::Context) {
         observed.snapshot = TestScriptCollectionSortPopup {
             open: true,
             within_screen: true,
+            sort_control_locked,
+            popup_ui_enabled,
+            viewport: format!(
+                "{:?} ppp={:.2}",
+                ctx.viewport_rect(),
+                ctx.pixels_per_point()
+            ),
             ..Default::default()
         };
     });
@@ -766,10 +793,9 @@ pub(crate) fn record_collection_sort_popup_row(
         return;
     }
     let row = response.rect;
-    let visible = row.left() >= clip.left() - 1.0
-        && row.right() <= clip.right() + 1.0
-        && row.top() >= clip.top() - 1.0
-        && row.bottom() <= clip.bottom() + 1.0;
+    let visible_x = row.left() >= clip.left() - 1.0 && row.right() <= clip.right() + 1.0;
+    let visible_y = row.top() >= clip.top() - 1.0 && row.bottom() <= clip.bottom() + 1.0;
+    let visible = visible_x && visible_y;
     let screen = ctx.viewport_rect();
     let within_screen = row.left() >= screen.left() - 1.0
         && row.right() <= screen.right() + 1.0
@@ -780,12 +806,15 @@ pub(crate) fn record_collection_sort_popup_row(
         if observed.frame_nr != ctx.cumulative_frame_nr() || observed.snapshot.rows.len() >= 16 {
             return;
         }
-        observed.snapshot.needs_scrolling |= !visible;
+        observed.snapshot.needs_scrolling |= !visible_y;
         observed.snapshot.within_screen &= within_screen;
         observed.snapshot.rows.push(TestScriptSortPopupRow {
             label: label.to_owned(),
             disabled: !response.enabled(),
             visible,
+            visible_x,
+            visible_y,
+            geometry: format!("row={row:?} clip={clip:?} viewport={screen:?}"),
         });
     });
     register_sort_popup_pointer_row(label, response, clip);
@@ -1139,9 +1168,21 @@ enum UiCommand {
         expected_identity: TestScriptWindowIdentity,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    Capture {
+        label: String,
+        scope: CaptureScope,
+        selection: TestScriptActionSelection,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     Log(String),
     Precondition(PreconditionTrace),
     Finished(ScriptOutcome),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureScope {
+    Selected,
+    All,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1466,6 +1507,34 @@ impl RunnerBridge {
             .lock()
             .map(|selection| selection.clone())
             .map_err(|_| "test-script action selection is poisoned".to_string())
+    }
+
+    fn capture(&self, label: &str, scope: CaptureScope) -> Result<(), String> {
+        let selection = self.action_selection()?;
+        let (reply, received) = mpsc::sync_channel(1);
+        self.send(UiCommand::Capture {
+            label: label.to_owned(),
+            scope,
+            selection,
+            reply,
+        })?;
+        let deadline = Instant::now() + capture::EXPLICIT_TIMEOUT + Duration::from_secs(1);
+        loop {
+            self.interrupt.check()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "capture '{label}' timed out waiting for screenshot evidence"
+                ));
+            }
+            match received.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("capture response channel disconnected".into());
+                }
+            }
+        }
     }
 
     fn select_root(&self) -> Result<Map, String> {
@@ -2575,6 +2644,30 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
         },
     );
 
+    let capture_bridge = bridge.clone();
+    engine.register_fn(
+        "capture",
+        move |label: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            capture_bridge
+                .capture(&label, CaptureScope::Selected)
+                .map_err(rhai_error)
+        },
+    );
+    let capture_all_bridge = bridge.clone();
+    engine.register_fn(
+        "capture",
+        move |label: ImmutableString, scope: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            let scope = match scope.as_str() {
+                "current" => CaptureScope::Selected,
+                "all" => CaptureScope::All,
+                _ => return Err(rhai_error("capture scope must be 'current' or 'all'")),
+            };
+            capture_all_bridge
+                .capture(&label, scope)
+                .map_err(rhai_error)
+        },
+    );
+
     engine.register_fn(
         "fail",
         move |message: ImmutableString| -> Result<(), Box<EvalAltResult>> {
@@ -2782,6 +2875,9 @@ struct UiRuntime {
     sidecar_observations: std::collections::HashSet<(u64, u64, TestScriptSidecarObservation)>,
     next_observation_revision: u64,
     pointer_regions: pointer_input::SharedRegionCatalog,
+    capture: Option<capture::Coordinator>,
+    failure_capture_requested: bool,
+    failure_capture_batch: Option<u64>,
 }
 
 impl UiRuntime {
@@ -2807,6 +2903,9 @@ impl UiRuntime {
             sidecar_observations: std::collections::HashSet::new(),
             next_observation_revision: 0,
             pointer_regions,
+            capture: None,
+            failure_capture_requested: false,
+            failure_capture_batch: None,
         }
     }
 
@@ -2860,6 +2959,105 @@ impl UiRuntime {
                 .iter()
                 .any(|window| window.accepts_owner(identity))
         });
+    }
+
+    fn capture_targets(
+        &self,
+        scope: CaptureScope,
+        selection: &TestScriptActionSelection,
+    ) -> Result<Vec<capture::Target>, String> {
+        let root = capture::Target {
+            viewport_id: egui::ViewportId::ROOT,
+            role: "root".into(),
+        };
+        if scope == CaptureScope::Selected {
+            return match selection {
+                TestScriptActionSelection::LegacyImplicit => Ok(vec![root]),
+                TestScriptActionSelection::Targeted(identity) => {
+                    if !self
+                        .authoritative_windows
+                        .iter()
+                        .any(|window| window.identity.as_ref() == Some(identity))
+                    {
+                        return Err(format!(
+                            "capture target is no longer current: {}",
+                            identity.describe()
+                        ));
+                    }
+                    match identity {
+                        TestScriptWindowIdentity::Root { .. } => Ok(vec![root]),
+                        TestScriptWindowIdentity::Detached {
+                            window_id,
+                            context_serial,
+                            viewport_id,
+                            ..
+                        } => Ok(vec![capture::Target {
+                            viewport_id: *viewport_id,
+                            role: format!("detached-{window_id}-{context_serial}"),
+                        }]),
+                    }
+                }
+            };
+        }
+        let mut targets = vec![root];
+        let mut seen = std::collections::HashSet::from([egui::ViewportId::ROOT]);
+        for identity in self
+            .authoritative_windows
+            .iter()
+            .filter_map(|window| window.identity.as_ref())
+        {
+            if let TestScriptWindowIdentity::Detached {
+                window_id,
+                context_serial,
+                viewport_id,
+                ..
+            } = identity
+                && seen.insert(*viewport_id)
+            {
+                targets.push(capture::Target {
+                    viewport_id: *viewport_id,
+                    role: format!("detached-{window_id}-{context_serial}"),
+                });
+            }
+        }
+        Ok(targets)
+    }
+
+    fn request_failure_capture(
+        &mut self,
+        ctx: &egui::Context,
+        arm_watchdog: impl FnOnce(&ScriptOutcome),
+    ) {
+        if self.finish.is_none() || self.failure_capture_requested {
+            return;
+        }
+        self.failure_capture_requested = true;
+        let Some(outcome) = self
+            .finish
+            .as_ref()
+            .map(|finish| &finish.outcome)
+            .filter(|outcome| outcome.kind != ScriptOutcomeKind::Success)
+            .cloned()
+        else {
+            return;
+        };
+
+        // A stalled renderer can prevent every later UI update, including the
+        // update that would expire the capture batch. Guard the original result
+        // before sending any screenshot command.
+        arm_watchdog(&outcome);
+        let targets = self.capture_targets(
+            CaptureScope::All,
+            &TestScriptActionSelection::LegacyImplicit,
+        );
+        if let (Some(capture), Ok(targets)) = (self.capture.as_mut(), targets) {
+            match capture.request(ctx, "failure", targets, capture::FAILURE_TIMEOUT, None) {
+                Ok(batch) => self.failure_capture_batch = Some(batch),
+                Err(error) => crate::logger::log(format!(
+                    "[test-script] automatic failure screenshot unavailable: {error}"
+                )),
+            }
+        }
     }
 
     fn joined_windows(&self) -> Vec<TestScriptWindowSnapshot> {
@@ -3278,9 +3476,9 @@ fn describe_issue(issue: &SyntheticInputIssue) -> String {
     }
 }
 
-pub(crate) fn start(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
+pub(crate) fn start(path: PathBuf, run_dir: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     PROCESS_EXIT_CODE.store(EXIT_NOT_SET, Ordering::Release);
-    let result = start_inner(path, ctx);
+    let result = start_inner(path, run_dir, ctx);
     if let Err(error) = &result {
         let outcome = ScriptOutcome::environment_failure(format!("runner start failed: {error}"));
         PROCESS_EXIT_CODE.store(EXIT_ENVIRONMENT_FAILURE, Ordering::Release);
@@ -3298,7 +3496,8 @@ pub(crate) fn start(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     result
 }
 
-fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
+fn start_inner(path: PathBuf, run_dir: PathBuf, ctx: &egui::Context) -> Result<(), String> {
+    let capture = capture::Coordinator::new(&run_dir)?;
     if !crate::key_input::arm_synthetic_input() {
         return Err("failed to arm synthetic input timeline".to_string());
     }
@@ -3331,7 +3530,9 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
         crate::key_input::disarm_synthetic_input();
         return Err("a test-script runtime is already active".to_string());
     }
-    *guard = Some(UiRuntime::new(rx, snapshot, interrupt, pointer_regions));
+    let mut active = UiRuntime::new(rx, snapshot, interrupt, pointer_regions);
+    active.capture = Some(capture);
+    *guard = Some(active);
     drop(guard);
 
     if let Err(error) = spawn_script_path(path, bridge) {
@@ -3561,6 +3762,16 @@ fn arm_shutdown_watchdog(exit_code: i32, trigger: &'static str) {
     }
 }
 
+pub(crate) fn receive_screenshot_events(ctx: &egui::Context) {
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    if let Some(capture) = guard.as_mut().and_then(|runtime| runtime.capture.as_mut()) {
+        capture.receive_events(ctx);
+        capture.poll();
+    }
+}
+
 pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bool {
     let frame = frame_key(ctx);
     let issues = crate::key_input::take_synthetic_input_issues(ctx);
@@ -3581,6 +3792,10 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
     let Some(runtime) = guard.as_mut() else {
         return false;
     };
+    if let Some(capture) = runtime.capture.as_mut() {
+        capture.receive_events(ctx);
+        capture.poll();
+    }
 
     let new_frame = runtime.last_frame != Some(frame);
     if new_frame {
@@ -3691,6 +3906,38 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                 }
                 let _ = reply.send(result);
             }
+            UiCommand::Capture {
+                label,
+                scope,
+                selection,
+                reply,
+            } => {
+                let result = if runtime.finish.is_some() {
+                    Err("script is already finishing".to_string())
+                } else {
+                    runtime
+                        .capture_targets(scope, &selection)
+                        .and_then(|targets| {
+                            runtime
+                                .capture
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    "screenshot evidence output is unavailable".to_string()
+                                })?
+                                .request(
+                                    ctx,
+                                    &label,
+                                    targets,
+                                    capture::EXPLICIT_TIMEOUT,
+                                    Some(reply.clone()),
+                                )
+                                .map(|_| ())
+                        })
+                };
+                if let Err(error) = result {
+                    let _ = reply.send(Err(error));
+                }
+            }
             UiCommand::Log(message) => {
                 crate::logger::log(format!("[test-script] {message}"));
                 emit_perf_step(&message);
@@ -3707,12 +3954,31 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
         );
     }
 
+    runtime.request_failure_capture(ctx, |outcome| {
+        let exit_code = outcome.kind.exit_code();
+        PROCESS_EXIT_CODE.store(exit_code, Ordering::Release);
+        crate::logger::log(format!(
+            "[test-script] failure capture guarded kind={:?} exit_code={exit_code} message={}",
+            outcome.kind, outcome.message
+        ));
+        arm_shutdown_watchdog(exit_code, "failure-capture");
+    });
+    if let Some(capture) = runtime.capture.as_mut() {
+        capture.poll();
+    }
+
     let mut close = false;
     if let Some(finish) = runtime.finish.as_mut() {
         if new_frame && frame != finish.started_frame {
             finish.newer_frames = finish.newer_frames.saturating_add(1);
         }
-        if finish.newer_frames >= 2 && crate::key_input::synthetic_input_is_idle() {
+        let capture_done = runtime.failure_capture_batch.is_none_or(|batch| {
+            runtime
+                .capture
+                .as_ref()
+                .is_none_or(|capture| !capture.is_pending(batch))
+        });
+        if finish.newer_frames >= 2 && crate::key_input::synthetic_input_is_idle() && capture_done {
             let outcome = finish.outcome.clone();
             PROCESS_EXIT_CODE.store(outcome.kind.exit_code(), Ordering::Release);
             crate::logger::log(format!(
@@ -4085,6 +4351,39 @@ pub(crate) fn cli_script_path_from(args: &[std::ffi::OsString]) -> Result<Option
     Ok(script_path)
 }
 
+pub(crate) fn cli_capture_dir_from(args: &[std::ffi::OsString]) -> Result<Option<PathBuf>, String> {
+    let mut run_dir = None;
+    let mut index = 1usize;
+    while index < args.len() {
+        if args[index] == "--" {
+            break;
+        }
+        if args[index] == "--test-evidence-dir" {
+            if run_dir.is_some() {
+                return Err("--test-evidence-dir may only be specified once".into());
+            }
+            let value = args
+                .get(index + 1)
+                .ok_or("--test-evidence-dir requires a path value")?;
+            if value.is_empty() || value.to_string_lossy().starts_with("--") {
+                return Err("--test-evidence-dir requires a path value".into());
+            }
+            run_dir = Some(PathBuf::from(value));
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    let scripted = cli_script_path_from(args)?.is_some();
+    if scripted && run_dir.is_none() {
+        return Err("--test-script requires --test-evidence-dir".into());
+    }
+    if !scripted && run_dir.is_some() {
+        return Err("--test-evidence-dir requires --test-script".into());
+    }
+    Ok(run_dir)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "test-script"))]
@@ -4148,6 +4447,15 @@ mod tests {
         let mut engine = rhai::Engine::new();
         engine.set_max_expr_depths(64, 64);
         engine.compile(script).unwrap();
+    }
+
+    #[test]
+    fn multi_window_pdf_script_with_captures_parses() {
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine
+            .compile(include_str!("../scripts/ui-smoke/multi-window-pdf.rhai"))
+            .expect("PDF smoke script syntax");
     }
 
     #[test]
@@ -4254,7 +4562,7 @@ mod tests {
         };
         let _ = ctx.run(input.clone(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                super::begin_collection_sort_popup(ctx);
+                super::begin_collection_sort_popup(ctx, false, ui.is_enabled());
                 let manual = ui.button("手動");
                 let rating = ui.add_enabled(false, egui::Button::new("評価↑"));
                 let clip = egui::Rect::from_min_max(
@@ -4271,14 +4579,52 @@ mod tests {
         assert!(observed.within_screen);
         assert_eq!(observed.rows.len(), 2);
         assert!(observed.rows[0].visible);
+        assert!(observed.rows[0].visible_x && observed.rows[0].visible_y);
+        assert!(observed.popup_ui_enabled);
+        assert!(!observed.sort_control_locked);
         assert!(!observed.rows[0].disabled);
         assert!(!observed.rows[1].visible);
+        assert!(!observed.rows[1].visible_y);
         assert!(observed.rows[1].disabled);
         assert!(observed.rendered_tooltip.is_none());
         for _ in 0..2 {
             let _ = ctx.run(input.clone(), |_| {});
         }
         assert!(!super::collection_sort_popup_snapshot(&ctx).open);
+    }
+
+    #[test]
+    fn collection_sort_popup_horizontal_clip_is_not_scrolling() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::begin_collection_sort_popup(ctx, false, ui.is_enabled());
+                let row = ui.button("シャッフル（再選択で並べ直す）");
+                let clip = egui::Rect::from_min_max(
+                    row.rect.min - egui::vec2(1.0, 1.0),
+                    egui::pos2(row.rect.center().x, row.rect.max.y + 1.0),
+                );
+                super::record_collection_sort_popup_row(
+                    "シャッフル（再選択で並べ直す）",
+                    &row,
+                    clip,
+                );
+            });
+        });
+        let popup = super::collection_sort_popup_snapshot(&ctx);
+        assert!(!popup.needs_scrolling);
+        assert!(!popup.rows[0].visible);
+        assert!(!popup.rows[0].visible_x);
+        assert!(popup.rows[0].visible_y);
+        assert!(!popup.rows[0].disabled);
+        assert!(popup.rows[0].geometry.contains("clip="));
     }
 
     use super::InterruptState;
@@ -4413,6 +4759,133 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(parsed, Some(PathBuf::from("smoke.rhai")));
+    }
+
+    #[test]
+    fn cli_capture_dir_is_required_and_kept_with_the_script() {
+        let missing = cli_capture_dir_from(&args(&[
+            "mimageviewer-core.exe",
+            "--data-dir",
+            "sandbox",
+            "--test-script",
+            "smoke.rhai",
+        ]));
+        assert!(missing.unwrap_err().contains("--test-evidence-dir"));
+        let parsed = cli_capture_dir_from(&args(&[
+            "mimageviewer-core.exe",
+            "--data-dir",
+            "sandbox",
+            "--test-script",
+            "smoke.rhai",
+            "--test-evidence-dir",
+            "run-evidence",
+        ]))
+        .unwrap();
+        assert_eq!(parsed, Some(PathBuf::from("run-evidence")));
+        assert!(
+            cli_capture_dir_from(&args(&[
+                "mimageviewer-core.exe",
+                "--test-evidence-dir",
+                "run-evidence",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_script_call_waits_for_the_ui_reply() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("capture(\"checkpoint\");".into(), bridge).unwrap();
+        let command = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let UiCommand::Capture {
+            label,
+            scope,
+            selection,
+            reply,
+        } = command
+        else {
+            panic!("expected capture command");
+        };
+        assert_eq!(label, "checkpoint");
+        assert_eq!(scope, CaptureScope::Selected);
+        assert!(matches!(
+            selection,
+            TestScriptActionSelection::LegacyImplicit
+        ));
+        reply.send(Ok(())).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(
+            matches!(commands.last(), Some(UiCommand::Finished(outcome)) if outcome.kind == ScriptOutcomeKind::Success)
+        );
+    }
+
+    #[test]
+    fn failure_capture_watchdog_exits_without_another_frame() {
+        const CHILD_ENV: &str = "MIV_TEST_FAILURE_CAPTURE_WATCHDOG_RUN";
+        const ORIGINAL_MESSAGE: &str = "original failure before screenshot";
+        if let Some(run_dir) = std::env::var_os(CHILD_ENV) {
+            let (_tx, rx) = mpsc::channel();
+            let mut runtime = UiRuntime::new(
+                rx,
+                Arc::new(RwLock::new(TestScriptSnapshot::default())),
+                Arc::new(InterruptState::default()),
+                Arc::new(RwLock::new(pointer_input::RegionCatalog::default())),
+            );
+            runtime.capture = Some(capture::Coordinator::new(Path::new(&run_dir)).unwrap());
+            runtime.begin_finish(ScriptOutcome::script_failure(ORIGINAL_MESSAGE), 1);
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                runtime.request_failure_capture(ctx, |outcome| {
+                    assert_eq!(outcome.message, ORIGINAL_MESSAGE);
+                    PROCESS_EXIT_CODE.store(outcome.kind.exit_code(), Ordering::Release);
+                    println!("failure-capture original message={}", outcome.message);
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    arm_shutdown_watchdog(outcome.kind.exit_code(), "failure-capture-test");
+                });
+            });
+            assert!(runtime.capture.as_ref().unwrap().is_pending(1));
+            // No second ctx.run or capture.poll: only the process watchdog can
+            // complete this child. The parent kills it if that guarantee fails.
+            std::thread::sleep(SHUTDOWN_WATCHDOG_GRACE + Duration::from_secs(3));
+            panic!("watchdog did not terminate a stalled capture");
+        }
+
+        let runs_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("ui-smoke-runs");
+        std::fs::create_dir_all(&runs_root).unwrap();
+        let run = tempfile::Builder::new()
+            .prefix("watchdog-capture-test-")
+            .tempdir_in(runs_root)
+            .unwrap();
+        let started = Instant::now();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("test_script::tests::failure_capture_watchdog_exits_without_another_frame")
+            .arg("--nocapture")
+            .env(CHILD_ENV, run.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = started + SHUTDOWN_WATCHDOG_GRACE + Duration::from_secs(2);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("failure capture did not exit within the watchdog budget");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(EXIT_SCRIPT_FAILURE));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(ORIGINAL_MESSAGE),
+            "original failure message missing from child output"
+        );
     }
 
     #[test]

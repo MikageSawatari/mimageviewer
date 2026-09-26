@@ -331,6 +331,57 @@ function Try-RegisterUiSmokeEvidenceDirectory {
     }
 }
 
+function Register-UiSmokeScreenshots {
+    $shotsDir = Join-Path $script:runDir 'screenshots'
+    if (-not (Test-Path -LiteralPath $shotsDir -PathType Container)) { return }
+    Assert-NoReparsePath $shotsDir $repoRoot 'screenshot'
+    Assert-NoReparseTree $shotsDir 'screenshot'
+    $manifestPath = Join-Path $shotsDir 'manifest.jsonl'
+    Register-UiSmokeEvidenceFile $manifestPath 'screenshots/manifest.jsonl' 'screenshot-manifest'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($line in (Get-Content -LiteralPath $manifestPath -Encoding UTF8)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $record = $line | ConvertFrom-Json
+        $relative = [string]$record.path
+        if ($relative -notmatch '^screenshots/[0-9]{2,}-[A-Za-z0-9_-]+-(root|detached-[0-9]+-[0-9]+)\.png$' -or
+            -not $seen.Add($relative)) {
+            throw "[screenshot] invalid or duplicate manifest path: $relative"
+        }
+        if ([int]$record.width -le 0 -or [int]$record.height -le 0 -or
+            [long]$record.frame -lt 0 -or [long]$record.timestamp_ms -le 0) {
+            throw "[screenshot] invalid dimensions or frame/time: $relative"
+        }
+        $path = Join-Path $script:runDir ($relative.Replace('/', '\'))
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "[screenshot] manifest file is missing: $relative"
+        }
+        Register-UiSmokeEvidenceFile $path $relative 'viewport-screenshot'
+        foreach ($entry in $script:evidenceEntries) {
+            if ($entry.path -eq $relative) {
+                $entry['label'] = [string]$record.label
+                $entry['viewport'] = [string]$record.viewport
+                $entry['width'] = [int]$record.width
+                $entry['height'] = [int]$record.height
+                $entry['frame'] = [long]$record.frame
+                $entry['timestamp_ms'] = [long]$record.timestamp_ms
+                break
+            }
+        }
+    }
+}
+
+function Apply-UiSmokeArchiveDisposition {
+    if ($script:archiveErrors.Count -eq 0) { return }
+    # Evidence failure turns an otherwise successful run into an environment
+    # failure, but cannot replace a scenario's already determined failure.
+    if ($script:runExitCode -eq 0) {
+        $script:runExitCode = 2
+    }
+    if (-not $script:failureMessage) {
+        $script:failureMessage = 'one or more evidence files could not be collected'
+    }
+}
+
 function Stop-ExactUiSmokeProcess {
     if ($null -eq $script:process) { return }
     try {
@@ -501,25 +552,26 @@ function Save-UiSmokeEvidence {
             Try-AddUiSmokeEvidenceFile $script:sharedAnalyzerPath 'inputs/shared-analyzer.py' 'shared-analyzer'
         }
         Try-AddUiSmokeEvidenceDirectory (Join-Path $dataDir 'logs') 'logs' 'application-log'
+        try {
+            Register-UiSmokeScreenshots
+        }
+        catch {
+            [void]$script:archiveErrors.Add("screenshots: $($_.Exception.Message)")
+        }
         if ($script:lifetimeSamplesPath) {
             Try-RegisterUiSmokeEvidenceFile $script:lifetimeSamplesPath 'lifetime-samples.jsonl' 'process-lifetime'
         }
         Try-RegisterUiSmokeEvidenceDirectory (Join-Path $script:runDir 'analysis') 'post-analysis'
     }
 
-    if ($script:archiveErrors.Count -gt 0) {
-        $script:runExitCode = 2
-        if (-not $script:failureMessage) {
-            $script:failureMessage = 'one or more evidence files could not be collected'
-        }
-    }
+    Apply-UiSmokeArchiveDisposition
     $evidenceIndexPath = Join-Path $script:runDir 'evidence-index.json'
     try {
         Write-UiSmokeJson $evidenceIndexPath @($script:evidenceEntries)
     }
     catch {
         [void]$script:archiveErrors.Add("evidence-index: $($_.Exception.Message)")
-        $script:runExitCode = 2
+        Apply-UiSmokeArchiveDisposition
     }
 
     $metadata = [ordered]@{
@@ -1409,6 +1461,7 @@ $arguments = @(
     '--perf-log',
     '--data-dir', $dataDir,
     '--test-script', $scriptPath,
+    '--test-evidence-dir', $script:runDir,
     '--settings-override', $settingsPath,
     $fixtureDir
 )

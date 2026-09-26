@@ -51,12 +51,29 @@ wait_collection(|s| s.collection_root_visible && s.collection_id == expected_id
     30000, "Collection root");
 let before = snapshot();
 log("collection-sort: root ready names=" + before.item_names.to_debug());
+capture("collection-root");
 
 click_widget("collection_sort_combo");
 wait_until(|s| s.collection_sort_popup.open && s.collection_sort_popup.rows.len == 12, 10000);
 let popup = snapshot().collection_sort_popup;
-if popup.needs_scrolling || !popup.within_screen {
-    fail("Collection sort popup is clipped or needs scrolling: " + popup.to_debug());
+let first_popup = popup;
+// The opening frame can precede egui's final popup placement. Check the settled
+// popup while preserving both readbacks if it never reaches the expected state.
+for attempt in 0..40 {
+    if popup.open && popup.rows.len == 12 && !popup.needs_scrolling
+        && popup.within_screen && !popup.sort_control_locked
+        && popup.popup_ui_enabled && popup.rows[1].visible
+        && !popup.rows[0].disabled {
+        break;
+    }
+    sleep(50);
+    popup = snapshot().collection_sort_popup;
+}
+if !popup.open || popup.rows.len != 12 || !popup.rows[1].visible
+    || popup.rows[0].disabled || popup.needs_scrolling || !popup.within_screen
+    || popup.sort_control_locked || !popup.popup_ui_enabled {
+    fail("Collection sort popup did not settle: first=" + first_popup.to_debug()
+        + " last=" + popup.to_debug());
 }
 for i in 0..expected_rows.len {
     let row = popup.rows[i];
@@ -65,12 +82,15 @@ for i in 0..expected_rows.len {
         fail("Collection sort popup row " + i + " is wrong: " + row.to_debug());
     }
 }
+capture("sort-popup");
 
 hover_sort_row("評価↑");
 wait_until(|s| s.collection_sort_popup.open
     && s.collection_sort_popup.tooltip_open
     && s.collection_sort_popup.tooltip_text == reason, 10000);
+capture("rating-tooltip");
 click_sort_row("評価↑");
+capture("disabled-rating-click");
 sleep(600);
 let after = snapshot();
 if !after.collection_root_visible || after.collection_id != before.collection_id
