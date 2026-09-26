@@ -279,10 +279,12 @@ pub use ui_fullscreen::{
     draw_music_panel_reach_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
     draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
+mod ui_details_icon;
 pub mod ui_helpers;
 mod ui_main;
 #[doc(hidden)]
 pub use ui_main::draw_cut_item_appearance_snapshot_fixture;
+pub use ui_main::draw_details_icons_snapshot_fixture;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{
