@@ -8,6 +8,55 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[test]
+fn epub_batch_completion_refreshes_grid_and_applies_same_name_pdf_priority() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("epub-batch-refresh");
+    std::fs::create_dir(&folder).unwrap();
+    let epub = folder.join("book.epub");
+    let pdf = folder.join("book.pdf");
+    std::fs::write(&epub, b"epub").unwrap();
+    app.settings.skip_epub_if_pdf_exists = true;
+    app.load_folder(folder.clone());
+    assert!(
+        app.items
+            .iter()
+            .any(|item| matches!(item, GridItem::PdfFile(path) if path == &epub))
+    );
+    std::fs::write(&pdf, b"%PDF-1.4").unwrap();
+    app.epub_batch_convert = Some(
+        crate::ui_dialogs::epub_batch_convert::EpubBatchPending::completed_for_test(
+            epub.clone(),
+            crate::ui_dialogs::epub_batch_convert::EpubBatchResult::Saved(pdf.clone(), vec![]),
+        ),
+    );
+    app.poll_epub_batch_convert();
+    assert!(app.folder_pane_open_pending.is_some());
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+            let _ = app.resolve_main_folder_open_ready(&ctx, ready);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "folder refresh stalled"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        app.items
+            .iter()
+            .any(|item| matches!(item, GridItem::PdfFile(path) if path == &pdf))
+    );
+    assert!(
+        !app.items
+            .iter()
+            .any(|item| matches!(item, GridItem::PdfFile(path) if path == &epub))
+    );
+}
+
+#[test]
 fn rar_nav_main_ignore_setting_can_leave_open_rar_but_cannot_land_on_another() {
     let mut app = setup_app_for_test();
     let root = app.tmp.path().join("rar-main-ignore-nav");

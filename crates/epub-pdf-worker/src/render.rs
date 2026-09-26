@@ -1,5 +1,5 @@
 use crate::package::{Package, SpineItem};
-use lopdf::{Document, Object, dictionary};
+use lopdf::{Document, Object, StringFormat, dictionary};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -144,7 +144,21 @@ pub fn virtual_url(path: &str) -> String {
         .join("/");
     format!("https://epub.invalid/{encoded}")
 }
-pub fn merge_pdf(files: &[PathBuf], out: &Path, rtl: bool) -> Result<(), String> {
+fn info_text(value: &str) -> Object {
+    let mut bytes = vec![0xfe, 0xff];
+    for unit in value.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    Object::String(bytes, StringFormat::Literal)
+}
+
+pub fn merge_pdf(
+    files: &[PathBuf],
+    out: &Path,
+    rtl: bool,
+    title: Option<&str>,
+    author: Option<&str>,
+) -> Result<(), String> {
     if files.is_empty() {
         return Err("no printed PDF segments".into());
     }
@@ -192,8 +206,33 @@ pub fn merge_pdf(files: &[PathBuf], out: &Path, rtl: bool) -> Result<(), String>
         .objects
         .insert(new_catalog, Object::Dictionary(catalog));
     merged.trailer.set("Root", new_catalog);
+    let mut info = lopdf::Dictionary::new();
+    if let Some(title) = title {
+        info.set("Title", info_text(title));
+    }
+    if let Some(author) = author {
+        info.set("Author", info_text(author));
+    }
+    if !info.is_empty() {
+        let info_id = merged.add_object(info);
+        merged.trailer.set("Info", info_id);
+    }
     merged.save(out).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn merge_pdf_for_package(
+    files: &[PathBuf],
+    out: &Path,
+    package: &crate::package::Package,
+) -> Result<(), String> {
+    merge_pdf(
+        files,
+        out,
+        package.direction == "rtl",
+        package.title.as_deref(),
+        package.creator.as_deref(),
+    )
 }
 pub fn inspect_pdf(
     path: &Path,
@@ -410,7 +449,14 @@ mod tests {
         let out = dir.join("merged.pdf");
         one_page(&a, 300, 400);
         one_page(&b, 500, 600);
-        merge_pdf(&[a.clone(), b.clone()], &out, true).unwrap();
+        merge_pdf(
+            &[a.clone(), b.clone()],
+            &out,
+            true,
+            Some("書名"),
+            Some("著者"),
+        )
+        .unwrap();
         assert_eq!(
             pdf_sizes(&out).unwrap(),
             vec![(300.0, 400.0), (500.0, 600.0)]
@@ -424,8 +470,67 @@ mod tests {
             .as_dict()
             .unwrap();
         assert_eq!(prefs.get(b"Direction").unwrap().as_name().unwrap(), b"R2L");
+        let info_id = d.trailer.get(b"Info").unwrap().as_reference().unwrap();
+        let info = d.get_object(info_id).unwrap().as_dict().unwrap();
+        for (key, expected) in [
+            (b"Title".as_slice(), "書名"),
+            (b"Author".as_slice(), "著者"),
+        ] {
+            let bytes = info.get(key).unwrap().as_str().unwrap();
+            let units = bytes[2..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>();
+            assert_eq!(&bytes[..2], &[0xfe, 0xff]);
+            assert_eq!(String::from_utf16(&units).unwrap(), expected);
+        }
         fs::remove_file(a).unwrap();
         fs::remove_file(b).unwrap();
+        fs::remove_file(out).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn merge_uses_title_and_first_creator_from_opf() {
+        use std::io::{Cursor, Write};
+        use zip::{ZipWriter, write::SimpleFileOptions};
+        let mut epub = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut epub);
+            for (name, bytes) in [
+                ("META-INF/container.xml", br#"<container><rootfiles><rootfile full-path="OPS/content.opf"/></rootfiles></container>"#.as_slice()),
+                ("OPS/content.opf", r#"<package><metadata><dc:title xmlns:dc="x">本の題名</dc:title><dc:creator xmlns:dc="x">第一著者</dc:creator><dc:creator xmlns:dc="x">第二著者</dc:creator></metadata><manifest><item id="p" href="p.xhtml" media-type="application/xhtml+xml"/></manifest><spine page-progression-direction="rtl"><itemref idref="p"/></spine></package>"#.as_bytes()),
+                ("OPS/p.xhtml", br#"<html><body>page</body></html>"#.as_slice()),
+            ] {
+                zip.start_file(name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let package = crate::package::inspect_bytes(&epub.into_inner()).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("epub-pdf-package-info-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("page.pdf");
+        let out = dir.join("book.pdf");
+        one_page(&part, 300, 400);
+        merge_pdf_for_package(&[part.clone()], &out, &package).unwrap();
+        let doc = Document::load(&out).unwrap();
+        let info_id = doc.trailer.get(b"Info").unwrap().as_reference().unwrap();
+        let info = doc.get_object(info_id).unwrap().as_dict().unwrap();
+        for (key, expected) in [
+            (b"Title".as_slice(), "本の題名"),
+            (b"Author".as_slice(), "第一著者"),
+        ] {
+            let bytes = info.get(key).unwrap().as_str().unwrap();
+            assert_eq!(&bytes[..2], &[0xfe, 0xff]);
+            let utf16: Vec<_> = bytes[2..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
+            assert_eq!(String::from_utf16(&utf16).unwrap(), expected);
+        }
+        fs::remove_file(part).unwrap();
         fs::remove_file(out).unwrap();
         fs::remove_dir(dir).unwrap();
     }

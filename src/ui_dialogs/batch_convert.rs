@@ -218,7 +218,10 @@ impl App {
     /// 「変換 > ZIP ファイルに変換」の実処理。選択 (またはカーソル) の
     /// `ConvertibleArchive` を同名 zip へ変換する。
     pub(crate) fn start_batch_convert_to_zip(&mut self) {
-        if self.batch_convert.is_some() || self.archive_convert.is_some() {
+        if self.batch_convert.is_some()
+            || self.archive_convert.is_some()
+            || self.epub_batch_convert.is_some()
+        {
             return;
         }
 

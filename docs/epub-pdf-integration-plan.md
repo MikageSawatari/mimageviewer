@@ -957,3 +957,14 @@ EPUB 以外の台帳・編集行には今回の per-book ガードがない。�
 独立レビュー 3 回目で承認 (`3277fde39`)。1〜2 回目の指摘は修正 1〜2 で対応した。設計判断: 検索索引の `INDEX_VERSION` は
 据え置き (旧版へ戻した場合の影響は上記のとおり)、EPUB はファイル名・パスでのみ検索対象 (書誌情報の索引は後の課題)。
 全ライブラリテスト 9,278 件成功 (レビュー担当が再実行)。実機確認 (一覧表示・D5・★固定・外部アプリ設定) は未実施。
+
+### S3b 実装記録 (2026-09-26)
+
+- D12 の保存は同じフォルダの `.pdf` へ行う。保存先フォルダ内で排他的に作成した `.part` を既存の PDF ページ数検証に通し、同じボリューム内で上書きしない公開操作を行う。失敗・取消時は `.part` と作業フォルダを削除する。
+- 元 EPUB の現在状態と一致する現行世代があれば PDF を複写して再検証する。なければ通常の worker と profile で `.part` へ変換し、`epub_cache` の世代は作成しない。PDF Info の `/Title` と `/Author` は EPUB の `dc:title` と最初の `dc:creator` から作る。既存の `/ViewerPreferences /Direction` は維持する。
+- 公開後のデータ引き継ぎには通常のファイルコピー用 `copy_restore_stores_without_identity_at` を exact と仮想ページ prefix の両方へ適用する。レーティング・ページ補正などは EPUB と PDF の両方に残る。内容同定の行は PDF へ複写しない。しおりとコレクション登録も通常のコピーと同じく複写せず、元 EPUB に残る。
+- 確認画面では同名 PDF の有無を inspect worker が調べ、存在する場合は保存ボタンを理由付きで無効にする。保存結果は元の open owner・履歴・フルスクリーン予約を保って通常の PDF として開く。スマートフォルダとコレクションの参照元は EPUB のままにする。バッチは選択 EPUB を順に処理し、同名 PDF・失敗を個別表示し、処理中の 1 件の後で停止する。完了後に一覧を更新して D5 を反映する。
+- ZIP/RAR を `ArchiveFormat` によって分類する既存バッチとは EPUB の入力型を共有しないため、`ConvertSource` は導入しない。
+- 実経路の回帰テストでは、現行世代の再利用と古い世代の再変換、キャッシュ外パスの除外、PDF 検証後の上書き禁止、取消・書込失敗時の `.part` 除去、通常コピーで扱う設定の複写と内容同定・しおり・コレクションの非複写、ダイアログの所有権と案内、バッチ結果・停止・D5 再走査、PDF Info を確認する。実装条件を一時的に外す感度確認でも対応するテストの失敗を確認した。
+- S3b の自動検証: `cargo test -p mimageviewer --lib` は 9,299 成功・47 ignored、`cargo test -p epub-pdf-worker` は 37 成功。core check、fmt、glyph lint、開発用 core・remote・EPUB worker の build-dev も成功。共通 `test-full.ps1` は、この worktree に release 版 core・remote がなく launcher の build script で停止したため、S3b の合否には上記の指定ゲートを用いる。実際の WebView2 による 27 冊変換と画面操作は設計担当の実機確認に残す。
+- S5 TODO: 明示保存した PDF と EPUB 内の書誌情報についてプライバシー文言を更新する。`privacy.html` は S3b で編集しない。

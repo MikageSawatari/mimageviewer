@@ -2132,6 +2132,57 @@ impl App {
         }
     }
 
+    /// Keep the EPUB row as the Smart Folder parent while loading the newly saved PDF.
+    pub(crate) fn supply_smart_saved_epub_pdf(
+        &mut self,
+        source_path: &Path,
+        pdf_path: &Path,
+        owner: &super::OpenRequestOwner,
+    ) -> bool {
+        let super::OpenRequestOwner::MainGridArchive(intent) = owner else {
+            return false;
+        };
+        let super::SmartGridArchiveOwner::Transition(request_id) = intent.smart_folder_owner else {
+            return false;
+        };
+        if !self.smart_epub_conversion_request_is_current(request_id, source_path)
+            || !crate::folder_tree::path_eq(&source_path.with_extension("pdf"), pdf_path)
+        {
+            return false;
+        }
+        let Some(mut transition) = self.smart_folder_transition.take() else {
+            return false;
+        };
+        let phase = std::mem::replace(&mut transition.phase, SmartFolderTransitionPhase::Retired);
+        let SmartFolderTransitionPhase::ChildPreflight {
+            root,
+            child: SmartPhysicalPreflight::EpubConvert,
+        } = phase
+        else {
+            transition.phase = phase;
+            self.smart_folder_transition = Some(transition);
+            return false;
+        };
+        let load_source = SmartChildSource {
+            logical_source: source_path.to_path_buf(),
+            load_path: pdf_path.to_path_buf(),
+        };
+        match self.begin_smart_child_preflight(&load_source, SmartChildKind::Pdf) {
+            Ok(child) => {
+                if let SmartFolderTransitionTarget::Child { source, .. } = &mut transition.target {
+                    *source = load_source;
+                }
+                transition.phase = SmartFolderTransitionPhase::ChildPreflight { root, child };
+                self.smart_folder_transition = Some(transition);
+                true
+            }
+            Err(message) => {
+                self.show_feedback_toast(message);
+                false
+            }
+        }
+    }
+
     /// A converted cache path (or directly readable RAR) is a load alias for the original
     /// Smart row. It joins the same offscreen request instead of entering the ordinary loader.
     pub(crate) fn supply_smart_archive_load_alias(
@@ -8447,6 +8498,25 @@ mod tests {
                     }
                 ))
         );
+    }
+
+    #[test]
+    fn saved_epub_pdf_uses_pdf_load_path_and_preserves_smart_epub_parent() {
+        let mut app = crate::app::setup_app_for_test();
+        let (epub, owner) = stage_smart_epub_conversion(&mut app);
+        let pdf = epub.with_extension("pdf");
+        assert!(app.supply_smart_saved_epub_pdf(&epub, &pdf, &owner));
+        let transition = app.smart_folder_transition.as_ref().unwrap();
+        assert!(matches!(&transition.target,
+            SmartFolderTransitionTarget::Child { source, kind: SmartChildKind::Pdf, .. }
+                if source.logical_source == epub && source.load_path == pdf));
+        assert!(matches!(
+            transition.phase,
+            SmartFolderTransitionPhase::ChildPreflight {
+                child: SmartPhysicalPreflight::Pdf { .. },
+                ..
+            }
+        ));
     }
 
     #[test]

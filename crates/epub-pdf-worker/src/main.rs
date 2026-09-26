@@ -516,7 +516,7 @@ impl Engine {
         }
         let t = Instant::now();
         self.progress(Phase::Merge, 0, 1);
-        render::merge_pdf(&part_files, out, package.direction == "rtl").map_err(|e| (5, e))?;
+        render::merge_pdf_for_package(&part_files, out, &package).map_err(|e| (5, e))?;
         self.progress(Phase::Merge, 1, 1);
         r.timings.insert("merge_ms".into(), t.elapsed().as_millis());
         self.progress(Phase::Verify, 0, 1);

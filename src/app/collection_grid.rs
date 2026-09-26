@@ -1034,7 +1034,15 @@ impl App {
                     && session.wanted_revision == owner.wanted_revision
                     && session.installed_items_generation == Some(*items_generation)
                     && self.items_generation == *items_generation
-                    && crate::folder_tree::path_eq(&owner.root_source_path, target_path)
+                    && (crate::folder_tree::path_eq(&owner.root_source_path, target_path)
+                        || (owner
+                            .root_source_path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                            && crate::folder_tree::path_eq(
+                                &owner.root_source_path.with_extension("pdf"),
+                                target_path,
+                            )))
             }
             CollectionGridPhysicalLoadOrigin::PhysicalSource { current_path } => {
                 matches!(
@@ -4526,6 +4534,34 @@ mod tests {
         app.context_menu_idx = Some(current);
         assert!(app.show_context_menu(&egui::Context::default()).is_none());
         assert!(app.context_menu_idx.is_none());
+    }
+
+    #[test]
+    fn saved_epub_sibling_pdf_keeps_collection_root_owner() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let epub = temp.path().join("book.epub");
+        let pdf = epub.with_extension("pdf");
+        std::fs::write(&epub, b"epub").unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(epub.clone(), CollectionResolvedKind::Pdf)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let mut owner = app.collection_grid_physical_load_owner(0, &epub).unwrap();
+        owner.target_path = pdf.clone();
+        assert!(app.collection_grid_physical_load_owner_is_current(&owner, &pdf));
+        assert!(!app.collection_grid_physical_load_owner_is_current(
+            &owner,
+            &temp.path().join("other.pdf")
+        ));
+        assert!(app.commit_collection_grid_physical_load(&owner, &pdf));
+        assert!(
+            matches!(&app.top_level_grid_view.collection_session().unwrap().position,
+            CollectionGridPosition::PhysicalSource { path, .. } if crate::folder_tree::path_eq(path, &epub))
+        );
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]

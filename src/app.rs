@@ -13704,6 +13704,7 @@ pub struct App {
     /// 複数アーカイブの明示 ZIP 変換 (バッチ)。`start_batch_convert_to_zip` で spawn、
     /// `poll_batch_convert` で受信、`show_batch_convert_progress_dialog` でモーダル表示。
     pub(crate) batch_convert: Option<crate::ui_dialogs::batch_convert::BatchConvertPending>,
+    pub(crate) epub_batch_convert: Option<crate::ui_dialogs::epub_batch_convert::EpubBatchPending>,
     /// 削除成功後に busy 等で残ったメタ行を永続 journal から再 purge する worker。
     pub(crate) delete_purge_retry_pending: Option<crate::metadata_cleanup::DeletePurgeRetryPending>,
     /// 起動時または新しい journal 追記後に retry worker を開始すべきか。
@@ -17039,6 +17040,7 @@ impl App {
             tag_prewarm_queued: std::collections::HashSet::new(),
             delete_pending: None,
             batch_convert: None,
+            epub_batch_convert: None,
             delete_purge_retry_pending: None,
             delete_purge_retry_needed: true,
             delete_purge_retry_after: None,
@@ -21342,7 +21344,7 @@ impl App {
         self.apply_sort_change_reload_with_physical_mode(PhysicalFolderSortReload::Immediate);
     }
 
-    fn apply_sort_change_reload_without_ui_io(&mut self) {
+    pub(crate) fn apply_sort_change_reload_without_ui_io(&mut self) {
         self.apply_sort_change_reload_with_physical_mode(PhysicalFolderSortReload::WorkerScan);
     }
 
@@ -40903,6 +40905,13 @@ impl App {
         }
         if self
             .keymap
+            .consume_action(ctx, KeyAction::GridConvertEpubToPdf)
+        {
+            self.start_batch_convert_to_pdf();
+            return None;
+        }
+        if self
+            .keymap
             .consume_action(ctx, KeyAction::GridToggleStackMode)
         {
             self.toggle_stack_mode();
@@ -41189,6 +41198,13 @@ impl App {
         }
         if self.keymap.consume_action(ctx, KeyAction::GridReload) {
             self.reload_top_level_grid(ctx);
+            return None;
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridConvertEpubToPdf)
+        {
+            self.start_batch_convert_to_pdf();
             return None;
         }
 
@@ -77205,6 +77221,7 @@ impl App {
         self.poll_tag_prewarm_results();
         self.poll_delete_pending();
         self.poll_batch_convert();
+        self.poll_epub_batch_convert();
         self.poll_file_drop_pending();
         self.poll_external_tool_launch(ctx);
         self.poll_new_folder_pending(ctx);
@@ -77972,6 +77989,7 @@ impl App {
         self.show_bulk_page_edit_dialog(ctx);
         self.show_delete_progress_dialog(ctx);
         self.show_batch_convert_progress_dialog(ctx);
+        self.show_epub_batch_convert_dialog(ctx);
         self.show_pdf_password_dialog_window(ctx);
         self.show_about_dialog_window(ctx);
         self.show_update_dialog_window(ctx);

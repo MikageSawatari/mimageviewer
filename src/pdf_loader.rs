@@ -82,6 +82,10 @@ impl ResolvedReadPath {
         Self(output.part_path().to_owned())
     }
 
+    fn physical_sibling_output(output: &crate::epub_convert::SiblingOutput) -> Self {
+        Self(output.part_path().to_owned())
+    }
+
     pub fn as_path(&self) -> &Path {
         &self.0
     }
@@ -4783,6 +4787,23 @@ pub(crate) fn verify_converted_pdf_with_cancel(
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(), crate::epub_convert::EpubConvertError> {
     let read_path = ResolvedReadPath::physical_converter_output(output);
+    verify_converter_pdf_with_cancel(read_path, expected_pages, cancel)
+}
+
+pub(crate) fn verify_sibling_pdf_with_cancel(
+    output: &crate::epub_convert::SiblingOutput,
+    expected_pages: usize,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(), crate::epub_convert::EpubConvertError> {
+    let read_path = ResolvedReadPath::physical_sibling_output(output);
+    verify_converter_pdf_with_cancel(read_path, expected_pages, cancel)
+}
+
+fn verify_converter_pdf_with_cancel(
+    read_path: ResolvedReadPath,
+    expected_pages: usize,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<(), crate::epub_convert::EpubConvertError> {
     let request = encode_enumerate_request(&read_path, None, EnumerateOptions::default());
     let response = get_pool()
         .execute(

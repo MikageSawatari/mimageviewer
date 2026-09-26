@@ -370,6 +370,10 @@ impl EpubCache {
             [key], decode_generation).optional().map_err(Into::into)
     }
 
+    pub(crate) fn validate_generation_pdf(&self, row: &GenerationRow) -> Result<(), CacheError> {
+        validate_payload_file(&self.data_dir.join("epub_cache"), &row.pdf_file)
+    }
+
     pub fn touch_current(&self, key: &str, id: i64) -> Result<(), CacheError> {
         self.conn.execute(
             "UPDATE current SET last_access_at=?3 WHERE src_path_key=?1 AND generation_id=?2",

@@ -1601,6 +1601,7 @@ pub enum KeyAction {
     GridToggleMaximize,
     GridToggleFolderTreePane,
     GridToggleStackMode,
+    GridConvertEpubToPdf,
     GridTagApply,
     GridTagView,
     GridRotateCw,
@@ -2152,6 +2153,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridToggleMaximize,
     KeyAction::GridToggleFolderTreePane,
     KeyAction::GridToggleStackMode,
+    KeyAction::GridConvertEpubToPdf,
     KeyAction::GridTagApply,
     KeyAction::GridTagView,
     KeyAction::GridRotateCw,
@@ -4105,6 +4107,7 @@ impl KeyAction {
             GridToggleMaximize => "GridToggleMaximize",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
             GridToggleStackMode => "GridToggleStackMode",
+            GridConvertEpubToPdf => "GridConvertEpubToPdf",
             GridTagApply => "GridTagApply",
             GridTagView => "GridTagView",
             GridRotateCw => "GridRotateCw",
@@ -4819,6 +4822,7 @@ impl KeyAction {
             GridToggleMaximize => "メインウィンドウを最大化/復元する",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
             GridToggleStackMode => "スタック表示を切り替える",
+            GridConvertEpubToPdf => "選択中の EPUB を PDF ファイルに変換する",
             GridTagApply => "タグを付ける/外すダイアログを開く",
             GridTagView => "タグビューを開く",
             GridRotateCw => "選択中の画像を右に90度回転する",
@@ -5355,6 +5359,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
             | GridRotateCw
@@ -5845,6 +5850,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
             | GridRotateCw
@@ -6376,6 +6382,7 @@ impl KeyAction {
             GridToggleMaximize => ChordList::one(Chord::key(F11)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
             GridToggleStackMode => ChordList::EMPTY,
+            GridConvertEpubToPdf => ChordList::EMPTY,
             GridTagApply => ChordList::one(Chord::key(T)),
             GridTagView => ChordList::one(Chord::ctrl(T)),
             GridRotateCw => ChordList::one(Chord::key(R)),
@@ -11270,6 +11277,9 @@ mod tests {
     #[test]
     fn grid_toggle_stack_mode_is_default_unassigned() {
         assert!(KeyAction::GridToggleStackMode.default_chords().is_empty());
+        assert!(KeyAction::GridConvertEpubToPdf.default_chords().is_empty());
+        assert_eq!(KeyAction::GridConvertEpubToPdf.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridConvertEpubToPdf.trigger(), KeyTrigger::Press);
         assert_eq!(KeyAction::GridToggleStackMode.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridToggleStackMode.trigger(), KeyTrigger::Press);
     }

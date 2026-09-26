@@ -6553,7 +6553,8 @@ impl App {
                                     }
                                     let enabled = self.grid_item_input_allowed() && convert_target_count > 0
                                         && self.archive_convert.is_none()
-                                        && self.batch_convert.is_none();
+                                        && self.batch_convert.is_none()
+                                        && self.epub_batch_convert.is_none();
                                     let response = ui
                                         .add_enabled(
                                             enabled,

@@ -462,9 +462,9 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<Package, EpubError> {
                     }
                 }
                 if let Some(k) = &current_text {
-                    if k == "title" {
+                    if k == "title" && title.is_none() {
                         title = Some(value);
-                    } else if k == "creator" {
+                    } else if k == "creator" && creator.is_none() {
                         creator = Some(value);
                     }
                 }
@@ -617,6 +617,16 @@ mod tests {
         )
     }
     const PAGE:&[u8]=br#"<html><head><meta name="viewport" content="width=1200,height=1700"/></head><body><img src="a.jpg"/></body></html>"#;
+    #[test]
+    fn package_metadata_uses_first_title_and_creator_for_pdf_info() {
+        let opf = opf("ltr", "").replace(
+            "</metadata>",
+            "<dc:creator xmlns:dc=\"x\">最初の著者</dc:creator><dc:creator xmlns:dc=\"x\">後の著者</dc:creator><dc:title xmlns:dc=\"x\">後の題名</dc:title></metadata>",
+        );
+        let package = inspect_bytes(&book(&opf, &[("OPS/p.xhtml", PAGE)])).unwrap();
+        assert_eq!(package.title.as_deref(), Some("Test"));
+        assert_eq!(package.creator.as_deref(), Some("最初の著者"));
+    }
     #[test]
     fn direction_and_override() {
         for d in ["rtl", "ltr"] {

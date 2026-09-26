@@ -23,8 +23,10 @@ pub(crate) enum EpubConvertPhase {
     Scanning,
     Confirm(EpubInspectSummary),
     Converting(Option<ConvertProgress>),
+    Saving(Option<ConvertProgress>),
     Stale,
     Error(String),
+    SaveError(String),
 }
 
 /// Abort restores the view left by this request. A later open already owns a superseded view.
@@ -44,6 +46,7 @@ enum EpubConvertMsg {
     InspectDone(Result<EpubInspectSummary, EpubConvertError>),
     Progress(ConvertProgress),
     ConvertDone(epub_convert::ConvertResult),
+    SaveDone(Result<epub_convert::SavedPdf, EpubConvertError>),
 }
 
 pub(crate) struct EpubConvertState {
@@ -117,6 +120,10 @@ pub(crate) fn error_message(error: &EpubConvertError) -> String {
         | EpubConvertError::InvalidPdf => "EPUB の変換に失敗しました".into(),
         EpubConvertError::Timeout => "EPUB の変換がタイムアウトしました".into(),
         EpubConvertError::SourceBusy => "EPUB ファイルが使用中です".into(),
+        EpubConvertError::SourceChanged => {
+            "変換中に EPUB が変更されました。もう一度お試しください".into()
+        }
+        EpubConvertError::ExistingPdf => "同じ名前の PDF が既にあります".into(),
         EpubConvertError::Unavailable(reason) => format!("EPUB 変換が無効です: {reason}"),
         EpubConvertError::Cancelled => "EPUB の変換を取り消しました".into(),
         EpubConvertError::Io(_) | EpubConvertError::Cache(_) => {
@@ -156,6 +163,13 @@ fn summary_direction(direction: &str) -> &'static str {
         "ltr" => "左開き",
         _ => "指定なし",
     }
+}
+
+fn save_pdf_button(ui: &mut egui::Ui, summary: &EpubInspectSummary) -> egui::Response {
+    ui.add_enabled(
+        !summary.sibling_pdf_exists,
+        egui::Button::new("PDF ファイルとして保存して開く"),
+    )
 }
 
 fn start_inspect(state: &mut EpubConvertState) -> Result<(), String> {
@@ -211,6 +225,43 @@ fn start_convert(state: &mut EpubConvertState) -> Result<(), String> {
         .map_err(|_| "EPUB の変換を開始できませんでした".to_owned())?;
     state.rx = rx;
     state.phase = EpubConvertPhase::Converting(None);
+    Ok(())
+}
+
+fn start_save(state: &mut EpubConvertState) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel();
+    let path = state.src_path.clone();
+    let cancel = state.cancel.clone();
+    std::thread::Builder::new()
+        .name("epub-save-pdf".into())
+        .spawn(move || {
+            let (progress_tx, progress_rx) = mpsc::channel();
+            let forward_tx = tx.clone();
+            let forward = std::thread::spawn(move || {
+                while let Ok(progress) = progress_rx.recv() {
+                    if forward_tx.send(EpubConvertMsg::Progress(progress)).is_err() {
+                        break;
+                    }
+                }
+            });
+            let result = match crate::pdf_loader::epub_conversion_guard() {
+                Ok(guard) => epub_convert::save_sibling(
+                    guard,
+                    &path,
+                    &cancel,
+                    &progress_tx,
+                    EPUB_WORKER_TIMEOUT_SECS,
+                    &PdfiumConvertedPdfVerifier,
+                ),
+                Err(error) => Err(EpubConvertError::Unavailable(error.to_string())),
+            };
+            drop(progress_tx);
+            let _ = forward.join();
+            let _ = tx.send(EpubConvertMsg::SaveDone(result));
+        })
+        .map_err(|_| "PDF の保存を開始できませんでした".to_owned())?;
+    state.rx = rx;
+    state.phase = EpubConvertPhase::Saving(None);
     Ok(())
 }
 
@@ -350,6 +401,73 @@ impl App {
         self.epub_convert = Some(state);
     }
 
+    fn finish_epub_conversion_open(
+        &mut self,
+        mut state: EpubConvertState,
+        path: PathBuf,
+        saved_sibling: bool,
+        user_data_errors: Vec<String>,
+    ) {
+        let mut owner = state.owner.clone();
+        if !self.epub_conversion_owner_is_current(&state) {
+            self.epub_convert = Some(state);
+            self.finish_epub_convert(EpubConvertExit::Superseded);
+            return;
+        }
+        let restore = std::mem::replace(
+            &mut state.open_restore,
+            EpubOpenRestore {
+                logical: state.src_path.clone(),
+                history: None,
+            },
+        );
+        let deferred = state.deferred_fullscreen.take();
+        let source = state.src_path.clone();
+        drop(state);
+        if saved_sibling && let OpenRequestOwner::CollectionGridPhysical(collection) = &mut owner {
+            collection.target_path = path.clone();
+        }
+        if !user_data_errors.is_empty() {
+            self.show_feedback_toast(format!(
+                "PDF は保存されましたが、一部の設定を引き継げませんでした: {}",
+                user_data_errors.join("; ")
+            ));
+        }
+        if matches!(
+            &owner,
+            OpenRequestOwner::MainGridArchive(intent)
+                if matches!(intent.smart_folder_owner, crate::app::SmartGridArchiveOwner::Transition(_))
+        ) {
+            if saved_sibling {
+                let _ = self.supply_smart_saved_epub_pdf(&source, &path, &owner);
+            } else {
+                let _ = self.supply_smart_epub_conversion(&path, &owner);
+            }
+            if deferred.is_some() {
+                self.release_fs_nav_lock();
+            }
+            return;
+        }
+        let reopened = if matches!(owner, OpenRequestOwner::CollectionGridPhysical(_)) {
+            self.load_folder_with_scan_owned(path.clone(), None, owner.clone())
+        } else {
+            self.load_pdf_as_folder_owned(path.clone(), owner.clone());
+            true
+        };
+        if reopened
+            && let Some(pending) = self.pdf_enumerate_pending.as_mut()
+            && crate::folder_tree::path_eq(&pending.0, &path)
+            && pending.3 == owner
+        {
+            pending.4 = restore.history;
+            if deferred.is_some() {
+                self.fs_nav_after_pdf_enumerate = deferred;
+            }
+        } else if deferred.is_some() {
+            self.release_fs_nav_lock();
+        }
+    }
+
     pub(crate) fn show_epub_convert_dialog(&mut self, ctx: &egui::Context) {
         if self
             .epub_convert
@@ -371,7 +489,10 @@ impl App {
                     state.phase = EpubConvertPhase::Error(error_message(&error));
                 }
                 Ok(EpubConvertMsg::Progress(progress)) => {
-                    state.phase = EpubConvertPhase::Converting(Some(progress));
+                    state.phase = match state.phase {
+                        EpubConvertPhase::Saving(_) => EpubConvertPhase::Saving(Some(progress)),
+                        _ => EpubConvertPhase::Converting(Some(progress)),
+                    };
                 }
                 Ok(EpubConvertMsg::ConvertDone(Ok(PublishOutcome::Stale))) => {
                     state.phase = EpubConvertPhase::Stale;
@@ -380,56 +501,23 @@ impl App {
                     PublishOutcome::Published | PublishOutcome::Adopted(_),
                 ))) => {
                     let path = state.src_path.clone();
-                    let owner = state.owner.clone();
-                    if !self.epub_conversion_owner_is_current(&state) {
-                        // The cache publication is valid, but this view no longer owns the open.
-                        self.epub_convert = Some(state);
-                        self.finish_epub_convert(EpubConvertExit::Superseded);
-                        return;
-                    }
-                    let restore = std::mem::replace(
-                        &mut state.open_restore,
-                        EpubOpenRestore {
-                            logical: path.clone(),
-                            history: None,
-                        },
-                    );
-                    let deferred = state.deferred_fullscreen.take();
-                    drop(state);
-                    if matches!(
-                        &owner,
-                        OpenRequestOwner::MainGridArchive(intent)
-                            if matches!(intent.smart_folder_owner, crate::app::SmartGridArchiveOwner::Transition(_))
-                    ) {
-                        let _ = self.supply_smart_epub_conversion(&path, &owner);
-                        if deferred.is_some() {
-                            self.release_fs_nav_lock();
-                        }
-                        return;
-                    }
-                    let reopened = if matches!(owner, OpenRequestOwner::CollectionGridPhysical(_)) {
-                        self.load_folder_with_scan_owned(path.clone(), None, owner.clone())
-                    } else {
-                        self.load_pdf_as_folder_owned(path.clone(), owner.clone());
-                        true
-                    };
-                    if reopened
-                        && let Some(pending) = self.pdf_enumerate_pending.as_mut()
-                        && crate::folder_tree::path_eq(&pending.0, &path)
-                        && pending.3 == owner
-                    {
-                        pending.4 = restore.history;
-                        if deferred.is_some() {
-                            self.fs_nav_after_pdf_enumerate = deferred;
-                        }
-                    } else {
-                        if deferred.is_some() {
-                            self.release_fs_nav_lock();
-                        }
-                        // A rejected owner already belongs to a newer view; it must not
-                        // roll that view's navigation history back.
-                    }
+                    self.finish_epub_conversion_open(state, path, false, Vec::new());
                     return;
+                }
+                Ok(EpubConvertMsg::SaveDone(Ok(saved))) => {
+                    self.finish_epub_conversion_open(
+                        state,
+                        saved.path,
+                        true,
+                        saved.user_data_errors,
+                    );
+                    return;
+                }
+                Ok(EpubConvertMsg::SaveDone(Err(error))) => {
+                    state.phase = EpubConvertPhase::SaveError(format!(
+                        "PDF を保存できませんでした: {}。『変換して開く』をお試しください",
+                        error_message(&error)
+                    ));
                 }
                 Ok(EpubConvertMsg::ConvertDone(Err(error))) => {
                     state.phase = EpubConvertPhase::Error(error_message(&error));
@@ -438,7 +526,9 @@ impl App {
                 Err(TryRecvError::Disconnected) => {
                     if matches!(
                         state.phase,
-                        EpubConvertPhase::Scanning | EpubConvertPhase::Converting(_)
+                        EpubConvertPhase::Scanning
+                            | EpubConvertPhase::Converting(_)
+                            | EpubConvertPhase::Saving(_)
                     ) {
                         state.phase = EpubConvertPhase::Error("EPUB の処理が中断されました".into());
                     }
@@ -449,6 +539,7 @@ impl App {
 
         let mut close = false;
         let mut convert = false;
+        let mut save = false;
         if !matches!(state.phase, EpubConvertPhase::Scanning)
             || !self.settings.archive_convert_suppresses_confirm()
         {
@@ -484,13 +575,24 @@ impl App {
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 if ui.button("変換して開く").clicked() || enter { convert = true; }
+                                let save_button = save_pdf_button(ui, summary);
+                                if save_button.clicked() { save = true; }
                                 if ui.button("キャンセル").clicked() { close = true; }
                             });
+                            if summary.sibling_pdf_exists {
+                                ui.weak("同じ名前の PDF があるため保存できません");
+                            }
                         }
                         EpubConvertPhase::Converting(progress) => {
                             if let Some(progress) = progress {
                                 ui.add(egui::ProgressBar::new(progress_fraction(progress)).text(progress_label(progress)));
                             } else { ui.label("変換を準備しています..."); }
+                            if ui.button("キャンセル").clicked() { close = true; }
+                        }
+                        EpubConvertPhase::Saving(progress) => {
+                            if let Some(progress) = progress {
+                                ui.add(egui::ProgressBar::new(progress_fraction(progress)).text(progress_label(progress)));
+                            } else { ui.label("PDF の保存を準備しています..."); }
                             if ui.button("キャンセル").clicked() { close = true; }
                         }
                         EpubConvertPhase::Stale => {
@@ -507,6 +609,13 @@ impl App {
                             ui.colored_label(ui.visuals().error_fg_color, message);
                             if ui.button("閉じる").clicked() { close = true; }
                         }
+                        EpubConvertPhase::SaveError(message) => {
+                            ui.colored_label(ui.visuals().error_fg_color, message);
+                            ui.horizontal(|ui| {
+                                if ui.button("変換して開く").clicked() { convert = true; }
+                                if ui.button("閉じる").clicked() { close = true; }
+                            });
+                        }
                     }
                 });
             close |= !open || escape;
@@ -514,13 +623,18 @@ impl App {
         if convert && let Err(message) = start_convert(&mut state) {
             state.phase = EpubConvertPhase::Error(message);
         }
+        if save && let Err(message) = start_save(&mut state) {
+            state.phase = EpubConvertPhase::SaveError(message);
+        }
         if close {
             self.epub_convert = Some(state);
             self.finish_epub_convert(EpubConvertExit::Abort);
         } else {
             if matches!(
                 state.phase,
-                EpubConvertPhase::Scanning | EpubConvertPhase::Converting(_)
+                EpubConvertPhase::Scanning
+                    | EpubConvertPhase::Converting(_)
+                    | EpubConvertPhase::Saving(_)
             ) {
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
@@ -607,6 +721,7 @@ mod tests {
             layout: "fixed".into(),
             direction: "default".into(),
             spine_count: 7,
+            sibling_pdf_exists: false,
         })))
         .unwrap();
         let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
@@ -691,6 +806,105 @@ mod tests {
         );
         assert!(app.fs_nav_after_pdf_enumerate.is_some());
         assert_eq!(app.fs_nav_locked_gen, Some(7));
+    }
+
+    #[test]
+    fn sibling_save_result_opens_pdf_with_original_owner_and_fullscreen_handover() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let (mut state, tx, _) = fake_state(EpubConvertPhase::Saving(None));
+        let pdf = state.src_path.with_extension("pdf");
+        let owner = state.owner.clone();
+        state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
+            resume_slideshow: false,
+            target: crate::app::DeferredFsTarget::None,
+            resume_to_last_page: false,
+            from_explicit_open: false,
+            preserve_after_password_prompt: false,
+        });
+        app.fs_nav_locked_gen = Some(7);
+        app.epub_convert = Some(state);
+        tx.send(EpubConvertMsg::SaveDone(Ok(epub_convert::SavedPdf {
+            path: pdf.clone(),
+            reused_cache: false,
+            user_data_errors: Vec::new(),
+        })))
+        .unwrap();
+        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        assert!(app.epub_convert.is_none());
+        assert!(
+            app.pdf_enumerate_pending
+                .as_ref()
+                .is_some_and(|pending| pending.0 == pdf && pending.3 == owner)
+        );
+        assert!(app.fs_nav_after_pdf_enumerate.is_some());
+    }
+
+    #[test]
+    fn inspect_same_name_pdf_shows_disabled_save_reason() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let (state, tx, _) = fake_state(EpubConvertPhase::Scanning);
+        app.epub_convert = Some(state);
+        let summary = EpubInspectSummary {
+            layout: "fixed".into(),
+            direction: "ltr".into(),
+            spine_count: 2,
+            sibling_pdf_exists: true,
+        };
+        tx.send(EpubConvertMsg::InspectDone(Ok(summary.clone())))
+            .unwrap();
+        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let output = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        assert!(
+            matches!(app.epub_convert.as_ref().map(|state| &state.phase), Some(EpubConvertPhase::Confirm(summary)) if summary.sibling_pdf_exists)
+        );
+        let mut text = String::new();
+        let mut stack: Vec<&egui::epaint::Shape> =
+            output.shapes.iter().map(|shape| &shape.shape).collect();
+        while let Some(shape) = stack.pop() {
+            match shape {
+                egui::epaint::Shape::Text(shape) => text.push_str(shape.galley.text()),
+                egui::epaint::Shape::Vec(shapes) => stack.extend(shapes.iter()),
+                _ => {}
+            }
+        }
+        assert!(
+            text.contains("同じ名前の PDF があるため保存できません"),
+            "{text}"
+        );
+        let mut enabled = true;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                enabled = save_pdf_button(ui, &summary).enabled();
+            });
+        });
+        assert!(!enabled);
+        let mut available = summary;
+        available.sibling_pdf_exists = false;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                enabled = save_pdf_button(ui, &available).enabled();
+            });
+        });
+        assert!(enabled);
+    }
+
+    #[test]
+    fn save_failure_explains_cache_fallback() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let (state, tx, _) = fake_state(EpubConvertPhase::Saving(None));
+        app.epub_convert = Some(state);
+        tx.send(EpubConvertMsg::SaveDone(Err(EpubConvertError::Io(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read-only"),
+        ))))
+        .unwrap();
+        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        assert!(
+            matches!(app.epub_convert.as_ref().map(|state| &state.phase), Some(EpubConvertPhase::SaveError(message)) if message.contains("変換して開く"))
+        );
     }
 
     #[test]

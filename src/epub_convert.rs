@@ -4,7 +4,7 @@
 //! The S2a byte-level placeholder is available only to tests.
 
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -81,6 +81,8 @@ pub enum EpubConvertError {
     RenderFailed,
     Timeout,
     SourceBusy,
+    SourceChanged,
+    ExistingPdf,
     Unavailable(String),
     Cancelled,
     Protocol,
@@ -102,11 +104,62 @@ impl From<epub_cache::CacheError> for EpubConvertError {
 
 pub type ConvertResult = Result<PublishOutcome, EpubConvertError>;
 
+#[derive(Debug)]
+pub struct SavedPdf {
+    pub path: PathBuf,
+    pub reused_cache: bool,
+    pub user_data_errors: Vec<String>,
+}
+
+/// A sibling `.part` created exclusively by the save operation. The PDF verifier
+/// accepts this token so logical EPUB paths cannot bypass generation resolution.
+pub struct SiblingOutput {
+    part_path: PathBuf,
+}
+
+impl SiblingOutput {
+    pub fn part_path(&self) -> &Path {
+        &self.part_path
+    }
+
+    fn create(destination: &Path) -> io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let folder = destination
+            .parent()
+            .ok_or_else(|| io::Error::other("PDF destination has no folder"))?;
+        for _ in 0..100 {
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let part_path =
+                folder.join(format!(".miv-epub-{}-{sequence}.part", std::process::id()));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&part_path)
+            {
+                Ok(_) => return Ok(Self { part_path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "EPUB PDF temp name exhaustion",
+        ))
+    }
+}
+
 /// Verifies the finished worker output before it is promoted or published.
 pub trait ConvertedPdfVerifier: Send + Sync {
     fn verify(
         &self,
         output: &ReservedOutput,
+        pages: usize,
+        cancel: &CancelToken,
+    ) -> Result<(), EpubConvertError>;
+
+    fn verify_sibling(
+        &self,
+        output: &SiblingOutput,
         pages: usize,
         cancel: &CancelToken,
     ) -> Result<(), EpubConvertError>;
@@ -123,6 +176,15 @@ impl ConvertedPdfVerifier for PdfiumConvertedPdfVerifier {
         cancel: &CancelToken,
     ) -> Result<(), EpubConvertError> {
         crate::pdf_loader::verify_converted_pdf_with_cancel(output, pages, Some(cancel.pool_flag()))
+    }
+
+    fn verify_sibling(
+        &self,
+        output: &SiblingOutput,
+        pages: usize,
+        cancel: &CancelToken,
+    ) -> Result<(), EpubConvertError> {
+        crate::pdf_loader::verify_sibling_pdf_with_cancel(output, pages, Some(cancel.pool_flag()))
     }
 }
 
@@ -201,6 +263,7 @@ pub struct EpubInspectSummary {
     pub layout: String,
     pub direction: String,
     pub spine_count: usize,
+    pub sibling_pdf_exists: bool,
 }
 
 fn worker_environment() -> Vec<(OsString, OsString)> {
@@ -355,6 +418,7 @@ pub fn inspect_at<S: WorkerSpawner>(
         layout: layout.to_owned(),
         direction: inspected.direction,
         spine_count: inspected.spine.len(),
+        sibling_pdf_exists: source.with_extension("pdf").exists(),
     })
 }
 
@@ -421,6 +485,51 @@ pub fn convert_at<S: WorkerSpawner>(
     fs::create_dir_all(final_path.parent().ok_or(EpubConvertError::Protocol)?)?;
     let part = reserved.part_path();
     let _part_cleanup = PartCleanup(part.to_owned());
+    let (pages, direction, profile) = run_worker_to_part(
+        source_copy,
+        part,
+        &temp,
+        cancel,
+        progress,
+        timeout_secs,
+        spawner,
+    )?;
+    verifier.verify(&reserved, pages, cancel)?;
+    if cancel.is_cancelled() {
+        return Err(EpubConvertError::Cancelled);
+    }
+    promote_part(part, final_path)?;
+    let candidate = GenerationRow {
+        generation_id: reserved.generation_id(),
+        src_path_key: epub_cache::src_key(source),
+        src_path: source.to_owned(),
+        src_state: state,
+        src_sha256: full_hash,
+        src_head_hash: head_hash,
+        pdf_file: final_path.to_owned(),
+        pdf_size: fs::metadata(final_path)?.len(),
+        page_count: pages as u32,
+        direction,
+        profile,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+    };
+    // Open before BEGIN IMMEDIATE. The guard denies writes until publish commits.
+    let guard = WriteDenyingSource::open(source).map_err(map_source_open)?;
+    db.publish(&candidate, &guard).map_err(Into::into)
+}
+
+fn run_worker_to_part<S: WorkerSpawner>(
+    source_copy: PathBuf,
+    part: &Path,
+    temp: &TempFolder,
+    cancel: &CancelToken,
+    progress: &mpsc::Sender<ConvertProgress>,
+    timeout_secs: u32,
+    spawner: &S,
+) -> Result<(usize, String, String), EpubConvertError> {
     let spec = WorkerSpec {
         operation: WorkerOperation::Convert,
         executable: worker_executable()?,
@@ -457,32 +566,152 @@ pub fn convert_at<S: WorkerSpawner>(
         return Err(EpubConvertError::Cancelled);
     }
     let result = parsed?;
-    let (pages, direction, profile) = validate_result(code, result)?;
-    verifier.verify(&reserved, pages, cancel)?;
+    validate_result(code, result)
+}
+
+/// Explicit sibling-PDF save. Only the caller's worker thread may invoke this;
+/// it performs filesystem, PDF-pool and SQLite operations.
+pub fn save_sibling(
+    gate: &epub_cache::AliveGuard,
+    source: &Path,
+    cancel: &CancelToken,
+    progress: &mpsc::Sender<ConvertProgress>,
+    timeout_secs: u32,
+    verifier: &dyn ConvertedPdfVerifier,
+) -> Result<SavedPdf, EpubConvertError> {
+    let data_dir = crate::data_dir::get();
+    save_sibling_at(
+        ConvertContext {
+            gate,
+            data_dir: &data_dir,
+            temp_root: &crate::materializer::epub_temp_root(),
+        },
+        source,
+        cancel,
+        progress,
+        timeout_secs,
+        &NativeSpawner,
+        verifier,
+    )
+}
+
+pub fn save_sibling_at<S: WorkerSpawner>(
+    context: ConvertContext<'_>,
+    source: &Path,
+    cancel: &CancelToken,
+    progress: &mpsc::Sender<ConvertProgress>,
+    timeout_secs: u32,
+    spawner: &S,
+    verifier: &dyn ConvertedPdfVerifier,
+) -> Result<SavedPdf, EpubConvertError> {
+    if !context.gate.authorizes(context.data_dir) {
+        return Err(
+            epub_cache::CacheError::InvalidState("gate for a different data directory").into(),
+        );
+    }
+    if timeout_secs == 0
+        || !source
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    {
+        return Err(EpubConvertError::Invalid);
+    }
+    let destination = source.with_extension("pdf");
+    if destination.exists() {
+        return Err(EpubConvertError::ExistingPdf);
+    }
     if cancel.is_cancelled() {
         return Err(EpubConvertError::Cancelled);
     }
-    promote_part(part, final_path)?;
-    let candidate = GenerationRow {
-        generation_id: reserved.generation_id(),
-        src_path_key: epub_cache::src_key(source),
-        src_path: source.to_owned(),
-        src_state: state,
-        src_sha256: full_hash,
-        src_head_hash: head_hash,
-        pdf_file: final_path.to_owned(),
-        pdf_size: fs::metadata(final_path)?.len(),
-        page_count: pages as u32,
-        direction,
-        profile,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
+    let output = SiblingOutput::create(&destination)?;
+    let _part_cleanup = PartCleanup(output.part_path.clone());
+
+    let cache = EpubCache::open_at(context.data_dir)?;
+    let source_guard = WriteDenyingSource::open(source).map_err(map_source_open)?;
+    let source_state = source_guard.state()?;
+    let cached = cache
+        .current_generation(&epub_cache::src_key(source))?
+        .filter(|row| row.src_state == source_state && row.page_count > 0)
+        .filter(|row| cache.validate_generation_pdf(row).is_ok())
+        .filter(|row| {
+            fs::metadata(&row.pdf_file)
+                .is_ok_and(|meta| meta.is_file() && meta.len() == row.pdf_size)
+        });
+    let (pages, reused_cache, expected_state, guard) = if let Some(row) = cached {
+        copy_cached_pdf(&row.pdf_file, output.part_path(), cancel)?;
+        (row.page_count as usize, true, source_state, source_guard)
+    } else {
+        drop(source_guard);
+        let temp = TempFolder::create(context.temp_root)?;
+        let source_copy = temp.path.join("source.epub");
+        let (state, _, _) = copy_source(source, &source_copy, cancel)?;
+        let (pages, _, _) = run_worker_to_part(
+            source_copy,
+            output.part_path(),
+            &temp,
+            cancel,
+            progress,
+            timeout_secs,
+            spawner,
+        )?;
+        let guard = WriteDenyingSource::open(source).map_err(map_source_open)?;
+        (pages, false, state, guard)
     };
-    // Open before BEGIN IMMEDIATE. The guard denies writes until publish commits.
-    let guard = WriteDenyingSource::open(source).map_err(map_source_open)?;
-    db.publish(&candidate, &guard).map_err(Into::into)
+    verifier.verify_sibling(&output, pages, cancel)?;
+    if cancel.is_cancelled() {
+        return Err(EpubConvertError::Cancelled);
+    }
+    if guard.state()? != expected_state {
+        return Err(EpubConvertError::SourceChanged);
+    }
+    crate::archive_converter::replace_file_atomic(output.part_path(), &destination, true).map_err(
+        |error| {
+            if destination.exists() {
+                EpubConvertError::ExistingPdf
+            } else {
+                EpubConvertError::Io(error)
+            }
+        },
+    )?;
+    drop(guard);
+    let mappings = [
+        crate::rename_key_migration::StoreCopyPathMapping::exact(source, &destination),
+        crate::rename_key_migration::StoreCopyPathMapping::virtual_prefix(source, &destination),
+    ];
+    let copied = crate::rename_key_migration::copy_restore_stores_without_identity_at(
+        context.data_dir,
+        &mappings,
+    );
+    Ok(SavedPdf {
+        path: destination,
+        reused_cache,
+        user_data_errors: copied.errors,
+    })
+}
+
+fn copy_cached_pdf(
+    source: &Path,
+    destination: &Path,
+    cancel: &CancelToken,
+) -> Result<(), EpubConvertError> {
+    let mut input = File::open(source)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(destination)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(EpubConvertError::Cancelled);
+        }
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+    }
+    output.flush()?;
+    Ok(())
 }
 
 fn copy_source(
@@ -1011,6 +1240,15 @@ mod tests {
         ) -> Result<(), EpubConvertError> {
             verify_converted_pdf_stage2a(output.part_path(), pages)
         }
+
+        fn verify_sibling(
+            &self,
+            output: &SiblingOutput,
+            pages: usize,
+            _cancel: &CancelToken,
+        ) -> Result<(), EpubConvertError> {
+            verify_converted_pdf_stage2a(output.part_path(), pages)
+        }
     }
 
     fn reserved_part(root: &Path) -> PathBuf {
@@ -1123,7 +1361,11 @@ mod tests {
     impl WorkerSpawner for InspectSpawner {
         fn spawn(&self, spec: &WorkerSpec) -> Result<Box<dyn WorkerChild>, EpubConvertError> {
             assert!(matches!(spec.operation, WorkerOperation::Inspect));
-            assert_eq!(spec.input, Path::new("book.epub"));
+            assert!(
+                spec.input
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            );
             Ok(Box::new(FakeChild {
                 stdout: Some(self.stdout.clone()),
                 code: self.code,
@@ -1146,6 +1388,7 @@ mod tests {
                 layout: "fixed".into(),
                 direction: "rtl".into(),
                 spine_count: 2,
+                sibling_pdf_exists: false,
             }
         );
         let drm = InspectSpawner {
@@ -1156,6 +1399,20 @@ mod tests {
             inspect_at(Path::new("book.epub"), &cancel, 5, &drm),
             Err(EpubConvertError::Drm)
         ));
+    }
+
+    #[test]
+    fn inspect_worker_result_marks_existing_sibling_pdf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        fs::write(&source, b"epub").unwrap();
+        fs::write(source.with_extension("pdf"), b"existing").unwrap();
+        let spawner = InspectSpawner {
+            code: 0,
+            stdout: br#"{"rendition":{"layout":"pre-paginated"},"direction":"ltr","spine":[{"rendition":{"layout":null}}],"drm":"none"}"#.to_vec(),
+        };
+        let summary = inspect_at(&source, &CancelToken::new().unwrap(), 5, &spawner).unwrap();
+        assert!(summary.sibling_pdf_exists);
     }
 
     fn run(mode: FakeMode) -> (ConvertResult, tempfile::TempDir, Arc<AtomicBool>, PathBuf) {
@@ -1189,6 +1446,456 @@ mod tests {
             &TestPdfVerifier,
         );
         (result, tmp, killed, temp_root)
+    }
+
+    struct NoSpawner;
+    impl WorkerSpawner for NoSpawner {
+        fn spawn(&self, _: &WorkerSpec) -> Result<Box<dyn WorkerChild>, EpubConvertError> {
+            panic!("a current cache generation must be copied without launching the worker")
+        }
+    }
+
+    fn save_with<S: WorkerSpawner>(
+        root: &Path,
+        source: &Path,
+        spawner: &S,
+        verifier: &dyn ConvertedPdfVerifier,
+        cancel: &CancelToken,
+    ) -> Result<SavedPdf, EpubConvertError> {
+        let gate = epub_cache::startup_gate(root);
+        let epub_cache::GateOutcome::Enabled { guard, .. } = gate else {
+            panic!("test gate disabled")
+        };
+        let (tx, _rx) = mpsc::channel();
+        save_sibling_at(
+            ConvertContext {
+                gate: &guard,
+                data_dir: root,
+                temp_root: &root.join("temp"),
+            },
+            source,
+            cancel,
+            &tx,
+            3,
+            spawner,
+            verifier,
+        )
+    }
+
+    #[test]
+    fn sibling_save_reuses_current_generation_without_worker() {
+        let (converted, tmp, _, _) = run(FakeMode::Success);
+        assert!(converted.is_ok());
+        let source = tmp.path().join("book.epub");
+        let before = EpubCache::open_at(tmp.path())
+            .unwrap()
+            .list_current()
+            .unwrap()
+            .len();
+        let saved = save_with(
+            tmp.path(),
+            &source,
+            &NoSpawner,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        )
+        .unwrap();
+        assert!(saved.reused_cache);
+        assert!(saved.path.exists());
+        assert_eq!(
+            EpubCache::open_at(tmp.path())
+                .unwrap()
+                .list_current()
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+
+    #[test]
+    fn sibling_save_without_generation_converts_without_cache_row_and_cleans_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        fs::write(&source, b"source EPUB bytes").unwrap();
+        let fake = FakeSpawner {
+            mode: FakeMode::Success,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        let saved = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        )
+        .unwrap();
+        assert!(!saved.reused_cache);
+        assert_eq!(fs::read(&saved.path).unwrap(), b"%PDF-1.4\nfake");
+        assert!(
+            EpubCache::open_at(tmp.path())
+                .unwrap()
+                .list_current()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn sibling_save_stale_generation_runs_worker() {
+        let (converted, tmp, _, _) = run(FakeMode::Success);
+        assert!(converted.is_ok());
+        let source = tmp.path().join("book.epub");
+        fs::write(&source, b"new EPUB bytes").unwrap();
+        let fake = FakeSpawner {
+            mode: FakeMode::Success,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        let saved = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        )
+        .unwrap();
+        assert!(!saved.reused_cache);
+        assert_eq!(
+            EpubCache::open_at(tmp.path())
+                .unwrap()
+                .list_current()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn sibling_save_does_not_reuse_generation_path_outside_cache() {
+        let (converted, tmp, _, _) = run(FakeMode::Success);
+        assert!(converted.is_ok());
+        let source = tmp.path().join("book.epub");
+        let outside = tmp.path().join("outside.pdf");
+        fs::write(&outside, b"%PDF-1.4\nfake").unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("epub_cache.db")).unwrap();
+        db.execute(
+            "UPDATE generations SET pdf_file = ?1 WHERE src_path_key = ?2",
+            rusqlite::params![outside.to_string_lossy(), epub_cache::src_key(&source)],
+        )
+        .unwrap();
+        drop(db);
+        let fake = FakeSpawner {
+            mode: FakeMode::Success,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        let saved = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        )
+        .unwrap();
+        assert!(!saved.reused_cache);
+    }
+
+    struct PublishRaceVerifier {
+        destination: PathBuf,
+    }
+    impl ConvertedPdfVerifier for PublishRaceVerifier {
+        fn verify(
+            &self,
+            _: &ReservedOutput,
+            _: usize,
+            _: &CancelToken,
+        ) -> Result<(), EpubConvertError> {
+            unreachable!()
+        }
+        fn verify_sibling(
+            &self,
+            output: &SiblingOutput,
+            pages: usize,
+            cancel: &CancelToken,
+        ) -> Result<(), EpubConvertError> {
+            TestPdfVerifier.verify_sibling(output, pages, cancel)?;
+            fs::write(&self.destination, b"another writer's PDF").unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sibling_save_publish_does_not_clobber_pdf_created_after_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        fs::write(&source, b"source EPUB bytes").unwrap();
+        let fake = FakeSpawner {
+            mode: FakeMode::Success,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        let result = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &PublishRaceVerifier {
+                destination: source.with_extension("pdf"),
+            },
+            &CancelToken::new().unwrap(),
+        );
+        assert!(
+            matches!(result, Err(EpubConvertError::ExistingPdf)),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read(source.with_extension("pdf")).unwrap(),
+            b"another writer's PDF"
+        );
+        assert_eq!(
+            fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn sibling_save_cancel_removes_part_and_does_not_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        fs::write(&source, b"source EPUB bytes").unwrap();
+        let fake = FakeSpawner {
+            mode: FakeMode::Cancel,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        let result = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        );
+        assert!(
+            matches!(result, Err(EpubConvertError::Cancelled)),
+            "{result:?}"
+        );
+        assert!(!source.with_extension("pdf").exists());
+        assert_eq!(
+            fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn sibling_save_worker_failure_removes_part_and_does_not_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        fs::write(&source, b"source EPUB bytes").unwrap();
+        let fake = FakeSpawner {
+            mode: FakeMode::Failure(5),
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        let result = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        );
+        assert!(
+            matches!(result, Err(EpubConvertError::RenderFailed)),
+            "{result:?}"
+        );
+        assert!(!source.with_extension("pdf").exists());
+        assert_eq!(
+            fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+                .count(),
+            0
+        );
+    }
+
+    struct PermissionDeniedVerifier;
+    impl ConvertedPdfVerifier for PermissionDeniedVerifier {
+        fn verify(
+            &self,
+            _: &ReservedOutput,
+            _: usize,
+            _: &CancelToken,
+        ) -> Result<(), EpubConvertError> {
+            unreachable!()
+        }
+
+        fn verify_sibling(
+            &self,
+            _: &SiblingOutput,
+            _: usize,
+            _: &CancelToken,
+        ) -> Result<(), EpubConvertError> {
+            Err(EpubConvertError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "read-only destination",
+            )))
+        }
+    }
+
+    #[test]
+    fn sibling_save_permission_failure_removes_part_and_does_not_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        fs::write(&source, b"source EPUB bytes").unwrap();
+        let fake = FakeSpawner {
+            mode: FakeMode::Success,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        let result = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &PermissionDeniedVerifier,
+            &CancelToken::new().unwrap(),
+        );
+        assert!(
+            matches!(result, Err(EpubConvertError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert!(!source.with_extension("pdf").exists());
+        assert_eq!(
+            fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn sibling_save_copies_existing_file_copy_data_but_not_identity_bookmarks_or_collection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        let destination = source.with_extension("pdf");
+        fs::write(&source, b"source EPUB bytes").unwrap();
+        let epub_key = crate::adjustment_db::normalize_path(&source);
+        let pdf_key = crate::adjustment_db::normalize_path(&destination);
+        let epub_page = format!("{epub_key}::page_1");
+        let pdf_page = format!("{pdf_key}::page_1");
+        let rating = crate::rating_db::RatingDb::open_at(tmp.path().join("rating.db")).unwrap();
+        rating.set(&epub_key, 4).unwrap();
+        drop(rating);
+        let adjust =
+            crate::adjustment_db::AdjustmentDb::open_at(&tmp.path().join("adjustment.db")).unwrap();
+        let params = crate::adjustment::AdjustParams {
+            brightness: 19.0,
+            ..Default::default()
+        };
+        adjust.set_page_params(&epub_page, &params).unwrap();
+        drop(adjust);
+        let identity = rusqlite::Connection::open(tmp.path().join("content_identity.db")).unwrap();
+        identity.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY, size INTEGER NOT NULL, head_hash TEXT NOT NULL, full_hash TEXT, hashed_mtime INTEGER NOT NULL, kind TEXT NOT NULL, last_edit_at INTEGER NOT NULL, has_restorable_content INTEGER NOT NULL)").unwrap();
+        identity
+            .execute(
+                "INSERT INTO edit_origin VALUES (?1, 10, 'head', 'full', 20, 'epub', 30, 1)",
+                [&epub_key],
+            )
+            .unwrap();
+        drop(identity);
+        let bookmarks_path = tmp.path().join("book_bookmarks.db");
+        crate::book_bookmarks::ensure_schema_at(&bookmarks_path).unwrap();
+        let bookmarks = rusqlite::Connection::open(&bookmarks_path).unwrap();
+        bookmarks.execute("INSERT INTO book_bookmarks (container_key, container_path, container_kind, page_kind, page_value, page_key, created_at_ms) VALUES (?1, ?2, 'pdf', 'index', '1', 'page_1', 1)", rusqlite::params![crate::book_bookmarks::container_key(&source), source.to_string_lossy()]).unwrap();
+        drop(bookmarks);
+        let collection = rusqlite::Connection::open(tmp.path().join("collection.db")).unwrap();
+        collection
+            .execute_batch("CREATE TABLE collection_entries (source_path TEXT NOT NULL)")
+            .unwrap();
+        collection
+            .execute(
+                "INSERT INTO collection_entries VALUES (?1)",
+                [source.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(collection);
+
+        let fake = FakeSpawner {
+            mode: FakeMode::Success,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        let saved = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            saved.user_data_errors.is_empty(),
+            "{:?}",
+            saved.user_data_errors
+        );
+        let rating = crate::rating_db::RatingDb::open_at(tmp.path().join("rating.db")).unwrap();
+        assert_eq!(rating.get(&epub_key), 4);
+        assert_eq!(rating.get(&pdf_key), 4);
+        let adjust =
+            crate::adjustment_db::AdjustmentDb::open_at(&tmp.path().join("adjustment.db")).unwrap();
+        assert_eq!(adjust.get_page_params(&epub_page).unwrap().brightness, 19.0);
+        assert_eq!(adjust.get_page_params(&pdf_page).unwrap().brightness, 19.0);
+        let identity = rusqlite::Connection::open(tmp.path().join("content_identity.db")).unwrap();
+        let count: i64 = identity
+            .query_row(
+                "SELECT COUNT(*) FROM edit_origin WHERE file_key = ?1",
+                [&pdf_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let count: i64 = identity
+            .query_row(
+                "SELECT COUNT(*) FROM edit_origin WHERE file_key = ?1",
+                [&epub_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let bookmarks = rusqlite::Connection::open(bookmarks_path).unwrap();
+        let bookmark_paths: Vec<String> = bookmarks
+            .prepare("SELECT container_path FROM book_bookmarks")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(bookmark_paths, vec![source.to_string_lossy().to_string()]);
+        let collection = rusqlite::Connection::open(tmp.path().join("collection.db")).unwrap();
+        let collection_paths: Vec<String> = collection
+            .prepare("SELECT source_path FROM collection_entries")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(collection_paths, vec![source.to_string_lossy().to_string()]);
     }
 
     #[test]
