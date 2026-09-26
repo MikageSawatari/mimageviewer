@@ -22,6 +22,7 @@ use crate::settings::{
     GridClickSelectionMode, GridViewMode,
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
+use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
 
@@ -4405,57 +4406,6 @@ mod details_text_clip_tests {
     }
 }
 
-fn draw_details_preview_icon(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    color: egui::Color32,
-    muted: bool,
-) {
-    if rect.width() < 12.0 || rect.height() < 12.0 {
-        return;
-    }
-    let alpha = if muted { 90 } else { color.a() };
-    let stroke_color =
-        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
-    let icon = egui::Rect::from_center_size(
-        rect.center(),
-        egui::vec2(rect.width().min(17.0), rect.height().min(15.0)),
-    );
-    let stroke = egui::Stroke::new(1.25, stroke_color);
-    painter.rect_stroke(icon, 2.0, stroke, egui::StrokeKind::Inside);
-    painter.circle_filled(
-        egui::pos2(
-            icon.left() + icon.width() * 0.28,
-            icon.top() + icon.height() * 0.32,
-        ),
-        1.7,
-        stroke_color,
-    );
-    let mountain = vec![
-        egui::pos2(
-            icon.left() + icon.width() * 0.16,
-            icon.bottom() - icon.height() * 0.22,
-        ),
-        egui::pos2(
-            icon.left() + icon.width() * 0.42,
-            icon.top() + icon.height() * 0.55,
-        ),
-        egui::pos2(
-            icon.left() + icon.width() * 0.57,
-            icon.bottom() - icon.height() * 0.32,
-        ),
-        egui::pos2(
-            icon.left() + icon.width() * 0.78,
-            icon.top() + icon.height() * 0.44,
-        ),
-        egui::pos2(
-            icon.right() - icon.width() * 0.12,
-            icon.bottom() - icon.height() * 0.22,
-        ),
-    ];
-    painter.add(egui::Shape::line(mountain, stroke));
-}
-
 /// Snapshot fixture for the cut-item content/interaction paint split.
 ///
 /// The thumbnail cells use the production grid layout and painter. The details rows use
@@ -4557,7 +4507,13 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
         content_painter.multiply_opacity(details_item_content_opacity(false, is_cut));
         let icon_rect =
             egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 4.0), egui::vec2(34.0, 34.0));
-        draw_details_preview_icon(&content_painter, icon_rect, strong_text, false);
+        draw_details_preview_icon(
+            &content_painter,
+            icon_rect,
+            DetailsIconKind::Image,
+            strong_text,
+            false,
+        );
         draw_details_text_with_painter(
             ui,
             &content_painter,
@@ -4599,6 +4555,216 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
     ui.separator();
     draw_details_sample(ui, "詳細一覧・通常", false);
     draw_details_sample(ui, "詳細一覧・切り取り中", true);
+}
+
+/// Fixed Details rows for reviewing the typed preview icons in both themes.
+#[doc(hidden)]
+pub fn draw_details_icons_snapshot_fixture(ui: &mut egui::Ui) {
+    use crate::archive_converter::ArchiveFormat;
+    use crate::grid_item::{CollectionPlaceholderReason, SearchContainerKind};
+
+    let path = PathBuf::from("C:/sample/item");
+    let rows: Vec<(&str, GridItem, bool)> = vec![
+        ("Folder", GridItem::Folder(path.clone()), false),
+        ("Image (selected, cut)", GridItem::Image(path.clone()), true),
+        ("Video", GridItem::Video(path.clone()), false),
+        ("Audio", GridItem::Audio(path.clone()), false),
+        ("ZIP", GridItem::ZipFile(path.clone()), false),
+        (
+            "RAR",
+            GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: ArchiveFormat::Rar,
+            },
+            false,
+        ),
+        (
+            "7z",
+            GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: ArchiveFormat::SevenZ,
+            },
+            false,
+        ),
+        (
+            "LZH",
+            GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: ArchiveFormat::Lzh,
+            },
+            false,
+        ),
+        ("PDF", GridItem::PdfFile(path.clone()), false),
+        (
+            "ZIP image",
+            GridItem::ZipImage {
+                zip_path: path.clone(),
+                entry_name: "page.jpg".into(),
+            },
+            false,
+        ),
+        (
+            "ZIP directory",
+            GridItem::ZipDir {
+                zip_path: path.clone(),
+                dir_prefix: "pages/".into(),
+                is_archive: false,
+                representative: None,
+            },
+            false,
+        ),
+        (
+            "Nested ZIP",
+            GridItem::ZipDir {
+                zip_path: path.clone(),
+                dir_prefix: "inside.zip/".into(),
+                is_archive: true,
+                representative: None,
+            },
+            false,
+        ),
+        (
+            "PDF page",
+            GridItem::PdfPage {
+                pdf_path: path.clone(),
+                page_num: 0,
+                content_type: None,
+            },
+            false,
+        ),
+        (
+            "Stack",
+            GridItem::Stack {
+                key: "stack".into(),
+                representative: path.clone(),
+                count: 2,
+            },
+            false,
+        ),
+        (
+            "Search folder",
+            GridItem::SearchContainer {
+                path: path.clone(),
+                kind: SearchContainerKind::Folder,
+                hit_count: 1,
+                representative: None,
+            },
+            false,
+        ),
+        (
+            "Search ZIP",
+            GridItem::SearchContainer {
+                path: path.clone(),
+                kind: SearchContainerKind::Zip,
+                hit_count: 1,
+                representative: None,
+            },
+            false,
+        ),
+        (
+            "Unavailable",
+            GridItem::CollectionPlaceholder {
+                path,
+                last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
+                reason: CollectionPlaceholderReason::Missing,
+            },
+            false,
+        ),
+    ];
+
+    ui.set_width(440.0);
+    let row_size = egui::vec2(440.0, 22.0);
+    let (header, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
+    let visuals = ui.visuals();
+    ui.painter()
+        .rect_filled(header, 0.0, visuals.widgets.inactive.bg_fill);
+    let header_icon = egui::Rect::from_min_size(header.min, egui::vec2(34.0, 22.0));
+    draw_details_preview_icon(
+        ui.painter(),
+        header_icon.shrink2(egui::vec2(6.0, 2.0)),
+        DetailsIconKind::Image,
+        visuals.text_color(),
+        false,
+    );
+    ui.painter().text(
+        header.min + egui::vec2(42.0, 11.0),
+        egui::Align2::LEFT_CENTER,
+        "Name",
+        egui::FontId::proportional(12.0),
+        visuals.text_color(),
+    );
+    ui.painter().text(
+        header.min + egui::vec2(300.0, 11.0),
+        egui::Align2::LEFT_CENTER,
+        "Kind",
+        egui::FontId::proportional(12.0),
+        visuals.text_color(),
+    );
+    ui.painter().line_segment(
+        [header.left_bottom(), header.right_bottom()],
+        egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+    );
+
+    for (row, (label, item, is_cut)) in rows.iter().enumerate() {
+        let (rect, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
+        let visuals = ui.visuals();
+        let selected = *is_cut;
+        let hovered = ui.rect_contains_pointer(rect);
+        let bg = details_row_background(
+            visuals,
+            DetailsRowStyle::SeparatorAndStripe,
+            row,
+            selected,
+            false,
+            hovered,
+        );
+        let separator_color = details_separator_color(visuals);
+        ui.painter().rect_filled(rect, 0.0, bg);
+        let text_color = details_row_text_color(visuals, selected);
+        let mut content_painter = ui.painter().clone();
+        content_painter.multiply_opacity(details_item_content_opacity(false, *is_cut));
+        let preview = egui::Rect::from_min_size(rect.min, egui::vec2(34.0, 22.0));
+        let icon_rect = preview.shrink2(egui::vec2(6.0, 2.0));
+        draw_details_preview_icon(
+            &content_painter,
+            icon_rect,
+            details_icon_kind(item),
+            text_color,
+            false,
+        );
+        draw_details_text_with_painter(
+            ui,
+            &content_painter,
+            egui::Rect::from_min_max(
+                rect.min + egui::vec2(42.0, 0.0),
+                rect.min + egui::vec2(295.0, 22.0),
+            ),
+            label,
+            egui::Align2::LEFT_CENTER,
+            text_color,
+            false,
+        );
+        draw_details_text_with_painter(
+            ui,
+            &content_painter,
+            egui::Rect::from_min_max(rect.min + egui::vec2(300.0, 0.0), rect.right_bottom()),
+            label,
+            egui::Align2::LEFT_CENTER,
+            text_color,
+            false,
+        );
+        if *is_cut {
+            crate::app::draw_cut_badge(ui.painter(), icon_rect);
+        }
+        let y = details_separator_y(rect, ui.ctx().pixels_per_point());
+        ui.painter().line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(
+                details_separator_stroke_width(ui.ctx().pixels_per_point()),
+                separator_color,
+            ),
+        );
+    }
 }
 
 fn archive_container_format_label(
@@ -16717,6 +16883,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 draw_details_preview_icon(
                     ui.painter(),
                     col_rect.shrink2(egui::vec2(6.0, 4.0)),
+                    DetailsIconKind::Image,
                     text_color,
                     false,
                 );
@@ -17026,6 +17193,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let Some(item) = self.items.get(idx) else {
             return None;
         };
+        let icon_kind = details_icon_kind(item);
         let is_cut = !display_only
             && item
                 .drag_source_path()
@@ -17112,6 +17280,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     draw_details_preview_icon(
                         &content_painter,
                         col_rect.shrink2(egui::vec2(6.0, 5.0)),
+                        icon_kind,
                         text_color,
                         false,
                     );
