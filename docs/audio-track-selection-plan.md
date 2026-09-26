@@ -254,6 +254,12 @@ demux が**旧 routing・旧位置**で読んだ packet が**新しい serial** 
 - 規則: **cancel が立っていない audio lane の切断 (packet 送信・`Flush` 送信のどちらでも) は「音声 lane の喪失」とし、
   demux は音声の routing を外して (`audio_stream_idx_for_demux = None` 相当) 映像を続ける。映像 lane が無い素材
   (音声のみ) では終端。** cancel が立っている場合は従来どおり終端。
+- 音声のみの素材の終端は、`AudioInactive` ではなく既存の decoder の終端失敗 (`DecoderEvent::Failed`、demux の panic
+  経路と同じ) として engine / UI に届ける。demux は終了前にこの event を確実に届け (event lane が満杯なら cancel を
+  見ながら空きを待つ)、engine は Seeking / Buffering を含むどの状態からも終端に移る。受け付け済みの選択の seek が
+  終了済みの demux に公開されても、engine が完了を待ち続けない (S2 区切り B の独立レビュー P2)。
+- 選択の受付と lane の閉鎖は `AudioTrackSelection` の同じ mutex で確定する。閉鎖後の選択は `Rejected`、閉鎖前に
+  受け付けた保留中の選択は `WorkerGone`。
 - 音声 lane を外した後は、以後の seek の `Flush` 条件も video だけになる (§5.3 の「存在する lane」)。
 - engine への通知: 音声 lane を外した demux は、engine の既存の `AudioEvent::AudioInactive` 遷移 (`actor.rs:697-704`、
   現在は本番の送り手が無い) へ event lane 経由で通知する。event lane が満杯なら `SeekCompleted` と同じく保留して
@@ -805,6 +811,9 @@ Remote で続きを見るときも、同じトラックで始める。
   - `multi.mkv`: testsrc2 映像 6 秒 + 音声 3 本。周波数で識別できる sine
     (440 Hz / 880 Hz / 1320 Hz)、channels (2 / 6 / 1)、sample rate (48000 / 44100 / 32000)、codec
     (aac / ac3 / flac。Opus は仕様上 48 kHz 固定で 32 kHz を作れないため flac)、language (jpn / eng / 無し)、title (有 / 有 / 無し)、disposition default は 2 本目。
+  - `multi-timebase.mp4`: 同じ映像 + AAC 3 本 (48000 / 44100 / 32000 Hz、channels 2 / 6 / 1、440 / 880 / 1320 Hz)。
+    MKV は全 stream の time base が 1/1000 に揃うので、トラック間で time base が異なる場合 (MP4 は sample rate が
+    time base になる) の切り替えと A/V clock の連続性はこの素材で検証する (S2 の実装中に判明して追加)。
   - `single.mp4` (音声 1 本)、`silent.mp4` (音声なし)。
   - サイズは各 数百 KB 以下。`.gitignore` の `/testdata/*` に `!/testdata/audio-tracks/` を加えて追跡する。
 - `VideoInfo.audio_tracks` / `default_audio_stream_index` の列挙。
@@ -831,8 +840,9 @@ Remote で続きを見るときも、同じトラックで始める。
   - 失敗した選択は、その後の通常 seek (別位置) で自動再試行されない。選択し直すと再試行される。
   - `demux_serial`: audio-only の素材 (動画なし) の seek、seek 失敗後の再開、`SeekCompleted` の再送が重なる場合で、
     新世代の packet が `Flush` より前に decode されず、旧世代の packet が新世代として decode されない。
-  - audio decode thread が終了した状態での切り替えは、既存の disconnect 終端と同じ結果になる (失敗表示で
-    再生を続けない)。
+  - audio decode thread が終了した状態での切り替えは §5.3.1 の「音声 lane の喪失」になる: 映像がある素材では
+    音声の routing を外して映像を続け、選択は `WorkerGone`、以後の切り替えは `Rejected`。音声のみの素材では
+    終端し、閉鎖前に受け付けた選択は `WorkerGone` になる。
   - 速度・音量・mute が切り替えで変わらない。
   - 異なる sample rate / channel 数 / time base のトラック間 (素材の 3 本) で、切り替え後の audio PTS と
     A/V clock が連続している (切り替え前後の位置差が seek 誤差の範囲)。

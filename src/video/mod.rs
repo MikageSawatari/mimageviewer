@@ -29,6 +29,7 @@ pub mod anime4k_policy;
 pub mod audio;
 pub mod audio_diagnostics;
 pub mod audio_stretch;
+pub mod audio_track_selection;
 pub mod avio_progress;
 pub mod clock;
 pub mod clockless_transcode;
@@ -90,6 +91,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
+use audio_track_selection::{AudioTrackRequestOutcome, AudioTrackSelection};
+pub use audio_track_selection::{
+    AudioTrackSelectOutcome, AudioTrackSelectResult, AudioTrackSelectionDisplayState,
+    AudioTrackSelectionSnapshot, AudioTrackSwitchFailureReason,
+};
 use clock::AvClock;
 use decoder::{DecodeHandles, VideoFrame, VideoFrameData, VideoInfo};
 use thumbnail::{Thumbnail, ThumbnailWorker};
@@ -145,6 +151,18 @@ impl EngineEventSender {
         event: EngineEvent,
     ) -> Result<(), crossbeam_channel::TrySendError<EngineEvent>> {
         let result = self.tx.try_send(event);
+        if result.is_ok() {
+            self.ui_wake.wake();
+        }
+        result
+    }
+
+    pub(crate) fn send_timeout(
+        &self,
+        event: EngineEvent,
+        timeout: std::time::Duration,
+    ) -> Result<(), crossbeam_channel::SendTimeoutError<EngineEvent>> {
+        let result = self.tx.send_timeout(event, timeout);
         if result.is_ok() {
             self.ui_wake.wake();
         }
@@ -309,6 +327,9 @@ pub struct VideoPlayer {
     /// 保持目的に加え、Remote streaming session が audio tap controller を取得する。
     audio: Option<audio::AudioOutput>,
     info: Option<VideoInfo>,
+    /// Created by demux only after audio setup succeeds and accepted here only
+    /// when the output device is active.
+    audio_track_selection: Option<Arc<AudioTrackSelection>>,
     /// open 失敗 / DLL ロード失敗のメッセージ。Some なら UI は赤字エラー表示する。
     error: Option<String>,
     /// シーク先サムネ抽出ワーカー。Drop で停止する。
@@ -8272,6 +8293,7 @@ impl VideoPlayer {
             video_output: VideoOutputState::Inactive,
             audio: None,
             info: None,
+            audio_track_selection: None,
             error: None,
             thumb_worker: None,
             remote_seek_thumbnail_request: Mutex::new(None),
@@ -8612,6 +8634,7 @@ impl VideoPlayer {
                 video_output: VideoOutputState::Inactive,
                 audio: None,
                 info: None,
+                audio_track_selection: None,
                 error: Some(format!("FFmpeg DLL のロードに失敗しました: {e}")),
                 thumb_worker: None,
                 remote_seek_thumbnail_request: Mutex::new(None),
@@ -8732,6 +8755,7 @@ impl VideoPlayer {
             video_rx,
             audio_rx,
             info_rx,
+            audio_track_selection_rx,
             prep_progress,
             video_tap,
         } = decode;
@@ -8867,12 +8891,14 @@ impl VideoPlayer {
                 video_rx,
                 audio_rx: dummy_audio_rx(),
                 info_rx,
+                audio_track_selection_rx,
                 prep_progress,
                 video_tap,
             },
             video_output,
             audio,
             info: None,
+            audio_track_selection: None,
             error: headless_init_error.or(native_init_error),
             thumb_worker,
             remote_seek_thumbnail_request: Mutex::new(None),
@@ -8924,11 +8950,15 @@ impl VideoPlayer {
     /// Phase 3c: engine event channel から events を drain して engine actor に
     /// dispatch する。tick の冒頭で呼ぶ。
     /// 1 tick 内で全 events を処理する (= UI 60fps なら遅くても 16ms 内に decoder/
-    /// audio events が actor に届く)。channel が full のときは decoder/audio 側で
-    /// drop されるが、Phase 3c では非クリティカル events のみ流すので問題ない。
+    /// audio events が actor に届く)。満杯時に破棄してよいのは非クリティカル event
+    /// のみ。demux の終端 Failed は cancel まで空きを待って送る。
     fn drain_engine_events(&mut self) {
         let mut engine = self.engine.lock().unwrap();
+        let mut audio_only_failed = false;
         while let Ok(ev) = self.engine_event_rx.try_recv() {
+            if let EngineEvent::Decoder(engine::state::DecoderEvent::Failed { reason }) = &ev {
+                audio_only_failed |= reason == decoder::AUDIO_ONLY_LANE_LOST_REASON;
+            }
             let readiness_event = match &ev {
                 EngineEvent::Decoder(engine::state::DecoderEvent::SeekCompleted {
                     epoch,
@@ -8962,6 +8992,11 @@ impl VideoPlayer {
                     ));
                 }
             }
+        }
+        drop(engine);
+        if audio_only_failed && self.error.is_none() {
+            self.error = Some(decoder::AUDIO_ONLY_LANE_LOST_REASON.to_owned());
+            self.shutdown_workers_for_error();
         }
     }
 
@@ -9151,6 +9186,64 @@ impl VideoPlayer {
 
     pub fn info(&self) -> Option<&VideoInfo> {
         self.info.as_ref()
+    }
+
+    pub fn audio_track_selection(&self) -> Option<AudioTrackSelectionSnapshot> {
+        self.audio_track_selection
+            .as_ref()
+            .map(|selection| selection.snapshot())
+    }
+
+    /// Publishes the desired stream before issuing one immediate, position-preserving seek.
+    /// Decoder setup and FFmpeg seek run on demux; this method never waits for either.
+    pub fn select_audio_track(&self, stream_index: usize) -> AudioTrackSelectResult {
+        let rejected = AudioTrackSelectResult {
+            outcome: AudioTrackSelectOutcome::Rejected,
+        };
+        let Some(selection) = self.audio_track_selection.as_ref() else {
+            return rejected;
+        };
+        if !self.info.as_ref().is_some_and(|info| {
+            info.audio_tracks
+                .iter()
+                .any(|track| track.stream_index == stream_index)
+        }) {
+            return rejected;
+        }
+        match selection.request(stream_index) {
+            AudioTrackRequestOutcome::Rejected => return rejected,
+            AudioTrackRequestOutcome::Unchanged => {
+                return AudioTrackSelectResult {
+                    outcome: AudioTrackSelectOutcome::Unchanged,
+                };
+            }
+            AudioTrackRequestOutcome::Accepted => {}
+        }
+        let should_play = self.intent_playing();
+        if self.engine_state_code() == engine::actor::state_code::EOF
+            || (should_play && self.clock.is_eof_reached())
+        {
+            return AudioTrackSelectResult {
+                outcome: AudioTrackSelectOutcome::Deferred,
+            };
+        }
+        let base = if should_play {
+            self.user_seek_base_secs()
+        } else if self.is_frame_step_active() {
+            self.last_displayed_pts_secs()
+                .unwrap_or_else(|| self.position())
+        } else if self.clock.is_seeking() {
+            // A precise paused seek still owns its target until a post-seek
+            // frame is consumed. The displayed frame can be from before it.
+            self.position()
+        } else {
+            self.last_displayed_pts_secs()
+                .unwrap_or_else(|| self.position())
+        };
+        self.seek_with_play_state(base, should_play);
+        AudioTrackSelectResult {
+            outcome: AudioTrackSelectOutcome::Requested,
+        }
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -10663,12 +10756,25 @@ impl VideoPlayer {
         // dispatch する。EngineActor は state machine のみ更新し、AvClock の挙動には
         // まだ影響しない (= Phase 3d までは AvClock が引き続き source of truth)。
         self.drain_engine_events();
+        // A terminal decoder event may have stopped audio output before the
+        // first InfoReceived is consumed. Do not reinterpret that stopped
+        // output as an open-time audio initialization failure below.
+        if self.error.is_some() {
+            return None;
+        }
 
         // info を取り込む
         if self.info.is_none() {
             if let Ok(result) = self.decode.info_rx.try_recv() {
                 match result {
                     Ok(info) => {
+                        if self.audio.is_some()
+                            && info.opened_audio_stream_index.is_some()
+                            && !self.clock.audio_lane_lost()
+                        {
+                            self.audio_track_selection =
+                                self.decode.audio_track_selection_rx.try_recv().ok();
+                        }
                         #[cfg(windows)]
                         self.duration_secs_bits
                             .store(info.duration_secs.to_bits(), Ordering::Release);
@@ -11661,10 +11767,12 @@ fn dummy_decode_handles() -> DecodeHandles {
     let (_, video_rx) = crossbeam_channel::bounded(0);
     let (_, audio_rx) = crossbeam_channel::bounded(0);
     let (_, info_rx) = crossbeam_channel::bounded(0);
+    let (_, audio_track_selection_rx) = crossbeam_channel::bounded(0);
     DecodeHandles {
         video_rx,
         audio_rx,
         info_rx,
+        audio_track_selection_rx,
         prep_progress: crate::video::avio_progress::PreparingProgress::new(),
         video_tap: crate::video::stream::video_tap::VideoTapController::disconnected(),
     }
@@ -11682,6 +11790,224 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    fn selection_player(playing: bool) -> super::VideoPlayer {
+        use super::engine::state::{AudioEvent, DecoderEvent};
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("selection-test.mkv"),
+        );
+        let info = player.info.as_mut().unwrap();
+        info.audio_tracks.push(super::decoder::AudioTrackInfo {
+            stream_index: 2,
+            ordinal: 2,
+            language: None,
+            title: None,
+            codec: "flac".to_owned(),
+            channels: Some(1),
+            sample_rate: Some(32_000),
+            disposition_default: false,
+        });
+        player.audio_track_selection =
+            Some(std::sync::Arc::new(super::AudioTrackSelection::new(1)));
+        {
+            let mut actor = player.engine.lock().unwrap();
+            actor.begin_loading();
+            actor.handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 30.0,
+                has_audio: true,
+                has_video: true,
+            });
+            actor.handle_audio_event(AudioEvent::BufferReady {
+                epoch: 0,
+                pts: 0.0,
+                wall_now: std::time::Instant::now(),
+            });
+            actor.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+            if playing {
+                actor.apply_command(super::engine::actor::TransportCommand::Play);
+            }
+        }
+        player
+    }
+
+    #[test]
+    fn audio_select_paused_and_frame_step_pause_seek_at_displayed_pts() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(5.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let req = player.clock.take_seek_request().unwrap();
+        assert!((req.target_secs - 5.0).abs() < 1e-9);
+        assert!(!player.intent_playing());
+
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(7.0);
+        player.step_frame(1);
+        assert!(player.is_frame_step_active());
+        player.set_last_displayed_pts_for_test(7.25);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let req = player.clock.take_seek_request().unwrap();
+        assert!((req.target_secs - 7.25).abs() < 1e-9);
+        assert!(!player.intent_playing());
+    }
+
+    #[test]
+    fn audio_select_paused_seek_uses_unshown_target_instead_of_old_display() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek_paused(10.0);
+        assert!(player.clock.is_seeking());
+        assert!((player.last_displayed_pts_secs().unwrap() - 5.0).abs() < 1e-9);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let req = player.clock.take_seek_request().unwrap();
+        assert!((req.target_secs - 10.0).abs() < 1e-9);
+        assert!(!player.intent_playing());
+    }
+
+    #[test]
+    fn audio_select_uses_pending_seek_target_and_coalesces_to_one_request() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        player
+            .user_seek_coalesce
+            .lock()
+            .unwrap()
+            .pending_target_secs = Some(6.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let req = player.clock.take_seek_request().unwrap();
+        assert!((req.target_secs - 6.0).abs() < 1e-9);
+        assert!(
+            player
+                .user_seek_coalesce
+                .lock()
+                .unwrap()
+                .pending_target_secs
+                .is_none()
+        );
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Unchanged);
+        assert!(player.clock.take_seek_request().is_none());
+
+        let player = selection_player(true);
+        player.clock.request_seek(4.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let req = player.clock.take_seek_request().unwrap();
+        assert!((req.target_secs - 4.0).abs() < 1e-9);
+        assert_eq!(req.serial, 2);
+    }
+
+    #[test]
+    fn audio_select_defers_only_playing_tail_and_engine_eof() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        player.clock.notify_eof_reached();
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Deferred);
+        assert!(player.clock.take_seek_request().is_none());
+        assert_eq!(
+            player.audio_track_selection().unwrap().display_state(true),
+            super::AudioTrackSelectionDisplayState::Deferred
+        );
+
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.clock.notify_eof_reached();
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
+
+        let player = selection_player(true);
+        player.engine.lock().unwrap().handle_decoder_event(
+            super::engine::state::DecoderEvent::EofReached {
+                epoch: 0,
+                duration_secs: 30.0,
+            },
+        );
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Deferred);
+        assert!(player.clock.take_seek_request().is_none());
+    }
+
+    #[test]
+    fn audio_select_rejects_missing_track_or_audio_lane() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        assert_eq!(player.select_audio_track(99).outcome, Outcome::Rejected);
+        player.audio_track_selection.as_ref().unwrap().close_lane();
+        player.clock.mark_audio_lane_lost();
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Rejected);
+        let player = super::VideoPlayer::disconnected_for_test("silent.mp4".into(), 0.0);
+        assert_eq!(player.select_audio_track(1).outcome, Outcome::Rejected);
+    }
+
+    #[test]
+    fn audio_select_rejects_after_audio_only_lane_is_lost() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let mut player = selection_player(false);
+        player.info.as_mut().unwrap().has_video = false;
+        player.audio_track_selection.as_ref().unwrap().close_lane();
+        player.clock.mark_audio_lane_lost();
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Rejected);
+        assert!(player.clock.take_seek_request().is_none());
+    }
+
+    #[test]
+    fn audio_only_decoder_failure_surfaces_error_and_stops_player() {
+        use std::sync::atomic::Ordering;
+
+        let mut player = selection_player(true);
+        player
+            .engine_event_tx
+            .try_send(super::EngineEvent::Decoder(
+                super::engine::state::DecoderEvent::Failed {
+                    reason: super::decoder::AUDIO_ONLY_LANE_LOST_REASON.to_owned(),
+                },
+            ))
+            .unwrap();
+        player.drain_engine_events();
+        assert_eq!(
+            player.error(),
+            Some(super::decoder::AUDIO_ONLY_LANE_LOST_REASON)
+        );
+        assert_eq!(
+            player.engine_state_code(),
+            super::engine::actor::state_code::IDLE
+        );
+        assert!(player.cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn first_tick_keeps_audio_only_terminal_reason_when_info_is_also_ready() {
+        use std::sync::atomic::Ordering;
+
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("audio-only.flac"),
+        );
+        player.engine.lock().unwrap().begin_loading();
+        player.cancel.store(false, Ordering::Release);
+        let mut info = player.info.take().unwrap();
+        info.has_video = false;
+        let (info_tx, info_rx) = crossbeam_channel::bounded(1);
+        info_tx.send(Ok(info)).unwrap();
+        player.decode.info_rx = info_rx;
+        player
+            .engine_event_tx
+            .try_send(super::EngineEvent::Decoder(
+                super::engine::state::DecoderEvent::Failed {
+                    reason: super::decoder::AUDIO_ONLY_LANE_LOST_REASON.to_owned(),
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(player.tick(&egui::Context::default()), None);
+        assert_eq!(
+            player.error(),
+            Some(super::decoder::AUDIO_ONLY_LANE_LOST_REASON)
+        );
+        assert_eq!(
+            player.engine_state_code(),
+            super::engine::actor::state_code::IDLE
+        );
+        assert!(player.cancel.load(Ordering::Acquire));
+    }
+
     #[cfg(windows)]
     #[test]
     fn changed_video_placement_cannot_be_ready_before_a_frame_is_owned() {

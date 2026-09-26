@@ -1630,6 +1630,30 @@ mod tests {
     }
 
     #[test]
+    fn decoder_failure_ends_audio_only_buffering_and_seeking() {
+        for seeking in [false, true] {
+            let mut actor = fresh_actor();
+            actor.begin_loading();
+            actor.handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 6.0,
+                has_audio: true,
+                has_video: false,
+            });
+            assert_eq!(actor.state, EngineState::Buffering);
+            if seeking {
+                actor.handle_seek_request(0.5);
+                assert!(matches!(actor.state, EngineState::Seeking { .. }));
+            }
+            actor.handle_decoder_event(DecoderEvent::Failed {
+                reason: "audio lane lost".to_owned(),
+            });
+            assert_eq!(actor.state, EngineState::Idle);
+            assert_eq!(actor.published_state_code(), state_code::IDLE);
+        }
+    }
+
+    #[test]
     fn late_info_does_not_restore_a_lost_audio_lane() {
         let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
         actor.begin_loading();

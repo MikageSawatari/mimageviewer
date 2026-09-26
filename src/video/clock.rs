@@ -126,6 +126,10 @@ pub struct AvClock {
     >,
     #[cfg(test)]
     fail_next_demux_seek: AtomicBool,
+    #[cfg(test)]
+    fail_next_audio_setup: AtomicBool,
+    #[cfg(test)]
+    fail_next_audio_flush: AtomicBool,
     /// Audio decode worker の終了通知。出力 channel に未読 frame が残り、pump が
     /// 逆圧中でも lane の喪失を検知できるようにする。
     audio_worker_exited: AtomicBool,
@@ -273,6 +277,10 @@ impl AvClock {
             demux_after_audio_packet_gate: Mutex::new(None),
             #[cfg(test)]
             fail_next_demux_seek: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_audio_setup: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_audio_flush: AtomicBool::new(false),
             audio_worker_exited: AtomicBool::new(false),
             seek_serial,
             seek_target_override_bits: AtomicU64::new(SEEK_NONE),
@@ -711,6 +719,26 @@ impl AvClock {
     #[cfg(test)]
     pub(super) fn take_demux_seek_failure_for_test(&self) -> bool {
         self.fail_next_demux_seek.swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_audio_setup_for_test(&self) {
+        self.fail_next_audio_setup.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_audio_setup_failure_for_test(&self) -> bool {
+        self.fail_next_audio_setup.swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_audio_flush_for_test(&self) {
+        self.fail_next_audio_flush.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_audio_flush_failure_for_test(&self) -> bool {
+        self.fail_next_audio_flush.swap(false, Ordering::AcqRel)
     }
 
     pub(super) fn note_audio_worker_exit(&self) {

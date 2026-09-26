@@ -2731,6 +2731,177 @@ mod tests {
         }
     }
 
+    #[test]
+    fn track_switch_output_pts_and_clock_stay_continuous_through_pump_and_callback() {
+        use crate::video::decoder;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks/multi-timebase.mp4");
+        let input = ffmpeg_the_third::format::input(&fixture).unwrap();
+        let time_bases: Vec<_> = [1, 2, 3]
+            .map(|index| {
+                let base = input.stream(index).unwrap().time_base();
+                (base.numerator(), base.denominator())
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(time_bases, [(1, 48_000), (1, 44_100), (1, 32_000)]);
+
+        let serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, serial));
+        clock.set_playing(true);
+        let demux_cancel = Arc::new(AtomicBool::new(false));
+        let engine_state = playing_state();
+        let (raw_event_tx, event_rx) = bounded(256);
+        let engine_event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let handles = decoder::spawn(
+            fixture,
+            Arc::clone(&clock),
+            Arc::clone(&demux_cancel),
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            Arc::clone(&engine_state),
+            engine_event_tx.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(decoder::VideoDynamicState::default()),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            info.audio_tracks
+                .iter()
+                .map(|track| (track.sample_rate, track.channels))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(48_000), Some(2)),
+                (Some(44_100), Some(6)),
+                (Some(32_000), Some(1))
+            ]
+        );
+        let selection = handles
+            .audio_track_selection_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let pump_cancel = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (tap_tx, tap_rx) = unbounded();
+        let pump = {
+            let rx = handles.audio_rx.clone();
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&pump_cancel);
+            let clock = Arc::clone(&clock);
+            let state = Arc::clone(&engine_state);
+            let diagnostics = Arc::clone(&diagnostics);
+            std::thread::spawn(move || {
+                run_pump(
+                    rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    engine_event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                );
+            })
+        };
+
+        let mut previous_pts: Option<f64> = None;
+        let mut previous_clock: Option<f64> = None;
+        let mut previous_callback_at: Option<std::time::Instant> = None;
+        for stream_index in [2, 1, 3, 2] {
+            let target = if stream_index == 2 && previous_pts.is_none() {
+                None
+            } else {
+                let target = clock.now_secs();
+                assert_eq!(
+                    selection.request(stream_index),
+                    crate::video::audio_track_selection::AudioTrackRequestOutcome::Accepted
+                );
+                clock.request_seek(target);
+                Some(target)
+            };
+            let expected_serial = clock.current_seek_serial();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut consumed = 0;
+            let mut first_pts = None;
+            while consumed < 8 && std::time::Instant::now() < deadline {
+                while handles.video_rx.try_recv().is_ok() {}
+                while event_rx.try_recv().is_ok() {}
+                let before = diagnostics.audio_audible_pts_bits.load(Ordering::Acquire);
+                let buffer_serial = buffer.lock().unwrap().pump_seek_serial;
+                let mut output = [0.0_f32; 960]; // 10 ms at 48 kHz stereo
+                fill_output(
+                    &mut output,
+                    &buffer,
+                    &clock,
+                    &engine_state,
+                    &diagnostics,
+                    None,
+                );
+                let after = diagnostics.audio_audible_pts_bits.load(Ordering::Acquire);
+                if buffer_serial == expected_serial
+                    && after != before
+                    && output.iter().any(|sample| sample.abs() > 1e-4)
+                {
+                    let pts = f64::from_bits(after);
+                    let now = clock.now_secs();
+                    let callback_at = std::time::Instant::now();
+                    let elapsed = previous_callback_at
+                        .map(|at| callback_at.duration_since(at).as_secs_f64())
+                        .unwrap_or(0.0);
+                    if first_pts.is_none() {
+                        first_pts = Some(pts);
+                        if let Some(target) = target {
+                            assert!(
+                                (pts - target).abs() < 0.18,
+                                "stream={stream_index} first output PTS={pts} target={target}"
+                            );
+                            assert!(
+                                previous_pts.is_none_or(|prev| pts >= prev - 0.04),
+                                "stream={stream_index} output PTS regressed"
+                            );
+                        }
+                    }
+                    if let Some(prev) = previous_pts {
+                        assert!(pts >= prev - 0.04 && pts - prev < elapsed + 0.18);
+                    }
+                    if let Some(prev) = previous_clock {
+                        assert!(now >= prev - 0.04 && now - prev < elapsed + 0.18);
+                    }
+                    assert!((now - pts).abs() < elapsed + 0.18);
+                    previous_pts = Some(pts);
+                    previous_clock = Some(now);
+                    previous_callback_at = Some(callback_at);
+                    consumed += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(consumed, 8, "no output for stream={stream_index}");
+            assert_eq!(selection.snapshot().applied.stream_index, stream_index);
+        }
+
+        pump_cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.try_send(());
+        demux_cancel.store(true, Ordering::Release);
+        pump.join().unwrap();
+        drop(tap_tx);
+    }
+
     fn disconnected_pump_releases_eof_gate(loop_enabled: bool) {
         use crate::video::engine::EngineEvent;
         use crate::video::engine::actor::{EngineActor, OpenOptions};
@@ -2793,6 +2964,7 @@ mod tests {
                     samples: vec![0.0; 9_600],
                     pts_secs: index as f64 * 0.1,
                     seek_serial: 0,
+                    stream_index: 0,
                     duration_secs: 0.1,
                     queued_wall_secs: 0.0,
                     audio_tx_accounting_epoch: 0,
@@ -2883,6 +3055,7 @@ mod tests {
             samples: vec![0.0; 576_000],
             pts_secs: 0.0,
             seek_serial: 0,
+            stream_index: 0,
             duration_secs: 6.0,
             queued_wall_secs: 0.0,
             audio_tx_accounting_epoch: 0,
@@ -2897,6 +3070,7 @@ mod tests {
                 samples: vec![0.0; 9_600],
                 pts_secs: 6.0,
                 seek_serial: 0,
+                stream_index: 0,
                 duration_secs: 0.1,
                 queued_wall_secs: 0.0,
                 audio_tx_accounting_epoch: 0,
@@ -3089,6 +3263,7 @@ mod tests {
                     samples: vec![0.0; (SAMPLE_RATE as f64 * 2.0 * FRAME_SECS) as usize],
                     pts_secs,
                     seek_serial: 0,
+                    stream_index: 0,
                     duration_secs: FRAME_SECS,
                     queued_wall_secs: FRAME_SECS,
                     audio_tx_accounting_epoch: 0,
@@ -3214,6 +3389,7 @@ mod tests {
             samples: vec![0.0; 2],
             pts_secs: seek_serial as f64,
             seek_serial,
+            stream_index: 0,
             duration_secs: 0.01,
             queued_wall_secs: 0.01,
             audio_tx_accounting_epoch: 0,

@@ -1096,7 +1096,7 @@ keyframe が疎すぎる material unavailable も同じ UI surface と入力 gat
 **seek 調停**: `clock.take_seek_request()` を pull するのは demux thread のみ
 (= 旧構造と同じ単一 puller)。`input.seek` 成否を判定後、packet queue とは別の
 control channel で video に `Flush { serial, trim_before_secs, frame_step }`、audio に
-`Flush { serial, seek_target_secs, trim_before_secs }` を enqueue する。decode thread は
+`Flush { serial, seek_target_secs, trim_before_secs, replace_setup }` を enqueue する。decode thread は
 `select_biased!` で control を優先受信するため、packet queue が満杯でも Flush が古い
 compressed packet の後ろに埋もれない。
 audio の `seek_target_secs` はユーザー要求 target (= timeline / engine anchor 用)、
@@ -1112,10 +1112,24 @@ callback の 3 者を止めない。
 demux が packet に付ける serial は clock の live 値ではなく、処理済み seek の `demux_serial`。
 存在する decode lane すべての Flush 送信が受理された後にだけ要求 serial へ進める
 (seek 失敗時の trim なし Flush も同じ)。audio-only / video-only は存在する lane のみを数え、
-cancel 中の送信失敗と video lane の送信失敗は demux の終端となる。cancel を伴わない audio lane の切断は音声 routing を外し、映像があれば映像のみで続ける。以後の seek は video Flush だけを条件に serial を進める。音声のみなら終端となる。`SeekCompleted` の event lane 再送はこの更新と独立している。
-audio decode worker の終了も demux と pump に通知する。demux は `AudioInactive` を engine event lane へ送り、満杯なら EOF 待機中も再送する。engine は音声 readiness を外し、遅れて届く `InfoReceived` や古い音声 event で復活させない。pump は入力切断または worker 終了時に raw / processed を破棄し、音声会計を 0 にする。これで音声喪失後の seek と EOF / ループの quiet 判定が進む。
+cancel 中の送信失敗と video lane の送信失敗は demux の終端となる。cancel を伴わない audio lane の切断は音声 routing を外し、映像があれば映像のみで続ける。以後の seek は video Flush だけを条件に serial を進める。音声のみなら lane 喪失を記録してから `DecoderEvent::Failed` を確実に送り終端となり、保留中のトラック選択には `WorkerGone` を付ける。event lane が満杯なら cancel を見ながら空きを待つため、選択後の seek が終端済み demux に公開されても engine は Seeking に残らない。UI は失敗理由を表示して出力を停止する。`SeekCompleted` の event lane 再送はこの更新と独立している。
+初回 `tick()` 前に `Ok(info)` と終端 `Failed` が両方届いても、終端理由を確定した tick は後続の info 処理へ進まず、停止済み出力を音声初期化失敗として上書きしない。
+audio decode worker の終了も demux と pump に通知する。映像が残る場合、demux は `AudioInactive` を engine event lane へ送り、満杯なら EOF 待機中も再送する。engine は音声 readiness を外し、遅れて届く `InfoReceived` や古い音声 event で復活させない。pump は入力切断または worker 終了時に raw / processed を破棄し、音声会計を 0 にする。これで音声喪失後の seek と EOF / ループの quiet 判定が進む。
 これにより、UI が serial を進めてから seek 要求を公開するまでに読んだ旧位置の packet は
 旧 serial のまま decode thread へ渡り、Flush 後に stale として破棄される。
+
+音声トラック選択 (backlog §1.251 S2) は player ごとの `AudioTrackSelection` が
+desired / applied / last_failure を generation 付きで所有する。UI は desired を書いて
+表示位置への seek を発行するだけで、demux が seek 要求の取り出し後に最新 desired を読む。
+選択の受付と音声 lane の閉鎖はこの owner の同じ mutex で直列化する。閉鎖前に受け付けた保留選択には `WorkerGone` を記録し、閉鎖後の選択は拒否する。
+別 stream なら demux thread が `AudioSetup` (avcodec + resampler) を構築し、seek 成功後に
+video Flush → `replace_setup` 付き audio Flush を送る。audio Flush が受理された時点でだけ
+routing と applied を確定する。構築失敗・seek 失敗では旧 routing を使って通常 seek を続け、
+失敗 generation は利用者の次の選択まで自動再試行しない。audio Flush の切断は上記の
+音声 lane 喪失として扱う。setup 構築時間は `audio/audio_setup_build` perf event に記録する。
+`AudioFrame.stream_index` は実際に decode した setup の stream index で、S3 の Norm gain 表に渡す。
+末尾 drain 中と engine Eof での選択は次の seek まで保留する。一時停止中の通常 seek が未表示なら clock の seek target を基準とし、frame-step pause 中は表示 PTS を使う。未表示の seek が無い一時停止中も表示 PTS を使う。
+異なる audio time base の検証には `multi-timebase.mp4` の 3 AAC stream を使い、実 pump と `fill_output` で出力消費時の PTS と A/V clock を測る。
 frame-step seek だけは video 側 `trim_before_secs=None` と `frame_step=Some(...)` で流し、
 video decoder が decoded PTS を見て base の直前/直後の 1 枚だけを送出する。audio 側は
 基準 PTS まで trim し、停止中の余分な音声 decode を抑える。

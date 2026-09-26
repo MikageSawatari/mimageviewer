@@ -20,6 +20,33 @@ def run_ffmpeg(output: Path, *arguments: str) -> None:
     )
 
 
+def generate_multi_timebase(output: Path) -> None:
+    run_ffmpeg(
+        output / "multi-timebase.mp4",
+        "-f", "lavfi", "-i", VIDEO_SOURCE,
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=44100:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=1320:sample_rate=32000:duration=6",
+        "-filter_complex",
+        "[1:a]volume=6dB,aformat=channel_layouts=stereo[a0];"
+        "[2:a]volume=0dB,aformat=channel_layouts=5.1[a1];"
+        "[3:a]volume=-6dB[a2]",
+        "-map", "0:v", "-map", "[a0]", "-map", "[a1]", "-map", "[a2]",
+        *VIDEO_OPTIONS,
+        "-c:a", "aac",
+        "-b:a:0", "48k", "-b:a:1", "128k", "-b:a:2", "48k",
+        # The MP4 muxer exposes these as `name` tags, not `title` in ffprobe.
+        "-metadata:s:a:0", "language=jpn",
+        "-metadata:s:a:0", "title=日本語 440Hz",
+        "-metadata:s:a:1", "language=eng",
+        "-metadata:s:a:1", "title=English 880Hz",
+        "-disposition:a:0", "0",
+        "-disposition:a:1", "default",
+        "-disposition:a:2", "0",
+        "-shortest",
+    )
+
+
 def generate(output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     run_ffmpeg(
@@ -46,6 +73,7 @@ def generate(output: Path) -> None:
         "-disposition:a:2", "0",
         "-shortest",
     )
+    generate_multi_timebase(output)
     run_ffmpeg(
         output / "single.mp4",
         "-f", "lavfi", "-i", VIDEO_SOURCE,
