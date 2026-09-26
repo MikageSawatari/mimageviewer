@@ -374,4 +374,45 @@ main と現在開いている別窓を保存する。画像は `screenshots/NN-<
 exit code と failure message を上書きしない。egui viewport の描画結果だけを取得し、
 デスクトップや他アプリの画面は含めない。画像の保存は UI thread 外で行う。
 この archive 優先順位の runner 回帰は `scripts/test-ui-smoke-screenshots.ps1` で確認する。
+2026-09-26 の MultiWindowPdf run `20260926T131312679Z-225084-MultiWindowPdf-3b245082` では
+最初の `capture("first-detached", "all")` が別窓分だけ timeout した。root PNG は保存された。
+原因は eframe native backend の immediate viewport paint が Screenshot command を消費せず、
+wgpu へ空の capture list を渡していたこと。backend の配送を修正し、headless の
+  root + immediate 別窓 command/event/PNG 回帰を追加した。この時点では実窓での再確認は未実施だった。
 `MultiWindowPdf` の出力には入力デスクトップ preflight の行が出ていない。preflight が新シナリオだけに入っている可能性があり、T2 で確認する。
+
+2026-09-26 の再実行 `20260926T135827388Z-22136-MultiWindowPdf-9e598672` と
+`20260926T141955613Z-185920-MultiWindowPdf-c7477a1b` では、immediate 別窓の PNG は
+取得できたが、2 窓目を開いた後の最初の別窓が capture 待ちで timeout した。
+後者は HWND の `InvalidateRect` を加えても同じ結果だったため、その方法での解決仮説は棄却した。
+先行窓の context は `AtRest` に移るが、その凍結表示は `show_viewport_deferred` で描画される。
+eframe の screenshot 応答は次に描画する viewport の input に入り、test-script はその
+deferred callback で応答を読んでいなかった。callback に応答処理を接続し、対象は
+eframe の native viewport 登録表と window identity の両方で選ぶ。登録表に無い窓と
+OS が hidden/minimized と判定した窓は理由付き `status=skipped` を manifest に記録する。
+表示可能な描画対象の capture timeout は失敗を維持する。
+
+計装 run `20260926T152033476Z-227256-MultiWindowPdf-7e5d76c3` では batch 2 の
+先行別窓 `detached-1-1` に Screenshot action が queue された後、Deferred native pass が
+一度も発生しなかった。egui の対象 ViewportId repaint 要求は既存の capture 発行経路に
+あったため維持した。eframe の action queue 境界で Deferred window に redraw を
+要求しても run `20260926T153506671Z-221916-MultiWindowPdf-dea8c081` では native pass が
+発生しなかったため、その変更は撤去した。App が `Parked` / `AtRest` として保持する
+passive frozen view は egui に再描画されないため、capture harness はその presentation
+だけ `parked frozen view (not re-rendered by egui)` として manifest に skip を記録し、
+待機しない。root、active immediate、および他の renderable deferred viewport は引き続き
+  画像取得または timeout 失敗とする。
+
+  2026-09-27 00:55 JST の隔離 portable 実窓 run は 5 scenario すべて exit 0:
+  `20260926T155430402Z-211364-MultiWindowPdf-062bab16`,
+  `20260926T155442576Z-211364-MultiWindowStills-aa14a333`,
+  `20260926T155454307Z-211364-MultiWindowRarNav-6465c238`,
+  `20260926T155506024Z-211364-RatingSort-9fc960fa`,
+  `20260926T155521211Z-211364-RatingSortCollection-bd7f3b81`。
+  PDF の `two-detached` manifest は先行 `detached-1-1` を
+  `status=skipped` / `parked frozen view (not re-rendered by egui)` と記録し、
+  root と active な `detached-2-2` の PNG は取得した。`first-detached` は root と
+  `detached-1-1` の両 PNG を取得した。runner metadata は 5 件とも
+  `runner_exit_code=0`, `app_exit_code=0`, `timed_out=false`。
+  後続の probe 計装整理では App と eframe の詳細行を capture session あたり
+  128 行に制限し、最後に出力行数と抑制行数を要約する。重複 batch も同じ枠を共有する。

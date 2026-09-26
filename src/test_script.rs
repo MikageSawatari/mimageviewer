@@ -443,6 +443,27 @@ impl TestScriptSeekStripSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TestScriptWindowPresentation {
+    Root,
+    ActiveImmediate,
+    ParkedLiveImmediate,
+    PassiveDeferredFrozen,
+    Other,
+}
+
+impl TestScriptWindowPresentation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::ActiveImmediate => "active_immediate",
+            Self::ParkedLiveImmediate => "parked_live_immediate",
+            Self::PassiveDeferredFrozen => "passive_deferred_frozen",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) identity: Option<TestScriptWindowIdentity>,
@@ -454,6 +475,7 @@ pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) hwnd: Option<u64>,
     pub(crate) backend_token: Option<u64>,
     pub(crate) residence: String,
+    pub(crate) presentation: TestScriptWindowPresentation,
     pub(crate) media_kind: String,
     pub(crate) page_index: Option<usize>,
     pub(crate) items_generation: u64,
@@ -520,6 +542,7 @@ impl TestScriptWindowSnapshot {
         );
         map.insert("host_ready".into(), self.identity.is_some().into());
         map.insert("residence".into(), self.residence.clone().into());
+        map.insert("presentation".into(), self.presentation.as_str().into());
         map.insert("media_kind".into(), self.media_kind.clone().into());
         map.insert(
             "page_index".into(),
@@ -3056,25 +3079,44 @@ impl UiRuntime {
         &self,
         scope: CaptureScope,
         selection: &TestScriptActionSelection,
+        native_viewports: &std::collections::HashSet<egui::ViewportId>,
     ) -> Result<Vec<capture::Target>, String> {
+        // eframe builds RawInput.viewports from the same native viewport table
+        // that its paint dispatcher uses. An App context/host identity alone
+        // can outlive that table during an active-to-passive handoff.
+        let availability = |id| {
+            if native_viewports.contains(&id) {
+                capture::Availability::Registered
+            } else {
+                capture::Availability::Absent
+            }
+        };
         let root = capture::Target {
             viewport_id: egui::ViewportId::ROOT,
             role: "root".into(),
+            hwnd: self
+                .authoritative_windows
+                .iter()
+                .find(|window| window.role == "root")
+                .and_then(|window| window.identity.as_ref())
+                .map(TestScriptWindowIdentity::hwnd),
+            availability: availability(egui::ViewportId::ROOT),
+            presentation: TestScriptWindowPresentation::Root,
         };
         if scope == CaptureScope::Selected {
             return match selection {
                 TestScriptActionSelection::LegacyImplicit => Ok(vec![root]),
                 TestScriptActionSelection::Targeted(identity) => {
-                    if !self
+                    let target_window = self
                         .authoritative_windows
                         .iter()
-                        .any(|window| window.identity.as_ref() == Some(identity))
-                    {
-                        return Err(format!(
-                            "capture target is no longer current: {}",
-                            identity.describe()
-                        ));
-                    }
+                        .find(|window| window.identity.as_ref() == Some(identity))
+                        .ok_or_else(|| {
+                            format!(
+                                "capture target is no longer current: {}",
+                                identity.describe()
+                            )
+                        })?;
                     match identity {
                         TestScriptWindowIdentity::Root { .. } => Ok(vec![root]),
                         TestScriptWindowIdentity::Detached {
@@ -3085,6 +3127,9 @@ impl UiRuntime {
                         } => Ok(vec![capture::Target {
                             viewport_id: *viewport_id,
                             role: format!("detached-{window_id}-{context_serial}"),
+                            hwnd: Some(identity.hwnd()),
+                            availability: availability(*viewport_id),
+                            presentation: target_window.presentation,
                         }]),
                     }
                 }
@@ -3092,11 +3137,10 @@ impl UiRuntime {
         }
         let mut targets = vec![root];
         let mut seen = std::collections::HashSet::from([egui::ViewportId::ROOT]);
-        for identity in self
-            .authoritative_windows
-            .iter()
-            .filter_map(|window| window.identity.as_ref())
-        {
+        for window in &self.authoritative_windows {
+            let Some(identity) = window.identity.as_ref() else {
+                continue;
+            };
             if let TestScriptWindowIdentity::Detached {
                 window_id,
                 context_serial,
@@ -3108,6 +3152,9 @@ impl UiRuntime {
                 targets.push(capture::Target {
                     viewport_id: *viewport_id,
                     role: format!("detached-{window_id}-{context_serial}"),
+                    hwnd: Some(identity.hwnd()),
+                    availability: availability(*viewport_id),
+                    presentation: window.presentation,
                 });
             }
         }
@@ -3150,9 +3197,11 @@ impl UiRuntime {
         // update that would expire the capture batch. Guard the original result
         // before sending any screenshot command.
         arm_watchdog(&outcome);
+        let native_viewports = ctx.input(|input| input.raw.viewports.keys().copied().collect());
         let targets = self.capture_targets(
             CaptureScope::All,
             &TestScriptActionSelection::LegacyImplicit,
+            &native_viewports,
         );
         if let (Some(capture), Ok(targets)) = (self.capture.as_mut(), targets) {
             match capture.request(ctx, "failure", targets, capture::FAILURE_TIMEOUT, None) {
@@ -3866,14 +3915,28 @@ fn arm_shutdown_watchdog(exit_code: i32, trigger: &'static str) {
     }
 }
 
-pub(crate) fn receive_screenshot_events(ctx: &egui::Context) {
+pub(crate) fn receive_screenshot_events(ctx: &egui::Context, kind: &'static str) {
     let Ok(mut guard) = runtime().lock() else {
         return;
     };
     if let Some(capture) = guard.as_mut().and_then(|runtime| runtime.capture.as_mut()) {
+        capture.note_pass(ctx.viewport_id(), kind);
         capture.receive_events(ctx);
         capture.poll();
     }
+}
+
+pub(crate) fn capture_pending_for(viewport_id: egui::ViewportId) -> bool {
+    runtime()
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|runtime| runtime.capture.as_ref())
+                .map(|capture| capture.pending_viewport(viewport_id))
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bool {
@@ -3911,6 +3974,9 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
     emit_perf_level_reads(&snapshot.keymap_level_observations);
     if let Err(error) = runtime.publish_snapshot(snapshot) {
         runtime.fail_environment(error, frame);
+    }
+    if let Some(capture) = runtime.capture.as_mut() {
+        capture.begin_root_frame(&runtime.authoritative_windows);
     }
 
     for issue in issues {
@@ -4016,12 +4082,34 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                 selection,
                 reply,
             } => {
+                let native_viewports =
+                    ctx.input(|input| input.raw.viewports.keys().copied().collect());
                 let result = if runtime.finish.is_some() {
                     Err("script is already finishing".to_string())
                 } else {
                     runtime
-                        .capture_targets(scope, &selection)
+                        .capture_targets(scope, &selection, &native_viewports)
                         .and_then(|targets| {
+                            for target in targets.iter().take(16) {
+                                let window = runtime.authoritative_windows.iter().find(|window| window.viewport_id == target.viewport_id);
+                                crate::logger::log(format!(
+                                    "[capture-probe] batch_start label={label} role={} viewport={:?} expected={} residence={} presentation={:?} backend_token={:?} hwnd={:?} native_registered={}",
+                                    target.role,
+                                    target.viewport_id,
+                                    window.and_then(|window| window.identity.as_ref()).map(|identity| identity.describe()).unwrap_or_else(|| "missing".into()),
+                                    window.map(|window| window.residence.as_str()).unwrap_or("missing"),
+                                    target.presentation,
+                                    window.and_then(|window| window.backend_token),
+                                    window.and_then(|window| window.hwnd),
+                                    native_viewports.contains(&target.viewport_id)
+                                ));
+                            }
+                            if targets.len() > 16 {
+                                crate::logger::log(format!(
+                                    "[capture-probe] batch_start additional_targets_suppressed={}",
+                                    targets.len() - 16
+                                ));
+                            }
                             runtime
                                 .capture
                                 .as_mut()
@@ -5616,6 +5704,76 @@ mod tests {
     }
 
     #[test]
+    fn capture_targets_preserve_frozen_presentation_and_native_registration() {
+        let root = root_identity(0, 0x100);
+        let first = window_identity(1, 1, 1);
+        let second = window_identity(2, 2, 2);
+        let mut runtime = local_runtime();
+        let mut frozen = window_snapshot(first.clone(), 1, 0, "pdf::first");
+        frozen.presentation = TestScriptWindowPresentation::PassiveDeferredFrozen;
+        runtime
+            .publish_windows(vec![
+                window_snapshot(root, 1, 0, "root::page"),
+                frozen,
+                window_snapshot(second.clone(), 1, 0, "pdf::second"),
+            ])
+            .unwrap();
+
+        // Native registration and App presentation are separate facts. A live
+        // native host can hold a frozen passive view with no egui pass.
+        let native_viewports = std::collections::HashSet::from([
+            egui::ViewportId::ROOT,
+            first.viewport_id(),
+            second.viewport_id(),
+        ]);
+        let targets = runtime
+            .capture_targets(
+                CaptureScope::All,
+                &TestScriptActionSelection::LegacyImplicit,
+                &native_viewports,
+            )
+            .unwrap();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[1].viewport_id, first.viewport_id());
+        assert_eq!(targets[1].availability, capture::Availability::Registered);
+        assert_eq!(
+            targets[1].presentation,
+            TestScriptWindowPresentation::PassiveDeferredFrozen
+        );
+        assert_eq!(
+            targets[2].presentation,
+            TestScriptWindowPresentation::ActiveImmediate
+        );
+
+        let selected = runtime
+            .capture_targets(
+                CaptureScope::Selected,
+                &TestScriptActionSelection::Targeted(first.clone()),
+                &native_viewports,
+            )
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].presentation,
+            TestScriptWindowPresentation::PassiveDeferredFrozen
+        );
+
+        // If eframe no longer owns that viewport, keep its identity in the
+        // manifest but mark it unavailable rather than waiting for a paint.
+        let native_viewports =
+            std::collections::HashSet::from([egui::ViewportId::ROOT, second.viewport_id()]);
+        let targets = runtime
+            .capture_targets(
+                CaptureScope::All,
+                &TestScriptActionSelection::LegacyImplicit,
+                &native_viewports,
+            )
+            .unwrap();
+        assert_eq!(targets[1].availability, capture::Availability::Absent);
+        assert_eq!(targets[2].availability, capture::Availability::Registered);
+    }
+
+    #[test]
     fn fresh_owner_barrier_accepts_the_exact_live_ui_and_backend_identity() {
         let context = egui::Context::default();
         let viewport = egui::ViewportId::from_hash_of("fresh-owner-current");
@@ -6155,6 +6313,11 @@ mod tests {
             hwnd: Some(identity.hwnd()),
             backend_token: Some(identity.backend_token()),
             residence: "at_rest".to_string(),
+            presentation: if identity.window_id().is_some() {
+                TestScriptWindowPresentation::ActiveImmediate
+            } else {
+                TestScriptWindowPresentation::Root
+            },
             media_kind: "pdf".to_string(),
             page_index: Some(page_index),
             items_generation: generation,

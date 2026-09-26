@@ -4,7 +4,31 @@
 //! claims. It does not mount a context, allocate a window identity, or advance a
 //! lifecycle transition.
 
-use super::{App, ContextResidence, FsCacheEntry, GridItem};
+use super::{App, ContextResidence, DetachedWindowState, FsCacheEntry, GridItem};
+use crate::test_script::TestScriptWindowPresentation;
+
+fn test_script_window_presentation(
+    window_id: Option<u64>,
+    state: Option<DetachedWindowState>,
+    residence: ContextResidence,
+    has_frozen_view: bool,
+) -> TestScriptWindowPresentation {
+    match (window_id, state) {
+        (None, _) => TestScriptWindowPresentation::Root,
+        (Some(_), Some(DetachedWindowState::Parked))
+            if residence == ContextResidence::AtRest && has_frozen_view =>
+        {
+            TestScriptWindowPresentation::PassiveDeferredFrozen
+        }
+        (Some(_), Some(DetachedWindowState::ParkedLive)) => {
+            TestScriptWindowPresentation::ParkedLiveImmediate
+        }
+        (Some(_), Some(DetachedWindowState::Active)) => {
+            TestScriptWindowPresentation::ActiveImmediate
+        }
+        (Some(_), _) => TestScriptWindowPresentation::Other,
+    }
+}
 
 fn test_script_native_host_style(
     role: &str,
@@ -263,6 +287,16 @@ impl App {
         identity: Option<crate::test_script::TestScriptWindowIdentity>,
     ) -> Option<crate::test_script::TestScriptWindowSnapshot> {
         let residence = self.viewer_context_residence(context_id);
+        let presentation = test_script_window_presentation(
+            window_id,
+            window_id.and_then(|id| self.detached_window_state(id)),
+            residence,
+            window_id.is_some_and(|id| {
+                self.detached_image_windows
+                    .iter()
+                    .any(|window| window.id == id)
+            }),
+        );
         self.with_viewer_context_ref(context_id, |context| {
             let page_index = context.fullscreen_idx();
             let item = page_index.and_then(|idx| context.items().get(idx));
@@ -291,6 +325,7 @@ impl App {
                 context_serial: context_id.serial(),
                 viewport_id,
                 residence: test_script_residence(residence).to_string(),
+                presentation,
                 media_kind: media_kind.to_string(),
                 page_index,
                 items_generation: context.items_generation(),
@@ -649,6 +684,45 @@ fn test_script_media_kind(item: &GridItem) -> &'static str {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn frozen_capture_presentation_requires_parked_at_rest_passive_view() {
+        let classify = |state, residence, has_frozen_view| {
+            test_script_window_presentation(Some(1), state, residence, has_frozen_view)
+        };
+        assert_eq!(
+            classify(
+                Some(DetachedWindowState::Parked),
+                ContextResidence::AtRest,
+                true
+            ),
+            TestScriptWindowPresentation::PassiveDeferredFrozen
+        );
+        assert_eq!(
+            classify(
+                Some(DetachedWindowState::Parked),
+                ContextResidence::AtRest,
+                false
+            ),
+            TestScriptWindowPresentation::Other
+        );
+        assert_eq!(
+            classify(
+                Some(DetachedWindowState::Active),
+                ContextResidence::AtRest,
+                true
+            ),
+            TestScriptWindowPresentation::ActiveImmediate
+        );
+        assert_eq!(
+            classify(
+                Some(DetachedWindowState::ParkedLive),
+                ContextResidence::AtRest,
+                true
+            ),
+            TestScriptWindowPresentation::ParkedLiveImmediate
+        );
+    }
 
     #[test]
     fn window_snapshot_reads_an_at_rest_context_without_mounting_it() {
