@@ -834,3 +834,12 @@ master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` �
 `shell_delete_keeps_epub_backfill_out_until_purge_finishes` は実 delete worker の fake Shell で `cover.png` を消した直後に停止し、同名ディレクトリ内に `book.epub` を作り、実 `run_backfill_at` から書込を開始する。Shell の停止中は書込が完了せず、worker が実 purge を終えた後に新しい台帳行が残ることを検査する。ガード取得を `dd589a59d` と同じ Shell 後・purge 前へ一時的に戻すと assertion で失敗し、元の bytes に復元した。
 
 EPUB 以外の台帳・編集行には今回の per-book ガードがない。例えば `cover.png/x.jpg` の編集行について Shell と purge の間に行が作られる窓は master にもある既存の制約であり、この段階では変更しない。
+
+### S2c-2 検収 (2026-09-26)
+
+独立レビュー 7 回目で承認 (`9359baab9`)。1〜6 回目の指摘は修正 1〜6 で対応した。検収時の全ライブラリテスト 9,264 件、
+変換器 35 件が成功。受容した制約: (1) 再起動後に再変換された EPUB が子フォルダーの代表のとき、ドライブ一覧で worker の
+結果が届くまで旧表紙が一時表示され得る (最終表示は常に現行世代)。(2) 削除の確認ダイアログ表示中は、その範囲の EPUB の
+固定・backfill・移行が待つ (UI スレッドは待たない)。(3) Shell 削除から purge までの窓は非 EPUB 行では master から既存で範囲外。
+別課題へ切り出したもの: 並列テストで `RECORD_SEQUENCE` を共有する既存の不安定テスト。残る P3: `shell_delete_keeps_epub_backfill_out_until_purge_finishes`
+の開始通知は高負荷時に退行を見逃し得る (テストの限界)。実機確認 (再変換後の表示・キャッシュ管理画面・先出しの計測) は未実施。
