@@ -2214,6 +2214,49 @@ mod tests {
     }
 
     #[test]
+    fn reconverted_epub_materializer_reuses_only_current_generation_output() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 93, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = MaterializeRequest {
+            source: MaterializeSource::PdfPage {
+                pdf_path: fixture.source.clone(),
+                page_num: 0,
+                password: None,
+            },
+            policy: MaterializePolicy::TempOriginal,
+            page_edits: None,
+            pdf_render_long_edge: 4096,
+        };
+        ensure_process_directory(&manager.inner).unwrap();
+        let output = manager.inner.process_dir.join("current.png");
+        std::fs::write(&output, b"already rendered in this run").unwrap();
+        let key = CacheKey {
+            source: request.source.clone(),
+            policy: request.policy,
+            pdf_render_long_edge: 4096,
+            edit_fingerprint: [0; 32],
+        };
+        let read = crate::pdf_loader::pinned_epub_target(&fixture.source).unwrap();
+        manager.inner.state.lock().unwrap().cache.insert(
+            key,
+            CacheRecord {
+                path: output.clone(),
+                source_stamp: generation_file_stamp(&read).unwrap(),
+                output_stamp: file_stamp(&output).unwrap(),
+            },
+        );
+        let prepared = manager
+            .session()
+            .materialize(&request, &cancel, generation)
+            .unwrap();
+        assert_eq!(prepared.path(), output);
+        assert_ne!(fixture.old.page_count, fixture.current.page_count);
+    }
+
+    #[test]
     fn zip_original_writes_exact_entry_bytes_and_reuses_valid_target() {
         let temp = tempfile::tempdir().unwrap();
         let zip_path = temp.path().join("book.zip");

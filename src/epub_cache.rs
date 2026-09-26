@@ -902,6 +902,69 @@ pub fn startup_gate(data_dir: &Path) -> GateOutcome {
 }
 
 #[cfg(test)]
+pub(crate) struct TestReconvertedEpub {
+    pub(crate) source: PathBuf,
+    pub(crate) old: GenerationRow,
+    pub(crate) current: GenerationRow,
+    _pin: crate::pdf_loader::TestEpubPin,
+    _root: tempfile::TempDir,
+}
+
+#[cfg(test)]
+pub(crate) fn reconverted_for_worker_test() -> TestReconvertedEpub {
+    struct Source(SourceState);
+    impl SourceGuard for Source {
+        fn state(&self) -> std::io::Result<SourceState> {
+            Ok(self.0)
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("worker-book.epub");
+    let mut cache = EpubCache::open_at(root.path()).unwrap();
+    let mut publish = |bytes: &[u8], page_count: u32| {
+        std::fs::write(&source, bytes).unwrap();
+        let state = source_state(&std::fs::metadata(&source).unwrap());
+        let reserved = cache.reserve_output(&source).unwrap();
+        std::fs::create_dir_all(reserved.final_path().parent().unwrap()).unwrap();
+        std::fs::write(reserved.final_path(), b"%PDF-1.4\n").unwrap();
+        let row = GenerationRow {
+            generation_id: reserved.generation_id(),
+            src_path_key: src_key(&source),
+            src_path: source.clone(),
+            src_state: state,
+            src_sha256: format!("hash-{page_count}"),
+            src_head_hash: format!("head-{page_count}"),
+            pdf_file: reserved.final_path().to_path_buf(),
+            pdf_size: 9,
+            page_count,
+            direction: "ltr".into(),
+            profile: "test".into(),
+            created_at: 1,
+        };
+        assert_eq!(
+            cache.publish(&row, &Source(state)).unwrap(),
+            PublishOutcome::Published
+        );
+        row
+    };
+    let old = publish(b"first source", 2);
+    let prior_run = crate::pdf_loader::pin_epub_for_test(&source, old.generation_id, old.pdf_size);
+    drop(prior_run);
+    let current = publish(b"replacement with more pages", 5);
+    assert_ne!(old.generation_id, current.generation_id);
+    assert_ne!(old.page_count, current.page_count);
+    let pin =
+        crate::pdf_loader::pin_epub_for_test(&source, current.generation_id, current.pdf_size);
+    TestReconvertedEpub {
+        source,
+        old,
+        current,
+        _pin: pin,
+        _root: root,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};

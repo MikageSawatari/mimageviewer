@@ -708,8 +708,12 @@ master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` �
 | 編集済みページのプレビュー | `app.rs:62862-62986` が表示属性を保存要求へ渡し、`edit_preview_cache.rs:1231-1280` がコンテナ size を保存。`thumb_loader.rs:1210-1225` はコンテナ属性を比較 | 保存 worker と読込 worker の両方で世代 stamp を使用。既存整数列の EPUB 行のみ意味を変える |
 | auto-aspect の最初の seed | `app.rs:18305-18405` は UI の `image_metas` / 要求属性で WebP を比較 | EPUB は UI で解決せず seed を省略し、worker サムネ結果の sample を使う |
 | ピンの source ID と代表 WebP | `folder_thumb_pins.rs:640-759,814-947` は target の stat を ID に埋め込み、`app.rs:80000-80135` 等が要求キーへ写す | EPUB leaf では世代 stamp を source ID と要求の照合属性へ使う。UI での解決を避けるため worker 側で確定させる |
-| フォルダ代表選定・seed | `thumb_loader.rs:2755-2805`, `app.rs:30075-30110` は選定元の stat / ピン ID を使う | EPUB が代表 source なら上記 worker stamp に従い、元 EPUB の stat を鮮度に使わない |
+| フォルダ代表選定・seed | `thumb_loader.rs:2755-2805` は選定元の stat / ピン ID を使う | 通常の代表選定は worker stamp を使う。ドライブ一覧の間接ピン seed は別経路なので下記で扱う |
+| ドライブ一覧の間接ピン seed | `app.rs:30256-30455` は子フォルダの代表行を読み、selection proof を捨てて一覧へコピー。`thumb_loader.rs:1066` は直接 EPUB ピンだけ世代照合 | 子の代表 proof が EPUB、またはピン行の source ID が EPUB なら seed せず、読込済みの旧 seed も破棄。通常の非 EPUB seed は維持 |
+| 仮想フォルダの親子 seed / writeback | `app.rs:27709-27870` は `.pdf` / ZIP だけを対象にし、親 WebP 行を仮想 catalog へコピー、ページ 0 完成時に元ファイル stat で親へ書き戻す | EPUB は明示的に対象外。世代照合を伴わない UI の catalog I/O を追加せず、親とページ 0 が別々に描画される追加コストを受け入れる |
+| 詳細の `DetailsLazyMeta` メモリ hit | `app.rs:54491-54497,5541-5545` は `image_metas` の元属性で比較 | 実行中の固定世代は不変で、このメモリ表は再起動で破棄されるため変更不要。永続 `pdf_meta` は別行で世代照合 |
 | 外部渡し用 PDF ページ PNG | `materializer.rs:274-292,548-634,1202-1217` は論理ファイルの時刻とサイズを再利用判定に使う | EPUB ページは世代 stamp で再利用し、描画も同一 target。実ファイルの直接渡しは元 EPUB のまま |
+| 外部渡しの結合見開き | `materializer.rs:558-566,937-951` は単一元ファイルが無く空 stamp を使い、再利用が常に miss | EPUB の左右ページも毎回合成するため stale な見開き cache hit は起きない。変更不要 |
 | 内容同定台帳 | `content_identity.rs:56-77,100-155,1763-1868` は元ファイル hash、種類は PDF | `Epub` 種別を追加。固定済みは世代表のハッシュ・元サイズ・元時刻、未固定は元 EPUB。遅れた backfill は書込直前に来歴を再照合 |
 | 保持ラスタ / final AI | `app.rs:65221-65261` は実行中のページ ID | I7 で世代が固定されるため追加 stamp 不要 |
 | PDF ワーカー文書 cache / 列挙合流 | `pdf_loader.rs:4335-4354,5160-5210` は実読込パスで cache / 合流 | 世代ごとに物理パスが異なり既に分離。変更不要 |
@@ -739,8 +743,12 @@ master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` �
 | 編集プレビュー | `edit_preview_cache.rs:1210,1231-1300` で保存、`thumb_loader.rs:1210` で照合 | `epub_preview_save_and_load_use_generation_in_existing_integer_columns` |
 | auto-aspect 初期 seed | `app.rs:18381` で EPUB の元属性 hit を省略 | `epub_auto_aspect_seed_ignores_source_metadata_cache_hit` |
 | ピン source ID | `folder_thumb_pins.rs:738-765` の保留印を `thumb_loader.rs:369` が確定 | `epub_page_pin_source_id_waits_for_worker_generation` と thumbnail 要求テスト |
-| フォルダ代表・seed | `thumb_loader.rs:2719,2791,2950,3124` が共通世代抽出を使用 | 共通世代抽出テスト |
+| フォルダ代表・seed | `thumb_loader.rs:2719,2791,2950,3124` が共通世代抽出を使用 | 共通世代抽出テスト。ドライブ一覧 seed は次行 |
+| ドライブ一覧の間接ピン seed | `app.rs:30256-30455` で EPUB 代表を seed せず旧 seed を除去 | `drive_list_indirect_epub_cover_is_not_seeded_after_reconversion` |
+| 仮想フォルダの親子 seed / writeback | `app.rs:27721` の対象分岐は PDF / ZIP のみ | `epub_virtual_folder_seed_and_parent_writeback_are_explicitly_excluded`。親とページ 0 の追加描画コストあり |
+| `DetailsLazyMeta` メモリ hit | `app.rs:54491,5541` の元属性比較 | 固定世代は実行中不変、表は再起動で破棄。変更不要 |
 | 外部渡し PNG | `materializer.rs:274,555-635` の世代 stamp と同一 target | `epub_materializer_stamp_changes_with_generation_not_source_attributes` |
+| 外部渡しの結合見開き | `materializer.rs:558-566,937-951` は空 stamp で毎回 miss | 再利用されないことを既存 `lookup_reusable` 判定で確認 |
 | 内容同定台帳 | `content_identity.rs:56-77,767-785,1811-1940` | EPUB 種別、固定世代、backfill 来歴、FILETIME の各テスト |
 | 保持ラスタ / final AI | `app.rs:65221-65261` は実行中の論理ページ。I7 により世代固定で変更不要 | `pdf_loader::tests::epub_resolver_pins_first_generation_across_retire_and_republish` |
 | PDF worker 文書 cache | `pdf_loader.rs:4335-4354` は実ファイルパス。世代ごとに物理パスが異なり変更不要 | 同じ固定世代テスト |
@@ -756,3 +764,19 @@ master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` �
 回帰テストは `epub_cache::tests` の世代 ID・再起動・極端時刻・`Stale`・先勝ち・削除予約、`content_identity::tests` の固定世代値と backfill 来歴、`app::tests` の UI 要求・先出し・`pdf_meta` 保存・auto-aspect、`thumb_loader::tests` の要求と catch-up/隣接/代表共通 stamp、`app::metadata_ops::tests` の詳細ページ数、`materializer::tests` の外部渡し stamp、`folder_thumb_pins::tests` の source ID、`edit_preview_cache::tests` の保存・再利用、`archive_cache::tests` の容量除外に追加した。実 PDFium 描画を必要とするページ画像自体の再変換後確認と Remote は、それぞれ利用者の実機確認・S4 に残す。
 
 負例は一時的なコード差し替え後に絞り込みテストを実行して確認し、各実行の `finally` で元のファイルを byte 単位で復元した。元ファイル属性へのフォールバック、世代 ID 固定、元時刻の飽和、来歴チェック除去、編集プレビューの元属性保存、削除予約漏れ、容量への EPUB 加算、固定表の無視、古いページ数の保存、auto-aspect の早期 hit、バッチの行存在判定、ピン ID の元属性使用、詳細・外部渡しの元属性使用は、それぞれ対応するテストを失敗させた。
+
+#### S2c-2 独立レビュー fix round 1
+
+台帳への EPUB 書込は本ごとの固定ロックと同じロックで、来歴の最終確認から SQLite 更新までを一操作にした。通常の固定解決は最初の元ファイル stat / DB 照合をロック外で済ませ、固定直前に本ロック内で元状態を再照合する。固定表全体の mutex はメモリ検索・挿入だけに使い、他の本は別ロックで進める。フォルダ rename / purge / restore copy のように複数の台帳キーを更新する汎用 migration は、対象パス範囲の lease を取る。範囲外の本の固定は待たない。台帳書込経路の再調査結果は次の通り。
+
+| EPUB 論理キーを書ける経路 | 最終確認と書込の所有者 |
+| --- | --- |
+| 編集 / 閲覧記録、非同期 backfill (`content_identity.rs:1811-2090`) | 分岐時来歴を本ロック内で再確認して `mark_restorable` / `upsert` |
+| stage-0 copy detection cache (`content_identity.rs:1590-1700`) | 未固定元状態を hash 前に記録し、本ロック内で再確認して `upsert`。固定済みは元ファイル hash を台帳へ書かない |
+| 復元先の台帳昇格と復元拒否 (`content_identity/restore.rs:205-410`) | EPUB 復元先は未固定元状態を本ロック内で再確認。固定済みを昇格しない。拒否行も本ロック内で保存 |
+| 空になった編集 origin の clear / 差し戻し (`content_identity.rs:548-595`) | 対象 EPUB キーの本ロック内で flag を更新 |
+| 共通 STORES の rename / purge / restore copy (`rename_key_migration.rs:1490-1770`) | `edit_origin.file_key` の対象 exact / 子孫パスを範囲 lease で保護して transaction を実行 |
+
+ドライブ一覧から子フォルダを指すピンは、子の代表 proof の勝者またはピン source ID が EPUB の場合、旧行を一覧へ seed せず、読み込んだ一覧 seed も除去する。直接 EPUB ピンは従来どおり worker 世代照合を使う。EPUB ページを指すピンの UI 要求作成では stat を呼ばず、worker 解決印だけを作る。通常 PDF ピンの stat は維持する。キャッシュ管理画面を閉じた際は、アーカイブと EPUB の全削除確認状態を共に消す。
+
+再起動を模した旧世代 2 ページ→新世代 5 ページの fixture で、実際の `process_load_request`、`process_meta_only_with` (列挙だけ fake)、`load_details_page_count_with_pdf_enumerator` (cache hit、PDFium を呼べば失敗)、`MaterializeSession::materialize` (再利用 hit) を通した。4 つの worker 本体を元 EPUB stat に差し戻し、stamp helper は残した負例では各テストが失敗する。固定ロック、stage-0 来歴、復元先の固定判定、範囲 lease、間接 seed、UI pin stat、仮想フォルダ除外、確認状態も個別の旧動作へ差し戻した負例で各テストが失敗した。

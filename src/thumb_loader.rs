@@ -2091,6 +2091,33 @@ fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
 
 /// 実作業: cache hit 経由の pdf_meta catch-up (enumerate のみ、確信値 false で書き込み)
 fn process_meta_only(path: &Path, catalog: &crate::catalog::CatalogDb, cancel: &Arc<AtomicBool>) {
+    process_meta_only_with(path, catalog, cancel, |path, read, cancel| {
+        if let Some(read) = read {
+            crate::pdf_loader::enumerate_pages_with_read_target(
+                path,
+                read,
+                None,
+                Some(Arc::clone(cancel)),
+                crate::pdf_loader::EnumerateOptions::default(),
+            )
+            .map(|result| result.pages.len() as u32)
+        } else {
+            crate::pdf_loader::enumerate_pages_with_cancel(path, None, Some(Arc::clone(cancel)))
+                .map(|pages| pages.len() as u32)
+        }
+    });
+}
+
+fn process_meta_only_with(
+    path: &Path,
+    catalog: &crate::catalog::CatalogDb,
+    cancel: &Arc<AtomicBool>,
+    enumerate: impl FnOnce(
+        &Path,
+        Option<&crate::pdf_loader::ReadTarget>,
+        &Arc<AtomicBool>,
+    ) -> std::io::Result<u32>,
+) {
     if cancel.load(Ordering::Relaxed) {
         return;
     }
@@ -2123,25 +2150,11 @@ fn process_meta_only(path: &Path, catalog: &crate::catalog::CatalogDb, cancel: &
     // `bump_catchup_epoch` によるフォルダ移動キャンセルが、走行中の MetaOnly enumerate も
     // Interrupted で抜けさせる (旧実装: cancel 非対応の `enumerate_pages` を呼んでいて
     // 走行中の MetaOnly は完走するまで PDF worker を占有していた)。
-    let result = if let Some(read) = epub_read.as_ref() {
-        crate::pdf_loader::enumerate_pages_with_read_target(
-            path,
-            read,
-            None,
-            Some(Arc::clone(cancel)),
-            crate::pdf_loader::EnumerateOptions::default(),
-        )
-        .map(|result| result.pages)
-    } else {
-        crate::pdf_loader::enumerate_pages_with_cancel(path, None, Some(Arc::clone(cancel)))
-    };
+    let result = enumerate(path, epub_read.as_ref(), cancel);
     match result {
-        Ok(entries) => {
+        Ok(count) => {
             if let Err(e) = catalog.set_pdf_meta(
-                filename,
-                mtime,
-                file_size,
-                entries.len() as u32,
+                filename, mtime, file_size, count,
                 false, // password not required (enumerate succeeded without pw)
             ) {
                 crate::logger::log(format!(
@@ -5940,6 +5953,115 @@ mod tests {
             (fresh.mtime, fresh.file_size)
         );
         assert_ne!(stamped.cache_key_override, fresh.cache_key_override);
+    }
+
+    #[test]
+    fn reconverted_epub_thumbnail_worker_hits_current_generation_row() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let source_meta = std::fs::metadata(&fixture.source).unwrap();
+        let req = LoadRequest {
+            idx: 0,
+            path: fixture.source.clone(),
+            pdf_page: Some(0),
+            mtime: crate::ui_helpers::mtime_secs(&source_meta),
+            file_size: source_meta.len() as i64,
+            pdf_stamp_policy: PdfStampPolicy::ResolveInWorker,
+            ..Default::default()
+        };
+        let key = cache_key_for_request(&req).unwrap().into_owned();
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([30, 80, 160, 255]));
+        let mut webp = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut webp),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
+            key,
+            crate::catalog::CacheEntry {
+                mtime: fixture.current.generation_id,
+                file_size: fixture.current.pdf_size as i64,
+                jpeg_data: webp,
+                source_dims: Some((4, 4)),
+                layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
+            },
+        )]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let keep_start = Arc::new(AtomicUsize::new(0));
+        let keep_end = Arc::new(AtomicUsize::new(1));
+        process_load_request(
+            &req,
+            &cache_map,
+            &tx,
+            None,
+            64,
+            75,
+            64,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &keep_start,
+            &keep_end,
+            None,
+            None,
+            None,
+            None,
+        );
+        let message = rx.try_recv().unwrap();
+        assert!(
+            message.image.is_some(),
+            "worker must hit the current WebP row"
+        );
+        assert_ne!(fixture.old.page_count, fixture.current.page_count);
+    }
+
+    #[test]
+    fn reconverted_epub_catchup_worker_writes_current_generation_page_count() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap();
+        let filename = fixture.source.file_name().unwrap().to_str().unwrap();
+        catalog
+            .set_pdf_meta(
+                filename,
+                fixture.old.generation_id,
+                fixture.old.pdf_size as i64,
+                fixture.old.page_count,
+                false,
+            )
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut calls = 0;
+        process_meta_only_with(&fixture.source, &catalog, &cancel, |_, read, _| {
+            calls += 1;
+            assert_eq!(
+                read.unwrap().stamp.generation_catalog_pair(),
+                Some((
+                    fixture.current.generation_id,
+                    fixture.current.pdf_size as i64
+                ))
+            );
+            Ok(fixture.current.page_count)
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(
+            catalog
+                .get_pdf_meta(
+                    filename,
+                    fixture.current.generation_id,
+                    fixture.current.pdf_size as i64,
+                )
+                .unwrap()
+                .unwrap()
+                .0,
+            fixture.current.page_count
+        );
     }
 
     #[test]

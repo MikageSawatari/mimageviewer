@@ -126,6 +126,8 @@ file-local fallback する。close / 動画切替 / fullscreen 終了の cancel 
 
 通常 PDF と固定済み EPUB の列挙は呼出元で合流登録し、新しい実行要求だけ `pdf-enumerate-nav` スレッドを起こす。未固定 EPUB の admission は専用の背景スレッドで source stat・DB 照合・登録・エンコードを行う。固定表 mutex はメモリ検索・挿入だけを保護し、stat・DB 照合中は保持しない。同じ実読込パスへの追加 waiter はスレッドを増やさない。
 
+EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 / 復元書込は worker 上で来歴確認から SQLite 更新まで保持し、別の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は対象パス範囲の lease を保持して transaction を行い、範囲外の本を待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。
+
 ## 2. スレッド間通信
 
 ### 2.1 共有アトミック

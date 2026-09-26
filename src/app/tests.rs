@@ -12449,6 +12449,151 @@ mod phase_c_key_tests {
     }
 
     #[test]
+    fn drive_list_indirect_epub_cover_is_not_seeded_after_reconversion() {
+        struct Source(crate::epub_cache::SourceState);
+        impl crate::epub_cache::SourceGuard for Source {
+            fn state(&self) -> std::io::Result<crate::epub_cache::SourceState> {
+                Ok(self.0)
+            }
+        }
+        let mut app = setup_app();
+        let drive = app.tmp.path().join("drive-with-epub");
+        let child = drive.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let epub = child.join("book.epub");
+        let mut generations = crate::epub_cache::EpubCache::open_at(app.tmp.path()).unwrap();
+        let mut publish = |bytes: &[u8], page_count| {
+            std::fs::write(&epub, bytes).unwrap();
+            let source = crate::epub_cache::source_state(&std::fs::metadata(&epub).unwrap());
+            let reserved = generations.reserve_output(&epub).unwrap();
+            std::fs::create_dir_all(reserved.final_path().parent().unwrap()).unwrap();
+            std::fs::write(reserved.final_path(), b"%PDF-1.4\n").unwrap();
+            let row = crate::epub_cache::GenerationRow {
+                generation_id: reserved.generation_id(),
+                src_path_key: crate::epub_cache::src_key(&epub),
+                src_path: epub.clone(),
+                src_state: source,
+                src_sha256: format!("hash-{page_count}"),
+                src_head_hash: format!("head-{page_count}"),
+                pdf_file: reserved.final_path().to_path_buf(),
+                pdf_size: 9,
+                page_count,
+                direction: "ltr".into(),
+                profile: "test".into(),
+                created_at: 1,
+            };
+            assert_eq!(
+                generations.publish(&row, &Source(source)).unwrap(),
+                crate::epub_cache::PublishOutcome::Published
+            );
+            row
+        };
+        let old = publish(b"first source", 2);
+        let _old_pin = crate::pdf_loader::pin_epub_for_test(&epub, old.generation_id, 9);
+        drop(_old_pin); // a new run has a new pinned table
+        let current = publish(b"replacement with more pages", 5);
+        assert_ne!(old.generation_id, current.generation_id);
+        assert_ne!(old.page_count, current.page_count);
+
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent = crate::catalog::CatalogDb::open(&cache_dir, &drive).unwrap();
+        let source = crate::folder_thumb_pins::FolderPinSource::File {
+            rel: "child".into(),
+            kind: crate::folder_thumb_pins::FileKind::Folder,
+        };
+        let key = container_cache_base_key(
+            &GridItem::Folder(child.clone()),
+            false,
+            Some(app.settings.folder_thumb_sort),
+            app.settings.folder_thumb_depth,
+        )
+        .unwrap();
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([70, 80, 90, 255]));
+        let mut old_webp = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut old_webp),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        let proof = crate::catalog::FolderSelectionProof {
+            directories: Vec::new(),
+            pin_store: crate::catalog::PinStoreProof::NotConsulted,
+            winner: crate::catalog::FolderSelectionWinner {
+                path: epub.clone(),
+                mtime: old.generation_id,
+                file_size: old.pdf_size as i64,
+                archive_row_key: None,
+            },
+        };
+        parent
+            .save_with_folder_proof(
+                &key,
+                old.generation_id,
+                old.pdf_size as i64,
+                4,
+                4,
+                None,
+                None,
+                &old_webp,
+                Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+                Some(&proof),
+            )
+            .unwrap();
+        app.items = vec![GridItem::Folder(drive.clone())];
+        app.image_metas = vec![None];
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive),
+            source.clone(),
+        );
+        let target = std::sync::Arc::new(
+            crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
+        );
+        let map = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let prefix = drive_list_pinned_cache_key_prefix(
+            &crate::thumb_loader::folder_thumb_cache_key_for_path(
+                &drive,
+                true,
+                app.settings.folder_thumb_sort,
+                app.settings.folder_thumb_depth,
+                crate::catalog::FolderThumbProvenance::Seeded,
+            )
+            .unwrap(),
+            &source,
+        );
+        map.write().unwrap().insert(
+            drive_list_pinned_cache_key(&prefix, old.generation_id, old.pdf_size as i64),
+            parent.load_one(&key).unwrap().unwrap(),
+        );
+        app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
+        assert!(
+            map.read()
+                .unwrap()
+                .keys()
+                .all(|key| !key.starts_with(&prefix))
+        );
+        assert!(target.load_latest_with_prefix(&prefix).unwrap().is_none());
+    }
+
+    #[test]
+    fn epub_virtual_folder_seed_and_parent_writeback_are_explicitly_excluded() {
+        let mut app = setup_app();
+        let epub = app.tmp.path().join("virtual-seed.epub");
+        std::fs::write(&epub, b"source").unwrap();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: epub.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        let cache_dir = crate::catalog::default_cache_dir();
+        let target = crate::catalog::CatalogDb::open(&cache_dir, &epub).unwrap();
+        let map = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        app.setup_virtual_folder_seed_and_writeback(&epub, &target, &map);
+        assert!(app.virtual_folder_writeback.is_none());
+        assert!(map.read().unwrap().is_empty());
+    }
+
+    #[test]
     fn drive_list_root_folder_pin_uses_drive_aware_full_path_tile_key() {
         let mut app = setup_app();
         let drive_root = PathBuf::from(r"C:\");

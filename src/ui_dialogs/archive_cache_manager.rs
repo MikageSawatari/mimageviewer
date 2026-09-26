@@ -65,12 +65,19 @@ impl App {
                 && !self.archive_cache_confirm_delete_all
                 && !self.epub_cache_confirm_delete_all)
         {
-            self.show_archive_cache_manager = false;
-            self.archive_cache_confirm_delete_all = false;
+            self.close_archive_cache_manager();
         }
 
         self.show_archive_cache_confirm_dialog(ctx);
         self.show_epub_cache_confirm_dialog(ctx);
+    }
+
+    fn close_archive_cache_manager(&mut self) {
+        close_archive_cache_manager_flags(
+            &mut self.show_archive_cache_manager,
+            &mut self.archive_cache_confirm_delete_all,
+            &mut self.epub_cache_confirm_delete_all,
+        );
     }
 
     pub(crate) fn poll_epub_cache_maint_pending(&mut self) {
@@ -186,6 +193,12 @@ impl App {
             self.archive_cache_confirm_delete_all = false;
         }
     }
+}
+
+fn close_archive_cache_manager_flags(show: &mut bool, archive: &mut bool, epub: &mut bool) {
+    *show = false;
+    *archive = false;
+    *epub = false;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -546,6 +559,13 @@ fn spawn_delete_selected(app: &mut App, db: std::sync::Arc<crate::archive_cache:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_manager_clears_both_delete_all_confirmations() {
+        let (mut show, mut archive, mut epub) = (true, true, true);
+        close_archive_cache_manager_flags(&mut show, &mut archive, &mut epub);
+        assert!(!show && !archive && !epub);
+    }
 
     #[test]
     fn archive_cache_scroll_area_uses_the_full_dialog_width() {

@@ -173,6 +173,21 @@ pub(crate) enum JournalPersistStatus {
 /// SQLite の既定可変長 parameter 上限 (999) を十分下回る exact purge の batch 幅。
 const PURGE_EXACT_BATCH_SIZE: usize = 500;
 
+fn with_identity_epub_coverage<T>(
+    descriptor: &StoreDescriptor,
+    paths: &[PathBuf],
+    action: impl FnOnce() -> T,
+) -> T {
+    if descriptor.file == "content_identity.db"
+        && descriptor.table == "edit_origin"
+        && descriptor.column == "file_key"
+    {
+        crate::pdf_loader::with_epub_pin_coverage(paths, action)
+    } else {
+        action()
+    }
+}
+
 /// 移行結果。`rows` = 書き換えた行数合計 (sidecar / パスワードは 1 件 = 1)。
 pub struct RenameMigrationReport {
     pub rows: usize,
@@ -1504,62 +1519,68 @@ fn purge_store(
         return;
     }
     report.db_open_count += 1;
-    let result = (|| -> Result<usize, rusqlite::Error> {
-        let mut conn = rusqlite::Connection::open(&db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let table_exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            [descriptor.table],
-            |row| row.get(0),
-        )?;
-        if !table_exists {
-            return Ok(0);
-        }
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-        let _rating_write =
-            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
-        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-        let tx = conn.transaction()?;
-        let mut changed = 0usize;
+    let coverage = removed_keys.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let result = with_identity_epub_coverage(descriptor, &coverage, || {
+        (|| -> Result<usize, rusqlite::Error> {
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            let table_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [descriptor.table],
+                |row| row.get(0),
+            )?;
+            if !table_exists {
+                return Ok(0);
+            }
+            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            let _rating_write =
+                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+            let _tag_write =
+                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+            let tx = conn.transaction()?;
+            let mut changed = 0usize;
 
-        // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
-        // 上限 999 より小さくし、削除数に比例した statement 数を抑える。
-        for keys in removed_keys.chunks(PURGE_EXACT_BATCH_SIZE) {
-            let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "DELETE FROM {} WHERE {} IN ({placeholders})",
+            // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
+            // 上限 999 より小さくし、削除数に比例した statement 数を抑える。
+            for keys in removed_keys.chunks(PURGE_EXACT_BATCH_SIZE) {
+                let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "DELETE FROM {} WHERE {} IN ({placeholders})",
+                    descriptor.table, descriptor.column
+                );
+                changed += tx.execute(&sql, rusqlite::params_from_iter(keys.iter()))?;
+            }
+
+            // 全 STORES のキー列は既定 BINARY collation で、PK または path index を持つ。
+            // substr(col, ...) を列へ適用せず、同じ collation 上の range scan にする。
+            let range_sql = format!(
+                "DELETE FROM {} WHERE {} >= ?1 AND {} < ?2",
+                descriptor.table, descriptor.column, descriptor.column
+            );
+            let fallback_sql = format!(
+                "DELETE FROM {} WHERE substr({}, 1, ?1) = ?2",
                 descriptor.table, descriptor.column
             );
-            changed += tx.execute(&sql, rusqlite::params_from_iter(keys.iter()))?;
-        }
-
-        // 全 STORES のキー列は既定 BINARY collation で、PK または path index を持つ。
-        // substr(col, ...) を列へ適用せず、同じ collation 上の range scan にする。
-        let range_sql = format!(
-            "DELETE FROM {} WHERE {} >= ?1 AND {} < ?2",
-            descriptor.table, descriptor.column, descriptor.column
-        );
-        let fallback_sql = format!(
-            "DELETE FROM {} WHERE substr({}, 1, ?1) = ?2",
-            descriptor.table, descriptor.column
-        );
-        {
-            let mut range_statement = tx.prepare(&range_sql)?;
-            let mut fallback_statement = tx.prepare(&fallback_sql)?;
-            for key in removed_keys {
-                for prefix in [format!("{key}/"), format!("{key}::")] {
-                    if let Some(upper) = prefix_upper_bound(&prefix) {
-                        changed += range_statement.execute(rusqlite::params![prefix, upper])?;
-                    } else {
-                        changed += fallback_statement
-                            .execute(rusqlite::params![prefix.chars().count() as i64, prefix,])?;
+            {
+                let mut range_statement = tx.prepare(&range_sql)?;
+                let mut fallback_statement = tx.prepare(&fallback_sql)?;
+                for key in removed_keys {
+                    for prefix in [format!("{key}/"), format!("{key}::")] {
+                        if let Some(upper) = prefix_upper_bound(&prefix) {
+                            changed += range_statement.execute(rusqlite::params![prefix, upper])?;
+                        } else {
+                            changed += fallback_statement.execute(rusqlite::params![
+                                prefix.chars().count() as i64,
+                                prefix,
+                            ])?;
+                        }
                     }
                 }
             }
-        }
-        tx.commit()?;
-        Ok(changed)
-    })();
+            tx.commit()?;
+            Ok(changed)
+        })()
+    });
     match result {
         Ok(rows) => {
             report.rows += rows;
@@ -1583,74 +1604,78 @@ fn migrate_store(
     if !db_path.exists() {
         return;
     }
-    let result = (|| -> Result<usize, rusqlite::Error> {
-        let mut conn = rusqlite::Connection::open(db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-        let _rating_write =
-            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
-        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-        let tx = conn.transaction()?;
-        let columns = table_columns(&tx, descriptor.table)?;
-        if columns.is_empty()
-            && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
-        {
-            return Ok(0);
-        }
-        if !columns.iter().any(|column| column == descriptor.column) {
-            return Err(rusqlite::Error::InvalidColumnName(
-                descriptor.column.to_string(),
-            ));
-        }
-        let mut changed = 0usize;
-        changed += move_exact(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            old_key,
-            new_key,
-        )?;
-        changed += move_prefix(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            &format!("{old_key}/"),
-            &format!("{new_key}/"),
-        )?;
-        changed += move_prefix(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            &format!("{old_key}::"),
-            &format!("{new_key}::"),
-        )?;
-        // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
-        // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
-        // "::" より前、無ければキー自身)。
-        if descriptor.table == "ratings" && changed > 0 {
-            tx.execute(
-                "UPDATE ratings SET source_path = CASE
+    let coverage = [PathBuf::from(old_key), PathBuf::from(new_key)];
+    let result = with_identity_epub_coverage(descriptor, &coverage, || {
+        (|| -> Result<usize, rusqlite::Error> {
+            let mut conn = rusqlite::Connection::open(db_path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            let _rating_write =
+                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+            let _tag_write =
+                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+            let tx = conn.transaction()?;
+            let columns = table_columns(&tx, descriptor.table)?;
+            if columns.is_empty()
+                && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+            {
+                return Ok(0);
+            }
+            if !columns.iter().any(|column| column == descriptor.column) {
+                return Err(rusqlite::Error::InvalidColumnName(
+                    descriptor.column.to_string(),
+                ));
+            }
+            let mut changed = 0usize;
+            changed += move_exact(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                old_key,
+                new_key,
+            )?;
+            changed += move_prefix(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                &format!("{old_key}/"),
+                &format!("{new_key}/"),
+            )?;
+            changed += move_prefix(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                &format!("{old_key}::"),
+                &format!("{new_key}::"),
+            )?;
+            // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
+            // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
+            // "::" より前、無ければキー自身)。
+            if descriptor.table == "ratings" && changed > 0 {
+                tx.execute(
+                    "UPDATE ratings SET source_path = CASE
                      WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
                      ELSE path
                  END
                  WHERE path = ?1
                     OR substr(path, 1, ?2) = ?3
                     OR substr(path, 1, ?4) = ?5",
-                rusqlite::params![
-                    new_key,
-                    format!("{new_key}/").chars().count() as i64,
-                    format!("{new_key}/"),
-                    format!("{new_key}::").chars().count() as i64,
-                    format!("{new_key}::"),
-                ],
-            )?;
-        }
-        tx.commit()?;
-        Ok(changed)
-    })();
+                    rusqlite::params![
+                        new_key,
+                        format!("{new_key}/").chars().count() as i64,
+                        format!("{new_key}/"),
+                        format!("{new_key}::").chars().count() as i64,
+                        format!("{new_key}::"),
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        })()
+    });
     match result {
         Ok(n) => {
             report.rows += n;
@@ -1733,7 +1758,24 @@ fn copy_store(
         return;
     }
     report.database_opens += 1;
-    let result = copy_store_transaction(db_path, descriptor, mappings);
+    let coverage = mappings
+        .iter()
+        .flat_map(|mapping| match mapping {
+            NormalizedStoreCopyMapping::Exact {
+                old_key, new_key, ..
+            } => [PathBuf::from(old_key), PathBuf::from(new_key)],
+            NormalizedStoreCopyMapping::Prefix {
+                old_prefix,
+                new_prefix,
+            } => [
+                PathBuf::from(old_prefix.trim_end_matches("::")),
+                PathBuf::from(new_prefix.trim_end_matches("::")),
+            ],
+        })
+        .collect::<Vec<_>>();
+    let result = with_identity_epub_coverage(&descriptor, &coverage, || {
+        copy_store_transaction(db_path, descriptor, mappings)
+    });
     match result {
         Ok(rows) => report.rows += rows,
         Err(error) => report.errors.push(format!(

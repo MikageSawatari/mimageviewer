@@ -1224,6 +1224,51 @@ fn load_details_page_count(
     cancel: &Arc<AtomicBool>,
     config: &DetailsPageCountConfig,
 ) -> Result<Option<u32>, DetailsPageCountError> {
+    load_details_page_count_with_pdf_enumerator(
+        target,
+        cache_dir,
+        catalogs,
+        io_sem,
+        cancel,
+        config,
+        |path, read, password, cancel| {
+            let pages = if let Some(read) = read {
+                crate::pdf_loader::enumerate_pages_with_read_target(
+                    path,
+                    read,
+                    password,
+                    Some(Arc::clone(cancel)),
+                    crate::pdf_loader::EnumerateOptions::default(),
+                )
+                .map(|result| result.pages)
+            } else {
+                crate::pdf_loader::enumerate_pages_with_cancel(
+                    path,
+                    password,
+                    Some(Arc::clone(cancel)),
+                )
+            }
+            .map_err(|_| ())?;
+            u32::try_from(pages.len()).map_err(|_| ())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_details_page_count_with_pdf_enumerator(
+    target: &DetailsMetaTarget,
+    cache_dir: &Path,
+    catalogs: &mut ContainerCatalogCache,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    cancel: &Arc<AtomicBool>,
+    config: &DetailsPageCountConfig,
+    enumerate_pdf: impl FnOnce(
+        &Path,
+        Option<&crate::pdf_loader::ReadTarget>,
+        Option<&str>,
+        &Arc<AtomicBool>,
+    ) -> Result<u32, ()>,
+) -> Result<Option<u32>, DetailsPageCountError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(DetailsPageCountError::Cancelled(
             DetailsMetaCancelReason::BeforeTarget,
@@ -1450,37 +1495,19 @@ fn load_details_page_count(
                     }
                 }
             }
-            let pages = {
+            let count = {
                 let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
                     return Err(DetailsPageCountError::Cancelled(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfEnumerate),
                     ));
                 };
-                if let Some(read) = epub_read.as_ref() {
-                    crate::pdf_loader::enumerate_pages_with_read_target(
-                        path,
-                        read,
-                        pdf_password.as_deref(),
-                        Some(Arc::clone(cancel)),
-                        crate::pdf_loader::EnumerateOptions::default(),
-                    )
-                    .map(|result| result.pages)
-                    .map_err(|_| ())?
-                } else {
-                    crate::pdf_loader::enumerate_pages_with_cancel(
-                        path,
-                        pdf_password.as_deref(),
-                        Some(Arc::clone(cancel)),
-                    )
-                    .map_err(|_| ())?
-                }
+                enumerate_pdf(path, epub_read.as_ref(), pdf_password.as_deref(), cancel)?
             };
             if cancel.load(Ordering::Relaxed) {
                 return Err(DetailsPageCountError::Cancelled(
                     DetailsMetaCancelReason::AfterIo(DetailsMetaIoStage::PdfEnumerate),
                 ));
             }
-            let count = u32::try_from(pages.len()).map_err(|_| ())?;
             if count == 0 {
                 return Ok(None);
             }
@@ -2204,6 +2231,73 @@ mod tests {
             details_pdf_catalog_stamp(None, 123, 456).unwrap(),
             (123, 456)
         );
+    }
+
+    #[test]
+    fn reconverted_epub_details_worker_reads_current_generation_page_count() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("catalog");
+        let folder = fixture.source.parent().unwrap();
+        let key = fixture.source.file_name().unwrap().to_str().unwrap();
+        let catalog = crate::catalog::CatalogDb::open(&cache_dir, folder).unwrap();
+        catalog
+            .set_pdf_meta(
+                key,
+                fixture.old.generation_id,
+                fixture.old.pdf_size as i64,
+                fixture.old.page_count,
+                false,
+            )
+            .unwrap();
+        catalog
+            .set_pdf_meta(
+                key,
+                fixture.current.generation_id,
+                fixture.current.pdf_size as i64,
+                fixture.current.page_count,
+                false,
+            )
+            .unwrap();
+        let source_meta = std::fs::metadata(&fixture.source).unwrap();
+        let target = DetailsMetaTarget {
+            idx: 0,
+            key: crate::adjustment_db::normalize_path(&fixture.source),
+            item: GridItem::PdfFile(fixture.source.clone()),
+            relative_page_provenance: None,
+            source_mtime: crate::ui_helpers::mtime_secs(&source_meta),
+            source_size: source_meta.len() as i64,
+            catalog_folder: Some(folder.to_path_buf()),
+            catalog_key: Some(key.into()),
+            warm_image_dims: None,
+            warm_page_count: None,
+            pdf_password_revision: None,
+            load_page_count: true,
+            load_created_at: false,
+            load_ai_metadata: false,
+            load_image_dims: false,
+            load_video_meta: false,
+            priority: crate::io_semaphore::IoPriority::Normal,
+        };
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut catalogs = ContainerCatalogCache::new(8);
+        let config = DetailsPageCountConfig {
+            fingerprint: 0,
+            image_folder_options: None,
+            pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+        };
+        let count = load_details_page_count_with_pdf_enumerator(
+            &target,
+            &cache_dir,
+            &mut catalogs,
+            &io_sem,
+            &cancel,
+            &config,
+            |_, _, _, _| panic!("current generation must hit pdf_meta before PDFium"),
+        )
+        .unwrap();
+        assert_eq!(count, Some(fixture.current.page_count));
     }
 
     /// pass 2 は 1 項目のうちに複数の file を読む。取消を見ずに読みを続けると、

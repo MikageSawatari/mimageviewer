@@ -30257,9 +30257,10 @@ impl App {
         &mut self,
         container: &std::path::Path,
         source: &crate::folder_thumb_pins::FolderPinSource,
-    ) -> Option<crate::catalog::CacheEntry> {
+    ) -> Option<(crate::catalog::CacheEntry, bool)> {
         use crate::folder_thumb_pins::{FileKind, FolderPinSource};
-        match source {
+        let mut pinned_key_is_epub = false;
+        let entry = match source {
             FolderPinSource::File { rel, kind } => {
                 let fname = direct_pin_rel_file_name(rel)?;
                 let use_full_path_key = crate::path_key::is_drive_or_share_root(container);
@@ -30336,7 +30337,10 @@ impl App {
                             .load_latest_with_prefix(&pinned_prefix)
                             .ok()
                             .flatten()
-                            .map(|(_, entry)| entry);
+                            .map(|(key, entry)| {
+                                pinned_key_is_epub = key.to_ascii_lowercase().contains(".epub");
+                                entry
+                            });
                         pinned_entry.or(base_entry)
                     }
                 }
@@ -30381,7 +30385,8 @@ impl App {
                     .ok()
                     .flatten()
             }
-        }
+        };
+        entry.map(|entry| (entry, pinned_key_is_epub))
     }
 
     fn seed_drive_list_pin_thumbs_from_catalog(
@@ -30417,9 +30422,57 @@ impl App {
                 continue;
             };
             let prefix = drive_list_pinned_cache_key_prefix(&base_key, &source);
-            let Some(mut entry) = self.drive_list_pin_seed_entry(&container_path, &source) else {
+            let Some((mut entry, pinned_key_is_epub)) =
+                self.drive_list_pin_seed_entry(&container_path, &source)
+            else {
+                if matches!(
+                    source,
+                    crate::folder_thumb_pins::FolderPinSource::File {
+                        kind: crate::folder_thumb_pins::FileKind::Folder,
+                        ..
+                    }
+                ) {
+                    // No current child row means a prior indirect seed has no
+                    // representative proof to validate against.
+                    if let Ok(mut map) = cache_map.write() {
+                        map.retain(|key, _| !key.starts_with(&prefix));
+                    }
+                }
                 continue;
             };
+            // A child folder's representative can be an EPUB page. Its old
+            // WebP row is not proof of the current converted generation, and
+            // dropping selection_proof here used to make it appear valid.
+            let indirect_epub = pinned_key_is_epub
+                || entry.selection_proof.as_ref().is_some_and(|proof| {
+                    proof
+                        .winner
+                        .path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                });
+            let direct_epub = match &source {
+                crate::folder_thumb_pins::FolderPinSource::File {
+                    rel,
+                    kind: crate::folder_thumb_pins::FileKind::PdfFile,
+                } => container_path.join(rel),
+                crate::folder_thumb_pins::FolderPinSource::PdfPage { pdf_rel, .. } => {
+                    container_path.join(pdf_rel)
+                }
+                _ => std::path::PathBuf::new(),
+            }
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
+            if direct_epub || indirect_epub {
+                // Also evict an earlier drive-list seed already loaded into
+                // memory; the cache-only worker must not display it this run.
+                if let Ok(mut map) = cache_map.write() {
+                    map.retain(|key, _| !key.starts_with(&prefix));
+                }
+                continue;
+            }
             entry.folder_provenance = Some(crate::catalog::FolderThumbProvenance::Seeded);
             entry.selection_proof = None;
             let key = drive_list_pinned_cache_key(&prefix, entry.mtime, entry.file_size);

@@ -182,6 +182,110 @@ impl From<std::io::Error> for PdfReadError {
 
 static EPUB_GATE: OnceLock<GateOutcome> = OnceLock::new();
 static EPUB_PINNED: OnceLock<Mutex<HashMap<String, ReadTarget>>> = OnceLock::new();
+// A ledger writer and the first pin of the same logical book must have one
+// linearization point. The map lock is only held while finding a book lock;
+// SQLite and source I/O never block resolution of a different book.
+static EPUB_PIN_GUARDS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+static EPUB_PIN_COORD: OnceLock<(Mutex<EpubPinCoordState>, Condvar)> = OnceLock::new();
+
+#[derive(Default)]
+struct EpubPinCoordState {
+    active_books: HashMap<String, usize>,
+    active_range: Option<Vec<String>>,
+}
+
+fn epub_pin_coord() -> &'static (Mutex<EpubPinCoordState>, Condvar) {
+    EPUB_PIN_COORD.get_or_init(|| (Mutex::new(EpubPinCoordState::default()), Condvar::new()))
+}
+
+fn key_is_within(key: &str, root: &str) -> bool {
+    key == root
+        || key
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+struct EpubBookLease(String);
+
+impl Drop for EpubBookLease {
+    fn drop(&mut self) {
+        let (mutex, changed) = epub_pin_coord();
+        let mut state = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = state
+            .active_books
+            .get_mut(&self.0)
+            .expect("book lease exists");
+        *count -= 1;
+        if *count == 0 {
+            state.active_books.remove(&self.0);
+        }
+        changed.notify_all();
+    }
+}
+
+fn enter_epub_book(key: &str) -> EpubBookLease {
+    let (mutex, changed) = epub_pin_coord();
+    let mut state = mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while state
+        .active_range
+        .as_ref()
+        .is_some_and(|roots| roots.iter().any(|root| key_is_within(key, root)))
+    {
+        state = changed
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    *state.active_books.entry(key.to_owned()).or_default() += 1;
+    EpubBookLease(key.to_owned())
+}
+
+struct EpubRangeLease;
+
+impl Drop for EpubRangeLease {
+    fn drop(&mut self) {
+        let (mutex, changed) = epub_pin_coord();
+        let mut state = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active_range = None;
+        changed.notify_all();
+    }
+}
+
+/// Generic rename/copy/purge transactions may rewrite a whole folder of EPUB
+/// ledger keys. A range lease blocks only books below those paths, not unrelated
+/// books. Never invoke this while holding an individual book guard.
+pub(crate) fn with_epub_pin_coverage<T>(paths: &[PathBuf], action: impl FnOnce() -> T) -> T {
+    let roots = paths
+        .iter()
+        .map(|path| epub_cache::src_key(path))
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return action();
+    }
+    let (mutex, changed) = epub_pin_coord();
+    let mut state = mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while state.active_range.is_some()
+        || state
+            .active_books
+            .keys()
+            .any(|book| roots.iter().any(|root| key_is_within(book, root)))
+    {
+        state = changed
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    state.active_range = Some(roots);
+    drop(state);
+    let _lease = EpubRangeLease;
+    action()
+}
 
 /// Install the startup gate once and retain its liveness lock for the process.
 pub(crate) fn install_epub_gate(gate: GateOutcome) {
@@ -210,6 +314,20 @@ fn epub_pinned() -> &'static Mutex<HashMap<String, ReadTarget>> {
     EPUB_PINNED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub(crate) fn with_epub_pin_guard<T>(logical: &Path, action: impl FnOnce() -> T) -> T {
+    let key = epub_cache::src_key(logical);
+    let _book_lease = enter_epub_book(&key);
+    let book = EPUB_PIN_GUARDS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _guard = book.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    action()
+}
+
 /// Memory-only lookup; safe for the placeholder decision on the UI thread.
 pub fn pinned_epub_target(logical: &Path) -> Option<ReadTarget> {
     if !is_epub(logical) {
@@ -228,17 +346,21 @@ pub(crate) struct TestEpubPin(String);
 #[cfg(test)]
 impl Drop for TestEpubPin {
     fn drop(&mut self) {
-        epub_pinned().lock().unwrap().remove(&self.0);
+        with_epub_pin_guard(Path::new(&self.0), || {
+            epub_pinned().lock().unwrap().remove(&self.0);
+        });
     }
 }
 
 #[cfg(test)]
 pub(crate) fn pin_epub_for_test(logical: &Path, id: i64, pdf_size: u64) -> TestEpubPin {
     let key = epub_cache::src_key(logical);
-    epub_pinned().lock().unwrap().insert(
-        key.clone(),
-        generation_target_for_test(logical, id, pdf_size),
-    );
+    with_epub_pin_guard(logical, || {
+        epub_pinned().lock().unwrap().insert(
+            key.clone(),
+            generation_target_for_test(logical, id, pdf_size),
+        );
+    });
     TestEpubPin(key)
 }
 
@@ -250,13 +372,15 @@ pub(crate) fn pin_epub_with_source_for_test(
     source: epub_cache::SourceState,
 ) -> TestEpubPin {
     let guard = pin_epub_for_test(logical, id, pdf_size);
-    if let Some(target) = epub_pinned()
-        .lock()
-        .unwrap()
-        .get_mut(&epub_cache::src_key(logical))
-    {
-        target.display_source_state = Some(source);
-    }
+    with_epub_pin_guard(logical, || {
+        if let Some(target) = epub_pinned()
+            .lock()
+            .unwrap()
+            .get_mut(&epub_cache::src_key(logical))
+        {
+            target.display_source_state = Some(source);
+        }
+    });
     guard
 }
 
@@ -299,6 +423,12 @@ fn read_target_without_io(logical: &Path) -> Option<Result<ReadTarget, PdfReadEr
 /// EPUB resolution can stat the source and access SQLite; call that branch only
 /// from a background thread. The PDF passthrough branch performs no I/O.
 pub fn resolve_read_target(logical: &Path) -> Result<ReadTarget, PdfReadError> {
+    #[cfg(test)]
+    if let Some(read) = pinned_epub_target(logical) {
+        // Test seam: worker-entry tests can exercise cache hits without
+        // starting the process-global conversion gate or a PDFium process.
+        return Ok(read);
+    }
     resolve_read_target_with(logical, |logical| {
         let gate = EPUB_GATE
             .get()
@@ -399,15 +529,34 @@ fn resolve_epub_at(
             epub_direction: parse_epub_direction_name(&row.direction),
         })
     })();
-    let mut pinned = pinned
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(existing) = pinned.get(&key) {
-        return Ok(existing.clone());
-    }
-    let target = candidate?;
-    pinned.insert(key, target.clone());
-    Ok(target)
+    with_epub_pin_guard(logical, || {
+        if let Some(existing) = pinned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+        let target = candidate?;
+        if let Some(expected) = target.display_source_state {
+            let actual = match std::fs::metadata(logical) {
+                Ok(metadata) => epub_cache::source_state(&metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(PdfReadError::NotConverted);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if actual != expected {
+                return Err(PdfReadError::NotConverted);
+            }
+        }
+        let mut pinned = pinned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pinned.insert(key, target.clone());
+        Ok(target)
+    })
 }
 
 /// The caller must be a background worker; PDFs are statted here at consumer demand.
@@ -5729,6 +5878,44 @@ mod tests {
                 pdf_size: 9
             }
         );
+    }
+
+    #[test]
+    fn epub_folder_ledger_coverage_blocks_only_books_below_that_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let covered = root.path().join("shelf").join("book.epub");
+        let other = root.path().join("other").join("book.epub");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let covered_thread = covered.clone();
+        let holder = std::thread::spawn(move || {
+            with_epub_pin_guard(&covered_thread, || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        ready_rx.recv().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let folder = covered.parent().unwrap().to_path_buf();
+        let migrator = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            with_epub_pin_coverage(&[folder], || entered_tx.send(()).unwrap());
+        });
+        started_rx.recv().unwrap();
+        // The pending folder migration must not stop an unrelated book.
+        with_epub_pin_guard(&other, || {});
+        assert!(
+            entered_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        holder.join().unwrap();
+        migrator.join().unwrap();
     }
 
     #[test]
