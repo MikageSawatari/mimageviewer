@@ -9537,7 +9537,6 @@ impl Settings {
         self.thumb_aspect = src.thumb_aspect;
         self.thumb_aspect_auto = src.thumb_aspect_auto;
         self.sort_order = src.sort_order;
-        self.rating_sort_unrated_position = src.rating_sort_unrated_position;
         self.subfolder_expansion_order = src.subfolder_expansion_order;
         self.subfolder_expansion_max_depth = src.subfolder_expansion_max_depth;
         self.subfolder_expansion_filter_kinds = src.subfolder_expansion_filter_kinds.clone();

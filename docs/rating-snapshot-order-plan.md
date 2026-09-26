@@ -468,6 +468,23 @@ Collection actor が閉じて**すべての Collection が開けなくなる** (
   別窓からの書き込みで各窓の順序が不変・badge / filter が更新されること、1窓の reload が sibling の items /
   generation を変えないことを確認する。
 
+### 9.4 実アプリ smoke (RatingSort)
+
+R4 の実機確認 (利用者、2026-09-26) で、次の 3 件がテストをすり抜けて見つかった。ソート候補のポップアップが固定高で
+スクロールする、環境設定の未評価位置が OK の確定処理で既定値へ上書きされる、評価順の Smart Folder が fallback の
+sort を stamp にして準備を繰り返す。すり抜けた理由は、テストが prepared 結果を直接 install していたこと、UI の
+dispatch 回数だけを数えていたこと、環境設定の確定経路を通していなかったこと。
+
+これを受けて、App 単位の回帰テストに加え、実アプリの `scripts/ui-smoke.ps1 -Scenario RatingSort`
+(`scripts/ui-smoke/rating-sort.rhai`、fixture は `testdata/rating-sort/`) を追加した。使い捨ての
+`target/portable-smoke` だけを使い、評価順で開く → 評価変更で順序不変 → 更新ボタン (実クリック) で再 sort かつ
+フォルダ読込要求がちょうど 1 → 環境設定の未評価位置のラジオと OK (実クリック) → 保存と反映 → Smart Folder の
+Root が評価順で 1 回で確定、を確かめる。実行は利用者の了承した時間帯に限る。
+
+- 2026-09-26 10:40〜11:02 (利用者了承): 修正版で PASS。未評価位置の上書きを一時的に戻した版は
+  「Preferences OK and order」で FAIL (並び `01-one ★5, 02-unrated 未評価, 03-two ★2`) し、検出できることを確認。
+  同じ build で `MultiWindowStills` / `MultiWindowPdf` / `MultiWindowRarNav` も PASS。
+
 ## 10. 完了条件
 
 - 利用者が評価を変えても、評価順の既存行が移動しない (どの窓・Remote から書いても)。

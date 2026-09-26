@@ -1428,11 +1428,15 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             RatingSortUnratedPosition::BetweenThreeAndTwo,
             "★3 と ★2 の間（既定）",
         );
-        ui.radio_value(
+        let below_all = ui.radio_value(
             &mut state.settings.rating_sort_unrated_position,
             RatingSortUnratedPosition::BelowAll,
             "すべての評価より下",
         );
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::register_clickable_widget("すべての評価より下", &below_all);
+        #[cfg(not(all(windows, feature = "test-script")))]
+        let _ = below_all;
         ui.small(
             "低い順では、この並びを逆にします。評価を変えた後は一覧を更新すると並びが変わります。",
         );

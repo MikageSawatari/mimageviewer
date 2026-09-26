@@ -25,7 +25,7 @@ MultiWindowRarNav checks Ctrl+Up/Down across direct RAR, ZIP, and CBR in one det
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -680,7 +680,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence')
+    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -766,6 +766,53 @@ if ($script:archiveErrors.Count -gt 0) {
     $candidateFixtureGeneratorPdfDependencyPath = $null
 
     switch ($Scenario) {
+    'RatingSort' {
+        $scenarioRoot = Join-Path $dataDir 'rating-sort'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\rating-sort.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_rating_sort_fixture.py'
+        $sourceFixtureDir = Join-Path $repoRoot 'testdata\rating-sort'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\portable-smoke\data\rating-sort') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $dataDir 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        if (-not (Test-Path -LiteralPath $candidateScriptPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $candidateFixtureGeneratorPath -PathType Leaf)) {
+            throw '[ui-smoke] rating sort scenario inputs are missing'
+        }
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        foreach ($name in @('01-one.png', '02-unrated.png', '03-two.png')) {
+            $source = Join-Path $sourceFixtureDir $name
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                throw "[ui-smoke] rating sort fixture not found: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $candidateFixtureDir $name)
+        }
+        Assert-NoReparseTree $candidateFixtureDir 'rating-sort-fixture'
+        & python $candidateFixtureGeneratorPath $candidateFixtureDir --seed-db $dataDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "[ui-smoke] rating sort DB seed failed with exit $LASTEXITCODE"
+        }
+        $settings = [ordered]@{
+            sort_order = 'RatingDesc'
+            rating_sort_unrated_position = 'BetweenThreeAndTwo'
+            auto_fullscreen_image_folders = $false
+            smart_folders = @([ordered]@{
+                id = 'b3ff891f-5b83-4bf4-9554-148e363a439b'
+                name = 'RatingSortSmoke'
+                rules = @([ordered]@{
+                    id = 'e199c622-c192-4d26-8291-a11124c2cb4f'
+                    source = $candidateFixtureDir
+                    enabled = $true
+                    include_descendants = $false
+                })
+            })
+        }
+        Write-UiSmokeJson $candidateSettingsPath $settings
+    }
     'MultiWindowRarNav' {
         $scenarioRoot = Join-Path $dataDir 'multi-window-rar-nav'
         $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\multi-window-rar-nav.rhai'
@@ -1499,6 +1546,14 @@ $arguments = @(
             $script:failureMessage = "application exited with code $processExitCode"
         }
         Write-UiSmokeEvent "exit: $processExitCode"
+        if ($Scenario -eq 'RatingSort' -and $processExitCode -eq 0) {
+            & python $candidateFixtureGeneratorPath $candidateFixtureDir --verify-settings $dataDir
+            if ($LASTEXITCODE -ne 0) {
+                $script:runExitCode = 1
+                $script:runPhase = 'analysis-failed'
+                $script:failureMessage = 'rating sort Preferences value was not saved'
+            }
+        }
         if ($Scenario -eq 'Idle198Convergence' -and $processExitCode -eq 0) {
             $analysisExitCode = Invoke-Idle198PostAnalysis
             if ($analysisExitCode -ne 0) {

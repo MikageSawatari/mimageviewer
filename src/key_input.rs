@@ -2534,6 +2534,8 @@ impl egui::Plugin for SyntheticInputPlugin {
         self.inject_prepared(input);
         #[cfg(all(windows, any(test, feature = "test-script")))]
         self.inject_prepared_pointer(input);
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::append_widget_click_events(input);
     }
 }
 

@@ -26,6 +26,7 @@ pub(crate) mod pointer_input;
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+pub(crate) const MAX_ITEM_ROWS_IN_SNAPSHOT: usize = 16;
 const EXIT_NOT_SET: i32 = -1;
 const EXIT_SCRIPT_FAILURE: i32 = 1;
 const EXIT_ENVIRONMENT_FAILURE: i32 = 2;
@@ -685,6 +686,7 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) is_fullscreen: bool,
     pub(crate) fs_idx: i64,
     pub(crate) items_generation: i64,
+    pub(crate) folder_load_requests: i64,
     pub(crate) focused: bool,
     pub(crate) target_viewport: String,
     pub(crate) target_registered: bool,
@@ -694,6 +696,17 @@ pub(crate) struct TestScriptSnapshot {
     /// `pending_thumbs == 0` だけでは「全部終わった」と「まだ何も始まっていない」を
     /// 区別できない。落ち着いたことを待つ条件には `items_len > 0` を併せて使う。
     pub(crate) items_len: i64,
+    pub(crate) item_names: Vec<String>,
+    pub(crate) item_ratings: Vec<i64>,
+    pub(crate) sort_order: String,
+    pub(crate) rating_sort_unrated_position: String,
+    pub(crate) preferences_open: bool,
+    pub(crate) preferences_page: String,
+    pub(crate) preferences_draft_unrated_position: String,
+    pub(crate) smart_folder_busy: bool,
+    pub(crate) smart_folder_name: String,
+    pub(crate) smart_folder_root_visible: bool,
+    pub(crate) smart_folder_session_phase: String,
     pub(crate) pending_thumbs: i64,
     pub(crate) spread_mode: String,
     pub(crate) continuous_reading: bool,
@@ -728,11 +741,23 @@ impl Default for TestScriptSnapshot {
             is_fullscreen: false,
             fs_idx: -1,
             items_generation: 0,
+            folder_load_requests: 0,
             focused: false,
             target_viewport: "unregistered".to_string(),
             target_registered: false,
             target_rendered: false,
             items_len: 0,
+            item_names: Vec::new(),
+            item_ratings: Vec::new(),
+            sort_order: String::new(),
+            rating_sort_unrated_position: String::new(),
+            preferences_open: false,
+            preferences_page: String::new(),
+            preferences_draft_unrated_position: String::new(),
+            smart_folder_busy: false,
+            smart_folder_name: String::new(),
+            smart_folder_root_visible: false,
+            smart_folder_session_phase: String::new(),
             pending_thumbs: 0,
             spread_mode: "Single".to_string(),
             continuous_reading: false,
@@ -771,11 +796,39 @@ impl TestScriptSnapshot {
         insert!(is_fullscreen);
         insert!(fs_idx);
         insert!(items_generation);
+        insert!(folder_load_requests);
         insert!(focused);
         insert!(target_viewport);
         insert!(target_registered);
         insert!(target_rendered);
         insert!(items_len);
+        map.insert(
+            "item_names".into(),
+            self.item_names
+                .iter()
+                .cloned()
+                .map(Dynamic::from)
+                .collect::<rhai::Array>()
+                .into(),
+        );
+        map.insert(
+            "item_ratings".into(),
+            self.item_ratings
+                .iter()
+                .copied()
+                .map(Dynamic::from)
+                .collect::<rhai::Array>()
+                .into(),
+        );
+        insert!(sort_order);
+        insert!(rating_sort_unrated_position);
+        insert!(preferences_open);
+        insert!(preferences_page);
+        insert!(preferences_draft_unrated_position);
+        insert!(smart_folder_busy);
+        insert!(smart_folder_name);
+        insert!(smart_folder_root_visible);
+        insert!(smart_folder_session_phase);
         insert!(pending_thumbs);
         insert!(spread_mode);
         insert!(continuous_reading);
@@ -888,6 +941,11 @@ enum UiCommand {
         selection: TestScriptActionSelection,
         applied: mpsc::SyncSender<Result<(), String>>,
     },
+    RatingSortSmoke(RatingSortSmokeAction),
+    ClickWidget {
+        label: String,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     ValidateSelectedOwner {
         expected_identity: TestScriptWindowIdentity,
         reply: mpsc::SyncSender<Result<(), String>>,
@@ -895,6 +953,136 @@ enum UiCommand {
     Log(String),
     Precondition(PreconditionTrace),
     Finished(ScriptOutcome),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RatingSortSmokeAction {
+    OpenThumbnailPreferences,
+    OpenFirstSmartFolder,
+}
+
+#[derive(Clone, Copy)]
+enum WidgetClickPhase {
+    Down,
+    Up,
+}
+
+struct WidgetClick {
+    point: egui::Pos2,
+    phase: WidgetClickPhase,
+}
+
+#[derive(Default)]
+struct WidgetClickDriver {
+    requested: Option<(String, mpsc::SyncSender<Result<(), String>>)>,
+    active: Option<WidgetClick>,
+}
+
+static WIDGET_CLICK_DRIVER: OnceLock<Mutex<WidgetClickDriver>> = OnceLock::new();
+
+fn widget_click_driver() -> &'static Mutex<WidgetClickDriver> {
+    WIDGET_CLICK_DRIVER.get_or_init(|| Mutex::new(WidgetClickDriver::default()))
+}
+
+fn request_widget_click(
+    label: String,
+    reply: mpsc::SyncSender<Result<(), String>>,
+) -> Result<(), String> {
+    let mut driver = widget_click_driver()
+        .lock()
+        .map_err(|_| "widget click driver is poisoned".to_string())?;
+    if driver.requested.is_some() || driver.active.is_some() {
+        return Err("another widget click is still in progress".to_string());
+    }
+    driver.requested = Some((label, reply));
+    Ok(())
+}
+
+/// Register the actual interactive rectangle; a pending click scrolls its widget into view.
+/// The button/radio handler still sees an ordinary egui pointer press and release.
+pub(crate) fn register_clickable_widget(label: &str, response: &egui::Response) {
+    let Ok(mut driver) = widget_click_driver().lock() else {
+        return;
+    };
+    if !driver
+        .requested
+        .as_ref()
+        .is_some_and(|(requested, _)| requested == label)
+    {
+        return;
+    }
+    if !response.interact_rect.contains(response.rect.center()) {
+        response.scroll_to_me(Some(egui::Align::Center));
+        return;
+    }
+    if !response.enabled() {
+        return;
+    }
+    let point = response.rect.center();
+    let (_, reply) = driver.requested.take().expect("matching request exists");
+    if reply.send(Ok(())).is_ok() {
+        driver.active = Some(WidgetClick {
+            point,
+            phase: WidgetClickPhase::Down,
+        });
+    }
+}
+
+/// Called by the synthetic-input plugin before egui processes the root pass.
+pub(crate) fn append_widget_click_events(input: &mut egui::RawInput) {
+    if input.viewport_id != egui::ViewportId::ROOT
+        || input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::PointerMoved(_)
+                    | egui::Event::PointerButton { .. }
+                    | egui::Event::PointerGone
+            )
+        })
+    {
+        return;
+    }
+    let Ok(mut driver) = widget_click_driver().lock() else {
+        return;
+    };
+    let Some(click) = driver.active.as_mut() else {
+        return;
+    };
+    let point = click.point;
+    let pressed = matches!(click.phase, WidgetClickPhase::Down);
+    input.events.push(egui::Event::PointerMoved(point));
+    input.events.push(egui::Event::PointerButton {
+        pos: point,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    });
+    if pressed {
+        click.phase = WidgetClickPhase::Up;
+    } else {
+        driver.active = None;
+    }
+}
+
+fn widget_click_in_progress() -> bool {
+    widget_click_driver()
+        .lock()
+        .is_ok_and(|driver| driver.requested.is_some() || driver.active.is_some())
+}
+
+pub(crate) fn take_rating_sort_smoke_action(action: RatingSortSmokeAction) -> bool {
+    let Ok(mut guard) = runtime().lock() else {
+        return false;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return false;
+    };
+    if runtime.rating_sort_smoke_actions.front() == Some(&action) {
+        runtime.rating_sort_smoke_actions.pop_front();
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -1744,6 +1932,54 @@ fn wait_interruptibly(
 }
 
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
+    let rating_sort_bridge = bridge.clone();
+    engine.register_fn(
+        "rating_sort_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            let action = match name.as_str() {
+                "open_thumbnail_preferences" => RatingSortSmokeAction::OpenThumbnailPreferences,
+                "open_first_smart_folder" => RatingSortSmokeAction::OpenFirstSmartFolder,
+                _ => {
+                    return Err(rhai_error(format!(
+                        "unknown rating-sort smoke action: {name}"
+                    )));
+                }
+            };
+            rating_sort_bridge
+                .send(UiCommand::RatingSortSmoke(action))
+                .map_err(rhai_error)
+        },
+    );
+    let click_widget_bridge = bridge.clone();
+    engine.register_fn(
+        "click_widget",
+        move |label: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            let (reply, received) = mpsc::sync_channel(1);
+            click_widget_bridge
+                .send(UiCommand::ClickWidget {
+                    label: label.to_string(),
+                    reply,
+                })
+                .map_err(rhai_error)?;
+            let started = Instant::now();
+            loop {
+                click_widget_bridge.interrupt.check().map_err(rhai_error)?;
+                if started.elapsed() >= Duration::from_secs(30) {
+                    return Err(rhai_error(format!(
+                        "click_widget timed out waiting for visible widget: {label}"
+                    )));
+                }
+                match received.recv_timeout(WAIT_POLL_INTERVAL) {
+                    Ok(Ok(())) => return Ok(()),
+                    Ok(Err(message)) => return Err(rhai_error(message)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(rhai_error("widget click acknowledgement disconnected"));
+                    }
+                }
+            }
+        },
+    );
     let select_root_bridge = bridge.clone();
     engine.register_fn("select_root", move || -> Result<Map, Box<EvalAltResult>> {
         select_root_bridge.select_root().map_err(rhai_error)
@@ -2228,6 +2464,7 @@ struct UiRuntime {
     snapshot: Arc<RwLock<TestScriptSnapshot>>,
     interrupt: Arc<InterruptState>,
     pending_actions: VecDeque<PendingAction>,
+    rating_sort_smoke_actions: VecDeque<RatingSortSmokeAction>,
     last_frame: Option<u64>,
     finish: Option<FinishState>,
     cancel_requested: bool,
@@ -2252,6 +2489,7 @@ impl UiRuntime {
             snapshot,
             interrupt,
             pending_actions: VecDeque::new(),
+            rating_sort_smoke_actions: VecDeque::new(),
             last_frame: None,
             finish: None,
             cancel_requested: false,
@@ -3109,6 +3347,20 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                     }
                 }
             }
+            UiCommand::RatingSortSmoke(action) => {
+                if runtime.finish.is_none() {
+                    runtime.rating_sort_smoke_actions.push_back(action);
+                }
+            }
+            UiCommand::ClickWidget { label, reply } => {
+                if runtime.finish.is_some() {
+                    let _ = reply.send(Err("script is already finishing".to_string()));
+                } else if let Err(message) = request_widget_click(label, reply.clone()) {
+                    let _ = reply.send(Err(message));
+                } else {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            }
             UiCommand::ValidateSelectedOwner {
                 expected_identity,
                 reply,
@@ -3156,7 +3408,7 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
         } else {
             ctx.request_repaint_of(egui::ViewportId::ROOT);
         }
-    } else if !crate::key_input::synthetic_input_is_idle() {
+    } else if !crate::key_input::synthetic_input_is_idle() || widget_click_in_progress() {
         // A held key must keep advancing the deterministic repeat timeline even
         // while the application would otherwise sleep.
         ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -3515,6 +3767,61 @@ pub(crate) fn cli_script_path_from(args: &[std::ffi::OsString]) -> Result<Option
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn click_widget_reaches_an_egui_button_handler() {
+        let (reply, received) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_click("Test button".to_string(), reply).unwrap();
+        let ctx = egui::Context::default();
+        let render = |mut input: egui::RawInput| {
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            ));
+            ctx.begin_pass(input);
+            let mut clicked = false;
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                let response = ui.button("Test button");
+                super::register_clickable_widget("Test button", &response);
+                clicked = response.clicked();
+            });
+            let _ = ctx.end_pass();
+            clicked
+        };
+
+        assert!(!render(egui::RawInput {
+            time: Some(0.0),
+            focused: true,
+            ..Default::default()
+        }));
+        received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let mut down = egui::RawInput {
+            time: Some(0.01),
+            focused: true,
+            ..Default::default()
+        };
+        super::append_widget_click_events(&mut down);
+        assert!(!render(down));
+        let mut up = egui::RawInput {
+            time: Some(0.02),
+            focused: true,
+            ..Default::default()
+        };
+        super::append_widget_click_events(&mut up);
+        assert!(render(up));
+    }
+
+    #[test]
+    fn rating_sort_smoke_script_parses_without_launching_the_app() {
+        let script = include_str!("../scripts/ui-smoke/rating-sort.rhai");
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine.compile(script).unwrap();
+    }
+
     use super::InterruptState;
     use std::sync::Arc;
     use std::time::{Duration, Instant};

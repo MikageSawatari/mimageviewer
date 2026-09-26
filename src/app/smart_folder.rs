@@ -567,6 +567,14 @@ impl SmartFolderSession {
         self.definition_id
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_phase(&self) -> &'static str {
+        match self.phase.visible() {
+            SmartFolderOpenPhase::Root => "Root",
+            SmartFolderOpenPhase::Child { .. } => "Child",
+        }
+    }
+
     /// The resident root has one snapshot owner: either the installed session or the parked
     /// offscreen prepare result. Its scan entries remain stable across deletes; tombstones carry
     /// removals until the next prepare, as they do for an installed root.
@@ -4981,7 +4989,6 @@ fn build_smart_entry_sort_keys_for_request(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SmartFolderPresentation {
-    sort: crate::settings::SortOrder,
     order_request: crate::rating_sort::ListingOrderRequest,
     display: crate::settings::GridDisplayOrder,
     grouping: crate::settings::SubfolderExpansionOrder,
@@ -4990,7 +4997,6 @@ struct SmartFolderPresentation {
 impl SmartFolderPresentation {
     fn current(app: &App, grouping: crate::settings::SubfolderExpansionOrder) -> Self {
         Self {
-            sort: app.settings.sort_order,
             order_request: crate::rating_sort::ListingOrderRequest::from_settings(&app.settings),
             display: app.settings.grid_display_order.normalized(),
             grouping,
@@ -5005,7 +5011,6 @@ impl SmartFolderPresentation {
         grouping: crate::settings::SubfolderExpansionOrder,
     ) -> Self {
         let from_state = |state: &crate::settings::FavoriteViewState| Self {
-            sort: state.sort_order,
             order_request: crate::rating_sort::ListingOrderRequest::from_sort(
                 state.sort_order,
                 app.settings.rating_sort_unrated_position,
@@ -5550,7 +5555,6 @@ fn prepare_smart_folder(
     cancel: &AtomicBool,
     tx: &mpsc::Sender<SmartFolderPrepareEvent>,
 ) -> Result<Option<PreparedSmartFolder>, String> {
-    let sort = request.standard_fallback();
     let reuse_metadata = reused_metadata.is_some();
     let reuse_resort_metadata_unchanged = reuse_metadata && removed_paths.is_empty();
     let total = snapshot.entries.len();
@@ -6021,7 +6025,6 @@ fn prepare_smart_folder(
         }
     };
     let presentation = SmartFolderPresentation {
-        sort,
         order_request: request,
         display: display_order.normalized(),
         grouping: snapshot.definition.grouping,

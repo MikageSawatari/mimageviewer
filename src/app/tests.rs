@@ -7,6 +7,19 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[cfg(all(windows, feature = "test-script"))]
+#[test]
+fn test_script_counts_the_actual_refresh_folder_request() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("rating-sort-refresh-request");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("page.jpg"), b"page").unwrap();
+    app.load_folder(folder);
+    let before = app.test_script_folder_load_requests;
+    app.reload_current_folder_preserving_override();
+    assert_eq!(app.test_script_folder_load_requests, before + 1);
+}
+
 #[test]
 fn rar_nav_main_ignore_setting_can_leave_open_rar_but_cannot_land_on_another() {
     let mut app = setup_app_for_test();
@@ -74814,14 +74827,44 @@ mod smart_folder_transition_tests {
         let ctx = egui::Context::default();
         app.open_smart_folder(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            assert_eq!(
+                app.top_level_grid_view
+                    .smart_folder_session()
+                    .map(|session| session.test_script_phase()),
+                Some("Root")
+            );
+            assert!(app.test_script_smart_folder_root_visible());
+        }
 
         select_real_path(&mut app, &entry);
         app.scroll_offset_y = 234.0;
         app.scroll_to_selected = false;
         app.open_staged_smart_folder_and_wait(&ctx, &entry);
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            assert_eq!(
+                app.top_level_grid_view
+                    .smart_folder_session()
+                    .map(|session| session.test_script_phase()),
+                Some("Child")
+            );
+            assert!(!app.test_script_smart_folder_root_visible());
+        }
 
         let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
         assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            assert_eq!(
+                app.top_level_grid_view
+                    .smart_folder_session()
+                    .map(|session| session.test_script_phase()),
+                Some("Root")
+            );
+            assert!(app.test_script_smart_folder_root_visible());
+        }
         assert!(
             selected_real_path(&app)
                 .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entry))
@@ -77040,6 +77083,151 @@ mod smart_folder_transition_tests {
             GridItem::Image(path)
                 if path.file_name().and_then(|name| name.to_str()) == Some("a.jpg")
         ));
+    }
+
+    #[test]
+    fn rating_smart_prepare_worker_polls_once_and_settles() {
+        use crate::app::smart_folder::{
+            SmartFolderDiag, SmartFolderEntry, SmartFolderEntryKind, SmartFolderSnapshot,
+        };
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-rating-poll");
+        std::fs::create_dir_all(&source).unwrap();
+        app.settings.sort_order = SortOrder::RatingDesc;
+        let definition = definition("Smart rating poll", source.clone());
+        let id = definition.id;
+        let source_id = definition.rules[0].id;
+        app.settings.smart_folders = vec![definition.clone()];
+        let entries = ["a.jpg", "b.jpg"]
+            .into_iter()
+            .map(|name| {
+                let path = source.join(name);
+                std::fs::write(&path, b"image").unwrap();
+                SmartFolderEntry {
+                    source_id,
+                    source_root: source.clone(),
+                    source_order: 0,
+                    relative_parent: PathBuf::new(),
+                    path,
+                    kind: SmartFolderEntryKind::Image,
+                    mtime: 1,
+                    file_size: Some(5),
+                    matching_rule_indices: vec![0],
+                }
+            })
+            .collect::<Vec<_>>();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(
+                &crate::adjustment_db::normalize_path(&source.join("b.jpg")),
+                5,
+                None,
+            )
+            .unwrap();
+        let snapshot = SmartFolderSnapshot {
+            definition,
+            entries: std::sync::Arc::new(entries),
+            video_thumb_overrides: std::collections::HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let ctx = egui::Context::default();
+        app.smart_folder_generation = app.smart_folder_generation.wrapping_add(1);
+        let before = app.items_generation;
+        app.start_smart_folder_prepare(snapshot, false);
+        let mut installs = 0;
+        let mut observed_generation = before;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            app.poll_smart_folder(&ctx);
+            if app.items_generation != observed_generation {
+                installs += 1;
+                observed_generation = app.items_generation;
+            }
+            if app.items_are_smart_folder_view
+                && app.current_smart_folder_id == Some(id)
+                && app.smart_folder_prepare_pending.is_none()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(installs, 1, "one worker result must install exactly once");
+        assert!(
+            app.smart_folder_prepare_pending.is_none(),
+            "prepare re-dispatched"
+        );
+        assert_eq!(app.current_smart_folder_id, Some(id));
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"],
+        );
+    }
+
+    #[test]
+    fn smart_prepare_setting_change_reprepares_under_new_rating_request_once() {
+        use crate::app::smart_folder::{
+            SmartFolderDiag, SmartFolderEntry, SmartFolderEntryKind, SmartFolderSnapshot,
+        };
+
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-setting-change");
+        std::fs::create_dir_all(&source).unwrap();
+        let definition = definition("Smart setting change", source.clone());
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition.clone()];
+        let entries = ["a.jpg", "b.jpg"]
+            .into_iter()
+            .map(|name| {
+                let path = source.join(name);
+                std::fs::write(&path, b"image").unwrap();
+                SmartFolderEntry {
+                    source_id: definition.rules[0].id,
+                    source_root: source.clone(),
+                    source_order: 0,
+                    relative_parent: PathBuf::new(),
+                    path,
+                    kind: SmartFolderEntryKind::Image,
+                    mtime: 1,
+                    file_size: Some(5),
+                    matching_rule_indices: vec![0],
+                }
+            })
+            .collect();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(
+                &crate::adjustment_db::normalize_path(&source.join("b.jpg")),
+                5,
+                None,
+            )
+            .unwrap();
+        let snapshot = SmartFolderSnapshot {
+            definition,
+            entries: std::sync::Arc::new(entries),
+            video_thumb_overrides: std::collections::HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let ctx = egui::Context::default();
+        app.smart_folder_generation = app.smart_folder_generation.wrapping_add(1);
+        app.start_smart_folder_prepare(snapshot, false);
+        app.settings.sort_order = SortOrder::RatingDesc;
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(app.smart_folder_prepare_pending.is_none());
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"],
+        );
     }
 
     #[test]

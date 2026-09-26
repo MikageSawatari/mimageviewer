@@ -1631,6 +1631,34 @@ fn sort_combo_popup_style() -> egui::style::StyleModifier {
     })
 }
 
+/// Height of the sort popup's scroll viewport, in egui points. The menu has
+/// one selectable row per visible sort and two more rows plus a separator for
+/// each context-specific group. Only a short screen should need scrolling.
+fn sort_combo_popup_height(
+    ui: &egui::Ui,
+    standard_rows: usize,
+    collection_rows: bool,
+    rating_rows: bool,
+    bookmark_rows: bool,
+) -> f32 {
+    let groups =
+        usize::from(collection_rows) + usize::from(rating_rows) + usize::from(bookmark_rows);
+    let rows = standard_rows + 2 * groups;
+    let spacing = ui.spacing();
+    let row_height = spacing.interact_size.y;
+    let desired = rows as f32 * row_height
+        + (rows + groups).saturating_sub(1) as f32 * spacing.item_spacing.y
+        + groups as f32 * 6.0 // egui::Separator's default height
+        + 8.0; // scroll viewport rounding and font metrics
+
+    let screen = ui.ctx().content_rect();
+    let anchor_top = ui.cursor().top();
+    let below = screen.bottom() - anchor_top - row_height;
+    let above = anchor_top - screen.top();
+    let viewport_room = below.max(above) - 16.0; // popup frame and screen edge
+    desired.min(viewport_room.max(row_height))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CollectionToolbarIntent {
     SelectTarget(crate::collection_store::CollectionId),
@@ -8916,7 +8944,7 @@ impl App {
 
             const TOOLBAR_COLS_COMBO_HEIGHT: f32 = 320.0;
             const TOOLBAR_ASPECT_COMBO_HEIGHT: f32 = 280.0;
-            const TOOLBAR_SORT_COMBO_HEIGHT: f32 = 240.0;
+            const TOOLBAR_SUBFOLDER_COMBO_HEIGHT: f32 = 240.0;
 
             // 空き領域 右クリック用の背景 interact。セクション (= ui.scope の中身) より
             // **前** に登録することで z-order が背面になり、ボタンの直接クリックは奪わず、
@@ -9510,6 +9538,18 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                             }
                         }
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
+                            let sort_popup_height = sort_combo_popup_height(
+                                ui,
+                                tb_sorts
+                                    .iter()
+                                    .filter(|&&order| {
+                                        sort_order_visible_on_surface(order, root_order.is_some())
+                                    })
+                                    .count(),
+                                root_order.is_some(),
+                                self.items_are_rating_view,
+                                self.items_are_bookmark_view,
+                            );
                             let current_text = if let Some(reason) = sort_lock {
                                 reason.short_label().to_string()
                             } else if let Some(root) = root_order {
@@ -9535,7 +9575,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 |ui, text| {
                                 egui::ComboBox::from_id_salt("toolbar_sort_combo")
                                     .width(100.0)
-                                    .height(TOOLBAR_SORT_COMBO_HEIGHT)
+                                    .height(sort_popup_height)
                                     .popup_style(sort_combo_popup_style())
                                     .selected_text(text)
                                     .show_ui(ui, |ui| {
@@ -9665,7 +9705,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                         let combo = toolbar_combo_slot(ui, true, 132.0, current_mode.label().to_string(), |ui, text| {
 egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             .width(132.0)
-                            .height(TOOLBAR_SORT_COMBO_HEIGHT)
+                            .height(TOOLBAR_SUBFOLDER_COMBO_HEIGHT)
                             .selected_text(text)
                             .show_ui(ui, |ui| {
                                 apply_toolbar_style(ui);
@@ -9695,6 +9735,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         let refresh = ui.button("⟳").on_hover_text("最新の情報に更新");
                         refresh.widget_info(|| egui::WidgetInfo::labeled(
                             egui::WidgetType::Button, true, "最新の情報に更新"));
+                        #[cfg(all(windows, feature = "test-script"))]
+                        crate::test_script::register_clickable_widget("最新の情報に更新", &refresh);
                         if refresh.clicked() {
                             toolbar_sort_reload_requested = true;
                         }
@@ -24662,9 +24704,96 @@ mod decide_drag_payload_tests {
 #[cfg(test)]
 mod toolbar_wrap_tests {
     use super::{
-        sort_combo_popup_style, toolbar_combo_slot, toolbar_combo_width, toolbar_text_width,
+        sort_combo_popup_height, sort_combo_popup_style, toolbar_combo_slot, toolbar_combo_width,
+        toolbar_text_width,
     };
     use eframe::egui;
+
+    #[test]
+    fn sort_popup_shows_all_ten_rows_or_fits_a_short_screen() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        for (screen_size, all_rows_expected) in [
+            (egui::vec2(600.0, 480.0), true),
+            (egui::vec2(360.0, 150.0), false),
+        ] {
+            let combo_id = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let observed_id = combo_id.clone();
+            let row_geometry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed_rows = row_geometry.clone();
+            let mut harness = Harness::builder().with_size(screen_size).build(move |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.spacing_mut().interact_size.y = 22.0;
+                    ui.spacing_mut().button_padding.y = 1.0;
+                    let orders = crate::settings::SortOrder::all();
+                    let height = sort_combo_popup_height(ui, orders.len(), false, false, false);
+                    let combo = egui::ComboBox::from_id_salt("ten-sort-rows")
+                        .width(100.0)
+                        .height(height)
+                        .popup_style(sort_combo_popup_style())
+                        .selected_text("ソート")
+                        .show_ui(ui, |ui| {
+                            ui.spacing_mut().interact_size.y = 22.0;
+                            observed_rows.lock().unwrap().clear();
+                            for &order in orders {
+                                let row = ui.selectable_label(false, order.short_label());
+                                observed_rows
+                                    .lock()
+                                    .unwrap()
+                                    .push((row.rect, ui.clip_rect()));
+                            }
+                        });
+                    *observed_id.lock().unwrap() = Some(combo.response.id);
+                });
+            });
+            harness.run();
+            let popup_id = combo_id.lock().unwrap().expect("sort combo").with("popup");
+            egui::Popup::open_id(&harness.ctx, popup_id);
+            harness.run();
+            harness.run();
+            let popup_rect = harness
+                .ctx
+                .memory(|memory| memory.area_rect(popup_id))
+                .expect("sort popup rect");
+            assert!(
+                popup_rect.top() >= -1.0,
+                "popup above screen: {popup_rect:?}"
+            );
+            assert!(
+                popup_rect.bottom() <= screen_size.y + 1.0,
+                "popup below screen: {popup_rect:?} / {screen_size:?}"
+            );
+            if all_rows_expected {
+                let geometry = row_geometry.lock().unwrap();
+                assert_eq!(geometry.len(), 10);
+                assert!(
+                    geometry
+                        .iter()
+                        .all(|(row, clip)| row.bottom() <= clip.bottom() + 1.0),
+                    "a standard sort row is outside the scroll viewport: {geometry:?}"
+                );
+                let mut last_bottom = 0.0;
+                for &order in crate::settings::SortOrder::all() {
+                    let row = harness.get_by_label(order.short_label()).rect();
+                    assert!(row.top() >= last_bottom, "rows overlap: {row:?}");
+                    assert!(
+                        row.bottom() <= popup_rect.bottom(),
+                        "{} is clipped by popup: {row:?} / {popup_rect:?}",
+                        order.short_label()
+                    );
+                    last_bottom = row.bottom();
+                }
+            } else {
+                let geometry = row_geometry.lock().unwrap();
+                assert!(
+                    geometry
+                        .last()
+                        .is_some_and(|(row, clip)| row.bottom() > clip.bottom()),
+                    "short screen should use the popup's scroll viewport"
+                );
+            }
+        }
+    }
 
     const SELECTED_TEXTS: &[&str] = &[
         "名前",

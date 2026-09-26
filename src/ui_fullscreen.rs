@@ -27908,12 +27908,59 @@ impl App {
             is_fullscreen: fs_idx.is_some(),
             fs_idx: fs_idx.map_or(-1, |idx| idx as i64),
             items_generation: self.items_generation as i64,
+            folder_load_requests: i64::try_from(self.test_script_folder_load_requests)
+                .unwrap_or(i64::MAX),
             focused,
             target_viewport,
             target_registered: target.is_some(),
             // A child callback publishes true after it is actually reached.
             target_rendered: target.is_some_and(|target| target.viewport == egui::ViewportId::ROOT),
             items_len: i64::try_from(self.items.len()).unwrap_or(i64::MAX),
+            item_names: self
+                .items
+                .iter()
+                .take(crate::test_script::MAX_ITEM_ROWS_IN_SNAPSHOT)
+                .map(|item| item.name().into_owned())
+                .collect(),
+            item_ratings: (0..self
+                .items
+                .len()
+                .min(crate::test_script::MAX_ITEM_ROWS_IN_SNAPSHOT))
+                .map(|index| i64::from(self.rating_cache.get(&index).copied().unwrap_or(0)))
+                .collect(),
+            sort_order: format!("{:?}", self.settings.sort_order),
+            rating_sort_unrated_position: format!(
+                "{:?}",
+                self.settings.rating_sort_unrated_position
+            ),
+            preferences_open: self.show_preferences,
+            preferences_page: self
+                .pref_state
+                .as_ref()
+                .map(|state| format!("{:?}", state.selected))
+                .unwrap_or_default(),
+            preferences_draft_unrated_position: self
+                .pref_state
+                .as_ref()
+                .map(|state| format!("{:?}", state.settings.rating_sort_unrated_position))
+                .unwrap_or_default(),
+            smart_folder_busy: self.smart_folder_busy(),
+            smart_folder_root_visible: self.test_script_smart_folder_root_visible(),
+            smart_folder_session_phase: self
+                .top_level_grid_view
+                .smart_folder_session()
+                .map(|session| session.test_script_phase().to_owned())
+                .unwrap_or_default(),
+            smart_folder_name: self
+                .current_smart_folder_id
+                .and_then(|id| {
+                    self.settings
+                        .smart_folders
+                        .iter()
+                        .find(|folder| folder.id == id)
+                })
+                .map(|folder| folder.name.clone())
+                .unwrap_or_default(),
             pending_thumbs: i64::try_from(pending_thumbs).unwrap_or(i64::MAX),
             spread_mode: format!("{:?}", self.spread_mode),
             continuous_reading,

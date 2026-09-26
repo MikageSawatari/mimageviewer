@@ -925,6 +925,19 @@ impl DetachedImageWindowSnapshot {
 
 #[cfg(windows)]
 impl App {
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_smart_folder_root_visible(&self) -> bool {
+        self.items_are_smart_folder_view
+            && matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::SmartFolder(_)
+            )
+            && self
+                .top_level_grid_view
+                .smart_folder_session()
+                .is_some_and(|session| session.test_script_phase() == "Root")
+    }
+
     const EGUI_VIEWPORT_CLASS: &'static str = "Window Class";
     const DETACHED_PHYSICAL_ACTIVATION_MAX_DRAG_PX: i32 = 8;
 
@@ -12895,6 +12908,10 @@ pub struct App {
     /// 旧フォルダ用ワーカーが新 items の同じ idx に違う画像を書き込む race を防ぐ。
     pub(crate) items_generation: u64,
 
+    /// Counts top-level load requests before cancellation or install can hide a duplicate.
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) test_script_folder_load_requests: u64,
+
     /// 最上位一覧 surface の所有者、復元先、遷移世代の正本。
     /// 既存の `items_are_*` / search active flag は描画互換の派生状態として段階移行中。
     pub(crate) top_level_grid_view: top_level_grid_view::TopLevelGridView,
@@ -16670,6 +16687,8 @@ impl App {
             fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
             colorize_mono_summary_cache: std::collections::HashMap::new(),
             items_generation: 0,
+            #[cfg(all(windows, feature = "test-script"))]
+            test_script_folder_load_requests: 0,
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             items_are_global_search_view: false,
             empty_items_reason: None,
@@ -21944,6 +21963,11 @@ impl App {
             self.reject_snapshot_out_of_scope_open();
             return FolderOpenOutcome::Ignored;
         }
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            self.test_script_folder_load_requests =
+                self.test_script_folder_load_requests.saturating_add(1);
+        }
         if matches!(owner, OpenRequestOwner::Navigation)
             && !self.navigation_scope.is_detached_physical()
             && let Some(kind) = self.smart_physical_target_kind(&path)
@@ -22062,6 +22086,11 @@ impl App {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
             return false;
+        }
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            self.test_script_folder_load_requests =
+                self.test_script_folder_load_requests.saturating_add(1);
         }
         if matches!(owner, OpenRequestOwner::Navigation)
             && !self.navigation_scope.is_detached_physical()
@@ -76312,6 +76341,20 @@ impl App {
             let snapshot = self.test_script_snapshot(ctx);
             if crate::test_script::ui_update(ctx, snapshot) {
                 ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            }
+            if crate::test_script::take_rating_sort_smoke_action(
+                crate::test_script::RatingSortSmokeAction::OpenThumbnailPreferences,
+            ) {
+                self.open_preferences_page(
+                    crate::ui_dialogs::preferences::PreferencesPage::Thumbnail,
+                );
+            }
+            if crate::test_script::take_rating_sort_smoke_action(
+                crate::test_script::RatingSortSmokeAction::OpenFirstSmartFolder,
+            ) {
+                if let Some(id) = self.settings.smart_folders.first().map(|folder| folder.id) {
+                    self.open_smart_folder_staged(id, false);
+                }
             }
         }
         self.edit_preview_repaint_ctx = Some(ctx.clone());
