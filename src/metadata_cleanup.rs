@@ -237,6 +237,13 @@ fn retry_delete_purge_journal_at(data_dir: &Path) -> DeletePurgeRetryReport {
         attempted: snapshot.len(),
         ..Default::default()
     };
+    // The released journal has no Exact/Tree field. Treat every restored root
+    // as Tree, and acquire before the orphan filesystem check or any purge.
+    let retry_scopes = snapshot
+        .iter()
+        .map(|entry| crate::delete_worker::DeleteSourceScope::Tree(entry.path.clone()))
+        .collect::<Vec<_>>();
+    let range_guard = crate::rename_key_migration::acquire_delete_epub_guard(&retry_scopes);
     let mut completed = Vec::new();
     for entry in &snapshot {
         if classify_path(&entry.path) != PathClassification::Orphan {
@@ -246,10 +253,11 @@ fn retry_delete_purge_journal_at(data_dir: &Path) -> DeletePurgeRetryReport {
             ));
             continue;
         }
-        let purge = crate::rename_key_migration::purge_removed_paths_at(
+        let purge = crate::rename_key_migration::purge_removed_paths_guarded_at(
             data_dir,
             std::slice::from_ref(&entry.path),
             &entry.pdf_paths,
+            &range_guard,
         );
         report.rows += purge.rows;
         report.store_mutations.merge(purge.store_mutations);

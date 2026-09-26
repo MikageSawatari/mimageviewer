@@ -824,3 +824,13 @@ master に既存の不具合 (両経路とも `load_folder_with_scan_claimed` �
 ドライブ一覧の子ピンが解決不能になった際の自動代表も、通常の子フォルダ読取と同じ `folder_cached_row_usable` を通してから送信する。EPUB 世代だけでなく選定元ファイル、pin revision、依存 catalog の選定証明を検証する。`drive_list_missing_child_image_pin_uses_cached_auto_representative` は実際のフォルダ代表 writer が選定証明付きで保存した行を drive-list worker から読む。有効時は表示し、選定元画像の削除後はアイコンへ戻す。
 
 負例は対象分岐だけを一時的に変更し、各テストが compile ではなく assertion で失敗した後に元の bytes を復元した。`Exact` を非 EPUB 拡張子ではガードから除く `90dfc7f7b` の規則に戻すと `cover.png/book.epub` の後続台帳行が purge に消される。自動代表の共通証明検証を外すと削除済み画像の WebP が表示される。範囲を全件直列に戻すと非重複の同時進行テストが、重なり判定を無効化すると重複範囲の待機テストが失敗する。SQL の子孫 prefix を狭めると Exact の `/`・`::` 削除テストが失敗する。
+
+#### S2c-2 独立レビュー fix round 6
+
+`dd589a59d` では範囲ガードの取得が purge 内であり、Shell 成功から purge 開始までに新しい EPUB の台帳行を書けた。削除 worker は要求時に型付きで保存した `Exact / Tree` の全範囲について、最初の Shell 処理より前に RAII 範囲ガードを 1 回取得する。キャンセル、Shell の一部失敗、複数チャンク、purge の再試行を含め、成功した範囲の最後の purge と失敗 journal 記録まで保持する。purge は渡された同じガードを使用し、内側で再取得しない。SQL の exact・`/`・`::` 範囲と round 5 の重なり判定は維持する (`delete_worker.rs`、`rename_key_migration.rs`、`pdf_loader.rs`)。
+
+保持中に待つのは、同じ範囲内の EPUB 本の pin と台帳 backfill 書込、および重なる別の範囲操作である。pin と backfill は worker 上で走り、UI スレッドはガードを取得せず結果を非同期に受ける。Shell の確認・進捗 UI が開いても UI スレッドはこのガードを待たず、範囲ガードの mutex は登録・解除時だけ保持するため、確認操作との待ち合わせ循環はない。retry journal は公開済み形式を変えず、読み出した全 path を scope 不明の `Tree` として、孤立判定と purge より前に同じ RAII ガードを取得する。journal lock はガード取得前に解放し、更新時だけ取り直す。
+
+`shell_delete_keeps_epub_backfill_out_until_purge_finishes` は実 delete worker の fake Shell で `cover.png` を消した直後に停止し、同名ディレクトリ内に `book.epub` を作り、実 `run_backfill_at` から書込を開始する。Shell の停止中は書込が完了せず、worker が実 purge を終えた後に新しい台帳行が残ることを検査する。ガード取得を `dd589a59d` と同じ Shell 後・purge 前へ一時的に戻すと assertion で失敗し、元の bytes に復元した。
+
+EPUB 以外の台帳・編集行には今回の per-book ガードがない。例えば `cover.png/x.jpg` の編集行について Shell と purge の間に行が作られる窓は master にもある既存の制約であり、この段階では変更しない。

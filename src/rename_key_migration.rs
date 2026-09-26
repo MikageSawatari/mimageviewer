@@ -1457,6 +1457,7 @@ pub(crate) struct PurgeReport {
 /// [`STORES`] を走査し、exact + `<key>/` + `<key>::` を素の `DELETE` にする。
 /// `pdf_paths` は SHA-256 キーの逆引きができない PDF password 用に、worker が削除前に
 /// 列挙した実 path 群。
+#[cfg(test)]
 pub(crate) fn purge_removed_paths_at(
     data_dir: &Path,
     removed: &[PathBuf],
@@ -1470,13 +1471,60 @@ pub(crate) fn purge_removed_paths_at(
     purge_removed_scopes_at(data_dir, &scopes, pdf_paths)
 }
 
-/// The delete request retains whether each path was a file or a tree before
-/// Shell moves it. A file key needs EPUB pin coverage only if it is EPUB;
-/// a tree covers possible EPUB descendants even after the directory is gone.
+/// The retry journal has no source shape; its paths conservatively cover trees.
+pub(crate) fn purge_removed_paths_guarded_at(
+    data_dir: &Path,
+    removed: &[PathBuf],
+    pdf_paths: &[PathBuf],
+    guard: &crate::pdf_loader::EpubRangeLease,
+) -> PurgeReport {
+    let scopes = removed
+        .iter()
+        .cloned()
+        .map(crate::delete_worker::DeleteSourceScope::Tree)
+        .collect::<Vec<_>>();
+    purge_removed_scopes_guarded_at(data_dir, &scopes, pdf_paths, guard)
+}
+
+/// Acquire once before Shell, then pass this guard through every purge attempt.
+pub(crate) fn acquire_delete_epub_guard(
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+) -> crate::pdf_loader::EpubRangeLease {
+    let paths = scopes
+        .iter()
+        .map(|scope| match scope {
+            crate::delete_worker::DeleteSourceScope::Exact(path)
+            | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
+        })
+        .collect::<Vec<_>>();
+    crate::pdf_loader::acquire_epub_pin_coverage(&paths)
+}
+
+/// The SQL uses exact, slash-descendant and virtual-descendant keys for both
+/// source shapes, even if a deleted file or folder no longer exists on disk.
+#[cfg(test)]
 pub(crate) fn purge_removed_scopes_at(
     data_dir: &Path,
     scopes: &[crate::delete_worker::DeleteSourceScope],
     pdf_paths: &[PathBuf],
+) -> PurgeReport {
+    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, None)
+}
+
+pub(crate) fn purge_removed_scopes_guarded_at(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+    guard: &crate::pdf_loader::EpubRangeLease,
+) -> PurgeReport {
+    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, Some(guard))
+}
+
+fn purge_removed_scopes_impl(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
 ) -> PurgeReport {
     let mut report = PurgeReport::default();
     if scopes.is_empty() {
@@ -1490,6 +1538,10 @@ pub(crate) fn purge_removed_scopes_at(
             | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
         })
         .collect::<Vec<_>>();
+    assert!(
+        guard.is_none_or(|guard| guard.covers_paths_and_descendants(&removed)),
+        "delete purge must keep the Shell range guard"
+    );
 
     let keep_drive_keys = normalized_removed_keys(&removed, StoreKeyNormalization::KeepDrive);
     let drive_stripped_keys =
@@ -1509,7 +1561,7 @@ pub(crate) fn purge_removed_scopes_at(
             StoreKeyNormalization::KeepDrive => &keep_drive_coverage,
             StoreKeyNormalization::DriveStripped => &drive_stripped_coverage,
         };
-        purge_store(data_dir, descriptor, keys, coverage, &mut report);
+        purge_store(data_dir, descriptor, keys, coverage, guard, &mut report);
     }
     drop(rating_write);
     drop(tag_write);
@@ -1631,9 +1683,18 @@ fn purge_store(
     descriptor: &StoreDescriptor,
     removed_keys: &[String],
     coverage: &[(PathBuf, IdentityCoverageShape)],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
     report: &mut PurgeReport,
 ) {
-    purge_store_with_before_sql(data_dir, descriptor, removed_keys, coverage, report, || {});
+    purge_store_with_before_sql(
+        data_dir,
+        descriptor,
+        removed_keys,
+        coverage,
+        guard,
+        report,
+        || {},
+    );
 }
 
 fn purge_store_with_before_sql(
@@ -1641,6 +1702,7 @@ fn purge_store_with_before_sql(
     descriptor: &StoreDescriptor,
     removed_keys: &[String],
     coverage: &[(PathBuf, IdentityCoverageShape)],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
     report: &mut PurgeReport,
     before_sql: impl FnOnce(),
 ) {
@@ -1649,7 +1711,7 @@ fn purge_store_with_before_sql(
         return;
     }
     report.db_open_count += 1;
-    let result = with_identity_epub_coverage(descriptor, coverage, || {
+    let action = || {
         before_sql();
         (|| -> Result<usize, rusqlite::Error> {
             let mut conn = rusqlite::Connection::open(&db_path)?;
@@ -1710,7 +1772,12 @@ fn purge_store_with_before_sql(
             tx.commit()?;
             Ok(changed)
         })()
-    });
+    };
+    let result = if guard.is_some() {
+        action()
+    } else {
+        with_identity_epub_coverage(descriptor, coverage, action)
+    };
     match result {
         Ok(rows) => {
             report.rows += rows;
@@ -1744,6 +1811,7 @@ pub(crate) fn purge_exact_identity_with_before_sql_for_test(
         descriptor,
         &keys,
         &coverage,
+        None,
         &mut report,
         before_sql,
     );
@@ -2781,7 +2849,14 @@ mod tests {
             table_availability: StoreTableAvailability::Required,
         };
         let mut report = PurgeReport::default();
-        purge_store(dir.path(), &descriptor, &removed_keys, &[], &mut report);
+        purge_store(
+            dir.path(),
+            &descriptor,
+            &removed_keys,
+            &[],
+            None,
+            &mut report,
+        );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, legacy_changed);
         assert_eq!(
@@ -2846,7 +2921,14 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let mut report = PurgeReport::default();
-        purge_store(dir.path(), &descriptor, &removed_keys, &[], &mut report);
+        purge_store(
+            dir.path(),
+            &descriptor,
+            &removed_keys,
+            &[],
+            None,
+            &mut report,
+        );
         let elapsed = started.elapsed();
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);

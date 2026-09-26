@@ -2034,6 +2034,33 @@ fn write_if_provenance_valid(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn backfill_epub_after_delete_for_test(
+    path: &Path,
+    db_path: &Path,
+) -> Result<(), String> {
+    let source = ContentIdentitySource::from_path(path)
+        .ok_or_else(|| "EPUB source unavailable".to_string())?;
+    let cancel = AtomicBool::new(false);
+    let io = crate::io_semaphore::GlobalIoSemaphore::new(1);
+    let result = run_backfill_at(db_path, vec![source], &cancel, &io, None)?
+        .ok_or_else(|| "backfill was canceled".to_string())?;
+    if result.errors != 0 || result.ledger_updates.len() != 1 {
+        return Err(format!(
+            "backfill wrote {} rows with {} errors",
+            result.ledger_updates.len(),
+            result.errors
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn initialize_identity_db_for_delete_test(db_path: &Path) -> Result<(), String> {
+    drop(ContentIdentityDb::open_at(db_path)?);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_observation_with_hasher_guarded(
     db: &ContentIdentityDb,

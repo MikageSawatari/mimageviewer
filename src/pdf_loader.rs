@@ -297,15 +297,44 @@ fn enter_epub_book(key: &str) -> EpubBookLease {
     EpubBookLease(key.to_owned())
 }
 
-struct EpubRangeLease(u64);
+/// Owned by the background operation from its first filesystem mutation through
+/// its last ledger mutation. It can be borrowed by the purge without reacquiring.
+pub(crate) struct EpubRangeLease {
+    id: Option<u64>,
+    range: Vec<EpubKeyMatch>,
+}
+
+impl EpubRangeLease {
+    pub(crate) fn covers_paths_and_descendants(&self, paths: &[PathBuf]) -> bool {
+        let mut requested = Vec::new();
+        for path in paths {
+            EpubPinCoverage::PathAndDescendants(path.clone()).append_matches(&mut requested);
+        }
+        requested.iter().all(|item| {
+            self.range.iter().any(|held| match (held, item) {
+                (EpubKeyMatch::Exact(a), EpubKeyMatch::Exact(b)) => a == b,
+                (EpubKeyMatch::Prefix(prefix), EpubKeyMatch::Exact(key)) => key.starts_with(prefix),
+                (EpubKeyMatch::Prefix(held), EpubKeyMatch::Prefix(requested)) => {
+                    requested.starts_with(held)
+                }
+                (EpubKeyMatch::Exact(_), EpubKeyMatch::Prefix(_)) => false,
+            })
+        })
+    }
+}
 
 impl Drop for EpubRangeLease {
     fn drop(&mut self) {
+        let Some(id) = self.id else {
+            return;
+        };
         let (mutex, changed) = epub_pin_coord();
         let mut state = mutex
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.active_ranges.retain(|(id, _)| *id != self.0);
+        state
+            .active_ranges
+            .retain(|(active_id, _)| *active_id != id);
         changed.notify_all();
     }
 }
@@ -314,24 +343,34 @@ impl Drop for EpubRangeLease {
 /// entries below these paths. Only overlapping leases and books wait. Never
 /// invoke this while holding an individual book guard.
 pub(crate) fn with_epub_pin_coverage<T>(paths: &[PathBuf], action: impl FnOnce() -> T) -> T {
+    let _lease = acquire_epub_pin_coverage(paths);
+    action()
+}
+
+pub(crate) fn acquire_epub_pin_coverage(paths: &[PathBuf]) -> EpubRangeLease {
     let coverage = paths
         .iter()
         .cloned()
         .map(EpubPinCoverage::PathAndDescendants)
         .collect::<Vec<_>>();
-    with_epub_pin_ranges(&coverage, action)
+    acquire_epub_pin_ranges(&coverage)
 }
 
 pub(crate) fn with_epub_pin_ranges<T>(
     coverage: &[EpubPinCoverage],
     action: impl FnOnce() -> T,
 ) -> T {
+    let _lease = acquire_epub_pin_ranges(coverage);
+    action()
+}
+
+fn acquire_epub_pin_ranges(coverage: &[EpubPinCoverage]) -> EpubRangeLease {
     let mut range = Vec::new();
     for item in coverage {
         item.append_matches(&mut range);
     }
     if range.is_empty() {
-        return action();
+        return EpubRangeLease { id: None, range };
     }
     let (mutex, changed) = epub_pin_coord();
     let mut state = mutex
@@ -355,10 +394,12 @@ pub(crate) fn with_epub_pin_ranges<T>(
         .checked_add(1)
         .expect("range ID exhausted");
     let id = state.next_range_id;
-    state.active_ranges.push((id, range));
+    state.active_ranges.push((id, range.clone()));
     drop(state);
-    let _lease = EpubRangeLease(id);
-    action()
+    EpubRangeLease {
+        id: Some(id),
+        range,
+    }
 }
 
 /// Install the startup gate once and retain its liveness lock for the process.
