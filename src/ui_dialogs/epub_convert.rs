@@ -105,6 +105,32 @@ impl EpubConvertState {
             rx,
         }
     }
+
+    pub(crate) fn saved_for_test(
+        src_path: PathBuf,
+        owner: OpenRequestOwner,
+        saved: epub_convert::SavedPdf,
+        surface_generation: u64,
+        smart_transition_sequence: u64,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        tx.send(EpubConvertMsg::SaveDone(Ok(saved))).unwrap();
+        let logical = src_path.clone();
+        Self {
+            src_path,
+            owner,
+            surface_generation,
+            smart_transition_sequence,
+            open_restore: EpubOpenRestore {
+                logical,
+                history: None,
+            },
+            deferred_fullscreen: None,
+            phase: EpubConvertPhase::Saving(None),
+            cancel: CancelToken::new().unwrap(),
+            rx,
+        }
+    }
 }
 
 pub(crate) fn error_message(error: &EpubConvertError) -> String {

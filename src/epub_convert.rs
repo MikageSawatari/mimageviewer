@@ -651,9 +651,36 @@ pub fn save_sibling_at<S: WorkerSpawner>(
     if guard.state()? != expected_state {
         return Err(EpubConvertError::SourceChanged);
     }
-    let reserved = cache.reserve_sibling_output(&destination)?;
+    let mut reserved = cache.reserve_sibling_output(&destination)?;
     let publish = (|| {
-        copy_cached_pdf(output.part_path(), reserved.temp_path(), cancel)?;
+        let mut destination_file = match reserved.create_file() {
+            Ok(file) => file,
+            Err(error) => {
+                if let Err(cleanup_error) = cache.abandon_sibling_reservation(&reserved) {
+                    crate::logger::log(format!(
+                        "epub sibling reservation removal failed: {cleanup_error:?}"
+                    ));
+                }
+                return Err(EpubConvertError::Io(error));
+            }
+        };
+        if let Err(error) = cache.mark_sibling_created(&mut reserved, &destination_file) {
+            if let Err(cleanup_error) =
+                epub_cache::discard_unrecorded_sibling_file(&destination_file, reserved.temp_path())
+            {
+                crate::logger::log(format!(
+                    "epub sibling unrecorded temp removal failed: {cleanup_error:?}"
+                ));
+            }
+            if let Err(cleanup_error) = cache.abandon_sibling_reservation(&reserved) {
+                crate::logger::log(format!(
+                    "epub sibling reservation removal failed: {cleanup_error:?}"
+                ));
+            }
+            return Err(error.into());
+        }
+        copy_pdf_to_open_file(output.part_path(), &mut destination_file, cancel)?;
+        drop(destination_file);
         if cancel.is_cancelled() {
             return Err(EpubConvertError::Cancelled);
         }
@@ -669,13 +696,11 @@ pub fn save_sibling_at<S: WorkerSpawner>(
                 }
             })
     })();
-    let cleanup = cache.finish_sibling_output(&reserved);
-    if let Err(error) = cleanup {
-        if publish.is_ok() {
-            return Err(error.into());
-        }
+    if reserved.was_created()
+        && let Err(error) = cache.finish_sibling_output(&reserved)
+    {
         crate::logger::log(format!(
-            "epub sibling cleanup deferred to startup gate: {error:?}"
+            "epub sibling cleanup deferred to next startup: {error:?}"
         ));
     }
     publish?;
@@ -700,11 +725,19 @@ fn copy_cached_pdf(
     destination: &Path,
     cancel: &CancelToken,
 ) -> Result<(), EpubConvertError> {
-    let mut input = File::open(source)?;
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(destination)?;
+    copy_pdf_to_open_file(source, &mut output, cancel)
+}
+
+fn copy_pdf_to_open_file(
+    source: &Path,
+    output: &mut File,
+    cancel: &CancelToken,
+) -> Result<(), EpubConvertError> {
+    let mut input = File::open(source)?;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         if cancel.is_cancelled() {
@@ -2041,6 +2074,96 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(collection_paths, vec![source.to_string_lossy().to_string()]);
+    }
+
+    #[test]
+    fn sibling_save_post_publish_bookkeeping_error_preserves_success_and_copies_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("book.epub");
+        let destination = source.with_extension("pdf");
+        fs::write(&source, b"source EPUB bytes").unwrap();
+        let epub_key = crate::adjustment_db::normalize_path(&source);
+        let pdf_key = crate::adjustment_db::normalize_path(&destination);
+        crate::rating_db::RatingDb::open_at(tmp.path().join("rating.db"))
+            .unwrap()
+            .set(&epub_key, 4)
+            .unwrap();
+        let adjust =
+            crate::adjustment_db::AdjustmentDb::open_at(&tmp.path().join("adjustment.db")).unwrap();
+        adjust
+            .set_page_params(
+                &format!("{epub_key}::page_1"),
+                &crate::adjustment::AdjustParams {
+                    brightness: 19.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        drop(adjust);
+        let fake = FakeSpawner {
+            mode: FakeMode::Success,
+            source: source.clone(),
+            killed: Arc::new(AtomicBool::new(false)),
+        };
+        crate::epub_cache::fail_next_sibling_finish_for_test();
+        let saved = save_with(
+            tmp.path(),
+            &source,
+            &fake,
+            &TestPdfVerifier,
+            &CancelToken::new().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.path, destination);
+        assert!(
+            saved.user_data_errors.is_empty(),
+            "{:?}",
+            saved.user_data_errors
+        );
+        assert!(saved.path.exists());
+        let mut app = crate::app::setup_app_for_test();
+        app.epub_convert = Some(
+            crate::ui_dialogs::epub_convert::EpubConvertState::saved_for_test(
+                source.clone(),
+                crate::app::OpenRequestOwner::Navigation,
+                saved,
+                app.top_level_grid_view.generation(),
+                app.smart_folder_transition_sequence,
+            ),
+        );
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        assert_eq!(app.pdf_enumerate_pending.as_ref().unwrap().0, destination);
+        assert_eq!(
+            crate::rating_db::RatingDb::open_at(tmp.path().join("rating.db"))
+                .unwrap()
+                .get(&pdf_key),
+            4
+        );
+        assert_eq!(
+            crate::adjustment_db::AdjustmentDb::open_at(&tmp.path().join("adjustment.db"))
+                .unwrap()
+                .get_page_params(&format!("{pdf_key}::page_1"))
+                .unwrap()
+                .brightness,
+            19.0
+        );
+        let db = crate::epub_cache::EpubCache::open_at(tmp.path()).unwrap();
+        assert_eq!(db.outstanding_sibling_count_for_test(), 1);
+        drop(db);
+        assert!(matches!(
+            crate::epub_cache::startup_gate(tmp.path()),
+            crate::epub_cache::GateOutcome::Enabled { .. }
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let db = crate::epub_cache::EpubCache::open_at(tmp.path()).unwrap();
+            if db.outstanding_sibling_count_for_test() == 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

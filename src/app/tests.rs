@@ -3498,6 +3498,38 @@ fn epub_batch_modal_blocks_grid_keyboard_and_click_open() {
     assert_eq!(app.rating_db.as_ref().unwrap().get(&rating_key), 0);
 }
 
+#[test]
+fn epub_single_save_modal_blocks_grid_keyboard() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let mut app = phase_c_support::setup_app();
+    app.keymap = crate::keymap::Keymap::from_ini_str("[Rating]\nRatingItemStepUp = F13\n");
+    app.items = vec![GridItem::Image(app.tmp.path().join("save-blocks-grid.jpg"))];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    let rating_key = app.rating_path_key(0).unwrap();
+    let mut state = crate::ui_dialogs::epub_convert::EpubConvertState::completed_for_test(
+        app.tmp.path().join("book.epub"),
+        OpenRequestOwner::Navigation,
+        crate::epub_cache::PublishOutcome::Published,
+        app.top_level_grid_view.generation(),
+        app.smart_folder_transition_sequence,
+    );
+    state.phase = crate::ui_dialogs::epub_convert::EpubConvertPhase::Saving(None);
+    app.epub_convert = Some(state);
+    let ctx = egui::Context::default();
+    assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
+    assert!(!app.grid_open_from_click_allowed());
+    ctx.begin_pass(viewport_raw_input(
+        egui::ViewportId::ROOT,
+        vec![fullscreen_fixed_key_event(egui::Key::F13)],
+    ));
+    let _ = app.handle_keyboard(&ctx);
+    let _ = ctx.end_pass();
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&rating_key), 0);
+}
+
 /// A panel that is only drawn in fullscreen must not outlive fullscreen.
 ///
 /// It holds the keyboard while it is open - including the Esc that would close it - so leaving

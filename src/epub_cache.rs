@@ -175,11 +175,76 @@ pub struct ReservedSiblingOutput {
     id: i64,
     destination: PathBuf,
     temp_path: PathBuf,
+    token: String,
+    identity: Option<FileIdentity>,
 }
 
 impl ReservedSiblingOutput {
     pub fn temp_path(&self) -> &Path {
         &self.temp_path
+    }
+
+    pub fn was_created(&self) -> bool {
+        self.identity.is_some()
+    }
+
+    pub fn create_file(&self) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // DELETE lets the creator discard its own handle if recording fails.
+            options.access_mode(0x4000_0000 | 0x0001_0000);
+        }
+        options.open(&self.temp_path)
+    }
+}
+
+/// Identity read from an open file handle; the name alone never authorizes deletion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity(Vec<u8>);
+
+struct RecordedSiblingRow {
+    destination: String,
+    temp_file: String,
+    token: String,
+    phase: String,
+    identity: Option<Vec<u8>>,
+}
+
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    #[cfg(windows)]
+    {
+        use std::mem::size_of;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let mut info = FILE_ID_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                HANDLE(file.as_raw_handle()),
+                FileIdInfo,
+                (&raw mut info).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        }
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        let mut bytes = Vec::with_capacity(24);
+        bytes.extend_from_slice(&info.VolumeSerialNumber.to_le_bytes());
+        bytes.extend_from_slice(&info.FileId.Identifier);
+        Ok(FileIdentity(bytes))
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata()?;
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&metadata.dev().to_le_bytes());
+        bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+        Ok(FileIdentity(bytes))
     }
 }
 
@@ -200,6 +265,16 @@ impl EpubCache {
     pub(crate) fn conn_for_tests_retired_count(&self) -> i64 {
         self.conn
             .query_row("SELECT COUNT(*) FROM retired", [], |row| row.get(0))
+            .unwrap()
+    }
+    #[cfg(test)]
+    pub(crate) fn outstanding_sibling_count_for_test(&self) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM outstanding_sibling_outputs",
+                [],
+                |row| row.get(0),
+            )
             .unwrap()
     }
     pub fn open_at(data_dir: &Path) -> Result<Self, CacheError> {
@@ -229,7 +304,9 @@ impl EpubCache {
                 generation_id INTEGER PRIMARY KEY, retired_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS outstanding_sibling_outputs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, destination TEXT NOT NULL,
-                temp_file TEXT NOT NULL, reserved_at INTEGER NOT NULL);",
+                temp_file TEXT NOT NULL, reserved_at INTEGER NOT NULL,
+                token TEXT NOT NULL DEFAULT '', phase TEXT NOT NULL DEFAULT 'reserved',
+                file_identity BLOB);",
         )?;
         let has_output_version = {
             let mut stmt = conn.prepare("PRAGMA table_info(generations)")?;
@@ -243,6 +320,25 @@ impl EpubCache {
                 "ALTER TABLE generations ADD COLUMN output_version INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
+        }
+        let sibling_columns = {
+            let mut stmt = conn.prepare("PRAGMA table_info(outstanding_sibling_outputs)")?;
+            stmt.query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (name, declaration) in [
+            ("token", "TEXT NOT NULL DEFAULT ''"),
+            ("phase", "TEXT NOT NULL DEFAULT 'reserved'"),
+            ("file_identity", "BLOB"),
+        ] {
+            if !sibling_columns.iter().any(|column| column == name) {
+                conn.execute(
+                    &format!(
+                        "ALTER TABLE outstanding_sibling_outputs ADD COLUMN {name} {declaration}"
+                    ),
+                    [],
+                )?;
+            }
         }
         validate_schema(&conn)?;
         Ok(Self { conn, data_dir })
@@ -291,49 +387,115 @@ impl EpubCache {
         {
             return Err(CacheError::UnsafePath(destination));
         }
+        // Two independent UUID v4 values provide 244 random bits in the filename.
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let temp_path = parent.join(format!(".miv-part-{token}.pdf"));
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO outstanding_sibling_outputs(destination,temp_file,reserved_at) VALUES (?1,'',?2)",
-            params![destination.to_string_lossy(), now()],
+            "INSERT INTO outstanding_sibling_outputs(destination,temp_file,reserved_at,token,phase) VALUES (?1,?2,?3,?4,'reserved')",
+            params![destination.to_string_lossy(), temp_path.to_string_lossy(), now(), token],
         )?;
         let id = tx.last_insert_rowid();
-        let stem = destination.file_stem().unwrap().to_string_lossy();
-        let temp_path = parent.join(format!(".{stem}.miv-part-{id}.pdf"));
-        tx.execute(
-            "UPDATE outstanding_sibling_outputs SET temp_file=?2 WHERE id=?1",
-            params![id, temp_path.to_string_lossy()],
-        )?;
         tx.commit()?;
         Ok(ReservedSiblingOutput {
             id,
             destination,
             temp_path,
+            token,
+            identity: None,
         })
+    }
+
+    /// Call only after `create_new` succeeds, while its handle remains open.
+    pub fn mark_sibling_created(
+        &mut self,
+        reserved: &mut ReservedSiblingOutput,
+        file: &File,
+    ) -> Result<(), CacheError> {
+        let identity = file_identity(file)?;
+        let updated = self.conn.execute(
+            "UPDATE outstanding_sibling_outputs SET phase='created',file_identity=?3 WHERE id=?1 AND token=?2 AND phase='reserved'",
+            params![reserved.id, reserved.token, identity.0],
+        )?;
+        if updated != 1 {
+            return Err(CacheError::InvalidState(
+                "sibling output reservation missing or changed",
+            ));
+        }
+        reserved.identity = Some(identity);
+        Ok(())
+    }
+
+    /// A failed `create_new` never grants ownership of an existing path.
+    pub fn abandon_sibling_reservation(
+        &mut self,
+        reserved: &ReservedSiblingOutput,
+    ) -> Result<(), CacheError> {
+        if reserved.identity.is_some() {
+            return Err(CacheError::InvalidState(
+                "created sibling cannot be abandoned",
+            ));
+        }
+        self.conn.execute(
+            "DELETE FROM outstanding_sibling_outputs WHERE id=?1 AND token=?2 AND phase='reserved'",
+            params![reserved.id, reserved.token],
+        )?;
+        Ok(())
     }
 
     pub fn finish_sibling_output(
         &mut self,
         reserved: &ReservedSiblingOutput,
     ) -> Result<(), CacheError> {
-        let recorded: Option<(String, String)> = self
+        #[cfg(test)]
+        if FAIL_NEXT_SIBLING_FINISH.with(|flag| flag.replace(false)) {
+            return Err(CacheError::Sql(rusqlite::Error::InvalidQuery));
+        }
+        let recorded: Option<RecordedSiblingRow> = self
             .conn
             .query_row(
-                "SELECT destination,temp_file FROM outstanding_sibling_outputs WHERE id=?1",
+                "SELECT destination,temp_file,token,phase,file_identity FROM outstanding_sibling_outputs WHERE id=?1",
                 [reserved.id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok(RecordedSiblingRow {
+                    destination: row.get(0)?,
+                    temp_file: row.get(1)?,
+                    token: row.get(2)?,
+                    phase: row.get(3)?,
+                    identity: row.get(4)?,
+                }),
             )
             .optional()?;
-        if recorded
-            != Some((
-                reserved.destination.to_string_lossy().into_owned(),
-                reserved.temp_path.to_string_lossy().into_owned(),
-            ))
+        let Some(recorded) = recorded else {
+            return Err(CacheError::InvalidState(
+                "sibling output reservation missing or changed",
+            ));
+        };
+        if recorded.destination != reserved.destination.to_string_lossy()
+            || recorded.temp_file != reserved.temp_path.to_string_lossy()
+            || recorded.token != reserved.token
+            || !matches!(recorded.phase.as_str(), "reserved" | "created")
         {
             return Err(CacheError::InvalidState(
                 "sibling output reservation missing or changed",
             ));
         }
-        delete_sibling_file(reserved)?;
+        if recorded.phase == "created" {
+            let identity = recorded.identity.ok_or(CacheError::InvalidState(
+                "created sibling has no file identity",
+            ))?;
+            if reserved
+                .identity
+                .as_ref()
+                .is_some_and(|value| value.0 != identity)
+            {
+                return Err(CacheError::InvalidState("created sibling identity changed"));
+            }
+            delete_sibling_file(reserved, &FileIdentity(identity))?;
+        }
         self.conn.execute(
             "DELETE FROM outstanding_sibling_outputs WHERE id=?1",
             [reserved.id],
@@ -570,24 +732,44 @@ impl EpubCache {
         Ok(())
     }
 
-    fn collect_outstanding_siblings(&mut self) -> Result<(), CacheError> {
-        let rows: Vec<ReservedSiblingOutput> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id,destination,temp_file FROM outstanding_sibling_outputs")?;
-            stmt.query_map([], |row| {
-                Ok(ReservedSiblingOutput {
-                    id: row.get(0)?,
-                    destination: PathBuf::from(row.get::<_, String>(1)?),
-                    temp_path: PathBuf::from(row.get::<_, String>(2)?),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
-        for row in rows {
-            self.finish_sibling_output(&row)?;
+    fn outstanding_sibling_ids(&self) -> Result<Vec<i64>, CacheError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM outstanding_sibling_outputs")?;
+        Ok(stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn collect_outstanding_siblings(&mut self, ids: &[i64]) {
+        for id in ids {
+            let row = self.conn.query_row(
+                "SELECT id,destination,temp_file,token,file_identity FROM outstanding_sibling_outputs WHERE id=?1",
+                [id],
+                |row| {
+                    Ok(ReservedSiblingOutput {
+                        id: row.get(0)?,
+                        destination: PathBuf::from(row.get::<_, String>(1)?),
+                        temp_path: PathBuf::from(row.get::<_, String>(2)?),
+                        token: row.get(3)?,
+                        identity: row.get::<_, Option<Vec<u8>>>(4)?.map(FileIdentity),
+                    })
+                },
+            ).optional();
+            match row {
+                Ok(Some(row)) => {
+                    if let Err(error) = self.finish_sibling_output(&row) {
+                        crate::logger::log(format!(
+                            "epub sibling leftover cleanup failed (id={id}): {error:?}"
+                        ));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => crate::logger::log(format!(
+                    "epub sibling leftover row unreadable (id={id}): {error:?}"
+                )),
+            }
         }
-        Ok(())
     }
 
     fn prune_closed_reservations(&mut self) -> Result<(), CacheError> {
@@ -601,13 +783,23 @@ impl EpubCache {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_SIBLING_FINISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_sibling_finish_for_test() {
+    FAIL_NEXT_SIBLING_FINISH.with(|flag| flag.set(true));
+}
+
 fn validate_schema(conn: &Connection) -> Result<(), CacheError> {
     for query in [
         "SELECT generation_id,reserved_at,pdf_file,closed_at FROM generation_ids LIMIT 0",
         "SELECT generation_id,src_path_key,src_path,src_size,src_mtime_ticks,src_sha256,src_head_hash,pdf_file,pdf_size,page_count,direction,profile,created_at,output_version FROM generations LIMIT 0",
         "SELECT src_path_key,generation_id,last_access_at FROM current LIMIT 0",
         "SELECT generation_id,retired_at FROM retired LIMIT 0",
-        "SELECT id,destination,temp_file,reserved_at FROM outstanding_sibling_outputs LIMIT 0",
+        "SELECT id,destination,temp_file,reserved_at,token,phase,file_identity FROM outstanding_sibling_outputs LIMIT 0",
     ] {
         conn.prepare(query)?;
     }
@@ -711,38 +903,44 @@ fn validate_real_absolute_dir(path: &Path) -> Result<bool, CacheError> {
     Ok(true)
 }
 
-fn delete_sibling_file(reserved: &ReservedSiblingOutput) -> Result<(), CacheError> {
+fn delete_sibling_file(
+    reserved: &ReservedSiblingOutput,
+    identity: &FileIdentity,
+) -> Result<(), CacheError> {
     let destination = &reserved.destination;
     let path = &reserved.temp_path;
     let parent = destination
         .parent()
         .ok_or_else(|| CacheError::UnsafePath(destination.clone()))?;
     if reserved.id <= 0
+        || reserved.token.len() != 64
+        || !reserved.token.bytes().all(|byte| byte.is_ascii_hexdigit())
         || !destination.is_absolute()
         || destination
             .extension()
             .is_none_or(|ext| !ext.eq_ignore_ascii_case("pdf"))
         || path.parent() != Some(parent)
-        || path
-            != &parent.join(format!(
-                ".{}.miv-part-{}.pdf",
-                destination.file_stem().unwrap().to_string_lossy(),
-                reserved.id
-            ))
+        || path != &parent.join(format!(".miv-part-{}.pdf", reserved.token))
     {
         return Err(CacheError::UnsafePath(path.clone()));
     }
     if !validate_real_absolute_dir(parent)? {
-        return Ok(());
+        return Err(CacheError::InvalidState(
+            "sibling parent missing or unreachable",
+        ));
     }
     #[cfg(windows)]
     {
-        delete_payload_file_by_handle(parent, path)
+        delete_sibling_file_by_handle(path, identity)
     }
     #[cfg(not(windows))]
     {
         match fs::symlink_metadata(path) {
             Ok(meta) if meta.is_file() && !reparse(&meta) => {
+                let file = File::open(path)?;
+                if &file_identity(&file)? != identity {
+                    return Err(CacheError::InvalidState("sibling file identity mismatch"));
+                }
                 fs::remove_file(path).map_err(Into::into)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -750,6 +948,92 @@ fn delete_sibling_file(reserved: &ReservedSiblingOutput) -> Result<(), CacheErro
             Err(error) => Err(error.into()),
         }
     }
+}
+
+/// Used only in the create-to-record gap, when the still-open handle itself proves ownership.
+pub fn discard_unrecorded_sibling_file(file: &File, path: &Path) -> Result<(), CacheError> {
+    #[cfg(windows)]
+    {
+        use std::mem::size_of;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        };
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        unsafe {
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileDispositionInfo,
+                (&raw const disposition).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        }
+        .map_err(|error| CacheError::Io(io::Error::other(error.to_string())))?;
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(path).map_err(Into::into)
+    }
+}
+
+#[cfg(windows)]
+fn delete_sibling_file_by_handle(path: &Path, identity: &FileIdentity) -> Result<(), CacheError> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
+        GetFileInformationByHandle, OPEN_EXISTING, SetFileInformationByHandle,
+    };
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let raw = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            DELETE.0 | FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, // deny delete sharing; keep this exact handle
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    };
+    let raw = match raw {
+        Ok(handle) => handle,
+        Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() => {
+            return Ok(());
+        }
+        Err(error) => return Err(CacheError::Io(io::Error::other(error.to_string()))),
+    };
+    let file = unsafe { File::from_raw_handle(raw.0) };
+    let handle = HANDLE(file.as_raw_handle());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle, &mut info) }
+        .map_err(|error| CacheError::Io(io::Error::other(error.to_string())))?;
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT.0 | FILE_ATTRIBUTE_DIRECTORY.0) != 0 {
+        return Err(CacheError::UnsafePath(path.to_owned()));
+    }
+    if &file_identity(&file)? != identity {
+        return Err(CacheError::InvalidState("sibling file identity mismatch"));
+    }
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    }
+    .map_err(|error| CacheError::Io(io::Error::other(error.to_string())))?;
+    Ok(())
 }
 
 fn validate_real_dir(root: &Path, path: &Path) -> Result<(), CacheError> {
@@ -1045,7 +1329,7 @@ fn unlock(_file: &File) -> io::Result<()> {
 }
 
 pub fn startup_gate(data_dir: &Path) -> GateOutcome {
-    let result = (|| -> Result<(AliveGuard, bool), GateReason> {
+    let result = (|| -> Result<(AliveGuard, bool, Vec<i64>), GateReason> {
         fs::create_dir_all(data_dir).map_err(GateReason::Lock)?;
         let data_dir = fs::canonicalize(data_dir).map_err(GateReason::Lock)?;
         let root = data_dir.join("epub_cache");
@@ -1066,13 +1350,21 @@ pub fn startup_gate(data_dir: &Path) -> GateOutcome {
         }
         let file = options.open(alive_path).map_err(GateReason::Lock)?;
         let exclusive = lock(&file, true, true).is_ok();
+        let mut sibling_ids = Vec::new();
         if exclusive {
             let cleanup = (|| -> Result<(), GateReason> {
                 let mut db = EpubCache::open_at(&data_dir).map_err(GateReason::Schema)?;
                 db.collect_retired().map_err(GateReason::Cleanup)?;
                 db.collect_pending().map_err(GateReason::Cleanup)?;
-                db.collect_outstanding_siblings()
-                    .map_err(GateReason::Cleanup)?;
+                sibling_ids = match db.outstanding_sibling_ids() {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "epub sibling leftover listing failed: {error:?}"
+                        ));
+                        Vec::new()
+                    }
+                };
                 crate::materializer::cleanup_epub_sibling_work_startup(&data_dir);
                 db.prune_closed_reservations()
                     .map_err(GateReason::Cleanup)?;
@@ -1096,10 +1388,24 @@ pub fn startup_gate(data_dir: &Path) -> GateOutcome {
                     .map_err(|e| GateReason::Schema(e.into()))?;
             validate_schema(&conn).map_err(GateReason::Schema)?;
         }
-        Ok((AliveGuard { file, data_dir }, exclusive))
+        Ok((AliveGuard { file, data_dir }, exclusive, sibling_ids))
     })();
     match result {
-        Ok((guard, cleaned)) => {
+        Ok((guard, cleaned, sibling_ids)) => {
+            if !sibling_ids.is_empty() {
+                let cleanup_dir = guard.data_dir.clone();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("epub-sibling-cleanup".into())
+                    .spawn(move || match EpubCache::open_at(&cleanup_dir) {
+                        Ok(mut db) => db.collect_outstanding_siblings(&sibling_ids),
+                        Err(error) => crate::logger::log(format!(
+                            "epub sibling cleanup DB open failed: {error:?}"
+                        )),
+                    })
+                {
+                    crate::logger::log(format!("epub sibling cleanup thread failed: {error}"));
+                }
+            }
             crate::logger::log(format!(
                 "epub_cache: startup gate enabled; cleanup={cleaned}"
             ));
@@ -1180,6 +1486,21 @@ pub(crate) fn reconverted_for_worker_test() -> TestReconvertedEpub {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    fn wait_for_sibling_rows_to_clear(data_dir: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let db = EpubCache::open_at(data_dir).unwrap();
+            if db.outstanding_sibling_ids().unwrap().is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sibling cleanup thread did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn epub_cache_source_key_distinguishes_drives() {
@@ -1712,15 +2033,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = EpubCache::open_at(tmp.path()).unwrap();
         let destination = tmp.path().join("book.pdf");
-        let reserved = db.reserve_sibling_output(&destination).unwrap();
-        fs::write(reserved.temp_path(), b"recorded leftover").unwrap();
-        let unrecorded = tmp.path().join(".book.miv-part-999.pdf");
+        let mut reserved = db.reserve_sibling_output(&destination).unwrap();
+        let file = reserved.create_file().unwrap();
+        db.mark_sibling_created(&mut reserved, &file).unwrap();
+        drop(file);
+        let unrecorded = tmp.path().join(format!(".miv-part-{}.pdf", "0".repeat(64)));
         fs::write(&unrecorded, b"unrecorded").unwrap();
         drop(db);
         assert!(matches!(
             startup_gate(tmp.path()),
             GateOutcome::Enabled { cleaned: true, .. }
         ));
+        wait_for_sibling_rows_to_clear(tmp.path());
         assert!(!reserved.temp_path().exists());
         assert_eq!(fs::read(unrecorded).unwrap(), b"unrecorded");
         let db = EpubCache::open_at(tmp.path()).unwrap();
@@ -1733,6 +2057,102 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn epub_cache_reserved_sibling_never_deletes_preexisting_same_name_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        let reserved = db
+            .reserve_sibling_output(&tmp.path().join("book.pdf"))
+            .unwrap();
+        fs::write(reserved.temp_path(), b"user file").unwrap();
+        assert!(reserved.create_file().is_err());
+        db.abandon_sibling_reservation(&reserved).unwrap();
+        assert_eq!(fs::read(reserved.temp_path()).unwrap(), b"user file");
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM outstanding_sibling_outputs",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn epub_cache_reserved_row_with_file_is_dropped_without_deletion_at_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        let reserved = db
+            .reserve_sibling_output(&tmp.path().join("book.pdf"))
+            .unwrap();
+        fs::write(reserved.temp_path(), b"not proven ours").unwrap();
+        drop(db);
+        assert!(matches!(
+            startup_gate(tmp.path()),
+            GateOutcome::Enabled { .. }
+        ));
+        wait_for_sibling_rows_to_clear(tmp.path());
+        assert_eq!(fs::read(reserved.temp_path()).unwrap(), b"not proven ours");
+    }
+
+    #[test]
+    fn epub_cache_created_sibling_identity_mismatch_keeps_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        let mut reserved = db
+            .reserve_sibling_output(&tmp.path().join("book.pdf"))
+            .unwrap();
+        let file = reserved.create_file().unwrap();
+        db.mark_sibling_created(&mut reserved, &file).unwrap();
+        drop(file);
+        let moved = tmp.path().join("original-temp");
+        fs::rename(reserved.temp_path(), &moved).unwrap();
+        fs::write(reserved.temp_path(), b"replacement").unwrap();
+        assert!(matches!(
+            db.finish_sibling_output(&reserved),
+            Err(CacheError::InvalidState("sibling file identity mismatch"))
+        ));
+        assert_eq!(fs::read(reserved.temp_path()).unwrap(), b"replacement");
+        assert_eq!(db.outstanding_sibling_ids().unwrap(), vec![reserved.id]);
+    }
+
+    #[test]
+    fn epub_cache_created_sibling_matching_identity_is_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        let mut reserved = db
+            .reserve_sibling_output(&tmp.path().join("book.pdf"))
+            .unwrap();
+        let file = reserved.create_file().unwrap();
+        db.mark_sibling_created(&mut reserved, &file).unwrap();
+        drop(file);
+        db.finish_sibling_output(&reserved).unwrap();
+        assert!(!reserved.temp_path().exists());
+        assert!(db.outstanding_sibling_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn epub_cache_unreachable_created_sibling_keeps_row_without_disabling_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shelf = tmp.path().join("shelf");
+        fs::create_dir(&shelf).unwrap();
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        let mut reserved = db.reserve_sibling_output(&shelf.join("book.pdf")).unwrap();
+        let file = reserved.create_file().unwrap();
+        db.mark_sibling_created(&mut reserved, &file).unwrap();
+        drop(file);
+        drop(db);
+        fs::rename(&shelf, tmp.path().join("temporarily-unreachable")).unwrap();
+        assert!(matches!(
+            startup_gate(tmp.path()),
+            GateOutcome::Enabled { .. }
+        ));
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        db.collect_outstanding_siblings(&[reserved.id]);
+        assert_eq!(db.outstanding_sibling_ids().unwrap(), vec![reserved.id]);
     }
 
     #[test]
@@ -1773,6 +2193,7 @@ mod tests {
             startup_gate(tmp.path()),
             GateOutcome::Enabled { cleaned: true, .. }
         ));
+        wait_for_sibling_rows_to_clear(tmp.path());
         let db = EpubCache::open_at(tmp.path()).unwrap();
         let count: i64 = db
             .conn
@@ -1811,11 +2232,15 @@ mod tests {
         fs::create_dir(&shelf).unwrap();
         fs::create_dir(&real).unwrap();
         let mut db = EpubCache::open_at(tmp.path()).unwrap();
-        let reserved = db.reserve_sibling_output(&shelf.join("book.pdf")).unwrap();
+        let mut reserved = db.reserve_sibling_output(&shelf.join("book.pdf")).unwrap();
+        let file = reserved.create_file().unwrap();
+        db.mark_sibling_created(&mut reserved, &file).unwrap();
+        drop(file);
         drop(db);
         let real_temp = real.join(reserved.temp_path().file_name().unwrap());
         fs::write(&real_temp, b"keep").unwrap();
-        fs::remove_dir(&shelf).unwrap();
+        let moved = tmp.path().join("moved-shelf");
+        fs::rename(&shelf, &moved).unwrap();
         let result = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(&shelf)
@@ -1829,8 +2254,11 @@ mod tests {
         );
         assert!(matches!(
             startup_gate(tmp.path()),
-            GateOutcome::Disabled(GateReason::Cleanup(CacheError::UnsafePath(_)))
+            GateOutcome::Enabled { .. }
         ));
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        db.collect_outstanding_siblings(&[reserved.id]);
+        assert_eq!(db.outstanding_sibling_ids().unwrap(), vec![reserved.id]);
         assert_eq!(fs::read(real_temp).unwrap(), b"keep");
         fs::remove_dir(shelf).unwrap();
     }
