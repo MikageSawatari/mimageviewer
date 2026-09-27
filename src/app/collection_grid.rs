@@ -3381,6 +3381,245 @@ mod tests {
         zip.finish().unwrap();
     }
 
+    fn write_nested_history_zip(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for entry in ["root.png", "chapter/first.png", "chapter/second.png"] {
+            zip.start_file(entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"page").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn write_two_page_history_pdf(path: &Path) {
+        // A valid two-page PDF lets the normal PDFium worker enumerate the file.
+        let objects: [&[u8]; 6] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>",
+            b"<< /Length 0 >>\nstream\nendstream",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 3 0 R >>",
+            b"<< /Length 0 >>\nstream\nendstream",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 5 0 R >>",
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = vec![0usize];
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            bytes.extend_from_slice(object);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes(),
+        );
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn read_real_pdf_pages_for_history(path: &Path) -> Vec<crate::pdf_loader::PdfPageEntry> {
+        use pdfium_render::prelude::Pdfium;
+
+        // The lib-test executable cannot act as the application's --pdf-worker child.
+        // Bind PDFium in-process for this test and feed the real file's enumerated pages
+        // into the same staged adoption boundary that the worker normally feeds.
+        let dll_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/pdfium/bin");
+        let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+            dll_dir.to_str().unwrap(),
+        ))
+        .expect("PDFium DLL binding");
+        let pdfium = Pdfium::new(bindings);
+        let document = pdfium
+            .load_pdf_from_file(path, None)
+            .expect("valid real PDF");
+        let metadata = std::fs::metadata(path).unwrap();
+        let pages = (0..document.pages().len())
+            .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                page_num: u32::from(page_num),
+                mtime: crate::ui_helpers::mtime_secs(&metadata),
+                file_size: metadata.len(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 2);
+        pages
+    }
+
+    fn history_grid_key(app: &mut App, key: egui::Key) -> Option<crate::ui_main::AddressBarNav> {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        let nav = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+        nav
+    }
+
+    fn seed_real_pdf_preflight_if_ready(
+        app: &mut App,
+        pages: Option<&[crate::pdf_loader::PdfPageEntry]>,
+        seeded: &mut bool,
+    ) {
+        if *seeded {
+            return;
+        }
+        let Some(pages) = pages else {
+            return;
+        };
+        if matches!(
+            app.top_level_grid_view.history_navigation_transition(),
+            Some(super::super::HistoryNavigationTransition::Physical(_))
+        ) {
+            seed_physical_history_preflight(
+                app,
+                super::super::collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(
+                    pages.to_vec(),
+                ),
+            );
+            *seeded = true;
+            return;
+        }
+        let child_preflighting = matches!(
+            app.top_level_grid_view.history_navigation_transition(),
+            Some(super::super::HistoryNavigationTransition::Collection(request))
+                if matches!(&request.phase, super::super::CollectionHistoryPhase::ChildPreflighting { .. })
+        );
+        if child_preflighting {
+            let Some(super::super::HistoryNavigationTransition::Collection(mut request)) =
+                app.top_level_grid_view.take_history_navigation_transition()
+            else {
+                unreachable!()
+            };
+            let super::super::CollectionHistoryPhase::ChildPreflighting { preflight, .. } =
+                &mut request.phase
+            else {
+                unreachable!()
+            };
+            *preflight =
+                super::super::collection_navigation::PhysicalHistoryPreflight::ready_for_test(
+                    super::super::collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(
+                        pages.to_vec(),
+                    ),
+                );
+            app.top_level_grid_view
+                .set_history_navigation_transition(Some(
+                    super::super::HistoryNavigationTransition::Collection(request),
+                ));
+            *seeded = true;
+        }
+    }
+
+    fn poll_real_history_load(
+        app: &mut App,
+        expected: Option<&Path>,
+        pdf_pages: Option<&[crate::pdf_loader::PdfPageEntry]>,
+    ) {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut seeded = false;
+        loop {
+            seed_real_pdf_preflight_if_ready(app, pdf_pages, &mut seeded);
+            app.poll_collection_ui(&ctx);
+            seed_real_pdf_preflight_if_ready(app, pdf_pages, &mut seeded);
+            app.poll_collection_grid(&ctx);
+            seed_real_pdf_preflight_if_ready(app, pdf_pages, &mut seeded);
+            app.poll_rating_view();
+            seed_real_pdf_preflight_if_ready(app, pdf_pages, &mut seeded);
+            app.poll_collection_history_transition(&ctx);
+            if app
+                .current_folder
+                .as_deref()
+                .zip(expected)
+                .is_some_and(|(path, expected)| crate::folder_tree::path_eq(path, expected))
+                || app.current_folder.is_none() && expected.is_none()
+            {
+                if app
+                    .top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
+                    && app.rating_view_pending.is_none()
+                {
+                    assert!(
+                        pdf_pages.is_none() || seeded,
+                        "PDF preflight was not adopted"
+                    );
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real history load did not settle: expected={expected:?} current={:?} seeded={seeded} transition={} pdf_pending={} position={:?} items={:?}",
+                app.current_folder,
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some(),
+                app.pdf_enumerate_pending.is_some(),
+                app.top_level_grid_view
+                    .collection_session()
+                    .map(|session| &session.position),
+                app.items
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn replay_real_history(
+        app: &mut App,
+        back: bool,
+        expected: Option<&Path>,
+        pdf_pages: Option<&[crate::pdf_loader::PdfPageEntry]>,
+    ) {
+        let target = if back {
+            app.folder_history_back_target()
+        } else {
+            app.folder_history_forward_target()
+        }
+        .cloned()
+        .expect("history target");
+        let direction = if back {
+            super::super::FolderHistoryDirection::Back
+        } else {
+            super::super::FolderHistoryDirection::Forward
+        };
+        let started = match &target {
+            super::super::FolderNavHistoryTarget::Collection(_)
+            | super::super::FolderNavHistoryTarget::CollectionPhysical(_) => app
+                .start_collection_history_transition(
+                    target.clone(),
+                    super::super::CollectionHistoryIntent::Replay {
+                        direction,
+                        target: target.clone(),
+                    },
+                    None,
+                ),
+            super::super::FolderNavHistoryTarget::Rating { stars } => {
+                app.start_rating_history_replay(direction, *stars)
+            }
+            super::super::FolderNavHistoryTarget::RatingPhysical(restore) => app
+                .start_rating_physical_restore(restore.clone(), Some((direction, target.clone()))),
+            _ => panic!("unexpected virtual book history target: {target:?}"),
+        };
+        assert!(started, "history replay did not start: {target:?}");
+        poll_real_history_load(app, expected, pdf_pages);
+        assert_eq!(app.folder_nav_current_target(), Some(target));
+    }
+
     fn seed_physical_history_preflight(
         app: &mut App,
         payload: super::super::collection_navigation::PhysicalHistoryPreflightPayload,
@@ -4977,6 +5216,259 @@ mod tests {
         assert_eq!(app.address, zip_path.to_string_lossy());
         assert_eq!(app.pin_container_key().as_deref(), Some(zip_path.as_path()));
         assert_eq!(app.folder_thumb_pin_for(&zip_path), Some(&logical_pin));
+        assert!(matches!(
+            app.folder_history_back_target(),
+            Some(super::super::FolderNavHistoryTarget::Collection(restore))
+                if restore.identity.collection_id == collection.collection_id()
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    fn assert_real_virtual_history(zip: bool, collection: bool) {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let saved = temp.path().join("before-book");
+        std::fs::create_dir(&saved).unwrap();
+        let source = temp.path().join(if zip { "book.zip" } else { "book.pdf" });
+        let pdf_pages = if zip {
+            write_nested_history_zip(&source);
+            None
+        } else {
+            write_two_page_history_pdf(&source);
+            Some(read_real_pdf_pages_for_history(&source))
+        };
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.current_folder = Some(saved);
+
+        let root = if collection {
+            let snapshot = collection_with_sources(
+                &client,
+                &[(
+                    source.clone(),
+                    if zip {
+                        CollectionResolvedKind::Zip
+                    } else {
+                        CollectionResolvedKind::Pdf
+                    },
+                )],
+            );
+            app.open_collection_grid_from_navigation(snapshot.collection_id());
+            wait_for_grid(&mut app, snapshot.collection_id());
+            poll_until(
+                &mut app,
+                "Collection root transition did not settle",
+                |app| {
+                    app.top_level_grid_view
+                        .history_navigation_transition()
+                        .is_none()
+                },
+            );
+            app.current_folder.clone()
+        } else {
+            let key = crate::adjustment_db::normalize_path(&source);
+            app.rating_db.as_ref().unwrap().set(&key, 1).unwrap();
+            app.enter_rating_view_from_menu(1);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while app.rating_view_pending.is_some() {
+                assert!(Instant::now() < deadline, "Rating root did not settle");
+                app.poll_rating_view();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(app.items_are_rating_view);
+            assert!(
+                app.items.iter().any(|item| item
+                    .drag_source_path()
+                    .is_some_and(|path| crate::adjustment_db::normalize_path(path)
+                        == crate::adjustment_db::normalize_path(&source))),
+                "Rating source row missing: {:?}",
+                app.items
+            );
+            app.current_folder.clone()
+        };
+        let root_target = app.folder_nav_current_target().expect("root location");
+
+        if collection {
+            let index = app
+                .items
+                .iter()
+                .position(|item| {
+                    item.drag_source_path()
+                        .is_some_and(|path| crate::folder_tree::path_eq(path, &source))
+                })
+                .unwrap();
+            let owner = app
+                .collection_grid_physical_load_owner(index, &source)
+                .unwrap();
+            assert!(
+                app.main_folder_history_available(),
+                "Collection root must own main history"
+            );
+            assert!(app.load_folder_with_scan_owned(
+                source.clone(),
+                None,
+                super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            ));
+            assert!(
+                matches!(
+                    app.top_level_grid_view.history_navigation_transition(),
+                    Some(super::super::HistoryNavigationTransition::Physical(_))
+                ),
+                "Collection open must have a staged physical request: source={source:?} items={:?} surface={:?}",
+                app.items,
+                app.top_level_grid_view.surface()
+            );
+        } else {
+            let owner = app.rating_view_physical_load_owner(&source).unwrap();
+            assert!(app.start_rating_physical_open(owner));
+        }
+        poll_real_history_load(&mut app, Some(&source), pdf_pages.as_deref());
+        let source_target = app
+            .folder_nav_current_target()
+            .expect("adopted book location");
+        assert_ne!(source_target, root_target);
+        assert_eq!(app.folder_history_back_target(), Some(&root_target));
+        let outer_back = app.folder_nav_back_stack.clone();
+        let outer_forward = app.folder_nav_forward_stack.clone();
+
+        if zip {
+            assert!(app.items.iter().any(|item| matches!(item, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "chapter/")));
+            app.zip_nav_enter("chapter/");
+            assert!(app.items.iter().any(|item| matches!(item, GridItem::ZipImage { entry_name, .. } if entry_name == "chapter/second.png")));
+            assert_eq!(app.folder_nav_current_target(), Some(source_target.clone()));
+            assert_eq!(app.folder_nav_back_stack, outer_back);
+            assert_eq!(app.folder_nav_forward_stack, outer_forward);
+            assert!(history_grid_key(&mut app, egui::Key::Backspace).is_none());
+            assert!(app.zip_nav.as_ref().is_some_and(|nav| nav.at_root()));
+            assert_eq!(app.folder_nav_current_target(), Some(source_target.clone()));
+            app.zip_nav_enter("chapter/");
+        } else {
+            assert_eq!(
+                app.items.len(),
+                2,
+                "PDFium must enumerate the real two-page file"
+            );
+            assert!(matches!(
+                app.items[0],
+                GridItem::PdfPage { page_num: 0, .. }
+            ));
+            assert!(matches!(
+                app.items[1],
+                GridItem::PdfPage { page_num: 1, .. }
+            ));
+            app.selected = Some(0);
+            assert!(history_grid_key(&mut app, egui::Key::ArrowRight).is_none());
+            assert_eq!(
+                app.selected,
+                Some(1),
+                "page selection should move within the PDF"
+            );
+            assert_eq!(app.folder_nav_current_target(), Some(source_target.clone()));
+            assert_eq!(app.folder_nav_back_stack, outer_back);
+            assert_eq!(app.folder_nav_forward_stack, outer_forward);
+        }
+
+        replay_real_history(&mut app, true, root.as_deref(), None);
+        assert_eq!(app.folder_history_forward_target(), Some(&source_target));
+        replay_real_history(&mut app, false, Some(&source), pdf_pages.as_deref());
+        assert_eq!(app.folder_nav_current_target(), Some(source_target));
+        assert_eq!(app.folder_history_back_target(), Some(&root_target));
+
+        let parent_nav = history_grid_key(&mut app, egui::Key::Backspace);
+        if collection {
+            let Some(crate::ui_main::AddressBarNav::Collection(restore)) = parent_nav else {
+                panic!("Collection BS must restore its root anchor: {parent_nav:?}");
+            };
+            app.apply_collection_input_nav(restore, false);
+        } else {
+            assert!(
+                parent_nav.is_none(),
+                "Rating BS is handled by its parent router"
+            );
+        }
+        poll_real_history_load(&mut app, root.as_deref(), None);
+        assert_eq!(app.folder_nav_current_target(), Some(root_target));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn real_zip_internal_and_outer_history_from_rating() {
+        assert_real_virtual_history(true, false);
+    }
+
+    #[test]
+    fn real_zip_internal_and_outer_history_from_collection() {
+        assert_real_virtual_history(true, true);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn real_pdf_pages_and_outer_history_from_rating() {
+        assert_real_virtual_history(false, false);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn real_pdf_pages_and_outer_history_from_collection() {
+        assert_real_virtual_history(false, true);
+    }
+
+    #[test]
+    fn stale_convertible_collection_tile_folder_result_commits_source_position() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("archive-became-folder.7z");
+        std::fs::write(&source, b"old archive tile").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        let collection = collection_with_sources(
+            &client,
+            &[(source.clone(), CollectionResolvedKind::ConvertibleArchive)],
+        );
+        app.open_collection_grid(collection.collection_id(), None);
+        wait_for_grid(&mut app, collection.collection_id());
+        assert!(matches!(
+            app.items.first(),
+            Some(GridItem::ConvertibleArchive { .. })
+        ));
+
+        std::fs::remove_file(&source).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("001.png"), b"dummy").unwrap();
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+        let owner = app.main_grid_archive_open_owner(0, &source);
+        assert!(matches!(
+            owner,
+            super::super::OpenRequestOwner::MainGridArchive(ref intent)
+                if intent.collection_grid_owner.is_some()
+        ));
+        let _ = app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            source.clone(),
+            false,
+            owner,
+        );
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        poll_until(&mut app, "stale Collection tile did not settle", |app| {
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        });
+
+        assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+        assert!(matches!(app.items.first(), Some(GridItem::Image(_))));
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .map(|session| &session.position),
+            Some(CollectionGridPosition::PhysicalSource { .. })
+        ));
         assert!(matches!(
             app.folder_history_back_target(),
             Some(super::super::FolderNavHistoryTarget::Collection(restore))

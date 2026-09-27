@@ -20261,6 +20261,23 @@ impl App {
         }
     }
 
+    // A history command is dispatched after keyboard, toolbar, ring, and gamepad input merge.
+    // Search/Snapshot own a transient grid; their return_to is an exit target, not the current
+    // history position. Keep the cursor paused until that grid has been left.
+    fn history_input_nav_allowed(&self) -> bool {
+        self.main_folder_history_available()
+            && !self.global_search.active
+            && !self.favsearch.active
+            && !self.tag_view.active
+            && !self.show_search_bar
+            && !self.is_snapshot_active()
+            && !matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Search(_)
+                    | top_level_grid_view::TopLevelGridSurface::Snapshot
+            )
+    }
+
     fn push_folder_nav_stack(
         stack: &mut Vec<FolderNavHistoryTarget>,
         target: FolderNavHistoryTarget,
@@ -21036,6 +21053,84 @@ impl App {
                     self.folder_nav_forward_stack.last()
                 }
             })
+    }
+
+    /// All merged Back/Forward input routes land here. A transient search or Snapshot surface
+    /// keeps its exit target in `return_to`; it must not advance the main history cursor.
+    fn dispatch_main_folder_history_input(
+        &mut self,
+        direction: FolderHistoryDirection,
+        history_nav_rollback: &mut Option<FolderNavHistorySnapshot>,
+    ) -> Option<PathBuf> {
+        if !self.history_input_nav_allowed() {
+            return None;
+        }
+        let smart_direction = match direction {
+            FolderHistoryDirection::Back => smart_folder::SmartHistoryDirection::Back,
+            FolderHistoryDirection::Forward => smart_folder::SmartHistoryDirection::Forward,
+        };
+        if let Some(action) = self.advance_staged_smart_history(smart_direction) {
+            return self.dispatch_staged_smart_history_action(action, history_nav_rollback);
+        }
+        let head = match direction {
+            FolderHistoryDirection::Back => self.folder_history_back_target().cloned(),
+            FolderHistoryDirection::Forward => self.folder_history_forward_target().cloned(),
+        };
+        match head {
+            Some(FolderNavHistoryTarget::SmartFolder(state)) => {
+                let smart_direction = match direction {
+                    FolderHistoryDirection::Back => smart_folder::SmartHistoryDirection::Back,
+                    FolderHistoryDirection::Forward => smart_folder::SmartHistoryDirection::Forward,
+                };
+                self.begin_smart_history_navigation(state, smart_direction);
+                None
+            }
+            Some(FolderNavHistoryTarget::Rating { stars }) => {
+                self.start_rating_history_replay(direction, stars);
+                None
+            }
+            Some(
+                target @ (FolderNavHistoryTarget::Collection(_)
+                | FolderNavHistoryTarget::CollectionPhysical(_)),
+            ) => {
+                self.start_collection_history_transition(
+                    target.clone(),
+                    CollectionHistoryIntent::Replay { direction, target },
+                    None,
+                );
+                None
+            }
+            Some(target @ FolderNavHistoryTarget::Path(_))
+                if matches!(&target, FolderNavHistoryTarget::Path(path)
+                    if crate::folder_tree::is_virtual_folder(path)
+                        || crate::folder_tree::is_convertible_archive_path(path)) =>
+            {
+                self.start_ordinary_archive_history_replay(direction, target);
+                None
+            }
+            _ => {
+                let mut snapshot = Some(self.folder_nav_history_snapshot());
+                let target = match direction {
+                    FolderHistoryDirection::Back => self.navigate_folder_history_back(),
+                    FolderHistoryDirection::Forward => self.navigate_folder_history_forward(),
+                }?;
+                match self
+                    .dispatch_synthetic_folder_history_target_with_rollback(&target, &mut snapshot)
+                {
+                    SyntheticFolderHistoryDispatch::NotSynthetic => {
+                        *history_nav_rollback = snapshot.take();
+                        target.into_path()
+                    }
+                    SyntheticFolderHistoryDispatch::Restored => None,
+                    SyntheticFolderHistoryDispatch::Unavailable => {
+                        if let Some(snapshot) = snapshot.take() {
+                            self.restore_folder_nav_history(snapshot);
+                        }
+                        None
+                    }
+                }
+            }
+        }
     }
 
     fn dispatch_staged_smart_history_action(
@@ -22504,13 +22599,14 @@ impl App {
         path: &Path,
         owner: &OpenRequestOwner,
     ) -> bool {
-        if !self.main_folder_history_available() || !path.is_file() {
+        if !self.main_folder_history_available() {
             return false;
         }
         match owner {
             OpenRequestOwner::Navigation => {
-                crate::folder_tree::is_virtual_folder(path)
-                    || crate::folder_tree::is_convertible_archive_path(path)
+                (crate::folder_tree::is_virtual_folder(path)
+                    || crate::folder_tree::is_convertible_archive_path(path))
+                    && !self.visible_grid_item_is_folder(path)
             }
             OpenRequestOwner::MainGridArchive(intent) => {
                 crate::folder_tree::is_convertible_archive_path(path)
@@ -22519,6 +22615,15 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// A mounted Folder cell already carries the file/dir classification from its scan. For
+    /// paths without a mounted item, an archive-looking suffix only selects worker preflight;
+    /// the worker's metadata result remains authoritative.
+    fn visible_grid_item_is_folder(&self, path: &Path) -> bool {
+        self.items.iter().any(|item| {
+            matches!(item, GridItem::Folder(folder) if crate::folder_tree::path_eq(folder, path))
+        })
     }
 
     pub(crate) fn load_folder_or_convert_archive_with_auto_fullscreen_owned(
@@ -22568,18 +22673,11 @@ impl App {
                 };
             }
         }
-        if path.is_file()
-            && crate::folder_tree::is_convertible_archive_path(&path)
+        if crate::folder_tree::is_convertible_archive_path(&path)
             && self.main_folder_history_available()
             && let OpenRequestOwner::MainGridArchive(intent) = &owner
             && (intent.rating_grid_owner.is_some() || intent.collection_grid_owner.is_some())
         {
-            if self.settings.archive_file_handling_ignores_convertible() {
-                self.show_feedback_toast(
-                    "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
-                );
-                return FolderOpenOutcome::Ignored;
-            }
             if !self.claim_open_request_owner(&path, &owner) {
                 return FolderOpenOutcome::Ignored;
             }
@@ -22595,17 +22693,11 @@ impl App {
                 FolderOpenOutcome::Ignored
             };
         }
-        if path.is_file()
-            && crate::folder_tree::is_convertible_archive_path(&path)
+        if crate::folder_tree::is_convertible_archive_path(&path)
+            && !self.visible_grid_item_is_folder(&path)
             && self.main_folder_history_available()
             && matches!(owner, OpenRequestOwner::Navigation)
         {
-            if self.settings.archive_file_handling_ignores_convertible() {
-                self.show_feedback_toast(
-                    "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
-                );
-                return FolderOpenOutcome::Ignored;
-            }
             if !self.claim_open_request_owner(&path, &owner) {
                 return FolderOpenOutcome::Ignored;
             }
@@ -22683,8 +22775,13 @@ impl App {
         {
             self.pending_auto_fs_open = true;
         }
-        if self.load_folder_with_scan_claimed(path, None, owner, VisibleInstallAuthority::Ordinary)
-        {
+        if self.load_folder_with_scan_claimed(
+            path,
+            None,
+            owner,
+            VisibleInstallAuthority::Ordinary,
+            None,
+        ) {
             FolderOpenOutcome::Loaded
         } else {
             FolderOpenOutcome::Ignored
@@ -22705,6 +22802,16 @@ impl App {
         path: PathBuf,
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
+    ) -> bool {
+        self.load_folder_with_scan_owned_and_effects(path, pre_scan, owner, None)
+    }
+
+    fn load_folder_with_scan_owned_and_effects(
+        &mut self,
+        path: PathBuf,
+        pre_scan: Option<ScannedDir>,
+        owner: OpenRequestOwner,
+        grid_effects: Option<GridVirtualOpenEffects>,
     ) -> bool {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
@@ -22727,7 +22834,13 @@ impl App {
         if !self.claim_open_request_owner(&path, &owner) {
             return false;
         }
-        self.load_folder_with_scan_claimed(path, pre_scan, owner, VisibleInstallAuthority::Ordinary)
+        self.load_folder_with_scan_claimed(
+            path,
+            pre_scan,
+            owner,
+            VisibleInstallAuthority::Ordinary,
+            grid_effects,
+        )
     }
 
     /// Pure preflight for whether a visible open belongs to the current snapshot scope.
@@ -23036,13 +23149,15 @@ impl App {
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
         authority: VisibleInstallAuthority<'_>,
+        grid_effects: Option<GridVirtualOpenEffects>,
     ) -> bool {
         let detached_physical = self.navigation_scope.is_detached_physical();
         if !detached_physical
             && self.main_folder_history_available()
             && let OpenRequestOwner::CollectionGridPhysical(collection) = &owner
-            && path.is_file()
+            && pre_scan.is_none()
             && crate::folder_tree::is_virtual_folder(&path)
+            && !self.visible_grid_item_is_folder(&path)
         {
             return self.start_physical_history_transition(
                 PhysicalHistoryIntent::CollectionGrid {
@@ -23054,8 +23169,9 @@ impl App {
         if !detached_physical
             && self.main_folder_history_available()
             && matches!(owner, OpenRequestOwner::Navigation)
-            && path.is_file()
+            && pre_scan.is_none()
             && crate::folder_tree::is_virtual_folder(&path)
+            && !self.visible_grid_item_is_folder(&path)
             && !self.smart_folder_session_owns_load(&path)
         {
             let auto_fullscreen = std::mem::take(&mut self.pending_auto_fs_open);
@@ -23252,7 +23368,11 @@ impl App {
             }
         }
         // パスが .zip / .cbz / .pdf ファイルなら仮想フォルダとして開く
-        if path.is_file() {
+        if pre_scan.is_none()
+            && crate::folder_tree::is_virtual_folder(&path)
+            && !self.visible_grid_item_is_folder(&path)
+            && path.is_file()
+        {
             let ext = path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -23358,6 +23478,23 @@ impl App {
         ) {
             self.pending_auto_fs_open = false;
             return false;
+        }
+        // The worker proved this suffix path is a Folder. Apply the source tile's filter and
+        // return effects after owner admission but before deriving visible rows and fullscreen.
+        if let Some(effects) = grid_effects {
+            if matches!(
+                &owner,
+                OpenRequestOwner::MainGridArchive(intent)
+                    if intent.collection_grid_owner.as_ref().is_none_or(|collection| {
+                        collection.navigation_request.is_none()
+                    })
+            ) {
+                // A grid-origin Collection owner is valid only against the old root generation.
+                // Commit its anchor/history after admission and before row installation bumps it.
+                self.commit_main_grid_archive_transition(&owner);
+            } else {
+                self.commit_grid_virtual_open_effects(&path, effects);
+            }
         }
         self.install_scanned_folder_listing(
             path,
@@ -27099,24 +27236,51 @@ impl App {
             if replay.is_some() {
                 self.set_active_folder_nav_suppress_record_once(true);
             }
-            let adopted = self.adopt_prepared_ordinary_archive_navigation(
-                &request.path,
-                payload,
-                backing_path.as_deref(),
-                request.source_location.as_ref(),
-                *auto_fullscreen
-                    || grid_effects
+            let adopted = match payload {
+                collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
+                    // A suffix is only a candidate for worker preflight. A directory called
+                    // `book.zip` must still land as a directory after metadata resolves it.
+                    if (*auto_fullscreen
+                        || grid_effects
+                            .as_ref()
+                            .is_some_and(|effects| effects.auto_fullscreen))
+                        && self.settings.auto_fullscreen_image_folders_enabled()
+                    {
+                        self.pending_auto_fs_open = true;
+                    }
+                    if request
+                        .dfs_continuation
                         .as_ref()
-                        .is_some_and(|effects| effects.auto_fullscreen),
-                grid_effects.as_ref(),
-                pdf_password_submission
-                    .as_ref()
-                    .map(|(password, _)| password.clone()),
-                request
-                    .dfs_continuation
-                    .as_ref()
-                    .is_some_and(|dfs| dfs.fullscreen),
-            );
+                        .is_some_and(|dfs| dfs.fullscreen)
+                    {
+                        self.close_fullscreen_for_folder_nav_reopen();
+                    }
+                    self.load_folder_with_scan_owned_and_effects(
+                        request.path.clone(),
+                        Some(scan),
+                        OpenRequestOwner::Navigation,
+                        grid_effects.clone(),
+                    )
+                }
+                payload => self.adopt_prepared_ordinary_archive_navigation(
+                    &request.path,
+                    payload,
+                    backing_path.as_deref(),
+                    request.source_location.as_ref(),
+                    *auto_fullscreen
+                        || grid_effects
+                            .as_ref()
+                            .is_some_and(|effects| effects.auto_fullscreen),
+                    grid_effects.as_ref(),
+                    pdf_password_submission
+                        .as_ref()
+                        .map(|(password, _)| password.clone()),
+                    request
+                        .dfs_continuation
+                        .as_ref()
+                        .is_some_and(|dfs| dfs.fullscreen),
+                ),
+            };
             if adopted {
                 if replay.is_none() {
                     self.commit_staged_search_navigation_effects(
@@ -27176,6 +27340,43 @@ impl App {
         } = &request.intent
         {
             let open_owner = OpenRequestOwner::MainGridArchive(owner.clone());
+            let payload = match payload {
+                collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
+                    if *auto_fullscreen && self.settings.auto_fullscreen_image_folders_enabled() {
+                        self.pending_auto_fs_open = true;
+                    }
+                    let path = request.path;
+                    let effects = GridVirtualOpenEffects {
+                        reading_history_return_from: owner.reading_history_return_from.clone(),
+                        suppress_rating_filter: owner.suppress_rating_filter,
+                        suppress_facet_filter: owner.suppress_facet_filter,
+                        auto_fullscreen: *auto_fullscreen,
+                    };
+                    if self.load_folder_with_scan_owned_and_effects(
+                        path.clone(),
+                        Some(scan),
+                        open_owner.clone(),
+                        Some(effects),
+                    ) {
+                        if owner
+                            .collection_grid_owner
+                            .as_ref()
+                            .is_some_and(|collection| collection.navigation_request.is_some())
+                        {
+                            // Descendant navigation is landed only once its physical path is visible.
+                            self.commit_main_grid_archive_transition(&open_owner);
+                        }
+                        self.commit_staged_search_navigation_effects(
+                            &path,
+                            request.favsearch_origin,
+                            request.tag_view_origin,
+                            request.global_search_origin,
+                        );
+                    }
+                    return;
+                }
+                payload => payload,
+            };
             let collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) = payload
             else {
                 return;
@@ -27211,6 +27412,25 @@ impl App {
         }
         if let PhysicalHistoryIntent::CollectionGrid { owner } = &request.intent {
             let open_owner = OpenRequestOwner::CollectionGridPhysical(owner.clone());
+            let payload = match payload {
+                collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
+                    let path = request.path;
+                    if grid_effects
+                        .as_ref()
+                        .is_some_and(|effects| effects.auto_fullscreen)
+                    {
+                        self.pending_auto_fs_open = true;
+                    }
+                    let _ = self.load_folder_with_scan_owned_and_effects(
+                        path,
+                        Some(scan),
+                        open_owner,
+                        grid_effects,
+                    );
+                    return;
+                }
+                payload => payload,
+            };
             if !matches!(
                 &payload,
                 collection_navigation::PhysicalHistoryPreflightPayload::Zip(_)
@@ -81397,159 +81617,16 @@ impl App {
                         self.adopt_saved_group_ready(id);
                         None
                     }
-                    crate::ui_main::AddressBarNav::HistoryBack => {
-                        if !self.main_folder_history_available() {
-                            None
-                        } else if let Some(action) = self
-                            .advance_staged_smart_history(smart_folder::SmartHistoryDirection::Back)
-                        {
-                            self.dispatch_staged_smart_history_action(
-                                action,
-                                &mut history_nav_rollback,
-                            )
-                        } else if let Some(FolderNavHistoryTarget::SmartFolder(state)) =
-                            self.folder_history_back_target().cloned()
-                        {
-                            self.begin_smart_history_navigation(
-                                state,
-                                smart_folder::SmartHistoryDirection::Back,
-                            );
-                            None
-                        } else if let Some(FolderNavHistoryTarget::Rating { stars }) =
-                            self.folder_history_back_target().cloned()
-                        {
-                            self.start_rating_history_replay(FolderHistoryDirection::Back, stars);
-                            None
-                        } else if let Some(
-                            target @ (FolderNavHistoryTarget::Collection(_)
-                            | FolderNavHistoryTarget::CollectionPhysical(_)),
-                        ) = self.folder_history_back_target().cloned()
-                        {
-                            self.start_collection_history_transition(
-                                target.clone(),
-                                CollectionHistoryIntent::Replay {
-                                    direction: FolderHistoryDirection::Back,
-                                    target,
-                                },
-                                None,
-                            );
-                            None
-                        } else if let Some(target @ FolderNavHistoryTarget::Path(_)) =
-                            self.folder_history_back_target().cloned()
-                            && matches!(&target, FolderNavHistoryTarget::Path(path)
-                                if crate::folder_tree::is_virtual_folder(path)
-                                    || crate::folder_tree::is_convertible_archive_path(path))
-                        {
-                            self.start_ordinary_archive_history_replay(
-                                FolderHistoryDirection::Back,
-                                target,
-                            );
-                            None
-                        } else {
-                            let mut snapshot = Some(self.folder_nav_history_snapshot());
-                            let target = self.navigate_folder_history_back();
-                            match target {
-                                Some(target) => {
-                                    match self
-                                        .dispatch_synthetic_folder_history_target_with_rollback(
-                                            &target,
-                                            &mut snapshot,
-                                        ) {
-                                        SyntheticFolderHistoryDispatch::NotSynthetic => {
-                                            history_nav_rollback = snapshot.take();
-                                            target.into_path()
-                                        }
-                                        SyntheticFolderHistoryDispatch::Restored => None,
-                                        SyntheticFolderHistoryDispatch::Unavailable => {
-                                            if let Some(snapshot) = snapshot.take() {
-                                                self.restore_folder_nav_history(snapshot);
-                                            }
-                                            None
-                                        }
-                                    }
-                                }
-                                None => None,
-                            }
-                        }
-                    }
-                    crate::ui_main::AddressBarNav::HistoryForward => {
-                        if !self.main_folder_history_available() {
-                            None
-                        } else if let Some(action) = self.advance_staged_smart_history(
-                            smart_folder::SmartHistoryDirection::Forward,
-                        ) {
-                            self.dispatch_staged_smart_history_action(
-                                action,
-                                &mut history_nav_rollback,
-                            )
-                        } else if let Some(FolderNavHistoryTarget::SmartFolder(state)) =
-                            self.folder_history_forward_target().cloned()
-                        {
-                            self.begin_smart_history_navigation(
-                                state,
-                                smart_folder::SmartHistoryDirection::Forward,
-                            );
-                            None
-                        } else if let Some(FolderNavHistoryTarget::Rating { stars }) =
-                            self.folder_history_forward_target().cloned()
-                        {
-                            self.start_rating_history_replay(
-                                FolderHistoryDirection::Forward,
-                                stars,
-                            );
-                            None
-                        } else if let Some(
-                            target @ (FolderNavHistoryTarget::Collection(_)
-                            | FolderNavHistoryTarget::CollectionPhysical(_)),
-                        ) = self.folder_history_forward_target().cloned()
-                        {
-                            self.start_collection_history_transition(
-                                target.clone(),
-                                CollectionHistoryIntent::Replay {
-                                    direction: FolderHistoryDirection::Forward,
-                                    target,
-                                },
-                                None,
-                            );
-                            None
-                        } else if let Some(target @ FolderNavHistoryTarget::Path(_)) =
-                            self.folder_history_forward_target().cloned()
-                            && matches!(&target, FolderNavHistoryTarget::Path(path)
-                                if crate::folder_tree::is_virtual_folder(path)
-                                    || crate::folder_tree::is_convertible_archive_path(path))
-                        {
-                            self.start_ordinary_archive_history_replay(
-                                FolderHistoryDirection::Forward,
-                                target,
-                            );
-                            None
-                        } else {
-                            let mut snapshot = Some(self.folder_nav_history_snapshot());
-                            let target = self.navigate_folder_history_forward();
-                            match target {
-                                Some(target) => {
-                                    match self
-                                        .dispatch_synthetic_folder_history_target_with_rollback(
-                                            &target,
-                                            &mut snapshot,
-                                        ) {
-                                        SyntheticFolderHistoryDispatch::NotSynthetic => {
-                                            history_nav_rollback = snapshot.take();
-                                            target.into_path()
-                                        }
-                                        SyntheticFolderHistoryDispatch::Restored => None,
-                                        SyntheticFolderHistoryDispatch::Unavailable => {
-                                            if let Some(snapshot) = snapshot.take() {
-                                                self.restore_folder_nav_history(snapshot);
-                                            }
-                                            None
-                                        }
-                                    }
-                                }
-                                None => None,
-                            }
-                        }
-                    }
+                    crate::ui_main::AddressBarNav::HistoryBack => self
+                        .dispatch_main_folder_history_input(
+                            FolderHistoryDirection::Back,
+                            &mut history_nav_rollback,
+                        ),
+                    crate::ui_main::AddressBarNav::HistoryForward => self
+                        .dispatch_main_folder_history_input(
+                            FolderHistoryDirection::Forward,
+                            &mut history_nav_rollback,
+                        ),
                 }
             } else if let Some(p) = open_folder_nav {
                 Some(p)

@@ -842,13 +842,14 @@ if ($script:archiveErrors.Count -gt 0) {
         $candidateFixtureDir = Join-Path $scenarioRoot 'A'
         $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
         $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_folder_history_fixture.py'
+        $candidateFixtureGeneratorPdfDependencyPath = Join-Path $PSScriptRoot 'page-turn\generate_pdf_fixture.py'
         $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\portable-smoke\data\folder-history') 'ui-smoke-scenario'
         Assert-NoReparsePath $scenarioRoot $dataDir 'ui-smoke-scenario'
         if (Test-Path -LiteralPath $scenarioRoot) {
             Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
             Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
         }
-        foreach ($path in @($candidateScriptPath, $candidateFixtureGeneratorPath)) {
+        foreach ($path in @($candidateScriptPath, $candidateFixtureGeneratorPath, $candidateFixtureGeneratorPdfDependencyPath)) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
                 throw "[ui-smoke] folder-history input not found: $path"
             }
@@ -859,13 +860,14 @@ if ($script:archiveErrors.Count -gt 0) {
             throw "[ui-smoke] folder-history fixture generator failed with exit $LASTEXITCODE"
         }
         Assert-NoReparseTree $candidateFixtureDir 'folder-history-fixture'
-        foreach ($relative in @('F\G\g-page.png', 'F\z-page.png', 'B\D\d-page.png', 'B\z-page.png')) {
+        foreach ($relative in @('F\G\g-page.png', 'F\z-page.png', 'F\x-book.pdf', 'F\y-book.zip', 'B\D\d-page.png', 'B\z-page.png', 'B\x-book.pdf', 'B\y-book.zip')) {
             if (-not (Test-Path -LiteralPath (Join-Path $candidateFixtureDir $relative) -PathType Leaf)) {
                 throw "[ui-smoke] folder-history fixture file missing: $relative"
             }
         }
         Write-UiSmokeJson $candidateSettingsPath ([ordered]@{
             auto_fullscreen_image_folders = $false
+            auto_fullscreen_zip_pdf = $false
             sort_order = 'FileName'
         })
     }

@@ -1,10 +1,12 @@
 """Create a disposable folder-history fixture and seed Rating/Collection DBs."""
 
 import argparse
+import importlib.util
 import sqlite3
 import struct
 import uuid
 import zlib
+import zipfile
 from pathlib import Path
 
 
@@ -49,6 +51,20 @@ def seed(fixture: Path, data_dir: Path):
         destination = fixture / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(image(color))
+
+    pdf_generator = Path(__file__).resolve().parents[1] / "page-turn" / "generate_pdf_fixture.py"
+    pdf_spec = importlib.util.spec_from_file_location("folder_history_pdf_fixture", pdf_generator)
+    if pdf_spec is None or pdf_spec.loader is None:
+        raise RuntimeError("PDF fixture generator is unavailable")
+    pdf_module = importlib.util.module_from_spec(pdf_spec)
+    pdf_spec.loader.exec_module(pdf_module)
+    for folder, doc in (("F", 0), ("B", 1)):
+        book_dir = fixture / folder
+        book_dir.joinpath("x-book.pdf").write_bytes(pdf_module.build_pdf(doc, 2, 612, 792))
+        with zipfile.ZipFile(book_dir / "y-book.zip", "w") as archive:
+            archive.writestr("root.png", image((80, 80, 80)))
+            archive.writestr("chapter/first.png", image((30, 100, 220)))
+            archive.writestr("chapter/second.png", image((220, 180, 30)))
 
     with sqlite3.connect(data_dir / "rating.db") as db:
         db.execute("CREATE TABLE ratings (path TEXT PRIMARY KEY, stars INTEGER NOT NULL)")

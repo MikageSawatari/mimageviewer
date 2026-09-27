@@ -12081,6 +12081,232 @@ mod phase_c_folder_nav_history_tests {
     use std::sync::mpsc;
     use std::time::SystemTime;
 
+    fn history_key_nav(app: &mut App, key: egui::Key) -> Option<crate::ui_main::AddressBarNav> {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            modifiers: egui::Modifiers::ALT,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            }],
+            ..Default::default()
+        });
+        let nav = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+        nav
+    }
+
+    #[test]
+    fn ring_history_input_is_rejected_at_shared_boundary_during_search() {
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        for mode in 0..3 {
+            for (action, expected, direction) in [
+                (
+                    RingActionId::GridHistoryBack,
+                    crate::ui_main::AddressBarNav::HistoryBack,
+                    FolderHistoryDirection::Back,
+                ),
+                (
+                    RingActionId::GridHistoryForward,
+                    crate::ui_main::AddressBarNav::HistoryForward,
+                    FolderHistoryDirection::Forward,
+                ),
+            ] {
+                let mut app = setup_app();
+                let origin = app.tmp.path().join("history-search-origin");
+                std::fs::create_dir_all(&origin).unwrap();
+                app.current_folder = Some(origin.clone());
+                app.active_quick_folder_slot = None;
+                app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(origin.join("back"))];
+                app.folder_nav_forward_stack =
+                    vec![FolderNavHistoryTarget::Path(origin.join("forward"))];
+                match mode {
+                    0 => app.open_global_search(),
+                    1 => app.open_favsearch(),
+                    _ => app.open_tag_view(),
+                }
+                let before = app.folder_nav_history_snapshot();
+                let nav = app.apply_ring_action(
+                    &egui::Context::default(),
+                    RingShortcutContext::Grid,
+                    action,
+                    "test-ring",
+                );
+                assert!(matches!(
+                    (nav, expected),
+                    (
+                        Some(crate::ui_main::AddressBarNav::HistoryBack),
+                        crate::ui_main::AddressBarNav::HistoryBack
+                    ) | (
+                        Some(crate::ui_main::AddressBarNav::HistoryForward),
+                        crate::ui_main::AddressBarNav::HistoryForward
+                    )
+                ));
+                let mut rollback = None;
+                let result = app.dispatch_main_folder_history_input(direction, &mut rollback);
+                assert!(result.is_none(), "search mode {mode}");
+                assert!(rollback.is_none());
+                assert_eq!(app.folder_nav_back_stack, before.back_stack);
+                assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_history_input_is_rejected_if_search_activates_before_dispatch() {
+        for mode in 0..3 {
+            for (key, expected, direction) in [
+                (
+                    egui::Key::ArrowLeft,
+                    crate::ui_main::AddressBarNav::HistoryBack,
+                    FolderHistoryDirection::Back,
+                ),
+                (
+                    egui::Key::ArrowRight,
+                    crate::ui_main::AddressBarNav::HistoryForward,
+                    FolderHistoryDirection::Forward,
+                ),
+            ] {
+                let mut app = setup_app();
+                let origin = app.tmp.path().join("keyboard-history-search-origin");
+                std::fs::create_dir_all(&origin).unwrap();
+                app.current_folder = Some(origin.clone());
+                app.active_quick_folder_slot = None;
+                app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(origin.join("back"))];
+                app.folder_nav_forward_stack =
+                    vec![FolderNavHistoryTarget::Path(origin.join("forward"))];
+                assert!(matches!(
+                    (history_key_nav(&mut app, key), expected),
+                    (
+                        Some(crate::ui_main::AddressBarNav::HistoryBack),
+                        crate::ui_main::AddressBarNav::HistoryBack
+                    ) | (
+                        Some(crate::ui_main::AddressBarNav::HistoryForward),
+                        crate::ui_main::AddressBarNav::HistoryForward
+                    )
+                ));
+                match mode {
+                    0 => app.open_global_search(),
+                    1 => app.open_favsearch(),
+                    _ => app.open_tag_view(),
+                }
+                let before = app.folder_nav_history_snapshot();
+                let mut rollback = None;
+                let result = app.dispatch_main_folder_history_input(direction, &mut rollback);
+                assert!(result.is_none(), "search mode {mode}");
+                assert!(rollback.is_none());
+                assert!(history_key_nav(&mut app, key).is_none());
+                assert_eq!(app.folder_nav_back_stack, before.back_stack);
+                assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
+            }
+        }
+    }
+
+    #[test]
+    fn archive_preflight_classifies_uncertain_paths_off_the_ui_thread() {
+        let mut app = setup_app();
+        let suffix_folder = app.tmp.path().join("directory.zip");
+        std::fs::create_dir_all(&suffix_folder).unwrap();
+        app.items = vec![GridItem::Folder(suffix_folder.clone())];
+        assert!(
+            !app.will_stage_archive_navigation(
+                &suffix_folder,
+                &super::OpenRequestOwner::Navigation,
+            )
+        );
+
+        let uncertain_zip = app.tmp.path().join("not-yet-probed.zip");
+        assert!(app.will_stage_archive_navigation(
+            &uncertain_zip,
+            &super::OpenRequestOwner::Navigation,
+        ));
+    }
+
+    #[test]
+    fn uncertain_zip_suffix_directory_preflights_and_adopts_as_folder() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = app.tmp.path().join("origin");
+        let suffix_folder = app.tmp.path().join("unlisted-directory.zip");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&suffix_folder).unwrap();
+        app.current_folder = Some(origin);
+
+        assert!(app.load_folder_with_scan_owned(
+            suffix_folder.clone(),
+            None,
+            super::OpenRequestOwner::Navigation,
+        ));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some(),
+            "uncertain suffix paths must be classified by worker preflight"
+        );
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app
+            .top_level_grid_view
+            .history_navigation_transition()
+            .is_some()
+        {
+            assert!(std::time::Instant::now() < deadline);
+            app.poll_collection_history_transition(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.current_folder.as_ref(), Some(&suffix_folder));
+        assert_eq!(
+            app.folder_nav_current_target(),
+            Some(FolderNavHistoryTarget::Path(suffix_folder))
+        );
+    }
+
+    #[test]
+    fn ignored_convertible_suffix_directory_still_opens_as_folder() {
+        for suffix in ["rar", "7z", "lzh"] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings
+                .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+            let origin = app.tmp.path().join("origin");
+            let suffix_folder = app.tmp.path().join(format!("folder.{suffix}"));
+            std::fs::create_dir_all(&origin).unwrap();
+            std::fs::create_dir_all(&suffix_folder).unwrap();
+            app.current_folder = Some(origin);
+
+            let _ = app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                suffix_folder.clone(),
+                false,
+                super::OpenRequestOwner::Navigation,
+            );
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some(),
+                "{suffix} directory must reach worker classification"
+            );
+            let ctx = egui::Context::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+            {
+                assert!(std::time::Instant::now() < deadline);
+                app.poll_collection_history_transition(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(app.current_folder.as_ref(), Some(&suffix_folder));
+            assert_eq!(
+                app.folder_nav_current_target(),
+                Some(FolderNavHistoryTarget::Path(suffix_folder))
+            );
+        }
+    }
+
     #[test]
     fn default_quick_folder_history_back_forward_does_not_duplicate_history_edges() {
         let mut app = setup_app();
@@ -13009,6 +13235,95 @@ mod phase_c_folder_nav_history_tests {
             assert!(!app.visible_indices.is_empty());
             assert!(app.fullscreen_idx.is_some() || app.fs_nav_after_pdf_enumerate.is_some());
         }
+    }
+
+    #[test]
+    fn stale_archive_tile_classified_as_folder_commits_grid_open_effects() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("reading-history-source");
+        let target = app.tmp.path().join("archive-became-folder.zip");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("001.png"), b"dummy").unwrap();
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.settings
+            .facet_filter
+            .kinds
+            .insert(crate::settings::FacetItemKind::Zip);
+        let rating_key = crate::adjustment_db::normalize_path(&target);
+        app.rating_db.as_ref().unwrap().set(&rating_key, 5).unwrap();
+        app.install_new_items(vec![GridItem::ZipFile(target.clone())], vec![None]);
+        app.visible_indices = vec![0];
+        app.current_folder = Some(source.clone());
+        app.items_are_reading_history_view = true;
+        app.reading_history_return_from = Some(source.clone());
+
+        let crate::ui_main::AddressBarNav::GridVirtual(intent) =
+            app.grid_physical_navigation(0, target.clone(), true)
+        else {
+            panic!("stale ZIP tile must retain its typed grid request");
+        };
+        assert!(app.start_grid_virtual_open(intent));
+        assert_eq!(app.reading_history_return_from, Some(source));
+        finish_staged_physical_history_for_test(&mut app);
+
+        assert_eq!(app.current_folder.as_deref(), Some(target.as_path()));
+        assert_eq!(app.reading_history_return_from, Some(target));
+        assert!(app.rating_filter_suppressed_at.is_some());
+        assert_eq!(app.facet_filter_suppression_stack.len(), 1);
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+
+    #[test]
+    fn stale_convertible_rating_tile_classified_as_folder_ignores_archive_policy() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.rating_view_stars = 4;
+        app.rating_view_rows_stars = Some(4);
+        app.items_are_rating_view = true;
+        app.current_folder = Some(super::rating_view_synthetic_path());
+        app.top_level_grid_view.begin(
+            super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 4 },
+            None,
+        );
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+        let target = app.tmp.path().join("archive-became-folder.7z");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("001.png"), b"dummy").unwrap();
+        app.install_new_items(
+            vec![GridItem::ConvertibleArchive {
+                path: target.clone(),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            }],
+            vec![None],
+        );
+        app.visible_indices = vec![0];
+        let owner = app.main_grid_archive_open_owner(0, &target);
+        assert!(matches!(
+            owner,
+            super::OpenRequestOwner::MainGridArchive(ref intent)
+                if intent.rating_grid_owner.is_some()
+        ));
+        let _ = app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            target.clone(),
+            false,
+            owner,
+        );
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        finish_staged_physical_history_for_test(&mut app);
+
+        assert_eq!(app.current_folder.as_deref(), Some(target.as_path()));
+        assert!(matches!(app.items.first(), Some(GridItem::Image(_))));
+        assert_eq!(app.rating_view_nav_stack, vec![target]);
     }
 
     #[test]

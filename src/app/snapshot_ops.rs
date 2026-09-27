@@ -1690,7 +1690,11 @@ impl App {
         navigation_purpose: crate::app::FsNavigationPurpose,
     ) {
         if self.main_folder_history_available()
-            && folder_path.is_file()
+            && matches!(
+                target,
+                crate::snapshot::SnapshotTarget::ZipImage { .. }
+                    | crate::snapshot::SnapshotTarget::PdfPage { .. }
+            )
             && crate::folder_tree::is_virtual_folder(&folder_path)
         {
             // A prepared ZIP/PDF has no legacy enumerate receiver yet. Carry the required
@@ -2259,6 +2263,47 @@ mod tests {
             }),
             Some(0)
         );
+    }
+
+    #[test]
+    fn required_virtual_leaf_stages_before_filesystem_preflight() {
+        use crate::snapshot::SnapshotTarget;
+
+        let temp = tempfile::tempdir().unwrap();
+        for (name, pdf) in [("missing.zip", false), ("missing.pdf", true)] {
+            let path = temp.path().join(name);
+            let target = if pdf {
+                SnapshotTarget::PdfPage {
+                    pdf_path: path.clone(),
+                    page_num: 0,
+                }
+            } else {
+                SnapshotTarget::ZipImage {
+                    zip_path: path.clone(),
+                    entry_name: "page.jpg".into(),
+                }
+            };
+            let old_page = temp.path().join("old.jpg");
+            let mut app = test_app_with_items(vec![GridItem::Image(old_page)]);
+            app.fullscreen_idx = Some(0);
+            let old_items = app.items.clone();
+
+            app.open_required_fullscreen_location(
+                &egui::Context::default(),
+                path,
+                target,
+                crate::app::HistoryTrigger::UserChosen,
+            );
+
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some(),
+                "the worker must classify the container before changing the visible viewer"
+            );
+            assert_eq!(app.items, old_items);
+            assert_eq!(app.fullscreen_idx, Some(0));
+        }
     }
 
     #[test]
