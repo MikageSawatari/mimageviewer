@@ -994,9 +994,12 @@ impl DspBridge {
                 drop(inner);
                 let exe = extract::ensure_bridge_extracted()
                     .map_err(|e| format!("bridge exe 展開失敗: {e}"))?;
-                let mut bridge = Bridge::spawn(exe, |line| {
-                    crate::logger::log(format!("[vst3-bridge] {line}"));
-                })
+                let gui_signal_wake = self.gui_result_wake.lock().unwrap().clone();
+                let mut bridge = Bridge::spawn_with_gui_signal_wake(
+                    exe,
+                    |line| crate::logger::log(format!("[vst3-bridge] {line}")),
+                    gui_signal_wake,
+                )
                 .map_err(|e| format!("bridge spawn 失敗: {e}"))?;
                 if let Err(e) = bridge.send(&Cmd::Hello {
                     version: crate::video::dsp::bridge::PROTOCOL_VERSION,

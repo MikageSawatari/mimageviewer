@@ -401,6 +401,8 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - EffeTune の GUI signal pump は UI frame で行うが、focus、resize、resize session に伴う
   host コマンドは専用 `effetune-host-control` worker に送る。host monitor と GUI attach worker は
   結果が届いた時に egui の repaint を要求し、アイドル中の失敗も controller の `fail()` に渡す。
+  host の `GuiUserHidden` / `GuiBypassToggle` も event pump でキューへ入れた直後に同じ
+  notifier で repaint を要求する。notifier は EffeTune 専用 bridge の生成時だけ渡す。
 - ローカル音声の引き渡し型は `AudioDspChain { user, effetune }`。`EffetuneAudioSlot` は
   `Mutex` をブロックごとに 1 回読んで世代と bridge を取得する。
 - 終了時の EffeTune 最終取得は `ExitCaptureFence` を先に作り、既存 VST3 スナップショットと

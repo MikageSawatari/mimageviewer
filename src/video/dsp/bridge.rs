@@ -368,6 +368,27 @@ pub struct Bridge {
     sig_out: Option<EventHandle>,
 }
 
+type GuiSignalWake = Arc<dyn Fn() + Send + Sync>;
+
+fn route_gui_signal(
+    event: &Event,
+    user_hidden_tx: &crossbeam_channel::Sender<u64>,
+    bypass_toggle_tx: &crossbeam_channel::Sender<u64>,
+    wake: Option<&GuiSignalWake>,
+) -> bool {
+    let queued = match event {
+        Event::GuiUserHidden { slot_id } => user_hidden_tx.try_send(*slot_id).is_ok(),
+        Event::GuiBypassToggle { slot_id } => bypass_toggle_tx.try_send(*slot_id).is_ok(),
+        _ => return false,
+    };
+    if queued {
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+    queued
+}
+
 #[cfg(windows)]
 struct SharedMemory {
     handle: HANDLE,
@@ -430,6 +451,17 @@ impl Bridge {
     /// tester 側はこれを使ってログファイルにブリッジの内部状態 (show_gui の各ステップ等)
     /// を合流させる。バックグラウンドスレッドが子プロセス終了まで動き続ける。
     pub fn spawn<F>(exe_path: &std::path::Path, stderr_cb: F) -> std::io::Result<Self>
+    where
+        F: Fn(String) + Send + 'static,
+    {
+        Self::spawn_with_gui_signal_wake(exe_path, stderr_cb, None)
+    }
+
+    pub(crate) fn spawn_with_gui_signal_wake<F>(
+        exe_path: &std::path::Path,
+        stderr_cb: F,
+        gui_signal_wake: Option<GuiSignalWake>,
+    ) -> std::io::Result<Self>
     where
         F: Fn(String) + Send + 'static,
     {
@@ -522,11 +554,14 @@ impl Bridge {
                             // (= stale ack race 防止、Codex 助言、2026-05-01)。
                             let _ = reset_ack_tx.try_send(reset_id);
                         }
-                        Ok(Event::GuiUserHidden { slot_id }) => {
-                            let _ = gui_user_hidden_tx.try_send(slot_id);
-                        }
-                        Ok(Event::GuiBypassToggle { slot_id }) => {
-                            let _ = gui_bypass_toggle_tx.try_send(slot_id);
+                        Ok(event @ Event::GuiUserHidden { .. })
+                        | Ok(event @ Event::GuiBypassToggle { .. }) => {
+                            route_gui_signal(
+                                &event,
+                                &gui_user_hidden_tx,
+                                &gui_bypass_toggle_tx,
+                                gui_signal_wake.as_ref(),
+                            );
                         }
                         Ok(Event::PluginState {
                             request_id: Some(request_id),
@@ -1297,6 +1332,48 @@ impl Drop for Bridge {
 #[cfg(test)]
 mod concurrent_state_tests {
     use super::*;
+
+    #[test]
+    fn host_gui_user_hidden_wakes_idle_effetune_context_only() {
+        use std::sync::atomic::AtomicUsize;
+
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(AtomicUsize::new(0));
+        let repaint_count_for_callback = Arc::clone(&repaint_count);
+        ctx.set_request_repaint_callback(move |_| {
+            repaint_count_for_callback.fetch_add(1, Ordering::SeqCst);
+        });
+        // Drain egui's initial two-pass repaint before simulating an idle app.
+        for _ in 0..3 {
+            let _ = ctx.run(Default::default(), |_| {});
+        }
+        repaint_count.store(0, Ordering::SeqCst);
+
+        let wake_ctx = ctx.clone();
+        let wake: GuiSignalWake = Arc::new(move || wake_ctx.request_repaint());
+        let (hidden_tx, hidden_rx) = crossbeam_channel::bounded(1);
+        let (bypass_tx, bypass_rx) = crossbeam_channel::bounded(1);
+        let host_event: Event =
+            serde_json::from_str(r#"{"event":"gui_user_hidden","slot_id":17}"#).unwrap();
+        assert!(route_gui_signal(
+            &host_event,
+            &hidden_tx,
+            &bypass_tx,
+            Some(&wake),
+        ));
+        assert_eq!(hidden_rx.try_recv().unwrap(), 17);
+        assert!(repaint_count.load(Ordering::SeqCst) > 0);
+
+        let prior_repaints = repaint_count.load(Ordering::SeqCst);
+        assert!(route_gui_signal(
+            &Event::GuiBypassToggle { slot_id: 18 },
+            &hidden_tx,
+            &bypass_tx,
+            None,
+        ));
+        assert_eq!(bypass_rx.try_recv().unwrap(), 18);
+        assert_eq!(repaint_count.load(Ordering::SeqCst), prior_repaints);
+    }
 
     #[test]
     fn state_responses_follow_request_ids_and_abort_on_bridge_exit() {
