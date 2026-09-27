@@ -2045,10 +2045,15 @@ fn folder_thumb_aspect_height_ratio(settings: &crate::settings::Settings, folder
 fn pdf_page_sizes_needed(
     items: &[crate::grid_item::GridItem],
     cached: &std::collections::HashMap<String, Option<(u32, u32)>>,
+    recover_empty_dims: bool,
 ) -> bool {
     items.iter().any(|item| match item {
         crate::grid_item::GridItem::PdfPage { page_num, .. } => {
-            !cached.contains_key(&crate::grid_item::pdf_page_cache_key(*page_num))
+            match cached.get(&crate::grid_item::pdf_page_cache_key(*page_num)) {
+                None => true,
+                Some(None) => recover_empty_dims,
+                Some(Some(_)) => false,
+            }
         }
         _ => false,
     })
@@ -5524,7 +5529,11 @@ impl ContainerEngine {
         read: Option<&crate::pdf_loader::ReadTarget>,
     ) -> std::collections::HashMap<String, (u32, u32)> {
         let mut dims = std::collections::HashMap::new();
-        if pdf_page_sizes_needed(items, cached) {
+        // EPUB の古い空寸法行は、別世代のサムネイルに頼らず固定済み世代から補う。
+        // 通常の PDF は従来どおり空寸法行だけでは追加の PDF 読みをしない。
+        let recover_empty_dims =
+            read.is_some_and(|target| target.stamp.generation_catalog_pair().is_some());
+        if pdf_page_sizes_needed(items, cached, recover_empty_dims) {
             let password = self.real_pdf_password(container_path);
             let page_sizes = if let Some(read) = read {
                 crate::pdf_loader::get_page_sizes_with_read_target(
@@ -5643,26 +5652,28 @@ impl ContainerEngine {
                     pages += 1;
                 }
                 let dims = key.and_then(|key| {
-                    // A present-but-empty value is a row saved before the dimension columns
-                    // existed, and only those are worth paying for a thumbnail read to recover.
+                    // Empty dimension columns predate catalog dimensions. For EPUB, use the
+                    // pinned generation's page box before consulting any thumbnail row.
                     match cached.get(&key) {
-                        Some(recorded) => recorded.or_else(|| {
-                            catalog
-                                .as_ref()
-                                .and_then(|catalog| catalog.load_one(&key).ok().flatten())
-                                .filter(|entry| {
-                                    if is_epub_path(container_path) {
-                                        epub_stamp.is_some_and(|(id, size)| {
-                                            entry.mtime == id && entry.file_size == size
-                                        })
-                                    } else {
-                                        true
-                                    }
-                                })
-                                .and_then(|entry| {
-                                    crate::catalog::decode_thumb_dims(&entry.jpeg_data)
-                                })
-                        }),
+                        Some(recorded) => recorded
+                            .or_else(|| fallback_dims.get(&key).copied())
+                            .or_else(|| {
+                                catalog
+                                    .as_ref()
+                                    .and_then(|catalog| catalog.load_one(&key).ok().flatten())
+                                    .filter(|entry| {
+                                        if is_epub_path(container_path) {
+                                            epub_stamp.is_some_and(|(id, size)| {
+                                                entry.mtime == id && entry.file_size == size
+                                            })
+                                        } else {
+                                            true
+                                        }
+                                    })
+                                    .and_then(|entry| {
+                                        crate::catalog::decode_thumb_dims(&entry.jpeg_data)
+                                    })
+                            }),
                         // カタログ行が 1 つも無い場合。ZIP / PDF / 実ファイルのどれも
                         // `catalog_free_dims` が一括で求めてあるので、ここで 1 件ずつ
                         // 読み直す枝は無い (あると「束ねたのに逐次経路も残る」になる)。
@@ -7769,6 +7780,76 @@ mod tests {
     }
 
     #[test]
+    fn remote_epub_spread_uses_pinned_landscape_page_after_portrait_rewrite() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("landscape-race.epub");
+        std::fs::write(&epub, b"source").unwrap();
+        let pdf = minimal_remote_pdf(144, 72);
+        let generated = epub.with_extension("generated.pdf");
+        std::fs::write(&generated, &pdf).unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&generated);
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &epub).unwrap();
+        let landscape = image::DynamicImage::ImageRgba8(image::RgbaImage::new(96, 48));
+        let portrait = image::DynamicImage::ImageRgba8(image::RgbaImage::new(48, 96));
+        let (old_webp, _, _) = crate::catalog::encode_thumb_webp(&landscape, 96, 75.0).unwrap();
+        let (new_webp, _, _) = crate::catalog::encode_thumb_webp(&portrait, 96, 75.0).unwrap();
+        catalog
+            .save("page_0000", 903, pdf.len() as i64, 96, 48, None, &old_webp)
+            .unwrap();
+        open_parent_catalog(&epub)
+            .unwrap()
+            .set_pdf_meta_safe("landscape-race.epub", 903, pdf.len() as i64, 1)
+            .unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 903, pdf.len() as u64);
+        let resolves = crate::pdf_loader::RemoteResolveTestCounter::for_path(&epub);
+        let path = epub.clone();
+        remote_dim_race_hooks().lock().unwrap().insert(
+            epub.clone(),
+            Box::new(move || {
+                crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &path)
+                    .unwrap()
+                    .save("page_0000", 904, pdf.len() as i64, 48, 96, None, &new_webp)
+                    .unwrap();
+            }),
+        );
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+            spread_mode: Some(RemoteSpreadMode::SplitLtr),
+            ..remote_epub_request(&epub)
+        }) else {
+            panic!("EPUB split spread open failed");
+        };
+        assert_eq!(payload.entries.len(), 1);
+        assert_eq!(payload.page_groups.len(), 2, "pinned wide page must split");
+        assert_eq!(resolves.take(), 1);
+        assert_eq!(catalog.load_one("page_0000").unwrap().unwrap().mtime, 904);
+    }
+
+    #[test]
+    fn remote_plain_pdf_d10_off_cache_miss_enumerates_without_direction() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let pdf_path = root.path().join("direction-cache-miss.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let settings = crate::settings::Settings {
+            default_spread_mode: crate::settings::SpreadMode::Single,
+            default_reading_direction: crate::settings::ReadingDirection::Ltr,
+            follow_document_reading_direction: false,
+            ..Default::default()
+        };
+        let engine = ContainerEngine::new(settings);
+        let ContainerResponse::Success(payload) = engine.container(remote_epub_request(&pdf_path))
+        else {
+            panic!("PDF open with D10 off and no page-count cache failed");
+        };
+        assert_eq!(payload.reading_direction, RemoteReadingDirection::Ltr);
+        assert_eq!(backend.direction_requests(), vec![false]);
+    }
+
+    #[test]
     fn remote_plain_pdf_d10_is_opt_in_and_saved_spread_wins() {
         let _data_dir = crate::data_dir::TestDataDirGuard::new();
         let root = tempfile::tempdir().unwrap();
@@ -9118,22 +9199,24 @@ mod tests {
                 Some((600u32, 800u32)),
             );
         }
-        assert!(!pdf_page_sizes_needed(&items, &cached));
+        assert!(!pdf_page_sizes_needed(&items, &cached, false));
 
         // 寸法列が空の古い行でも「行はある」ので取りに行かない (サムネイルから復元できる)。
         cached.insert(crate::grid_item::pdf_page_cache_key(1), None);
-        assert!(!pdf_page_sizes_needed(&items, &cached));
+        assert!(!pdf_page_sizes_needed(&items, &cached, false));
+        assert!(pdf_page_sizes_needed(&items, &cached, true));
 
         // 行そのものが無いページが 1 つでもあれば取りに行く。
         cached.remove(&crate::grid_item::pdf_page_cache_key(2));
-        assert!(pdf_page_sizes_needed(&items, &cached));
+        assert!(pdf_page_sizes_needed(&items, &cached, false));
 
         // PDF ページが 1 つも無ければ関係ない。
         assert!(!pdf_page_sizes_needed(
             &[crate::grid_item::GridItem::Image(std::path::PathBuf::from(
                 "a.jpg"
             ))],
-            &std::collections::HashMap::new()
+            &std::collections::HashMap::new(),
+            true
         ));
     }
 
