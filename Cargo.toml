@@ -4,6 +4,7 @@ members = [
     "crates/susie-crash-plugin",
     "crates/launcher",
     "crates/local-adjust-core",
+    "crates/libraw-sys",
     "crates/comic-core",
     "crates/music-core",
     "crates/remote-ipc",
@@ -90,6 +91,13 @@ required-features = ["dev-tools"]
 [[bin]]
 name = "bench_dupe"
 path = "src/bin/bench_dupe.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "bench_raw"
+path = "src/bin/bench_raw.rs"
 test = false
 bench = false
 required-features = ["dev-tools"]
@@ -266,6 +274,7 @@ bench = false
 required-features = ["manual-e2e"]
 
 [target.'cfg(windows)'.dependencies]
+libraw-sys = { path = "crates/libraw-sys" }
 windows-core = "0.61"
 # wgpu-hal 27 系が要求する windows 0.58。`windows_058` 別名でアプリ側にも
 # 公開し、wgpu の hal::Api::Device 経由で得る ID3D12Resource を OpenSharedHandle

@@ -1,0 +1,342 @@
+{
+  "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "source_catalog": "https://raw.pixls.us/json/getrepository.php?set=all",
+  "samples": [
+    {
+      "id": "885",
+      "case": "deflate-dng",
+      "file": "885.dng",
+      "url": "https://raw.pixls.us/getfile.php/885/nice/Canon - EOS 5D Mark III - 16bit 16bit RAW.dng",
+      "sha256": "6275226bfa2d86ba479130999d045ea0b8da6be4b011130c9eb91cd6a0eb2233",
+      "size": 20460092,
+      "format": "DNG",
+      "camera": "Canon EOS 5D Mark III",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "1018",
+      "case": "cr2",
+      "file": "1018.cr2",
+      "url": "https://raw.pixls.us/getfile.php/1018/nice/Canon - EOS 20D - RAW (3:2).CR2",
+      "sha256": "db78660d48589130d99e0bc621424851eb0f84df052634fb5bc89c7a02fe7033",
+      "size": 7489116,
+      "format": "CR2",
+      "camera": "Canon EOS 20D",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "1023",
+      "case": "lossy-dng",
+      "file": "1023.dng",
+      "url": "https://raw.pixls.us/getfile.php/1023/nice/Adobe DNG Converter - Canon EOS 5D Mark III - Lossy JPEG compression (3:2).DNG",
+      "sha256": "159326856c29073e845c3c5a9ecf98c6474f43ca15798a88ad5e2baecd0664b7",
+      "size": 6193902,
+      "format": "DNG",
+      "camera": "Adobe DNG Converter Canon EOS 5D Mark III",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "1230",
+      "case": "portrait-flip-5",
+      "file": "1230.cr2",
+      "url": "https://raw.pixls.us/getfile.php/1230/nice/Canon - EOS Digital Rebel XT - RAW (3:2).CR2",
+      "sha256": "4b47ba27c0090efa091aaf99babc76d9a3e6f6f121b443d6c58c3ce7275cd770",
+      "size": 7456886,
+      "format": "CR2",
+      "camera": "Canon EOS Digital Rebel XT",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": 5
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "1386",
+      "case": "portrait-flip-6-nef",
+      "file": "1386.nef",
+      "url": "https://raw.pixls.us/getfile.php/1386/nice/Nikon - Df - 12bit 12bit compressed (Lossy (type 2)) (3:2).NEF",
+      "sha256": "902483437706df59bed669ebb4eb7d9ecaf95b23a70d6c79e319316ce50ee884",
+      "size": 12836622,
+      "format": "NEF",
+      "camera": "Nikon Df",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": true,
+        "flip": 6
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "1582",
+      "case": "arw-compressed",
+      "file": "1582.arw",
+      "url": "https://raw.pixls.us/getfile.php/1582/nice/Sony - ILCE-7S - 14bit 14bit compressed (3:2).ARW",
+      "sha256": "a35ebb2fbec929daa5beb20d1ce5c15a8aac7b1a7a231455387f3df8a7442e07",
+      "size": 6160384,
+      "format": "ARW",
+      "camera": "Sony ILCE-7S",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "2073",
+      "case": "crw",
+      "file": "2073.crw",
+      "url": "https://raw.pixls.us/getfile.php/2073/nice/Canon - PowerShot G1 - RAW (4:3).crw",
+      "sha256": "f39be5acf14057ce04527fd8d0574e57ec8ed5fed082d7bfaff763075a44ee8a",
+      "size": 2300702,
+      "format": "CRW",
+      "camera": "Canon PowerShot G1",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "2239",
+      "case": "pef",
+      "file": "2239.pef",
+      "url": "https://raw.pixls.us/getfile.php/2239/nice/Pentax - K10D - 12bit 12bit compressed (3:2).PEF",
+      "sha256": "e35ae4154a468be3154f5f462e884ba5941f010d3e8f23d347fbec14809f44d3",
+      "size": 9561139,
+      "format": "PEF",
+      "camera": "Pentax K10D",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "2663",
+      "case": "cr3-craw",
+      "file": "2663.cr3",
+      "url": "https://raw.pixls.us/getfile.php/2663/nice/Canon - EOS M50 - CRAW (3:2).CR3",
+      "sha256": "15384b775867ec4c42b11882837f1e368cedc0561832ffab271221e6bb80be4c",
+      "size": 20948692,
+      "format": "CR3",
+      "camera": "Canon EOS M50",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "2756",
+      "case": "portrait-flip-6",
+      "file": "2756.dng",
+      "url": "https://raw.pixls.us/getfile.php/2756/nice/Ricoh - GXR - 12bit (4:3).DNG",
+      "sha256": "219a062f3d1eb8d66c9dd6088eecf495be082cf5c81f88622eb0dd28cc893cec",
+      "size": 15293931,
+      "format": "DNG",
+      "camera": "Ricoh GXR",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": 6
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "2811",
+      "case": "rwl",
+      "file": "2811.rwl",
+      "url": "https://raw.pixls.us/getfile.php/2811/nice/Leica - D-LUX 5 - 1:1.RWL",
+      "sha256": "ceeb5e5bf2358c04706e807bc023971e085d969b6f36491a57ecff051a05e8d3",
+      "size": 10355200,
+      "format": "RWL",
+      "camera": "Leica D-LUX 5",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "3502",
+      "case": "phone-dng",
+      "file": "3502.dng",
+      "url": "https://raw.pixls.us/getfile.php/3502/nice/Google - Pixel 4 XL - 16bit (4:3).dng",
+      "sha256": "0c03a6c93b4b8593cd0e4426166e6389710007238b82eb23861ef191322f0c54",
+      "size": 11402436,
+      "format": "DNG",
+      "camera": "Google Pixel 4 XL",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "3668",
+      "case": "srw",
+      "file": "3668.srw",
+      "url": "https://raw.pixls.us/getfile.php/3668/nice/Samsung - NX500 - 12bit 12bit normal compression (3:2).SRW",
+      "sha256": "156e43118811bcecb6fcc600b5f41ee1773c4f00b6a5b2dd72e177e35f6596ab",
+      "size": 20750652,
+      "format": "SRW",
+      "camera": "Samsung NX500",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "3914",
+      "case": "raf-xtrans-compressed",
+      "file": "3914.raf",
+      "url": "https://raw.pixls.us/getfile.php/3914/nice/Fujifilm - X-T4 - 14bit 14bit lossless compressed (3:2).RAF",
+      "sha256": "07ea642656074834ffe5c661870a612ffa2e80fc1218a05166ee966bbe5f6fae",
+      "size": 27949104,
+      "format": "RAF",
+      "camera": "Fujifilm X-T4",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "4659",
+      "case": "cr3",
+      "file": "4659.cr3",
+      "url": "https://raw.pixls.us/getfile.php/4659/nice/Canon - EOS R6 - 3:2.CR3",
+      "sha256": "74abb0a113d075ad9887a058082f40dd2a938c4813a08474d82356f11a027778",
+      "size": 5273174,
+      "format": "CR3",
+      "camera": "Canon EOS R6",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "5227",
+      "case": "nef",
+      "file": "5227.nef",
+      "url": "https://raw.pixls.us/getfile.php/5227/nice/Nikon - D2H - 12bit 12bit compressed (Lossy (type 1)) (3:2).NEF",
+      "sha256": "155edb938f884ea7372ce98d4ff5f965c3e413b43b95bc9923da6e92082cf914",
+      "size": 3236017,
+      "format": "NEF",
+      "camera": "Nikon D2H",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "5424",
+      "case": "orf",
+      "file": "5424.orf",
+      "url": "https://raw.pixls.us/getfile.php/5424/nice/Olympus - E-10 - 16bit (4:3).ORF",
+      "sha256": "2bfdade72439017a60a47aad1e5bbcb1aca36f2be7a21e94a4257a678fb6f4da",
+      "size": 7614592,
+      "format": "ORF",
+      "camera": "Olympus E-10",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "6616",
+      "case": "nef-he-negative",
+      "file": "6616.nef",
+      "url": "https://raw.pixls.us/getfile.php/6616/nice/Nikon - Z 8 - 8bit 8bit compressed (3:2).NEF",
+      "sha256": "82df041542b8d328738443bb5ff3373b396e406ecc8cbe7dc3b35252790c53e7",
+      "size": 24384512,
+      "format": "NEF",
+      "camera": "Nikon Z 8",
+      "expected": {
+        "develop_supported": false,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "7008",
+      "case": "rw2",
+      "file": "7008.rw2",
+      "url": "https://raw.pixls.us/getfile.php/7008/nice/Panasonic - DMC-LX7 - 1:1.RW2",
+      "sha256": "d142a23aca836053ed53e9ce3cb3ed2d434541d734d71a94a6eefadcd08bd31b",
+      "size": 3249664,
+      "format": "RW2",
+      "camera": "Panasonic DMC-LX7",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "7834",
+      "case": "arw-lossless",
+      "file": "7834.arw",
+      "url": "https://raw.pixls.us/getfile.php/7834/nice/Sony - ILCE-1M2 - lossless (3:2).ARW",
+      "sha256": "006b477808b3edaaa41e58ce082653a36e544c4ddc0bfe1bc8a6ef39d93d8369",
+      "size": 25092096,
+      "format": "ARW",
+      "camera": "Sony ILCE-1M2",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "8010",
+      "case": "iiq",
+      "file": "8010.iiq",
+      "url": "https://raw.pixls.us/getfile.php/8010/nice/Phase One - P40+ - IIQ S (4:3).IIQ",
+      "sha256": "61aa32c5947d386f0d5ee465c5183185df6c9cd7ff7eb66ffec12e84b487878c",
+      "size": 11172571,
+      "format": "IIQ",
+      "camera": "Phase One P40+",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": null,
+        "flip": null
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    }
+  ]
+}

@@ -13,6 +13,8 @@ mimageviewer.dat
 bench_thumbs.tsv
 /installer/Output
 /vendor/pdfium
+/vendor/libraw
+/vendor/raw-samples
 /vendor/models
 /vendor/susie-worker
 /vendor/ort
