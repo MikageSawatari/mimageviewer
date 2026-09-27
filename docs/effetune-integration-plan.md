@@ -176,6 +176,10 @@ enum EffetuneFailure {
   fullscreen owner は設定しない。TOPMOST にもしない。
 - 既存のフルスクリーン関連の VST GUI 操作 (owner 付け替え、全 GUI 表示／非表示、TOPMOST、HUD の
   allowlist、フォーカスの受け渡し) は `self.dsp_bridge` のみを対象のまま変えない。
+- **EffeTune の窓には、host の container が付けるタイトルバーの電源 (bypass) ボタンを出さない**。
+  このボタンはスロットを bypass にするため、controller が `Running` のまま音が素通しになる別の持ち主を
+  作ってしまう。ON/OFF の正本は Mixwright の状態 (画面内の全体バイパス) の 1 か所にする。
+  ユーザー VST の窓の電源ボタンは従来どおり (実装時に判明、2026-09-27)。
 - `pump_gui_signals` を EffeTune の bridge についても毎フレーム呼ぶ。`vst3_enabled` や
   VST マネージャ表示の分岐の外で呼ぶ。× で閉じたら非表示にするだけで経路からは外さない。
 - **既知の制約 (サンプル版、意図的に触らない)**:
