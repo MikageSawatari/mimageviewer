@@ -2004,6 +2004,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `edit_preview_cache_max_bytes` | u64 | 1,000,000,000 | 編集プレビューキャッシュの容量上限。環境設定では MB 単位で指定し、超過時は最終アクセスが古いものから削除する |
 | `archive_cache_max_bytes` | u64 | 0 | RAR / 7z / LZH / (非 ZIP 入れ子入り) ZIP から作成した変換済み ZIP キャッシュの容量上限。`0` は無制限。環境設定では MB 単位で指定する。上限を超えた場合は、次回の変換完了後に最終アクセスが古いキャッシュから削除する。直近で作成したキャッシュは、単体で上限を超えても削除しない |
 | `archive_file_handling` | ArchiveFileHandling | Ask | RAR / 7z / LZH (および非 ZIP アーカイブを入れ子に含む ZIP) の扱い。非ソリッド・入れ子なし・暗号化なし RAR は直接閲覧し、それ以外を `Ask` / `Convert` で変換する。`Ignore` は直接閲覧対象を含め一覧・フォルダ移動で扱わない |
+| `epub_file_handling` | EpubFileHandling | Ask | EPUB を PDF に変換して開くときの確認方法。`Ask` は確認画面を表示、`Convert` は確認なしで変換、`Ignore` は一覧・フォルダ移動から除き、変換済みの本も開かない。RAR / 7z / LZH の設定とは独立 |
 | `archive_convert_without_dialog` | bool | false | 旧設定互換フィールド。新規 UI / 実行時判定は `archive_file_handling` を使い、保存時は `archive_file_handling == Convert` に同期する |
 | `batch_cache_zip_contents` | bool | false | 一括キャッシュ作成で ZIP 内の全画像をキャッシュ |
 | `batch_cache_pdf_contents` | bool | false | 一括キャッシュ作成で PDF 内の全ページをキャッシュ |

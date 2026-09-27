@@ -1491,6 +1491,9 @@ fn omitted_entries_breakdown_label(counts: crate::app::OmittedFolderEntryCounts)
             counts.ignored_archive
         ));
     }
+    if counts.ignored_epub > 0 {
+        parts.push(format!("EPUB（設定で無視） {}", counts.ignored_epub));
+    }
     parts.push(format!("対象外 {}", counts.unsupported));
     if counts.system > 0 {
         // システムファイルは主数字に入れないので、内訳でも別立てにして誤解を防ぐ。
@@ -1520,7 +1523,11 @@ fn draw_omitted_entries_chip(
             .small()
             .weak(),
         );
-        if counts.same_name > 0 || counts.ignored_archive > 0 || counts.hidden > 0 {
+        if counts.same_name > 0
+            || counts.ignored_archive > 0
+            || counts.ignored_epub > 0
+            || counts.hidden > 0
+        {
             ui.separator();
         }
         if counts.same_name > 0 && ui.link("同名ファイル設定を開く").clicked() {
@@ -1538,6 +1545,11 @@ fn draw_omitted_entries_chip(
                     Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::ARCHIVE_HANDLING);
                 ui.close();
             }
+        }
+        if counts.ignored_epub > 0 && ui.link("「EPUB の処理」を設定する").clicked() {
+            open_preferences =
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::EPUB_HANDLING);
+            ui.close();
         }
         if counts.hidden > 0
             && ui
@@ -15229,6 +15241,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             None
         };
         if activation_allowed {
+            if self.reject_ignored_epub_grid_item(idx).is_some() {
+                return nav;
+            }
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
             if self.stack_try_open_from_grid(ctx, idx, true) {
@@ -15359,7 +15374,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         (crate::app::FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                             self.attach_archive_convert_nav_history_rollback(snapshot);
                         }
-                        (crate::app::FolderOpenOutcome::Ignored, Some(snapshot)) => {
+                        (
+                            crate::app::FolderOpenOutcome::Ignored
+                            | crate::app::FolderOpenOutcome::Refused(_),
+                            Some(snapshot),
+                        ) => {
                             self.restore_folder_nav_history(snapshot);
                         }
                         _ => {}
@@ -18897,6 +18916,7 @@ mod facet_filter_bar_tests {
             same_name: 3,
             hidden: 2,
             ignored_archive: 4,
+            ignored_epub: 0,
             unsupported: 1,
             system: 4,
         };
@@ -18908,11 +18928,24 @@ mod facet_filter_bar_tests {
             omitted_entries_breakdown_label(counts),
             "同名など 3、隠し項目 2、RAR / 7z / LZH（設定で無視） 4、対象外 1、システム 4"
         );
+        let epub_only = crate::app::OmittedFolderEntryCounts {
+            ignored_epub: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            omitted_entries_chip_label(epub_only).as_deref(),
+            Some("非表示 2 件")
+        );
+        assert_eq!(
+            omitted_entries_breakdown_label(epub_only),
+            "同名など 0、隠し項目 0、EPUB（設定で無視） 2、対象外 0"
+        );
 
         let unsupported_only = crate::app::OmittedFolderEntryCounts {
             same_name: 0,
             hidden: 0,
             ignored_archive: 0,
+            ignored_epub: 0,
             unsupported: 5,
             system: 0,
         };
@@ -18931,6 +18964,7 @@ mod facet_filter_bar_tests {
             same_name: 0,
             hidden: 0,
             ignored_archive: 0,
+            ignored_epub: 0,
             unsupported: 0,
             system: 9,
         };
@@ -18950,6 +18984,7 @@ mod facet_filter_bar_tests {
             same_name: 3,
             hidden: 2,
             ignored_archive: 4,
+            ignored_epub: 0,
             unsupported: 1,
             system: 0,
         };
@@ -18985,6 +19020,7 @@ mod facet_filter_bar_tests {
             same_name: 0,
             hidden: 0,
             ignored_archive: 0,
+            ignored_epub: 0,
             unsupported: 1,
             system: 0,
         };
@@ -19045,6 +19081,7 @@ mod facet_filter_bar_tests {
                 same_name: 1,
                 hidden: 0,
                 ignored_archive: 0,
+                ignored_epub: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -19060,6 +19097,7 @@ mod facet_filter_bar_tests {
                 same_name: 0,
                 hidden: 0,
                 ignored_archive: 1,
+                ignored_epub: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -19071,6 +19109,7 @@ mod facet_filter_bar_tests {
                 same_name: 0,
                 hidden: 1,
                 ignored_archive: 0,
+                ignored_epub: 0,
                 unsupported: 0,
                 system: 0,
             },

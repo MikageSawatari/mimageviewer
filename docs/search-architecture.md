@@ -149,6 +149,10 @@ Ctrl+S の EPUB は既存の `search_index.db` の `PdfFile`、Ctrl+G の EPUB �
 `fts_meta.db` / Tantivy の `Pdf` として追加する。既存行・列・kind 値・索引の schema は
 変えず、`fts_meta::INDEX_VERSION` は 10 のままにする。全利用者へ索引再構築を強制しない。
 前方互換では新しい EPUB 行だけが増え、移行は不要。
+「EPUB の処理」が「無視する」のとき、Ctrl+S は SQLite の `WHERE` で EPUB を除いてから
+5,000 件の上限を適用する。Ctrl+G は検索ワーカーが EPUB のパスを STORED 原文取得前に
+除き、残った結果だけを 10,000 件の上限に数える。EPUB は PDF と同じ kind で索引されるため、
+Ctrl+G の kind 条件だけでは区別できない。
 
 v4.1.0 へ戻すと、残っている Ctrl+G の `Pdf` 行は旧 `grid_item_from_fs_hit_path` で
 **画像タイル**に再分類される。クリックすると画像としての読込に失敗するが、その前に
@@ -496,7 +500,7 @@ PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた�
 ```
 UI (render_favsearch_bar)
   → execute_favsearch (spawn worker thread)
-    → SearchIndexDb::search(query, favorite_roots, kind, mode)
+    → SearchIndexDb::search_with_epub(query, favorite_roots, kind, mode, include_epub)
          SQL: SELECT ... FROM entries WHERE
               include 群を mode に応じて AND / OR 結合した LIKE
               AND exclude 群の NOT LIKE
@@ -504,6 +508,8 @@ UI (render_favsearch_bar)
               AND 種別フィルタ:
                   kind=Some(k) なら kind = ?
                   kind=None    なら kind <> VideoFile
+              AND EPUB を無視する場合は PdfFile の .epub パスを除外
+         ORDER BY display_name LIMIT 5000
   → poll_favsearch が結果を受け取り GridItem::Folder/ZipFile/PdfFile に展開
 ```
 
@@ -593,13 +599,14 @@ UI (global_search_ui::render_global_search_bar)
        重複・抜け防止: commit が走っても snapshot は古い seg を見続ける)
     3. TopDocs::with_limit(PAGE_SIZE=500).and_offset(offset) をループ:
        a. Tantivy 候補 (path, addr, score) を取得
-       b. doc_text_for_target で同じ Tantivy snapshot から STORED 原文を引く
+       b. EPUB を無視する場合は .epub パスを除外 (valid 件数には数えない)
+       c. doc_text_for_target で同じ Tantivy snapshot から STORED 原文を引く
           (target で取り出すフィールドを切り替え)
-       c. search_query::matches_with_mode で post-filter (phrase / NOT / AND/OR 判定)
-       d. 1 candidate page ごとに Batch 送信 (path と累計 scanned / valid を streaming)。
+       d. search_query::matches_with_mode で post-filter (phrase / NOT / AND/OR 判定)
+       e. 1 candidate page ごとに Batch 送信 (path と累計 scanned / valid を streaming)。
           post-filter で全滅した page も空 Batch として進捗を送る
-       e. 累計 valid_hits が HARD_MAX=10_000 到達で TruncatedAtMax 終了
-       f. 候補使い切りで Complete、cancel で Cancelled
+       f. 累計 valid_hits が HARD_MAX=10_000 到達で TruncatedAtMax 終了
+       g. 候補使い切りで Complete、cancel で Cancelled
     4. Done 送信
 
   [UI] 毎フレーム:

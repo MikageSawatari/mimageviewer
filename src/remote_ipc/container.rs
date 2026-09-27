@@ -3954,12 +3954,36 @@ impl ContainerEngine {
             .and_then(super::session::SessionHandle::archive_job_registry)
         {
             match registry.active_resolved_path(&address.path) {
-                Ok(Some(resolved)) => return Ok(resolved),
+                Ok(Some(resolved)) => {
+                    self.ensure_epub_allowed(&resolved)?;
+                    return Ok(resolved);
+                }
                 Ok(None) => {}
                 Err(error) => return Err(active_archive_media_error(error)),
             }
         }
-        resolve_existing(&address.path).map_err(resolve_media_error)
+        let resolved = resolve_existing(&address.path).map_err(resolve_media_error)?;
+        self.ensure_epub_allowed(&resolved)?;
+        Ok(resolved)
+    }
+
+    /// Every direct Remote address (container, page, thumbnail and related reads)
+    /// passes through `resolve`. Read the live listing setting so an already-open
+    /// Remote session observes a change made in the PC preferences dialog.
+    fn ensure_epub_allowed(&self, resolved: &ResolvedPath) -> Result<(), MediaError> {
+        if !is_epub_path(&resolved.logical) {
+            return Ok(());
+        }
+        let settings = self
+            .settings_for_listing()
+            .map_err(media_error_from_remote_write)?;
+        if settings.epub_file_handling_ignores_epub() {
+            return Err(media_error(
+                MediaErrorCode::RenderFailed,
+                "この PC では EPUB を開けません。PC の mImageViewer で EPUB の設定を確認してください",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn execute_remote_ai(
@@ -7698,6 +7722,89 @@ mod tests {
         let entries = list(true);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].address.path, pdf.to_string_lossy());
+    }
+
+    #[test]
+    fn remote_folder_epub_ignore_is_independent_of_archive_handling() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("book.epub"), b"epub").unwrap();
+        std::fs::write(root.path().join("archive.7z"), b"archive").unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            epub_file_handling: crate::settings::EpubFileHandling::Ignore,
+            archive_file_handling: crate::settings::ArchiveFileHandling::Ask,
+            ..Default::default()
+        });
+        let FolderListResponse::Success(payload) = engine.folder_list(FolderListRequest {
+            address: RemoteAddress::file(root.path().to_string_lossy().into_owned()),
+        }) else {
+            panic!("Remote folder list failed");
+        };
+        assert!(
+            payload
+                .entries
+                .iter()
+                .all(|entry| !entry.address.path.ends_with("book.epub"))
+        );
+        assert!(
+            payload
+                .entries
+                .iter()
+                .any(|entry| entry.address.path.ends_with("archive.7z"))
+        );
+    }
+
+    #[test]
+    fn remote_epub_ignore_rejects_direct_container_page_and_thumbnail_addresses() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("book.epub");
+        std::fs::write(&epub, b"epub").unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            epub_file_handling: crate::settings::EpubFileHandling::Ignore,
+            ..Default::default()
+        });
+        let expected = "EPUB の設定を確認してください";
+        let ContainerResponse::Error(error) = engine.container(remote_epub_request(&epub)) else {
+            panic!("ignored EPUB container opened");
+        };
+        assert_eq!(error.code, MediaErrorCode::RenderFailed);
+        assert!(error.message.contains(expected));
+
+        let address = RemoteAddress {
+            path: epub.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 0 },
+        };
+        let PageResponse::Error(error) = engine.page_with_job_cancel(
+            PageRequest {
+                job_id: "ignored-epub-page".into(),
+                display_request_id: None,
+                address,
+                target_px: 128,
+                priority: PagePriority::Foreground,
+                render_context: None,
+                adjustment_preview: None,
+            },
+            &WorkerContext::without_databases(),
+            Arc::new(AtomicBool::new(false)),
+        ) else {
+            panic!("ignored EPUB page rendered");
+        };
+        assert_eq!(error.code, MediaErrorCode::RenderFailed);
+        assert!(error.message.contains(expected));
+
+        let ThumbnailResponse::Error(error) = engine.thumbnail(
+            &mimageviewer_ipc::ThumbnailRequest {
+                address: RemoteAddress::file(epub.to_string_lossy().into_owned()),
+                source_address: None,
+                target_px: 96,
+            },
+            &WorkerContext::without_databases(),
+        ) else {
+            panic!("ignored EPUB thumbnail rendered");
+        };
+        assert_eq!(error.code, ThumbnailErrorCode::GenerationFailed);
+        assert!(error.message.contains(expected));
     }
 
     #[test]

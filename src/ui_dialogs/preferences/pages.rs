@@ -7113,6 +7113,10 @@ pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState
     });
 }
 
+pub(super) fn reset_epub_file_handling(settings: &mut crate::settings::Settings) {
+    settings.epub_file_handling = crate::settings::EpubFileHandling::default();
+}
+
 pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         "サムネイルキャッシュをいつ生成するかを指定します。\n\
@@ -7272,6 +7276,25 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .small()
         .weak(),
     );
+    });
+    ui.add_space(8.0);
+    anchored(ui, state, "cache/epub-handling", |ui, state| {
+        let s = &mut state.settings;
+        ui.label(egui::RichText::new("EPUB の処理").strong());
+        for &handling in crate::settings::EpubFileHandling::all() {
+            ui.radio_value(&mut s.epub_file_handling, handling, handling.label())
+                .on_hover_text(handling.description());
+        }
+        if ui.button("既定値に戻す").clicked() {
+            reset_epub_file_handling(s);
+        }
+        ui.label(
+            egui::RichText::new(
+                "「無視する」では、EPUB を一覧・フォルダ移動の対象にせず、変換済みの本も開きません。",
+            )
+            .small()
+            .weak(),
+        );
     });
     ui.add_space(8.0);
     anchored(ui, state, "cache/archive-limit", |ui, state| {

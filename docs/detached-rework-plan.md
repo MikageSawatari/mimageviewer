@@ -1455,6 +1455,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-27 D13: EPUB しおりの開封拒否を別ウィンドウ確定前に処理**
+
+設計担当の D13 5 回目の指示に従い、しおり行の EPUB Ignore 判定を既存ウィンドウの退避・loading context 作成より前に置く。解決中に設定が変わった場合は、同じ bookmark request ID の待機を終了する。detached descriptor の PDF 開封は理由付きの `FolderOpenOutcome` を返し、拒否時は既存の build abort / Preparing session terminal へ渡す。グリッドからの別ウィンドウ開封と parked 窓の descriptor 再開でも、PDF の拒否を既存ウィンドウの退避前に処理する。新しい detached 状態や時間待ちは足さず、viewport ID・host・placement・focus の所有規則も変更しない。Codex は開封結果を捨てて成功扱いした境界を直す構造修正として §2 に適合すると判断した。独立レビューは未実施。
+
 **2026-09-27 §1.250 常に最前面**
 
 `Settings.always_on_top` を唯一の希望状態とし、active / loading / holdover / cleanup と passive / parked の閲覧用 viewport builder に `Normal` または `AlwaysOnTop` を明示する。root への切替 command と、子 host の builder diff を別の発行 owner にして二重送信を避ける。同一 ViewportId を active session が所有する間は passive snapshot を重ねて登録せず、handoff 後に passive が所有する。別の detached 状態 flag、時間待ち、Focus、個別 HWND への症状的な `SetWindowPos` は追加しない。これは他機能の level 設定が viewport builder 経路へ到達する構造変更であり、§2 の同一 host ownership を維持する。復帰時の再 assert は style 実測で欠落が確認された edge に限り、現時点では追加していない。設計は [always-on-top-plan.md](always-on-top-plan.md) を参照。
