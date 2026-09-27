@@ -218,9 +218,9 @@ fn kbd_chip(ui: &mut egui::Ui, text: &str) {
 mod tests {
     use super::*;
 
-    /// README の最新の更新履歴が、**この描画器で描ける記法だけ**でできていること。
+    /// CHANGELOG.md の最新の更新履歴が、**この描画器で描ける記法だけ**でできていること。
     ///
-    /// 更新通知ダイアログは GitHub release の body をここで描く。README の該当節が
+    /// 更新通知ダイアログは GitHub release の body をここで描く。CHANGELOG.md の該当節が
     /// そのまま body になるので、対応していない記法 (リンク・画像・表) を書くと
     /// **そのまま文字として出る**。しかも気付くのは公開した後になる。
     ///
@@ -230,9 +230,12 @@ mod tests {
     /// マーカーが残っていればそれが検出結果になる。
     #[test]
     fn the_newest_changelog_entry_only_uses_markup_this_renderer_handles() {
-        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
-            .expect("README.md");
-        let mut lines = readme.lines().skip_while(|l| !l.starts_with("## 更新履歴"));
+        let changelog =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/CHANGELOG.md"))
+                .expect("CHANGELOG.md");
+        let mut lines = changelog
+            .lines()
+            .skip_while(|l| !l.starts_with("## 更新履歴"));
         lines.next();
         let section: Vec<&str> = lines
             .skip_while(|l| !l.starts_with("### v"))
