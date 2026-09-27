@@ -6716,7 +6716,7 @@ fn decode_remote_ai_canonical(
         crate::canonical_image_loader::CanonicalDecodeOptions {
             susie_priority: true,
             susie_cancel: Some(cancel),
-            cancel: None,
+            cancel: Some(cancel),
             animation_policy: crate::canonical_image_loader::AnimationPolicy::FullFrames,
             on_animation_confirmed: None,
             raw_stage: crate::canonical_image_loader::RawStage::Full,
@@ -7327,6 +7327,75 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_remote_page_is_explicitly_unsupported_before_decode() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("raw-remote-page");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = Path::new("vendor/raw-samples/885.dng");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let path = folder.join("page.dng");
+        std::fs::copy(source, &path).unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("RAW".to_owned(), folder)],
+            ..Default::default()
+        });
+        let context = WorkerContext::open();
+        let response = engine.page_with_job_cancel(
+            PageRequest {
+                job_id: "raw-page".to_owned(),
+                display_request_id: None,
+                address: RemoteAddress::file(path.to_string_lossy().into_owned()),
+                target_px: 2048,
+                priority: PagePriority::Foreground,
+                render_context: None,
+                adjustment_preview: None,
+            },
+            &context,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(response, PageResponse::Error(MediaError {
+            code: MediaErrorCode::Unsupported,
+            message,
+        }) if message.contains("RAW pages are not supported yet")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_remote_file_and_zip_probes_use_libraw_dimensions() {
+        use std::io::Write;
+        let source = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let bytes = std::fs::read(source).unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+            .unwrap()
+            .developed_dims;
+        let expected = (dims[0], dims[1]);
+        assert_eq!(file_image_dims(source), Some(expected));
+
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("raw.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        writer
+            .start_file("page.cr2", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let items = [crate::grid_item::GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: "page.cr2".to_owned(),
+        }];
+        let mut output = std::collections::HashMap::new();
+        collect_zip_entry_dims(
+            &zip_path,
+            &items,
+            &std::collections::HashMap::new(),
+            &mut output,
+        );
+        assert_eq!(output.get("page.cr2"), Some(&expected));
+    }
 
     #[test]
     fn remote_physical_rating_order_is_an_immutable_listing_until_explicit_recompute() {

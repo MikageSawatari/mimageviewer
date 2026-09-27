@@ -69,6 +69,7 @@ pub struct RawDevelopOutput {
 pub enum AppliedBrightness {
     Match(super::brightness::MatchDecision),
     None,
+    ThumbnailAuto001,
 }
 
 #[cfg(any(test, feature = "dev-tools"))]
@@ -804,6 +805,26 @@ mod windows {
         })
     }
 
+    pub(in crate::raw) fn develop_thumbnail_half(
+        source: RawSource<'_>,
+        cancel: &RawCancellation,
+        progress: &AtomicU8,
+    ) -> Result<RawDevelopOutput, RawError> {
+        if cancel.flag.load(Ordering::Acquire) {
+            return Err(RawError::Cancelled);
+        }
+        let handle = Handle::open(source)?;
+        let _binding = cancel.bind(handle.raw);
+        process(&handle, RawDevelopScale::Half, 1, cancel, progress)?;
+        let (width, height, length) = dimensions(&handle)?;
+        let image = copy_image(&handle, width, height, length, None, cancel)?;
+        progress.store(100, Ordering::Release);
+        Ok(RawDevelopOutput {
+            image,
+            brightness: AppliedBrightness::ThumbnailAuto001,
+        })
+    }
+
     #[cfg(any(test, feature = "dev-tools"))]
     pub(in crate::raw) fn develop_bench(
         source: RawSource<'_>,
@@ -973,6 +994,8 @@ pub(in crate::raw) use windows::develop_bench;
 #[cfg(all(windows, any(test, feature = "dev-tools")))]
 pub(in crate::raw) use windows::develop_match_preview;
 #[cfg(windows)]
+pub(in crate::raw) use windows::develop_thumbnail_half;
+#[cfg(windows)]
 pub use windows::{info, preview};
 
 #[cfg(not(windows))]
@@ -990,6 +1013,15 @@ pub(in crate::raw) fn develop(
     _source: RawSource<'_>,
     _scale: RawDevelopScale,
     _brightness: RawBrightness,
+    _cancel: &RawCancellation,
+    _progress: &AtomicU8,
+) -> Result<RawDevelopOutput, RawError> {
+    Err(RawError::Unsupported(RawUnsupportedReason::Platform))
+}
+
+#[cfg(not(windows))]
+pub(in crate::raw) fn develop_thumbnail_half(
+    _source: RawSource<'_>,
     _cancel: &RawCancellation,
     _progress: &AtomicU8,
 ) -> Result<RawDevelopOutput, RawError> {

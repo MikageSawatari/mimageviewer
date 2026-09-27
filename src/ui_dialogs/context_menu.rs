@@ -1080,14 +1080,25 @@ impl crate::app::App {
         let rotation = self.get_rotation(idx);
         match item {
             GridItem::Image(path) => {
-                copy_image_to_clipboard(&path, rotation);
+                copy_image_to_clipboard(
+                    &path,
+                    rotation,
+                    self.raw_develop_executor.clone(),
+                    self.settings.raw_brightness,
+                );
                 true
             }
             GridItem::ZipImage {
                 zip_path,
                 entry_name,
             } => {
-                copy_zip_image_to_clipboard(&zip_path, &entry_name, rotation);
+                copy_zip_image_to_clipboard(
+                    &zip_path,
+                    &entry_name,
+                    rotation,
+                    self.raw_develop_executor.clone(),
+                    self.settings.raw_brightness,
+                );
                 true
             }
             _ => false,
@@ -1671,11 +1682,22 @@ impl crate::app::App {
                 if let Some(idx) = target.item_index {
                     let rotation = self.get_rotation(idx);
                     match &target.item {
-                        GridItem::Image(path) => copy_image_to_clipboard(path, rotation),
+                        GridItem::Image(path) => copy_image_to_clipboard(
+                            path,
+                            rotation,
+                            self.raw_develop_executor.clone(),
+                            self.settings.raw_brightness,
+                        ),
                         GridItem::ZipImage {
                             zip_path,
                             entry_name,
-                        } => copy_zip_image_to_clipboard(zip_path, entry_name, rotation),
+                        } => copy_zip_image_to_clipboard(
+                            zip_path,
+                            entry_name,
+                            rotation,
+                            self.raw_develop_executor.clone(),
+                            self.settings.raw_brightness,
+                        ),
                         _ => {}
                     }
                 }
@@ -2352,6 +2374,14 @@ fn clipboard_seq_is_latest(my_seq: u64) -> bool {
     CLIPBOARD_SEQ.load(std::sync::atomic::Ordering::Relaxed) == my_seq
 }
 
+fn decode_clipboard_raw(
+    source: crate::raw::RawOwnedSource,
+    executor: &crate::raw::RawDevelopExecutor,
+    brightness: crate::raw::RawBrightness,
+) -> Result<image::DynamicImage, crate::raw::RawError> {
+    crate::raw::develop_full_on_worker(executor, source, brightness, None)
+}
+
 /// Path を PowerShell の単一引用符文字列リテラル (`'...'`、内部の `'` を `''` へ
 /// エスケープ) に変換する。外部 D&D 受け取りのスクリプト生成で使う。
 #[cfg(windows)]
@@ -2367,34 +2397,57 @@ fn ps_quote(path: &std::path::Path) -> String {
 /// 数百ms〜秒単位かかるため、UI スレッドから同期実行すると右クリック操作で固まる。
 /// 発行時に `CLIPBOARD_SEQ` を bump し、set 直前に最新 seq と比較、自分が古ければ
 /// set をスキップする — 遅い A が速い B を追い越して上書きするのを防ぐ。
-fn copy_image_to_clipboard(path: &std::path::Path, rotation: crate::rotation_db::Rotation) {
+fn copy_image_to_clipboard(
+    path: &std::path::Path,
+    rotation: crate::rotation_db::Rotation,
+    raw_executor: std::sync::Arc<crate::raw::RawDevelopExecutor>,
+    raw_brightness: crate::raw::RawBrightness,
+) {
     let path = path.to_path_buf();
     let my_seq = bump_clipboard_seq();
     std::thread::Builder::new()
         .name("clipboard-image-copy".into())
         .spawn(move || {
-            let img = match image::open(&path) {
-                Ok(i) => i,
-                Err(_) => {
-                    #[cfg(windows)]
-                    {
-                        match crate::wic_decoder::decode_to_dynamic_image(&path)
-                            .or_else(|| crate::susie_loader::decode_file(&path, true, None).ok())
-                        {
-                            Some(i) => i,
-                            None => return,
-                        }
+            let img = if crate::raw_format::is_raw_path(&path) {
+                match decode_clipboard_raw(
+                    crate::raw::RawOwnedSource::Path(path.clone()),
+                    &raw_executor,
+                    raw_brightness,
+                ) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        crate::logger::log(format!("RAW clipboard decode failed: {error}"));
+                        return;
                     }
-                    #[cfg(not(windows))]
-                    {
-                        match crate::susie_loader::decode_file(&path, true, None) {
-                            Ok(i) => i,
-                            Err(_) => return,
+                }
+            } else {
+                match image::open(&path) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        #[cfg(windows)]
+                        {
+                            match crate::wic_decoder::decode_to_dynamic_image(&path).or_else(|| {
+                                crate::susie_loader::decode_file(&path, true, None).ok()
+                            }) {
+                                Some(i) => i,
+                                None => return,
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            match crate::susie_loader::decode_file(&path, true, None) {
+                                Ok(i) => i,
+                                Err(_) => return,
+                            }
                         }
                     }
                 }
             };
-            let img = crate::thumb_loader::apply_exif_orientation(img, &path);
+            let img = if crate::raw_format::is_raw_path(&path) {
+                img
+            } else {
+                crate::thumb_loader::apply_exif_orientation(img, &path)
+            };
             let img = crate::capture::rotate_dynamic_image(img, rotation);
             // ここの pre-check は DIB 構築を省くだけの best-effort 短絡。
             // 正式な stale 判定は `set_image_to_clipboard` 内部で
@@ -2414,6 +2467,8 @@ fn copy_zip_image_to_clipboard(
     zip_path: &std::path::Path,
     entry_name: &str,
     rotation: crate::rotation_db::Rotation,
+    raw_executor: std::sync::Arc<crate::raw::RawDevelopExecutor>,
+    raw_brightness: crate::raw::RawBrightness,
 ) {
     let zip_path = zip_path.to_path_buf();
     let entry_name = entry_name.to_string();
@@ -2424,24 +2479,42 @@ fn copy_zip_image_to_clipboard(
             let Ok(bytes) = crate::zip_loader::read_entry_bytes(&zip_path, &entry_name) else {
                 return;
             };
-            let Some(img) = image::load_from_memory(&bytes)
-                .ok()
-                .or_else(|| {
-                    crate::wic_decoder::decode_to_dynamic_image_from_bytes(
-                        &bytes,
-                        std::path::Path::new(&entry_name)
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .unwrap_or(""),
-                    )
-                })
-                .or_else(|| {
-                    crate::susie_loader::decode_bytes(&entry_name, &bytes, true, None).ok()
-                })
-            else {
-                return;
+            let raw = std::path::Path::new(&entry_name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(crate::raw_format::is_raw_ext);
+            let img = if raw {
+                match decode_clipboard_raw(
+                    crate::raw::RawOwnedSource::Bytes(bytes.clone().into()),
+                    &raw_executor,
+                    raw_brightness,
+                ) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        crate::logger::log(format!("ZIP RAW clipboard decode failed: {error}"));
+                        return;
+                    }
+                }
+            } else {
+                let Some(img) = image::load_from_memory(&bytes)
+                    .ok()
+                    .or_else(|| {
+                        crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+                            &bytes,
+                            std::path::Path::new(&entry_name)
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .unwrap_or(""),
+                        )
+                    })
+                    .or_else(|| {
+                        crate::susie_loader::decode_bytes(&entry_name, &bytes, true, None).ok()
+                    })
+                else {
+                    return;
+                };
+                crate::thumb_loader::apply_exif_orientation_from_bytes(img, &bytes)
             };
-            let img = crate::thumb_loader::apply_exif_orientation_from_bytes(img, &bytes);
             let img = crate::capture::rotate_dynamic_image(img, rotation);
             // pre-check は best-effort 短絡 (DIB 構築省略)。正式な stale 判定は
             // `set_image_to_clipboard` 側の mutex 内で行う。
@@ -2862,6 +2935,35 @@ fn open_folder_in_explorer(path: &std::path::Path) {
     #[cfg(not(windows))]
     {
         let _ = path;
+    }
+}
+
+#[cfg(test)]
+mod raw_clipboard_tests {
+    use super::*;
+    use image::GenericImageView;
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_clipboard_file_and_zip_bytes_use_full_libraw() {
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        for name in ["1018.cr2", "885.dng"] {
+            let path = std::path::Path::new("vendor/raw-samples").join(name);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let bytes = std::fs::read(&path).unwrap();
+            let info = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes)).unwrap();
+            let source = if name.ends_with(".cr2") {
+                crate::raw::RawOwnedSource::Path(path)
+            } else {
+                crate::raw::RawOwnedSource::Bytes(bytes.into())
+            };
+            let image =
+                decode_clipboard_raw(source, &executor, crate::raw::RawBrightness::None).unwrap();
+            assert_eq!(
+                image.dimensions(),
+                (info.developed_dims[0], info.developed_dims[1])
+            );
+        }
     }
 }
 

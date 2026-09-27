@@ -478,6 +478,12 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 | ZipDir | Some(representative) または None (`ZipDirRepresentative`) | None | `zipdir:{dir_prefix}` | 通常は部分木代表 entry を直接読む。ZipDir source pin は `zip_dir_prefix` を worker に渡し、同じ sort で部分木代表を選び直す |
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
 
+ZIP 内 RAW は拡張子で先に LibRaw へ振り分け、entry bytes から info / preview を読む。
+プレビューが要求長辺に足りないときは half 現像を thumbnail queue へ非同期で引き継ぐ。
+`ZipFile` の先頭ページと `ZipDir` の代表 entry も同じ経路を通る。RAW の向きは LibRaw の
+flip が適用済みであり、ZIP bytes の rexif や WIC の Orientation を重ねない。
+catalog の `source_*` には縮小画像ではなく LibRaw の `developed_dims` を保存する。
+
 PDF ワーカーの render 結果は raster に加えて、PDFium が読んだページ box の point 寸法を返す。
 `thumbnails.source_width/source_height` は PDF を含め raster の**ピクセル寸法**を保存する。
 ページ box は別の `layout_width/layout_height` に **1/1000 point の固定小数点**で保存する。
@@ -678,12 +684,14 @@ fullscreen viewport、detached window、in-window がそれぞれの実 inner si
 **ZipImage でできないことリスト**:
 
 - GIF / APNG アニメーション (fs_animation がパス API)
-- ZIP 内 RAW/WIC 系の Orientation 読み取り (bytes 版は rexif で読める EXIF のみ。JPEG などは自動回転される)
+- ZIP 内 WIC 系の Orientation 読み取り (bytes 版は rexif で読める EXIF のみ。JPEG などは自動回転される)
 
 WIC デコードは `wic_decoder::decode_to_dynamic_image_from_bytes` でバイト列から
-直接デコードできるため、ZIP 内の HEIC/AVIF/JXL/TIFF/RAW も開ける
+直接デコードできるため、ZIP 内の HEIC/AVIF/JXL/TIFF も開ける
 (対応コーデックがインストールされていれば)。サムネイル・フルスクリーン両方の
-ZIP エントリ経路で `image::load_from_memory` 失敗時のフォールバックとして使われる。
+非 RAW ZIP エントリ経路で `image::load_from_memory` 失敗時のフォールバックとして使われる。
+ZIP 内 RAW は拡張子で先に LibRaw へ分岐し、entry bytes から preview または現像結果と
+向きを得る。RAW の失敗時は他のデコーダへフォールバックしない。
 JPEG など EXIF Orientation を持つ ZIP 内画像は、サムネイル・フルスクリーンとも
 エントリ bytes から向きを読んで正立表示する。
 

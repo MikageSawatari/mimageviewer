@@ -246,6 +246,23 @@ pub fn probe_dims_from_bytes(bytes: &[u8], extension: &str) -> Option<[usize; 2]
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn raw_path_and_byte_probes_report_libraw_developed_dimensions() {
+        for name in ["885.dng", "1018.cr2"] {
+            let path = std::path::Path::new("vendor/raw-samples").join(name);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let bytes = std::fs::read(&path).unwrap();
+            let expected = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+                .unwrap()
+                .developed_dims
+                .map(|dim| dim as usize);
+            let extension = path.extension().unwrap().to_str().unwrap();
+            assert_eq!(probe_dims(&path), Some(expected));
+            assert_eq!(probe_dims_from_bytes(&bytes, extension), Some(expected));
+        }
+    }
+
     #[test]
     fn bilinear_rgba8_exact_produces_correct_dims() {
         let src = RgbaImage::from_pixel(256, 128, image::Rgba([10, 20, 30, 255]));

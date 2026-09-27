@@ -322,9 +322,16 @@ struct MaterializerInner {
 pub struct Materializer {
     inner: Arc<MaterializerInner>,
     startup_cleanup: Option<JoinHandle<()>>,
+    raw: Option<crate::raw::RawDecodeContext>,
 }
 
 impl Materializer {
+    pub fn new_with_raw(raw: crate::raw::RawDecodeContext) -> Self {
+        let mut materializer = Self::new();
+        materializer.raw = Some(raw);
+        materializer
+    }
+
     pub fn new() -> Self {
         #[cfg(test)]
         {
@@ -381,6 +388,7 @@ impl Materializer {
         Self {
             inner,
             startup_cleanup,
+            raw: None,
         }
     }
 
@@ -403,6 +411,7 @@ impl Materializer {
         MaterializeSession {
             inner: Arc::clone(&self.inner),
             databases: None,
+            raw: self.raw.clone(),
         }
     }
 
@@ -471,6 +480,7 @@ impl EditDatabases {
 pub struct MaterializeSession {
     inner: Arc<MaterializerInner>,
     databases: Option<EditDatabases>,
+    raw: Option<crate::raw::RawDecodeContext>,
 }
 
 struct LoadedPageEdits {
@@ -610,6 +620,7 @@ impl MaterializeSession {
                             loaded_edits.as_ref(),
                             pdf_render_long_edge,
                             cancel,
+                            self.raw.as_ref(),
                         )?
                     };
                     check_current(&self.inner, cancel, generation)?;
@@ -899,6 +910,7 @@ fn render_materialize_source(
     edits: Option<&LoadedMaterializePageEdits>,
     pdf_render_long_edge: u32,
     cancel: &Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<egui::ColorImage, String> {
     match source {
         MaterializeSource::MergedSpread { left, right, .. } => {
@@ -911,8 +923,10 @@ fn render_materialize_source(
                 }
                 None => (None, None),
             };
-            let left = render_materialize_page(left, left_edits, pdf_render_long_edge, cancel)?;
-            let right = render_materialize_page(right, right_edits, pdf_render_long_edge, cancel)?;
+            let left =
+                render_materialize_page(left, left_edits, pdf_render_long_edge, cancel, raw)?;
+            let right =
+                render_materialize_page(right, right_edits, pdf_render_long_edge, cancel, raw)?;
             crate::capture::combine_spread_color_images(&left, &right)
         }
         _ => {
@@ -923,7 +937,7 @@ fn render_materialize_source(
                 }
                 None => None,
             };
-            render_materialize_page(source, edits, pdf_render_long_edge, cancel)
+            render_materialize_page(source, edits, pdf_render_long_edge, cancel, raw)
         }
     }
 }
@@ -933,12 +947,14 @@ fn render_materialize_page(
     edits: Option<&LoadedPageEdits>,
     pdf_render_long_edge: u32,
     cancel: &Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<egui::ColorImage, String> {
     let source = composite_source(source)?;
     let image = crate::books::decode_composite_source_for_materialization(
         &source,
         pdf_render_long_edge,
         Arc::clone(cancel),
+        raw,
     )?;
     match edits {
         Some(edits) if edits.requires_composite => {
@@ -1637,6 +1653,53 @@ fn baked_params_and_lut(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn raw_external_tool_materialization_uses_full_libraw_for_file_and_zip() {
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let raw = crate::raw::RawDecodeContext::new(executor, crate::raw::RawBrightness::None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cr2 = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(cr2.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let file = render_materialize_source(
+            &MaterializeSource::File {
+                path: cr2.clone(),
+                image_page: true,
+            },
+            None,
+            4096,
+            &cancel,
+            Some(&raw),
+        )
+        .unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&cr2))
+            .unwrap()
+            .developed_dims;
+        assert_eq!(file.size, [dims[0] as usize, dims[1] as usize]);
+
+        let dng = PathBuf::from("vendor/raw-samples/885.dng");
+        assert!(dng.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let bytes = std::fs::read(&dng).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("pages.zip");
+        write_test_zip(&zip_path, "page.dng", &bytes);
+        let zip = render_materialize_source(
+            &MaterializeSource::ZipEntry {
+                zip_path,
+                entry_name: "page.dng".to_owned(),
+            },
+            None,
+            4096,
+            &cancel,
+            Some(&raw),
+        )
+        .unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+            .unwrap()
+            .developed_dims;
+        assert_eq!(zip.size, [dims[0] as usize, dims[1] as usize]);
+    }
+
     fn write_test_zip(path: &Path, entry_name: &str, bytes: &[u8]) {
         use std::io::Write as _;
         let file = std::fs::File::create(path).unwrap();
@@ -2013,12 +2076,13 @@ mod tests {
             left: loaded_stage(crate::bake_stage::BakeStage::Edits),
             right: loaded_stage(crate::bake_stage::BakeStage::Edits),
         };
-        let plain = render_materialize_source(&source, Some(&edits), 4096, &cancel).unwrap();
+        let plain = render_materialize_source(&source, Some(&edits), 4096, &cancel, None).unwrap();
         let display = LoadedMaterializePageEdits::Spread {
             left: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
             right: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
         };
-        let adjusted = render_materialize_source(&source, Some(&display), 4096, &cancel).unwrap();
+        let adjusted =
+            render_materialize_source(&source, Some(&display), 4096, &cancel, None).unwrap();
 
         assert_eq!(plain.size, adjusted.size);
         assert_ne!(plain.pixels, adjusted.pixels);

@@ -125,13 +125,17 @@ egui pass を続けても `SurfaceAbsent` となり screenshot と表示更新�
    ├─ ヒット (`source_policy != SourceOnly`): WebP バイト → ColorImage
    ├─ ミス + `CacheOnly`: 元ソースを開かず終了
    └─ ミス or `SourceOnly`:
-        ├─ ソースデコード (JPEG=turbojpeg, PNG/GIF/WebP/BMP=image crate,
-        │                   HEIC/AVIF/JXL/RAW=WIC, PDF=PDFium ワーカー)
-        ├─ EXIF Orientation 適用 (通常画像=path / ZIP=bytes、PDF は対象外)
+        ├─ ソースデコード (RAW=LibRaw preview、必要なら executor で half 現像,
+        │                   JPEG=turbojpeg, PNG/GIF/WebP/BMP=image crate,
+        │                   HEIC/AVIF/JXL=WIC, PDF=PDFium ワーカー)
+        ├─ EXIF Orientation 適用 (通常画像=path / ZIP=bytes。RAW は LibRaw の
+        │                   flip 適用済み、PDF は対象外)
         ├─ Lanczos3 で display_px までリサイズ
         ├─ CacheDecision::should_cache でキャッシュ可否判定
         └─ 必要なら WebP エンコードして catalog.db に保存
-3. mpsc で (idx, ColorImage, from_cache, from_edit_preview,
+3. RAW half は現像完了時に画像を持つ後続 LoadRequest を既存キューへ戻し、
+   thumbnail worker が縮小・cache 保存を続ける。画像と finalized の 2 通を送信し gen_done を進める
+4. mpsc で (idx, ColorImage, from_cache, from_edit_preview,
    edit_preview_adjustment, source_dims, layout_dims) を送信
 ```
 

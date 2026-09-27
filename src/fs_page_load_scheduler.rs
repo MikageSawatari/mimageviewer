@@ -35,7 +35,7 @@ impl FsPageLoadScheduler {
         )
     }
 
-    fn with_limits(total: usize, high_reserved: usize) -> Self {
+    pub(crate) fn with_limits(total: usize, high_reserved: usize) -> Self {
         assert!(total >= 1, "page-load permits must be non-zero");
         assert!(
             high_reserved < total,
@@ -206,6 +206,10 @@ impl FsPageLoadTicket {
     }
 
     pub(crate) fn cancel(&self) {
+        // The permit can finish before a RAW development job does. Its drop
+        // removes the scheduler record, but the ticket still owns the job's
+        // shared cancellation flag.
+        self.cancel.store(true, Ordering::Relaxed);
         cancel_request(&self.inner, self.request_id, "scheduler_cancel");
     }
 
@@ -831,6 +835,27 @@ mod tests {
         );
         assert!(next.waiter().acquire_cancellable().is_some());
         drop((failed, next));
+    }
+
+    #[test]
+    fn cancel_after_permit_drop_sets_flag_without_changing_accounting() {
+        let scheduler = FsPageLoadScheduler::with_limits(1, 0);
+        let ticket = test_ticket(
+            &scheduler,
+            1,
+            0,
+            FsPageLoadPriority::High,
+            FsPageLoadContract::Sequential,
+        );
+        let permit = ticket.waiter().acquire_cancellable().unwrap();
+        assert_eq!(scheduler.stats().running, 1);
+        drop(permit);
+        let before = scheduler.stats();
+        assert_eq!(before, FsPageLoadSchedulerStats::default());
+        assert!(!ticket.is_cancelled());
+        ticket.cancel();
+        assert!(ticket.is_cancelled());
+        assert_eq!(scheduler.stats(), before);
     }
 
     #[test]

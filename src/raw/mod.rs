@@ -9,6 +9,52 @@ pub use raw_decoder::{
     RawSource, RawUnsupportedReason,
 };
 
+#[derive(Clone)]
+pub struct RawDecodeContext {
+    pub executor: std::sync::Arc<RawDevelopExecutor>,
+    pub brightness: RawBrightness,
+}
+
+impl RawDecodeContext {
+    pub fn new(executor: std::sync::Arc<RawDevelopExecutor>, brightness: RawBrightness) -> Self {
+        Self {
+            executor,
+            brightness,
+        }
+    }
+
+    pub(crate) fn full(
+        &self,
+        source: RawOwnedSource,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<image::DynamicImage, RawError> {
+        develop_full_on_worker(&self.executor, source, self.brightness, cancel)
+    }
+}
+
+/// Wait for Full development on a caller-owned worker. The caller must have
+/// released any unrelated scheduler or I/O permit before entering here.
+pub(crate) fn develop_full_on_worker(
+    executor: &RawDevelopExecutor,
+    source: RawOwnedSource,
+    brightness: RawBrightness,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<image::DynamicImage, RawError> {
+    let (send, receive) = std::sync::mpsc::channel();
+    let _ticket = executor.submit_with_cancel_flag(
+        source,
+        RawDevelopScale::Full,
+        brightness,
+        RawPriority::High,
+        send,
+        cancel,
+    );
+    receive
+        .recv()
+        .map_err(|_| RawError::Cancelled)?
+        .map(|output| output.image)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

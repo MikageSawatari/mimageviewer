@@ -821,6 +821,57 @@ mod tests {
     use std::io::{Cursor, Write};
     use std::sync::{Mutex, atomic::AtomicUsize};
 
+    #[cfg(windows)]
+    #[test]
+    fn tiff_structured_raw_files_route_to_libraw_preview_and_full() {
+        let executor = RawDevelopExecutor::new(1).unwrap();
+        for name in ["885.dng", "1018.cr2"] {
+            let path = Path::new("vendor/raw-samples").join(name);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let dims = raw_decoder::info(RawSource::Path(&path))
+                .unwrap()
+                .developed_dims;
+            let preview = decode_canonical_image(
+                CanonicalImageSource::File {
+                    path: &path,
+                    verified_bytes: None,
+                },
+                CanonicalDecodeOptions::fullscreen(
+                    AnimationPolicy::FirstFrameOnly,
+                    RawStage::Preview,
+                ),
+            )
+            .unwrap();
+            assert!(matches!(preview, CanonicalImageDecode::RawPreview {
+                preview: Some(_), developed_dims, ..
+            } if developed_dims == dims.map(|dim| dim as usize)));
+            let full = static_image(
+                decode_canonical_image(
+                    CanonicalImageSource::File {
+                        path: &path,
+                        verified_bytes: None,
+                    },
+                    CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full)
+                        .with_raw_runtime(RawDecodeRuntime {
+                            executor: &executor,
+                            brightness: RawBrightness::None,
+                            priority: RawPriority::High,
+                        }),
+                )
+                .unwrap(),
+            );
+            assert_eq!(full.image.dimensions(), (dims[0], dims[1]));
+        }
+        let error = decode_canonical_image(
+            CanonicalImageSource::File {
+                path: Path::new("bad.dng"),
+                verified_bytes: Some(b"not a raw file"),
+            },
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Preview),
+        );
+        assert!(matches!(error, Err(CanonicalDecodeError::Raw(_))));
+    }
+
     fn rgba_fixture(width: u32, height: u32) -> image::RgbaImage {
         image::RgbaImage::from_fn(width, height, |x, y| {
             image::Rgba([

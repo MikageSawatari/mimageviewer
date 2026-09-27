@@ -499,6 +499,13 @@ struct ItemQueryTestHook {
 }
 
 impl SimilarIndexManager {
+    pub(crate) fn set_raw_executor(&self, executor: Arc<crate::raw::RawDevelopExecutor>) {
+        *self
+            .scheduler
+            .raw_executor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(executor);
+    }
     pub(crate) fn new_if_enabled(
         capability: SimilarFeatureCapability,
         data_dir: PathBuf,
@@ -564,6 +571,7 @@ impl SimilarIndexManager {
                 known_book_store: Mutex::new(ObservedBookStore::Unobserved),
                 prefill_db: Arc::new(Mutex::new(None)),
                 enabled_roots: Arc::clone(&enabled_roots),
+                raw_executor: Mutex::new(None),
                 state: Mutex::new(SchedulerState::default()),
                 array_update: Mutex::new(ArrayUpdateState::default()),
                 array_changed: Condvar::new(),
@@ -1934,6 +1942,7 @@ struct SimilarIndexScheduler {
     known_book_store: Mutex<ObservedBookStore>,
     prefill_db: Arc<Mutex<Option<Arc<SimilarDb>>>>,
     enabled_roots: Arc<RwLock<Vec<String>>>,
+    raw_executor: Mutex<Option<Arc<crate::raw::RawDevelopExecutor>>>,
     state: Mutex<SchedulerState>,
     array_update: Mutex<ArrayUpdateState>,
     array_changed: Condvar,
@@ -4907,6 +4916,13 @@ fn run_index_job(
     array_refresh: &ArrayRefreshNotifier,
     telemetry: Option<&ReconcileRunTelemetry>,
 ) -> Result<ScanJobOutcome, String> {
+    let raw_executor = array_refresh.scheduler.upgrade().and_then(|scheduler| {
+        scheduler
+            .raw_executor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    });
     if !wait_for_full_inventory_start(activity_gate, cancel) {
         return Ok(ScanJobOutcome {
             report: IndexReport::default(),
@@ -4971,6 +4987,7 @@ fn run_index_job(
                     array_refresh,
                     ScanPass::Full(&inventory),
                     telemetry,
+                    raw_executor.as_ref(),
                 )
             }));
         }
@@ -5049,6 +5066,13 @@ fn run_delta_index_job(
     _array_refresh: &ArrayRefreshNotifier,
     telemetry: Option<&ReconcileRunTelemetry>,
 ) -> Result<ScanJobOutcome, String> {
+    let raw_executor = _array_refresh.scheduler.upgrade().and_then(|scheduler| {
+        scheduler
+            .raw_executor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    });
     if !wait_for_full_inventory_start(config.activity_gate.as_deref(), cancel) {
         return Ok(ScanJobOutcome {
             report: IndexReport::default(),
@@ -5245,6 +5269,7 @@ fn run_delta_index_job(
                         publication: &publication,
                     },
                     telemetry,
+                    raw_executor.as_ref(),
                 )
             }));
         }
@@ -5349,6 +5374,7 @@ struct ScanContext<'a> {
     prune_safe: bool,
     array_refresh: &'a ArrayRefreshNotifier,
     pass: ScanPass<'a>,
+    raw_executor: Option<&'a Arc<crate::raw::RawDevelopExecutor>>,
 }
 
 #[derive(Clone)]
@@ -5371,6 +5397,7 @@ fn scan_worker_loop(
     array_refresh: &ArrayRefreshNotifier,
     pass: ScanPass<'_>,
     telemetry: Option<&ReconcileRunTelemetry>,
+    raw_executor: Option<&Arc<crate::raw::RawDevelopExecutor>>,
 ) {
     while let Some(mut lease) = queue.take(activity_gate, cancel.as_ref()) {
         let work = lease.take_task();
@@ -5402,6 +5429,7 @@ fn scan_worker_loop(
             prune_safe: true,
             array_refresh,
             pass,
+            raw_executor,
         };
         let result = if context.cancelled() {
             Ok(Vec::new())
@@ -6201,12 +6229,13 @@ impl ScanContext<'_> {
         if let Some(prefill) = self.load_prefill(key, candidate)? {
             return Ok(with_identity(prefill, kind, container_key, page_index));
         }
-        let canonical = proxy_from_source(
+        let canonical = crate::similar_image::proxy_from_source_with_raw(
             ProxySource::File {
                 path: &candidate.path,
                 verified_bytes: None,
             },
             Some(self.cancel),
+            self.raw_executor,
         )
         .map_err(|error| error.to_string())?;
         stored_from_proxy(key, kind, container_key, page_index, candidate, canonical)
@@ -6235,12 +6264,13 @@ impl ScanContext<'_> {
             self.cancel,
         )
         .map_err(|error| error.to_string())?;
-        let canonical = proxy_from_source(
+        let canonical = crate::similar_image::proxy_from_source_with_raw(
             ProxySource::Encoded {
                 filename_hint: entry_name,
                 bytes: &bytes,
             },
             Some(self.cancel),
+            self.raw_executor,
         )
         .map_err(|error| error.to_string())?;
         stored_from_proxy(
@@ -6743,6 +6773,20 @@ fn raster_is_large_enough_for_canonical_proxy(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn raw_preview_prefill_accepts_smaller_raster_than_developed_dimensions() {
+        assert!(raster_is_large_enough_for_canonical_proxy(
+            SimilarImageFormat::Raw,
+            (1024, 683),
+            (6000, 4000),
+        ));
+        assert!(!raster_is_large_enough_for_canonical_proxy(
+            SimilarImageFormat::Other,
+            (1024, 683),
+            (6000, 4000),
+        ));
+    }
 
     #[cfg(windows)]
     fn current_working_set_bytes() -> usize {
@@ -7875,6 +7919,7 @@ mod tests {
                 inventory: &inventory,
                 publication: &publication,
             },
+            raw_executor: None,
         };
         context.process_zip(&zip).unwrap();
         assert_eq!(context.report.unchanged, 0);
@@ -8849,6 +8894,7 @@ mod tests {
                 inventory: &inventory,
                 publication: &publication,
             },
+            raw_executor: None,
         };
         let unchanged = FileCandidate {
             path: PathBuf::from("this-file-does-not-exist.png"),

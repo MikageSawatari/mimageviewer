@@ -31989,6 +31989,10 @@ mod favorite_adjustment_defaults_tests {
                 entries,
                 include_metadata: false,
                 local_ai_activity: None,
+                raw: Some(crate::raw::RawDecodeContext::new(
+                    Arc::clone(&app.raw_develop_executor),
+                    app.settings.raw_brightness,
+                )),
             })
             .expect("start export worker");
         let cancel = std::sync::Arc::clone(&pending.cancel);

@@ -1455,6 +1455,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-27 RAW thumbnail ticket ownership (S2a)**
+
+`raw_thumb_develop` は `requested` と同じ viewer context が所有する idx / items generation 付き map として `ViewerContextBundle` に加えた。keep range 離脱、一覧世代変更、folder 移動、park、drop でその context の ticket を cancel し、既存の canceled `ThumbMsg` で requested を解放する。別の detached flag や viewport 分岐は追加しない。
+
 **2026-09-27 §1.250 常に最前面**
 
 `Settings.always_on_top` を唯一の希望状態とし、active / loading / holdover / cleanup と passive / parked の閲覧用 viewport builder に `Normal` または `AlwaysOnTop` を明示する。root への切替 command と、子 host の builder diff を別の発行 owner にして二重送信を避ける。同一 ViewportId を active session が所有する間は passive snapshot を重ねて登録せず、handoff 後に passive が所有する。別の detached 状態 flag、時間待ち、Focus、個別 HWND への症状的な `SetWindowPos` は追加しない。これは他機能の level 設定が viewport builder 経路へ到達する構造変更であり、§2 の同一 host ownership を維持する。復帰時の再 assert は style 実測で欠落が確認された edge に限り、現時点では追加していない。設計は [always-on-top-plan.md](always-on-top-plan.md) を参照。

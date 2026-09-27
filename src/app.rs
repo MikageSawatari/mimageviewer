@@ -6238,13 +6238,195 @@ pub(crate) use crate::thumb_loader::{
 
 use crate::canonical_image_loader::{
     AnimationPolicy, CanonicalAnimatedFormat, CanonicalDecodeError, CanonicalDecodeOptions,
-    CanonicalImageDecode, CanonicalImageSource, CanonicalStaticAnimation, CanonicalStaticImage,
-    RawDecodeRuntime, RawStage, decode_canonical_resolved, resolve_canonical_source,
+    CanonicalImageDecode, CanonicalImageSource, CanonicalResolvedSource, CanonicalStaticAnimation,
+    CanonicalStaticImage, RawDecodeRuntime, RawStage, decode_canonical_resolved,
+    resolve_canonical_source,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry, FsLoadResult, StaticAnimationState};
 use crate::fs_page_load_scheduler::{
-    FsPageLoadContract, FsPageLoadPriority, FsPageLoadScheduler, FsPageLoadTicket,
+    FsPageLoadContract, FsPageLoadPermit, FsPageLoadPriority, FsPageLoadScheduler, FsPageLoadTicket,
 };
+
+fn decode_pano_high_res_source(
+    path: &std::path::Path,
+    raw_executor: &crate::raw::RawDevelopExecutor,
+    raw_brightness: crate::raw::RawBrightness,
+    cancel: &Arc<AtomicBool>,
+) -> Result<image::DynamicImage, String> {
+    if crate::raw_format::is_raw_path(path) {
+        return crate::raw::develop_full_on_worker(
+            raw_executor,
+            crate::raw::RawOwnedSource::Path(path.to_owned()),
+            raw_brightness,
+            Some(Arc::clone(cancel)),
+        )
+        .map_err(|error| format!("RAW development failed: {error}"));
+    }
+    let image = image::open(path).or_else(|primary| {
+        crate::wic_decoder::decode_to_dynamic_image(path)
+            .or_else(|| crate::susie_loader::decode_file(path, true, None).ok())
+            .ok_or(primary)
+    });
+    image
+        .map(|image| crate::thumb_loader::apply_exif_orientation(image, path))
+        .map_err(|error| error.to_string())
+}
+
+fn decode_fullscreen_resolved_with_permit(
+    source: CanonicalResolvedSource<'_>,
+    options: CanonicalDecodeOptions<'_>,
+    permit: &mut Option<FsPageLoadPermit>,
+) -> Result<CanonicalImageDecode, CanonicalDecodeError> {
+    if source.needs_raw_development(options.raw_stage) {
+        // RAW plan §9: archive read is complete; development uses its own budget.
+        permit.take();
+    }
+    decode_canonical_resolved(source, options)
+}
+
+/// Called only by the fullscreen worker after source resolution. RAW dimensions
+/// describe the developed raster, which may differ from the container header.
+fn fullscreen_raw_source_dims(source: &CanonicalResolvedSource<'_>) -> Option<[usize; 2]> {
+    if !source.is_raw() {
+        return None;
+    }
+    source
+        .raw_info()
+        .ok()
+        .map(|info| info.developed_dims.map(|value| value as usize))
+}
+
+#[cfg(all(test, windows))]
+mod raw_fullscreen_permit_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn raw_dims_only_uses_libraw_developed_dimensions() {
+        for filename in ["3502.dng", "1018.cr2"] {
+            let path = PathBuf::from("vendor/raw-samples").join(filename);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let source = resolve_canonical_source(
+                CanonicalImageSource::File {
+                    path: &path,
+                    verified_bytes: None,
+                },
+                None,
+            )
+            .unwrap();
+            let expected = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&path))
+                .unwrap()
+                .developed_dims
+                .map(|value| value as usize);
+            assert_eq!(fullscreen_raw_source_dims(&source), Some(expected));
+        }
+    }
+
+    #[test]
+    fn raw_panorama_high_res_source_uses_full_libraw() {
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let image = decode_pano_high_res_source(
+            &path,
+            &executor,
+            crate::raw::RawBrightness::None,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&path))
+            .unwrap()
+            .developed_dims;
+        assert_eq!((image.width(), image.height()), (dims[0], dims[1]));
+    }
+
+    #[test]
+    fn raw_full_wait_releases_fs_permit_and_fs_cancel_reaches_executor() {
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let scheduler = FsPageLoadScheduler::with_limits(1, 0);
+        let first = scheduler.request(
+            1,
+            0,
+            FsPageLoadPriority::High,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        let first_waiter = first.waiter();
+        let fs_cancel = first.cancel_token();
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let (block_started_tx, block_started_rx) = mpsc::channel();
+        let (block_release_tx, block_release_rx) = mpsc::channel();
+        let _blocker = executor.block_one_slot_for_test(block_started_tx, block_release_rx);
+        block_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let (resolved_tx, resolved_rx) = mpsc::channel();
+        let (decode_tx, decode_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let raw_executor = Arc::clone(&executor);
+        let worker = std::thread::spawn(move || {
+            let permit = first_waiter.acquire_cancellable().unwrap();
+            let source = resolve_canonical_source(
+                CanonicalImageSource::File {
+                    path: &path,
+                    verified_bytes: None,
+                },
+                Some(&fs_cancel),
+            )
+            .unwrap();
+            resolved_tx.send(()).unwrap();
+            decode_rx.recv().unwrap();
+            let options = CanonicalDecodeOptions::fullscreen_cancellable(
+                AnimationPolicy::FirstFrameOnly,
+                &fs_cancel,
+                RawStage::Full,
+            )
+            .with_raw_runtime(RawDecodeRuntime {
+                executor: &raw_executor,
+                brightness: crate::raw::RawBrightness::None,
+                priority: crate::raw::RawPriority::High,
+            });
+            let mut permit = Some(permit);
+            let result = decode_fullscreen_resolved_with_permit(source, options, &mut permit);
+            result_tx.send(result).unwrap();
+        });
+        resolved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = scheduler.request(
+            1,
+            1,
+            FsPageLoadPriority::High,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        let second_waiter = second.waiter();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (second_release_tx, second_release_rx) = mpsc::channel();
+        let second_worker = std::thread::spawn(move || {
+            let _permit = second_waiter.acquire_cancellable().unwrap();
+            acquired_tx.send(()).unwrap();
+            second_release_rx.recv().unwrap();
+        });
+        decode_tx.send(()).unwrap();
+        executor.wait_for_queued_job_for_test();
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("RAW Full wait must release the only fs permit");
+        first.cancel();
+        block_release_tx.send(()).unwrap();
+        let result = result_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(matches!(
+            result,
+            Err(CanonicalDecodeError::Raw(crate::raw::RawError::Cancelled))
+        ));
+        second_release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        second_worker.join().unwrap();
+    }
+}
 use crate::items_generation_cache::{ItemsGenerationMap, ItemsGenerationVec};
 
 const ANIMATION_EXPANSION_PROGRESS_DELAY: std::time::Duration =
@@ -12868,7 +13050,7 @@ pub struct App {
     /// Process-wide execution budget. Request ownership remains in each
     /// viewer context's fs_pending map through FsPendingValue tickets.
     fs_page_load_scheduler: Arc<FsPageLoadScheduler>,
-    raw_develop_executor: Arc<crate::raw::RawDevelopExecutor>,
+    pub(crate) raw_develop_executor: Arc<crate::raw::RawDevelopExecutor>,
     /// 表示パイプライン入力の世代番号。
     ///
     /// raw decode / AI / 補正など、消しゴム確定結果の入力になるレイヤが変わるたび
@@ -16140,6 +16322,7 @@ impl App {
         raw_develop_executor: Arc<crate::raw::RawDevelopExecutor>,
     ) -> Self {
         settings.raw_develop_parallelism = settings.raw_develop_parallelism.clamp(1, 10);
+        let raw_brightness_for_materializer = settings.raw_brightness;
         // VST3 bridge host が手に入らない版 (= host exe を同梱しないポータブルビルド) では
         // VST3 を強制 OFF にする。設定 DB に true が残っていても (例: 通常版の設定を流用)
         // ここで落とすことで、bridge 起動・動画 VST 経路・設定 UI のすべてが OFF に揃う。
@@ -16558,6 +16741,9 @@ impl App {
             crate::data_dir::get(),
             notify_book_query_change,
         );
+        if let Some(index) = &similar_index {
+            index.set_raw_executor(Arc::clone(&raw_develop_executor));
+        }
 
         let mut app = Self {
             address: String::new(),
@@ -16715,7 +16901,7 @@ impl App {
             content_identity_restore_pending: None,
             content_identity_fallback_io_sem,
             fs_page_load_scheduler,
-            raw_develop_executor,
+            raw_develop_executor: Arc::clone(&raw_develop_executor),
             input_generation: std::collections::HashMap::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
@@ -17327,7 +17513,12 @@ impl App {
             association_prewarm_generation: None,
             association_prewarm_queue: std::collections::VecDeque::new(),
             external_tool_launch_pending: Vec::new(),
-            external_tool_materializer: crate::materializer::Materializer::new(),
+            external_tool_materializer: crate::materializer::Materializer::new_with_raw(
+                crate::raw::RawDecodeContext::new(
+                    Arc::clone(&raw_develop_executor),
+                    raw_brightness_for_materializer,
+                ),
+            ),
             external_tool_materialize_pending: Vec::new(),
             external_tool_launch_ui_frame: None,
             external_tool_modal_viewport: egui::ViewportId::ROOT,
@@ -37321,11 +37512,23 @@ impl App {
         }
         let root = self.book_root_path();
         let data_dir = crate::data_dir::get();
+        let raw = crate::raw::RawDecodeContext::new(
+            Arc::clone(&self.raw_develop_executor),
+            self.settings.raw_brightness,
+        );
         self.start_book_op(
             ctx,
             "book-append",
             crate::books::BookOpIntent::Unrelated,
-            move || crate::books::append_pages_at(data_dir, root, book_name, sources),
+            move || {
+                crate::books::append_pages_at_with_raw(
+                    data_dir,
+                    root,
+                    book_name,
+                    sources,
+                    Some(&raw),
+                )
+            },
         );
     }
 
@@ -38260,7 +38463,6 @@ impl App {
         let edit_preview_db = self.edit_preview_cache.as_ref().map(|service| service.db());
         let raw_executor = Arc::clone(&self.raw_develop_executor);
         let raw_tickets = Arc::clone(&self.raw_thumb_develop);
-        let raw_brightness = self.settings.raw_brightness;
 
         crate::logger::log(format!(
             "  spawning {} regular + {} I/O workers",
@@ -38287,12 +38489,13 @@ impl App {
             // 件数は典型的に数件程度なので contention は無視できる。
             let pin_db_w = pin_db.clone();
             let edit_preview_db_w = edit_preview_db.clone();
-            let raw_handoff = crate::thumb_loader::RawThumbHandoff {
-                executor: Arc::clone(&raw_executor),
-                queue: Arc::clone(&queue),
-                tickets: Arc::clone(&raw_tickets),
-                brightness: raw_brightness,
-            };
+            let raw_handoff = crate::thumb_loader::RawThumbHandoff::Local(
+                crate::thumb_loader::RawThumbLocalHandoff {
+                    executor: Arc::clone(&raw_executor),
+                    queue: Arc::clone(&queue),
+                    tickets: Arc::clone(&raw_tickets),
+                },
+            );
             let tag = format!("{prefix}{worker_idx}");
 
             std::thread::spawn(move || {
@@ -38467,6 +38670,7 @@ impl App {
         let stats = Arc::clone(&self.stats);
         let hint = Arc::clone(&self.scroll_hint);
         let vis_end = Arc::clone(&self.visible_end_shared);
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
         // 世代スナップショット: items が差し替わる前にフリーズ。以降 ThumbMsg に載せ、
         // UI 側は自 items_generation と一致しないものを破棄する (旧 items 混入防止)。
         let items_gen = self.items_generation;
@@ -38610,7 +38814,18 @@ impl App {
                         ));
                     }
                     (
-                        crate::thumb_loader::decode_image_for_thumb(img_path, display_px),
+                        crate::thumb_loader::decode_image_for_thumb(
+                            img_path,
+                            display_px,
+                            &raw_executor,
+                        )
+                        .unwrap_or_else(|error| {
+                            crate::logger::log(format!(
+                                "video thumb override RAW decode failed {}: {error}",
+                                img_path.display()
+                            ));
+                            None
+                        }),
                         "override",
                     )
                 } else {
@@ -39727,21 +39942,10 @@ impl App {
         );
         let interactive_thumbnail_pages = self.install_thumbnail_keep_projection(projection, false);
         let (keep_start, keep_end) = self.keep_range;
-        let exited_raw: Vec<_> = {
-            let mut tickets = self.raw_thumb_develop.lock().unwrap();
-            let exited: Vec<_> = tickets
-                .keys()
-                .copied()
-                .filter(|idx| !self.keep_set.contains(idx))
-                .collect();
-            exited
-                .into_iter()
-                .filter_map(|idx| tickets.remove(&idx))
-                .collect()
-        };
-        for pending in exited_raw {
-            pending.cancel();
-        }
+        crate::thumb_loader::cancel_raw_thumb_tickets_outside_keep(
+            &self.raw_thumb_develop,
+            &self.keep_set,
+        );
         let t2 = frame_t0.elapsed();
 
         // (2) reload_queue 内の keep_range 外リクエストを除去し、
@@ -59932,6 +60136,7 @@ impl App {
                 emit_exit("cancel_before_acquire");
                 return;
             };
+            let mut permit = Some(permit);
             // Checkpoint 1: cancellation can race with permit acquisition.
             if cancel.load(Ordering::Relaxed) {
                 emit_exit("cancel_after_acquire");
@@ -60159,19 +60364,10 @@ impl App {
             }
             let canonical_decode = match resolve_canonical_source(canonical_source, Some(&cancel)) {
                 Ok(source) => {
-                    if source.is_raw() {
-                        if let Ok(info) = source.raw_info() {
-                            let _ = tx.send(FsLoadResult::DimsOnly {
-                                source_dims: info.developed_dims.map(|value| value as usize),
-                            });
-                        }
+                    if let Some(source_dims) = fullscreen_raw_source_dims(&source) {
+                        let _ = tx.send(FsLoadResult::DimsOnly { source_dims });
                     }
-                    if source.needs_raw_development(RawStage::Full) {
-                        // RAW plan §9: archive read stays under the scheduler permit;
-                        // development waits under the executor's independent budget.
-                        drop(permit);
-                    }
-                    decode_canonical_resolved(source, decode_options)
+                    decode_fullscreen_resolved_with_permit(source, decode_options, &mut permit)
                 }
                 Err(error) => Err(error),
             };
@@ -72076,6 +72272,8 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let tx = self.pano_high_res_tx.clone();
         let cancel_worker = Arc::clone(&cancel);
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
+        let raw_brightness = self.settings.raw_brightness;
         let source_key_worker = source_key.clone();
         // **per-spawn request_id を発行** (Codex P1 第 7、2026-05): 同じ source_key +
         // 同じ cache_key の再 spawn でも、message と pending を 1:1 に対応させるための
@@ -72146,18 +72344,12 @@ impl App {
                 // pending は新 worker のために残す (上書きされている可能性あり)。
                 return;
             }
-            // image::open → WIC → Susie の順 (start_fs_load と同じ fallback)
-            let open_result = match image::open(&path) {
-                Ok(img) => Ok(img),
-                Err(e) => match crate::wic_decoder::decode_to_dynamic_image(&path) {
-                    Some(img) => Ok(img),
-                    None => match crate::susie_loader::decode_file(&path, true, None) {
-                        Ok(img) => Ok(img),
-                        Err(_) => Err(e),
-                    },
-                },
-            };
-            let img = match open_result {
+            let img = match decode_pano_high_res_source(
+                &path,
+                &raw_executor,
+                raw_brightness,
+                &cancel_worker,
+            ) {
                 Ok(i) => i,
                 Err(e) => {
                     crate::logger::log(format!(
@@ -72170,7 +72362,6 @@ impl App {
                 // cancel 起因 → Drop guard が silent exit (新 worker の pending を残す)
                 return;
             }
-            let img = crate::thumb_loader::apply_exif_orientation(img, &path);
             let rgba_img = img.into_rgba8();
             let (w, h) = (rgba_img.width(), rgba_img.height());
             let raw = rgba_img.into_raw();

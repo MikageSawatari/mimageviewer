@@ -46334,6 +46334,10 @@ impl App {
             entries,
             include_metadata: effective_include_metadata,
             local_ai_activity: needs_ai_lease.then(|| self.local_ai_activity_lease()),
+            raw: Some(crate::raw::RawDecodeContext::new(
+                Arc::clone(&self.raw_develop_executor),
+                self.settings.raw_brightness,
+            )),
         };
         let pending = crate::export_dialog::spawn_export_worker(request)?;
         self.export_pending = Some(pending);

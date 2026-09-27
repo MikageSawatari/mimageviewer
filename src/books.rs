@@ -763,8 +763,9 @@ pub fn append_pages(
     root: PathBuf,
     book_name: String,
     sources: Vec<BookPageSource>,
+    raw: &crate::raw::RawDecodeContext,
 ) -> Result<BookOpResult, String> {
-    append_pages_at(crate::data_dir::get(), root, book_name, sources)
+    append_pages_at_with_raw(crate::data_dir::get(), root, book_name, sources, Some(raw))
 }
 
 pub(crate) fn append_pages_at(
@@ -772,6 +773,16 @@ pub(crate) fn append_pages_at(
     root: PathBuf,
     book_name: String,
     sources: Vec<BookPageSource>,
+) -> Result<BookOpResult, String> {
+    append_pages_at_with_raw(data_dir, root, book_name, sources, None)
+}
+
+pub(crate) fn append_pages_at_with_raw(
+    data_dir: PathBuf,
+    root: PathBuf,
+    book_name: String,
+    sources: Vec<BookPageSource>,
+    raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<BookOpResult, String> {
     if sources.is_empty() {
         return Err("追加するページがありません".to_string());
@@ -816,7 +827,7 @@ pub(crate) fn append_pages_at(
                 BookSourceCopy::Semantic(_) => semantic_copies.push(mapping),
             }
         }
-        if write_source(source, &dest)? {
+        if write_source(source, &dest, raw)? {
             erase_fallback_pages += 1;
         }
         if let Some(source_path) = byte_copy_source {
@@ -1180,7 +1191,11 @@ fn journal_transfer_staging_path(
     )))
 }
 
-fn write_source(source: BookPageSource, dest: &Path) -> Result<bool, String> {
+fn write_source(
+    source: BookPageSource,
+    dest: &Path,
+    raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<bool, String> {
     match source {
         BookPageSource::File { src, .. } => {
             copy_file_snapshot(&src, dest)?;
@@ -1203,6 +1218,7 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<bool, String> {
                 &edits,
                 dest,
                 crate::export_dialog::ExportScale::Full,
+                raw,
             )
         }
         BookPageSource::Rendered {
@@ -1277,7 +1293,21 @@ fn source_edit_copy_path<'a>(
     (!crate::folder_tree::path_eq(&source_book, dest_folder)).then_some(copy)
 }
 
-fn decode_file_color_image(path: &Path) -> Result<egui::ColorImage, String> {
+fn decode_file_color_image(
+    path: &Path,
+    raw: Option<&crate::raw::RawDecodeContext>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<egui::ColorImage, String> {
+    if crate::raw_format::is_raw_path(path) {
+        let raw = raw.ok_or("RAW decoder context unavailable")?;
+        let image = raw
+            .full(
+                crate::raw::RawOwnedSource::Path(path.to_path_buf()),
+                Some(Arc::clone(cancel)),
+            )
+            .map_err(|error| format!("RAW を現像できません: {}: {error}", path.display()))?;
+        return Ok(dynamic_image_to_color_image(&image));
+    }
     let image = image::open(path)
         .or_else(|_| {
             crate::wic_decoder::decode_to_dynamic_image(path).ok_or_else(|| {
@@ -1295,7 +1325,26 @@ fn decode_file_color_image(path: &Path) -> Result<egui::ColorImage, String> {
     Ok(dynamic_image_to_color_image(&image))
 }
 
-fn decode_bytes_color_image(hint: &str, bytes: &[u8]) -> Result<egui::ColorImage, String> {
+fn decode_bytes_color_image(
+    hint: &str,
+    bytes: &[u8],
+    raw: Option<&crate::raw::RawDecodeContext>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<egui::ColorImage, String> {
+    if Path::new(hint)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(crate::raw_format::is_raw_ext)
+    {
+        let raw = raw.ok_or("RAW decoder context unavailable")?;
+        let image = raw
+            .full(
+                crate::raw::RawOwnedSource::Bytes(bytes.to_vec().into()),
+                Some(Arc::clone(cancel)),
+            )
+            .map_err(|error| format!("ZIP RAW を現像できません: {hint}: {error}"))?;
+        return Ok(dynamic_image_to_color_image(&image));
+    }
     let image = image::load_from_memory(bytes)
         .or_else(|_| {
             crate::wic_decoder::decode_to_dynamic_image_from_bytes(
@@ -1321,8 +1370,11 @@ fn decode_bytes_color_image(hint: &str, bytes: &[u8]) -> Result<egui::ColorImage
     Ok(dynamic_image_to_color_image(&image))
 }
 
-fn decode_composite_source(source: &CompositeSource) -> Result<egui::ColorImage, String> {
-    decode_composite_source_for_materialization(source, 4096, Arc::new(AtomicBool::new(false)))
+fn decode_composite_source(
+    source: &CompositeSource,
+    raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<egui::ColorImage, String> {
+    decode_composite_source_for_materialization(source, 4096, Arc::new(AtomicBool::new(false)), raw)
 }
 
 /// Worker 側の外部ツール実体化用 decode。
@@ -1333,11 +1385,12 @@ pub(crate) fn decode_composite_source_for_materialization(
     source: &CompositeSource,
     pdf_long_edge: u32,
     cancel: Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<egui::ColorImage, String> {
     ensure_materialization_not_cancelled(cancel.as_ref())?;
     match source {
         CompositeSource::File { path } => {
-            let image = decode_file_color_image(path)?;
+            let image = decode_file_color_image(path, raw, &cancel)?;
             ensure_materialization_not_cancelled(cancel.as_ref())?;
             Ok(image)
         }
@@ -1348,7 +1401,7 @@ pub(crate) fn decode_composite_source_for_materialization(
             let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name)
                 .map_err(|e| format!("ZIP 内画像を読み取れません: {entry_name}: {e}"))?;
             ensure_materialization_not_cancelled(cancel.as_ref())?;
-            let image = decode_bytes_color_image(entry_name, &bytes)?;
+            let image = decode_bytes_color_image(entry_name, &bytes, raw, &cancel)?;
             ensure_materialization_not_cancelled(cancel.as_ref())?;
             Ok(image)
         }
@@ -1635,8 +1688,9 @@ pub fn write_composited_page(
     edits: &BakedEditSnapshot,
     dest: &Path,
     scale: crate::export_dialog::ExportScale,
+    raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<bool, String> {
-    let image = decode_composite_source(source)?;
+    let image = decode_composite_source(source, raw)?;
     let result = compose_book_page(image, edits)?;
     let image = crate::export_dialog::scale_export_pixels(
         std::borrow::Cow::Borrowed(&result.image),
@@ -2384,6 +2438,54 @@ fn sanitize_filename(input: &str, fallback: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn unedited_raw_book_page_is_copied_and_counted() {
+        let source = Path::new("vendor/raw-samples/885.dng");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("books");
+        let result = append_pages_at(
+            temp.path().join("data"),
+            root.clone(),
+            "raw".to_owned(),
+            vec![BookPageSource::File {
+                src: source.to_owned(),
+                original_name: "885.dng".to_owned(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(result, BookOpResult::Append(_)));
+        let pages = book_page_paths(&root.join("raw")).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0].extension().and_then(|ext| ext.to_str()),
+            Some("dng")
+        );
+        assert_eq!(fs::read(&pages[0]).unwrap(), fs::read(source).unwrap());
+        for extension in crate::raw_format::RAW_EXTENSIONS {
+            assert!(is_supported_book_image_path(Path::new(&format!(
+                "0001_page.{extension}"
+            ))));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edited_raw_book_decode_uses_full_libraw_dimensions() {
+        let source = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let context = crate::raw::RawDecodeContext::new(executor, crate::raw::RawBrightness::None);
+        let image =
+            decode_file_color_image(source, Some(&context), &Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(source))
+            .unwrap()
+            .developed_dims;
+        assert_eq!(image.size, [dims[0] as usize, dims[1] as usize]);
+    }
+
     #[test]
     fn default_books_root_is_the_capture_output_books_directory() {
         assert_eq!(
@@ -2696,6 +2798,7 @@ mod tests {
             &source,
             2048,
             Arc::new(AtomicBool::new(true)),
+            None,
         )
         .unwrap_err();
 

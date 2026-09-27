@@ -91,7 +91,7 @@ required-features = ["dev-tools"]
 [[bin]]
 name = "bench_dupe"
 path = "src/bin/bench_dupe.rs"
-test = false
+test = true # D11 RAW decode routing regression runs only with --features dev-tools --bin bench_dupe.
 bench = false
 required-features = ["dev-tools"]
 

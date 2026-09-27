@@ -4,7 +4,7 @@ use super::raw_decoder::{
 };
 use super::raw_decoder::{
     RawBrightness, RawCancellation, RawDevelopOutput, RawDevelopScale, RawError, RawOwnedSource,
-    develop,
+    develop, develop_thumbnail_half,
 };
 use image::DynamicImage;
 use std::collections::{HashMap, VecDeque};
@@ -351,6 +351,36 @@ pub struct RawDevelopExecutor {
 }
 
 impl RawDevelopExecutor {
+    #[cfg(test)]
+    pub(crate) fn block_one_slot_for_test(
+        &self,
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    ) -> RawTicket {
+        let (result, _receive) = mpsc::channel();
+        self.submit_work(
+            RawPriority::Normal,
+            result,
+            Box::new(move |_, _| {
+                let _ = started.send(());
+                let _ = release.recv();
+                Ok(DynamicImage::new_rgb8(1, 1))
+            }),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_queued_job_for_test(&self) {
+        let mut state = self.shared.state.lock().unwrap();
+        while state.waiting() == 0 {
+            state = self.shared.wake.wait(state).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running_jobs_for_test(&self) -> usize {
+        self.shared.state.lock().unwrap().running.len()
+    }
     pub fn new(parallelism: usize) -> std::io::Result<Self> {
         assert!(
             (1..=10).contains(&parallelism),
@@ -485,6 +515,57 @@ impl RawDevelopExecutor {
                 complete: Box::new(complete),
                 work: Box::new(move |cancel, progress| {
                     develop(source.as_source(), scale, brightness, cancel, progress)
+                }),
+            },
+            None,
+        );
+        if rejected.is_some() {
+            Err(RawError::Cancelled)
+        } else {
+            Ok(ticket)
+        }
+    }
+
+    pub fn submit_thumbnail_half(
+        &self,
+        source: RawOwnedSource,
+        priority: RawPriority,
+        result: mpsc::Sender<ProductResult>,
+    ) -> RawTicket {
+        self.submit_thumbnail_half_with_cancel_flag(source, priority, result, None)
+    }
+
+    pub fn submit_thumbnail_half_with_cancel_flag(
+        &self,
+        source: RawOwnedSource,
+        priority: RawPriority,
+        result: mpsc::Sender<ProductResult>,
+        cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> RawTicket {
+        self.submit_action(
+            priority,
+            JobAction::Product {
+                result,
+                work: Box::new(move |cancel, progress| {
+                    develop_thumbnail_half(source.as_source(), cancel, progress)
+                }),
+            },
+            cancel_flag,
+        )
+    }
+
+    pub fn submit_thumbnail_half_with_completion(
+        &self,
+        source: RawOwnedSource,
+        priority: RawPriority,
+        complete: impl FnOnce(ProductResult) + Send + 'static,
+    ) -> Result<RawTicket, RawError> {
+        let (ticket, rejected) = self.submit_action_inner(
+            priority,
+            JobAction::ProductCallback {
+                complete: Box::new(complete),
+                work: Box::new(move |cancel, progress| {
+                    develop_thumbnail_half(source.as_source(), cancel, progress)
                 }),
             },
             None,

@@ -204,6 +204,9 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         AppliedBrightness::None => {
             return json!({"id":id,"error":"MatchPreview returned None brightness"});
         }
+        AppliedBrightness::ThumbnailAuto001 => {
+            return json!({"id":id,"error":"MatchPreview returned thumbnail brightness"});
+        }
     };
     let cancel_ms = cancel_latency(executor, &path);
     let aspect_diff_percent = preview_dims.map(|(w, h)| {

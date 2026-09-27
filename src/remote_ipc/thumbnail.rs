@@ -342,6 +342,9 @@ impl ThumbnailEngine {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
         let effective_target = target_px.min(self.settings.thumb_px.max(1));
+        let (raw_unavailable_tx, raw_unavailable_rx) = mpsc::channel();
+        let raw_handoff =
+            crate::thumb_loader::RawThumbHandoff::RemotePreviewOnly(raw_unavailable_tx);
         crate::thumb_loader::process_load_request(
             &mut load_request,
             &cache_map,
@@ -360,8 +363,37 @@ impl ThumbnailEngine {
             context.folder_pin_db.as_ref(),
             None,
             context.adjustment_db.as_ref(),
-            None,
+            Some(&raw_handoff),
         );
+        if matches!(
+            raw_unavailable_rx.try_recv(),
+            Ok(crate::thumb_loader::RawThumbUnavailable::NeedsHalfDevelopment)
+        ) {
+            return Err(error_response(
+                ThumbnailErrorCode::Unsupported,
+                "RAW thumbnail requires half development; Remote does not support it yet",
+            ));
+        }
+        if !is_folder && crate::raw_format::is_raw_path(&resolved.logical) {
+            let source = crate::raw::RawSource::Path(&resolved.logical);
+            let info = crate::raw::raw_decoder::info(source).map_err(|error| {
+                error_response(
+                    ThumbnailErrorCode::Unsupported,
+                    format!("RAW thumbnail information unavailable: {error}"),
+                )
+            })?;
+            let required = target_px
+                .min(self.settings.thumb_px.max(1))
+                .min(info.developed_dims[0].max(info.developed_dims[1]));
+            let preview_sufficient = crate::raw::raw_decoder::preview(source)
+                .is_ok_and(|preview| preview.image.width().max(preview.image.height()) >= required);
+            if !preview_sufficient {
+                return Err(error_response(
+                    ThumbnailErrorCode::Unsupported,
+                    "RAW thumbnail requires half development; Remote does not support it yet",
+                ));
+            }
+        }
         drop(tx);
         let color_image = rx
             .into_iter()
@@ -668,6 +700,30 @@ fn error_response(code: ThumbnailErrorCode, message: impl Into<String>) -> Thumb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_raw_thumbnail_needing_half_returns_typed_unsupported() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("remote-raw-thumbnail");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let path = folder.join("page.cr2");
+        std::fs::copy(source, &path).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.thumb_px = 2048;
+        let engine = ThumbnailEngine::new(settings);
+        let context = WorkerContext::open();
+        let resolved = resolve_existing(path.to_string_lossy().as_ref()).unwrap();
+        let result = engine.generate_catalog_resolved(&resolved, 2048, &context);
+        assert!(
+            matches!(result, Err(ThumbnailResponse::Error(ThumbnailError {
+            code: ThumbnailErrorCode::Unsupported,
+            message,
+        })) if message.contains("requires half development"))
+        );
+    }
 
     #[test]
     fn remote_folder_pins_use_typed_seeded_and_auto_keys() {

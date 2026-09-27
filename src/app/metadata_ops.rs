@@ -2684,6 +2684,23 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn raw_metadata_probe_uses_libraw_developed_dimensions() {
+        for name in ["885.dng", "1018.cr2"] {
+            let path = std::path::Path::new("vendor/raw-samples").join(name);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let bytes = std::fs::read(path).unwrap();
+            let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+                .unwrap()
+                .developed_dims;
+            assert_eq!(
+                probe_image_dims_from_bytes(&bytes, name),
+                Some((dims[0], dims[1]))
+            );
+        }
+    }
+
     #[test]
     fn facet_member_metadata_filters_exempt_stack_consistently() {
         use std::path::PathBuf;
