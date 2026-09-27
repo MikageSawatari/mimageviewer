@@ -10,9 +10,9 @@
 # Steps:
 #   1. complete Rust test gate (scripts\test-full.ps1)
 #   2. idle-health analyzer regression tests
-#   3. cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher
-#      (+ the portable target dir's mimageviewer + remote packages)
-#   4. build-release.ps1   -> target\release\mimageviewer.exe (launcher) + core + remote
+#   3. cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher
+#      (+ the portable target dir's mimageviewer + remote + EPUB worker packages)
+#   4. build-release.ps1   -> target\release\mimageviewer.exe (launcher) + core + remote + EPUB worker
 #   5. ISCC                -> installer\Output\mImageViewer_setup.exe
 #   6. build-portable.ps1  -> dist\mImageViewer_portable_v<ver>.zip (target-portable)
 #   7. inspect the final runtime/portable/installer PE closure
@@ -96,6 +96,7 @@ $runningNames = @(
     'mimageviewer',
     'mimageviewer-core',
     'mimageviewer-remote',
+    'mimageviewer-epub-pdf',
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
@@ -133,14 +134,14 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] idle-health analyzer tests faile
 # exit in PowerShell 5.1, so check $LASTEXITCODE explicitly. A silently-failed
 # clean would let the build reuse a stale fingerprint -- the exact bug this script
 # exists to prevent.
-Write-Host "[build-dist] (3/7) cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher"
-& cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher
+Write-Host "[build-dist] (3/7) cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher"
+& cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (workspace) failed (exit {0})" -f $LASTEXITCODE) }
-Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer -p mimageviewer-remote"
-& cargo clean --release --target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote
+Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker"
+& cargo clean --release --target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (portable) failed (exit {0})" -f $LASTEXITCODE) }
 
-# --- 2. Core + remote + launcher (fresh, since cleaned above) ---
+# --- 2. Core + remote + EPUB worker + launcher (fresh, since cleaned above) ---
 $releaseArgs = @()
 if ($SkipVst3Bridge) { $releaseArgs += '-SkipVst3Bridge' }
 if ($sign) { $releaseArgs += '-Sign' }
@@ -196,6 +197,7 @@ $finalRuntimePe = @(
     (Join-Path $repoRoot 'target\release\mimageviewer.exe'),
     (Join-Path $repoRoot 'target\release\mimageviewer-core.exe'),
     (Join-Path $repoRoot 'target\release\mimageviewer-remote.exe'),
+    (Join-Path $repoRoot 'target\release\mimageviewer-epub-pdf.exe'),
     $portableDir
 )
 Write-Host '[build-dist] (7/7) final PE dependency closure'

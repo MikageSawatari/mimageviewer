@@ -978,7 +978,7 @@ EPUB 以外の台帳・編集行には今回の per-book ガードがない。�
 - S3b 独立レビュー修正 3: 128 bit のファイル ID が全ゼロ、または ID 取得が失敗した場合は所有を証明できないため、`unprovable` 行として記録し、自動削除しない。起動後の背景回収はその行だけを閉じ、乱数名の残置ファイルは許容する。64 bit の旧ファイルインデックスへはフォールバックしない。保存先の一時名は `.miv-part-<64 桁の乱数>.tmp` とし、作成時の Hidden 属性は best effort、通常一覧と一括名前索引では属性に関わらず名前で除外する。開発途中の旧 `.pdf` 一時名も除外・既存の識別子つき回収対象にする。作業 PDF は PDFium 検証の前から読み取り共有だけを許すハンドルで保持し、検証後も同じハンドルから複写する。保存先も読み取り共有だけを許す作成ハンドルを公開まで保持し、作業 PDF の複写時 SHA-256 と保存先ハンドルからの再読込 SHA-256 を照合する。Hidden を外してから同じハンドルの `FileRenameInfo` (置換なし) で公開する。不一致・公開失敗では同じハンドルから削除する。
 - 修正 3 の検証: `sibling_zero_file_id_is_unprovable_and_gate_never_deletes` はゼロ ID 判定を外すと失敗した。一時名の除外を外すと `sibling_output_temp_names_are_internal_even_without_hidden_attribute`・実フォルダ走査・一括名前索引の 3 テストが失敗した。保存先共有制限、再読込ハッシュ比較、置換禁止、検証前の作業 PDF 共有制限を個別に外すと、それぞれ `sibling_temp_denies_concurrent_write_until_handle_publish`、`sibling_save_readback_hash_mismatch_removes_temp_without_publishing`、`sibling_handle_publish_never_replaces_pdf_created_after_temp`、`sibling_save_holds_verified_work_file_write_denied_through_publish` が失敗した。復元後、保存関連 67 テストと全 lib 9,323 成功・47 ignored、EPUB worker 43 成功。core check、fmt、glyph lint、`build-dev.ps1` による core・Remote・EPUB worker 配置と PE 依存検査も成功。ビルドの既定待機は別 worktree の MSBuild ノードが残ったため中断し、既存手順の `-WaitForOtherBuildsMinutes 0` で完了した。実 WebView2 の 27 冊再実行と GUI 操作は設計担当の確認待ち。
 - 修正 1 の検証: `cargo test -p mimageviewer --lib` は 9,308 成功・47 ignored、`cargo test -p epub-pdf-worker` は 43 成功。core check、fmt、glyph lint、`build-dev.ps1` による core・Remote・EPUB worker と PE 依存検査も成功した。別 worktree の MSBuild 待機ノードが残ったため、ビルドはスクリプトの `-WaitForOtherBuildsMinutes 0` を指定して実行した。保存先 worker 出力の旧経路は取消テストで失敗し、出力版・起動時回収・モーダルの判定を一時的に外すと対応する 6 テストが失敗した。書名代替値を旧処理へ戻すと `/Title=source` で失敗した。実 WebView2 の 27 冊再実行は設計担当の確認待ち。
-- S5 TODO: 明示保存した PDF と EPUB 内の書誌情報についてプライバシー文言を更新する。`privacy.html` は S3b で編集しない。
+- S5 で反映済み: 明示保存した PDF と EPUB 内の書誌情報について、`privacy.html` の日本語・英語を更新した。S3b では編集しなかった。
 
 ### S3b 検収 (2026-09-27)
 
@@ -1004,3 +1004,12 @@ mIV の通常のファイルコピーと同じ (しおり・コレクション�
 両方に効く (設定 ON かつ本別の保存値なしのときだけ方向を取得)。IPC は wire 変更なしだが `pdf` 種別の意味が EPUB へ広がったため v61。
 検収時: 全ライブラリ 9,334 件成功・1 件は既存の類似索引テスト (5 秒の待ち上限) が並列負荷で時間切れ、単独 3 回とも成功 (S4 は当該
 ファイル未変更)。remote-ipc 59 件、remote-web 123 件、Web JS 412 件成功。Remote の実機確認は未実施。
+
+### S5 配布・文書 (2026-09-27、実装・静的検証完了、配布ビルドと独立レビュー待ち)
+
+- launcher は EPUB converter を core・remote と同じ版別 runtime へ展開し、SHA-256 で照合する。署名する配布ビルドでは内包前に converter を署名する。core の既存探索は自分の exe の隣の `mimageviewer-epub-pdf.exe` を指す。portable は `target-portable` で worker をビルドし、core exe の隣へ複製する。
+- `build-release.ps1` は core → remote → EPUB worker → 内側 3 exe の署名 → launcher → launcher の署名の順とした。`build-release.sh` も同じビルド順。`build-dist.ps1` の clean・稼働プロセス確認・最終 PE 検査、portable の稼働プロセス確認・存在確認・署名・診断ビルド manifest に worker を含める。
+- `installer/mimageviewer.iss` の配布ファイル一覧は launcher だけで正しいため、埋め込み対象のコメントのみ更新した。readme、マニュアル、製品ページ、プライバシー文書の日本語・英語、構成・配布文書を更新した。Remote マニュアルは S4 の文言が変換済みのみ閲覧できる仕様と一致するため変更不要。`docs/architecture-overview.md` と `docs/async-architecture.md` には S2 の起動ゲート、Job Object、世代寿命の記述が既にあり、前者は配布配置も追記した。
+- 設計担当の判断: 一時データの保存先は実装どおり記述し、変更しない。閲覧用の通常変換は Windows の一時フォルダ、portable 版はアプリのデータフォルダ、同じ場所への PDF 保存は全版でデータフォルダ内の作業領域を使う。管理者・利用者の WebView2 ポリシーが別の保存先を指定した場合は従い、アプリはその別領域を削除しない。アプリ所有の一時フォルダは変換後と次回通常起動時に削除を試みる。
+- 公開文言の利用者判断: 製品ページ「安心して使えます」は元の見出し・説明文を維持し、EPUB の通信と明示保存を短く追記した。EPUB 以外の画像送信・Remote・外部ツールの既存文言は 38006d8cd に戻した。プライバシー文書の日本語・英語には、EPUB 内の外部サイト要求の遮断、一時データ、ポリシー、キャッシュ PDF、明示保存時だけの元 EPUB の隣 (ネットワークフォルダを含む) への出力を追記した。保存 PDF は EPUB の書名と、存在すれば最初の著者をメタデータに記録し、書名が無ければ元ファイル名を使う。キャッシュ削除は同じデータフォルダを使う全アプリ終了後の起動時と明記した。
+- 自動検査: `test-build-dev-safety.ps1`、`test-release-build-safety.ps1`、fmt、glyph lint、HTML パーサ、PowerShell 変更行の ASCII 確認、`git diff --check` が成功。launcher unit test は worktree に内包元の release exe 3 本がないため build.rs の事前検査で停止。配布・release・portable ビルドは S5 brief に従い実行していない。

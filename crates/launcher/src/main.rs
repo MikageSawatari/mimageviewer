@@ -1,8 +1,8 @@
 //! Small launcher for the distributable `mimageviewer.exe`.
 //!
 //! The real application binary (`mimageviewer-core.exe`) imports FFmpeg DLLs at
-//! process load time and starts `mimageviewer-remote.exe` from its own directory.
-//! The launcher therefore extracts both executables, FFmpeg DLLs, and the app-local VC runtime into
+//! process load time and starts `mimageviewer-remote.exe` and `mimageviewer-epub-pdf.exe`
+//! from its own directory. The launcher therefore extracts all three executables, FFmpeg DLLs, and the app-local VC runtime into
 //! `%APPDATA%/mimageviewer/runtime/<version>/` first, then spawns the core there.
 
 #![windows_subsystem = "windows"]
@@ -21,6 +21,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static CORE_EXE: &[u8] = include_bytes!(env!("MIMV_CORE_EXE"));
 static REMOTE_EXE: &[u8] = include_bytes!(env!("MIMV_REMOTE_EXE"));
+static EPUB_PDF_EXE: &[u8] = include_bytes!(env!("MIMV_EPUB_PDF_EXE"));
 static AVCODEC_DLL: &[u8] = include_bytes!(env!("MIMV_AVCODEC_DLL"));
 static AVFORMAT_DLL: &[u8] = include_bytes!(env!("MIMV_AVFORMAT_DLL"));
 static AVUTIL_DLL: &[u8] = include_bytes!(env!("MIMV_AVUTIL_DLL"));
@@ -88,6 +89,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         "mimageviewer-remote.exe",
         REMOTE_EXE,
         env!("MIMV_REMOTE_EXE_SHA256"),
+    ),
+    (
+        "mimageviewer-epub-pdf.exe",
+        EPUB_PDF_EXE,
+        env!("MIMV_EPUB_PDF_EXE_SHA256"),
     ),
 ];
 
@@ -606,6 +612,24 @@ mod tests {
             remote.2,
             "the versioned runtime copy must match the bytes embedded by the launcher"
         );
+    }
+
+    #[test]
+    fn embedded_epub_worker_extracts_beside_core_and_matches_core_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime").join(super::VERSION);
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        super::extract_assets(&runtime_dir).unwrap();
+
+        let core = runtime_dir.join("mimageviewer-core.exe");
+        let worker = core.with_file_name("mimageviewer-epub-pdf.exe");
+        let asset = super::ASSETS
+            .iter()
+            .find(|(name, _, _)| *name == "mimageviewer-epub-pdf.exe")
+            .expect("EPUB worker must be embedded");
+        assert!(core.is_file());
+        assert!(worker.is_file());
+        assert_eq!(super::sha256_file_hex(&worker).unwrap(), asset.2);
     }
 
     #[test]
