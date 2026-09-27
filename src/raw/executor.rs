@@ -1,5 +1,6 @@
 use super::raw_decoder::{
-    RawBrightness, RawCancellation, RawDevelopScale, RawError, RawOwnedSource, develop,
+    RawBrightness, RawCancellation, RawDevelopScale, RawError, RawMatchPreviewOutput,
+    RawOwnedSource, develop, develop_match_preview,
 };
 use image::DynamicImage;
 use std::collections::{HashMap, VecDeque};
@@ -9,6 +10,65 @@ use std::time::{Duration, Instant};
 
 type RawResult = Result<DynamicImage, RawError>;
 type Work = Box<dyn FnOnce(&RawCancellation, &AtomicU8) -> RawResult + Send + 'static>;
+type MatchResult = Result<RawMatchPreviewOutput, RawError>;
+type MatchWork = Box<dyn FnOnce(&RawCancellation, &AtomicU8) -> MatchResult + Send + 'static>;
+
+enum JobAction {
+    Image {
+        result: mpsc::Sender<RawResult>,
+        work: Work,
+    },
+    Match {
+        result: mpsc::Sender<MatchResult>,
+        work: MatchWork,
+    },
+}
+
+enum Completion {
+    Image(mpsc::Sender<RawResult>, RawResult),
+    Match(mpsc::Sender<MatchResult>, MatchResult),
+}
+
+impl JobAction {
+    fn cancel(self) {
+        match self {
+            Self::Image { result, .. } => {
+                let _ = result.send(Err(RawError::Cancelled));
+            }
+            Self::Match { result, .. } => {
+                let _ = result.send(Err(RawError::Cancelled));
+            }
+        }
+    }
+
+    fn run(self, cancel: &RawCancellation, progress: &AtomicU8) -> Completion {
+        match self {
+            Self::Image { result, work } => Completion::Image(result, work(cancel, progress)),
+            Self::Match { result, work } => Completion::Match(result, work(cancel, progress)),
+        }
+    }
+}
+
+impl Completion {
+    fn send(self, cancelled: bool) {
+        match self {
+            Self::Image(sender, result) => {
+                let _ = sender.send(if cancelled {
+                    Err(RawError::Cancelled)
+                } else {
+                    result
+                });
+            }
+            Self::Match(sender, result) => {
+                let _ = sender.send(if cancelled {
+                    Err(RawError::Cancelled)
+                } else {
+                    result
+                });
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawPriority {
@@ -33,8 +93,7 @@ struct Job {
     queued_at: Instant,
     cancel: Arc<RawCancellation>,
     progress: Arc<AtomicU8>,
-    result: mpsc::Sender<RawResult>,
-    work: Work,
+    action: JobAction,
 }
 
 struct Running {
@@ -179,7 +238,7 @@ impl RawTicket {
         };
         shared.wake.notify_all();
         if let Some(job) = waiting_job {
-            let _ = job.result.send(Err(RawError::Cancelled));
+            job.action.cancel();
             emit(
                 "executor_cancel_waiting",
                 self.id,
@@ -318,12 +377,41 @@ impl RawDevelopExecutor {
         )
     }
 
+    pub fn submit_match_preview(
+        &self,
+        source: RawOwnedSource,
+        scale: RawDevelopScale,
+        preview_median: Option<f64>,
+        priority: RawPriority,
+        result: mpsc::Sender<MatchResult>,
+    ) -> RawTicket {
+        self.submit_action(
+            priority,
+            JobAction::Match {
+                result,
+                work: Box::new(move |cancel, progress| {
+                    develop_match_preview(
+                        source.as_source(),
+                        scale,
+                        preview_median,
+                        cancel,
+                        progress,
+                    )
+                }),
+            },
+        )
+    }
+
     fn submit_work(
         &self,
         priority: RawPriority,
         result: mpsc::Sender<RawResult>,
         work: Work,
     ) -> RawTicket {
+        self.submit_action(priority, JobAction::Image { result, work })
+    }
+
+    fn submit_action(&self, priority: RawPriority, action: JobAction) -> RawTicket {
         let cancel = Arc::new(RawCancellation::new());
         let progress = Arc::new(AtomicU8::new(0));
         let (id, waiting, running, closed) = {
@@ -338,11 +426,10 @@ impl RawDevelopExecutor {
                     queued_at: Instant::now(),
                     cancel: Arc::clone(&cancel),
                     progress: Arc::clone(&progress),
-                    result,
-                    work,
+                    action,
                 });
             } else {
-                let _ = result.send(Err(RawError::Cancelled));
+                action.cancel();
             }
             (id, state.waiting(), state.running.len(), closed)
         };
@@ -376,7 +463,7 @@ impl Drop for RawDevelopExecutor {
         };
         for job in waiting {
             job.cancel.cancel();
-            let _ = job.result.send(Err(RawError::Cancelled));
+            job.action.cancel();
         }
         for cancel in running {
             cancel.cancel();
@@ -593,10 +680,8 @@ fn worker(shared: Arc<Shared>) {
             Some(job.queued_at.elapsed()),
         );
         let started = Instant::now();
-        let mut result = (job.work)(&job.cancel, &job.progress);
-        if job.cancel.flag.load(Ordering::Acquire) {
-            result = Err(RawError::Cancelled);
-        }
+        let completion = job.action.run(&job.cancel, &job.progress);
+        let cancelled = job.cancel.flag.load(Ordering::Acquire);
         let (priority, cancel_at, waiting, running) = {
             let mut state = shared.state.lock().unwrap();
             let running_job = state.running.remove(&job.id).expect("running RAW job");
@@ -609,7 +694,7 @@ fn worker(shared: Arc<Shared>) {
             shared.wake.notify_all();
             values
         };
-        let _ = job.result.send(result);
+        completion.send(cancelled);
         emit(
             "executor_finish",
             job.id,

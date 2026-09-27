@@ -60,6 +60,13 @@ mod windows {
         ) -> c_int;
         pub fn miv_raw_image_info(handle: *mut c_void, width: *mut u32, height: *mut u32) -> c_int;
         pub fn miv_raw_copy_rgb(handle: *mut c_void, data: *mut u8, stride: usize) -> c_int;
+        pub fn miv_raw_copy_rgb_adjusted(
+            handle: *mut c_void,
+            data: *mut u8,
+            stride: usize,
+            bright_mode: c_int,
+            gain: f32,
+        ) -> c_int;
         pub fn miv_raw_set_cancel_flag(handle: *mut c_void) -> c_int;
         pub fn miv_raw_free(data: *mut u8) -> c_int;
         pub fn miv_raw_close(handle: *mut c_void) -> c_int;

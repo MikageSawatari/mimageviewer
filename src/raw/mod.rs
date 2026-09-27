@@ -1,3 +1,4 @@
+pub mod brightness;
 pub mod executor;
 pub mod raw_decoder;
 
@@ -14,6 +15,43 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{atomic::Ordering, mpsc};
     use std::time::Duration;
+
+    #[cfg(windows)]
+    #[test]
+    fn match_preview_fallback_reuses_developed_pixels_for_auto_0001() {
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let executor = RawDevelopExecutor::new(1).unwrap();
+        let (match_sender, match_receiver) = mpsc::channel();
+        let _ticket = executor.submit_match_preview(
+            RawOwnedSource::Path(path.clone()),
+            RawDevelopScale::Full,
+            None,
+            RawPriority::High,
+            match_sender,
+        );
+        let output = match_receiver
+            .recv_timeout(Duration::from_secs(180))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            output.decision,
+            brightness::MatchDecision::Fallback(brightness::MatchFallback::NoPreview)
+        );
+        let (auto_sender, auto_receiver) = mpsc::channel();
+        let _ticket = executor.submit(
+            RawOwnedSource::Path(path),
+            RawDevelopScale::Full,
+            RawBrightness::Auto0001,
+            RawPriority::High,
+            auto_sender,
+        );
+        let auto = auto_receiver
+            .recv_timeout(Duration::from_secs(180))
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.matched.as_bytes(), auto.as_bytes());
+    }
 
     #[cfg(windows)]
     fn samples() -> Vec<serde_json::Value> {
@@ -62,6 +100,16 @@ mod tests {
                 Ok(preview) => {
                     assert!(expected_preview, "{} unexpected preview", path.display());
                     let [width, height] = preview.info.dims;
+                    let (width, height) =
+                        if preview.info.format == raw_decoder::RawPreviewFormat::Jpeg {
+                            let divisor = [1u32, 2, 4, 8]
+                                .into_iter()
+                                .find(|divisor| width.max(height).div_ceil(*divisor) <= 8192)
+                                .unwrap();
+                            (width.div_ceil(divisor), height.div_ceil(divisor))
+                        } else {
+                            (width, height)
+                        };
                     let flip = preview
                         .info
                         .tflip
@@ -130,6 +178,23 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nikon_z8_full_size_jpeg_preview_is_usable_when_scaled() {
+        let path = PathBuf::from("vendor/raw-samples/6616.nef");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let info = raw_decoder::info(RawSource::Path(&path)).unwrap();
+        assert!(
+            info.previews
+                .iter()
+                .any(|preview| preview.dims == [8256, 5504])
+        );
+        let preview = raw_decoder::preview(RawSource::Path(&path)).unwrap();
+        assert_eq!(preview.info.dims, [8256, 5504]);
+        assert_eq!(preview.image.dimensions(), (4128, 2752));
+        assert!(preview.image.width().max(preview.image.height()) <= 8192);
     }
 
     #[cfg(windows)]

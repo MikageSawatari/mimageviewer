@@ -2,6 +2,7 @@
 #include "miv_libraw.h"
 #include "libraw/libraw.h"
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -9,7 +10,6 @@
 
 namespace {
 constexpr size_t kMaxPreviewBytes = 512ull * 1024 * 1024;
-constexpr uint32_t kMaxPreviewEdge = 8192;
 
 struct FreeBuffer {
   void operator()(unsigned char *data) const noexcept { std::free(data); }
@@ -120,9 +120,7 @@ extern "C" int miv_raw_preview_extract(void *opaque, uint32_t index, MivRawBuffe
     if (!preview_format(format))
       return LIBRAW_UNSUPPORTED_THUMBNAIL;
     // LibRaw allocates the thumbnail during unpack_thumb_ex, before we can inspect it.
-    if (item.tlength > kMaxPreviewBytes ||
-        (preview_format(format) == LIBRAW_THUMBNAIL_BITMAP &&
-         (item.twidth > kMaxPreviewEdge || item.theight > kMaxPreviewEdge)))
+    if (item.tlength > kMaxPreviewBytes)
       return LIBRAW_TOO_BIG;
     int result = h->raw.unpack_thumb_ex(static_cast<int>(index));
     if (result) return result;
@@ -130,9 +128,7 @@ extern "C" int miv_raw_preview_extract(void *opaque, uint32_t index, MivRawBuffe
     if (thumb.tformat != LIBRAW_THUMBNAIL_JPEG && thumb.tformat != LIBRAW_THUMBNAIL_BITMAP)
       return LIBRAW_UNSUPPORTED_THUMBNAIL;
     if (!thumb.thumb || !thumb.tlength) return LIBRAW_DATA_ERROR;
-    if (thumb.tlength > kMaxPreviewBytes ||
-        (thumb.tformat == LIBRAW_THUMBNAIL_BITMAP &&
-         (thumb.twidth > kMaxPreviewEdge || thumb.theight > kMaxPreviewEdge)))
+    if (thumb.tlength > kMaxPreviewBytes)
       return LIBRAW_TOO_BIG;
     std::unique_ptr<unsigned char, FreeBuffer> copy(
         static_cast<unsigned char *>(std::malloc(thumb.tlength)));
@@ -167,6 +163,7 @@ extern "C" int miv_raw_develop(void *opaque, int half, int bright_mode,
     params.half_size = half ? 1 : 0;
     params.no_auto_bright = bright_mode == 2;
     params.auto_bright_thr = bright_mode == 1 ? 0.001f : 0.01f;
+    params.bright = 1.0f;
     Progress progress{h, callback, user};
     h->raw.set_progress_handler(miv_progress_callback, &progress);
     int result = h->raw.unpack();
@@ -203,6 +200,29 @@ extern "C" int miv_raw_copy_rgb(void *opaque, unsigned char *data, size_t stride
     if (w <= 0 || hgt <= 0 || colors != 3 || bits != 8 || stride < static_cast<size_t>(w) * 3)
       return LIBRAW_DATA_ERROR;
     return h->raw.copy_mem_image(data, static_cast<int>(stride), 0);
+  } catch (const std::bad_alloc &) { return LIBRAW_UNSUFFICIENT_MEMORY; }
+    catch (...) { return LIBRAW_UNSPECIFIED_ERROR; }
+}
+
+extern "C" int miv_raw_copy_rgb_adjusted(void *opaque, unsigned char *data,
+                                           size_t stride, int bright_mode, float gain) {
+  try {
+    if (!opaque) return LIBRAW_DATA_ERROR;
+    auto *h = static_cast<Handle *>(opaque);
+    if (!h->developed || !std::isfinite(gain)) return LIBRAW_OUT_OF_ORDER_CALL;
+    auto &params = h->raw.imgdata.params;
+    if (bright_mode == 1) {
+      params.no_auto_bright = 0;
+      params.auto_bright_thr = 0.001f;
+      params.bright = 1.0f;
+    } else if (bright_mode == 3 && gain >= 0.125f && gain <= 8.0f) {
+      params.no_auto_bright = 1;
+      params.bright = gain;
+    } else {
+      return LIBRAW_DATA_ERROR;
+    }
+    // copy_mem_image rebuilds the gamma curve from these params without demosaicing again.
+    return miv_raw_copy_rgb(opaque, data, stride);
   } catch (const std::bad_alloc &) { return LIBRAW_UNSUFFICIENT_MEMORY; }
     catch (...) { return LIBRAW_UNSPECIFIED_ERROR; }
 }

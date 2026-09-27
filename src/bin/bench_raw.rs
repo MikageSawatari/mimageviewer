@@ -1,5 +1,6 @@
 //! S1-only RAW measurement. All development is submitted to RawDevelopExecutor.
 use image::{DynamicImage, GenericImage, GenericImageView, RgbaImage};
+use mimageviewer::raw::brightness::{MatchDecision, median_linear_luma};
 use mimageviewer::raw::raw_decoder::{
     self, RawBrightness, RawDevelopScale, RawDevelopSupport, RawOwnedSource, RawSource,
 };
@@ -21,6 +22,27 @@ fn develop(
         RawOwnedSource::Path(path.to_path_buf()),
         scale,
         brightness,
+        RawPriority::High,
+        sender,
+    );
+    let result = receiver
+        .recv()
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    Ok((result, start.elapsed().as_secs_f64() * 1000.0))
+}
+
+fn develop_match_preview(
+    executor: &RawDevelopExecutor,
+    path: &Path,
+    preview_median: Option<f64>,
+) -> Result<(raw_decoder::RawMatchPreviewOutput, f64), String> {
+    let (sender, receiver) = mpsc::channel();
+    let start = Instant::now();
+    let _ticket = executor.submit_match_preview(
+        RawOwnedSource::Path(path.to_path_buf()),
+        RawDevelopScale::Full,
+        preview_median,
         RawPriority::High,
         sender,
     );
@@ -148,11 +170,26 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         Ok(value) => value,
         Err(error) => return json!({"id":id,"error":error,"full_ms":full_ms}),
     };
-    let (no_auto, no_auto_ms) =
-        match develop(executor, &path, RawDevelopScale::Full, RawBrightness::None) {
+    let preview_median_linear = preview
+        .as_ref()
+        .ok()
+        .and_then(|preview| median_linear_luma(&preview.image));
+    let (matched_output, match_preview_ms) =
+        match develop_match_preview(executor, &path, preview_median_linear) {
             Ok(value) => value,
             Err(error) => return json!({"id":id,"error":error,"full_ms":full_ms}),
         };
+    let no_auto = &matched_output.no_auto;
+    let matched = &matched_output.matched;
+    let matched_median_linear = median_linear_luma(matched);
+    let (gain, unclamped_gain, gain_clamped, match_fallback) = match matched_output.decision {
+        MatchDecision::Gain {
+            gain,
+            unclamped,
+            clamped,
+        } => (Some(gain), Some(unclamped), clamped, None),
+        MatchDecision::Fallback(reason) => (None, None, false, Some(format!("{reason:?}"))),
+    };
     let cancel_ms = cancel_latency(executor, &path);
     let aspect_diff_percent = preview_dims.map(|(w, h)| {
         let preview_ratio = f64::from(w) / f64::from(h);
@@ -164,10 +201,11 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         .as_ref()
         .ok()
         .map(|_| output.join(format!("{id}.png")));
-    if let (Some(preview), Some(path)) = (preview.as_ref().ok(), comparison.as_ref()) {
-        if let Err(error) = write_comparison(path, &[&preview.image, &full, &auto0001, &no_auto]) {
-            eprintln!("{}: comparison PNG: {}", id, error);
-        }
+    if let (Some(preview), Some(path)) = (preview.as_ref().ok(), comparison.as_ref())
+        && let Err(error) =
+            write_comparison(path, &[&preview.image, &full, &auto0001, no_auto, matched])
+    {
+        eprintln!("{}: comparison PNG: {}", id, error);
     }
     let wic_dims = if sample["format"] == "DNG" {
         mimageviewer::wic_decoder::decode_to_dynamic_image(&path)
@@ -184,11 +222,19 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         "selected_preview_tflip":preview.as_ref().ok().and_then(|preview|preview.info.tflip),
         "zero_dim_cr3_thumb_candidate":zero_dim_cr3_thumb,
         "info_ms":info_ms,"preview_ms":preview_ms,"full_ms":full_ms,"half_ms":half_ms,
-        "auto0001_ms":auto0001_ms,"no_auto_ms":no_auto_ms,"cancel_ms":cancel_ms,
+        "auto0001_ms":auto0001_ms,"match_preview_ms":match_preview_ms,"cancel_ms":cancel_ms,
         "aspect_diff_percent":aspect_diff_percent,"preview_luma":preview_luma,
         "auto001_luma_diff":preview_luma.map(|value|(mean_luma(&full)-value).abs()),
         "auto0001_luma_diff":preview_luma.map(|value|(mean_luma(&auto0001)-value).abs()),
-        "no_auto_luma_diff":preview_luma.map(|value|(mean_luma(&no_auto)-value).abs()),
+        "no_auto_luma_diff":preview_luma.map(|value|(mean_luma(no_auto)-value).abs()),
+        "match_mean_luma_diff":preview_luma.map(|value|(mean_luma(matched)-value).abs()),
+        "preview_median_linear":preview_median_linear,
+        "developed_median_linear":matched_output.developed_median,
+        "matched_median_linear":matched_median_linear,
+        "match_median_luma_diff_linear":preview_median_linear.zip(matched_median_linear)
+            .map(|(preview, developed)| (preview-developed).abs()),
+        "match_gain":gain,"match_unclamped_gain":unclamped_gain,
+        "match_gain_clamped":gain_clamped,"match_fallback":match_fallback,
         "comparison_png":comparison.map(|p|p.display().to_string()),"wic_dims":wic_dims,
     })
 }

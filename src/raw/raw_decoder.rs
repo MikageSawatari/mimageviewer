@@ -52,6 +52,13 @@ pub enum RawBrightness {
     None,
 }
 
+pub struct RawMatchPreviewOutput {
+    pub no_auto: DynamicImage,
+    pub matched: DynamicImage,
+    pub decision: super::brightness::MatchDecision,
+    pub developed_median: Option<f64>,
+}
+
 impl RawBrightness {
     #[cfg(windows)]
     fn code(self) -> i32 {
@@ -284,7 +291,7 @@ mod windows {
         Ok((metadata, bytes))
     }
 
-    fn check_preview_dims(width: u32, height: u32, colors: usize) -> Result<(), RawError> {
+    fn check_preview_bytes(width: u32, height: u32, colors: usize) -> Result<usize, RawError> {
         if width == 0 || height == 0 {
             return Err(RawError::Corrupt("Invalid preview dimensions".into()));
         }
@@ -293,19 +300,54 @@ mod windows {
             .and_then(|width| width.checked_mul(height as usize))
             .and_then(|pixels| pixels.checked_mul(colors))
             .ok_or(RawError::TooLarge)?;
-        if width > MAX_PREVIEW_EDGE || height > MAX_PREVIEW_EDGE || bytes > MAX_PREVIEW_BYTES {
+        if bytes > MAX_PREVIEW_BYTES {
             return Err(RawError::TooLarge);
         }
-        Ok(())
+        Ok(bytes)
     }
 
-    fn jpeg_preview_dims(bytes: &[u8]) -> Result<[u32; 2], RawError> {
+    struct JpegLayout {
+        scale: turbojpeg::ScalingFactor,
+        width: u32,
+        height: u32,
+        length: usize,
+    }
+
+    fn jpeg_preview_layout(bytes: &[u8]) -> Result<JpegLayout, RawError> {
         let header = turbojpeg::read_header(bytes)
             .map_err(|_| RawError::Corrupt("Invalid preview JPEG header".into()))?;
-        let width = u32::try_from(header.width).map_err(|_| RawError::TooLarge)?;
-        let height = u32::try_from(header.height).map_err(|_| RawError::TooLarge)?;
-        check_preview_dims(width, height, 3)?;
-        Ok([width, height])
+        if header.width == 0
+            || header.height == 0
+            || header.width > 65_535
+            || header.height > 65_535
+        {
+            return Err(RawError::Corrupt(
+                "Impossible preview JPEG dimensions".into(),
+            ));
+        }
+        let factors = [
+            turbojpeg::ScalingFactor::ONE,
+            turbojpeg::ScalingFactor::ONE_HALF,
+            turbojpeg::ScalingFactor::ONE_QUARTER,
+            turbojpeg::ScalingFactor::ONE_EIGHTH,
+        ];
+        let scale = factors
+            .into_iter()
+            .find(|factor| {
+                (!header.is_lossless || *factor == turbojpeg::ScalingFactor::ONE)
+                    && factor.scale(header.width.max(header.height)) <= MAX_PREVIEW_EDGE as usize
+            })
+            .unwrap_or(turbojpeg::ScalingFactor::ONE);
+        let scaled = header.scaled(scale);
+        let width = u32::try_from(scaled.width).map_err(|_| RawError::TooLarge)?;
+        let height = u32::try_from(scaled.height).map_err(|_| RawError::TooLarge)?;
+        let length = check_preview_bytes(width, height, 3)?;
+        Ok(JpegLayout {
+            scale,
+            width,
+            height,
+            length,
+        })
     }
 
     pub fn info(source: RawSource<'_>) -> Result<RawInfo, RawError> {
@@ -438,17 +480,6 @@ mod windows {
                 rejected_too_large = true;
                 continue;
             }
-            if meta.format == RawPreviewFormat::Bitmap
-                && (meta.recorded_dims[0] > MAX_PREVIEW_EDGE
-                    || meta.recorded_dims[1] > MAX_PREVIEW_EDGE)
-            {
-                rejected_too_large = true;
-                continue;
-            }
-            if meta.dims != [0, 0] && check_preview_dims(meta.dims[0], meta.dims[1], 3).is_err() {
-                rejected_too_large = true;
-                continue;
-            }
             let handle = Handle::open(source)?;
             let (buffer, bytes) = match extract(&handle, meta.index) {
                 Ok(value) => value,
@@ -460,28 +491,45 @@ mod windows {
             };
             let image = match meta.format {
                 RawPreviewFormat::Jpeg => {
-                    match jpeg_preview_dims(&bytes) {
-                        Ok(_) => {}
+                    let layout = match jpeg_preview_layout(&bytes) {
+                        Ok(layout) => layout,
                         Err(RawError::TooLarge) => {
                             rejected_too_large = true;
                             continue;
                         }
                         Err(_) => continue,
+                    };
+                    let mut decompressor = match turbojpeg::Decompressor::new() {
+                        Ok(value) => value,
+                        Err(_) => continue,
+                    };
+                    if decompressor.set_scaling_factor(layout.scale).is_err() {
+                        continue;
                     }
-                    turbojpeg::decompress(&bytes, turbojpeg::PixelFormat::RGB)
-                        .ok()
-                        .and_then(|decoded| {
-                            RgbImage::from_raw(
-                                decoded.width as u32,
-                                decoded.height as u32,
-                                decoded.pixels,
-                            )
-                        })
+                    let mut pixels = Vec::new();
+                    pixels
+                        .try_reserve_exact(layout.length)
+                        .map_err(|_| RawError::OutOfMemory)?;
+                    pixels.resize(layout.length, 0);
+                    let mut decoded = turbojpeg::Image {
+                        pixels,
+                        width: layout.width as usize,
+                        pitch: layout.width as usize * 3,
+                        height: layout.height as usize,
+                        format: turbojpeg::PixelFormat::RGB,
+                    };
+                    if decompressor
+                        .decompress(&bytes, decoded.as_deref_mut())
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    RgbImage::from_raw(layout.width, layout.height, decoded.pixels)
                         .map(DynamicImage::ImageRgb8)
                 }
                 RawPreviewFormat::Bitmap => {
-                    match check_preview_dims(buffer.width, buffer.height, buffer.colors as usize) {
-                        Ok(()) => {}
+                    match check_preview_bytes(buffer.width, buffer.height, buffer.colors as usize) {
+                        Ok(_) => {}
                         Err(RawError::TooLarge) => {
                             rejected_too_large = true;
                             continue;
@@ -506,6 +554,11 @@ mod windows {
                 }
             };
             if let Some(image) = image {
+                let image = if image.width().max(image.height()) > MAX_PREVIEW_EDGE {
+                    image.thumbnail(MAX_PREVIEW_EDGE, MAX_PREVIEW_EDGE)
+                } else {
+                    image
+                };
                 let flip = meta
                     .tflip
                     .filter(|&flip| flip != 0)
@@ -562,18 +615,13 @@ mod windows {
         state.cancel.flag.load(Ordering::Acquire) as i32
     }
 
-    pub(in crate::raw) fn develop(
-        source: RawSource<'_>,
+    fn process(
+        handle: &Handle<'_>,
         scale: RawDevelopScale,
         brightness: RawBrightness,
         cancel: &RawCancellation,
         progress: &AtomicU8,
-    ) -> Result<DynamicImage, RawError> {
-        if cancel.flag.load(Ordering::Acquire) {
-            return Err(RawError::Cancelled);
-        }
-        let handle = Handle::open(source)?;
-        let _binding = cancel.bind(handle.raw);
+    ) -> Result<(), RawError> {
         let callback_state = CallbackState { cancel, progress };
         let code = unsafe {
             ffi::miv_raw_develop(
@@ -592,6 +640,10 @@ mod windows {
         if code != 0 {
             return Err(map_error(code));
         }
+        Ok(())
+    }
+
+    fn dimensions(handle: &Handle<'_>) -> Result<(u32, u32, usize), RawError> {
         let mut width = 0;
         let mut height = 0;
         let code = unsafe { ffi::miv_raw_image_info(handle.raw, &mut width, &mut height) };
@@ -604,22 +656,92 @@ mod windows {
             .and_then(|pixels| pixels.checked_mul(3))
             .filter(|length| *length <= 2 * 1024 * 1024 * 1024)
             .ok_or(RawError::TooLarge)?;
+        Ok((width, height, length))
+    }
+
+    fn copy_image(
+        handle: &Handle<'_>,
+        width: u32,
+        height: u32,
+        length: usize,
+        adjusted: Option<(i32, f32)>,
+        cancel: &RawCancellation,
+    ) -> Result<DynamicImage, RawError> {
         let mut rgb = Vec::new();
         rgb.try_reserve_exact(length)
             .map_err(|_| RawError::OutOfMemory)?;
         rgb.resize(length, 0);
-        let code =
-            unsafe { ffi::miv_raw_copy_rgb(handle.raw, rgb.as_mut_ptr(), width as usize * 3) };
+        let code = unsafe {
+            match adjusted {
+                Some((mode, gain)) => ffi::miv_raw_copy_rgb_adjusted(
+                    handle.raw,
+                    rgb.as_mut_ptr(),
+                    width as usize * 3,
+                    mode,
+                    gain,
+                ),
+                None => ffi::miv_raw_copy_rgb(handle.raw, rgb.as_mut_ptr(), width as usize * 3),
+            }
+        };
         if cancel.flag.load(Ordering::Acquire) {
             return Err(RawError::Cancelled);
         }
         if code != 0 {
             return Err(map_error(code));
         }
-        progress.store(100, Ordering::Release);
         RgbImage::from_raw(width, height, rgb)
             .map(DynamicImage::ImageRgb8)
             .ok_or(RawError::Internal(-1))
+    }
+
+    pub(in crate::raw) fn develop(
+        source: RawSource<'_>,
+        scale: RawDevelopScale,
+        brightness: RawBrightness,
+        cancel: &RawCancellation,
+        progress: &AtomicU8,
+    ) -> Result<DynamicImage, RawError> {
+        if cancel.flag.load(Ordering::Acquire) {
+            return Err(RawError::Cancelled);
+        }
+        let handle = Handle::open(source)?;
+        let _binding = cancel.bind(handle.raw);
+        process(&handle, scale, brightness, cancel, progress)?;
+        let (width, height, length) = dimensions(&handle)?;
+        let image = copy_image(&handle, width, height, length, None, cancel)?;
+        progress.store(100, Ordering::Release);
+        Ok(image)
+    }
+
+    pub(in crate::raw) fn develop_match_preview(
+        source: RawSource<'_>,
+        scale: RawDevelopScale,
+        preview_median: Option<f64>,
+        cancel: &RawCancellation,
+        progress: &AtomicU8,
+    ) -> Result<RawMatchPreviewOutput, RawError> {
+        if cancel.flag.load(Ordering::Acquire) {
+            return Err(RawError::Cancelled);
+        }
+        let handle = Handle::open(source)?;
+        let _binding = cancel.bind(handle.raw);
+        process(&handle, scale, RawBrightness::None, cancel, progress)?;
+        let (width, height, length) = dimensions(&handle)?;
+        let no_auto = copy_image(&handle, width, height, length, None, cancel)?;
+        let developed_median = crate::raw::brightness::median_linear_luma(&no_auto);
+        let decision = crate::raw::brightness::match_gain(preview_median, developed_median);
+        let adjusted = match decision {
+            crate::raw::brightness::MatchDecision::Gain { gain, .. } => (3, gain as f32),
+            crate::raw::brightness::MatchDecision::Fallback(_) => (1, 1.0),
+        };
+        let matched = copy_image(&handle, width, height, length, Some(adjusted), cancel)?;
+        progress.store(100, Ordering::Release);
+        Ok(RawMatchPreviewOutput {
+            no_auto,
+            matched,
+            decision,
+            developed_median,
+        })
     }
 
     #[cfg(test)]
@@ -652,7 +774,7 @@ mod windows {
 
     #[cfg(test)]
     #[test]
-    fn jpeg_preview_rejects_huge_sof_before_decode() {
+    fn jpeg_preview_scales_huge_sof_before_decode() {
         let path = Path::new("vendor/raw-samples/2756.dng");
         assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
         let raw_info = info(RawSource::Path(path)).unwrap();
@@ -669,14 +791,18 @@ mod windows {
             .position(|marker| marker[0] == 0xff && (0xc0..=0xc3).contains(&marker[1]))
             .expect("sample JPEG has a baseline or progressive SOF");
         jpeg[sof + 5..sof + 9].copy_from_slice(&[0x7f, 0xff, 0x7f, 0xff]);
-        // 32,767 x 32,767 passes JPEG header parsing but exceeds our preview cap.
-        let result = jpeg_preview_dims(&jpeg);
-        assert!(matches!(result, Err(RawError::TooLarge)), "{result:?}");
+        // 32,767 x 32,767 must not allocate a full decoded image.
+        let layout = jpeg_preview_layout(&jpeg).unwrap();
+        assert_eq!(layout.scale, turbojpeg::ScalingFactor::ONE_QUARTER);
+        assert_eq!((layout.width, layout.height), (8192, 8192));
+        assert!(layout.length <= MAX_PREVIEW_BYTES);
     }
 }
 
 #[cfg(windows)]
 pub(in crate::raw) use windows::develop;
+#[cfg(windows)]
+pub(in crate::raw) use windows::develop_match_preview;
 #[cfg(windows)]
 pub use windows::{info, preview};
 
@@ -698,5 +824,16 @@ pub(in crate::raw) fn develop(
     _cancel: &RawCancellation,
     _progress: &AtomicU8,
 ) -> Result<DynamicImage, RawError> {
+    Err(RawError::Unsupported(RawUnsupportedReason::Platform))
+}
+
+#[cfg(not(windows))]
+pub(in crate::raw) fn develop_match_preview(
+    _source: RawSource<'_>,
+    _scale: RawDevelopScale,
+    _preview_median: Option<f64>,
+    _cancel: &RawCancellation,
+    _progress: &AtomicU8,
+) -> Result<RawMatchPreviewOutput, RawError> {
     Err(RawError::Unsupported(RawUnsupportedReason::Platform))
 }
