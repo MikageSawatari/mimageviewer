@@ -4317,6 +4317,20 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    #[test]
+    fn twenty_grid_columns_roundtrip_without_changing_toolbar_choices() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.grid_cols = 20;
+        settings.toolbar_cols_items = vec![1, 4, 10];
+        db.save_full(&settings).unwrap();
+
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.grid_cols, 20);
+        assert_eq!(loaded.toolbar_cols_items, vec![1, 4, 10]);
+    }
+
     fn sample_settings() -> Settings {
         let mut s = Settings::default();
         s.grid_cols = 7;

@@ -1583,6 +1583,83 @@ fn phase_a2_unrelated_restore_does_not_clear_virtual_projection() {
 }
 
 #[test]
+fn metadata_import_keeps_unaffected_thumb_adjustment() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    app.items = vec![
+        GridItem::Image("C:/pics/import-changed.jpg".into()),
+        GridItem::Image("C:/pics/import-untouched.jpg".into()),
+    ];
+    app.thumbnails = (0..2)
+        .map(|idx| ThumbnailState::Loaded {
+            tex: ctx.load_texture(
+                format!("import_original_{idx}"),
+                egui::ColorImage::filled([1, 1], egui::Color32::GRAY),
+                egui::TextureOptions::LINEAR,
+            ),
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 1,
+            },
+            from_edit_preview: false,
+            rendered_at_px: 1,
+            source_dims: Some((1, 1)),
+            layout_dims: None,
+        })
+        .collect();
+    for idx in 0..2 {
+        app.thumb_pixels.insert(
+            idx,
+            Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::GRAY)),
+        );
+        app.thumb_adjust_tex.insert(
+            idx,
+            ctx.load_texture(
+                format!("import_adjusted_{idx}"),
+                egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+    }
+    let mut changed_params = crate::adjustment::AdjustParams::default();
+    changed_params.brightness = 20.0;
+    let result = metadata_import_refresh::ContextResult {
+        context_id: app.virtual_list_context_id(),
+        items_generation: app.items_generation,
+        rating_cache: None,
+        tags_cache: None,
+        current_rating: None,
+        page_state: Some(metadata_import_refresh::PageStateResult {
+            adjustment_page_params: [(0, changed_params)].into(),
+            local_adjust_pages: Default::default(),
+            export_crop_page_settings: Default::default(),
+            view_trim_page_overrides: Default::default(),
+            mask_pages: Default::default(),
+            conceal_pages: Default::default(),
+            comic_pages: Default::default(),
+            rotation_cache: Default::default(),
+            thumbnail_reset_indices: vec![0],
+        }),
+        folder_pin_map: None,
+        folder_pin_reset_indices: None,
+        video_pin_blobs: None,
+        video_items: None,
+        container_state: None,
+    };
+    assert!(app.apply_current_metadata_import_terminal_result(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            page_state: true,
+            ..Default::default()
+        },
+    ));
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+    assert!(!app.thumb_pixels.contains_key(&0));
+    assert!(!app.thumb_adjust_tex.contains_key(&0));
+    assert!(matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }));
+    assert!(app.thumb_adjust_tex.contains_key(&1));
+}
+
+#[test]
 fn phase_a2_metadata_import_updates_virtual_keyed_owner() {
     let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let mut app = phase_c_support::setup_app();
@@ -16775,10 +16852,14 @@ mod phase_c_folder_nav_history_tests {
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
     use super::phase_c_support::setup_app;
-    use crate::app::{App, FacetField, GridEditBadges, subfolder_expansion_synthetic_path};
+    use crate::app::{
+        AdjustmentDragSession, App, FacetField, GridEditBadges, subfolder_expansion_synthetic_path,
+    };
     use crate::global_search::GlobalHit;
     use crate::global_search_ui::GlobalSearchView;
+    use crate::grid_item::{GridItem, ThumbnailState};
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn grid_key_nav(
         app: &mut crate::app::App,
@@ -18676,7 +18757,7 @@ mod phase_c_drill_nav_tests {
         );
 
         app.settings.global_preset.brightness = 20.0;
-        app.maybe_apply_thumb_adjustment(&ctx, 1);
+        app.maybe_apply_thumb_adjustment(&ctx, 1, "visible");
         assert!(
             app.thumb_adjust_tex.contains_key(&1),
             "復元した thumb_pixels から検索ビューのグローバル補正を再生成できる"
@@ -18703,7 +18784,7 @@ mod phase_c_drill_nav_tests {
         );
 
         // 通常のサムネイルは identity なら生サムネで正しいので生成しない。
-        app.maybe_apply_thumb_adjustment(&ctx, 0);
+        app.maybe_apply_thumb_adjustment(&ctx, 0, "visible");
         assert!(
             !app.thumb_adjust_tex.contains_key(&0),
             "焼き込みの無いサムネイルでは identity で生成しない"
@@ -18712,11 +18793,189 @@ mod phase_c_drill_nav_tests {
         // 編集プレビュー由来は identity でも下地 + 注釈で組み直す。
         app.thumb_edit_preview_layers
             .insert(0, std::sync::Arc::new(Vec::new()));
-        app.maybe_apply_thumb_adjustment(&ctx, 0);
+        app.thumbnails[0] = ThumbnailState::Loaded {
+            tex: ctx.load_texture(
+                "edit_preview_original",
+                egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 2,
+            },
+            from_edit_preview: true,
+            rendered_at_px: 2,
+            source_dims: Some((2, 2)),
+            layout_dims: None,
+        };
+        app.maybe_apply_thumb_adjustment(&ctx, 0, "visible");
         assert!(
             app.thumb_adjust_tex.contains_key(&0),
             "焼き込み済みテクスチャへフォールバックさせない"
         );
+    }
+
+    #[test]
+    fn evicted_thumb_with_retained_pixels_waits_for_original_texture() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items = vec![GridItem::Image("C:/pics/tray-adjust.jpg".into())];
+        app.thumbnails = vec![ThumbnailState::Evicted];
+        app.thumb_pixels.insert(
+            0,
+            Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::GRAY)),
+        );
+        app.settings.global_preset.brightness = 20.0;
+        app.maybe_apply_thumb_adjustment(&ctx, 0, "visible");
+        assert!(app.thumb_adjust_tex.is_empty());
+        app.thumbnails[0] = ThumbnailState::Loaded {
+            tex: ctx.load_texture(
+                "tray_restored_original",
+                egui::ColorImage::filled([2, 2], egui::Color32::GRAY),
+                egui::TextureOptions::LINEAR,
+            ),
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 2,
+            },
+            from_edit_preview: false,
+            rendered_at_px: 2,
+            source_dims: Some((2, 2)),
+            layout_dims: None,
+        };
+        app.maybe_apply_thumb_adjustment(&ctx, 0, "visible");
+        assert!(app.thumb_adjust_tex.contains_key(&0));
+    }
+
+    #[test]
+    fn interrupted_page_drag_invalidates_only_matching_thumb_keys() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image("C:/pics/edited.jpg".into()),
+            GridItem::Image("C:/pics/representative.jpg".into()),
+            GridItem::Image("C:/pics/unrelated.jpg".into()),
+        ];
+        let edited_key = app.page_path_key(0).unwrap();
+        app.thumb_edit_preview_keys.insert(1, edited_key.clone());
+        for idx in 0..3 {
+            app.thumb_adjust_tex.insert(
+                idx,
+                ctx.load_texture(
+                    format!("drag_cached_{idx}"),
+                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                ),
+            );
+        }
+        let before = crate::adjustment::AdjustParams::default();
+        let mut after = before.clone();
+        after.brightness = 20.0;
+        app.adjustment_page_params.insert(0, after);
+        app.adjustment_drag_session = Some(AdjustmentDragSession {
+            fs_idx: 0,
+            before: Some(before),
+        });
+        app.thumb_adjust_drag_color_dirty = true;
+        app.clear_meta_undo();
+        assert!(!app.thumb_adjust_tex.contains_key(&0));
+        assert!(!app.thumb_adjust_tex.contains_key(&1));
+        assert!(app.thumb_adjust_tex.contains_key(&2));
+        assert!(app.pinned_adjustment_refresh_keys.contains(&edited_key));
+    }
+
+    /// 4K / Windows 175%: 3840x2160 becomes about 2194x1234 logical points. Allowing for
+    /// toolbars and one partially visible row gives 6x10 or 11x20 visible square cells.
+    /// Run explicitly with `--ignored --nocapture`; this is a timing probe, not a CI threshold.
+    #[test]
+    #[ignore = "manual 4K/175% thumbnail adjustment timing probe"]
+    fn visible_thumb_adjustment_4k_175pct_timing() {
+        use crate::grid_item::GridItem;
+        use std::sync::Arc;
+
+        let mut app = setup_app();
+        let log_path = app.tmp.path().join("grid20-adjustment-perf.jsonl");
+        crate::perf::init_with_path(true, None, Some(log_path.clone()));
+        assert!(crate::perf::is_enabled());
+        app.settings.global_preset.brightness = 20.0;
+        let ctx = egui::Context::default();
+
+        let dpi = 1.75;
+        let logical_width = 3840.0 / dpi;
+        for (cols, rows) in [(10usize, 6usize), (20, 11)] {
+            let cell_points = logical_width / cols as f32;
+            let side =
+                crate::thumb_loader::compute_display_px(cell_points, cell_points, dpi) as usize;
+            let cells = cols * rows;
+            app.items = (0..cells)
+                .map(|idx| GridItem::Image(format!("C:/grid20-bench/{idx}.jpg").into()))
+                .collect();
+            let original_tex = ctx.load_texture(
+                format!("grid20_bench_original_{cols}"),
+                egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            );
+            app.thumbnails = (0..cells)
+                .map(|_| ThumbnailState::Loaded {
+                    tex: original_tex.clone(),
+                    origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                        evaluated_display_px: side as u32,
+                    },
+                    from_edit_preview: false,
+                    rendered_at_px: side as u32,
+                    source_dims: Some((side as u32, side as u32)),
+                    layout_dims: None,
+                })
+                .collect();
+            app.thumb_pixels.clear();
+            app.thumb_adjust_tex.clear();
+            let source = egui::ColorImage::new(
+                [side, side],
+                (0..side * side)
+                    .map(|pixel| {
+                        let x = pixel % side;
+                        let y = pixel / side;
+                        egui::Color32::from_rgb(x as u8, y as u8, (x ^ y) as u8)
+                    })
+                    .collect(),
+            );
+            for idx in 0..cells {
+                app.thumb_pixels.insert(idx, Arc::new(source.clone()));
+            }
+
+            let started = std::time::Instant::now();
+            for idx in 0..cells {
+                app.maybe_apply_thumb_adjustment(&ctx, idx, "visible");
+                assert!(app.thumb_adjust_tex.contains_key(&idx));
+            }
+            let batch_ms = started.elapsed().as_secs_f64() * 1000.0;
+            crate::perf::flush();
+            let events: Vec<serde_json::Value> = std::fs::read_to_string(&log_path)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| event["kind"] == "adjustment_build" && event["width"] == side)
+                .collect();
+            assert_eq!(events.len(), cells);
+            let stats = |name: &str| {
+                let values: Vec<f64> = events
+                    .iter()
+                    .map(|event| event[name].as_f64().unwrap())
+                    .collect();
+                let mean = values.iter().sum::<f64>() / cells as f64;
+                let max = values.iter().copied().fold(0.0_f64, f64::max);
+                (mean, max)
+            };
+            let (apply_mean, apply_max) = stats("apply_ms");
+            let (texture_mean, texture_max) = stats("texture_ms");
+            let (cell_mean, cell_max) = stats("total_ms");
+            println!(
+                "cols={cols} cells={cells} pixels={side}x{side} batch_ms={batch_ms:.3} \
+                 apply_mean/max_ms={apply_mean:.3}/{apply_max:.3} \
+                 texture_mean/max_ms={texture_mean:.3}/{texture_max:.3} \
+                 cell_mean/max_ms={cell_mean:.3}/{cell_max:.3} \
+                 conservative_batch_ms={:.3}",
+                cell_max * cells as f64
+            );
+        }
     }
 
     /// 旧選択アイテムが新 items から消えた場合は内容キー復元を諦め、

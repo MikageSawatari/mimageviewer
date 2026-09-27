@@ -704,7 +704,7 @@ mod tests {
         a_state.grid_cols = 4;
         a_state.sort_order = crate::settings::SortOrder::SizeDesc;
         let mut b_state = a_state.clone();
-        b_state.grid_cols = 8;
+        b_state.grid_cols = 20;
 
         {
             let db = AdjustmentDb::open_at(&path).unwrap();

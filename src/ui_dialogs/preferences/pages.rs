@@ -2433,6 +2433,16 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::GridColumnCount8 => RingActionId::GridColumnCount8,
         KeyAction::GridColumnCount9 => RingActionId::GridColumnCount9,
         KeyAction::GridColumnCount10 => RingActionId::GridColumnCount10,
+        KeyAction::GridColumnCount11 => RingActionId::GridColumnCount11,
+        KeyAction::GridColumnCount12 => RingActionId::GridColumnCount12,
+        KeyAction::GridColumnCount13 => RingActionId::GridColumnCount13,
+        KeyAction::GridColumnCount14 => RingActionId::GridColumnCount14,
+        KeyAction::GridColumnCount15 => RingActionId::GridColumnCount15,
+        KeyAction::GridColumnCount16 => RingActionId::GridColumnCount16,
+        KeyAction::GridColumnCount17 => RingActionId::GridColumnCount17,
+        KeyAction::GridColumnCount18 => RingActionId::GridColumnCount18,
+        KeyAction::GridColumnCount19 => RingActionId::GridColumnCount19,
+        KeyAction::GridColumnCount20 => RingActionId::GridColumnCount20,
         KeyAction::FsClose => RingActionId::CloseFullscreen,
         KeyAction::FsToggleMetadata => RingActionId::ImageToggleMetadata,
         KeyAction::FsToggleWindowMode => RingActionId::ToggleWindowMode,
@@ -10301,6 +10311,8 @@ mod tests {
     #[test]
     fn operation_labels_sort_numbers_naturally() {
         let mut labels = vec![
+            "サムネイル列数を20列に",
+            "サムネイル列数を11列に",
             "サムネイル列数を10列に",
             "サムネイル列数を1列に",
             "サムネイル列数を2列に",
@@ -10314,6 +10326,8 @@ mod tests {
                 "サムネイル列数を2列に",
                 "サムネイル列数を9列に",
                 "サムネイル列数を10列に",
+                "サムネイル列数を11列に",
+                "サムネイル列数を20列に",
             ]
         );
     }

@@ -285,6 +285,16 @@
 # GridColumnCount9.2 = Alt+Numpad9 ; サムネイル列数を9列にする
 # GridColumnCount10.1 = Alt+0 ; サムネイル列数を10列にする
 # GridColumnCount10.2 = Alt+Numpad0 ; サムネイル列数を10列にする
+# GridColumnCount11 = none ; サムネイル列数を11列にする
+# GridColumnCount12 = none ; サムネイル列数を12列にする
+# GridColumnCount13 = none ; サムネイル列数を13列にする
+# GridColumnCount14 = none ; サムネイル列数を14列にする
+# GridColumnCount15 = none ; サムネイル列数を15列にする
+# GridColumnCount16 = none ; サムネイル列数を16列にする
+# GridColumnCount17 = none ; サムネイル列数を17列にする
+# GridColumnCount18 = none ; サムネイル列数を18列にする
+# GridColumnCount19 = none ; サムネイル列数を19列にする
+# GridColumnCount20 = none ; サムネイル列数を20列にする
 # GridToggleDetailsView = Alt+- ; サムネイル一覧と詳細一覧を切り替える
 # GridOpenPreferences = none ; 環境設定を開く
 # GridOpenOperationCustomize = none ; 操作カスタマイズを開く

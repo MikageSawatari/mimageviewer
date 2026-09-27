@@ -6635,7 +6635,7 @@ fn default_video_seek_strip_waveform_span_secs() -> f64 {
 /// グリッド列数の最小値
 pub const MIN_GRID_COLS: usize = 1;
 /// グリッド列数の最大値
-pub const MAX_GRID_COLS: usize = 10;
+pub const MAX_GRID_COLS: usize = 20;
 pub const FULLSCREEN_JUMP_PERCENT_MIN: u32 = 1;
 pub const FULLSCREEN_JUMP_PERCENT_MAX: u32 = 100;
 pub const FULLSCREEN_JUMP_PERCENT_DEFAULT: u32 = 10;

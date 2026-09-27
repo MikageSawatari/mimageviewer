@@ -15045,10 +15045,10 @@ pub struct App {
     /// viewer context ごとに所有し、通常の final composite cache とは寿命を分ける。
     pub(crate) passthrough_rendition_cache: PassthroughRenditionCache,
     /// 前フレームのスライダードラッグ状態。true→false 遷移を検知して
-    /// release 時に `thumb_adjust_tex` を全無効化する。
+    /// release 時にドラッグ状態を戻す。
     pub(crate) thumb_adjust_was_dragging: bool,
     /// 進行中のスライダードラッグで **色調系** パラメータが動いたか。
-    /// release 時の `thumb_adjust_tex` 全クリアをこのフラグで gate する
+    /// release 時のページ単位の失効をこのフラグで gate する
     /// (シャープ化 / post_filter だけのドラッグではサムネを無駄に再生成しない)。
     pub(crate) thumb_adjust_drag_color_dirty: bool,
     /// スライダードラッグ中フラグ（パネル内ウィジェットのドラッグ検出）
@@ -33851,7 +33851,9 @@ impl App {
             self.rotation_cache = page.rotation_cache.into();
             self.reconcile_spread_landscapes_from_rotation_cache();
             self.adjustment_cache.clear();
-            self.thumb_adjust_tex.clear();
+            // thumbnail_reset_indices は旧/新いずれかのページ状態を持つ idx を網羅し、
+            // evict_thumbnail_for_reload が pixels と補正 tex を一緒に破棄済み。
+            // 状態が変わらない他の可視セルの補正テクスチャは保持する。
             self.erase_result_cache.clear();
             self.local_adjust_cache.clear();
             self.local_adjust_layer_bypass_cache.clear();
@@ -44465,7 +44467,7 @@ impl App {
             });
 
             if ctrl {
-                // Ctrl+ホイール: 列数を増減（1〜10 の範囲）
+                // Ctrl+ホイール: 列数を増減（1〜20 の範囲）
                 let delta = -scroll_delta_y.signum() as i32;
                 if self.change_grid_cols_by(delta) {
                     self.settings.save();
@@ -46312,6 +46314,10 @@ impl App {
     fn finish_adjustment_drag_for_detached_pause(&mut self) {
         self.adjustment_dragging = false;
         if let Some(session) = self.adjustment_drag_session.take() {
+            if self.thumb_adjust_drag_color_dirty {
+                self.invalidate_thumb_adjust_for_dragged_page(session.fs_idx);
+                self.thumb_adjust_drag_color_dirty = false;
+            }
             let in_memory = self.adjustment_page_params.get(&session.fs_idx).cloned();
             if session.before != in_memory {
                 if let Some(params) = in_memory.clone() {
@@ -72116,6 +72122,34 @@ impl App {
         self.clear_final_pipeline_caches_for_idx(idx);
     }
 
+    /// ページ個別補正のドラッグで触れたキーと、そのキーを代表する編集プレビュー
+    /// セルだけを失効させる。ドラッグ中の in-memory 値を release 時に永続化すると、
+    /// set_page_params は旧値も最終値として見るため、この失効は別途必要。
+    pub(crate) fn invalidate_thumb_adjust_for_dragged_page(&mut self, idx: usize) {
+        let Some(key) = self.page_path_key(idx) else {
+            self.thumb_adjust_tex.remove(&idx);
+            return;
+        };
+        // 補正 tex のある keep セルだけ調べる。全 items の path を release 時に
+        // 作り直すと、大きな一覧では単一ページ操作でも UI を止めてしまう。
+        let affected: Vec<usize> = self
+            .thumb_adjust_tex
+            .keys()
+            .copied()
+            .filter(|&candidate| {
+                self.page_path_key(candidate).as_deref() == Some(key.as_str())
+                    || self
+                        .thumb_edit_preview_keys
+                        .get(&candidate)
+                        .is_some_and(|preview_key| preview_key == &key)
+            })
+            .collect();
+        for affected in affected {
+            self.thumb_adjust_tex.remove(&affected);
+        }
+        self.pinned_adjustment_refresh_keys.insert(key);
+    }
+
     /// フルスクリーン補正キャッシュとサムネ補正テクスチャを同時に全クリアする。
     /// バルク系操作 (apply_params_to_all_pages / clear_all_page_params /
     /// copy_params_to_global) で表示優先順位の上位キャッシュを一掃するためのヘルパー。
@@ -72143,8 +72177,21 @@ impl App {
     /// 描画は焼き込み済みテクスチャへフォールバックし、個別設定を解除しても
     /// 一覧だけ古い色のまま残る (フォルダを出入りして再 materialize するまで直らない)。
     /// identity のときは色調を掛けずに下地 + 注釈で組み直す。
-    pub(crate) fn maybe_apply_thumb_adjustment(&mut self, ctx: &egui::Context, idx: usize) {
+    pub(crate) fn maybe_apply_thumb_adjustment(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        origin: &'static str,
+    ) {
         if !is_thumb_adjust_target(self.items.get(idx)) {
+            return;
+        }
+        // トレイ格納時などは CPU pixels を保持したまま元の GPU texture を退去する。
+        // 元サムネが復帰するまで補正 texture は描けないため、ここで生成しない。
+        if !matches!(
+            self.thumbnails.get(idx),
+            Some(ThumbnailState::Loaded { .. })
+        ) {
             return;
         }
         if self.thumb_adjust_tex.contains_key(&idx) {
@@ -72153,6 +72200,7 @@ impl App {
         let Some(pixels) = self.thumb_pixels.get(&idx).cloned() else {
             return;
         };
+        let build_started = crate::perf::is_enabled().then(std::time::Instant::now);
         let from_edit_preview = self.thumb_edit_preview_layers.contains_key(&idx);
         let mut adjusted = {
             let params = self.effective_params(idx);
@@ -72171,12 +72219,42 @@ impl App {
             adjusted =
                 crate::edit_preview_cache::composite_cached_annotation_layers(&adjusted, layers);
         }
+        let apply_ms = build_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+        let texture_started = build_started.map(|_| std::time::Instant::now());
+        let image_size = adjusted.size;
         let handle = ctx.load_texture(
             format!("thumb_adj_{idx}"),
             adjusted,
             egui::TextureOptions::LINEAR,
         );
         self.thumb_adjust_tex.insert(idx, handle);
+        if let (Some(started), Some(texture_started), Some(apply_ms)) =
+            (build_started, texture_started, apply_ms)
+        {
+            crate::perf::event(
+                "thumb",
+                "adjustment_build",
+                None,
+                self.items_generation,
+                &[
+                    ("idx", serde_json::Value::from(idx)),
+                    ("origin", serde_json::Value::from(origin)),
+                    ("n", serde_json::Value::from(self.frame_counter)),
+                    ("width", serde_json::Value::from(image_size[0])),
+                    ("height", serde_json::Value::from(image_size[1])),
+                    ("edit_preview", serde_json::Value::from(from_edit_preview)),
+                    ("apply_ms", serde_json::Value::from(apply_ms)),
+                    (
+                        "texture_ms",
+                        serde_json::Value::from(texture_started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "total_ms",
+                        serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
     }
 
     /// keep_set 内の「ピクセルは持っているが補正テクスチャがまだ無い」idx を
@@ -72195,6 +72273,12 @@ impl App {
             if !is_thumb_adjust_target(self.items.get(idx)) {
                 continue;
             }
+            if !matches!(
+                self.thumbnails.get(idx),
+                Some(ThumbnailState::Loaded { .. })
+            ) {
+                continue;
+            }
             if self.thumb_adjust_tex.contains_key(&idx) {
                 continue;
             }
@@ -72208,7 +72292,7 @@ impl App {
             {
                 continue;
             }
-            self.maybe_apply_thumb_adjustment(ctx, idx);
+            self.maybe_apply_thumb_adjustment(ctx, idx, "prefetch");
             processed += 1;
         }
         if processed > 0 {
@@ -72216,14 +72300,13 @@ impl App {
         }
     }
 
-    /// スライダードラッグの true → false 遷移を検知して `thumb_adjust_tex`
-    /// を全無効化する。ピクセル (`thumb_pixels`) は保持し続けるので、次フレーム
-    /// 以降の `maybe_apply_thumb_adjustment` が新パラメータで再生成する。
+    /// スライダードラッグの true → false 遷移で dirty を清算する。
+    /// ページ個別の補正テクスチャは release/中断時に対象キーだけ失効済み。
     /// 毎フレーム update() の終盤に呼ぶ。
     ///
     /// フルスクリーン外 (補正パネル非描画) では `adjustment_dragging` が真の値に
     /// 更新されないため、ここで強制的に false に戻す。フルスクリーンをドラッグ
-    /// 途中で閉じても、release 検知が正しく走ってサムネ補正が再生成される。
+    /// 途中で閉じても、次フレームから補正生成を再開できる。
     pub(crate) fn update_thumb_adjust_drag_state(&mut self) {
         if self.fullscreen_idx.is_none() {
             self.adjustment_dragging = false;
@@ -72231,11 +72314,6 @@ impl App {
         let was = self.thumb_adjust_was_dragging;
         let now = self.adjustment_dragging;
         if was && !now {
-            // 色調が動いたドラッグだけサムネ補正を作り直す。シャープ化 / post_filter
-            // のみのドラッグではサムネ内容が変わらないので既存テクスチャを温存する。
-            if self.thumb_adjust_drag_color_dirty {
-                self.thumb_adjust_tex.clear();
-            }
             self.thumb_adjust_drag_color_dirty = false;
         }
         self.thumb_adjust_was_dragging = now;
@@ -78363,9 +78441,8 @@ impl App {
 
         mark_update_perf(&mut update_perf, UpdatePerfStage::NativeVideo);
 
-        // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、
-        // サムネ補正テクスチャを全無効化する (次フレームに visible は同期適用、
-        // 先読み分は process_thumb_adjust_budget がフレーム分割で埋める)。
+        // パネル外でドラッグが終わった場合も状態を戻す。ページ個別の補正 tex は
+        // release/中断の各境界で対象キーのみ無効化済み。
         self.update_thumb_adjust_drag_state();
 
         // ── メニューバー ─────────────────────────────────────────────
@@ -78755,7 +78832,7 @@ impl App {
             }
         }
 
-        // ── Alt+1〜0: 列数切り替え / Alt+-: 詳細表示切り替え ─────────
+        // ── 列数切り替え (1〜10 は Alt+数字) / Alt+-: 詳細表示切り替え ─────────
         if !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus
@@ -78769,7 +78846,7 @@ impl App {
             {
                 self.toggle_grid_details_view();
             }
-            let alt_col = [
+            let selected_cols = [
                 (KeyAction::GridColumnCount1, 1),
                 (KeyAction::GridColumnCount2, 2),
                 (KeyAction::GridColumnCount3, 3),
@@ -78780,11 +78857,21 @@ impl App {
                 (KeyAction::GridColumnCount8, 8),
                 (KeyAction::GridColumnCount9, 9),
                 (KeyAction::GridColumnCount10, 10),
+                (KeyAction::GridColumnCount11, 11),
+                (KeyAction::GridColumnCount12, 12),
+                (KeyAction::GridColumnCount13, 13),
+                (KeyAction::GridColumnCount14, 14),
+                (KeyAction::GridColumnCount15, 15),
+                (KeyAction::GridColumnCount16, 16),
+                (KeyAction::GridColumnCount17, 17),
+                (KeyAction::GridColumnCount18, 18),
+                (KeyAction::GridColumnCount19, 19),
+                (KeyAction::GridColumnCount20, 20),
             ]
             .into_iter()
             .find(|(action, _)| self.keymap.pressed_action(ctx, *action))
             .map(|(_, cols)| cols);
-            if let Some(cols) = alt_col {
+            if let Some(cols) = selected_cols {
                 self.set_grid_view_mode(crate::settings::GridViewMode::Thumbnail);
                 if cols != self.settings.grid_cols {
                     self.settings.grid_cols = cols;

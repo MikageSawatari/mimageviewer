@@ -1622,6 +1622,16 @@ pub enum KeyAction {
     GridColumnCount8,
     GridColumnCount9,
     GridColumnCount10,
+    GridColumnCount11,
+    GridColumnCount12,
+    GridColumnCount13,
+    GridColumnCount14,
+    GridColumnCount15,
+    GridColumnCount16,
+    GridColumnCount17,
+    GridColumnCount18,
+    GridColumnCount19,
+    GridColumnCount20,
     GridToggleDetailsView,
     GridOpenPreferences,
     GridOpenOperationCustomize,
@@ -2175,6 +2185,16 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridColumnCount8,
     KeyAction::GridColumnCount9,
     KeyAction::GridColumnCount10,
+    KeyAction::GridColumnCount11,
+    KeyAction::GridColumnCount12,
+    KeyAction::GridColumnCount13,
+    KeyAction::GridColumnCount14,
+    KeyAction::GridColumnCount15,
+    KeyAction::GridColumnCount16,
+    KeyAction::GridColumnCount17,
+    KeyAction::GridColumnCount18,
+    KeyAction::GridColumnCount19,
+    KeyAction::GridColumnCount20,
     KeyAction::GridToggleDetailsView,
     KeyAction::GridOpenPreferences,
     KeyAction::GridOpenOperationCustomize,
@@ -4153,6 +4173,16 @@ impl KeyAction {
             GridColumnCount8 => "GridColumnCount8",
             GridColumnCount9 => "GridColumnCount9",
             GridColumnCount10 => "GridColumnCount10",
+            GridColumnCount11 => "GridColumnCount11",
+            GridColumnCount12 => "GridColumnCount12",
+            GridColumnCount13 => "GridColumnCount13",
+            GridColumnCount14 => "GridColumnCount14",
+            GridColumnCount15 => "GridColumnCount15",
+            GridColumnCount16 => "GridColumnCount16",
+            GridColumnCount17 => "GridColumnCount17",
+            GridColumnCount18 => "GridColumnCount18",
+            GridColumnCount19 => "GridColumnCount19",
+            GridColumnCount20 => "GridColumnCount20",
             GridToggleDetailsView => "GridToggleDetailsView",
             GridOpenPreferences => "GridOpenPreferences",
             GridOpenOperationCustomize => "GridOpenOperationCustomize",
@@ -4871,6 +4901,16 @@ impl KeyAction {
             GridColumnCount8 => "サムネイル列数を8列にする",
             GridColumnCount9 => "サムネイル列数を9列にする",
             GridColumnCount10 => "サムネイル列数を10列にする",
+            GridColumnCount11 => "サムネイル列数を11列にする",
+            GridColumnCount12 => "サムネイル列数を12列にする",
+            GridColumnCount13 => "サムネイル列数を13列にする",
+            GridColumnCount14 => "サムネイル列数を14列にする",
+            GridColumnCount15 => "サムネイル列数を15列にする",
+            GridColumnCount16 => "サムネイル列数を16列にする",
+            GridColumnCount17 => "サムネイル列数を17列にする",
+            GridColumnCount18 => "サムネイル列数を18列にする",
+            GridColumnCount19 => "サムネイル列数を19列にする",
+            GridColumnCount20 => "サムネイル列数を20列にする",
             GridToggleDetailsView => "サムネイル一覧と詳細一覧を切り替える",
             GridOpenPreferences => "環境設定を開く",
             GridOpenOperationCustomize => "操作カスタマイズを開く",
@@ -5407,6 +5447,16 @@ impl KeyAction {
             | GridColumnCount8
             | GridColumnCount9
             | GridColumnCount10
+            | GridColumnCount11
+            | GridColumnCount12
+            | GridColumnCount13
+            | GridColumnCount14
+            | GridColumnCount15
+            | GridColumnCount16
+            | GridColumnCount17
+            | GridColumnCount18
+            | GridColumnCount19
+            | GridColumnCount20
             | GridToggleDetailsView
             | GridOpenPreferences
             | GridOpenOperationCustomize
@@ -5899,6 +5949,16 @@ impl KeyAction {
             | GridColumnCount8
             | GridColumnCount9
             | GridColumnCount10
+            | GridColumnCount11
+            | GridColumnCount12
+            | GridColumnCount13
+            | GridColumnCount14
+            | GridColumnCount15
+            | GridColumnCount16
+            | GridColumnCount17
+            | GridColumnCount18
+            | GridColumnCount19
+            | GridColumnCount20
             | GridToggleDetailsView
             | GridOpenPreferences
             | GridOpenOperationCustomize
@@ -6435,6 +6495,9 @@ impl KeyAction {
             GridColumnCount8 => alt_digit_pair(Num8, Numpad8),
             GridColumnCount9 => alt_digit_pair(Num9, Numpad9),
             GridColumnCount10 => alt_digit_pair(Num0, Numpad0),
+            GridColumnCount11 | GridColumnCount12 | GridColumnCount13 | GridColumnCount14
+            | GridColumnCount15 | GridColumnCount16 | GridColumnCount17 | GridColumnCount18
+            | GridColumnCount19 | GridColumnCount20 => ChordList::EMPTY,
             GridToggleDetailsView => ChordList::one(Chord::alt(Minus)),
             GridOpenPreferences | GridOpenOperationCustomize => ChordList::EMPTY,
             GridAdjustSlot1 => ctrl_digit_pair(Num1, Numpad1),
@@ -10319,7 +10382,7 @@ mod tests {
         ]);
         add_numbered_names(&mut key_handled, "OpenFavorite", 1..=20);
         add_drive_names(&mut key_handled, "OpenDrive");
-        add_numbered_names(&mut key_handled, "GridColumnCount", 1..=10);
+        add_numbered_names(&mut key_handled, "GridColumnCount", 1..=20);
 
         let fixed_or_ring_only = std::collections::BTreeSet::from([
             // Favorite picker / snapshot lock / Explorer open-folder are input-layer features.
@@ -14342,6 +14405,40 @@ mod tests {
             vec![Chord::ctrl_shift(KeyName::S)]
         );
         assert!(restored.effective_chords(KeyAction::FsSlideshow).is_empty());
+    }
+
+    #[test]
+    fn grid_column_actions_11_to_20_roundtrip_from_ini_through_settings() {
+        let mut ini = String::from("[Grid]\n");
+        for cols in 11..=20 {
+            ini.push_str(&format!("GridColumnCount{cols} = F{}\n", cols + 2));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(&path, ini).unwrap();
+        let parsed = Keymap::load_from_file(&path);
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        let settings = KeymapSettings::from_keymap(&parsed);
+        let restored = Keymap::from_settings(&settings);
+        for cols in 11..=20 {
+            let name = format!("GridColumnCount{cols}");
+            let action = KeyAction::from_ini_name(&name).expect("registered action");
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert_eq!(
+                parsed.effective_chords(action),
+                restored.effective_chords(action)
+            );
+            assert_eq!(
+                settings
+                    .overrides
+                    .iter()
+                    .filter(|row| row.action == name)
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
