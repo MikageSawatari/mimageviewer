@@ -9190,14 +9190,19 @@ impl App {
                 video_decoder: info.video_decoder.clone(),
                 audio_codec: info.audio_codec.clone(),
                 audio_bit_rate_bps: info.audio_bit_rate_bps,
-                audio_track_rows: crate::video::audio_track_ui::audio_track_rows(
-                    info,
-                    player.audio_track_selection(),
-                    matches!(
-                        player.audio_track_display_state(),
-                        Some(crate::video::AudioTrackSelectionDisplayState::Deferred)
-                    ),
-                ),
+                audio_track_rows: {
+                    let selection = player.audio_track_selection();
+                    let deferred = selection.is_some_and(|snapshot| {
+                        matches!(
+                            snapshot.display_state(
+                                player.engine_state_code()
+                                    == crate::video::engine::actor::state_code::EOF,
+                            ),
+                            crate::video::AudioTrackSelectionDisplayState::Deferred
+                        )
+                    });
+                    crate::video::audio_track_ui::audio_track_rows(info, selection, deferred)
+                },
                 audio_track_count: info.audio_tracks.len(),
                 opened_audio_stream_index: info.opened_audio_stream_index,
                 avg_fps: info.avg_fps,

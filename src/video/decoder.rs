@@ -552,6 +552,7 @@ fn abort_frame_step_output(clock: &AvClock, serial: u64, pts_secs: f64, reason: 
         "[video-decode] frame-step output failed: serial={serial} pts={pts_secs:.6} reason={reason}; clearing seek override"
     ));
     clock.set_paused_position(pts_secs);
+    clock.mark_seek_interrupted(serial);
     clock.clear_seek_target_override(serial);
     if crate::perf::is_enabled() {
         crate::perf::event(
@@ -1688,7 +1689,7 @@ impl DeinterlaceStatusSnapshot {
 }
 
 /// Open 時に demux が列挙した、decoder のある音声 stream。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AudioTrackInfo {
     /// AVStream index。選択と packet routing の key。
     pub stream_index: usize,
@@ -1705,6 +1706,9 @@ pub struct AudioTrackInfo {
     pub sample_rate: Option<u32>,
     /// AV_DISPOSITION_DEFAULT が立っているか。
     pub disposition_default: bool,
+    /// Seconds from this stream's timestamps and stream metadata only.
+    pub start_secs: Option<f64>,
+    pub end_secs: Option<f64>,
 }
 
 /// デコード開始時に分かる動画情報。UI の HUD で利用。
@@ -2094,6 +2098,22 @@ fn enumerate_audio_tracks_with_decoder(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
+            let raw_start = stream.start_time();
+            let start_secs = stream_timestamp_secs(raw_start, stream.time_base(), true);
+            let stream_duration =
+                stream_timestamp_secs(stream.duration(), stream.time_base(), false);
+            let end_secs = if let Some(duration) = stream_duration {
+                let origin = if raw_start == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
+                    Some(0.0)
+                } else {
+                    start_secs
+                };
+                origin.and_then(|start| valid_stream_secs(start + duration))
+            } else if raw_start == 0 || raw_start == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
+                metadata.get("DURATION").and_then(parse_stream_duration_tag)
+            } else {
+                None
+            };
             Some(AudioTrackInfo {
                 stream_index: stream.index(),
                 ordinal: audio_ordinal,
@@ -2103,9 +2123,42 @@ fn enumerate_audio_tracks_with_decoder(
                 channels: Some(params.ch_layout().channels()).filter(|&value| value != 0),
                 sample_rate: Some(params.sample_rate()).filter(|&value| value != 0),
                 disposition_default: stream.disposition().contains(Disposition::DEFAULT),
+                start_secs,
+                end_secs,
             })
         })
         .collect()
+}
+
+fn valid_stream_secs(value: f64) -> Option<f64> {
+    (value.is_finite() && value >= 0.0).then_some(value)
+}
+
+fn stream_timestamp_secs(
+    value: i64,
+    time_base: ffmpeg_the_third::Rational,
+    allow_zero: bool,
+) -> Option<f64> {
+    if value < 0
+        || (!allow_zero && value == 0)
+        || time_base.numerator() <= 0
+        || time_base.denominator() <= 0
+    {
+        return None;
+    }
+    valid_stream_secs(value as f64 * time_base.numerator() as f64 / time_base.denominator() as f64)
+}
+
+/// Matroska's stream DURATION tag, accepted only for zero/unknown starts.
+fn parse_stream_duration_tag(value: &str) -> Option<f64> {
+    let mut parts = value.split(':');
+    let hours = parts.next()?.parse::<u64>().ok()?;
+    let minutes = parts.next()?.parse::<u32>().ok()?;
+    let seconds = parts.next()?.parse::<f64>().ok()?;
+    if parts.next().is_some() || minutes >= 60 || !(0.0..60.0).contains(&seconds) {
+        return None;
+    }
+    valid_stream_secs(hours as f64 * 3600.0 + minutes as f64 * 60.0 + seconds)
 }
 
 /// 動画オープン (= prepare) フェーズ中だけ demux thread の CPU 優先度を
@@ -2690,7 +2743,7 @@ fn run_decoder(
         audio_codec: audio_setup.as_ref().map(|a| a.codec_name.clone()),
         audio_bit_rate_bps: audio_setup.as_ref().map(|a| a.bit_rate_bps).unwrap_or(0),
         has_audio,
-        audio_tracks,
+        audio_tracks: audio_tracks.clone(),
         default_audio_stream_index,
         opened_audio_stream_index,
         open_notice: saved_open_failed.then_some(
@@ -3147,11 +3200,40 @@ fn run_decoder(
                 serial,
                 kind,
             } = req;
+            // Audio is adopted at the trim lower bound, not necessarily at
+            // the demux seek start. Frame-step scans from before its base.
+            let audio_adoption_start_secs = match kind {
+                super::clock::SeekRequestKind::Precise => target_secs,
+                super::clock::SeekRequestKind::FrameStep { base_secs, .. } => base_secs,
+            };
             // Snapshot desired only after taking the seek request. UI publishes
             // desired before request_seek; this order preserves latest-wins.
             let mut switch_candidate: Option<AudioTrackChoice> = audio_track_selection
                 .as_ref()
                 .and_then(|selection| selection.snapshot().switch_candidate());
+            if let Some(choice) = switch_candidate {
+                let available = audio_tracks
+                    .iter()
+                    .find(|track| track.stream_index == choice.stream_index)
+                    .is_some_and(|track| {
+                        super::audio_track_selection::audio_track_available_at(
+                            track,
+                            audio_adoption_start_secs,
+                        )
+                    });
+                if available {
+                    audio_track_selection
+                        .as_ref()
+                        .unwrap()
+                        .begin_attempt(choice);
+                } else {
+                    audio_track_selection
+                        .as_ref()
+                        .unwrap()
+                        .defer_if_current(choice);
+                    switch_candidate = None;
+                }
+            }
             let mut replacement_setup: Option<Box<AudioSetup>> = None;
             let mut replacement_route: Option<(usize, (f64, f64))> = None;
             if let Some(choice) = switch_candidate {
@@ -3222,7 +3304,6 @@ fn run_decoder(
                     direction,
                 }),
             };
-            let display_target_secs = frame_step.map(|spec| spec.base_secs).unwrap_or(target_secs);
             // Phase B: post_seek_frame_sent / drop_before_secs / current_seek_serial は
             // すべて video decode thread のローカル変数として所有される。demux thread は
             // 「seek 要求を受け取り → input.seek() を実行 → 両 decode thread に Flush
@@ -3285,7 +3366,7 @@ fn run_decoder(
                 seek_result = input.seek(target_pts, target_pts..);
             }
             crate::logger::log(format!(
-                "seek: target={target_secs:.3}s display_target={display_target_secs:.3}s serial={serial} kind={kind:?} result={seek_result:?}"
+                "seek: target={target_secs:.3}s audio_adoption_start={audio_adoption_start_secs:.3}s serial={serial} kind={kind:?} result={seek_result:?}"
             ));
             if seek_result.is_err() {
                 if let Some(choice) = switch_candidate.take() {
@@ -3298,6 +3379,7 @@ fn run_decoder(
                 replacement_route = None;
                 // 完全失敗: override を明示解除しないと pace_now が target 固定で
                 // UI が hang する。clock 経由で wall extrapolation に切替える。
+                clock.mark_seek_interrupted(serial);
                 clock.clear_seek_target_override(serial);
                 if crate::perf::is_enabled() {
                     crate::perf::event(
@@ -3316,18 +3398,15 @@ fn run_decoder(
             // Flush は channel 経由で送る。順序保証 channel なので、Flush 後に enqueue
             // される packet は前世代として処理されない。
             //
-            // **video / audio とも同じ trim 下限を送る**:
+            // Audio の採用開始位置は可用性判定と同じ値を使う。video は
+            // frame-step 時に base 前後の候補を選ぶため trim を送らない:
             //
-            // - `seek_target_for_flush` (= ユーザー要求 seek 位置): 成功時は常に
-            //   `Some(target_secs)`。pump が BufferReady の audio_anchor pts に使う。
-            //   Buffering→Playing 入場時の anchor が target に維持され、timeline 表示が
-            //   target 固定になる。失敗時のみ `None`。
-            // - `trim_before` (= video/audio 共通の preroll trim 下限):
-            //   - 成功: Some(target) → keyframe → target を decode + drop し
-            //     target ぴったりに着地 (post_seek_frame_sent=false で 1 枚目を待機)
-            //   - 失敗: None → trim せず通常 pacing
+            // - `seek_target_for_flush`: 成功時は audio 採用開始位置。pump が
+            //   BufferReady の audio_anchor pts に使う。失敗時のみ `None`。
+            // - video trim: 通常 seek 成功時は target、frame-step と失敗時は None。
+            // - audio trim: 成功時は採用開始位置、失敗時は None。
             let seek_target_for_flush = if seek_result.is_ok() {
-                Some(display_target_secs)
+                Some(audio_adoption_start_secs)
             } else {
                 None
             };
@@ -3341,7 +3420,7 @@ fn run_decoder(
                 None
             };
             let audio_trim_before = if seek_result.is_ok() {
-                Some(display_target_secs)
+                Some(audio_adoption_start_secs)
             } else {
                 None
             };
@@ -3447,7 +3526,7 @@ fn run_decoder(
             // frame / sample が set_audio_pts / set_fallback_anchor 経由で自然に
             // 現在位置にアンカーし直す。
             if seek_result.is_ok() {
-                clock.notify_seek_completed(display_target_secs);
+                clock.notify_seek_completed(audio_adoption_start_secs);
             } else {
                 clock.reset_audio_bookkeeping_only();
             }
@@ -3459,15 +3538,15 @@ fn run_decoder(
             let completed = crate::video::engine::EngineEvent::Decoder(
                 crate::video::engine::state::DecoderEvent::SeekCompleted {
                     epoch: serial,
-                    actual_pts: display_target_secs,
+                    actual_pts: audio_adoption_start_secs,
                 },
             );
             if pending_audio_inactive.is_some() {
-                pending_seek_completed = Some((serial, display_target_secs));
+                pending_seek_completed = Some((serial, audio_adoption_start_secs));
             } else {
                 match engine_event_tx.try_send(completed) {
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
-                        pending_seek_completed = Some((serial, display_target_secs));
+                        pending_seek_completed = Some((serial, audio_adoption_start_secs));
                     }
                     _ => {
                         pending_seek_completed = None;
@@ -8733,6 +8812,10 @@ mod audio_track_fixture_tests {
 
     impl SwitchSession {
         fn new() -> Self {
+            Self::new_for("multi.mkv", 2)
+        }
+
+        fn new_for(name: &str, initial_stream: usize) -> Self {
             let cancel = Arc::new(AtomicBool::new(false));
             let serial = Arc::new(AtomicU64::new(0));
             let clock = Arc::new(AvClock::new(1.0, Arc::clone(&serial)));
@@ -8740,7 +8823,7 @@ mod audio_track_fixture_tests {
             actor.begin_loading();
             let (event_tx, event_rx) = bounded(64);
             let handles = spawn_headless(
-                "multi.mkv",
+                name,
                 Arc::clone(&clock),
                 Arc::clone(&cancel),
                 actor.published_state_handle(),
@@ -8751,7 +8834,7 @@ mod audio_track_fixture_tests {
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap()
                 .unwrap();
-            assert_eq!(info.opened_audio_stream_index, Some(2));
+            assert_eq!(info.opened_audio_stream_index, Some(initial_stream));
             let selection = handles
                 .audio_track_selection_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -8790,6 +8873,25 @@ mod audio_track_fixture_tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
             panic!("switch failure missing: {reason:?}");
+        }
+
+        fn wait_display_state(
+            &self,
+            wanted: crate::video::audio_track_selection::AudioTrackSelectionDisplayState,
+        ) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if self.selection.snapshot().display_state(false) == wanted {
+                    return;
+                }
+                while self.handles.video_rx.try_recv().is_ok() {}
+                while self.handles.audio_rx.try_recv().is_ok() {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!(
+                "selection did not reach {wanted:?}: {:?}",
+                self.selection.snapshot()
+            );
         }
 
         fn wait_pcm(&self, serial: u64, stream_index: usize, hz: f64, count: usize) -> Vec<f64> {
@@ -8900,6 +9002,8 @@ mod audio_track_fixture_tests {
                     channels: Some(2),
                     sample_rate: Some(48_000),
                     disposition_default: false,
+                    start_secs: None,
+                    end_secs: None,
                 },
                 AudioTrackInfo {
                     stream_index: 2,
@@ -8910,6 +9014,8 @@ mod audio_track_fixture_tests {
                     channels: Some(6),
                     sample_rate: Some(44_100),
                     disposition_default: true,
+                    start_secs: None,
+                    end_secs: None,
                 },
                 AudioTrackInfo {
                     stream_index: 3,
@@ -8920,6 +9026,8 @@ mod audio_track_fixture_tests {
                     channels: Some(1),
                     sample_rate: Some(32_000),
                     disposition_default: false,
+                    start_secs: Some(0.0),
+                    end_secs: Some(6.0),
                 },
             ]
         );
@@ -8927,6 +9035,201 @@ mod audio_track_fixture_tests {
         assert_eq!(info.opened_audio_stream_index, Some(2));
         assert_eq!(info.audio_codec.as_deref(), Some("ac3"));
         assert!(info.has_audio);
+    }
+
+    #[test]
+    fn range_mp4_reads_each_stream_start_and_duration() {
+        let info = open_fixture_info("range-mp4.mp4");
+        assert_eq!(info.audio_tracks.len(), 2);
+        let a = &info.audio_tracks[0];
+        let b = &info.audio_tracks[1];
+        assert_eq!(a.start_secs, Some(0.0));
+        assert!((a.end_secs.unwrap() - 20.0).abs() < 0.01);
+        assert!((b.start_secs.unwrap() - 3.976).abs() < 0.01);
+        assert!((b.end_secs.unwrap() - 9.999).abs() < 0.01);
+    }
+
+    #[test]
+    fn range_mkv_uses_duration_tag_only_at_zero_start() {
+        let info = open_fixture_info("range-mkv.mkv");
+        assert_eq!(info.audio_tracks.len(), 3);
+        let b = &info.audio_tracks[1];
+        let late = &info.audio_tracks[2];
+        assert_eq!(b.start_secs, Some(0.0), "b={b:?} late={late:?}");
+        assert!((b.end_secs.unwrap() - 6.0).abs() < 0.01);
+        assert_eq!(late.start_secs, Some(4.0));
+        assert_eq!(late.end_secs, None);
+    }
+
+    #[test]
+    fn stream_duration_tag_rejects_invalid_values() {
+        use super::parse_stream_duration_tag;
+        assert_eq!(parse_stream_duration_tag("00:00:06.023000000"), Some(6.023));
+        for value in [
+            "",
+            "6",
+            "00:60:00",
+            "00:00:60",
+            "-1:00:00",
+            "00:00:NaN",
+            "00:00:inf",
+        ] {
+            assert_eq!(parse_stream_duration_tag(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn unavailable_short_track_stays_on_long_audio_until_in_range_seek() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        for (name, target) in [
+            ("range-mp4.mp4", 3.0),
+            ("range-mp4.mp4", 9.7),
+            ("range-mp4.mp4", 11.0),
+            ("range-mkv.mkv", 5.7),
+            ("range-mkv.mkv", 8.0),
+        ] {
+            let session = SwitchSession::new_for(name, 1);
+            session.request(2, target);
+            session.wait_display_state(Display::Deferred);
+            let deferred = session.selection.snapshot();
+            assert_eq!(deferred.applied.stream_index, 1, "{name} at {target}");
+            assert_eq!(deferred.deferred_gen, Some(deferred.desired.generation));
+            assert!(deferred.last_failure.is_none());
+            session.wait_pcm(1, 1, 440.0, 1);
+            // This is a plain later seek, not a new selection. Demux must
+            // consume the pending choice when it reaches the short track.
+            session.clock.request_seek(5.0);
+            session.wait_pcm(2, 2, 880.0, 2);
+            session.wait_display_state(Display::Applied);
+        }
+    }
+
+    #[test]
+    fn frame_step_past_short_track_end_keeps_selection_deferred() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let session = SwitchSession::new_for("range-mkv.mkv", 1);
+        session.request(2, 6.5);
+        session.wait_display_state(Display::Deferred);
+        session.wait_pcm(1, 1, 440.0, 1);
+
+        // Demux starts at 5.5 s, where B's end at 6.0 s looks available.
+        // Audio Flush trims before 6.5 s, where B has no samples.
+        session.clock.request_frame_step_seek(5.5, 6.5, 1);
+        let pts = session.wait_pcm(2, 1, 440.0, 2);
+        assert!(pts.into_iter().all(|pts| pts >= 6.5));
+        let snapshot = session.selection.snapshot();
+        assert_eq!(snapshot.applied.stream_index, 1);
+        assert_eq!(snapshot.display_state(false), Display::Deferred);
+        assert_eq!(snapshot.deferred_gen, Some(snapshot.desired.generation));
+    }
+
+    #[test]
+    fn frame_step_into_late_track_applies_at_audio_trim_base() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let session = SwitchSession::new_for("range-mkv.mkv", 1);
+        session.request(3, 3.0);
+        session.wait_display_state(Display::Deferred);
+        session.wait_pcm(1, 1, 440.0, 1);
+
+        // C starts at 4.0 s. The demux seek start is before it, but audio
+        // begins at the frame-step base inside the stream's available range.
+        session.clock.request_frame_step_seek(3.5, 4.5, 1);
+        let pts = session.wait_pcm(2, 3, 1320.0, 2);
+        assert!(pts.into_iter().all(|pts| pts >= 4.5));
+        let snapshot = session.selection.snapshot();
+        assert_eq!(snapshot.applied, snapshot.desired);
+        assert_eq!(snapshot.display_state(false), Display::Applied);
+    }
+
+    #[test]
+    fn deferred_choice_survives_failed_ordinary_seek_and_retries_in_range() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let session = SwitchSession::new_for("range-mp4.mp4", 1);
+        let (entered, release) = session.clock.gate_next_demux_packet_for_test();
+        session.clock.request_seek(1.0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut blocked = false;
+        while std::time::Instant::now() < deadline {
+            if entered.try_recv().is_ok() {
+                blocked = true;
+                break;
+            }
+            while session.handles.video_rx.try_recv().is_ok() {}
+            while session.handles.audio_rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(blocked, "demux did not reach packet gate");
+        // The gate is in the actual demux packet path, before its next seek
+        // request. Publish both requests while demux is held there.
+        assert_eq!(
+            session.selection.request(2),
+            AudioTrackRequestOutcome::Accepted
+        );
+        session.clock.request_seek(5.0); // choice's position
+        session.clock.fail_next_demux_seek_for_test();
+        session.clock.request_seek(11.0); // ordinary seek supersedes it
+        release.send(()).unwrap();
+        session.wait_display_state(Display::Deferred);
+        assert!(session.selection.snapshot().last_failure.is_none());
+        let serial = session.clock.current_seek_serial();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !session.clock.seek_was_interrupted(serial) && std::time::Instant::now() < deadline {
+            while session.handles.video_rx.try_recv().is_ok() {}
+            while session.handles.audio_rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.clock.seek_was_interrupted(serial));
+        assert_eq!(
+            session.selection.snapshot().display_state(false),
+            Display::Deferred
+        );
+        session.clock.request_seek(5.0);
+        session.wait_pcm(serial + 1, 2, 880.0, 2);
+        session.wait_display_state(Display::Applied);
+    }
+
+    #[test]
+    fn deferred_choice_applies_once_on_loop_seek_after_audio_clears_override() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let session = SwitchSession::new_for("range-mp4.mp4", 1);
+        session.request(2, 11.0);
+        session.wait_display_state(Display::Deferred);
+        let choice = session.selection.snapshot().desired;
+        // Simulate the loop target being published before its video frame and
+        // audio output clearing the override first.
+        session.clock.request_seek(5.0);
+        let loop_serial = session.clock.current_seek_serial();
+        session.clock.clear_seek_target_override(loop_serial);
+        session.wait_pcm(loop_serial, 2, 880.0, 2);
+        session.wait_display_state(Display::Applied);
+        assert_eq!(session.selection.snapshot().applied, choice);
+        session.clock.request_seek(5.0);
+        session.wait_pcm(loop_serial + 1, 2, 880.0, 1);
+        assert_eq!(session.selection.snapshot().applied, choice);
+    }
+
+    #[test]
+    fn deferred_choice_becomes_switching_then_failure_on_in_range_attempt() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let session = SwitchSession::new_for("range-mp4.mp4", 1);
+        session.request(2, 11.0);
+        session.wait_display_state(Display::Deferred);
+        session.clock.fail_next_audio_setup_for_test();
+        session.clock.request_seek(5.0);
+        session.wait_failure(AudioTrackSwitchFailureReason::SetupFailed);
+        let snapshot = session.selection.snapshot();
+        assert_eq!(snapshot.deferred_gen, None);
+        assert_eq!(
+            snapshot.display_state(false),
+            Display::Failed(AudioTrackSwitchFailureReason::SetupFailed)
+        );
+        assert_eq!(snapshot.applied.stream_index, 1);
+        session.clock.request_seek(5.25);
+        session.wait_pcm(3, 1, 440.0, 1);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 1);
+        session.request(2, 5.0);
+        session.wait_pcm(4, 2, 880.0, 1);
+        session.wait_display_state(Display::Applied);
     }
 
     #[test]

@@ -1169,7 +1169,8 @@ routing と applied を確定する。構築失敗・seek 失敗では旧 routin
 失敗 generation は利用者の次の選択まで自動再試行しない。audio Flush の切断は上記の
 音声 lane 喪失として扱う。setup 構築時間は `audio/audio_setup_build` perf event に記録する。
 `AudioFrame.stream_index` は実際に decode した setup の stream index で、S3 の Norm gain 表に渡す。
-末尾 drain 中と engine Eof での選択は次の seek まで保留する。一時停止中の通常 seek が未表示なら clock の seek target を基準とし、frame-step pause 中は表示 PTS を使う。未表示の seek が無い一時停止中も表示 PTS を使う。
+選択を次の seek まで保留するのは engine の published state が Eof、または切り替え先の既知の stream 範囲で音声を準備できない場合。`audio_track_available_at` は start 前と `position + AUDIO_TRACK_READY_MARGIN_SECS > end` を利用不可とし、UI の選択と demux の seek 取り出しで共用する。demux は音声を採用し始める位置 (通常 seek は target、frame-step seek は `FrameStep.base_secs` = audio trim 下限) で判定する。範囲外の選択は seek を出さず、demux で範囲外になった選択は旧 routing で通常 seek を続ける。`AudioTrackSelection.deferred_gen` は判定した generation と現在の desired が一致する場合だけ記録し、同じ generation の試行開始で解除する。表示は確定・失敗・保留・切り替え中の順に snapshot から導出する。`AudioTrackInfo` の範囲は stream の start_time/duration を優先し、MKV の stream `DURATION` タグは start_time が 0 または無い場合だけ end とする。
+demux が末尾を先読みして `clock.is_eof_reached()` を立てても、範囲内なら選択は即時 seek する。再生中・一時停止中とも、未表示の進行中 seek target (coalesce 中の pending を優先) があればそれを基準とし、無ければ表示済みフレームの PTS を使う。demux seek 失敗・frame-step 出力失敗・相対 seek の端判定・EOF 固着保険で中断した target は退役させる。音声出力が先に override を正常解除した target は映像表示まで保持する。frame-step pause は常に表示 PTS、映像が無ければ現在位置を使う。
 異なる audio time base の検証には `multi-timebase.mp4` の 3 AAC stream を使い、実 pump と `fill_output` で出力消費時の PTS と A/V clock を測る。
 frame-step seek だけは video 側 `trim_before_secs=None` と `frame_step=Some(...)` で流し、
 video decoder が decoded PTS を見て base の直前/直後の 1 枚だけを送出する。audio 側は

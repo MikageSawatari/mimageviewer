@@ -2,6 +2,18 @@
 
 use std::sync::Mutex;
 
+pub(crate) fn audio_track_available_at(
+    track: &crate::video::decoder::AudioTrackInfo,
+    position: f64,
+) -> bool {
+    position.is_finite()
+        && position >= 0.0
+        && track.start_secs.is_none_or(|start| position >= start)
+        && track
+            .end_secs
+            .is_none_or(|end| position + crate::video::audio::AUDIO_TRACK_READY_MARGIN_SECS <= end)
+}
+
 /// File-scoped choice. Unlike `AudioTrackChoice`, it has no request generation.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SavedAudioTrackChoice {
@@ -80,6 +92,7 @@ pub struct AudioTrackSelectionSnapshot {
     pub desired: AudioTrackChoice,
     pub applied: AudioTrackChoice,
     pub last_failure: Option<AudioTrackSwitchFailure>,
+    pub deferred_gen: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +104,7 @@ pub enum AudioTrackSelectionDisplayState {
 }
 
 impl AudioTrackSelectionSnapshot {
-    pub fn display_state(self, deferred: bool) -> AudioTrackSelectionDisplayState {
+    pub fn display_state(self, engine_eof: bool) -> AudioTrackSelectionDisplayState {
         if self.desired.generation == self.applied.generation {
             AudioTrackSelectionDisplayState::Applied
         } else if let Some(failure) = self
@@ -99,7 +112,7 @@ impl AudioTrackSelectionSnapshot {
             .filter(|failure| failure.choice.generation == self.desired.generation)
         {
             AudioTrackSelectionDisplayState::Failed(failure.reason)
-        } else if deferred {
+        } else if engine_eof || self.deferred_gen == Some(self.desired.generation) {
             AudioTrackSelectionDisplayState::Deferred
         } else {
             AudioTrackSelectionDisplayState::Switching
@@ -165,6 +178,7 @@ impl AudioTrackSelection {
                     desired: choice,
                     applied: choice,
                     last_failure: None,
+                    deferred_gen: None,
                 },
                 lane: AudioLaneState::Active,
                 notified_failure_generation: 0,
@@ -195,9 +209,16 @@ impl AudioTrackSelection {
     /// UI thread only. Admission and demux lane closure share one lock. The
     /// caller publishes the seek after an accepted request returns.
     pub(crate) fn request(&self, stream_index: usize) -> AudioTrackRequestOutcome {
+        self.request_with_choice(stream_index).0
+    }
+
+    pub(crate) fn request_with_choice(
+        &self,
+        stream_index: usize,
+    ) -> (AudioTrackRequestOutcome, Option<AudioTrackChoice>) {
         let mut state = self.state.lock().unwrap();
         if state.lane == AudioLaneState::Lost {
-            return AudioTrackRequestOutcome::Rejected;
+            return (AudioTrackRequestOutcome::Rejected, None);
         }
         let snapshot = &mut state.snapshot;
         if snapshot.desired.stream_index == stream_index
@@ -205,11 +226,27 @@ impl AudioTrackSelection {
                 .last_failure
                 .is_none_or(|failure| failure.choice.generation != snapshot.desired.generation)
         {
-            return AudioTrackRequestOutcome::Unchanged;
+            return (AudioTrackRequestOutcome::Unchanged, None);
         }
         snapshot.desired.generation += 1;
         snapshot.desired.stream_index = stream_index;
-        AudioTrackRequestOutcome::Accepted
+        (AudioTrackRequestOutcome::Accepted, Some(snapshot.desired))
+    }
+
+    /// UI and demux can record a deferral only while this exact choice is current.
+    pub(crate) fn defer_if_current(&self, choice: AudioTrackChoice) {
+        let mut state = self.state.lock().unwrap();
+        if state.lane == AudioLaneState::Active && state.snapshot.desired == choice {
+            state.snapshot.deferred_gen = Some(choice.generation);
+        }
+    }
+
+    /// A stale demux attempt cannot clear a newer choice's deferral.
+    pub(crate) fn begin_attempt(&self, choice: AudioTrackChoice) {
+        let mut state = self.state.lock().unwrap();
+        if state.snapshot.deferred_gen == Some(choice.generation) {
+            state.snapshot.deferred_gen = None;
+        }
     }
 
     /// Demux thread only. A request admitted before closure gets WorkerGone;
@@ -251,6 +288,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn availability_uses_stream_bounds_and_a_margin_above_readiness() {
+        assert!(
+            crate::video::audio::AUDIO_TRACK_READY_MARGIN_SECS
+                >= crate::video::audio::READY_THRESHOLD_SECS
+        );
+        let mut track = crate::video::decoder::AudioTrackInfo {
+            stream_index: 2,
+            ordinal: 2,
+            language: None,
+            title: None,
+            codec: "aac".into(),
+            channels: Some(1),
+            sample_rate: Some(44_100),
+            disposition_default: false,
+            start_secs: Some(4.0),
+            end_secs: Some(10.0),
+        };
+        assert!(!audio_track_available_at(&track, 3.99));
+        assert!(audio_track_available_at(&track, 4.0));
+        assert!(audio_track_available_at(&track, 9.5));
+        assert!(!audio_track_available_at(&track, 9.501));
+        assert!(!audio_track_available_at(&track, 10.0));
+        track.end_secs = None;
+        assert!(audio_track_available_at(&track, 20.0));
+        track.start_secs = None;
+        assert!(audio_track_available_at(&track, 0.0));
+    }
+
+    #[test]
+    fn stale_availability_result_cannot_defer_new_choice() {
+        let selection = AudioTrackSelection::new(1);
+        assert_eq!(selection.request(2), AudioTrackRequestOutcome::Accepted);
+        let old = selection.snapshot().desired;
+        assert_eq!(selection.request(3), AudioTrackRequestOutcome::Accepted);
+        selection.defer_if_current(old);
+        let snapshot = selection.snapshot();
+        assert_eq!(snapshot.deferred_gen, None);
+        assert_eq!(
+            snapshot.display_state(false),
+            AudioTrackSelectionDisplayState::Switching
+        );
+    }
+
+    #[test]
+    fn stale_attempt_cannot_clear_new_choice_deferral() {
+        let selection = AudioTrackSelection::new(1);
+        assert_eq!(selection.request(2), AudioTrackRequestOutcome::Accepted);
+        let old = selection.snapshot().desired;
+        selection.defer_if_current(old);
+        assert_eq!(selection.request(3), AudioTrackRequestOutcome::Accepted);
+        let newest = selection.snapshot().desired;
+        selection.defer_if_current(newest);
+        selection.begin_attempt(old);
+        assert_eq!(selection.snapshot().deferred_gen, Some(newest.generation));
+        assert_eq!(
+            selection.snapshot().display_state(false),
+            AudioTrackSelectionDisplayState::Deferred
+        );
+        selection.begin_attempt(newest);
+        assert_eq!(
+            selection.snapshot().display_state(false),
+            AudioTrackSelectionDisplayState::Switching
+        );
+        selection.fail(newest, AudioTrackSwitchFailureReason::SeekFailed);
+        assert_eq!(
+            selection.snapshot().display_state(true),
+            AudioTrackSelectionDisplayState::Failed(AudioTrackSwitchFailureReason::SeekFailed)
+        );
+    }
+
+    #[test]
     fn saved_track_identity_requires_present_metadata_and_title() {
         let track = crate::video::decoder::AudioTrackInfo {
             stream_index: 2,
@@ -261,6 +369,8 @@ mod tests {
             channels: Some(2),
             sample_rate: Some(48_000),
             disposition_default: false,
+            start_secs: None,
+            end_secs: None,
         };
         let tracks = [track.clone()];
         let saved = SavedAudioTrackChoice::from(&track);

@@ -111,6 +111,8 @@ mod tests {
             channels: Some(2),
             sample_rate: None,
             disposition_default: false,
+            start_secs: None,
+            end_secs: None,
         };
         assert_eq!(
             audio_track_label(&track, Some(4), AudioTrackSelectionDisplayState::Applied),

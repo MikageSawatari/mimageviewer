@@ -28,6 +28,8 @@ use super::decoder::AudioFrame;
 use super::engine::actor::state_code;
 
 const MAX_STALE_AUDIO_DRAIN_PER_TICK: usize = 256;
+pub(crate) const READY_THRESHOLD_SECS: f64 = 0.10;
+pub(crate) const AUDIO_TRACK_READY_MARGIN_SECS: f64 = 0.50;
 
 fn duration_ns_u64(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
@@ -113,6 +115,69 @@ impl AudioOutput {
                 next_owner_id: Arc::new(AtomicU64::new(1)),
             },
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pumping_without_device_for_test(
+        sample_rate: u32,
+        rx: Receiver<AudioFrame>,
+        clock: Arc<AvClock>,
+        engine_event_tx: crate::video::EngineEventSender,
+        engine_state: Arc<AtomicU8>,
+    ) -> Self {
+        let mut output = Self::connected_without_output_for_test(sample_rate);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (tap_tx, tap_rx) = unbounded();
+        output.shutdown_tx = shutdown_tx;
+        output.audio_tap.command_tx = tap_tx;
+        let buffer = Arc::clone(&output.buffer);
+        let cancel = Arc::clone(&output.cancel);
+        let diagnostics = Arc::clone(&output.diagnostics);
+        output.pump = Some(std::thread::spawn(move || {
+            run_pump(
+                rx,
+                shutdown_rx,
+                buffer,
+                cancel,
+                clock,
+                engine_event_tx,
+                engine_state,
+                diagnostics,
+                tap_rx,
+                #[cfg(windows)]
+                None,
+            );
+        }));
+        output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fill_without_device_for_test(
+        &self,
+        clock: &Arc<AvClock>,
+        engine_state: &Arc<AtomicU8>,
+    ) -> (bool, Option<f64>) {
+        let before = self
+            .diagnostics
+            .audio_audible_pts_bits
+            .load(Ordering::Acquire);
+        let mut samples = [0.0_f32; 960];
+        fill_output(
+            &mut samples,
+            &self.buffer,
+            clock,
+            engine_state,
+            &self.diagnostics,
+            None,
+        );
+        let after = self
+            .diagnostics
+            .audio_audible_pts_bits
+            .load(Ordering::Acquire);
+        (
+            samples.iter().any(|sample| sample.abs() > 1e-4),
+            (after != before).then(|| f64::from_bits(after)),
+        )
     }
 
     pub fn pause_stream(&self) {
@@ -1160,7 +1225,6 @@ fn run_pump(
     const TARGET_PROCESSED_SECS: f64 = 0.10;
     // ── BufferReady 閾値 ──
     // Buffering → Playing の遷移トリガ (level event)。
-    const READY_THRESHOLD_SECS: f64 = 0.10;
     // ── raw_pending back-pressure / warning ──
     // 以前は 30 秒を超えたら最新フレームで再 anchor していたが、video packet overflow
     // queue 導入後は demux が audio を大きく先読みできるため、通常の seek/open でも

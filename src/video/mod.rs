@@ -8204,8 +8204,15 @@ fn eof_drain_observed_deadline(
 #[derive(Debug, Default)]
 struct UserSeekCoalesceState {
     pending_target_secs: Option<f64>,
-    last_issued_at: Option<std::time::Instant>,
-    last_issued_display_seq: u64,
+    last_issued: Option<IssuedUserSeek>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IssuedUserSeek {
+    target_secs: f64,
+    serial: u64,
+    at: std::time::Instant,
+    displayed_seq: u64,
 }
 
 fn user_seek_ready_to_issue(
@@ -8215,10 +8222,10 @@ fn user_seek_ready_to_issue(
     now: std::time::Instant,
 ) -> bool {
     !is_seeking
-        || displayed_seq > state.last_issued_display_seq
+        || displayed_seq > state.last_issued.map_or(0, |issued| issued.displayed_seq)
         || state
-            .last_issued_at
-            .is_some_and(|issued_at| now.duration_since(issued_at) >= USER_SEEK_REISSUE_AFTER)
+            .last_issued
+            .is_some_and(|issued| now.duration_since(issued.at) >= USER_SEEK_REISSUE_AFTER)
 }
 
 fn frame_step_base_secs(
@@ -8378,6 +8385,8 @@ impl VideoPlayer {
                 channels: Some(2),
                 sample_rate: Some(48_000),
                 disposition_default: true,
+                start_secs: None,
+                end_secs: None,
             }],
             default_audio_stream_index: Some(1),
             opened_audio_stream_index: Some(1),
@@ -8423,6 +8432,8 @@ impl VideoPlayer {
                 channels: Some(2),
                 sample_rate: Some(48_000),
                 disposition_default: false,
+                start_secs: None,
+                end_secs: None,
             });
         }
         info.opened_audio_stream_index = Some(stream_index);
@@ -9335,16 +9346,14 @@ impl VideoPlayer {
     }
 
     pub fn audio_track_display_state(&self) -> Option<AudioTrackSelectionDisplayState> {
-        let deferred = self.engine_state_code() == engine::actor::state_code::EOF
-            || (self.intent_playing() && self.clock.is_eof_reached());
+        let deferred = self.engine_state_code() == engine::actor::state_code::EOF;
         self.audio_track_selection()
             .map(|selection| selection.display_state(deferred))
     }
 
     /// UI thread polls this on the owning player. A failure is announced once per generation.
     pub fn take_audio_track_failure_notification(&self) -> bool {
-        let deferred = self.engine_state_code() == engine::actor::state_code::EOF
-            || (self.intent_playing() && self.clock.is_eof_reached());
+        let deferred = self.engine_state_code() == engine::actor::state_code::EOF;
         self.audio_track_selection
             .as_ref()
             .is_some_and(|selection| selection.take_failure_notification(deferred))
@@ -9367,7 +9376,8 @@ impl VideoPlayer {
         }) {
             return rejected;
         }
-        match selection.request(stream_index) {
+        let (request, choice) = selection.request_with_choice(stream_index);
+        match request {
             AudioTrackRequestOutcome::Rejected => return rejected,
             AudioTrackRequestOutcome::Unchanged => {
                 return AudioTrackSelectResult {
@@ -9381,27 +9391,26 @@ impl VideoPlayer {
             AudioTrackRequestOutcome::Accepted => {}
         }
         let should_play = self.intent_playing();
-        if self.engine_state_code() == engine::actor::state_code::EOF
-            || (should_play && self.clock.is_eof_reached())
-        {
+        if self.engine_state_code() == engine::actor::state_code::EOF {
             return AudioTrackSelectResult {
                 outcome: AudioTrackSelectOutcome::Deferred,
                 normalize_unresolved: self.clock.normalize_gain_for_stream(stream_index).is_none(),
             };
         }
-        let base = if should_play {
-            self.user_seek_base_secs()
-        } else if self.is_frame_step_active() {
-            self.last_displayed_pts_secs()
-                .unwrap_or_else(|| self.position())
-        } else if self.clock.is_seeking() {
-            // A precise paused seek still owns its target until a post-seek
-            // frame is consumed. The displayed frame can be from before it.
-            self.position()
-        } else {
-            self.last_displayed_pts_secs()
-                .unwrap_or_else(|| self.position())
-        };
+        let base = self.audio_track_seek_base_secs();
+        let track = self.info.as_ref().and_then(|info| {
+            info.audio_tracks
+                .iter()
+                .find(|track| track.stream_index == stream_index)
+        });
+        if track.is_some_and(|track| !audio_track_selection::audio_track_available_at(track, base))
+        {
+            selection.defer_if_current(choice.expect("accepted audio choice"));
+            return AudioTrackSelectResult {
+                outcome: AudioTrackSelectOutcome::Deferred,
+                normalize_unresolved: self.clock.normalize_gain_for_stream(stream_index).is_none(),
+            };
+        }
         self.seek_with_play_state(base, should_play);
         AudioTrackSelectResult {
             outcome: AudioTrackSelectOutcome::Requested,
@@ -9492,6 +9501,7 @@ impl VideoPlayer {
             self.clear_pending_user_seek();
             self.clear_frame_step_target();
             self.clock.request_seek(0.0);
+            self.record_issued_seek(0.0);
             self.clear_audio_output_buffer();
             // 2026-05 root fix: `clock.set_playing(true)` の直書きは撤去。
             // 続く `handle_seek_request` → `apply_command(Play)` → engine 内部で
@@ -9600,7 +9610,55 @@ impl VideoPlayer {
             .unwrap_or_else(|| self.position())
     }
 
+    /// The seek target wins only while it has not produced a displayed frame.
+    /// Otherwise use the last real frame, including during demux EOF drain:
+    /// the clock can already be beyond the last decodable video frame then.
+    fn audio_track_seek_base_secs(&self) -> f64 {
+        if self.is_frame_step_active() {
+            return self
+                .last_displayed_pts_secs()
+                .unwrap_or_else(|| self.position());
+        }
+        if let Ok(state) = self.user_seek_coalesce.lock() {
+            if let Some(target) = state.pending_target_secs {
+                return target;
+            }
+            if self.info.as_ref().is_some_and(|info| !info.has_video) {
+                // Audio-only has no displayed-frame sequence to retire an
+                // issued seek. The audio clock is its position source.
+                return self.position();
+            }
+            if let Some(issued) = state.last_issued.filter(|issued| {
+                issued.serial == self.clock.current_seek_serial()
+                    && !self.clock.seek_was_interrupted(issued.serial)
+            }) {
+                // Audio output can clear the clock override before video has
+                // displayed the seek result, or leave it set after display.
+                // The display sequence identifies which side of that boundary
+                // the choice belongs to, independently of the audio callback.
+                if self.displayed_frame_seq.load(Ordering::Acquire) <= issued.displayed_seq {
+                    return issued.target_secs;
+                }
+                return self
+                    .last_displayed_pts_secs()
+                    .unwrap_or_else(|| self.position());
+            }
+        }
+        if self.clock.is_seeking()
+            && !self
+                .clock
+                .seek_was_interrupted(self.clock.current_seek_serial())
+        {
+            // During an issued seek, position() is the target override. The
+            // old displayed frame can still belong to the previous generation.
+            return self.position();
+        }
+        self.last_displayed_pts_secs()
+            .unwrap_or_else(|| self.position())
+    }
+
     fn issue_user_seek_locked(&self, state: &mut UserSeekCoalesceState, target_secs: f64) {
+        let displayed_seq_at_issue = self.displayed_frame_seq.load(Ordering::Acquire);
         self.clock.request_seek(target_secs);
         self.clear_audio_output_buffer();
         // 2026-05 root fix: `clock.set_playing(true)` の直書きは撤去。続く
@@ -9612,8 +9670,22 @@ impl VideoPlayer {
         g.handle_seek_request(target_secs);
         g.apply_command(engine::actor::TransportCommand::Play);
         state.pending_target_secs = None;
-        state.last_issued_at = Some(std::time::Instant::now());
-        state.last_issued_display_seq = self.displayed_frame_seq.load(Ordering::Acquire);
+        state.last_issued = Some(IssuedUserSeek {
+            target_secs,
+            serial: self.clock.current_seek_serial(),
+            at: std::time::Instant::now(),
+            displayed_seq: displayed_seq_at_issue,
+        });
+    }
+
+    fn record_issued_seek(&self, target_secs: f64) {
+        let mut state = self.user_seek_coalesce.lock().unwrap();
+        state.last_issued = Some(IssuedUserSeek {
+            target_secs,
+            serial: self.clock.current_seek_serial(),
+            at: std::time::Instant::now(),
+            displayed_seq: self.displayed_frame_seq.load(Ordering::Acquire),
+        });
     }
 
     fn request_user_seek(&self, target_secs: f64) {
@@ -9654,8 +9726,8 @@ impl VideoPlayer {
             self.issue_user_seek_locked(&mut state, target);
             None
         } else {
-            state.last_issued_at.map(|issued_at| {
-                USER_SEEK_REISSUE_AFTER.saturating_sub(now.saturating_duration_since(issued_at))
+            state.last_issued.map(|issued| {
+                USER_SEEK_REISSUE_AFTER.saturating_sub(now.saturating_duration_since(issued.at))
             })
         }
     }
@@ -9930,6 +10002,8 @@ impl VideoPlayer {
         if self.clock.is_eof_reached() {
             self.clear_pending_user_seek();
             self.clock
+                .mark_seek_interrupted(self.clock.current_seek_serial());
+            self.clock
                 .clear_seek_target_override(self.clock.current_seek_serial());
         }
         outcome
@@ -9946,6 +10020,7 @@ impl VideoPlayer {
         self.clear_pending_user_seek();
         let clamped = self.clamp_seek_target(target_secs);
         self.clock.request_seek(clamped);
+        self.record_issued_seek(clamped);
         self.clear_audio_output_buffer();
         // 2026-05 root fix: `clock.set_playing(false)` の直書きは撤去。続く
         // `apply_command(Pause)` が transition_to_seeking → transition_to_paused
@@ -11062,6 +11137,7 @@ impl VideoPlayer {
                             info.duration_secs,
                         ) {
                             self.clock.request_seek(resume);
+                            self.record_issued_seek(resume);
                             // 共有 seek_serial は clock.request_seek で 1 回 bump。
                             // 続く engine.handle_seek_request は adaptive ロジックで
                             // 「外部 bump 検知」となり、自身は bump せず state 更新のみ。
@@ -11175,6 +11251,7 @@ impl VideoPlayer {
                 self.seek_eof_stuck_since = None;
                 self.clear_pending_user_seek();
                 let serial = self.clock.current_seek_serial();
+                self.clock.mark_seek_interrupted(serial);
                 self.clock.clear_seek_target_override(serial);
                 crate::logger::log(format!(
                     "[video] stuck seek override force-cleared after {}ms \
@@ -11267,6 +11344,7 @@ impl VideoPlayer {
                     let target = self.clamp_loop_seek_target(raw);
                     self.clear_pending_user_seek();
                     self.clock.request_seek(target);
+                    self.record_issued_seek(target);
                     self.clear_audio_output_buffer();
                     // 2026-05 root fix: `clock.set_playing(true)` 直書きは撤去
                     // (engine 経由で更新)。
@@ -11483,6 +11561,7 @@ impl VideoPlayer {
                 let target = self.clamp_loop_seek_target(raw);
                 self.clear_pending_user_seek();
                 self.clock.request_seek(target);
+                self.record_issued_seek(target);
                 self.clear_audio_output_buffer();
                 // 2026-05 root fix: `clock.set_playing(true)` 直書きは撤去
                 // (engine 経由で更新)。
@@ -12028,6 +12107,8 @@ mod tests {
             channels: Some(1),
             sample_rate: Some(32_000),
             disposition_default: false,
+            start_secs: None,
+            end_secs: None,
         });
         player.audio_track_selection =
             Some(std::sync::Arc::new(super::AudioTrackSelection::new(1)));
@@ -12051,6 +12132,148 @@ mod tests {
             }
         }
         player
+    }
+
+    /// Drive the real demux through the six-second file while keeping the
+    /// displayed frame at the start. This fixes the EOF read-ahead ordering.
+    fn selection_player_with_demux_at_eof() -> super::VideoPlayer {
+        selection_player_with_demux_at_eof_fixture("multi.mkv", 2)
+    }
+
+    fn selection_player_with_demux_at_eof_fixture(
+        name: &str,
+        initial_stream: usize,
+    ) -> super::VideoPlayer {
+        use super::engine::state::{AudioEvent, DecoderEvent};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks")
+            .join(name);
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.cancel = std::sync::Arc::new(AtomicBool::new(false));
+        player.engine.lock().unwrap().begin_loading();
+        player.decode = super::decoder::spawn(
+            path,
+            std::sync::Arc::clone(&player.clock),
+            std::sync::Arc::clone(&player.cancel),
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            std::sync::Arc::clone(&player.engine_state_atomic),
+            player.engine_event_tx.clone(),
+            std::sync::Arc::clone(&player.decoder_dropped_full_count),
+            #[cfg(windows)]
+            std::sync::Arc::clone(&player.dynamic),
+            #[cfg(not(windows))]
+            std::sync::Arc::new(super::decoder::VideoDynamicState::default()),
+        );
+        let info = player
+            .decode
+            .info_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.opened_audio_stream_index, Some(initial_stream));
+        player.audio_track_selection = Some(
+            player
+                .decode
+                .audio_track_selection_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+        );
+        player
+            .engine
+            .lock()
+            .unwrap()
+            .handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: info.duration_secs,
+                has_audio: info.has_audio,
+                has_video: info.has_video,
+            });
+        let has_video = info.has_video;
+        player.info = Some(info);
+        let video_pts = has_video.then(|| {
+            player
+                .decode
+                .video_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("initial video frame")
+                .pts_secs
+        });
+        let audio_pts = player
+            .decode
+            .audio_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("initial audio frame")
+            .pts_secs;
+        if let Some(video_pts) = video_pts {
+            player.set_last_displayed_pts_for_test(video_pts);
+        }
+        {
+            let mut actor = player.engine.lock().unwrap();
+            actor.handle_audio_event(AudioEvent::BufferReady {
+                epoch: 0,
+                pts: audio_pts,
+                wall_now: std::time::Instant::now(),
+            });
+            if let Some(video_pts) = video_pts {
+                actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+                    epoch: 0,
+                    pts: video_pts,
+                });
+            }
+            actor.apply_command(super::engine::actor::TransportCommand::Play);
+        }
+        // A test clock seam makes read-ahead deterministic without waiting for
+        // wall-clock playback. The displayed PTS stays on the initial frame.
+        player
+            .clock
+            .set_audio_pts_jump(player.info.as_ref().unwrap().duration_secs);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !player.clock.is_eof_reached() && std::time::Instant::now() < deadline {
+            let _ = player
+                .decode
+                .video_rx
+                .recv_timeout(std::time::Duration::from_millis(5));
+            while player.decode.audio_rx.try_recv().is_ok() {}
+        }
+        assert!(
+            player.clock.is_eof_reached(),
+            "real demux did not reach EOF"
+        );
+        assert_eq!(
+            player.engine_state_code(),
+            super::engine::actor::state_code::PLAYING
+        );
+        assert!(!player.cancel.load(Ordering::Acquire));
+        player
+    }
+
+    fn assert_new_track_pcm(frame: &super::decoder::AudioFrame) -> bool {
+        assert_eq!(frame.seek_serial, 1);
+        assert_eq!(frame.stream_index, 1);
+        // AAC priming/padding distorts boundary frames; count zero crossings
+        // in the steady sine section, but check stream identity everywhere.
+        if (0.3..=5.5).contains(&frame.pts_secs)
+            && frame.duration_secs >= 0.015
+            && frame.samples.iter().any(|sample| sample.abs() >= 0.02)
+        {
+            let mut rising = 0;
+            let mut previous = frame.samples[0];
+            for sample in frame.samples.chunks_exact(2).skip(1).map(|pair| pair[0]) {
+                if previous <= 0.0 && sample > 0.0 {
+                    rising += 1;
+                }
+                previous = sample;
+            }
+            let measured = rising as f64 / frame.duration_secs;
+            assert!((measured - 440.0).abs() < 110.0, "{measured:.1} Hz");
+            return true;
+        }
+        false
     }
 
     #[test]
@@ -12128,6 +12351,151 @@ mod tests {
     }
 
     #[test]
+    fn audio_select_uses_issued_target_until_display_even_if_audio_clears_override() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek(10.0);
+        let old_serial = player.clock.current_seek_serial();
+        player.clock.clear_seek_target_override(old_serial);
+        assert!(!player.clock.is_seeking());
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn interrupted_seek_targets_retire_but_audio_clear_retains_target() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek(10.0);
+        let serial = player.clock.current_seek_serial();
+        player.clock.clear_seek_target_override(serial); // normal audio consumption
+        assert!((player.audio_track_seek_base_secs() - 10.0).abs() < 1e-9);
+        player.clock.mark_seek_interrupted(serial); // demux abort/EOF insurance
+        assert!((player.audio_track_seek_base_secs() - 5.0).abs() < 1e-9);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn relative_seek_at_end_retires_unshown_target() {
+        use super::{AudioTrackSelectOutcome as Outcome, RelativeSeekOutcome};
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek(29.9);
+        let serial = player.clock.current_seek_serial();
+        player.clock.notify_eof_reached();
+        assert_eq!(player.seek_relative(1.0), RelativeSeekOutcome::AtEnd);
+        assert!(player.clock.seek_was_interrupted(serial));
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eof_stuck_insurance_retires_unshown_target() {
+        let mut player = selection_player(true);
+        #[cfg(windows)]
+        {
+            player.native_output = None;
+        }
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek(29.9);
+        let serial = player.clock.current_seek_serial();
+        player.clock.notify_eof_reached();
+        player.seek_eof_stuck_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        player.tick(&egui::Context::default());
+        assert!(player.clock.seek_was_interrupted(serial));
+        assert!((player.audio_track_seek_base_secs() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn real_demux_seek_failure_retires_selection_base() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player_with_demux_at_eof();
+        player.set_last_displayed_pts_for_test(4.0);
+        player.clock.fail_next_demux_seek_for_test();
+        player.seek(5.0);
+        let aborted_serial = player.clock.current_seek_serial();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !player.clock.seek_was_interrupted(aborted_serial)
+            && std::time::Instant::now() < deadline
+        {
+            while player.decode.video_rx.try_recv().is_ok() {}
+            while player.decode.audio_rx.try_recv().is_ok() {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(player.clock.seek_was_interrupted(aborted_serial));
+        assert_eq!(player.select_audio_track(1).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn first_display_pending_seek_and_position_choose_selection_base() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use std::sync::atomic::Ordering;
+        let player = selection_player(false);
+        player
+            .last_displayed_pts_bits
+            .store(f64::NAN.to_bits(), Ordering::Release);
+        player.seek_paused(8.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 8.0).abs() < 1e-9);
+
+        let player = selection_player(false);
+        player
+            .last_displayed_pts_bits
+            .store(f64::NAN.to_bits(), Ordering::Release);
+        player.clock.set_audio_pts_jump(4.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 4.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn audio_select_uses_newly_displayed_pts_even_if_audio_override_remains() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use std::sync::atomic::Ordering;
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek(10.0);
+        player.set_last_displayed_pts_for_test(10.1);
+        player.displayed_frame_seq.fetch_add(1, Ordering::Release);
+        assert!(player.clock.is_seeking());
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 10.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn audio_only_selection_uses_current_audio_position_after_previous_seek() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use std::sync::atomic::Ordering;
+        let mut player = selection_player(true);
+        player.info.as_mut().unwrap().has_video = false;
+        player
+            .last_displayed_pts_bits
+            .store(f64::NAN.to_bits(), Ordering::Release);
+        player.clock.set_audio_pts_jump(4.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let first = player.clock.take_seek_request().unwrap();
+        assert!(
+            (first.target_secs - 4.0).abs() < 0.1,
+            "{}",
+            first.target_secs
+        );
+        player.apply_desired_audio_track_for_test();
+        player.clock.clear_seek_target_override(first.serial);
+        player.clock.set_audio_pts_jump(4.5);
+        assert_eq!(player.select_audio_track(1).outcome, Outcome::Requested);
+        let second = player.clock.take_seek_request().unwrap();
+        assert!(
+            (second.target_secs - 4.5).abs() < 0.1,
+            "{}",
+            second.target_secs
+        );
+    }
+
+    #[test]
     fn audio_select_uses_pending_seek_target_and_coalesces_to_one_request() {
         use super::AudioTrackSelectOutcome as Outcome;
         let player = selection_player(true);
@@ -12159,15 +12527,27 @@ mod tests {
     }
 
     #[test]
-    fn audio_select_defers_only_playing_tail_and_engine_eof() {
+    fn audio_select_playing_uses_displayed_pts_when_clock_is_ahead() {
         use super::AudioTrackSelectOutcome as Outcome;
         let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.clock.set_audio_pts_jump(8.0);
+        assert!(player.position() > 7.9);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn audio_select_defers_only_after_engine_eof() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
         player.clock.notify_eof_reached();
-        assert_eq!(player.select_audio_track(2).outcome, Outcome::Deferred);
-        assert!(player.clock.take_seek_request().is_none());
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
         assert_eq!(
-            player.audio_track_selection().unwrap().display_state(true),
-            super::AudioTrackSelectionDisplayState::Deferred
+            player.audio_track_display_state(),
+            Some(super::AudioTrackSelectionDisplayState::Switching)
         );
 
         let player = selection_player(false);
@@ -12185,6 +12565,252 @@ mod tests {
         );
         assert_eq!(player.select_audio_track(2).outcome, Outcome::Deferred);
         assert!(player.clock.take_seek_request().is_none());
+        assert_eq!(
+            player.audio_track_display_state(),
+            Some(super::AudioTrackSelectionDisplayState::Deferred)
+        );
+    }
+
+    #[test]
+    fn audio_select_defers_known_unavailable_track_without_seeking_or_stopping() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        for position in [3.0, 9.7, 11.0] {
+            let mut player = selection_player(true);
+            let track = &mut player.info.as_mut().unwrap().audio_tracks[1];
+            track.start_secs = Some(4.0);
+            track.end_secs = Some(10.0);
+            player.set_last_displayed_pts_for_test(position);
+            assert_eq!(player.select_audio_track(2).outcome, Outcome::Deferred);
+            assert!(player.clock.take_seek_request().is_none());
+            assert_eq!(
+                player.engine_state_code(),
+                super::engine::actor::state_code::PLAYING
+            );
+            assert_eq!(
+                player.audio_track_display_state(),
+                Some(super::AudioTrackSelectionDisplayState::Deferred)
+            );
+            let snapshot = player.audio_track_selection().unwrap();
+            assert_eq!(snapshot.deferred_gen, Some(snapshot.desired.generation));
+        }
+    }
+
+    #[test]
+    fn audio_select_after_demux_eof_switches_real_pcm_at_playback_start() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player_with_demux_at_eof();
+        assert!(player.clock.is_eof_reached());
+        assert_eq!(player.select_audio_track(1).outcome, Outcome::Requested);
+        assert_eq!(
+            player.audio_track_display_state(),
+            Some(super::AudioTrackSelectionDisplayState::Switching)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut audible = 0;
+        while audible < 3 && std::time::Instant::now() < deadline {
+            while player.decode.video_rx.try_recv().is_ok() {}
+            let Ok(frame) = player
+                .decode
+                .audio_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+            else {
+                continue;
+            };
+            if frame.seek_serial != 1 {
+                continue;
+            }
+            if assert_new_track_pcm(&frame) {
+                audible += 1;
+            }
+        }
+        assert_eq!(audible, 3, "new-track PCM missing after EOF read-ahead");
+        let snapshot = player.audio_track_selection().unwrap();
+        assert_eq!(snapshot.applied.stream_index, 1);
+        assert_eq!(snapshot.applied, snapshot.desired);
+    }
+
+    #[test]
+    fn audio_select_before_last_frame_reenters_playing_through_real_actor() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use super::engine::EngineEvent;
+        use super::engine::state::{AudioEvent, DecoderEvent};
+        let player = selection_player_with_demux_at_eof_fixture("tail-audio.mkv", 1);
+        let displayed_pts = 5.8;
+        assert!(displayed_pts < player.info.as_ref().unwrap().duration_secs);
+        // The fixture's final video frame is 5.9 s, but audio lasts beyond it.
+        // A position-based target clamps beyond 5.9 s and has no video frame.
+        assert!(player.info.as_ref().unwrap().duration_secs - 0.1 > 5.9);
+        player.set_last_displayed_pts_for_test(displayed_pts);
+        player
+            .clock
+            .set_audio_pts_jump(player.info.as_ref().unwrap().duration_secs);
+        assert!(player.position() > displayed_pts);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert_eq!(
+            player.engine_state_code(),
+            super::engine::actor::state_code::SEEKING
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut completed = None;
+        let mut video_pts = None;
+        let mut audio_pts = None;
+        while std::time::Instant::now() < deadline
+            && (completed.is_none() || video_pts.is_none() || audio_pts.is_none())
+        {
+            while let Ok(event) = player.engine_event_rx.try_recv() {
+                if let EngineEvent::Decoder(DecoderEvent::SeekCompleted {
+                    epoch: 1,
+                    actual_pts,
+                }) = event
+                {
+                    completed = Some(actual_pts);
+                }
+            }
+            while let Ok(frame) = player.decode.video_rx.try_recv() {
+                if frame.seek_serial == 1 && frame.pts_secs >= displayed_pts - 0.01 {
+                    video_pts.get_or_insert(frame.pts_secs);
+                }
+            }
+            while let Ok(frame) = player.decode.audio_rx.try_recv() {
+                if frame.seek_serial == 1 {
+                    assert_eq!(frame.stream_index, 2);
+                    audio_pts.get_or_insert(frame.pts_secs);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let completed = completed.expect("real demux SeekCompleted");
+        let video_pts = video_pts.expect("post-seek video frame near the last frame");
+        let audio_pts = audio_pts.expect("post-seek audio frame near the last frame");
+        assert!((completed - displayed_pts).abs() < 0.01);
+        {
+            let mut actor = player.engine.lock().unwrap();
+            actor.handle_decoder_event(DecoderEvent::SeekCompleted {
+                epoch: 1,
+                actual_pts: completed,
+            });
+            actor.handle_audio_event(AudioEvent::BufferReady {
+                epoch: 1,
+                pts: audio_pts,
+                wall_now: std::time::Instant::now(),
+            });
+            actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+                epoch: 1,
+                pts: video_pts,
+            });
+        }
+        assert_eq!(
+            player.engine_state_code(),
+            super::engine::actor::state_code::PLAYING,
+            "the near-end switch must not strand the engine in Seeking/Buffering"
+        );
+    }
+
+    #[test]
+    fn near_last_frame_switch_plays_and_reaches_eof_with_real_pump_and_display() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use super::engine::actor::state_code;
+        let mut player = selection_player_with_demux_at_eof_fixture("tail-audio.mkv", 1);
+        #[cfg(windows)]
+        {
+            player.native_output = None;
+        }
+        player.audio = Some(super::audio::AudioOutput::pumping_without_device_for_test(
+            48_000,
+            player.decode.audio_rx.clone(),
+            std::sync::Arc::clone(&player.clock),
+            player.engine_event_tx.clone(),
+            std::sync::Arc::clone(&player.engine_state_atomic),
+        ));
+        player.set_last_displayed_pts_for_test(5.8);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        let ctx = egui::Context::default();
+        let mut saw_playing = false;
+        let mut audible = false;
+        while std::time::Instant::now() < deadline {
+            player.tick(&ctx);
+            let state = player.engine_state_code();
+            if state == state_code::PLAYING {
+                saw_playing = true;
+                let (heard, _) = player
+                    .audio
+                    .as_ref()
+                    .unwrap()
+                    .fill_without_device_for_test(&player.clock, &player.engine_state_atomic);
+                audible |= heard;
+            }
+            if state == state_code::EOF {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            saw_playing,
+            "selection stayed in Seeking/Buffering: readiness={:?} eof={} seeking={} now={:.3} displayed={:?} seq={} future={:?} raw={:.3} processed={:.3} video_rx={} audio_rx={} selection={:?}",
+            player.engine.lock().unwrap().readiness_snapshot(),
+            player.clock.is_eof_reached(),
+            player.clock.is_seeking(),
+            player.clock.now_secs(),
+            player.last_displayed_pts_secs(),
+            player.displayed_frame_seq(),
+            player
+                .future_frames
+                .front()
+                .map(|frame| (frame.seek_serial, frame.pts_secs)),
+            player.clock.audio_raw_pending_secs(),
+            player.clock.audio_processed_secs(),
+            player.decode.video_rx.len(),
+            player.decode.audio_rx.len(),
+            player.audio_track_selection(),
+        );
+        assert!(audible, "real pump output was not consumed");
+        assert_eq!(player.engine_state_code(), state_code::EOF);
+    }
+
+    #[test]
+    fn audio_only_near_end_switch_reaches_eof_with_real_pump() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use super::engine::actor::state_code;
+        let mut player = selection_player_with_demux_at_eof_fixture("multi-audio.m4a", 1);
+        #[cfg(windows)]
+        {
+            player.native_output = None;
+        }
+        player.audio = Some(super::audio::AudioOutput::pumping_without_device_for_test(
+            48_000,
+            player.decode.audio_rx.clone(),
+            std::sync::Arc::clone(&player.clock),
+            player.engine_event_tx.clone(),
+            std::sync::Arc::clone(&player.engine_state_atomic),
+        ));
+        player.clock.set_audio_pts_jump(5.4);
+        assert_eq!(player.select_audio_track(0).outcome, Outcome::Requested);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        let ctx = egui::Context::default();
+        let mut saw_playing = false;
+        let mut audible = false;
+        while std::time::Instant::now() < deadline {
+            player.tick(&ctx);
+            let state = player.engine_state_code();
+            if state == state_code::PLAYING {
+                saw_playing = true;
+                let (heard, _) = player
+                    .audio
+                    .as_ref()
+                    .unwrap()
+                    .fill_without_device_for_test(&player.clock, &player.engine_state_atomic);
+                audible |= heard;
+            }
+            if state == state_code::EOF {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(saw_playing);
+        assert!(audible);
+        assert_eq!(player.engine_state_code(), state_code::EOF);
     }
 
     #[test]
@@ -13600,10 +14226,22 @@ mod tests {
         let now = std::time::Instant::now();
         let state = super::UserSeekCoalesceState {
             pending_target_secs: Some(12.0),
-            last_issued_at: Some(now),
-            last_issued_display_seq: 7,
+            last_issued: Some(super::IssuedUserSeek {
+                target_secs: 10.0,
+                serial: 1,
+                at: now,
+                displayed_seq: 7,
+            }),
         };
         assert!(!super::user_seek_ready_to_issue(&state, true, 7, now));
+    }
+
+    #[test]
+    fn user_seek_coalesce_keeps_initial_display_gate_for_external_seek() {
+        let state = super::UserSeekCoalesceState::default();
+        let now = std::time::Instant::now();
+        assert!(!super::user_seek_ready_to_issue(&state, true, 0, now));
+        assert!(super::user_seek_ready_to_issue(&state, true, 1, now));
     }
 
     #[test]
@@ -13611,8 +14249,12 @@ mod tests {
         let now = std::time::Instant::now();
         let state = super::UserSeekCoalesceState {
             pending_target_secs: Some(12.0),
-            last_issued_at: Some(now - super::USER_SEEK_REISSUE_AFTER),
-            last_issued_display_seq: 7,
+            last_issued: Some(super::IssuedUserSeek {
+                target_secs: 10.0,
+                serial: 1,
+                at: now - super::USER_SEEK_REISSUE_AFTER,
+                displayed_seq: 7,
+            }),
         };
         assert!(super::user_seek_ready_to_issue(&state, true, 8, now));
         assert!(super::user_seek_ready_to_issue(&state, true, 7, now));

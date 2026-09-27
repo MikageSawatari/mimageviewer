@@ -153,6 +153,8 @@ pub struct AvClock {
     /// 「古い fill_output コールバックが、新たに発生した override を誤クリアする」
     /// race を排除する。
     seek_override_serial: AtomicU64,
+    /// Latest serial abandoned before its video frame was displayed.
+    interrupted_seek_serial: AtomicU64,
     /// 音声バッファ会計 (pump 残量 + tx queued)。
     /// Phase 2a で `AudioBookkeeping` に切り出し、AvClock は委譲のみ。動作は等価。
     audio_bookkeeping: AudioBookkeeping,
@@ -294,6 +296,7 @@ impl AvClock {
             seek_serial,
             seek_target_override_bits: AtomicU64::new(SEEK_NONE),
             seek_override_serial: AtomicU64::new(0),
+            interrupted_seek_serial: AtomicU64::new(0),
             audio_bookkeeping: AudioBookkeeping::new(),
             playback_speed_bits: AtomicU64::new(1.0_f64.to_bits()),
             playback_speed_update_lock: Mutex::new(()),
@@ -958,6 +961,17 @@ impl AvClock {
     /// 整合しないクロック状態を作ってしまうため、失敗経路ではこちらを使う。
     pub fn reset_audio_bookkeeping_only(&self) {
         self.audio_bookkeeping.reset();
+    }
+
+    /// Aborting a seek retires its target; ordinary sample/frame consumption
+    /// must only clear the override and leave this serial untouched.
+    pub(super) fn mark_seek_interrupted(&self, serial: u64) {
+        self.interrupted_seek_serial
+            .fetch_max(serial, Ordering::AcqRel);
+    }
+
+    pub(super) fn seek_was_interrupted(&self, serial: u64) -> bool {
+        self.interrupted_seek_serial.load(Ordering::Acquire) == serial
     }
 
     /// fallback wall clock を `(pts, 今)` に再アンカー。

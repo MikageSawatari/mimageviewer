@@ -60,6 +60,50 @@ def generate_multi_audio_only(output: Path) -> None:
     )
 
 
+def generate_range_fixture(output: Path, container: str) -> None:
+    """Long A/video, short B, and a late MKV track to test unknown end."""
+    common = [
+        "-f", "lavfi", "-i", "testsrc2=size=64x36:rate=2:duration=20",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=20",
+        "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=44100:duration=6",
+    ]
+    if container == "mp4":
+        run_ffmpeg(
+            output / "range-mp4.mp4",
+            *common,
+            "-filter_complex", "[2:a]asetpts=PTS+4/TB[late]",
+            "-map", "0:v", "-map", "1:a", "-map", "[late]",
+            "-c:v", "mpeg4", "-q:v", "10", "-c:a", "aac", "-b:a", "32k",
+            "-disposition:a:0", "default", "-disposition:a:1", "0",
+        )
+    else:
+        run_ffmpeg(
+            output / "range-mkv.mkv",
+            *common,
+            "-f", "lavfi", "-i", "sine=frequency=1320:sample_rate=32000:duration=6",
+            "-filter_complex", "[3:a]asetpts=PTS+4/TB[late]",
+            "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "[late]",
+            "-c:v", "mpeg4", "-q:v", "10",
+            "-c:a:0", "aac", "-b:a:0", "32k",
+            "-c:a:1", "flac", "-c:a:2", "flac",
+            "-disposition:a:0", "default", "-disposition:a:1", "0",
+            "-disposition:a:2", "0",
+        )
+
+
+def generate_tail_audio(output: Path) -> None:
+    """Final video frame at 5.9 s, with enough audio beyond it to switch."""
+    run_ffmpeg(
+        output / "tail-audio.mkv",
+        "-f", "lavfi", "-i", VIDEO_SOURCE,
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6.8",
+        "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=44100:duration=6.8",
+        "-map", "0:v", "-map", "1:a", "-map", "2:a",
+        *VIDEO_OPTIONS, "-c:a", "aac", "-b:a", "48k",
+        "-disposition:a:0", "default", "-disposition:a:1", "0",
+    )
+
+
 def generate(output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     run_ffmpeg(
@@ -88,6 +132,9 @@ def generate(output: Path) -> None:
     )
     generate_multi_timebase(output)
     generate_multi_audio_only(output)
+    generate_range_fixture(output, "mp4")
+    generate_range_fixture(output, "mkv")
+    generate_tail_audio(output)
     run_ffmpeg(
         output / "single.mp4",
         "-f", "lavfi", "-i", VIDEO_SOURCE,

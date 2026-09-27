@@ -1,6 +1,6 @@
 # 動画の複数音声トラック選択 設計 (backlog §1.251)
 
-- 状態: 第7版で独立レビュー ACCEPT (2026-09-27)。実装は §10 の段階順に進める
+- 状態: 第7版で独立レビュー ACCEPT (2026-09-27)。実装は §10 の段階順に進める。2026-09-27 の実機確認で判明した再生中の切り替えの不具合に合わせて §5.1・§7.3 を改訂 (第8版)
 - 出典: [next-release-backlog.md §1.251](next-release-backlog.md) (>>429)
 - 担当: 設計・検収 = ClaudeCode Opus / 実装 = Codex Sol / 独立レビュー = 別の Sol
 - 関連: [video-architecture.md](video-architecture.md) (decoder 3-thread 構成・seek 調停・audio.rs・Norm)、
@@ -110,6 +110,13 @@ pub struct AudioTrackInfo {
     pub sample_rate: Option<u32>,
     /// AV_DISPOSITION_DEFAULT が立っているか (表示用の事実。選択規則には使わない)。
     pub disposition_default: bool,
+    /// トラックの範囲 (秒)。stream の start_time / duration をその stream の time base で秒に変換する。duration が
+    /// 無い場合、その stream の metadata の "DURATION" タグ (MKV の `HH:MM:SS.nnnnnnnnn`、format 側は使わない) は
+    /// **start_time が 0 または無いときだけ** end として使う。タグの意味は書いたツールで「長さ」と「終了時刻」に分かれ
+    /// (FFmpeg の matroska muxer は終了時刻を書く。S2 修正の実装中に実測)、開始が 0 ならどちらでも同じ値になるため。
+    /// 開始が 0 でなければ end は None。取得できない・解釈できない・負や非有限の値は None。§7.3 の保留判定に使う。
+    pub start_secs: Option<f64>,
+    pub end_secs: Option<f64>,
 }
 
 // VideoInfo
@@ -158,9 +165,10 @@ struct AudioTrackSelectionState {
 | 導出状態 | 条件 |
 |---|---|
 | 確定 | `desired.gen == applied.gen` |
-| 保留 | `desired.gen > applied.gen` で、player が末尾の保留条件 (§7.3) にある |
+| 失敗 | (確定でなく) `last_failure.gen == desired.gen`。保留より優先 |
+| 保留 | (確定・失敗でなく) engine の `Eof`、または `deferred_gen == Some(desired.gen)` (§7.3 の保留の記録。初期値 None、UI と demux が可用性で保留にしたとき書き、demux が切り替えの試行を始めたとき None に戻す)。表示・通知へ渡す deferred もこの同じ判定で作る |
 | 切り替え中 | `desired.gen > applied.gen` かつ `last_failure.gen != desired.gen` かつ保留でない |
-| 失敗 | `last_failure.gen == desired.gen` (routing は `applied` のまま) |
+
 
 ## 5. 切り替えの手順
 
@@ -173,11 +181,25 @@ struct AudioTrackSelectionState {
 4. 末尾の保留条件 (§7.3) に当たるなら seek は発行しない。`Deferred` を返す。
 5. それ以外は、**3 の後で**、位置を保つ seek を 1 回発行する:
    - 基準位置 (再生中・一時停止中とも同じ規則): まだ表示されていない進行中の seek target (coalesce 中の pending
-     target、または発行済みで未表示の seek target) があればそれ。無ければ `last_displayed_pts_secs()` (いま画面に
-     出ているフレームの時刻。実在するフレームなので、seek 後に必ず最初のフレームが届き、末尾付近でも
-     「シーク中...」が固着しない)。frame-step pause は常に表示中の PTS。表示フレームが無い (音声のみ) ときは
-     `position()`。(2026-09-27 利用者の実機確認で、再生中の切り替えが末尾 drain の保留に入って効かない不具合が
-     判明し、§7.3 の保留条件と合わせて改めた。)
+     target、または発行済みで未表示の seek target) があればそれ。無ければ表示中のフレームの時刻
+     (`last_displayed_pts_secs()`)。実在するフレームなので、seek 後に最初のフレームが必ず届き、末尾付近でも
+     「シーク中...」が固着しない。音声は表示中のフレームの時刻まで戻る。通常の動画ではその差は 1 フレーム程度だが、
+     表示が更新されるのは実際にフレームが表示されたときだけなので、フレームの間隔が長い動画 (静止画に近い動画など)
+     や表示が遅れている場合は数秒戻り得る。これは許容する (いま画面に出ている場面から新しいトラックで聞き直す形に
+     なる)。
+     frame-step pause も表示中の PTS。表示フレームが無い (音声のみ) ときは `position()`。
+     - 初回のフレームが表示される前 (open 直後) に選ばれた場合は、進行中の seek target (open 時の resume seek 等)、
+       無ければ `position()`。
+     - 「未表示の進行中 seek target」から、**中断された** seek を除く。中断の経路 (固着解除の保険
+       `seek_eof_stuck_since`、seek 失敗、`seek_relative` の `AtStart` / `AtEnd` での override 解除など、target の
+       フレームが表示されないまま seek を終わらせる経路) で、その serial の target を退役させる。音声出力による
+       正常な override 解除 (映像の初表示より先に起こり得る) は中断ではなく、その世代の映像が表示されるまで target を
+       保持する (S2 修正の独立レビュー)。実装者は override を解除する経路をすべて列挙し、中断か正常かを分類する。
+     - 映像と音声の長さが大きく異なる素材で、片方の stream が既に終わった区間では、この基準位置での切り替えは
+       音声が巻き戻る (映像が先に終わった区間) か、準備完了待ちが長引く (音声が先に終わった区間) ことがある。
+       これは通常の seek でその区間へ移動した場合と同じ既存の制限で、本機能の範囲では直さない (§7.3、§11)。
+     (2026-09-27 利用者の実機確認で、再生中の切り替えが末尾 drain の保留に入って効かない不具合が判明し、
+     §7.3 の保留条件と合わせて改めた。)
    - 再生状態: `seek_with_play_state(base, self.intent_playing())`。一時停止中は一時停止のまま、再生中は再生のまま。
      `seek_with_play_state` は coalesce を挟まず即時に `request_seek` する。coalesce 待ちの pending target が
      あれば基準位置としてそれを使い、その pending は clear する (同じ位置への seek を 2 回出さない)。
@@ -190,7 +212,10 @@ struct AudioTrackSelectionState {
 `take_seek_request()` で要求を取り出した直後に selection を読み、次の順で処理する。**routing と `applied` の
 確定は、seek と `Flush` の受理が両方成立した後に限る。**
 
-切り替えを試みる条件は `desired.gen > applied.gen` **かつ `last_failure.gen != desired.gen`**。一度失敗した選択は、
+切り替えを試みる条件は `desired.gen > applied.gen` **かつ `last_failure.gen != desired.gen`** **かつ
+`audio_track_available_at(desired のトラック, その seek で音声を採用し始める位置)`** (§7.3。通常 seek は target、
+frame-step seek は `FrameStep.base_secs`、すなわち audio Flush の trim 下限。false なら切り替えを適用せず、その seek は
+旧トラックのまま通常の seek として処理し、選択は保留のまま残す。失敗としては記録しない)。一度失敗した選択は、
 次に利用者が選択し直す (generation が進む) まで、後続の通常 seek で自動再試行しない (失敗表示中のトラックへ
 別位置の seek で突然切り替わることを防ぐ)。
 
@@ -464,17 +489,48 @@ seek を取り出していなければ要求は上書きされ (latest-value)、
 
 ### 7.3 再生終了 (EOF) と重なった場合
 
-保留 (`Deferred`) にするのは **engine の published state が `Eof` (末尾で停止済み) のときだけ**。
+保留 (`Deferred`) にするのは次の 2 つだけ:
 
-- 旧版 (第7版) は「demux が末尾に達し (`clock.is_eof_reached()`)、再生 intent がある」も保留にしていた。
-  demux は再生より先に読むので、短い動画では再生開始の直後から、長い動画でも末尾の先読み分の間、再生中の
-  選択がすべて保留になり切り替わらなかった (2026-09-27 利用者の実機確認、6 秒の素材で再生中の切り替えが効かず、
-  一時停止中は効いた。ログでは再生中の選択の直後に `audio setup` が無く、先頭へ戻る seek でまとめて切り替わって
-  いた)。この条件は削除する。
-- demux が末尾に達していても、再生中・一時停止中とも §5.1 の基準位置 (表示中のフレームの時刻) へ seek して
-  即時に反映する。`request_seek` が `eof_reached` を戻し、demux は seek 先から読み直す。基準位置が実在する
-  フレームなので、seek 後の最初のフレームが届かずに「シーク中...」が固着することは無い。
-- 末尾で停止済み (engine の `Eof`) は保留する。末尾への seek は既存の固着経路を踏むため。
+- engine の published state が `Eof` (末尾で停止済み)。末尾への seek は既存の「シーク中...固着」経路を踏むため。
+- **切り替え先のトラックが基準位置で「利用できない」と事実から分かる**とき。切り替え先に基準位置以降の音声が準備量
+  に満たないと、音声の準備完了 (`BufferReady`) が素材全体の読み終わり待ちになり、映像の先読み制限で demux がそこまで
+  進めずに Buffering のまま止まり得る (元のトラックのままの seek では起きない、切り替え固有の経路。第 8 版の独立
+  レビュー P1)。
+  - トラックの範囲は列挙時の事実として `AudioTrackInfo.start_secs: Option<f64>` と `end_secs: Option<f64>` に持つ
+    (§4.1)。
+  - 判定は 1 つの関数 `audio_track_available_at(track, position) -> bool`:
+    `start_secs` が分かっていて `position < start_secs` なら false。`end_secs` が分かっていて
+    `position + AUDIO_TRACK_READY_MARGIN_SECS > end_secs` なら false (margin は音声の準備完了の閾値 (現行 0.1 秒) に
+    余裕を持たせた固定値、例 0.5 秒。閾値と同じ場所に定数として置き、閾値以上であることを test で固定する)。
+    それ以外は true (範囲が分からない場合も true)。
+  - この関数を使うのは 2 か所で、同じ関数を呼ぶ: (1) `select_audio_track` が seek を出すか (false なら `Deferred`)、
+    (2) demux が seek 要求の取り出し時に、その seek で音声を採用し始める位置で切り替えを適用するか (§5.2 の条件。
+    通常 seek は target、frame-step seek は `FrameStep.base_secs` で判定する。false なら適用せず保留のまま残し、範囲内への
+    seek で適用する)。表示は下の記録から導出する。
+  - この判定は「範囲の中では音声が続いている」ことを前提にした早期の保留であり、準備完了を保証するものではない。
+    範囲が分からないトラック、および範囲の中で音声の packet が長く途切れているトラックでは、その位置以降に準備量の
+    音声が無いと Buffering のまま止まり得る。利用者が**そのトラックに音声がある範囲へ** seek するか、元のトラックへ
+    戻せば回復する。既知の制限 (§11、§1.288)。根本の解決 (切り替え先の音声を準備できない世代の準備完了規則) は
+    §1.288 で seek 全般の終端の扱いと合わせて検討する。
+  - 保留の記録: `AudioTrackSelection` に `deferred_gen: Option<u64>` (初期値 None) を持つ。`select_audio_track` が
+    可用性で `Deferred` を返したとき、また demux が可用性で切り替えを適用しなかったとき、**判定した choice の
+    generation が現在の `desired.gen` と一致する場合だけ** `deferred_gen = Some(その generation)` を書く (同じ mutex で
+    比較と書き込みを行う。判定の後に新しい選択が入っていれば書かない)。書き手は UI と demux。
+  - 記録の解除: demux がその generation の切り替えを試行し始めた時点 (可用性が true になり §5.2 の手順 1 に入った
+    とき)、同じ mutex の中で **`deferred_gen == Some(試行する generation)` の場合に限り** `deferred_gen = None` にする
+    (旧 generation の試行が、その後に UI が書いた新しい generation の保留記録を消さない)。以後は「切り替え中」、結果に応じて「確定」または「失敗」。新しい選択
+    (generation が進む) では比較が一致しなくなるので、古い記録は自然に無効になる。
+  - 可用性の判定を行うのは UI (`select_audio_track`) と demux の 2 か所で、どちらも同じ関数を呼ぶ。表示は判定を
+    行わず、記録 (`deferred_gen`) と engine の状態から導出する (§4.2)。
+
+- それ以外は、demux が末尾に達していても (短い素材では再生開始の直後から達する)、再生中・一時停止中とも §5.1 の
+  基準位置 (表示中のフレームの時刻) へ seek して即時に反映する。`request_seek` が `eof_reached` を戻し、demux は
+  seek 先から読み直す。
+- seek 全般の準備完了の規則は変えない。第 8 版の検討で、(a) 映像が target 以降のフレームを出さずに終わる seek を
+  準備完了とみなす規則、(b) 「映像の表示が終わり音声だけが続いている」間を保留にする規則、を検討したが、どちらも
+  stream ごとの終端の届き方 (現行の映像 EOF は素材全体の読み終わりの後) や Buffering 中の先読み制限など、終端まわりの
+  既存の仕組みへの波及が大きい。映像と音声の長さが大きく異なる素材の、片方が終わった区間への seek の扱いは、通常の
+  seek と共通の既存の制限として backlog に別項目で起票し、本機能では扱わない (§11)。
 - 次に seek が発生したとき (利用者の seek、ループ再生の先頭 seek、再生ボタンによる先頭からの再開) に demux が
   反映する。
 - demux が EOF idle wait 中に `desired` だけ変わっても起床は不要 (seek 要求で起床する既存の設計どおり)。
@@ -855,7 +911,26 @@ Remote で続きを見るときも、同じトラックで始める。
   - 一時停止中の切り替えで一時停止が保たれ、位置が変わらない。frame-step pause 中も同じ。
   - seek 直後 (前の seek 未表示・coalesce 待ち) の切り替え、連続 3 回の切り替えで最後の選択だけが `applied` になる。
   - 切り替えの seek の後に通常 seek を重ねても切り替えが反映される。frame-step seek・ループの先頭 seek でも同じ。
-  - 末尾到達中 (demux EOF 済み・engine の `Eof` 確定前の drain 中を含む) の選択は seek を出さず、次の seek で反映される。
+  - demux EOF 済みでも (短い素材では再生開始の直後から) 選択は即時 seek して新トラックを反映し、表示中のフレームの
+    時刻から Playing に戻る。保留は engine の `Eof` と `audio_track_available_at` が false のときだけで、
+    保留は次の (そのトラックの範囲内への) seek で反映される。
+  - 長尺のトラック A で再生中に、`audio_track_available_at` が false になる位置 (短いトラック B の終わり以降、終わりの
+    直前の margin 内、開始の遅い B の開始前) で B を選ぶと保留になり、止まらない (長尺の映像で)。表示は「保留」になる。
+  - frame-step seek の demux 開始位置と音声の採用開始位置がトラックの終了・開始境界をまたぐ場合も、音声 Flush の
+    trim 下限で可用性を判定する。終了後は保留を維持して旧トラックの PCM を出し、開始後は保留を解除して新トラックの
+    PCM を出す (実 demux で検証)。
+  - B を選んだ直後の通常 seek が選択 seek を上書きし、demux がその target で B を保留した後、その seek が失敗・保険
+    解除されても、表示は「保留」のまま (切り替え中にならない)。B の範囲内への次の seek で B が適用される。
+  - demux が古い選択を「利用不可」と判定した後に新しい選択が入る割り込みで、新しい選択が誤って「保留」にならない。
+    逆順 (demux が旧 generation の試行を決めた直後に UI が新 generation を保留として記録する) でも、旧試行の解除が
+    新しい保留記録を消さない。
+  - 保留の後、範囲内への seek で切り替えの試行が始まると「切り替え中」になり、その試行が失敗すると「失敗」になる。
+    B の範囲内へ seek すると B に切り替わる。この素材 (A 長尺・B 短尺、MP4 と MKV の `DURATION` タグの両方) を追加する。
+  - ループ再生で音声出力が override を先に正常解除する順序でも、保留中の選択が次のループの seek で 1 回だけ反映される。
+  - 末尾付近 (最後のフレームの直前) で再生中に選んでも固着せず Playing に戻り、音声の drain 完了で Eof になる
+    (実 pump と表示側の通知を経由する)。音声のみの素材 (multi-audio.m4a) の末尾付近から Eof まで。
+  - 中断された seek (保険・失敗・`seek_relative` の境界) の target は次の選択の基準位置に使われず、音声による
+    正常な override 解除の後で映像が未表示の target は使われる。初回表示前の選択は進行中の seek target / position()。
   - `AudioSetup` 構築失敗・`av_seek_frame` 失敗・audio `Flush` 送信失敗 (それぞれテスト用の注入 seam) で routing と
     `applied` が変わらず、失敗が desired.gen と理由つきで記録され、後から来た古い失敗が新しい選択の表示を上書きしない。
   - 失敗した選択は、その後の通常 seek (別位置) で自動再試行されない。選択し直すと再試行される。
@@ -892,8 +967,8 @@ UI より先に入れる (UI から切り替えられるようになった時点
   読まない)・`clear_all`/`count`、scanner が指定 stream を測る (sine の振幅をトラックごとに変えて LUFS 差で判定)、
   Norm gain 表 (`Pending` のトラックの frame だけ止まり他のトラックは流れる、トラック境界で snap、同じトラックは
   ramp、lookup の測定済み / 未測定で scan 開始 / 未測定で scan 不可 / lookup 失敗の各分岐で `Pending` が残らない、
-  再選択・`Unchanged` で何も解除されない、Norm OFF で表が空になり遅れた lookup 結果を捨てる、末尾 drain 中の
-  選択で drain が止まらない、ブロッキング中の別トラック scan が選択で cancel される)、
+  再選択・`Unchanged` で何も解除されない、Norm OFF で表が空になり遅れた lookup 結果を捨てる、demux EOF 先読み中の
+  選択では新トラックの `Pending` が seek 公開前に効き旧世代の残音声が新世代へ漏れない、ブロッキング中の別トラック scan が選択で cancel される)、
   scan 中のトラック変更で旧 scan が cancel される、抑止が stream 単位、波形・音楽解析の key に stream index が
   入り別トラックの結果が再利用されない (永続キャッシュ・LRU とも)。
   - `Pending` が seek の公開より前に立つ (選択 → seek 公開 → pump 処理の順を seam で止め、新トラックの frame が
@@ -964,6 +1039,11 @@ UI より先に入れる (UI から切り替えられるようになった時点
 ## 11. 対象外とした事項の理由
 
 - 詳細表示 (一覧): ファイル単位の情報で、再生中の選択とは無関係。
+- 映像と音声の長さが大きく異なる素材の、片方の stream が終わった区間への seek (音声トラックの切り替えの seek を
+  含む) の扱い: 通常の seek と共通の既存の制限。backlog §1.288 に起票。
+- 範囲が分からない音声トラック、または範囲の中で音声が長く途切れているトラックへ、その位置以降に準備量の音声が
+  無い位置で切り替えた場合に Buffering のまま止まり得ること (そのトラックに音声がある範囲への seek か元のトラックへの
+  切り替えで回復する): §7.3、backlog §1.288。
 - 開いた時点で音声が無効な player での切り替え: §7.4。
 
 ## 12. 判断済みの事項
