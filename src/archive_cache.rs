@@ -640,6 +640,50 @@ mod tests {
     }
 
     #[test]
+    fn archive_capacity_total_excludes_epub_generations() {
+        struct Stable(crate::epub_cache::SourceState);
+        impl crate::epub_cache::SourceGuard for Stable {
+            fn state(&self) -> std::io::Result<crate::epub_cache::SourceState> {
+                Ok(self.0)
+            }
+        }
+        let _guard = crate::data_dir::TestDataDirGuard::new();
+        let root = crate::data_dir::get();
+        let archive = ArchiveCacheDb::open().unwrap();
+        let mut epub = crate::epub_cache::EpubCache::open_at(&root).unwrap();
+        let source = root.join("book.epub");
+        let output = epub.reserve_output(&source).unwrap();
+        std::fs::create_dir_all(output.final_path().parent().unwrap()).unwrap();
+        std::fs::write(output.final_path(), b"%PDF-1.4\n").unwrap();
+        let source_state = crate::epub_cache::SourceState {
+            size: 3,
+            mtime_ticks: 100,
+        };
+        let row = crate::epub_cache::GenerationRow {
+            generation_id: output.generation_id(),
+            src_path_key: crate::epub_cache::src_key(&source),
+            src_path: source,
+            src_state: source_state,
+            src_sha256: "full".into(),
+            src_head_hash: "head".into(),
+            pdf_file: output.final_path().to_path_buf(),
+            pdf_size: 9,
+            page_count: 2,
+            direction: "ltr".into(),
+            profile: "test".into(),
+            created_at: 1,
+            output_version: crate::epub_cache::CONVERTER_OUTPUT_VERSION,
+        };
+        assert_eq!(
+            epub.publish(&row, &Stable(source_state)).unwrap(),
+            crate::epub_cache::PublishOutcome::Published
+        );
+        assert_eq!(archive.total_size().unwrap(), 0);
+        epub.retire_all_current().unwrap();
+        assert_eq!(archive.total_size().unwrap(), 0);
+    }
+
+    #[test]
     fn path_hash_stable() {
         let a = path_hash(Path::new(r"C:\foo\bar.7z"));
         let b = path_hash(Path::new(r"C:\foo\bar.7z"));

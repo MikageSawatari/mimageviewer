@@ -1327,6 +1327,15 @@ pub(crate) fn decode_composite_source_for_materialization(
     pdf_long_edge: u32,
     cancel: Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, String> {
+    decode_composite_source_for_materialization_with_target(source, pdf_long_edge, cancel, None)
+}
+
+pub(crate) fn decode_composite_source_for_materialization_with_target(
+    source: &CompositeSource,
+    pdf_long_edge: u32,
+    cancel: Arc<AtomicBool>,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
+) -> Result<egui::ColorImage, String> {
     ensure_materialization_not_cancelled(cancel.as_ref())?;
     match source {
         CompositeSource::File { path } => {
@@ -1350,16 +1359,30 @@ pub(crate) fn decode_composite_source_for_materialization(
             page_num,
             password,
         } => {
-            let result = crate::pdf_loader::render_page(
-                pdf_path,
-                *page_num,
-                pdf_long_edge,
-                password.as_deref(),
-                Some(Arc::clone(&cancel)),
-                crate::pdf_loader::JobPriority::Critical,
-                0,
-                crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-            )
+            let result = if let Some(read) = epub_read {
+                crate::pdf_loader::render_page_with_read_target(
+                    pdf_path,
+                    read,
+                    *page_num,
+                    pdf_long_edge,
+                    password.as_deref(),
+                    Some(Arc::clone(&cancel)),
+                    crate::pdf_loader::JobPriority::Critical,
+                    0,
+                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                )
+            } else {
+                crate::pdf_loader::render_page(
+                    pdf_path,
+                    *page_num,
+                    pdf_long_edge,
+                    password.as_deref(),
+                    Some(Arc::clone(&cancel)),
+                    crate::pdf_loader::JobPriority::Critical,
+                    0,
+                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                )
+            }
             .map_err(|e| format!("PDF ページを描画できません: {}: {e}", pdf_path.display()))?;
             ensure_materialization_not_cancelled(cancel.as_ref())?;
             Ok(dynamic_image_to_color_image(&result.image))

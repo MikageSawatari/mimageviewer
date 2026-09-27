@@ -4558,6 +4558,8 @@ pub struct Settings {
     /// 同名の ZIP/CBZ がある場合、RAR/7z/LZH 側をスキップする
     #[serde(default = "default_true")]
     pub skip_archive_if_zip_exists: bool,
+    #[serde(default = "default_true")]
+    pub skip_epub_if_pdf_exists: bool,
     /// 同名の動画と画像がある場合、画像をスキップする（動画サムネイルで代替）
     #[serde(default = "default_true")]
     pub skip_image_if_video_exists: bool,
@@ -4719,6 +4721,9 @@ pub struct Settings {
     /// デフォルトのページ構成
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
+    /// 本に保存した見開きモードがない場合、PDF / EPUB の右開き指定に従う。
+    #[serde(default)]
+    pub follow_document_reading_direction: bool,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -7132,6 +7137,7 @@ impl Default for Settings {
             exif_hidden_tags: default_exif_hidden_tags(),
             skip_zip_if_folder_exists: true,
             skip_archive_if_zip_exists: true,
+            skip_epub_if_pdf_exists: true,
             skip_image_if_video_exists: true,
             skip_duplicate_images: true,
             image_ext_priority: default_image_ext_priority(),
@@ -7150,6 +7156,7 @@ impl Default for Settings {
             active_book_name: default_active_book_name(),
             pinned_books: Vec::new(),
             default_spread_mode: SpreadMode::default(),
+            follow_document_reading_direction: false,
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,

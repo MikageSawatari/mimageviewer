@@ -5702,6 +5702,9 @@ impl ScanContext<'_> {
             let recognized_image = crate::folder_tree::is_recognized_image_ext(&extension);
             let is_zip = crate::folder_tree::is_zip_extension(&extension);
             let is_pdf = crate::folder_tree::is_pdf_extension(&extension);
+            // EPUB is deliberately excluded until the similar index can carry the
+            // immutable conversion-generation stamp for every page. Its source
+            // mtime/size must never validate a converted page.
             let is_convertible = crate::folder_tree::is_convertible_archive_path(&path);
             let media_kind = if recognized_image {
                 Some(crate::app::folder_scan::ScanMediaKind::Image)

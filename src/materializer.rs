@@ -271,6 +271,17 @@ struct FileStamp {
     size: u64,
 }
 
+fn generation_file_stamp(read: &crate::pdf_loader::ReadTarget) -> Result<FileStamp, String> {
+    let (id, size) = read
+        .stamp
+        .generation_catalog_pair()
+        .ok_or_else(|| "EPUB の世代を確認できません".to_string())?;
+    Ok(FileStamp {
+        modified_ns: Some(u128::try_from(id).map_err(|_| "EPUB の世代 ID が不正です")?),
+        size: size as u64,
+    })
+}
+
 fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| format!("対象を確認できません: {}: {error}", path.display()))?;
@@ -551,9 +562,29 @@ impl MaterializeSession {
         // 常に miss させる** (`lookup_reusable` が `modified_ns.is_some()` を要求する)。
         // 左右 2 source の stamp を単一 source 用 cache key へ不完全に畳まず、見開きは
         // 当面つねに worker で decode・合成し直す。
-        let source_stamp = match request.source.source_path() {
-            Some(path) => file_stamp(path)?,
-            None => FileStamp::default(),
+        let epub_read = if let MaterializeSource::PdfPage { pdf_path, .. } = &request.source {
+            if pdf_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                Some(
+                    crate::pdf_loader::resolve_read_target(pdf_path)
+                        .map_err(|error| format!("EPUB を読み取れません: {error:?}"))?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let source_stamp = if let Some(read) = epub_read.as_ref() {
+            generation_file_stamp(read)?
+        } else {
+            match request.source.source_path() {
+                Some(path) => file_stamp(path)?,
+                None => FileStamp::default(),
+            }
         };
 
         let edit_fingerprint = loaded_edits
@@ -610,6 +641,7 @@ impl MaterializeSession {
                             loaded_edits.as_ref(),
                             pdf_render_long_edge,
                             cancel,
+                            epub_read.as_ref(),
                         )?
                     };
                     check_current(&self.inner, cancel, generation)?;
@@ -899,6 +931,7 @@ fn render_materialize_source(
     edits: Option<&LoadedMaterializePageEdits>,
     pdf_render_long_edge: u32,
     cancel: &Arc<AtomicBool>,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
 ) -> Result<egui::ColorImage, String> {
     match source {
         MaterializeSource::MergedSpread { left, right, .. } => {
@@ -911,8 +944,10 @@ fn render_materialize_source(
                 }
                 None => (None, None),
             };
-            let left = render_materialize_page(left, left_edits, pdf_render_long_edge, cancel)?;
-            let right = render_materialize_page(right, right_edits, pdf_render_long_edge, cancel)?;
+            let left =
+                render_materialize_page(left, left_edits, pdf_render_long_edge, cancel, None)?;
+            let right =
+                render_materialize_page(right, right_edits, pdf_render_long_edge, cancel, None)?;
             crate::capture::combine_spread_color_images(&left, &right)
         }
         _ => {
@@ -923,7 +958,7 @@ fn render_materialize_source(
                 }
                 None => None,
             };
-            render_materialize_page(source, edits, pdf_render_long_edge, cancel)
+            render_materialize_page(source, edits, pdf_render_long_edge, cancel, epub_read)
         }
     }
 }
@@ -933,12 +968,14 @@ fn render_materialize_page(
     edits: Option<&LoadedPageEdits>,
     pdf_render_long_edge: u32,
     cancel: &Arc<AtomicBool>,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
 ) -> Result<egui::ColorImage, String> {
     let source = composite_source(source)?;
-    let image = crate::books::decode_composite_source_for_materialization(
+    let image = crate::books::decode_composite_source_for_materialization_with_target(
         &source,
         pdf_render_long_edge,
         Arc::clone(cancel),
+        epub_read,
     )?;
     match edits {
         Some(edits) if edits.requires_composite => {
@@ -1493,8 +1530,35 @@ fn cleanup_own_process_directory(inner: &MaterializerInner) {
     let _ = std::fs::remove_dir(&inner.process_dir);
 }
 
-fn orphan_pid(name: &str) -> Option<u32> {
-    name.strip_prefix("ext-")?.parse().ok()
+fn orphan_pid(name: &str) -> Option<(u32, bool)> {
+    if let Some(id) = name.strip_prefix("ext-") {
+        return id.parse().ok().map(|pid| (pid, false));
+    }
+    let (pid, nonce) = name.strip_prefix("epub-")?.split_once('-')?;
+    if nonce.is_empty() {
+        return None;
+    }
+    pid.parse().ok().map(|pid| (pid, true))
+}
+
+/// Shared root for disposable EPUB conversions. Each conversion owns a distinct
+/// `epub-<pid>-<nonce>` child; startup cleanup recognizes dead owners.
+pub(crate) fn epub_temp_root() -> PathBuf {
+    if cfg!(feature = "portable") {
+        crate::data_dir::get().join("temp")
+    } else {
+        std::env::temp_dir().join("mimageviewer")
+    }
+}
+
+/// Remove work directories left by a crashed sibling-PDF save. The worker output
+/// lives in the data directory; only dead PID owners are eligible for cleanup.
+pub(crate) fn cleanup_epub_sibling_work_startup(data_dir: &Path) {
+    cleanup_startup_directories(
+        &data_dir.join("epub_sibling_work"),
+        std::process::id(),
+        pid_is_alive,
+    );
 }
 
 fn startup_cleanup_candidates<I, F>(entries: I, current_pid: u32, mut alive: F) -> Vec<PathBuf>
@@ -1508,7 +1572,13 @@ where
             path.file_name()
                 .and_then(|name| name.to_str())
                 .and_then(orphan_pid)
-                .is_some_and(|pid| pid == current_pid || !alive(pid))
+                .is_some_and(|(pid, epub)| {
+                    if epub {
+                        pid != current_pid && !alive(pid)
+                    } else {
+                        pid == current_pid || !alive(pid)
+                    }
+                })
         })
         .collect()
 }
@@ -1540,7 +1610,7 @@ fn cleanup_startup_directories(root: &Path, current_pid: u32, alive: impl FnMut(
     }
 }
 
-fn remove_tree_without_following_links(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_tree_without_following_links(path: &Path) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata_is_link_or_reparse(&metadata) {
         return std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path));
@@ -1567,7 +1637,7 @@ fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-fn validate_real_directory(path: &Path, label: &str) -> Result<(), String> {
+pub(crate) fn validate_real_directory(path: &Path, label: &str) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("{label}を確認できません: {}: {error}", path.display()))?;
     if metadata_is_link_or_reparse(&metadata) {
@@ -2013,12 +2083,13 @@ mod tests {
             left: loaded_stage(crate::bake_stage::BakeStage::Edits),
             right: loaded_stage(crate::bake_stage::BakeStage::Edits),
         };
-        let plain = render_materialize_source(&source, Some(&edits), 4096, &cancel).unwrap();
+        let plain = render_materialize_source(&source, Some(&edits), 4096, &cancel, None).unwrap();
         let display = LoadedMaterializePageEdits::Spread {
             left: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
             right: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
         };
-        let adjusted = render_materialize_source(&source, Some(&display), 4096, &cancel).unwrap();
+        let adjusted =
+            render_materialize_source(&source, Some(&display), 4096, &cancel, None).unwrap();
 
         assert_eq!(plain.size, adjusted.size);
         assert_ne!(plain.pixels, adjusted.pixels);
@@ -2079,6 +2150,20 @@ mod tests {
             vec![PathBuf::from("ext-99")],
             "the current PID directory predates this process and must be reclaimed before use"
         );
+        assert_eq!(
+            startup_cleanup_candidates(
+                vec![
+                    PathBuf::from("epub-10-1"),
+                    PathBuf::from("epub-20-2"),
+                    PathBuf::from("epub-99-3"),
+                    PathBuf::from("epub-invalid-4")
+                ],
+                99,
+                |pid| pid == 10,
+            ),
+            vec![PathBuf::from("epub-20-2")],
+            "a live conversion owned by this PID must survive asynchronous startup cleanup"
+        );
     }
 
     #[test]
@@ -2118,6 +2203,67 @@ mod tests {
                 .ensure_current(&AtomicBool::new(false), current)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn epub_materializer_stamp_changes_with_generation_not_source_attributes() {
+        let path = Path::new("book.epub");
+        let first = crate::pdf_loader::generation_target_for_test(path, 17, 4096);
+        let second = crate::pdf_loader::generation_target_for_test(path, 18, 4096);
+        assert_eq!(
+            generation_file_stamp(&first).unwrap(),
+            FileStamp {
+                modified_ns: Some(17),
+                size: 4096,
+            }
+        );
+        assert_ne!(
+            generation_file_stamp(&first).unwrap(),
+            generation_file_stamp(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn reconverted_epub_materializer_reuses_only_current_generation_output() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 93, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = MaterializeRequest {
+            source: MaterializeSource::PdfPage {
+                pdf_path: fixture.source.clone(),
+                page_num: 0,
+                password: None,
+            },
+            policy: MaterializePolicy::TempOriginal,
+            page_edits: None,
+            pdf_render_long_edge: 4096,
+        };
+        ensure_process_directory(&manager.inner).unwrap();
+        let output = manager.inner.process_dir.join("current.png");
+        std::fs::write(&output, b"already rendered in this run").unwrap();
+        let key = CacheKey {
+            source: request.source.clone(),
+            policy: request.policy,
+            pdf_render_long_edge: 4096,
+            edit_fingerprint: [0; 32],
+        };
+        let read = crate::pdf_loader::pinned_epub_target(&fixture.source).unwrap();
+        manager.inner.state.lock().unwrap().cache.insert(
+            key,
+            CacheRecord {
+                path: output.clone(),
+                source_stamp: generation_file_stamp(&read).unwrap(),
+                output_stamp: file_stamp(&output).unwrap(),
+            },
+        );
+        let prepared = manager
+            .session()
+            .materialize(&request, &cancel, generation)
+            .unwrap();
+        assert_eq!(prepared.path(), output);
+        assert_ne!(fixture.old.page_count, fixture.current.page_count);
     }
 
     #[test]

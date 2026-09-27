@@ -997,11 +997,8 @@ pub(in crate::app) struct ViewerContextBundle {
     pdf_password_request: Option<PdfPasswordRequest>,
     pdf_current_password: Option<String>,
     pdf_password_pending_save: Option<(PathBuf, String)>,
-    pdf_enumerate_pending: Option<(
-        PathBuf,
-        Option<String>,
-        crate::pdf_loader::PdfEnumerateHandle,
-    )>,
+    pdf_enumerate_pending: Option<super::PdfEnumeratePending>,
+    epub_convert: Option<crate::ui_dialogs::epub_convert::EpubConvertState>,
     zip_enumerate_pending: Option<ZipEnumeratePending>,
     fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
     pending_auto_fs_open: bool,
@@ -1587,6 +1584,7 @@ impl ViewerContextBundle {
             pdf_current_password: None,
             pdf_password_pending_save: None,
             pdf_enumerate_pending: None,
+            epub_convert: None,
             zip_enumerate_pending: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
@@ -1650,6 +1648,7 @@ impl ViewerContextBundle {
 impl App {
     #[cfg(windows)]
     pub(in crate::app) fn pause_mounted_background_work_keep_current_frame(&mut self) {
+        self.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
         self.slideshow_playing = false;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
@@ -1673,7 +1672,9 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         if let Some(mut pending) = self.folder_pane_open_pending.take() {
+            let restore = pending.epub_restore.take();
             pending.cancel_with_diagnostic("context_parked");
+            self.finish_pane_open_restore(restore, super::PaneOpenRestoreExit::Abandoned);
         }
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = FolderNavMode::Grid;
@@ -1952,6 +1953,7 @@ impl App {
             pdf_current_password,
             pdf_password_pending_save,
             pdf_enumerate_pending,
+            epub_convert,
             zip_enumerate_pending,
             fs_nav_after_pdf_enumerate,
             pending_auto_fs_open,
@@ -2228,6 +2230,7 @@ impl App {
         swap_field!(pdf_current_password);
         swap_field!(pdf_password_pending_save);
         swap_field!(pdf_enumerate_pending);
+        swap_field!(epub_convert);
         swap_field!(zip_enumerate_pending);
         swap_field!(fs_nav_after_pdf_enumerate);
         swap_field!(pending_auto_fs_open);
@@ -2538,6 +2541,7 @@ impl App {
             continuous_reading_scroll_transition,
             slideshow_scroll_range_cache,
             pdf_enumerate_pending,
+            epub_convert,
             zip_enumerate_pending,
             fs_nav_after_pdf_enumerate,
             pdf_password_request,
@@ -2848,6 +2852,7 @@ impl App {
             reading_flow,
             reading_direction,
             pdf_enumerate_pending,
+            epub_convert,
             zip_enumerate_pending,
             fs_nav_after_pdf_enumerate,
             pending_auto_fs_open,
@@ -3832,6 +3837,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         (
             FolderPaneOpenPending {
+                epub_restore: None,
                 path: PathBuf::from("c:/trace/pending"),
                 cancel,
                 rx,
@@ -3889,6 +3895,38 @@ mod tests {
             SimilarMoveTrace::terminal_reasons_for_test(navigation_id),
             vec!["context_parked"]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epub_conversion_state_follows_pdf_pending_through_context_stash() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let path = PathBuf::from("C:/books/context.epub");
+        assert_eq!(
+            app.route_pdf_open_failure(
+                super::super::OpenRequestOwner::Navigation,
+                &path,
+                super::super::PdfOpenFailure::NotConverted,
+            ),
+            super::super::PdfOpenFailureRoute::ConversionDialogOpened,
+        );
+        let stashed = app.stash_mounted_and_start_fresh("epub_test_stash");
+        assert!(app.epub_convert.is_none());
+        // A Smart request in the fresh main context cannot supersede the stashed viewer's
+        // conversion. Exercise the actual dialog poll after mounting that viewer again.
+        app.smart_folder_transition_sequence += 1;
+        let retained = app
+            .with_viewer_context(stashed, |app| {
+                let ctx = egui::Context::default();
+                let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+                app.epub_convert
+                    .as_ref()
+                    .is_some_and(|state| state.src_path == path)
+            })
+            .unwrap();
+        assert!(retained);
     }
 
     #[cfg(windows)]

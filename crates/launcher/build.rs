@@ -1,8 +1,8 @@
 //! ランチャークレートのビルドスクリプト。
 //!
-//! - 内包する `mimageviewer-core.exe`、`mimageviewer-remote.exe` と FFmpeg DLL のパスを `MIMV_*` 環境変数
+//! - 内包する `mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` と FFmpeg DLL のパスを `MIMV_*` 環境変数
 //!   経由でソースに渡す (`include_bytes!(env!("..."))` で参照)。
-//! - core と remote が先にビルドされていることを確認し、未ビルドなら明確なエラーで止める。
+//! - core、remote、EPUB worker が先にビルドされていることを確認し、未ビルドなら明確なエラーで止める。
 //! - exe アイコンを埋め込む (本体と同じアイコン)。
 
 use std::path::PathBuf;
@@ -30,6 +30,7 @@ fn main() {
 
     let core_exe = target_dir.join("release").join("mimageviewer-core.exe");
     let remote_exe = target_dir.join("release").join("mimageviewer-remote.exe");
+    let epub_worker_exe = target_dir.join("release").join("mimageviewer-epub-pdf.exe");
 
     let missing = [
         (
@@ -41,6 +42,11 @@ fn main() {
             &remote_exe,
             "mimageviewer-remote.exe",
             "cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets",
+        ),
+        (
+            &epub_worker_exe,
+            "mimageviewer-epub-pdf.exe",
+            "cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf",
         ),
     ]
     .into_iter()
@@ -55,7 +61,7 @@ fn main() {
             eprintln!("     build with: {command}");
         }
         eprintln!();
-        eprintln!(" Build core and remote before the launcher, or use the wrapper:");
+        eprintln!(" Build core, remote, and EPUB worker before the launcher, or use the wrapper:");
         eprintln!("   bash scripts/build-release.sh        (Git Bash)");
         eprintln!("   .\\scripts\\build-release.ps1         (PowerShell)");
         eprintln!("================================================================");
@@ -115,6 +121,15 @@ fn main() {
         sha256_file_hex(&remote_exe)
     );
     println!("cargo:rerun-if-changed={}", remote_exe.display());
+    println!(
+        "cargo:rustc-env=MIMV_EPUB_PDF_EXE={}",
+        epub_worker_exe.display()
+    );
+    println!(
+        "cargo:rustc-env=MIMV_EPUB_PDF_EXE_SHA256={}",
+        sha256_file_hex(&epub_worker_exe)
+    );
+    println!("cargo:rerun-if-changed={}", epub_worker_exe.display());
 
     // Single-instance 用の Mutex / Event 名を core 側のソースから取り出して
     // 環境変数経由で渡す。core 側を変えると次のビルドで自動反映される。

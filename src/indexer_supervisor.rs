@@ -925,7 +925,7 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
     if ext == "zip" {
         return None;
     }
-    let kind = if ext == "pdf" {
+    let kind = if crate::folder_tree::is_paged_document_path(abs_path) {
         search_walker::CandidateKind::Pdf
     } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
         search_walker::CandidateKind::Video
@@ -1076,6 +1076,11 @@ mod tests {
         let audio_key = crate::search_index_db::normalize_path(&audio);
         let candidate = build_candidate_from_path(&audio, audio_key).expect("音声は候補になる");
         assert_eq!(candidate.kind, search_walker::CandidateKind::Audio);
+        let epub = tmp.path().join("book.EPUB");
+        fs::write(&epub, b"epub").unwrap();
+        let epub_key = crate::search_index_db::normalize_path(&epub);
+        let candidate = build_candidate_from_path(&epub, epub_key).expect("EPUB は本の候補になる");
+        assert_eq!(candidate.kind, search_walker::CandidateKind::Pdf);
     }
 
     /// supervisor の初期スキャンが走り、stats に結果が反映されることを確認する。

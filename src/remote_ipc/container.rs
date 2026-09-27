@@ -34,6 +34,16 @@ const REMOTE_COMPOSITE_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const REMOTE_AUTO_TRIM_CACHE_ENTRIES: usize = 64;
 const REMOTE_LUT_CACHE_ENTRIES: usize = 16;
 const MAX_PAGE_RENDER_PX: u32 = crate::pdf_loader::PDF_RENDER_MAX_LONG_PX;
+const EPUB_NOT_CONVERTED_MESSAGE: &str =
+    "この EPUB はまだ変換されていません。PC の mImageViewer で一度開いて変換してください";
+#[cfg(test)]
+type RemoteDimRaceHooks = Mutex<HashMap<PathBuf, Box<dyn FnOnce() + Send>>>;
+
+#[cfg(test)]
+fn remote_dim_race_hooks() -> &'static RemoteDimRaceHooks {
+    static HOOKS: std::sync::OnceLock<RemoteDimRaceHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
 const PAGE_JPEG_QUALITY: i32 = 85;
 /// Bump only when the native remote AI pipeline changes pixel semantics.
 const REMOTE_AI_PIPELINE_SCHEMA: u32 = 1;
@@ -2045,10 +2055,15 @@ fn folder_thumb_aspect_height_ratio(settings: &crate::settings::Settings, folder
 fn pdf_page_sizes_needed(
     items: &[crate::grid_item::GridItem],
     cached: &std::collections::HashMap<String, Option<(u32, u32)>>,
+    recover_empty_dims: bool,
 ) -> bool {
     items.iter().any(|item| match item {
         crate::grid_item::GridItem::PdfPage { page_num, .. } => {
-            !cached.contains_key(&crate::grid_item::pdf_page_cache_key(*page_num))
+            match cached.get(&crate::grid_item::pdf_page_cache_key(*page_num)) {
+                None => true,
+                Some(None) => recover_empty_dims,
+                Some(Some(_)) => false,
+            }
         }
         _ => false,
     })
@@ -2821,7 +2836,9 @@ impl ContainerEngine {
                         is_directory
                             || is_file
                                 && (is_archive_container(&resolved)
-                                    || is_pdf_path(&resolved.logical))
+                                    || crate::folder_tree::is_paged_document_path(
+                                        &resolved.logical,
+                                    ))
                     }
                     RemoteSubresource::ZipDirectory { .. } => {
                         is_file && is_archive_container(&resolved)
@@ -3156,7 +3173,7 @@ impl ContainerEngine {
                     remote_bookmark_row(bookmark, target)
                 })
                 .collect()
-        } else if is_pdf_path(&resolved.logical) {
+        } else if crate::folder_tree::is_paged_document_path(&resolved.logical) {
             let metadata = match std::fs::metadata(&resolved.canonical) {
                 Ok(metadata) => metadata,
                 Err(_) => {
@@ -3317,9 +3334,12 @@ impl ContainerEngine {
                         )
                     })
             }
-            RemoteSubresource::PdfPage { page_number } if is_pdf_path(&resolved.logical) => self
-                .ensure_pdf_page_in_range(&resolved, &metadata, *page_number)
-                .map_err(remote_write_error_from_media),
+            RemoteSubresource::PdfPage { page_number }
+                if crate::folder_tree::is_paged_document_path(&resolved.logical) =>
+            {
+                self.ensure_pdf_page_in_range(&resolved, &metadata, *page_number)
+                    .map_err(remote_write_error_from_media)
+            }
             _ => Err(RemoteWriteError::new(
                 RemoteWriteErrorCode::Unsupported,
                 "このページにはレーティングを付けられません",
@@ -3719,6 +3739,12 @@ impl ContainerEngine {
         };
         let (outcome, output_bytes) = match &response {
             ThumbnailResponse::Success { webp_bytes } => ("ok", webp_bytes.len()),
+            ThumbnailResponse::Error(error)
+                if is_epub_path(&resolved.logical)
+                    && error.message == EPUB_NOT_CONVERTED_MESSAGE =>
+            {
+                ("placeholder", 0)
+            }
             ThumbnailResponse::Error(_) => ("error", 0),
         };
         crate::logger::log(format!(
@@ -4428,12 +4454,14 @@ impl ContainerEngine {
                     cancel,
                 )
             }
-            RemoteSubresource::PdfPage { page_number } if is_pdf_path(&resolved.logical) => {
+            RemoteSubresource::PdfPage { page_number }
+                if crate::folder_tree::is_paged_document_path(&resolved.logical) =>
+            {
                 self.ensure_pdf_page_in_range(resolved, metadata, *page_number)
                     .map_err(remote_ai_media_error)?;
-                let password = self.pdf_passwords.get(&resolved.logical);
+                let password = self.real_pdf_password(&resolved.logical);
                 let analysis = crate::pdf_loader::analyze_page_content_type(
-                    &resolved.canonical,
+                    pdf_loader_path(resolved),
                     *page_number,
                     password.as_deref(),
                     Some(Arc::clone(cancel)),
@@ -4450,7 +4478,7 @@ impl ContainerEngine {
                     });
                 }
                 match crate::pdf_loader::render_page_canonical_raster(
-                    &resolved.canonical,
+                    pdf_loader_path(resolved),
                     *page_number,
                     analysis.content_type,
                     password.as_deref(),
@@ -4499,12 +4527,12 @@ impl ContainerEngine {
         if !metadata.is_file() {
             return Err(media_error(
                 MediaErrorCode::Unsupported,
-                "対象はフォルダまたは ZIP/PDF ファイルではありません",
+                "対象はフォルダまたは ZIP/PDF/EPUB ファイルではありません",
             ));
         }
         if is_archive_container(resolved) {
             self.enumerate_zip(request, resolved)
-        } else if is_pdf_path(&resolved.logical) {
+        } else if crate::folder_tree::is_paged_document_path(&resolved.logical) {
             self.enumerate_pdf(request, resolved, &metadata)
         } else {
             Err(media_error(
@@ -4839,7 +4867,9 @@ impl ContainerEngine {
                 "PDF の一覧アドレスが不正です",
             ));
         }
-        let page_count = self.pdf_page_count(resolved, metadata)?;
+        let read =
+            crate::pdf_loader::resolve_read_target(&resolved.logical).map_err(pdf_read_error)?;
+        let page_count = self.pdf_page_count_with_read(resolved, metadata, &read, None, None)?;
         let mut budget = ContainerEntryBudget::new(super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
         let mut items = Vec::new();
         let mut entries = Vec::new();
@@ -4868,7 +4898,7 @@ impl ContainerEngine {
         }
         let resume_page = self.resume_page_for_items(&address, &resolved.logical, &items, true);
         let complete_book_eligible = entries.len() == page_count as usize && !byte_truncated;
-        let spread = self.spread_payload(
+        let spread = self.spread_payload_with_read(
             request,
             resolved,
             &items,
@@ -4876,6 +4906,7 @@ impl ContainerEngine {
             None,
             true,
             complete_book_eligible,
+            Some(&read),
         )?;
         let (entry_limit, truncated) =
             container_limit_metadata(page_count as usize, entries.len(), byte_truncated);
@@ -4929,6 +4960,30 @@ impl ContainerEngine {
         use_book_defaults: bool,
         complete_book_eligible: bool,
     ) -> Result<SpreadPayload, MediaError> {
+        self.spread_payload_with_read(
+            request,
+            resolved,
+            items,
+            source_items,
+            zip_context,
+            use_book_defaults,
+            complete_book_eligible,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spread_payload_with_read(
+        &self,
+        request: &ContainerRequest,
+        resolved: &ResolvedPath,
+        items: &[crate::grid_item::GridItem],
+        source_items: Option<&[crate::grid_item::GridItem]>,
+        zip_context: Option<(&[String], &Path)>,
+        use_book_defaults: bool,
+        complete_book_eligible: bool,
+        read: Option<&crate::pdf_loader::ReadTarget>,
+    ) -> Result<SpreadPayload, MediaError> {
         let reading_settings = self
             .reading_settings
             .load(&self.settings)
@@ -4946,7 +5001,7 @@ impl ContainerEngine {
             page_alone_preference,
         ) = self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
         let source_items = source_items.unwrap_or(items);
-        let (default_mode, default_direction) = if use_book_defaults {
+        let (mut default_mode, mut default_direction) = if use_book_defaults {
             (
                 reading_settings.default_spread_mode,
                 reading_settings.default_reading_direction,
@@ -4957,6 +5012,49 @@ impl ContainerEngine {
                 crate::settings::ReadingDirection::Ltr,
             )
         };
+        // A saved direction without a saved mode rotates the default mode, as on PC.
+        if let (None, Some(direction)) = (stored_mode, stored_direction) {
+            default_mode = default_mode.with_reading_direction(direction);
+        }
+        // The open operation owns the target used for count, direction and dimensions.
+        // Only an enabled D10 without a saved book value reads a plain PDF's direction.
+        if reading_settings.follow_document_reading_direction
+            && stored_mode.is_none()
+            && stored_direction.is_none()
+        {
+            let document_direction = if is_epub_path(&resolved.logical) {
+                read.and_then(|target| target.epub_direction)
+            } else if is_pdf_path(&resolved.logical) {
+                read.map(|target| {
+                    crate::pdf_loader::enumerate_pages_with_read_target(
+                        &resolved.logical,
+                        target,
+                        self.real_pdf_password(&resolved.logical).as_deref(),
+                        None,
+                        crate::pdf_loader::EnumerateOptions {
+                            want_direction: true,
+                        },
+                    )
+                    .map(|pages| pages.direction)
+                    .map_err(pdf_error)
+                })
+                .transpose()?
+                .flatten()
+            } else {
+                None
+            };
+            if let Some(direction) = document_direction {
+                default_direction = match direction {
+                    crate::pdf_loader::PdfReadingDirection::L2R => {
+                        crate::settings::ReadingDirection::Ltr
+                    }
+                    crate::pdf_loader::PdfReadingDirection::R2L => {
+                        crate::settings::ReadingDirection::Rtl
+                    }
+                };
+                default_mode = default_mode.with_reading_direction(default_direction);
+            }
+        }
         let (configured, effective, reading_direction) = resolve_spread_state(
             request.spread_mode,
             request.reading_direction,
@@ -4973,7 +5071,7 @@ impl ContainerEngine {
         let landscape = if effective == RemoteSpreadMode::Single {
             vec![false; items.len()]
         } else {
-            self.cached_landscape_flags(&resolved.logical, items)
+            self.cached_landscape_flags_with_read(&resolved.logical, items, read)
         };
         let final_cover_enabled =
             final_cover_preference.effective(reading_settings.final_cover_spread_enabled);
@@ -5475,11 +5573,25 @@ impl ContainerEngine {
         container_path: &Path,
         items: &[crate::grid_item::GridItem],
         cached: &std::collections::HashMap<String, Option<(u32, u32)>>,
+        read: Option<&crate::pdf_loader::ReadTarget>,
     ) -> std::collections::HashMap<String, (u32, u32)> {
         let mut dims = std::collections::HashMap::new();
-        if pdf_page_sizes_needed(items, cached) {
-            let password = self.pdf_passwords.get(container_path);
-            match crate::pdf_loader::get_page_sizes(container_path, password.as_deref()) {
+        // EPUB の古い空寸法行は、別世代のサムネイルに頼らず固定済み世代から補う。
+        // 通常の PDF は従来どおり空寸法行だけでは追加の PDF 読みをしない。
+        let recover_empty_dims =
+            read.is_some_and(|target| target.stamp.generation_catalog_pair().is_some());
+        if pdf_page_sizes_needed(items, cached, recover_empty_dims) {
+            let password = self.real_pdf_password(container_path);
+            let page_sizes = if let Some(read) = read {
+                crate::pdf_loader::get_page_sizes_with_read_target(
+                    container_path,
+                    read,
+                    password.as_deref(),
+                )
+            } else {
+                crate::pdf_loader::get_page_sizes(container_path, password.as_deref())
+            };
+            match page_sizes {
                 Ok(sizes) => {
                     for (page_num, (width, height)) in sizes.into_iter().enumerate() {
                         // 縦横比だけを見る。points を丸めて幅・高さとして扱う。
@@ -5503,10 +5615,23 @@ impl ContainerEngine {
         dims
     }
 
+    #[cfg(test)]
     fn cached_landscape_flags(
         &self,
         container_path: &Path,
         items: &[crate::grid_item::GridItem],
+    ) -> Vec<bool> {
+        let read = is_epub_path(container_path)
+            .then(|| crate::pdf_loader::resolve_read_target(container_path).ok())
+            .flatten();
+        self.cached_landscape_flags_with_read(container_path, items, read.as_ref())
+    }
+
+    fn cached_landscape_flags_with_read(
+        &self,
+        container_path: &Path,
+        items: &[crate::grid_item::GridItem],
+        read: Option<&crate::pdf_loader::ReadTarget>,
     ) -> Vec<bool> {
         // 寸法列だけを引く。`load_all` は thumbnail の blob も運ぶので、横長かどうかを
         // 知るためだけに 5 万枚で 1.7 GB を確保して即捨てることになる。
@@ -5516,13 +5641,31 @@ impl ContainerEngine {
         )
         .ok()
         .flatten();
+        let epub_stamp = is_epub_path(container_path)
+            .then(|| read.and_then(|target| target.stamp.generation_catalog_pair()))
+            .flatten();
         let cached = catalog
             .as_ref()
-            .and_then(|catalog| catalog.load_source_dims().ok())
+            .and_then(|catalog| {
+                if is_epub_path(container_path) {
+                    epub_stamp
+                        .and_then(|(id, size)| catalog.load_source_dims_matching(id, size).ok())
+                } else {
+                    catalog.load_source_dims().ok()
+                }
+            })
             .unwrap_or_default();
         // カタログに行が無いページの寸法を、カタログに依らない経路でまとめて求める。
         // カタログが揃っている間は 1 件も読まない。
-        let fallback_dims = self.catalog_free_dims(container_path, items, &cached);
+        let fallback_dims = self.catalog_free_dims(container_path, items, &cached, read);
+        #[cfg(test)]
+        if let Some(hook) = remote_dim_race_hooks()
+            .lock()
+            .unwrap()
+            .remove(container_path)
+        {
+            hook();
+        }
         let rotation_keys = items
             .iter()
             .map(crate::edit_source::page_key_for_grid_item)
@@ -5556,17 +5699,28 @@ impl ContainerEngine {
                     pages += 1;
                 }
                 let dims = key.and_then(|key| {
-                    // A present-but-empty value is a row saved before the dimension columns
-                    // existed, and only those are worth paying for a thumbnail read to recover.
+                    // Empty dimension columns predate catalog dimensions. For EPUB, use the
+                    // pinned generation's page box before consulting any thumbnail row.
                     match cached.get(&key) {
-                        Some(recorded) => recorded.or_else(|| {
-                            catalog
-                                .as_ref()
-                                .and_then(|catalog| catalog.load_one(&key).ok().flatten())
-                                .and_then(|entry| {
-                                    crate::catalog::decode_thumb_dims(&entry.jpeg_data)
-                                })
-                        }),
+                        Some(recorded) => recorded
+                            .or_else(|| fallback_dims.get(&key).copied())
+                            .or_else(|| {
+                                catalog
+                                    .as_ref()
+                                    .and_then(|catalog| catalog.load_one(&key).ok().flatten())
+                                    .filter(|entry| {
+                                        if is_epub_path(container_path) {
+                                            epub_stamp.is_some_and(|(id, size)| {
+                                                entry.mtime == id && entry.file_size == size
+                                            })
+                                        } else {
+                                            true
+                                        }
+                                    })
+                                    .and_then(|entry| {
+                                        crate::catalog::decode_thumb_dims(&entry.jpeg_data)
+                                    })
+                            }),
                         // カタログ行が 1 つも無い場合。ZIP / PDF / 実ファイルのどれも
                         // `catalog_free_dims` が一括で求めてあるので、ここで 1 件ずつ
                         // 読み直す枝は無い (あると「束ねたのに逐次経路も残る」になる)。
@@ -5660,12 +5814,31 @@ impl ContainerEngine {
                 "対象はコンテナファイルではありません",
             ));
         }
-        let mtime = crate::ui_helpers::mtime_secs(&metadata);
-        let file_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let mut mtime = crate::ui_helpers::mtime_secs(&metadata);
+        let mut file_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let paged_read = if crate::folder_tree::is_paged_document_path(&resolved.logical) {
+            Some(
+                crate::pdf_loader::resolve_read_target(&resolved.logical)
+                    .map_err(pdf_read_error)?,
+            )
+        } else {
+            None
+        };
+        if let Some((id, size)) = paged_read
+            .as_ref()
+            .and_then(|read| read.stamp.generation_catalog_pair())
+        {
+            mtime = id;
+            file_size = size;
+        }
         let mut request = crate::thumb_loader::LoadRequest {
             path: resolved.readable_logical().to_path_buf(),
             mtime,
             file_size,
+            pdf_stamp_policy: paged_read.as_ref().map_or(
+                crate::thumb_loader::PdfStampPolicy::CallerFileAttributes,
+                |read| crate::thumb_loader::PdfStampPolicy::Resolved(read.clone()),
+            ),
             source_policy: if full_page {
                 crate::thumb_loader::LoadSourcePolicy::SourceOnly
             } else {
@@ -5687,16 +5860,19 @@ impl ContainerEngine {
                     media_error(MediaErrorCode::PathRejected, "親フォルダを解決できません")
                 })?
             }
-            RemoteSubresource::File if is_pdf_path(&resolved.logical) => {
-                self.ensure_pdf_page_in_range_timed(
+            RemoteSubresource::File
+                if crate::folder_tree::is_paged_document_path(&resolved.logical) =>
+            {
+                self.ensure_pdf_page_in_range_with_read_timed(
                     resolved,
                     &metadata,
+                    paged_read.as_ref().expect("paged document target"),
                     0,
                     page_timing.as_mut().map(|timing| &mut timing.resolve),
                     ambient_wait_stage.as_deref_mut(),
                 )?;
                 request.pdf_page = Some(0);
-                request.pdf_password = self.pdf_passwords.get(&resolved.logical);
+                request.pdf_password = self.real_pdf_password(&resolved.logical);
                 request.cache_key_override = Some(container_thumb_key(
                     crate::thumb_loader::CACHE_KEY_PDF,
                     &resolved.logical,
@@ -5715,16 +5891,19 @@ impl ContainerEngine {
                 request.folder_thumb_sort = Some(crate::app::BOOK_READING_PAGE_ORDER);
                 &resolved.logical
             }
-            RemoteSubresource::PdfPage { page_number } if is_pdf_path(&resolved.logical) => {
-                self.ensure_pdf_page_in_range_timed(
+            RemoteSubresource::PdfPage { page_number }
+                if crate::folder_tree::is_paged_document_path(&resolved.logical) =>
+            {
+                self.ensure_pdf_page_in_range_with_read_timed(
                     resolved,
                     &metadata,
+                    paged_read.as_ref().expect("paged document target"),
                     *page_number,
                     page_timing.as_mut().map(|timing| &mut timing.resolve),
                     ambient_wait_stage.as_deref_mut(),
                 )?;
                 request.pdf_page = Some(*page_number);
-                request.pdf_password = self.pdf_passwords.get(&resolved.logical);
+                request.pdf_password = self.real_pdf_password(&resolved.logical);
                 &resolved.logical
             }
             RemoteSubresource::File if is_image_path(&resolved.logical) => {
@@ -5735,7 +5914,7 @@ impl ContainerEngine {
             RemoteSubresource::File => {
                 return Err(media_error(
                     MediaErrorCode::Unsupported,
-                    "対象は画像または ZIP/PDF ではありません",
+                    "対象は画像または ZIP/PDF/EPUB ではありません",
                 ));
             }
             _ => {
@@ -5863,6 +6042,16 @@ impl ContainerEngine {
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let source_identity =
             RemoteSourceDecodeIdentity::from_load_request(&request, target_px, full_page);
+        if let crate::thumb_loader::PdfStampPolicy::Resolved(read) = &request.pdf_stamp_policy
+            && let Some(stamp) = read.stamp.generation_catalog_pair()
+            && ((request.mtime, request.file_size) != stamp
+                || (source_identity.mtime, source_identity.file_size) != stamp)
+        {
+            return Err(media_error(
+                MediaErrorCode::Internal,
+                "EPUB ページの読み込み状態が一致しません",
+            ));
+        }
         let pdf_password = request.pdf_password.clone();
         let cache_decision = remote_page_cache_decision(full_page, &self.settings);
         let zip_directory = matches!(address.subresource, RemoteSubresource::ZipDirectory { .. });
@@ -5923,7 +6112,7 @@ impl ContainerEngine {
                     RemoteSubresource::PdfPage { page_number } => {
                         let edit_space_started = Instant::now();
                         let analysis_result = crate::pdf_loader::analyze_page_content_type(
-                            &resolved.canonical,
+                            pdf_loader_path(resolved),
                             *page_number,
                             pdf_password.as_deref(),
                             Some(Arc::clone(&cancel)),
@@ -6152,6 +6341,21 @@ impl ContainerEngine {
         )
     }
 
+    fn ensure_pdf_page_in_range_with_read_timed(
+        &self,
+        resolved: &ResolvedPath,
+        metadata: &std::fs::Metadata,
+        read: &crate::pdf_loader::ReadTarget,
+        page_number: u32,
+        primary: Option<&mut RemotePageStageGuard>,
+        fallback: Option<&mut RemotePageStageGuard>,
+    ) -> Result<(), MediaError> {
+        validate_page_number(
+            page_number,
+            self.pdf_page_count_with_read(resolved, metadata, read, primary, fallback)?,
+        )
+    }
+
     /// 本体の PDF 一覧と同じ `pdf_meta` を先に引き、miss 時だけ PDFium で列挙する。
     /// `container_page_meta` は ZIP / folder / converted archive 用であり、PDF は
     /// password_required も保持する専用テーブルが正本になる。
@@ -6163,17 +6367,45 @@ impl ContainerEngine {
         self.pdf_page_count_timed(resolved, metadata, None, None)
     }
 
+    fn real_pdf_password(&self, path: &Path) -> Option<String> {
+        is_pdf_path(path)
+            .then(|| self.pdf_passwords.get(path))
+            .flatten()
+    }
+
     fn pdf_page_count_timed(
         &self,
         resolved: &ResolvedPath,
         metadata: &std::fs::Metadata,
+        primary: Option<&mut RemotePageStageGuard>,
+        fallback: Option<&mut RemotePageStageGuard>,
+    ) -> Result<u32, MediaError> {
+        // The resolver pins an EPUB generation. Reuse this target for both the
+        // cache identity and PDFium enumeration; the source EPUB's stat is only
+        // for display and must not validate converted-page data.
+        let read =
+            crate::pdf_loader::resolve_read_target(&resolved.logical).map_err(pdf_read_error)?;
+        self.pdf_page_count_with_read(resolved, metadata, &read, primary, fallback)
+    }
+
+    fn pdf_page_count_with_read(
+        &self,
+        resolved: &ResolvedPath,
+        metadata: &std::fs::Metadata,
+        read: &crate::pdf_loader::ReadTarget,
         mut primary: Option<&mut RemotePageStageGuard>,
         mut fallback: Option<&mut RemotePageStageGuard>,
     ) -> Result<u32, MediaError> {
+        let (mtime, file_size) = match &read.stamp {
+            crate::pdf_loader::DocumentStamp::Generation { id, pdf_size } => (*id, *pdf_size),
+            crate::pdf_loader::DocumentStamp::File { .. } => {
+                (crate::ui_helpers::mtime_secs(metadata), metadata.len())
+            }
+        };
         let identity = PdfIdentity {
             path: resolved.canonical.clone(),
-            mtime: crate::ui_helpers::mtime_secs(metadata),
-            file_size: metadata.len(),
+            mtime,
+            file_size,
         };
         let cached = lock_with_remote_page_wait(
             &self.pdf_page_counts,
@@ -6185,7 +6417,7 @@ impl ContainerEngine {
         let count = match cached {
             Some(count) => count,
             None => {
-                let password = self.pdf_passwords.get(&resolved.logical);
+                let password = self.real_pdf_password(&resolved.logical);
                 let catalog = open_parent_catalog(&resolved.logical);
                 let filename = resolved.logical.file_name().and_then(|name| name.to_str());
                 let persistent = catalog
@@ -6215,12 +6447,15 @@ impl ContainerEngine {
                     }
                     Some((count, _)) if count > 0 => count,
                     _ => {
-                        let pages = crate::pdf_loader::enumerate_pages(
+                        let pages = crate::pdf_loader::enumerate_pages_with_read_target(
                             &resolved.logical,
+                            read,
                             password.as_deref(),
+                            None,
+                            crate::pdf_loader::EnumerateOptions::default(),
                         )
                         .map_err(pdf_error)?;
-                        let count = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+                        let count = u32::try_from(pages.pages.len()).unwrap_or(u32::MAX);
                         if let (Some(catalog), Some(filename)) = (catalog.as_ref(), filename) {
                             let write_result = if password.is_none() {
                                 catalog.set_pdf_meta_safe(
@@ -6400,7 +6635,9 @@ fn remote_adjustment_identity(
     let page_key = crate::edit_source::page_key_for_remote(logical_path, &address.subresource)?;
     match &address.subresource {
         RemoteSubresource::File => {
-            let location_path = if is_zip_path(logical_path) || is_pdf_path(logical_path) {
+            let location_path = if is_zip_path(logical_path)
+                || crate::folder_tree::is_paged_document_path(logical_path)
+            {
                 logical_path.to_path_buf()
             } else {
                 logical_path.parent()?.to_path_buf()
@@ -7107,7 +7344,7 @@ fn media_source_kind(address: &RemoteAddress) -> &'static str {
             let path = Path::new(&address.path);
             if is_zip_path(path) {
                 "zip"
-            } else if is_pdf_path(path) {
+            } else if crate::folder_tree::is_paged_document_path(path) {
                 "pdf"
             } else {
                 "file"
@@ -7117,6 +7354,9 @@ fn media_source_kind(address: &RemoteAddress) -> &'static str {
 }
 
 fn pdf_error(error: std::io::Error) -> MediaError {
+    if let Some(typed) = crate::pdf_loader::typed_read_error(&error) {
+        return pdf_read_error(typed);
+    }
     let message = error.to_string();
     if crate::pdf_loader::is_password_required_error(&error) {
         media_error(
@@ -7126,6 +7366,40 @@ fn pdf_error(error: std::io::Error) -> MediaError {
     } else {
         crate::logger::log(format!("remote_ipc: pdf operation failed: {message}"));
         media_error(MediaErrorCode::RenderFailed, "PDF を開けませんでした")
+    }
+}
+
+fn is_epub_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+}
+
+fn pdf_loader_path(resolved: &ResolvedPath) -> &Path {
+    if is_epub_path(&resolved.logical) {
+        &resolved.logical
+    } else {
+        &resolved.canonical
+    }
+}
+
+fn pdf_read_error(error: crate::pdf_loader::PdfReadError) -> MediaError {
+    match error {
+        crate::pdf_loader::PdfReadError::NotConverted => {
+            media_error(MediaErrorCode::RenderFailed, EPUB_NOT_CONVERTED_MESSAGE)
+        }
+        crate::pdf_loader::PdfReadError::EpubUnavailable { .. } => media_error(
+            MediaErrorCode::RenderFailed,
+            "この PC では EPUB を開けません。PC の mImageViewer で EPUB の状態を確認してください",
+        ),
+        crate::pdf_loader::PdfReadError::PasswordRequired => media_error(
+            MediaErrorCode::PasswordRequired,
+            "この PDF はパスワード保護されているため Web から開けません",
+        ),
+        crate::pdf_loader::PdfReadError::Other(error) => {
+            crate::logger::log(format!("remote_ipc: pdf operation failed: {error}"));
+            media_error(MediaErrorCode::RenderFailed, "PDF を開けませんでした")
+        }
     }
 }
 
@@ -7333,6 +7607,593 @@ mod tests {
     }
     use crate::settings::FavoriteEntry;
     use std::io::{Cursor, Write};
+
+    fn remote_epub_request(path: &Path) -> ContainerRequest {
+        ContainerRequest {
+            address: RemoteAddress::file(path.to_string_lossy().into_owned()),
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
+        }
+    }
+
+    fn minimal_remote_pdf(width: u32, height: u32) -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] >>"),
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Root 1 0 R /Size 4 >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        bytes
+    }
+
+    fn minimal_remote_pdf_with_direction(width: u32, height: u32) -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R /ViewerPreferences << /Direction /R2L >> >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] >>"),
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Root 1 0 R /Size 4 >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn remote_folder_lists_epub_as_pdf_book_and_honors_pdf_duplicate_setting() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("book.epub");
+        let pdf = root.path().join("book.pdf");
+        std::fs::write(&epub, b"epub").unwrap();
+        let list = |skip_epub_if_pdf_exists| {
+            let engine = ContainerEngine::new(crate::settings::Settings {
+                skip_epub_if_pdf_exists,
+                ..Default::default()
+            });
+            let FolderListResponse::Success(payload) = engine.folder_list(FolderListRequest {
+                address: RemoteAddress::file(root.path().to_string_lossy().into_owned()),
+            }) else {
+                panic!("Remote folder list failed");
+            };
+            payload.entries
+        };
+        let entries = list(true);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, RemoteEntryKind::Pdf);
+        assert_eq!(entries[0].address.path, epub.to_string_lossy());
+
+        std::fs::write(&pdf, b"pdf").unwrap();
+        let entries = list(false);
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.kind == RemoteEntryKind::Pdf)
+        );
+        let entries = list(true);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].address.path, pdf.to_string_lossy());
+    }
+
+    #[test]
+    fn remote_epub_container_uses_logical_page_keys_and_generation_page_count() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("book.epub");
+        std::fs::write(&epub, b"source whose file attributes do not change").unwrap();
+        let resolved = resolve_existing(epub.to_string_lossy().as_ref()).unwrap();
+        assert!(!is_archive_container(&resolved));
+        let catalog = open_parent_catalog(&epub).unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let logical = epub.to_string_lossy().into_owned();
+
+        {
+            let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 501, 900);
+            catalog.set_pdf_meta_safe("book.epub", 501, 900, 2).unwrap();
+            let ContainerResponse::Success(payload) = engine.container(remote_epub_request(&epub))
+            else {
+                panic!("converted EPUB did not open as a Remote PDF book");
+            };
+            assert_eq!(payload.kind, ContainerKind::Pdf);
+            assert_eq!(payload.effective_address.path, logical);
+            assert_eq!(payload.entries.len(), 2);
+            assert_eq!(payload.entries[1].address.path, logical);
+            assert_eq!(
+                payload.entries[1].address.subresource,
+                RemoteSubresource::PdfPage { page_number: 1 }
+            );
+        }
+        {
+            let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 502, 900);
+            catalog.set_pdf_meta_safe("book.epub", 502, 900, 5).unwrap();
+            assert_eq!(
+                engine
+                    .pdf_page_count(&resolved, &std::fs::metadata(&epub).unwrap())
+                    .unwrap(),
+                5
+            );
+            let ContainerResponse::Success(payload) = engine.container(remote_epub_request(&epub))
+            else {
+                panic!("reconverted EPUB did not open");
+            };
+            assert_eq!(payload.entries.len(), 5);
+            assert_eq!(payload.entries[4].address.path, logical);
+        }
+    }
+
+    #[test]
+    fn remote_epub_open_surfaces_distinct_conversion_and_startup_messages() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("waiting.epub");
+        std::fs::write(&epub, b"unconverted").unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        for (failure, expected) in [
+            (
+                crate::pdf_loader::PdfReadError::NotConverted,
+                "PC の mImageViewer で一度開いて変換",
+            ),
+            (
+                crate::pdf_loader::PdfReadError::EpubUnavailable {
+                    reason: "startup gate".into(),
+                },
+                "この PC では EPUB を開けません",
+            ),
+        ] {
+            let _failure = crate::pdf_loader::fail_epub_for_test(&epub, failure);
+            let ContainerResponse::Error(error) = engine.container(remote_epub_request(&epub))
+            else {
+                panic!("unreadable EPUB unexpectedly opened");
+            };
+            assert!(error.message.contains(expected), "{}", error.message);
+            let ThumbnailResponse::Error(tile) = engine.thumbnail(
+                &mimageviewer_ipc::ThumbnailRequest {
+                    address: RemoteAddress::file(epub.to_string_lossy().into_owned()),
+                    source_address: None,
+                    target_px: 96,
+                },
+                &WorkerContext::without_databases(),
+            ) else {
+                panic!("unreadable EPUB unexpectedly produced a cover");
+            };
+            assert!(tile.message.contains(expected), "{}", tile.message);
+        }
+    }
+
+    #[test]
+    fn remote_epub_direction_follows_generation_unless_book_has_saved_spread() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("rtl.epub");
+        std::fs::write(&epub, b"epub").unwrap();
+        open_parent_catalog(&epub)
+            .unwrap()
+            .set_pdf_meta_safe("rtl.epub", 707, 400, 1)
+            .unwrap();
+        let settings = crate::settings::Settings {
+            default_spread_mode: crate::settings::SpreadMode::LtrCover,
+            default_reading_direction: crate::settings::ReadingDirection::Ltr,
+            follow_document_reading_direction: true,
+            ..Default::default()
+        };
+        let _pin = crate::pdf_loader::pin_epub_with_direction_for_test(
+            &epub,
+            707,
+            400,
+            crate::pdf_loader::PdfReadingDirection::R2L,
+        );
+        let mut db = crate::spread_db::SpreadDb::open().unwrap();
+        let engine = ContainerEngine::new(settings.clone());
+        let ContainerResponse::Success(payload) = engine.container(remote_epub_request(&epub))
+        else {
+            panic!("EPUB direction fallback failed");
+        };
+        assert_eq!(payload.configured_spread_mode, RemoteSpreadMode::RtlCover);
+        assert_eq!(payload.reading_direction, RemoteReadingDirection::Rtl);
+
+        db.set_mode_and_direction(
+            &epub,
+            None,
+            crate::settings::SpreadMode::Ltr,
+            crate::settings::ReadingDirection::Ltr,
+            (
+                settings.default_spread_mode,
+                crate::settings::ReadingFlow::Paged,
+                settings.default_reading_direction,
+            ),
+        )
+        .unwrap();
+        let engine = ContainerEngine::new(settings);
+        let ContainerResponse::Success(payload) = engine.container(remote_epub_request(&epub))
+        else {
+            panic!("saved EPUB spread failed");
+        };
+        assert_eq!(payload.configured_spread_mode, RemoteSpreadMode::Ltr);
+        assert_eq!(payload.reading_direction, RemoteReadingDirection::Ltr);
+    }
+
+    #[test]
+    fn remote_epub_landscape_ignores_old_generation_catalog_dimensions() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("aspect.epub");
+        std::fs::write(&epub, b"source").unwrap();
+        let converted = epub.with_extension("generated.pdf");
+        let pdf = minimal_remote_pdf(72, 144);
+        std::fs::write(&converted, &pdf).unwrap();
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &epub).unwrap();
+        catalog
+            .save(
+                "page_0000",
+                801,
+                pdf.len() as i64,
+                120,
+                60,
+                Some((120, 60)),
+                b"old",
+            )
+            .unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 802, pdf.len() as u64);
+        let items = vec![crate::grid_item::GridItem::PdfPage {
+            pdf_path: epub.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        assert_eq!(engine.cached_landscape_flags(&epub, &items), vec![false]);
+    }
+
+    #[test]
+    fn remote_epub_spread_never_decodes_a_replaced_generation_row() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("race.epub");
+        std::fs::write(&epub, b"source").unwrap();
+        let pdf = minimal_remote_pdf(72, 144);
+        std::fs::write(epub.with_extension("generated.pdf"), &pdf).unwrap();
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &epub).unwrap();
+        let portrait = image::DynamicImage::ImageRgba8(image::RgbaImage::new(48, 96));
+        let landscape = image::DynamicImage::ImageRgba8(image::RgbaImage::new(96, 48));
+        let (old_webp, _, _) = crate::catalog::encode_thumb_webp(&portrait, 96, 75.0).unwrap();
+        let (new_webp, _, _) = crate::catalog::encode_thumb_webp(&landscape, 96, 75.0).unwrap();
+        catalog
+            .save("page_0000", 901, pdf.len() as i64, 48, 96, None, &old_webp)
+            .unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 901, pdf.len() as u64);
+        let resolves = crate::pdf_loader::RemoteResolveTestCounter::for_path(&epub);
+        let path = epub.clone();
+        remote_dim_race_hooks().lock().unwrap().insert(
+            epub.clone(),
+            Box::new(move || {
+                crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &path)
+                    .unwrap()
+                    .save("page_0000", 902, pdf.len() as i64, 96, 48, None, &new_webp)
+                    .unwrap();
+            }),
+        );
+        let items = vec![crate::grid_item::GridItem::PdfPage {
+            pdf_path: epub.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        assert_eq!(engine.cached_landscape_flags(&epub, &items), vec![false]);
+        assert_eq!(resolves.take(), 1);
+        assert_eq!(catalog.load_one("page_0000").unwrap().unwrap().mtime, 902);
+        open_parent_catalog(&epub)
+            .unwrap()
+            .set_pdf_meta_safe(
+                "race.epub",
+                901,
+                std::fs::metadata(epub.with_extension("generated.pdf"))
+                    .unwrap()
+                    .len() as i64,
+                1,
+            )
+            .unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(
+            &epub.with_extension("generated.pdf"),
+        );
+        let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+            spread_mode: Some(RemoteSpreadMode::Ltr),
+            ..remote_epub_request(&epub)
+        }) else {
+            panic!("EPUB spread open failed");
+        };
+        assert_eq!(payload.entries.len(), 1);
+        assert_eq!(resolves.take(), 1);
+    }
+
+    #[test]
+    fn remote_epub_spread_uses_pinned_landscape_page_after_portrait_rewrite() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("landscape-race.epub");
+        std::fs::write(&epub, b"source").unwrap();
+        let pdf = minimal_remote_pdf(144, 72);
+        let generated = epub.with_extension("generated.pdf");
+        std::fs::write(&generated, &pdf).unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&generated);
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &epub).unwrap();
+        let landscape = image::DynamicImage::ImageRgba8(image::RgbaImage::new(96, 48));
+        let portrait = image::DynamicImage::ImageRgba8(image::RgbaImage::new(48, 96));
+        let (old_webp, _, _) = crate::catalog::encode_thumb_webp(&landscape, 96, 75.0).unwrap();
+        let (new_webp, _, _) = crate::catalog::encode_thumb_webp(&portrait, 96, 75.0).unwrap();
+        catalog
+            .save("page_0000", 903, pdf.len() as i64, 96, 48, None, &old_webp)
+            .unwrap();
+        open_parent_catalog(&epub)
+            .unwrap()
+            .set_pdf_meta_safe("landscape-race.epub", 903, pdf.len() as i64, 1)
+            .unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 903, pdf.len() as u64);
+        let resolves = crate::pdf_loader::RemoteResolveTestCounter::for_path(&epub);
+        let path = epub.clone();
+        remote_dim_race_hooks().lock().unwrap().insert(
+            epub.clone(),
+            Box::new(move || {
+                crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &path)
+                    .unwrap()
+                    .save("page_0000", 904, pdf.len() as i64, 48, 96, None, &new_webp)
+                    .unwrap();
+            }),
+        );
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+            spread_mode: Some(RemoteSpreadMode::SplitLtr),
+            ..remote_epub_request(&epub)
+        }) else {
+            panic!("EPUB split spread open failed");
+        };
+        assert_eq!(payload.entries.len(), 1);
+        assert_eq!(payload.page_groups.len(), 2, "pinned wide page must split");
+        assert_eq!(resolves.take(), 1);
+        assert_eq!(catalog.load_one("page_0000").unwrap().unwrap().mtime, 904);
+    }
+
+    #[test]
+    fn remote_plain_pdf_d10_off_cache_miss_enumerates_without_direction() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let pdf_path = root.path().join("direction-cache-miss.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let settings = crate::settings::Settings {
+            default_spread_mode: crate::settings::SpreadMode::Single,
+            default_reading_direction: crate::settings::ReadingDirection::Ltr,
+            follow_document_reading_direction: false,
+            ..Default::default()
+        };
+        let engine = ContainerEngine::new(settings);
+        let ContainerResponse::Success(payload) = engine.container(remote_epub_request(&pdf_path))
+        else {
+            panic!("PDF open with D10 off and no page-count cache failed");
+        };
+        assert_eq!(payload.reading_direction, RemoteReadingDirection::Ltr);
+        assert_eq!(backend.direction_requests(), vec![false]);
+    }
+
+    #[test]
+    fn remote_plain_pdf_d10_is_opt_in_and_saved_spread_wins() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let pdf_path = root.path().join("direction.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let resolves = crate::pdf_loader::RemoteResolveTestCounter::for_path(&pdf_path);
+        let metadata = std::fs::metadata(&pdf_path).unwrap();
+        open_parent_catalog(&pdf_path)
+            .unwrap()
+            .set_pdf_meta_safe(
+                "direction.pdf",
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                1,
+            )
+            .unwrap();
+        let settings = crate::settings::Settings {
+            default_spread_mode: crate::settings::SpreadMode::Single,
+            default_reading_direction: crate::settings::ReadingDirection::Ltr,
+            ..Default::default()
+        };
+        let off = ContainerEngine::new(settings.clone());
+        let ContainerResponse::Success(payload) = off.container(remote_epub_request(&pdf_path))
+        else {
+            panic!("PDF open with D10 off failed");
+        };
+        assert_eq!(payload.reading_direction, RemoteReadingDirection::Ltr);
+        assert!(backend.direction_requests().is_empty());
+        assert_eq!(resolves.take(), 1);
+
+        let on_settings = crate::settings::Settings {
+            follow_document_reading_direction: true,
+            ..settings
+        };
+        let on = ContainerEngine::new(on_settings.clone());
+        let ContainerResponse::Success(payload) = on.container(remote_epub_request(&pdf_path))
+        else {
+            panic!("PDF open with D10 on failed");
+        };
+        assert_eq!(payload.reading_direction, RemoteReadingDirection::Rtl);
+        assert_eq!(backend.direction_requests(), vec![true]);
+        assert_eq!(resolves.take(), 1);
+
+        let mut db = crate::spread_db::SpreadDb::open().unwrap();
+        db.set_mode_and_direction(
+            &pdf_path,
+            None,
+            crate::settings::SpreadMode::Ltr,
+            crate::settings::ReadingDirection::Ltr,
+            (
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingFlow::Paged,
+                crate::settings::ReadingDirection::Ltr,
+            ),
+        )
+        .unwrap();
+        let saved = ContainerEngine::new(on_settings);
+        let ContainerResponse::Success(payload) = saved.container(remote_epub_request(&pdf_path))
+        else {
+            panic!("PDF open with saved spread failed");
+        };
+        assert_eq!(payload.configured_spread_mode, RemoteSpreadMode::Ltr);
+        assert_eq!(payload.reading_direction, RemoteReadingDirection::Ltr);
+        assert_eq!(backend.direction_requests(), vec![true]);
+        assert_eq!(resolves.take(), 1);
+    }
+
+    #[test]
+    fn remote_epub_pdf_page_request_renders_the_pinned_generation() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("page.epub");
+        std::fs::write(&epub, b"source").unwrap();
+        let pdf = minimal_remote_pdf(72, 144);
+        let generated = epub.with_extension("generated.pdf");
+        std::fs::write(&generated, &pdf).unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 911, pdf.len() as u64);
+        let resolves = crate::pdf_loader::RemoteResolveTestCounter::for_path(&epub);
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&generated);
+        open_parent_catalog(&epub)
+            .unwrap()
+            .set_pdf_meta_safe("page.epub", 911, pdf.len() as i64, 1)
+            .unwrap();
+        drop(crate::adjustment_db::AdjustmentDb::open().unwrap());
+        drop(crate::mask_db::MaskDb::open().unwrap());
+        drop(crate::local_adjust_db::LocalAdjustDb::open().unwrap());
+        drop(crate::conceal_db::ConcealDb::open().unwrap());
+        drop(crate::comic_db::ComicDb::open().unwrap());
+        drop(crate::export_crop::CropDb::open().unwrap());
+        let address = RemoteAddress {
+            path: epub.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 0 },
+        };
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let response = engine.page_with_job_cancel(
+            PageRequest {
+                job_id: "epub-page".into(),
+                display_request_id: Some("display".into()),
+                address: address.clone(),
+                target_px: 128,
+                priority: PagePriority::Foreground,
+                render_context: None,
+                adjustment_preview: None,
+            },
+            &WorkerContext::open(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let PageResponse::Success(page) = response else {
+            panic!("Remote EPUB PdfPage request failed: {response:?}");
+        };
+        assert_eq!(page.identity, address);
+        assert!(page.width > 0 && page.height > page.width);
+        assert_eq!(
+            image::load_from_memory(&page.bytes).unwrap().width(),
+            page.width
+        );
+        assert_eq!(resolves.take(), 1);
+        let thumbnail = engine.thumbnail(
+            &mimageviewer_ipc::ThumbnailRequest {
+                address: RemoteAddress::file(epub.to_string_lossy().into_owned()),
+                source_address: None,
+                target_px: 96,
+            },
+            &WorkerContext::without_databases(),
+        );
+        assert!(
+            matches!(thumbnail, ThumbnailResponse::Success { .. }),
+            "{thumbnail:?}"
+        );
+        assert_eq!(resolves.take(), 1);
+    }
+
+    #[test]
+    fn remote_epub_page_render_and_thumbnail_use_converted_generation() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("cover.epub");
+        std::fs::write(&epub, b"source").unwrap();
+        let converted = epub.with_extension("generated.pdf");
+        let pdf = minimal_remote_pdf(72, 144);
+        std::fs::write(&converted, &pdf).unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 909, pdf.len() as u64);
+        let resolved = resolve_existing(epub.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(pdf_loader_path(&resolved), resolved.logical);
+        let (width, height) =
+            crate::pdf_loader::render_resolved_page_in_process_for_test(&resolved.logical, 0)
+                .unwrap();
+        assert!(width > 0 && height > width);
+        let cover = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            48,
+            96,
+            image::Rgba([30, 60, 90, 255]),
+        ));
+        let (webp, _, _) = crate::catalog::encode_thumb_webp(&cover, 96, 75.0).unwrap();
+        let catalog = open_parent_catalog(&epub).unwrap();
+        catalog
+            .set_pdf_meta_safe("cover.epub", 909, pdf.len() as i64, 1)
+            .unwrap();
+        catalog
+            .save(
+                "pdfthumb:cover.epub",
+                909,
+                pdf.len() as i64,
+                48,
+                96,
+                Some((48, 96)),
+                &webp,
+            )
+            .unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            cache_pdf_always: true,
+            ..Default::default()
+        });
+        let response = engine.thumbnail(
+            &mimageviewer_ipc::ThumbnailRequest {
+                address: RemoteAddress::file(epub.to_string_lossy().into_owned()),
+                source_address: None,
+                target_px: 96,
+            },
+            &WorkerContext::without_databases(),
+        );
+        let ThumbnailResponse::Success { webp_bytes } = response else {
+            panic!("generation-stamped EPUB cover was not served: {response:?}");
+        };
+        let returned = image::load_from_memory(&webp_bytes).unwrap().to_rgb8();
+        let pixel = returned.get_pixel(0, 0);
+        assert!(
+            pixel[2] > pixel[1] && pixel[1] > pixel[0],
+            "Remote did not return the current generation's cached cover: {pixel:?}"
+        );
+    }
 
     #[test]
     fn settings_family_quiescing_maps_to_all_container_busy_codes() {
@@ -8490,22 +9351,24 @@ mod tests {
                 Some((600u32, 800u32)),
             );
         }
-        assert!(!pdf_page_sizes_needed(&items, &cached));
+        assert!(!pdf_page_sizes_needed(&items, &cached, false));
 
         // 寸法列が空の古い行でも「行はある」ので取りに行かない (サムネイルから復元できる)。
         cached.insert(crate::grid_item::pdf_page_cache_key(1), None);
-        assert!(!pdf_page_sizes_needed(&items, &cached));
+        assert!(!pdf_page_sizes_needed(&items, &cached, false));
+        assert!(pdf_page_sizes_needed(&items, &cached, true));
 
         // 行そのものが無いページが 1 つでもあれば取りに行く。
         cached.remove(&crate::grid_item::pdf_page_cache_key(2));
-        assert!(pdf_page_sizes_needed(&items, &cached));
+        assert!(pdf_page_sizes_needed(&items, &cached, false));
 
         // PDF ページが 1 つも無ければ関係ない。
         assert!(!pdf_page_sizes_needed(
             &[crate::grid_item::GridItem::Image(std::path::PathBuf::from(
                 "a.jpg"
             ))],
-            &std::collections::HashMap::new()
+            &std::collections::HashMap::new(),
+            true
         ));
     }
 

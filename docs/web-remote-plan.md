@@ -1016,6 +1016,12 @@ change は 180 ms debounce 後にこの判定を再実行する。
 
 `spread.db::get_direction` も本体側で同じ key / fallback から読み、`reading_direction` として応答する。
 LTR / RTL の見開きモードは本体と同じく方向をそのモードへ揃え、Single は保存済み方向を維持する。
+変換済み EPUB は PDF の本と同じ Remote 経路で開き、本とページの address は元 `.epub` とその
+`PdfPage` subresource を使う。Remote は変換を始めず、未変換時は PC の mImageViewer で一度開くよう
+案内する。一覧は本体の同名 PDF 優先設定を適用し、Web は EPUB バッジと表紙未取得時のプレースホルダーを表示する。
+本体の世代スタンプでページ数・表紙・見開き用寸法を照合する。EPUB の綴じ方向は保存済み本別値が無く、
+「文書の綴じ方向に従う」が有効なときに固定世代の方向を採用する。通常 PDF の `/Direction` は
+Remote では従来どおり既定方向への反映対象外である。
 Web で RTL から Single へ切り替えた場合も、そのセッションの RTL を request に引き継ぐ。
 RTL の横方向入力は画面上の方向を反転し、左 swipe / 左 tap zone / `ArrowLeft` を次グループ、
 右 swipe / 右 tap zone / `ArrowRight` を前グループとする。上下矢印と PageUp / PageDown は
@@ -1878,7 +1884,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-現行版は **v61**。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
+現行版は **v62**。v62 は EPUB 対応 (ブランチ epub-pdf) と master の v61 を統合した版で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げ、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
 `{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
 catalog / snapshot / navigation を追加した。collection の session spread request と
 address-based `page_groups` を追加した版は v49。

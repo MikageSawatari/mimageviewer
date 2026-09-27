@@ -359,7 +359,7 @@ pub fn classify_name_index_kind(
     let ext = ext.to_ascii_lowercase();
     if crate::folder_tree::is_zip_extension(&ext) {
         Some(IndexKind::ZipFile)
-    } else if crate::folder_tree::is_pdf_extension(&ext) {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         Some(IndexKind::PdfFile)
     } else {
         None
@@ -412,6 +412,7 @@ mod tests {
         mkdir(&sub);
         touch(&root.join("a.zip"));
         touch(&root.join("b.pdf"));
+        touch(&root.join("book.epub"));
         touch(&root.join("c.jpg")); // 画像は名前索引対象外
         touch(&sub.join("d.zip"));
 
@@ -421,14 +422,35 @@ mod tests {
 
         // folders_visited = root + sub
         assert_eq!(summary.folders_visited, 2);
-        // entries_written: root 直下 = sub(Folder) + a.zip + b.pdf = 3,
+        // entries_written: root 直下 = sub(Folder) + a.zip + b.pdf + book.epub = 4,
         //                  sub 直下  = d.zip = 1
-        assert_eq!(summary.entries_written, 4);
+        assert_eq!(summary.entries_written, 5);
         assert!(!summary.cancelled);
 
-        // DB に登録されたエントリを count で確認 (root に 4 件入るはず)
+        // DB に登録されたエントリを count で確認 (計 5 件)
         let count = db.count_for_favorite(&root).unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn bulk_index_ignores_sibling_output_temp_during_save() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        mkdir(&root);
+        touch(&root.join("book.pdf"));
+        let mut cache = crate::epub_cache::EpubCache::open_at(&tmp.path().join("data")).unwrap();
+        let reserved = cache
+            .reserve_sibling_output(&root.join("new-book.pdf"))
+            .unwrap();
+        let _held_temp = reserved.create_file().unwrap();
+        let token = "a".repeat(64);
+        touch(&root.join(format!(".miv-part-{token}.pdf")));
+        touch(&root.join(format!(".miv-part-{token}.tmp")));
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let summary = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
+        assert_eq!(summary.entries_written, 1);
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
     }
 
     /// `.cbz` は他の全経路でネイティブ ZIP として開けるコンテナなのに、名前索引の
