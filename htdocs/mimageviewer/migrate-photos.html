@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Windows フォトから画像ビューアを乗り換える｜mImageViewer 移行ガイド</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="Windows 標準のフォトで物足りなくなった方へ。大量の画像をサムネイルで見渡す、ZIP・PDF の漫画を見開きで読む、★やタグで整理する、といった使い方ができる無料画像ビューア mImageViewer への移行案内です。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/migrate-photos.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/migrate-photos.html">
+  <meta property="og:title" content="Windows フォトから画像ビューアを乗り換える｜mImageViewer 移行ガイド">
+  <meta property="og:description" content="Windows 標準のフォトで物足りなくなった方へ。大量の画像をサムネイルで見渡す、ZIP・PDF の漫画を見開きで読む、★やタグで整理する、といった使い方ができる無料画像ビューア mImageViewer への移行案内です。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Windows フォトから画像ビューアを乗り換える｜mImageViewer 移行ガイド">
+  <meta name="twitter:description" content="Windows 標準のフォトで物足りなくなった方へ。大量の画像をサムネイルで見渡す、ZIP・PDF の漫画を見開きで読む、★やタグで整理する、といった使い方ができる無料画像ビューア mImageViewer への移行案内です。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial,
+                   "游ゴシック体", YuGothic, "Yu Gothic", "メイリオ", Meiryo, sans-serif;
+      background: linear-gradient(135deg, #fff5f9 0%, #ffeef7 100%);
+      background-attachment: fixed;
+      color: #333; line-height: 1.7; min-height: 100vh;
+    }
+    a { color: #d63384; text-decoration: none; }
+    a:hover { text-decoration: underline; color: #a02860; }
+
+    header {
+      background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(8px);
+      border-bottom: 1px solid #ffb0d9; padding: 0 2rem;
+      position: sticky; top: 0; z-index: 100;
+    }
+    .header-inner { max-width: 900px; margin: 0 auto; display: flex; align-items: center; gap: 2rem; height: 56px; }
+    .logo { font-size: 1.2rem; font-weight: 700; background: linear-gradient(90deg, #ff60c0, #d63384);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .site-nav a { color: #a02860; font-size: 0.9rem; font-weight: 600; }
+    .site-nav a:hover { color: #d63384; text-decoration: none; }
+
+    .hero {
+      background: linear-gradient(135deg, #fff0f7 0%, #ffe0f0 50%, #ffd0eb 100%);
+      border-bottom: 1px solid #ffb0d9; padding: 2.75rem 2rem 2.5rem; text-align: center;
+    }
+    .hero .crumb { font-size: 0.82rem; color: #a02860; opacity: 0.85; margin-bottom: 0.6rem; }
+    .hero h1 {
+      font-size: 2.1rem; font-weight: 700;
+      background: linear-gradient(135deg, #ff60c0, #d63384);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+      margin-bottom: 0.5rem;
+    }
+    .hero .tagline { font-size: 1rem; color: #a02860; }
+
+    main { max-width: 820px; margin: 0 auto; padding: 2.75rem 2rem 1rem; }
+    section { margin-bottom: 2.75rem; }
+    .lead { color: #555; font-size: 1rem; }
+
+    h2 {
+      font-size: 1.3rem; font-weight: 700; color: #c0255a;
+      margin-bottom: 1.1rem; padding-bottom: 0.5rem; border-bottom: 2px solid #ffb0d9; position: relative;
+    }
+    h2::after { content: ""; position: absolute; left: 0; bottom: -2px; width: 60px; height: 2px;
+      background: linear-gradient(90deg, #ff60c0, #d63384); }
+    h3 { font-size: 1.02rem; font-weight: 700; color: #d63384; margin: 1.4rem 0 0.5rem; }
+    p { margin-bottom: 0.8rem; color: #444; }
+    strong { color: #c0255a; }
+
+    .pink-list { list-style: none; padding: 0; }
+    .pink-list li { padding: 0.45rem 0 0.45rem 1.4rem; border-bottom: 1px solid #ffeef7;
+      font-size: 0.95rem; color: #444; position: relative; }
+    .pink-list li::before { content: "♦"; position: absolute; left: 0; color: #ff60c0; font-size: 0.65rem; top: 0.7rem; }
+    .pink-list li:last-child { border-bottom: none; }
+
+    .steps { counter-reset: step; list-style: none; padding: 0; margin: 0.4rem 0; }
+    .steps li { position: relative; padding: 0.55rem 0 0.55rem 2.5rem; border-bottom: 1px solid #ffeef7;
+      color: #444; font-size: 0.95rem; }
+    .steps li:last-child { border-bottom: none; }
+    .steps li::before { counter-increment: step; content: counter(step);
+      position: absolute; left: 0; top: 0.5rem; width: 1.65rem; height: 1.65rem; line-height: 1.65rem;
+      text-align: center; border-radius: 50%; background: linear-gradient(135deg, #ff60c0, #d63384);
+      color: #fff; font-size: 0.8rem; font-weight: 700; }
+
+    kbd { display: inline-block; background: #ffeef7; border: 1px solid #ffb0d9; border-radius: 5px;
+      padding: 0.1em 0.55em; font-family: "Consolas", "Courier New", monospace; font-size: 0.83em;
+      color: #c0255a; white-space: nowrap; }
+    code { background: #ffeef7; border: 1px solid #ffb0d9; border-radius: 4px; padding: 0.1em 0.45em;
+      font-family: "Consolas", "Courier New", monospace; font-size: 0.88em; color: #c0255a; }
+
+    .info-box { background: #fff; border: 1px solid #ffe0ec; border-left: 4px solid #ff60c0;
+      border-radius: 8px; padding: 0.85rem 1.1rem; font-size: 0.9rem; color: #666; margin-top: 0.75rem; }
+
+    .table-scroll { overflow-x: auto; margin: 0.75rem 0 1rem; background: #fff;
+      border: 1px solid #ffe0ec; border-radius: 8px; }
+    .compare-table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 0.9rem; }
+    .compare-table th, .compare-table td { padding: 0.65rem 0.8rem; border-bottom: 1px solid #ffeef7;
+      vertical-align: top; text-align: left; }
+    .compare-table th { background: #fff0f7; color: #c0255a; font-weight: 700; white-space: nowrap; }
+    .compare-table td:first-child { width: 24%; color: #a02860; font-weight: 700; }
+    .compare-table tr:last-child td { border-bottom: none; }
+
+    .shot { width: 100%; border-radius: 12px; border: 1px solid #ffe0ec;
+      box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); display: block; margin: 0.5rem 0 0; }
+    .shot-cap { font-size: 0.82rem; color: #a02860; opacity: 0.8; text-align: center; margin-top: 0.5rem; }
+
+    .showcase { background: #fff; border: 1px solid #ffe0ec; border-radius: 14px;
+      padding: 1rem; box-shadow: 0 4px 16px rgba(214, 51, 132, 0.12); margin-top: 1rem; }
+    .showcase-grid { display: grid; grid-template-columns: minmax(185px, 0.8fr) minmax(0, 2.2fr);
+      gap: 1rem; align-items: start; }
+    .showcase-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 520px;
+      overflow: auto; padding-right: 0.15rem; }
+    .showcase-button { width: 100%; border: 1px solid #ffd2e8; background: #fff7fb;
+      border-radius: 9px; padding: 0.62rem 0.75rem; color: #a02860; font-weight: 700;
+      text-align: left; cursor: pointer; font: inherit; line-height: 1.35; }
+    .showcase-button:hover, .showcase-button:focus, .showcase-button.is-active {
+      background: #d63384; border-color: #d63384; color: #fff; outline: none; }
+    .showcase-stage { min-width: 0; }
+    .showcase-link { display: block; border-radius: 10px; overflow: hidden; background: #111;
+      border: 1px solid #ffe0ec; }
+    .showcase-frame { position: relative; display: block; aspect-ratio: 16 / 9; background: #111; }
+    .showcase-frame img { position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: contain; display: block; }
+    .showcase-image-alt { opacity: 0; }
+    .showcase-stage.is-animated .showcase-image-main { animation: showcase-main 2.8s steps(1, end) infinite; }
+    .showcase-stage.is-animated .showcase-image-alt { animation: showcase-alt 2.8s steps(1, end) infinite; }
+    .showcase-caption { margin-top: 0.65rem; color: #666; font-size: 0.9rem; }
+    .showcase-caption strong { color: #c0255a; display: block; margin-bottom: 0.15rem; }
+    .showcase-credit { margin-top: 0.55rem; color: #888; font-size: 0.78rem; text-align: right; }
+    @keyframes showcase-main { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+    @keyframes showcase-alt { 0%, 49% { opacity: 0; } 50%, 100% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .showcase-stage.is-animated .showcase-image-main,
+      .showcase-stage.is-animated .showcase-image-alt { animation: none; }
+      .showcase-stage.is-animated .showcase-image-main { opacity: 1; }
+      .showcase-stage.is-animated .showcase-image-alt { opacity: 0; }
+    }
+
+    .features { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1.1rem; }
+    .feature-card { background: #fff; border: 1px solid #ffe0ec; border-radius: 15px; padding: 1.2rem 1.3rem;
+      box-shadow: 0 3px 12px rgba(255, 96, 192, 0.08); }
+    .feature-card .icon { font-size: 1.6rem; margin-bottom: 0.4rem; }
+    .feature-card h3 { margin: 0 0 0.35rem; font-size: 0.97rem; color: #c0255a; }
+    .feature-card p { font-size: 0.88rem; color: #666; margin: 0; }
+
+    .manual-cta { background: linear-gradient(135deg, #fff0f7 0%, #ffe0f0 100%);
+      border: 1px solid #ffb0d9; border-radius: 16px; padding: 1.8rem 2.2rem; display: flex;
+      align-items: center; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; }
+    .manual-cta-body { flex: 1; min-width: 200px; }
+    .manual-cta-title { font-size: 1.12rem; font-weight: 700; color: #c0255a; margin-bottom: 0.3rem; }
+    .manual-cta-body p { font-size: 0.92rem; color: #a02860; margin: 0; }
+    .btn-download { display: inline-block; background: linear-gradient(135deg, #ff60c0, #d63384);
+      color: #fff; padding: 0.7rem 2rem; border-radius: 30px; font-size: 1rem; font-weight: 700;
+      box-shadow: 0 4px 15px rgba(214, 51, 132, 0.35); white-space: nowrap; }
+    .btn-download:hover { text-decoration: none; color: #fff; transform: translateY(-2px); }
+
+    .related { display: flex; gap: 0.7rem; flex-wrap: wrap; }
+    .related a { display: inline-block; background: #fff; border: 1px solid #ffb0d9; border-radius: 20px;
+      padding: 0.4rem 1.1rem; font-size: 0.88rem; color: #a02860; font-weight: 600; }
+    .related a:hover { background: #d63384; color: #fff; text-decoration: none; }
+
+    footer { border-top: 1px solid #ffb0d9; background: rgba(255, 255, 255, 0.6); padding: 2rem;
+      text-align: center; color: #a02860; font-size: 0.85rem; }
+
+    @media (max-width: 700px) {
+      .hero h1 { font-size: 1.7rem; }
+      main { padding: 2rem 1rem; }
+      .showcase-grid { grid-template-columns: 1fr; }
+      .showcase-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: none; }
+      .showcase-button { font-size: 0.84rem; padding: 0.55rem 0.65rem; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <span class="logo">mikage.to</span>
+    <nav class="site-nav">
+      <a href="index.html">mImageViewer</a>
+      <a href="manual/index.html">マニュアル</a>
+      <a href="index.html#download">ダウンロード</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="crumb"><a href="index.html">mImageViewer</a> ＞ 移行ガイド</div>
+  <h1>Windows フォトからの移行ガイド</h1>
+  <p class="tagline">標準のフォトから、一覧と整理に強いビューアへ</p>
+</div>
+
+<main>
+  <section>
+    <p class="lead">Windows に最初から入っている「フォト」で画像を見ていて、<strong>フォルダの中身をもっと一覧で見渡したい</strong>、<strong>ZIP や PDF の漫画も同じソフトで読みたい</strong>、<strong>気に入った画像に印を付けて後から集めたい</strong>と感じた方へ。mImageViewer は、そうした使い方のために作った無料・広告なしの画像ビューアです。フォトと入れ替える必要はなく、<strong>併用しながら試せます</strong>。</p>
+  </section>
+
+  <section>
+    <h2>mImageViewer で変わること</h2>
+    <ul class="pink-list">
+      <li><strong>フォルダを開くと、中身がすべてサムネイルで並びます。</strong>画像・動画・音声・ZIP・PDF が同じ一覧に並び、クリックでフルスクリーン表示に切り替わります。数万枚のフォルダでも、画面に見えている分から先に表示します（<a href="guide-fast-browsing.html">しくみ</a>）。</li>
+      <li><strong>ZIP / CBZ や PDF は展開せずにページをめくれます。</strong>漫画は見開き（右→左）や表紙あり見開きで読めます。RAR / 7z / LZH にも対応しています。</li>
+      <li><strong>★1〜5 とタグで整理できます。</strong>付けた★やタグで、フォルダをまたいだ 1 つの一覧を呼び出せます。★もタグも mImageViewer の中に記録し、画像ファイルは書き換えません。</li>
+      <li><strong>補正や回転は元のファイルを変えません。</strong>明るさ・色合いの補正、回転、切り取りは記録として持ち、表示にだけ反映します。ファイルにしたいときだけ別ファイルとして書き出します。</li>
+      <li><strong>AI の処理はすべて PC の中で行います。</strong>AI アップスケール・ノイズ除去・消しゴムの補完は PC の GPU で実行し、画像を外部へ送りません。広告・アクセス解析・アカウント登録もありません。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>はじめに知っておきたいこと</h2>
+    <ul class="pink-list">
+      <li><strong>動作環境は Windows 11（64bit）</strong>で、DirectX 12 に対応した GPU が必要です。</li>
+      <li><strong>画面は日本語のみ</strong>です。</li>
+      <li><strong>HEIC・各社 RAW・AVIF は Windows の拡張機能で表示します。</strong>Microsoft Store の「HEIF 画像拡張機能」「Microsoft Raw 画像拡張機能」などを入れると表示できます（<a href="manual/formats.html">対応フォーマット</a>）。</li>
+      <li><strong>エクスプローラーからの開き方</strong>：環境設定の「起動と連携 → エクスプローラ連携」で「送る」メニューに登録すると、画像を右クリックして <strong>送る → mImageViewer</strong> で開けます。画像のフォルダを開いたうえで、その画像をフルスクリーンで表示します。</li>
+      <li><strong>ダウンロードは 3 種類</strong>あります。ふつうはインストーラ版、インストールせずに試すならポータブル版がおすすめです（<a href="index.html#download">ダウンロード</a>）。Microsoft Store からも入手できます。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>よく使う操作</h2>
+    <p>フルスクリーン表示中の操作です。キーは設定メニューの「操作カスタマイズ…」で変更できます。</p>
+    <div class="table-scroll">
+      <table class="compare-table">
+        <thead>
+          <tr><th>やりたいこと</th><th>mImageViewer の操作</th><th>補足</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>次 / 前の画像</td><td><kbd>→</kbd> / <kbd>←</kbd>、マウスホイール、画面の左右クリック</td><td>タッチ画面では左右のタップでも移れます。</td></tr>
+          <tr><td>拡大・縮小</td><td><kbd>Ctrl</kbd>+ホイール、ドラッグで移動</td><td><kbd>0</kbd> でページ全体・横幅・縦幅・原寸を切り替えます。タッチ画面では 2 本指で拡大縮小できます。</td></tr>
+          <tr><td>回転</td><td><kbd>R</kbd>（右へ 90°）/ <kbd>L</kbd>（左へ 90°）</td><td>元のファイルは書き換えません。</td></tr>
+          <tr><td>全画面 ⇔ ウィンドウ内</td><td><kbd>F11</kbd></td><td></td></tr>
+          <tr><td>一覧に戻る</td><td><kbd>Esc</kbd></td><td></td></tr>
+          <tr><td>★を付ける</td><td><kbd>F1</kbd>〜<kbd>F5</kbd> で★1〜★5、<kbd>F6</kbd> で解除</td><td>一覧で★の数を指定して絞り込めます。</td></tr>
+          <tr><td>スライドショー</td><td><kbd>S</kbd></td><td></td></tr>
+          <tr><td>撮影情報を見る</td><td>画面の右端にマウスを寄せる、または <kbd>I</kbd> / <kbd>Tab</kbd></td><td>EXIF・GPS のほか、AI 生成画像のプロンプトも表示します。</td></tr>
+          <tr><td>加工した画像を保存する</td><td><kbd>Ctrl</kbd>+<kbd>E</kbd>（エクスポート）</td><td>JPEG / PNG / WebP の別ファイルとして書き出します。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>フォトと併用するときは</h2>
+    <p>mImageViewer は画像ファイルを移動したり、フォトのライブラリを変更したりしません。★・タグ・補正などの記録は mImageViewer の中にあり、フォトには表示されません。まずは写真や漫画の入ったフォルダを 1 つ開いて、一覧の見え方を試してみてください。最初の使い方は <a href="manual/tut-first-run.html">チュートリアル「はじめての 10 分」</a> にまとめています。</p>
+  </section>
+  <section>
+    <div class="manual-cta">
+      <div class="manual-cta-body">
+        <div class="manual-cta-title">mImageViewer を使ってみる</div>
+        <p>無料でダウンロードできます。インストール不要の単体 exe 版・ポータブル版もあります。</p>
+      </div>
+      <a class="btn-download" href="index.html#download">ダウンロード</a>
+    </div>
+    <p style="margin-top:1rem;font-size:0.9rem;">使い始める前の疑問は <a href="manual/faq.html#before">FAQ（使い始める前に）</a>、操作の詳細は <a href="manual/index.html">オンラインマニュアル</a> をご覧ください。</p>
+  </section>
+
+  <section>
+    <h2>ほかのガイド</h2>
+    <div class="related">
+      <a href="guide-ai-images.html">AI 生成画像を整理・検索する</a>
+      <a href="guide-remote.html">外出先のスマホから見る</a>
+      <a href="guide-fast-browsing.html">大量の画像を高速に一覧できるしくみ</a>
+      <a href="migrate-vix.html">ViX からの移行</a>
+      <a href="migrate-leeyes.html">Leeyes からの移行</a>
+      <a href="migrate-mangameeya.html">マンガミーヤからの移行</a>
+      <a href="migrate-zippla.html">ZipPla からの移行</a>
+      <a href="migrate-honeyview.html">Honeyview からの移行</a>
+      <a href="migrate-massigra.html">MassiGra からの移行</a>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <p>mImageViewer &nbsp;·&nbsp; <a href="/">mikage.to</a></p>
+</footer>
+
+</body>
+</html>
