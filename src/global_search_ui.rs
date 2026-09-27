@@ -382,8 +382,6 @@ pub struct GlobalSearchState {
     /// streaming 経過統計
     pub total_valid: usize,
     pub total_scanned: usize,
-    /// 索引には残すが、EPUB の「無視する」で結果から除いた件数。
-    ignored_epub_hits: usize,
     /// 完了フラグ
     pub done: bool,
     /// HARD_MAX で打ち切られたか
@@ -455,7 +453,6 @@ impl Default for GlobalSearchState {
             drill: None,
             total_valid: 0,
             total_scanned: 0,
-            ignored_epub_hits: 0,
             done: false,
             truncated: false,
             reject_message: None,
@@ -568,7 +565,6 @@ impl GlobalSearchState {
         self.drill = None;
         self.total_valid = 0;
         self.total_scanned = 0;
-        self.ignored_epub_hits = 0;
         self.done = false;
         self.truncated = false;
         self.reject_message = None;
@@ -660,21 +656,6 @@ fn split_zip_hit_path(hit_path: &str) -> Option<(&str, &str)> {
 
 fn is_zip_hit_path(hit_path: &str) -> bool {
     split_zip_hit_path(hit_path).is_some()
-}
-
-fn remove_ignored_epub_hits(hits: &mut Vec<GlobalHit>, ignore_epub: bool) -> usize {
-    if !ignore_epub {
-        return 0;
-    }
-    let original_len = hits.len();
-    hits.retain(|hit| {
-        is_zip_hit_path(&hit.path)
-            || !Path::new(&hit.path)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
-    });
-    original_len - hits.len()
 }
 
 /// GlobalHit のパスから「サムネ表示できる代表」の情報を抽出する。
@@ -2225,12 +2206,26 @@ impl App {
 
     /// 現在のクエリで検索を spawn する。
     pub(crate) fn spawn_global_search(&mut self, ctx: &egui::Context) {
+        self.spawn_global_search_impl(ctx, true);
+    }
+
+    /// The query did not change; retain tag suggestions rather than reading
+    /// tags.db synchronously from the preferences OK handler.
+    pub(crate) fn respawn_global_search_for_epub_setting(&mut self, ctx: &egui::Context) {
+        self.spawn_global_search_impl(ctx, false);
+    }
+
+    fn spawn_global_search_impl(&mut self, ctx: &egui::Context, refresh_tag_suggestions: bool) {
+        let retained_suggestions = (!refresh_tag_suggestions)
+            .then(|| std::mem::take(&mut self.global_search.tag_bridge_suggestions));
         self.global_search.reset_for_new_query();
         if !self.restart_search_page_edit_prepare(ctx) {
             return;
         }
         self.global_search.last_executed = self.global_search.query.clone();
-        if let Some(db) = self.tags_db.as_ref() {
+        if let Some(retained) = retained_suggestions {
+            self.global_search.tag_bridge_suggestions = retained;
+        } else if let Some(db) = self.tags_db.as_ref() {
             self.global_search.tag_bridge_suggestions = tag_bridge_suggestions_for_query(
                 db,
                 &self.global_search.query,
@@ -2271,6 +2266,7 @@ impl App {
             kinds: self.global_search.filters.kind.map(|k| vec![k]),
             target: self.global_search.filters.target.clone(),
             mode: self.global_search.filters.or_mode.into(),
+            ignore_epub: self.settings.epub_file_handling_ignores_epub(),
         };
 
         let repaint_ctx = ctx.clone();
@@ -2353,14 +2349,10 @@ impl App {
         while events_processed < MAX_EVENTS_PER_FRAME {
             match rx.try_recv() {
                 Ok(SearchStreamEvent::Batch {
-                    mut hits,
+                    hits,
                     scanned_candidates,
                     valid_hits,
                 }) => {
-                    self.global_search.ignored_epub_hits += remove_ignored_epub_hits(
-                        &mut hits,
-                        self.settings.epub_file_handling_ignores_epub(),
-                    );
                     // Accepted batches enter the worker FIFO in order. The worker does
                     // the rating lookup before returning each rated batch to this owner.
                     if let Some(prepare) = self.global_search.page_edit_prepare.as_mut() {
@@ -2371,8 +2363,7 @@ impl App {
                         ));
                     }
                     self.global_search.total_scanned = scanned_candidates;
-                    self.global_search.total_valid =
-                        valid_hits.saturating_sub(self.global_search.ignored_epub_hits);
+                    self.global_search.total_valid = valid_hits;
                     stats_changed = true;
                     events_processed += 1;
                 }
@@ -3640,35 +3631,6 @@ mod tests {
     use super::*;
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
-
-    #[test]
-    fn ignored_epub_is_removed_before_flat_aggregate_and_drill_state() {
-        let hit = |path: &str| GlobalHit {
-            path: path.into(),
-            score: 1.0,
-            mtime: 0,
-            file_size: None,
-            stars: 0,
-        };
-        let source = vec![
-            hit("c:/books/hidden.EPUB"),
-            hit("c:/books/visible.pdf"),
-            hit("c:/books/photo.jpg"),
-        ];
-        let mut included = source.clone();
-        assert_eq!(remove_ignored_epub_hits(&mut included, false), 0);
-        assert_eq!(included.len(), 3);
-        let mut ignored = source;
-        assert_eq!(remove_ignored_epub_hits(&mut ignored, true), 1);
-        let mut state = GlobalSearchState::default();
-        for hit in &ignored {
-            state.accumulate_hit(hit);
-        }
-        assert_eq!(state.all_hits.len(), 2);
-        assert_eq!(state.containers[&PathBuf::from("c:/books")].hit_count, 2);
-        let (items, _) = build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
-        assert!(items.iter().all(|item| item.name() != "hidden.EPUB"));
-    }
 
     #[test]
     fn search_membership_keeps_survivor_order_and_appends_candidates() {

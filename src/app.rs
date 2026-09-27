@@ -14169,6 +14169,9 @@ pub struct App {
     /// 閲覧履歴ビュー表示中の DB 行キャッシュ (key → row)。
     pub(crate) reading_history_rows:
         std::collections::HashMap<String, crate::reading_history_db::ReadingHistoryEntry>,
+    /// Fully filtered history indices before the EPUB policy. Preferences can
+    /// toggle EPUB visibility using this in-memory projection, without DB I/O.
+    reading_history_visible_without_epub_policy: Vec<usize>,
     /// 直近に閲覧履歴へ送った key と時刻。連続ページ送りの同一 key 書き込みを抑える。
     pub(crate) last_reading_history_touch: Option<(String, std::time::Instant)>,
     /// 閲覧履歴ビューから開いた本の effective パス。本を閉じて親へ戻るとき、実ディレクトリ
@@ -17228,6 +17231,7 @@ impl App {
             reading_history_db,
             reading_history_writer,
             reading_history_rows: std::collections::HashMap::new(),
+            reading_history_visible_without_epub_policy: Vec::new(),
             last_reading_history_touch: None,
             reading_history_return_from: None,
             spread_db,
@@ -25047,13 +25051,15 @@ impl App {
 
         let mode: crate::search_query::MatchMode = self.favsearch.or_mode.into();
         let kind_filter = self.favsearch.kind_filter;
+        let include_epub = !self.settings.epub_file_handling_ignores_epub();
         std::thread::Builder::new()
             .name("favsearch-db".to_string())
             .spawn(move || {
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = db.search(&query, &fav_roots, kind_filter, mode);
+                let result =
+                    db.search_with_epub(&query, &fav_roots, kind_filter, mode, include_epub);
                 // キャンセル後の送信は無意味なので捨てる (UI 側 pending も None に戻っている)
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
@@ -25091,19 +25097,6 @@ impl App {
 
     /// SQLite 検索結果を `start_loading_items` に流し込む共通処理。
     fn apply_favsearch_results(&mut self, results: Vec<crate::search_index_db::IndexEntry>) {
-        let ignore_epub = self.settings.epub_file_handling_ignores_epub();
-        let results: Vec<_> = results
-            .into_iter()
-            .filter(|entry| {
-                !ignore_epub
-                    || entry.kind != crate::search_index_db::IndexKind::PdfFile
-                    || !entry
-                        .path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
-            })
-            .collect();
         let mut items: Vec<GridItem> = Vec::with_capacity(results.len());
         let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(results.len());
         let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
@@ -25249,10 +25242,6 @@ impl App {
         &mut self,
         entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
     ) {
-        let entries = entries
-            .into_iter()
-            .filter(|entry| !self.settings.epub_file_handling_ignores_path(&entry.path))
-            .collect();
         let ReadingHistoryLoadInputs {
             items,
             image_metas,
@@ -25310,6 +25299,39 @@ impl App {
             self.selected = Some(idx);
             self.scroll_to_selected = true;
         }
+    }
+
+    /// Reapply only the EPUB policy to the already prepared history view.
+    /// All other filters were evaluated when the candidate indices were built;
+    /// this path does not reopen history, pin, rating or tag databases on OK.
+    pub(crate) fn refresh_reading_history_epub_visibility(&mut self) {
+        if !self.items_are_reading_history_view {
+            return;
+        }
+        self.visible_indices = self
+            .reading_history_visible_without_epub_policy
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                !self.items.get(idx).is_some_and(|item| {
+                    matches!(item, GridItem::PdfFile(path) if self.settings.epub_file_handling_ignores_path(path))
+                })
+            })
+            .collect();
+        // History has toolbar order even in Details mode.
+        self.details_order = self.visible_indices.clone();
+        self.details_order_revision = self.details_order_revision.wrapping_add(1);
+        self.viewer_navigation_caches.invalidate();
+        self.facet_tag_counts_cache = None;
+        self.facet_place_counts_cache = None;
+        self.facet_ai_model_counts_cache = None;
+        self.facet_ai_tool_counts_cache = None;
+        if !self.checked.is_empty() {
+            let visible = &self.visible_indices;
+            self.checked
+                .retain(|idx| visible.binary_search(idx).is_ok());
+        }
+        self.ensure_selected_visible_or_first();
     }
 
     /// メニュー操作でレーティング一覧を開く。
@@ -29734,6 +29756,7 @@ impl App {
         self.items_are_smart_folder_view = false;
         self.items_are_drive_list = false;
         self.reading_history_rows.clear();
+        self.reading_history_visible_without_epub_policy.clear();
         // 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) のピン情報を 1 度の lookup_many で取得し、
         // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
         // 大半は empty なので、典型的なフォルダで HashMap は数百 bytes に収まる。
@@ -55299,6 +55322,16 @@ impl App {
         {
             session.rating_rule_qualifying_count = smart_rule_total;
             session.rating_rule_search_match_count = smart_rule_search_matches;
+        }
+        if self.items_are_reading_history_view {
+            self.reading_history_visible_without_epub_policy = result.clone();
+            if self.settings.epub_file_handling_ignores_epub() {
+                result.retain(|&idx| {
+                    !self.items.get(idx).is_some_and(|item| {
+                        matches!(item, GridItem::PdfFile(path) if self.settings.epub_file_handling_ignores_path(path))
+                    })
+                });
+            }
         }
         self.visible_indices = result;
         if let Some(t0) = facet_name_filter_t0 {

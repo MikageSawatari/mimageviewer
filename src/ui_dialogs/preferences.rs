@@ -2643,7 +2643,7 @@ impl App {
                     // cannot put ignored books back into the mounted list.
                     let refreshed_result_view = if epub_handling_changed {
                         if self.global_search.active && self.items_are_global_search_view {
-                            self.spawn_global_search(ctx);
+                            self.respawn_global_search_for_epub_setting(ctx);
                             true
                         } else if self.favsearch.active
                             && self.current_folder.as_ref().is_some_and(|path| {
@@ -2659,7 +2659,7 @@ impl App {
                             self.execute_tag_view();
                             true
                         } else if self.items_are_reading_history_view {
-                            self.enter_reading_history();
+                            self.refresh_reading_history_epub_visibility();
                             true
                         } else if self.items_are_rating_view {
                             self.reload_current_rating_view_preserving_sort();
@@ -4898,6 +4898,60 @@ mod tests {
         harness.run();
         assert!(harness.state().favsearch.active);
         assert!(harness.state().favsearch.results_paths.is_empty());
+    }
+
+    #[test]
+    fn epub_handling_ok_reprojects_history_without_reading_history_db() {
+        use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+        use crate::settings::EpubFileHandling;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut app = crate::app::setup_app_for_test();
+        app.reading_history_db = None;
+        app.folder_thumb_pin_db = None;
+        app.items_are_reading_history_view = true;
+        app.current_folder = Some(crate::app::reading_history_synthetic_path());
+        for name in ["book.epub", "book.pdf"] {
+            let path = app.tmp.path().join(name);
+            let entry = ReadingHistoryEntry::new(
+                path.clone(),
+                ReadingHistoryKind::Pdf,
+                None,
+                name.into(),
+                None,
+                None,
+            );
+            app.reading_history_rows.insert(entry.key.clone(), entry);
+            app.items.push(crate::grid_item::GridItem::PdfFile(path));
+        }
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0, 1]);
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        for (handling, expected) in [
+            (EpubFileHandling::Ignore, vec![1]),
+            (EpubFileHandling::Ask, vec![0, 1]),
+        ] {
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::Cache);
+            harness.run();
+            harness
+                .state_mut()
+                .pref_state
+                .as_mut()
+                .unwrap()
+                .settings
+                .epub_file_handling = handling;
+            harness.run();
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            assert!(harness.state().items_are_reading_history_view);
+            assert_eq!(harness.state().visible_indices, expected);
+            assert_eq!(harness.state().reading_history_rows.len(), 2);
+        }
     }
 
     #[test]

@@ -16113,22 +16113,40 @@ mod phase_c_folder_nav_history_tests {
         app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
         let root = app.tmp.path().join("favorite-search-epub");
         std::fs::create_dir_all(&root).unwrap();
-        let epub = root.join("book.epub");
-        let pdf = root.join("book.pdf");
-        std::fs::write(&epub, b"epub").unwrap();
+        let pdf = root.join("zzz-book.pdf");
         std::fs::write(&pdf, b"pdf").unwrap();
-        app.favsearch.active = true;
-        app.apply_favsearch_results(
-            [epub, pdf.clone()]
-                .into_iter()
-                .map(|path| crate::search_index_db::IndexEntry {
+        let db = crate::search_index_db::SearchIndexDb::open_at(&root.join("index.db")).unwrap();
+        let mut indexed = (0..crate::search_index_db::SEARCH_RESULT_LIMIT)
+            .map(|n| {
+                let path = root.join(format!("aaa-book-{n:04}.EPUB"));
+                crate::search_index_db::IndexEntry {
                     display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
                     path,
                     kind: crate::search_index_db::IndexKind::PdfFile,
                     mtime: 0,
-                })
-                .collect(),
-        );
+                }
+            })
+            .collect::<Vec<_>>();
+        indexed.push(crate::search_index_db::IndexEntry {
+            path: pdf.clone(),
+            display_name: "zzz-book.pdf".into(),
+            kind: crate::search_index_db::IndexKind::PdfFile,
+            mtime: 0,
+        });
+        db.upsert_children(&root, &root, &indexed).unwrap();
+        app.search_index_db = Some(std::sync::Arc::new(db));
+        let mut favorite = crate::settings::FavoriteEntry::new("books".into(), root);
+        favorite.auto_index_structure = true;
+        app.settings.favorites.push(favorite);
+        app.favsearch.active = true;
+        app.favsearch.query = "book".into();
+        app.execute_favsearch();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.favsearch_pending.is_some() {
+            app.poll_favsearch();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         assert_eq!(app.favsearch.results_paths, vec![pdf.clone()]);
         assert!(
             app.items
