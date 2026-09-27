@@ -1047,9 +1047,29 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   safety limiter のゲインリダクション量が 1dB 以上に達した場合は音量表示右側に
   赤いインジケータを約 500ms 表示する (ceiling に触れただけ・タイムストレッチ由来の
   微小オーバーでは点かない)。
+- 複数の音声トラックがある動画では、下部 HUD の「音声 N」から一覧を開いて選ぶ。
+  行には番号と、分かる場合は言語・タイトル・形式・チャンネル数を示し、既定の行に
+  「(既定)」を付ける。右メタ情報パネルには現在の音声情報とトラックの本数を示す。
+  再生中の選択は現在位置から再生を続け、一時停止中は停止したまま切り替わる。
+  最後まで再生して停止中、または選択先に現在位置の音声がないと分かる場合は、
+  「(次の再生位置で切り替え)」と表示し、次の位置移動や再生開始で切り替える。
+  長さの情報がないトラックや途中で長く途切れるトラックは、音声のない位置への切り替えで
+  読み込み中のままになることがあり、そのトラックに音声がある位置へ移動するか元のトラックへ戻すと再開する。
+  動画から音声モードへ移った場合も下部 HUD から同じトラックを選べる。
+  「次の音声トラックへ切り替える」は操作カスタマイズで割り当てられ、既定キーはない。
+  音量ノーマライズの測定結果はファイル内のトラックごとに分ける。
+- 選んだ音声トラックは動画ファイルごとに記憶し、再生位置の復元設定とは独立して次回も使う。
+  「環境設定 → ライブラリ → 履歴と復元」の「再生位置と音声トラックの選択をすべてクリア」は
+  両方の記憶を消す。
+- リモート閲覧の動画は PC で選んだ音声トラックから始まる。端末の「動画の操作」では、
+  複数ある場合にトラックを選び直せる。端末で確定した選択は PC に記憶される。
+  端末で見た動画のファイル識別情報・再生位置・長さは PC へ渡され、PC の再生位置設定と閲覧履歴に反映される。
+  再生開始時の位置は PC の位置復元設定に従う。PC 側で接続を切った場合は、最後の数秒の進みが残らないことがある。
+  リモート接続を受け付けると PC の閲覧ウィンドウをすべて閉じて「リモート接続中」だけを表示する。
+  切断後は一覧に戻り、閉じた閲覧ウィンドウは復元しない。
 - 保存済み再生位置 (動画) と読書位置 (ZIP/PDF/対応アーカイブ) の記憶件数の確認・全件クリアは
-  **環境設定 → ライブラリ → 履歴と復元** ページに集約 (動画は `settings.video_resume_positions`、本は
-  `book_resume_db` を対象)。動画クリアは settings 経路のため OK 適用時、本クリアは
+  **環境設定 → ライブラリ → 履歴と復元** ページに集約 (動画・音声の再生位置と動画の音声トラック選択、
+  本の読書位置を対象)。再生位置とトラック選択のクリアは OK 適用時、本クリアは
   `book_resume_clear_requested` one-shot 経由で App が即時 `book_resume_db.clear_all()`。
 - 閲覧履歴は、ユーザー操作で開いた画像フォルダ / ZIP / PDF / 対応アーカイブと、
   動画・音声ファイルを %APPDATA%\mimageviewer\reading_history.db に MRU として保存する。
@@ -2036,11 +2056,12 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `video_anime4k_measurement` | Option<VideoAnime4kMeasurementCache> | None | S/L/UL×540p/1080pのGPU timestamp結果。adapter・driver情報が一致するときだけ再利用する |
 | `video_grid_open_starts_from_beginning` | bool | false | 位置復元マトリクス「動画 × 一覧から開く」の保存先 (v0.9.0 リリース済み bool を流用)。ON = 先頭から / OFF = 続きから。UI からは `video_open_resume` / `set_video_open_resume` 経由で ResumeMode として読み書き |
 | `video_nav_resume` | ResumeMode | Resume | 位置復元マトリクス「動画 × Ctrl+↑↓ 移動 (ホイール/キー含む)」。Resume=続きから / FromStart=先頭から |
+| `video_audio_track_choices` | `HashMap<String, SavedAudioTrackChoice>` | 空 | 切り替えた音声トラックをファイルごとに記憶。再生位置とは独立し、Remote で確定した選択も記録。「再生位置と音声トラックの選択をすべてクリア」で再生位置とともに消す |
 | `book_open_resume` | ResumeMode | Resume | 位置復元マトリクス「ZIP/PDF/対応アーカイブ/画像のみ通常フォルダ × 一覧から開く」。Resume=続き (保存済み読書位置) / FromStart=先頭ページ |
 | `book_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「ZIP/PDF/対応アーカイブ × Ctrl+↑↓ フォルダナビ移動」。既定 FromStart=従来のフォルダ先頭着地 / Resume=続き |
 | `music_open_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 一覧から開く」。既定 FromStart=最初から / Resume=続き。位置は動画と同じ `video_resume_positions` に path キーで保存 |
 | `music_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 移動 (↓↑/ホイールの前後ファイル移動 + Ctrl+↑↓/キー)」。既定 FromStart=最初から (誤って別曲へ行って戻っても頭から) |
-| `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用。測定済み動画は再生開始前から初期 gain を入れる。未測定動画は再生前に自動スキャンし、長尺では約 10 分ぶん測れた時点で仮 gain により再生を開始、確定値が出たら DB 保存して数秒かけて gain を追従する。キャンセル / 失敗後は同 fs_idx の自動再試行を抑止する。全体 OFF は実行中のスキャンもキャンセルする。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
+| `audio_normalize_enabled` | bool | false | 動画音量ノーマライズの全体 ON/OFF。ON のとき、選択中の音声トラックの測定値を使い -14 LUFS 相当の音量にする。測定結果はトラックごとに保存し、再生開始前から適用する。未測定のトラックは再生前に自動測定し、長い動画では途中の測定値で再生を始めて、測定完了後に音量を徐々に合わせる。測定を中止したトラックは、同じ動画を表示している間は自動で測り直さず、Norm ボタンから再開できる。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
 | `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。通常 fullscreen / in-window / F12 別窓 / ParkedLive の viewport と native presenter は同じ identity のまま hidden にし、動画、動画→音声モード、単体音楽の running / paused / EOF transport state を変更しない。hidden presenter は decode queue を drain して最新 frame を保持し、復帰で viewport と presenter を visible に戻すため再生中ならそのまま映像が再開する。detached / switching session と typed placement request は維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。mounted context の非 media texture とアイドル GPU 動画プールは解放するが、detached active viewer cache、稼働中 decoder / presenter / GPU frame、VST3 プラグインチェーンは保持するため、常駐中も動画 decode の CPU/GPU/電力コストを負う |

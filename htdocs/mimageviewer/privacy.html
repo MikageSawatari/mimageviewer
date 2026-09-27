@@ -119,22 +119,23 @@
       本アプリは利用者の PC 上でローカルに動作するデスクトップアプリケーションであり、
       <strong>開発者が利用者の個人情報を収集・送信・販売することは一切ありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年9月4日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年9月28日</p>
   </section>
 
   <section>
     <h2>収集する個人情報</h2>
     <p>
-      本アプリは、氏名・メールアドレス・位置情報・連絡先などの<strong>個人を特定できる情報を収集・保存・送信しません</strong>。
-      アカウント登録やログインも不要です。開発者が利用者の利用状況を受け取ることはありません。
+      本アプリは、氏名・メールアドレス・位置情報・連絡先などの個人情報を利用者に求めません。
+      アカウント登録やログインも不要です。<strong>開発者が利用者の情報や利用状況を受け取ることはありません</strong>。
+      ファイルの場所や閲覧位置など利用に必要な情報は利用者の PC に保存され、リモート閲覧中は利用者の端末と PC の間でだけやり取りされます。
     </p>
   </section>
 
   <section>
     <h2>端末内に保存されるデータ</h2>
-    <p>本アプリは、動作に必要な次のデータを<strong>利用者の PC 内のみ</strong>に保存します。外部へ送信されることはありません。</p>
+    <p>本アプリは、動作に必要な次のデータを利用者の PC に保存します。リモート閲覧を有効にした場合、再生位置などは利用者の端末から PC へ送られます。開発者や第三者のサーバーへ送信されることはありません。</p>
     <ul class="pink-list">
-      <li>アプリの設定・表示状態</li>
+      <li>アプリの設定・表示状態、動画・音声の再生位置とファイルごとに選んだ音声トラック</li>
       <li>サムネイルキャッシュ（動画の場面と音声波形の解析結果を含みます）</li>
       <li>タグ・レーティング・回転情報・読み込み履歴</li>
       <li>コレクションの名前・並び順・登録した元ファイルやフォルダのパス（<code>collection.db</code>）と、その世代バックアップ</li>
@@ -169,7 +170,10 @@
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。</li>
       <li><strong>リモート閲覧（既定では無効）</strong>: 利用者が自ら有効にした場合に限り、
-        PC 内で待ち受けを始め、利用者自身のスマートフォンやタブレットのブラウザへ画像を送ります。
+        PC 内で待ち受けを始め、利用者自身のスマートフォンやタブレットのブラウザへ画像・動画・音声を送ります。
+        複数の音声トラックがある動画では、トラックの番号と表示名の一覧、および選んだトラックの音声が端末へ渡ります。
+        端末で見た動画のファイル識別情報・再生位置・長さは端末から PC へ送られ、再生位置は PC の設定と閲覧履歴に記録されます。
+        端末で選んだ音声トラックも PC に保存されます。
         待ち受けは PC の内部に対して行うので、外部から直接つながることはありません。
         外出先からつなぐには、別途インストールする Tailscale を利用者自身が設定します。
         <strong>画像やライブラリの内容が、開発者やその他の第三者のサーバーへ送られることはありません。</strong></li>
@@ -204,7 +208,7 @@
 
   <section>
     <h2>第三者への提供</h2>
-    <p>本アプリは個人情報を収集しないため、第三者へ提供する情報はありません。</p>
+    <p>開発者は利用者の情報を取得しないため、第三者へ提供する情報はありません。</p>
     <p>
       リモート閲覧を外出先から使う場合に必要な Tailscale は、本アプリとは別の会社が提供する
       ソフトウェアとサービスで、利用者自身が契約・設定します。その利用は
@@ -238,23 +242,25 @@
       runs locally on your PC. <strong>The developer does not collect, transmit, or sell any of
       your personal information.</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">Last updated: August 12, 2026</p>
+    <p style="font-size:0.85rem; color:#888;">Last updated: September 28, 2026</p>
   </section>
 
   <section>
     <h2>Personal information we collect</h2>
     <p>
-      The App does <strong>not collect, store, or transmit any personally identifiable
-      information</strong> such as your name, email address, location, or contacts. No account
-      or sign-in is required, and the developer does not receive any usage data from you.
+      The App does not ask you for personal information such as your name, email address, location,
+      or contacts, and no account or sign-in is required. <strong>The developer does not receive your
+      information or any usage data.</strong> Information needed to use the App, such as file locations
+      and viewing positions, is stored on your PC and, during remote viewing, travels only between your
+      device and your PC.
     </p>
   </section>
 
   <section>
     <h2>Data stored on your device</h2>
-    <p>The App stores the following data <strong>only on your own PC</strong>; none of it is sent anywhere.</p>
+    <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer or to a third-party server.</p>
     <ul class="pink-list">
-      <li>Application settings and view state</li>
+      <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
       <li>Thumbnail cache (including video frames and audio waveform analysis)</li>
       <li>Tags, ratings, rotation info, and reading history</li>
       <li>Collections (list names, ordering, and the locations of the files and folders you add), and their rolling backups</li>
@@ -284,8 +290,11 @@
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
       <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source.</li>
       <li><strong>Remote viewing (off by default)</strong>: only when you turn it on, the App
-        starts listening inside your PC and sends images to a browser on your own phone or
-        tablet. It listens on the PC itself, so nothing can reach it directly from outside.
+        starts listening inside your PC and sends images, video, and audio to a browser on your own phone or
+        tablet. For videos with multiple audio tracks, the device receives a list of track numbers and display names,
+        plus audio from the selected track. Your device sends the video file identifier, playback position, and duration
+        to your PC, where the position is recorded in settings and viewing history. The audio track you choose on the
+        device is also saved on your PC. The App listens on the PC itself, so nothing can reach it directly from outside.
         To connect while away from home you set up Tailscale yourself, which you install
         separately. <strong>Your images and the contents of your library are never sent to the
         developer or to any other third party's server.</strong></li>
@@ -320,7 +329,7 @@
 
   <section>
     <h2>Sharing with third parties</h2>
-    <p>Because the App collects no personal information, there is nothing to share with third parties.</p>
+    <p>Because the developer does not obtain your information, there is nothing to share with third parties.</p>
     <p>
       Tailscale, which you need in order to use remote viewing away from home, is software and
       a service from a different company; you sign up for it and configure it yourself. Your use
