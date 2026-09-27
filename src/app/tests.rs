@@ -7,6 +7,19 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[test]
+fn history_transition_storage_keeps_app_stack_footprint_bounded() {
+    use std::mem::size_of;
+    // A staged history request is rarely active and must not be stored inline in every App.
+    // The capture/fullscreen input test creates several App values on a default test stack.
+    assert_eq!(
+        size_of::<Option<Box<HistoryNavigationTransition>>>(),
+        size_of::<usize>()
+    );
+    assert!(size_of::<top_level_grid_view::TopLevelGridView>() < 3_200);
+    assert!(size_of::<App>() < 110_000);
+}
+
 #[cfg(all(windows, feature = "test-script"))]
 #[test]
 fn test_script_counts_the_actual_refresh_folder_request() {

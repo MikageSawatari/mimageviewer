@@ -1292,7 +1292,7 @@ pub(crate) struct TopLevelGridView {
         Option<super::collection_navigation::CollectionNavigationPending>,
     /// History replay preparation travels with its viewer bundle during park/mount and is never
     /// copied into a sibling context. The transition owns its cancellation and old-view intent.
-    history_navigation_transition: Option<super::HistoryNavigationTransition>,
+    history_navigation_transition: Option<Box<super::HistoryNavigationTransition>>,
     /// Monotonic intent identity for collection playback requests in this viewer context.
     /// Navigation producers and terminal actions advance it so an index ABA cannot make an old
     /// asynchronous result current again.
@@ -1372,20 +1372,22 @@ impl TopLevelGridView {
     pub(crate) fn history_navigation_transition(
         &self,
     ) -> Option<&super::HistoryNavigationTransition> {
-        self.history_navigation_transition.as_ref()
+        self.history_navigation_transition.as_deref()
     }
 
     pub(crate) fn take_history_navigation_transition(
         &mut self,
     ) -> Option<super::HistoryNavigationTransition> {
-        self.history_navigation_transition.take()
+        self.history_navigation_transition
+            .take()
+            .map(|transition| *transition)
     }
 
     pub(crate) fn set_history_navigation_transition(
         &mut self,
         transition: Option<super::HistoryNavigationTransition>,
     ) {
-        self.history_navigation_transition = transition;
+        self.history_navigation_transition = transition.map(Box::new);
     }
 
     pub(crate) fn generation(&self) -> u64 {
