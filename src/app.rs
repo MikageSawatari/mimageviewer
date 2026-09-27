@@ -6312,6 +6312,21 @@ fn finish_out_of_keep_thumbnail_request(
     }
 }
 
+fn finish_pruned_raw_half_followup(
+    req: &crate::thumb_loader::LoadRequest,
+    tx: &mpsc::Sender<crate::thumb_loader::ThumbMsg>,
+    gen_done: &AtomicUsize,
+) {
+    // The executor has already handed this request to the thumbnail queue and
+    // removed its ticket. Pruning the queue now owns the deferred completion.
+    if matches!(
+        req.raw_source,
+        crate::thumb_loader::LoadRequestSource::RawHalfDeveloped { .. }
+    ) {
+        finish_out_of_keep_thumbnail_request(req, tx, gen_done);
+    }
+}
+
 /// Called only by the fullscreen worker after source resolution. RAW dimensions
 /// describe the developed raster, which may differ from the container header.
 fn fullscreen_raw_source_dims(source: &CanonicalResolvedSource<'_>) -> Option<[usize; 2]> {
@@ -6365,7 +6380,7 @@ mod raw_fullscreen_permit_tests {
             executor.queued_priority_for_test(&raw_ticket),
             Some(crate::raw::RawPriority::Normal)
         );
-        assert!(pending.promote_to_high(FsPageLoadContract::Sequential));
+        assert!(!pending.promote_to_high(FsPageLoadContract::Sequential));
         assert_eq!(
             executor.queued_priority_for_test(&raw_ticket),
             Some(crate::raw::RawPriority::High)
@@ -6656,17 +6671,15 @@ impl FsRawJobState {
         }
     }
 
-    fn promote_to_high(&mut self) -> bool {
+    fn promote_to_high(&mut self) {
         match self {
             Self::Awaiting(priority) => {
                 *priority = crate::raw::RawPriority::High;
-                false
             }
             Self::Submitted(ticket) => {
                 ticket.promote_to_high();
-                true
             }
-            Self::Cancelled => false,
+            Self::Cancelled => {}
         }
     }
 
@@ -6723,8 +6736,10 @@ impl FsPendingValue {
     }
 
     fn promote_to_high(&self, contract: FsPageLoadContract) -> bool {
-        let raw_promoted = self.raw_job.lock().unwrap().promote_to_high();
-        self.ticket.promote_to_high(contract) || raw_promoted
+        self.raw_job.lock().unwrap().promote_to_high();
+        // LatestSeek supersession depends solely on whether the fs scheduler
+        // still has this request waiting. A RAW job may outlive its fs permit.
+        self.ticket.promote_to_high(contract)
     }
 
     fn disarm_ticket(&mut self) {
@@ -39575,6 +39590,7 @@ impl App {
                         }
                     } else {
                         locally_canceled.insert(req.idx);
+                        finish_pruned_raw_half_followup(req, &self.tx, &self.cache_gen_done);
                     }
                     keep
                 });
@@ -39590,6 +39606,7 @@ impl App {
                         }
                     } else {
                         locally_canceled.insert(req.idx);
+                        finish_pruned_raw_half_followup(req, &self.tx, &self.cache_gen_done);
                     }
                     keep
                 });
@@ -40404,6 +40421,7 @@ impl App {
             q.retain(|r| {
                 let keep = keep_set.contains(&r.idx);
                 if !keep {
+                    finish_pruned_raw_half_followup(r, &self.tx, &self.cache_gen_done);
                     requested.remove(&r.idx);
                     return false;
                 }
@@ -40411,6 +40429,7 @@ impl App {
                 let foreground = now_visible || interactive_thumbnail_pages.contains(&r.idx);
                 let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
+                    finish_pruned_raw_half_followup(r, &self.tx, &self.cache_gen_done);
                     requested.remove(&r.idx);
                     pruned_regular += 1;
                     return false;
@@ -40442,6 +40461,7 @@ impl App {
             q.retain(|r| {
                 let keep = keep_set.contains(&r.idx);
                 if !keep {
+                    finish_pruned_raw_half_followup(r, &self.tx, &self.cache_gen_done);
                     requested.remove(&r.idx);
                     return false;
                 }
@@ -40449,6 +40469,7 @@ impl App {
                 let foreground = now_visible || interactive_thumbnail_pages.contains(&r.idx);
                 let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
+                    finish_pruned_raw_half_followup(r, &self.tx, &self.cache_gen_done);
                     requested.remove(&r.idx);
                     pruned_heavy += 1;
                     return false;

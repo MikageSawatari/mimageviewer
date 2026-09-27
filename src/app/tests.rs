@@ -7,6 +7,154 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[cfg(windows)]
+#[test]
+fn latest_seek_during_raw_development_supersedes_waiting_pages_and_promotes_raw() {
+    let mut app = setup_app_for_test();
+    app.items = (0..3)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("page-{idx}.dng"))))
+        .collect();
+    app.fullscreen_idx = Some(2);
+    let owner = app.fs_page_load_context_serial();
+    let scheduler = Arc::new(FsPageLoadScheduler::with_limits(1, 0));
+    app.fs_page_load_scheduler = Arc::clone(&scheduler);
+
+    let fs_ticket = scheduler.request(
+        owner,
+        2,
+        FsPageLoadPriority::Normal,
+        FsPageLoadContract::Sequential,
+        None,
+        0,
+    );
+    drop(fs_ticket.waiter().acquire_cancellable().unwrap());
+    let blocker = scheduler.request(
+        owner + 1,
+        0,
+        FsPageLoadPriority::High,
+        FsPageLoadContract::Sequential,
+        None,
+        0,
+    );
+    let blocker_permit = blocker.waiter().acquire_cancellable().unwrap();
+    let older = scheduler.request(
+        owner,
+        1,
+        FsPageLoadPriority::Normal,
+        FsPageLoadContract::Sequential,
+        None,
+        0,
+    );
+    assert_eq!(scheduler.stats().waiting, 1);
+
+    let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let _raw_blocker = executor.block_one_slot_for_test(started_tx, release_rx);
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let (result_tx, _result_rx) = std::sync::mpsc::channel();
+    let raw_ticket = Arc::new(executor.submit_thumbnail_half(
+        crate::raw::RawOwnedSource::Path(PathBuf::from("vendor/raw-samples/1018.cr2")),
+        crate::raw::RawPriority::Normal,
+        result_tx,
+    ));
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let pending = FsPendingValue::scheduled(fs_ticket, rx, 0, FsLoadPurpose::Prefetch);
+    pending
+        .raw_job
+        .lock()
+        .unwrap()
+        .publish(Arc::clone(&raw_ticket));
+    app.fs_pending.insert(2, pending);
+
+    app.apply_fs_page_load_contract(2, FsPageLoadContract::LatestSeek);
+    assert!(
+        older.is_cancelled(),
+        "LatestSeek must supersede the older waiting page"
+    );
+    assert_eq!(scheduler.stats().waiting, 0);
+    assert_eq!(
+        executor.queued_priority_for_test(&raw_ticket),
+        Some(crate::raw::RawPriority::High)
+    );
+
+    app.fs_pending.remove(&2).unwrap().cancel();
+    release_tx.send(()).unwrap();
+    drop(blocker_permit);
+}
+
+fn raw_half_followup_for_prune(idx: usize) -> crate::thumb_loader::LoadRequest {
+    crate::thumb_loader::LoadRequest {
+        idx,
+        input_seq: 42,
+        items_gen: 7,
+        raw_source: crate::thumb_loader::LoadRequestSource::RawHalfDeveloped {
+            image: image::DynamicImage::new_rgb8(2, 2),
+            developed_dims: [2, 2],
+            decode_ms: 0.0,
+            folder_selection_proof: None,
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn keep_projection_prunes_queued_raw_followups_and_counts_both_completions() {
+    let mut app = setup_app_for_test();
+    app.items = (0..2)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("page-{idx}.dng"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; 2];
+    app.keep_set = [0, 1].into_iter().collect();
+    app.reload_queue = Some(Arc::new((
+        Mutex::new(vec![raw_half_followup_for_prune(0)]),
+        Condvar::new(),
+    )));
+    app.heavy_io_queue = Some(Arc::new((
+        Mutex::new(vec![raw_half_followup_for_prune(1)]),
+        Condvar::new(),
+    )));
+    app.requested.insert(0, false);
+    app.requested.insert(1, false);
+
+    app.install_thumbnail_keep_projection(thumbnail_keep_projection(2, [], [], None, [], []), true);
+    assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), 2);
+    assert!(!app.requested.contains_key(&0) && !app.requested.contains_key(&1));
+    let mut canceled = [app.rx.try_recv().unwrap(), app.rx.try_recv().unwrap()].map(|msg| {
+        assert!(msg.canceled && !msg.finalized);
+        assert_eq!((msg.input_seq, msg.items_gen), (42, 7));
+        msg.idx
+    });
+    canceled.sort();
+    assert_eq!(canceled, [0, 1]);
+}
+
+#[test]
+fn grid_queue_prune_counts_queued_raw_followup() {
+    let mut app = setup_app_for_test();
+    app.items = (0..2)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("page-{idx}.dng"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; 2];
+    app.image_metas = vec![None; 2];
+    app.visible_indices = vec![0];
+    app.reload_queue = Some(Arc::new((
+        Mutex::new(vec![raw_half_followup_for_prune(1)]),
+        Condvar::new(),
+    )));
+    app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+    app.requested.insert(1, false);
+
+    app.update_keep_range_and_requests(&egui::Context::default(), std::time::Instant::now());
+    assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), 1);
+    assert!(!app.requested.contains_key(&1));
+    let msg = app.rx.try_recv().unwrap();
+    assert_eq!((msg.idx, msg.input_seq, msg.items_gen), (1, 42, 7));
+    assert!(msg.canceled && !msg.finalized);
+}
+
 #[cfg(all(windows, feature = "test-script"))]
 #[test]
 fn test_script_counts_the_actual_refresh_folder_request() {
