@@ -16108,6 +16108,37 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
+    fn favorite_search_omits_ignored_epub_without_hiding_pdf() {
+        let mut app = setup_app();
+        app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+        let root = app.tmp.path().join("favorite-search-epub");
+        std::fs::create_dir_all(&root).unwrap();
+        let epub = root.join("book.epub");
+        let pdf = root.join("book.pdf");
+        std::fs::write(&epub, b"epub").unwrap();
+        std::fs::write(&pdf, b"pdf").unwrap();
+        app.favsearch.active = true;
+        app.apply_favsearch_results(
+            [epub, pdf.clone()]
+                .into_iter()
+                .map(|path| crate::search_index_db::IndexEntry {
+                    display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    path,
+                    kind: crate::search_index_db::IndexKind::PdfFile,
+                    mtime: 0,
+                })
+                .collect(),
+        );
+        assert_eq!(app.favsearch.results_paths, vec![pdf.clone()]);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::PdfFile(path) if path == &pdf))
+        );
+        assert_eq!(app.items.len(), 1);
+    }
+
+    #[test]
     fn closing_favsearch_after_result_restores_subfolder_expansion_snapshot() {
         use crate::app::subfolder_expansion::{
             SubfolderExpansionDiag, SubfolderExpansionEntry, SubfolderExpansionSnapshot,

@@ -258,7 +258,8 @@ impl CollectionEngine {
                 ));
             }
         };
-        let (entries, truncated) = map_favorite_search_entries(index_entries);
+        let (entries, truncated) =
+            map_favorite_search_entries(index_entries, !settings.epub_file_handling_ignores_epub());
         Ok(FavoriteSearchPayload {
             listing: self.favorite_search_listing(&settings, sort_order, entries, truncated),
             index_state: FavoriteSearchIndexState::Ready,
@@ -1358,12 +1359,20 @@ fn remote_entry_from_candidate(candidate: CandidateEntry) -> RemoteEntry {
     }
 }
 
-fn map_favorite_search_entries(index_entries: Vec<IndexEntry>) -> (Vec<RemoteEntry>, bool) {
-    map_favorite_search_entries_with_entry_limit(index_entries, MAX_REMOTE_COLLECTION_ENTRIES)
+fn map_favorite_search_entries(
+    index_entries: Vec<IndexEntry>,
+    include_epub: bool,
+) -> (Vec<RemoteEntry>, bool) {
+    map_favorite_search_entries_with_entry_limit(
+        index_entries,
+        include_epub,
+        MAX_REMOTE_COLLECTION_ENTRIES,
+    )
 }
 
 fn map_favorite_search_entries_with_entry_limit(
     index_entries: Vec<IndexEntry>,
+    include_epub: bool,
     entry_limit: usize,
 ) -> (Vec<RemoteEntry>, bool) {
     let index_limit_reached = index_entries.len() == SEARCH_RESULT_LIMIT;
@@ -1376,7 +1385,7 @@ fn map_favorite_search_entries_with_entry_limit(
                 IndexKind::PdfFile => RemoteEntryKind::Pdf,
                 IndexKind::VideoFile => return None,
             };
-            Some(CandidateEntry {
+            let candidate = CandidateEntry {
                 path: entry.path,
                 name: entry.display_name,
                 kind,
@@ -1384,7 +1393,18 @@ fn map_favorite_search_entries_with_entry_limit(
                 progress_current: None,
                 progress_total: None,
                 rating: None,
-            })
+            };
+            if !include_epub
+                && candidate.kind == RemoteEntryKind::Pdf
+                && candidate
+                    .path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                return None;
+            }
+            Some(candidate)
         })
         .collect();
     let entries = to_remote_entries_bounded(candidates, entry_limit.saturating_add(1));
@@ -2805,9 +2825,32 @@ mod tests {
             .collect();
 
         let (entries, truncated) =
-            map_favorite_search_entries_with_entry_limit(index_entries, test_limit);
+            map_favorite_search_entries_with_entry_limit(index_entries, true, test_limit);
 
         assert_eq!(entries.len(), test_limit);
         assert!(truncated);
+    }
+
+    #[test]
+    fn favorite_search_mapping_omits_epub_only_when_epub_policy_ignores_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = [temp.path().join("book.epub"), temp.path().join("book.pdf")];
+        for path in &paths {
+            std::fs::write(path, b"book").unwrap();
+        }
+        let entries = paths
+            .iter()
+            .map(|path| IndexEntry {
+                path: path.clone(),
+                display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                kind: IndexKind::PdfFile,
+                mtime: 0,
+            })
+            .collect::<Vec<_>>();
+        let (included, _) = map_favorite_search_entries(entries.clone(), true);
+        let (ignored, _) = map_favorite_search_entries(entries, false);
+        assert_eq!(included.len(), 2);
+        assert_eq!(ignored.len(), 1);
+        assert_eq!(ignored[0].name, "book.pdf");
     }
 }

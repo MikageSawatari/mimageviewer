@@ -8414,6 +8414,14 @@ impl Settings {
         self.epub_file_handling == EpubFileHandling::Ignore
     }
 
+    pub fn epub_file_handling_ignores_path(&self, path: &std::path::Path) -> bool {
+        self.epub_file_handling_ignores_epub()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    }
+
     pub fn archive_convert_suppresses_confirm(&self) -> bool {
         self.archive_file_handling_resolved() == ArchiveFileHandling::Convert
     }

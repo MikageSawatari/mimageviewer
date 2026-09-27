@@ -23418,7 +23418,28 @@ impl App {
         let Some(key) = similar_index_item_key(item) else {
             return Arc::new(crate::similar_index::ItemQuery::NotIndexed);
         };
-        similar_index.query_item(&key)
+        let query = similar_index.query_item(&key);
+        if !self.settings.epub_file_handling_ignores_epub() {
+            return query;
+        }
+        if let crate::similar_index::ItemQuery::Ready(matches) = query.as_ref() {
+            let ignored_hit = |hit: &crate::similar_index::QueryHit| {
+                let path = match hit.target.as_ref() {
+                    Some(crate::similar_index::SimilarItemTarget::PdfPage { pdf_path, .. }) => {
+                        Some(pdf_path.as_path())
+                    }
+                    _ => hit.container_key.as_deref().map(Path::new),
+                };
+                path.is_some_and(|path| self.settings.epub_file_handling_ignores_path(path))
+            };
+            if !matches.hits.iter().any(&ignored_hit) {
+                return query;
+            }
+            let mut visible = matches.clone();
+            visible.hits.retain(|hit| !ignored_hit(hit));
+            return Arc::new(crate::similar_index::ItemQuery::Ready(visible));
+        }
+        query
     }
 
     pub(crate) fn query_similar_book(
@@ -23434,7 +23455,23 @@ impl App {
             similar_index.withdraw_book_query(client);
             return std::sync::Arc::new(crate::similar_index::BookQuery::NotBook);
         };
-        similar_index.query_book(client, &key)
+        let query = similar_index.query_book(client, &key);
+        if !self.settings.epub_file_handling_ignores_epub() {
+            return query;
+        }
+        if let crate::similar_index::BookQuery::Ready(relations) = query.as_ref() {
+            let ignored_hit = |hit: &crate::similar_index::BookRelationHit| {
+                self.settings
+                    .epub_file_handling_ignores_path(Path::new(&hit.other_container_key))
+            };
+            if !relations.hits.iter().any(&ignored_hit) {
+                return query;
+            }
+            let mut visible = relations.clone();
+            visible.hits.retain(|hit| !ignored_hit(hit));
+            return Arc::new(crate::similar_index::BookQuery::Ready(visible));
+        }
+        query
     }
 
     /// 起動時 IndexerManager 初期化をバックグラウンドスレッドで開始する。
@@ -24711,7 +24748,11 @@ impl App {
         }
     }
 
-    fn apply_tag_view_result(&mut self, result: crate::tag_view::TagViewResult) {
+    fn apply_tag_view_result(&mut self, mut result: crate::tag_view::TagViewResult) {
+        result.entries.retain(|entry| {
+            entry.kind != crate::tag_view::TagViewItemKind::PdfFile
+                || !self.settings.epub_file_handling_ignores_path(&entry.path)
+        });
         self.tag_view.summaries = result.summaries;
         self.tag_view.truncated = result.truncated;
         self.tag_view.result_count = result.entries.len();
@@ -25050,6 +25091,19 @@ impl App {
 
     /// SQLite 検索結果を `start_loading_items` に流し込む共通処理。
     fn apply_favsearch_results(&mut self, results: Vec<crate::search_index_db::IndexEntry>) {
+        let ignore_epub = self.settings.epub_file_handling_ignores_epub();
+        let results: Vec<_> = results
+            .into_iter()
+            .filter(|entry| {
+                !ignore_epub
+                    || entry.kind != crate::search_index_db::IndexKind::PdfFile
+                    || !entry
+                        .path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            })
+            .collect();
         let mut items: Vec<GridItem> = Vec::with_capacity(results.len());
         let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(results.len());
         let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
@@ -25195,6 +25249,10 @@ impl App {
         &mut self,
         entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
     ) {
+        let entries = entries
+            .into_iter()
+            .filter(|entry| !self.settings.epub_file_handling_ignores_path(&entry.path))
+            .collect();
         let ReadingHistoryLoadInputs {
             items,
             image_metas,
@@ -25566,6 +25624,7 @@ impl App {
             crate::rating_view::RatingViewPrepareOptions {
                 intent,
                 sort: self.rating_view_sort,
+                include_epub: !self.settings.epub_file_handling_ignores_epub(),
                 display_order: self.settings.grid_display_order.clone(),
                 pin_db: self.folder_thumb_pin_db.clone(),
                 folder_thumb_sort: self.settings.folder_thumb_sort,
@@ -37207,7 +37266,10 @@ impl App {
         if let Some(result) = build_result {
             self.bookmark_browser_pending = None;
             match result {
-                Ok(rows) => {
+                Ok(mut rows) => {
+                    rows.retain(|row| {
+                        !matches!(&row.item, GridItem::PdfFile(path) if self.settings.epub_file_handling_ignores_path(path))
+                    });
                     let grid_content_unchanged = self.items_are_bookmark_view
                         && crate::bookmark_browser::rows_have_same_grid_content(
                             &self.bookmark_browser_rows,

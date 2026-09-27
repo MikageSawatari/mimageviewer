@@ -382,6 +382,8 @@ pub struct GlobalSearchState {
     /// streaming 経過統計
     pub total_valid: usize,
     pub total_scanned: usize,
+    /// 索引には残すが、EPUB の「無視する」で結果から除いた件数。
+    ignored_epub_hits: usize,
     /// 完了フラグ
     pub done: bool,
     /// HARD_MAX で打ち切られたか
@@ -453,6 +455,7 @@ impl Default for GlobalSearchState {
             drill: None,
             total_valid: 0,
             total_scanned: 0,
+            ignored_epub_hits: 0,
             done: false,
             truncated: false,
             reject_message: None,
@@ -565,6 +568,7 @@ impl GlobalSearchState {
         self.drill = None;
         self.total_valid = 0;
         self.total_scanned = 0;
+        self.ignored_epub_hits = 0;
         self.done = false;
         self.truncated = false;
         self.reject_message = None;
@@ -656,6 +660,21 @@ fn split_zip_hit_path(hit_path: &str) -> Option<(&str, &str)> {
 
 fn is_zip_hit_path(hit_path: &str) -> bool {
     split_zip_hit_path(hit_path).is_some()
+}
+
+fn remove_ignored_epub_hits(hits: &mut Vec<GlobalHit>, ignore_epub: bool) -> usize {
+    if !ignore_epub {
+        return 0;
+    }
+    let original_len = hits.len();
+    hits.retain(|hit| {
+        is_zip_hit_path(&hit.path)
+            || !Path::new(&hit.path)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    });
+    original_len - hits.len()
 }
 
 /// GlobalHit のパスから「サムネ表示できる代表」の情報を抽出する。
@@ -2334,10 +2353,14 @@ impl App {
         while events_processed < MAX_EVENTS_PER_FRAME {
             match rx.try_recv() {
                 Ok(SearchStreamEvent::Batch {
-                    hits,
+                    mut hits,
                     scanned_candidates,
                     valid_hits,
                 }) => {
+                    self.global_search.ignored_epub_hits += remove_ignored_epub_hits(
+                        &mut hits,
+                        self.settings.epub_file_handling_ignores_epub(),
+                    );
                     // Accepted batches enter the worker FIFO in order. The worker does
                     // the rating lookup before returning each rated batch to this owner.
                     if let Some(prepare) = self.global_search.page_edit_prepare.as_mut() {
@@ -2348,7 +2371,8 @@ impl App {
                         ));
                     }
                     self.global_search.total_scanned = scanned_candidates;
-                    self.global_search.total_valid = valid_hits;
+                    self.global_search.total_valid =
+                        valid_hits.saturating_sub(self.global_search.ignored_epub_hits);
                     stats_changed = true;
                     events_processed += 1;
                 }
@@ -3616,6 +3640,35 @@ mod tests {
     use super::*;
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
+
+    #[test]
+    fn ignored_epub_is_removed_before_flat_aggregate_and_drill_state() {
+        let hit = |path: &str| GlobalHit {
+            path: path.into(),
+            score: 1.0,
+            mtime: 0,
+            file_size: None,
+            stars: 0,
+        };
+        let source = vec![
+            hit("c:/books/hidden.EPUB"),
+            hit("c:/books/visible.pdf"),
+            hit("c:/books/photo.jpg"),
+        ];
+        let mut included = source.clone();
+        assert_eq!(remove_ignored_epub_hits(&mut included, false), 0);
+        assert_eq!(included.len(), 3);
+        let mut ignored = source;
+        assert_eq!(remove_ignored_epub_hits(&mut ignored, true), 1);
+        let mut state = GlobalSearchState::default();
+        for hit in &ignored {
+            state.accumulate_hit(hit);
+        }
+        assert_eq!(state.all_hits.len(), 2);
+        assert_eq!(state.containers[&PathBuf::from("c:/books")].hit_count, 2);
+        let (items, _) = build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
+        assert!(items.iter().all(|item| item.name() != "hidden.EPUB"));
+    }
 
     #[test]
     fn search_membership_keeps_survivor_order_and_appends_candidates() {

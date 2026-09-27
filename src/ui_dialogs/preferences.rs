@@ -2629,6 +2629,7 @@ impl App {
                     self.settings.epub_file_handling,
                 );
                 let duplicate_settings_changed = old_dup != new_dup;
+                let epub_handling_changed = old_dup.8 != new_dup.8;
                 let file_visibility_changed =
                     old_show_hidden_files != self.settings.show_hidden_files;
                 let grid_display_order_changed =
@@ -2637,7 +2638,44 @@ impl App {
                     != self.settings.rating_sort_unrated_position
                     && self.settings.sort_order.is_rating();
                 if duplicate_settings_changed || file_visibility_changed {
-                    self.reload_current_folder_preserving_override();
+                    // A synthetic result view has no physical folder to reload. Re-run its
+                    // producer when EPUB visibility changes so an in-flight old result
+                    // cannot put ignored books back into the mounted list.
+                    let refreshed_result_view = if epub_handling_changed {
+                        if self.global_search.active && self.items_are_global_search_view {
+                            self.spawn_global_search(ctx);
+                            true
+                        } else if self.favsearch.active
+                            && self.current_folder.as_ref().is_some_and(|path| {
+                                crate::folder_tree::path_eq(
+                                    path,
+                                    &crate::app::search_results_synthetic_path(),
+                                )
+                            })
+                        {
+                            self.execute_favsearch();
+                            true
+                        } else if self.tag_view.active && self.items_are_tag_view {
+                            self.execute_tag_view();
+                            true
+                        } else if self.items_are_reading_history_view {
+                            self.enter_reading_history();
+                            true
+                        } else if self.items_are_rating_view {
+                            self.reload_current_rating_view_preserving_sort();
+                            true
+                        } else if self.items_are_bookmark_view {
+                            self.refresh_bookmark_browser();
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !refreshed_result_view {
+                        self.reload_current_folder_preserving_override();
+                    }
                 } else if grid_display_order_changed || rating_sort_position_changed {
                     self.apply_sort_change_reload();
                 }
@@ -4752,6 +4790,7 @@ mod tests {
     #[test]
     fn epub_handling_preferences_cancel_ok_reload_reset_and_listing_effect() {
         use crate::settings::{ArchiveFileHandling, EpubFileHandling, Settings};
+        use egui_kittest::{Harness, kittest::Queryable};
 
         let mut app = crate::app::setup_app_for_test();
         app.settings
@@ -4761,16 +4800,49 @@ mod tests {
         std::fs::write(folder.join("book.epub"), b"book").unwrap();
         std::fs::write(folder.join("archive.7z"), b"archive").unwrap();
 
-        let mut cancelled = preferences_state_for_test(&app.settings);
-        cancelled.settings.epub_file_handling = EpubFileHandling::Ignore;
-        drop(cancelled);
-        assert_eq!(app.settings.epub_file_handling, EpubFileHandling::Ask);
+        app.open_preferences_page(PreferencesPage::Cache);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .epub_file_handling = EpubFileHandling::Ignore;
+        harness.run();
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        assert!(harness.state().show_preferences_discard_confirm);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness.state().settings.epub_file_handling,
+            EpubFileHandling::Ask
+        );
 
-        let mut edited = preferences_state_for_test(&app.settings);
-        edited.settings.epub_file_handling = EpubFileHandling::Ignore;
-        prepare_preferences_state_settings_for_commit(&mut edited, &mut app.settings);
-        app.settings = edited.settings;
-        app.settings.save();
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .epub_file_handling = EpubFileHandling::Ignore;
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness.state().settings.epub_file_handling,
+            EpubFileHandling::Ignore
+        );
 
         let reloaded = Settings::load();
         assert_eq!(reloaded.epub_file_handling, EpubFileHandling::Ignore);
@@ -4784,17 +4856,48 @@ mod tests {
         )));
         assert_eq!(scan.omitted.ignored_epub, 1);
 
-        let mut reset = preferences_state_for_test(&reloaded);
-        pages::reset_epub_file_handling(&mut reset.settings);
-        prepare_preferences_state_settings_for_commit(&mut reset, &mut app.settings);
-        app.settings = reset.settings;
-        app.settings.save();
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        pages::reset_epub_file_handling(
+            &mut harness.state_mut().pref_state.as_mut().unwrap().settings,
+        );
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
         let restored = Settings::load();
         assert_eq!(restored.epub_file_handling, EpubFileHandling::Ask);
         assert_eq!(restored.archive_file_handling, ArchiveFileHandling::Convert);
         let scan =
             crate::app::folder_scan::scan_directory_with_settings(&folder, &restored).unwrap();
         assert!(scan.folders.iter().any(|entry| matches!(&entry.item, crate::grid_item::GridItem::PdfFile(path) if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))));
+
+        // The same OK path refreshes a mounted synthetic result view instead of
+        // trying to scan its synthetic path as a physical folder.
+        {
+            let app = harness.state_mut();
+            app.favsearch.active = true;
+            app.favsearch.query.clear();
+            app.favsearch.results_paths = vec![folder.join("book.epub")];
+            app.current_folder = Some(crate::app::search_results_synthetic_path());
+        }
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .epub_file_handling = EpubFileHandling::Ignore;
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(harness.state().favsearch.active);
+        assert!(harness.state().favsearch.results_paths.is_empty());
     }
 
     #[test]
