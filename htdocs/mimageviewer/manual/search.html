@@ -79,7 +79,7 @@
     <h1 class="page-title">検索機能</h1>
     <p class="page-desc">
       mImageViewer には 4 種類の検索モード (<kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>T</kbd>) があります。
-      「S はフォルダ・ZIP・PDF を探す / G は画像・PDF・動画・音声 1 件ずつを探す / F は今見ている場所を絞る / T はタグで探す」と覚えると使い分けが簡単です。
+      「S はフォルダ・ZIP・PDF・EPUB を探す / G は画像・PDF・EPUB・動画・音声 1 件ずつを探す / F は今見ている場所を絞る / T はタグで探す」と覚えると使い分けが簡単です。
     </p>
 
     <h2 id="overview">1. 4 つの検索モードの使い分け</h2>
@@ -99,7 +99,7 @@
           <tr>
             <td><kbd>Ctrl</kbd>+<kbd>S</kbd></td>
             <td><strong>コンテナ検索</strong></td>
-            <td>お気に入り配下の<strong>フォルダ / ZIP / PDF</strong></td>
+            <td>お気に入り配下の<strong>フォルダ / ZIP / PDF / EPUB</strong></td>
             <td>名前のみ</td>
             <td>「あのフォルダ、どこに置いたっけ?」をフォルダ名・ファイル名で呼び出す</td>
           </tr>
@@ -113,8 +113,8 @@
           <tr>
             <td><kbd>Ctrl</kbd>+<kbd>G</kbd></td>
             <td><strong>アイテム検索</strong></td>
-            <td>お気に入り全体の<strong>画像 / PDF / 動画 / 音声</strong></td>
-            <td>画像・PDF・動画はファイル名と各種メタ情報、音声はファイル名</td>
+            <td>お気に入り全体の<strong>画像 / PDF / EPUB / 動画 / 音声</strong></td>
+            <td>画像・PDF・動画はファイル名と各種メタ情報、EPUB・音声はファイル名</td>
             <td>お気に入り横断で画像やメディアを掘り出す</td>
           </tr>
           <tr>
@@ -133,7 +133,7 @@
       <div class="box-body">
         <strong>どれを使えばいい?</strong>
         <ul>
-          <li>フォルダ・ZIP・PDF を名前で探したい → <kbd>Ctrl</kbd>+<kbd>S</kbd> (コンテナ検索)</li>
+          <li>フォルダ・ZIP・PDF・EPUB を名前で探したい → <kbd>Ctrl</kbd>+<kbd>S</kbd> (コンテナ検索)</li>
           <li>今開いている場所の中で絞り込みたい → <kbd>Ctrl</kbd>+<kbd>F</kbd> (現在地フィルタ)</li>
           <li>お気に入り全体から画像・動画・音声 1 件を見つけたい → <kbd>Ctrl</kbd>+<kbd>G</kbd> (アイテム検索)</li>
           <li>タグで横断的に探したい → <kbd>Ctrl</kbd>+<kbd>T</kbd> (タグビュー)</li>
@@ -142,7 +142,7 @@
     </div>
 
     <h2 id="ctrl-s">2. Ctrl+S: コンテナ検索</h2>
-    <p>お気に入りに登録したルート配下の<strong>フォルダ / ZIP / PDF の名前</strong>を横断検索します。
+    <p>お気に入りに登録したルート配下の<strong>フォルダ / ZIP / PDF / EPUB の名前</strong>を横断検索します。
     動画はコンテナ (フォルダ・アーカイブ) ではないため対象外です。過去に訪れたフォルダや
     よく使うアーカイブを名前で素早く呼び出すのに向いています。</p>
 
@@ -166,7 +166,7 @@
     <h3>絞り込みフィルタ</h3>
     <ul>
       <li><strong>お気に入り</strong>: 「すべて」または単一のお気に入り配下に絞り込み。コンテナ索引 ON のお気に入りだけが候補に出ます。</li>
-      <li><strong>種別</strong>: <strong>すべて / フォルダ / ZIP / PDF</strong> から 1 つ選んで絞り込み。</li>
+      <li><strong>種別</strong>: <strong>すべて / フォルダ / ZIP / PDF・EPUB</strong> から 1 つ選んで絞り込み。</li>
       <li><strong>OR 検索</strong>: <a href="#or-mode">後述</a>の OR モードに切り替え。</li>
     </ul>
 
@@ -184,11 +184,12 @@
     <h3>アイテム種別ごとの絞り込みルール</h3>
     <p>現在地フィルタはグリッドに表示されているすべての種類のアイテムを対象にします:</p>
     <ul>
-      <li><strong>フォルダ / ZIP / PDF ファイル</strong>: ファイル名 (basename) でマッチ判定します。</li>
+      <li><strong>フォルダ / ZIP / PDF / EPUB ファイル</strong>: ファイル名でマッチ判定します。</li>
       <li><strong>画像 / 動画</strong>: 「検索対象」の設定に応じて、ファイル名・EXIF・XMP・AI プロンプト・PDF メタ・動画メタ・サイドカーを検索します。</li>
       <li><strong>PDF ファイル</strong>: ファイル名に加え、検索対象が「PDF メタ情報」または「すべて」のときはタイトル・著者・件名・キーワードも対象になります。</li>
+      <li><strong>EPUB ファイル</strong>: ファイル名のみが対象です。本の中のタイトル・著者は検索しません。</li>
     </ul>
-    <p>「検索対象」を EXIF など画像専用の次元に設定すると、その情報を持たないフォルダ・ZIP・PDF は
+    <p>「検索対象」を EXIF など画像専用の次元に設定すると、その情報を持たないフォルダ・ZIP・PDF・EPUB は
     すべて非表示になります。これは意図どおりの動作です (「EXIF で絞った場合は画像だけ残る」)。</p>
     <p>マッチ件数は検索バーに「<strong>X/Y 件</strong>」と表示されます。すべての可視マッチをカウントします。</p>
 
@@ -197,15 +198,15 @@
     ZIP 内の画像は AI プロンプト・EXIF などのメタ情報を逐次読み取る仕組みを持たないため、ファイル名で素早く絞り込む用途に特化しています。
     I/O なしで即座に動作するため、大きなアーカイブでも快適に使えます。</p>
 
-    <h3>PDF ページを表示中の場合</h3>
-    <p>PDF を開いてページ一覧を表示しているときは、<kbd>Ctrl</kbd>+<kbd>F</kbd> は<strong>無効</strong>になります (ショートカット無反応・検索バーは開きません)。
-    PDF のページは連番の名前しか持たないため、絞り込んでも得られる情報がほとんどないためです。</p>
+    <h3>PDF / EPUB のページを表示中の場合</h3>
+    <p>PDF / EPUB を開いてページ一覧を表示しているときは、<kbd>Ctrl</kbd>+<kbd>F</kbd> は<strong>無効</strong>になります (ショートカット無反応・検索バーは開きません)。
+    ページは連番の名前しか持たないため、絞り込んでも得られる情報がほとんどないためです。</p>
 
     <h2 id="ctrl-g">4. Ctrl+G: アイテム検索</h2>
     <p>メニュー「お気に入り」→「アイテム検索 (<kbd>Ctrl</kbd>+<kbd>G</kbd>)」でお気に入り全体を
     横断検索します。数万件規模でも全文索引による高速検索で、即座にヒット件数と候補が表示されます。
-    画像・PDF・動画・音声が対象で、ZIP は対象外です (ZIP を探すには Ctrl+S を使います)。
-    音声はファイル名で検索でき、曲名やアーティストなどの埋め込み情報は検索対象になりません。</p>
+    画像・PDF・EPUB・動画・音声が対象で、ZIP は対象外です (ZIP を探すには Ctrl+S を使います)。
+    EPUB と音声はファイル名で検索できます。EPUB 内のタイトル・著者や、音声の曲名・アーティストなどの埋め込み情報は検索対象になりません。</p>
 
     <ol>
       <li>任意のタイミングで <kbd>Ctrl</kbd>+<kbd>G</kbd> を押すと画面上部に検索バーが出ます。</li>
@@ -321,8 +322,8 @@
         </thead>
         <tbody>
           <tr><td>お気に入り</td><td>◯</td><td>—</td><td>◯</td></tr>
-          <tr><td>種別 (フォルダ/ZIP/PDF)</td><td>◯</td><td>—</td><td>—</td></tr>
-          <tr><td>種別 (画像/PDF/動画/音声)</td><td>—</td><td>—</td><td>◯</td></tr>
+          <tr><td>種別 (フォルダ/ZIP/PDF・EPUB)</td><td>◯</td><td>—</td><td>—</td></tr>
+          <tr><td>種別 (画像/PDF・EPUB/動画/音声)</td><td>—</td><td>—</td><td>◯</td></tr>
           <tr><td>検索対象 (ファイル名/EXIF/XMP/…)</td><td>—</td><td>◯</td><td>◯</td></tr>
           <tr><td>集約トグル</td><td>—</td><td>—</td><td>◯</td></tr>
           <tr><td>OR 検索チェック</td><td>◯</td><td>◯</td><td>◯</td></tr>
@@ -336,11 +337,11 @@
     のお気に入りだけが候補に出ます。</p>
 
     <h3>種別 (Ctrl+S 専用)</h3>
-    <p><strong>すべて / フォルダ / ZIP ファイル / PDF ファイル</strong>から 1 つを選んで絞り込みます。
-    「PDF だけ探したい」「フォルダだけ一覧したい」といった場面で使います。</p>
+    <p><strong>すべて / フォルダ / ZIP ファイル / PDF・EPUB ファイル</strong>から 1 つを選んで絞り込みます。
+    「本だけ探したい」「フォルダだけ一覧したい」といった場面で使います。</p>
 
     <h3>種別 (Ctrl+G 専用)</h3>
-    <p><strong>画像 / PDF ファイル / 動画ファイル / 音声ファイル</strong>から 1 つを選んで絞り込みます。
+    <p><strong>画像 / PDF・EPUB ファイル / 動画ファイル / 音声ファイル</strong>から 1 つを選んで絞り込みます。
     「PDF のタイトルだけで検索したい」「音声ファイルだけに絞りたい」といった用途に使います。</p>
 
     <h3 id="target">検索対象 (Ctrl+F / Ctrl+G 共通)</h3>

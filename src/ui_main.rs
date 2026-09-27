@@ -4848,12 +4848,32 @@ fn details_kind_label(
         GridItem::Video(path) => details_ext_kind(path, "動画"),
         GridItem::Audio(path) => details_ext_kind(path, "音声"),
         GridItem::ZipFile(path) => details_ext_kind(path, "ZIP"),
-        GridItem::PdfFile(path) => details_ext_kind(path, "PDF"),
+        GridItem::PdfFile(path) => {
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                "EPUB".to_string()
+            } else {
+                details_ext_kind(path, "PDF")
+            }
+        }
         GridItem::ConvertibleArchive { format, .. } => format.label().to_string(),
         GridItem::ZipImage { zip_path, .. } => {
             archive_inner_image_kind_label(zip_path, archive_source_override, current_folder)
         }
-        GridItem::PdfPage { .. } => "PDF ページ".to_string(),
+        GridItem::PdfPage { pdf_path, .. } => {
+            if pdf_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                "EPUB ページ".to_string()
+            } else {
+                "PDF ページ".to_string()
+            }
+        }
         GridItem::ZipDir {
             zip_path,
             is_archive,
@@ -7217,7 +7237,8 @@ impl App {
                                     }
                                     let enabled = self.grid_item_input_allowed() && convert_target_count > 0
                                         && self.archive_convert.is_none()
-                                        && self.batch_convert.is_none();
+                                        && self.batch_convert.is_none()
+                                        && self.epub_batch_convert.is_none();
                                     let response = ui
                                         .add_enabled(
                                             enabled,
@@ -14464,7 +14485,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             None => "すべての種別",
                             Some(IndexKind::Folder) => "フォルダ",
                             Some(IndexKind::ZipFile) => "ZIP",
-                            Some(IndexKind::PdfFile) => "PDF",
+                            Some(IndexKind::PdfFile) => "PDF / EPUB",
                             Some(IndexKind::VideoFile) => "動画",
                         }
                     };
@@ -19644,6 +19665,26 @@ mod selection_info_tests {
 
     #[test]
     fn shared_builder_formats_zip_and_pdf_container_fields() {
+        assert_eq!(
+            details_kind_label(
+                &GridItem::PdfFile(PathBuf::from(r"C:\books\book.epub")),
+                None,
+                None
+            ),
+            "EPUB"
+        );
+        assert_eq!(
+            details_kind_label(
+                &GridItem::PdfPage {
+                    pdf_path: PathBuf::from(r"C:\books\book.epub"),
+                    page_num: 0,
+                    content_type: None,
+                },
+                None,
+                None
+            ),
+            "EPUB ページ"
+        );
         let mut zip = app_with_item(
             GridItem::ZipFile(PathBuf::from(r"C:\books\book.zip")),
             Some((1_700_000_000, 4096)),

@@ -1228,10 +1228,12 @@ impl App {
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => {
-                // `<pdf>/p:<num>` 形式
-                let mut p = pdf_path.clone();
-                p.push(format!("p:{page_num}"));
-                Some(p)
+                // `<book>/p:<num>` 形式。Windows で PathBuf::push("p:1") を使うと
+                // `p:` がドライブ指定と見なされ、本のパスが失われる。
+                let mut pseudo_path = pdf_path.as_os_str().to_os_string();
+                pseudo_path.push("/");
+                pseudo_path.push(format!("p:{page_num}"));
+                Some(pseudo_path.into())
             }
             _ => None,
         }
@@ -2973,6 +2975,70 @@ mod tests {
             !app.fs_nav_is_locked(),
             "直接 open 後は nav lock が解除され、次の Ctrl+↑↓ が block されない"
         );
+    }
+
+    #[test]
+    fn snapshot_epub_page_list_navigates_from_current_page() {
+        let ctx = egui::Context::default();
+        let book = PathBuf::from(r"E:\test\book.epub");
+        let mut app = test_app_with_items(
+            (0..3)
+                .map(|page_num| GridItem::PdfPage {
+                    pdf_path: book.clone(),
+                    page_num,
+                    content_type: None,
+                })
+                .collect(),
+        );
+        app.current_folder = Some(book);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen,));
+        assert_eq!(
+            app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
+            Some(1)
+        );
+        assert!(app.snapshot_navigate(
+            &ctx,
+            true,
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert_eq!(app.fullscreen_idx, Some(2));
+        assert_eq!(
+            app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn snapshot_pdf_pages_inside_epub_named_folder_keep_their_owner() {
+        let ctx = egui::Context::default();
+        let book = PathBuf::from(r"E:\test\shelf.epub\book.pdf");
+        let mut app = test_app_with_items(
+            (0..3)
+                .map(|page_num| GridItem::PdfPage {
+                    pdf_path: book.clone(),
+                    page_num,
+                    content_type: None,
+                })
+                .collect(),
+        );
+        app.current_folder = Some(book);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen));
+        assert_eq!(
+            app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
+            Some(1),
+        );
+        assert!(app.snapshot_navigate(
+            &ctx,
+            true,
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert_eq!(app.fullscreen_idx, Some(2));
     }
 
     /// Codex follow-up (スライドショー経路): snapshot スライドショーの直接 leaf 送りでも

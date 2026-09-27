@@ -19,7 +19,7 @@ pub mod gui;
 pub mod scanner;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub use bridge::{Bridge, Cmd, Event};
@@ -110,6 +110,25 @@ pub struct GuiSignalChanges {
     pub bypass_updates: Vec<(String, bool)>,
 }
 
+/// Visible editor registration published as one immutable value. Readers clone
+/// the Arc under a short lock and release it before querying any HWND.
+#[derive(Debug, Default)]
+pub(crate) struct EditorUiSnapshot {
+    pub(crate) hwnds: std::collections::HashSet<u64>,
+    pub(crate) hwnd_pids: std::collections::HashMap<u64, u32>,
+    pub(crate) bridge_pids: std::collections::HashSet<u32>,
+}
+
+pub(crate) type SharedEditorUiSnapshot = Arc<RwLock<Arc<EditorUiSnapshot>>>;
+
+pub(crate) fn read_editor_ui_snapshot(shared: &SharedEditorUiSnapshot) -> Arc<EditorUiSnapshot> {
+    shared.read().unwrap_or_else(|err| err.into_inner()).clone()
+}
+
+pub(crate) fn publish_editor_ui_snapshot(shared: &SharedEditorUiSnapshot, next: EditorUiSnapshot) {
+    *shared.write().unwrap_or_else(|err| err.into_inner()) = Arc::new(next);
+}
+
 /// DspBridge — 1 本の VST3 チェーンホスト bridge との対話を管理する。
 ///
 /// ローカル再生用はアプリ起動から終了まで 1 個を保持する。時計なしリモート配信は
@@ -165,7 +184,9 @@ pub struct DspBridge {
     /// user_hidden / remove / bridge disconnect / 一括 visibility の全経路で
     /// 「visible かつ `IsWindow` で生存している HWND だけ」で再構築する。
     /// `gui_hwnd` は hidden 後も残るので「slot に HWND がある」だけでは入れない。
-    editor_hwnds: Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
+    editor_ui_snapshot: SharedEditorUiSnapshot,
+    /// Newer refreshes and disable invalidate any older in-flight snapshot.
+    editor_snapshot_revision: AtomicU64,
     /// HUD overlay を最前面に上げ直す要求を流すフック。App が `set_hud_raise_hook`
     /// で登録し、各 z-order op (`set_all_guis_topmost` / `set_all_guis_visible_blocking`
     /// / `set_all_guis_app_active` / `send_chain_z_order` 等) の末尾で発火する。
@@ -279,7 +300,8 @@ impl DspBridge {
             main_hwnd: AtomicU64::new(0),
             fullscreen_owner_hwnd: AtomicU64::new(0),
             hud_hwnd: AtomicU64::new(0),
-            editor_hwnds: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            editor_ui_snapshot: Arc::new(RwLock::new(Arc::new(EditorUiSnapshot::default()))),
+            editor_snapshot_revision: AtomicU64::new(0),
             hud_raise_hook: Mutex::new(None),
             chain_rebuild_gen: AtomicU64::new(0),
         })
@@ -330,12 +352,12 @@ impl DspBridge {
         self.hud_hwnd.store(hwnd, Ordering::Release);
     }
 
-    /// HUD raise allowlist 用に editor_hwnds snapshot の `Arc<RwLock<...>>` を
-    /// clone して返す。presenter thread が polling で `read()` して
-    /// `foreground_allows_hud_raise` に渡す。
-    #[allow(dead_code)]
-    pub fn editor_hwnds_snapshot(&self) -> Arc<std::sync::RwLock<std::collections::HashSet<u64>>> {
-        Arc::clone(&self.editor_hwnds)
+    pub fn hud_hwnd(&self) -> u64 {
+        self.hud_hwnd.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn editor_ui_snapshot(&self) -> SharedEditorUiSnapshot {
+        Arc::clone(&self.editor_ui_snapshot)
     }
 
     /// HUD raise hook を登録する。引数のクロージャは `set_all_guis_topmost` 等の
@@ -371,42 +393,83 @@ impl DspBridge {
     /// Lock 順序 (Codex 7 P2 #5):
     /// 1. inner lock で「HWND + visible 状態」をローカル `Vec` にコピー (短時間)。
     /// 2. inner lock 解放後に Windows API (`IsWindow`) を呼んで filter。
-    /// 3. `editor_hwnds.write()` で snapshot 入れ替え。
+    /// 3. inner を取り直して候補がまだ同じなら snapshot を入れ替える。
+    ///    GUI worker と UI thread の refresh が前後しても古い capture は publish しない。
     fn refresh_editor_hwnds_snapshot(&self) {
-        // Step 1: inner lock を短時間取って HWND リストをコピー。
-        let candidates: Vec<u64> = {
+        // Step 1: revision と HWND capture を同じ inner lock で順序づける。
+        let (revision, candidates, bridge_pids): (
+            u64,
+            Vec<(u64, u32)>,
+            std::collections::HashSet<u32>,
+        ) = {
             let inner = match self.inner.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
-            inner
-                .slots
-                .iter()
-                .filter(|s| s.gui_hwnd != 0 && s.gui_visible)
-                .map(|s| s.gui_hwnd)
-                .collect()
+            (
+                self.editor_snapshot_revision.fetch_add(1, Ordering::AcqRel) + 1,
+                Self::editor_snapshot_candidates(&inner),
+                Self::bridge_snapshot_candidates(&inner),
+            )
         };
 
         // Step 2: inner lock 外で IsWindow チェックして filter。
         #[cfg(windows)]
-        let filtered: std::collections::HashSet<u64> = {
+        let filtered: Vec<(u64, u32)> = {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::IsWindow;
             candidates
-                .into_iter()
-                .filter(|raw| {
+                .iter()
+                .copied()
+                .filter(|(raw, _)| {
                     let hwnd = HWND(*raw as *mut _);
                     unsafe { IsWindow(Some(hwnd)) }.as_bool()
                 })
                 .collect()
         };
         #[cfg(not(windows))]
-        let filtered: std::collections::HashSet<u64> = candidates.into_iter().collect();
+        let filtered: Vec<(u64, u32)> = candidates.clone();
 
-        // Step 3: editor_hwnds.write() で snapshot 入れ替え。
-        if let Ok(mut guard) = self.editor_hwnds.write() {
-            *guard = filtered;
+        let next = EditorUiSnapshot {
+            hwnds: filtered.iter().map(|(hwnd, _)| *hwnd).collect(),
+            hwnd_pids: filtered.iter().copied().collect(),
+            bridge_pids: bridge_pids.clone(),
+        };
+
+        // Step 3: inner を握ったまま候補と revision を確認し、両 view を一度に公開。
+        // 全 writer の revision 更新も inner の下なので、check と swap の間に
+        // 新しい refresh/disable が割り込むことはない。
+        let inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if !editor_snapshot_publish_is_current(
+            revision,
+            self.editor_snapshot_revision.load(Ordering::Acquire),
+            &candidates,
+            &Self::editor_snapshot_candidates(&inner),
+        ) || bridge_pids != Self::bridge_snapshot_candidates(&inner)
+        {
+            return;
         }
+        publish_editor_ui_snapshot(&self.editor_ui_snapshot, next);
+    }
+
+    fn editor_snapshot_candidates(inner: &DspBridgeInner) -> Vec<(u64, u32)> {
+        inner
+            .slots
+            .iter()
+            .filter(|s| s.gui_hwnd != 0 && s.gui_visible)
+            .map(|s| (s.gui_hwnd, s.bridge.process_id()))
+            .collect()
+    }
+
+    fn bridge_snapshot_candidates(inner: &DspBridgeInner) -> std::collections::HashSet<u32> {
+        inner
+            .slots
+            .iter()
+            .map(|slot| slot.bridge.process_id())
+            .collect()
     }
 
     /// VST editor の owner にする mIV 側 HWND を返す。
@@ -526,31 +589,18 @@ impl DspBridge {
 
     #[cfg(windows)]
     fn foreground_belongs_to_miv_or_bridge(&self) -> bool {
-        use windows::Win32::System::Threading::GetCurrentProcessId;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowThreadProcessId,
-        };
-
-        let mut foreground_pid = 0_u32;
-        unsafe {
-            let hwnd = GetForegroundWindow();
-            if hwnd.0.is_null() {
-                return true;
-            }
-            let _ = GetWindowThreadProcessId(hwnd, Some(&mut foreground_pid));
-            if foreground_pid == 0 {
-                return true;
-            }
-            if foreground_pid == GetCurrentProcessId() {
-                return true;
-            }
+        let editors = read_editor_ui_snapshot(&self.editor_ui_snapshot);
+        match crate::video::native_window::foreground_ui_group(
+            &editors.hwnd_pids,
+            &editors.bridge_pids,
+        ) {
+            crate::video::native_window::ForegroundUiGroup::OwnProcess
+            | crate::video::native_window::ForegroundUiGroup::RegisteredEditor
+            | crate::video::native_window::ForegroundUiGroup::OtherBridgeWindow
+            | crate::video::native_window::ForegroundUiGroup::Unknown => return true,
+            crate::video::native_window::ForegroundUiGroup::External => {}
         }
-
-        let bridge_pids: Vec<u32> = {
-            let inner = self.inner.lock().unwrap();
-            inner.slots.iter().map(|s| s.bridge.process_id()).collect()
-        };
-        bridge_pids.contains(&foreground_pid)
+        false
     }
 
     #[cfg(not(windows))]
@@ -762,6 +812,17 @@ impl DspBridge {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn mark_enabled_without_bridge_for_test(&self) {
+        self.inner.lock().unwrap().state = DspState::Enabled;
+        self.enabled.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gui_all_visible_desired_for_test(&self) -> bool {
+        self.gui_all_visible_desired.load(Ordering::Acquire)
+    }
+
     /// VST3 機能を無効化する。全スロットを破棄して各 bridge 子プロセスを終了する。
     pub fn disable(&self) {
         self.disable_with_reason(None);
@@ -780,13 +841,11 @@ impl DspBridge {
         }
         inner.next_slot_id = 0;
         inner.state = DspState::Disabled;
+        self.editor_snapshot_revision.fetch_add(1, Ordering::AcqRel);
+        // Publish the empty identity under the same inner lock as revision
+        // invalidation, so an older refresh cannot restore a stale editor.
+        publish_editor_ui_snapshot(&self.editor_ui_snapshot, EditorUiSnapshot::default());
         drop(inner);
-        // editor_hwnds allowlist を確実に空にする (Codex CP1 P2 反映)。
-        // `refresh_editor_hwnds_snapshot` は IsWindow filter で空 set に
-        // なるはずだが、HWND 再利用時の誤許可リスクを残さないよう明示クリアする。
-        if let Ok(mut guard) = self.editor_hwnds.write() {
-            guard.clear();
-        }
         // bridge disconnect / quarantine 経路。HUD は VST がいなくなったあと
         // 最前面を維持しておきたいので念のため raise hook を発火する。
         self.fire_hud_raise_hook();
@@ -1023,6 +1082,7 @@ impl DspBridge {
         });
         self.recalc_active_count(&inner);
         drop(inner);
+        self.refresh_editor_hwnds_snapshot();
         self.prewarm_slot_gui(idx);
         Ok(idx)
     }
@@ -2391,6 +2451,27 @@ impl DspBridge {
             .count();
         self.active_slot_count.store(count, Ordering::Release);
     }
+}
+
+fn editor_snapshot_publish_is_current(
+    captured_revision: u64,
+    current_revision: u64,
+    captured: &[(u64, u32)],
+    current: &[(u64, u32)],
+) -> bool {
+    captured_revision == current_revision && captured == current
+}
+
+#[cfg(test)]
+#[test]
+fn stale_editor_refresh_cannot_overwrite_newer_identity_snapshot() {
+    let old = [(0x301, 42)];
+    let replaced = [(0x301, 43)];
+    assert!(!editor_snapshot_publish_is_current(1, 2, &old, &old));
+    assert!(!editor_snapshot_publish_is_current(2, 2, &old, &replaced));
+    assert!(editor_snapshot_publish_is_current(
+        2, 2, &replaced, &replaced
+    ));
 }
 
 impl Drop for DspBridge {

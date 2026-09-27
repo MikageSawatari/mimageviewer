@@ -4532,7 +4532,12 @@ fn remote_source_kind(address: &RemoteAddress) -> &'static str {
             .and_then(|value| value.to_str())
         {
             Some(extension) if extension.eq_ignore_ascii_case("zip") => "zip",
-            Some(extension) if extension.eq_ignore_ascii_case("pdf") => "pdf",
+            Some(extension)
+                if extension.eq_ignore_ascii_case("pdf")
+                    || extension.eq_ignore_ascii_case("epub") =>
+            {
+                "pdf"
+            }
             _ => "file",
         },
     }
@@ -6709,8 +6714,10 @@ mod tests {
     fn thumbnail_diagnostics_distinguish_container_source_without_logging_a_path() {
         let zip = RemoteAddress::file("C:/Books/volume.ZIP");
         let pdf = RemoteAddress::file("C:/Books/volume.pdf");
+        let epub = RemoteAddress::file("C:/Books/volume.EPUB");
         assert_eq!(remote_source_kind(&zip), "zip");
         assert_eq!(remote_source_kind(&pdf), "pdf");
+        assert_eq!(remote_source_kind(&epub), "pdf");
         assert_eq!(remote_address_kind(&zip), "file");
     }
 

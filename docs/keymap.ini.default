@@ -255,6 +255,7 @@
 # GridToggleMaximize = F11 ; メインウィンドウを最大化/復元する
 # GridToggleFolderTreePane = F ; フォルダツリーペインの表示を切り替える
 # GridToggleStackMode = none ; スタック表示を切り替える
+# GridConvertEpubToPdf = none ; 選択中の EPUB を PDF ファイルに変換する
 # GridTagApply = T ; タグを付ける/外すダイアログを開く
 # GridTagView = Ctrl+T ; タグビューを開く
 # GridRotateCw = R ; 選択中の画像を右に90度回転する

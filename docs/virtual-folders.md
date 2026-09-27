@@ -1,4 +1,58 @@
-# 仮想フォルダ (ZIP / RAR / PDF) 処理
+# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
+
+## EPUB → PDF 読み取り境界とオープン導線 (S2b / S2c-1)
+
+S2b は `pdf_loader` の読み取り経路を用意した。S2c-1 では、アドレスバー・起動引数・復元先に指定された
+`.epub` を PDF 系の本として開く。S3a では通常フォルダ・スマートフォルダ・サブ展開などの一覧でも
+`PdfFile` として分類し、元 EPUB パスを保つ。同じフォルダに同名 PDF がある場合は設定に従って EPUB を隠す。
+S3b の明示保存では同じフォルダの同名 PDF を上書きせず作り、検証後に通常の PDF として開く。現在の EPUB 変換結果を再利用できる場合はそれを複写し、古い場合は保存先へ直接変換してキャッシュ世代を増やさない。スマートフォルダやコレクションから保存した場合も、元 EPUB の行を親として保って PDF を開く。バッチ保存後は一覧を読み直し、同名 PDF 優先の設定を反映する。
+未変換の場合はファイル処理設定に従い、確認、直接変換、または無視する。確認時は別プロセスで内容を調べ、
+レイアウト、開き方向、章数を表示する。保護された EPUB は変換を提示せず理由を表示する。
+変換中の進捗と取消はダイアログが所有し、公開または既存世代の採用後は元 EPUB パスを開き直す。
+元ファイルが変換中に変わった場合は再試行を提示する。変換器の制限時間は 600 秒。
+開いた本の `PdfPage` と履歴・保存キーは元 EPUB の論理パスを保持する。一覧タイルの
+`PdfFile` も同じ論理パスを使い、未変換時はアイコンと EPUB バッジ、変換済みなら第 1 ページを表示する。
+Remote でも同じ本・ページの論理パスと世代スタンプを使う。変換済みの表紙とページは本体の PDF
+読み取り経路で生成し、未変換のタイルは EPUB の目印を出す。Remote から変換は開始しない。
+`pdf_loader::resolve_read_target` は論理パスを変換世代の PDF パスへ解決する。EPUB の初回解決は背景スレッドで行い、
+PDFium の open admission・worker 文書キャッシュ・列挙合流にはその実ファイルのパスを渡す。
+表示や perf のキーは論理パスのままにする。通常 PDF の解決はパスをそのまま返し、stat を追加しない。
+IPC の要求生成には `ResolvedReadPath` を必須にし、PDF pool へは要求 bytes と解決済みパスを `PdfPoolRequest` で対にして渡す。
+変換 PDF の物理 `.part` 検証だけは例外で、キャッシュの世代予約時に発行した `ReservedOutput` token を必須にする。
+非同期列挙では通常 PDF と固定表にある EPUB の待ち手を呼出元で直ちに登録する。
+新しいハンドルを受け取ってから旧ハンドルを破棄しても同じ実行要求に合流できる。
+未固定の EPUB だけは元ファイル stat と DB 照合を背景スレッドで済ませてから登録する。
+固定表の mutex はメモリ検索と挿入だけを保護し、元ファイルの stat や DB 照合中は保持しない。
+
+EPUB の初回解決では元ファイルの完全精度の FILETIME とサイズを `epub_cache.db` の現在世代と照合する。
+有効な世代が無ければ `NotConverted`、起動時の削除ゲートが無効なら `EpubUnavailable` を返す。
+世代ファイルが欠落していれば現在表から条件付きで切り離す。
+成功した世代は正規化した論理パスでプロセス内の固定表へ挿入し、以後は元 EPUB の変更や別接続の
+再公開があっても実行中は同じ世代を読み続ける。派生データの照合には PDF の従来の時刻・サイズと
+区別した `DocumentStamp::Generation { id, pdf_size }` を使う。
+固定した EPUB 世代行の `direction` (`rtl` / `ltr` / `default`) も列挙結果へ渡す。EPUB の変換 PDF は方向取得のために再読込しない。
+通常 PDF の `/ViewerPreferences /Direction` は `EnumerateOptions.want_direction=true` の要求時だけ取得する。
+その場合だけ PDF ワーカーは公開 PDFium bindings で PDF をもう一度開いて方向を読み、必ず閉じる。
+追加 open の失敗時は方向無しとしてページ列挙を維持する。既定の `false` では追加 open を行わない。
+S2c-1 は D10 設定が ON かつ本ごとの見開き保存値が無い場合だけ `true` を渡す。
+この場合は列挙結果が届くまでページ数キャッシュの仮ページを先出ししない。EPUB はこの実行で
+固定済みなら、固定表の世代 ID と世代 PDF サイズで `pdf_meta` を照合して仮ページを先出しできる。
+未固定なら UI で元ファイルや DB を読まず列挙を待つ。通常 PDF の既定 OFF の先出しは従来どおり。
+
+S2c-2 の派生データは EPUB について `(世代 ID, 世代 PDF サイズ)` で照合する。既存の
+サムネイル・`pdf_meta` の整数列をそのまま使い、`image_metas` の更新日時とサイズは元 EPUB の
+表示用属性に保つ。タイルとページの UI 要求は worker 解決印を持ち、worker は同一 `ReadTarget` で
+cache hit 判定、PDFium 描画、保存を行う。auto-aspect の初期 seed は EPUB の元属性から
+hit させず、worker サムネイル結果で比率を集める。ピンの EPUB source ID は worker が固定世代を
+付けて確定する。内容同定は論理パスの EPUB 種別を使い、固定済みなら世代表の元サイズ・時刻・
+ハッシュを読み、未固定なら元 EPUB を読む。非同期 backfill は分岐時の来歴を保存し、
+本ごとの固定ロック内で固定状態と元ファイル状態を再照合して台帳を書き込む。
+stage-0 検出と復元時の台帳更新も同じ境界を使う。復元候補は検出時の未固定元状態を保持し、
+復元 worker は本単位ガード内でコピー前に再照合してから編集行のコピーと台帳昇格を行う。
+ドライブ一覧の間接ピンでは、UI は従来と同じ親 catalog 行を先に seed する。cache-only worker は現行子ピンを設定深さで解決し、子代表の書込側と同じキーを作って親 catalog の一行を完全一致で読む。EPUB は固定世代 suffix と整数 stamp を照合する。行が異なれば最終画像へ差し替え、行が無い・旧世代・変更済みピンなら固定ドライブアイコンへ戻る。同じ画像・stamp・寸法ならテクスチャを作り直さない。子ピンの対象が移動・削除されて解決できない場合は、自動代表の保存行を通常の子フォルダ読取と同じ選定証明で検証する。選定元の状態・pin revision・依存 catalog のいずれかが変わっていればアイコンへ戻る。画像・通常 PDF の初回表示は従来の seed を使う。再起動後に EPUB が再変換された場合、worker の判定まで旧表紙が一時表示され得るが、最終表示には現行世代の代表だけを採用する。
+仮想フォルダを開く際の親子 WebP seed / writeback は EPUB を対象にせず、
+PDFium の先読み抑制だけは PDF と同じ 100 ms を適用する。
+親とページ 0 を個別に描画する。
 
 ZIP アーカイブ、直接閲覧できる RAR/CBR、PDF ドキュメントは「中身のページをフォルダ内のファイルに見立てて扱う」仮想フォルダとして実装されている。
 通常画像ファイルとの処理分岐が多く、修正漏れが起きやすい。**ZIP/PDF 対応のある機能を触るときは必ずこのドキュメントを見る**。
@@ -25,7 +79,7 @@ placeholder は採用後も同じ enumerate handle で検証する。取消・�
 | `Video(PathBuf)` | 通常フォルダ内 | 動画ファイル |
 | `Audio(PathBuf)` | 通常フォルダ内 | 音声ファイル |
 | `ZipFile(PathBuf)` | 通常フォルダ内 | ZIP アーカイブ (未展開)。`.zip` と別名 `.cbz` を含む (`folder_tree::is_zip_extension` で判定) |
-| `PdfFile(PathBuf)` | 通常フォルダ内 | PDF ドキュメント (未展開) |
+| `PdfFile(PathBuf)` | 通常フォルダ内 | PDF または EPUB の本 (元の論理パスを保持) |
 | `ConvertibleArchive { path, format }` | 通常フォルダ内 | RAR/7z/LZH 等。RAR は worker 判定で直接閲覧または ZIP 変換キャッシュ、7z/LZH は ZIP 変換キャッシュ経由で開く |
 | `ZipImage { zip_path, entry_name }` | ZIP を開いた中 | ZIP 内の画像エントリ。`entry_name` はネストでも `"outer/ch01.zip/p.jpg"` のフルパス |
 | `ZipDir { zip_path, dir_prefix, is_archive, representative }` | ネスト ZIP を開いた中 (v1.3.0) | 「入れる」子ディレクトリ / 内側アーカイブ。Enter で降りる。仮想コンテナで実パスなし |
@@ -348,7 +402,7 @@ PDF は **非同期**で開く:
 
 ```
 1. 即座に items = [] で画面を更新
-2. `PdfEnumerateCoordinator` で同じ `(path, password)` の実行中 enumerate を確認する
+2. 背景 admission で解決し、`PdfEnumerateCoordinator` で同じ `(実読込パス, password, want_direction)` の実行中 enumerate を確認する
    - cancel されていなければ新しい pool 要求を作らず waiter として合流
    - cancel 済み、または key が異なる場合は明示的に新規要求を開始
    - 時間窓と完了結果 cache は使わない

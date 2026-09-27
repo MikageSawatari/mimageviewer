@@ -20,7 +20,7 @@ mod restore;
 
 pub(crate) use restore::{
     ContentRestoreReport, DeclinedRestore, InternalByteCopyDeclineRecorder, RestorePresence,
-    RestoreSidecarMirror, SelectedRestore, restore_candidates_at,
+    RestoreSidecarMirror, SelectedRestore, restore_candidates_at_with_progress,
 };
 
 const HEAD_HASH_BYTES: u64 = 64 * 1024;
@@ -57,6 +57,7 @@ pub(crate) enum ContentKind {
     Image,
     Zip,
     Pdf,
+    Epub,
     Convertible,
 }
 
@@ -66,6 +67,10 @@ impl ContentKind {
             Self::Image => "image",
             Self::Zip => "zip",
             Self::Pdf => "pdf",
+            // content_identity.db is released. Older builds reject an unknown kind
+            // while loading the whole ledger, so EPUB keeps the compatible `pdf`
+            // stored value and is reclassified by its logical path on read.
+            Self::Epub => "pdf",
             Self::Convertible => "convertible",
         }
     }
@@ -75,6 +80,7 @@ impl ContentKind {
             "image" => Some(Self::Image),
             "zip" => Some(Self::Zip),
             "pdf" => Some(Self::Pdf),
+            "epub" => Some(Self::Epub),
             "convertible" => Some(Self::Convertible),
             _ => None,
         }
@@ -108,6 +114,8 @@ impl ContentIdentitySource {
             ContentKind::Zip
         } else if extension == "pdf" {
             ContentKind::Pdf
+        } else if extension == "epub" {
+            ContentKind::Epub
         } else if crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some() {
             ContentKind::Convertible
         } else if crate::folder_tree::is_recognized_image_ext(&extension) {
@@ -139,7 +147,7 @@ impl ContentIdentitySource {
         match item {
             GridItem::Image(path) => Some(Self::new(path, ContentKind::Image)),
             GridItem::ZipFile(path) => Some(Self::new(path, ContentKind::Zip)),
-            GridItem::PdfFile(path) => Some(Self::new(path, ContentKind::Pdf)),
+            GridItem::PdfFile(path) => Self::from_path(path),
             GridItem::ConvertibleArchive { path, .. } => {
                 Some(Self::new(path, ContentKind::Convertible))
             }
@@ -151,7 +159,7 @@ impl ContentIdentitySource {
                     Self::from_path(&root)
                 }
             }
-            GridItem::PdfPage { pdf_path, .. } => Some(Self::new(pdf_path, ContentKind::Pdf)),
+            GridItem::PdfPage { pdf_path, .. } => Self::from_path(pdf_path),
             GridItem::Folder(_)
             | GridItem::Video(_)
             | GridItem::Audio(_)
@@ -293,6 +301,9 @@ pub(crate) struct RestoreCandidate {
     pub(crate) target_kind: ContentKind,
     pub(crate) full_hash: String,
     pub(crate) sources: Vec<RestoreSourceCandidate>,
+    /// The unpinned source observed when detection branched. A later pin or
+    /// replacement must invalidate the restore before any store copy.
+    pub(crate) epub_source_state: Option<crate::epub_cache::SourceState>,
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +352,7 @@ struct CoalescedRecordRequest {
     source: ContentIdentitySource,
     trigger: ContentIdentityTrigger,
     recorded_at: i64,
+    epub_provenance: Option<EpubProvenance>,
 }
 
 /// 前回記録と物理観測が同一なら、大きなファイルを再度読み出す必要はない。
@@ -542,15 +554,18 @@ impl ContentIdentityDb {
     /// `kind` と `last_edit_at` は触らない。取り消すのは自分の clear だけで、その編集の
     /// 記録は編集側の経路が持っている。
     fn restore_restorable_flag(&self, file_key: &str) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE edit_origin
+        let write = || {
+            self.conn
+                .execute(
+                    "UPDATE edit_origin
                     SET has_restorable_content = 1
                   WHERE file_key = ?1",
-                rusqlite::params![file_key],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+                    rusqlite::params![file_key],
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        with_epub_ledger_key_guard(file_key, write)
     }
 
     /// 復元元 flag を下ろす。**store を全部読んで 1 行も無いと確認できたときだけ**呼ぶ。
@@ -571,17 +586,20 @@ impl ContentIdentityDb {
         file_key: &str,
         last_edit_at: i64,
     ) -> Result<bool, String> {
-        self.conn
-            .execute(
-                "UPDATE edit_origin
+        let write = || {
+            self.conn
+                .execute(
+                    "UPDATE edit_origin
                     SET has_restorable_content = 0
                   WHERE file_key = ?1
                     AND last_edit_at = ?2
                     AND has_restorable_content = 1",
-                rusqlite::params![file_key, last_edit_at],
-            )
-            .map(|rows| rows > 0)
-            .map_err(|error| error.to_string())
+                    rusqlite::params![file_key, last_edit_at],
+                )
+                .map(|rows| rows > 0)
+                .map_err(|error| error.to_string())
+        };
+        with_epub_ledger_key_guard(file_key, write)
     }
 
     fn upsert(
@@ -625,6 +643,14 @@ impl ContentIdentityDb {
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+}
+
+fn with_epub_ledger_key_guard<T>(file_key: &str, action: impl FnOnce() -> T) -> T {
+    if file_key.to_ascii_lowercase().ends_with(".epub") {
+        crate::pdf_loader::with_epub_pin_guard(Path::new(file_key), action)
+    } else {
+        action()
     }
 }
 
@@ -766,8 +792,14 @@ fn ledger_entry_from_row(row: &rusqlite::Row<'_>) -> Result<LedgerEntry, rusqlit
             )),
         )
     })?;
+    let file_key: String = row.get(0)?;
+    let kind = if kind == ContentKind::Pdf && file_key.to_ascii_lowercase().ends_with(".epub") {
+        ContentKind::Epub
+    } else {
+        kind
+    };
     Ok(LedgerEntry {
-        file_key: row.get(0)?,
+        file_key,
         size,
         head_hash: row.get(2)?,
         full_hash: row.get(3)?,
@@ -1175,9 +1207,22 @@ fn run_backfill_at(
         };
         ContentIdentityDb::open_at(db_path)?
     };
+    // Branch once on the backfill worker before hashing any source. A later
+    // pin or source replacement cannot change the identity this request writes.
+    let sources = sources
+        .into_iter()
+        .map(|source| {
+            let provenance = if source.kind == ContentKind::Epub {
+                Some(capture_epub_provenance(&source.path))
+            } else {
+                None
+            };
+            (source, provenance)
+        })
+        .collect::<Vec<_>>();
     let mut ledger_updates = Vec::new();
     let mut errors = 0;
-    for source in sources {
+    for (source, provenance) in sources {
         if cancel.load(Ordering::Acquire) {
             return Ok(None);
         }
@@ -1191,6 +1236,17 @@ fn run_backfill_at(
             source,
             trigger: ContentIdentityTrigger::ViewingState,
             recorded_at: 0,
+            epub_provenance: match provenance {
+                Some(Ok(provenance)) => Some(provenance),
+                Some(Err(error)) => {
+                    errors += 1;
+                    crate::logger::log(format!(
+                        "content_identity: EPUB backfill branch failed: {error}"
+                    ));
+                    continue;
+                }
+                None => None,
+            },
         };
         match record_source(&db, &request, cancel) {
             Ok(Some(entry)) => {
@@ -1558,6 +1614,18 @@ fn detect_target_with_opener<R: Read + Seek>(
     if cancel.load(Ordering::Acquire) {
         return Ok(None);
     }
+    let epub_provenance = if target.source.kind == ContentKind::Epub {
+        let provenance = capture_epub_provenance(&target.source.path)?;
+        // A pinned EPUB is represented by its immutable generation row through
+        // the record worker. Stage-0 must not publish a hash of a replacement
+        // source over that identity.
+        if matches!(provenance, EpubProvenance::Pinned(_)) {
+            return Ok(None);
+        }
+        Some(provenance)
+    } else {
+        None
+    };
     let before = std::fs::metadata(&target.source.path).map_err(|error| error.to_string())?;
     if !before.is_file() || before.len() != target.size {
         return Ok(None);
@@ -1610,15 +1678,23 @@ fn detect_target_with_opener<R: Read + Seek>(
         if cancel.load(Ordering::Acquire) {
             return Ok(None);
         }
-        record_observation_with_hasher(
+        let written = record_observation_with_hasher_guarded(
             db,
             &target.source,
             &state,
             ContentIdentityTrigger::ViewingState,
             ObservationRole::DetectionCache,
             unix_time_millis(),
+            epub_provenance.is_some(),
             || Ok(Some((head_hash.clone(), full_hash.clone()))),
+            || match epub_provenance.as_ref() {
+                Some(original) => Ok(&capture_epub_provenance(&target.source.path)? == original),
+                None => Ok(true),
+            },
         )?;
+        if !written && epub_provenance.is_some() {
+            return Ok(None);
+        }
         let update = db
             .ledger_entry(&target.file_key)?
             .ok_or_else(|| "detection cache row was not stored".to_string())?;
@@ -1656,6 +1732,10 @@ fn detect_target_with_opener<R: Read + Seek>(
             target_kind: target.source.kind,
             full_hash,
             sources,
+            epub_source_state: match epub_provenance {
+                Some(EpubProvenance::Unpinned(state)) => Some(state),
+                _ => None,
+            },
         })
     };
     Ok(Some((candidate, update)))
@@ -1741,6 +1821,7 @@ fn coalesce_record_requests(requests: Vec<RecordRequest>) -> Vec<CoalescedRecord
                 source: request.source,
                 trigger: request.trigger,
                 recorded_at: request.recorded_at,
+                epub_provenance: None,
             });
         }
     }
@@ -1765,7 +1846,58 @@ fn record_source(
     request: &CoalescedRecordRequest,
     shutdown: &AtomicBool,
 ) -> Result<Option<LedgerEntry>, String> {
+    record_source_at(db, request, shutdown, &crate::data_dir::get())
+}
+
+fn record_source_at(
+    db: &ContentIdentityDb,
+    request: &CoalescedRecordRequest,
+    shutdown: &AtomicBool,
+    epub_data_dir: &Path,
+) -> Result<Option<LedgerEntry>, String> {
     let source = &request.source;
+    let epub_provenance = if let Some(provenance) = request.epub_provenance.as_ref() {
+        Some(provenance.clone())
+    } else if source.kind == ContentKind::Epub {
+        Some(capture_epub_provenance(&source.path)?)
+    } else {
+        None
+    };
+    if let Some(EpubProvenance::Pinned(id)) = epub_provenance.as_ref() {
+        let cache = crate::epub_cache::EpubCache::open_at(epub_data_dir)
+            .map_err(|error| format!("{error:?}"))?;
+        let row = cache
+            .generation(*id)
+            .map_err(|error| format!("{error:?}"))?
+            .ok_or_else(|| "pinned EPUB generation is missing".to_string())?;
+        let state = RecordedFileState {
+            file_key: request.file_key.clone(),
+            size: row.src_state.size,
+            hashed_mtime: filetime_ticks_to_ledger_ns(row.src_state.mtime_ticks),
+        };
+        let written = record_observation_with_hasher_guarded(
+            db,
+            source,
+            &state,
+            request.trigger,
+            ObservationRole::RestorableContent,
+            request.recorded_at,
+            true,
+            || Ok(Some((row.src_head_hash.clone(), row.src_sha256.clone()))),
+            || {
+                Ok(
+                    matches!(capture_epub_provenance(&source.path)?, EpubProvenance::Pinned(current) if current == *id),
+                )
+            },
+        )?;
+        if !written {
+            return Ok(None);
+        }
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        return db.ledger_entry(&state.file_key);
+    }
     let before = std::fs::metadata(&source.path).map_err(|error| error.to_string())?;
     if !before.is_file() {
         return Err("source is not a regular file".to_string());
@@ -1775,13 +1907,19 @@ fn record_source(
         size: before.len(),
         hashed_mtime: metadata_mtime(&before)?,
     };
-    record_observation_with_hasher(
+    if let Some(EpubProvenance::Unpinned(branch_state)) = epub_provenance
+        && crate::epub_cache::source_state(&before) != branch_state
+    {
+        return Ok(None);
+    }
+    let written = record_observation_with_hasher_guarded(
         db,
         source,
         &state,
         request.trigger,
         ObservationRole::RestorableContent,
         request.recorded_at,
+        epub_provenance.is_some(),
         || {
             let mut file = File::open(&source.path).map_err(|error| error.to_string())?;
             let head_hash =
@@ -1811,11 +1949,42 @@ fn record_source(
             }
             Ok(Some((head_hash, full_hash)))
         },
+        || match epub_provenance {
+            Some(ref original) => Ok(&capture_epub_provenance(&source.path)? == original),
+            None => Ok(true),
+        },
     )?;
+    if !written && epub_provenance.is_some() {
+        return Ok(None);
+    }
     if shutdown.load(Ordering::Acquire) {
         return Ok(None);
     }
     db.ledger_entry(&state.file_key)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EpubProvenance {
+    Pinned(i64),
+    Unpinned(crate::epub_cache::SourceState),
+}
+
+fn capture_epub_provenance(path: &Path) -> Result<EpubProvenance, String> {
+    if let Some(read) = crate::pdf_loader::pinned_epub_target(path)
+        && let crate::pdf_loader::DocumentStamp::Generation { id, .. } = read.stamp
+    {
+        return Ok(EpubProvenance::Pinned(id));
+    }
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    Ok(EpubProvenance::Unpinned(crate::epub_cache::source_state(
+        &metadata,
+    )))
+}
+
+fn filetime_ticks_to_ledger_ns(ticks: u64) -> i64 {
+    const FILETIME_UNIX_EPOCH: i128 = 116_444_736_000_000_000;
+    let ns = (i128::from(ticks) - FILETIME_UNIX_EPOCH) * 100;
+    ns.clamp(-(i64::MAX as i128), i64::MAX as i128) as i64
 }
 
 fn record_observation_with_hasher(
@@ -1827,29 +1996,118 @@ fn record_observation_with_hasher(
     last_edit_at: i64,
     hasher: impl FnOnce() -> Result<Option<(String, String)>, String>,
 ) -> Result<(), String> {
+    record_observation_with_hasher_guarded(
+        db,
+        source,
+        state,
+        trigger,
+        role,
+        last_edit_at,
+        false,
+        hasher,
+        || Ok(true),
+    )
+    .map(|_| ())
+}
+
+/// The only EPUB identity-write boundary. The per-book guard serializes the
+/// provenance check and SQLite mutation with the resolver's first pin. A
+/// different EPUB uses a different guard; normal files do not acquire one.
+fn write_if_provenance_valid(
+    source: &ContentIdentitySource,
+    valid: impl FnOnce() -> Result<bool, String>,
+    before_write: impl FnOnce(),
+    write: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    let action = || {
+        if !valid()? {
+            return Ok(false);
+        }
+        before_write();
+        write()?;
+        Ok(true)
+    };
+    if source.kind == ContentKind::Epub {
+        crate::pdf_loader::with_epub_pin_guard(&source.path, action)
+    } else {
+        action()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn backfill_epub_after_delete_for_test(
+    path: &Path,
+    db_path: &Path,
+) -> Result<(), String> {
+    let source = ContentIdentitySource::from_path(path)
+        .ok_or_else(|| "EPUB source unavailable".to_string())?;
+    let cancel = AtomicBool::new(false);
+    let io = crate::io_semaphore::GlobalIoSemaphore::new(1);
+    let result = run_backfill_at(db_path, vec![source], &cancel, &io, None)?
+        .ok_or_else(|| "backfill was canceled".to_string())?;
+    if result.errors != 0 || result.ledger_updates.len() != 1 {
+        return Err(format!(
+            "backfill wrote {} rows with {} errors",
+            result.ledger_updates.len(),
+            result.errors
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn initialize_identity_db_for_delete_test(db_path: &Path) -> Result<(), String> {
+    drop(ContentIdentityDb::open_at(db_path)?);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_observation_with_hasher_guarded(
+    db: &ContentIdentityDb,
+    source: &ContentIdentitySource,
+    state: &RecordedFileState,
+    trigger: ContentIdentityTrigger,
+    role: ObservationRole,
+    last_edit_at: i64,
+    force_rehash: bool,
+    hasher: impl FnOnce() -> Result<Option<(String, String)>, String>,
+    valid_before_write: impl Fn() -> Result<bool, String>,
+) -> Result<bool, String> {
     let recorded = db.recorded_state(&state.file_key)?;
-    if !needs_rehashing(
-        recorded.as_ref().map(|recorded| &recorded.state),
-        &state.file_key,
-        state.size,
-        state.hashed_mtime,
-    ) {
+    if !force_rehash
+        && !needs_rehashing(
+            recorded.as_ref().map(|recorded| &recorded.state),
+            &state.file_key,
+            state.size,
+            state.hashed_mtime,
+        )
+    {
         return match (role, trigger) {
             (ObservationRole::RestorableContent, ContentIdentityTrigger::Edit) => {
-                db.mark_restorable(&state.file_key, source.kind, Some(last_edit_at))
+                write_if_provenance_valid(
+                    source,
+                    valid_before_write,
+                    || {},
+                    || db.mark_restorable(&state.file_key, source.kind, Some(last_edit_at)),
+                )
             }
             (ObservationRole::RestorableContent, ContentIdentityTrigger::ViewingState)
                 if !recorded
                     .as_ref()
                     .is_some_and(|recorded| recorded.has_restorable_content) =>
             {
-                db.mark_restorable(&state.file_key, source.kind, None)
+                write_if_provenance_valid(
+                    source,
+                    valid_before_write,
+                    || {},
+                    || db.mark_restorable(&state.file_key, source.kind, None),
+                )
             }
-            _ => Ok(()),
+            _ => Ok(false),
         };
     }
     let Some((head_hash, full_hash)) = hasher()? else {
-        return Ok(());
+        return Ok(false);
     };
     let stored_last_edit_at = match trigger {
         ContentIdentityTrigger::Edit => last_edit_at,
@@ -1858,13 +2116,20 @@ fn record_observation_with_hasher(
             .map(|recorded| recorded.last_edit_at)
             .unwrap_or(0),
     };
-    db.upsert(
+    write_if_provenance_valid(
         source,
-        state,
-        &head_hash,
-        &full_hash,
-        stored_last_edit_at,
-        role,
+        valid_before_write,
+        || {},
+        || {
+            db.upsert(
+                source,
+                state,
+                &head_hash,
+                &full_hash,
+                stored_last_edit_at,
+                role,
+            )
+        },
     )
 }
 
@@ -1928,6 +2193,7 @@ mod tests {
         .unwrap();
 
         let mut candidates = vec![RestoreCandidate {
+            epub_source_state: None,
             target_key: "target".to_string(),
             target_path: dir.path().join("target.png"),
             target_kind: ContentKind::Image,
@@ -2003,6 +2269,7 @@ mod tests {
         .unwrap();
 
         let mut candidates = vec![RestoreCandidate {
+            epub_source_state: None,
             target_key: "target".to_string(),
             target_path: dir.path().join("target.png"),
             target_kind: ContentKind::Image,
@@ -2063,6 +2330,7 @@ mod tests {
         .unwrap();
 
         let mut candidates = vec![RestoreCandidate {
+            epub_source_state: None,
             target_key: "target".to_string(),
             target_path: dir.path().join("target.png"),
             target_kind: ContentKind::Image,
@@ -3750,5 +4018,416 @@ mod tests {
             ContentIdentitySource::new("C:/missing/image.png", ContentKind::Image),
             ContentIdentityTrigger::Edit,
         );
+    }
+
+    #[test]
+    fn epub_kind_uses_released_ledger_value_and_logical_path_classification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = ContentIdentityDb::open_at(&tmp.path().join("content_identity.db")).unwrap();
+        let path = tmp.path().join("book.epub");
+        let source = ContentIdentitySource::from_path(&path).unwrap();
+        assert_eq!(source.kind, ContentKind::Epub);
+        let page = crate::grid_item::GridItem::PdfPage {
+            pdf_path: path.clone(),
+            page_num: 0,
+            content_type: None,
+        };
+        assert_eq!(
+            ContentIdentitySource::for_grid_item(&page, None, None),
+            Some(source.clone())
+        );
+        let state = RecordedFileState {
+            file_key: crate::path_key::normalize_keep_drive(&path),
+            size: 5,
+            hashed_mtime: 7,
+        };
+        db.upsert(
+            &source,
+            &state,
+            "head",
+            "full",
+            1,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        let stored_kind: String = db
+            .conn
+            .query_row(
+                "SELECT kind FROM edit_origin WHERE file_key=?1",
+                [&state.file_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_kind, "pdf");
+        assert_eq!(
+            db.ledger_entry(&state.file_key).unwrap().unwrap().kind,
+            ContentKind::Epub
+        );
+    }
+
+    #[test]
+    fn pinned_epub_identity_uses_generation_row_after_source_is_removed() {
+        struct Guard(crate::epub_cache::SourceState);
+        impl crate::epub_cache::SourceGuard for Guard {
+            fn state(&self) -> std::io::Result<crate::epub_cache::SourceState> {
+                Ok(self.0)
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("book.epub");
+        std::fs::write(&path, b"source").unwrap();
+        let src_state = crate::epub_cache::source_state(&std::fs::metadata(&path).unwrap());
+        let mut cache = crate::epub_cache::EpubCache::open_at(tmp.path()).unwrap();
+        let output = cache.reserve_output(&path).unwrap();
+        std::fs::create_dir_all(output.final_path().parent().unwrap()).unwrap();
+        std::fs::write(output.final_path(), b"%PDF-1.4\n").unwrap();
+        let row = crate::epub_cache::GenerationRow {
+            generation_id: output.generation_id(),
+            src_path_key: crate::epub_cache::src_key(&path),
+            src_path: path.clone(),
+            src_state,
+            src_sha256: "generation-full".into(),
+            src_head_hash: "generation-head".into(),
+            pdf_file: output.final_path().to_path_buf(),
+            pdf_size: 9,
+            page_count: 1,
+            direction: "rtl".into(),
+            profile: "test".into(),
+            created_at: 1,
+            output_version: crate::epub_cache::CONVERTER_OUTPUT_VERSION,
+        };
+        assert_eq!(
+            cache.publish(&row, &Guard(src_state)).unwrap(),
+            crate::epub_cache::PublishOutcome::Published
+        );
+        let _pin = crate::pdf_loader::pin_epub_for_test(&path, row.generation_id, row.pdf_size);
+        std::fs::remove_file(&path).unwrap();
+        let db = ContentIdentityDb::open_at(&tmp.path().join("content_identity.db")).unwrap();
+        let request = CoalescedRecordRequest {
+            file_key: crate::path_key::normalize_keep_drive(&path),
+            source: ContentIdentitySource::from_path(&path).unwrap(),
+            trigger: ContentIdentityTrigger::Edit,
+            recorded_at: 10,
+            epub_provenance: Some(EpubProvenance::Pinned(row.generation_id)),
+        };
+        let entry = record_source_at(&db, &request, &AtomicBool::new(false), tmp.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.full_hash.as_deref(), Some("generation-full"));
+        assert_eq!(entry.head_hash, "generation-head");
+        assert_eq!(entry.size, src_state.size);
+        assert_eq!(
+            entry.hashed_mtime,
+            filetime_ticks_to_ledger_ns(src_state.mtime_ticks)
+        );
+    }
+
+    #[test]
+    fn unpinned_epub_backfill_cannot_replace_pinned_identity_after_source_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("book.epub");
+        std::fs::write(&path, b"before").unwrap();
+        let source = ContentIdentitySource::from_path(&path).unwrap();
+        let branch = capture_epub_provenance(&path).unwrap();
+        assert!(matches!(branch, EpubProvenance::Unpinned(_)));
+        let db = ContentIdentityDb::open_at(&tmp.path().join("content_identity.db")).unwrap();
+        let state = RecordedFileState {
+            file_key: crate::path_key::normalize_keep_drive(&path),
+            size: 6,
+            hashed_mtime: metadata_mtime(&std::fs::metadata(&path).unwrap()).unwrap(),
+        };
+        db.upsert(
+            &source,
+            &state,
+            "pinned-head",
+            "pinned-full",
+            99,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        let pin = std::cell::RefCell::new(None);
+        record_observation_with_hasher_guarded(
+            &db,
+            &source,
+            &state,
+            ContentIdentityTrigger::ViewingState,
+            ObservationRole::RestorableContent,
+            0,
+            true,
+            || {
+                std::fs::write(&path, b"AFTER!").unwrap();
+                *pin.borrow_mut() = Some(crate::pdf_loader::pin_epub_for_test(&path, 41, 123));
+                Ok(Some(("late-head".into(), "late-full".into())))
+            },
+            || Ok(capture_epub_provenance(&path)? == branch),
+        )
+        .unwrap();
+        assert_eq!(
+            db.ledger_entry(&state.file_key)
+                .unwrap()
+                .unwrap()
+                .full_hash
+                .as_deref(),
+            Some("pinned-full")
+        );
+        drop(pin);
+    }
+
+    #[test]
+    fn filetime_conversion_matches_ledger_range_policy() {
+        const EPOCH: u64 = 116_444_736_000_000_000;
+        assert_eq!(filetime_ticks_to_ledger_ns(EPOCH), 0);
+        assert_eq!(filetime_ticks_to_ledger_ns(EPOCH + 10), 1_000);
+        assert_eq!(filetime_ticks_to_ledger_ns(0), -i64::MAX);
+        assert_eq!(filetime_ticks_to_ledger_ns(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn epub_pin_after_provenance_check_cannot_be_overwritten_by_unpinned_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("race.epub");
+        std::fs::write(&path, b"source").unwrap();
+        let db_path = tmp.path().join("content_identity.db");
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        let source = ContentIdentitySource::from_path(&path).unwrap();
+        let branch = capture_epub_provenance(&path).unwrap();
+        let state = RecordedFileState {
+            file_key: crate::path_key::normalize_keep_drive(&path),
+            size: 6,
+            hashed_mtime: metadata_mtime(&std::fs::metadata(&path).unwrap()).unwrap(),
+        };
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread_source = source.clone();
+        let thread_state = state.clone();
+        let pin_thread = std::thread::spawn(move || {
+            start_tx.send(()).unwrap();
+            let _pin = crate::pdf_loader::pin_epub_for_test(&path, 77, 321);
+            std::fs::write(&path, b"replacement after pin").unwrap();
+            let pinned_db = ContentIdentityDb::open_at(&db_path).unwrap();
+            pinned_db
+                .upsert(
+                    &thread_source,
+                    &thread_state,
+                    "pinned-head",
+                    "pinned-full",
+                    2,
+                    ObservationRole::RestorableContent,
+                )
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let written = write_if_provenance_valid(
+            &source,
+            || Ok(capture_epub_provenance(&source.path)? == branch),
+            || {
+                start_rx.recv().unwrap();
+                // With the book guard, pinning cannot finish until this write
+                // returns. Removing it lets the pinned write win here, then the
+                // stale unpinned write below overwrites the ledger.
+                let _ = done_rx.recv_timeout(Duration::from_millis(300));
+            },
+            || {
+                db.upsert(
+                    &source,
+                    &state,
+                    "unpinned-head",
+                    "unpinned-full",
+                    1,
+                    ObservationRole::DetectionCache,
+                )
+            },
+        )
+        .unwrap();
+        assert!(written);
+        pin_thread.join().unwrap();
+        assert_eq!(
+            db.ledger_entry(&state.file_key)
+                .unwrap()
+                .unwrap()
+                .full_hash
+                .as_deref(),
+            Some("pinned-full")
+        );
+    }
+
+    #[test]
+    fn deleted_dotted_folder_purge_waits_for_checked_epub_backfill_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("books.v2");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("book.epub");
+        std::fs::write(&path, b"source").unwrap();
+        let source = ContentIdentitySource::from_path(&path).unwrap();
+        let state = RecordedFileState {
+            file_key: crate::path_key::normalize_keep_drive(&path),
+            size: 6,
+            hashed_mtime: 1,
+        };
+        let db_path = tmp.path().join("content_identity.db");
+        drop(ContentIdentityDb::open_at(&db_path).unwrap());
+        std::fs::remove_dir_all(&folder).unwrap();
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_db_path = db_path.clone();
+        let writer = std::thread::spawn(move || {
+            let db = ContentIdentityDb::open_at(&writer_db_path).unwrap();
+            write_if_provenance_valid(
+                &source,
+                || Ok(true), // backfill's already checked branch provenance
+                || {
+                    checked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+                || {
+                    db.upsert(
+                        &source,
+                        &state,
+                        "head",
+                        "full",
+                        1,
+                        ObservationRole::DetectionCache,
+                    )
+                },
+            )
+            .unwrap();
+        });
+        checked_rx.recv().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let purge_root = tmp.path().to_path_buf();
+        let purge = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let report =
+                crate::rename_key_migration::purge_removed_paths_at(&purge_root, &[folder], &[]);
+            done_tx.send(report.errors).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(250));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        purge.join().unwrap();
+        assert!(
+            early.is_err(),
+            "purge must wait for the checked ledger write"
+        );
+        assert!(done_rx.recv().unwrap().is_empty());
+        assert!(
+            ContentIdentityDb::open_at(&db_path)
+                .unwrap()
+                .ledger_entry(&crate::path_key::normalize_keep_drive(&path))
+                .unwrap()
+                .is_none(),
+            "a delayed backfill must not recreate the purged EPUB row"
+        );
+    }
+
+    #[test]
+    fn exact_plain_file_purge_cannot_delete_later_epub_ledger_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let removed = tmp.path().join("cover.png");
+        std::fs::create_dir(&removed).unwrap();
+        let path = removed.join("book.epub");
+        std::fs::write(&path, b"source").unwrap();
+        let source = ContentIdentitySource::from_path(&path).unwrap();
+        let state = RecordedFileState {
+            file_key: crate::path_key::normalize_keep_drive(&path),
+            size: 6,
+            hashed_mtime: 1,
+        };
+        let db_path = tmp.path().join("content_identity.db");
+        drop(ContentIdentityDb::open_at(&db_path).unwrap());
+
+        let (purge_entered_tx, purge_entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let purge_dir = tmp.path().to_path_buf();
+        let purge = std::thread::spawn(move || {
+            crate::rename_key_migration::purge_exact_identity_with_before_sql_for_test(
+                &purge_dir,
+                &removed,
+                || {
+                    purge_entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        purge_entered_rx.recv().unwrap();
+
+        let (write_entered_tx, write_entered_rx) = std::sync::mpsc::channel();
+        let writer_path = db_path.clone();
+        let writer = std::thread::spawn(move || {
+            let db = ContentIdentityDb::open_at(&writer_path).unwrap();
+            write_if_provenance_valid(
+                &source,
+                || Ok(true),
+                || {
+                    write_entered_tx.send(()).unwrap();
+                },
+                || {
+                    db.upsert(
+                        &source,
+                        &state,
+                        "head",
+                        "full",
+                        1,
+                        ObservationRole::DetectionCache,
+                    )
+                },
+            )
+            .unwrap();
+        });
+        let wrote_during_purge = write_entered_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok();
+        release_tx.send(()).unwrap();
+        let report = purge.join().unwrap();
+        writer.join().unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            !wrote_during_purge,
+            "an Exact delete also covers key/slash EPUB descendants"
+        );
+        assert!(
+            ContentIdentityDb::open_at(&db_path)
+                .unwrap()
+                .ledger_entry(&crate::path_key::normalize_keep_drive(&path))
+                .unwrap()
+                .is_some(),
+            "the post-purge ledger write must survive"
+        );
+    }
+
+    #[test]
+    fn epub_stage0_detection_does_not_write_source_hash_after_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stage0.epub");
+        std::fs::write(&path, b"matching copy").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let size = bytes.len() as u64;
+        let head = stage1_head_hash(&mut Cursor::new(&bytes), size).unwrap();
+        let full = stage2_full_hash(&mut Cursor::new(&bytes)).unwrap();
+        let origin = test_ledger_entry(
+            &crate::path_key::normalize_keep_drive(&tmp.path().join("origin.epub")),
+            size,
+            &head,
+            &full,
+            1,
+        );
+        let target = DetectionTarget {
+            source: ContentIdentitySource::from_path(&path).unwrap(),
+            file_key: crate::path_key::normalize_keep_drive(&path),
+            size,
+            origins: vec![origin],
+        };
+        let db = ContentIdentityDb::open_at(&tmp.path().join("content_identity.db")).unwrap();
+        let pin = std::cell::RefCell::new(None);
+        let detected =
+            detect_target_with_opener(&db, target.clone(), &AtomicBool::new(false), |_| {
+                *pin.borrow_mut() = Some(crate::pdf_loader::pin_epub_for_test(&path, 92, 100));
+                Ok(Cursor::new(bytes))
+            })
+            .unwrap();
+        assert!(detected.is_none());
+        assert!(db.ledger_entry(&target.file_key).unwrap().is_none());
     }
 }

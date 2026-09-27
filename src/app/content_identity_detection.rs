@@ -466,7 +466,7 @@ fn set_has_key_or_prefix(set: &BTreeSet<String>, key: &str, include_prefix: bool
 fn content_kind_uses_page_prefix(kind: ContentKind) -> bool {
     matches!(
         kind,
-        ContentKind::Zip | ContentKind::Pdf | ContentKind::Convertible
+        ContentKind::Zip | ContentKind::Pdf | ContentKind::Epub | ContentKind::Convertible
     )
 }
 

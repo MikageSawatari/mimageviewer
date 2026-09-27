@@ -156,3 +156,11 @@ main の back/forward に実 load から有効な target を用意した上で�
 Collection root からの変換書庫 tile が directory になった場合、Folder rows の install が `items_generation` を進める前に root source anchor と履歴を commit する。Collection descendant の再生要求は physical path が visible になってから commit する。この順序の違いは各 owner の有効性判定に合わせる。Collection root の stale `.7z` tile テストは修正前に position が Root のままで失敗し、修正後に PhysicalSource と Back の Collection target を確認した。
 
 修正後の focused history 群は 89/89、実 ZIP/PDF は 4/4、全 lib は 9,302 PASS / 48 ignored / 0 FAIL。`cargo fmt --all -- --check` と `git diff --check` は clean。`scripts/prepare-portable-smoke.ps1 -TestScript` は release core / Remote と VCRT/PE 検証を通り、隔離 `target/portable-smoke/data` を持つ bundle を更新した。`scripts/build-dev.ps1` も通常 feature の core / Remote と VCRT/PE 検証を通った。実アプリは起動していない。
+
+## 11. EPUB 統合時の履歴 open 所有（2026-09-27、設計担当決定）
+
+EPUB→PDF 統合との merge は案 A を採用する。変換ダイアログの継続先は `Direct(owner)` と `StagedHistory(context, request_id)` の型付き区別とし、後者では既存の物理／Collection 子 history transition が source snapshot、replay target、採用を最後まで所有する。ダイアログはその子操作であり、履歴を記録・rollback しない。未変換の `NotConverted` は worker から型を保って返し、Ask／Convert／Ignore／取消／失敗／古い公開では旧表示、address、履歴、A/B slot を維持する。変換成功後は同じ context と request ID を照合し、論理 `.epub` を再 preflight してから可視採用する。新しい直接 open は同一 path でも承認された admission 時に旧 history 変換を退役させ、history open は承認された admission 時に直接列挙・変換を退役させる。拒否された検索／detached 履歴入力は既存 open を退役させない。
+
+history の PDF/EPUB preflight は `PdfEnumerateResult` 全体（ページ、綴じ方向、世代 stamp）を渡し、直接 open と共通の prepared-PDF 成功処理で採用する。history の採用に仮ページや一時的な `pdf_enumerate_pending` owner は作らない。worker は既知の item kind があっても実 file／directory を判定し、`.epub` 名の directory を Folder として扱う。page flip と ZIP 内部階層は外側履歴の一点のままである。
+
+ダイアログの「変換して開く」は元の論理 `.epub` target へ戻る。「PDF を保存」は sibling `.pdf` を**明示的な新しい行き先**として再 preflight し、成功時にだけ採用する。Back／Forward の head が EPUB だった場合、その entry を pop しない。Collection root の明示 open では既存の source anchor/provenance を維持できる場合に維持し、EPUB entry の外へ出る Collection child replay は独立した物理行き先となる。fullscreen lock と parked／retired context は同じ staged request の終端で片付ける。

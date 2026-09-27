@@ -4,18 +4,19 @@
 # Output:
 #   target\dev-runtime\mimageviewer-core.exe
 #   target\dev-runtime\mimageviewer-remote.exe
+#   target\dev-runtime\mimageviewer-epub-pdf.exe
 #   FFmpeg DLLs are staged beside it so the core can run without the release
-#   launcher. Other native assets, workers, and models use the same embedded
+#   launcher. Other native assets and models use the same embedded
 #   extraction path as the regular application.
 #
-# Both executables are built together on purpose: the core spawns the remote
-# service from its own directory, and the two share PROTOCOL_VERSION.
+# The core, remote service, and EPUB converter are built together: the core
+# spawns each companion from its own directory. Core and remote share PROTOCOL_VERSION.
 #
 # The dev-runtime Cargo profile only changes optimization/build-time settings.
 # The portable feature is intentionally NOT enabled, so an ordinary launch uses
 # %APPDATA%\mimageviewer just like the installed/release application.
 #
-# This script builds only the application core. It does not run the result or
+# This script builds the application core and its companions. It does not run them or
 # touch the normal application data.
 #
 # When another worktree is building native code, this waits for it rather than
@@ -43,6 +44,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $outputDir = Join-Path $repoRoot 'target\dev-runtime'
 $coreExe = Join-Path $outputDir 'mimageviewer-core.exe'
 $remoteExe = Join-Path $outputDir 'mimageviewer-remote.exe'
+$epubWorkerExe = Join-Path $outputDir 'mimageviewer-epub-pdf.exe'
 $normalDataDir = if ($env:APPDATA) {
     Join-Path $env:APPDATA 'mimageviewer'
 } else {
@@ -172,6 +174,8 @@ try {
         -PreserveRuntime:$PreserveRuntime
     Stop-StagedProcess -ExeName 'mimageviewer-remote' -ExePath $remoteExe -Label 'remote service' `
         -PreserveRuntime:$PreserveRuntime
+    Stop-StagedProcess -ExeName 'mimageviewer-epub-pdf' -ExePath $epubWorkerExe -Label 'EPUB converter' `
+        -PreserveRuntime:$PreserveRuntime
 
     Ensure-LibclangPath
     $featureArgs = @()
@@ -202,6 +206,15 @@ try {
         throw "[build-dev] remote service was not produced: $remoteExe"
     }
 
+    Write-Host '[build-dev] building EPUB PDF worker with Cargo profile dev-runtime'
+    & cargo build --profile dev-runtime -p epub-pdf-worker --bin mimageviewer-epub-pdf
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+    if (-not (Test-Path $epubWorkerExe -PathType Leaf)) {
+        throw "[build-dev] EPUB PDF worker was not produced: $epubWorkerExe"
+    }
+
     $copies = @(
         @{ src = 'vendor\ffmpeg\bin\avcodec-61.dll'; dst = 'avcodec-61.dll' }
         @{ src = 'vendor\ffmpeg\bin\avformat-61.dll'; dst = 'avformat-61.dll' }
@@ -222,13 +235,14 @@ try {
     }
 
     & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
-        -InputPaths @($coreExe, $remoteExe) -RequireCompanionRuntime `
+        -InputPaths @($coreExe, $remoteExe, $epubWorkerExe) -RequireCompanionRuntime `
         -ReportPath 'target\vcrt-pe-reports\dev-runtime.json'
 
     Write-Host ''
     Write-Host '[build-dev] DONE'
     Write-Host ("  core: {0}" -f $coreExe)
     Write-Host ("  remote service: {0}" -f $remoteExe)
+    Write-Host ("  EPUB PDF worker: {0}" -f $epubWorkerExe)
     Write-Host ("  data (default): {0}" -f $normalDataDir)
     Write-Host ("  isolated override: --data-dir `"{0}`"" -f
         (Join-Path $outputDir 'data'))

@@ -191,7 +191,8 @@ function Write-SmokeBuildManifest {
         [string] $Path,
         [string] $SourceFingerprint,
         [string] $CorePath,
-        [string] $RemotePath
+        [string] $RemotePath,
+        [string] $EpubWorkerPath
     )
     $head = (& git -C $repoRoot rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $head) {
@@ -206,6 +207,7 @@ function Write-SmokeBuildManifest {
         source_fingerprint_sha256 = $SourceFingerprint
         core_sha256 = (Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash.ToLowerInvariant()
         remote_sha256 = (Get-FileHash -LiteralPath $RemotePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        epub_worker_sha256 = (Get-FileHash -LiteralPath $EpubWorkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     $json = $manifest | ConvertTo-Json -Depth 3
     [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -216,7 +218,8 @@ function Assert-SmokeBuildManifest {
         [string] $Path,
         [string] $ExpectedSourceFingerprint,
         [string] $CorePath,
-        [string] $RemotePath
+        [string] $RemotePath,
+        [string] $EpubWorkerPath
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "[portable-smoke-build] diagnostic build manifest not found: $Path"
@@ -241,7 +244,9 @@ function Assert-SmokeBuildManifest {
     }
     $coreHash = (Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $remoteHash = (Get-FileHash -LiteralPath $RemotePath -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($manifest.core_sha256 -ne $coreHash -or $manifest.remote_sha256 -ne $remoteHash) {
+    $epubWorkerHash = (Get-FileHash -LiteralPath $EpubWorkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($manifest.core_sha256 -ne $coreHash -or $manifest.remote_sha256 -ne $remoteHash -or
+        $manifest.epub_worker_sha256 -ne $epubWorkerHash) {
         throw '[portable-smoke-build] diagnostic artifact hash does not match its build manifest'
     }
 }
@@ -297,6 +302,7 @@ $stoppableProcessNames = @(
     'mimageviewer',
     'mimageviewer-core',
     'mimageviewer-remote',
+    'mimageviewer-epub-pdf',
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
@@ -334,6 +340,7 @@ $portableTargetName = if ($SmokeTestScript) { 'target-portable-test-script' } el
 $portableTargetDir = Join-Path $repoRoot $portableTargetName
 $coreExe = Join-Path $portableTargetDir 'release\mimageviewer-core.exe'
 $remoteExe = Join-Path $portableTargetDir 'release\mimageviewer-remote.exe'
+$epubWorkerExe = Join-Path $portableTargetDir 'release\mimageviewer-epub-pdf.exe'
 $smokeBuildManifest = Join-Path $portableTargetDir 'release\mimageviewer-core.build-manifest.json'
 Assert-NoReparsePath $portableTargetDir $repoRoot 'portable-target'
 $sourceFingerprint = $null
@@ -358,6 +365,11 @@ if (-not $SkipBuild) {
             & cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir $portableTargetDir
             $cargoExit = $LASTEXITCODE
         }
+        if ($cargoExit -eq 0) {
+            Write-Host "[portable] cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf --target-dir $portableTargetName"
+            & cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf --target-dir $portableTargetDir
+            $cargoExit = $LASTEXITCODE
+        }
     }
     finally {
         Pop-Location
@@ -372,13 +384,15 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $coreExe)) { throw "[portable] core exe not found: $coreExe" }
 if (-not (Test-Path $remoteExe)) { throw "[portable] remote service exe not found: $remoteExe" }
+if (-not (Test-Path $epubWorkerExe)) { throw "[portable] EPUB worker exe not found: $epubWorkerExe" }
 Assert-NoReparsePath $coreExe $repoRoot 'portable-core'
 Assert-NoReparsePath $remoteExe $repoRoot 'portable-remote'
+Assert-NoReparsePath $epubWorkerExe $repoRoot 'portable-epub-worker'
 if ($SmokeTestScript) {
     if ($SkipBuild) {
-        Assert-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe
+        Assert-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe
     } else {
-        Write-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe
+        Write-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe
     }
 }
 
@@ -410,6 +424,7 @@ New-Item -ItemType Directory -Path (Join-Path $pkgDir 'models') | Out-Null
 $copies = @(
     @{ src = $coreExe; dst = 'mimageviewer.exe' }
     @{ src = $remoteExe; dst = 'mimageviewer-remote.exe' }
+    @{ src = $epubWorkerExe; dst = 'mimageviewer-epub-pdf.exe' }
     @{ src = 'vendor\ffmpeg\bin\avcodec-61.dll';     dst = 'avcodec-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avformat-61.dll';    dst = 'avformat-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avutil-59.dll';      dst = 'avutil-59.dll' }
@@ -497,6 +512,7 @@ if ($Sign) {
     $portablePe = @(
         'mimageviewer.exe',
         'mimageviewer-remote.exe',
+        'mimageviewer-epub-pdf.exe',
         'pdfium.dll',
         'mimageviewer-susie32.exe',
         'avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll',

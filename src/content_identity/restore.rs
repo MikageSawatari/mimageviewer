@@ -144,19 +144,44 @@ impl InternalByteCopyDeclineRecorder {
 
 /// A3b worker の batch 入口。全候補の mapping を先に集約し、shared STORES と
 /// runtime update の各 DB は候補数にかかわらず 1 回ずつだけ開く。
-pub(crate) fn restore_candidates_at(
+#[cfg(test)]
+fn restore_candidates_at(
     data_dir: &Path,
     selected: &[SelectedRestore],
     declined: &[DeclinedRestore],
     load_sidecar_bases: bool,
 ) -> ContentRestoreReport {
-    let mappings = selected
+    restore_candidates_at_with_progress(
+        data_dir,
+        selected,
+        declined,
+        load_sidecar_bases,
+        |_, _, _| {},
+    )
+}
+
+pub(crate) fn restore_candidates_at_with_progress(
+    data_dir: &Path,
+    selected: &[SelectedRestore],
+    declined: &[DeclinedRestore],
+    load_sidecar_bases: bool,
+    mut on_progress: impl FnMut(&'static str, usize, usize),
+) -> ContentRestoreReport {
+    let ordinary = selected
+        .iter()
+        .filter(|selection| selection.candidate.target_kind != ContentKind::Epub)
+        .collect::<Vec<_>>();
+    let mappings = ordinary
         .iter()
         .flat_map(|selection| {
             restore_copy_mappings(data_dir, &selection.candidate, &selection.source)
         })
         .collect::<Vec<_>>();
-    let copied = crate::rename_key_migration::copy_stores_at(data_dir, &mappings);
+    let copied = crate::rename_key_migration::copy_stores_at_with_progress(
+        data_dir,
+        &mappings,
+        |processed, total| on_progress("copy", processed, total),
+    );
     let mut report = ContentRestoreReport {
         requested_restores: selected.len(),
         requested_declines: declined.len(),
@@ -166,9 +191,95 @@ pub(crate) fn restore_candidates_at(
         ..ContentRestoreReport::default()
     };
 
-    apply_batch_ledger_updates(data_dir, selected, declined, &mut report);
+    apply_batch_ledger_updates(data_dir, &ordinary, declined, &mut report, &mut on_progress);
 
-    match load_restore_runtime_updates(data_dir, selected) {
+    let mut accepted = ordinary;
+    let epub_selections = selected
+        .iter()
+        .filter(|selection| selection.candidate.target_kind == ContentKind::Epub)
+        .collect::<Vec<_>>();
+    let epub_mappings = epub_selections
+        .iter()
+        .map(|selection| restore_copy_mappings(data_dir, &selection.candidate, &selection.source))
+        .collect::<Vec<_>>();
+    let epub_store_count = crate::rename_key_migration::STORES
+        .iter()
+        .filter(|store| store.unique && store.file != "content_identity.db")
+        .count();
+    let epub_total = epub_mappings
+        .iter()
+        .map(|mappings| mappings.len() * epub_store_count + 1)
+        .sum();
+    let mut epub_processed = 0;
+    for (selection, mappings) in epub_selections.into_iter().zip(epub_mappings) {
+        let copy_work = mappings.len() * epub_store_count;
+        let processed_before = epub_processed;
+        let Some(expected) = selection.candidate.epub_source_state else {
+            epub_processed += copy_work + 1;
+            on_progress("epub", epub_processed, epub_total);
+            continue;
+        };
+        let result = crate::pdf_loader::with_epub_pin_guard(
+            &selection.candidate.target_path,
+            || {
+                if super::capture_epub_provenance(&selection.candidate.target_path)?
+                    != super::EpubProvenance::Unpinned(expected)
+                {
+                    return Ok(None);
+                }
+                let db = ContentIdentityDb::open_at(&data_dir.join("content_identity.db"))
+                    .map_err(|error| error.to_string())?;
+                let source_entry = db
+                    .ledger_entry(&selection.source.file_key)?
+                    .ok_or_else(|| "restore source ledger row is missing".to_string())?;
+                if source_entry.full_hash.as_deref() != Some(selection.candidate.full_hash.as_str())
+                {
+                    return Err("restore source hash changed".into());
+                }
+                if db
+                    .ledger_entry(&selection.candidate.target_key)?
+                    .is_some_and(|entry| entry.has_restorable_content)
+                {
+                    return Ok(None);
+                }
+                let copied =
+                    crate::rename_key_migration::copy_restore_stores_without_identity_at_with_progress(
+                        data_dir,
+                        &mappings,
+                        |processed, _| {
+                            on_progress("epub", processed_before + processed, epub_total)
+                        },
+                    );
+                if !copied.errors.is_empty() {
+                    return Err(copied.errors.join("; "));
+                }
+                let (entry, changed) = mark_restored_origin_inner(
+                    &db,
+                    &selection.candidate,
+                    &selection.source,
+                    Some(expected),
+                )?;
+                Ok(Some((entry, changed, copied)))
+            },
+        );
+        match result {
+            Ok(Some((entry, changed, copied))) => {
+                report.database_opens += copied.database_opens + 1;
+                report.rows += copied.rows + usize::from(changed);
+                report.ledger_entries.push(entry);
+                accepted.push(selection);
+            }
+            Ok(None) => {}
+            Err(error) => report.errors.push(format!(
+                "content_identity target={}: {error}",
+                selection.candidate.target_path.display()
+            )),
+        }
+        epub_processed += copy_work + 1;
+        on_progress("epub", epub_processed, epub_total);
+    }
+
+    match load_restore_runtime_updates(data_dir, &accepted) {
         Ok((sidecar_mirrors, presence, database_opens)) => {
             report.database_opens += database_opens;
             report.sidecar_mirrors = sidecar_mirrors;
@@ -179,6 +290,7 @@ pub(crate) fn restore_candidates_at(
         }
         Err(error) => report.errors.push(format!("sidecar mirror: {error}")),
     }
+    on_progress("runtime", 1, 1);
     report
 }
 
@@ -196,9 +308,10 @@ fn load_restore_sidecar_bases(
 
 fn apply_batch_ledger_updates(
     data_dir: &Path,
-    selected: &[SelectedRestore],
+    selected: &[&SelectedRestore],
     declined: &[DeclinedRestore],
     report: &mut ContentRestoreReport,
+    on_progress: &mut impl FnMut(&'static str, usize, usize),
 ) {
     if selected.is_empty() && declined.is_empty() {
         return;
@@ -211,17 +324,22 @@ fn apply_batch_ledger_updates(
             return;
         }
     };
+    let total = selected.len() + declined.len();
+    let mut processed = 0;
     for selection in selected {
         match mark_restored_origin(&db, &selection.candidate, &selection.source) {
-            Ok((entry, changed)) => {
+            Ok(Some((entry, changed))) => {
                 report.rows += usize::from(changed);
                 report.ledger_entries.push(entry);
             }
+            Ok(None) => {} // a pin or source replacement superseded this restore
             Err(error) => report.errors.push(format!(
                 "content_identity target={}: {error}",
                 selection.candidate.target_path.display()
             )),
         }
+        processed += 1;
+        on_progress("ledger", processed, total);
     }
     for refusal in declined {
         match record_restore_declined(&db, refusal) {
@@ -231,6 +349,8 @@ fn apply_batch_ledger_updates(
                 refusal.target_key
             )),
         }
+        processed += 1;
+        on_progress("ledger", processed, total);
     }
 }
 
@@ -238,13 +358,15 @@ fn record_restore_declined(
     db: &ContentIdentityDb,
     refusal: &DeclinedRestore,
 ) -> Result<bool, String> {
-    db.conn
-        .execute(
-            "INSERT OR IGNORE INTO restore_declined(full_hash, target_key) VALUES (?1, ?2)",
-            rusqlite::params![refusal.full_hash, refusal.target_key],
-        )
-        .map(|rows| rows > 0)
-        .map_err(|error| error.to_string())
+    super::with_epub_ledger_key_guard(&refusal.target_key, || {
+        db.conn
+            .execute(
+                "INSERT OR IGNORE INTO restore_declined(full_hash, target_key) VALUES (?1, ?2)",
+                rusqlite::params![refusal.full_hash, refusal.target_key],
+            )
+            .map(|rows| rows > 0)
+            .map_err(|error| error.to_string())
+    })
 }
 
 fn record_internal_byte_copy_decline(
@@ -290,10 +412,19 @@ fn restore_copy_mappings(
     candidate: &RestoreCandidate,
     source: &RestoreSourceCandidate,
 ) -> Vec<StoreCopyPathMapping> {
-    let mut mappings = vec![
-        StoreCopyPathMapping::exact(&source.path, &candidate.target_path),
-        StoreCopyPathMapping::virtual_prefix(&source.path, &candidate.target_path),
-    ];
+    let mut mappings = vec![StoreCopyPathMapping::exact(
+        &source.path,
+        &candidate.target_path,
+    )];
+    if matches!(
+        source.kind,
+        ContentKind::Zip | ContentKind::Pdf | ContentKind::Epub | ContentKind::Convertible
+    ) {
+        mappings.push(StoreCopyPathMapping::virtual_prefix(
+            &source.path,
+            &candidate.target_path,
+        ));
+    }
     if source.kind == ContentKind::Convertible && candidate.target_kind == ContentKind::Convertible
     {
         let old_cache = crate::archive_cache::cache_zip_path_for_data_dir(data_dir, &source.path);
@@ -309,6 +440,36 @@ fn mark_restored_origin(
     db: &ContentIdentityDb,
     candidate: &RestoreCandidate,
     source: &RestoreSourceCandidate,
+) -> Result<Option<(LedgerEntry, bool)>, String> {
+    let epub_state = if candidate.target_kind == ContentKind::Epub {
+        match super::capture_epub_provenance(&candidate.target_path)? {
+            super::EpubProvenance::Unpinned(state) => Some(state),
+            super::EpubProvenance::Pinned(_) => return Ok(None),
+        }
+    } else {
+        None
+    };
+    let action = || {
+        if let Some(expected) = epub_state
+            && super::capture_epub_provenance(&candidate.target_path)?
+                != super::EpubProvenance::Unpinned(expected)
+        {
+            return Ok(None);
+        }
+        mark_restored_origin_inner(db, candidate, source, epub_state).map(Some)
+    };
+    if epub_state.is_some() {
+        crate::pdf_loader::with_epub_pin_guard(&candidate.target_path, action)
+    } else {
+        action()
+    }
+}
+
+fn mark_restored_origin_inner(
+    db: &ContentIdentityDb,
+    candidate: &RestoreCandidate,
+    source: &RestoreSourceCandidate,
+    epub_state: Option<crate::epub_cache::SourceState>,
 ) -> Result<(LedgerEntry, bool), String> {
     let source_entry = db
         .ledger_entry(&source.file_key)?
@@ -336,6 +497,9 @@ fn mark_restored_origin(
             "restore target is not a regular file: {}",
             candidate.target_path.display()
         ));
+    }
+    if epub_state.is_some_and(|expected| crate::epub_cache::source_state(&metadata) != expected) {
+        return Err("restore target EPUB changed before ledger write".into());
     }
     let size = i64::try_from(metadata.len())
         .map_err(|_| "target file size exceeds SQLite INTEGER".to_string())?;
@@ -423,19 +587,35 @@ fn query_family_rows(
     let conn = rusqlite::Connection::open(&path).map_err(|error| error.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|error| error.to_string())?;
-    let sql = format!(
-        "SELECT {key_column}, {selected_columns} FROM {table}
-          WHERE {key_column} = ?1 OR substr({key_column}, 1, ?2) = ?3"
-    );
-    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let select = format!("SELECT {key_column}, {selected_columns} FROM {table}");
+    let mut exact = conn
+        .prepare(&format!("{select} WHERE {key_column} = ?1"))
+        .map_err(|error| error.to_string())?;
+    let mut range = conn
+        .prepare(&format!(
+            "{select} WHERE {key_column} >= ?1 AND {key_column} < ?2"
+        ))
+        .map_err(|error| error.to_string())?;
+    let mut no_upper = conn
+        .prepare(&format!(
+            "{select} WHERE {key_column} >= ?1 AND substr({key_column}, 1, ?2) = ?1"
+        ))
+        .map_err(|error| error.to_string())?;
     for family in families {
         let prefix = format!("{}::", family.base_key);
-        let mut rows = statement
-            .query(rusqlite::params![
-                family.base_key,
-                prefix.chars().count() as i64,
-                prefix,
-            ])
+        let mut rows = exact
+            .query([&family.base_key])
+            .map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            visit(row)?;
+        }
+        drop(rows);
+        let mut rows =
+            if let Some(upper) = crate::rename_key_migration::prefix_upper_bound(&prefix) {
+                range.query(rusqlite::params![prefix, upper])
+            } else {
+                no_upper.query(rusqlite::params![prefix, prefix.chars().count() as i64])
+            }
             .map_err(|error| error.to_string())?;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             visit(row)?;
@@ -476,7 +656,7 @@ fn sidecar_mask_from_row(
 
 fn load_restore_runtime_updates(
     data_dir: &Path,
-    selected: &[SelectedRestore],
+    selected: &[&SelectedRestore],
 ) -> Result<(Vec<RestoreSidecarMirror>, RestorePresence, usize), String> {
     let families = selected
         .iter()
@@ -675,6 +855,204 @@ fn sidecar_coords_for_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_promotion_cannot_replace_a_pinned_epub_identity() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let temp = tempfile::tempdir().unwrap();
+        let db = ContentIdentityDb::open_at(&temp.path().join("content_identity.db")).unwrap();
+        let origin = temp.path().join("origin.png");
+        std::fs::write(&origin, b"source").unwrap();
+        let source = ContentIdentitySource::from_path(&origin).unwrap();
+        let origin_key = crate::path_key::normalize_keep_drive(&origin);
+        db.upsert(
+            &source,
+            &RecordedFileState {
+                file_key: origin_key.clone(),
+                size: 6,
+                hashed_mtime: 1,
+            },
+            "head",
+            "full",
+            1,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        let restore_source = RestoreSourceCandidate {
+            file_key: origin_key,
+            path: origin,
+            kind: ContentKind::Image,
+            last_edit_at: 1,
+            source_exists: true,
+        };
+        let candidate = RestoreCandidate {
+            target_key: crate::path_key::normalize_keep_drive(&fixture.source),
+            target_path: fixture.source.clone(),
+            target_kind: ContentKind::Epub,
+            full_hash: "full".into(),
+            sources: vec![restore_source.clone()],
+            epub_source_state: None,
+        };
+        assert!(
+            mark_restored_origin(&db, &candidate, &restore_source)
+                .unwrap()
+                .is_none()
+        );
+        assert!(db.ledger_entry(&candidate.target_key).unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_candidates_rechecks_epub_before_copying_edits() {
+        let data = tempfile::tempdir().unwrap();
+        let origin = data.path().join("origin.png");
+        let epub = data.path().join("book.epub");
+        let original_bytes = b"source";
+        std::fs::write(&origin, original_bytes).unwrap();
+        std::fs::write(&epub, original_bytes).unwrap();
+        let db = ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
+        let origin_key = crate::path_key::normalize_keep_drive(&origin);
+        let target_key = crate::path_key::normalize_keep_drive(&epub);
+        let head = super::super::stage1_head_hash(
+            &mut std::io::Cursor::new(original_bytes),
+            original_bytes.len() as u64,
+        )
+        .unwrap();
+        let full =
+            super::super::stage2_full_hash(&mut std::io::Cursor::new(original_bytes)).unwrap();
+        db.upsert(
+            &ContentIdentitySource::from_path(&origin).unwrap(),
+            &RecordedFileState {
+                file_key: origin_key.clone(),
+                size: 6,
+                hashed_mtime: 1,
+            },
+            &head,
+            &full,
+            1,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        let rotations = rusqlite::Connection::open(data.path().join("rotation.db")).unwrap();
+        rotations
+            .execute_batch("CREATE TABLE rotations (path TEXT PRIMARY KEY, angle INTEGER NOT NULL)")
+            .unwrap();
+        rotations
+            .execute(
+                "INSERT INTO rotations(path, angle) VALUES (?1, 90)",
+                [&origin_key],
+            )
+            .unwrap();
+        let origin_entry = db.ledger_entry(&origin_key).unwrap().unwrap();
+        let detection = super::super::DetectionTarget {
+            source: ContentIdentitySource::from_path(&epub).unwrap(),
+            file_key: target_key.clone(),
+            size: original_bytes.len() as u64,
+            origins: vec![origin_entry],
+        };
+        let (candidate, observed) =
+            super::super::detect_target(&db, detection, &std::sync::atomic::AtomicBool::new(false))
+                .unwrap()
+                .unwrap();
+        let candidate = candidate.expect("matching EPUB must create a restore candidate");
+        assert!(candidate.epub_source_state.is_some());
+        let source = candidate.sources[0].clone();
+
+        // Replacement and pin happen after detection but before restore.
+        std::fs::write(&epub, b"replacement with different content").unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 44, 4096);
+        let selection = SelectedRestore { candidate, source };
+        let report = restore_candidates_at(data.path(), &[selection], &[], false);
+        assert!(report.ledger_entries.is_empty());
+        assert_eq!(db.ledger_entry(&target_key).unwrap(), Some(observed));
+        let copied: i64 = rotations
+            .query_row(
+                "SELECT COUNT(*) FROM rotations WHERE path = ?1",
+                [&target_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied, 0, "stale restore must not copy any edit rows");
+    }
+
+    #[test]
+    fn epub_restore_copies_virtual_pages_and_reports_progress() {
+        let data = tempfile::tempdir().unwrap();
+        let origin = data.path().join("origin.epub");
+        let target = data.path().join("copy.epub");
+        std::fs::write(&origin, b"same book bytes").unwrap();
+        std::fs::write(&target, b"same book bytes").unwrap();
+        let origin_key = crate::path_key::normalize_keep_drive(&origin);
+        let target_key = crate::path_key::normalize_keep_drive(&target);
+        let db = ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
+        db.upsert(
+            &ContentIdentitySource::from_path(&origin).unwrap(),
+            &RecordedFileState {
+                file_key: origin_key.clone(),
+                size: 15,
+                hashed_mtime: 1,
+            },
+            "head",
+            "full",
+            1,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        let rotations = rusqlite::Connection::open(data.path().join("rotation.db")).unwrap();
+        rotations
+            .execute_batch("CREATE TABLE rotations (path TEXT PRIMARY KEY, angle INTEGER NOT NULL)")
+            .unwrap();
+        for key in [origin_key.clone(), format!("{origin_key}::page_1")] {
+            rotations
+                .execute("INSERT INTO rotations(path, angle) VALUES (?1, 90)", [key])
+                .unwrap();
+        }
+        let (mut candidate, source) = candidate(origin, target.clone(), ContentKind::Epub, "full");
+        candidate.epub_source_state = Some(crate::epub_cache::source_state(
+            &std::fs::metadata(target).unwrap(),
+        ));
+        let mut progress = Vec::new();
+        let report = restore_candidates_at_with_progress(
+            data.path(),
+            &[SelectedRestore { candidate, source }],
+            &[],
+            false,
+            |stage, processed, total| progress.push((stage, processed, total)),
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.ledger_entries.len(), 1);
+        assert!(
+            db.ledger_entry(&target_key)
+                .unwrap()
+                .unwrap()
+                .has_restorable_content
+        );
+        for key in [target_key.clone(), format!("{target_key}::page_1")] {
+            assert_eq!(
+                rotations
+                    .query_row(
+                        "SELECT angle FROM rotations WHERE path = ?1",
+                        [key],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                90,
+            );
+        }
+        let epub_progress = progress
+            .iter()
+            .filter(|event| event.0 == "epub")
+            .collect::<Vec<_>>();
+        assert!(!epub_progress.is_empty());
+        assert!(
+            epub_progress
+                .windows(2)
+                .all(|events| events[0].1 <= events[1].1)
+        );
+        assert_eq!(
+            epub_progress.last().unwrap().1,
+            epub_progress.last().unwrap().2
+        );
+    }
     use crate::content_identity::{
         ContentIdentitySource, ObservationRole, RecordedFileState, stage0_target,
     };
@@ -695,6 +1073,7 @@ mod tests {
                 target_kind: kind,
                 full_hash: full_hash.to_string(),
                 sources: Vec::new(),
+                epub_source_state: None,
             },
             RestoreSourceCandidate {
                 file_key: source_key,
@@ -718,6 +1097,180 @@ mod tests {
                     rusqlite::params![key, angle],
                 )
                 .unwrap();
+        }
+    }
+
+    #[test]
+    fn image_mappings_skip_virtual_prefix_and_containers_keep_it() {
+        let data = tempfile::tempdir().unwrap();
+        for (kind, expected) in [
+            (ContentKind::Image, 1),
+            (ContentKind::Zip, 2),
+            (ContentKind::Pdf, 2),
+            (ContentKind::Epub, 2),
+            (ContentKind::Convertible, 4),
+        ] {
+            let (candidate, source) = candidate(
+                PathBuf::from(r"C:\本\old.ext"),
+                PathBuf::from(r"D:\本\new.ext"),
+                kind,
+                "hash",
+            );
+            let mappings = restore_copy_mappings(data.path(), &candidate, &source);
+            assert_eq!(mappings.len(), expected, "{kind:?}");
+            assert_eq!(
+                mappings
+                    .iter()
+                    .filter(|mapping| matches!(mapping, StoreCopyPathMapping::VirtualPrefix { .. }))
+                    .count(),
+                if kind == ContentKind::Convertible {
+                    2
+                } else {
+                    expected - 1
+                },
+                "{kind:?}"
+            );
+        }
+    }
+
+    fn assert_runtime_family_query_plans(data_dir: &Path) {
+        for (file, table, column, selected) in [
+            ("adjustment.db", "page_params", "page_path", "params_json"),
+            (
+                "mask.db",
+                "masks",
+                "path",
+                "mask_data, width, height, vectors",
+            ),
+            (
+                "conceal.db",
+                "conceal_entries",
+                "page_path",
+                "bitmap_data, bitmap_w, bitmap_h, shapes",
+            ),
+            (
+                "local_adjust.db",
+                "local_adjust_pages",
+                "page_path",
+                "layers_json",
+            ),
+            (
+                "export_crop.db",
+                "export_crop_pages",
+                "page_path",
+                "min_x, min_y, max_x, max_y, aspect_mode, source_width, source_height",
+            ),
+            ("comic.db", "comic_entries", "page_path", "doc_json"),
+            ("rotation.db", "rotations", "path", "angle"),
+        ] {
+            let connection = rusqlite::Connection::open(data_dir.join(file)).unwrap();
+            for predicate in [
+                format!("{column} = ?1"),
+                format!("{column} >= ?1 AND {column} < ?2"),
+                format!("{column} >= ?1 AND substr({column}, 1, ?2) = ?1"),
+            ] {
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN SELECT {column}, {selected} FROM {table} WHERE {predicate}"
+                );
+                let mut statement = connection.prepare(&sql).unwrap();
+                let plan: String = if predicate == format!("{column} = ?1") {
+                    statement
+                        .query_row(["c:/日本/本::"], |row| row.get(3))
+                        .unwrap()
+                } else {
+                    statement
+                        .query_row(
+                            rusqlite::params!["c:/日本/本::", "c:/日本/本:;"],
+                            |row| row.get(3),
+                        )
+                        .unwrap()
+                };
+                assert!(
+                    plan.contains("SEARCH") && plan.contains("INDEX") && !plan.contains("SCAN"),
+                    "{file}.{table}: {plan}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_family_exact_and_prefix_query_plans_search_key_index() {
+        let data = tempfile::tempdir().unwrap();
+        create_production_store_schemas(data.path());
+        assert_runtime_family_query_plans(data.path());
+    }
+
+    #[test]
+    fn runtime_family_rows_match_legacy_or_substr_for_unicode_and_case() {
+        let data = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(data.path().join("rotation.db")).unwrap();
+        connection
+            .execute_batch("CREATE TABLE rotations (path TEXT PRIMARY KEY, angle INTEGER NOT NULL)")
+            .unwrap();
+        for (index, key) in [
+            "c:/日本/本.zip",
+            "c:/日本/本.zip::一.jpg",
+            "c:/日本/本.zip::二.jpg",
+            "c:/日本/本.zip:;outside",
+            "c:/A.zip",
+            "c:/A.zip::upper",
+            "c:/a.zip",
+            "c:/a.zip::lower",
+            "c:/\u{10ffff}.zip::edge",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            connection
+                .execute(
+                    "INSERT INTO rotations VALUES (?1, ?2)",
+                    rusqlite::params![key, index as i64],
+                )
+                .unwrap();
+        }
+        for base in [
+            "c:/日本/本.zip",
+            "c:/A.zip",
+            "c:/a.zip",
+            "c:/\u{10ffff}.zip",
+        ] {
+            let family = DestinationEditFamily {
+                base_path: PathBuf::from(base),
+                base_key: base.to_owned(),
+            };
+            let mut actual = Vec::new();
+            query_family_rows(
+                data.path(),
+                "rotation.db",
+                "rotations",
+                "path",
+                "angle",
+                &[family],
+                |row| {
+                    actual.push((
+                        row.get::<_, String>(0).map_err(|error| error.to_string())?,
+                        row.get::<_, i64>(1).map_err(|error| error.to_string())?,
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let prefix = format!("{base}::");
+            let mut expected = connection
+                .prepare(
+                    "SELECT path, angle FROM rotations WHERE path = ?1 OR substr(path, 1, ?2) = ?3",
+                )
+                .unwrap()
+                .query_map(
+                    rusqlite::params![base, prefix.chars().count() as i64, prefix],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected, "{base}");
         }
     }
 
@@ -781,6 +1334,407 @@ mod tests {
         }
     }
 
+    /// Exercise the schema creation and additive migrations used by the application, rather
+    /// than test-local CREATE TABLE statements. Every STORES file is opened at least once.
+    fn create_production_store_schemas(data_dir: &Path) {
+        drop(crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).unwrap());
+        drop(ContentIdentityDb::open_at(&data_dir.join("content_identity.db")).unwrap());
+        drop(crate::adjustment_db::AdjustmentDb::open_at(&data_dir.join("adjustment.db")).unwrap());
+        drop(crate::mask_db::MaskDb::open_at(&data_dir.join("mask.db")).unwrap());
+        drop(crate::conceal_db::ConcealDb::open_at(&data_dir.join("conceal.db")).unwrap());
+        drop(
+            crate::local_adjust_db::LocalAdjustDb::open_at(&data_dir.join("local_adjust.db"))
+                .unwrap(),
+        );
+        drop(crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db")).unwrap());
+        drop(crate::export_crop::CropDb::open_at(&data_dir.join("export_crop.db")).unwrap());
+        drop(
+            crate::edit_preview_cache::EditPreviewCacheDb::open_at(
+                &data_dir.join("edit_preview_cache.db"),
+            )
+            .unwrap(),
+        );
+        drop(crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap());
+        drop(crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db")).unwrap());
+        drop(crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db")).unwrap());
+        drop(crate::video_pins::VideoPinDb::open_at(&data_dir.join("video_pins.db")).unwrap());
+        drop(
+            crate::video_bookmarks::VideoBookmarkDb::open_at(&data_dir.join("video_bookmarks.db"))
+                .unwrap(),
+        );
+        drop(
+            crate::folder_thumb_pins::FolderThumbPinDb::open_at(
+                &data_dir.join("folder_thumb_pins.db"),
+            )
+            .unwrap(),
+        );
+        drop(
+            crate::book_resume_db::BookResumeDb::open_at(&data_dir.join("book_resume.db")).unwrap(),
+        );
+        drop(crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db")).unwrap());
+        drop(
+            crate::reading_history_db::ReadingHistoryDb::open_at(
+                data_dir.join("reading_history.db"),
+            )
+            .unwrap(),
+        );
+    }
+
+    fn assert_production_store_prefix_plans(data_dir: &Path) {
+        for descriptor in crate::rename_key_migration::STORES {
+            let connection = rusqlite::Connection::open(data_dir.join(descriptor.file)).unwrap();
+            let indexes = connection
+                .prepare(&format!("PRAGMA index_list({})", descriptor.table))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let leading_binary = indexes.iter().any(|index| {
+                let mut statement = connection
+                    .prepare(&format!(
+                        "PRAGMA index_xinfo('{}')",
+                        index.replace('\'', "''")
+                    ))
+                    .unwrap();
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+                    .iter()
+                    .any(|(seq, column, collation, key)| {
+                        *seq == 0
+                            && column.as_deref() == Some(descriptor.column)
+                            && collation == "BINARY"
+                            && *key == 1
+                    })
+            });
+            assert!(
+                leading_binary,
+                "{}.{}.{} lacks BINARY leading-key index",
+                descriptor.file, descriptor.table, descriptor.column
+            );
+            let column = descriptor.column;
+            let table = descriptor.table;
+            for predicate in [
+                format!("{column} >= ?1 AND {column} < ?2"),
+                format!("{column} >= ?1 AND substr({column}, 1, ?2) = ?1"),
+            ] {
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM {table} WHERE {predicate}"
+                );
+                let plan: String = connection
+                    .prepare(&sql)
+                    .unwrap()
+                    .query_row(
+                        rusqlite::params!["c:/日本/本.zip::", "c:/日本/本.zip:;"],
+                        |row| row.get(3),
+                    )
+                    .unwrap();
+                assert!(
+                    plan.contains("SEARCH") && plan.contains("INDEX") && !plan.contains("SCAN"),
+                    "{}.{} {predicate}: {plan}",
+                    descriptor.file,
+                    descriptor.table
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_store_prefix_plans_use_binary_leading_indexes() {
+        let data = tempfile::tempdir().unwrap();
+        create_production_store_schemas(data.path());
+        assert_production_store_prefix_plans(data.path());
+        // Reopening an already current schema uses the same production constructors.
+        create_production_store_schemas(data.path());
+        assert_production_store_prefix_plans(data.path());
+    }
+
+    #[test]
+    fn migrated_production_store_prefix_plans_use_binary_leading_indexes() {
+        let data = tempfile::tempdir().unwrap();
+        // Released/development predecessor schemas exercise the additive or rebuild branches
+        // of the same open_at constructors. All other stores start from an absent DB.
+        for (file, sql) in [
+            (
+                "rating.db",
+                "CREATE TABLE ratings(path TEXT PRIMARY KEY, stars INTEGER NOT NULL)",
+            ),
+            (
+                "content_identity.db",
+                "CREATE TABLE edit_origin (
+                    file_key TEXT PRIMARY KEY, size INTEGER NOT NULL, head_hash TEXT NOT NULL,
+                    full_hash TEXT, hashed_mtime INTEGER NOT NULL, kind TEXT NOT NULL,
+                    last_edit_at INTEGER NOT NULL);
+                 PRAGMA user_version = 0;",
+            ),
+            (
+                "adjustment.db",
+                "CREATE TABLE sidecar_sync (
+                    folder_key TEXT PRIMARY KEY, synced_at INTEGER NOT NULL)",
+            ),
+            (
+                "mask.db",
+                "CREATE TABLE masks (
+                    path TEXT PRIMARY KEY, mask_data BLOB, width INTEGER, height INTEGER)",
+            ),
+            (
+                "export_crop.db",
+                "CREATE TABLE export_crop_pages (
+                    page_path TEXT PRIMARY KEY, min_x REAL NOT NULL, min_y REAL NOT NULL,
+                    max_x REAL NOT NULL, max_y REAL NOT NULL, aspect_mode TEXT NOT NULL)",
+            ),
+            (
+                "edit_preview_cache.db",
+                "CREATE TABLE edit_previews(item_key TEXT PRIMARY KEY);
+                 PRAGMA user_version = 1;",
+            ),
+            (
+                "video_pins.db",
+                "CREATE TABLE video_pins (
+                    path TEXT PRIMARY KEY, pin_pts_secs REAL NOT NULL, thumb_webp BLOB)",
+            ),
+            (
+                "video_bookmarks.db",
+                "CREATE TABLE video_bookmarks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL,
+                    pts_secs REAL NOT NULL, title TEXT, thumb_webp BLOB,
+                    created_at INTEGER NOT NULL)",
+            ),
+            (
+                "folder_thumb_pins.db",
+                "CREATE TABLE folder_thumb_pins (
+                    container_key TEXT PRIMARY KEY, source_kind TEXT NOT NULL,
+                    source_rel TEXT NOT NULL, source_entry TEXT, source_page INTEGER)",
+            ),
+            (
+                "spread.db",
+                "CREATE TABLE spreads(path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE singleton_spread_placements (
+                    path TEXT PRIMARY KEY, preference INTEGER NOT NULL)",
+            ),
+            (
+                "reading_history.db",
+                "CREATE TABLE reading_history (
+                    key TEXT PRIMARY KEY, path TEXT NOT NULL, kind TEXT NOT NULL,
+                    archive_format TEXT, title TEXT NOT NULL,
+                    last_read_at_ms INTEGER NOT NULL, last_page INTEGER, page_count INTEGER,
+                    file_size INTEGER, mtime_ms INTEGER)",
+            ),
+        ] {
+            let connection = rusqlite::Connection::open(data.path().join(file)).unwrap();
+            connection.execute_batch(sql).unwrap();
+        }
+        create_production_store_schemas(data.path());
+        assert_production_store_prefix_plans(data.path());
+        assert_runtime_family_query_plans(data.path());
+    }
+
+    #[test]
+    fn retry_after_partial_store_commits_matches_uninterrupted_restore_rows() {
+        let files = tempfile::tempdir().unwrap();
+        let uninterrupted = tempfile::tempdir().unwrap();
+        let resumed = tempfile::tempdir().unwrap();
+        let source_path = files.path().join("origin.zip");
+        let target_path = files.path().join("target.zip");
+        std::fs::write(&source_path, b"same archive bytes").unwrap();
+        std::fs::write(&target_path, b"same archive bytes").unwrap();
+        let source_key = crate::path_key::normalize_keep_drive(&source_path);
+        let target_key = crate::path_key::normalize_keep_drive(&target_path);
+        let metadata = std::fs::metadata(&target_path).unwrap();
+        let full_hash = "same-full-hash";
+        let fixture = |data_dir: &Path| {
+            create_all_unique_store_schemas(data_dir);
+            let ledger = ContentIdentityDb::open_at(&data_dir.join("content_identity.db")).unwrap();
+            ledger
+                .upsert(
+                    &ContentIdentitySource::new(&source_path, ContentKind::Zip),
+                    &RecordedFileState {
+                        file_key: source_key.clone(),
+                        size: metadata.len(),
+                        hashed_mtime: 1,
+                    },
+                    "head",
+                    full_hash,
+                    99,
+                    ObservationRole::RestorableContent,
+                )
+                .unwrap();
+            ledger
+                .upsert(
+                    &ContentIdentitySource::new(&target_path, ContentKind::Zip),
+                    &RecordedFileState {
+                        file_key: target_key.clone(),
+                        size: metadata.len(),
+                        hashed_mtime: metadata_mtime(&metadata).unwrap(),
+                    },
+                    "head",
+                    full_hash,
+                    0,
+                    ObservationRole::DetectionCache,
+                )
+                .unwrap();
+            drop(ledger);
+
+            let ratings = rusqlite::Connection::open(data_dir.join("rating.db")).unwrap();
+            for key in [source_key.clone(), format!("{source_key}::一.jpg")] {
+                ratings
+                    .execute(
+                        "INSERT INTO ratings(path, source_path) VALUES (?1, ?2)",
+                        rusqlite::params![key, source_key],
+                    )
+                    .unwrap();
+            }
+            let rotations = rusqlite::Connection::open(data_dir.join("rotation.db")).unwrap();
+            for key in [source_key.clone(), format!("{source_key}::一.jpg")] {
+                rotations
+                    .execute("INSERT INTO rotations(path, angle) VALUES (?1, 90)", [key])
+                    .unwrap();
+            }
+            rusqlite::Connection::open(data_dir.join("reading_history.db"))
+                .unwrap()
+                .execute(
+                    "INSERT INTO reading_history(key, path) VALUES (?1, ?2)",
+                    rusqlite::params![source_key, source_path.to_string_lossy()],
+                )
+                .unwrap();
+        };
+        fixture(uninterrupted.path());
+        fixture(resumed.path());
+
+        let (candidate, source) = candidate(source_path, target_path, ContentKind::Zip, full_hash);
+        let selection = SelectedRestore { candidate, source };
+        let selected = [selection.clone()];
+        let complete = restore_candidates_at(uninterrupted.path(), &selected, &[], false);
+        assert!(complete.errors.is_empty(), "{:?}", complete.errors);
+
+        // Simulate process exit after rating.db committed, before later stores or ledger update.
+        let paused_files = ["rotation.db", "reading_history.db"].map(|name| {
+            (
+                resumed.path().join(name),
+                resumed.path().join(format!("{name}.paused")),
+            )
+        });
+        for (path, paused) in &paused_files {
+            std::fs::rename(path, paused).unwrap();
+        }
+        let mappings =
+            restore_copy_mappings(resumed.path(), &selection.candidate, &selection.source);
+        let partial = crate::rename_key_migration::copy_stores_at(resumed.path(), &mappings);
+        assert!(partial.errors.is_empty(), "{:?}", partial.errors);
+        assert_eq!(partial.rows, 2, "rating exact and virtual rows committed");
+        let ledger =
+            ContentIdentityDb::open_at(&resumed.path().join("content_identity.db")).unwrap();
+        assert!(
+            !ledger
+                .ledger_entry(&target_key)
+                .unwrap()
+                .unwrap()
+                .has_restorable_content,
+            "target ledger must still be unrecorded at interruption"
+        );
+        drop(ledger);
+        for (path, paused) in &paused_files {
+            std::fs::rename(paused, path).unwrap();
+        }
+        let retried = restore_candidates_at(resumed.path(), &selected, &[], false);
+        assert!(retried.errors.is_empty(), "{:?}", retried.errors);
+
+        let snapshot = |data_dir: &Path| {
+            let mut databases = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(data_dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_none_or(|extension| extension != "db") {
+                    continue;
+                }
+                let connection = rusqlite::Connection::open(&path).unwrap();
+                let table_names = connection
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let mut tables = std::collections::BTreeMap::new();
+                for table in table_names {
+                    let mut statement = connection
+                        .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
+                        .unwrap();
+                    let column_count = statement.column_count();
+                    let mut rows = statement
+                        .query_map([], |row| {
+                            (0..column_count)
+                                .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .unwrap()
+                        .map(|row| format!("{:?}", row.unwrap()))
+                        .collect::<Vec<_>>();
+                    rows.sort();
+                    tables.insert(table, rows);
+                }
+                databases.insert(
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    tables,
+                );
+            }
+            databases
+        };
+        assert_eq!(
+            snapshot(uninterrupted.path()),
+            snapshot(resumed.path()),
+            "every DB table row, including ledger and rating source_path, must match"
+        );
+        for data_dir in [uninterrupted.path(), resumed.path()] {
+            let ratings = rusqlite::Connection::open(data_dir.join("rating.db")).unwrap();
+            for key in [&target_key, &format!("{target_key}::一.jpg")] {
+                let source_path: String = ratings
+                    .query_row(
+                        "SELECT source_path FROM ratings WHERE path = ?1",
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(source_path, target_key);
+            }
+            let rotation = rusqlite::Connection::open(data_dir.join("rotation.db")).unwrap();
+            let angle: i64 = rotation
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [format!("{target_key}::一.jpg")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(angle, 90, "a later store must be copied on retry");
+            let history = rusqlite::Connection::open(data_dir.join("reading_history.db")).unwrap();
+            let raw_path: String = history
+                .query_row(
+                    "SELECT path FROM reading_history WHERE key = ?1",
+                    [&target_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(raw_path, selection.candidate.target_path.to_string_lossy());
+            let ledger = ContentIdentityDb::open_at(&data_dir.join("content_identity.db")).unwrap();
+            assert!(
+                ledger
+                    .ledger_entry(&target_key)
+                    .unwrap()
+                    .unwrap()
+                    .has_restorable_content
+            );
+        }
+    }
+
     fn sample_comic_objects() -> Vec<AnnotationObject> {
         vec![AnnotationObject::new_text(
             1,
@@ -836,9 +1790,29 @@ mod tests {
             selected.push(SelectedRestore { candidate, source });
         }
         drop(db);
-        let report = restore_candidates_at(data.path(), &selected, &[], true);
+        let mut progress = Vec::new();
+        let report = restore_candidates_at_with_progress(
+            data.path(),
+            &selected,
+            &[],
+            true,
+            |stage, processed, total| progress.push((stage, processed, total)),
+        );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.ledger_entries.len(), candidate_count);
+        for stage in ["copy", "ledger", "runtime"] {
+            let events = progress
+                .iter()
+                .filter(|event| event.0 == stage)
+                .collect::<Vec<_>>();
+            assert!(!events.is_empty(), "{stage}");
+            assert!(events.windows(2).all(|events| events[0].1 <= events[1].1));
+            assert_eq!(
+                events.last().unwrap().1,
+                events.last().unwrap().2,
+                "{stage}"
+            );
+        }
         report.database_opens
     }
 

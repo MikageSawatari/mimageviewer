@@ -1419,7 +1419,7 @@ fn portable_media_kind(path: &Path, kind: PortableEntryKind) -> PortableMediaKin
         PortableMediaKind::Audio
     } else if crate::folder_tree::is_zip_extension(&extension) {
         PortableMediaKind::Zip
-    } else if extension == "pdf" {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         PortableMediaKind::Pdf
     } else if crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some() {
         PortableMediaKind::ConvertibleArchive
@@ -5894,6 +5894,18 @@ impl<W: Write> Write for CancelWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epub_transfer_uses_paged_book_metadata_kind() {
+        assert_eq!(
+            portable_media_kind(Path::new("book.EPUB"), PortableEntryKind::File),
+            PortableMediaKind::Pdf
+        );
+        assert_eq!(
+            portable_media_kind(Path::new("book.pdf"), PortableEntryKind::File),
+            PortableMediaKind::Pdf
+        );
+    }
 
     fn no_progress(_: TransferProgress) {}
 
