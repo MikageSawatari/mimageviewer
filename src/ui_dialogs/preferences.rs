@@ -4837,6 +4837,72 @@ mod tests {
     }
 
     #[test]
+    fn ignoring_open_epub_on_preferences_ok_does_not_select_same_named_item_in_next_book() {
+        use crate::grid_item::GridItem;
+        use crate::settings::EpubFileHandling;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut app = crate::app::setup_app_for_test();
+        let epub = app.tmp.path().join("open-book.epub");
+        std::fs::write(&epub, b"book").unwrap();
+        app.current_folder = Some(epub.clone());
+        app.address = epub.to_string_lossy().into_owned();
+        app.items = vec![
+            GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 0,
+                content_type: None,
+            },
+            GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 2,
+                content_type: None,
+            },
+        ];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(1);
+        app.open_preferences_page(PreferencesPage::Cache);
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .epub_file_handling = EpubFileHandling::Ignore;
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+
+        assert_eq!(
+            harness.state().settings.epub_file_handling,
+            EpubFileHandling::Ignore
+        );
+        assert_eq!(
+            harness.state().current_folder.as_deref(),
+            Some(epub.as_path())
+        );
+        assert_eq!(harness.state().selected, Some(1));
+        assert_eq!(harness.state().select_after_load, None);
+
+        let next_book = harness.state().tmp.path().join("next-book");
+        std::fs::create_dir_all(next_book.join("A")).unwrap();
+        std::fs::create_dir_all(next_book.join("Page 3")).unwrap();
+        harness.state_mut().load_folder(next_book);
+        let same_name = harness
+            .state()
+            .items
+            .iter()
+            .position(|item| item.name() == "Page 3")
+            .unwrap();
+        assert_ne!(harness.state().selected, Some(same_name));
+    }
+
+    #[test]
     fn archive_and_epub_handling_ok_use_same_history_reload_timing() {
         use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
         use crate::settings::{ArchiveFileHandling, EpubFileHandling};

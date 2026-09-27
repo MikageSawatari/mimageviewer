@@ -21379,14 +21379,21 @@ impl App {
         if self.restore_subfolder_expansion_for_synthetic_path(&folder) {
             return;
         }
+        let previous_hint = self.select_after_load.clone();
         self.preserve_cursor_hint_for_reload();
         let saved_override = self.archive_source_override.clone();
         let owner = self
             .collection_grid_physical_reload_owner(&folder)
             .map(OpenRequestOwner::CollectionGridPhysical)
             .unwrap_or(OpenRequestOwner::Navigation);
-        let _ =
+        let outcome =
             self.load_folder_or_convert_archive_with_auto_fullscreen_owned(folder, false, owner);
+        if matches!(
+            outcome,
+            FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+        ) {
+            self.select_after_load = previous_hint;
+        }
         if let Some(src) = saved_override {
             self.address = src.to_string_lossy().to_string();
             self.archive_source_override = Some(src);

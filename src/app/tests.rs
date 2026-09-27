@@ -21381,6 +21381,59 @@ fn ignored_epub_bookmark_after_resolve_does_not_park_existing_window() {
 
 #[cfg(windows)]
 #[test]
+fn ignored_epub_bookmark_resolver_keeps_refusal_feedback() {
+    let mut app = phase_c_support::setup_app();
+    let epub = app.tmp.path().join("resolved-then-ignored.epub");
+    std::fs::write(&epub, b"book").unwrap();
+    arm_detached_bookmark_book_open(
+        &mut app,
+        epub.clone(),
+        crate::book_bookmarks::BookContainerKind::Pdf,
+        crate::book_bookmarks::PageIdentity::PdfPage(0),
+    );
+    let request_id = crate::bookmark_browser::BookmarkOpenRequestId(1);
+    let owner = StartupOpenPathOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
+        request_id,
+        target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(epub.clone()),
+        detached_lease: None,
+    });
+    app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+
+    app.finish_startup_open_path_resolve(
+        owner,
+        StartupOpenPathResolveResult {
+            requested: epub.clone(),
+            resolved: Some(crate::folder_tree::OpenablePathResolution {
+                path: epub,
+                kind: crate::folder_tree::OpenablePathKind::File,
+                requested_is_file: true,
+            }),
+            bookmark_relative_page_openable: None,
+            elapsed_ms: 1.0,
+        },
+        &egui::Context::default(),
+    );
+
+    assert!(app.bookmark_open_pending.is_none());
+    assert!(app.bookmark_view_state.is_none());
+    assert_eq!(
+        app.current_folder,
+        Some(super::bookmark_view_synthetic_path())
+    );
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("EPUB を無視"))
+    );
+    assert!(
+        !app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("開けるパス"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
 fn ignored_epub_bookmark_loading_context_ends_without_page_wait() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
