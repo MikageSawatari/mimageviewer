@@ -1,6 +1,7 @@
 # EffeTune (Mixwright) 組み込み — サンプル版設計
 
-状態: 設計第 2 版 (2026-09-27)。第 1 版への Sol 設計レビュー (REVISE、P1×5 / P2×4 / P3×1) を反映。
+状態: 設計第 3 版 (2026-09-27)。第 1 版 (REVISE、P1×5 / P2×4 / P3×1) と第 2 版 (REVISE、P1×4 / P2×2) への
+Sol 設計レビューを反映。
 サンプル版 (試験用) の範囲を定める。配布版で決めることは §10。
 
 ## 0. 目的と決定済み事項
@@ -36,8 +37,22 @@ mIV の音声経路へ組み込み、エフェクト処理とビジュアライ�
   audio loop、`plugin_loader.cpp` `PluginLoader::query_state`)。その間 mIV 側の
   `process_audio_blocking` は 100ms で失敗し、連続 3 回で bridge が無効化される
   (`src/video/audio.rs` の `VST3_CONSECUTIVE_FAILURE_DISABLE`)。**再生中に状態を取ると音が止まり得る。**
-- **host の `add_plugin` は初期状態の decode / restore に失敗しても既定状態で続行し、成功として返す**
-  (`main.cpp` の add_plugin 処理)。
+- **host の `open` (bridge の最初のプラグイン) と `add_plugin` は、初期状態の decode / restore に
+  失敗しても既定状態で続行し、成功として返す** (`main.cpp` の open / add_plugin 処理)。
+- host の GUI スレッドの非同期タスクは、エディタと WebView のメッセージを配る同じメッセージループで
+  実行される (`plugin_loader.cpp`)。bridge のイベントは 1 本の受信口に入り、同期呼び出しは想定外の
+  イベントを捨てる (`bridge.rs`)。
+- `reset_plugins_sync` は最大 2 秒待ち、期限切れでも `()` を返して処理を続ける。reset の ack は
+  1 本の受信口で、同じ bridge を 2 つの pump が同時に reset すると互いの ID を捨て得る。
+- `DspBridge::total_latency_samples` は上限超過時に自分でスロットを自動 bypass する
+  (上限超えのスロット、またはチェーン超過時は最大のスロット)。
+- **Mixwright v0.11.1 の `getState` の並行安全性 (上流ソースで確認、タグ v0.11.1
+  `src/plugin/plugin_processor.cpp`)**: `getState` は `commitPendingControllerWritesIfAudioIdle(true)`
+  を呼ぶが、音声処理中 (component active かつ audio idle でない) なら mutex を取る前に return する。
+  音声コールバック (`process`) は `processingResourcesMutex_` も `stateMutex_` も取らない
+  (同ファイルのコメント「The audio callback never takes this mutex」と `process` 本体で確認)。
+  したがって UI スレッドからの `getState` が `process` を止める経路はソース上は無い。
+  **実機での負荷試験 (§8) で裏付ける。**
 - 音声 pump は `Option<Arc<DspBridge>>` を open 時に受け取り pump へ move する (open 時点の固定値)。
   リミッター条件は `vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active`。
   `DspBridge::total_latency_samples` は自分のスロットだけで 2 秒上限を見る。
@@ -91,8 +106,13 @@ enum EffetuneFailure {
   `Option<(generation: u64, Arc<DspBridge>)>`。`ArcSwapOption` 相当で、pump は **ブロックごとに 1 回**
   読む (lock を取らない)。既に依存にある型を使えるならそれを使い、無ければ `Mutex` を 1 ブロック 1 回
   取るだけの単純な実装でよい (試験用。pump スレッドは cpal の RT スレッドではない)。
-- 公開は **ロード・状態の厳格な復元 (§5.4)・既存と同じ warm-up・readiness 確認がすべて成功した後** に、
-  generation を 1 増やして行う。ロード途中の bridge は公開しない。
+- 公開は、ロード worker が次を **すべて成功させた後** に、generation を 1 増やして行う。
+  ロード途中の bridge は公開しない。
+  1. ロードと状態の厳格な復元 (§5.4)
+  2. 既存と同じ warm-up
+  3. **reset を行い、成功を確認する** (まだどの pump も使っていないので競合しない)
+  4. 初回の状態取得 (§5.2)。成功した状態を controller のメモリ上の「最新状態」にする
+  どれかが失敗したら公開せず `fail()`。
 - `AudioDspChain { user: Option<Arc<DspBridge>>, effetune: Arc<EffetuneAudioSlot> }` を
   `VideoPlayer::open*` → `audio::start` → `run_pump` へ渡す (スロットは全 player で共有の 1 つ)。
   動画・音楽・キャッシュ済み player の再利用・動画→音声モードのすべてが同じスロットを見る。
@@ -102,8 +122,13 @@ enum EffetuneFailure {
 
 ユーザーチェーンの処理の **後** に EffeTune の段を置く。
 
-- 各ブロックでスロットを読み、pump が最後に見た generation と違えば、そのブロックを処理する前に
-  EffeTune bridge を `reset_plugins_sync` する (シーク時の reset と同じ扱い)。
+- 各ブロックでスロットを読む。generation の変化で pump は reset しない (公開前に reset 済み、§3.2)。
+  pump は generation を PDC の記録に使うだけ。
+- シーク時の EffeTune の reset は、結果を返す版 (`Result`) を使う。期限切れ・失敗は controller へ
+  `ProcessFailed` として報告し、そのシーク後のブロックには EffeTune 段を適用しない。
+  複数の player が同時に同じ bridge を reset する競合は、既存のユーザーチェーンの共有 bridge と
+  同じ前提 (同時に音声を出す pump は 1 つ) に従う。この前提をコードで確認し、成り立たなければ
+  実装前に報告する。
 - EffeTune 段の入力は **ユーザーチェーン通過後のサンプル**。EffeTune 段が失敗したブロックは
   **ユーザーチェーン通過後のサンプル** をそのまま出す (normalize 直後に戻さない)。
 - 失敗カウンタは EffeTune 段専用に持つ (閾値はユーザーチェーンと同じ 3 回 / 回復 5 回)。
@@ -111,13 +136,18 @@ enum EffetuneFailure {
   disable は controller が行う。報告からスロットが空になるまでの間も、失敗ブロックは上記の
   fallback で流す。
 - 出力バッファは EffeTune 段専用に 1 本持って使い回す。
-- シーク時の reset、終了時の `flush_silence` を EffeTune 段にも行う。
+- 終了時の `flush_silence` を EffeTune 段にも行う。
 - **遅延 (PDC)**: チャンクごとに「実際に適用した段」の遅延だけを合算して記録する。
   - プラグイン遅延の合計 = ユーザーチェーン (適用時) + EffeTune (適用時)。
   - **2 秒上限はプラグイン遅延の合計に掛ける** (リミッター・time stretch の遅延は上限の外)。
-    ユーザーチェーンは既存どおり自分の中で上限を守る。合計が上限を超えるのが EffeTune を足した
-    ことによる場合、EffeTune 段は適用せず controller へ `LatencyExceeded` を報告する
-    (ユーザーチェーンは既存の挙動を保つ)。値を丸めて報告すると音と映像がずれるため、丸めない。
+    優先順位は **ユーザーチェーン優先**。ユーザーチェーンは既存どおり自分の中で上限を守る。
+  - EffeTune 段を **適用する前に** 「ユーザーチェーンの遅延 + EffeTune の現在の遅延」を確認し、
+    上限を超えるなら適用せず controller へ `LatencyExceeded` を報告する。
+    値を丸めると音と映像がずれるため、丸めない。遅延が処理の後で変わった場合は、次のブロックの
+    適用前の確認で捉える。
+  - EffeTune の bridge では `total_latency_samples` の **自動 bypass を使わない** (bridge に
+    latency 方針 `AutoBypass` (既存) / `ReportOnly` を持たせ、EffeTune は `ReportOnly`)。
+    自動 bypass で「Running なのに素通し」になる別の持ち主を作らないため。
   - 途中挿入で遅延が増えた場合は、既存の per-chunk PDC 公開と decoder の追従に任せる。
 - 安全リミッター: EffeTune 段を適用したチャンクでは常にリミッターを通す (決定的な規則)。
 
@@ -175,7 +205,14 @@ enum EffetuneFailure {
   VST3 の規約では `IComponent::getState` は UI スレッドから呼ばれ、処理と並行し得る (DAW の再生中
   保存と同じ)。**このコマンドは EffeTune の bridge だけが使う。** ユーザー VST の既存 `query_state`
   (音声スレッドの fence) は変えない。
-- 取得のきっかけ: GUI を非表示にしたとき (× を含む)、GUI 表示中は 2 秒ごと、終了時。
+- 取得のきっかけ: **ロード直後 (公開前、§3.2)、GUI を非表示にしたとき (× を含む)、終了時** の 3 つ。
+  GUI 表示中の定期取得はしない (第 2 版の 2 秒ごとの取得は取りやめ)。ランプは窓を閉じたときに
+  更新される。
+- **応答の経路**: `query_state_concurrent` の完了とエラーは要求 ID 付きのイベントで返し、bridge の
+  event pump が **既存の `event_rx` とは別の、要求 ID ごとの経路** へ振り分ける (同期呼び出しが
+  捨てないように)。bridge の終了・タイムアウト時は未完了の要求をすべて「中断」で完了させる。
+  host 側は、要求を受けた時点の loader を保持したまま GUI スレッドで実行し、loader の破棄は
+  未完了の要求の完了 (または中断) の後に行う。
 - **取得は controller の 1 本の直列キューで行う**。各要求に generation を振り、
   新しい generation の結果だけを採用する。同時に in-flight は 1 本。
 - 取得・decode・判定・書き込みのどれかが失敗したら、**前のファイルと前の判定を保つ**
@@ -185,7 +222,8 @@ enum EffetuneFailure {
 - 終了時の順序: 新しいポーリングを止める → 最終取得を 1 回要求 → 期限付き (既存の終了時 VST
   スナップショットと同程度) で書き込み完了を待つ → 期限切れなら前のファイルのまま終了 (log)。
   既存の `on_exit_inner` の VST スナップショットとは独立に行い、互いを待たせない。
-- 試験のため、取得した状態の判定結果とサイズを毎回 log に出す (実機の fixture 収集を兼ねる)。
+- 試験のため、取得した状態の判定結果・サイズ・取得にかかった時間を毎回 log に出す
+  (実機の fixture 収集と負荷試験を兼ねる)。
 
 ### 5.3 `EffectiveState`
 
@@ -209,9 +247,10 @@ enum EffectiveState {
 
 ### 5.4 状態の厳格な復元
 
-- host の `add_plugin` に `strict_state: bool` を追加する。true のとき、初期状態の base64 decode
-  または `setState` に失敗したら **ロード失敗として返す** (既定状態で続行しない)。
-  EffeTune の bridge は常に true。ユーザー VST は従来どおり false。
+- host の **`open` (最初のプラグイン) と `add_plugin` の両方** に `strict_state: bool` を追加する。
+  true のとき、初期状態の base64 decode または `setState` に失敗したら **ロード失敗として返す**
+  (既定状態で続行しない)。EffeTune の bridge は常に true。ユーザー VST は従来どおり false。
+  失敗は `Running` の公開前に決まる。
 - 失敗したら controller は `Failed(RestoreFailed)`。**保存ファイルは書き換えない**
   (既定状態で上書きして利用者の設定を失わない)。
 - host のプロトコル版 (`PROTOCOL_VERSION`、Rust `src/video/dsp/bridge.rs` と C++ `protocol.h`) を
@@ -220,20 +259,26 @@ enum EffectiveState {
 ## 6. リモート配信
 
 - 配信セッションを作る時点で EffeTune が `Running` なら、そのセッションに適用する。
-  **リモート側は既存のセッション用 bridge 1 つに、ユーザーチェーンの後ろへ Mixwright を足す**
-  (プロセスを増やさない)。
-- 状態は controller が持つ **最後に取得できた状態 (メモリ上)** を使う。`prepare_once` の中で
-  ローカルへ問い合わせない (配信のロード予算を消費しないため)。Mixwright の追加は既存の
-  ロード予算の中で行う。
+- **リモートもローカルと同じ 2 段構成にする**: セッション用のユーザーチェーン bridge とは別に、
+  セッション用の EffeTune bridge を 1 つ作り、既存の `ClocklessVstProcessor` を 2 段つなぐ。
+  段の合成規則 (適用前の遅延確認、ユーザーチェーン優先の上限、失敗時はユーザーチェーン後の
+  サンプルに戻る、`ReportOnly`) は **ローカルと同じ純関数** を使う。
+  - 第 2 版の「同じ host に足す」案は取りやめ。同じ host では自動 bypass がユーザー側のプラグインを
+    外し得て、ローカルと優先順位が食い違うため。
+  - 代償: 配信中の host プロセスは最大 4 (ローカル 2 + リモート 2)。Mixwright が落ちてもリモートの
+    ユーザーチェーンは巻き込まれない。
+- 状態は controller のメモリ上の **最新状態** を使う (§3.2 の手順 4 により、`Running` なら必ずある)。
+  `prepare_once` の中でローカルへ問い合わせない。EffeTune のロードは既存のロード予算の中で行う。
+  最新状態が無い・ロード失敗・復元失敗のときは、そのセッションでは EffeTune 段を外し、
+  既存の `ClocklessVstStatus` の warning で「EffeTune の状態が無い」「EffeTune のロードに失敗」を
+  区別して出す。既定状態で代わりに動かさない。
+- リモートでも `strict_state` を使う。
 - `remote_clockless_audio_processing` の「`!vst3_enabled || plugins.is_empty()` なら VST なし」の
   早期 return を、EffeTune を含めた条件に直す。ユーザー VST が無効でも EffeTune だけで経路を作る。
-- リモートでも `strict_state` を使う。warning は既存の `ClocklessVstStatus` 経路で出し、
-  「EffeTune の状態がまだ取得されていない」「EffeTune のロードに失敗した」を区別する。
-- トレードオフ (明記): ユーザー VST と Mixwright が同じ host にいるため、Mixwright が落ちると
-  リモートのユーザーチェーンも落ちる。既存の「失敗時は normalize 済み dry で継続」に従う。
 - **既知の制約 (サンプル版)**:
   - 配信中に EffeTune を起動しても、その配信セッションは EffeTune なしのまま。次のセッションから適用。
-  - 配信中に EffeTune の設定を変えても、次のセッションまで反映しない。
+  - 配信中に EffeTune の設定を変えても、次のセッションまで反映しない (最新状態は窓を閉じたときに
+    更新される)。
 
 ## 7. bundle の配置 (サンプル版)
 
@@ -262,22 +307,32 @@ enum EffectiveState {
   上限、上限超過時に EffeTune 段だけ外れる、リミッター条件。
 - 状態取得キュー: 古い generation の結果が新しい結果を上書きしない、失敗時に前のファイルが残る、
   一時ファイル名が衝突しない、終了時の期限。
-- 厳格な復元: 失敗でロード失敗になり、保存ファイルが変わらない。
-- リモート: ユーザー VST 無効 + EffeTune Running で経路が作られる、Mixwright が末尾、状態未取得の
-  warning、配信開始後の起動はそのセッションに入らない。
+- 厳格な復元: `open` と `add_plugin` の両方で、失敗がロード失敗になり、保存ファイルが変わらない。
+- 非同期の状態取得: 要求 ID の振り分け、状態取得と GUI の問い合わせと終了の交錯で結果が捨てられない、
+  終了・タイムアウトで未完了の要求が中断として完了する。
+- 公開前の reset 失敗で公開されない。シーク時の reset 失敗が `ProcessFailed` になる。
+- 遅延: 適用前の確認で上限超過なら EffeTune 段を適用しない、`ReportOnly` では自動 bypass しない。
+- リモート: ユーザー VST 無効 + EffeTune Running で経路が作られる、2 段の順序、ローカルと同じ合成規則、
+  状態が無い場合に EffeTune 段が外れて warning が出る、配信開始後の起動はそのセッションに入らない。
 - settings: 新フィールドが `overwrite_non_preferences_from` で保持される。
 - GUI signal: `vst3_enabled=false` でも EffeTune の `GuiUserHidden` が処理される。
 - 共有メモリ: 同時に 2 本 `open_audio_pipe` しても名前が衝突しない。既存オブジェクトを開いた場合
   (`ERROR_ALREADY_EXISTS`) は失敗として扱う。
 
 実行時の確認は利用者の実機で行う (GUI が開くか、音が処理されるか、ビジュアライザー、空パイプラインの
-遅延と透過性、初回の既定パイプライン、再生中の GUI 開閉で音が途切れないこと)。
+遅延と透過性、初回の既定パイプライン)。
+
+**負荷試験 (利用者の実機、必須)**: 再生中に EffeTune の窓でエフェクトの追加・削除・パラメータ操作を
+続け、窓の開閉を繰り返す。音が途切れないこと、EffeTune が `Failed` にならないこと、log の
+状態取得時間と pump の失敗回数を確認する。問題が出たら取得方式か取得のきっかけを見直す。
 
 ## 9. 付随修正
 
 - 共有メモリ・イベント名に process 内の atomic 連番を足す。`CreateFileMappingW` /
   `CreateEventW` で `ERROR_ALREADY_EXISTS` を失敗として扱う (bridge.rs)。
 - host の `query_state_concurrent` と `strict_state` (§5.2、§5.4)。
+- `DspBridge` の方針フィールド: GUI owner (`Auto` / `FixedMain`) と latency (`AutoBypass` / `ReportOnly`)。
+  既存の bridge は既定値で従来どおり動く。
 
 ## 10. サンプル版の範囲外 (配布版で決める)
 
