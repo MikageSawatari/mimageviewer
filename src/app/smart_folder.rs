@@ -2439,6 +2439,16 @@ impl App {
             self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
             return true;
         }
+        if kind == SmartChildKind::Pdf
+            && self.settings.epub_file_handling_ignores_epub()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
+            self.show_feedback_toast("設定により EPUB を無視しています".into());
+            return true;
+        }
         if self
             .begin_smart_physical_navigation(path.clone(), kind, auto_fullscreen, None, Some(index))
             .is_err()
@@ -2906,7 +2916,7 @@ impl App {
                 root_entry,
                 current,
             } => {
-                let kind = match classify_entry_kind(root_entry, true) {
+                let kind = match classify_entry_kind(root_entry, true, true) {
                     Some(SmartFolderEntryKind::Pdf) => SmartChildKind::Pdf,
                     Some(SmartFolderEntryKind::Zip) => SmartChildKind::Zip,
                     Some(SmartFolderEntryKind::Archive) => SmartChildKind::ConvertibleArchive,
@@ -3537,6 +3547,7 @@ impl App {
                 let worker_path = path.clone();
                 let include_convertible =
                     !self.settings.archive_file_handling_ignores_convertible();
+                let include_epub = !self.settings.epub_file_handling_ignores_epub();
                 let show_hidden = self.settings.show_hidden_files;
                 let (tx, rx) = mpsc::channel();
                 std::thread::Builder::new()
@@ -3546,6 +3557,7 @@ impl App {
                             super::folder_scan::scan_directory_with_convertible_archives_cancel(
                                 &worker_path,
                                 include_convertible,
+                                include_epub,
                                 show_hidden,
                                 Some(&worker_cancel),
                             );
@@ -3559,6 +3571,14 @@ impl App {
                 Ok(SmartPhysicalPreflight::Folder { path, cancel, rx })
             }
             SmartChildKind::Pdf => {
+                if self.settings.epub_file_handling_ignores_epub()
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                {
+                    return Err("設定により EPUB を無視しています".into());
+                }
                 let saved_password = self.pdf_passwords.get(&path);
                 let password = self.pdf_open_password(&path);
                 let is_epub = path
@@ -4270,6 +4290,7 @@ struct ActiveRule {
 struct SmartFolderScanOptions {
     show_hidden_files: bool,
     include_convertible_archives: bool,
+    include_epub: bool,
     skip_zip_if_folder_exists: bool,
     skip_archive_if_zip_exists: bool,
     skip_epub_if_pdf_exists: bool,
@@ -4284,6 +4305,7 @@ impl From<&crate::settings::Settings> for SmartFolderScanOptions {
         Self {
             show_hidden_files: settings.show_hidden_files,
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
+            include_epub: !settings.epub_file_handling_ignores_epub(),
             skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
             skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
@@ -4422,6 +4444,7 @@ fn passes_cheap_filter_values(
 fn classify_entry_kind(
     path: &Path,
     include_convertible_archives: bool,
+    include_epub: bool,
 ) -> Option<SmartFolderEntryKind> {
     let extension = path.extension()?.to_str()?;
     let extension = extension.to_ascii_lowercase();
@@ -4435,7 +4458,7 @@ fn classify_entry_kind(
     } else if crate::folder_tree::is_zip_extension(extension) {
         Some(SmartFolderEntryKind::Zip)
     } else if crate::folder_tree::is_paged_document_path(path) {
-        Some(SmartFolderEntryKind::Pdf)
+        (include_epub || extension != "epub").then_some(SmartFolderEntryKind::Pdf)
     } else if include_convertible_archives
         && crate::archive_converter::ArchiveFormat::from_extension(extension).is_some()
     {
@@ -4623,8 +4646,11 @@ fn scan_one_directory(
             if !entry_kind.is_file() || crate::folder_tree::is_apple_double(&path) {
                 continue;
             }
-            let Some(kind) = classify_entry_kind(&path, options.include_convertible_archives)
-            else {
+            let Some(kind) = classify_entry_kind(
+                &path,
+                options.include_convertible_archives,
+                options.include_epub,
+            ) else {
                 continue;
             };
             kind
@@ -10419,6 +10445,7 @@ mod tests {
         SmartFolderScanOptions {
             show_hidden_files: false,
             include_convertible_archives: true,
+            include_epub: true,
             skip_zip_if_folder_exists: false,
             skip_archive_if_zip_exists: false,
             skip_epub_if_pdf_exists: false,
@@ -11166,6 +11193,17 @@ mod tests {
         let mut unfiltered_options = options.clone();
         unfiltered_options.skip_epub_if_pdf_exists = false;
         let unfiltered = run_test_scan(definition.clone(), unfiltered_options);
+        let mut ignored_options = options.clone();
+        ignored_options.include_epub = false;
+        ignored_options.skip_epub_if_pdf_exists = false;
+        let ignored = run_test_scan(definition.clone(), ignored_options);
+        assert!(
+            ignored
+                .snapshot
+                .entries
+                .iter()
+                .all(|entry| !entry.path.ends_with("sibling.EPUB"))
+        );
         assert!(unfiltered.snapshot.entries.iter().any(|entry| {
             entry
                 .path

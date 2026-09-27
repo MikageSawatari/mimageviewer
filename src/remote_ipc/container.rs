@@ -7701,6 +7701,36 @@ mod tests {
     }
 
     #[test]
+    fn remote_folder_epub_ignore_is_independent_of_archive_handling() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("book.epub"), b"epub").unwrap();
+        std::fs::write(root.path().join("archive.7z"), b"archive").unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            epub_file_handling: crate::settings::EpubFileHandling::Ignore,
+            archive_file_handling: crate::settings::ArchiveFileHandling::Ask,
+            ..Default::default()
+        });
+        let FolderListResponse::Success(payload) = engine.folder_list(FolderListRequest {
+            address: RemoteAddress::file(root.path().to_string_lossy().into_owned()),
+        }) else {
+            panic!("Remote folder list failed");
+        };
+        assert!(
+            payload
+                .entries
+                .iter()
+                .all(|entry| !entry.address.path.ends_with("book.epub"))
+        );
+        assert!(
+            payload
+                .entries
+                .iter()
+                .any(|entry| entry.address.path.ends_with("archive.7z"))
+        );
+    }
+
+    #[test]
     fn remote_epub_container_uses_logical_page_keys_and_generation_page_count() {
         let _data_dir = crate::data_dir::TestDataDirGuard::new();
         let root = tempfile::tempdir().unwrap();

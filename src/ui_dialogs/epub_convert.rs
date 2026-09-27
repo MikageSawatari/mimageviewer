@@ -59,8 +59,19 @@ pub(crate) struct EpubConvertState {
     pub(crate) open_restore: EpubOpenRestore,
     pub(crate) deferred_fullscreen: Option<crate::app::DeferredFsReopen>,
     pub(crate) phase: EpubConvertPhase,
+    suppress_confirm_next_time: bool,
     cancel: CancelToken,
     rx: Receiver<EpubConvertMsg>,
+}
+
+fn apply_epub_suppress_confirm_choice(
+    settings: &mut crate::settings::Settings,
+    suppress_next_time: bool,
+) {
+    if suppress_next_time && !settings.epub_convert_suppresses_confirm() {
+        settings.epub_file_handling = crate::settings::EpubFileHandling::Convert;
+        settings.save();
+    }
 }
 
 impl Drop for EpubConvertState {
@@ -101,6 +112,7 @@ impl EpubConvertState {
             },
             deferred_fullscreen: None,
             phase: EpubConvertPhase::Converting(None),
+            suppress_confirm_next_time: false,
             cancel: CancelToken::new().unwrap(),
             rx,
         }
@@ -127,6 +139,7 @@ impl EpubConvertState {
             },
             deferred_fullscreen: None,
             phase: EpubConvertPhase::Saving(None),
+            suppress_confirm_next_time: false,
             cancel: CancelToken::new().unwrap(),
             rx,
         }
@@ -292,7 +305,7 @@ fn start_save(state: &mut EpubConvertState) -> Result<(), String> {
 }
 
 impl App {
-    fn restore_address_after_epub_open_aborted(&mut self, logical: &Path) {
+    pub(crate) fn restore_address_after_epub_open_aborted(&mut self, logical: &Path) {
         // A direct PDF-style open updates the address before asynchronous enumeration. On an
         // EPUB refusal/cancel the previous visible book is still installed.
         if self.address == logical.to_string_lossy() {
@@ -312,7 +325,7 @@ impl App {
     ) -> PdfOpenFailureRoute {
         match failure {
             PdfOpenFailure::NotConverted => {
-                if self.settings.archive_file_handling_ignores_convertible() {
+                if self.settings.epub_file_handling_ignores_epub() {
                     self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
                     self.restore_address_after_epub_open_aborted(logical);
                     return PdfOpenFailureRoute::Handled;
@@ -334,10 +347,11 @@ impl App {
                     },
                     deferred_fullscreen: None,
                     phase: EpubConvertPhase::Scanning,
+                    suppress_confirm_next_time: false,
                     cancel,
                     rx,
                 };
-                let started = if self.settings.archive_convert_suppresses_confirm() {
+                let started = if self.settings.epub_convert_suppresses_confirm() {
                     start_convert(&mut state)
                 } else {
                     start_inspect(&mut state)
@@ -362,7 +376,7 @@ impl App {
     pub(crate) fn epub_convert_dialog_visible(&self) -> bool {
         self.epub_convert.as_ref().is_some_and(|state| {
             !matches!(state.phase, EpubConvertPhase::Scanning)
-                || !self.settings.archive_convert_suppresses_confirm()
+                || !self.settings.epub_convert_suppresses_confirm()
         })
     }
 
@@ -567,7 +581,7 @@ impl App {
         let mut convert = false;
         let mut save = false;
         if !matches!(state.phase, EpubConvertPhase::Scanning)
-            || !self.settings.archive_convert_suppresses_confirm()
+            || !self.settings.epub_convert_suppresses_confirm()
         {
             let escape = self.dialog_escape_pressed(ctx);
             let enter = self.dialog_enter_pressed(ctx);
@@ -596,6 +610,7 @@ impl App {
                             };
                             let direction = summary_direction(&summary.direction);
                             ui.label(format!("{layout} / {direction} / 本文 {} 項目 / 保護なし", summary.spine_count));
+                            ui.checkbox(&mut state.suppress_confirm_next_time, "次回から表示しない");
                             ui.add_space(8.0);
                             ui.separator();
                             ui.add_space(4.0);
@@ -646,6 +661,12 @@ impl App {
                 });
             close |= !open || escape;
         }
+        if convert || save {
+            apply_epub_suppress_confirm_choice(
+                &mut self.settings,
+                state.suppress_confirm_next_time,
+            );
+        }
         if convert && let Err(message) = start_convert(&mut state) {
             state.phase = EpubConvertPhase::Error(message);
         }
@@ -673,6 +694,31 @@ impl App {
 mod tests {
     use super::*;
 
+    #[test]
+    fn epub_do_not_ask_again_changes_only_epub_policy() {
+        let app = crate::app::setup_app_for_test();
+        let mut settings = app.settings.clone();
+        settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        apply_epub_suppress_confirm_choice(&mut settings, false);
+        assert_eq!(
+            settings.epub_file_handling,
+            crate::settings::EpubFileHandling::Ask
+        );
+        apply_epub_suppress_confirm_choice(&mut settings, true);
+        assert_eq!(
+            settings.epub_file_handling,
+            crate::settings::EpubFileHandling::Convert
+        );
+        assert_eq!(
+            settings.archive_file_handling,
+            crate::settings::ArchiveFileHandling::Ask
+        );
+        assert_eq!(
+            crate::settings::Settings::load().epub_file_handling,
+            crate::settings::EpubFileHandling::Convert
+        );
+    }
+
     fn fake_state(
         phase: EpubConvertPhase,
     ) -> (EpubConvertState, mpsc::Sender<EpubConvertMsg>, CancelToken) {
@@ -690,6 +736,7 @@ mod tests {
                 },
                 deferred_fullscreen: None,
                 phase,
+                suppress_confirm_next_time: false,
                 cancel: cancel.clone(),
                 rx,
             },

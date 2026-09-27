@@ -10177,6 +10177,7 @@ pub(crate) struct ExternalRescanPending {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExternalRescanOptions {
     pub(crate) include_convertible_archives: bool,
+    pub(crate) include_epub: bool,
     pub(crate) show_hidden_files: bool,
 }
 
@@ -21074,6 +21075,7 @@ impl App {
             include_convertible_archives: !self
                 .settings
                 .archive_file_handling_ignores_convertible(),
+            include_epub: !self.settings.epub_file_handling_ignores_epub(),
             show_hidden_files: self.settings.show_hidden_files,
         };
         // 同じ要求が既に走っているなら、**通知を捨てずに再走査を予約する**。走査が stamp を
@@ -21091,6 +21093,7 @@ impl App {
         }
         let ExternalRescanOptions {
             include_convertible_archives,
+            include_epub,
             show_hidden_files,
         } = scan_options;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -21112,6 +21115,7 @@ impl App {
                 let scan = folder_scan::scan_directory_with_convertible_archives(
                     &worker_folder,
                     include_convertible_archives,
+                    include_epub,
                     show_hidden_files,
                 )
                 .ok();
@@ -22247,6 +22251,18 @@ impl App {
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
             return false;
         }
+        if self.settings.epub_file_handling_ignores_epub()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
+            self.pending_auto_fs_open = false;
+            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+            self.show_feedback_toast("設定により EPUB を無視しています".into());
+            self.restore_address_after_epub_open_aborted(&path);
+            return false;
+        }
         #[cfg(all(windows, feature = "test-script"))]
         {
             self.test_script_folder_load_requests =
@@ -22976,12 +22992,13 @@ impl App {
             // チップが出ない / 数が合わないという報告を、推測でなくログで切り分けるための 1 行。
             // 走査済みの値を書くだけで追加の I/O は無い。
             crate::logger::log(format!(
-                "omitted entries: same_name={} hidden={} ignored_archive={} unsupported={} \
+                "omitted entries: same_name={} hidden={} ignored_archive={} ignored_epub={} unsupported={} \
                  system={} chip={} \
                  published={} surface={:?}",
                 omitted_entries.same_name,
                 omitted_entries.hidden,
                 omitted_entries.ignored_archive,
+                omitted_entries.ignored_epub,
                 omitted_entries.unsupported,
                 omitted_entries.system,
                 omitted_entries.primary_count(),
@@ -26954,6 +26971,17 @@ impl App {
         prepared_pages: Option<crate::pdf_loader::PdfEnumerateResult>,
         owner: OpenRequestOwner,
     ) {
+        if self.settings.epub_file_handling_ignores_epub()
+            && pdf_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
+            self.pending_auto_fs_open = false;
+            self.show_feedback_toast("設定により EPUB を無視しています".into());
+            self.restore_address_after_epub_open_aborted(&pdf_path);
+            return;
+        }
         self.cancel_superseded_epub_convert(&pdf_path, &owner);
         crate::logger::log(format!(
             "=== load_pdf_as_folder: {} ===",
@@ -42505,6 +42533,7 @@ impl App {
                         tree_opts
                             .archive_policy
                             .includes_convertible_in_directory_scan(),
+                        tree_opts.include_epub,
                         show_hidden_files,
                     );
                     if crate::perf::is_enabled() {
@@ -42959,6 +42988,7 @@ impl App {
         let scan_path = path.clone();
         let include_convertible_archives =
             !self.settings.archive_file_handling_ignores_convertible();
+        let include_epub = !self.settings.epub_file_handling_ignores_epub();
         let show_hidden_files = self.settings.show_hidden_files;
         std::thread::spawn(move || {
             if cancel_w.load(Ordering::Relaxed) {
@@ -42967,6 +42997,7 @@ impl App {
             let scan = scan_directory_with_convertible_archives(
                 &scan_path,
                 include_convertible_archives,
+                include_epub,
                 show_hidden_files,
             );
             if !cancel_w.load(Ordering::Relaxed) {

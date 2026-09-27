@@ -1159,6 +1159,14 @@ pub(crate) fn startup_openable_should_auto_fullscreen(
     }
     match kind {
         crate::folder_tree::OpenablePathKind::File => {
+            if settings.epub_file_handling_ignores_epub()
+                && openable
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                return false;
+            }
             crate::folder_tree::is_open_as_container(openable)
                 || (!settings.archive_file_handling_ignores_convertible()
                     && crate::folder_tree::is_convertible_archive_path(openable))

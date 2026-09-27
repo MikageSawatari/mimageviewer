@@ -641,6 +641,7 @@ fn preflight_candidates(
                             tree_options
                                 .archive_policy
                                 .includes_convertible_in_directory_scan(),
+                            tree_options.include_epub,
                             show_hidden_files,
                             Some(cancel),
                         )
@@ -680,34 +681,43 @@ fn preflight_candidates(
                     .map(CollectionNavigationPreflightPayload::Zip)
                 }
                 CollectionResolvedKind::Pdf => {
-                    match crate::pdf_loader::enumerate_pages_with_options(
-                        path,
-                        candidate.pdf_password.as_deref(),
-                        Some(Arc::clone(cancel)),
-                        crate::pdf_loader::EnumerateOptions {
-                            want_direction: candidate.want_direction,
-                        },
-                    ) {
-                        Ok(pages) if !pages.pages.is_empty() => {
-                            Some(CollectionNavigationPreflightPayload::PdfPages(pages))
+                    if !tree_options.include_epub
+                        && path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                    {
+                        None
+                    } else {
+                        match crate::pdf_loader::enumerate_pages_with_options(
+                            path,
+                            candidate.pdf_password.as_deref(),
+                            Some(Arc::clone(cancel)),
+                            crate::pdf_loader::EnumerateOptions {
+                                want_direction: candidate.want_direction,
+                            },
+                        ) {
+                            Ok(pages) if !pages.pages.is_empty() => {
+                                Some(CollectionNavigationPreflightPayload::PdfPages(pages))
+                            }
+                            Err(error) if crate::pdf_loader::is_password_required_error(&error) => {
+                                Some(CollectionNavigationPreflightPayload::PdfPasswordRequired)
+                            }
+                            Err(error)
+                                if matches!(
+                                    crate::pdf_loader::typed_read_error(&error),
+                                    Some(
+                                        crate::pdf_loader::PdfReadError::NotConverted
+                                            | crate::pdf_loader::PdfReadError::EpubUnavailable { .. }
+                                    )
+                                ) =>
+                            {
+                                Some(CollectionNavigationPreflightPayload::PdfOpenFailure(
+                                    crate::pdf_loader::typed_read_error(&error).unwrap().into(),
+                                ))
+                            }
+                            _ => None,
                         }
-                        Err(error) if crate::pdf_loader::is_password_required_error(&error) => {
-                            Some(CollectionNavigationPreflightPayload::PdfPasswordRequired)
-                        }
-                        Err(error)
-                            if matches!(
-                                crate::pdf_loader::typed_read_error(&error),
-                                Some(
-                                    crate::pdf_loader::PdfReadError::NotConverted
-                                        | crate::pdf_loader::PdfReadError::EpubUnavailable { .. }
-                                )
-                            ) =>
-                        {
-                            Some(CollectionNavigationPreflightPayload::PdfOpenFailure(
-                                crate::pdf_loader::typed_read_error(&error).unwrap().into(),
-                            ))
-                        }
-                        _ => None,
                     }
                 }
                 CollectionResolvedKind::ConvertibleArchive => {
@@ -3172,6 +3182,18 @@ impl App {
             CollectionNavigationPreflightPayload::PdfOpenFailure(_)
         )
         .then(|| self.folder_nav_history_snapshot());
+        if self.settings.epub_file_handling_ignores_epub()
+            && matches!(ready.target.resolved_kind, CollectionResolvedKind::Pdf)
+            && ready
+                .target
+                .source_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
+            self.finish_collection_navigation_without_target(ctx, &action);
+            return;
+        }
         let Some(landing) = self.install_collection_navigation_root(
             &mut request,
             Arc::clone(&prepared),

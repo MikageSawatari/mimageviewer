@@ -920,23 +920,23 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
 }
 
 #[test]
-fn epub_failure_route_preserves_owner_and_archive_handling_policy() {
-    use crate::settings::ArchiveFileHandling;
+fn epub_failure_route_preserves_owner_and_uses_epub_handling_policy() {
+    use crate::settings::{ArchiveFileHandling, EpubFileHandling};
     use crate::ui_dialogs::epub_convert::EpubConvertPhase;
 
     let mut app = setup_app_for_test();
     let path = Path::new("C:/books/book.epub");
     let owner = OpenRequestOwner::Navigation;
     app.settings
-        .set_archive_file_handling(ArchiveFileHandling::Ignore);
+        .set_archive_file_handling(ArchiveFileHandling::Convert);
+    app.settings.epub_file_handling = EpubFileHandling::Ignore;
     assert_eq!(
         app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::NotConverted),
         PdfOpenFailureRoute::Handled
     );
     assert!(app.epub_convert.is_none());
 
-    app.settings
-        .set_archive_file_handling(ArchiveFileHandling::Ask);
+    app.settings.epub_file_handling = EpubFileHandling::Ask;
     assert_eq!(
         app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::NotConverted),
         PdfOpenFailureRoute::ConversionDialogOpened
@@ -947,8 +947,7 @@ fn epub_failure_route_preserves_owner_and_archive_handling_policy() {
     assert!(matches!(state.phase, EpubConvertPhase::Scanning));
     drop(state);
 
-    app.settings
-        .set_archive_file_handling(ArchiveFileHandling::Convert);
+    app.settings.epub_file_handling = EpubFileHandling::Convert;
     assert_eq!(
         app.route_pdf_open_failure(owner.clone(), path, PdfOpenFailure::NotConverted),
         PdfOpenFailureRoute::ConversionDialogOpened
@@ -957,6 +956,10 @@ fn epub_failure_route_preserves_owner_and_archive_handling_policy() {
     assert_eq!(state.owner, owner);
     assert!(matches!(state.phase, EpubConvertPhase::Converting(_)));
     drop(state);
+    assert_eq!(
+        app.settings.archive_file_handling,
+        ArchiveFileHandling::Convert
+    );
 
     assert_eq!(
         app.route_pdf_open_failure(
@@ -975,6 +978,17 @@ fn epub_failure_route_preserves_owner_and_archive_handling_policy() {
         app.route_pdf_open_failure(owner, path, PdfOpenFailure::Other("test".into())),
         PdfOpenFailureRoute::Unhandled
     );
+}
+
+#[test]
+fn epub_ignore_rejects_direct_open_before_pdf_cache_lookup() {
+    let mut app = setup_app_for_test();
+    let source = app.tmp.path().join("cached-book.epub");
+    std::fs::write(&source, b"book").unwrap();
+    app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+    assert!(!app.load_folder_with_scan_owned(source, None, OpenRequestOwner::Navigation));
+    assert!(app.pdf_enumerate_pending.is_none());
+    assert!(app.epub_convert.is_none());
 }
 
 #[test]
@@ -7573,7 +7587,8 @@ fn scan_directory_never_lists_portable_metadata_bundle() {
     )
     .unwrap();
     assert_eq!(scan_folder_names(temp.path()), vec!["visible"]);
-    let shown_hidden = scan_directory_with_convertible_archives(temp.path(), true, true).unwrap();
+    let shown_hidden =
+        scan_directory_with_convertible_archives(temp.path(), true, true, true).unwrap();
     assert!(shown_hidden.folders.iter().all(|entry| {
         entry.item.container_path().map_or(true, |path| {
             !crate::fs_entry::is_internal_app_entry_name(path.file_name().unwrap_or_default())
@@ -7787,12 +7802,14 @@ fn folder_scan_can_ignore_convertible_archives() {
     std::fs::write(tmp.path().join("book.7z"), b"7z").unwrap();
     std::fs::write(tmp.path().join("book.lzh"), b"lzh").unwrap();
     std::fs::write(tmp.path().join("book.zip"), b"zip").unwrap();
+    std::fs::write(tmp.path().join("book.epub"), b"epub").unwrap();
 
     let mut settings = crate::settings::Settings::default();
     settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
     let scan = scan_directory_with_settings(tmp.path(), &settings).unwrap();
 
     assert!(scan.folders.iter().any(|entry| matches!(&entry.item, GridItem::ZipFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.zip"))));
+    assert!(scan.folders.iter().any(|entry| matches!(&entry.item, GridItem::PdfFile(path) if path.file_name().and_then(|n| n.to_str()) == Some("book.epub"))));
     assert!(
         !scan
             .folders
@@ -7893,7 +7910,7 @@ fn scan_directory_with_convertible_archives_reports_read_dir_failure() {
     let missing = tmp.path().join("missing");
 
     assert!(
-        scan_directory_with_convertible_archives(&missing, true, false).is_err(),
+        scan_directory_with_convertible_archives(&missing, true, true, false).is_err(),
         "read_dir failure must not be converted into an empty ScannedDir"
     );
 }
@@ -9351,6 +9368,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
         same_name: 3,
         hidden: 2,
         ignored_archive: 4,
+        ignored_epub: 0,
         unsupported: 5,
         system: 1,
     };

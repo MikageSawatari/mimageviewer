@@ -461,6 +461,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["対応アーカイブ", "変換", "無視"]
     ),
     entry!(
+        "cache/epub-handling",
+        Cache,
+        "EPUB の処理",
+        ["確認", "PDF に変換", "無視"]
+    ),
+    entry!(
         "cache/archive-limit",
         Cache,
         "容量上限を有効にする",

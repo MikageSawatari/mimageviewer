@@ -392,6 +392,7 @@ impl CollectionEngine {
             request.kind,
             key_scan_limit,
             !settings.archive_file_handling_ignores_convertible(),
+            !settings.epub_file_handling_ignores_epub(),
         );
         Ok(TagItemsPayload {
             listing: self.tag_items_listing(settings, sort_order, entries, truncated),
@@ -1107,8 +1108,19 @@ fn candidate_from_tag_item_key(key: String, filter: TagItemKind) -> Option<Candi
 }
 
 fn include_collection_candidate(settings: &Settings, candidate: &CandidateEntry) -> bool {
-    candidate.kind != RemoteEntryKind::Archive
-        || !settings.archive_file_handling_ignores_convertible()
+    if candidate.kind == RemoteEntryKind::Archive {
+        return !settings.archive_file_handling_ignores_convertible();
+    }
+    if candidate.kind == RemoteEntryKind::Pdf
+        && candidate
+            .path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    {
+        return !settings.epub_file_handling_ignores_epub();
+    }
+    true
 }
 
 fn map_tag_item_keys(
@@ -1116,12 +1128,14 @@ fn map_tag_item_keys(
     filter: TagItemKind,
     key_scan_limit: usize,
     include_archives: bool,
+    include_epub: bool,
 ) -> (Vec<RemoteEntry>, bool) {
     map_tag_item_keys_with_entry_limit(
         item_keys,
         filter,
         key_scan_limit,
         include_archives,
+        include_epub,
         MAX_REMOTE_COLLECTION_ENTRIES,
     )
 }
@@ -1131,6 +1145,7 @@ fn map_tag_item_keys_with_entry_limit(
     filter: TagItemKind,
     key_scan_limit: usize,
     include_archives: bool,
+    include_epub: bool,
     entry_limit: usize,
 ) -> (Vec<RemoteEntry>, bool) {
     let key_limit_reached = item_keys.len() > key_scan_limit;
@@ -1141,6 +1156,16 @@ fn map_tag_item_keys_with_entry_limit(
             continue;
         };
         if !include_archives && candidate.kind == RemoteEntryKind::Archive {
+            continue;
+        }
+        if !include_epub
+            && candidate.kind == RemoteEntryKind::Pdf
+            && candidate
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
             continue;
         }
         candidates.push(candidate);
@@ -2543,6 +2568,7 @@ mod tests {
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
             true,
+            true,
             test_limit,
         );
 
@@ -2562,17 +2588,41 @@ mod tests {
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
             false,
+            true,
         );
         let (included, _) = map_tag_item_keys(
             vec![key],
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
             true,
+            true,
         );
 
         assert!(ignored.is_empty());
         assert_eq!(included.len(), 1);
         assert_eq!(included[0].kind, RemoteEntryKind::Archive);
+    }
+
+    #[test]
+    fn tag_item_mapping_honors_epub_ignore_independently_of_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let epub = temp.path().join("tagged.epub");
+        let archive = temp.path().join("tagged.7z");
+        std::fs::write(&epub, b"epub").unwrap();
+        std::fs::write(&archive, b"archive").unwrap();
+        let keys = vec![
+            crate::tags_db::item_key_for_path(&epub),
+            crate::tags_db::item_key_for_path(&archive),
+        ];
+        let (entries, _) = map_tag_item_keys(
+            keys,
+            TagItemKind::All,
+            crate::tag_view::TAG_VIEW_RESULT_LIMIT,
+            true,
+            false,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, RemoteEntryKind::Archive);
     }
 
     #[test]
@@ -2594,6 +2644,7 @@ mod tests {
             item_keys,
             TagItemKind::Image,
             crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT,
+            true,
             true,
             test_limit,
         );
