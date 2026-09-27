@@ -225,7 +225,7 @@ impl EditPreviewCacheDb {
         Self::open_at(&db_path())
     }
 
-    fn open_at(path: &Path) -> rusqlite::Result<Self> {
+    pub(crate) fn open_at(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
