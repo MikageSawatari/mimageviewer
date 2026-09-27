@@ -291,8 +291,16 @@ pub enum RawError {
 - フル現像の出力 (`dcraw_make_mem_image` / `copy_mem_image`) は **flip 適用済み**
   (`src/postprocessing/mem_image.cpp:153-233`)。追加で回転しない
 - 埋め込みプレビューは **flip 未適用** (`src/decoders/unpack_thumb.cpp` に flip 処理が無い)。
-  `unpack_thumb_ex(i)` の生バッファを使い、`tflip` が既知 (≠0xffff) ならそれ、不明なら `sizes.flip` を
-  自前で適用する。JPEG 内の EXIF Orientation は**読まない** (`dcraw_make_mem_thumb` は EXIF の無い
+  `unpack_thumb_ex(i)` の生バッファを使い、次の規則で向きを決めて自前で適用する:
+  - `tflip` が **0 でも 0xffff でもない**ならそれを使う。それ以外は `sizes.flip` を使う。
+    **`tflip = 0` は「向き不明」と区別できない**: LibRaw は TIFF IFD を 0 で初期化し、Orientation タグが
+    あるときだけ `t_flip` を書き (`src/metadata/tiff.cpp:631`、Orientation 1 も 0 になる)、それをそのまま
+    `thumbs_list` へ写す (`tiff.cpp:2398`)。S1 で Nikon Df の縦位置 NEF (`sizes.flip = 6`、プレビューの
+    IFD に Orientation 無し) が第2版の規則では横倒しになった (実装担当の報告、2026-09-27)
+  - 向きを当てた後のプレビューの縦横 (長辺が幅か高さか) を `developed_dims` と比べ、両方が正方形に
+    近くない (長辺と短辺の差が長辺の 5% 超) のに縦横が食い違えば、**そのプレビューは使えない**
+    (`RawError` ではなく「使えるプレビューが無い」扱いの型付き理由 `OrientationMismatch`)。
+    横倒しの絵を出さないための検査で、180 度の食い違いはこの検査では分からない (既知の限界)JPEG 内の EXIF Orientation は**読まない** (`dcraw_make_mem_thumb` は EXIF の無い
   JPEG に向きを挿入するため、そちらを使うと二重適用の経路が生まれる)。向きの正しさは縦位置サンプル
   (flip 5 / 6) の unit test で固定する
 - ZIP 内 RAW も bytes から同じ向きを得る (現状の「ZIP 内 RAW は向き 1」は解消される)
