@@ -345,19 +345,28 @@ mod windows {
                 "Impossible preview JPEG dimensions".into(),
             ));
         }
-        let factors = [
-            turbojpeg::ScalingFactor::ONE,
-            turbojpeg::ScalingFactor::ONE_HALF,
-            turbojpeg::ScalingFactor::ONE_QUARTER,
-            turbojpeg::ScalingFactor::ONE_EIGHTH,
-        ];
+        let factors = if statistic {
+            // Use the smallest decoded image that still retains a useful
+            // luminance sample. Small embedded previews stay full resolution.
+            [
+                turbojpeg::ScalingFactor::ONE_EIGHTH,
+                turbojpeg::ScalingFactor::ONE_QUARTER,
+                turbojpeg::ScalingFactor::ONE_HALF,
+                turbojpeg::ScalingFactor::ONE,
+            ]
+        } else {
+            [
+                turbojpeg::ScalingFactor::ONE,
+                turbojpeg::ScalingFactor::ONE_HALF,
+                turbojpeg::ScalingFactor::ONE_QUARTER,
+                turbojpeg::ScalingFactor::ONE_EIGHTH,
+            ]
+        };
         let scale = factors
             .into_iter()
             .find(|factor| {
                 (!header.is_lossless || *factor == turbojpeg::ScalingFactor::ONE)
-                    && (!statistic
-                        || *factor == turbojpeg::ScalingFactor::ONE_EIGHTH
-                        || header.is_lossless)
+                    && (!statistic || factor.scale(header.width.max(header.height)) >= 1024)
                     && factor.scale(header.width.max(header.height)) <= MAX_PREVIEW_EDGE as usize
             })
             .unwrap_or(turbojpeg::ScalingFactor::ONE);
@@ -702,6 +711,9 @@ mod windows {
         adjusted: Option<(i32, f32)>,
         cancel: &RawCancellation,
     ) -> Result<DynamicImage, RawError> {
+        if cancel.flag.load(Ordering::Acquire) {
+            return Err(RawError::Cancelled);
+        }
         let mut rgb = Vec::new();
         rgb.try_reserve_exact(length)
             .map_err(|_| RawError::OutOfMemory)?;
@@ -762,6 +774,7 @@ mod windows {
             ),
             RawBrightness::MatchPreview => {
                 let first = copy_image(&handle, width, height, length, None, cancel)?;
+                progress.fetch_max(88, Ordering::Release);
                 let developed_median = crate::raw::brightness::median_linear_luma(&first);
                 // The product job owns at most one developed RGB buffer at a time.
                 drop(first);
@@ -770,6 +783,10 @@ mod windows {
                     crate::raw::brightness::MatchDecision::Gain { gain, .. } => (3, gain as f32),
                     crate::raw::brightness::MatchDecision::Fallback(_) => (1, 1.0),
                 };
+                progress.fetch_max(92, Ordering::Release);
+                if cancel.flag.load(Ordering::Acquire) {
+                    return Err(RawError::Cancelled);
+                }
                 (
                     copy_image(&handle, width, height, length, Some(adjusted), cancel)?,
                     AppliedBrightness::Match(decision),
@@ -819,12 +836,17 @@ mod windows {
         process(&handle, scale, 2, cancel, progress)?;
         let (width, height, length) = dimensions(&handle)?;
         let no_auto = copy_image(&handle, width, height, length, None, cancel)?;
+        progress.fetch_max(88, Ordering::Release);
         let developed_median = crate::raw::brightness::median_linear_luma(&no_auto);
         let decision = crate::raw::brightness::match_gain(preview_median, developed_median);
         let adjusted = match decision {
             crate::raw::brightness::MatchDecision::Gain { gain, .. } => (3, gain as f32),
             crate::raw::brightness::MatchDecision::Fallback(_) => (1, 1.0),
         };
+        progress.fetch_max(92, Ordering::Release);
+        if cancel.flag.load(Ordering::Acquire) {
+            return Err(RawError::Cancelled);
+        }
         let matched = copy_image(&handle, width, height, length, Some(adjusted), cancel)?;
         progress.store(100, Ordering::Release);
         Ok(RawMatchPreviewOutput {
@@ -887,6 +909,56 @@ mod windows {
         assert_eq!(layout.scale, turbojpeg::ScalingFactor::ONE_QUARTER);
         assert_eq!((layout.width, layout.height), (8192, 8192));
         assert!(layout.length <= MAX_PREVIEW_BYTES);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn statistic_jpeg_scale_preserves_small_preview_detail() {
+        let path = Path::new("vendor/raw-samples/2756.dng");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let raw_info = info(RawSource::Path(path)).unwrap();
+        let index = raw_info
+            .previews
+            .iter()
+            .find(|preview| preview.format == RawPreviewFormat::Jpeg)
+            .unwrap()
+            .index;
+        let handle = Handle::open(RawSource::Path(path)).unwrap();
+        let (_, mut jpeg) = extract(&handle, index).unwrap();
+        let sof = jpeg
+            .windows(2)
+            .position(|marker| marker[0] == 0xff && (0xc0..=0xc3).contains(&marker[1]))
+            .expect("sample JPEG has a baseline or progressive SOF");
+        for (width, height, expected) in [
+            (160u16, 120u16, turbojpeg::ScalingFactor::ONE),
+            (672, 502, turbojpeg::ScalingFactor::ONE),
+            (1536, 1024, turbojpeg::ScalingFactor::ONE),
+            (2048, 1365, turbojpeg::ScalingFactor::ONE_HALF),
+            (6000, 4000, turbojpeg::ScalingFactor::ONE_QUARTER),
+            (8256, 5504, turbojpeg::ScalingFactor::ONE_EIGHTH),
+        ] {
+            jpeg[sof + 5..sof + 7].copy_from_slice(&height.to_be_bytes());
+            jpeg[sof + 7..sof + 9].copy_from_slice(&width.to_be_bytes());
+            let layout = jpeg_preview_layout(&jpeg, true).unwrap();
+            assert_eq!(layout.scale, expected, "{width}x{height}");
+            if width > 1024 {
+                assert!(layout.width.max(layout.height) >= 1024);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn cancelled_copy_returns_before_rgb_allocation() {
+        let path = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let handle = Handle::open(RawSource::Path(path)).unwrap();
+        let cancel = RawCancellation::new();
+        cancel.cancel();
+        assert!(matches!(
+            copy_image(&handle, 1, 1, usize::MAX, None, &cancel),
+            Err(RawError::Cancelled)
+        ));
     }
 }
 

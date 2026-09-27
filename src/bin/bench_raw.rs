@@ -1,8 +1,9 @@
 //! S1-only RAW measurement. All development is submitted to RawDevelopExecutor.
 use image::{DynamicImage, GenericImage, GenericImageView, RgbaImage};
-use mimageviewer::raw::brightness::{MatchDecision, median_linear_luma};
+use mimageviewer::raw::brightness::{MatchDecision, match_gain, median_linear_luma};
 use mimageviewer::raw::raw_decoder::{
-    self, RawBenchBrightness, RawDevelopScale, RawDevelopSupport, RawOwnedSource, RawSource,
+    self, AppliedBrightness, RawBenchBrightness, RawBrightness, RawDevelopScale, RawDevelopSupport,
+    RawOwnedSource, RawSource,
 };
 use mimageviewer::raw::{RawDevelopExecutor, RawPriority};
 use serde_json::{Value, json};
@@ -32,17 +33,17 @@ fn develop(
     Ok((result, start.elapsed().as_secs_f64() * 1000.0))
 }
 
-fn develop_match_preview(
+fn develop_product(
     executor: &RawDevelopExecutor,
     path: &Path,
-    preview_median: Option<f64>,
-) -> Result<(raw_decoder::RawMatchPreviewOutput, f64), String> {
+    brightness: RawBrightness,
+) -> Result<(raw_decoder::RawDevelopOutput, f64), String> {
     let (sender, receiver) = mpsc::channel();
     let start = Instant::now();
-    let _ticket = executor.submit_match_preview(
+    let _ticket = executor.submit(
         RawOwnedSource::Path(path.to_path_buf()),
         RawDevelopScale::Full,
-        preview_median,
+        brightness,
         RawPriority::High,
         sender,
     );
@@ -174,21 +175,35 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         .as_ref()
         .ok()
         .and_then(|preview| median_linear_luma(&preview.image));
+    let (no_auto_output, no_auto_ms) = match develop_product(executor, &path, RawBrightness::None) {
+        Ok(value) => value,
+        Err(error) => return json!({"id":id,"error":error,"full_ms":full_ms}),
+    };
+    let no_auto = &no_auto_output.image;
+    let developed_median_linear = median_linear_luma(no_auto);
+    let full_preview_match_gain = match match_gain(preview_median_linear, developed_median_linear) {
+        MatchDecision::Gain { gain, .. } => Some(gain),
+        MatchDecision::Fallback(_) => None,
+    };
     let (matched_output, match_preview_ms) =
-        match develop_match_preview(executor, &path, preview_median_linear) {
+        match develop_product(executor, &path, RawBrightness::MatchPreview) {
             Ok(value) => value,
             Err(error) => return json!({"id":id,"error":error,"full_ms":full_ms}),
         };
-    let no_auto = &matched_output.no_auto;
-    let matched = &matched_output.matched;
+    let matched = &matched_output.image;
     let matched_median_linear = median_linear_luma(matched);
-    let (gain, unclamped_gain, gain_clamped, match_fallback) = match matched_output.decision {
-        MatchDecision::Gain {
+    let (gain, unclamped_gain, gain_clamped, match_fallback) = match matched_output.brightness {
+        AppliedBrightness::Match(MatchDecision::Gain {
             gain,
             unclamped,
             clamped,
-        } => (Some(gain), Some(unclamped), clamped, None),
-        MatchDecision::Fallback(reason) => (None, None, false, Some(format!("{reason:?}"))),
+        }) => (Some(gain), Some(unclamped), clamped, None),
+        AppliedBrightness::Match(MatchDecision::Fallback(reason)) => {
+            (None, None, false, Some(format!("{reason:?}")))
+        }
+        AppliedBrightness::None => {
+            return json!({"id":id,"error":"MatchPreview returned None brightness"});
+        }
     };
     let cancel_ms = cancel_latency(executor, &path);
     let aspect_diff_percent = preview_dims.map(|(w, h)| {
@@ -222,18 +237,20 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         "selected_preview_tflip":preview.as_ref().ok().and_then(|preview|preview.info.tflip),
         "zero_dim_cr3_thumb_candidate":zero_dim_cr3_thumb,
         "info_ms":info_ms,"preview_ms":preview_ms,"full_ms":full_ms,"half_ms":half_ms,
-        "auto0001_ms":auto0001_ms,"match_preview_ms":match_preview_ms,"cancel_ms":cancel_ms,
+        "auto0001_ms":auto0001_ms,"no_auto_ms":no_auto_ms,
+        "match_preview_ms":match_preview_ms,"cancel_ms":cancel_ms,
         "aspect_diff_percent":aspect_diff_percent,"preview_luma":preview_luma,
         "auto001_luma_diff":preview_luma.map(|value|(mean_luma(&full)-value).abs()),
         "auto0001_luma_diff":preview_luma.map(|value|(mean_luma(&auto0001)-value).abs()),
         "no_auto_luma_diff":preview_luma.map(|value|(mean_luma(no_auto)-value).abs()),
         "match_mean_luma_diff":preview_luma.map(|value|(mean_luma(matched)-value).abs()),
         "preview_median_linear":preview_median_linear,
-        "developed_median_linear":matched_output.developed_median,
+        "developed_median_linear":developed_median_linear,
         "matched_median_linear":matched_median_linear,
         "match_median_luma_diff_linear":preview_median_linear.zip(matched_median_linear)
             .map(|(preview, developed)| (preview-developed).abs()),
-        "match_gain":gain,"match_unclamped_gain":unclamped_gain,
+        "match_gain":gain,"full_preview_match_gain":full_preview_match_gain,
+        "match_unclamped_gain":unclamped_gain,
         "match_gain_clamped":gain_clamped,"match_fallback":match_fallback,
         "comparison_png":comparison.map(|p|p.display().to_string()),"wic_dims":wic_dims,
     })

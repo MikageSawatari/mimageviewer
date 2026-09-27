@@ -12,7 +12,10 @@ auto-bright, measures its first RGB copy, drops that copy, and re-copies from
 the same LibRaw process with the clamped linear-light gain. It returns the
 applied gain, clamp state, or fallback reason with the image. If no usable
 preview or either median is zero/invalid, it falls back to LibRaw auto-bright
-threshold 0.001. The setting and UI connection belong to S3.
+threshold 0.001. JPEG previews at or below 1024 pixels on their long edge
+are measured at full size; larger JPEGs use the smallest DCT image that
+retains at least 1024 pixels. BITMAP previews follow the same 1024-pixel
+rule. The setting and UI connection belong to S3.
 
 ## Codec and build decisions
 
@@ -36,8 +39,8 @@ SHA-256 and byte size. Times are milliseconds from
 `cargo run --release -p mimageviewer --features dev-tools --bin bench_raw`
 on this machine and are comparative, not throughput guarantees. Brightness
 values compare each developed candidate to the embedded preview. The fourth
-candidate matches the preview's median luminance in linear light; the five-panel
-comparison PNGs support the user's visual decision.
+candidate runs the product MatchPreview executor path; the five-panel
+comparison PNGs show its actual output.
 
 ### Dimensions, orientation, and comparisons
 
@@ -75,36 +78,37 @@ at half DCT scale to 4128×2752; its HE RAW development remains unsupported.
 ### Timings and brightness
 
 All times are milliseconds from the release-profile benchmark. `Match ms`
-includes one no-auto develop, the linear-median calculation, and two
-`copy_mem_image` calls from the same LibRaw instance. The first copy supplies
-the no-auto panel; the second uses the matched gain or fallback brightness.
+measures the complete product MatchPreview job: preview extraction and
+statistic decode, one no-auto develop, the linear-median calculation, and two
+`copy_mem_image` calls from the same LibRaw instance. The first copy is
+dropped before the second. The no-auto panel is measured in a separate job.
 
 | Case | Info ms | Preview ms | Full ms | Half ms | Match ms | Cancel ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| deflate-dng | 4.6 | 72.2 | 2200.1 | 422.7 | 2353.9 | 56.3 |
-| cr2 | 2.1 | 10.4 | 867.5 | 170.0 | 813.6 | 17.5 |
-| lossy-dng | 2.2 | 90.3 | 568.2 | 580.4 | 662.2 | 112.1 |
-| portrait-flip-5 | 2.2 | 13.5 | 973.5 | 211.3 | 1037.6 | 18.9 |
-| portrait-flip-6-nef | 2.9 | 84.2 | 1786.1 | 341.6 | 1876.6 | 50.5 |
-| arw-compressed | 2.2 | 15.0 | 513.0 | 50.3 | 484.0 | 7.1 |
-| crw | 0.9 | 2.5 | 376.5 | 85.2 | 398.6 | 4.1 |
-| pef | 2.3 | 48.3 | 991.6 | 195.4 | 1198.7 | 27.5 |
-| cr3-craw | 3.4 | 96.1 | 2527.8 | 381.8 | 2526.5 | 81.2 |
-| portrait-flip-6 | 0.9 | 2.8 | 1193.6 | 188.5 | 995.3 | 28.3 |
-| rwl | 1.3 | 21.8 | 708.6 | 100.2 | 715.3 | 13.7 |
-| phone-dng | 1.1 | 3.5 | 997.1 | 204.5 | 977.9 | 30.4 |
-| srw | 4.3 | 120.5 | 2641.7 | 445.7 | 2779.4 | 86.3 |
-| raf-xtrans-compressed | 4.3 | 89.3 | 13115.1 | 1409.2 | 13513.5 | 106.7 |
-| cr3 | 2.0 | 29.8 | 746.1 | 144.9 | 752.6 | 16.1 |
-| nef | 1.1 | 3.2 | 431.7 | 81.9 | 410.6 | 5.0 |
-| orf | 0.6 | 1.1 | 321.6 | 24.6 | 339.7 | 1.8 |
-| nef-he-negative | 8.1 | 126.6 | — | — | — | — |
-| rw2 | 1.2 | 19.7 | 185.1 | 26.6 | 198.3 | 4.6 |
-| arw-lossless | 1.3 | 30.4 | 445.0 | 480.5 | 536.1 | 89.3 |
-| iiq | 0.9 | 1.1 | 1074.0 | 245.6 | 1103.5 | 0.9 |
+| deflate-dng | 2.8 | 57.1 | 2015.7 | 358.3 | 2287.2 | 63.0 |
+| cr2 | 1.6 | 9.4 | 876.2 | 155.4 | 836.8 | 21.2 |
+| lossy-dng | 1.7 | 81.9 | 538.0 | 534.7 | 636.6 | 98.7 |
+| portrait-flip-5 | 1.6 | 13.5 | 908.7 | 190.0 | 951.7 | 23.0 |
+| portrait-flip-6-nef | 2.3 | 78.4 | 1614.3 | 301.1 | 1743.3 | 40.9 |
+| arw-compressed | 1.5 | 14.8 | 496.3 | 66.2 | 505.1 | 15.4 |
+| crw | 1.1 | 1.8 | 429.7 | 85.4 | 436.1 | 13.4 |
+| pef | 2.0 | 49.8 | 1147.6 | 210.0 | 1035.6 | 24.4 |
+| cr3-craw | 3.7 | 84.9 | 2720.5 | 620.2 | 3245.3 | 82.5 |
+| portrait-flip-6 | 0.8 | 3.3 | 1115.5 | 153.6 | 1147.8 | 24.9 |
+| rwl | 1.9 | 22.4 | 877.1 | 118.4 | 933.2 | 24.7 |
+| phone-dng | 1.1 | 4.0 | 1158.8 | 243.0 | 1210.6 | 25.6 |
+| srw | 3.6 | 145.0 | 2687.5 | 451.4 | 3025.6 | 72.9 |
+| raf-xtrans-compressed | 5.6 | 112.2 | 13785.8 | 1236.6 | 14838.0 | 115.6 |
+| cr3 | 2.3 | 34.9 | 826.0 | 124.6 | 798.0 | 18.7 |
+| nef | 1.1 | 2.2 | 411.8 | 74.5 | 423.0 | 6.4 |
+| orf | 0.7 | 0.8 | 349.8 | 31.7 | 352.2 | 4.3 |
+| nef-he-negative | 6.8 | 123.6 | — | — | — | — |
+| rw2 | 1.1 | 18.3 | 181.8 | 26.4 | 232.8 | 2.1 |
+| arw-lossless | 1.8 | 32.4 | 437.9 | 460.7 | 520.8 | 72.5 |
+| iiq | 0.9 | 1.4 | 1163.8 | 286.6 | 1070.3 | 1.0 |
 
-For the match candidate, the benchmark samples up to 100,000 pixels from the
-oriented embedded preview and no-auto developed image. It converts sRGB
+For the match candidate, the product job samples up to 100,000 pixels from the
+oriented statistic preview and no-auto developed image. It converts sRGB
 channels to linear light, uses Rec.709 luminance weights, and divides their
 medians. Gain is clamped to [0.125, 8]. LibRaw's `copy_mem_image` computes
 `gamma_curve(..., (t_white << 3) / bright)`; the curve uses
@@ -115,41 +119,44 @@ back to auto-bright threshold 0.001. Auto 0.01 and auto 0.001 remain
 benchmark-only standalone choices; the latter is an internal product fallback.
 
 The first four ΔL columns compare sampled **mean sRGB-encoded** luminance to
-the preview, preserving the earlier benchmark's visual screening measure.
-`Median ΔL` is the absolute difference in **linear** luminance medians after
-matching. `Decision` records clamping or fallback; plain `gain` means neither.
+the full decoded preview. `Median ΔL` is the absolute difference in **linear**
+luminance medians between the full preview and product output. `Product gain`
+comes from the returned product decision; `Full-preview gain` uses the earlier
+full-preview statistic with the separate no-auto panel. `Decision` records
+clamping or fallback; plain `gain` means neither.
 
-| Case | ΔL auto 0.01 | ΔL auto 0.001 | ΔL no auto | ΔL match mean | Median ΔL linear | Gain | Decision |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| deflate-dng | 0.0522 | 0.0023 | 0.0516 | 0.0047 | 0.0001 | 1.330 | gain |
-| cr2 | 0.1743 | 0.1555 | 0.1401 | 0.0261 | 0.0011 | 2.453 | gain |
-| lossy-dng | 0.0281 | 0.0785 | 0.1265 | 0.0124 | 0.0006 | 2.126 | gain |
-| portrait-flip-5 | 0.0019 | 0.0148 | 0.1124 | 0.0011 | 0.0005 | 2.069 | gain |
-| portrait-flip-6-nef | 0.1860 | 0.1860 | 0.1860 | 0.0406 | 0.0000 | 2.603 | gain |
-| arw-compressed | 0.0731 | 0.1549 | 0.1598 | 0.0520 | 0.0013 | 2.465 | gain |
-| crw | 0.0649 | 0.0075 | 0.0075 | 0.0075 | 0.0000 | 1.000 | gain |
-| pef | 0.0076 | 0.0268 | 0.0406 | 0.0215 | 0.0002 | 1.503 | gain |
-| cr3-craw | 0.0914 | 0.0272 | 0.2304 | 0.0209 | 0.0017 | 3.185 | gain |
-| portrait-flip-6 | 0.0451 | 0.0785 | 0.0932 | 0.0998 | 0.0012 | 2.392 | gain |
-| rwl | 0.0700 | 0.0700 | 0.0700 | 0.0067 | 0.0003 | 1.452 | gain |
-| phone-dng | 0.0440 | 0.0268 | 0.0993 | 0.0586 | 0.0008 | 2.169 | gain |
-| srw | 0.0511 | 0.0433 | 0.1024 | 0.0183 | 0.0005 | 1.789 | gain |
-| raf-xtrans-compressed | 0.0466 | 0.0566 | 0.0566 | 0.0005 | 0.0002 | 1.506 | gain |
-| cr3 | 0.0746 | 0.0095 | 0.1355 | 0.0175 | 0.0007 | 2.397 | gain |
-| nef | 0.0329 | 0.0329 | 0.0329 | 0.0320 | 0.0002 | 1.279 | gain |
-| orf | 0.0731 | 0.0407 | 0.0290 | 0.0367 | 0.0004 | 1.348 | gain |
-| nef-he-negative | — | — | — | — | — | — | — |
-| rw2 | 0.0116 | 0.0007 | 0.0842 | 0.0094 | 0.0003 | 1.699 | gain |
-| arw-lossless | 0.1391 | 0.1391 | 0.1392 | 0.0295 | 0.0017 | 2.648 | gain |
-| iiq | 0.1385 | 0.1869 | 0.2123 | 0.0121 | 0.0008 | 3.476 | gain |
+| Case | ΔL auto 0.01 | ΔL auto 0.001 | ΔL no auto | ΔL match mean | Median ΔL linear | Product gain | Full-preview gain | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| deflate-dng | 0.0522 | 0.0023 | 0.0516 | 0.0039 | 0.0006 | 1.336 | 1.330 | gain |
+| cr2 | 0.1743 | 0.1555 | 0.1401 | 0.0266 | 0.0016 | 2.457 | 2.453 | gain |
+| lossy-dng | 0.0281 | 0.0785 | 0.1265 | 0.0128 | 0.0011 | 2.130 | 2.126 | gain |
+| portrait-flip-5 | 0.0019 | 0.0148 | 0.1124 | 0.0010 | 0.0006 | 2.070 | 2.069 | gain |
+| portrait-flip-6-nef | 0.1860 | 0.1860 | 0.1860 | 0.0408 | 0.0005 | 2.606 | 2.603 | gain |
+| arw-compressed | 0.0731 | 0.1549 | 0.1598 | 0.0513 | 0.0002 | 2.459 | 2.465 | gain |
+| crw | 0.0649 | 0.0075 | 0.0075 | 0.0075 | 0.0000 | 1.000 | 1.000 | gain |
+| pef | 0.0076 | 0.0268 | 0.0406 | 0.0223 | 0.0007 | 1.511 | 1.503 | gain |
+| cr3-craw | 0.0914 | 0.0272 | 0.2304 | 0.0239 | 0.0053 | 3.220 | 3.185 | gain |
+| portrait-flip-6 | 0.0451 | 0.0785 | 0.0932 | 0.0998 | 0.0012 | 2.392 | 2.392 | gain |
+| rwl | 0.0700 | 0.0700 | 0.0700 | 0.0071 | 0.0007 | 1.455 | 1.452 | gain |
+| phone-dng | 0.0440 | 0.0268 | 0.0993 | 0.0586 | 0.0008 | 2.169 | 2.169 | gain |
+| srw | 0.0511 | 0.0433 | 0.1024 | 0.0180 | 0.0004 | 1.787 | 1.789 | gain |
+| raf-xtrans-compressed | 0.0466 | 0.0566 | 0.0566 | 0.0011 | 0.0005 | 1.512 | 1.506 | gain |
+| cr3 | 0.0746 | 0.0095 | 0.1355 | 0.0175 | 0.0007 | 2.397 | 2.397 | gain |
+| nef | 0.0329 | 0.0329 | 0.0329 | 0.0320 | 0.0002 | 1.279 | 1.279 | gain |
+| orf | 0.0731 | 0.0407 | 0.0290 | 0.0367 | 0.0004 | 1.348 | 1.348 | gain |
+| nef-he-negative | — | — | — | — | — | — | — | — |
+| rw2 | 0.0116 | 0.0007 | 0.0842 | 0.0093 | 0.0002 | 1.698 | 1.699 | gain |
+| arw-lossless | 0.1391 | 0.1391 | 0.1392 | 0.0295 | 0.0017 | 2.648 | 2.648 | gain |
+| iiq | 0.1385 | 0.1869 | 0.2123 | 0.0121 | 0.0008 | 3.476 | 3.476 | gain |
 
-Across the 20 developed samples, applied gain ranged from 1.000 to 3.476
-(median 2.098, mean 2.044); 0 were clamped and 0 fell back. The median linear
-ΔL averaged 0.0007 and peaked at 0.0017. Excluding the Ricoh file with its
-striped JPEG, the mean-luminance ΔL averages were 0.0716 (auto 0.01), 0.0663
-(auto 0.001), 0.1061 (no auto), and 0.0215 (match preview). These numbers do
-not replace the user's visual choice from the PNGs. Full development ranged
-from 185.1 to 13115.1 ms; cancel-to-exit latency ranged from 0.9 to 112.1 ms.
+Across the 20 developed samples, product gain ranged from 1.000 to 3.476
+(median 2.100, mean 2.047); 0 were clamped and 0 fell back. The largest
+absolute difference from the full-preview gain was 0.035 on CR3 CRAW. The
+median linear ΔL against the full preview averaged 0.0009 and peaked at
+0.0053. Excluding the Ricoh file with its striped JPEG, the mean-luminance
+ΔL averages were 0.0716 (auto 0.01), 0.0663 (auto 0.001), 0.1061 (no auto),
+and 0.0217 (product match preview). Full development ranged from 181.8 to
+13785.8 ms; cancel-to-exit latency ranged from 1.0 to 115.6 ms.
 
 ### WIC comparison for DNG
 
@@ -213,22 +220,23 @@ development was not attempted by the benchmark.
 
 ## Verification
 
-- `cargo test -j 1 -p mimageviewer --lib raw:: --offline`: 56 passed, 0 failed,
-  including all 21 manifest samples, Nikon Z 8 scaling, gain/fallback tests,
-  and executor fake-job tests.
+- `cargo test -j 1 -p mimageviewer --lib raw:: --offline`: 60 passed, 0 failed,
+  including all 21 manifest samples, small-preview statistic scaling,
+  cancellation before RGB allocation, gain/fallback, and executor fake-job tests.
 - `cargo test -j 1 -p libraw-sys --offline`: 3 passed, 0 failed.
-- `cargo check -j 1 -p mimageviewer --features dev-tools --bin bench_raw
-  --offline`: passed.
-- Release-profile `bench_raw`: 21 results, no benchmark errors, 20 five-panel
-  PNGs, and every supported developed dimension matched `info()`.
-- The earlier S1 `cargo build --release -j 1 --bin mimageviewer-core --offline`
-  passed; it was not rerun for this follow-up.
-  `check-vcrt-pe-dependencies.ps1` passed for that executable, with zero direct
-  `msvcp*`, `vcruntime*`, or `concrt*` imports.
-- `cargo fmt --all -- --check`: passed.
-- `cargo clippy -j 1 -p libraw-sys -p mimageviewer --features dev-tools --lib
-  --bin bench_raw --offline`: passed after a local lint cleanup; the main
-  crate still reports 1,535 broad warnings, including S1's unwired API.
+- Release-profile `bench_raw` rerun: 21 results, no benchmark errors, 20
+  five-panel PNGs showing the product MatchPreview output, and every supported
+  developed dimension matched `info()`.
+- Fresh `cargo build --release --bin mimageviewer-core -j 1 --offline`: passed
+  (28m 41s). `check-vcrt-pe-dependencies.ps1 -InputPaths
+  target\release\mimageviewer-core.exe` passed (`runtime=4 pe=1`). The x64 core
+  has zero direct `msvcp*`, `vcruntime*`, or `concrt*` imports; SHA-256 is
+  `646976860BB56BD9DF95B9EF01205F0364749B103D24AEA82DB752EA58FAFABB`.
+- `cargo fmt --all` and `cargo fmt --all --check`: passed.
+- `cargo clippy -p libraw-sys -j 1 --offline` and `cargo clippy -p
+  mimageviewer --lib --bin bench_raw --features dev-tools -j 1 --offline`:
+  passed. The main crate still reports 1,535 broad warnings, with none in the
+  changed RAW decoder or benchmark paths.
 - The Windows-host non-Windows shadow script was attempted with shared and
   isolated target directories, including offline mode, but its PowerShell
   Cargo capture did not return a verdict. A direct offline check from the
