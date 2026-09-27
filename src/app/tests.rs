@@ -47941,6 +47941,92 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn native_audio_track_event_checks_owner_epoch_and_track_then_uses_norm_owner() {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("audio-track-event.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        app.settings.audio_normalize_enabled = true;
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        assert!(
+            crate::video::audio_track_ui::audio_track_rows(player.info().unwrap(), None, false)
+                .is_empty()
+        );
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        let desired = |app: &App| match app.fs_cache.get(&0).unwrap() {
+            FsCacheEntry::Video { player, .. } => {
+                player.audio_track_selection().unwrap().desired.stream_index
+            }
+            _ => unreachable!(),
+        };
+        app.handle_native_video_output_event(&ctx, 1, 0, Ev::SelectAudioTrack { stream_index: 2 });
+        assert_eq!(desired(&app), 1);
+        app.handle_native_video_output_event(&ctx, 0, 99, Ev::SelectAudioTrack { stream_index: 2 });
+        assert_eq!(desired(&app), 1);
+        app.handle_native_video_output_event(&ctx, 0, 0, Ev::SelectAudioTrack { stream_index: 99 });
+        assert_eq!(desired(&app), 1);
+        app.handle_native_video_output_event(&ctx, 0, 0, Ev::SelectAudioTrack { stream_index: 2 });
+        assert_eq!(desired(&app), 2);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert!(matches!(
+            player.normalize_track_gain(2),
+            crate::video::normalize_gain::NormalizeTrackGain::Pending(Some(_))
+        ));
+        player.fail_desired_audio_track_for_test();
+        assert_eq!(
+            app.take_audio_track_failure_toast(0),
+            Some("音声トラックを切り替えられませんでした")
+        );
+        assert_eq!(app.take_audio_track_failure_toast(0), None);
+        app.handle_native_video_output_event(&ctx, 0, 0, Ev::SelectAudioTrack { stream_index: 2 });
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        player.fail_desired_audio_track_for_test();
+        assert_eq!(
+            app.take_audio_track_failure_toast(0),
+            Some("音声トラックを切り替えられませんでした")
+        );
+    }
+
+    #[test]
+    fn next_audio_track_cycles_and_single_track_does_nothing() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("audio-cycle.mkv");
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_opened_audio_stream_for_test(1, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        assert_eq!(app.cycle_video_audio_track(0), None);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get_mut(&0).unwrap() else {
+            unreachable!()
+        };
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        assert!(app.cycle_video_audio_track(0).unwrap().starts_with("2:"));
+        assert!(app.cycle_video_audio_track(0).unwrap().starts_with("1:"));
+    }
+
+    #[test]
     fn audio_selection_cancels_only_the_other_blocking_normalize_scan() {
         let mut app = setup_app();
         let path = app.tmp.path().join("selection.mkv");
@@ -66014,6 +66100,11 @@ mod still_window_mode_key_tests {
         );
         assert!(
             App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::SelectAudioTrack { stream_index: 2 }
+            )
+        );
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(
                 &Ev::ToggleWindowMode
             )
         );
@@ -66108,6 +66199,12 @@ mod still_window_mode_key_tests {
         );
 
         app.handle_native_video_output_event(&ctx, video, 0, Ev::ToggleAudioMode);
+        app.handle_native_video_output_event(
+            &ctx,
+            video,
+            0,
+            Ev::SelectAudioTrack { stream_index: 2 },
+        );
 
         assert_eq!(app.native_video_parked_live_activation_requests, vec![92]);
         assert!(

@@ -98,6 +98,7 @@ enum AudioLaneState {
 struct AudioTrackSelectionState {
     snapshot: AudioTrackSelectionSnapshot,
     lane: AudioLaneState,
+    notified_failure_generation: u64,
 }
 
 pub(crate) struct AudioTrackSelection {
@@ -119,12 +120,29 @@ impl AudioTrackSelection {
                     open_notice: None,
                 },
                 lane: AudioLaneState::Active,
+                notified_failure_generation: 0,
             }),
         }
     }
 
     pub(crate) fn snapshot(&self) -> AudioTrackSelectionSnapshot {
         self.state.lock().unwrap().snapshot
+    }
+
+    pub(crate) fn take_failure_notification(&self, deferred: bool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !matches!(
+            state.snapshot.display_state(deferred),
+            AudioTrackSelectionDisplayState::Failed(_)
+        ) {
+            return false;
+        }
+        let generation = state.snapshot.desired.generation;
+        if state.notified_failure_generation == generation {
+            return false;
+        }
+        state.notified_failure_generation = generation;
+        true
     }
 
     /// UI thread only. Admission and demux lane closure share one lock. The
@@ -184,6 +202,22 @@ impl AudioTrackSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_notification_is_once_per_desired_generation() {
+        let selection = AudioTrackSelection::new(1);
+        assert!(!selection.take_failure_notification(false));
+        assert_eq!(selection.request(2), AudioTrackRequestOutcome::Accepted);
+        let first = selection.snapshot().desired;
+        selection.fail(first, AudioTrackSwitchFailureReason::SetupFailed);
+        assert!(selection.take_failure_notification(false));
+        assert!(!selection.take_failure_notification(false));
+        assert_eq!(selection.request(2), AudioTrackRequestOutcome::Accepted);
+        let second = selection.snapshot().desired;
+        selection.fail(second, AudioTrackSwitchFailureReason::SeekFailed);
+        assert!(selection.take_failure_notification(false));
+        assert!(!selection.take_failure_notification(false));
+    }
 
     #[test]
     fn display_state_is_derived_from_generation_and_deferred_condition() {

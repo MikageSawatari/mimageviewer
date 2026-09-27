@@ -526,14 +526,15 @@ seek を取り出していなければ要求は上書きされ (latest-value)、
 
 - 下部 HUD の音量群 (mute / Norm / 音量) の近くに、`audio_tracks.len() >= 2` のときだけ「音声 N」の text
   ボタンを出す (N = 選択中トラックの ordinal)。環境依存グリフ・絵文字は使わない。HUD の縮小段では
-  capture 系より後、速度より先に隠す (具体的な段は実装時に既存の縮小表で決め、スナップショットで固定する)。
+  capture 系より後、速度より先に隠す。S4 では Full / NoCapture で表示し、NoMarkers から隠す。
 - クリックで popup。雛形は seek strip メニュー (`draw_native_seek_strip_menu`) と同じ
   「行 = (label, is_current, command)」形式。open flag / 描画 rect は `NativeEguiOverlay` に持ち、
   `compute_hud_regions` に rect を加える (HUD HWND の `SetWindowRgn` がクリックを透過しないように)。
 - 行ラベル (取得できた項目だけを並べる): `N: <言語> <title> — <codec> <channels>ch (既定)`
   - 言語: 固定表 (jpn→日本語、eng→英語、… 少数) で変換、表に無い code はそのまま。
   - `(既定)` は `stream_index == default_audio_stream_index` の行だけ。
-  - 導出状態が「切り替え中」の行には「(切り替え中)」、「失敗」の行には「(切り替えできません)」を添える。
+  - 導出状態が「切り替え中」の行には「(切り替え中)」、「保留」の行には「(次の再生位置で切り替え)」、
+    「失敗」の行には「(切り替えできません)」を添える。
 - 選択 → `NativeOverlayCommand::SelectAudioTrack { stream_index }` → `NativeVideoOutputEvent::SelectAudioTrack` →
   App の handler → (Norm が ON なら §6.1 の Norm owner の手順を通して) `VideoPlayer::select_audio_track`。
 - 失敗時は App が既存のトーストで 1 回通知する (「音声トラックを切り替えられませんでした」)。

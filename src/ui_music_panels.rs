@@ -38,7 +38,120 @@ use crate::video::native_presenter::overlay_draw::{
 #[cfg(windows)]
 use crate::video::native_presenter::{
     NativeOverlayCommand, NativeOverlayJumpEntry, NativeOverlayTimelineMarkerKind,
+    draw_native_audio_track_menu,
 };
+
+pub(crate) fn music_audio_track_selector_id(
+    ui_id: egui::Id,
+    fs_idx: usize,
+    path: &std::path::Path,
+) -> egui::Id {
+    ui_id.with(("music_audio_track_menu", fs_idx, path))
+}
+
+pub(crate) fn music_audio_track_popup_open(
+    ctx: &egui::Context,
+    ui_id: egui::Id,
+    fs_idx: usize,
+    path: &std::path::Path,
+) -> bool {
+    let id = music_audio_track_selector_id(ui_id, fs_idx, path);
+    ctx.data(|data| data.get_temp::<bool>(id).unwrap_or(false))
+}
+
+#[cfg(windows)]
+fn consume_music_popup_wheel(ctx: &egui::Context) {
+    ctx.input_mut(|input| {
+        input.raw_scroll_delta = egui::Vec2::ZERO;
+        input.smooth_scroll_delta = egui::Vec2::ZERO;
+        input
+            .events
+            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+    });
+}
+
+#[cfg(windows)]
+pub(crate) fn draw_music_audio_track_selector(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    rows: &[crate::video::audio_track_ui::AudioTrackRow],
+    interactive: bool,
+    id: egui::Id,
+) -> Option<usize> {
+    if rows.len() < 2 {
+        return None;
+    }
+    let mut open = interactive
+        && ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<bool>(id).unwrap_or(false));
+    let response = ui.interact(
+        rect,
+        id.with("button"),
+        if interactive {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let painter = ui.painter_at(rect);
+    draw_overlay_button_bg(&painter, rect, interactive && response.hovered(), open);
+    let ordinal = rows
+        .iter()
+        .find(|row| row.is_current)
+        .map_or(1, |row| row.ordinal);
+    painter.text(
+        egui::pos2(rect.center().x, rect.center().y + 4.0),
+        egui::Align2::CENTER_CENTER,
+        format!("音声 {ordinal}"),
+        crate::ui_fonts::hud_text_font(12.0),
+        egui::Color32::from_gray(226),
+    );
+    if interactive && response.clicked() {
+        open = !open;
+    }
+    let mut commands = Vec::new();
+    let mut menu_rect = None;
+    if open {
+        let screen = ui.ctx().viewport_rect();
+        draw_native_audio_track_menu(
+            ui.ctx(),
+            screen,
+            rect,
+            rows,
+            id.with("popup"),
+            &mut open,
+            &mut menu_rect,
+            &mut commands,
+        );
+        // A popup above the HUD owns wheel input for the entire frame.
+        consume_music_popup_wheel(ui.ctx());
+    }
+    ui.ctx().data_mut(|data| data.insert_temp(id, open));
+    commands.into_iter().find_map(|command| match command {
+        NativeOverlayCommand::SelectAudioTrack { stream_index } => Some(stream_index),
+        _ => None,
+    })
+}
+
+#[cfg(windows)]
+fn music_audio_track_button_fits(
+    hud_right: f32,
+    left_next_x: f32,
+    side_pad: f32,
+    gap: f32,
+    bsz: f32,
+) -> bool {
+    let right_width = 14.0
+        + (60.0 + gap)
+        + (144.0 + gap)
+        + (bsz + gap)
+        + (bsz + gap)
+        + (62.0 + gap)
+        + (bsz * 1.55 + gap)
+        + 132.0;
+    hud_right - side_pad - right_width >= left_next_x
+}
 
 /// 左パネル (ブックマーク) の幅。画像補正パネル (`LEFT_PANEL_WIDTH`) と揃える。
 pub(crate) const MUSIC_LEFT_PANEL_WIDTH: f32 = 292.0;
@@ -1129,6 +1242,27 @@ impl App {
         let mut cycle_continuous = false;
         let mut toggle_mute = false;
         let mut set_vol: Option<f64> = None;
+        let (audio_track_rows, audio_track_selector_id) = self
+            .fs_cache
+            .get(&fs_idx)
+            .and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => player.info().map(|info| {
+                    (
+                        crate::video::audio_track_ui::audio_track_rows(
+                            info,
+                            player.audio_track_selection(),
+                            matches!(
+                                player.audio_track_display_state(),
+                                Some(crate::video::AudioTrackSelectionDisplayState::Deferred)
+                            ),
+                        ),
+                        music_audio_track_selector_id(ui.id(), fs_idx, player.path()),
+                    )
+                }),
+                _ => None,
+            })
+            .unwrap_or_else(|| (Vec::new(), ui.id().with(("music_audio_track_menu", fs_idx))));
+        let mut selected_audio_track = None;
         // 前/次ファイル移動 intent (-1 = 前, +1 = 次)。動画 HUD の ↑↓ = VideoPrevFile/NextFile
         // と同一挙動 (末尾でまとめて適用)。
         let mut nav_file: Option<i32> = None;
@@ -1439,6 +1573,13 @@ impl App {
 
         // ── コントロール行: 右クラスタ (右寄せ: リミッター / dB ラベル / 音量 / Norm /
         // ミュート / 速度 / 時間) ──
+        let track_w = 62.0;
+        let show_audio_track = audio_track_rows.len() >= 2
+            && music_audio_track_button_fits(hud_rect.right(), x, side_pad, gap, bsz);
+        if !show_audio_track {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(audio_track_selector_id, false));
+        }
         // 右端 padding は動画 native HUD の side_pad に揃える (旧 14 → 10、音量バー位置ズレ修正)。
         let mut rx = hud_rect.right() - side_pad;
         // リミッター作動ドット (最右、動画 HUD の vol_label の右に置くのと同じ)。
@@ -1635,6 +1776,20 @@ impl App {
         if mresp.clicked() {
             toggle_mute = true;
         }
+        if show_audio_track {
+            let track_rect = egui::Rect::from_min_size(
+                egui::pos2(rx - track_w, controls_cy - bsz * 0.5),
+                egui::vec2(track_w, bsz),
+            );
+            rx -= track_w + 8.0;
+            selected_audio_track = draw_music_audio_track_selector(
+                ui,
+                track_rect,
+                &audio_track_rows,
+                interactive,
+                audio_track_selector_id,
+            );
+        }
         // 再生速度: 動画/音楽共有の speed ボタン + プリセット popup (Inc 5c-B2)。
         // 左クリックで popup をトグル、右クリック / ダブルクリックで x1。動画と同じ 11
         // プリセット (`PLAYBACK_SPEED_CHOICES`) / ラベル形式 (`format_playback_speed`) に揃う。
@@ -1669,6 +1824,9 @@ impl App {
             speed_popup_open,
             &mut speed_popup_rect_sink,
         );
+        if *speed_popup_open {
+            consume_music_popup_wheel(ui.ctx());
+        }
         // 時間表示は動画 native HUD に揃える (Inc 7 ③): 速度ボタンの左に time_w=132 の固定
         // スロットを取り、その左端に LEFT_CENTER・14px・白(238) で置く。旧実装は速度ボタンに
         // 右寄せで密着していて、動画 (左寄せ・スロット左端) と再生時間の x がズレていた。
@@ -1690,6 +1848,9 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 84),
             );
             return;
+        }
+        if let Some(stream_index) = selected_audio_track {
+            self.select_video_audio_track(fs_idx, stream_index);
         }
         let ctx = ui.ctx().clone();
         if let Some(s) = set_speed {
@@ -2140,5 +2301,62 @@ mod tests {
         );
         // ブックマーク皆無 + 先頭 → no-op
         assert_eq!(music_marker_target(&[], 0.0, false), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn music_audio_track_selector_open_dark_snapshot() {
+        use crate::video::AudioTrackSelectionDisplayState;
+        use crate::video::audio_track_ui::AudioTrackRow;
+        use egui_kittest::Harness;
+
+        let rows = vec![
+            AudioTrackRow {
+                label: "1: 日本語 主音声 — aac 2ch (既定)".into(),
+                stream_index: 1,
+                ordinal: 1,
+                is_current: true,
+                state: AudioTrackSelectionDisplayState::Applied,
+            },
+            AudioTrackRow {
+                label: "2: 英語 Commentary — ac3 6ch".into(),
+                stream_index: 2,
+                ordinal: 2,
+                is_current: false,
+                state: AudioTrackSelectionDisplayState::Applied,
+            },
+        ];
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 280.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let id = ui.id().with("fixture_audio_track_popup");
+                    ui.ctx().data_mut(|data| data.insert_temp(id, true));
+                    let rect =
+                        egui::Rect::from_min_size(egui::pos2(235.0, 210.0), egui::vec2(62.0, 28.0));
+                    super::draw_music_audio_track_selector(ui, rect, &rows, true, id);
+                });
+            });
+        harness.run();
+        harness.snapshot("music_audio_track_selector_open_dark");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn music_audio_track_button_hides_before_clashing_with_left_controls() {
+        assert!(!super::music_audio_track_button_fits(
+            850.0, 314.0, 10.0, 8.0, 28.0
+        ));
+        assert!(super::music_audio_track_button_fits(
+            900.0, 314.0, 10.0, 8.0, 28.0
+        ));
     }
 }

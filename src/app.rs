@@ -76334,6 +76334,14 @@ impl App {
             // wheel / 前-次項目ボタンが pending 中に押されたケースで「反応しない」
             // 体感バグを防ぐ (実機 fb 2026-05-26)。
             self.maybe_apply_deferred_native_video_nav(ctx);
+            if let Some(message) = self.take_audio_track_failure_toast(fs_idx) {
+                let message = message.to_string();
+                if self.fs_music_view_active(fs_idx) {
+                    self.show_feedback_toast(message);
+                } else {
+                    self.show_native_video_overlay_toast(message, false);
+                }
+            }
             self.sync_native_video_metadata(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);

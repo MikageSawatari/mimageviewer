@@ -581,6 +581,7 @@
 # VideoAdjustSlot10.1 = Ctrl+0 ; 動画補正スロット10を読み込む
 # VideoAdjustSlot10.2 = Ctrl+Numpad0 ; 動画補正スロット10を読み込む
 # VideoToggleAudioMode = Z ; 映像を消して音声モード（音楽ビュー）で聴く。音声モード中は動画表示へ戻す
+# VideoNextAudioTrack = none ; 次の音声トラックへ切り替える
 
 [Erase] ; 消しゴムモード
 # EraseConfirm = E ; 消しゴム処理を実行して終了する

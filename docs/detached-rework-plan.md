@@ -1455,6 +1455,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-27 §1.251 S4: 動画 HUD の音声トラック選択を ParkedLive の HUD クリック分類と music shell の許可に追加**
+
+音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §7.6・§8.1) で、動画 HUD の新しい
+操作 `NativeVideoOutputEvent::SelectAudioTrack` を追加した。`native_video_output_event_is_parked_live_hud_click_activation`
+では既存の HUD 操作と同じく HUD クリック (true) に分類し、ParkedLive の窓でのクリックは既存 filter どおり「窓の活性化」に
+なる (操作自体は実行しない)。音声モード (music shell) で許可する操作の一覧にも加えた。App の handler は source epoch の
+検査の後で処理し、`NavigateItem` 型の epoch 不一致の許容には入れない。detached の状態・述語の条件、viewport の生成・
+終了、時間窓は増やしていない。
+判断: 既存の明示的な分類表と許可リストに新しい操作を 1 つ加えるだけの構造的変更であり、症状パッチではない (§2 の
+禁止事項に抵触しない)。独立レビュー (Sol) と ClaudeCode の双方がこの判断に合意した。
+
 **2026-09-27 §1.251 S3-B: 音楽解析・波形の結果を所有 viewer context と音声トラックで照合**
 
 音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §6.2) で、音楽解析と seek strip

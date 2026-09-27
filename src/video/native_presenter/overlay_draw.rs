@@ -5942,17 +5942,33 @@ pub(super) fn draw_native_metadata_panel(
                 metadata.deinterlace_status,
                 metadata.interlace_detected,
             );
-            let audio_label = match metadata.audio_codec.as_deref() {
-                Some(codec) if metadata.audio_bit_rate_bps > 0 => {
-                    format!(
-                        "{} ({})",
-                        codec,
-                        format_bitrate(metadata.audio_bit_rate_bps)
-                    )
-                }
-                Some(codec) => codec.to_string(),
-                None => "なし".to_string(),
-            };
+            let audio_label = metadata
+                .audio_track_rows
+                .iter()
+                .find(|row| row.is_current)
+                .map_or_else(
+                    || match metadata.audio_codec.as_deref() {
+                        Some(codec) if metadata.audio_bit_rate_bps > 0 => format!(
+                            "{} ({})",
+                            codec,
+                            format_bitrate(metadata.audio_bit_rate_bps)
+                        ),
+                        Some(codec) => codec.to_owned(),
+                        None => "なし".to_owned(),
+                    },
+                    |row| {
+                        let mut label = row.label.clone();
+                        if metadata.opened_audio_stream_index == Some(row.stream_index)
+                            && metadata.audio_bit_rate_bps > 0
+                        {
+                            label.push_str(&format!(
+                                " ({})",
+                                format_bitrate(metadata.audio_bit_rate_bps)
+                            ));
+                        }
+                        label
+                    },
+                );
             let mut rows = vec![
                 ("ファイル", metadata.file_name.clone()),
                 ("タイトル", title.to_string()),
@@ -5984,6 +6000,14 @@ pub(super) fn draw_native_metadata_panel(
                     "音声",
                     if metadata.probe_info_available {
                         audio_label
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "音声トラック",
+                    if metadata.audio_track_count >= 2 {
+                        format!("{} 本", metadata.audio_track_count)
                     } else {
                         String::new()
                     },
@@ -7674,6 +7698,9 @@ mod tests {
             video_decoder: "test".to_owned(),
             audio_codec: Some("aac".to_owned()),
             audio_bit_rate_bps: 192_000,
+            audio_track_rows: Vec::new(),
+            audio_track_count: 0,
+            opened_audio_stream_index: None,
             avg_fps: 23.976,
             bit_rate_bps: 4_000_000,
             chapter_count: 0,

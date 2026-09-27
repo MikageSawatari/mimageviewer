@@ -725,6 +725,7 @@ impl App {
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
+            music_ctrl_wheel_gate_reached: false,
         };
         if let Some(error) = self.sns_split_rotation_error(fs_idx) {
             self.reset_sns_split_mode();

@@ -1857,6 +1857,7 @@ pub enum KeyAction {
     /// 動画→音声モード (映像を消して音楽ビューで聴く、Inc 7) のトグル。動画では enter、
     /// 音声モード中は exit。音声ファイル単体では対象外 (映像が無いので no-op)。
     VideoToggleAudioMode,
+    VideoNextAudioTrack,
     EraseConfirm,
     EraseConfirmPolygon,
     EraseRedo,
@@ -2406,6 +2407,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoAdjustSlot9,
     KeyAction::VideoAdjustSlot10,
     KeyAction::VideoToggleAudioMode,
+    KeyAction::VideoNextAudioTrack,
     KeyAction::EraseConfirm,
     KeyAction::EraseConfirmPolygon,
     KeyAction::EraseRedo,
@@ -4359,6 +4361,7 @@ impl KeyAction {
             VideoAdjustSlot9 => "VideoAdjustSlot9",
             VideoAdjustSlot10 => "VideoAdjustSlot10",
             VideoToggleAudioMode => "VideoToggleAudioMode",
+            VideoNextAudioTrack => "VideoNextAudioTrack",
             EraseConfirm => "EraseConfirm",
             EraseConfirmPolygon => "EraseConfirmPolygon",
             EraseRedo => "EraseRedo",
@@ -5083,6 +5086,7 @@ impl KeyAction {
             VideoToggleAudioMode => {
                 "映像を消して音声モード（音楽ビュー）で聴く。音声モード中は動画表示へ戻す"
             }
+            VideoNextAudioTrack => "次の音声トラックへ切り替える",
             EraseConfirm => "消しゴム処理を実行して終了する",
             EraseConfirmPolygon => "消しゴム多角形を確定する",
             EraseRedo => "消しゴム編集をやり直す",
@@ -5601,6 +5605,7 @@ impl KeyAction {
             | VideoAdjustSlot9
             | VideoAdjustSlot10
             | VideoToggleAudioMode => KeyContext::FsVideo,
+            VideoNextAudioTrack => KeyContext::FsVideo,
             EraseConfirm | EraseConfirmPolygon | EraseRedo | EraseUndo | EraseDeleteShape
             | EraseToolSelect | EraseToolBrush | EraseToolBucket | EraseToolLasso
             | EraseToolPolygon | EraseToolVLine | EraseToolHLine | EraseToolLine
@@ -6095,6 +6100,7 @@ impl KeyAction {
             | VideoAdjustSlot9
             | VideoAdjustSlot10
             | VideoToggleAudioMode
+            | VideoNextAudioTrack
             | EraseConfirm
             | EraseConfirmPolygon
             | EraseRedo
@@ -6632,6 +6638,7 @@ impl KeyAction {
             VideoAdjustSlot10 => ctrl_digit_pair(Num0, Numpad0),
             // Z: 動画→音声モードのトグル。画像の Z (FsZoomMode) とは別コンテキスト (FsVideo) なので競合しない。
             VideoToggleAudioMode => ChordList::one(Chord::key(Z)),
+            VideoNextAudioTrack => ChordList::EMPTY,
             EraseConfirm => ChordList::one(Chord::key(E)),
             EraseConfirmPolygon => ChordList::one(Chord::key(Enter)),
             EraseRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),

@@ -243,6 +243,26 @@ swap pending を detached 動画ではない `fullscreen_idx` で処理しない
 
 ### HUD overlay HWND (v0.9.0+ 後期 — CP1-8 で導入)
 
+複数の再生可能な音声トラックがある動画では、下部 HUD の速度とミュートの間に
+「音声 N」ボタンを置く。`N` は player の `applied` の ordinal。popup の行ラベルは
+`src/video/audio_track_ui.rs` が音声モード HUD と共有し、`NativeOverlayMetadata` は
+ラベル・stream index・現在行・導出状態を render thread へ渡す。popup の実描画 rect は
+`compute_hud_regions` が `SetWindowRgn` に渡す領域にも追加し、開いている間は HUD を
+表示し続ける。幅が足りないときは Full / NoCapture ではボタンを残し、NoMarkers から隠す。
+音声モード HUD でも左右クラスタが重なる幅ではボタンを隠す。popup は viewport 内に収め、
+多数の行は popup 上のホイールでスクロールする。長い行は hover で全文を確認できる。
+native HUD はソース切り替え時に popup のスクロール位置も破棄し、再オープン時は現在行を表示する。
+音声モードでは音声・速度 popup がホイールを消費してから Ctrl+ホイールによる Row 秒数変更を処理する。
+Row 操作はキー処理が従来のホイール位置まで到達したフレームに限り、TextEdit・IME 入力中や
+ブックマーク／Norm モーダル中には行わない。
+選択イベントは source epoch 検査を通過した後、現在 player の stream index を確認して
+App の Norm owner 経由で `VideoPlayer::select_audio_track` に届く。ParkedLive では
+この HUD クリックは操作を実行せず窓の活性化要求になる。音声 VST シェル中は音源操作として許可する。
+右パネルの「音声」は `applied` のトラック情報を表示し、ビットレートはそのトラックが
+open 時に開いた stream と同じ場合に限って添える。2 本以上なら本数も表示する。
+音声 lane を作れず selection が無い場合は選択ボタンを隠し、右パネルには従来の
+codec / bitrate metadata を表示する。
+
 VST3 プラグイン GUI がフルスクリーン動画再生中も最前面に維持されるため (= 動画を見ながら EQ
 カーブを調整する用途)、以前は **VST GUI が presenter HWND の owned + TOPMOST** になっていた。
 Windows の owner rule (= owned は owner より常に手前) で、presenter HWND の DComp tree に

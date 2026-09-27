@@ -120,6 +120,7 @@ fn menu_key_frame(key: egui::Key) -> (FsKeyAction, bool) {
         sibling_nav: None,
         mouse_nav: None,
         jump_to: None,
+        music_ctrl_wheel_gate_reached: false,
     };
     let _ = ctx.run(
         egui::RawInput {

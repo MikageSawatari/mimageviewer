@@ -708,6 +708,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 現在コンテキストの前 / 次フォルダまたは検索結果へ移動 | native presenter 経路でも有効。切り離した detached 窓 / always-new 窓ではメイン一覧を動かさず、案内だけ出す |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ | 同じ親の直下だけを対象にし、空フォルダも skip しない。検索中は無効。切り離した detached 窓 / always-new 窓では無効 |
 | <kbd>M</kbd> | ミュート トグル | |
+| 既定キーなし | 次の再生可能な音声トラックへ循環 | Action: `VideoNextAudioTrack`。`[FsVideo]` で割り当て可能。動画 HUD と動画→音声モード HUD の「音声 N」からも直接選べる。1 本以下では何もしない |
 | <kbd>L</kbd> | ループ再生 トグル | 連続再生 ON 中は無効化し、「連続再生中はループ無効」を表示 |
 | <kbd>B</kbd> | ブックマーク追加 (現在位置 🔖) | |
 | <kbd>S</kbd> | タイルモード ON/OFF | |

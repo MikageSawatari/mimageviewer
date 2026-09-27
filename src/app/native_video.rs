@@ -1754,6 +1754,45 @@ impl App {
         result
     }
 
+    pub(crate) fn cycle_video_audio_track(&mut self, fs_idx: usize) -> Option<String> {
+        let (stream_index, label) = {
+            let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&fs_idx)? else {
+                return None;
+            };
+            let info = player.info()?;
+            if info.audio_tracks.len() < 2 {
+                return None;
+            }
+            let selection = player.audio_track_selection()?;
+            let current = info
+                .audio_tracks
+                .iter()
+                .position(|track| track.stream_index == selection.desired.stream_index)?;
+            let next = &info.audio_tracks[(current + 1) % info.audio_tracks.len()];
+            (
+                next.stream_index,
+                crate::video::audio_track_ui::audio_track_label(
+                    next,
+                    info.default_audio_stream_index,
+                    crate::video::AudioTrackSelectionDisplayState::Applied,
+                ),
+            )
+        };
+        let result = self.select_video_audio_track(fs_idx, stream_index);
+        (result.outcome != crate::video::AudioTrackSelectOutcome::Rejected).then_some(label)
+    }
+
+    pub(crate) fn take_audio_track_failure_toast(&self, fs_idx: usize) -> Option<&'static str> {
+        self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. }
+                if player.take_audio_track_failure_notification() =>
+            {
+                Some("音声トラックを切り替えられませんでした")
+            }
+            _ => None,
+        })
+    }
+
     pub(super) fn cancel_blocking_normalize_scan_for_other_track(
         &mut self,
         fs_idx: usize,
@@ -5355,6 +5394,7 @@ impl App {
             | Ev::DismissTouchSidePanels
             | Ev::ToggleVst3Gui
             | Ev::ToggleAudioMode
+            | Ev::SelectAudioTrack { .. }
             | Ev::CloseFullscreen { .. }
             | Ev::ToggleWindowMode
             | Ev::SetVst3VideoCompact { .. }
@@ -5780,6 +5820,18 @@ impl App {
             }
         }
         match event {
+            crate::video::NativeVideoOutputEvent::SelectAudioTrack { stream_index } => {
+                let valid = self.fs_cache.get(&fs_idx).is_some_and(|entry| {
+                    matches!(entry,
+                    FsCacheEntry::Video { player, .. } if player.info().is_some_and(|info|
+                        info.audio_tracks.iter().any(|track| track.stream_index == stream_index)))
+                });
+                if valid {
+                    self.select_video_audio_track(fs_idx, stream_index);
+                    self.sync_native_video_metadata(fs_idx);
+                    self.request_native_video_hud_repaint(ctx);
+                }
+            }
             crate::video::NativeVideoOutputEvent::OverlayInputRouting(_) => {
                 debug_assert!(false, "routing snapshots are consumed by NativeVideoOutput");
             }
@@ -9118,6 +9170,16 @@ impl App {
                 video_decoder: info.video_decoder.clone(),
                 audio_codec: info.audio_codec.clone(),
                 audio_bit_rate_bps: info.audio_bit_rate_bps,
+                audio_track_rows: crate::video::audio_track_ui::audio_track_rows(
+                    info,
+                    player.audio_track_selection(),
+                    matches!(
+                        player.audio_track_display_state(),
+                        Some(crate::video::AudioTrackSelectionDisplayState::Deferred)
+                    ),
+                ),
+                audio_track_count: info.audio_tracks.len(),
+                opened_audio_stream_index: info.opened_audio_stream_index,
                 avg_fps: info.avg_fps,
                 bit_rate_bps: info.bit_rate_bps,
                 chapter_count: info.chapters.len(),
@@ -9153,6 +9215,9 @@ impl App {
                 video_decoder: String::new(),
                 audio_codec: None,
                 audio_bit_rate_bps: 0,
+                audio_track_rows: Vec::new(),
+                audio_track_count: 0,
+                opened_audio_stream_index: None,
                 avg_fps: 0.0,
                 bit_rate_bps: 0,
                 chapter_count: 0,
@@ -12783,6 +12848,17 @@ impl App {
                 self.toggle_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeKey);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoToggleAudioMode)
             }
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoNextAudioTrack, &key) =>
+            {
+                if let Some(label) = self.cycle_video_audio_track(fs_idx) {
+                    self.show_native_video_overlay_toast(label, false);
+                    self.sync_native_video_metadata(fs_idx);
+                }
+                NativeVideoKeyOutcome::Action(KeyAction::VideoNextAudioTrack)
+            }
             _ => {
                 hud_activity = false;
                 NativeVideoKeyOutcome::NoMatch
@@ -13307,6 +13383,7 @@ impl App {
                 // (Codex Medium)。
                 | Ev::SetVolume { .. }
                 | Ev::SetPlaybackSpeed { .. }
+                | Ev::SelectAudioTrack { .. }
                 | Ev::TogglePerfOverlay
                 | Ev::ToggleSidePanelMode
                 | Ev::ToggleBarLock { .. }

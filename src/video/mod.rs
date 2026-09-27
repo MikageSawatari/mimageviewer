@@ -30,6 +30,7 @@ pub mod audio;
 pub mod audio_diagnostics;
 pub mod audio_stretch;
 pub mod audio_track_selection;
+pub mod audio_track_ui;
 pub mod avio_progress;
 pub mod clock;
 pub mod clockless_transcode;
@@ -702,6 +703,9 @@ fn video_scale_feedback_toast(
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 pub enum NativeVideoOutputEvent {
+    SelectAudioTrack {
+        stream_index: usize,
+    },
     Window(native_window::NativeVideoWindowEvent),
     /// Latest presenter-side input ownership snapshot. This is observation
     /// state, not an App command, so `NativeVideoOutput::drain_events` consumes
@@ -4229,6 +4233,9 @@ fn send_native_overlay_command(
 ) {
     use crate::video::native_presenter::NativeOverlayCommand as Command;
     let event = match command {
+        Command::SelectAudioTrack { stream_index } => {
+            NativeVideoOutputEvent::SelectAudioTrack { stream_index }
+        }
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
         Command::SeekRelative { delta_secs } => NativeVideoOutputEvent::SeekRelative { delta_secs },
         Command::SeekMedium { forward } => NativeVideoOutputEvent::SeekMedium { forward },
@@ -6562,6 +6569,13 @@ fn run_native_video_output(
                         let _ = command_index;
                         let event_epoch = source.source_epoch;
                         match command {
+                            crate::video::native_presenter::NativeOverlayCommand::SelectAudioTrack { stream_index } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SelectAudioTrack { stream_index },
+                                );
+                            }
                             crate::video::native_presenter::NativeOverlayCommand::Seek {
                                 target_secs,
                             } => {
@@ -8420,6 +8434,18 @@ impl VideoPlayer {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_desired_audio_track_for_test(&self) {
+        let selection = self
+            .audio_track_selection
+            .as_ref()
+            .expect("audio selection");
+        selection.fail(
+            selection.snapshot().desired,
+            AudioTrackSwitchFailureReason::SetupFailed,
+        );
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_panorama_metadata_for_test(
         &mut self,
         width: u32,
@@ -9242,6 +9268,22 @@ impl VideoPlayer {
         self.audio_track_selection
             .as_ref()
             .map(|selection| selection.snapshot())
+    }
+
+    pub fn audio_track_display_state(&self) -> Option<AudioTrackSelectionDisplayState> {
+        let deferred = self.engine_state_code() == engine::actor::state_code::EOF
+            || (self.intent_playing() && self.clock.is_eof_reached());
+        self.audio_track_selection()
+            .map(|selection| selection.display_state(deferred))
+    }
+
+    /// UI thread polls this on the owning player. A failure is announced once per generation.
+    pub fn take_audio_track_failure_notification(&self) -> bool {
+        let deferred = self.engine_state_code() == engine::actor::state_code::EOF
+            || (self.intent_playing() && self.clock.is_eof_reached());
+        self.audio_track_selection
+            .as_ref()
+            .is_some_and(|selection| selection.take_failure_notification(deferred))
     }
 
     /// Publishes the desired stream before issuing one immediate, position-preserving seek.

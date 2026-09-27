@@ -1779,6 +1779,155 @@ fn draw_native_seek_strip_menu(
     }
 }
 
+pub(crate) fn draw_native_audio_track_menu(
+    ctx: &egui::Context,
+    full_rect: egui::Rect,
+    button_rect: egui::Rect,
+    rows: &[crate::video::audio_track_ui::AudioTrackRow],
+    menu_id: egui::Id,
+    menu_open: &mut bool,
+    menu_rect_out: &mut Option<egui::Rect>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    *menu_rect_out = None;
+    if !*menu_open || rows.len() < 2 {
+        *menu_open = false;
+        return;
+    }
+    let font = egui::FontId::proportional(13.0);
+    let widest = ctx.fonts_mut(|fonts| {
+        rows.iter().fold(0.0_f32, |width, row| {
+            width.max(
+                fonts
+                    .layout_no_wrap(row.label.clone(), font.clone(), egui::Color32::WHITE)
+                    .rect
+                    .width(),
+            )
+        })
+    });
+    let (size, visible_rows) = audio_track_menu_size(full_rect, widest, rows.len());
+    let anchor = native_seek_strip_menu_rect(full_rect, button_rect, size);
+    let max_first = rows.len().saturating_sub(visible_rows);
+    let scroll_id = menu_id.with("first_row");
+    let mut first = ctx
+        .data_mut(|data| data.get_temp::<usize>(scroll_id))
+        .unwrap_or_else(|| {
+            rows.iter()
+                .position(|row| row.is_current)
+                .unwrap_or(0)
+                .min(max_first)
+        })
+        .min(max_first);
+    if anchor.contains(ctx.input(|input| input.pointer.hover_pos().unwrap_or_default())) {
+        let delta = ctx.input(|input| input.raw_scroll_delta.y);
+        if delta < -0.1 {
+            first = (first + 1).min(max_first);
+        }
+        if delta > 0.1 {
+            first = first.saturating_sub(1);
+        }
+    }
+    ctx.data_mut(|data| data.insert_temp(scroll_id, first));
+    let mut drawn_rect = anchor;
+    let mut selected = None;
+    egui::Area::new(menu_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor.min)
+        .show(ctx, |ui| {
+            crate::os_theme::apply_dark_ui(ui);
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            drawn_rect = rect;
+            let painter = ui.painter().clone();
+            let row_painter = ui.painter_at(rect.shrink(6.0));
+            painter.rect_filled(
+                rect,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240),
+            );
+            painter.rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(100)),
+                egui::StrokeKind::Outside,
+            );
+            for (index, row) in rows.iter().enumerate().skip(first).take(visible_rows) {
+                let item_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        rect.min.x + 6.0,
+                        rect.min.y + 6.0 + (index - first) as f32 * SEEK_STRIP_MENU_ROW_HEIGHT,
+                    ),
+                    egui::vec2(rect.width() - 12.0, SEEK_STRIP_MENU_ROW_HEIGHT),
+                );
+                let response = ui
+                    .interact(item_rect, menu_id.with(index), egui::Sense::click())
+                    .hover_tip_dark(&row.label);
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if row.is_current || response.hovered() {
+                    row_painter.rect_filled(
+                        item_rect,
+                        4.0,
+                        if row.is_current {
+                            egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                        },
+                    );
+                }
+                row_painter.text(
+                    egui::pos2(item_rect.min.x + 8.0, item_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &row.label,
+                    font.clone(),
+                    egui::Color32::from_gray(226),
+                );
+                if response.clicked() {
+                    selected = Some(row.stream_index);
+                }
+            }
+        });
+    if let Some(stream_index) = selected {
+        commands.push(NativeOverlayCommand::SelectAudioTrack { stream_index });
+        *menu_open = false;
+    } else if let Some(pos) = ctx.input(|input| input.pointer.press_origin())
+        && !drawn_rect.contains(pos)
+        && !button_rect.contains(pos)
+        && ctx.input(|input| input.pointer.any_pressed())
+    {
+        *menu_open = false;
+    }
+    if *menu_open {
+        *menu_rect_out = Some(drawn_rect);
+    }
+}
+
+fn native_audio_track_menu_id() -> egui::Id {
+    egui::Id::new("native_video_audio_track_menu")
+}
+
+fn reset_native_audio_track_menu_for_source_change(
+    ctx: &egui::Context,
+    menu_open: &mut bool,
+    menu_rect: &mut Option<egui::Rect>,
+) {
+    *menu_open = false;
+    *menu_rect = None;
+    ctx.data_mut(|data| data.remove_temp::<usize>(native_audio_track_menu_id().with("first_row")));
+}
+
+fn audio_track_menu_size(full_rect: egui::Rect, widest: f32, rows: usize) -> (egui::Vec2, usize) {
+    let size = egui::vec2(
+        (widest + 30.0)
+            .max(150.0)
+            .min((full_rect.width() - 16.0).max(80.0)),
+        (rows as f32 * SEEK_STRIP_MENU_ROW_HEIGHT + 12.0)
+            .min((full_rect.height() - 16.0).max(SEEK_STRIP_MENU_ROW_HEIGHT + 12.0)),
+    );
+    let visible_rows = (((size.y - 12.0) / SEEK_STRIP_MENU_ROW_HEIGHT).floor() as usize).max(1);
+    (size, visible_rows)
+}
+
 const SEEK_STRIP_MENU_ROW_HEIGHT: f32 = 26.0;
 const SEEK_STRIP_MENU_TEXT_LEFT: f32 = 14.0;
 const SEEK_STRIP_MENU_VERTICAL_PADDING: f32 = 6.0;
@@ -1829,6 +1978,22 @@ fn native_seek_strip_menu_hud_rect(
     menu_open
         .then_some(last_drawn_rect?)
         .map(|rect| rect.expand(4.0))
+}
+
+fn audio_track_menu_owns_wheel(menu_open: bool, rect: Option<egui::Rect>, pos: egui::Pos2) -> bool {
+    menu_open && rect.is_some_and(|rect| rect.contains(pos))
+}
+
+fn native_wheel_region_owns(
+    over_seek_strip: bool,
+    over_scroll_panel: bool,
+    modal_dialog_visible: bool,
+    audio_menu_open: bool,
+    audio_menu_rect: Option<egui::Rect>,
+    pos: egui::Pos2,
+) -> bool {
+    pointer_region_owns_wheel(over_seek_strip, over_scroll_panel, modal_dialog_visible)
+        || audio_track_menu_owns_wheel(audio_menu_open, audio_menu_rect, pos)
 }
 
 fn seek_status_visible_for_times(
@@ -2327,6 +2492,7 @@ struct NativeEguiOverlay {
     panorama_projection_popup_open: bool,
     /// 右下のストリップボタンのメニューが開いているか。
     seek_strip_menu_open: bool,
+    audio_track_menu_open: bool,
     frame_step_hold: Option<NativeFrameStepHold>,
     video_loop_enabled: bool,
     /// HUD ボタン表示用のループモード (= ユーザー設定の display_mode)。
@@ -2383,6 +2549,7 @@ struct NativeEguiOverlay {
     last_drawn_speed_popup_rect: Option<egui::Rect>,
     /// 直近 egui run で描画したストリップメニューの実 rect。HUD の当たり判定に足す。
     last_drawn_seek_strip_menu_rect: Option<egui::Rect>,
+    last_drawn_audio_track_menu_rect: Option<egui::Rect>,
     /// 直近 egui run で描画した投影方式一覧の actual rect。
     /// HUD HWND の入力 region に同じ矩形を登録し、行クリックが背面の 360 見回し
     /// ドラッグへ抜けないようにする。
@@ -2824,6 +2991,9 @@ pub struct NativeOverlayMetadata {
     pub audio_codec: Option<String>,
     /// 音声ストリーム単体の平均ビットレート (bps)。0 のときは未知。
     pub audio_bit_rate_bps: i64,
+    pub audio_track_rows: Vec<crate::video::audio_track_ui::AudioTrackRow>,
+    pub audio_track_count: usize,
+    pub opened_audio_stream_index: Option<usize>,
     pub avg_fps: f64,
     pub bit_rate_bps: i64,
     pub chapter_count: usize,
@@ -4119,6 +4289,9 @@ fn native_video_fullscreen_shortcut_key(
 
 #[derive(Clone, Debug)]
 pub enum NativeOverlayCommand {
+    SelectAudioTrack {
+        stream_index: usize,
+    },
     Seek {
         target_secs: f64,
     },
@@ -8711,6 +8884,7 @@ impl NativeEguiOverlay {
             video_speed_popup_open: false,
             panorama_projection_popup_open: false,
             seek_strip_menu_open: false,
+            audio_track_menu_open: false,
             frame_step_hold: None,
             video_loop_enabled: false,
             video_loop_mode: crate::settings::VideoLoopMode::Off,
@@ -8745,6 +8919,7 @@ impl NativeEguiOverlay {
             last_drawn_toast_rect: None,
             last_drawn_speed_popup_rect: None,
             last_drawn_seek_strip_menu_rect: None,
+            last_drawn_audio_track_menu_rect: None,
             last_drawn_panorama_projection_popup_rect: None,
             last_drawn_bookmark_editor_rect: None,
             last_drawn_bulk_bookmark_dialog_rect: None,
@@ -9224,8 +9399,14 @@ impl NativeEguiOverlay {
                 ))
                 .rect
                 .contains(pos);
-        let region_owns_wheel =
-            pointer_region_owns_wheel(over_seek_strip, over_scroll_panel, modal_dialog_visible);
+        let region_owns_wheel = native_wheel_region_owns(
+            over_seek_strip,
+            over_scroll_panel,
+            modal_dialog_visible,
+            self.audio_track_menu_open,
+            self.last_drawn_audio_track_menu_rect,
+            pos,
+        );
         let plan = plan_native_wheel(
             wheel,
             [pos.x, pos.y],
@@ -9782,6 +9963,15 @@ impl NativeEguiOverlay {
         if self.video_metadata == metadata {
             self.dirty |= touch_changed;
             return;
+        }
+        if self.video_metadata.as_ref().map(|old| &old.item_key)
+            != metadata.as_ref().map(|new| &new.item_key)
+        {
+            reset_native_audio_track_menu_for_source_change(
+                &self.egui_ctx,
+                &mut self.audio_track_menu_open,
+                &mut self.last_drawn_audio_track_menu_rect,
+            );
         }
         self.video_metadata = metadata;
         self.dirty = true;
@@ -10978,6 +11168,16 @@ impl NativeEguiOverlay {
             }
         }
 
+        if let Some(rect) = native_seek_strip_menu_hud_rect(
+            self.audio_track_menu_open,
+            self.last_drawn_audio_track_menu_rect,
+        ) {
+            let rect_px = rect_to_px(rect);
+            if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
+                regions.push(rect_px);
+            }
+        }
+
         // Bookmark title editor: center modal。`draw_native_bookmark_title_editor` の
         // 実描画 rect (`last_drawn_bookmark_editor_rect`) をそのまま region にする。
         //
@@ -11212,7 +11412,7 @@ impl NativeEguiOverlay {
 
     fn hud_visible(&self) -> bool {
         // メニューはボタンの上に出るので、HUD が引っ込むとメニューごと消える。
-        if self.seek_strip_menu_open {
+        if self.seek_strip_menu_open || self.audio_track_menu_open {
             return true;
         }
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
@@ -11865,6 +12065,9 @@ impl NativeEguiOverlay {
         let mut seek_strip_menu_open = self.seek_strip_menu_open;
         let mut seek_strip_menu_button_rect = None;
         let mut seek_strip_menu_rect = None;
+        let mut audio_track_menu_open = self.audio_track_menu_open;
+        let mut audio_track_button_rect = None;
+        let mut audio_track_menu_rect = None;
         let seek_strip_height = self.seek_strip_height;
         let mut frame_step_hold = self.frame_step_hold;
         let mut seek_row_gesture = self.seek_row_gesture;
@@ -12457,13 +12660,14 @@ impl NativeEguiOverlay {
                         let mute_w = btn_size;
                         let norm_w = btn_size;
                         let speed_w = btn_size * 1.55;
+                        let audio_track_w = if video_metadata.as_ref().is_some_and(|metadata| metadata.audio_track_rows.len() >= 2) { 62.0 } else { 0.0 };
                         let lock_w = btn_size;
                         let seek_strip_selector_reservation = if audio_only {
                             0.0
                         } else {
                             btn_size + gap
                         };
-                        let right_w_full = time_w
+                        let right_w_without_audio = time_w
                             + gap
                             + speed_w
                             + gap
@@ -12478,6 +12682,8 @@ impl NativeEguiOverlay {
                             + seek_strip_selector_reservation
                             + gap
                             + lock_w;
+                        let right_w_full = right_w_without_audio
+                            + if audio_track_w > 0.0 { audio_track_w + gap } else { 0.0 };
                         let right_w_compact = time_w
                             + gap
                             + speed_w
@@ -12516,9 +12722,9 @@ impl NativeEguiOverlay {
                         let total_no_capture =
                             side_pad * 2.0 + left_w_no_capture + gap + right_w_full;
                         let total_no_markers =
-                            side_pad * 2.0 + left_w_no_markers + gap + right_w_full;
+                            side_pad * 2.0 + left_w_no_markers + gap + right_w_without_audio;
                         let total_no_file_nav =
-                            side_pad * 2.0 + left_w_no_file_nav + gap + right_w_full;
+                            side_pad * 2.0 + left_w_no_file_nav + gap + right_w_without_audio;
                         // tier 4 (Minimal) は left = left_w_no_file_nav、right = right_w_compact
                         // で約 571pt 以上で収まる (= 最小窓 640pt 対応)。
 
@@ -12551,6 +12757,9 @@ impl NativeEguiOverlay {
                                 | CompactionTier::NoMarkers
                         );
                         let compact_right_cluster = matches!(tier, CompactionTier::Minimal);
+                        let show_audio_track = audio_track_w > 0.0
+                            && matches!(tier, CompactionTier::Full | CompactionTier::NoCapture);
+                        if !show_audio_track { audio_track_menu_open = false; }
 
                         let mut x = hud_rect.min.x + side_pad;
 
@@ -13010,8 +13219,10 @@ impl NativeEguiOverlay {
                         let show_limiter_slot = !compact_right_cluster;
                         let right_controls_w = if compact_right_cluster {
                             right_w_compact
-                        } else {
+                        } else if show_audio_track {
                             right_w_full
+                        } else {
+                            right_w_without_audio
                         };
                         let right_controls_x = hud_rect.max.x - side_pad - right_controls_w;
                         // 動画 HUD 2 段化リデザイン (Phase 3): bar はシーク行 (上段) に独立配置し、
@@ -13056,9 +13267,22 @@ impl NativeEguiOverlay {
                             egui::vec2(speed_w, btn_size),
                         );
                         let mute_rect = egui::Rect::from_min_size(
-                            egui::pos2(speed_rect.max.x + gap, center_y - btn_size * 0.5),
+                            egui::pos2(speed_rect.max.x + gap + if show_audio_track { audio_track_w + gap } else { 0.0 }, center_y - btn_size * 0.5),
                             egui::vec2(mute_w, btn_size),
                         );
+                        if show_audio_track {
+                            let rect = egui::Rect::from_min_size(
+                                egui::pos2(speed_rect.max.x + gap, center_y - btn_size * 0.5),
+                                egui::vec2(audio_track_w, btn_size),
+                            );
+                            let response = ui.interact(rect, egui::Id::new("native_video_audio_track_button"), egui::Sense::click());
+                            draw_overlay_button_bg(painter, rect, response.hovered(), audio_track_menu_open);
+                            let ordinal = video_metadata.as_ref().and_then(|metadata| metadata.audio_track_rows.iter().find(|row| row.is_current)).map_or(1, |row| row.ordinal);
+                            painter.text(egui::pos2(rect.center().x, text_center_y), egui::Align2::CENTER_CENTER,
+                                format!("音声 {ordinal}"), crate::ui_fonts::hud_text_font(12.0), egui::Color32::from_gray(226));
+                            if response.clicked() { audio_track_menu_open = !audio_track_menu_open; }
+                            audio_track_button_rect = Some(rect);
+                        }
                         let norm_rect = egui::Rect::from_min_size(
                             egui::pos2(mute_rect.max.x + gap, center_y - btn_size * 0.5),
                             egui::vec2(norm_w, btn_size),
@@ -13706,6 +13930,22 @@ impl NativeEguiOverlay {
                 } else {
                     seek_strip_menu_open = false;
                 }
+                if let Some(button_rect) = audio_track_button_rect {
+                    if let Some(metadata) = video_metadata.as_ref() {
+                        draw_native_audio_track_menu(
+                            ctx,
+                            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, overlay_height_points)),
+                            button_rect,
+                            &metadata.audio_track_rows,
+                            native_audio_track_menu_id(),
+                            &mut audio_track_menu_open,
+                            &mut audio_track_menu_rect,
+                            &mut commands,
+                        );
+                    }
+                } else {
+                    audio_track_menu_open = false;
+                }
             } // ← `if bottom_hud_visible {` の閉じ (Codex 4周目 P1)
             // Codex 3周目 P2 反映: 音量ノーマライズ進捗パネルは **すべての overlay UI
             // 描画の最後** に置く。同じ Order::Foreground の Area は描画順 = z-order なので、
@@ -13824,6 +14064,8 @@ impl NativeEguiOverlay {
         if !bottom_hud_visible {
             seek_strip_menu_open = false;
             seek_strip_menu_rect = None;
+            audio_track_menu_open = false;
+            audio_track_menu_rect = None;
             // A release can occur while the strip is hidden and therefore never reach its
             // widgets. Do not carry a pre-hide drag/gesture into a later visible presentation.
             // The accepted RequestWindow dedup and decoded cells remain session resources.
@@ -13832,6 +14074,8 @@ impl NativeEguiOverlay {
         }
         self.seek_strip_menu_open = seek_strip_menu_open;
         self.last_drawn_seek_strip_menu_rect = seek_strip_menu_rect;
+        self.audio_track_menu_open = audio_track_menu_open;
+        self.last_drawn_audio_track_menu_rect = audio_track_menu_rect;
         self.panorama_projection_popup_open = panorama_projection_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.seek_row_gesture = seek_row_gesture;
@@ -14946,6 +15190,125 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audio_track_popup_claims_its_drawn_hud_region() {
+        let drawn = egui::Rect::from_min_size(egui::pos2(700.0, 500.0), egui::vec2(220.0, 80.0));
+        assert_eq!(
+            super::native_seek_strip_menu_hud_rect(true, Some(drawn)),
+            Some(drawn.expand(4.0))
+        );
+        assert_eq!(
+            super::native_seek_strip_menu_hud_rect(false, Some(drawn)),
+            None
+        );
+    }
+
+    #[test]
+    fn audio_track_popup_owns_wheel_before_video_navigation_or_zoom() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(180.0, 80.0));
+        let inside = egui::pos2(120.0, 130.0);
+        let owns = super::native_wheel_region_owns(false, false, false, true, Some(rect), inside);
+        assert!(owns);
+        let plan = super::plan_native_wheel(
+            crate::video::native_window::NativeVideoMouseWheelEvent {
+                x: 120,
+                y: 130,
+                delta: -120,
+                shift: false,
+                ctrl: false,
+                alt: false,
+            },
+            [inside.x, inside.y],
+            owns,
+            true,
+            true,
+            false,
+        );
+        assert!(plan.command.is_none());
+        assert!(plan.deliver_to_egui);
+        assert!(!super::native_wheel_region_owns(
+            false,
+            false,
+            false,
+            false,
+            Some(rect),
+            inside
+        ));
+        assert!(!super::native_wheel_region_owns(
+            false,
+            false,
+            false,
+            true,
+            Some(rect),
+            egui::pos2(350.0, 130.0)
+        ));
+    }
+
+    #[test]
+    fn long_audio_track_menu_stays_in_viewport_and_has_scrollable_rows() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 200.0));
+        let (size, visible_rows) = super::audio_track_menu_size(viewport, 800.0, 20);
+        assert!(size.x <= viewport.width() - 16.0);
+        assert!(size.y <= viewport.height() - 16.0);
+        assert!(visible_rows < 20);
+        let button = egui::Rect::from_min_size(egui::pos2(150.0, 170.0), egui::vec2(62.0, 28.0));
+        let menu = super::native_seek_strip_menu_rect(viewport, button, size);
+        assert!(viewport.contains_rect(menu));
+    }
+
+    #[test]
+    fn audio_track_menu_source_change_discards_scroll_and_reopens_on_current_row() {
+        let ctx = egui::Context::default();
+        let scroll_id = super::native_audio_track_menu_id().with("first_row");
+        ctx.data_mut(|data| data.insert_temp(scroll_id, 0usize));
+        let mut open = true;
+        let mut drawn_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(10.0, 10.0),
+            egui::vec2(100.0, 50.0),
+        ));
+        super::reset_native_audio_track_menu_for_source_change(&ctx, &mut open, &mut drawn_rect);
+        assert!(!open);
+        assert!(drawn_rect.is_none());
+        assert_eq!(ctx.data(|data| data.get_temp::<usize>(scroll_id)), None);
+
+        let rows: Vec<_> = (0..20)
+            .map(|index| crate::video::audio_track_ui::AudioTrackRow {
+                label: format!("{}: Track", index + 1),
+                stream_index: index,
+                ordinal: index + 1,
+                is_current: index == 15,
+                state: crate::video::AudioTrackSelectionDisplayState::Applied,
+            })
+            .collect();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 200.0));
+        let button = egui::Rect::from_min_size(egui::pos2(150.0, 170.0), egui::vec2(62.0, 28.0));
+        let mut commands = Vec::new();
+        open = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            },
+            |ctx| {
+                super::draw_native_audio_track_menu(
+                    ctx,
+                    viewport,
+                    button,
+                    &rows,
+                    super::native_audio_track_menu_id(),
+                    &mut open,
+                    &mut drawn_rect,
+                    &mut commands,
+                );
+            },
+        );
+        let first = ctx
+            .data(|data| data.get_temp::<usize>(scroll_id))
+            .expect("reopened menu should store its first visible row");
+        let (_, visible_rows) = super::audio_track_menu_size(viewport, 100.0, rows.len());
+        assert!(first <= 15 && 15 < first + visible_rows);
+        assert!(drawn_rect.is_some());
+    }
     use crate::video::seek_strip_layout::{
         SeekStripHeight, SeekStripHeightValues, SeekStripLayout, SeekStripSpan,
     };

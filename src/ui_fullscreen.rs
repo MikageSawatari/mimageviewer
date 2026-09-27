@@ -15667,6 +15667,8 @@ pub(crate) struct FsKeyAction {
     pub(crate) mouse_nav: Option<crate::ui_main::AddressBarNav>,
     /// Home/End などの絶対ジャンプ先 item index
     pub(crate) jump_to: Option<usize>,
+    /// The key pass reached the former music Ctrl+wheel slot without an early return.
+    pub(crate) music_ctrl_wheel_gate_reached: bool,
 }
 
 #[derive(Clone)]
@@ -23426,6 +23428,7 @@ impl App {
                                             image_rect,
                                             reserved_panel_width,
                                             fs_idx,
+                                            key_action.music_ctrl_wheel_gate_reached,
                                         );
                                         // 上バーの閉じる× は描画中の直呼びを避け遅延フラグ経由で
                                         // ここで close_fs に合流させる (動画の close_requested と同じ)。
@@ -28073,6 +28076,7 @@ impl App {
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
+            music_ctrl_wheel_gate_reached: false,
         };
 
         // Current focus is not allowed to invalidate an already-routed edge.
@@ -28459,12 +28463,7 @@ impl App {
         // Enter/Space/文字キー/Ctrl+V が奪われて日本語変換や貼り付けが壊れるのを防ぐ
         // (動画は native presenter 側で入力するので同問題は無い)。モーダル表示中は ESC/Space 等の
         // フルスクリーンショートカット (閉じる/再生トグル) も塞いでモーダル操作へ集中させる。
-        if fs_music_view_active
-            && (ctx.wants_keyboard_input()
-                || self.ime_input_active(ctx)
-                || self.music_bookmark_modal_open()
-                || self.music_normalize_modal_active(fs_idx))
-        {
+        if fs_music_view_active && self.music_fullscreen_editor_or_modal_blocks_input(ctx, fs_idx) {
             #[cfg(windows)]
             if let Some(inputs) = video_audio_exit_key_diagnostic.as_ref() {
                 log_video_audio_exit_key_outcome(
@@ -28599,6 +28598,22 @@ impl App {
             );
         }
 
+        #[cfg(windows)]
+        if fs_music_view_active
+            && self.fs_context_menu_idx.is_none()
+            && !self.ime_input_active(ctx)
+            && !ctx.wants_keyboard_input()
+            && !self.music_bookmark_modal_open()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::VideoNextAudioTrack)
+        {
+            if let Some(label) = self.cycle_video_audio_track(fs_idx) {
+                self.show_feedback_toast(label);
+            }
+            return action;
+        }
+
         // 音楽ビュー: Space / Enter で再生・一時停止 (動画の VideoPlayPause = Space+Enter を共有)。
         // 動画の handle_video_input と同じく esc/FsClose 判定より前でここで Enter を先取り consume
         // するので、音声でも動画と同じく Enter = 再生トグル / Esc = 閉じる になる (FsClose の
@@ -28729,33 +28744,11 @@ impl App {
             self.toggle_video_session_mute_for_fs_idx(fs_idx);
         }
 
-        // 音楽ビュー: Ctrl+ホイール上下で Row 秒数 (タイムライン解像度) を切り替える (実機 FB)。
-        // 通常ホイールは前後ファイル移動なので、Ctrl 付きのときだけここで横取りして消費し、下流の
-        // 一般ホイールハンドラ (9400 付近) / 前後移動 / ScrollArea へ渡さない。ホイール上 (wheel_y>0)
-        // = 解像度を上げる (Row 秒数を減らす)。上バーの − / + ステッパーと同じ step_row_secs。
-        if fs_music_view_active
+        // The Ctrl+wheel action is drawn after the HUD so popups can consume it first.
+        // Carry the exact old key-pass reachability across the intervening UI pass.
+        action.music_ctrl_wheel_gate_reached = fs_music_view_active
             && self.fs_context_menu_idx.is_none()
-            && !self.music_bookmark_modal_open()
-        {
-            let (wheel_y, ctrl_held) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
-            if ctrl_held && wheel_y.abs() > 0.5 {
-                let delta = if wheel_y > 0.0 { -1 } else { 1 };
-                let new_secs =
-                    crate::ui_music_timeline::step_row_secs(self.music_timeline_row_secs, delta);
-                if self.set_music_timeline_row_secs_from_input(new_secs) {
-                    self.show_feedback_toast(format!(
-                        "Row {}",
-                        crate::ui_music_timeline::format_row_secs(new_secs)
-                    ));
-                }
-                ctx.input_mut(|i| {
-                    i.raw_scroll_delta = egui::Vec2::ZERO;
-                    i.smooth_scroll_delta = egui::Vec2::ZERO;
-                    i.events
-                        .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-                });
-            }
-        }
+            && !self.music_bookmark_modal_open();
 
         // 音楽ビュー: ←→ でシーク (動画と同じ Small / Medium / Large 設定を使う)。
         // 動画は handle_video_input で処理するが音声は egui 経路なのでここで消費する。プレーン ←→
@@ -33060,6 +33053,22 @@ impl App {
             cursor_in_seek_panel,
             self.fs_seek_drag_active,
         );
+        // The music HUD owns Ctrl+wheel after drawing its popups. An already open
+        // audio or speed popup also owns plain wheel before this early viewer pass.
+        let music_audio_popup_open = music_view_active
+            && panel_fs_idx
+                .and_then(|idx| {
+                    let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&idx)? else {
+                        return None;
+                    };
+                    Some(crate::ui_music_panels::music_audio_track_popup_open(
+                        ctx,
+                        ui.id(),
+                        idx,
+                        player.path(),
+                    ))
+                })
+                .unwrap_or(false);
         let handle_wheel_here = should_handle_fullscreen_wheel(
             cursor_in_panel_for_wheel,
             in_video_tile,
@@ -33070,8 +33079,9 @@ impl App {
                 || self.slideshow_popup_open
                 || self.panorama_projection_popup_open
                 || fs_rotation_popup_open(ctx)
-                || fs_still_seek_strip_popup_open(ctx),
-        );
+                || fs_still_seek_strip_popup_open(ctx)
+                || (music_view_active && (music_audio_popup_open || self.music_speed_popup_open)),
+        ) && !(music_view_active && ctrl_held);
         #[cfg(windows)]
         if self.viewer_session_is_detached_or_switching()
             && Self::detached_image_window_debug_enabled()
@@ -46441,6 +46451,21 @@ impl App {
         }
 
         #[cfg(windows)]
+        if self.fs_context_menu_idx.is_none()
+            && !ctx.wants_keyboard_input()
+            && !self.any_modal_dialog_open_for_fullscreen_keys()
+            && !self.normalize_scan_is_modal_for_current_player(fs_idx)
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::VideoNextAudioTrack)
+        {
+            if let Some(label) = self.cycle_video_audio_track(fs_idx) {
+                self.show_native_video_overlay_toast(label, false);
+            }
+            return;
+        }
+
+        #[cfg(windows)]
         // handle_video_input is currently called only outside the ordinary music view, but keep
         // the visibility rule explicit so a future caller cannot make hidden audio mode consume
         // an FsVideo slot key. Do not simplify this to video_audio_mode != Some(fs_idx): the VST
@@ -47128,6 +47153,56 @@ impl App {
         true
     }
 
+    fn music_fullscreen_editor_or_modal_blocks_input(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> bool {
+        ctx.wants_keyboard_input()
+            || self.ime_input_active(ctx)
+            || self.music_bookmark_modal_open()
+            || self.music_normalize_modal_active(fs_idx)
+    }
+
+    fn handle_music_timeline_ctrl_wheel_after_hud(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        key_gate_reached: bool,
+    ) {
+        if !key_gate_reached
+            || crate::keyboard_input::keyboard_input_permits(ctx)
+                .discrete
+                .is_none()
+            || self.any_modal_dialog_open_for_fullscreen_keys()
+            || fs_still_seek_strip_popup_open(ctx)
+            || self.fs_context_menu_idx.is_some()
+            || self.music_fullscreen_editor_or_modal_blocks_input(ctx, fs_idx)
+        {
+            return;
+        }
+        // The HUD popups have consumed their wheel events by this point. Wheel up
+        // raises timeline resolution, like the Row stepper in the top chrome.
+        let (wheel_y, ctrl_held) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
+        if !ctrl_held || wheel_y.abs() <= 0.5 {
+            return;
+        }
+        let delta = if wheel_y > 0.0 { -1 } else { 1 };
+        let new_secs = crate::ui_music_timeline::step_row_secs(self.music_timeline_row_secs, delta);
+        if self.set_music_timeline_row_secs_from_input(new_secs) {
+            self.show_feedback_toast(format!(
+                "Row {}",
+                crate::ui_music_timeline::format_row_secs(new_secs)
+            ));
+        }
+        ctx.input_mut(|i| {
+            i.raw_scroll_delta = egui::Vec2::ZERO;
+            i.smooth_scroll_delta = egui::Vec2::ZERO;
+            i.events
+                .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+        });
+    }
+
     /// fs_idx で「音楽ビュー」(DJ 波形タイムライン + スペクトラム + 上下バー/左右パネル) が
     /// 表示されているか。用途 = 表示 dispatch / 画像用パネルの抑止 / 音楽ビュー用のキーゲート
     /// (画像・動画ショートカットの consume 抑止と音楽キーの有効化)。
@@ -47177,6 +47252,7 @@ impl App {
         rect: egui::Rect,
         reserved_info_panel_w: f32,
         fs_idx: usize,
+        music_ctrl_wheel_key_gate_reached: bool,
     ) -> MusicViewFrameUiState {
         // 音楽ビューは動画フルスクリーンと同じく黒背景ベースで統一する。App テーマが Light でも
         // ここは常にダーク配色にする (CLAUDE.md「フルスクリーン内は黒背景ベース統一」、実機 FB:
@@ -47387,7 +47463,26 @@ impl App {
         );
         let left_hover = frame_ui.left_panel_visible;
         let right_hover = frame_ui.right_panel_visible;
-        let pointer_over_panel = left_hover || right_hover || music_modal_open;
+        let audio_track_popup_open = self
+            .fs_cache
+            .get(&fs_idx)
+            .and_then(|entry| {
+                let FsCacheEntry::Video { player, .. } = entry else {
+                    return None;
+                };
+                Some(crate::ui_music_panels::music_audio_track_popup_open(
+                    ctx,
+                    ui.id(),
+                    fs_idx,
+                    player.path(),
+                ))
+            })
+            .unwrap_or(false);
+        let pointer_over_panel = left_hover
+            || right_hover
+            || music_modal_open
+            || audio_track_popup_open
+            || self.music_speed_popup_open;
 
         let show_timeline = !music_shell_active
             && self
@@ -47402,8 +47497,8 @@ impl App {
             playing,
             show_timeline,
         );
-        // 左右パネルは中央タイムラインに重なるため、パネル上のホイールを背面の ScrollArea へ
-        // 渡さない。パネル自身は後段で描くので、描画後に delta を復元して従来どおり受け取らせる。
+        // 左右パネルと HUD popup は中央タイムラインに重なる。ホイールを一度退避し、
+        // 後段のパネル・popup 描画前に戻して背面の ScrollArea に渡さない。
         let panel_scroll_deltas = pointer_over_panel.then(|| {
             ctx.input_mut(|i| {
                 let deltas = (i.raw_scroll_delta, i.smooth_scroll_delta);
@@ -47689,6 +47784,11 @@ impl App {
             &active_chrome,
             dark,
             !music_modal_open,
+        );
+        self.handle_music_timeline_ctrl_wheel_after_hud(
+            ctx,
+            fs_idx,
+            music_ctrl_wheel_key_gate_reached,
         );
 
         // 再生前ノーマライズスキャン中は最前面にモーダル進捗パネルを描く (windows 限定)。
@@ -59797,12 +59897,14 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
+                let mut music_ctrl_wheel_key_gate_reached = false;
                 if route_music_keyboard_first {
                     let fs_idx = app
                         .fullscreen_idx
                         .expect("music fixture has a current item");
                     let action = app.handle_fs_key_input(ctx, fs_idx, false);
                     assert!(action.page_nav.is_none());
+                    music_ctrl_wheel_key_gate_reached = action.music_ctrl_wheel_gate_reached;
                 }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
@@ -59818,6 +59920,14 @@ mod tests {
                             &mut navigator_reservation,
                         );
                     });
+                if route_music_keyboard_first {
+                    let fs_idx = app.fullscreen_idx.unwrap();
+                    app.handle_music_timeline_ctrl_wheel_after_hud(
+                        ctx,
+                        fs_idx,
+                        music_ctrl_wheel_key_gate_reached,
+                    );
+                }
             },
         );
         result
@@ -65116,6 +65226,184 @@ mod tests {
         assert!(!should_handle_fullscreen_wheel(
             false, false, true, false, true
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn music_audio_track_popup_consumes_ctrl_wheel_before_row_step() {
+        use crate::video::AudioTrackSelectionDisplayState;
+        use crate::video::audio_track_ui::AudioTrackRow;
+
+        let mut app = crate::app::setup_app_for_test();
+        let before = app.music_timeline_row_secs;
+        let rows = [
+            AudioTrackRow {
+                label: "1: 日本語 — aac 2ch".into(),
+                stream_index: 1,
+                ordinal: 1,
+                is_current: true,
+                state: AudioTrackSelectionDisplayState::Applied,
+            },
+            AudioTrackRow {
+                label: "2: 英語 — ac3 6ch".into(),
+                stream_index: 2,
+                ordinal: 2,
+                is_current: false,
+                state: AudioTrackSelectionDisplayState::Applied,
+            },
+        ];
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let modifiers = egui::Modifiers::CTRL;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 300.0),
+                )),
+                modifiers,
+                events: vec![
+                    egui::Event::PointerMoved(egui::pos2(220.0, 220.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, -1.0),
+                        modifiers,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let id = ui.id().with("music_audio_popup_wheel_regression");
+                    ctx.data_mut(|data| data.insert_temp(id, true));
+                    let button =
+                        egui::Rect::from_min_size(egui::pos2(200.0, 270.0), egui::vec2(62.0, 28.0));
+                    crate::ui_music_panels::draw_music_audio_track_selector(
+                        ui, button, &rows, true, id,
+                    );
+                    assert!(ctx.data(|data| data.get_temp::<bool>(id).unwrap_or(false)));
+                    app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
+                });
+            },
+        );
+        assert_eq!(app.music_timeline_row_secs, before);
+    }
+
+    #[test]
+    fn music_ctrl_wheel_blocks_row_step_with_text_edit_focus() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let edit_id = egui::Id::new("music_ctrl_wheel_text_edit");
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::ime_focus::add_singleline(ui, &mut text, None, |edit| edit.id(edit_id))
+                    .request_focus();
+            });
+        });
+        let before = app.music_timeline_row_secs;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: egui::Modifiers::CTRL,
+                events: vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    crate::ime_focus::add_singleline(ui, &mut text, None, |edit| edit.id(edit_id));
+                });
+                assert!(ctx.wants_keyboard_input());
+                assert!(ctx.input(|input| input.raw_scroll_delta.y.abs() > 0.5));
+                app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
+            },
+        );
+        assert_eq!(app.music_timeline_row_secs, before);
+    }
+
+    #[test]
+    fn music_ctrl_wheel_blocks_row_step_during_ime_input() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        let before = app.music_timeline_row_secs;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: egui::Modifiers::CTRL,
+                events: vec![
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".into())),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, -1.0),
+                        modifiers: egui::Modifiers::CTRL,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(app.ime_input_active(ctx));
+                assert!(ctx.input(|input| input.raw_scroll_delta.y.abs() > 0.5));
+                app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
+            },
+        );
+        assert_eq!(app.music_timeline_row_secs, before);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn music_ctrl_wheel_blocks_row_step_during_normalize_modal() {
+        let mut app = crate::app::setup_app_for_test();
+        let path = PathBuf::from("c:/test/music-ctrl-wheel-norm.mkv");
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 1);
+        assert_eq!(player.applied_audio_stream_index(), Some(1));
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            owner_context_id: crate::app::ViewerContextId::for_test(0),
+            fs_idx: 0,
+            stream_index: 1,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress: std::sync::Arc::new(
+                crate::video::normalize_scanner::NormalizeScanProgress::default(),
+            ),
+            rx: std::sync::mpsc::channel().1,
+            was_playing: true,
+            file_path: path,
+            target_lufs_milli: -14_000,
+            provisional_applied: false,
+            provisional_result: None,
+            _join: std::thread::spawn(|| {}),
+        });
+        assert!(app.music_normalize_modal_active(0));
+        let ctx = egui::Context::default();
+        let before = app.music_timeline_row_secs;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: egui::Modifiers::CTRL,
+                events: vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(ctx.input(|input| input.raw_scroll_delta.y.abs() > 0.5));
+                app.handle_music_timeline_ctrl_wheel_after_hud(ctx, 0, true);
+            },
+        );
+        assert_eq!(app.music_timeline_row_secs, before);
     }
 
     #[test]
