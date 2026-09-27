@@ -20,6 +20,7 @@ bench_thumbs.tsv
 /vendor/vst3sdk
 /vendor/vst3-host
 /vendor/twemoji
+/vendor/effetune-mixwright
 /vendor/bench_baseline.json
 /crates/vst3-host/build
 /dev/
