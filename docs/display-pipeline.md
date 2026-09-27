@@ -225,11 +225,17 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 
 サムネイル四隅 overlay の計測・padding・配置は `src/thumb_overlay_layout.rs` の
 `ThumbnailOverlayLayout` が所有する。v2.9.1 では左上と左下を移行済み。左上は
-ブックマーク時刻 → 動画 `UP` → 編集状態 / pin → タグの順に実測幅を予約し、幅不足時は
-タグだけを省略または非表示にする。描画とタグ hover / click は同じ `BadgePlacement.rect` を
+ブックマーク時刻 → 動画 `UP` → 編集状態 / pin → タグの順に実測幅を予約する。幅不足時は
+時刻・`UP` を省略表示し、編集状態は順序を保って入る分を置き、残りを ASCII の `+N` にまとめる。
+タグは残る幅に応じて省略または非表示にする。描画とタグ hover / click は同じ `BadgePlacement.rect` を
 使う。左下はフォルダ名または形式バッジとファイル名プレートを同じ下段へ配置し、その実測行の
-上へ評価を積む。色・角丸・フォントなど各要素の見た目は `ui_helpers.rs` の個別描画関数が持つ。
+上へ評価を積む。評価の星が収まらない幅では数値へ短縮し、セル外や優先順位が高い左上の表示に
+重なる場合は左下の低優先要素を表示しない。色・角丸・フォントなど各要素の見た目は
+`ui_helpers.rs` の個別描画関数が持つ。
 右上のチェック / スタック枚数と右下の絞り込み件数は未移行で、バックログ §2.2 第3段階に残す。
+スタック枚数と絞り込み件数も狭幅では文字を短縮し、`draw_cell` の内容はセル内に clip する。
+補正済みサムネイルの可視セル生成は `thumb.adjustment_build` perf event で色調処理と
+`ctx.load_texture` を分けて計測できる。
 
 **Video ピンの特殊経路**: pin source が動画の場合は `seed_folder_video_pin_thumbs`
 が起動時に `video_pins` DB の抽出済み WebP を pinned cache key として catalog にミラー

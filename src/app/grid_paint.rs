@@ -105,10 +105,14 @@ fn draw_thumb(
 /// スタックは複数枚画像をまとめた仮想コンテナなので、通常画像との見分けを付ける。
 /// スタックはチェック非対象なので右上のチェックオーバーレイとは衝突しない。
 fn draw_stack_count_badge(painter: &egui::Painter, inner: egui::Rect, count: usize) {
-    let text = format!("{count} 枚");
     let font = egui::FontId::proportional((inner.height() * 0.09).clamp(11.0, 16.0));
-    let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
     let pad = egui::vec2(6.0, 3.0);
+    let available = inner.width() - 4.0 - pad.x * 2.0;
+    let galley = [format!("{count} 枚"), count.to_string(), "…".to_owned()]
+        .into_iter()
+        .map(|text| painter.layout_no_wrap(text, font.clone(), egui::Color32::WHITE))
+        .find(|galley| galley.size().x <= available);
+    let Some(galley) = galley else { return };
     let size = galley.size() + pad * 2.0;
     // バッジの右上をセル右上 (inner.max.x-4, inner.min.y+4) に合わせる。
     let anchor = egui::pos2(inner.max.x - 4.0, inner.min.y + 4.0);
@@ -396,7 +400,8 @@ pub(crate) fn draw_cell(
     }
 
     let base_painter = ui.painter();
-    let mut content_painter = base_painter.clone();
+    // Labels and placeholders also belong to this cell, including at the 32pt width floor.
+    let mut content_painter = base_painter.with_clip_rect(rect);
     let content_opacity = if is_cut {
         crate::cut_clipboard::CUT_CONTENT_OPACITY
     } else {
@@ -802,10 +807,15 @@ pub(crate) fn draw_cell(
         crate::ui_helpers::draw_overlay_upscaled_video_badge(painter, placement);
     }
     for placement in &overlay_layout.top_left.edit_badges {
-        let crate::thumb_overlay_layout::BadgeKind::Edit(kind) = placement.kind else {
-            continue;
-        };
-        crate::ui_helpers::draw_overlay_edit_badge(painter, placement, kind);
+        match placement.kind {
+            crate::thumb_overlay_layout::BadgeKind::Edit(kind) => {
+                crate::ui_helpers::draw_overlay_edit_badge(painter, placement, kind);
+            }
+            crate::thumb_overlay_layout::BadgeKind::EditOverflow => {
+                crate::ui_helpers::draw_overlay_edit_overflow_badge(painter, placement);
+            }
+            _ => {}
+        }
     }
     if let Some(placement) = overlay_layout.top_left.tag.as_ref() {
         crate::ui_helpers::draw_overlay_tag_badge(painter, placement);
@@ -931,9 +941,14 @@ fn draw_filter_match_badge(painter: &egui::Painter, cell_rect: egui::Rect, count
         count.to_string()
     };
     let font = egui::FontId::proportional(11.0);
-    let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
     let pad_x = 5.0;
     let pad_y = 2.0;
+    let available = cell_rect.width() - 6.0 - pad_x * 2.0;
+    let galley = [text, "…".to_owned()]
+        .into_iter()
+        .map(|text| painter.layout_no_wrap(text, font.clone(), egui::Color32::WHITE))
+        .find(|galley| galley.size().x <= available);
+    let Some(galley) = galley else { return };
     let bg_w = galley.size().x + pad_x * 2.0;
     let bg_h = galley.size().y + pad_y * 2.0;
     let bg_rect = egui::Rect::from_min_size(

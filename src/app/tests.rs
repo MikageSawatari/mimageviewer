@@ -18719,6 +18719,80 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    /// 4K / Windows 175%: 3840x2160 becomes about 2194x1234 logical points. Allowing for
+    /// toolbars and one partially visible row gives 6x10 or 11x20 visible square cells.
+    /// Run explicitly with `--ignored --nocapture`; this is a timing probe, not a CI threshold.
+    #[test]
+    #[ignore = "manual 4K/175% thumbnail adjustment timing probe"]
+    fn visible_thumb_adjustment_4k_175pct_timing() {
+        use crate::grid_item::GridItem;
+        use std::sync::Arc;
+
+        let mut app = setup_app();
+        let log_path = app.tmp.path().join("grid20-adjustment-perf.jsonl");
+        crate::perf::init_with_path(true, None, Some(log_path.clone()));
+        assert!(crate::perf::is_enabled());
+        app.settings.global_preset.brightness = 20.0;
+        let ctx = egui::Context::default();
+
+        for (cols, rows, side) in [(10, 6, 384usize), (20, 11, 192usize)] {
+            let cells = cols * rows;
+            app.items = (0..cells)
+                .map(|idx| GridItem::Image(format!("C:/grid20-bench/{idx}.jpg").into()))
+                .collect();
+            app.thumb_pixels.clear();
+            app.thumb_adjust_tex.clear();
+            let source = egui::ColorImage::new(
+                [side, side],
+                (0..side * side)
+                    .map(|pixel| {
+                        let x = pixel % side;
+                        let y = pixel / side;
+                        egui::Color32::from_rgb(x as u8, y as u8, (x ^ y) as u8)
+                    })
+                    .collect(),
+            );
+            for idx in 0..cells {
+                app.thumb_pixels.insert(idx, Arc::new(source.clone()));
+            }
+
+            let started = std::time::Instant::now();
+            for idx in 0..cells {
+                app.maybe_apply_thumb_adjustment(&ctx, idx);
+                assert!(app.thumb_adjust_tex.contains_key(&idx));
+            }
+            let frame_ms = started.elapsed().as_secs_f64() * 1000.0;
+            crate::perf::flush();
+            let events: Vec<serde_json::Value> = std::fs::read_to_string(&log_path)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| event["kind"] == "adjustment_build" && event["width"] == side)
+                .collect();
+            assert_eq!(events.len(), cells);
+            let stats = |name: &str| {
+                let values: Vec<f64> = events
+                    .iter()
+                    .map(|event| event[name].as_f64().unwrap())
+                    .collect();
+                let mean = values.iter().sum::<f64>() / cells as f64;
+                let max = values.iter().copied().fold(0.0_f64, f64::max);
+                (mean, max)
+            };
+            let (apply_mean, apply_max) = stats("apply_ms");
+            let (texture_mean, texture_max) = stats("texture_ms");
+            let (cell_mean, cell_max) = stats("total_ms");
+            println!(
+                "cols={cols} cells={cells} pixels={side}x{side} frame_ms={frame_ms:.3} \
+                 apply_mean/max_ms={apply_mean:.3}/{apply_max:.3} \
+                 texture_mean/max_ms={texture_mean:.3}/{texture_max:.3} \
+                 cell_mean/max_ms={cell_mean:.3}/{cell_max:.3} \
+                 conservative_frame_ms={:.3}",
+                cell_max * cells as f64
+            );
+        }
+    }
+
     /// 旧選択アイテムが新 items から消えた場合は内容キー復元を諦め、
     /// 常時可視カーソルの不変条件に従って先頭の選択可能アイテムへフォールバックする。
     #[test]

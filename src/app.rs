@@ -72153,6 +72153,7 @@ impl App {
         let Some(pixels) = self.thumb_pixels.get(&idx).cloned() else {
             return;
         };
+        let build_started = crate::perf::is_enabled().then(std::time::Instant::now);
         let from_edit_preview = self.thumb_edit_preview_layers.contains_key(&idx);
         let mut adjusted = {
             let params = self.effective_params(idx);
@@ -72171,12 +72172,40 @@ impl App {
             adjusted =
                 crate::edit_preview_cache::composite_cached_annotation_layers(&adjusted, layers);
         }
+        let apply_ms = build_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+        let texture_started = build_started.map(|_| std::time::Instant::now());
+        let image_size = adjusted.size;
         let handle = ctx.load_texture(
             format!("thumb_adj_{idx}"),
             adjusted,
             egui::TextureOptions::LINEAR,
         );
         self.thumb_adjust_tex.insert(idx, handle);
+        if let (Some(started), Some(texture_started), Some(apply_ms)) =
+            (build_started, texture_started, apply_ms)
+        {
+            crate::perf::event(
+                "thumb",
+                "adjustment_build",
+                None,
+                self.items_generation,
+                &[
+                    ("idx", serde_json::Value::from(idx)),
+                    ("width", serde_json::Value::from(image_size[0])),
+                    ("height", serde_json::Value::from(image_size[1])),
+                    ("edit_preview", serde_json::Value::from(from_edit_preview)),
+                    ("apply_ms", serde_json::Value::from(apply_ms)),
+                    (
+                        "texture_ms",
+                        serde_json::Value::from(texture_started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "total_ms",
+                        serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
     }
 
     /// keep_set 内の「ピクセルは持っているが補正テクスチャがまだ無い」idx を

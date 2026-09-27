@@ -99,6 +99,7 @@ pub enum BadgeKind {
     BookmarkTime,
     UpscaledVideo,
     Edit(EditBadgeKind),
+    EditOverflow,
     Tag,
     BottomContainer(BottomContainerKind),
     Rating,
@@ -358,44 +359,82 @@ pub fn layout_thumbnail_overlays(
     let mut top_left = TopLeftOverlayLayout::default();
     let mut cursor_x = input.cell.min.x + TOP_LEFT_OFFSET;
     let top_y = input.cell.min.y + TOP_LEFT_OFFSET;
+    let top_right = input.cell.max.x - TOP_LEFT_OFFSET;
 
     if let Some(text) = input.bookmark_time {
-        let placement = natural_placement(
-            BadgeKind::BookmarkTime,
-            BadgePriority::BookmarkTime,
-            text,
-            bookmark_time_style(),
-            egui::pos2(cursor_x, top_y),
-            &mut measure,
-        );
-        cursor_x = placement.rect.max.x + TOP_LEFT_GAP;
-        top_left.bookmark_time = Some(placement);
+        let style = bookmark_time_style();
+        let available = top_right - cursor_x - style.padding.left - style.padding.right;
+        if let Some(text) = fit_text(text, None, available, &mut measure, style) {
+            let placement = natural_placement(
+                BadgeKind::BookmarkTime,
+                BadgePriority::BookmarkTime,
+                &text,
+                style,
+                egui::pos2(cursor_x, top_y),
+                &mut measure,
+            );
+            cursor_x = placement.rect.max.x + TOP_LEFT_GAP;
+            top_left.bookmark_time = Some(placement);
+        }
     }
 
     if input.upscaled_video {
-        let placement = natural_placement(
-            BadgeKind::UpscaledVideo,
-            BadgePriority::UpscaledVideo,
-            "UP",
-            upscaled_video_style(input.inner),
-            egui::pos2(cursor_x, top_y),
-            &mut measure,
-        );
-        cursor_x = placement.rect.max.x + TOP_LEFT_GAP;
-        top_left.upscaled_video = Some(placement);
+        let style = upscaled_video_style(input.inner);
+        let available = top_right - cursor_x - style.padding.left - style.padding.right;
+        if let Some(text) = fit_text("UP", None, available, &mut measure, style) {
+            let placement = natural_placement(
+                BadgeKind::UpscaledVideo,
+                BadgePriority::UpscaledVideo,
+                &text,
+                style,
+                egui::pos2(cursor_x, top_y),
+                &mut measure,
+            );
+            cursor_x = placement.rect.max.x + TOP_LEFT_GAP;
+            top_left.upscaled_video = Some(placement);
+        }
     }
 
-    for kind in input.edit_badges.active() {
+    let active_edits: Vec<_> = input.edit_badges.active().collect();
+    for (index, kind) in active_edits.iter().copied().enumerate() {
+        let style = edit_badge_style();
         let placement = natural_placement(
             BadgeKind::Edit(kind),
             BadgePriority::EditState,
             kind.text(),
+            style,
+            egui::pos2(cursor_x, top_y),
+            &mut measure,
+        );
+        let remaining = active_edits.len() - index - 1;
+        let summary_fits = if remaining == 0 {
+            true
+        } else {
+            let summary = format!("+{remaining}");
+            let summary_width = measured_badge_size(&summary, style, &mut measure).x;
+            placement.rect.max.x + TOP_LEFT_GAP + summary_width <= top_right
+        };
+        if placement.rect.max.x > top_right || !summary_fits {
+            break;
+        }
+        cursor_x = placement.rect.max.x + TOP_LEFT_GAP;
+        top_left.edit_badges.push(placement);
+    }
+    let hidden_edits = active_edits.len() - top_left.edit_badges.len();
+    if hidden_edits > 0 {
+        let summary = format!("+{hidden_edits}");
+        let placement = natural_placement(
+            BadgeKind::EditOverflow,
+            BadgePriority::EditState,
+            &summary,
             edit_badge_style(),
             egui::pos2(cursor_x, top_y),
             &mut measure,
         );
-        cursor_x = placement.rect.max.x + TOP_LEFT_GAP;
-        top_left.edit_badges.push(placement);
+        if placement.rect.max.x <= top_right {
+            cursor_x = placement.rect.max.x + TOP_LEFT_GAP;
+            top_left.edit_badges.push(placement);
+        }
     }
 
     let combined_tags = combine_tags(input.tags);
@@ -436,13 +475,19 @@ pub fn layout_thumbnail_overlays(
         let max_text_width = (max_badge_width - style.padding.left - style.padding.right).max(0.0);
         if let Some(text) = fit_text(container.label, None, max_text_width, &mut measure, style) {
             let size = measured_badge_size(&text, style, &mut measure);
-            bottom_left.container = Some(BadgePlacement {
+            let placement = BadgePlacement {
                 kind: BadgeKind::BottomContainer(container.kind),
                 priority: BadgePriority::BottomContainer,
                 rect: egui::Rect::from_min_size(egui::pos2(left_x, bottom_y - size.y), size),
                 text,
                 style,
-            });
+            };
+            if !top_left
+                .placements()
+                .any(|top| top.rect.intersects(placement.rect))
+            {
+                bottom_left.container = Some(placement);
+            }
         }
     }
 
@@ -460,7 +505,7 @@ pub fn layout_thumbnail_overlays(
         {
             let size = measured_badge_size(&text, style, &mut measure);
             let center_x = (available_left + available_right) * 0.5;
-            bottom_left.filename = Some(BadgePlacement {
+            let placement = BadgePlacement {
                 kind: BadgeKind::Filename,
                 priority: BadgePriority::Filename,
                 rect: egui::Rect::from_min_size(
@@ -469,42 +514,72 @@ pub fn layout_thumbnail_overlays(
                 ),
                 text,
                 style,
-            });
+            };
+            if !top_left
+                .placements()
+                .any(|top| top.rect.intersects(placement.rect))
+            {
+                bottom_left.filename = Some(placement);
+            }
         }
     }
 
     if let Some(rating_text) = input.rating_text {
         let style = rating_badge_style();
-        let size = measured_badge_size(rating_text, style, &mut measure);
-        // The rating belongs in the corner. It only moves up when something already in the
-        // bottom row would sit under it: a container badge is anchored to the same corner and
-        // always does, a filename plate is centred and usually does not. Lifting it
-        // unconditionally left the stars floating over the picture on a plain video cell.
-        let corner = egui::Rect::from_min_size(egui::pos2(left_x, bottom_y - size.y), size);
-        let blocked = bottom_left
-            .container
-            .iter()
-            .chain(bottom_left.filename.iter())
-            .any(|placement| placement.rect.intersects(corner));
-        let rect = if blocked {
-            let row_top = bottom_left
+        let available = input.inner.max.x - BOTTOM_LEFT_OFFSET - left_x;
+        let compact_rating = rating_text
+            .chars()
+            .filter(|&ch| ch == '★')
+            .count()
+            .to_string();
+        let text = if measured_badge_size(rating_text, style, &mut measure).x <= available {
+            Some(rating_text.to_owned())
+        } else if compact_rating != "0"
+            && measured_badge_size(&compact_rating, style, &mut measure).x <= available
+        {
+            Some(compact_rating)
+        } else {
+            None
+        };
+        if let Some(text) = text {
+            let size = measured_badge_size(&text, style, &mut measure);
+            // The rating belongs in the corner. It only moves up when something already in the
+            // bottom row would sit under it: a container badge is anchored to the same corner and
+            // always does, a filename plate is centred and usually does not. Lifting it
+            // unconditionally left the stars floating over the picture on a plain video cell.
+            let corner = egui::Rect::from_min_size(egui::pos2(left_x, bottom_y - size.y), size);
+            let blocked = bottom_left
                 .container
                 .iter()
                 .chain(bottom_left.filename.iter())
-                .map(|placement| placement.rect.min.y)
-                .reduce(f32::min)
-                .unwrap_or(bottom_y);
-            egui::Rect::from_min_size(egui::pos2(left_x, row_top - BOTTOM_ITEM_GAP - size.y), size)
-        } else {
-            corner
-        };
-        bottom_left.rating = Some(BadgePlacement {
-            kind: BadgeKind::Rating,
-            priority: BadgePriority::Rating,
-            rect,
-            text: rating_text.to_owned(),
-            style,
-        });
+                .any(|placement| placement.rect.intersects(corner));
+            let rect = if blocked {
+                let row_top = bottom_left
+                    .container
+                    .iter()
+                    .chain(bottom_left.filename.iter())
+                    .map(|placement| placement.rect.min.y)
+                    .reduce(f32::min)
+                    .unwrap_or(bottom_y);
+                egui::Rect::from_min_size(
+                    egui::pos2(left_x, row_top - BOTTOM_ITEM_GAP - size.y),
+                    size,
+                )
+            } else {
+                corner
+            };
+            if rect.min.y >= input.cell.min.y
+                && !top_left.placements().any(|top| top.rect.intersects(rect))
+            {
+                bottom_left.rating = Some(BadgePlacement {
+                    kind: BadgeKind::Rating,
+                    priority: BadgePriority::Rating,
+                    rect,
+                    text,
+                    style,
+                });
+            }
+        }
     }
 
     ThumbnailOverlayLayout {
@@ -590,6 +665,11 @@ mod tests {
         (cell, cell.shrink(4.0))
     }
 
+    fn square_cell(width: f32) -> (egui::Rect, egui::Rect) {
+        let cell = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(width, width));
+        (cell, cell.shrink(4.0))
+    }
+
     fn assert_pairwise_non_intersecting<'a>(
         placements: impl IntoIterator<Item = &'a BadgePlacement>,
     ) {
@@ -603,6 +683,99 @@ mod tests {
 
     fn tags(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn assert_placements_inside_cell(layout: &ThumbnailOverlayLayout, cell: egui::Rect) {
+        for placement in layout
+            .top_left
+            .placements()
+            .chain(layout.bottom_left.placements())
+        {
+            assert!(
+                cell.contains_rect(placement.rect),
+                "{:?} escaped {:?}: {:?}",
+                placement.kind,
+                cell,
+                placement.rect
+            );
+        }
+    }
+
+    #[test]
+    fn edit_markers_fit_at_minimum_and_twenty_column_cell_widths() {
+        for width in [32.0, 100.0] {
+            let (cell, inner) = square_cell(width);
+            let layout = layout_thumbnail_overlays(
+                ThumbnailOverlayLayoutInput {
+                    cell,
+                    inner,
+                    bookmark_time: None,
+                    upscaled_video: false,
+                    edit_badges: EditBadgeFlags {
+                        page_override: true,
+                        local_adjust: true,
+                        mask: true,
+                        conceal: true,
+                        comic: true,
+                        crop: true,
+                        pin: true,
+                    },
+                    tags: &[],
+                    bottom_container: None,
+                    rating_text: None,
+                    filename: None,
+                },
+                measure,
+            );
+            assert_placements_inside_cell(&layout, cell);
+            let summary = layout.top_left.edit_badges.last().unwrap();
+            assert_eq!(summary.kind, BadgeKind::EditOverflow);
+            let displayed = layout.top_left.edit_badges.len() - 1;
+            assert_eq!(summary.text, format!("+{}", 7 - displayed));
+            assert_pairwise_non_intersecting(layout.top_left.placements());
+        }
+    }
+
+    #[test]
+    fn dense_overlays_stay_inside_narrow_cells() {
+        let tags = tags(&["#長い日本語のタグ"]);
+        for width in [32.0, 100.0] {
+            let (cell, inner) = square_cell(width);
+            let layout = layout_thumbnail_overlays(
+                ThumbnailOverlayLayoutInput {
+                    cell,
+                    inner,
+                    bookmark_time: Some("12:34"),
+                    upscaled_video: true,
+                    edit_badges: EditBadgeFlags {
+                        page_override: true,
+                        local_adjust: true,
+                        mask: true,
+                        conceal: true,
+                        comic: true,
+                        crop: true,
+                        pin: true,
+                    },
+                    tags: &tags,
+                    bottom_container: Some(BottomContainerInput {
+                        kind: BottomContainerKind::Format(FormatBadgeKind::Pdf),
+                        label: "PDF",
+                    }),
+                    rating_text: Some("📁★★★★★"),
+                    filename: Some("長いファイル名.pdf"),
+                },
+                measure,
+            );
+            assert_placements_inside_cell(&layout, cell);
+            assert_pairwise_non_intersecting(layout.top_left.placements());
+            assert_pairwise_non_intersecting(layout.bottom_left.placements());
+            assert_pairwise_non_intersecting(
+                layout
+                    .top_left
+                    .placements()
+                    .chain(layout.bottom_left.placements()),
+            );
+        }
     }
 
     #[test]
