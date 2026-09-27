@@ -174,6 +174,17 @@ mod windows {
     use std::marker::PhantomData;
     use std::os::windows::ffi::OsStrExt;
 
+    const MAX_PREVIEW_BYTES: usize = 512 * 1024 * 1024;
+    const MAX_PREVIEW_EDGE: u32 = crate::canonical_image_loader::CANONICAL_RASTER_MAX_LONG_EDGE;
+
+    struct NativeBuffer(ffi::MivRawBuffer);
+
+    impl Drop for NativeBuffer {
+        fn drop(&mut self) {
+            unsafe { ffi::miv_raw_free(self.0.data) };
+        }
+    }
+
     struct Handle<'a> {
         raw: *mut c_void,
         _source: PhantomData<RawSource<'a>>,
@@ -245,16 +256,56 @@ mod windows {
             format: 0,
         };
         let code = unsafe { ffi::miv_raw_preview_extract(handle.raw, index, &mut result) };
+        let result = NativeBuffer(result);
         if code != 0 {
             return Err(map_error(code));
         }
-        if result.data.is_null() || result.length == 0 || result.length > 512 * 1024 * 1024 {
-            unsafe { ffi::miv_raw_free(result.data) };
+        if result.0.data.is_null() || result.0.length == 0 {
             return Err(RawError::Corrupt("Invalid preview buffer".into()));
         }
-        let bytes = unsafe { std::slice::from_raw_parts(result.data, result.length).to_vec() };
-        unsafe { ffi::miv_raw_free(result.data) };
-        Ok((result, bytes))
+        if result.0.length > MAX_PREVIEW_BYTES {
+            return Err(RawError::TooLarge);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(result.0.length)
+            .map_err(|_| RawError::OutOfMemory)?;
+        bytes.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(result.0.data, result.0.length)
+        });
+        let metadata = ffi::MivRawBuffer {
+            data: std::ptr::null_mut(),
+            length: result.0.length,
+            width: result.0.width,
+            height: result.0.height,
+            colors: result.0.colors,
+            format: result.0.format,
+        };
+        Ok((metadata, bytes))
+    }
+
+    fn check_preview_dims(width: u32, height: u32, colors: usize) -> Result<(), RawError> {
+        if width == 0 || height == 0 {
+            return Err(RawError::Corrupt("Invalid preview dimensions".into()));
+        }
+        let bytes = usize::try_from(width)
+            .ok()
+            .and_then(|width| width.checked_mul(height as usize))
+            .and_then(|pixels| pixels.checked_mul(colors))
+            .ok_or(RawError::TooLarge)?;
+        if width > MAX_PREVIEW_EDGE || height > MAX_PREVIEW_EDGE || bytes > MAX_PREVIEW_BYTES {
+            return Err(RawError::TooLarge);
+        }
+        Ok(())
+    }
+
+    fn jpeg_preview_dims(bytes: &[u8]) -> Result<[u32; 2], RawError> {
+        let header = turbojpeg::read_header(bytes)
+            .map_err(|_| RawError::Corrupt("Invalid preview JPEG header".into()))?;
+        let width = u32::try_from(header.width).map_err(|_| RawError::TooLarge)?;
+        let height = u32::try_from(header.height).map_err(|_| RawError::TooLarge)?;
+        check_preview_dims(width, height, 3)?;
+        Ok([width, height])
     }
 
     pub fn info(source: RawSource<'_>) -> Result<RawInfo, RawError> {
@@ -378,19 +429,45 @@ mod windows {
         let mut candidates = raw_info.previews;
         let had_candidate = !candidates.is_empty();
         let mut orientation_mismatched = false;
+        let mut rejected_too_large = false;
         candidates.sort_by_key(|preview| {
             std::cmp::Reverse(u64::from(preview.dims[0]) * u64::from(preview.dims[1]))
         });
         for meta in candidates {
-            if meta.dims == [0, 0] {
+            if usize::try_from(meta.length).unwrap_or(usize::MAX) > MAX_PREVIEW_BYTES {
+                rejected_too_large = true;
+                continue;
+            }
+            if meta.format == RawPreviewFormat::Bitmap
+                && (meta.recorded_dims[0] > MAX_PREVIEW_EDGE
+                    || meta.recorded_dims[1] > MAX_PREVIEW_EDGE)
+            {
+                rejected_too_large = true;
+                continue;
+            }
+            if meta.dims != [0, 0] && check_preview_dims(meta.dims[0], meta.dims[1], 3).is_err() {
+                rejected_too_large = true;
                 continue;
             }
             let handle = Handle::open(source)?;
-            let Ok((buffer, bytes)) = extract(&handle, meta.index) else {
-                continue;
+            let (buffer, bytes) = match extract(&handle, meta.index) {
+                Ok(value) => value,
+                Err(RawError::TooLarge) => {
+                    rejected_too_large = true;
+                    continue;
+                }
+                Err(_) => continue,
             };
             let image = match meta.format {
                 RawPreviewFormat::Jpeg => {
+                    match jpeg_preview_dims(&bytes) {
+                        Ok(_) => {}
+                        Err(RawError::TooLarge) => {
+                            rejected_too_large = true;
+                            continue;
+                        }
+                        Err(_) => continue,
+                    }
                     turbojpeg::decompress(&bytes, turbojpeg::PixelFormat::RGB)
                         .ok()
                         .and_then(|decoded| {
@@ -403,6 +480,14 @@ mod windows {
                         .map(DynamicImage::ImageRgb8)
                 }
                 RawPreviewFormat::Bitmap => {
+                    match check_preview_dims(buffer.width, buffer.height, buffer.colors as usize) {
+                        Ok(()) => {}
+                        Err(RawError::TooLarge) => {
+                            rejected_too_large = true;
+                            continue;
+                        }
+                        Err(_) => continue,
+                    }
                     let count = usize::try_from(buffer.width)
                         .ok()
                         .and_then(|w| w.checked_mul(buffer.height as usize))
@@ -435,6 +520,8 @@ mod windows {
         }
         let reason = if orientation_mismatched {
             RawPreviewUnavailableReason::OrientationMismatch
+        } else if rejected_too_large {
+            return Err(RawError::TooLarge);
         } else if had_candidate {
             RawPreviewUnavailableReason::DecodeFailed
         } else {
@@ -561,6 +648,30 @@ mod windows {
         assert!(!orientation_mismatch([1000, 951], [3292, 4940]));
         assert!(!orientation_mismatch([1000, 950], [3292, 4940]));
         assert!(orientation_mismatch([1000, 949], [949, 1000]));
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn jpeg_preview_rejects_huge_sof_before_decode() {
+        let path = Path::new("vendor/raw-samples/2756.dng");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let raw_info = info(RawSource::Path(path)).unwrap();
+        let index = raw_info
+            .previews
+            .iter()
+            .find(|preview| preview.format == RawPreviewFormat::Jpeg)
+            .unwrap()
+            .index;
+        let handle = Handle::open(RawSource::Path(path)).unwrap();
+        let (_, mut jpeg) = extract(&handle, index).unwrap();
+        let sof = jpeg
+            .windows(2)
+            .position(|marker| marker[0] == 0xff && (0xc0..=0xc3).contains(&marker[1]))
+            .expect("sample JPEG has a baseline or progressive SOF");
+        jpeg[sof + 5..sof + 9].copy_from_slice(&[0x7f, 0xff, 0x7f, 0xff]);
+        // 32,767 x 32,767 passes JPEG header parsing but exceeds our preview cap.
+        let result = jpeg_preview_dims(&jpeg);
+        assert!(matches!(result, Err(RawError::TooLarge)), "{result:?}");
     }
 }
 

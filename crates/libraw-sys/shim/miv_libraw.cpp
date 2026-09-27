@@ -4,9 +4,17 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <new>
 
 namespace {
+constexpr size_t kMaxPreviewBytes = 512ull * 1024 * 1024;
+constexpr uint32_t kMaxPreviewEdge = 8192;
+
+struct FreeBuffer {
+  void operator()(unsigned char *data) const noexcept { std::free(data); }
+};
+
 struct Handle {
   LibRaw raw;
   bool info_only = false;
@@ -103,22 +111,34 @@ extern "C" int miv_raw_preview_info(void *opaque, uint32_t index, MivRawPreviewI
 extern "C" int miv_raw_preview_extract(void *opaque, uint32_t index, MivRawBuffer *out) {
   try {
     if (!opaque || !out) return LIBRAW_DATA_ERROR;
+    *out = {};
     auto *h = static_cast<Handle *>(opaque);
     auto &list = h->raw.imgdata.thumbs_list;
     if (index >= static_cast<uint32_t>(list.thumbcount)) return LIBRAW_REQUEST_FOR_NONEXISTENT_THUMBNAIL;
-    int format = list.thumblist[index].tformat;
+    const auto &item = list.thumblist[index];
+    int format = item.tformat;
     if (!preview_format(format))
       return LIBRAW_UNSUPPORTED_THUMBNAIL;
+    // LibRaw allocates the thumbnail during unpack_thumb_ex, before we can inspect it.
+    if (item.tlength > kMaxPreviewBytes ||
+        (preview_format(format) == LIBRAW_THUMBNAIL_BITMAP &&
+         (item.twidth > kMaxPreviewEdge || item.theight > kMaxPreviewEdge)))
+      return LIBRAW_TOO_BIG;
     int result = h->raw.unpack_thumb_ex(static_cast<int>(index));
     if (result) return result;
     auto &thumb = h->raw.imgdata.thumbnail;
     if (thumb.tformat != LIBRAW_THUMBNAIL_JPEG && thumb.tformat != LIBRAW_THUMBNAIL_BITMAP)
       return LIBRAW_UNSUPPORTED_THUMBNAIL;
     if (!thumb.thumb || !thumb.tlength) return LIBRAW_DATA_ERROR;
-    auto *copy = static_cast<unsigned char *>(std::malloc(thumb.tlength));
+    if (thumb.tlength > kMaxPreviewBytes ||
+        (thumb.tformat == LIBRAW_THUMBNAIL_BITMAP &&
+         (thumb.twidth > kMaxPreviewEdge || thumb.theight > kMaxPreviewEdge)))
+      return LIBRAW_TOO_BIG;
+    std::unique_ptr<unsigned char, FreeBuffer> copy(
+        static_cast<unsigned char *>(std::malloc(thumb.tlength)));
     if (!copy) return LIBRAW_UNSUFFICIENT_MEMORY;
-    std::memcpy(copy, thumb.thumb, thumb.tlength);
-    *out = {copy, thumb.tlength, thumb.twidth, thumb.theight,
+    std::memcpy(copy.get(), thumb.thumb, thumb.tlength);
+    *out = {copy.release(), thumb.tlength, thumb.twidth, thumb.theight,
             static_cast<uint32_t>(thumb.tcolors), static_cast<uint32_t>(thumb.tformat)};
     return 0;
   } catch (const std::bad_alloc &) { return LIBRAW_UNSUFFICIENT_MEMORY; }

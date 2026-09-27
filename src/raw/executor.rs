@@ -213,7 +213,12 @@ impl RawTicket {
             if let Some(mut job) = state.remove_waiting(self.id) {
                 job.priority = RawPriority::High;
                 changed = true;
-                state.high.push_back(job);
+                let position = state
+                    .high
+                    .iter()
+                    .position(|queued| queued.id > job.id)
+                    .unwrap_or(state.high.len());
+                state.high.insert(position, job);
             } else if let Some(job) = state.running.get_mut(&self.id)
                 && job.priority != RawPriority::High
             {
@@ -419,8 +424,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (_, n1, _) = fake(&executor, RawPriority::Normal, "normal1", tx.clone());
         let (_, n2, _) = fake(&executor, RawPriority::Normal, "normal2", tx.clone());
-        assert_eq!(started(&rx), "normal1");
-        assert_eq!(started(&rx), "normal2");
+        let mut running = [started(&rx), started(&rx)];
+        running.sort_unstable();
+        assert_eq!(running, ["normal1", "normal2"]);
         let (_, bg1, _) = fake(
             &executor,
             RawPriority::Background,
@@ -460,6 +466,23 @@ mod tests {
         high.send(()).unwrap();
         assert_eq!(started(&rx), "normal");
         normal.send(()).unwrap();
+    }
+
+    #[test]
+    fn promoted_high_keeps_original_acceptance_order() {
+        let executor = RawDevelopExecutor::new(1).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (_, active, _) = fake(&executor, RawPriority::Normal, "active", tx.clone());
+        assert_eq!(started(&rx), "active");
+        let (normal_a, normal_a_gate, _) =
+            fake(&executor, RawPriority::Normal, "normal_a", tx.clone());
+        let (_, high_b_gate, _) = fake(&executor, RawPriority::High, "high_b", tx);
+        normal_a.promote_to_high();
+        active.send(()).unwrap();
+        assert_eq!(started(&rx), "normal_a");
+        normal_a_gate.send(()).unwrap();
+        assert_eq!(started(&rx), "high_b");
+        high_b_gate.send(()).unwrap();
     }
 
     #[test]
