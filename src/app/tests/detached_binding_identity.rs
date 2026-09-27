@@ -49,8 +49,8 @@ fn detached_binding_identity_book_start_resolves_published_window() {
     let root = app.tmp.path().to_path_buf();
     let (_, window) = start_cached_pdf(&mut app, &root);
     app.with_active_viewer_context(|mounted| {
-        // A direct open keeps the source display until verified enumeration is adopted.
-        assert_eq!(mounted.pdf_placeholder_count, None);
+        // A warm direct open commits the cached placeholder before verification completes.
+        assert_eq!(mounted.pdf_placeholder_count, Some(2));
         assert!(mounted.pdf_enumerate_pending.is_some());
         assert_eq!(
             mounted.viewer_context_window(mounted.projected_viewer_context_id()),

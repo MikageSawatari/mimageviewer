@@ -937,6 +937,7 @@ pub(crate) enum PdfOpenPhase {
 /// No visible grid/surface change belongs to an unadopted request.
 pub(crate) struct DirectPdfAdoption {
     history_origin: Option<FolderNavHistoryTarget>,
+    grid_open_effects: Option<GridVirtualOpenEffects>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23144,6 +23145,52 @@ impl App {
         }
     }
 
+    /// Advance the requests stored in the currently projected viewer bundle. Callers mount the
+    /// owner first; the same routine serves main, active detached, and parked contexts.
+    fn poll_mounted_document_open_owners(&mut self, ctx: &egui::Context) {
+        self.poll_open_path_classification(ctx);
+        self.poll_collection_history_transition(ctx);
+    }
+
+    #[cfg(windows)]
+    fn poll_parked_document_open_owners(&mut self, ctx: &egui::Context) {
+        let active = self.active_viewer_context_id();
+        for id in self.other_viewer_context_ids() {
+            if Some(id) == active || self.viewer_context_residence(id) != ContextResidence::AtRest {
+                continue;
+            }
+            // Passive still windows render a frozen snapshot. Their pending owner still needs to
+            // progress; a conversion dialog is presented on root while the bundle is parked so
+            // Cancel and progress remain accessible without activating or mutating a sibling.
+            let needs_service = self
+                .with_viewer_context_ref(id, |owner| owner.document_open_needs_service())
+                .unwrap_or(false);
+            if !needs_service {
+                continue;
+            }
+            self.with_viewer_context(id, |app| {
+                app.poll_mounted_document_open_owners(ctx);
+                if let Some(result) = app.poll_folder_nav() {
+                    app.apply_folder_nav_result(ctx, result);
+                }
+                app.poll_pdf_enumerate();
+                app.poll_zip_enumerate();
+                app.poll_collection_grid(ctx);
+                app.poll_collection_navigation(ctx);
+                app.show_epub_convert_dialog(ctx);
+                if app.folder_nav_pending.is_some()
+                    || app.pdf_enumerate_pending.is_some()
+                    || app.zip_enumerate_pending.is_some()
+                {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                }
+            })
+            .unwrap_or_else(|error| {
+                panic!("parked document owner {id:?} failed to mount: {error:?}")
+            });
+        }
+    }
+
     fn finish_rejected_open_path_classification(&mut self, candidate: &OpenPathClassification) {
         // A DFS continuation owns the queued steps and lock for this candidate. A refused
         // destination ends that DFS step without retiring an unrelated direct or staged owner.
@@ -23198,7 +23245,9 @@ impl App {
                         HistoryNavigationTransition::Physical(request),
                     ));
             }
-        } else if matches!(outcome, FolderOpenOutcome::Loaded) {
+        } else if matches!(outcome, FolderOpenOutcome::Loaded)
+            && !self.defer_cold_direct_pdf_grid_effects(path, &effects)
+        {
             self.commit_grid_virtual_open_effects(path, effects);
         }
     }
@@ -24227,6 +24276,13 @@ impl App {
             && matches!(owner, OpenRequestOwner::Navigation)
             && pre_scan.is_none()
             && crate::folder_tree::is_virtual_folder(&path)
+            // The released direct PDF path commits a warm placeholder immediately. Cold PDF
+            // opens already retain their source and rollback in PdfOpenPhase::ColdCandidate.
+            // Keep history staging for ZIP and EPUB; EPUB conversion owns its typed continuation.
+            && !path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
             && classified_kind != Some(OpenPathKind::Directory)
             && !self.visible_grid_item_is_folder(&path)
             && !self.smart_folder_session_owns_load(&path)
@@ -24296,6 +24352,7 @@ impl App {
                     if let Some(restore) = pending.4.as_mut() {
                         restore.adoption = Some(Box::new(DirectPdfAdoption {
                             history_origin: navigation_history_origin,
+                            grid_open_effects: None,
                         }));
                     }
                 }
@@ -27401,8 +27458,13 @@ impl App {
     pub(crate) fn start_grid_virtual_open(&mut self, intent: GridVirtualOpenIntent) -> bool {
         let path = intent.path;
         let effects = intent.effects;
+        let direct_plain_pdf = matches!(intent.source, GridVirtualOpenSource::Direct)
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
         let auto_fullscreen_without_stage =
-            !self.main_folder_history_available() && effects.auto_fullscreen;
+            (!self.main_folder_history_available() || direct_plain_pdf) && effects.auto_fullscreen;
         let started = match intent.source {
             GridVirtualOpenSource::Direct => matches!(
                 self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
@@ -27448,11 +27510,35 @@ impl App {
             && crate::folder_tree::path_eq(&candidate.path, &path)
         {
             candidate.grid_open_effects = Some(effects);
-        } else {
-            // Detached/legacy loads are synchronous at this boundary. Their grid effects still
-            // belong to the chosen open and are never published for a rejected request.
+        } else if !self.defer_cold_direct_pdf_grid_effects(&path, &effects) {
+            // A warm PDF has already visibly adopted; other synchronous opens also commit here.
+            // A cold direct PDF carries these effects in its adoption owner until enumeration.
             self.commit_grid_virtual_open_effects(&path, effects);
         }
+        true
+    }
+
+    fn defer_cold_direct_pdf_grid_effects(
+        &mut self,
+        path: &Path,
+        effects: &GridVirtualOpenEffects,
+    ) -> bool {
+        let Some(pending) = self.pdf_enumerate_pending.as_mut() else {
+            return false;
+        };
+        if !crate::folder_tree::path_eq(&pending.0, path)
+            || !matches!(pending.5, PdfOpenPhase::ColdCandidate { .. })
+        {
+            return false;
+        }
+        let Some(adoption) = pending
+            .4
+            .as_mut()
+            .and_then(|restore| restore.adoption.as_mut())
+        else {
+            return false;
+        };
+        adoption.grid_open_effects = Some(effects.clone());
         true
     }
 
@@ -31456,9 +31542,12 @@ impl App {
                     logical: pdf_path.clone(),
                     history: Some(self.folder_nav_history_snapshot()),
                     address_before: Some(self.address.clone()),
-                    adoption: history_origin
-                        .clone()
-                        .map(|history_origin| Box::new(DirectPdfAdoption { history_origin })),
+                    adoption: history_origin.clone().map(|history_origin| {
+                        Box::new(DirectPdfAdoption {
+                            history_origin,
+                            grid_open_effects: None,
+                        })
+                    }),
                 });
         crate::logger::log(format!(
             "=== load_pdf_as_folder: {} ===",
@@ -31609,6 +31698,8 @@ impl App {
                 Vec::new(),
                 None,
             );
+            #[cfg(all(windows, feature = "test-script"))]
+            crate::test_script::record_pdf_warm_adoption(&pdf_path);
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
             self.pdf_placeholder_count = Some(page_count);
             if is_epub && crate::perf::is_enabled() {
@@ -31794,9 +31885,9 @@ impl App {
         }
     }
 
-    /// Read only the metadata already available through the warm catalog. Staged Smart opens
-    /// may use this when their prepared owner adopts a placeholder. Direct opens wait for the
-    /// enumerated result while the source display remains mounted.
+    /// Probe the warm catalog for an immediate visible PDF adoption. Plain PDFs use the same
+    /// requested-file metadata lookup as the released direct-open path, including opens from an
+    /// address, bookmark, or activation whose PDF is absent from the mounted rows.
     fn peek_pdf_meta_cache(
         &mut self,
         pdf_path: &Path,
@@ -31807,31 +31898,28 @@ impl App {
 
         let is_epub = pdf_stamp_policy_for_path(pdf_path)
             == crate::thumb_loader::PdfStampPolicy::ResolveInWorker;
-        let (lookup_mtime, lookup_size, mtime, file_size) =
-            if is_epub {
-                // The pinned table is memory-only. An unpinned book needs DB and source I/O,
-                // so it waits for the normal background enumeration instead.
-                let read = crate::pdf_loader::pinned_epub_target(pdf_path)?;
-                let (id, size) = read.stamp.generation_catalog_pair()?;
-                let source = read.display_source_state?;
-                const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
-                let display_mtime =
-                    (source.mtime_ticks.saturating_sub(FILETIME_UNIX_EPOCH) / 10_000_000) as i64;
-                (id, size, display_mtime, source.size)
-            } else {
-                // The mounted listing already owns this stamp. A path with no known listing stamp
-                // waits for worker enumeration; a cache hit must never add a UI-thread stat.
-                let (mtime, size) = self.items.iter().zip(&self.image_metas).find_map(
-                    |(item, meta)| match item {
-                        GridItem::PdfFile(path) if crate::folder_tree::path_eq(path, pdf_path) => {
-                            *meta
-                        }
-                        _ => None,
-                    },
-                )?;
-                let file_size = u64::try_from(size).ok()?;
-                (mtime, size, mtime, file_size)
-            };
+        let (lookup_mtime, lookup_size, mtime, file_size) = if is_epub {
+            // The pinned table is memory-only. An unpinned book needs DB and source I/O,
+            // so it waits for the normal background enumeration instead.
+            let read = crate::pdf_loader::pinned_epub_target(pdf_path)?;
+            let (id, size) = read.stamp.generation_catalog_pair()?;
+            let source = read.display_source_state?;
+            const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+            let display_mtime =
+                (source.mtime_ticks.saturating_sub(FILETIME_UNIX_EPOCH) / 10_000_000) as i64;
+            (id, size, display_mtime, source.size)
+        } else {
+            // Preserve master's single requested-file stat and catalog stamp. It is the
+            // existing warm direct-open cost, and does not classify the target or scan rows.
+            let meta = std::fs::metadata(pdf_path).ok()?;
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)?;
+            let file_size = meta.len();
+            (mtime, file_size as i64, mtime, file_size)
+        };
 
         // 親フォルダの catalog DB を **warm hit 経由のみ** で取得する (review #6 対応)。
         // ここは UI スレッドの「Enter→placeholder 即表示」hot path なので、
@@ -32217,7 +32305,7 @@ impl App {
 
         match result {
             Ok(pages) => {
-                if let Some(adoption) = open_restore
+                if let Some(mut adoption) = open_restore
                     .as_mut()
                     .and_then(|restore| restore.adoption.take())
                 {
@@ -32234,6 +32322,9 @@ impl App {
                         return;
                     }
                     self.finish_direct_pdf_visible_adoption(&pdf_path, &owner);
+                    if let Some(effects) = adoption.grid_open_effects.take() {
+                        self.commit_grid_virtual_open_effects(&pdf_path, effects);
+                    }
                     self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
                 }
                 drop(phase);
@@ -32374,7 +32465,7 @@ impl App {
 
     pub(crate) fn pdf_password_dialog_path(&self) -> Option<PathBuf> {
         #[cfg(windows)]
-        if let Some(path) = self.active_viewer_context_id().and_then(|id| {
+        if let Some(path) = self.pdf_password_request_context_id().and_then(|id| {
             self.with_viewer_context_ref(id, |context| {
                 context
                     .pdf_password_request()
@@ -32388,6 +32479,32 @@ impl App {
             .as_ref()
             .map(|request| request.path.clone())
             .or_else(|| self.smart_pdf_password_dialog_path())
+    }
+
+    #[cfg(windows)]
+    fn pdf_password_request_context_id(&self) -> Option<ViewerContextId> {
+        let active = self.active_viewer_context_id();
+        let projected = self.projected_viewer_context_id();
+        let mut ids = self.viewer_context_ids();
+        ids.sort_by_key(|id| {
+            if Some(*id) == active {
+                (0_u8, *id)
+            } else if *id == projected {
+                (1_u8, *id)
+            } else {
+                (2_u8, *id)
+            }
+        });
+        ids.into_iter().find(|id| {
+            self.with_viewer_context_ref(*id, |owner| owner.pdf_password_request().is_some())
+                .unwrap_or(false)
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn active_detached_owns_pdf_password_prompt(&self) -> bool {
+        self.active_viewer_context_id()
+            .is_some_and(|id| self.pdf_password_request_context_id() == Some(id))
     }
 
     pub(crate) fn pdf_password_request_pending_in_any_context(&self) -> bool {
@@ -32497,15 +32614,15 @@ impl App {
         // incorrect password will create a fresh prompt from the next worker result.
         let visible_before_retry = std::mem::take(&mut self.show_pdf_password_dialog);
         #[cfg(windows)]
-        if self.active_viewer_context_id().is_some_and(|id| {
-            self.with_viewer_context_ref(id, |context| context.pdf_password_request().is_some())
-                .unwrap_or(false)
-        }) {
-            let accepted = self
-                .with_active_viewer_context(|app| {
+        if let Some(id) = self.pdf_password_request_context_id() {
+            let accepted = if id == self.projected_viewer_context_id() {
+                self.retry_pdf_password_request_in_mounted_context(password, save)
+            } else {
+                self.with_viewer_context(id, |app| {
                     app.retry_pdf_password_request_in_mounted_context(password, save)
                 })
-                .unwrap_or(false);
+                .unwrap_or(false)
+            };
             if !accepted
                 && (self.pdf_password_request_pending_in_any_context()
                     || self.smart_pdf_password_dialog_path().is_some())
@@ -32560,15 +32677,15 @@ impl App {
 
     pub(crate) fn cancel_pdf_password_dialog_request(&mut self) -> bool {
         #[cfg(windows)]
-        if self.active_viewer_context_id().is_some_and(|id| {
-            self.with_viewer_context_ref(id, |context| context.pdf_password_request().is_some())
-                .unwrap_or(false)
-        }) {
-            return self
-                .with_active_viewer_context(|app| {
+        if let Some(id) = self.pdf_password_request_context_id() {
+            return if id == self.projected_viewer_context_id() {
+                self.cancel_pdf_password_request_in_mounted_context()
+            } else {
+                self.with_viewer_context(id, |app| {
                     app.cancel_pdf_password_request_in_mounted_context()
                 })
-                .unwrap_or(false);
+                .unwrap_or(false)
+            };
         }
         if self.pdf_password_request.is_none() && self.cancel_smart_pdf_password_request() {
             return true;
@@ -50823,6 +50940,15 @@ impl App {
 
         self.folder_nav_pending.is_some()
             || self.folder_pane_open_pending.is_some()
+            || self
+                .top_level_grid_view
+                .open_path_classification()
+                .is_some()
+            || self
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+            || self.epub_convert.is_some()
             || self.pdf_enumerate_pending.is_some()
             || self.zip_enumerate_pending.is_some()
             || self.fs_nav_deferred_reopen_wait_active()
@@ -54757,6 +54883,7 @@ impl App {
                         app.detached_image_windows.len()
                     ));
                 }
+                app.poll_mounted_document_open_owners(ctx);
                 if let Some(result) = app.poll_folder_nav() {
                     app.apply_folder_nav_result(ctx, result);
                 }
@@ -83459,7 +83586,6 @@ impl App {
         self.show_delete_progress_dialog(ctx);
         self.show_batch_convert_progress_dialog(ctx);
         self.show_epub_batch_convert_dialog(ctx);
-        self.show_pdf_password_dialog_window(ctx);
         self.show_about_dialog_window(ctx);
         self.show_update_dialog_window(ctx);
         self.show_whats_new_dialog(ctx);
@@ -84796,8 +84922,7 @@ impl eframe::App for App {
         // update_frame returns through a fullscreen or native-video presentation path.
         self.poll_collection_ui(ctx);
         self.poll_collection_grid(ctx);
-        self.poll_open_path_classification(ctx);
-        self.poll_collection_history_transition(ctx);
+        self.poll_mounted_document_open_owners(ctx);
         self.poll_collection_navigation(ctx);
         // A settings-family mutation may already hold the exclusive DB permit. Defer only a
         // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
@@ -84814,7 +84939,28 @@ impl eframe::App for App {
             self.similar_panel.preview.poll_background(ctx, &passwords);
         }
         self.update_frame(ctx, frame);
-        self.show_epub_convert_dialog(ctx);
+        #[cfg(windows)]
+        self.poll_parked_document_open_owners(ctx);
+        // Dedicated viewer viewports draw the same owner dialog inside their own callback.
+        // Root/embedded and parked fallbacks draw here.
+        if self.fullscreen_idx.is_none()
+            || self.fullscreen_embedded_still_active()
+            || self.current_viewer_context_contains_video()
+        {
+            self.show_epub_convert_dialog(ctx);
+        }
+        // `update_frame` can return before its menu/dialog section. Keep the global password
+        // input visible through those paths; a dedicated viewport draws it in its own callback.
+        #[cfg(windows)]
+        if !self.active_detached_owns_pdf_password_prompt()
+            && (self.fullscreen_idx.is_none()
+                || self.fullscreen_embedded_still_active()
+                || self.current_viewer_context_contains_video())
+        {
+            self.show_pdf_password_dialog_window(ctx);
+        }
+        #[cfg(not(windows))]
+        self.show_pdf_password_dialog_window(ctx);
         // `update_frame` has several native/fullscreen early returns. Recovery polling belongs
         // outside it so worker completions, writer fences, and the terminal continuation cannot
         // stall behind a presentation path. Running it after the frame also keeps the modal/input

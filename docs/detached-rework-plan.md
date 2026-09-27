@@ -1455,6 +1455,22 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-28 §1.280 履歴 / EPUB の context-owned 非同期処理 (review #8)**
+
+分類 candidate、staged 履歴 transition、EPUB 変換、DFS 結果、PDF/ZIP 列挙は表示先
+`ViewerContextBundle` が所有する。main の `App::update` だけで分類と変換を処理すると、
+detached の PDF enumeration が生成した変換は見えない modal になり、detached 入力の
+`.epub` / archive suffix 分類は完了しても採用されなかった。main、active detached、
+parked の各 bundle を所有 context として投影し、分類と履歴は共通
+`poll_mounted_document_open_owners`、その他の worker は各既存 poll / dialog で処理する。
+active detached の変換・PDF password prompt はその viewport callback に描き、passive
+parked は frozen renderer を変更せず、root に出す dialog の操作時だけ当該 bundle を mount
+して Cancel / Retry と worker result を処理する。窓の host / placement / viewport identity
+や park / resume の state machine は変更しない。これは非同期要求の所有者と処理 context
+を一致させる修正で、表示症状に対する時間待ちや別フラグは加えない。自動テストは
+detached suffix directory の入力から採用、および active / parked EPUB 変換の表示・進捗・
+取消・完了を対象とする。WebView2 実変換の窓操作は対話的検証 session に残す。
+
 **2026-09-27 履歴 preflight と直接 open の admission**
 
 独立 integration review の指摘に従い、`OpenRequestOwner` の各 variant が承認された後に、同じ viewer context が所有する staged 履歴要求だけを一か所で退役させる。`DetachedGridArchive` と detached lease を持つ `Bookmark` は型付き owner の window ID から registry の context ID を引き、通常 owner は投影中の context ID を使う。履歴 transition 自身の `source_context` も照合する。変換 cache 命中時の detached archive open は main App 上で admission を呼ぶが、宛先 context が detached なので main の staged 履歴・表示を変更しない。以前の `navigation_scope.is_detached_physical()` だけの判定ではこの経路を見落としていた。viewport / window の再作成や再試行は追加していない。これは要求と表示の context 所有権を揃える変更であり、detached 表示症状の局所回避ではない。

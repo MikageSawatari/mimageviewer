@@ -191,7 +191,7 @@ UI の modal guard だけでは非同期入口を覆えない。単冊 EPUB / ba
 
 ### 12.2 D-B: warm 直接 PDF/EPUB の表示を採用として確定する
 
-直接 PDF open は、D13 の EPUB refusal を先に通した後、released `pdf_meta` の stamp・page count・パスワード・綴じ方向条件を満たす warm hit なら、page placeholder の install を**可視採用**として扱う。rows / surface / selection / address / typed 現在地 / Back・Forward / Rating・Collection provenance / A/B の記憶先と active slot は同じ採用境界で確定する。検証列挙は裏で続け、page count 一致なら一覧を再構築せず cache を更新し、異なればその**採用済み PDF 地点の**ページ一覧を修正する。正常な cached EPUB も固定世代 `(generation_id, pdf_size)` と方向条件が一致すれば同じ PDF 経路の warm hit とする。未変換・未固定 EPUB、方向確定待ち、password 不明、cache miss では placeholder を出さない。`pdf_meta` 判定のため UI thread に新たな file / DB probe を足さない。
+直接 PDF open は、D13 の EPUB refusal を先に通した後、released `pdf_meta` の stamp・page count・パスワード・綴じ方向条件を満たす warm hit なら、page placeholder の install を**可視採用**として扱う。rows / surface / selection / address / typed 現在地 / Back・Forward / Rating・Collection provenance / A/B の記憶先と active slot は同じ採用境界で確定する。検証列挙は裏で続け、page count 一致なら一覧を再構築せず cache を更新し、異なればその**採用済み PDF 地点の**ページ一覧を修正する。正常な cached EPUB も固定世代 `(generation_id, pdf_size)` と方向条件が一致すれば同じ PDF 経路の warm hit とする。未変換・未固定 EPUB、方向確定待ち、password 不明、cache miss では placeholder を出さない。plain PDF では released requested-file metadata 読取を維持し、それを超える UI-thread file / DB probe を足さない。
 
 placeholder を出した時点で旧地点への rollback は**消費済み**であり、列挙失敗・パスワード要求は現在の PDF 地点の明示的な error / password 処理に入る。旧 rows へ戻すための部分的な snapshot は作らない。対して cold 直接 PDF/EPUB は列挙成功まで旧 rows・surface・selection を保ち、早期に変わる address / history 意図等は typed restore が所有する。失敗・Cancel なら元の表示・address・stack・A/B へ復元する。EPUB が `NotConverted` ならその restore を modal child が引き継ぐ。
 
@@ -235,4 +235,59 @@ warm PDF の検証列挙 pending は **採用済み source の owner** であり
 
 無人 `FolderHistory` portable smoke には、fixture PDF の warm 再 open → placeholder 表示と Back/Forward、staged 失敗/取消時の保持を、test-script が安定した初回表示 checkpoint を観測できる範囲で追加する。EPUB 実変換は WebView2 と dialog の Cancel / progress 操作を要するため無人 smoke へ入れず、利用者が承認する対話的検証 session で Ask、Convert、Ignore、変換中の別 open 拒否、変換取消後の履歴、固定世代の warm 再 open、batch Cancel を確認する。実アプリを agent が起動する前には既存の明示承認 gate に従う。
 
-2026-09-28 の自動検証では、`FolderHistory` test-script の snapshot が `item_names` と `items_generation` までしか持たず、placeholder と同数ページの列挙完了後を初回 frame で区別できない。このため warm PDF step は無人 script に追加せず、同一フレームの `CommittedVerification` / placeholder 採用と履歴確定を lib テストで確認する。実表示時間は上記の対話的 session で計測する。
+review #8 で `FolderHistory` test-script に warm direct PDF の実入力 step を加えた。
+`pdf_warm_adoption_phase=CommittedPlaceholder`、sequence と path は、
+`CommittedVerification` の placeholder を
+`start_loading_items` で可視採用した時だけ進む durable 診断 checkpoint で、worker の
+完了が速くても script は採用した事実を読める。Rating PDF を一度読み、物理 F の tile
+から Enter 入力で再 open して checkpoint の増分・path と Back / Forward / BS を確認する。EPUB の
+WebView2 変換は引き続き対話的 session の対象である。
+
+### 12.5 Detached owner servicing と warm stamp の review #8 修正
+
+`TopLevelGridView` の分類 candidate と staged 履歴 transition は main / mounted
+detached / parked の各投影 owner で同じ poll routine を呼ぶ。DFS result と PDF/ZIP
+enumeration は各 context の既存 poll を使い、parked bundle も root frame から一時 mount
+して drain する。EPUB 変換は active detached viewport 内で `show_epub_convert_dialog`
+を呼び、passive parked window の frozen renderer 中はその bundle を mount して root
+dialog を描く。これにより進捗・Cancel・成功 continuation は同じ owner で進む。
+PDF password prompt は global UI 入力欄だが typed request は context-local なので、
+表示先の path と Retry / Cancel は request を所有する mounted / parked context ID
+を選び、その bundle を直接または一時 mount して処理する。root / active detached
+viewport の表示は prompt owner に合わせて一度だけ行う。Collection grid / navigation
+worker も parked poll に含める。いずれも sibling の表示・履歴を交換しない。
+
+plain PDF の warm `pdf_meta` 照合 stamp は master の released direct-open と同じ
+requested-file `std::fs::metadata` 1 回から取る。これは既存 UI-thread コストであり、
+direct 分岐の既存 `path.is_file()` 判定も含め master と同じ費用で、分類用の
+新規 directory scan や追加 stat は行わない。現在 rows に PDF がない
+address / activation / bookmark open も同じ immediate placeholder 採用となる。
+`Navigation` の plain PDF は ZIP/EPUB の staged 履歴分岐から外し、cold 時は既存
+`ColdCandidate` の source/rollback owner、warm 時は同じ direct adoption とする。
+grid の PDF tile から開く場合、読み履歴の戻り先・rating/facet filter 抑制などの
+`GridVirtualOpenEffects` も cold では `DirectPdfAdoption` に預けて列挙成功時の可視採用で
+確定する。warm は placeholder 採用後に確定し、失敗・Cancel では source の効果を保持する。
+Back / Forward / BS と Rating / Collection replay の staged 分岐はそのまま保持する。
+
+fail-before 記録: §12 初回実装では `epub_convert_dialog_visible()` を Convert mode の
+旧条件へ戻すと `convert_mode_scanning_keeps_visible_modal_and_input_owner` が失敗し、
+warm placeholder 採用を外すと `warm_pdf_direct_open_commits_placeholder_and_history_failure_keeps_source`
+が失敗した。PDF password gate を外すと `pdf_password_prompt_blocks_new_direct_open_but_its_retry_proceeds`
+が失敗し、suffix worker 分類を外すと `ignored_epub_stale_tile_that_became_directory_is_not_refused`
+が失敗した。review #8 の追加テストでは、parked context の poll を外すと
+`detached_suffix_directory_input_is_classified_and_adopted_while_parked` が失敗し、
+requested-file stamp fallback を外すと
+`warm_pdf_direct_open_absent_from_current_rows_adopts_placeholders` が失敗する。
+実際の review #8 mutation run では、parked poll を空に戻すと
+`detached_epub_conversion_parked_dialog_progress_cancel_and_completion` は dialog 未描画、
+`detached_suffix_directory_input_is_classified_and_adopted_while_parked` は未採用のまま
+timeout した。active loading viewport の EPUB dialog 呼び出しを外すと
+`detached_epub_conversion_is_serviced_in_active_viewport` は area 未登録で失敗した。
+一覧外 PDF の stamp を row-only に戻すと
+`warm_pdf_direct_open_absent_from_current_rows_adopts_placeholders` は旧 source に留まり、
+plain PDF Navigation を staged 分岐へ戻すと
+`warm_pdf_navigation_absent_from_rows_adopts_before_worker` は旧 source に留まった。
+全 lib gate では旧 staged 前提の PDF テスト 2 件と旧 placeholder 前提の detached
+binding テスト 1 件が失敗した。cold direct の grid 効果を早期確定するコードを
+`DirectPdfAdoption` への預託に変え、前者は直接 PDF worker の成功・password Cancel を
+通すテストへ更新した。後者は released warm placeholder の即時表示を検査する。

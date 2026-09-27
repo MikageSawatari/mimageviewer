@@ -21707,6 +21707,8 @@ impl App {
                         );
                     });
                 self.show_sidecar_restore_dialog(vp_ctx);
+                self.show_epub_convert_dialog(vp_ctx);
+                self.show_pdf_password_dialog_window(vp_ctx);
             });
             self.register_detached_window_hwnd_after_show(
                 ctx,
@@ -21831,6 +21833,8 @@ impl App {
                         );
                     });
                 self.show_sidecar_restore_dialog(ctx);
+                self.show_epub_convert_dialog(ctx);
+                self.show_pdf_password_dialog_window(ctx);
             });
             #[cfg(windows)]
             if let Some(window_id) = keep_alive_window_id {
@@ -22187,6 +22191,8 @@ impl App {
                     }
                 });
             self.show_sidecar_restore_dialog(vp_ctx);
+            self.show_epub_convert_dialog(vp_ctx);
+            self.show_pdf_password_dialog_window(vp_ctx);
             inner_t0.elapsed().as_secs_f64() * 1000.0
         });
         let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
@@ -24924,6 +24930,13 @@ impl App {
                     self.show_remote_session_dialog(ctx);
                 }
                 self.show_sidecar_restore_dialog(ctx);
+
+                // The open owner is the mounted viewer bundle. A detached viewport must draw
+                // and drain its conversion here; the root update only sees the main bundle.
+                if !embedded {
+                    self.show_epub_convert_dialog(ctx);
+                    self.show_pdf_password_dialog_window(ctx);
+                }
 
                 // 外部ツールへ渡すファイルの準備進捗も、押された viewport 上に出す。
                 //
@@ -27985,6 +27998,7 @@ impl App {
             other => format!("{other:?}"),
         };
 
+        let pdf_warm_adoption = crate::test_script::pdf_warm_adoption_checkpoint();
         crate::test_script::TestScriptSnapshot {
             always_on_top: self.settings.always_on_top,
             window_visible: self.window_visible,
@@ -27993,6 +28007,9 @@ impl App {
             items_generation: self.items_generation as i64,
             folder_load_requests: i64::try_from(self.test_script_folder_load_requests)
                 .unwrap_or(i64::MAX),
+            pdf_warm_adoption_sequence: pdf_warm_adoption.sequence,
+            pdf_warm_adoption_path: pdf_warm_adoption.path,
+            pdf_warm_adoption_phase: pdf_warm_adoption.phase.as_str().into(),
             focused,
             target_viewport,
             target_registered: target.is_some(),

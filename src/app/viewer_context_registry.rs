@@ -1138,6 +1138,36 @@ impl<'a> ContextRef<'a> {
         }
     }
 
+    pub(in crate::app) fn document_open_needs_service(self) -> bool {
+        match self.source {
+            ContextRefSource::Mounted(app) => {
+                app.top_level_grid_view.open_path_classification().is_some()
+                    || app
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some()
+                    || app.epub_convert.is_some()
+                    || app.folder_nav_pending.is_some()
+                    || app.pdf_enumerate_pending.is_some()
+                    || app.zip_enumerate_pending.is_some()
+            }
+            ContextRefSource::AtRest(bundle) => {
+                bundle
+                    .top_level_grid_view
+                    .open_path_classification()
+                    .is_some()
+                    || bundle
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some()
+                    || bundle.epub_convert.is_some()
+                    || bundle.folder_nav_pending.is_some()
+                    || bundle.pdf_enumerate_pending.is_some()
+                    || bundle.zip_enumerate_pending.is_some()
+            }
+        }
+    }
+
     pub(in crate::app) fn current_folder(self) -> Option<&'a Path> {
         match self.source {
             ContextRefSource::Mounted(app) => app.current_folder.as_deref(),

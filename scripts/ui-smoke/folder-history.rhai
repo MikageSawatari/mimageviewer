@@ -104,6 +104,30 @@ arrive(rating_surface, rating_path, ["F"], "rating-bs-root");
 tap_key("Backspace");
 arrive("Folder", a, ["B", "F"], "rating-bs-a");
 
+// The earlier Rating PDF visit has populated F's catalog. Reopen it through an ordinary
+// physical grid input, then read the durable placeholder-adoption event instead of racing the
+// PDF worker's verification frame.
+let warm_before = snapshot().pdf_warm_adoption_sequence;
+run_action("GridMoveFirst");
+tap_key("Right");
+tap_key("Enter");
+arrive("Folder", f, ["G", "x-book.pdf", "y-book.zip", "z-page.png"], "warm-direct-folder-f");
+run_action("GridMoveFirst");
+tap_key("Right");
+tap_key("Enter");
+wait_until(|s| s.pdf_warm_adoption_sequence > warm_before
+    && s.pdf_warm_adoption_phase == "CommittedPlaceholder"
+    && s.pdf_warm_adoption_path == f + "\\x-book.pdf", 30000);
+arrive("Folder", f + "\\x-book.pdf", ["Page 1", "Page 2"], "warm-direct-pdf");
+tap_key("Left", "alt");
+arrive("Folder", f, ["G", "x-book.pdf", "y-book.zip", "z-page.png"], "warm-direct-back-f");
+tap_key("Right", "alt");
+arrive("Folder", f + "\\x-book.pdf", ["Page 1", "Page 2"], "warm-direct-forward-pdf");
+tap_key("Backspace");
+arrive("Folder", f, ["G", "x-book.pdf", "y-book.zip", "z-page.png"], "warm-direct-bs-f");
+tap_key("Backspace");
+arrive("Folder", a, ["B", "F"], "warm-direct-bs-a");
+
 folder_history_smoke("open_seeded_collection");
 arrive_collection_root(collection_surface, collection_id, "collection-root-c");
 run_action("GridMoveFirst");
