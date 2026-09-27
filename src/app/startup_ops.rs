@@ -730,7 +730,10 @@ impl App {
                 if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
                     self.open_startup_file_if_visible(&result.requested);
                 }
-                return !matches!(outcome, FolderOpenOutcome::Ignored);
+                return !matches!(
+                    outcome,
+                    FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+                );
             }
             if let Some(descriptor) = self.bookmark_detached_descriptor(&openable, resolution.kind)
             {
@@ -790,7 +793,10 @@ impl App {
             auto_fullscreen,
             owner.open_request_owner(),
         );
-        if matches!(outcome, FolderOpenOutcome::Ignored) {
+        if matches!(
+            outcome,
+            FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+        ) {
             return false;
         }
         if matches!(source, StartupOpenPathSource::Bookmark)

@@ -3147,7 +3147,9 @@ impl App {
                             history_trigger,
                         );
                     }
-                    FolderOpenOutcome::Ignored => self.release_fs_nav_lock(),
+                    FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_) => {
+                        self.release_fs_nav_lock()
+                    }
                 },
                 CollectionNavigationAction::Slideshow { .. } => match outcome {
                     FolderOpenOutcome::Loaded => {
@@ -3165,7 +3167,9 @@ impl App {
                             history_trigger,
                         );
                     }
-                    FolderOpenOutcome::Ignored => self.release_fs_nav_lock(),
+                    FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_) => {
+                        self.release_fs_nav_lock()
+                    }
                 },
                 CollectionNavigationAction::OuterGrid { .. } => {}
                 _ => {}
@@ -3236,9 +3240,8 @@ impl App {
                         .collection_grid_physical_load_owner(target_idx, &path)
                         .map(super::OpenRequestOwner::CollectionGridPhysical);
                     if let Some(owner) = owner {
-                        self.load_pdf_as_folder_prepared(path, pages, owner);
                         // The completed typed handle keeps direction and pages together.
-                        FolderOpenOutcome::Loaded
+                        self.load_pdf_as_folder_prepared(path, pages, owner)
                     } else {
                         FolderOpenOutcome::Ignored
                     }
@@ -3365,7 +3368,10 @@ impl App {
                 _ => {}
             }
             if !deferred_pdf
-                && !matches!(outcome, FolderOpenOutcome::Ignored)
+                && !matches!(
+                    outcome,
+                    FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+                )
                 && let Some((steps, fullscreen, resume_slideshow, native_toast)) =
                     outer_continuation
             {

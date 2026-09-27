@@ -992,6 +992,147 @@ fn epub_ignore_rejects_direct_open_before_pdf_cache_lookup() {
 }
 
 #[test]
+fn ignored_epub_in_stale_search_view_does_not_advance_normal_navigation() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("stale-search");
+    std::fs::create_dir(&folder).unwrap();
+    let epub = folder.join("book.epub");
+    std::fs::write(&epub, b"book").unwrap();
+    app.items = vec![GridItem::PdfFile(epub.clone())];
+    app.selected = Some(0);
+    app.items_are_global_search_view = true;
+    app.global_search.active = true;
+    app.global_search.drill = Some(crate::global_search_ui::DrillState {
+        container_root: folder.clone(),
+        current_path: folder.clone(),
+        is_zip: false,
+    });
+    app.current_folder = Some(crate::app::search_results_synthetic_path());
+    app.address = "検索結果".into();
+    app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(folder.clone())];
+    app.recent_folders = vec![folder.clone()];
+    app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+
+    let outcome = app.open_direct_navigation_target(
+        epub.clone(),
+        None,
+        OpenRequestOwner::Navigation,
+        None,
+        None,
+    );
+
+    assert_eq!(
+        outcome,
+        FolderOpenOutcome::Refused(FolderOpenRefusal::EpubIgnoredBySetting)
+    );
+    assert_eq!(
+        app.global_search.drill.as_ref().unwrap().current_path,
+        folder
+    );
+    assert_eq!(app.selected, Some(0));
+    assert_eq!(app.items.len(), 1);
+    assert_eq!(
+        app.current_folder,
+        Some(crate::app::search_results_synthetic_path())
+    );
+    assert_eq!(app.address, "検索結果");
+    assert_eq!(
+        app.folder_nav_back_stack,
+        vec![FolderNavHistoryTarget::Path(
+            app.tmp.path().join("stale-search")
+        )]
+    );
+    assert_eq!(
+        app.recent_folders,
+        vec![app.tmp.path().join("stale-search")]
+    );
+    assert!(app.pdf_enumerate_pending.is_none());
+    assert!(app.epub_convert.is_none());
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("EPUB を無視"))
+    );
+}
+
+#[test]
+fn ignored_epub_grid_preflight_preserves_reading_history_return() {
+    let mut app = setup_app_for_test();
+    let epub = app.tmp.path().join("history-book.epub");
+    std::fs::write(&epub, b"book").unwrap();
+    let previous = app.tmp.path().join("previous.pdf");
+    app.items = vec![GridItem::PdfFile(epub)];
+    app.items_are_reading_history_view = true;
+    app.reading_history_return_from = Some(previous.clone());
+    app.address = "閲覧履歴".into();
+    app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+
+    assert_eq!(
+        app.reject_ignored_epub_grid_item(0),
+        Some(FolderOpenRefusal::EpubIgnoredBySetting)
+    );
+    assert_eq!(app.reading_history_return_from, Some(previous));
+    assert_eq!(app.address, "閲覧履歴");
+    assert!(app.pdf_enumerate_pending.is_none());
+}
+
+#[test]
+fn ignored_convertible_archives_in_stale_search_view_keep_normal_navigation() {
+    for (extension, format) in [
+        ("rar", ArchiveFormat::Rar),
+        ("7z", ArchiveFormat::SevenZ),
+        ("lzh", ArchiveFormat::Lzh),
+    ] {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("stale-search");
+        std::fs::create_dir(&folder).unwrap();
+        let archive = folder.join(format!("book.{extension}"));
+        std::fs::write(&archive, b"archive").unwrap();
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: archive.clone(),
+            format,
+        }];
+        app.selected = Some(0);
+        app.global_search.active = true;
+        app.global_search.drill = Some(crate::global_search_ui::DrillState {
+            container_root: folder.clone(),
+            current_path: folder.clone(),
+            is_zip: false,
+        });
+        app.current_folder = Some(crate::app::search_results_synthetic_path());
+        app.address = "検索結果".into();
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+        let outcome = app.open_direct_navigation_target(
+            archive,
+            None,
+            OpenRequestOwner::Navigation,
+            None,
+            None,
+        );
+
+        assert_eq!(outcome, FolderOpenOutcome::Ignored, "{extension}");
+        assert_eq!(
+            app.global_search.drill.as_ref().unwrap().current_path,
+            folder
+        );
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(
+            app.current_folder,
+            Some(crate::app::search_results_synthetic_path())
+        );
+        assert_eq!(app.address, "検索結果");
+        assert!(app.archive_convert.is_none());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains("無視しています"))
+        );
+    }
+}
+
+#[test]
 fn epub_openable_path_uses_the_pdf_enumeration_route() {
     let mut app = setup_app_for_test();
     let dir = TempDir::new().unwrap();

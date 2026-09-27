@@ -491,8 +491,10 @@ impl App {
         let reopened = if matches!(owner, OpenRequestOwner::CollectionGridPhysical(_)) {
             self.load_folder_with_scan_owned(path.clone(), None, owner.clone())
         } else {
-            self.load_pdf_as_folder_owned(path.clone(), owner.clone());
-            true
+            matches!(
+                self.load_pdf_as_folder_owned(path.clone(), owner.clone()),
+                crate::app::FolderOpenOutcome::Loaded
+            )
         };
         if reopened
             && let Some(pending) = self.pdf_enumerate_pending.as_mut()

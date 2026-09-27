@@ -15240,6 +15240,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             None
         };
         if activation_allowed {
+            if self.reject_ignored_epub_grid_item(idx).is_some() {
+                return nav;
+            }
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
             if self.stack_try_open_from_grid(ctx, idx, true) {
@@ -15370,7 +15373,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         (crate::app::FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                             self.attach_archive_convert_nav_history_rollback(snapshot);
                         }
-                        (crate::app::FolderOpenOutcome::Ignored, Some(snapshot)) => {
+                        (
+                            crate::app::FolderOpenOutcome::Ignored
+                            | crate::app::FolderOpenOutcome::Refused(_),
+                            Some(snapshot),
+                        ) => {
                             self.restore_folder_nav_history(snapshot);
                         }
                         _ => {}
