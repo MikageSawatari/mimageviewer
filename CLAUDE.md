@@ -1312,7 +1312,7 @@ cargo test -p mimageviewer --test <integration-test-name>
 
 ⚠️ **`test-full.ps1` は `target\release\mimageviewer-core.exe` と
 `target\release\mimageviewer-remote.exe`、`target\release\mimageviewer-epub-pdf.exe` が既に在ることを前提にする**。`--workspace` が
-launcher package を含み、その build.rs が内包対象 exe の存在を検査するため、どちらかが
+launcher package を含み、その build.rs が内包対象 exe の存在を検査するため、いずれかが
 無いと**テストが 1 件も走らないままビルドエラーで落ちる**。新しい clone や
 `cargo clean` 直後は、先に 3 本を作ってから走らせる (どちらでもよい):
 

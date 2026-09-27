@@ -154,7 +154,7 @@
       EPUB の閲覧用変換では、Windows の一時フォルダ内に本アプリ専用の作業場所を作り、
       変換に使う Windows の表示機能（WebView2）のデータもそこに一時保存します。
       ポータブル版ではアプリのデータフォルダ内を使います。
-      「PDF ファイルとして保存」を選んだときの変換作業は、アプリのデータフォルダ内で行います。
+      元の EPUB と同じ場所に PDF を保存するときの変換作業は、アプリのデータフォルダ内で行います。
       本アプリが作った一時フォルダは変換後に削除を試み、異常終了などで残った分は次回の通常起動時に回収を試みます。
       Windows または Edge WebView2 に管理者や利用者がポリシーを設定して別の保存先を指定した場合は、
       その設定に従い、別の保存先のデータを本アプリは削除しません。
@@ -291,7 +291,7 @@
       When converting an EPUB for reading, the App creates a dedicated work folder inside the
       Windows temporary folder. It temporarily stores data from the Windows display component
       used for conversion (WebView2) there. The portable edition uses its data folder instead.
-      When you choose to save a PDF file, conversion uses a work folder inside the App's data folder.
+      When you save a PDF beside the EPUB, conversion uses a work folder inside the App's data folder.
       The App attempts to remove its own temporary folders after conversion and to clean up leftovers
       from an interrupted conversion at the next normal start. If an administrator or user has configured
       a Windows or Edge WebView2 policy that redirects data elsewhere, the App follows that policy

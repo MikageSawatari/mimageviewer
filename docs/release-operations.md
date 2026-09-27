@@ -93,7 +93,7 @@
   stderr に書く最初の行が NativeCommandError として terminating 化し、**ビルドが即 exit 1
   で死ぬ**。
 - **回避**: (A) スクリプトを素で `& scripts\build-release.ps1` (パイプ/マージなし) で呼ぶ、
-  または (B) cargo 3 段を直接実行する。どちらも stderr をリダイレクトしない。
+  または (B) cargo 4 段を直接実行する。どちらも stderr をリダイレクトしない。
 
 ### 2.3 4 段ビルドの正しいコマンド (順序不変: core → remote → EPUB worker → launcher)
 
