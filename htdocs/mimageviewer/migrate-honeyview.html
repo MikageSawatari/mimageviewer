@@ -204,9 +204,10 @@
     <ul class="pink-list">
       <li><strong>動作環境は Windows 11（64bit）</strong>です。</li>
       <li><strong>mImageViewer はサムネイル一覧が基本の画面です。</strong>フォルダを開くと、中の画像・動画・ZIP・PDF がサムネイルで並び、クリックでフルスクリーン表示に切り替わります。フルスクリーン中も <kbd>←</kbd> <kbd>→</kbd> やホイールで、同じフォルダの前後の画像へ移れます。</li>
-      <li><strong>エクスプローラーから 1 枚だけ開く使い方もできます。</strong>画像ファイルを渡して起動すると、その画像のフォルダを開いたうえで、その画像をフルスクリーンで表示します。環境設定の「起動と連携 → エクスプローラ連携」で「送る」メニューに登録すると、右クリックの <strong>送る → mImageViewer</strong> から開けます。</li>
-      <li><strong>書庫の扱いが一部ちがいます。</strong>ZIP / CBZ と、一般的な RAR / CBR（ソリッド圧縮でなく、中に別の書庫を含まず、パスワードなし）は展開せずにそのまま開きます。7z / LZH、ソリッド圧縮やパスワード付きの RAR は、<strong>最初に開くときに一度 ZIP へまとめ直してから表示</strong>します（元のファイルはそのまま残り、2 回目以降は待たずに開けます）。TAR には対応していません。</li>
-      <li><strong>HEIC・各社 RAW は Windows の機能で表示します。</strong>Microsoft Store の「HEIF 画像拡張機能」「Microsoft Raw 画像拡張機能」などを入れると表示できるようになります（<a href="manual/formats.html">対応フォーマット</a>）。JPEG / PNG / GIF / WebP / BMP は追加なしで表示できます。</li>
+      <li><strong>エクスプローラーから 1 枚だけ開く使い方もできます。</strong>画像ファイルを渡して起動すると、その画像のフォルダを開いたうえで、その画像をフルスクリーンで表示します。環境設定の「起動と連携 → エクスプローラ連携」で「送る」メニューに登録すると、右クリックの <strong>送る → mImageViewer</strong> から開けます。ダブルクリックで開くようにするには、画像を右クリックして「プログラムから開く」から mImageViewer を選び、その種類のファイルをいつも mImageViewer で開く設定にしてください。一覧に出ないときは、PC 上の mImageViewer の実行ファイルを指定できます。</li>
+      <li><strong>書庫の扱いが一部ちがいます。</strong>ZIP / CBZ と、一般的な RAR / CBR（ソリッド圧縮でなく、中に別の書庫を含まず、パスワードなし）は展開せずにそのまま開きます。7z / LZH、ソリッド圧縮やパスワード付きの RAR は、<strong>最初に開くときに一度 ZIP へまとめ直してから表示</strong>します（元のファイルはそのまま残ります。元の書庫が変わっておらず、変換した ZIP が残っていれば、次回は変換し直さずに開けます）。TAR には対応していません。</li>
+      <li><strong>HEIC・各社 RAW は Windows の機能で表示します。</strong>Microsoft Store の「HEIF 画像拡張機能」「Microsoft Raw 画像拡張機能」などを入れると表示できるようになります（<a href="manual/formats.html">対応フォーマット</a>）。JPEG / PNG / GIF / WebP / BMP は追加なしで表示でき、アニメーション GIF・APNG・アニメーション WebP も再生します。</li>
+      <li><strong>まとめて形式を変えたり縮小したりできます。</strong>一覧で複数の画像を選んで <kbd>Ctrl</kbd>+<kbd>E</kbd> を押すと、PNG / JPEG への変換や、1/2・1/4・長辺の指定での縮小をまとめて行い、1 つのフォルダへ書き出せます（<a href="manual/export.html">エクスポート</a>）。</li>
       <li><strong>画像・漫画のほか、動画・音声も同じ一覧で扱えます。</strong>動画はフルスクリーンでそのまま再生できます。</li>
     </ul>
   </section>
@@ -231,7 +232,7 @@
           <tr><td>見開きで読む</td><td><kbd>4</kbd>（右→左）/ <kbd>5</kbd>（右→左・表紙あり）、<kbd>1</kbd> で単ページ</td><td><kbd>2</kbd> / <kbd>3</kbd> は左→右です。</td></tr>
           <tr><td>スライドショー</td><td><kbd>S</kbd></td><td></td></tr>
           <tr><td>撮影情報（EXIF・GPS）を見る</td><td>画面の右端にマウスを寄せる、または <kbd>I</kbd> / <kbd>Tab</kbd></td><td>カメラ・撮影・画像・GPS などに分けて表示します。</td></tr>
-          <tr><td>ファイルを削除する</td><td>一覧で選んで <kbd>Delete</kbd></td><td>ごみ箱へ移します。</td></tr>
+          <tr><td>ファイルを削除する</td><td>一覧で選んで <kbd>Delete</kbd></td><td>通常はごみ箱へ移します。保存場所やごみ箱の設定によっては完全に削除されることがあり、その可能性があるときは確認画面が出ます。</td></tr>
         </tbody>
       </table>
     </div>
@@ -249,9 +250,9 @@
   <section>
     <h2>移行で使える便利な機能</h2>
     <div class="features">
-      <div class="feature-card"><div class="icon">🗂️</div><h3>サムネイル一覧</h3><p>フォルダ・ZIP・PDF・画像・動画を一覧で見渡して開けます。作ったサムネイルは保存するので、開き直しても待ちません。</p></div>
-      <div class="feature-card"><div class="icon">⭐</div><h3>★・タグで整理</h3><p>★1〜5 やタグを付けて、フォルダをまたいで呼び出せます。元のファイルは書き換えません。</p></div>
-      <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>小さな画像や古いスキャンを 4 倍に高精細化して表示できます。処理は PC の GPU で行います。</p></div>
+      <div class="feature-card"><div class="icon">🗂️</div><h3>サムネイル一覧</h3><p>フォルダ・ZIP・PDF・画像・動画を一覧で見渡して開けます。時間のかかった画像のサムネイルは保存するので、開き直すときは速く表示できます。</p></div>
+      <div class="feature-card"><div class="icon">⭐</div><h3>★・タグで整理</h3><p>★1〜5 やタグを付けて、フォルダをまたいで呼び出せます。既定では元のファイルを書き換えません。</p></div>
+      <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>小さな画像や古いスキャンを 4 倍に高精細化して表示できます。処理は PC の中で行います。</p></div>
       <div class="feature-card"><div class="icon">🎨</div><h3>非破壊の補正</h3><p>明るさ・コントラスト・色合いなどを、元のファイルを変えずに調整できます。</p></div>
       <div class="feature-card"><div class="icon">🎬</div><h3>動画・音楽の再生</h3><p>外部プレイヤーなしで再生し、長い動画はタイル表示で全体を見渡せます。</p></div>
       <div class="feature-card"><div class="icon">📱</div><h3>外出先から見る</h3><p>自宅 PC のライブラリを、スマートフォンのブラウザから開けます（<a href="guide-remote.html">案内</a>）。</p></div>

@@ -204,7 +204,7 @@
     <ul class="pink-list">
       <li><strong>動作環境は Windows 11（64bit）</strong>です。</li>
       <li><strong>mImageViewer はサムネイル一覧が基本の画面です。</strong>フォルダを開くと中の画像がサムネイルで並び、クリックでフルスクリーン表示に切り替わります。フルスクリーン中も <kbd>←</kbd> <kbd>→</kbd> やホイールで、同じフォルダの前後の画像へ移れます。</li>
-      <li><strong>エクスプローラーから 1 枚だけ開く使い方もできます。</strong>画像ファイルを渡して起動すると、その画像のフォルダを開いたうえで、その画像をフルスクリーンで表示します。環境設定の「起動と連携 → エクスプローラ連携」で「送る」メニューに登録すると、右クリックの <strong>送る → mImageViewer</strong> から開けます。</li>
+      <li><strong>エクスプローラーから 1 枚だけ開く使い方もできます。</strong>画像ファイルを渡して起動すると、その画像のフォルダを開いたうえで、その画像をフルスクリーンで表示します。環境設定の「起動と連携 → エクスプローラ連携」で「送る」メニューに登録すると、右クリックの <strong>送る → mImageViewer</strong> から開けます。ダブルクリックで開くようにするには、画像を右クリックして「プログラムから開く」から mImageViewer を選び、その種類のファイルをいつも mImageViewer で開く設定にしてください。一覧に出ないときは、PC 上の mImageViewer の実行ファイルを指定できます。</li>
       <li><strong>一般的な画像形式はプラグインなしで表示できます。</strong>JPEG / PNG / GIF / WebP / BMP は内蔵で表示し、HEIC・AVIF・各社 RAW は Windows の拡張機能（Microsoft Store）を入れると表示できます（<a href="manual/formats.html">対応フォーマット</a>）。アニメーション GIF・APNG・アニメーション WebP も再生します。</li>
       <li><strong>書庫は mImageViewer 本体が読みます。</strong>ZIP / CBZ と一般的な RAR / CBR は展開せずにそのまま開き、7z / LZH やソリッド圧縮の RAR は、最初に開くときに一度 ZIP へまとめ直してから表示します（元のファイルはそのまま残ります）。書庫用の Susie プラグインを用意する必要はありません。</li>
     </ul>
@@ -218,7 +218,7 @@
       <li><strong>開いたフォルダに、使っていた <code>.spi</code> ファイルをコピー</strong>します。</li>
       <li><strong>同じ画面の「⟳ プラグインを再読み込み」</strong>を押します。アプリの再起動は不要です。</li>
     </ul>
-    <div class="info-box">JPEG・PNG などは内蔵の読み込みが優先され、Susie プラグインは使われません。プラグインは別のプロセスで動かすため、不正な画像でプラグインが止まっても mImageViewer 本体は巻き込まれません。64bit 版（<code>.sph</code>）には対応していません。詳しくは <a href="manual/faq.html#format-retro">FAQ（古い PC の画像形式）</a> をご覧ください。</div>
+    <div class="info-box">JPEG・PNG などは内蔵の読み込みが優先され、Susie プラグインは使われません。不正な画像でプラグインが止まっても、mImageViewer 本体は影響を受けにくいつくりです。64bit 版（<code>.sph</code>）には対応していません。詳しくは <a href="manual/faq.html#format-retro">FAQ（古い PC の画像形式）</a> をご覧ください。</div>
   </section>
 
   <section>
@@ -238,7 +238,7 @@
           <tr><td>全画面 ⇔ ウィンドウ内</td><td><kbd>F11</kbd></td><td></td></tr>
           <tr><td>一覧に戻る</td><td><kbd>Esc</kbd></td><td></td></tr>
           <tr><td>スライドショー</td><td><kbd>S</kbd></td><td>間隔や、最後まで来たときの動き（ループ / 次のフォルダ / 停止）を選べます。</td></tr>
-          <tr><td>ファイルを削除する</td><td>一覧で選んで <kbd>Delete</kbd></td><td>ごみ箱へ移します。</td></tr>
+          <tr><td>ファイルを削除する</td><td>一覧で選んで <kbd>Delete</kbd></td><td>通常はごみ箱へ移します。保存場所やごみ箱の設定によっては完全に削除されることがあり、その可能性があるときは確認画面が出ます。</td></tr>
         </tbody>
       </table>
     </div>
@@ -258,10 +258,10 @@
   <section>
     <h2>移行で使える便利な機能</h2>
     <div class="features">
-      <div class="feature-card"><div class="icon">🗂️</div><h3>サムネイル一覧</h3><p>フォルダ・ZIP・PDF・画像・動画を一覧で見渡して開けます。作ったサムネイルは保存するので、開き直しても待ちません。</p></div>
+      <div class="feature-card"><div class="icon">🗂️</div><h3>サムネイル一覧</h3><p>フォルダ・ZIP・PDF・画像・動画を一覧で見渡して開けます。時間のかかった画像のサムネイルは保存するので、開き直すときは速く表示できます。</p></div>
       <div class="feature-card"><div class="icon">📖</div><h3>見開き表示</h3><p>ZIP や PDF の漫画を、右→左の見開きや表紙あり見開きで読めます。</p></div>
-      <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>PI / MAG などのレトロ画像や小さな画像を、4 倍に高精細化して表示できます。処理は PC の GPU で行います。</p></div>
-      <div class="feature-card"><div class="icon">⭐</div><h3>★・タグで整理</h3><p>★1〜5 やタグを付けて、フォルダをまたいで呼び出せます。元のファイルは書き換えません。</p></div>
+      <div class="feature-card"><div class="icon">🔍</div><h3>AI アップスケール</h3><p>PI / MAG などのレトロ画像や小さな画像を、4 倍に高精細化して表示できます。処理は PC の中で行います。</p></div>
+      <div class="feature-card"><div class="icon">⭐</div><h3>★・タグで整理</h3><p>★1〜5 やタグを付けて、フォルダをまたいで呼び出せます。既定では元のファイルを書き換えません。</p></div>
       <div class="feature-card"><div class="icon">🧹</div><h3>AI 消しゴム</h3><p>スキャンの汚れや傷を塗ると、周囲から自然に補完します（元ファイルは無改変）。</p></div>
       <div class="feature-card"><div class="icon">🖥️</div><h3>高 DPI・GPU 表示</h3><p>4K などの高解像度ディスプレイでも、きれいで滑らかに表示します。</p></div>
     </div>
