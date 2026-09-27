@@ -484,6 +484,8 @@ A2 / A3 を実装している間に開発機の台帳が埋まり、A3 の実機
 へ変更した。上限が表現できない Unicode 境界は `key >= prefix AND substr(...)` とし、
 文字数で判定する旧結果を維持しながら索引の下限を使う。`query_family_rows` の
 exact と virtual prefix は別クエリに分け、`OR substr(...)` を残さない。
+旧 `substr` と範囲検索が同じキー集合を返す前提は、保存済みキーと prefix に NUL が
+含まれないこと。Windows の実 path は NUL を含められず、これらのキーは実 path 由来。
 `ratings.source_path` の改名後・コピー後の再計算対象も同じ範囲に変更した。
 値を導出する `substr(path,1,instr(path,'::')-1)` 自体は検索条件ではなく維持する。
 
@@ -504,6 +506,13 @@ exact と virtual prefix は別クエリに分け、`OR substr(...)` を残さ�
 | folder_thumb_pins.db / book_resume.db | folder_thumb_pins.container_key、book_resume.path | 各 PK |
 | spread.db | spreads.path、final_cover_spreads.path、singleton_spread_placements.path、singleton_spread_endpoint_placements.path、page_alone_preferences.path | 各 PK |
 | reading_history.db | reading_history.key | PK |
+
+索引の回帰テストは本番の各 `open_at` / schema migration 経路で一時 DB を作り、
+新規作成・現行スキーマの再オープン・旧スキーマからの移行後に `PRAGMA index_xinfo` と
+`EXPLAIN QUERY PLAN` を確認する。移行 fixture は ratings、content identity、
+sidecar sync、mask、export crop、edit preview、video pins/bookmarks、folder thumb pins、
+spread、reading history を含む。読み取り専用・既存 DB 専用の open 経路はスキーマを
+作成・移行せず、通常の open 経路で初期化済みの DB を参照する。
 
 画像は Exact mapping のみ。ZIP / PDF は Exact と VirtualPrefix、変換アーカイブは
 元パスと予測 cache ZIP の各 Exact / VirtualPrefix の 4 面を維持する。分類には

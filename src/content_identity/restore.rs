@@ -807,27 +807,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn runtime_family_exact_and_prefix_query_plans_search_key_index() {
-        let data = tempfile::tempdir().unwrap();
-        create_all_unique_store_schemas(data.path());
-        for (file, table, column) in [
-            ("adjustment.db", "page_params", "page_path"),
-            ("mask.db", "masks", "path"),
-            ("conceal.db", "conceal_entries", "page_path"),
-            ("local_adjust.db", "local_adjust_pages", "page_path"),
-            ("export_crop.db", "export_crop_pages", "page_path"),
-            ("comic.db", "comic_entries", "page_path"),
-            ("rotation.db", "rotations", "path"),
+    fn assert_runtime_family_query_plans(data_dir: &Path) {
+        for (file, table, column, selected) in [
+            ("adjustment.db", "page_params", "page_path", "params_json"),
+            (
+                "mask.db",
+                "masks",
+                "path",
+                "mask_data, width, height, vectors",
+            ),
+            (
+                "conceal.db",
+                "conceal_entries",
+                "page_path",
+                "bitmap_data, bitmap_w, bitmap_h, shapes",
+            ),
+            (
+                "local_adjust.db",
+                "local_adjust_pages",
+                "page_path",
+                "layers_json",
+            ),
+            (
+                "export_crop.db",
+                "export_crop_pages",
+                "page_path",
+                "min_x, min_y, max_x, max_y, aspect_mode, source_width, source_height",
+            ),
+            ("comic.db", "comic_entries", "page_path", "doc_json"),
+            ("rotation.db", "rotations", "path", "angle"),
         ] {
-            let connection = rusqlite::Connection::open(data.path().join(file)).unwrap();
+            let connection = rusqlite::Connection::open(data_dir.join(file)).unwrap();
             for predicate in [
                 format!("{column} = ?1"),
                 format!("{column} >= ?1 AND {column} < ?2"),
                 format!("{column} >= ?1 AND substr({column}, 1, ?2) = ?1"),
             ] {
-                let sql =
-                    format!("EXPLAIN QUERY PLAN SELECT {column} FROM {table} WHERE {predicate}");
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN SELECT {column}, {selected} FROM {table} WHERE {predicate}"
+                );
                 let mut statement = connection.prepare(&sql).unwrap();
                 let plan: String = if predicate == format!("{column} = ?1") {
                     statement
@@ -847,6 +865,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn runtime_family_exact_and_prefix_query_plans_search_key_index() {
+        let data = tempfile::tempdir().unwrap();
+        create_production_store_schemas(data.path());
+        assert_runtime_family_query_plans(data.path());
     }
 
     #[test]
@@ -981,6 +1006,211 @@ mod tests {
             };
             connection.execute_batch(sql).unwrap();
         }
+    }
+
+    /// Exercise the schema creation and additive migrations used by the application, rather
+    /// than test-local CREATE TABLE statements. Every STORES file is opened at least once.
+    fn create_production_store_schemas(data_dir: &Path) {
+        drop(crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).unwrap());
+        drop(ContentIdentityDb::open_at(&data_dir.join("content_identity.db")).unwrap());
+        drop(crate::adjustment_db::AdjustmentDb::open_at(&data_dir.join("adjustment.db")).unwrap());
+        drop(crate::mask_db::MaskDb::open_at(&data_dir.join("mask.db")).unwrap());
+        drop(crate::conceal_db::ConcealDb::open_at(&data_dir.join("conceal.db")).unwrap());
+        drop(
+            crate::local_adjust_db::LocalAdjustDb::open_at(&data_dir.join("local_adjust.db"))
+                .unwrap(),
+        );
+        drop(crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db")).unwrap());
+        drop(crate::export_crop::CropDb::open_at(&data_dir.join("export_crop.db")).unwrap());
+        drop(
+            crate::edit_preview_cache::EditPreviewCacheDb::open_at(
+                &data_dir.join("edit_preview_cache.db"),
+            )
+            .unwrap(),
+        );
+        drop(crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap());
+        drop(crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db")).unwrap());
+        drop(crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db")).unwrap());
+        drop(crate::video_pins::VideoPinDb::open_at(&data_dir.join("video_pins.db")).unwrap());
+        drop(
+            crate::video_bookmarks::VideoBookmarkDb::open_at(&data_dir.join("video_bookmarks.db"))
+                .unwrap(),
+        );
+        drop(
+            crate::folder_thumb_pins::FolderThumbPinDb::open_at(
+                &data_dir.join("folder_thumb_pins.db"),
+            )
+            .unwrap(),
+        );
+        drop(
+            crate::book_resume_db::BookResumeDb::open_at(&data_dir.join("book_resume.db")).unwrap(),
+        );
+        drop(crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db")).unwrap());
+        drop(
+            crate::reading_history_db::ReadingHistoryDb::open_at(
+                data_dir.join("reading_history.db"),
+            )
+            .unwrap(),
+        );
+    }
+
+    fn assert_production_store_prefix_plans(data_dir: &Path) {
+        for descriptor in crate::rename_key_migration::STORES {
+            let connection = rusqlite::Connection::open(data_dir.join(descriptor.file)).unwrap();
+            let indexes = connection
+                .prepare(&format!("PRAGMA index_list({})", descriptor.table))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let leading_binary = indexes.iter().any(|index| {
+                let mut statement = connection
+                    .prepare(&format!(
+                        "PRAGMA index_xinfo('{}')",
+                        index.replace('\'', "''")
+                    ))
+                    .unwrap();
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+                    .iter()
+                    .any(|(seq, column, collation, key)| {
+                        *seq == 0
+                            && column.as_deref() == Some(descriptor.column)
+                            && collation == "BINARY"
+                            && *key == 1
+                    })
+            });
+            assert!(
+                leading_binary,
+                "{}.{}.{} lacks BINARY leading-key index",
+                descriptor.file, descriptor.table, descriptor.column
+            );
+            let column = descriptor.column;
+            let table = descriptor.table;
+            for predicate in [
+                format!("{column} >= ?1 AND {column} < ?2"),
+                format!("{column} >= ?1 AND substr({column}, 1, ?2) = ?1"),
+            ] {
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM {table} WHERE {predicate}"
+                );
+                let plan: String = connection
+                    .prepare(&sql)
+                    .unwrap()
+                    .query_row(
+                        rusqlite::params!["c:/日本/本.zip::", "c:/日本/本.zip:;"],
+                        |row| row.get(3),
+                    )
+                    .unwrap();
+                assert!(
+                    plan.contains("SEARCH") && plan.contains("INDEX") && !plan.contains("SCAN"),
+                    "{}.{} {predicate}: {plan}",
+                    descriptor.file,
+                    descriptor.table
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_store_prefix_plans_use_binary_leading_indexes() {
+        let data = tempfile::tempdir().unwrap();
+        create_production_store_schemas(data.path());
+        assert_production_store_prefix_plans(data.path());
+        // Reopening an already current schema uses the same production constructors.
+        create_production_store_schemas(data.path());
+        assert_production_store_prefix_plans(data.path());
+    }
+
+    #[test]
+    fn migrated_production_store_prefix_plans_use_binary_leading_indexes() {
+        let data = tempfile::tempdir().unwrap();
+        // Released/development predecessor schemas exercise the additive or rebuild branches
+        // of the same open_at constructors. All other stores start from an absent DB.
+        for (file, sql) in [
+            (
+                "rating.db",
+                "CREATE TABLE ratings(path TEXT PRIMARY KEY, stars INTEGER NOT NULL)",
+            ),
+            (
+                "content_identity.db",
+                "CREATE TABLE edit_origin (
+                    file_key TEXT PRIMARY KEY, size INTEGER NOT NULL, head_hash TEXT NOT NULL,
+                    full_hash TEXT, hashed_mtime INTEGER NOT NULL, kind TEXT NOT NULL,
+                    last_edit_at INTEGER NOT NULL);
+                 PRAGMA user_version = 0;",
+            ),
+            (
+                "adjustment.db",
+                "CREATE TABLE sidecar_sync (
+                    folder_key TEXT PRIMARY KEY, synced_at INTEGER NOT NULL)",
+            ),
+            (
+                "mask.db",
+                "CREATE TABLE masks (
+                    path TEXT PRIMARY KEY, mask_data BLOB, width INTEGER, height INTEGER)",
+            ),
+            (
+                "export_crop.db",
+                "CREATE TABLE export_crop_pages (
+                    page_path TEXT PRIMARY KEY, min_x REAL NOT NULL, min_y REAL NOT NULL,
+                    max_x REAL NOT NULL, max_y REAL NOT NULL, aspect_mode TEXT NOT NULL)",
+            ),
+            (
+                "edit_preview_cache.db",
+                "CREATE TABLE edit_previews(item_key TEXT PRIMARY KEY);
+                 PRAGMA user_version = 1;",
+            ),
+            (
+                "video_pins.db",
+                "CREATE TABLE video_pins (
+                    path TEXT PRIMARY KEY, pin_pts_secs REAL NOT NULL, thumb_webp BLOB)",
+            ),
+            (
+                "video_bookmarks.db",
+                "CREATE TABLE video_bookmarks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL,
+                    pts_secs REAL NOT NULL, title TEXT, thumb_webp BLOB,
+                    created_at INTEGER NOT NULL)",
+            ),
+            (
+                "folder_thumb_pins.db",
+                "CREATE TABLE folder_thumb_pins (
+                    container_key TEXT PRIMARY KEY, source_kind TEXT NOT NULL,
+                    source_rel TEXT NOT NULL, source_entry TEXT, source_page INTEGER)",
+            ),
+            (
+                "spread.db",
+                "CREATE TABLE spreads(path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE singleton_spread_placements (
+                    path TEXT PRIMARY KEY, preference INTEGER NOT NULL)",
+            ),
+            (
+                "reading_history.db",
+                "CREATE TABLE reading_history (
+                    key TEXT PRIMARY KEY, path TEXT NOT NULL, kind TEXT NOT NULL,
+                    archive_format TEXT, title TEXT NOT NULL,
+                    last_read_at_ms INTEGER NOT NULL, last_page INTEGER, page_count INTEGER,
+                    file_size INTEGER, mtime_ms INTEGER)",
+            ),
+        ] {
+            let connection = rusqlite::Connection::open(data.path().join(file)).unwrap();
+            connection.execute_batch(sql).unwrap();
+        }
+        create_production_store_schemas(data.path());
+        assert_production_store_prefix_plans(data.path());
+        assert_runtime_family_query_plans(data.path());
     }
 
     #[test]

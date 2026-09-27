@@ -1502,7 +1502,10 @@ fn normalized_removed_keys(
 /// BINARY collation で `prefix` から始まる文字列の排他的 upper bound を返す。
 ///
 /// UTF-8 の辞書順は Unicode code point 順を保つため、最後の scalar value を次へ進めれば
-/// `value >= prefix AND value < upper` が prefix 一致と同じ集合になる。最後が `char::MAX`
+/// `value >= prefix AND value < upper` が prefix 一致と同じ集合になる。ただし旧 SQL の
+/// `substr` との等価性は、保存済み path key と prefix に NUL が含まれないことが前提。
+/// Windows の実 path は NUL を含められず、この store の key は実 path 由来である。
+/// 最後が `char::MAX`
 /// または次が surrogate で scalar value にできない場合は `None` とし、呼び出し側で従来の
 /// `substr` 条件へ安全に fallback する。hard purge が渡す prefix は `/` / `:` 終端なので
 /// 通常は必ず index range 条件を使える。
@@ -1961,8 +1964,10 @@ fn copy_prefix(
     Ok(outcome)
 }
 
-/// All store keys use BINARY collation and have a leading-key index. Keep a lower
-/// bound even for Unicode prefixes without a representable exclusive upper bound.
+/// All store keys use BINARY collation and have a leading-key index. Equivalence
+/// with the old SQLite `substr` predicate assumes path keys and prefixes have no NUL;
+/// Windows paths cannot contain NUL. Keep a lower bound even for Unicode prefixes
+/// without a representable exclusive upper bound.
 fn indexed_prefix_keys(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -2496,77 +2501,6 @@ mod tests {
             assert!(
                 plan.contains("SEARCH") && !plan.contains("SCAN"),
                 "{prefix:?}: {plan}"
-            );
-        }
-    }
-
-    #[test]
-    fn every_store_prefix_plan_uses_a_binary_leading_key_index() {
-        let dir = tempfile::tempdir().unwrap();
-        setup_copy_store_rows(dir.path(), Path::new(r"C:\本\old.zip"));
-        for descriptor in STORES {
-            let connection = open(dir.path(), descriptor.file);
-            if !descriptor.unique {
-                connection.execute_batch(
-                    "CREATE INDEX IF NOT EXISTS idx_video_bookmarks_path ON video_bookmarks(path)"
-                ).unwrap();
-            }
-            let indexes = connection
-                .prepare(&format!("PRAGMA index_list({})", descriptor.table))
-                .unwrap()
-                .query_map([], |row| row.get::<_, String>(1))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            let mut leading_binary = false;
-            for index in indexes {
-                let mut statement = connection
-                    .prepare(&format!(
-                        "PRAGMA index_xinfo('{}')",
-                        index.replace('\'', "''")
-                    ))
-                    .unwrap();
-                let entries = statement
-                    .query_map([], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, Option<String>>(2)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, i64>(5)?,
-                        ))
-                    })
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
-                leading_binary |= entries.iter().any(|(seq, column, collation, key)| {
-                    *seq == 0
-                        && column.as_deref() == Some(descriptor.column)
-                        && collation == "BINARY"
-                        && *key == 1
-                });
-            }
-            assert!(
-                leading_binary,
-                "{}.{}.{}",
-                descriptor.file, descriptor.table, descriptor.column
-            );
-            let sql = format!(
-                "EXPLAIN QUERY PLAN SELECT DISTINCT {} FROM {} WHERE {} >= ?1 AND {} < ?2",
-                descriptor.column, descriptor.table, descriptor.column, descriptor.column,
-            );
-            let plan: String = connection
-                .prepare(&sql)
-                .unwrap()
-                .query_row(
-                    rusqlite::params!["c:/本/old.zip::", "c:/本/old.zip:;"],
-                    |row| row.get(3),
-                )
-                .unwrap();
-            assert!(
-                plan.contains("SEARCH") && plan.contains("INDEX") && !plan.contains("SCAN"),
-                "{}.{}: {plan}",
-                descriptor.file,
-                descriptor.table
             );
         }
     }
