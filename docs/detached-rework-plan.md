@@ -1455,6 +1455,22 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-28 §1.251 S7: Remote の取得時にローカルの閲覧 context をすべて閉じ、所有中は閲覧の open を拒否**
+
+音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §9B) で、Remote で見た再生位置を
+PC へ書き戻すため (利用者決定 2026-09-26)、Remote の取得 barrier の条件に「ローカルの閲覧を閉じ終えた」を加えた。
+取得時に、表示モード変更で使っている既存の terminal close (`close_all_detached_viewers_for_mode_change`) と
+`close_fullscreen_to_completion` で、active・passive / ParkedLive・残余の画像 context を retire し、viewport を
+hide する。両 helper が従来ログを残して続行していた失敗は型付きで返すようにした (表示モード変更の挙動は不変)。閉鎖の
+完了は実状態 (root 以外の context の有無、fullscreen viewport の非表示完了、detached の runtime / window / session、
+transition と未実行の effect) から判定し、完了したフレームでだけ `finish_acquire` する。取得前に積まれた閲覧の open
+要求 (fullscreen 復元、遅延 open、列挙完了後の再 open、ParkedLive 復帰要求など) は失効させ、共通の open 境界で Remote
+の所有中は open を拒否する。Remote の終了時には閉じたものを復元しない。
+判断: Remote の所有という境界で、ローカルの閲覧 context (所有する player・再生位置の書き手) を既存の terminal close で
+なくす構造的変更であり、guard・遅延・再試行・一括 reset で症状を隠すものではない。rect 一致・時間窓・新しい App の
+bool は加えていない (§2 の禁止事項に抵触しない。取得 barrier の既存の watchdog は取得を諦める判断にだけ使う)。
+独立レビュー (Sol) と ClaudeCode の双方がこの判断に合意した。
+
 **2026-09-27 §1.251 S4: 動画 HUD の音声トラック選択を ParkedLive の HUD クリック分類と music shell の許可に追加**
 
 音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §7.6・§8.1) で、動画 HUD の新しい

@@ -1374,16 +1374,6 @@ pub(crate) struct NativeVideoOpenPending {
 const NATIVE_VIDEO_NAV_SWAP_DEBOUNCE_MS: u64 = 120;
 
 #[cfg(windows)]
-pub(crate) fn video_mtime_secs_for_resume_thumb(path: &std::path::Path) -> i64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-#[cfg(windows)]
 pub(crate) struct NativeVideoSourceSwapPending {
     pub(crate) from_idx: usize,
     pub(crate) target_idx: usize,
@@ -2263,7 +2253,7 @@ impl App {
 
     #[cfg(windows)]
     fn video_mtime_secs(path: &std::path::Path) -> i64 {
-        video_mtime_secs_for_resume_thumb(path)
+        crate::video::tile_thumbnails::video_mtime_secs_for_resume_thumb(path)
     }
 
     #[cfg(windows)]

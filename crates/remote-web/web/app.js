@@ -1657,6 +1657,7 @@ if (!RUNTIME_TEST_MODE) {
   }
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") {
+      reportVideoProgressBeforePageHide(state.viewer);
       state.remoteSessionUserActive = false;
       state.remoteAiController?.suspend();
       state.archiveOpenController?.suspend();
@@ -1881,6 +1882,7 @@ export function applyRemoteSessionId(
   // Identity is the admission boundary. Publish its revocation before invoking an optional
   // image-viewer hook; video owns no pending page fetch and intentionally has no such method.
   state.remoteSessionId = next;
+  activateVideoProgressWriter(next, state.viewer?.progressRemoteSessionId);
   state.remoteSessionCorrelation = "";
   if (next) {
     telemetrySessionCorrelation(next).then((correlation) => {
@@ -3759,6 +3761,7 @@ function menuCommand(event, name, payload = {}) {
 }
 
 function cleanupScreen(preserveRequestController = null) {
+  enqueueVideoProgress(state.viewer?.snapshotProgress?.(), { immediate: true, keepalive: true });
   rememberCurrentGridViewport();
   containerSpreadRefreshOwner.clear();
   clearInterval(state.authCountdownTimer);
@@ -3795,6 +3798,24 @@ function cleanupScreen(preserveRequestController = null) {
   state.viewer = null;
   state.screenContext = "loading";
   app.replaceChildren();
+}
+
+export function cleanupVideoViewerForTest(viewer) {
+  if (!RUNTIME_TEST_MODE) return false;
+  state.viewer = viewer;
+  cleanupScreen();
+  return true;
+}
+
+export function retainVideoViewerForTest(viewer) {
+  if (!RUNTIME_TEST_MODE) return false;
+  state.viewer = viewer;
+  return true;
+}
+
+export function reportRetainedVideoProgressForTest() {
+  if (!RUNTIME_TEST_MODE) return null;
+  return reportVideoProgressBeforePageHide(state.viewer);
 }
 
 function renderHome(tab = "places") {
@@ -5745,6 +5766,63 @@ let readingProgressBatch = createReadingProgressBatch();
 let readingProgressContextIdentity = "";
 let readingProgressTimer = 0;
 let readingProgressWriteTail = Promise.resolve();
+const videoProgressWriters = new Map();
+
+function activateVideoProgressWriter(sessionId, viewerSessionId = "") {
+  // In-flight old requests retain their promise chain. Only the still-open viewer may create
+  // further reports for the old owner after a session switch.
+  for (const oldSessionId of videoProgressWriters.keys()) {
+    if (oldSessionId !== viewerSessionId) videoProgressWriters.delete(oldSessionId);
+  }
+  if (sessionId) {
+    videoProgressWriters.set(sessionId, { tail: Promise.resolve(), sequence: 0 });
+  }
+}
+
+export function reportVideoProgressBeforePageHide(viewer) {
+  return enqueueVideoProgress(viewer?.snapshotProgress?.(), { immediate: true, keepalive: true });
+}
+
+export function enqueueVideoProgress(snapshot, { keepalive = false, immediate = false } = {}) {
+  if (!snapshot) return videoProgressWriters.get(state.remoteSessionId)?.tail ?? Promise.resolve();
+  const sessionId = snapshot.remoteSessionId;
+  if (!sessionId) return Promise.resolve();
+  let writer = videoProgressWriters.get(sessionId);
+  if (!writer) {
+    writer = { tail: Promise.resolve(), sequence: 0 };
+    videoProgressWriters.set(sessionId, writer);
+  }
+  const request = addressedPostRequest("/api/write", {
+    kind: "record_video_progress",
+    address: snapshot.address,
+    sequence: ++writer.sequence,
+    position_secs: snapshot.positionSecs,
+    duration_secs: snapshot.durationSecs,
+    ended: snapshot.ended,
+  });
+  const headers = remoteHeaders({ Accept: "application/json", "Content-Type": "application/json" });
+  headers.set("X-mIV-Remote-Session", sessionId);
+  const send = async () => {
+    const response = await fetch(request.url, {
+      method: "POST",
+      credentials: "same-origin",
+      keepalive,
+      headers,
+      body: JSON.stringify(request.body),
+    });
+    if (!response.ok) throw new Error(`再生位置の保存に失敗しました (HTTP ${response.status})`);
+  };
+  // Page teardown cannot wait for a stalled earlier fetch. Core rejects an older sequence
+  // arriving after this keepalive report for the same session and path.
+  if (immediate) {
+    return send().catch((error) => recordClientError("video_progress_write_error", error));
+  }
+  writer.tail = writer.tail
+    .catch(() => {})
+    .then(send)
+    .catch((error) => recordClientError("video_progress_write_error", error));
+  return writer.tail;
+}
 
 function currentRemotePageTarget() {
   const group = currentPageGroup();
@@ -7302,6 +7380,7 @@ function renderVideoViewer(entry) {
     }),
     getPanelTab: () => state.videoPanelTab,
     setPanelTab: (tabId) => { state.videoPanelTab = tabId; },
+    reportProgress: enqueueVideoProgress,
   });
   if (!state.viewerBarsVisible) viewer.setBarsVisible(false);
   state.viewer = viewer;

@@ -1764,6 +1764,7 @@ export class VideoStreamViewer {
     keyboardAvailable = true,
     getPanelTab = () => "functions",
     setPanelTab = () => {},
+    reportProgress = () => {},
   }) {
     this.isVideoStreamViewer = true;
     this.entry = entry;
@@ -1772,6 +1773,8 @@ export class VideoStreamViewer {
     this.inputSource = inputSource;
     this.apiJson = apiJson;
     this.apiPostJson = apiPostJson;
+    this.reportProgress = reportProgress;
+    this.lastProgressReportAt = 0;
     this.reportPlaybackIssue = reportPlaybackIssue;
     this.publishVideoHealth = publishVideoHealth;
     this.getTelemetryDebugContext = getTelemetryDebugContext;
@@ -1785,6 +1788,7 @@ export class VideoStreamViewer {
     this.duration = 0;
     this.bufferTargetSecs = null;
     this.session = null;
+    this.progressRemoteSessionId = "";
     this.generation = null;
     this.encoder = "";
     this.codecs = "";
@@ -1970,7 +1974,11 @@ export class VideoStreamViewer {
       this.checkPlaybackStartupProgress();
       this.updateProgress();
       this.handlePlaybackBoundary(false);
+      if (!this.video.paused && performance.now() - this.lastProgressReportAt >= 5000) {
+        this.emitProgress();
+      }
     };
+    this.onPause = () => this.emitProgress();
     this.onPlaying = () => this.handleMediaPlaying();
     this.onCanPlay = () => {
       this.checkPlaybackStartupProgress();
@@ -1991,7 +1999,10 @@ export class VideoStreamViewer {
       this.captureVideoHealth("hud");
       this.beginWaiting("stalled");
     };
-    this.onEnded = () => this.handlePlaybackBoundary(true);
+    this.onEnded = () => {
+      this.emitProgress(true);
+      this.handlePlaybackBoundary(true);
+    };
     this.onMediaError = () => {
       if (
         this.destroyed ||
@@ -2019,6 +2030,7 @@ export class VideoStreamViewer {
       }
     };
     this.video.addEventListener("timeupdate", this.onTimeUpdate);
+    this.video.addEventListener("pause", this.onPause);
     this.video.addEventListener("playing", this.onPlaying);
     this.video.addEventListener("canplay", this.onCanPlay);
     this.video.addEventListener("loadeddata", this.onLoadedData);
@@ -2392,6 +2404,10 @@ export class VideoStreamViewer {
       url: playlistUrl,
     });
     if (!attached || this.destroyed) return;
+    // This is the owner attested by the successful stream start, not the app's current
+    // session at report time. Keep the previous owner until the new stream is attached.
+    this.progressRemoteSessionId = typeof started.remote_session_id === "string"
+      ? started.remote_session_id : "";
     this.announceAudioProcessingWarning();
     if (!restorePlaying) {
       await this.setPlaying(false);
@@ -3106,6 +3122,7 @@ export class VideoStreamViewer {
       this.video.currentTime = plan.mediaTimeSecs;
       this.finishSeekPreview(previewRequest);
       this.updateProgress();
+      this.emitProgress();
       return;
     }
     const request = previewRequest ?? this.beginSeekPreview(
@@ -3143,6 +3160,7 @@ export class VideoStreamViewer {
         url: sought.playlist,
       });
       if (!attached) this.cancelSeekPreview(request);
+      else this.emitProgress();
     } catch (error) {
       this.cancelSeekPreview(request);
       throw error;
@@ -3168,6 +3186,7 @@ export class VideoStreamViewer {
     if (!this.session || this.destroyed || preset.id !== quality || quality === this.quality) return;
     this.showNotice(`${preset.label}${this.hasVideo === false ? "音質" : "画質"}へ切り替えています。`, "waiting");
     const positionSecs = this.currentPosition();
+    this.emitProgress?.();
     try {
       await this.apiPostJson(
         "/api/video/control",
@@ -3192,6 +3211,32 @@ export class VideoStreamViewer {
     await this.refreshGeneration();
   }
 
+  snapshotProgress(ended = false) {
+    if (this.destroyed || !this.session || !this.progressRemoteSessionId ||
+        !Number.isFinite(this.duration) || this.duration <= 0) {
+      return null;
+    }
+    const positionSecs = this.currentPosition();
+    if (!Number.isFinite(positionSecs) || positionSecs < 0 || positionSecs > this.duration + 1) {
+      return null;
+    }
+    return {
+      address: this.address,
+      remoteSessionId: this.progressRemoteSessionId,
+      positionSecs,
+      durationSecs: this.duration,
+      ended: ended || this.video.ended,
+    };
+  }
+
+  emitProgress(ended = false) {
+    const snapshot = this.snapshotProgress(ended);
+    if (snapshot) {
+      this.lastProgressReportAt = performance.now();
+      this.reportProgress(snapshot);
+    }
+  }
+
   async setAudioTrack(streamIndex) {
     if (this.destroyed ||
         !this.audioTracks.some((track) => track.stream_index === streamIndex)) return;
@@ -3201,6 +3246,7 @@ export class VideoStreamViewer {
       return;
     }
     if (!this.session) return;
+    this.emitProgress?.();
     const session = this.session;
     const expectedGeneration = this.generation;
     this.showNotice("音声トラックを切り替えています。", "waiting");
@@ -4044,6 +4090,7 @@ export class VideoStreamViewer {
     this.pendingTimers.clear();
     this.stopPlaylistPlayback();
     this.video.removeEventListener("timeupdate", this.onTimeUpdate);
+    this.video.removeEventListener("pause", this.onPause);
     this.video.removeEventListener("playing", this.onPlaying);
     this.video.removeEventListener("canplay", this.onCanPlay);
     this.video.removeEventListener("loadeddata", this.onLoadedData);

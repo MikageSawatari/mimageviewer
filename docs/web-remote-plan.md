@@ -35,7 +35,7 @@ v3.0.0 の目玉として、外出先のスマートフォン / タブレット 
 | 読み取り (画像・動画バイト) | remote-web が **直接** read-only で読む | HTTP の range / 画像配信を本体 UI から分離する |
 | 通常フォルダ一覧 | **IPC → 本体** | 表示対象・順序・sidecar 吸収・重複除去を本体の production materializer 1 箇所に固定する (§12.15) |
 | サムネイル参照・生成 | **IPC → 本体** | catalog の実態が当初想定と異なったため。本体の既存生成経路とキャッシュ方針を一元利用する (§9) |
-| 書き込み (読書履歴・ブックマーク・見開き・トリム・タグ・レーティング) | **必ず IPC → 本体** | 全永続ストアの writer を本体 1 つに固定する |
+| 書き込み (読書履歴・動画/音声の再生位置・ブックマーク・見開き・トリム・タグ・レーティング) | **必ず IPC → 本体** | 全永続ストアの writer を本体 1 つに固定する |
 | 重い生成 (PDF レンダ・AI アップスケール・カラー化・補正合成) | **IPC → 本体** | PDFium プール・ONNX セッション・GPU をステートフルに保持しているのは本体 |
 
 SQLite は DB ごとに journal 設定が異なる。特に `spread.db` は WAL / `busy_timeout` を設定せず、
@@ -50,7 +50,10 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 本体に単一の remote session owner を置く。ブラウザは認証後に
 `POST /api/session/acquire` で確認なしに操作権を取得し、本体は「リモート接続中」ダイアログを
-出して main / fullscreen / detached / native presenter の通常入力をロックする。操作者は常に
+出す。取得 barrier は全ローカル viewer context、fullscreen、detached / メディア窓、player の
+閉鎖と AI の静止を確認してから RemoteActive に進む。閉鎖失敗または 30 秒の watchdog 超過時は
+取得を失敗として Local に戻す。AcquiringRemote 中は閉鎖の途中であり得るが、RemoteActive / DrainingRemote
+にはローカルの閲覧窓と player は残らない。操作者は常に
 1 人であり、2 台目やローカルとの競合は**後から操作した側が勝つ**。表示フォルダ等の状態同期はしない。
 
 - ダイアログには `tailscale status --json` の `Peer.TailscaleIPs` と接続元 IP の照合結果から
@@ -68,9 +71,14 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
   fail-closed guard で 401 とし、owner 解決へ進めない。
   認証後の全画面では左上の小さな badge に「操作中」または
   「別の端末が操作中 (操作すると取得します)」を常時表示し、確認や入力 blocking は行わない
-- session owner が変わった時、本体は既存の media pause、slideshow stop、owner-scoped native
-  pending cancel を通して動画・音声・音楽ビュー・スライドショー・GIF/APNG・連続送りを停止する。
-  player、停止位置、main/fullscreen/detached の window 構成は保持し、操作権返却時も自動再開しない
+- session owner が変わった時、本体は全 context の再生位置と確定済み音声トラック選択を収穫し、
+  取得前の delayed open / fullscreen restore を失効させる。既存の全窓 terminal close 経路で
+  main / detached / ParkedLive / メディア窓を閉じる。Remote が見た再生位置は IPC write で
+  PC の settings と読書履歴に戻す。hidden / viewer 破棄の最終報告は keepalive で即時発信し、
+  viewer は配信開始時の所有 session ID を attach 成功後に報告へ固定し、再接続中の旧位置を新 owner として
+  送らない。通常報告の列は session ごとに独立し、core は session・path 単位の連番で逆順到着を捨てる。
+  端末の再生中は 5 秒ごとに報告するため、突然の所有終了では
+  最終報告以後の最大 5 秒分が残らないことがある
 - ブラウザは 30 秒ごとに `POST /api/session/ping` を送り、直近の利用者入力と video/audio 再生中を
   通知する。通常の IPC 要求と remote-web が直接処理する一覧/画像 API も活動として数える
 - 生存タイムアウトは ping/API が 60 秒無い場合、放置タイムアウトは「利用者操作なし、かつ
@@ -78,9 +86,8 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - active 中は watchdog thread が `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` を保持し、解放時に
   `ES_CONTINUOUS` へ戻す
 - ローカルへ操作権が戻った瞬間、読書履歴・レーティング・ブックマーク・スマートフォルダ・
-  通常フォルダの既存「再読み込み」入口を 1 回呼ぶ。fullscreen 中は item identity を保持し、
-  一覧再構築後に同じ item を既存 `open_fullscreen` 経路で開き直す。再 open する media / animated
-  image には paused 状態を引き継ぎ、利用者が再生操作を行うまで動かさない
+  通常フォルダの既存「再読み込み」入口を 1 回呼ぶ。閉じた閲覧窓は復元せず一覧を表示する。
+  次に PC で開くと Remote が書いた位置と音声トラックで始まる
 - **その鏡像**として、リモートが操作権を取得した瞬間、端末は cache を破棄し、home 画面の
   データ (お気に入り / 場所 / スマートフォルダ定義) を取り直す。**この排他があるからこそ、
   セッション取得が「本体側で何か変わったかもしれない」の完全な信号になる** — 本体は

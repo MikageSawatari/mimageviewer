@@ -750,6 +750,25 @@ Remote で続きを見るときも、同じトラックで始める。
 利用者決定 (2026-09-26): Remote で見進めた位置を PC の再生位置へ書き戻す。書き戻しと競合するローカルの
 閲覧状態を残さないため、**Remote 接続を受け付けた時点で、ローカルの閲覧ウィンドウをすべて閉じる**。
 
+S7 実装 (2026-09-28): 取得 barrier が全 context の終端 close と fullscreen viewport の非表示を確認してから
+RemoteActive に進む。取得前のローカル open 意図は失効し、所有中の共通 open 境界は拒否する。終了時は一覧を
+再読み込みし、閉じた閲覧窓は復元しない。端末の再生位置は直列 writer から既存の write FIFO に送られ、
+core の PC 共通 resume 適用入口と履歴更新を通る。新しい IPC variant のバイナリ互換性のため protocol は
+62 から 63 に上げた。端末からの最終報告後に所有が終了した場合は、最大約 5 秒の再生位置が残らない。
+
+S7 独立レビュー REVISE 対応: hidden / destroy の最終報告は先行 fetch の完了を待たず keepalive で
+即時発信する。通常報告の直列列は維持し、session ごとの単調増加 `sequence` を protocol 63 の
+`RecordVideoProgress` に追加する。core は所有世代と検証済み logical path ごとの最大連番を持ち、
+後着の古い位置を無視する。動画の検証後は `resolved.logical` を request に反映し、PC と同じ
+resume / 履歴 key で適用する。再生位置サムネイルの mtime 取得と SQLite 照会は既存の
+`video-resume-thumb` worker の冒頭で行い、UI thread は予約だけを行う。
+
+S7 再レビュー REVISE 対応: `video/start` の応答にその配信を受け付けた Remote session ID を含める。
+viewer は新しい配信の attach 成功時にだけ進捗報告の所有 ID を更新する。再取得後も旧 viewer が
+残る間の hidden / destroy / pause 報告は旧 ID のまま送られ、core の所有照合で拒否される。
+client の通常報告 tail と連番は session 単位で独立させ、新 owner の報告が旧 owner の未完了 fetch を
+待たない。
+
 ### 9B.1 現状の競合 (コード確認 2026-09-26)
 
 再生位置の書き手はすべて「ローカルの `VideoPlayer` の位置」を無条件に書く (変化の有無を見ない)。Remote 所有中も
@@ -817,12 +836,14 @@ Remote で続きを見るときも、同じトラックで始める。
 
 ### 9B.3 端末からの位置の報告
 
-- 新しい書き込み `RemoteWriteRequest::RecordVideoProgress { address, position_secs, duration_secs, ended }` を
+- 新しい書き込み `RemoteWriteRequest::RecordVideoProgress { address, sequence, position_secs, duration_secs, ended }` を
   足す (既存の `RecordReadingProgress` と同じ書き込みレーン: HTTP `/api/write` → remote service → IPC → core の
   UI thread の FIFO。所有権の検査・応答あり。`DrainingRemote` 中は既存どおり拒否)。
-- client の writer: 画面遷移から独立した、module 単位の直列 writer (既存の `enqueueReadingProgress` と同じ promise の
-  列) を置く。viewer はこの writer に位置の snapshot を渡すだけで、viewer の破棄 (`destroy()` の controller abort)
-  に巻き込まれない。
+- client の writer: 画面遷移から独立した、module 単位で session ごとに独立した直列 writer
+  (既存の `enqueueReadingProgress` と同じ promise の列) を置く。viewer は配信開始の応答が示した
+  所有 session ID と位置の snapshot を渡し、viewer の破棄 (`destroy()` の controller abort)
+  に巻き込まれない。hidden / destroy の最終報告だけは直列列を待たず keepalive fetch を即時開始する。
+  先行する通常報告との到着逆転は session ごとの `sequence` を core で照合して防ぐ。
 - 送る契機:
   - 再生中は 5 秒ごと (PC の周期保存と同じ間隔)。
   - 一時停止したとき、シークが確定したとき、画質・トラックを切り替えたとき。
@@ -1015,6 +1036,7 @@ UI より先に入れる (UI から切り替えられるようになった時点
 
 ### S7: Remote 所有時の全閉じと再生位置の書き戻し
 
+- 実装日 2026-09-28。protocol 63。取得 barrier・open 境界・位置書き戻しは §9B に従う。
 - §9B (受け付け時の全閉じ、所有中の不変条件、`RecordVideoProgress`、client の報告契機と直列化、読書履歴の行、
   所有終了時の保存)。detached 経路に触れるので、独立レビューで構造的変更であることの合意を取り、
   detached-rework-plan §11 に記録する。

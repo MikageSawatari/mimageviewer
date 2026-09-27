@@ -171,13 +171,21 @@ impl TileThumbnailWorker {
 /// Resume プレビュー用に「最後に表示した 1 フレーム」を後追い保存する用途。呼び出し側は
 /// JoinHandle を保持しないが、通常の tile worker と同じ `run_worker` を使うため、既に
 /// キャッシュ済みなら FFmpeg input を開かず即終了する。
+pub(crate) fn video_mtime_secs_for_resume_thumb(path: &std::path::Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub fn spawn_resume_cache_warmup(
     path: PathBuf,
     target_secs: f64,
     max_w: u32,
     max_h: u32,
     cache: Arc<TileThumbCache>,
-    video_mtime: i64,
 ) {
     if !target_secs.is_finite() || target_secs < 0.0 {
         return;
@@ -187,6 +195,15 @@ pub fn spawn_resume_cache_warmup(
     let _ = std::thread::Builder::new()
         .name("video-resume-thumb".into())
         .spawn(move || {
+            // Metadata and SQLite lookup belong to this worker, not the UI caller.
+            let video_mtime = video_mtime_secs_for_resume_thumb(&path);
+            let timestamp_ms = (target_secs * 1000.0).round() as i64;
+            if cache
+                .lookup_resume_webp(&path, video_mtime, max_w)
+                .is_some_and(|(hit_timestamp_ms, _)| hit_timestamp_ms == timestamp_ms)
+            {
+                return;
+            }
             run_worker(
                 path,
                 vec![target_secs],

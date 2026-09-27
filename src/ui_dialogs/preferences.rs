@@ -2520,7 +2520,9 @@ impl App {
                         // detached viewer / native HUD はそれぞれ独立した egui Context を
                         // 持つため、表示倍率変更と同じ正規 teardown 経路で閉じる。
                         // 再度開いた時点で新しいフォント設定を使って生成される。
-                        let closed_detached = self.close_all_detached_viewers_for_mode_change(ctx);
+                        let closed_detached = self
+                            .close_all_detached_viewers_for_mode_change(ctx)
+                            .unwrap_or(true);
                         if !closed_detached && self.fullscreen_idx.is_some() {
                             self.close_fullscreen();
                         }
@@ -2546,7 +2548,9 @@ impl App {
                 if (old_detached_open_images_in_window
                     != self.settings.detached_viewer_open_images_in_window
                     || old_fullfeature_media_window != self.settings.fullfeature_media_window)
-                    && self.close_all_detached_viewers_for_mode_change(ctx)
+                    && self
+                        .close_all_detached_viewers_for_mode_change(ctx)
+                        .unwrap_or(true)
                 {
                     self.show_feedback_toast(
                         "別ウィンドウの表示モードを変更したため、開いていた別ウィンドウを閉じました"

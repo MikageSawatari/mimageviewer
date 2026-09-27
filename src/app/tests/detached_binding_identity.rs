@@ -260,7 +260,10 @@ fn detached_binding_identity_mode_close_releases_all_contexts() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     let window = install_detached_item(&mut app, &ctx, false);
-    assert!(app.close_all_detached_viewers_for_mode_change(&ctx));
+    assert!(
+        app.close_all_detached_viewers_for_mode_change(&ctx)
+            .unwrap()
+    );
     assert!(app.locate_window_context(window).is_none());
     assert_projection_matches_binding(&mut app);
 }

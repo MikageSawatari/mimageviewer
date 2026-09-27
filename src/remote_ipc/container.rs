@@ -2798,7 +2798,11 @@ impl ContainerEngine {
         &self,
         request: &mut RemoteWriteRequest,
     ) -> Result<(), RemoteWriteError> {
-        if let Some(address) = request.address_mut() {
+        // Video progress resolves its path in the media-specific validation below and writes
+        // that exact logical result back; avoid a second filesystem resolution here.
+        if !matches!(request, RemoteWriteRequest::RecordVideoProgress { .. })
+            && let Some(address) = request.address_mut()
+        {
             self.canonicalize_write_address(address)?;
         }
         if let Some(context_address) = request.context_address_mut() {
@@ -2856,6 +2860,54 @@ impl ContainerEngine {
                 *page_count = validated.page_count;
                 *record_resume = validated.record_resume;
                 *record_history = validated.record_history;
+                Ok(())
+            }
+            RemoteWriteRequest::RecordVideoProgress {
+                address,
+                position_secs,
+                duration_secs,
+                ..
+            } => {
+                if !position_secs.is_finite()
+                    || *position_secs < 0.0
+                    || !duration_secs.is_finite()
+                    || *duration_secs <= 0.0
+                    || *position_secs > *duration_secs + 1.0
+                {
+                    return Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::BadRequest,
+                        "再生位置または長さが範囲外です",
+                    ));
+                }
+                if !matches!(address.subresource, RemoteSubresource::File) {
+                    return Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::Unsupported,
+                        "動画・音声ファイルだけが再生位置の記録対象です",
+                    ));
+                }
+                let resolved = self
+                    .resolve(address)
+                    .map_err(remote_write_error_from_media)?;
+                let supported = resolved
+                    .logical
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .is_some_and(|ext| {
+                        crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str())
+                            || crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS
+                                .contains(&ext.as_str())
+                    });
+                if !supported || !std::fs::metadata(&resolved.canonical).is_ok_and(|m| m.is_file())
+                {
+                    return Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::Unsupported,
+                        "動画・音声ファイルだけが再生位置の記録対象です",
+                    ));
+                }
+                // The UI writer must use exactly the logical path validated here as its
+                // resume/history key, including aliases and paths containing `..`.
+                address.path = resolved.logical.to_string_lossy().into_owned();
                 Ok(())
             }
             RemoteWriteRequest::SetRating { address, stars } => {
@@ -10118,6 +10170,95 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn video_progress_write_validates_media_type_and_clock_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let movie = temp.path().join("movie.mp4");
+        let audio = temp.path().join("audio.flac");
+        let image = temp.path().join("image.jpg");
+        for path in [&movie, &audio, &image] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        for path in [&movie, &audio] {
+            let mut request = RemoteWriteRequest::RecordVideoProgress {
+                address: RemoteAddress::file(path.to_string_lossy().into_owned()),
+                sequence: 1,
+                position_secs: 11.0,
+                duration_secs: 10.0,
+                ended: false,
+            };
+            assert!(engine.validate_write_request(&mut request).is_ok());
+        }
+        for (position, duration) in [
+            (f64::NAN, 10.0),
+            (f64::INFINITY, 10.0),
+            (-0.1, 10.0),
+            (1.0, 0.0),
+            (1.0, f64::INFINITY),
+            (11.01, 10.0),
+        ] {
+            let mut request = RemoteWriteRequest::RecordVideoProgress {
+                address: RemoteAddress::file(movie.to_string_lossy().into_owned()),
+                sequence: 1,
+                position_secs: position,
+                duration_secs: duration,
+                ended: false,
+            };
+            assert_eq!(
+                engine
+                    .validate_write_request(&mut request)
+                    .unwrap_err()
+                    .code,
+                RemoteWriteErrorCode::BadRequest
+            );
+        }
+        let mut image_request = RemoteWriteRequest::RecordVideoProgress {
+            address: RemoteAddress::file(image.to_string_lossy().into_owned()),
+            sequence: 1,
+            position_secs: 5.0,
+            duration_secs: 10.0,
+            ended: false,
+        };
+        assert_eq!(
+            engine
+                .validate_write_request(&mut image_request)
+                .unwrap_err()
+                .code,
+            RemoteWriteErrorCode::Unsupported
+        );
+    }
+
+    #[test]
+    fn video_progress_write_uses_validated_logical_path_as_pc_resume_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let media_dir = temp.path().join("media");
+        std::fs::create_dir(&media_dir).unwrap();
+        let movie = media_dir.join("movie.mp4");
+        std::fs::write(&movie, b"fixture").unwrap();
+        let alias = media_dir.join("..").join("media").join("movie.mp4");
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let mut request = RemoteWriteRequest::RecordVideoProgress {
+            address: RemoteAddress::file(alias.to_string_lossy().into_owned()),
+            sequence: 1,
+            position_secs: 20.0,
+            duration_secs: 100.0,
+            ended: false,
+        };
+        engine.validate_write_request(&mut request).unwrap();
+        let RemoteWriteRequest::RecordVideoProgress { address, .. } = request else {
+            unreachable!()
+        };
+        let pc_path = super::super::path_guard::resolve_existing(movie.to_string_lossy().as_ref())
+            .unwrap()
+            .logical;
+        assert_eq!(std::path::Path::new(&address.path), pc_path);
+        assert_eq!(
+            crate::adjustment_db::normalize_path(std::path::Path::new(&address.path)),
+            crate::adjustment_db::normalize_path(&pc_path)
+        );
     }
 
     #[test]

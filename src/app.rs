@@ -11868,6 +11868,20 @@ struct MediaResumeUpdate {
     audio_track_choice: Option<crate::video::SavedAudioTrackChoice>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalViewerCloseFailure {
+    ActiveContextRetire,
+    PassiveContextRetire,
+    FullscreenTeardown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalViewerCloseState {
+    Closed,
+    InProgress,
+    Failed(LocalViewerCloseFailure),
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 struct ViewerContextMediaTeardownPlan {
@@ -16101,7 +16115,10 @@ impl App {
                 .is_some_and(|pending| pending.parked_live_window_id.is_none());
             // Viewer-mode settings use this path to close mounted + passive detached sessions.
             // It is a no-op when no such window/session exists.
-            if self.close_all_detached_viewers_for_mode_change(ctx) {
+            if self
+                .close_all_detached_viewers_for_mode_change(ctx)
+                .unwrap_or(true)
+            {
                 return;
             }
             if mounted_source_swap_presenter {
@@ -32640,7 +32657,7 @@ impl App {
                 }
                 // passive/parked の直接 retain-drop でも共通 teardown seam を通し、最終
                 // resume を保存してから rename の path 移行へ渡す (review-v2.3.0 追補3: A-4)。
-                self.teardown_paused_media_bundles_for_window_ids(&ids, reason);
+                let _ = self.teardown_paused_media_bundles_for_window_ids(&ids, reason);
                 self.detached_image_windows
                     .retain(|window| !ids.contains(&window.id));
                 for id in ids {
@@ -44589,6 +44606,20 @@ impl App {
             }
             _ => return,
         };
+        self.record_reading_history_path(path, kind, archive_format, last_page, page_count);
+    }
+
+    pub(crate) fn record_reading_history_path(
+        &mut self,
+        path: PathBuf,
+        kind: crate::reading_history_db::ReadingHistoryKind,
+        archive_format: Option<crate::archive_converter::ArchiveFormat>,
+        last_page: Option<i64>,
+        page_count: Option<i64>,
+    ) {
+        if !self.settings.reading_history_enabled || self.reading_history_writer.is_none() {
+            return;
+        }
         let key = crate::path_key::normalize_keep_drive(&path);
         let now = std::time::Instant::now();
         if self
@@ -44602,7 +44633,6 @@ impl App {
         {
             return;
         }
-
         let title = reading_history_title_for_path(&path);
         let entry = crate::reading_history_db::ReadingHistoryEntry::new(
             path,
@@ -45209,6 +45239,10 @@ impl App {
     #[cfg(windows)]
     #[track_caller]
     pub(crate) fn begin_active_detached_session(&mut self, window_id: u64, source: DetachedSource) {
+        if self.remote_session_blocks_local_control() {
+            crate::logger::log("remote_ipc: rejected detached session open outside Local phase");
+            return;
+        }
         #[cfg(not(test))]
         {
             let (owner, residence) = self.locate_window_context(window_id).unwrap_or_else(|| {
@@ -45888,6 +45922,7 @@ impl App {
         // book context の明示 close = detached セッション終了 (§3.7 closing)。desired set から
         // 外す前に closing を立て、teardown 後に finish して backstop が窓を復活させない。
         self.begin_active_detached_session_close(reason);
+        let mut terminal_failed = false;
         let result = self.close_and_retire_context(
             id,
             reason,
@@ -45896,13 +45931,21 @@ impl App {
                 // `close_fullscreen` を呼ぶと `TerminalClose` を出して戻るだけなので、
                 // ここで完遂させないと teardown へ到達しない (R-24)。
                 #[cfg(windows)]
-                app.close_fullscreen_to_completion(ctx);
+                {
+                    terminal_failed = app.close_fullscreen_to_completion(ctx).is_err();
+                }
                 #[cfg(not(windows))]
                 app.close_fullscreen();
             },
             |context| ClosedBookmarkSummary::read(context.as_ref()),
         );
         self.finish_active_detached_session_close(reason);
+        if terminal_failed {
+            crate::logger::log(format!(
+                "active_viewer_context_terminal_close_failed id={id:?} reason={reason}"
+            ));
+            return None;
+        }
         let summary = match result {
             Ok(summary) => summary,
             Err(error) => {
@@ -45933,19 +45976,26 @@ impl App {
     pub(crate) fn close_all_detached_viewers_for_mode_change(
         &mut self,
         ctx: &egui::Context,
-    ) -> bool {
+    ) -> Result<bool, LocalViewerCloseFailure> {
         let had_detached = self.active_detached_context_is_at_rest()
+            || !self.other_viewer_context_ids().is_empty()
             || self.active_detached_session.is_some()
             || self.viewer_session_is_detached_or_switching()
             || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
             || self.fs_viewport_shown
             || !self.detached_image_windows.is_empty()
+            || !self.deferred_detached_image_window_views.is_empty()
             || !self.detached_window_manager.is_empty()
+            || !self.native_video_parked_live_activation_requests.is_empty()
             || self.detached_video_host_switch_pending()
             || self.pending_detached_video_host_resync;
         if !had_detached {
-            return false;
+            return Ok(false);
         }
+        let mut close_failure = None;
+        let visible_viewport_id = self
+            .fs_viewport_shown
+            .then(|| self.fullscreen_viewport_id());
 
         if self.video_presentation_transition.is_transitioning() {
             self.video_presentation_transition
@@ -45968,7 +46018,9 @@ impl App {
         crate::dwm_transitions::disable_transitions_for_thread_windows();
 
         if self.active_detached_context_is_at_rest() {
-            let _ = self.close_current_active_viewer_context(ctx);
+            if !self.close_current_active_viewer_context(ctx) {
+                close_failure = Some(LocalViewerCloseFailure::ActiveContextRetire);
+            }
         }
 
         let active_window_id = self
@@ -45992,12 +46044,6 @@ impl App {
             self.finish_active_detached_session_close("mode_change_close_all_active");
             if self.fullscreen_idx.is_some() {
                 self.close_fullscreen();
-            } else {
-                self.fs_viewport_shown = false;
-                self.fs_viewport_presentation = None;
-                self.fs_viewport_recreate_after_hide = false;
-                self.detached_viewer_recreate_on_next_render = false;
-                self.clear_detached_viewer_host_hwnd();
             }
         }
 
@@ -46014,10 +46060,33 @@ impl App {
             );
             self.clear_detached_window_hwnd_for_window_id(*id);
         }
-        self.teardown_paused_media_bundles_for_window_ids(
+        if let Err(error) = self.teardown_paused_media_bundles_for_window_ids(
             &passive_ids,
             "mode_change_close_all_passive",
-        );
+        ) {
+            close_failure.get_or_insert(error);
+        }
+        // A context can exist before its detached window is registered (for example an image
+        // open awaiting enumeration). Window IDs alone are therefore insufficient for closing
+        // every local viewer owner.
+        for id in self.other_viewer_context_ids() {
+            let mut terminal_failed = false;
+            let result = self.close_and_retire_context(
+                id,
+                "mode_change_close_all_remaining_context",
+                |app| {
+                    terminal_failed = app.close_fullscreen_to_completion(ctx).is_err();
+                },
+                |context| ClosedBookmarkSummary::read(context.as_ref()),
+            );
+            if terminal_failed || result.is_err() {
+                crate::logger::log(format!(
+                    "mode_change_remaining_context_close_failed id={id:?} error={:?}",
+                    result.err()
+                ));
+                close_failure.get_or_insert(LocalViewerCloseFailure::ActiveContextRetire);
+            }
+        }
         self.detached_image_windows.clear();
         self.deferred_detached_image_window_views.clear();
         self.native_video_parked_live_activation_requests.clear();
@@ -46060,6 +46129,22 @@ impl App {
         self.detached_viewer_focus_requested = false;
         self.detached_viewer_no_activate_once = false;
         self.fs_open_intent_from_grid = false;
+        if let Some(viewport_id) = visible_viewport_id {
+            // Match the inactive fullscreen cleanup protocol: keep the viewport alive for
+            // this frame before sending Visible(false). Clearing the marker alone is not
+            // evidence that the existing native viewport was hidden.
+            let builder = self
+                .build_inactive_fullscreen_viewport_builder_with_source(0, "mode_change_close_all")
+                .with_visible(false);
+            ctx.show_viewport_immediate(viewport_id, builder, |_ctx, _class| {});
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(false));
+            self.observe_viewport_presentation_command(
+                viewport_id,
+                crate::presentation_observer::WindowAction::Visible,
+                "app::mode_change_close_all",
+                "value=false",
+            );
+        }
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
         self.fs_viewport_recreate_after_hide = false;
@@ -46079,7 +46164,10 @@ impl App {
             self.detached_image_windows.len(),
             self.detached_window_manager.len()
         ));
-        true
+        match close_failure {
+            Some(error) => Err(error),
+            None => Ok(true),
+        }
     }
 
     #[cfg(windows)]
@@ -46873,7 +46961,7 @@ impl App {
         &mut self,
         window_ids: &[u64],
         reason: &'static str,
-    ) {
+    ) -> Result<(), LocalViewerCloseFailure> {
         let clears_tile_companion = window_ids
             .iter()
             .any(|&window_id| self.parked_window_owns_video_tile_companion(window_id));
@@ -46896,6 +46984,7 @@ impl App {
         }
         let _ = clears_mode_switch;
         let mut plans = Vec::new();
+        let mut retire_failed = false;
         for &window_id in window_ids {
             let Some((id, _)) = self.locate_window_context(window_id) else {
                 continue;
@@ -46909,16 +46998,28 @@ impl App {
                 Err(RetireError::IsMain) => {
                     unreachable!("parked window owned the main viewer context")
                 }
-                Err(error) => self.log_detached_image_window_debug(format!(
-                    "media_teardown_skipped id={id:?} reason={reason} error={error:?}"
-                )),
+                Err(error) => {
+                    retire_failed = true;
+                    self.log_detached_image_window_debug(format!(
+                        "media_teardown_skipped id={id:?} reason={reason} error={error:?}"
+                    ));
+                }
             }
         }
         if plans.is_empty() {
-            return;
+            return if retire_failed {
+                Err(LocalViewerCloseFailure::PassiveContextRetire)
+            } else {
+                Ok(())
+            };
         }
         self.save_viewer_context_media_teardown_resumes(&plans);
         self.cleanup_viewer_context_media_teardown_globals(&plans, reason);
+        if retire_failed {
+            Err(LocalViewerCloseFailure::PassiveContextRetire)
+        } else {
+            Ok(())
+        }
     }
 
     #[cfg(windows)]
@@ -47143,6 +47244,28 @@ impl App {
         )
     }
 
+    /// Retire local viewer-open intentions admitted before Remote began acquiring ownership.
+    /// A late PDF/ZIP completion may still install list data, but it cannot reopen a viewer.
+    pub(crate) fn invalidate_local_viewer_open_intents_for_remote(&mut self) {
+        self.pending_auto_fs_open = false;
+        self.fs_nav_after_pdf_enumerate = None;
+        self.pending_rating_view_zipdir_open = None;
+        self.pending_return_to_parent = false;
+        self.cancel_pending_folder_nav();
+        self.pdf_enumerate_pending = None;
+        self.zip_enumerate_pending = None;
+        if let Some(request_id) = self
+            .bookmark_open_pending
+            .as_ref()
+            .map(crate::bookmark_browser::PendingBookmarkOpen::request_id)
+        {
+            self.cancel_bookmark_open_request(request_id, "remote_session_acquired");
+        }
+        #[cfg(windows)]
+        self.clear_mounted_native_video_pending();
+        self.discard_media_navigation_pending("remote_session_acquired");
+    }
+
     /// on_exit 時に mount 外の active detached / ParkedLive bundle から最終 resume を収穫する。
     /// bundle は所有権を移さず、teardown plan の read-only 部分だけを再利用する。
     /// (review-v2.3.0 追補6: R1-2 detached exit resume)
@@ -47335,7 +47458,7 @@ impl App {
             self.transition_detached_window_state(*id, DetachedWindowState::Closing, reason);
             self.clear_detached_window_hwnd_for_window_id(*id);
         }
-        self.teardown_paused_media_bundles_for_window_ids(&ids, reason);
+        let _ = self.teardown_paused_media_bundles_for_window_ids(&ids, reason);
         self.detached_image_windows
             .retain(|window| !ids.contains(&window.id));
         for id in ids {
@@ -47560,6 +47683,10 @@ impl App {
 
     #[cfg(windows)]
     fn activate_parked_live_media_window_snapshot(&mut self, ctx: &egui::Context, id: u64) -> bool {
+        if self.remote_session_blocks_local_control() {
+            crate::logger::log("remote_ipc: rejected parked media activation outside Local phase");
+            return false;
+        }
         let Some(pos) = self
             .detached_image_windows
             .iter()
@@ -48053,6 +48180,10 @@ impl App {
         placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
         resume_window_id: Option<u64>,
     ) -> bool {
+        if self.remote_session_blocks_local_control() {
+            crate::logger::log("remote_ipc: rejected detached collection open outside Local phase");
+            return false;
+        }
         let mut start_idx = None;
         let mut allocated_window_id = None;
         let built = self.build_viewer_context(
@@ -48315,6 +48446,10 @@ impl App {
         resume_window_id: Option<u64>,
         collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
     ) -> bool {
+        if self.remote_session_blocks_local_control() {
+            crate::logger::log("remote_ipc: rejected detached book open outside Local phase");
+            return false;
+        }
         let descriptor = match &start {
             DetachedBookContextStart::Descriptor(descriptor) => descriptor.clone(),
             DetachedBookContextStart::ScannedFolder { path, .. } => {
@@ -48702,6 +48837,10 @@ impl App {
         idx: usize,
         auto_fullscreen: bool,
     ) -> bool {
+        if self.remote_session_blocks_local_control() {
+            crate::logger::log("remote_ipc: rejected detached viewer open outside Local phase");
+            return false;
+        }
         let Some(plan) = self.detached_grid_item_open_plan(idx, auto_fullscreen) else {
             return false;
         };
@@ -49059,6 +49198,12 @@ impl App {
         ctx: &egui::Context,
         id: u64,
     ) -> bool {
+        if self.remote_session_blocks_local_control() {
+            crate::logger::log(
+                "remote_ipc: rejected detached window activation outside Local phase",
+            );
+            return false;
+        }
         if self.detached_window_state_is_parked_live(id) {
             return self.activate_parked_live_media_window_snapshot(ctx, id);
         }
@@ -51930,6 +52075,10 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> bool {
+        if self.remote_session_blocks_local_control() {
+            crate::logger::log("remote_ipc: rejected detached context open outside Local phase");
+            return false;
+        }
         if self.activate_existing_detached_viewer_for_grid_open(ctx, idx) {
             return false;
         }
@@ -52407,6 +52556,10 @@ impl App {
         load_contract: FsPageLoadContract,
         mut perf: Option<&mut FsOpenPerfRecorder>,
     ) {
+        if self.remote_session_blocks_local_control() {
+            crate::logger::log("remote_ipc: rejected fullscreen open outside Local phase");
+            return;
+        }
         if !self.grid_item_input_allowed() {
             return;
         }
@@ -61014,7 +61167,10 @@ impl App {
     ///
     /// ここで terminal effects を実行し切ってから通常の teardown へ入る。
     #[cfg(windows)]
-    pub(crate) fn close_fullscreen_to_completion(&mut self, ctx: &egui::Context) {
+    pub(crate) fn close_fullscreen_to_completion(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Result<(), LocalViewerCloseFailure> {
         // 守る不変条件は「この呼び出しを抜けたとき、未実行の effect が残っていない」。
         // 「遷移中なら」で条件を付けない — `close_fullscreen` が既に `TerminalClose` を
         // 出していると state は `Stable` なのに effect だけが積まれた状態になり、
@@ -61030,6 +61186,63 @@ impl App {
             == PresentationEffectsOutcome::DidNotClose
         {
             self.close_fullscreen();
+        }
+        if self.fullscreen_idx.is_some()
+            && !self.video_presentation_transition.is_transitioning()
+            && !self.video_presentation_transition.has_pending_effects()
+        {
+            return Err(LocalViewerCloseFailure::FullscreenTeardown);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn local_viewer_close_state(
+        &self,
+        failure: Option<LocalViewerCloseFailure>,
+    ) -> LocalViewerCloseState {
+        if let Some(failure) = failure {
+            return LocalViewerCloseState::Failed(failure);
+        }
+        if self.viewer_context_ids().len() > 1
+            || self.fullscreen_idx.is_some()
+            || self
+                .fs_cache
+                .values()
+                .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+            || self.fs_viewport_shown
+            || self.active_detached_session.is_some()
+            || !self.detached_image_windows.is_empty()
+            || !self.detached_window_manager.is_empty()
+            || !self.deferred_detached_image_window_views.is_empty()
+            || !self.native_video_parked_live_activation_requests.is_empty()
+            || self.video_presentation_transition.is_transitioning()
+            || self.video_presentation_transition.has_pending_effects()
+        {
+            LocalViewerCloseState::InProgress
+        } else {
+            LocalViewerCloseState::Closed
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn local_viewer_close_state(
+        &self,
+        failure: Option<LocalViewerCloseFailure>,
+    ) -> LocalViewerCloseState {
+        if let Some(failure) = failure {
+            return LocalViewerCloseState::Failed(failure);
+        }
+        if self.fullscreen_idx.is_some()
+            || self
+                .fs_cache
+                .values()
+                .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+            || self.fs_viewport_shown
+        {
+            LocalViewerCloseState::InProgress
+        } else {
+            LocalViewerCloseState::Closed
         }
     }
 
@@ -69688,6 +69901,14 @@ impl App {
         target_presentation: ViewerPresentation,
         reason: &'static str,
     ) {
+        if matches!(target_presentation, ViewerPresentation::DetachedWindow)
+            && self.remote_session_blocks_local_control()
+        {
+            crate::logger::log(
+                "remote_ipc: rejected detached presentation open outside Local phase",
+            );
+            return;
+        }
         self.viewer_presentation = target_presentation;
         self.native_video_in_window_active =
             matches!(target_presentation, ViewerPresentation::MainWindow);
@@ -69727,6 +69948,12 @@ impl App {
     }
 
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
+        if self.remote_session_blocks_local_control() {
+            crate::logger::log(
+                "remote_ipc: rejected detached presentation open outside Local phase",
+            );
+            return;
+        }
         #[cfg(windows)]
         self.log_detached_image_window_debug(format!(
             "toggle_detached_viewer_mode_begin enabled={} fs_idx={:?} presentation={:?} \
@@ -74641,6 +74868,28 @@ impl App {
         }
     }
 
+    pub(crate) fn apply_remote_media_resume_update(
+        &mut self,
+        path: PathBuf,
+        position: f64,
+        duration: f64,
+        ended: bool,
+    ) {
+        let key = crate::adjustment_db::normalize_path(&path);
+        self.apply_media_resume_updates(vec![MediaResumeUpdate {
+            path: path.clone(),
+            key: key.clone(),
+            position,
+            duration,
+            at_eof: ended,
+            audio_track_choice: None,
+        }]);
+        #[cfg(windows)]
+        if self.settings.video_resume_positions.contains_key(&key) {
+            self.maybe_schedule_video_resume_thumbnail(&path, &key, position);
+        }
+    }
+
     /// 動画再生プレイヤーの tick。
     /// fs_cache 内の `FsCacheEntry::Video` ごとに [`crate::video::VideoPlayer::tick`] を呼ぶ。
     /// 通常はフルスクリーン中の 1 つだけが入っている (動画は先読みしないため)。
@@ -74699,19 +74948,6 @@ impl App {
         {
             return;
         }
-        let video_mtime = crate::app::native_video::video_mtime_secs_for_resume_thumb(path);
-        if cache
-            .lookup_resume_webp(
-                path,
-                video_mtime,
-                crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH,
-            )
-            .is_some_and(|(hit_timestamp_ms, _)| hit_timestamp_ms == timestamp_ms)
-        {
-            self.video_resume_thumb_last_request
-                .insert(key.to_string(), timestamp_ms);
-            return;
-        }
         self.video_resume_thumb_last_request
             .insert(key.to_string(), timestamp_ms);
         crate::video::tile_thumbnails::spawn_resume_cache_warmup(
@@ -74720,7 +74956,6 @@ impl App {
             crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH,
             crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH,
             cache,
-            video_mtime,
         );
         if crate::perf::is_enabled() {
             crate::perf::event(

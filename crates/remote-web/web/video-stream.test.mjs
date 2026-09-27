@@ -267,6 +267,40 @@ test("start response immediately updates the open controls page state", async ()
   assert.equal(shown.audioTrack, 2);
 });
 
+test("retained viewer binds progress to the new owner only after stream attachment", async () => {
+  let finishAttach;
+  const viewer = {
+    destroyed: false, hasVideo: true, quality: "standard", volume: 1,
+    address: { path: "C:/movie.mp4", subresource: { kind: "file" } },
+    abortController: { signal: null }, progressRemoteSessionId: "old-owner",
+    session: 11, duration: 100, video: { paused: false, ended: false },
+    currentPosition: () => 24,
+    snapshotProgress: VideoStreamViewer.prototype.snapshotProgress,
+    clearPoll() {}, clearHealthTelemetry() {}, showNotice() {},
+    transitionPlaybackControl() {}, updateAudioProcessing() {}, updateDiagnostics() {},
+    seekInput: {}, menuState() { return {}; },
+    menu: { setSession() {}, setMediaState() {} },
+    apiPostJson: async () => ({
+      session: 12, generation: 1, playlist: "/stream/12/1",
+      remote_session_id: "new-owner", duration_secs: 100,
+    }),
+    switchGeneration: () => new Promise((resolve) => { finishAttach = resolve; }),
+    announceAudioProcessingWarning() {}, playIfRequested() {}, schedulePoll() {},
+    syncHealthTelemetry() {}, captureVideoHealth() {},
+  };
+  const starting = VideoStreamViewer.prototype.start.call(viewer);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(viewer.session, 12);
+  assert.equal(viewer.snapshotProgress().remoteSessionId, "old-owner");
+  finishAttach(true);
+  await starting;
+  assert.equal(viewer.snapshotProgress().remoteSessionId, "new-owner");
+  viewer.progressRemoteSessionId = "old-owner";
+  viewer.switchGeneration = async () => false;
+  await VideoStreamViewer.prototype.start.call(viewer);
+  assert.equal(viewer.snapshotProgress().remoteSessionId, "old-owner");
+});
+
 test("audio track command sends generation and ignores older success and 409 replies", async () => {
   const requests = [];
   const pending = [];
@@ -1747,4 +1781,56 @@ test("user video errors hide internal stage details and keep code-based guidance
     ),
     "動画の配信が終了しました。もう一度開いてください。"
   );
+});
+
+test("progress snapshots use the browser timeline and reject invalid clocks", () => {
+  const reports = [];
+  const viewer = {
+    destroyed: false,
+    session: 1,
+    progressRemoteSessionId: "owner-a",
+    duration: 100,
+    address: { path: "C:/movie.mp4", subresource: { kind: "file" } },
+    video: { ended: false },
+    currentPosition: () => 31.25,
+    snapshotProgress: VideoStreamViewer.prototype.snapshotProgress,
+    reportProgress: (snapshot) => reports.push(snapshot),
+  };
+  VideoStreamViewer.prototype.emitProgress.call(viewer);
+  assert.equal(reports[0].positionSecs, 31.25);
+  assert.equal(reports[0].remoteSessionId, "owner-a");
+  assert.equal(reports[0].ended, false);
+  VideoStreamViewer.prototype.emitProgress.call(viewer, true);
+  assert.equal(reports[1].ended, true);
+  viewer.currentPosition = () => 101.01;
+  assert.equal(VideoStreamViewer.prototype.snapshotProgress.call(viewer), null);
+  viewer.destroyed = true;
+  assert.equal(VideoStreamViewer.prototype.snapshotProgress.call(viewer), null);
+});
+
+test("quality and track switches snapshot before control requests", async () => {
+  const events = [];
+  const viewer = {
+    session: 1,
+    destroyed: false,
+    quality: "standard",
+    hasVideo: true,
+    audioTracks: [{ stream_index: 3 }],
+    audioTrackOperation: 0,
+    restartRequest: null,
+    abortController: { signal: null },
+    currentPosition: () => 23,
+    emitProgress: () => events.push("snapshot"),
+    showNotice() {},
+    apiPostJson: async () => { events.push("control"); },
+    menu: { setMediaState() {} },
+    menuState: () => ({}),
+    refreshGeneration: async () => {},
+    playRequested: true,
+  };
+  await VideoStreamViewer.prototype.setQuality.call(viewer, "low");
+  assert.deepEqual(events, ["snapshot", "control"]);
+  events.length = 0;
+  await VideoStreamViewer.prototype.setAudioTrack.call(viewer, 3);
+  assert.deepEqual(events, ["snapshot", "control"]);
 });

@@ -24,6 +24,55 @@ use super::video_stream::{VideoStreamStartBudget, VideoStreamStartStage};
 const REMOTE_ACQUIRE_BARRIER_LOG_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 const REMOTE_ACQUIRE_BARRIER_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const REMOTE_ACQUIRE_BARRIER_ABORT_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Default)]
+struct RemoteVideoProgressOrder {
+    generation: u64,
+    newest_by_path: std::collections::HashMap<String, u64>,
+}
+
+impl RemoteVideoProgressOrder {
+    fn accept(&mut self, generation: u64, path: &std::path::Path, sequence: u64) -> bool {
+        if self.generation != generation {
+            self.generation = generation;
+            self.newest_by_path.clear();
+        }
+        let key = crate::adjustment_db::normalize_path(path);
+        if self
+            .newest_by_path
+            .get(&key)
+            .is_some_and(|newest| sequence <= *newest)
+        {
+            return false;
+        }
+        self.newest_by_path.insert(key, sequence);
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteAcquireBarrierDecision {
+    Finish,
+    Wait,
+    AbortCloseFailure,
+    AbortTimeout,
+}
+
+fn remote_acquire_barrier_decision(
+    close_state: crate::app::LocalViewerCloseState,
+    ai_quiesced: bool,
+    elapsed: std::time::Duration,
+) -> RemoteAcquireBarrierDecision {
+    use crate::app::LocalViewerCloseState;
+    match close_state {
+        LocalViewerCloseState::Failed(_) => RemoteAcquireBarrierDecision::AbortCloseFailure,
+        LocalViewerCloseState::Closed if ai_quiesced => RemoteAcquireBarrierDecision::Finish,
+        _ if elapsed >= REMOTE_ACQUIRE_BARRIER_ABORT_AFTER => {
+            RemoteAcquireBarrierDecision::AbortTimeout
+        }
+        _ => RemoteAcquireBarrierDecision::Wait,
+    }
+}
 const REMOTE_ENABLE_WARNING_PREFIX: &str = "リモート閲覧を有効にすると、";
 const REMOTE_ENABLE_WARNING_EMPHASIS: &str = "すべてのドライブについて、mIV で表示できるファイル";
 const REMOTE_ENABLE_WARNING_SUFFIX: &str =
@@ -55,6 +104,7 @@ pub(crate) struct RemoteSessionUiState {
     video_stream: Option<AppRemoteVideoStreamState>,
     local_ai_lease: Option<RemoteLocalAiLease>,
     acquire_barrier_diagnostics: RemoteAcquireBarrierDiagnostics,
+    video_progress_order: RemoteVideoProgressOrder,
 }
 
 impl Drop for RemoteSessionUiState {
@@ -1000,35 +1050,70 @@ impl crate::app::App {
         if remote_phase == super::session::RemoteControlPhase::AcquiringRemote
             && let (Some(handle), Some(snapshot)) = (handle.as_ref(), snapshot.as_ref())
         {
-            let barrier = self.local_ai_remote_barrier_snapshot();
-            if barrier.is_quiesced() {
-                handle.finish_acquire(snapshot.generation);
-            } else {
-                let elapsed = snapshot
-                    .active
-                    .as_ref()
-                    .map_or(std::time::Duration::ZERO, |active| active.elapsed);
-                if self
-                    .remote_session_ui
-                    .acquire_barrier_diagnostics
-                    .should_log(snapshot.generation, elapsed)
+            self.remote_session_ui.pending_fullscreen_restore = None;
+            self.remote_session_ui.paused_animation_restore_key = None;
+            self.invalidate_local_viewer_open_intents_for_remote();
+            #[cfg(windows)]
+            let close_failure = {
+                let detached_failure = self.close_all_detached_viewers_for_mode_change(ctx).err();
+                let fullscreen_failure = if self.fullscreen_idx.is_some()
+                    || self.fs_cache.len() != 0
+                    || self.video_presentation_transition.is_transitioning()
+                    || self.video_presentation_transition.has_pending_effects()
                 {
-                    crate::logger::log(format!(
-                        "remote_ipc: acquire_barrier_wait generation={} elapsed_ms={} blockers={}",
-                        snapshot.generation,
-                        elapsed.as_millis(),
-                        barrier.blocker_summary()
-                    ));
+                    self.close_fullscreen_to_completion(ctx).err()
+                } else {
+                    None
+                };
+                detached_failure.or(fullscreen_failure)
+            };
+            #[cfg(not(windows))]
+            let close_failure = {
+                if self.fullscreen_idx.is_some() {
+                    self.close_fullscreen();
                 }
-                if elapsed >= REMOTE_ACQUIRE_BARRIER_ABORT_AFTER {
+                None
+            };
+            let close_state = self.local_viewer_close_state(close_failure);
+            let barrier = self.local_ai_remote_barrier_snapshot();
+            let elapsed = snapshot
+                .active
+                .as_ref()
+                .map_or(std::time::Duration::ZERO, |active| active.elapsed);
+            match remote_acquire_barrier_decision(close_state, barrier.is_quiesced(), elapsed) {
+                RemoteAcquireBarrierDecision::Finish => {
+                    handle.finish_acquire(snapshot.generation);
+                }
+                RemoteAcquireBarrierDecision::AbortCloseFailure => {
                     crate::logger::log(format!(
-                        "remote_ipc: acquire_barrier_timeout generation={} elapsed_ms={} blockers={}",
+                        "remote_ipc: acquire_barrier_close_failed generation={} state={close_state:?}",
+                        snapshot.generation
+                    ));
+                    handle.abort_acquire_barrier(snapshot.generation);
+                }
+                RemoteAcquireBarrierDecision::AbortTimeout => {
+                    crate::logger::log(format!(
+                        "remote_ipc: acquire_barrier_timeout generation={} elapsed_ms={} blockers={} close_state={close_state:?}",
                         snapshot.generation,
                         elapsed.as_millis(),
                         barrier.blocker_summary()
                     ));
                     handle.abort_acquire_barrier(snapshot.generation);
                 }
+                RemoteAcquireBarrierDecision::Wait
+                    if self
+                        .remote_session_ui
+                        .acquire_barrier_diagnostics
+                        .should_log(snapshot.generation, elapsed) =>
+                {
+                    crate::logger::log(format!(
+                        "remote_ipc: acquire_barrier_wait generation={} elapsed_ms={} blockers={} close_state={close_state:?}",
+                        snapshot.generation,
+                        elapsed.as_millis(),
+                        barrier.blocker_summary()
+                    ));
+                }
+                RemoteAcquireBarrierDecision::Wait => {}
             }
         }
         if remote_phase == super::session::RemoteControlPhase::DrainingRemote {
@@ -1046,7 +1131,9 @@ impl crate::app::App {
         if let Some(handle) = handle.as_ref() {
             self.apply_pending_remote_ui_requests(handle, ctx);
         }
-        self.poll_remote_fullscreen_restore();
+        if remote_phase == super::session::RemoteControlPhase::Local {
+            self.poll_remote_fullscreen_restore();
+        }
         if remote_phase == super::session::RemoteControlPhase::DrainingRemote
             && let (Some(handle), Some(snapshot)) = (handle.as_ref(), snapshot.as_ref())
             && handle.complete_app_drain(snapshot.generation)
@@ -1427,6 +1514,19 @@ impl crate::app::App {
                     return;
                 }
                 self.remember_confirmed_remote_audio_track(&mut starting.streaming);
+                let path = starting.streaming.requested_path.clone();
+                let kind = if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS
+                            .contains(&ext.to_ascii_lowercase().as_str())
+                    }) {
+                    crate::reading_history_db::ReadingHistoryKind::Audio
+                } else {
+                    crate::reading_history_db::ReadingHistoryKind::Video
+                };
+                self.record_reading_history_path(path, kind, None, None, None);
                 let published = starting.streaming.published();
                 if let Some(handle) = self.remote_session_ui.handle.as_ref() {
                     handle.publish_video_stream(published.clone());
@@ -2112,6 +2212,20 @@ impl crate::app::App {
             self.begin_remote_bookmark_write(pending);
             return;
         }
+        if let RemoteWriteRequest::RecordVideoProgress {
+            address, sequence, ..
+        } = pending.request()
+            && !self.remote_session_ui.video_progress_order.accept(
+                pending.generation(),
+                std::path::Path::new(&address.path),
+                *sequence,
+            )
+        {
+            pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Success(
+                RemoteWriteResult::applied(),
+            )));
+            return;
+        }
         let response = self.apply_remote_write(pending.request());
         pending.complete(UiWriteOutcome::Write(response));
         ctx.request_repaint();
@@ -2167,6 +2281,21 @@ impl crate::app::App {
                 *record_resume,
                 *record_history,
             ),
+            RemoteWriteRequest::RecordVideoProgress {
+                address,
+                position_secs,
+                duration_secs,
+                ended,
+                ..
+            } => {
+                self.apply_remote_media_resume_update(
+                    std::path::PathBuf::from(&address.path),
+                    *position_secs,
+                    *duration_secs,
+                    *ended,
+                );
+                RemoteWriteResponse::Success(RemoteWriteResult::applied())
+            }
             RemoteWriteRequest::SetRating { address, stars } => {
                 self.persist_remote_rating(address, *stars)
             }
@@ -3764,15 +3893,8 @@ impl crate::app::App {
     }
 
     fn reload_after_remote_session_release(&mut self) {
-        let paused_animation_key = self
-            .fullscreen_idx
-            .filter(|index| self.fs_entry_is_animated(*index))
-            .and_then(|index| self.items.get(index))
-            .map(crate::grid_item::GridItem::perf_key);
-        let fullscreen_key = self
-            .fullscreen_idx
-            .and_then(|index| self.items.get(index))
-            .map(crate::grid_item::GridItem::perf_key);
+        self.remote_session_ui.pending_fullscreen_restore = None;
+        self.remote_session_ui.paused_animation_restore_key = None;
         let view = if self.items_are_reading_history_view {
             ReloadedView::ReadingHistory
         } else if self.items_are_rating_view {
@@ -3787,42 +3909,24 @@ impl crate::app::App {
             ReloadedView::Other
         };
 
-        // 既存の各「再読み込み」入口は start_loading_items で viewer を閉じる。
-        // 先に identity を保持し、同じ入口が完了した後だけ open_fullscreen へ戻す。
-        if fullscreen_key.is_some() {
-            self.close_fullscreen();
-        }
-        let smart_request_id = match view {
+        // Remote が所有中に書いた履歴と一覧を読み直す。閲覧窓は再作成しない。
+        match view {
             ReloadedView::ReadingHistory => {
                 self.enter_reading_history();
-                None
             }
             ReloadedView::Rating => {
                 self.reload_current_rating_view_preserving_sort();
-                None
             }
             ReloadedView::Bookmarks => {
                 self.refresh_bookmark_browser();
-                None
             }
-            ReloadedView::SmartFolder(id) => self.refresh_smart_folder_staged(id),
+            ReloadedView::SmartFolder(id) => {
+                self.refresh_smart_folder_staged(id);
+            }
             ReloadedView::Other => {
                 self.reload_current_folder_preserving_override();
-                None
             }
-        };
-        self.remote_session_ui.pending_fullscreen_restore = fullscreen_key.and_then(|item_key| {
-            if matches!(view, ReloadedView::SmartFolder(_)) && smart_request_id.is_none() {
-                return None;
-            }
-            Some(PendingFullscreenRestore {
-                item_key,
-                view,
-                smart_request_id,
-                wait_frames: 0,
-            })
-        });
-        self.remote_session_ui.paused_animation_restore_key = paused_animation_key;
+        }
         crate::logger::log("remote_ipc: local control restored; current view reload requested");
     }
 
@@ -3884,7 +3988,8 @@ impl crate::app::App {
 /// databases or read-only response paths and stay available during settings recovery.
 fn remote_write_uses_settings_family(request: &RemoteWriteRequest) -> bool {
     match request {
-        RemoteWriteRequest::SetSortOrder { .. } => true,
+        RemoteWriteRequest::SetSortOrder { .. }
+        | RemoteWriteRequest::RecordVideoProgress { .. } => true,
         RemoteWriteRequest::SetSpread { .. }
         | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
         | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
@@ -4788,7 +4893,7 @@ mod tests {
     }
 
     #[test]
-    fn only_remote_sort_write_uses_settings_family() {
+    fn settings_mutations_use_settings_family_lease() {
         assert!(remote_write_uses_settings_family(
             &RemoteWriteRequest::SetSortOrder {
                 scope: mimageviewer_ipc::RemoteGridScope::Address {
@@ -4804,6 +4909,64 @@ mod tests {
                 reading_direction: RemoteReadingDirection::Rtl,
             }
         ));
+        assert!(remote_write_uses_settings_family(
+            &RemoteWriteRequest::RecordVideoProgress {
+                address: mimageviewer_ipc::RemoteAddress::file("C:/media/movie.mp4"),
+                sequence: 1,
+                position_secs: 19.5,
+                duration_secs: 120.0,
+                ended: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn video_progress_reverse_arrival_keeps_newest_position_for_session_path() {
+        let (handle, owner, _) = active_session();
+        let mut app = crate::app::setup_app_for_test();
+        let movie = app.tmp.path().join("reverse-order.mp4");
+        std::fs::write(&movie, b"fixture").unwrap();
+        let key = crate::adjustment_db::normalize_path(&movie);
+        let ctx = egui::Context::default();
+        for (sequence, position) in [(2, 30.0), (1, 20.0), (2, 10.0), (3, 40.0)] {
+            let operation = handle
+                .begin_operation(&owner, "video progress".to_owned())
+                .unwrap();
+            let (pending, response) = ClaimedRemoteWrite::for_test(
+                operation,
+                RemoteWriteRequest::RecordVideoProgress {
+                    address: mimageviewer_ipc::RemoteAddress::file(
+                        movie.to_string_lossy().into_owned(),
+                    ),
+                    sequence,
+                    position_secs: position,
+                    duration_secs: 100.0,
+                    ended: false,
+                },
+            );
+            app.apply_pending_remote_write(pending, &ctx);
+            assert!(matches!(
+                response
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap(),
+                UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+            ));
+            assert_eq!(
+                app.settings.video_resume_positions.get(&key),
+                Some(&if sequence == 3 { 40.0 } else { 30.0 })
+            );
+        }
+    }
+
+    #[test]
+    fn video_progress_sequence_is_scoped_to_owner_generation_and_path() {
+        let mut order = RemoteVideoProgressOrder::default();
+        let a = std::path::Path::new("C:/media/a.mp4");
+        let b = std::path::Path::new("C:/media/b.mp4");
+        assert!(order.accept(7, a, 9));
+        assert!(!order.accept(7, a, 8));
+        assert!(order.accept(7, b, 1));
+        assert!(order.accept(8, a, 1));
     }
 
     const REMOTE_ENABLE_WARNING_FIRST: &str = concat!(
@@ -4832,6 +4995,50 @@ mod tests {
                 VideoStreamErrorCode::Failed
             );
         }
+    }
+
+    #[test]
+    fn acquire_decision_requires_closed_contexts_and_uses_timeout_only_to_abort() {
+        use crate::app::{LocalViewerCloseFailure, LocalViewerCloseState};
+        use RemoteAcquireBarrierDecision::{AbortCloseFailure, AbortTimeout, Finish, Wait};
+
+        let before = REMOTE_ACQUIRE_BARRIER_ABORT_AFTER - std::time::Duration::from_millis(1);
+        assert_eq!(
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, before),
+            Finish
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, false, before),
+            Wait
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(LocalViewerCloseState::InProgress, true, before),
+            Wait
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(
+                LocalViewerCloseState::Failed(LocalViewerCloseFailure::PassiveContextRetire),
+                true,
+                before,
+            ),
+            AbortCloseFailure
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(
+                LocalViewerCloseState::InProgress,
+                true,
+                REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
+            ),
+            AbortTimeout
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(
+                LocalViewerCloseState::Closed,
+                false,
+                REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
+            ),
+            AbortTimeout
+        );
     }
 
     #[test]
@@ -5616,6 +5823,58 @@ mod tests {
             zip_target.key,
             crate::adjustment_db::zip_entry_key(&root.join("books/book.cbz"), "chapter/001.png",)
         );
+    }
+
+    #[test]
+    fn remote_static_page_progress_is_the_next_pc_open_position() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("remote-book");
+        std::fs::create_dir(&folder).unwrap();
+        let first = folder.join("01.jpg");
+        let second = folder.join("02.jpg");
+        std::fs::write(&first, b"page").unwrap();
+        std::fs::write(&second, b"page").unwrap();
+
+        let handle = super::super::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            super::super::session::RemoteControlPhase::RemoteActive
+        );
+
+        let response = app.persist_remote_reading_progress(
+            &mimageviewer_ipc::RemoteAddress::file(second.to_string_lossy().into_owned()),
+            &mimageviewer_ipc::RemoteAddress::file(folder.to_string_lossy().into_owned()),
+            1,
+            2,
+            2,
+            true,
+            true,
+        );
+        assert!(matches!(response, RemoteWriteResponse::Success(_)));
+        drop(app.book_resume_writer.take());
+
+        handle.local_disconnect();
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            super::super::session::RemoteControlPhase::Local
+        );
+        app.current_folder = Some(folder);
+        app.items = vec![
+            crate::grid_item::GridItem::Image(first),
+            crate::grid_item::GridItem::Image(second),
+        ];
+        assert_eq!(app.resume_page_for_container(), Some(1));
     }
 }
 

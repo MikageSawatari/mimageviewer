@@ -19345,7 +19345,7 @@ impl App {
                 ));
             }
         }
-        self.teardown_paused_media_bundles_for_window_ids(&close_ids, reason);
+        let _ = self.teardown_paused_media_bundles_for_window_ids(&close_ids, reason);
         self.detached_image_windows
             .retain(|window| !close_ids.contains(&window.id));
         for id in &close_ids {
@@ -34148,6 +34148,12 @@ impl App {
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
         fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
     ) {
+        if self.remote_session_blocks_local_control() {
+            crate::logger::log(
+                "remote_ipc: rejected fullscreen navigation open outside Local phase",
+            );
+            return;
+        }
         #[cfg(windows)]
         let should_block_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
         #[cfg(windows)]

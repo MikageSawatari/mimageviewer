@@ -1250,6 +1250,10 @@ impl ClaimedRemoteWrite {
         &self.request
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.operation.generation()
+    }
+
     pub(crate) fn ownership_response(&self) -> SessionResponse {
         self.operation.ownership_response()
     }
@@ -2680,6 +2684,13 @@ mod tests {
                 page_count: 10,
                 record_resume: true,
                 record_history: true,
+            },
+            RemoteWriteRequest::RecordVideoProgress {
+                address: mimageviewer_ipc::RemoteAddress::file("C:/media/movie.mp4"),
+                sequence: 1,
+                position_secs: 19.5,
+                duration_secs: 120.0,
+                ended: false,
             },
             RemoteWriteRequest::SetRating {
                 address: page.clone(),

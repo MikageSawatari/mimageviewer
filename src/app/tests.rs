@@ -17367,6 +17367,41 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    fn remote_media_progress_uses_local_resume_policy_and_history_writer() {
+        use crate::reading_history_db::{ReadingHistoryDb, ReadingHistoryKind};
+
+        let mut app = setup_app();
+        app.settings.reading_history_enabled = true;
+        let path = app.tmp.path().join("remote-only.mp4");
+        std::fs::write(&path, b"fixture").unwrap();
+        let key = crate::adjustment_db::normalize_path(&path);
+        assert!(app.items.is_empty());
+
+        app.record_reading_history_path(path.clone(), ReadingHistoryKind::Video, None, None, None);
+        app.apply_remote_media_resume_update(path.clone(), 20.0, 100.0, false);
+        assert_eq!(app.settings.video_resume_positions.get(&key), Some(&20.0));
+        #[cfg(windows)]
+        assert_eq!(app.video_resume_thumb_last_request.get(&key), Some(&20_000));
+        app.apply_remote_media_resume_update(path.clone(), 2.0, 100.0, false);
+        assert!(!app.settings.video_resume_positions.contains_key(&key));
+        app.apply_remote_media_resume_update(path.clone(), 50.0, 100.0, false);
+        app.apply_remote_media_resume_update(path.clone(), 96.0, 100.0, false);
+        assert!(!app.settings.video_resume_positions.contains_key(&key));
+        app.apply_remote_media_resume_update(path.clone(), 50.0, 100.0, false);
+        app.apply_remote_media_resume_update(path.clone(), 50.0, 100.0, true);
+        assert!(!app.settings.video_resume_positions.contains_key(&key));
+        drop(app.reading_history_writer.take());
+        let history = ReadingHistoryDb::open_readonly()
+            .unwrap()
+            .list_recent(10)
+            .unwrap();
+        let row = history.iter().find(|row| row.path == path).unwrap();
+        assert_eq!(row.kind, ReadingHistoryKind::Video);
+        assert_eq!(row.media_position_ms, Some(50_000));
+        assert_eq!(row.media_duration_ms, Some(100_000));
+    }
+
+    #[test]
     fn media_history_progress_text_uses_history_owned_columns() {
         use crate::grid_item::GridItem;
         use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
@@ -46537,14 +46572,6 @@ mod still_window_mode_key_tests {
         );
     }
 
-    fn assert_test_media_paused_at(app: &App, idx: usize, position_secs: f64) {
-        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) else {
-            unreachable!();
-        };
-        assert!(!player.intent_playing());
-        assert_eq!(player.position(), position_secs);
-    }
-
     #[cfg(windows)]
     fn install_fullfeature_linked_still_with_parked_media(
         app: &mut App,
@@ -55194,7 +55221,10 @@ mod still_window_mode_key_tests {
         assert!(!cancel.load(Ordering::Relaxed));
         // This is the bulk teardown seam: it retires the at-rest bundle directly and deliberately
         // does not mount it or call close_fullscreen first.
-        app.teardown_paused_media_bundles_for_window_ids(&[705], "test_bulk_context_retire");
+        assert!(
+            app.teardown_paused_media_bundles_for_window_ids(&[705], "test_bulk_context_retire")
+                .is_ok()
+        );
 
         assert!(cancel.load(Ordering::Relaxed));
         assert_eq!(app.viewer_context_residence(id), ContextResidence::Retired);
@@ -56577,7 +56607,7 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn remote_session_acquire_pauses_local_progress_without_auto_resume() {
+    fn remote_session_acquire_closes_local_progress_without_auto_resume() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video_path = app.tmp.path().join("remote-session.mp4");
@@ -56590,7 +56620,7 @@ mod still_window_mode_key_tests {
             Some(ContinuousReadingScrollTransition::AwaitingReanchor {
                 history_trigger: HistoryTrigger::AutoAdvance,
             });
-        install_playing_test_media(&mut app, video, video_path, 17.5);
+        install_playing_test_media(&mut app, video, video_path.clone(), 17.5);
         let pixels = egui::ColorImage::filled([1, 1], egui::Color32::WHITE);
         let texture = ctx.load_texture(
             "remote_session_animation",
@@ -56619,25 +56649,25 @@ mod still_window_mode_key_tests {
         });
         app.poll_remote_session(&ctx);
 
-        assert_test_media_paused_at(&app, video, 17.5);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::RemoteActive
+        );
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.fs_cache.is_empty());
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&crate::adjustment_db::normalize_path(&video_path)),
+            Some(&17.5)
+        );
         assert!(!app.slideshow_playing);
         assert!(app.continuous_reading_scroll_transition.is_none());
-        assert!(
-            !app.fs_cache
-                .get(&animated)
-                .expect("animated entry stays cached")
-                .animation_is_playing()
-        );
 
         handle.local_disconnect();
-        // 操作権返却そのものは transport へ Play を送らない。再開は利用者操作だけ。
-        assert_test_media_paused_at(&app, video, 17.5);
-        assert!(
-            !app.fs_cache
-                .get(&animated)
-                .expect("animated entry stays cached")
-                .animation_is_playing()
-        );
+        app.poll_remote_session(&ctx);
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.fs_cache.is_empty());
     }
 
     /// 出力 worker が持つ借用は、リモートへ操作権を渡す前の静止確認に数えられる。
@@ -56743,6 +56773,125 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn remote_acquire_closes_local_viewer_before_admitting_work_and_blocks_reopen() {
+        use crate::grid_item::GridItem;
+        use crate::remote_ipc::session::RemoteControlPhase;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        app.items = vec![GridItem::Image(app.tmp.path().join("page.jpg"))];
+        app.fullscreen_idx = Some(0);
+        app.pending_auto_fs_open = true;
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "an old viewer is closed by the barrier"
+        );
+        app.poll_remote_session(&ctx);
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(!app.pending_auto_fs_open);
+        assert_eq!(
+            app.local_viewer_close_state(None),
+            crate::app::LocalViewerCloseState::Closed
+        );
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::RemoteActive);
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
+    #[test]
+    fn local_viewer_close_state_distinguishes_pending_hide_and_helper_failure() {
+        let mut app = setup_app();
+        app.fs_viewport_shown = true;
+        assert_eq!(
+            app.local_viewer_close_state(None),
+            crate::app::LocalViewerCloseState::InProgress
+        );
+        assert_eq!(
+            app.local_viewer_close_state(Some(
+                crate::app::LocalViewerCloseFailure::ActiveContextRetire
+            )),
+            crate::app::LocalViewerCloseState::Failed(
+                crate::app::LocalViewerCloseFailure::ActiveContextRetire
+            )
+        );
+        app.fs_viewport_shown = false;
+        assert_eq!(
+            app.local_viewer_close_state(None),
+            crate::app::LocalViewerCloseState::Closed
+        );
+    }
+
+    #[test]
+    fn remote_close_retires_a_delayed_parked_activation_without_an_open_window() {
+        let mut app = setup_app();
+        app.native_video_parked_live_activation_requests.push(77);
+        assert_eq!(
+            app.local_viewer_close_state(None),
+            crate::app::LocalViewerCloseState::InProgress
+        );
+        assert_eq!(
+            app.close_all_detached_viewers_for_mode_change(&egui::Context::default()),
+            Ok(true)
+        );
+        assert!(app.native_video_parked_live_activation_requests.is_empty());
+        assert_eq!(
+            app.local_viewer_close_state(None),
+            crate::app::LocalViewerCloseState::Closed
+        );
+    }
+
+    #[test]
+    fn remote_close_hides_a_visible_detached_viewport_without_an_item() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        let viewport_id = app.fullscreen_viewport_id();
+        ctx.set_embed_viewports(false);
+        ctx.begin_pass(egui::RawInput::default());
+        assert_eq!(
+            app.close_all_detached_viewers_for_mode_change(&ctx),
+            Ok(true)
+        );
+        ctx.show_viewport_deferred(
+            viewport_id,
+            egui::ViewportBuilder::default(),
+            |_ctx, _class| {},
+        );
+        let output = ctx.end_pass();
+        assert!(!app.fs_viewport_shown);
+        assert_eq!(
+            app.local_viewer_close_state(None),
+            crate::app::LocalViewerCloseState::Closed
+        );
+        assert!(
+            output
+                .viewport_output
+                .get(&viewport_id)
+                .is_some_and(|viewport| viewport
+                    .commands
+                    .contains(&egui::ViewportCommand::Visible(false))),
+            "a detached loading viewport must receive the real hide command before acquisition: {:?}",
+            output
+                .viewport_output
+                .iter()
+                .map(|(id, viewport)| (id, &viewport.commands))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn streaming_drain_and_reacquire_between_frames_do_not_restore_local_view() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -56805,9 +56954,8 @@ mod still_window_mode_key_tests {
             crate::remote_ipc::session::RemoteControlPhase::RemoteActive
         );
         assert_eq!(
-            app.fullscreen_idx,
-            Some(image),
-            "a control return that was never visible must not enqueue the old local restore"
+            app.fullscreen_idx, None,
+            "reacquisition must not restore a closed local viewer"
         );
     }
 
@@ -56936,7 +57084,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn remote_session_acquire_pauses_mounted_active_and_parked_live_media_at_position() {
+    fn remote_session_acquire_closes_mounted_active_and_parked_live_media_at_position() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let mounted_path = PathBuf::from(r"C:\clips\remote-mounted.mp4");
@@ -56995,23 +57143,12 @@ mod still_window_mode_key_tests {
         });
         app.poll_remote_session(&ctx);
 
-        assert_test_media_paused_at(&app, mounted, 17.5);
-        app.with_active_viewer_context(|active| {
-            let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
-                unreachable!();
-            };
-            assert!(!player.intent_playing());
-            assert_eq!(player.position(), 51.0);
-        })
-        .unwrap();
-        app.with_window_viewer_context(201, |parked| {
-            let Some(FsCacheEntry::Video { player, .. }) = parked.fs_cache.get(&0) else {
-                unreachable!();
-            };
-            assert!(!player.intent_playing());
-            assert_eq!(player.position(), 63.0);
-        })
-        .unwrap();
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::remote_ipc::session::RemoteControlPhase::RemoteActive
+        );
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.fs_cache.is_empty());
 
         for (path, position) in [
             (&mounted_path, 17.5),
@@ -57025,11 +57162,13 @@ mod still_window_mode_key_tests {
                 Some(&position)
             );
         }
-        assert!(app.active_viewer_context_id().is_some());
-        assert!(app.locate_window_context(201).is_some());
+        assert!(app.active_viewer_context_id().is_none());
+        assert!(app.locate_window_context(201).is_none());
+        assert!(app.detached_image_windows.is_empty());
+        assert!(app.detached_window_manager.is_empty());
         assert_eq!(
-            app.detached_window_state(201),
-            Some(DetachedWindowState::ParkedLive)
+            app.local_viewer_close_state(None),
+            crate::app::LocalViewerCloseState::Closed
         );
     }
 
@@ -65241,7 +65380,10 @@ mod still_window_mode_key_tests {
             crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0),
         ));
 
-        assert!(app.close_all_detached_viewers_for_mode_change(&ctx));
+        assert!(
+            app.close_all_detached_viewers_for_mode_change(&ctx)
+                .unwrap()
+        );
 
         assert_eq!(app.fullscreen_idx, None);
         assert_eq!(
@@ -65270,7 +65412,10 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
 
-        assert!(!app.close_all_detached_viewers_for_mode_change(&ctx));
+        assert!(
+            !app.close_all_detached_viewers_for_mode_change(&ctx)
+                .unwrap()
+        );
         assert!(app.fs_feedback_toast.is_none());
         assert!(app.detached_image_windows.is_empty());
         assert!(app.detached_window_manager.is_empty());
@@ -68382,7 +68527,13 @@ mod still_window_mode_key_tests {
         app.push_window_context_for_test(&ctx, 611, make_context(first_path.clone(), 21.0));
         app.push_window_context_for_test(&ctx, 612, make_context(second_path.clone(), 42.0));
 
-        app.teardown_paused_media_bundles_for_window_ids(&[611, 612], "test_two_bundle_teardown");
+        assert!(
+            app.teardown_paused_media_bundles_for_window_ids(
+                &[611, 612],
+                "test_two_bundle_teardown"
+            )
+            .is_ok()
+        );
 
         assert_eq!(
             app.settings
@@ -68426,9 +68577,12 @@ mod still_window_mode_key_tests {
             false,
         );
 
-        app.teardown_paused_media_bundles_for_window_ids(
-            &[621],
-            "test_surviving_video_mode_switch",
+        assert!(
+            app.teardown_paused_media_bundles_for_window_ids(
+                &[621],
+                "test_surviving_video_mode_switch",
+            )
+            .is_ok()
         );
 
         assert!(app.video_presentation_transition.is_transitioning());
@@ -68469,7 +68623,10 @@ mod still_window_mode_key_tests {
             );
         });
 
-        app.teardown_paused_media_bundles_for_window_ids(&[631, 632], "test_bundleless_window");
+        assert!(
+            app.teardown_paused_media_bundles_for_window_ids(&[631, 632], "test_bundleless_window")
+                .is_ok()
+        );
 
         assert_eq!(
             app.settings
@@ -84154,8 +84311,8 @@ fn repaint_request_probe() -> (
 /// (seam を戻しても緑のままだった)。retire 後は context ごと消えるので観測点も残らない。
 /// そこで、この 1 つしかない seam の本文を読んで判定する。
 ///
-/// `close_and_retire_context` の本番呼び出し元はここだけ。増えたらこの検査も更新し、
-/// 増えた側が terminal effects をどう完遂するかを書くこと。
+/// `close_and_retire_context` の本番呼び出し元は active close と Remote 全閉じの残余
+/// context 回収。両方とも terminal effects を完遂してから retire する。
 #[test]
 #[cfg(windows)]
 fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
@@ -84205,11 +84362,22 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
         }
     }
 
-    // 本番の retire 経路がここだけであることも一緒に見る。
+    // 残余 context の回収も同じ terminal close seam を通る。
     let production_seams = src.matches("close_and_retire_context(").count();
     assert_eq!(
-        production_seams, 1,
+        production_seams, 2,
         "close_and_retire_context の呼び出しが {production_seams} 箇所ある。 増えた側も terminal effects を完遂しているか確認し、この検査を更新すること"
+    );
+    let remaining = src
+        .split_once("mode_change_close_all_remaining_context")
+        .unwrap()
+        .1;
+    assert!(
+        remaining
+            .split_once("self.detached_image_windows.clear()")
+            .unwrap()
+            .0
+            .contains("close_fullscreen_to_completion")
     );
 }
 
@@ -84487,7 +84655,7 @@ fn closing_a_context_mid_transition_still_reaches_the_normal_teardown() {
         "遷移中の close_fullscreen が teardown まで走っている (この前提が変わったなら close_fullscreen_to_completion の存在理由も見直すこと)"
     );
 
-    app.close_fullscreen_to_completion(&ctx);
+    assert!(app.close_fullscreen_to_completion(&ctx).is_ok());
 
     assert!(
         !app.video_presentation_transition.is_transitioning(),
@@ -84558,7 +84726,7 @@ fn closing_a_context_without_a_transition_still_tears_down() {
     app.spread_popup_open = true;
     app.fit_popup_open = true;
 
-    app.close_fullscreen_to_completion(&ctx);
+    assert!(app.close_fullscreen_to_completion(&ctx).is_ok());
 
     assert!(
         !app.spread_popup_open && !app.fit_popup_open,

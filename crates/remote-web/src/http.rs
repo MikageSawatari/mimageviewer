@@ -1527,6 +1527,14 @@ enum StreamRouteResource {
     Segment(VideoStreamSegmentIndex),
 }
 
+fn video_start_success_response(owner: &RemoteSessionIdentity, mut payload: Value) -> HttpResponse {
+    payload["remote_session_id"] = json!(owner.session_id);
+    HttpResponse::json(&payload)
+        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+        .with_header("Cache-Control", "no-store")
+        .with_sensitive_value(owner.session_id.clone())
+}
+
 fn api_video_start(
     request: &mut Request,
     state: &AppState,
@@ -1557,24 +1565,25 @@ fn api_video_start(
     match result {
         Ok(success) => {
             let payload = success.value;
-            HttpResponse::json(&json!({
-                "session": payload.session,
-                "generation": payload.generation,
-                "playlist": video_playlist_url(payload.session, payload.generation),
-                "duration_secs": payload.duration_secs,
-                "source_origin_secs": payload.source_origin_secs,
-                "buffer_target_secs": payload.buffer_target_secs,
-                "has_video": payload.has_video,
-                "codec": payload.codecs,
-                "encoder": payload.encoder,
-                "video_size": payload.video_size,
-                "audio_processing": payload.audio_processing,
-                "audio_tracks": payload.audio_tracks,
-                "audio_track": payload.audio_track,
-                "end_behavior": payload.end_behavior,
-            }))
-            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
-            .with_header("Cache-Control", "no-store")
+            video_start_success_response(
+                owner,
+                json!({
+                    "session": payload.session,
+                    "generation": payload.generation,
+                    "playlist": video_playlist_url(payload.session, payload.generation),
+                    "duration_secs": payload.duration_secs,
+                    "source_origin_secs": payload.source_origin_secs,
+                    "buffer_target_secs": payload.buffer_target_secs,
+                    "has_video": payload.has_video,
+                    "codec": payload.codecs,
+                    "encoder": payload.encoder,
+                    "video_size": payload.video_size,
+                    "audio_processing": payload.audio_processing,
+                    "audio_tracks": payload.audio_tracks,
+                    "audio_track": payload.audio_track,
+                    "end_behavior": payload.end_behavior,
+                }),
+            )
         }
         Err(failure) => video_ipc_error_response(failure),
     }
@@ -4854,6 +4863,20 @@ mod tests {
     use tiny_http::TestRequest;
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn video_start_response_attests_the_owner_that_created_the_stream() {
+        let owner = RemoteSessionIdentity {
+            client_id: "browser-client".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        let response = video_start_success_response(&owner, json!({ "session": 12 }));
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["session"], 12);
+        assert_eq!(body["remote_session_id"], owner.session_id);
+        assert!(response.sensitive_values.contains(&owner.session_id));
+    }
 
     #[test]
     fn video_control_body_flattens_audio_track_action() {
