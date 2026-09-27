@@ -324,7 +324,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 
 ### 2.3 ツールバー
 
-- 左フォルダツリーペインの表示切替、本棚の追加先切替/追加/開く、名前付きコレクションの開く/追加、列数（1〜10 + 詳細）、
+- 左フォルダツリーペインの表示切替、本棚の追加先切替/追加/開く、名前付きコレクションの開く/追加、列数（1〜20 + 詳細）、
   縦横比（7種）、一覧ソート順（名前 / 番号 / 更新日 / ファイルサイズの6種）、レーティングフィルタ、スマートフィルタ、お気に入りフォルダ、
   登録済みスマートフォルダのボタン、
   タグの付与/解除ボタンとピン留めタグのボタンを配置
@@ -338,7 +338,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   - **空き領域を右クリック** = 表示するセクションの ON/OFF チェックリスト。全セクションを隠した
     場合の入口として、`設定` メニュー → `ツールバー` からも同じメニューを開ける。
   - **セクションのラベルを右クリック** = そのセクションの設定 (表示形式 = 展開/折りたたみ/プルダウン、
-    出す項目 = 列1〜10/比率/ソート、行頭に表示、このセクションを隠す、本/お気に入り/タグの管理)。
+    出す項目 = 列1〜20/比率/ソート、行頭に表示、このセクションを隠す、本/お気に入り/タグの管理)。
     フォルダバーでは `フォルダ:` ラベルまたは `場所▼` を右クリックして、場所▼の表示項目も設定できる。
     スマートフィルタバーでは `絞り込み:` ラベルを右クリックして、表示するフィルタ項目
     （ファイル名欄を含む）とファイル名欄の幅を設定できる。
@@ -512,7 +512,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   即時に揃え、それ以上なら描画端数だけを 130ms の ease-out で補間し、正本オフセットは完了時に
   1 回だけ更新する。補間中に触れ直した場合はその位置から操作を引き継ぐ。慣性スクロールは行わない
 - サムネイル表示の 2 本指ピンチは、広げると列数を減らしてセルを大きくし、縮めると列数を
-  増やす。連続倍率は 1.25 / 0.8 の比に達するごとに 1 列だけ変更し、1〜10 列でクランプする。
+  増やす。連続倍率は 1.25 / 0.8 の比に達するごとに 1 列だけ変更し、1〜20 列でクランプする。
   ピンチ中の移動はスクロールへ渡さず、列数設定は操作終了時に 1 回だけ保存する
 - タッチ由来のドラッグは一覧スクロールが所有し、native ファイル D&D を開始しない。
   マウスの左ドラッグ D&D、ホイール、スクロールバー、クリック / ダブルクリックは従来どおり
@@ -1492,7 +1492,7 @@ F12 相当の別ウィンドウ ON/OFF、現在操作中の mIV ウィンドウ�
 現在の割り当てを混ぜて表示する。空の入力種別は省略し、全入力未割り当ての操作は `なし` と表示する。
 コマンド一覧と、キーボード図から開く「キーから割り当て」の候補一覧は、同じ操作 / キー検索欄と
 絞り込み状態を共有する。
-`GridColumnCount1..10` のようにキー操作とリング用アクションが対応するものは、同じ編集ダイアログから
+`GridColumnCount1..20` のようにキー操作とリング用アクションが対応するものは、同じ編集ダイアログから
 キー / リング / マウス戻る・進む / X+方向 / マウスジェスチャを編集できる。
 通常のキー割り当ては入力欄と「押して入力」で編集し、ルーペ表示などの修飾キー長押し操作は
 Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
@@ -1555,6 +1555,7 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | Ctrl + マウスホイール | 列数を増減 |
 | Alt + 1〜9 | 列数を 1〜9 に切り替え |
 | Alt + 0 | 列数を 10 に切り替え |
+| 操作カスタマイズで割り当て | 列数を 11〜20 に切り替え（既定キーなし） |
 | Alt + - | サムネイル表示 / 詳細表示を切り替え |
 | F11 | メインウィンドウを最大化 / 復元する（Action: `GridToggleMaximize`） |
 | リング系の「メインウィンドウを閉じる」 / 「アプリを終了する」 | 「メインウィンドウを閉じる」はグリッドだけで割り当て可能。[×] と同じ close request のため、タスクトレイ常駐設定が有効ならトレイへ格納する。「アプリを終了する」はグリッド / 画像フルスクリーン / 動画フルスクリーンで割り当て可能。明示終了として常駐設定にかかわらず通常の保存・終了処理を通り、次回起動時はフルスクリーンを復元せず一覧を表示する。画像 / 動画の「フルスクリーンを閉じる」とは別操作 |
@@ -1850,9 +1851,9 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 
 | 設定名 | 型 | デフォルト | 説明 |
 |--------|-----|---------|------|
-| `grid_cols` | usize | 4 | サムネイルグリッド列数（1〜10） |
+| `grid_cols` | usize | 4 | サムネイルグリッド列数（1〜20） |
 | `grid_view_mode` | GridViewMode | Thumbnail | グリッドの表示モード。`Thumbnail` は従来のサムネイルグリッド、`Details` は行ベースの詳細一覧 |
-| `remember_favorite_view_state` | bool | false | お気に入りごとの表示状態の自動記憶・復元。対象は `grid_view_mode` / `thumb_px` / `thumb_aspect` / `thumb_aspect_auto` / `grid_display_order` / `sort_order` / `default_spread_mode` / `default_reading_flow`。専用値は `adjustment.db.favorite_view_states` に UUID キーで保存し、共通値は `Settings` の非永続 overlay が分離する |
+| `remember_favorite_view_state` | bool | false | お気に入りごとの表示状態の自動記憶・復元。対象は `grid_view_mode` / `grid_cols` / `thumb_aspect` / `thumb_aspect_auto` / `grid_display_order` / `sort_order` / `default_spread_mode` / `default_reading_flow`。専用値は `adjustment.db.favorite_view_states` に UUID キーで保存し、共通値は `Settings` の非永続 overlay が分離する |
 | `details_sort_key` | DetailsSortKey | Toolbar | 詳細表示モードの列ヘッダソートキー。`Toolbar` はツールバーのロード時ソート順、ほかに Name / Rating / Tags / Kind / PageCount / Place / Size / Modified / Created / State / ImageDimensions / VideoDuration / VideoDimensions / VideoCodec |
 | `details_sort_ascending` | bool | true | 詳細表示モードの列ソート方向。`true` は昇順、`false` は降順 |
 | `details_size_display_mode` | DetailsSizeDisplayMode | Optimal | 詳細表示モードのサイズ列表示。`Optimal` は B / KB / MB / GB から自動選択、固定モードは Bytes / KB / MB |
@@ -2003,6 +2004,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `edit_preview_cache_max_bytes` | u64 | 1,000,000,000 | 編集プレビューキャッシュの容量上限。環境設定では MB 単位で指定し、超過時は最終アクセスが古いものから削除する |
 | `archive_cache_max_bytes` | u64 | 0 | RAR / 7z / LZH / (非 ZIP 入れ子入り) ZIP から作成した変換済み ZIP キャッシュの容量上限。`0` は無制限。環境設定では MB 単位で指定する。上限を超えた場合は、次回の変換完了後に最終アクセスが古いキャッシュから削除する。直近で作成したキャッシュは、単体で上限を超えても削除しない |
 | `archive_file_handling` | ArchiveFileHandling | Ask | RAR / 7z / LZH (および非 ZIP アーカイブを入れ子に含む ZIP) の扱い。非ソリッド・入れ子なし・暗号化なし RAR は直接閲覧し、それ以外を `Ask` / `Convert` で変換する。`Ignore` は直接閲覧対象を含め一覧・フォルダ移動で扱わない |
+| `epub_file_handling` | EpubFileHandling | Ask | EPUB を PDF に変換して開くときの確認方法。`Ask` は確認画面を表示、`Convert` は確認なしで変換、`Ignore` は一覧・フォルダ移動から除き、変換済みの本も開かない。RAR / 7z / LZH の設定とは独立 |
 | `archive_convert_without_dialog` | bool | false | 旧設定互換フィールド。新規 UI / 実行時判定は `archive_file_handling` を使い、保存時は `archive_file_handling == Convert` に同期する |
 | `batch_cache_zip_contents` | bool | false | 一括キャッシュ作成で ZIP 内の全画像をキャッシュ |
 | `batch_cache_pdf_contents` | bool | false | 一括キャッシュ作成で PDF 内の全ページをキャッシュ |

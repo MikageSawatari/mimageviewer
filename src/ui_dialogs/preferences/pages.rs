@@ -2433,6 +2433,16 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::GridColumnCount8 => RingActionId::GridColumnCount8,
         KeyAction::GridColumnCount9 => RingActionId::GridColumnCount9,
         KeyAction::GridColumnCount10 => RingActionId::GridColumnCount10,
+        KeyAction::GridColumnCount11 => RingActionId::GridColumnCount11,
+        KeyAction::GridColumnCount12 => RingActionId::GridColumnCount12,
+        KeyAction::GridColumnCount13 => RingActionId::GridColumnCount13,
+        KeyAction::GridColumnCount14 => RingActionId::GridColumnCount14,
+        KeyAction::GridColumnCount15 => RingActionId::GridColumnCount15,
+        KeyAction::GridColumnCount16 => RingActionId::GridColumnCount16,
+        KeyAction::GridColumnCount17 => RingActionId::GridColumnCount17,
+        KeyAction::GridColumnCount18 => RingActionId::GridColumnCount18,
+        KeyAction::GridColumnCount19 => RingActionId::GridColumnCount19,
+        KeyAction::GridColumnCount20 => RingActionId::GridColumnCount20,
         KeyAction::FsClose => RingActionId::CloseFullscreen,
         KeyAction::FsToggleMetadata => RingActionId::ImageToggleMetadata,
         KeyAction::FsToggleWindowMode => RingActionId::ToggleWindowMode,
@@ -7103,6 +7113,10 @@ pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState
     });
 }
 
+pub(super) fn reset_epub_file_handling(settings: &mut crate::settings::Settings) {
+    settings.epub_file_handling = crate::settings::EpubFileHandling::default();
+}
+
 pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         "サムネイルキャッシュをいつ生成するかを指定します。\n\
@@ -7262,6 +7276,25 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .small()
         .weak(),
     );
+    });
+    ui.add_space(8.0);
+    anchored(ui, state, "cache/epub-handling", |ui, state| {
+        let s = &mut state.settings;
+        ui.label(egui::RichText::new("EPUB の処理").strong());
+        for &handling in crate::settings::EpubFileHandling::all() {
+            ui.radio_value(&mut s.epub_file_handling, handling, handling.label())
+                .on_hover_text(handling.description());
+        }
+        if ui.button("既定値に戻す").clicked() {
+            reset_epub_file_handling(s);
+        }
+        ui.label(
+            egui::RichText::new(
+                "「無視する」では、EPUB を一覧・フォルダ移動の対象にせず、変換済みの本も開きません。",
+            )
+            .small()
+            .weak(),
+        );
     });
     ui.add_space(8.0);
     anchored(ui, state, "cache/archive-limit", |ui, state| {
@@ -10301,6 +10334,8 @@ mod tests {
     #[test]
     fn operation_labels_sort_numbers_naturally() {
         let mut labels = vec![
+            "サムネイル列数を20列に",
+            "サムネイル列数を11列に",
             "サムネイル列数を10列に",
             "サムネイル列数を1列に",
             "サムネイル列数を2列に",
@@ -10314,6 +10349,8 @@ mod tests {
                 "サムネイル列数を2列に",
                 "サムネイル列数を9列に",
                 "サムネイル列数を10列に",
+                "サムネイル列数を11列に",
+                "サムネイル列数を20列に",
             ]
         );
     }

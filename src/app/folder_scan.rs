@@ -30,7 +30,7 @@ pub(crate) struct ScannedMediaEntry {
 
 /// 通常フォルダ一覧を作るときに、物理フォルダ内には存在するが一覧へ出さなかった項目数。
 ///
-/// `hidden` / `ignored_archive` / `unsupported` / `system` は既存の `read_dir` ループ内で
+/// `hidden` / `ignored_archive` / `ignored_epub` / `unsupported` / `system` は既存の `read_dir` ループ内で
 /// 分類し、`same_name` は同名設定の filter が実際に除いた差分を加算する。件数表示のための
 /// 追加走査や metadata I/O は行わない。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -39,6 +39,8 @@ pub(crate) struct OmittedFolderEntryCounts {
     pub(crate) hidden: usize,
     /// 環境設定の書庫処理が「無視する」のため一覧へ出さなかった変換対象書庫。
     pub(crate) ignored_archive: usize,
+    /// EPUB の処理が「無視する」のため一覧へ出さなかった本。
+    pub(crate) ignored_epub: usize,
     pub(crate) unsupported: usize,
     /// OS / エクスプローラーが勝手に作る付随ファイル。利用者の持ち物ではないので主数字から外す。
     pub(crate) system: usize,
@@ -55,6 +57,7 @@ impl OmittedFolderEntryCounts {
         self.same_name
             .saturating_add(self.hidden)
             .saturating_add(self.ignored_archive)
+            .saturating_add(self.ignored_epub)
             .saturating_add(self.unsupported)
     }
 }
@@ -436,6 +439,7 @@ pub(crate) fn materialize_local_folder_listing_with_order(
 #[derive(Clone, Debug)]
 pub(crate) struct ImageFolderPageCountOptions {
     pub(crate) include_convertible_archives: bool,
+    pub(crate) include_epub: bool,
     pub(crate) show_hidden_files: bool,
     pub(crate) skip_duplicate_images: bool,
     pub(crate) image_ext_priority: Vec<String>,
@@ -450,6 +454,7 @@ pub(crate) fn image_folder_page_count_options(
     // the same background-loaded page count as ZIP and PDF containers.
     ImageFolderPageCountOptions {
         include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
+        include_epub: !settings.epub_file_handling_ignores_epub(),
         show_hidden_files: settings.show_hidden_files,
         skip_duplicate_images: settings.skip_duplicate_images,
         image_ext_priority: settings.image_ext_priority.clone(),
@@ -475,6 +480,7 @@ pub(crate) fn image_page_recognition_fingerprint(settings: &crate::settings::Set
     mix(&[u8::from(
         !settings.archive_file_handling_ignores_convertible(),
     )]);
+    mix(&[u8::from(!settings.epub_file_handling_ignores_epub())]);
     mix(&[u8::from(settings.susie_enabled)]);
     for extension in &settings.image_ext_priority {
         mix(extension.as_bytes());
@@ -501,6 +507,7 @@ pub(crate) fn image_folder_page_count(
     let mut scan = scan_directory_entries(
         entries,
         options.include_convertible_archives,
+        options.include_epub,
         options.show_hidden_files,
         None,
     )?;
@@ -541,10 +548,12 @@ pub(crate) fn is_image_only_book_contents(
 /// 方針は [docs/ui-responsiveness.md §1.1](../../docs/ui-responsiveness.md) にまとめてある。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
-    scan_directory_with_convertible_archives(path, true, false).unwrap_or_else(|_| ScannedDir {
-        folders: Vec::new(),
-        all_media: Vec::new(),
-        omitted: OmittedFolderEntryCounts::default(),
+    scan_directory_with_convertible_archives(path, true, true, false).unwrap_or_else(|_| {
+        ScannedDir {
+            folders: Vec::new(),
+            all_media: Vec::new(),
+            omitted: OmittedFolderEntryCounts::default(),
+        }
     })
 }
 
@@ -555,6 +564,7 @@ pub(crate) fn scan_directory_with_settings(
     scan_directory_with_convertible_archives(
         path,
         !settings.archive_file_handling_ignores_convertible(),
+        !settings.epub_file_handling_ignores_epub(),
         settings.show_hidden_files,
     )
 }
@@ -562,11 +572,13 @@ pub(crate) fn scan_directory_with_settings(
 pub(crate) fn scan_directory_with_convertible_archives(
     path: &std::path::Path,
     include_convertible_archives: bool,
+    include_epub: bool,
     show_hidden_files: bool,
 ) -> std::io::Result<ScannedDir> {
     scan_directory_with_convertible_archives_cancel(
         path,
         include_convertible_archives,
+        include_epub,
         show_hidden_files,
         None,
     )
@@ -575,6 +587,7 @@ pub(crate) fn scan_directory_with_convertible_archives(
 pub(crate) fn scan_directory_with_convertible_archives_cancel(
     path: &std::path::Path,
     include_convertible_archives: bool,
+    include_epub: bool,
     show_hidden_files: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<ScannedDir> {
@@ -582,6 +595,7 @@ pub(crate) fn scan_directory_with_convertible_archives_cancel(
     scan_directory_entries(
         entries,
         include_convertible_archives,
+        include_epub,
         show_hidden_files,
         cancel,
     )
@@ -590,6 +604,7 @@ pub(crate) fn scan_directory_with_convertible_archives_cancel(
 fn scan_directory_entries<I>(
     entries: I,
     include_convertible_archives: bool,
+    include_epub: bool,
     show_hidden_files: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<ScannedDir>
@@ -696,11 +711,15 @@ where
                     sort_meta,
                 });
             } else if crate::folder_tree::is_paged_document_path(&p) {
-                folders.push(ScannedFolderEntry {
-                    item: GridItem::PdfFile(p),
-                    display_meta: Some((mtime, file_size)),
-                    sort_meta,
-                });
+                if include_epub || ext_lower != "epub" {
+                    folders.push(ScannedFolderEntry {
+                        item: GridItem::PdfFile(p),
+                        display_meta: Some((mtime, file_size)),
+                        sort_meta,
+                    });
+                } else {
+                    omitted.ignored_epub = omitted.ignored_epub.saturating_add(1);
+                }
             } else if let Some(fmt) =
                 crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
             {
@@ -1215,6 +1234,7 @@ mod page_count_tests {
     fn options(skip_duplicate_images: bool) -> ImageFolderPageCountOptions {
         ImageFolderPageCountOptions {
             include_convertible_archives: true,
+            include_epub: true,
             show_hidden_files: true,
             skip_duplicate_images,
             image_ext_priority: vec!["png".to_owned(), "jpg".to_owned()],
@@ -1254,7 +1274,7 @@ mod page_count_tests {
         let new_temp = shelf.join(format!(".miv-part-{token}.tmp"));
         std::fs::write(&old_temp, b"temporary").unwrap();
         std::fs::write(&new_temp, b"temporary").unwrap();
-        let scan = scan_directory_with_convertible_archives(&shelf, true, true).unwrap();
+        let scan = scan_directory_with_convertible_archives(&shelf, true, true, true).unwrap();
         assert_eq!(scan.folders.len(), 1);
         assert!(
             matches!(&scan.folders[0].item, GridItem::PdfFile(path) if path == &shelf.join("book.pdf"))
@@ -1328,7 +1348,8 @@ mod page_count_tests {
         std::fs::write(temp.path().join("desktop.ini"), b"explorer view").unwrap();
 
         // 内訳はこの既存 read_dir の結果から導出する。件数取得専用の再走査 API は持たない。
-        let mut scan = scan_directory_with_convertible_archives(temp.path(), true, false).unwrap();
+        let mut scan =
+            scan_directory_with_convertible_archives(temp.path(), true, true, false).unwrap();
         scan.omitted.same_name =
             filter_image_ext_duplicates(&mut scan.all_media, &["png".to_owned(), "jpg".to_owned()]);
 
@@ -1355,7 +1376,8 @@ mod page_count_tests {
         std::fs::write(temp.path().join("notes.txt"), b"text").unwrap();
         std::fs::write(temp.path().join("Thumbs.db"), b"explorer cache").unwrap();
 
-        let scan = scan_directory_with_convertible_archives(temp.path(), true, false).unwrap();
+        let scan =
+            scan_directory_with_convertible_archives(temp.path(), true, true, false).unwrap();
         let mut settings = crate::settings::Settings::default();
         settings.skip_duplicate_images = true;
         settings.image_ext_priority = vec!["png".to_owned(), "jpg".to_owned()];
@@ -1459,6 +1481,7 @@ mod page_count_tests {
             same_name: 0,
             hidden: 0,
             ignored_archive: 0,
+            ignored_epub: 0,
             unsupported: 5,
             system: 0,
         };
@@ -1472,6 +1495,7 @@ mod page_count_tests {
             same_name: 0,
             hidden: 0,
             ignored_archive: 0,
+            ignored_epub: 0,
             unsupported: 0,
             system: 7,
         };
@@ -1544,6 +1568,7 @@ mod page_count_tests {
             same_name: 3,
             hidden: 2,
             ignored_archive: 4,
+            ignored_epub: 0,
             unsupported: 1,
             system: 7,
         };
@@ -1703,7 +1728,7 @@ mod page_count_tests {
             )),
         ];
 
-        let error = match scan_directory_entries(entries, true, false, None) {
+        let error = match scan_directory_entries(entries, true, true, false, None) {
             Ok(_) => panic!("a partial directory snapshot must not be published"),
             Err(error) => error,
         };

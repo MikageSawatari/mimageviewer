@@ -1975,6 +1975,11 @@ impl App {
         {
             return false;
         }
+        if matches!(&payload, PhysicalHistoryPreflightPayload::PdfPages(_))
+            && self.pdf_open_refusal(&target.visible_path).is_some()
+        {
+            return false;
+        }
         let path = target.visible_path.clone();
         let backing = match &payload {
             PhysicalHistoryPreflightPayload::ZipCached { backing_path, .. } => backing_path.clone(),
@@ -2080,8 +2085,14 @@ impl App {
                 true
             }
             PhysicalHistoryPreflightPayload::PdfPages(pages) => {
-                self.load_pdf_as_folder_prepared_with_password(path, pages, pdf_password_override);
-                true
+                matches!(
+                    self.load_pdf_as_folder_prepared_with_password(
+                        path,
+                        pages,
+                        pdf_password_override
+                    ),
+                    super::FolderOpenOutcome::Loaded
+                )
             }
             PhysicalHistoryPreflightPayload::PdfPasswordRequired
             | PhysicalHistoryPreflightPayload::PdfOpenFailure(_)

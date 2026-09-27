@@ -756,6 +756,9 @@ fn cell_filename_mixed_glyphs_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    checked: false,
+                    stack_count: None,
+                    filter_match_count: None,
                     bookmark_time: None,
                     upscaled_video: false,
                     edit_badges: Default::default(),
@@ -816,6 +819,9 @@ fn compact_file_format_badges_light() {
                     mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                         cell,
                         inner,
+                        checked: false,
+                        stack_count: None,
+                        filter_match_count: None,
                         bookmark_time: None,
                         upscaled_video: false,
                         edit_badges: Default::default(),
@@ -926,6 +932,9 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    checked: false,
+                    stack_count: None,
+                    filter_match_count: None,
                     bookmark_time: Some("0:25"),
                     upscaled_video: false,
                     edit_badges: Default::default(),
@@ -979,6 +988,9 @@ fn bookmark_time_and_tag_badges_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    checked: false,
+                    stack_count: None,
+                    filter_match_count: None,
                     bookmark_time: Some("12:34"),
                     upscaled_video: false,
                     edit_badges: mimageviewer::thumb_overlay_layout::EditBadgeFlags {

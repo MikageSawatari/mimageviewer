@@ -161,6 +161,16 @@ fn grid_ring_action_allowed_during_refresh(action: &RingActionId) -> bool {
                 | RingActionId::GridColumnCount8
                 | RingActionId::GridColumnCount9
                 | RingActionId::GridColumnCount10
+                | RingActionId::GridColumnCount11
+                | RingActionId::GridColumnCount12
+                | RingActionId::GridColumnCount13
+                | RingActionId::GridColumnCount14
+                | RingActionId::GridColumnCount15
+                | RingActionId::GridColumnCount16
+                | RingActionId::GridColumnCount17
+                | RingActionId::GridColumnCount18
+                | RingActionId::GridColumnCount19
+                | RingActionId::GridColumnCount20
                 | RingActionId::GridHistoryBack
                 | RingActionId::GridHistoryForward
                 | RingActionId::GridParentFolder
@@ -6014,6 +6024,46 @@ impl App {
                 self.apply_ring_grid_column_count(10);
                 None
             }
+            RingActionId::GridColumnCount11 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(11);
+                None
+            }
+            RingActionId::GridColumnCount12 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(12);
+                None
+            }
+            RingActionId::GridColumnCount13 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(13);
+                None
+            }
+            RingActionId::GridColumnCount14 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(14);
+                None
+            }
+            RingActionId::GridColumnCount15 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(15);
+                None
+            }
+            RingActionId::GridColumnCount16 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(16);
+                None
+            }
+            RingActionId::GridColumnCount17 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(17);
+                None
+            }
+            RingActionId::GridColumnCount18 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(18);
+                None
+            }
+            RingActionId::GridColumnCount19 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(19);
+                None
+            }
+            RingActionId::GridColumnCount20 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(20);
+                None
+            }
             RingActionId::GridHistoryBack => self.apply_folder_history_nav(false, source),
             RingActionId::GridHistoryForward => self.apply_folder_history_nav(true, source),
             RingActionId::GridParentFolder if context == RingShortcutContext::Grid => {
@@ -7266,7 +7316,7 @@ impl App {
                     // The Smart request owns conversion and adopts its logical source once.
                 } else {
                     let owner = self.main_grid_archive_open_owner(idx, &path);
-                    self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    let _outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                         path, auto_fs, owner,
                     );
                 }

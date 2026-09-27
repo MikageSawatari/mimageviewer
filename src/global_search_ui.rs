@@ -2252,6 +2252,7 @@ impl App {
             kinds: self.global_search.filters.kind.map(|k| vec![k]),
             target: self.global_search.filters.target.clone(),
             mode: self.global_search.filters.or_mode.into(),
+            ignore_epub: self.settings.epub_file_handling_ignores_epub(),
         };
 
         let repaint_ctx = ctx.clone();

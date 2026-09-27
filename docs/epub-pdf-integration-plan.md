@@ -20,12 +20,15 @@
 | D9 | 一度読み込んだ本は、実行中に元の EPUB を差し替えても次回起動まで差し替え前を表示する (I7) |
 | D10 | 綴じ方向の自動適用は設定「PDF / EPUB の右開き指定に従う」(見開き設定、**既定 OFF**) で行い、PDF と EPUB の両方に効く。本ごとの保存値があればそれが優先 (§4.3) |
 | D11 | WebView2 のレジストリポリシー (`AdditionalBrowserArguments`・`UserDataFolder` 等) は**検出せず、設定されていれば従う**。個人用アプリであり、ポリシーを書けるのは管理者か利用者本人のため。`WEBVIEW2_*` 環境変数は偶然の引き継ぎを防ぐため除去を続ける。プライバシーの説明に「ポリシー設定時はそれに従う」と書き添える (§4.5) |
-| D12 | (利用者合意 2026-09-26) D2 の例外として、利用者が**明示的に選んだときだけ**元 EPUB と同じフォルダへ同名の PDF を保存する変換を設ける。入口は開くときの確認画面のボタン「PDF ファイルとして保存して開く」と、一覧の右クリック「変換 > PDF ファイルに変換」(複数選択で一括、RAR→ZIP の sibling / batch 変換と同じ構成)。既存ファイルは上書きしない (同名 PDF があればボタンを無効化し理由を示す)、公開前に検証、書込不可ならキャッシュ変換を案内。保存した PDF は通常の PDF (キャッシュ世代を作らず、方向は PDF の `/ViewerPreferences` に書く)。D5 により同名 EPUB は一覧で隠れる。「確認せずに変換」設定時の自動変換は従来どおりキャッシュ。S3 で実装、プライバシーの記述は S5 |
+| D12 | (利用者合意 2026-09-26) D2 の例外として、利用者が**明示的に選んだときだけ**元 EPUB と同じフォルダへ同名の PDF を保存する変換を設ける。入口は開くときの確認画面のボタン「PDF ファイルとして保存して開く」と、一覧の右クリック「変換 > PDF ファイルに変換」(複数選択で一括、RAR→ZIP の sibling / batch 変換と同じ構成)。既存ファイルは上書きしない (同名 PDF があればボタンを無効化し理由を示す)、公開前に検証、書込不可ならキャッシュ変換を案内。保存した PDF は通常の PDF (キャッシュ世代を作らず、方向は PDF の `/ViewerPreferences` に書く)。D5 により同名 EPUB は一覧で隠れる。EPUB の「確認せず変換する」設定時の自動変換は従来どおりキャッシュ。S3 で実装、プライバシーの記述は S5 |
+| D13 | (利用者決定 2026-09-27) EPUB の開き方は RAR / 7z / LZH の `archive_file_handling` と分離し、専用の `epub_file_handling` (Ask / Convert / Ignore、既定 Ask) で決める。EPUB は未リリースなので旧書庫設定から引き継がない。確認画面の「次回から表示しない」も EPUB 設定だけを Convert にする。Ignore は一覧・フォルダ移動・検索結果の EPUB を除き、変換済みの本も開かない。**公開時は `Cargo.toml` の版番号を旧リリース 4.1.0 より上げることが前提**。`settings_db` は保存した版が実行中の版より新しい場合だけ旧版の読み書きを止めるため、開発中の同一版番号では新設定を旧バイナリから保護できない |
+
+設定変更時の一覧更新は、EPUB と RAR / 7z / LZH で同じ環境設定 OK の再読み込み経路を使う (2026-09-27 方針変更)。通常フォルダはその場で再読み込みし、検索結果・閲覧履歴などは専用の即時再構築をしない。EPUB の「無視する」による履歴除外は、次に履歴一覧を作るときに行う。
 
 ## 2. 利用者から見た挙動
 
 1. フォルダに `book.epub` があると、一覧に 1 冊の **PDF 系の本**として出る (バッジ「EPUB」)。未変換ならアイコン、変換済みなら 1 ページ目のサムネイル。
-2. 開くと、未変換なら確認ダイアログ → 変換 (進捗・キャンセル可) → 開く。変換済みなら即座に開く。確認の要否は既存の `archive_file_handling` (Ask / Convert / Ignore) に従う。どの入口 (クリック・フォルダ移動・履歴・しおり・コレクション・スマートフォルダー・起動復元) から開いても同じ。
+2. EPUB を開くと、未変換なら設定に応じて確認ダイアログを表示するか省略し、変換 (進捗・キャンセル可) して開く。「無視する」では開かない。変換済みの本は「無視する」以外なら即座に開く。確認の要否は EPUB 専用の `epub_file_handling` (Ask / Convert / Ignore、既定 Ask) に従う。どの入口 (クリック・フォルダ移動・履歴・しおり・コレクション・スマートフォルダー・起動復元) から開いても同じ。
 3. 開いた後のアドレスバー・親へ戻る・次回起動の復元・履歴・しおりは、すべて `book.epub` を指す。PDF の本と同じ種類として扱われる。
 4. DRM 付き / 壊れた EPUB / WebView2 Runtime なし / タイムアウトは、それぞれ理由を明示したエラー。空の本にはしない。
 5. 設定「PDF / EPUB の右開き指定に従う」(既定 OFF) を ON にすると、本に保存された見開き設定が無いとき、右開き指定のある
@@ -229,7 +232,7 @@ EPUB を「**中身のバイト列が変換キャッシュに置いてある PDF
   `NotConverted` のときはその owner のまま EPUB 変換要求へ移す。履歴の巻き戻しとフルスクリーン予約の引き継ぎは、
   既存の `FolderOpenOutcome::ConversionDialogOpened` を受けた呼び出し側の処理 (`app.rs:77968`) と同じ意味で行う
   (列挙完了時に発生する点だけが違う。実装時に同じ遷移を型で表す)。
-- 変換要求は `archive_file_handling` に従う: Ignore → 既存のトースト (文言を一般化)、Ask → 確認ダイアログ
+- 変換要求は `epub_file_handling` に従う: Ignore → EPUB を無視するトースト、Ask → 確認ダイアログ
   (要約は変換器の `inspect` をワーカーで実行: レイアウト・綴じ方向・spine 数・DRM 判定)、Convert → 確認なしで変換。
 - 変換ダイアログは既存 `ArchiveConvertState` の相 (`archive_convert.rs:113-188`) を流用し、完了処理は EPUB 専用の分岐
   (変換 ZIP 用の「開いた直後の current_folder 同期確認」`:358-393,1197-1241` と `archive_source_override` は通らない)。
@@ -534,6 +537,8 @@ x64 で `+crt-static` なので VC runtime 検査の追加設定は不要 (`chec
 2026-09-27 の再レビュー修正では、直接 PDF/EPUB open も列挙成功までは元の rows・surface・selection を保持する。warm `pdf_meta` placeholder は直接 open の未採用表示には使わない。詳細は同じ [履歴 plan §11](folder-history-location-plan.md#11-epub-統合時の履歴-open-所有2026-09-27設計担当決定) を参照。
 
 **2026-09-28 利用者決定（実装前）**: 上の 2026-09-27 の直接 open / placeholder 記述は [履歴 plan §12](folder-history-location-plan.md#12-epub-モーダルと直接-pdf-の採用境界2026-09-28利用者決定実装前設計) により更新する。Ask / Convert の未変換 EPUB は、確認を省く設定でも変換の全相で進捗・取消の modal を表示して他の local open admission を止める。Ignore は変換を開始しない。`pdf_meta` の条件を満たす直接 PDF と固定済み EPUB は placeholder を**可視採用**として address・履歴・A/B と同時に確定し、検証列挙を続ける。cold 直接 open と履歴 staged preflight は成功採用まで旧表示を保つ。warm 本から staged 履歴または cold 直接 open を始めても元の列挙は admission で取り消さず、新しい要求の成功採用または通常の leave / close まで source owner が保持する。単冊変換中の直接-to-直接 hand-off は modal gate により到達不能であり、cold 列挙中の supersession だけが共通 admission で typed restore を消費する。右クリック一括 EPUB→PDF は RAR 一括変換と同様、独立した modal を保つ。Remote は変換せず別 session を閲覧する。§12 の行列・削除対象・回帰テストを実装時の正本とする。
+
+§12 の modal / warm 採用設計は下記 D13 を前提とする。`epub_file_handling=Ignore` は変換済み EPUB も cache 参照・placeholder 採用・staged preparation・古い grid tile の副作用より前に typed `Refused` として拒否する。PDF password prompt も typed owner による共有 modal admission gate の対象とし、先行 DFS folder navigation の result は accepted EPUB open が退役させる。詳細な owner 行列とテストは [履歴 plan §12.1–12.4](folder-history-location-plan.md#12-epub-モーダルと直接-pdf-の採用境界2026-09-28利用者決定実装前設計) を正本とする。
 
 ### S3a 一覧・分類・D5 (2026-09-26)
 
@@ -1028,3 +1033,7 @@ mIV の通常のファイルコピーと同じ (しおり・コレクション�
 launcher テスト 11 件成功、portable の core・worker をコンパイル。**未実施**: `build-portable.ps1` / `build-dist.ps1` の通し実行と
 署名 (他の mImageViewer が起動中で `-PreserveRuntime` が停止を拒否したため)。リリース前に mImageViewer を閉じて実行し、
 配布成果物 (単体 exe・インストーラ・portable zip) に worker が入り署名されていることを確かめる。
+
+### S5 後の開き方設定の分離 (2026-09-27、D13)
+
+RAR の「次回から表示しない」が EPUB にも効いた実機確認を受け、EPUB 専用の 3 択を追加した。既定は確認ありで、旧書庫設定からの移行はしない。通常一覧・フォルダ移動・スマートフォルダ・Remote のフォルダ・コレクション・タグ一覧の EPUB 表示判定と、変換確認ダイアログの省略判定を独立させた。RAR / 7z / LZH は従来の設定を読む。

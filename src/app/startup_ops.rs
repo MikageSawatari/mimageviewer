@@ -3,6 +3,13 @@ use super::*;
 const STARTUP_OPEN_PATH_RESOLVE_TOAST_DELAY: std::time::Duration =
     std::time::Duration::from_millis(400);
 
+#[must_use]
+enum StartupOpenApplyOutcome {
+    Opened,
+    NotOpenable,
+    Refused(FolderOpenRefusal),
+}
+
 #[cfg(test)]
 thread_local! {
     static FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILURE: std::cell::Cell<bool> = const {
@@ -346,8 +353,23 @@ impl App {
             return;
         }
         let requested_display = result.requested.display().to_string();
-        if self.apply_startup_open_path_resolve_result(&owner, result, ctx) {
-            return;
+        match self.apply_startup_open_path_resolve_result(&owner, result, ctx) {
+            StartupOpenApplyOutcome::Opened => return,
+            StartupOpenApplyOutcome::Refused(reason) => {
+                if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner {
+                    self.cancel_bookmark_open_request(bookmark_owner.request_id, "epub_ignored");
+                }
+                crate::logger::log(format!(
+                    "startup open: refused source={} requested={} reason={reason:?}",
+                    source.perf_tag(),
+                    requested_display
+                ));
+                if matches!(source, StartupOpenPathSource::InitialStartup) {
+                    self.open_default_startup_target();
+                }
+                return;
+            }
+            StartupOpenApplyOutcome::NotOpenable => {}
         }
         if matches!(source, StartupOpenPathSource::InitialStartup) {
             self.open_default_startup_target();
@@ -686,17 +708,23 @@ impl App {
         owner: &StartupOpenPathOwner,
         result: StartupOpenPathResolveResult,
         ctx: &egui::Context,
-    ) -> bool {
+    ) -> StartupOpenApplyOutcome {
         let source = owner.source();
         let Some(resolution) = result.resolved else {
             crate::logger::log(format!(
                 "startup open: no openable path for {}",
                 result.requested.display()
             ));
-            return false;
+            return StartupOpenApplyOutcome::NotOpenable;
         };
 
         let openable = resolution.path;
+        if matches!(owner, StartupOpenPathOwner::Bookmark(_))
+            && let Some(reason) = self.pdf_open_refusal(&openable)
+        {
+            self.show_pdf_open_refusal(reason);
+            return StartupOpenApplyOutcome::Refused(reason);
+        }
         crate::logger::log(format!(
             "startup open: requested={} resolved={} resolve_ms={:.1}",
             result.requested.display(),
@@ -730,11 +758,21 @@ impl App {
                 if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
                     self.open_startup_file_if_visible(&result.requested);
                 }
-                return !matches!(outcome, FolderOpenOutcome::Ignored);
+                return match outcome {
+                    FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened => {
+                        StartupOpenApplyOutcome::Opened
+                    }
+                    FolderOpenOutcome::Ignored => StartupOpenApplyOutcome::NotOpenable,
+                    FolderOpenOutcome::Refused(reason) => StartupOpenApplyOutcome::Refused(reason),
+                };
             }
             if let Some(descriptor) = self.bookmark_detached_descriptor(&openable, resolution.kind)
             {
-                return self.continue_active_detached_book_context_from_descriptor(descriptor);
+                return if self.continue_active_detached_book_context_from_descriptor(descriptor) {
+                    StartupOpenApplyOutcome::Opened
+                } else {
+                    StartupOpenApplyOutcome::NotOpenable
+                };
             }
             // OtherArchive without a cache remains in this same loading context.  The ordinary
             // owned loader below starts probe/conversion and carries the bookmark's window lease
@@ -756,12 +794,16 @@ impl App {
                 })
             )
         {
-            return self.open_bookmark_media_in_detached_context(
+            return if self.open_bookmark_media_in_detached_context(
                 ctx,
                 &result.requested,
                 openable,
                 select_requested_file,
-            );
+            ) {
+                StartupOpenApplyOutcome::Opened
+            } else {
+                StartupOpenApplyOutcome::NotOpenable
+            };
         }
         #[cfg(windows)]
         if matches!(source, StartupOpenPathSource::Bookmark)
@@ -769,7 +811,11 @@ impl App {
             && let Some(opened) =
                 self.open_bookmark_book_in_detached_context(ctx, openable.clone(), resolution.kind)
         {
-            return opened;
+            return if opened {
+                StartupOpenApplyOutcome::Opened
+            } else {
+                StartupOpenApplyOutcome::NotOpenable
+            };
         }
         #[cfg(windows)]
         if matches!(source, StartupOpenPathSource::Bookmark)
@@ -781,7 +827,7 @@ impl App {
                 .is_some()
             && !self.park_detached_media_before_fullfeature_bookmark_book_open(ctx)
         {
-            return false;
+            return StartupOpenApplyOutcome::NotOpenable;
         }
         let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
             || startup_openable_should_auto_fullscreen(&self.settings, &openable, resolution.kind);
@@ -790,8 +836,12 @@ impl App {
             auto_fullscreen,
             owner.open_request_owner(),
         );
-        if matches!(outcome, FolderOpenOutcome::Ignored) {
-            return false;
+        match outcome {
+            FolderOpenOutcome::Ignored => return StartupOpenApplyOutcome::NotOpenable,
+            FolderOpenOutcome::Refused(reason) => {
+                return StartupOpenApplyOutcome::Refused(reason);
+            }
+            FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened => {}
         }
         if matches!(source, StartupOpenPathSource::Bookmark)
             && matches!(outcome, FolderOpenOutcome::Loaded)
@@ -802,7 +852,7 @@ impl App {
         if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
             self.open_startup_file_if_visible(&result.requested);
         }
-        true
+        StartupOpenApplyOutcome::Opened
     }
 
     /// Route a bookmark-backed book into the same independent context seam used by normal
@@ -879,7 +929,15 @@ impl App {
             return None;
         }
 
+        let request_id = pending.request_id;
         let descriptor = self.bookmark_detached_descriptor(&openable, kind)?;
+        if let ViewerContextDescriptor::Pdf { path, .. } = &descriptor
+            && let Some(reason) = self.pdf_open_refusal(path)
+        {
+            self.show_pdf_open_refusal(reason);
+            self.cancel_bookmark_open_request(request_id, "epub_ignored");
+            return Some(false);
+        }
 
         let pending = match self.bookmark_open_pending.take() {
             Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending)) => pending,
@@ -1081,10 +1139,18 @@ impl App {
             // にそのまま乗る (名前でケース無視照合 → フィルタで隠れていれば直近の可視 idx)。
             // 代入が無条件なのは、起動フォルダを開く時点で `select_after_load` に意見を
             // 持つ経路が他に無いため (BS 戻りも親フォルダボタンも、まだ 1 度も動いていない)。
+            let previous_selection = self.select_after_load.clone();
+            let previous_scroll = self.scroll_selected_to_rows_above;
             let hint = crate::known_folders::startup_cursor_hint(&self.settings, &folder);
             self.select_after_load = hint.as_ref().map(|(name, _)| name.clone());
             self.scroll_selected_to_rows_above = hint.and_then(|(_, rows)| rows);
-            let _ = self.load_folder_or_convert_archive(folder);
+            if matches!(
+                self.load_folder_or_convert_archive(folder),
+                FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+            ) {
+                self.select_after_load = previous_selection;
+                self.scroll_selected_to_rows_above = previous_scroll;
+            }
         }
     }
 
@@ -1159,6 +1225,14 @@ pub(crate) fn startup_openable_should_auto_fullscreen(
     }
     match kind {
         crate::folder_tree::OpenablePathKind::File => {
+            if settings.epub_file_handling_ignores_epub()
+                && openable
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                return false;
+            }
             crate::folder_tree::is_open_as_container(openable)
                 || (!settings.archive_file_handling_ignores_convertible()
                     && crate::folder_tree::is_convertible_archive_path(openable))

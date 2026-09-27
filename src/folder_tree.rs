@@ -39,6 +39,8 @@ pub struct FolderTreeOptions {
     pub skip_archive_if_zip_exists: bool,
     /// 同名 PDF がある EPUB をスキップする。
     pub skip_epub_if_pdf_exists: bool,
+    /// EPUB をフォルダ移動候補に含める。
+    pub include_epub: bool,
     /// RAR/7z/LZH などの変換アーカイブをフォルダ移動候補に含める。
     pub archive_policy: NavigationArchivePolicy,
     /// サブフォルダ / ZIP のツリー専用ソート順。
@@ -52,6 +54,7 @@ impl FolderTreeOptions {
             skip_zip: settings.skip_zip_if_folder_exists,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
             skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
+            include_epub: !settings.epub_file_handling_ignores_epub(),
             archive_policy: if settings.archive_file_handling_ignores_convertible() {
                 NavigationArchivePolicy::IgnoreConvertible
             } else {
@@ -68,6 +71,7 @@ impl Default for FolderTreeOptions {
             skip_zip: true,
             skip_archive_if_zip_exists: true,
             skip_epub_if_pdf_exists: true,
+            include_epub: true,
             archive_policy: NavigationArchivePolicy::AllSupported,
             sort_order: crate::settings::FolderTreeSortOrder::default(),
         }
@@ -359,6 +363,14 @@ fn is_folder_nav_file_candidate(
     if cancelled(cancel) {
         return false;
     }
+    if !opts.include_epub
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    {
+        return false;
+    }
     if is_virtual_folder(path) {
         return true;
     }
@@ -488,6 +500,14 @@ fn folder_qualifies(
     }
 
     if path.is_file() {
+        if !opts.include_epub
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
+            return false;
+        }
         if is_convertible_archive_path(path) {
             return resolve_with_memo(path, opts, cancel, cache, memo).is_some();
         }
@@ -1988,6 +2008,26 @@ mod tests {
                 .iter()
                 .any(|path| path.file_name().unwrap() == "Book.EPUB")
         );
+    }
+
+    #[test]
+    fn epub_ignore_removes_epub_but_keeps_pdf_and_archive_navigation_candidates() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for name in ["book.epub", "document.pdf", "archive.7z"] {
+            std::fs::write(temp.path().join(name), b"book").unwrap();
+        }
+        let mut settings = crate::settings::Settings::default();
+        settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+        let options = FolderTreeOptions::from_settings(&settings);
+        let paths = sorted_subdirs(temp.path(), options);
+        assert!(!paths.iter().any(|path| path.ends_with("book.epub")));
+        assert!(paths.iter().any(|path| path.ends_with("document.pdf")));
+        assert!(paths.iter().any(|path| path.ends_with("archive.7z")));
+        assert!(!folder_should_stop_with_options(
+            &temp.path().join("book.epub"),
+            None,
+            options
+        ));
     }
 
     #[test]

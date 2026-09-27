@@ -89,6 +89,7 @@ pub(crate) struct RatingViewPreparedItems {
 
 pub(crate) struct RatingViewPrepareOptions {
     pub(crate) sort: RatingViewSort,
+    pub(crate) include_epub: bool,
     pub(crate) intent: RatingViewBuildIntent,
     pub(crate) display_order: crate::settings::GridDisplayOrder,
     pub(crate) pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
@@ -208,6 +209,11 @@ fn prepare_rating_view(
         Ok(result) => result,
         Err(error) => return Err(error.to_string()),
     };
+    if !options.include_epub {
+        result.rows.retain(|row| {
+            !matches!(&row.item, GridItem::PdfFile(path) if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))
+        });
+    }
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }

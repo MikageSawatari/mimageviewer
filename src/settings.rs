@@ -2501,6 +2501,42 @@ impl ArchiveFileHandling {
     }
 }
 
+/// EPUB から PDF への変換を開始する際の扱い。書庫の旧設定移行とは独立する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpubFileHandling {
+    Ask,
+    Convert,
+    Ignore,
+}
+
+impl Default for EpubFileHandling {
+    fn default() -> Self {
+        Self::Ask
+    }
+}
+
+impl EpubFileHandling {
+    pub fn all() -> &'static [Self] {
+        &[Self::Ask, Self::Convert, Self::Ignore]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "確認してから変換する",
+            Self::Convert => "確認せず変換する",
+            Self::Ignore => "無視する",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Ask => "未変換の EPUB を開くときに確認画面を表示します。",
+            Self::Convert => "確認画面を省略して PDF に変換します。進捗とエラーは表示します。",
+            Self::Ignore => "EPUB を一覧やフォルダ移動の対象にせず、変換済みの本も開きません。",
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // インデクサ速度プロファイル (v0.8.0, docs/archive/search-metadata/search-expansion-design.md §7.5)
 // -----------------------------------------------------------------------
@@ -4327,6 +4363,9 @@ pub struct Settings {
     /// RAR / 7z / LZH などの変換対象アーカイブをどう扱うか。
     #[serde(default)]
     pub archive_file_handling: ArchiveFileHandling,
+    /// EPUB を PDF に変換して開くときの扱い。書庫の設定からは引き継がない。
+    #[serde(default)]
+    pub epub_file_handling: EpubFileHandling,
     /// 旧設定互換: RAR / 7z / LZH を開くとき、確認ダイアログを省略するか。
     /// 新規 UI / 実行時判定は `archive_file_handling` を source of truth とし、
     /// この bool は古い設定の読み込み互換と旧版へ戻した場合の近似互換のために同期する。
@@ -6638,7 +6677,7 @@ fn default_video_seek_strip_waveform_span_secs() -> f64 {
 /// グリッド列数の最小値
 pub const MIN_GRID_COLS: usize = 1;
 /// グリッド列数の最大値
-pub const MAX_GRID_COLS: usize = 10;
+pub const MAX_GRID_COLS: usize = 20;
 pub const FULLSCREEN_JUMP_PERCENT_MIN: u32 = 1;
 pub const FULLSCREEN_JUMP_PERCENT_MAX: u32 = 100;
 pub const FULLSCREEN_JUMP_PERCENT_DEFAULT: u32 = 10;
@@ -7114,6 +7153,7 @@ impl Default for Settings {
             edit_preview_cache_max_bytes: default_edit_preview_cache_max_bytes(),
             archive_cache_max_bytes: 0,
             archive_file_handling: ArchiveFileHandling::Ask,
+            epub_file_handling: EpubFileHandling::Ask,
             archive_convert_without_dialog: false,
             batch_cache_zip_contents: false,
             batch_cache_pdf_contents: false,
@@ -8368,6 +8408,22 @@ impl Settings {
     pub fn archive_file_handling_resolved(&self) -> ArchiveFileHandling {
         self.archive_file_handling
             .resolved(self.archive_convert_without_dialog)
+    }
+
+    pub fn epub_convert_suppresses_confirm(&self) -> bool {
+        self.epub_file_handling == EpubFileHandling::Convert
+    }
+
+    pub fn epub_file_handling_ignores_epub(&self) -> bool {
+        self.epub_file_handling == EpubFileHandling::Ignore
+    }
+
+    pub fn epub_file_handling_ignores_path(&self, path: &std::path::Path) -> bool {
+        self.epub_file_handling_ignores_epub()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
     }
 
     pub fn archive_convert_suppresses_confirm(&self) -> bool {
@@ -13194,6 +13250,7 @@ mod tests {
         );
         assert_eq!(s.archive_cache_max_bytes, 0);
         assert_eq!(s.archive_file_handling, ArchiveFileHandling::Ask);
+        assert_eq!(s.epub_file_handling, EpubFileHandling::Ask);
         assert!(!s.archive_convert_without_dialog);
         assert_eq!(s.thumb_prev_pages, 2);
         assert_eq!(s.thumb_next_pages, 4);
@@ -14491,6 +14548,19 @@ mod tests {
         assert!(s.migrate_legacy_archive_file_handling());
         assert_eq!(s.archive_file_handling, ArchiveFileHandling::Ignore);
         assert!(!s.archive_convert_without_dialog);
+    }
+
+    #[test]
+    fn missing_epub_handling_defaults_to_ask_without_archive_migration() {
+        let mut stored = serde_json::to_value(Settings::default()).unwrap();
+        stored.as_object_mut().unwrap().remove("epub_file_handling");
+        stored["archive_file_handling"] = serde_json::json!("Convert");
+        let loaded: Settings = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(loaded.archive_file_handling, ArchiveFileHandling::Convert);
+        assert_eq!(loaded.epub_file_handling, EpubFileHandling::Ask);
+
+        stored["epub_file_handling"] = serde_json::json!("Legacy");
+        assert!(serde_json::from_value::<Settings>(stored).is_err());
     }
 
     #[test]
