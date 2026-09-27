@@ -7,6 +7,8 @@
     指摘は S2 / S3 の統合前に直すこと、Remote は予定どおり別途 admission のレビューを受けること
 - **S1 完了 (2026-09-27、`3d00650a0`)**: 独立レビュー (GPT-6 Sol / xhigh、実装者とは別セッション) が受け入れ判定。
   実測と判断の記録は [raw-libraw-s1-results.md](raw-libraw-s1-results.md)。ubuntu CI は push 時に確認する
+- **S2a 完了 (2026-09-28、`a982704b9`)**: 全入口の RAW 振り分け・WIC 拒否・executor 接続・サムネイル受け渡し。
+  独立レビュー (別セッション) が 3 回で受け入れ判定、`test-full.ps1` PASS。S2b (Remote) は §10.2 の方針決定待ち
 - 作業場所: worktree `C:\home\mimageviewer-raw` / branch `raw-libraw` (master `edbac5f37` から分岐)
 - 引き継ぎ元: [raw-libraw-handoff.md](raw-libraw-handoff.md)。本書が完成したら handoff の内容は本書へ吸収済みとして削除してよい
 - 実装: Codex GPT-6 Sol / xhigh に段ごとに委任。独立レビュー: 実装者とは別の GPT-6 Sol / xhigh
