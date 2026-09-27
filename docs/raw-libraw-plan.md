@@ -1,7 +1,10 @@
 # RAW の LibRaw 対応 — 設計書
 
-- 状態: **設計 第2版 (独立レビュー 1 回目の指摘を反映、再レビュー待ち)**。2026-09-27 (ClaudeCode Opus 5.5)
-  - 第1版 `cb2953119` → GPT-6 Sol / xhigh 独立レビュー (P1×3 / P2×7 / P3×1、全件採用。対応表は §19)
+- 状態: **設計 第3版 (独立レビュー 2 回目の指摘を反映)**。2026-09-27 (ClaudeCode Opus 5.5)
+  - 第1版 `cb2953119` → GPT-6 Sol / xhigh 独立レビュー 1 回目 (P1×3 / P2×7 / P3×1、全件採用)
+  - 第2版 `ce97951ac` → 同セッションで再レビュー (P1×3 / P2×3 / P3×1、全件採用)。対応表は §19
+  - 再レビューの判定: **S1 (LibRaw 単体のビルドと decoder) は着手してよい**。fullscreen と executor の
+    指摘は S2 / S3 の統合前に直すこと、Remote は予定どおり別途 admission のレビューを受けること
 - 作業場所: worktree `C:\home\mimageviewer-raw` / branch `raw-libraw` (master `edbac5f37` から分岐)
 - 引き継ぎ元: [raw-libraw-handoff.md](raw-libraw-handoff.md)。本書が完成したら handoff の内容は本書へ吸収済みとして削除してよい
 - 実装: Codex GPT-6 Sol / xhigh に段ごとに委任。独立レビュー: 実装者とは別の GPT-6 Sol / xhigh
@@ -46,7 +49,9 @@ HEIC / HEIF / AVIF / JXL / TIFF は従来どおり WIC のまま。
 7. **製本**: 無編集なら元の RAW ファイルをそのまま入れる。何か編集していれば焼き込む。
    PNG 等と同じ規則にする (2026-09-27)
 8. 対象拡張子に `crw` / `srw` を加える (2026-09-27)
-9. フル現像の保持はしない。再処理でよい (2026-09-27)
+9. フル現像の保持はしない。再処理でよい (2026-09-27)。
+   意味: **追加の保持 (LRU・ディスク) を作らない**。既存の keep set (`prefetch_back` / `prefetch_forward`、
+   `src/app.rs:60569-60588`) の中で `fs_cache` に残る通常の保持はそのまま (AI の final cache と同じ扱い)
 10. **カラー化・LUT が効いているページ**は、フル現像が終わるまで既存と同じ
     「サムネイルにカラー化・LUT を掛けた低解像度の代役」を出す (Q1 案A、2026-09-27)
 11. **埋め込みプレビューが無い RAW** は、フルスクリーンでは「現像中」を出してフル現像を待つ。
@@ -272,7 +277,8 @@ pub enum RawError {
 
 `info()` と `preview()` は open (ヘッダ解析) とプレビュー部分の読み出しだけで、画素の現像をしない。
 `develop()` は `RawDevelopExecutor` の worker thread の中だけで呼べる (§5.4)。可視性で強制する
-(`pub(in crate::raw)`)。
+(`pub(in crate::raw)`)。外部 (bin を含む) から現像する手段は executor の公開 API
+(`submit` → ticket → 結果) だけにする。S1 の `bench_raw` もこの API を使う (§16)。
 
 #### 5.3.2 寸法と向き
 
@@ -340,7 +346,7 @@ LibRaw の現像はカメラ JPEG と色・トーンが一致しない (README: 
 - 優先度 3 段:
   - `High`: 表示中のページ (現在ページと見開き相方)、ページ送りの表示待ち target、利用者が今待っている
     書き出し / コピー / 外部ツール / 製本の焼き込み、Remote の前景ページ、Remote AI
-  - `Normal`: フルスクリーンの先読み現像、プレビューの無い RAW のサムネイル用 half 現像 (可視範囲)、
+  - `Normal`: フルスクリーンの先読み現像、プレビューの無い RAW のサムネイル用 half 現像 (可視範囲、§8)、
     Remote の先読みページ
   - `Background`: 類似索引の half 現像
 - 同時実行の上限: `N ≥ 2` のとき `Normal + Background` は `N - 1` まで (High 用に 1 枠を必ず空ける)、
@@ -349,7 +355,9 @@ LibRaw の現像はカメラ JPEG と色・トーンが一致しない (README: 
   - High が待機列に入った時点で実行中が Normal / Background で、かつその job が
     「もう要らない」(現像窓の外、取消済み view、等) なら cancel する。要る job は止めない
   - 中断できない区間 (§5.4.3) にある job は cancel しても実際の終了まで枠を占有する。
-    **High の待ち時間はその 1 job の残り時間を上限とする**。これを fake job のテストで固定する
+    保証するのは**順序**だけ: 実行中の 1 job が終わった次に、待機列の先頭である High が必ず取られる。
+    LibRaw には中断点の無い区間があるので、待ち時間の上限は保証しない。これを「中断できない fake job の
+    最中に High と Normal が来たとき、次に High が実行される」テストで固定する
 - 先読みが表示対象になったら同じ ticket を High へ昇格する (取消 + 再投入はしない)。
   `FsPageLoadScheduler::promote_to_high` (`src/fs_page_load_scheduler.rs:212`) と同型
 
@@ -468,15 +476,22 @@ FsCacheEntry::RawPreview {
 `fs_page_load_state` (`src/app.rs:66626-66642`) の「Failed 以外は表示可能」を RAW で使わない。
 RAW ページの状態は `RawPageStore` から次の 5 つへ写す:
 
-| RAW の状態 | 意味 | `waiting_for_display()` |
-| --- | --- | --- |
-| `PreviewPending` | プレビュー要求中 | true |
-| `PreviewShown` | プレビュー画素がある | false |
-| `PreviewAbsent` | 使えるプレビューが無い。フル現像待ち | **true** (表示できる画素が無い) |
-| `Developed` | Static がある | false |
-| `Terminal` | プレビューも現像も得られない (失敗・非対応でプレビュー無し) | false (`LoadFailed` と同じ) |
+| RAW の状態 | 意味 | `waiting_for_display()` | プレビュー要求を出すか (`needs_load_request`) | fullscreen に出してよい画素 |
+| --- | --- | --- | --- | --- |
+| `PreviewNotRequested` | `RawPageState` はあるが生きた preview 要求が無い (park 後など) | true | **出す** | サムネイル (既存 fallback) |
+| `PreviewPending` | 生きた preview 要求がある | true | 出さない | サムネイル (既存 fallback) |
+| `PreviewShown` | プレビュー画素がある | false | 出さない | プレビュー。色処理待ちなら色忠実 rendition (§7.3) |
+| `PreviewAbsent` | 使えるプレビューが無い。フル現像待ち | **true** | 出さない | **無し**。サムネイル・rendition も出さず「RAW 現像中」だけ (決定 11) |
+| `Developed` | Static がある | false | 出さない | 既存の表示優先順位 |
+| `Terminal` | プレビューも現像も得られない (失敗・非対応でプレビュー無し) | false (`LoadFailed` と同じ) | 出さない | 既存の失敗表示 |
 
-`ensure_fs_page_load` は `PreviewPending` 以外でプレビューを再要求しない。
+`waiting_for_display()` (「まだ表示できない」) と `needs_load_request` (「要求を出すべき」) は
+別の問いなので別の関数にする。既存の `ensure_fs_page_load` は `NeedsLoad` のときだけ要求を出す
+(`src/app.rs:8003-8012`, `66824-66834`)。RAW では `PreviewNotRequested` だけを `NeedsLoad` に写す。
+
+`PreviewAbsent` でサムネイルを出さないのは決定 11 のため。サムネイルは half 現像から作るので、
+fullscreen に出すと「half 現像をプレビュー代わりに出す」(利用者が選ばなかった案B) と同じになる。
+カラー化 / LUT の有無にかかわらずこの規則が優先する。
 
 ### 6.4 lifecycle (open / switch / park / close / cancel / error / 差し替え)
 
@@ -491,12 +506,13 @@ RAW ページの状態は `RawPageStore` から次の 5 つへ写す:
 | プレビュー窓 (keep set) を出る | `fs_cache` の entry と一緒に `RawPageState` を削除 (保持中の ticket は discard hook で cancel) |
 | 取消 (上記以外の cancel) | `Idle` へ戻す。`Blocked` にしない (窓に戻れば再要求) |
 | ページ送り中 | §7.6 の admission に従う |
-| viewer context の park | 既存の `fs_pending` drain と同じ場所で `RawPageStore` の全 ticket を cancel し `develop = Idle` (`src/app/viewer_context_registry.rs:1680-1682`)。park 中に完了した現像は捨てる。activate 後に現像窓を再評価して submit し直す |
+| viewer context の park | 既存の `fs_pending` drain (`src/app/viewer_context_registry.rs:1680-1682`) と同じ場所で、`RawPageStore` の全 ticket を cancel し `develop = Idle`。**preview も**: `Requested` なら request_id を失効させて `PreviewNotRequested` へ戻す (drain された `fs_pending` の要求はもう生きていない)。park 中に届いた結果は request_id 不一致で捨てる。activate 後は `needs_load_request` と現像窓を再評価して出し直す |
 | viewer context の mount / swap | bundle の `swap_field!` 一覧に `RawPageStore` を含める。結果の送り先 channel も context 所有なので、sibling context の結果を消化しない |
 | viewer context の drop | discard hook で全 ticket を cancel (`src/app/viewer_context_registry.rs:1304-1334` と同じ場所) |
 | idx 空間の差し替え (`invalidate_idx_state_and_queues`) / items generation の変更 | `RawPageStore` を clear (ticket cancel) |
 | fullscreen close | `fs_cache` の clear と同じ経路で `RawPageStore` を clear |
 | 同じ path のファイルが外部で上書きされた | 次の要求で `source` (size / mtime) が変わるので、古い結果は `apply_result` で拒否される |
+| **items generation を変えずに、ある idx の `fs_cache` を直接消す経路** | 例: detached viewer の同期で同じ idx の item key が変わったとき、generation を進めずに `fs_cache` / `fs_pending` / backlog を消す (`src/app.rs:51660-51673`)。`RawPageState` が `Developed` のまま残ると「表示可能だが texture が無い」になり、要求も出ない。**idx 単位の破棄を 1 つの操作 `discard_fs_page(idx)` に集め、`fs_cache` / `fs_pending` / backlog / `fs_margin_bbox_cache` / `RawPageStore` を一緒に消す**。S3 の最初に `fs_cache.remove` / `retain` / `clear` の全箇所 (HEAD で 31 箇所) を列挙し、idx 単位のものをこの操作へ、全体のものを `RawPageStore::clear` と対にする |
 
 これは detached 専用の bool / Option ではなく、既存の context-owned resource (`fs_pending` と同型) の
 追加である。detached 憲法 §2-3 には当たらない。context 切替をまたぐ回帰テスト (§15) を必須にし、
@@ -536,6 +552,7 @@ RAW ページの状態は `RawPageStore` から次の 5 つへ写す:
 - 近モノクロ判定 (`MonochromeOnly`) は `edit_result_cache` の画素を見る。フル現像までは memo miss なので
   安全側の「待つ」になる (既存規約のまま)
 - 見開きで片側だけ色処理待ちのときの扱い (左右とも rendition に揃える) も既存規約のまま
+- `PreviewAbsent` のページには rendition も出さない (§6.3。サムネイルが half 現像由来のため、決定 11 が優先)
 - プレビュー (カメラ JPEG) → フル現像 (LibRaw) の差し替えでは色・トーンが変わる (§5.3.4)。
   これは決定 2 が受け入れている差として扱い、時間窓や cross-fade で隠さない
 
@@ -577,22 +594,32 @@ RAW ページの状態は `RawPageStore` から次の 5 つへ写す:
 
 ### 7.6 ページ送り・フォルダ移動との関係
 
-- ページ送りの完了判定 (`src/ui_fullscreen.rs:11111-11142`) は既存どおり「実際に texture が解決できたか」
-  (`resolve_fs_display_tex(idx, true)`、サムネイルを含む) を使う。RAW では:
-  - `PreviewShown` → プレビュー、色処理待ちなら rendition で settle
-  - `PreviewAbsent` → サムネイルがあれば settle。無ければ target のサムネイル (half 現像) と
-    フル現像の両方が必要になる
+- ページ送りの完了判定 (`src/ui_fullscreen.rs:11111-11142`) は既存どおり「実際に texture が解決できて
+  提示されたか」を使う。RAW では §6.3 の「fullscreen に出してよい画素」だけが解決対象になる:
+  - `PreviewShown` → プレビュー、色処理待ちなら rendition の提示で settle
+  - `PreviewAbsent` → サムネイル・rendition では settle しない。**`Developed` の提示 (色処理待ちなら
+    完成した final composite) か、`Terminal` で settle する** (決定 11)
 - 現像の admission は既存の `FsPageTurnWorkAdmission` に従う:
   - `All`: 現像窓の通常の submit
-  - `NavigationTargetMaterializationOnly`: **target ページの現像と、target のサムネイル用 half 現像を
-    High で許可する** (これが無いと、プレビューの無い target が settle できないまま止まる。独立レビュー P2-5)。
-    target 外の現像は開始しない
+  - `NavigationTargetMaterializationOnly`: **target ページのフル現像を High で許可する**
+    (これが無いと、プレビューの無い target が settle できないまま止まる。独立レビュー P2-5)。
+    target 外の現像は開始しない。target のサムネイル用 half 現像は fullscreen の settle に使わないので、
+    ここでは要求しない
   - `Deferred` (ready な rendition を描いている): 現像を開始しない
-- フォルダ移動の lock (`poll_fs_nav_lock`) は既存規約を変えない。RAW の `PreviewShown` は
-  「サムネイル相当の表示可能」として `has_thumb` 側と同じ扱いにする (lock 解除条件に RAW を足す)。
-  カラー化 / LUT が必要なページは既存どおり完成した final composite まで待つので、RAW では
-  **フル現像 + 最終合成の完了まで旧フォルダの holdover が残る** (数秒、未計測)。この間 target の
-  現像は High で許可する。既存規約を RAW のために緩めない
+- 決定 11 の帰結: **プレビューの無い RAW が並ぶフォルダでキーを押しっぱなしにすると、1 ページごとに
+  フル現像を待つ**。ページの並びは飛ばさない (R1) ので、ページ送りの速さは現像時間で決まる
+- フォルダ移動の lock (`poll_fs_nav_lock`、`src/ui_fullscreen.rs:11781-11806`) は、ページ送りと
+  **同じ「表示してよい画素が実際に提示されたか」の述語**で解除する (独立レビュー 2 回目 P1-2)。
+  既存の lock は色処理が必要なページで完成した final composite まで待つが、RAW の `PreviewShown` で
+  それを待つと、決定 10 で出すはずの rendition の代わりに旧フォルダの holdover が数秒残る。
+  RAW では:
+  - `PreviewShown`: 色処理不要ならプレビュー、必要なら rendition が提示された frame で解除。
+    生のプレビュー画素を色処理前に出さない R2 の gate は維持する
+  - `PreviewAbsent`: `Developed` (色処理が必要なら完成した final composite) の提示、または `Terminal` で解除
+  - 非 RAW のページの解除条件は変えない
+  lock 解除とページ送りの settle が別々の条件式を持つと、片方だけ待ち続ける (既存の
+  `fs_display_bypasses_final_pipeline` を描画側と lock 側で共有している理由と同じ、
+  [display-pipeline.md §2.3](display-pipeline.md))。RAW の述語は 1 つの関数にし、両方から呼ぶ
 
 ### 7.7 `fs_cache` / 読み込み状態を読む consumer の点検
 
@@ -629,8 +656,8 @@ final composite** の consumer も点検する。S3 の最初に次を grep で�
 - 左下の読み込みラベル (`src/ui_fullscreen.rs:24033-24066`、「読込中...」/「PDF 再レンダリング中...」)
   と同じ場所に、現在ページの状態を出す: `RAW 現像待ち` (executor の待機列) / `RAW 現像中 NN%` /
   `RAW 読み込み中` (unpack 区間) / 非対応・失敗のメッセージ。表示内容は `RawPageStore` から導く
-- プレビューの無いページ (`PreviewAbsent`) は、サムネイルが無い間は既存の中央の「読込中」の位置に
-  「RAW 現像中 NN%」を出す (決定 11)
+- プレビューの無いページ (`PreviewAbsent`) は、サムネイルの有無にかかわらず、既存の中央の「読込中」の
+  位置に「RAW 現像中 NN%」を出す (決定 11。サムネイルは描かない)
 - 既存の先読み状況の行 (`draw_fs_prefetch_status_row`、AI 用) と同じ部品・同じ設定
   (`fullscreen_prefetch_status_visible`) で、**「RAW 現像」行**を足す。ドットは現像窓の
   各ページの `Ready / Active / Missing` (既存の `FsPrefetchPageState`)
@@ -639,8 +666,9 @@ final composite** の consumer も点検する。S3 の最初に次を grep で�
 
 - フル現像の結果は `fs_cache` の Static としてだけ持つ。ディスクにも保持 LRU にも持たない (決定 9)
 - 現像窓を出ても、keep set (`prefetch_back` / `prefetch_forward`) の中なら Static は残る。これは
-  同じ寸法の JPEG と同じ扱いで、RAW だけプレビューへ降格して解放する処理は作らない
-- fullscreen を閉じて開き直すと、現像はやり直しになる
+  同じ寸法の JPEG と同じ扱いで、RAW だけプレビューへ降格して解放する処理は作らない。
+  決定 9 が除いているのは追加の保持 (LRU・ディスク) であり、この通常の保持ではない
+- keep set を出た後、または fullscreen を閉じて開き直した後は、現像はやり直しになる
 
 ## 8. サムネイル
 
@@ -648,14 +676,26 @@ final composite** の consumer も点検する。S3 の最初に次を grep で�
   プレビューは既存の TurboJPEG DCT スケール経路へ bytes で渡す。向きは §5.3.2
 - プレビューを使う条件: 使えるプレビューがあり、その長辺が `min(要求された display_px, developed の長辺)`
   以上。満たさなければ half 現像にする。判定は要求とファイル内容だけで決まる
-- half 現像は **サムネイル worker の上で待たない** (独立レビュー P2-7)。worker は executor へ job を
-  submit し、`ThumbMsg` を送らずに次の要求へ進む。job の完了時に executor の thread が同じ `ThumbMsg`
-  を既存の送り先へ送る。これで可視サムネイルの処理が RAW の現像待ちで止まらない
-  - job は submit 元の cancel token (フォルダ単位の `cancel_token`) と要求の items generation を持ち、
-    既存の `ThumbMsg` の世代検査を通る。フォルダ移動では cancel される
-  - 優先度: 可視範囲は Normal、ページ送りの target は High (§7.6)、それ以外の先読みは submit しない
-    (可視に入ったら submit する)
-  - 1 フォルダで submit する数は keep range の中に限られる (既存の keep range が上限になる)
+- half 現像は **サムネイル worker の上で待たない** (独立レビュー P2-7)。また **executor の枠では
+  現像だけを行い**、縮小・WebP 化・cache 保存・統計・完了通知はサムネイル worker に戻す
+  (枠は RAW 現像専用で数が少ないため。独立レビュー 2 回目 P2-5)。流れ:
+  1. サムネイル worker が「使えるプレビューが無い」と判定したら、executor へ half 現像を submit し、
+     **`ThumbMsg` を 1 通も送らずに**次の要求へ進む。`requested[idx]` は立ったまま (二重要求を防ぐ)
+  2. 現像が終わったら executor の thread は、画像を載せた後続要求 (`LoadRequest` に
+     `RawHalfDeveloped { image, developed_dims }` の source を付けたもの) を**既存のサムネイル queue へ
+     入れて**枠を返す
+  3. サムネイル worker がその後続要求を通常どおり処理する: 縮小、向き (現像結果は flip 適用済み)、
+     `CacheDecision` と cache 保存、統計、**第 1 シグナル (画像) と第 2 シグナル (`finalized`)、
+     `gen_done`**。既存の 2 段通知 (`src/thumb_loader.rs:3554-3573`, `3693-3707`、UI 側
+     `src/app.rs:38758-38790`) をそのまま使う
+- half 現像の ticket は **idx ごとに**持つ。所有者は viewer context のサムネイル状態
+  (`requested` と同じ所有境界) で、`raw_thumb_develop: ItemsGenerationMap<Ticket>` とする:
+  - keep range が動いて範囲外になった idx の ticket は cancel し、既存の `canceled: true` の `ThumbMsg`
+    を UI へ出して `requested` を抜く (既存の STALE 取消と同じ扱い、[async-architecture.md §3.4](async-architecture.md))
+  - フォルダ移動・items generation の変更・context の park / drop では map ごと cancel する
+  - 後続要求が queue に入った時点で ticket は map から外す (以後は通常の要求と同じ扱い)
+- 優先度: 可視範囲は Normal、それ以外の keep range の先読みは submit しない (可視に入ったら submit する)。
+  fullscreen の settle には half 現像を使わないので (§7.6)、High の half 現像は無い
 - 報告する `source_dims` は `developed_dims`。これで一覧の縦横比・見開き判定・詳細表示の解像度列が
   フル現像と一致する
 - `CacheDecision::should_cache` に RAW 専用の規則は足さない (RAW はファイルが大きく既存の
@@ -796,9 +836,18 @@ canonical loader の Full (High)。
   - 現像窓の出入りでの cancel、非対応の終端、失敗後に再要求しない、取消後は再要求する
   - **park 中の完了を捨て、activate 後に再 submit する**、context drop での cancel
   - **別 viewer context の現像結果が sibling の `fs_cache` へ入らない**
-  - プレビューの無いページのページ送り (target の half 現像と現像が High で走り settle する)
+  - プレビューの無いページのページ送り (target のフル現像が High で走り、`Developed` の提示で settle する。
+    **サムネイルがあってもサムネイル・rendition は提示されない**)
   - カラー化 / LUT が有効な RAW でプレビュー画素が生で提示されないこと (rendition だけが提示される)
+  - カラー化 / LUT が有効な RAW へのフォルダ移動で、rendition の提示時に lock が解除されること
+    (旧フォルダの holdover が final composite まで残らない)。ページ送りの settle と同じ述語を使うこと
   - `N = 1` で中断できない現像中のページ送り
+  - **detached の同期で同じ idx の item key が変わる経路** (`src/app.rs:51660-51673`) で `RawPageStore` も
+    破棄され、新しい item の要求が出ること
+  - park 中に preview / 現像の結果が届いても捨てられ、activate 後に `PreviewNotRequested` から要求が出直すこと
+- サムネイルの half 現像: 2 段通知 (`finalized`) と `gen_done` が既存どおり届くこと、executor の枠が
+  縮小・cache 保存の前に返ること、スクロールで keep range 外になった idx の ticket が cancel され
+  `canceled` 通知で `requested` が抜けること
 - 編集 gate: `RawPreview` で消しゴム・補正レイヤー・隠蔽・注釈・SNS 分割・crop の入口 (キーと左パネル) が
   拒否され、Static 後に通ること (handler-level)
 - 表示: §7.5 の置換前後の transform 一致
@@ -809,8 +858,8 @@ canonical loader の Full (High)。
 
 | 段 | 内容 | 受入条件 |
 | --- | --- | --- |
-| **S1** | `crates/libraw-sys` (shim + cc ビルド、`USE_ZLIB` / `USE_JPEG`)、`setup-libraw.sh`、`raw_decoder` (info / preview / develop / 中断 / 進捗)、明るさの決定 (§5.3.4)、`bench_raw`、サンプル manifest | §15 の `raw_decoder` テストが緑。**lossy DNG と deflate DNG のフル現像が通る**。全サンプルの寸法一致・向き・プレビューと現像の縦横比差・所要時間・中断遅延の表を本書へ記録。core が VC runtime DLL を import しないこと (`check-vcrt-pe-dependencies.ps1`)。ubuntu CI の `cargo check` が通ること。`3fr erf kdc dcr mrw mos mef` の対応とサンプルの有無の報告 |
-| **S2** | `raw_format` と WIC 境界の拒否、`RawDevelopExecutor`、入口 D1〜D11・P1〜P4 の振り分け、サムネイル (worker を塞がない half 現像)、ZIP 内 RAW、類似索引、書き出し / コピー / 外部ツール / 製本、Remote (§10.2 の詳細設計を独立レビューしてから) | 入口ごとの回帰テスト、executor テスト。`is_raw_ext` を通らずに RAW を decode する経路が無いことを grep 手順と test で示す |
+| **S1** | `crates/libraw-sys` (shim + cc ビルド、`USE_ZLIB` / `USE_JPEG`)、`setup-libraw.sh`、`raw_decoder` (info / preview / develop / 中断 / 進捗)、**`RawDevelopExecutor` の本体 (枠・優先度・取消・進捗・`submit` API。App との接続は S2)**、明るさの決定 (§5.3.4)、`bench_raw` (executor の `submit` 経由で現像する)、サンプル manifest | §15 の `raw_decoder` テストが緑。**lossy DNG と deflate DNG のフル現像が通る**。全サンプルの寸法一致・向き・プレビューと現像の縦横比差・所要時間・中断遅延の表を本書へ記録。core が VC runtime DLL を import しないこと (`check-vcrt-pe-dependencies.ps1`)。ubuntu CI の `cargo check` が通ること。`3fr erf kdc dcr mrw mos mef` の対応とサンプルの有無の報告 |
+| **S2** | `raw_format` と WIC 境界の拒否、`RawDevelopExecutor` の App への接続 (設定値・App-global 所有)、入口 D1〜D11・P1〜P4 の振り分け、サムネイル (worker を塞がない half 現像)、ZIP 内 RAW、類似索引、書き出し / コピー / 外部ツール / 製本、Remote (§10.2 の詳細設計を独立レビューしてから) | 入口ごとの回帰テスト、executor テスト。`is_raw_ext` を通らずに RAW を decode する経路が無いことを grep 手順と test で示す |
 | **S3** | `RawPageStore`、`FsCacheEntry::RawPreview`、読み込み状態、現像窓、差し替えの layout (§7.5 の全経路)、色の gate、ページ送り / フォルダ移動、編集 gate、進捗表示と先読み行、設定 UI、§7.7 の consumer 点検 | `RawPageStore` の状態遷移テスト (§15 の全項目)、context 分離テスト、UI スナップショット (進捗表示と設定)。`build-dev.ps1` で利用者の実機確認 |
 | **S4** | ライセンス文書・バージョン情報・対応ソース・マニュアル・製品ページ・spec・readme・リリースチェックリスト・bootstrap | 文書差分のレビュー。`build-dist.ps1 -NoSign` 相当で同梱物に `LIBRAW-LICENSE.txt` が入ること |
 
@@ -862,3 +911,18 @@ S1 の実測 (寸法・向き・中断・codec・形式) は S2 / S3 へ進む�
 | P2-9 consumer 点検の漏れ (readiness / lock / rendition) | 採用 (コードで確認) | §7.7 |
 | P2-10 `USE_JPEG` を省くと lossy DNG の機能削減 | 採用 | §4、§4.1、§16 S1 の受入条件 |
 | P3-11 敵対的な順序・identity のテスト | 採用 | §15 |
+
+## 20. 独立レビュー 2 回目 (同セッション、2026-09-27) の対応
+
+第2版に対する判定: 前回の P1-1 / P2-6 / P2-9 / P2-10 / P3-11 は解決、P1-2 / P1-3 / P2-4 / P2-5 / P2-7 / P2-8 は
+一部解決。新しい指摘 7 件をすべて採用した (コードで確認)。
+
+| 指摘 | 判断 | 反映先 |
+| --- | --- | --- |
+| P1 プレビューの無い RAW で half 現像のサムネイルが fullscreen に出る (決定 11 違反) | 採用 | §6.3 (出してよい画素の列)、§7.3、§7.6 (settle と admission)、§7.8、§15 |
+| P1 フォルダ移動の lock が final composite まで待ち、決定 10 の rendition を旧フォルダの holdover が隠す (`src/ui_fullscreen.rs:11795-11806`) | 採用 | §7.6 (ページ送りと同じ述語で解除)、§15 |
+| P1 generation を変えずに同じ idx の `fs_cache` を消す経路が `RawPageStore` を素通りする (`src/app.rs:51660-51673`) | 採用 (コードで確認。`fs_cache` の直接操作は 31 箇所) | §6.4 (`discard_fs_page(idx)` に集約)、§15 |
+| P2 park 時の preview 要求の再開が未定義、`waiting_for_display` と要求要否の混同 | 採用 | §6.3 (`PreviewNotRequested` と `needs_load_request`)、§6.4 |
+| P2 サムネイルの executor 経路が既存の 2 段通知と idx ごとの取消を欠く | 採用 (コードで確認) | §8 (現像だけを枠で行い後続要求で queue へ戻す、idx ごとの ticket) |
+| P2 S1 の bench が executor 経由の現像規則と矛盾 | 採用 | §5.3.1、§16 (executor 本体を S1 へ) |
+| P3 `N = 1` の待ち時間上限の記述、決定 9 と keep set の関係 | 採用 | §5.4.1 (順序の保証だけ)、§2 決定 9、§7.9 |
