@@ -3738,6 +3738,7 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
     use crate::settings::ToolbarSectionId as TS;
     match section {
         TS::FolderTree => "ツリー",
+        TS::EffeTune => "EffeTune",
         TS::Bookshelf => "本棚",
         TS::Collections => "コレクション",
         TS::Cols => "列",
@@ -3876,6 +3877,7 @@ fn set_toolbar_section_visible(
     use crate::settings::ToolbarSectionId as TS;
     match section {
         TS::FolderTree => settings.show_toolbar_folder_tree_button = visible,
+        TS::EffeTune => settings.show_toolbar_effetune = visible,
         TS::Bookshelf => settings.show_toolbar_bookshelf = visible,
         TS::Collections => settings.show_toolbar_collections = visible,
         TS::Cols => settings.show_toolbar_cols = visible,
@@ -9297,6 +9299,7 @@ impl App {
         let show_rating = self.settings.show_toolbar_rating;
         let show_tags = self.settings.show_toolbar_tags;
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
+        let show_effetune = self.settings.show_toolbar_effetune;
         let show_bookshelf = self.settings.show_toolbar_bookshelf;
         let show_collections = self.settings.show_toolbar_collections;
         let (toolbar_collection_target_id, toolbar_collections, collections_status) =
@@ -9327,6 +9330,7 @@ impl App {
         // ドラッグ並べ替えの許可状態 (既定 OFF)。OFF のときはカーソルも変えない。
         let drag_enabled = self.settings.toolbar_section_drag_enabled;
         let any_toolbar_section = show_folder_tree_button
+            || show_effetune
             || show_bookshelf
             || show_collections
             || show_cols
@@ -9498,6 +9502,7 @@ impl App {
                     // セクションごとの表示可否 (= 旧 `if show_*` と同一条件)。
                     let visible = match section {
                         TS::FolderTree => show_folder_tree_button,
+                        TS::EffeTune => show_effetune,
                         TS::Bookshelf => show_bookshelf,
                         TS::Collections => show_collections,
                         TS::Cols => show_cols,
@@ -9552,6 +9557,45 @@ impl App {
                         &mut current_section_anchors,
                         &last_section_anchors,
                     );
+                }
+                TS::EffeTune => {
+                    #[cfg(windows)]
+                    {
+                        let active = matches!(
+                            self.effetune.runtime,
+                            crate::effetune::EffetuneRuntime::Running { .. }
+                        ) && matches!(
+                            self.effetune.effective_state(),
+                            Some(crate::effetune::EffectiveState::Effective)
+                        );
+                        let available = matches!(
+                            self.effetune.runtime,
+                            crate::effetune::EffetuneRuntime::Idle
+                                | crate::effetune::EffetuneRuntime::Running { .. }
+                        );
+                        let resp = ui
+                            .add_enabled(
+                                available,
+                                egui::Button::selectable(active, "EffeTune").sense(
+                                    if drag_enabled {
+                                        egui::Sense::click_and_drag()
+                                    } else {
+                                        egui::Sense::click()
+                                    },
+                                ),
+                            )
+                            .on_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()));
+                        if resp.clicked() {
+                            self.effetune_toolbar_click();
+                        }
+                        self.finish_toolbar_section_lead(
+                            ui,
+                            resp,
+                            TS::EffeTune,
+                            &mut current_section_anchors,
+                            &last_section_anchors,
+                        );
+                    }
                 }
                 TS::Bookshelf => {
                     let lead = toolbar_label(ui, "本棚:", 46.0, drag_enabled).hover_tip(lead_hint);
@@ -10812,6 +10856,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         changed |= ui
             .checkbox(&mut s.show_toolbar_folder_tree_button, "ツリー")
             .changed();
+        changed |= ui
+            .checkbox(&mut s.show_toolbar_effetune, "EffeTune")
+            .changed();
         changed |= ui.checkbox(&mut s.show_toolbar_bookshelf, "本棚").changed();
         changed |= ui
             .checkbox(&mut s.show_toolbar_collections, "コレクション")
@@ -10941,6 +10988,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let s = &mut self.settings;
         // 表示フラグ
         s.show_toolbar_folder_tree_button = true;
+        s.show_toolbar_effetune = true;
         s.show_toolbar_bookshelf = true;
         s.show_toolbar_collections = true;
         s.show_toolbar_cols = true;
@@ -11023,10 +11071,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             });
         }
 
-        let has_section_specific_settings =
-            !matches!(section, TS::FolderTree | TS::Rating | TS::Unknown);
+        let has_section_specific_settings = !matches!(
+            section,
+            TS::FolderTree | TS::EffeTune | TS::Rating | TS::Unknown
+        );
         match section {
-            TS::FolderTree | TS::Rating => {
+            TS::FolderTree | TS::EffeTune | TS::Rating => {
                 // 表示形式・出す項目を持たない。非表示 / 既定化のみ (下の共通部)。
             }
             TS::Bookshelf => {

@@ -388,6 +388,8 @@ impl App {
         #[cfg(windows)]
         {
             self.sync_native_video_main_cloak(false);
+            self.save_effetune_gui_rect();
+            let effetune_exit = self.effetune.begin_exit_capture();
             // T22: 終了経路は早く抜けたい (ユーザーが close ボタンを押した文脈) ので 2 秒
             // で打ち切る。timeout した slot は前回保存の state を保持する
             let states = self.snapshot_vst3_states_into_settings(std::time::Duration::from_secs(2));
@@ -395,6 +397,7 @@ impl App {
             if states > 0 || positions > 0 {
                 self.settings.save();
             }
+            self.effetune.finish_for_exit(effetune_exit);
         }
         self.stop_video_upscale_queue_for_exit();
         self.cancel_smart_folder_pending();

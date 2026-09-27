@@ -638,6 +638,7 @@ mod tests {
             source_secs_per_output_sec: 1.0,
             seek_serial,
             pdc_latency_secs_at_process: 0.0,
+            effetune_generation: None,
         }
     }
 

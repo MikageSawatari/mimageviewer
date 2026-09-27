@@ -4495,6 +4495,61 @@ fn all_context_clear_processes_a_paused_context_that_is_already_mounted() {
 
 #[test]
 #[cfg(windows)]
+fn effetune_and_vst_startup_gate_releases_deferred_media_once_in_either_order() {
+    use crate::effetune::{EffetuneRuntime, LoadOrigin};
+
+    for vst_finishes_first in [true, false] {
+        let mut app = phase_c_support::setup_app();
+        app.items = vec![GridItem::Video(PathBuf::from(r"C:\fixture\movie.mp4"))];
+        app.fullscreen_idx = Some(0);
+        app.vst3_deferred_media_open = Some(0);
+        let (vst_tx, vst_rx) = mpsc::channel();
+        app.vst3_startup_load = Some(Vst3StartupLoadPending {
+            rx: vst_rx,
+            progress: Arc::new(Mutex::new(String::new())),
+            started_at: std::time::Instant::now(),
+        });
+        app.effetune.runtime = EffetuneRuntime::Loading {
+            origin: LoadOrigin::Startup,
+            open_gui_when_ready: false,
+        };
+        assert!(app.media_startup_load_pending());
+
+        if vst_finishes_first {
+            app.vst3_startup_load = None;
+        } else {
+            app.effetune.runtime = EffetuneRuntime::Idle;
+        }
+        assert!(app.media_startup_load_pending());
+        if vst_finishes_first {
+            app.effetune.runtime = EffetuneRuntime::Failed(
+                crate::effetune::EffetuneFailure::LoadFailed("fixture".into()),
+            );
+        } else {
+            drop(vst_tx); // disconnected worker also settles the VST side
+            app.vst3_startup_load = None;
+        }
+        assert!(!app.media_startup_load_pending());
+
+        let mut resumed = Vec::new();
+        app.consume_deferred_vst3_media_open_in_all_contexts(|_, idx| resumed.push(idx));
+        app.consume_deferred_vst3_media_open_in_all_contexts(|_, idx| resumed.push(idx));
+        assert_eq!(resumed, vec![0]);
+    }
+
+    let mut app = phase_c_support::setup_app();
+    app.settings.vst3_enabled = false;
+    app.effetune.runtime = EffetuneRuntime::Loading {
+        origin: LoadOrigin::Startup,
+        open_gui_when_ready: false,
+    };
+    assert!(app.media_startup_load_pending());
+    app.effetune.runtime = EffetuneRuntime::Idle;
+    assert!(!app.media_startup_load_pending());
+}
+
+#[test]
+#[cfg(windows)]
 fn vst3_production_traversal_survives_removing_a_later_paused_window() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();

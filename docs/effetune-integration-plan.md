@@ -369,6 +369,21 @@ enum EffectiveState {
 
 ## 9. 付随修正
 
+### 実装事実 (2026-09-27)
+
+- bundle 解決は `src/effetune/mod.rs::resolve_bundle_from_exe` に置いた。通常版と portable 版で
+  `current_exe` の親から同じ相対パスを使い、`native_assets` には触れていない。
+- GUI タイトルバーの電源ボタンは bridge ごとの `show_editor_bypass_button` で切り替える。
+  既定値は表示、EffeTune 専用 bridge だけ非表示。
+- ローカル音声の引き渡し型は `AudioDspChain { user, effetune }`。`EffetuneAudioSlot` は
+  `Mutex` をブロックごとに 1 回読んで世代と bridge を取得する。
+- 終了時の EffeTune 最終取得は `ExitCaptureFence` を先に作り、既存 VST3 スナップショットと
+  並行して進め、その後に開始時点からの 2 秒期限の残りだけ待つ。
+- 共有 bridge の「同時に可聴な pump は 1 本」の前提は、メディア open 前に parked media と
+  `fs_cache` の他の Video/Audio player を閉じる経路、および `AudioOutput::drop` が停止を通知して
+  cpal stream を pause/drop する経路で確認した。旧 pump の終了待ちは別スレッドに逃がすため
+  teardown 中に処理スレッドが重なり得るが、旧 stream は可聴ではない。
+
 - 共有メモリ・イベント名に process 内の atomic 連番を足す。`CreateFileMappingW` /
   `CreateEventW` で `ERROR_ALREADY_EXISTS` を失敗として扱う (bridge.rs)。
 - host の `query_state_concurrent` と `strict_state` (§5.2、§5.4)。

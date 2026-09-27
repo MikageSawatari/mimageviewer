@@ -760,6 +760,7 @@ mod tests {
                 source_secs_per_output_sec: 1.0,
                 seek_serial: 1,
                 pdc_latency_secs_at_process: 0.070_227,
+                effetune_generation: None,
             })
             .map(|_| ())
             .map_err(|error| error.to_string());

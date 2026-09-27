@@ -1707,6 +1707,7 @@ impl ToolbarSectionDisplay {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ToolbarSectionId {
     FolderTree,
+    EffeTune,
     Bookshelf,
     Collections,
     Cols,
@@ -1729,6 +1730,7 @@ impl ToolbarSectionId {
     pub fn default_order() -> &'static [Self] {
         &[
             Self::FolderTree,
+            Self::EffeTune,
             Self::Bookshelf,
             Self::Collections,
             Self::Cols,
@@ -4443,6 +4445,9 @@ pub struct Settings {
     /// ツールバーに「ツリー」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder_tree_button: bool,
+    /// ツールバーに EffeTune ボタンを表示する。
+    #[serde(default = "default_true")]
+    pub show_toolbar_effetune: bool,
     /// ツールバーに「本棚」セクションを表示する。
     #[serde(default = "default_true")]
     pub show_toolbar_bookshelf: bool,
@@ -5514,6 +5519,11 @@ pub struct Settings {
     /// 全プラグイン共通の一斉トグル状態として扱う (個別表示の覚え書きはしない)。
     #[serde(default = "default_true")]
     pub vst3_gui_visible: bool,
+    /// EffeTune GUI の最後の位置と外枠サイズ。
+    #[serde(default)]
+    pub effetune_gui_pos: Option<(i32, i32)>,
+    #[serde(default)]
+    pub effetune_gui_size: Option<(u32, u32)>,
     /// 動画フルスクリーン再生中、動画を右上 1/4 に縮小表示する (= プラグイン作業領域確保用)。
     /// false (= 既定): 動画はフルスクリーン全体を使う。
     /// true: 動画を右上 1/4 (幅・高さ各 1/2 = 面積 1/4) に縮小、左下 3/4 はプラグイン GUI 用に空く。
@@ -7221,6 +7231,7 @@ impl Default for Settings {
             folder_tree_pane_width_ratio: default_folder_tree_pane_width_ratio(),
             show_toolbar_folder: true,
             show_toolbar_folder_tree_button: true,
+            show_toolbar_effetune: true,
             show_toolbar_bookshelf: true,
             show_toolbar_collections: true,
             show_address_bar_history_nav: true,
@@ -7392,6 +7403,8 @@ impl Default for Settings {
             vst3_plugin_path: None,
             vst3_plugin_state: None,
             vst3_gui_visible: true,
+            effetune_gui_pos: None,
+            effetune_gui_size: None,
             vst3_video_compact: false,
             vst3_panel_pos: None,
             vst3_chain_slots: Vst3ChainPresetSlots::default(),
@@ -9572,6 +9585,7 @@ impl Settings {
         self.show_toolbar_smart_folders = src.show_toolbar_smart_folders;
         self.show_toolbar_tags = src.show_toolbar_tags;
         self.show_toolbar_folder_tree_button = src.show_toolbar_folder_tree_button;
+        self.show_toolbar_effetune = src.show_toolbar_effetune;
         self.show_toolbar_bookshelf = src.show_toolbar_bookshelf;
         self.show_toolbar_collections = src.show_toolbar_collections;
         self.show_toolbar_rating = src.show_toolbar_rating;
@@ -9713,6 +9727,8 @@ impl Settings {
         // self → state へ移送する。これで preferences OK で巻き戻る不具合を回避する
         // (Codex P3 2026-05-01)。
         // legacy migration field (deprecated path/state) のみ App 側を残す。
+        self.effetune_gui_pos = src.effetune_gui_pos;
+        self.effetune_gui_size = src.effetune_gui_size;
         for entry in self.vst3_plugins.iter_mut() {
             if let Some(latest) = src.vst3_plugins.iter().find(|e| e.path == entry.path) {
                 entry.bypass = latest.bypass;
@@ -12729,6 +12745,10 @@ mod tests {
         assert!(!defaults.toolbar_collections_collapsed);
         assert_eq!(
             ToolbarSectionId::default_order()[2],
+            ToolbarSectionId::Bookshelf
+        );
+        assert_eq!(
+            ToolbarSectionId::default_order()[3],
             ToolbarSectionId::Collections
         );
 
@@ -13209,6 +13229,7 @@ mod tests {
         );
         assert!(s.show_toolbar_folder);
         assert!(s.show_toolbar_folder_tree_button);
+        assert!(s.show_toolbar_effetune);
         assert!(s.show_toolbar_bookshelf);
         assert!(s.show_address_bar_history_nav);
         assert!(s.show_address_bar_quick_folders);
@@ -13342,6 +13363,20 @@ mod tests {
                 assert_eq!(s.fullfeature_media_window, media_checkbox);
             }
         }
+    }
+
+    #[test]
+    fn effetune_runtime_window_rect_survives_preference_apply() {
+        let mut edited = Settings::default();
+        let mut live = Settings::default();
+        edited.show_toolbar_effetune = false;
+        live.show_toolbar_effetune = true;
+        live.effetune_gui_pos = Some((120, 240));
+        live.effetune_gui_size = Some((900, 700));
+        edited.overwrite_non_preferences_from(&mut live);
+        assert!(edited.show_toolbar_effetune);
+        assert_eq!(edited.effetune_gui_pos, Some((120, 240)));
+        assert_eq!(edited.effetune_gui_size, Some((900, 700)));
     }
 
     #[test]

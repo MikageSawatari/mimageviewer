@@ -15955,6 +15955,8 @@ pub struct App {
     /// 詳細は [docs/vst3-integration.md](../docs/vst3-integration.md) 参照。
     #[cfg(windows)]
     pub(crate) dsp_bridge: std::sync::Arc<crate::video::dsp::DspBridge>,
+    #[cfg(windows)]
+    pub(crate) effetune: crate::effetune::EffetuneController,
     /// VST3 プラグイン管理ウィンドウ (= プレイバックパネル) の表示状態。
     pub(crate) show_vst3_manager: bool,
     /// VST3 プラグイン候補のスキャン結果 (lazy ロード、初回 enable で実行)。
@@ -17760,6 +17762,8 @@ impl App {
 
             #[cfg(windows)]
             dsp_bridge: crate::video::dsp::DspBridge::new(),
+            #[cfg(windows)]
+            effetune: crate::effetune::EffetuneController::new(),
             show_vst3_manager: false,
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
@@ -23208,7 +23212,13 @@ impl App {
             return;
         }
         #[cfg(windows)]
-        self.kick_off_vst3_startup_load();
+        {
+            self.kick_off_vst3_startup_load();
+            self.effetune.startup(
+                self.settings.effetune_gui_pos,
+                self.settings.effetune_gui_size,
+            );
+        }
         let favorites = self.settings.favorites.clone();
         let excluded_roots = vec![self.settings.books_root_path()];
         if let Some(similar_index) = self.similar_index.as_ref() {
@@ -23444,7 +23454,9 @@ impl App {
                     pending.elapsed_ms()
                 ));
                 self.vst3_startup_load = None;
-                self.resume_deferred_vst3_media_open(ctx);
+                if !self.media_startup_load_pending() {
+                    self.resume_deferred_vst3_media_open(ctx);
+                }
             }
             Err(mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -23452,7 +23464,130 @@ impl App {
             Err(mpsc::TryRecvError::Disconnected) => {
                 crate::logger::log("[VST3 startup] background load worker disconnected");
                 self.vst3_startup_load = None;
+                if !self.media_startup_load_pending() {
+                    self.resume_deferred_vst3_media_open(ctx);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn save_effetune_gui_rect(&mut self) {
+        let Some(bridge) = self.effetune.bridge() else {
+            return;
+        };
+        let Some((_, x, y, width, height)) =
+            bridge.snapshot_all_window_positions().into_iter().next()
+        else {
+            return;
+        };
+        let pos = Some((x, y));
+        let size = Some((width, height));
+        if self.settings.effetune_gui_pos != pos || self.settings.effetune_gui_size != size {
+            self.settings.effetune_gui_pos = pos;
+            self.settings.effetune_gui_size = size;
+            self.settings.save();
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn effetune_toolbar_click(&mut self) {
+        match self.effetune.runtime.clone() {
+            crate::effetune::EffetuneRuntime::Idle => self.effetune.click_idle(
+                self.settings.effetune_gui_pos,
+                self.settings.effetune_gui_size,
+            ),
+            crate::effetune::EffetuneRuntime::Running { .. } => {
+                let Some(bridge) = self.effetune.bridge().cloned() else {
+                    return;
+                };
+                if bridge.slot(0).is_some_and(|slot| slot.gui_visible) {
+                    bridge.hide_slot_gui(0);
+                    self.save_effetune_gui_rect();
+                    self.effetune.capture_on_hide();
+                } else {
+                    if let Some(hwnd) = self.main_hwnd {
+                        bridge.set_main_hwnd(hwnd as u64);
+                    }
+                    bridge.show_slot_gui_async(0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn effetune_toolbar_tooltip(&self) -> String {
+        use crate::effetune::{EffectiveState, EffetuneRuntime, UnavailableReason};
+        match &self.effetune.runtime {
+            EffetuneRuntime::Unavailable(UnavailableReason::BundleMissing(reason)) => {
+                format!("EffeTune を利用できません: bundle が見つかりません\n{reason}")
+            }
+            EffetuneRuntime::Unavailable(UnavailableReason::CpuUnsupported) => {
+                "EffeTune を利用できません: CPU に AVX2 と FMA が必要です".into()
+            }
+            EffetuneRuntime::Unavailable(_) => "EffeTune を利用できません".into(),
+            EffetuneRuntime::Idle => "EffeTune を起動".into(),
+            EffetuneRuntime::Loading { .. } => "EffeTune を読み込み中…".into(),
+            EffetuneRuntime::Failed(reason) => format!("EffeTune は停止しました: {reason:?}"),
+            EffetuneRuntime::Running { .. } => match self.effetune.effective_state() {
+                Some(EffectiveState::Effective) => {
+                    "EffeTune は有効です。表示は最後の状態取得時点の判定です".into()
+                }
+                Some(EffectiveState::Inert) => {
+                    "EffeTune は空または全体バイパスです。表示は最後の状態取得時点の判定です".into()
+                }
+                Some(EffectiveState::Unparseable(reason)) => {
+                    format!("EffeTune の状態を判定できません: {reason}")
+                }
+                None => "EffeTune の状態を取得中です".into(),
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn poll_effetune(&mut self, ctx: &egui::Context) {
+        let startup_pending = self.effetune.startup_pending();
+        let open_gui_when_ready = matches!(
+            self.effetune.runtime,
+            crate::effetune::EffetuneRuntime::Loading {
+                open_gui_when_ready: true,
+                ..
+            }
+        );
+        if !self.sidecar_restore_active() && self.effetune.poll() {
+            if let Some(bridge) = self.effetune.bridge() {
+                if let Some(hwnd) = self.main_hwnd {
+                    bridge.set_main_hwnd(hwnd as u64);
+                }
+                if open_gui_when_ready {
+                    std::sync::Arc::clone(bridge).show_slot_gui_async(0);
+                }
+            }
+            if startup_pending
+                && !self.media_startup_load_pending()
+                && !self.sidecar_restore_active()
+            {
                 self.resume_deferred_vst3_media_open(ctx);
+            }
+        }
+        if matches!(
+            self.effetune.runtime,
+            crate::effetune::EffetuneRuntime::Loading { .. }
+        ) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        if let Some(bridge) = self.effetune.bridge().cloned() {
+            let changes = bridge.pump_gui_signals();
+            if !changes.user_hidden_paths.is_empty() {
+                self.save_effetune_gui_rect();
+                self.effetune.capture_on_hide();
+            }
+            if !changes.bypass_updates.is_empty() {
+                self.effetune
+                    .fail(crate::effetune::EffetuneFailure::ProcessFailed(
+                        "unexpected editor bypass event".into(),
+                    ));
             }
         }
     }
@@ -23667,8 +23802,8 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn vst3_startup_load_pending(&self) -> bool {
-        self.vst3_startup_load.is_some()
+    pub(crate) fn media_startup_load_pending(&self) -> bool {
+        self.vst3_startup_load.is_some() || self.effetune.startup_pending()
     }
 
     #[cfg(windows)]
@@ -52734,7 +52869,7 @@ impl App {
                     crate::logger::log(format!("  video cache hit idx={idx} → resume playback"));
                 } else {
                     #[cfg(windows)]
-                    if self.vst3_startup_load_pending() {
+                    if self.media_startup_load_pending() {
                         crate::logger::log(format!(
                             "[VST3 startup] defer video open idx={idx} until background load completes"
                         ));
@@ -52775,7 +52910,7 @@ impl App {
                     // され、動画 VST まで巻き添えでセッション全体死ぬ (実害 2026-07-04)。動画 open と
                     // 同じくロード完了まで遅延する (Inc 6 ① で音声が VST を通るようになって顕在化)。
                     #[cfg(windows)]
-                    if self.vst3_startup_load_pending() {
+                    if self.media_startup_load_pending() {
                         crate::logger::log(format!(
                             "[VST3 startup] defer audio open idx={idx} until background load completes"
                         ));
@@ -59008,7 +59143,10 @@ impl App {
                 // generation, so it must not also attach the App-global local-playback bridge here.
                 None
             } else {
-                Some(self.dsp_bridge.clone())
+                Some(crate::video::audio::AudioDspChain {
+                    user: Some(self.dsp_bridge.clone()),
+                    effetune: Arc::clone(&self.effetune.slot),
+                })
             },
             output_consumer,
             #[cfg(windows)]
@@ -59406,7 +59544,10 @@ impl App {
             #[cfg(windows)]
             None, // gpu_video_device (headless)
             #[cfg(windows)]
-            Some(self.dsp_bridge.clone()), // dsp_bridge: 動画と同じ VST3 チェーンを共有 (Inc 6)
+            Some(crate::video::audio::AudioDspChain {
+                user: Some(self.dsp_bridge.clone()),
+                effetune: Arc::clone(&self.effetune.slot),
+            }),
             #[cfg(windows)]
             None, // native_output_config (headless = 音楽ビューは egui 描画)
         );
@@ -76587,6 +76728,10 @@ impl App {
                     crate::key_input::install_main_window_subclass(hwnd_raw as u64);
                     #[cfg(windows)]
                     self.dsp_bridge.set_main_hwnd(hwnd_raw as u64);
+                    #[cfg(windows)]
+                    if let Some(bridge) = self.effetune.bridge() {
+                        bridge.set_main_hwnd(hwnd_raw as u64);
+                    }
                     // watchdog に HWND を共有 (IsHungAppWindow チェック用、
                     // intentional idle と actual hang を区別するため)。
                     crate::set_ui_heartbeat_main_hwnd(hwnd_raw as u64);
@@ -76917,6 +77062,8 @@ impl App {
             self.poll_startup_init();
             #[cfg(windows)]
             self.poll_vst3_startup_load(ctx);
+            #[cfg(windows)]
+            self.poll_effetune(ctx);
             if self.startup_init.is_some() {
                 self.render_startup_overlay(ctx);
                 self.consume_input_during_startup(ctx);
@@ -76930,6 +77077,10 @@ impl App {
         }
         #[cfg(windows)]
         self.poll_vst3_startup_load(ctx);
+        #[cfg(windows)]
+        if self.startup_done {
+            self.poll_effetune(ctx);
+        }
         self.poll_play_test(ctx);
 
         // バージョン更新通知: 起動完了後の初回 + 24h 周期で auto kick。

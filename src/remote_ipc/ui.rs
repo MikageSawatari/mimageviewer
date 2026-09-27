@@ -1114,19 +1114,53 @@ impl crate::app::App {
         {
             use crate::video::clockless_transcode::ClocklessAudioProcessing;
 
-            if !self.settings.vst3_enabled || self.settings.vst3_plugins.is_empty() {
+            let user_vst_requested =
+                self.settings.vst3_enabled && !self.settings.vst3_plugins.is_empty();
+            let effetune_requested = matches!(
+                self.effetune.runtime,
+                crate::effetune::EffetuneRuntime::Running { .. }
+            );
+            if !user_vst_requested && !effetune_requested {
                 return ClocklessAudioProcessing::without_vst3(normalize_gain);
             }
 
-            // This creates one session-owned host. Generation configs clone its Arc, while the
-            // worker-side OnceLock loads the chain only once and never blocks the UI thread.
+            // The worker prepares both session hosts in order against this one deadline.
             let sample_rate = crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
-            ClocklessAudioProcessing::with_remote_vst3(
-                normalize_gain,
-                self.settings.vst3_plugins.clone(),
-                sample_rate,
-                remote_vst_load_budget(start_budget_remaining),
-            )
+            let deadline =
+                std::time::Instant::now() + remote_vst_load_budget(start_budget_remaining);
+            let mut config = if user_vst_requested {
+                ClocklessAudioProcessing::with_remote_vst3(
+                    normalize_gain,
+                    self.settings.vst3_plugins.clone(),
+                    sample_rate,
+                    deadline,
+                )
+            } else {
+                ClocklessAudioProcessing::without_vst3(normalize_gain)
+            };
+            if effetune_requested {
+                if let Some(bundle) = self.effetune.bundle_path() {
+                    let capture = match self.effetune.request_remote_capture() {
+                        Ok(capture) => capture,
+                        Err(error) => {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let _ = tx.send(Err(error));
+                            rx
+                        }
+                    };
+                    config = config.with_remote_effetune(
+                        bundle.to_path_buf(),
+                        capture,
+                        sample_rate,
+                        deadline,
+                    );
+                } else {
+                    config = config.with_effetune_warning(
+                        "EffeTune の bundle を見つけられませんでした。".into(),
+                    );
+                }
+            }
+            config
         }
     }
 

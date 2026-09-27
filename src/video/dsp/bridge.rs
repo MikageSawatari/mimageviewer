@@ -374,6 +374,14 @@ impl Bridge {
         self.child.id()
     }
 
+    #[cfg(windows)]
+    pub fn is_alive(&self) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        unsafe {
+            WaitForSingleObject(HANDLE(self.child.as_raw_handle()), 0).0 == 258 // WAIT_TIMEOUT
+        }
+    }
+
     /// bridge exe を子プロセスとして起動する。
     /// `stderr_cb` は bridge プロセスの stderr に書かれた 1 行を受け取るコールバック。
     /// tester 側はこれを使ってログファイルにブリッジの内部状態 (show_gui の各ステップ等)

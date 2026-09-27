@@ -51,6 +51,31 @@ pub fn vst3_supported() -> bool {
     })
 }
 
+#[cfg(test)]
+mod effetune_policy_tests {
+    use super::*;
+
+    #[test]
+    fn editor_bypass_chrome_defaults_on_and_effetune_can_hide_it() {
+        let user = DspBridge::new();
+        assert_eq!(user.gui_owner_policy, GuiOwnerPolicy::Auto);
+        assert_eq!(user.latency_policy, LatencyPolicy::AutoBypass);
+        assert!(!user.strict_state);
+        assert!(user.show_editor_bypass_button);
+
+        let effect = DspBridge::new_with_gui_chrome(
+            GuiOwnerPolicy::FixedMain,
+            LatencyPolicy::ReportOnly,
+            true,
+            false,
+        );
+        assert_eq!(effect.gui_owner_policy, GuiOwnerPolicy::FixedMain);
+        assert_eq!(effect.latency_policy, LatencyPolicy::ReportOnly);
+        assert!(effect.strict_state);
+        assert!(!effect.show_editor_bypass_button);
+    }
+}
+
 /// PDC (Plugin Delay Compensation) で許容する最大遅延 (秒)。
 ///
 /// 用途:
@@ -120,6 +145,7 @@ pub struct DspBridge {
     gui_owner_policy: GuiOwnerPolicy,
     latency_policy: LatencyPolicy,
     strict_state: bool,
+    show_editor_bypass_button: bool,
     /// audio-pump thread が高速判定するためのフラグ。Mutex を取らずに読める。
     enabled: AtomicBool,
     /// 「処理対象スロット (= Loaded 且つ bypass=false) の個数」を atomic で公開。
@@ -283,6 +309,15 @@ impl DspBridge {
         latency_policy: LatencyPolicy,
         strict_state: bool,
     ) -> Arc<Self> {
+        Self::new_with_gui_chrome(gui_owner_policy, latency_policy, strict_state, true)
+    }
+
+    pub fn new_with_gui_chrome(
+        gui_owner_policy: GuiOwnerPolicy,
+        latency_policy: LatencyPolicy,
+        strict_state: bool,
+        show_editor_bypass_button: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(DspBridgeInner {
                 state: DspState::Disabled,
@@ -293,6 +328,7 @@ impl DspBridge {
             gui_owner_policy,
             latency_policy,
             strict_state,
+            show_editor_bypass_button,
             enabled: AtomicBool::new(false),
             active_slot_count: AtomicUsize::new(0),
             session_disabled_reason: Mutex::new(None),
@@ -1174,6 +1210,12 @@ impl DspBridge {
         bridge.query_state_concurrent(slot_id)
     }
 
+    #[cfg(windows)]
+    pub fn host_alive(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        !inner.slots.is_empty() && inner.slots.iter().all(|slot| slot.bridge.is_alive())
+    }
+
     /// Used only when the dedicated EffeTune host exceeds the exit fence.
     pub fn terminate_host_now(&self) {
         let bridges: Vec<Arc<Bridge>> = {
@@ -1517,6 +1559,12 @@ impl DspBridge {
         visible: bool,
         clear_user_hidden: bool,
     ) -> Result<(), String> {
+        if visible
+            && self.gui_owner_policy == GuiOwnerPolicy::FixedMain
+            && self.current_gui_owner_hwnd() == 0
+        {
+            return Err("main HWND not ready".to_string());
+        }
         // 既存ウィンドウが作成済みなら可視化のみで早期 return (= 高速パス)
         // **z-order は触らない**: ユーザーが手で並べた前後関係を保持する (Codex P1)。
         // ただし `gui_topmost_desired` の現在値は最後に適用する (= fullscreen 中に
@@ -1637,6 +1685,7 @@ impl DspBridge {
                 "width": pref_w,
                 "height": pref_h,
                 "resizable": if resizable { 1 } else { 0 },
+                "hide_bypass_button": if self.show_editor_bypass_button { 0 } else { 1 },
                 "has_initial_pos": if initial_pos.is_some() { 1 } else { 0 },
                 "x": initial_pos.map(|p| p.0).unwrap_or(0),
                 "y": initial_pos.map(|p| p.1).unwrap_or(0),

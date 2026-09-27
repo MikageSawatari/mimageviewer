@@ -8495,9 +8495,8 @@ impl VideoPlayer {
     /// `resume_secs` を指定すると、最初の動画情報受領後に自動的にその位置へシークする。
     /// `hw_decode` が true なら D3D11VA HW デコードを試行する。D3D11VA 非対応 codec は
     /// SW で開き、D3D11VA 対応 codec の HW 初期化 / open 失敗はエラーにする。
-    /// VST3 プラグイン処理用の DspBridge は `dsp_bridge` 引数で渡す。
-    /// `None` または `is_enabled()=false` なら audio-pump はパススルー。
-    /// `is_enabled()=true` のときは pump thread で `bridge.process_block` を呼ぶ。
+    /// `dsp_chain` はユーザー VST3 と EffeTune の共有スロットを音声 pump へ渡す。
+    /// RemoteHeadless はローカル音声出力を持たないので `None` を渡す。
     pub fn open(
         path: PathBuf,
         initial_volume: f64,
@@ -8510,7 +8509,7 @@ impl VideoPlayer {
         #[cfg(windows)] gpu_video_device: Option<
             std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
         >,
-        #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
+        #[cfg(windows)] dsp_chain: Option<audio::AudioDspChain>,
         #[cfg(windows)] native_output_config: Option<NativeVideoOutputConfig>,
     ) -> Self {
         Self::open_with_output_consumer(
@@ -8525,7 +8524,7 @@ impl VideoPlayer {
             #[cfg(windows)]
             gpu_video_device,
             #[cfg(windows)]
-            dsp_bridge,
+            dsp_chain,
             VideoOutputConsumer::Presentation,
             #[cfg(windows)]
             native_output_config,
@@ -8544,7 +8543,7 @@ impl VideoPlayer {
         #[cfg(windows)] gpu_video_device: Option<
             std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
         >,
-        #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
+        #[cfg(windows)] dsp_chain: Option<audio::AudioDspChain>,
         output_consumer: VideoOutputConsumer,
         #[cfg(windows)] native_output_config: Option<NativeVideoOutputConfig>,
     ) -> Self {
@@ -8732,7 +8731,7 @@ impl VideoPlayer {
             engine_state_handle.clone(),
             Arc::clone(&audio_diagnostics),
             #[cfg(windows)]
-            dsp_bridge,
+            dsp_chain,
         ) {
             Ok(a) => Some(a),
             Err(e) => {

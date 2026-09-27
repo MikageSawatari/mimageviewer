@@ -343,6 +343,8 @@ pub(crate) struct ProcessedChunk {
     /// (旧 `pdc_latency_secs_applied` 比較ロジックを chunk 単位に分離)。
     /// mIV Remote は tap metadata の有限性も AAC input 前に検証する。
     pub(crate) pdc_latency_secs_at_process: f64,
+    /// EffeTune slot generation actually applied to this chunk.
+    pub(crate) effetune_generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -855,6 +857,13 @@ pub fn default_output_sample_rate() -> Option<u32> {
     Some(cfg.sample_rate().0)
 }
 
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct AudioDspChain {
+    pub user: Option<Arc<crate::video::dsp::DspBridge>>,
+    pub effetune: Arc<crate::effetune::EffetuneAudioSlot>,
+}
+
 /// 音声出力ストリームを開く。デフォルトデバイスを使う。
 ///
 /// `audio_rx` がドロップされると pump スレッドは終了するが、cpal Stream は無音で
@@ -865,16 +874,15 @@ pub fn default_output_sample_rate() -> Option<u32> {
 /// emit する。EngineActor が Buffering → Playing に遷移するためのトリガ。
 /// 旧 Phase 3d の「1 度だけ emit」では Loading 中に届いた event が latch reset
 /// で消える race があったため、Phase 8.K で level 化した。
-/// 音声出力ストリームを起動する。`dsp_bridge` を渡すと audio-pump で VST3 プラグイン
-/// 処理 (チェーン) を挿入する。`is_enabled()=true` かつアクティブスロット
-/// (= bypass=false の Loaded スロット) が 1 個以上のときのみ実行され、それ以外はパススルー。
+/// 音声出力ストリームを起動する。`dsp_chain` はユーザー VST3 を先に、EffeTune を後に
+/// 適用する。EffeTune の共有スロットは各ブロックで 1 回だけ読む。
 pub(crate) fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
     engine_event_tx: crate::video::EngineEventSender,
     engine_state: Arc<AtomicU8>,
     diagnostics: Arc<AudioDiagnostics>,
-    #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
+    #[cfg(windows)] dsp_chain: Option<AudioDspChain>,
 ) -> Result<AudioOutput, String> {
     let host = cpal::default_host();
     let device = host
@@ -888,7 +896,9 @@ pub(crate) fn start(
     let device_name = device.name().unwrap_or_else(|_| "unknown".to_owned());
     let diagnostics_enabled = crate::perf::is_enabled();
     #[cfg(windows)]
-    let (vst_enabled, vst_active_slots) = dsp_bridge
+    let (vst_enabled, vst_active_slots) = dsp_chain
+        .as_ref()
+        .and_then(|chain| chain.user.as_ref())
         .as_ref()
         .map(|bridge| (bridge.is_enabled(), bridge.active_slot_count()))
         .unwrap_or((false, 0));
@@ -938,7 +948,7 @@ pub(crate) fn start(
     let pump_engine_state = engine_state.clone();
     let pump_diagnostics = Arc::clone(&diagnostics);
     #[cfg(windows)]
-    let pump_dsp_bridge = dsp_bridge;
+    let pump_dsp_chain = dsp_chain;
     let pump_handle = std::thread::Builder::new()
         .name("audio-pump".into())
         .spawn(move || {
@@ -953,7 +963,7 @@ pub(crate) fn start(
                 pump_diagnostics,
                 audio_tap_command_rx,
                 #[cfg(windows)]
-                pump_dsp_bridge,
+                pump_dsp_chain,
             );
         })
         .map_err(|e| format!("spawn audio-pump: {e}"))?;
@@ -1145,14 +1155,25 @@ fn run_pump(
     engine_state: Arc<AtomicU8>,
     diagnostics: Arc<AudioDiagnostics>,
     audio_tap_command_rx: Receiver<AudioTapCommand>,
-    #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
+    #[cfg(windows)] dsp_chain: Option<AudioDspChain>,
 ) {
     #[cfg(windows)]
     boost_audio_pump_priority();
+    #[cfg(windows)]
+    let (dsp_bridge, effetune_slot) = match dsp_chain {
+        Some(chain) => (chain.user, Some(chain.effetune)),
+        None => (None, None),
+    };
 
     // VST3 process_block 用の出力バッファ。再利用して realloc を抑える。
     #[cfg(windows)]
     let mut fx_out: Vec<f32> = Vec::with_capacity(4096);
+    #[cfg(windows)]
+    let mut effetune_out: Vec<f32> = Vec::with_capacity(4096);
+    #[cfg(windows)]
+    let mut effetune_health = crate::effetune::composition::StageHealth::default();
+    #[cfg(windows)]
+    let mut effetune_reset_failed_serial: Option<u64> = None;
 
     // ── processed queue cap (= EQ latency target) ──
     // EQ 設定変更が音に届くまでの最大時間 = processed 秒数。
@@ -1330,6 +1351,18 @@ fn run_pump(
                     {
                         b.reset_plugins_sync();
                     }
+                }
+                #[cfg(windows)]
+                if seen_valid_audio_frame
+                    && !cancel.load(Ordering::Acquire)
+                    && let Some(slot) = effetune_slot.as_ref()
+                    && let Some((_, bridge)) = slot.snapshot()
+                    && let Err(error) = bridge.try_reset_plugins_sync()
+                {
+                    effetune_reset_failed_serial = Some(frame_seek_serial);
+                    slot.report_failure(crate::effetune::EffetuneFailure::ProcessFailed(format!(
+                        "seek reset: {error}"
+                    )));
                 }
                 last_seen_seek_serial = frame_seek_serial;
                 seen_valid_audio_frame = true;
@@ -1677,6 +1710,83 @@ fn run_pump(
                 bool,
             ) = (stretched.samples.clone(), 0.0, false);
 
+            #[cfg(windows)]
+            let mut effetune_applied = false;
+            #[cfg(windows)]
+            let user_latency_secs = current_pdc_latency_secs;
+            #[cfg(windows)]
+            let mut applied_effetune_latency_secs = 0.0;
+            #[cfg(windows)]
+            let mut effetune_generation = None;
+            #[cfg(windows)]
+            if let Some(slot) = effetune_slot.as_ref() {
+                if let Some((generation, bridge)) = slot.snapshot() {
+                    if effetune_reset_failed_serial != Some(raw.seek_serial) {
+                        let effetune_latency_secs =
+                            bridge.total_latency_samples() as f64 / sample_rate as f64;
+                        match crate::effetune::composition::admit_effetune(
+                            current_pdc_latency_secs,
+                            effetune_latency_secs,
+                        ) {
+                            Err(total_secs) => {
+                                slot.report_failure(
+                                    crate::effetune::EffetuneFailure::LatencyExceeded {
+                                        total_secs,
+                                    },
+                                );
+                            }
+                            Ok(()) => {
+                                effetune_out.resize(output_samples.len(), 0.0);
+                                match bridge.process_block(&output_samples, &mut effetune_out) {
+                                    Ok(()) => {
+                                        effetune_applied = true;
+                                        effetune_generation = Some(generation);
+                                        effetune_health.succeeded();
+                                        applied_effetune_latency_secs = effetune_latency_secs;
+                                    }
+                                    Err(error) => {
+                                        let threshold_reached = effetune_health.failed();
+                                        let failures = effetune_health.failure_count();
+                                        if failures == 1 || failures % 10 == 0 {
+                                            crate::logger::log(format!(
+                                                "EffeTune process_block failed (consecutive #{}): {error}",
+                                                failures
+                                            ));
+                                        }
+                                        if threshold_reached {
+                                            slot.report_failure(
+                                                crate::effetune::EffetuneFailure::ProcessFailed(
+                                                    error,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    effetune_health = crate::effetune::composition::StageHealth::default();
+                }
+            }
+
+            #[cfg(windows)]
+            let (mut output_samples, reusable_effetune_out, composition) =
+                crate::effetune::composition::compose_samples(
+                    output_samples,
+                    effetune_out,
+                    vst_chain_active,
+                    user_latency_secs,
+                    effetune_applied,
+                    applied_effetune_latency_secs,
+                    effetune_generation,
+                );
+            #[cfg(windows)]
+            {
+                effetune_out = reusable_effetune_out;
+                current_pdc_latency_secs = composition.plugin_latency_secs;
+            }
+
             let pre_limiter_gain = clock.pre_limiter_gain();
             if pre_limiter_gain > 1.0 {
                 for sample in &mut output_samples {
@@ -1687,6 +1797,10 @@ fn run_pump(
             // VST3 無効 + 音量0dB以下 + normalize +20dB のケースで clip を防ぐ。
             // 下げ方向 (<1.0) は clip 不可なので limiter 不要 (5ms latency 節約)。
             let normalize_boost_active = max_normalize_gain_in_block > 1.0 + f32::EPSILON;
+            #[cfg(windows)]
+            let limiter_active =
+                composition.limiter_required || pre_limiter_gain > 1.0 || normalize_boost_active;
+            #[cfg(not(windows))]
             let limiter_active =
                 vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active;
             if limiter_active {
@@ -1762,6 +1876,10 @@ fn run_pump(
                 source_secs_per_output_sec,
                 seek_serial: raw.seek_serial,
                 pdc_latency_secs_at_process: current_latency_source_secs,
+                #[cfg(windows)]
+                effetune_generation: composition.effetune_generation,
+                #[cfg(not(windows))]
+                effetune_generation: None,
             };
 
             refresh_audio_tap(&audio_tap_command_rx, &mut active_audio_tap);
@@ -2289,6 +2407,11 @@ fn run_pump(
                 b.flush_silence(480, 10);
             }
         }
+        if let Some((_, bridge)) = effetune_slot.as_ref().and_then(|slot| slot.snapshot()) {
+            if bridge.is_enabled() && bridge.active_slot_count() > 0 {
+                bridge.flush_silence(480, 10);
+            }
+        }
     }
     crate::logger::log("audio-pump terminated");
 }
@@ -2701,6 +2824,7 @@ mod tests {
             source_secs_per_output_sec: 1.0,
             seek_serial: 0,
             pdc_latency_secs_at_process: 0.0,
+            effetune_generation: None,
         }
     }
 
@@ -3499,6 +3623,7 @@ mod tests {
                 source_secs_per_output_sec: 1.0,
                 seek_serial: 0,
                 pdc_latency_secs_at_process: 1.0,
+                effetune_generation: None,
             };
             b.processed.push_back(chunk);
         }

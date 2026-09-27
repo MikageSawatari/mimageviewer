@@ -910,6 +910,7 @@ private:
             options.width = static_cast<uint32_t>(extract_number_field(msg, "width"));
             options.height = static_cast<uint32_t>(extract_number_field(msg, "height"));
             options.resizable = extract_number_field(msg, "resizable") != 0;
+            options.show_bypass_button = extract_number_field(msg, "hide_bypass_button") == 0;
             options.has_initial_pos = extract_number_field(msg, "has_initial_pos") != 0;
             options.x = static_cast<int32_t>(extract_i64_field(msg, "x"));
             options.y = static_cast<int32_t>(extract_i64_field(msg, "y"));
