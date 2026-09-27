@@ -913,12 +913,12 @@ hidden 中は選択・worker・decoder・セルを保持し、波形の backgrou
 
 波形の粗トラック (全尺解析) はセッションより長く生きる。`SeekStripWaveWorker` は
 `SeekStripCloseCause::keeps_viewing_the_same_video` が真の境界では `cancel` せず、App の
-`video_seek_strip_wave_holdover` へ owner fs index、動画パス、source epoch、items generation と
-一緒に預ける。次のセッションは`take_or_spawn_seek_strip_wave_worker` でこの4 identityをexactに
+`video_seek_strip_wave_holdover` へ owner fs index、動画パス、`applied` の音声 stream index、source epoch、items generation と
+一緒に預ける。次のセッションは`take_or_spawn_seek_strip_wave_worker` でこの identity を exact に
 照合して拾い、**新しく spawn したものと
 見分けが付かない状態** (背景段は再開済み) で受け取る。預けている間は背景の全尺解析だけを
 止める。手放すのは動画が変わる / フルスクリーンを出るときで、`sync_native_video_seek_strip`
-が毎フレーム4 identityを照合してsource replacementの取りこぼしを拾う。保持は 1 本ぶん
+が毎フレーム同じ identity を照合して source replacement と音声トラック確定の取りこぼしを拾う。切り替え中は旧 `applied` の波形を保ち、新トラックが `applied` になった時点で worker を作り直す。保持は 1 本ぶん
 (`MAX_COARSE_WAVEFORM_BYTES` = 64 MiB が上限、通常の 1〜2 時間なら 250〜500 KB)。
 `cancel` は不可逆でスレッドが終わるため、預ける経路では絶対に呼ばない。サムネイルモードの
 `SeekStripThumbnailWorker` は索引の列挙、採用する場面の選択、SQLite/WebP 読み込み、未取得画像の
@@ -953,7 +953,7 @@ session open、全 strip KeyAction、presenter の film button、シーク行の
 source session reset で `Unknown` へ戻すため、前ファイルの unavailable が次の動画へ漏れない。
 
 波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
-音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く
+音楽解析 LRU にあれば対象時間窓を切り出す。いずれも path と音声 stream index が一致する結果だけを使う。無ければ、動画と `applied` トラックごとに 1 回だけ開く
 `AudioRangeDecoder` で設定された可視 span (5 / 10 / 15 / 30 秒、1 / 2 / 5 / 10 / 15 /
 30 / 60 / 120 / 180 分、既定 3 分) と 0.75 秒の pre-roll
 だけを 48kHz stereo PCM にして first-paint raster を返す。表示後は同じ中心の保持 span を
@@ -962,7 +962,7 @@ background で作る。保持 span は通常 3 倍だが 3600 秒で上限とす
 
 波形モードで可視 span が 10 分以上になると、同じ worker / decoder が 100ms、7 byte/bin の粗い全尺列を
 60 秒 chunk で構築する。列を作った直後、共有 `TileThumbCache` の `video_tile_thumbs.db` から
-file identity (`path` / mtime / size)、bin 幅・総 bin 数、format version が一致する全 chunk を
+file identity (`path` / stream index / mtime / size)、bin 幅・総 bin 数、format version が一致する全 chunk を
 1 batch で読み、長さと添字を検証できた chunk を coverage へ戻す。未取得 chunk は従来どおり
 foreground latest-wins request を loop 先頭で処理し、無いときだけ現在中心に最も近いものを 1 個埋め、
 復号・合成に成功した chunk だけを DB へ保存する。波形モード以外では背景段を止め、10 分の構築閾値、
@@ -2117,8 +2117,8 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
   同じ frame-selection は seek hover サムネ `thumbnail.rs` と共通
 - `tile_thumb_cache.rs`: 共有 `video_tile_thumbs.db` の永続キャッシュ。タイル / resume サムネイルは
   SQLite + WebP で、タイルは **絶対 PTS をキー**にしているため動画の長さが変わっても再ヒットする
-  (Phase 8.C の修正)。`video_wave_chunks` は粗い全尺波形の量子化 bin を chunk 単位で持ち、path、
-  動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用する。既存のファイル単位・
+  (Phase 8.C の修正)。粗い全尺波形の新規 chunk は `video_wave_chunks_track` に stream index 明示で保存し、path、
+  stream index、動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用する。旧 `video_wave_chunks` は既定トラックに限り互換読みする。既存のファイル単位・
   フォルダ単位・全件削除は両方のキャッシュを同時に消す
 - **抽出幅は `settings::VIDEO_TILE_EXTRACT_WIDTH` (640px) に固定**。列数・モニター解像度・
   どのモニターで再生するかに依らず常に同じ幅で抽出・保存するので、キャッシュは

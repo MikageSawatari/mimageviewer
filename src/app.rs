@@ -11235,13 +11235,26 @@ pub(crate) struct GridEditBadges {
 }
 
 /// 音楽ビューのタイムライン解析結果を保持する in-memory LRU のキー。
-/// path (case-insensitive 正規化) + size + mtime で「同一内容のファイル」を識別する。
+/// path (case-insensitive 正規化) + stream index + size + mtime で解析対象を識別する。
 /// 永続 DB (旧 `audio_analysis.db`) はやめて直近 N 曲だけメモリに載せる (§D9)。
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MusicAnalysisKey {
     pub(crate) path: String,
+    pub(crate) stream_index: usize,
     pub(crate) size: i64,
     pub(crate) mtime: i64,
+}
+
+/// The sole owner of the displayed timeline, progressive PCM, and worker inbox.
+/// The LRU above remains shareable because its immutable result is keyed by file and stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MusicAnalysisSource {
+    pub(crate) owner_context_id: ViewerContextId,
+    pub(crate) fs_idx: usize,
+    pub(crate) player_addr: usize,
+    pub(crate) load_seq: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) stream_index: usize,
 }
 
 /// in-memory LRU に載せる曲数の上限 (件数)。
@@ -11329,9 +11342,21 @@ mod music_analysis_lru_tests {
     fn key(name: &str) -> MusicAnalysisKey {
         MusicAnalysisKey {
             path: name.to_string(),
+            stream_index: 0,
             size: 1,
             mtime: 1,
         }
+    }
+
+    #[test]
+    fn same_file_metadata_on_another_stream_misses_music_analysis_lru() {
+        let mut lru = Vec::new();
+        let first = key("same.mkv");
+        music_analysis_lru_insert_bounded(&mut lru, first.clone(), analysis(1), 6, 100);
+        let mut second = first.clone();
+        second.stream_index = 2;
+        assert!(music_analysis_lru_get(&mut lru, &second).is_none());
+        assert!(music_analysis_lru_get(&mut lru, &first).is_some());
     }
 
     fn analysis(bins: usize) -> Arc<music_core::TimelineAnalysis> {
@@ -11421,8 +11446,8 @@ pub(crate) enum MusicAnalysisMsg {
 /// `run_music_analysis` を背景スレッドで走らせ、結果を in-memory LRU に載せる
 /// (docs/music-integration-plan.md §5.3 / D9)。UI スレッドは `poll_music_analysis` で受信するだけ。
 pub(crate) struct MusicAnalysisPending {
-    /// 解析対象パス (完了時の取り違え防止に使う)。
-    pub(crate) path: PathBuf,
+    /// 解析を開始した viewer / player / source / stream の完全な identity。
+    pub(crate) source: MusicAnalysisSource,
     /// キャンセルトークン。新しいファイルを開いたら旧ワーカーを止める。
     pub(crate) cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 解析結果 (timeline + spectrum PCM) を受け取るチャネル。ワーカーは複数メッセージを送り、
@@ -11453,6 +11478,7 @@ const MUSIC_PCM_RESERVE_MAX_FRAMES: usize = 4 * 3600 * 48_000;
 /// 非キャンセル区間は存在しない (leak-hunt P1)。
 fn run_music_analysis(
     path: &std::path::Path,
+    stream_index: usize,
     cancel: &std::sync::atomic::AtomicBool,
     tx: &std::sync::mpsc::Sender<MusicAnalysisMsg>,
     want_analysis: bool,
@@ -11467,7 +11493,7 @@ fn run_music_analysis(
     // しないので decode の完了を待たず情報を出せる。失敗しても解析は続ける。
     // duration は progressive partial の 50% 抑制ヒント (下記) にも使う。
     let mut total_dur = 0.0_f64;
-    if let Ok(probe) = crate::audio_decode::probe_audio_file(path) {
+    if let Ok(probe) = crate::audio_decode::probe_audio_file(path, stream_index) {
         total_dur = probe.duration_secs;
         let _ = tx.send(MusicAnalysisMsg::Probe(probe));
     }
@@ -11512,6 +11538,7 @@ fn run_music_analysis(
     let mut schedule = crate::audio_decode::PartialEmitSchedule::new(total_dur);
     let decode_result = crate::audio_decode::decode_audio_file_progressive(
         path,
+        stream_index,
         cancel,
         |delta, _rate| -> Result<(), String> {
             // デコード差分を共有バッファへ追記 (spectrum worker が即スライスできるようになる)。
@@ -15015,8 +15042,8 @@ pub struct App {
     /// 動画ミュートのセッション内状態。HUD 操作時は settings.video_muted に保存し、
     /// 次の VideoPlayer 作成時にも引き継ぐ。
     pub(crate) video_session_muted: bool,
-    /// 音楽ビュー (Inc 3b) の解析対象パス。開いているファイルが変わったら worker を作り直す。
-    pub(crate) music_analysis_path: Option<PathBuf>,
+    /// 音楽ビューの解析対象 viewer / player / applied track。変わったら worker を作り直す。
+    pub(crate) music_analysis_source: Option<MusicAnalysisSource>,
     /// 音楽ビューのタイムライン解析結果 (LRU hit または worker 完了で埋まる)。
     /// `Arc` で保持し、row raster worker へは refcount のクローンだけ渡す (Codex P2)。
     /// 代入は必ず `set_music_analysis` を通す (下の版数を進めるため)。
@@ -17470,7 +17497,7 @@ impl App {
             cursor_hide_reason: None,
             video_playback_speed,
             video_session_muted,
-            music_analysis_path: None,
+            music_analysis_source: None,
             music_analysis: None,
             music_analysis_version: 0,
             music_analysis_lru: Vec::new(),
@@ -32642,8 +32669,9 @@ impl App {
         // 解析 bin/FFT 窓単位) なので handle は数 ms で閉じる。窓 close の後に呼ぶこと
         // (現在ビューの teardown 順を既存経路と揃えるため)。
         let current_analysis_matches = self
-            .music_analysis_path
-            .as_deref()
+            .music_analysis_source
+            .as_ref()
+            .map(|source| source.path.as_path())
             .is_some_and(|p| matches_key(&crate::adjustment_db::normalize_path(p)));
         if current_analysis_matches {
             crate::logger::log(format!(
@@ -32653,7 +32681,7 @@ impl App {
         } else if self
             .music_analysis_pending
             .as_ref()
-            .is_some_and(|p| matches_key(&crate::adjustment_db::normalize_path(&p.path)))
+            .is_some_and(|p| matches_key(&crate::adjustment_db::normalize_path(&p.source.path)))
         {
             // 現在ビューは別ファイルだが、走行中ワーカーが削除対象を開いているケース
             // (連続切替直後など)。ビュー状態には触れず解析だけ止める。
@@ -46676,7 +46704,7 @@ impl App {
         };
         if let Some(path) = self.fs_music_source_for_idx(fs_idx) {
             let meta = self.image_metas.get(fs_idx).copied().flatten();
-            self.ensure_music_analysis(&path, meta);
+            self.ensure_music_analysis(fs_idx, &path, meta);
             self.ensure_music_bookmarks_loaded(&path);
         }
         self.poll_music_analysis(ctx);
@@ -59053,14 +59081,31 @@ impl App {
     /// spectrum 用 PCM のデコードは LRU ヒットでも走る (全尺 PCM は毎回必要)。
     pub(crate) fn ensure_music_analysis(
         &mut self,
+        fs_idx: usize,
         path: &std::path::Path,
         meta: Option<(i64, i64)>,
     ) {
-        if self.music_analysis_path.as_deref() == Some(path) {
-            return; // 同じファイル: worker/結果を保持したまま。
+        let source = self.music_analysis_source_for_player(fs_idx);
+        if source
+            .as_ref()
+            .is_none_or(|source| !crate::path_key::eq_keep_drive(&source.path, path))
+        {
+            // A new file can reach the view before its player publishes an applied track.
+            // Clear only this viewer's old display; a sibling's mounted music view owns its
+            // own result and must not be reset by a read-only visit here.
+            if self.music_analysis_source.as_ref().is_some_and(|current| {
+                current.owner_context_id == self.projected_viewer_context_id()
+            }) {
+                self.clear_music_view_state();
+            }
+            return;
+        }
+        let source = source.expect("checked above");
+        if self.music_analysis_source.as_ref() == Some(&source) {
+            return; // 同じ player / source / applied track: worker と結果を保持。
         }
 
-        // ── ファイルが変わった: 旧状態を全て捨てる ──
+        // ── player / source / applied track が変わった: 旧状態を全て捨てる ──
         self.cancel_music_analysis();
         self.music_timeline_cache.clear();
         self.music_spectrum.clear();
@@ -59076,7 +59121,7 @@ impl App {
         self.music_pcm = None;
         self.music_probe = None;
         self.music_analysis_error = None;
-        self.music_analysis_path = Some(path.to_path_buf());
+        self.music_analysis_source = Some(source.clone());
         // 左ジャンプパネルは楽曲単位のセッション状態。音声→音声ナビでも引き継がない。
         self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
 
@@ -59085,6 +59130,7 @@ impl App {
         let key = meta.and_then(|(mtime, size)| {
             (size > 0).then(|| MusicAnalysisKey {
                 path: crate::adjustment_db::normalize_path(path),
+                stream_index: source.stream_index,
                 size,
                 mtime,
             })
@@ -59107,19 +59153,23 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel::<MusicAnalysisMsg>();
         let worker_cancel = std::sync::Arc::clone(&cancel);
         let worker_path = path.to_path_buf();
+        let worker_stream_index = source.stream_index;
         let spawned = std::thread::Builder::new()
             .name("miv-music-analysis".into())
             .spawn(move || {
                 // ワーカーは timeline / PCM を複数メッセージで送る。送り終えると tx を drop し、
                 // 受信側は Disconnected で完了を知る。cancel 済みなら send 失敗は無視される。
-                run_music_analysis(&worker_path, &worker_cancel, &tx, want_analysis, hit_meta);
+                run_music_analysis(
+                    &worker_path,
+                    worker_stream_index,
+                    &worker_cancel,
+                    &tx,
+                    want_analysis,
+                    hit_meta,
+                );
             });
         if spawned.is_ok() {
-            self.music_analysis_pending = Some(MusicAnalysisPending {
-                path: path.to_path_buf(),
-                cancel,
-                rx,
-            });
+            self.music_analysis_pending = Some(MusicAnalysisPending { source, cancel, rx });
         } else {
             // スレッド生成に失敗したら「解析中」で固まらないようエラーを出す (Codex P3)。
             // LRU ヒットで既にタイムラインがある (want_analysis=false) ならエラーにしない。
@@ -59127,6 +59177,20 @@ impl App {
                 self.music_analysis_error = Some("解析ワーカーを起動できませんでした".to_string());
             }
         }
+    }
+
+    fn music_analysis_source_for_player(&self, fs_idx: usize) -> Option<MusicAnalysisSource> {
+        let FsCacheEntry::Video { player, load_seq } = self.fs_cache.get(&fs_idx)? else {
+            return None;
+        };
+        Some(MusicAnalysisSource {
+            owner_context_id: self.projected_viewer_context_id(),
+            fs_idx,
+            player_addr: player.as_ref() as *const crate::video::VideoPlayer as usize,
+            load_seq: *load_seq,
+            path: player.path().clone(),
+            stream_index: player.applied_audio_stream_index()?,
+        })
     }
 
     /// in-memory LRU からキー一致の解析結果を取り出し、最新位置へ繰り上げる (move-to-front)。
@@ -59144,16 +59208,28 @@ impl App {
     #[cfg(windows)]
     fn completed_music_analysis_for_seek_strip(
         &mut self,
+        fs_idx: usize,
         path: &std::path::Path,
+        stream_index: Option<usize>,
         meta: Option<(i64, i64)>,
     ) -> Option<crate::video::seek_strip_wave::CompletedTimelineAnalysis> {
+        let stream_index = stream_index?;
         let (mtime, size) = meta?;
         if size <= 0 {
             return None;
         }
-        let identity =
-            crate::video::seek_strip_wave::WaveFileIdentity::from_known_meta(path, mtime, size);
-        if self.music_analysis_path.as_deref() == Some(path)
+        let identity = crate::video::seek_strip_wave::WaveFileIdentity::from_known_meta(
+            path,
+            Some(stream_index),
+            mtime,
+            size,
+        );
+        if self.music_analysis_source.as_ref()
+            == self.music_analysis_source_for_player(fs_idx).as_ref()
+            && self.music_analysis_source.as_ref().is_some_and(|source| {
+                source.stream_index == stream_index
+                    && crate::path_key::eq_keep_drive(&source.path, path)
+            })
             && self.music_analysis_pending.is_none()
             && let Some(analysis) = self.music_analysis.as_ref()
         {
@@ -59164,6 +59240,7 @@ impl App {
         }
         let key = MusicAnalysisKey {
             path: crate::adjustment_db::normalize_path(path),
+            stream_index,
             size,
             mtime,
         };
@@ -59193,8 +59270,22 @@ impl App {
         let Some(pending) = self.music_analysis_pending.take() else {
             return;
         };
-        // 取り違え防止: 完了したワーカーのパスが現在の対象と一致するときだけ採用。
-        let matches = self.music_analysis_path.as_deref() == Some(pending.path.as_path());
+        // Shared inbox belongs to exactly one mounted viewer and its current player/source.
+        if pending.source.owner_context_id != self.projected_viewer_context_id() {
+            self.music_analysis_pending = Some(pending);
+            return;
+        }
+        let matches = self.music_analysis_source.as_ref() == Some(&pending.source)
+            && self
+                .music_analysis_source_for_player(pending.source.fs_idx)
+                .as_ref()
+                == Some(&pending.source);
+        if !matches {
+            pending
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let mut got_any = false;
         let mut disconnected = false;
         loop {
@@ -59222,7 +59313,10 @@ impl App {
                                 self.music_analysis_error = None;
                                 if let Some((mtime, size)) = meta {
                                     let key = MusicAnalysisKey {
-                                        path: crate::adjustment_db::normalize_path(&pending.path),
+                                        path: crate::adjustment_db::normalize_path(
+                                            &pending.source.path,
+                                        ),
+                                        stream_index: pending.source.stream_index,
                                         size,
                                         mtime,
                                     };
@@ -59282,7 +59376,7 @@ impl App {
     /// ようになったため、音声→画像/動画への移動でも確実に teardown する必要がある (Codex P2)。
     /// `open_fullscreen` で音楽ビュー状態 (`music_*`) を破棄すべきか (review-v2.3.0 P2-3)。
     ///
-    /// - 音声を開くとき: 破棄しない (音声→別音声は `ensure_music_analysis` が path 比較で処理)。
+    /// - 音声を開くとき: 破棄しない (音声→別音声は `ensure_music_analysis` が source 比較で処理)。
     /// - ParkedLive の音楽窓が global music_* を消費中で、開くのが非メディア (画像 / PDF
     ///   ページ等): 破棄しない。破棄すると「別窓 BGM 再生中にメイン窓で画像を見る」際、
     ///   ページを開くたびに解析ワーカー respawn + PCM 全尺再デコードが走り、parked 窓の
@@ -59320,11 +59414,11 @@ impl App {
         self.music_spectrum.clear();
         self.set_music_analysis(None);
         // LRU 本体 (直近 N 曲) はセッション中保持して音声への再入を即時にする。キーは
-        // path+size+mtime + ワーカーの fresh stat 検証なので stale hit は起きない。
+        // path+stream index+size+mtime + ワーカーの fresh stat 検証で再利用先を限定する。
         self.music_pcm = None;
         self.music_probe = None;
         self.music_analysis_error = None;
-        self.music_analysis_path = None;
+        self.music_analysis_source = None;
         // ▲▼ ボタンの保留スクロール量も teardown で破棄する (Codex P3、上記 path 変更と同じ理由)。
         self.music_timeline_scroll_req = 0.0;
         self.music_timeline_reanchor_playhead_once = false;

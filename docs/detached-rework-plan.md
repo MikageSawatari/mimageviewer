@@ -1455,6 +1455,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-27 §1.251 S3-B: 音楽解析・波形の結果を所有 viewer context と音声トラックで照合**
+
+音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §6.2) で、音楽解析と seek strip
+波形の結果・進行中 worker・spectrum PCM の key に音声トラック (stream index) と所有 viewer context を加えた。
+viewer context の retire では、その context が所有する音楽解析の結果と進行中 worker を破棄する。viewer context の
+fork (ParkedLive への live fork) では、同じ player・path・`applied` の stream が移ったことを照合したうえで、解析の
+source と進行中 worker の owner を移動先の context へ移し、結果と PCM を保持する (作り直さない)。detached の述語、
+host / park / focus の lifecycle、viewport の生成・終了には変更を加えない。
+判断: context 固有の resource (解析結果・worker・PCM) を所有 context だけに作用させ、fork では所有権を移管する
+構造的修正であり、guard・遅延・再試行・一括 reset で症状を隠すものではない (§2 の禁止事項に抵触しない)。独立レビュー
+(Sol) と ClaudeCode の双方がこの判断に合意した。
+
 **2026-09-27 §1.251 S3-A: 音量正規化 (Norm) の測定値 lookup を所有 viewer context へ配送**
 
 音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §6.1) で、Norm の測定値の

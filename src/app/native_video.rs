@@ -294,6 +294,8 @@ pub(super) struct VideoSeekStripSession {
     presentation: VideoSeekStripPresentationState,
     owner_fs_idx: usize,
     video_path: std::path::PathBuf,
+    audio_stream_index: Option<usize>,
+    default_audio_stream_index: Option<usize>,
     duration_secs: f64,
     /// 帯が動画のどこを写しているか。
     ///
@@ -382,6 +384,8 @@ impl VideoSeekStripSession {
             presentation: VideoSeekStripPresentationState::Visible,
             owner_fs_idx: 0,
             video_path,
+            audio_stream_index: Some(0),
+            default_audio_stream_index: Some(0),
             duration_secs: 600.0,
             span: crate::video::seek_strip_layout::SeekStripSpan::Window,
             center: crate::video::seek_strip::SeekStripCenter::Waveform {
@@ -629,6 +633,7 @@ pub(super) enum VideoSeekStripRuntime {
 pub(crate) struct HeldSeekStripWaveWorker {
     pub(super) owner_fs_idx: usize,
     pub(super) path: std::path::PathBuf,
+    pub(super) audio_stream_index: Option<usize>,
     pub(super) source_epoch: u64,
     pub(super) items_generation: u64,
     pub(super) worker: crate::video::seek_strip_wave::SeekStripWaveWorker,
@@ -646,12 +651,15 @@ fn take_or_spawn_seek_strip_wave_worker(
     holdover: &mut Option<HeldSeekStripWaveWorker>,
     owner_fs_idx: usize,
     path: &std::path::Path,
+    audio_stream_index: Option<usize>,
+    default_audio_stream_index: Option<usize>,
     source_epoch: u64,
     items_generation: u64,
     cache: Option<std::sync::Arc<crate::video::tile_thumb_cache::TileThumbCache>>,
 ) -> crate::video::seek_strip_wave::SeekStripWaveWorker {
     if let Some(held) = holdover.take() {
         if held.owner_fs_idx == owner_fs_idx
+            && held.audio_stream_index == audio_stream_index
             && held.source_epoch == source_epoch
             && held.items_generation == items_generation
             && crate::path_key::eq_keep_drive(&held.path, path)
@@ -664,7 +672,12 @@ fn take_or_spawn_seek_strip_wave_worker(
             return held.worker;
         }
     }
-    crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.to_path_buf(), cache)
+    crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+        path.to_path_buf(),
+        audio_stream_index,
+        default_audio_stream_index,
+        cache,
+    )
 }
 
 #[cfg(windows)]
@@ -672,10 +685,12 @@ fn held_seek_strip_wave_worker_matches_current(
     held: &HeldSeekStripWaveWorker,
     current_fs_idx: usize,
     current_path: Option<&std::path::Path>,
+    current_audio_stream_index: Option<usize>,
     current_source_epoch: Option<u64>,
     current_items_generation: u64,
 ) -> bool {
     held.owner_fs_idx == current_fs_idx
+        && held.audio_stream_index == current_audio_stream_index
         && held.items_generation == current_items_generation
         && current_source_epoch == Some(held.source_epoch)
         && current_path.is_some_and(|path| crate::path_key::eq_keep_drive(&held.path, path))
@@ -9619,6 +9634,8 @@ impl App {
             return false;
         }
         let path = player.path().clone();
+        let audio_stream_index = player.applied_audio_stream_index();
+        let default_audio_stream_index = info.default_audio_stream_index;
         let initial_time_secs = player.position();
         let duration_secs = info.duration_secs;
         let Some(source_epoch) = player.native_source_epoch() else {
@@ -9628,6 +9645,7 @@ impl App {
             && session.owner_fs_idx == fs_idx
             && session.items_generation == self.items_generation
             && session.source_epoch == source_epoch
+            && session.audio_stream_index == audio_stream_index
             && crate::path_key::eq_keep_drive(&session.video_path, &path)
         {
             return true;
@@ -9643,7 +9661,7 @@ impl App {
         let min_interval_secs = self.settings.video_seek_strip_min_interval_secs;
         let meta = self.image_metas.get(fs_idx).copied().flatten();
         let completed_analysis = if mode == crate::settings::VideoSeekStripMode::Waveform {
-            self.completed_music_analysis_for_seek_strip(&path, meta)
+            self.completed_music_analysis_for_seek_strip(fs_idx, &path, audio_stream_index, meta)
         } else {
             None
         };
@@ -9696,6 +9714,8 @@ impl App {
                 presentation: VideoSeekStripPresentationState::AwaitingFirstPresent,
                 owner_fs_idx: fs_idx,
                 video_path: path,
+                audio_stream_index,
+                default_audio_stream_index,
                 duration_secs,
                 span: showing.span,
                 center,
@@ -9792,6 +9812,7 @@ impl App {
                 self.video_seek_strip_wave_holdover = Some(HeldSeekStripWaveWorker {
                     owner_fs_idx: session.owner_fs_idx,
                     path: session.video_path.clone(),
+                    audio_stream_index: session.audio_stream_index,
                     source_epoch: session.source_epoch,
                     items_generation: session.items_generation,
                     worker,
@@ -10012,6 +10033,8 @@ impl App {
             return false;
         };
         let path = session.video_path.clone();
+        let audio_stream_index = session.audio_stream_index;
+        let default_audio_stream_index = session.default_audio_stream_index;
         let source_epoch = session.source_epoch;
         let items_generation = session.items_generation;
         let duration_secs = session.duration_secs;
@@ -10040,6 +10063,8 @@ impl App {
                 &mut self.video_seek_strip_wave_holdover,
                 fs_idx,
                 &path,
+                audio_stream_index,
+                default_audio_stream_index,
                 source_epoch,
                 items_generation,
                 wave_cache,
@@ -10049,7 +10074,7 @@ impl App {
         };
         let completed_analysis = if mode == crate::settings::VideoSeekStripMode::Waveform {
             let meta = self.image_metas.get(fs_idx).copied().flatten();
-            self.completed_music_analysis_for_seek_strip(&path, meta)
+            self.completed_music_analysis_for_seek_strip(fs_idx, &path, audio_stream_index, meta)
         } else {
             None
         };
@@ -10718,6 +10743,8 @@ impl App {
             session_id,
             mode,
             path,
+            audio_stream_index,
+            default_audio_stream_index,
             source_epoch,
             items_generation,
             duration_secs,
@@ -10733,6 +10760,8 @@ impl App {
                     session.session_id,
                     session.center.mode(),
                     session.video_path.clone(),
+                    session.audio_stream_index,
+                    session.default_audio_stream_index,
                     session.source_epoch,
                     session.items_generation,
                     session.duration_secs,
@@ -10763,6 +10792,8 @@ impl App {
                 &mut self.video_seek_strip_wave_holdover,
                 fs_idx,
                 &path,
+                audio_stream_index,
+                default_audio_stream_index,
                 source_epoch,
                 items_generation,
                 self.video_tile_cache.clone(),
@@ -10789,6 +10820,7 @@ impl App {
         &mut self,
         current_fs_idx: usize,
         current_path: Option<&std::path::Path>,
+        current_audio_stream_index: Option<usize>,
         current_source_epoch: Option<u64>,
     ) {
         if let Some(held) = self.video_seek_strip_wave_holdover.as_ref()
@@ -10796,6 +10828,7 @@ impl App {
                 held,
                 current_fs_idx,
                 current_path,
+                current_audio_stream_index,
                 current_source_epoch,
                 self.items_generation,
             )
@@ -10817,11 +10850,16 @@ impl App {
             FsCacheEntry::Video { player, .. } => player.native_source_epoch(),
             _ => None,
         });
+        let current_audio_stream_index = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => player.applied_audio_stream_index(),
+            _ => None,
+        });
         // 見ている動画が変わった / 動画を見ていない。close だけに任せると、ストリップを
         // 閉じたまま次の動画へ移った経路で持ち越しが残る。
         self.discard_stale_video_seek_strip_wave_holdover(
             fs_idx,
             current_path.as_deref(),
+            current_audio_stream_index,
             current_source_epoch,
         );
         if self.video_tile_mode_active {
@@ -10850,6 +10888,7 @@ impl App {
                 if session.owner_fs_idx == fs_idx
                     && session.items_generation == self.items_generation
                     && session.source_epoch == current_source_epoch.unwrap_or(u64::MAX)
+                    && session.audio_stream_index == current_audio_stream_index
                     && crate::path_key::eq_keep_drive(&session.video_path, path)
         );
         if !session_matches && !self.ensure_video_seek_strip_session(fs_idx, showing) {
@@ -10941,6 +10980,8 @@ impl App {
                                     &mut self.video_seek_strip_wave_holdover,
                                     session.owner_fs_idx,
                                     &session.video_path,
+                                    session.audio_stream_index,
+                                    session.default_audio_stream_index,
                                     session.source_epoch,
                                     session.items_generation,
                                     wave_cache.clone(),
@@ -16535,6 +16576,12 @@ mod configurable_video_seek_dispatch_tests {
 mod native_video_key_observation_tests {
     use super::*;
 
+    fn strip_player_with_audio_for_test(path: std::path::PathBuf) -> crate::video::VideoPlayer {
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_opened_audio_stream_for_test(0, 0);
+        player
+    }
+
     fn diagnostic_record(
         seq: u64,
         repeat: bool,
@@ -16792,8 +16839,12 @@ mod native_video_key_observation_tests {
             let mut app = crate::app::tests::phase_c_support::setup_app();
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("clip.mp4");
-            let worker =
-                crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+            let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+                path.clone(),
+                Some(0),
+                Some(0),
+                None,
+            );
             let identity = worker.identity_for_test();
             app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(
                 VideoSeekStripSession::for_wave_holdover_test(path, worker),
@@ -16834,19 +16885,34 @@ mod native_video_key_observation_tests {
         let one = dir.path().join("one.mp4");
         let other = dir.path().join("other.mp4");
 
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            one.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let held_identity = worker.identity_for_test();
         // 預けるときと同じ状態にしてから拾わせる。
         worker.set_background_paused(true);
         let mut holdover = Some(HeldSeekStripWaveWorker {
             owner_fs_idx: 0,
             path: one.clone(),
+            audio_stream_index: Some(0),
             source_epoch: 7,
             items_generation: 11,
             worker,
         });
 
-        let reused = take_or_spawn_seek_strip_wave_worker(&mut holdover, 0, &one, 7, 11, None);
+        let reused = take_or_spawn_seek_strip_wave_worker(
+            &mut holdover,
+            0,
+            &one,
+            Some(0),
+            Some(0),
+            7,
+            11,
+            None,
+        );
         assert_eq!(
             reused.identity_for_test(),
             held_identity,
@@ -16858,16 +16924,31 @@ mod native_video_key_observation_tests {
         );
         assert!(holdover.is_none(), "持ち越しは 1 本ぶんだけ");
 
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            one.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let stale_identity = worker.identity_for_test();
         let mut holdover = Some(HeldSeekStripWaveWorker {
             owner_fs_idx: 0,
             path: one.clone(),
+            audio_stream_index: Some(0),
             source_epoch: 7,
             items_generation: 11,
             worker,
         });
-        let fresh = take_or_spawn_seek_strip_wave_worker(&mut holdover, 0, &other, 7, 11, None);
+        let fresh = take_or_spawn_seek_strip_wave_worker(
+            &mut holdover,
+            0,
+            &other,
+            Some(0),
+            Some(0),
+            7,
+            11,
+            None,
+        );
         assert_ne!(
             fresh.identity_for_test(),
             stale_identity,
@@ -16875,21 +16956,64 @@ mod native_video_key_observation_tests {
         );
         assert!(holdover.is_none(), "別の動画のものを抱えたままになっている");
 
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            one.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let stale_epoch_identity = worker.identity_for_test();
         let mut holdover = Some(HeldSeekStripWaveWorker {
             owner_fs_idx: 0,
             path: one.clone(),
+            audio_stream_index: Some(0),
             source_epoch: 7,
             items_generation: 11,
             worker,
         });
-        let fresh_epoch = take_or_spawn_seek_strip_wave_worker(&mut holdover, 0, &one, 8, 11, None);
+        let fresh_epoch = take_or_spawn_seek_strip_wave_worker(
+            &mut holdover,
+            0,
+            &one,
+            Some(0),
+            Some(0),
+            8,
+            11,
+            None,
+        );
         assert_ne!(
             fresh_epoch.identity_for_test(),
             stale_epoch_identity,
             "同じ path でも新しい source epoch に旧 worker を再利用している"
         );
+
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            one.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let old_track_worker = worker.identity_for_test();
+        let mut holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
+            path: one.clone(),
+            audio_stream_index: Some(0),
+            source_epoch: 7,
+            items_generation: 11,
+            worker,
+        });
+        let other_track = take_or_spawn_seek_strip_wave_worker(
+            &mut holdover,
+            0,
+            &one,
+            Some(2),
+            Some(0),
+            7,
+            11,
+            None,
+        );
+        assert_ne!(other_track.identity_for_test(), old_track_worker);
+        assert!(holdover.is_none());
     }
 
     #[test]
@@ -16902,15 +17026,22 @@ mod native_video_key_observation_tests {
         app.video_seek_strip_wave_holdover = Some(HeldSeekStripWaveWorker {
             owner_fs_idx: 0,
             path: path.clone(),
+            audio_stream_index: Some(0),
             source_epoch: 7,
             items_generation: generation,
-            worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None),
+            worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+                path.clone(),
+                Some(0),
+                Some(0),
+                None,
+            ),
         });
 
         assert!(held_seek_strip_wave_worker_matches_current(
             app.video_seek_strip_wave_holdover.as_ref().unwrap(),
             0,
             Some(&path),
+            Some(0),
             Some(7),
             generation,
         ));
@@ -16918,17 +17049,18 @@ mod native_video_key_observation_tests {
             app.video_seek_strip_wave_holdover.as_ref().unwrap(),
             0,
             Some(&path),
+            Some(0),
             Some(8),
             generation,
         ));
 
         // The production sync calls this before inspecting whether a strip session is open.
-        app.discard_stale_video_seek_strip_wave_holdover(0, Some(&path), Some(7));
+        app.discard_stale_video_seek_strip_wave_holdover(0, Some(&path), Some(0), Some(7));
         assert!(
             app.video_seek_strip_wave_holdover.is_some(),
             "the exact source keeps the reusable worker"
         );
-        app.discard_stale_video_seek_strip_wave_holdover(0, Some(&path), Some(8));
+        app.discard_stale_video_seek_strip_wave_holdover(0, Some(&path), Some(0), Some(8));
         assert!(app.video_seek_strip_wave_holdover.is_none());
     }
 
@@ -16942,13 +17074,16 @@ mod native_video_key_observation_tests {
         app.fs_cache.insert(
             4,
             crate::fs_animation::FsCacheEntry::Video {
-                player: Box::new(
-                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone()),
-                ),
+                player: Box::new(strip_player_with_audio_for_test(path.clone())),
                 load_seq,
             },
         );
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let worker_id = worker.identity_for_test();
         let mut session = VideoSeekStripSession::for_wave_holdover_test(path.clone(), worker);
         session.owner_fs_idx = 2;
@@ -16970,13 +17105,18 @@ mod native_video_key_observation_tests {
             worker_id
         );
 
-        let held_worker =
-            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let held_worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let held_id = held_worker.identity_for_test();
         app.video_seek_strip_runtime = VideoSeekStripRuntime::Closed;
         app.video_seek_strip_wave_holdover = Some(HeldSeekStripWaveWorker {
             owner_fs_idx: 2,
             path: path.clone(),
+            audio_stream_index: Some(0),
             source_epoch: 0,
             items_generation: 11,
             worker: held_worker,
@@ -17038,8 +17178,12 @@ mod native_video_key_observation_tests {
                 .expect("fixture starts with an owned native output"),
             _ => unreachable!(),
         };
-        let worker =
-            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(from_path.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            from_path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let worker_id = worker.identity_for_test();
         let mut session = VideoSeekStripSession::for_wave_holdover_test(from_path, worker);
         session.items_generation = app.items_generation;
@@ -17108,8 +17252,12 @@ mod native_video_key_observation_tests {
                 load_seq,
             },
         );
-        let worker =
-            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(from_path.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            from_path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let mut session = VideoSeekStripSession::for_wave_holdover_test(from_path, worker);
         session.items_generation = app.items_generation;
         session.source_epoch = 0;
@@ -17184,8 +17332,12 @@ mod native_video_key_observation_tests {
             },
         );
         app.fullscreen_idx = Some(1);
-        let worker =
-            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(target_path.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            target_path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let mut successor = VideoSeekStripSession::for_wave_holdover_test(target_path, worker);
         successor.session_id = crate::video::seek_strip::SeekStripSessionId(2);
         successor.owner_fs_idx = 1;
@@ -17202,7 +17354,12 @@ mod native_video_key_observation_tests {
     fn layout_revision_does_not_change_visible_or_suspended_activity() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("clip.mp4");
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
 
         assert_eq!(
@@ -17251,15 +17408,18 @@ mod native_video_key_observation_tests {
         app.fs_cache.insert(
             0,
             crate::fs_animation::FsCacheEntry::Video {
-                player: Box::new(
-                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone()),
-                ),
+                player: Box::new(strip_player_with_audio_for_test(path.clone())),
                 load_seq,
             },
         );
         app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Waveform;
         app.settings.video_seek_strip_span = crate::video::seek_strip_layout::SeekStripSpan::Window;
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let worker_id = worker.identity_for_test();
         let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
         session.items_generation = app.items_generation;
@@ -17436,15 +17596,17 @@ mod native_video_key_observation_tests {
         app.fs_cache.insert(
             0,
             crate::fs_animation::FsCacheEntry::Video {
-                player: Box::new(
-                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone()),
-                ),
+                player: Box::new(strip_player_with_audio_for_test(path.clone())),
                 load_seq,
             },
         );
 
-        let disposable_wave =
-            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let disposable_wave = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let mut session =
             VideoSeekStripSession::for_wave_holdover_test(path.clone(), disposable_wave);
         session.wave_worker = None;
@@ -17579,13 +17741,16 @@ mod native_video_key_observation_tests {
         app.fs_cache.insert(
             fs_idx,
             crate::fs_animation::FsCacheEntry::Video {
-                player: Box::new(
-                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone()),
-                ),
+                player: Box::new(strip_player_with_audio_for_test(path.clone())),
                 load_seq,
             },
         );
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
         session.owner_fs_idx = fs_idx;
         session.items_generation = app.items_generation;
@@ -17639,16 +17804,19 @@ mod native_video_key_observation_tests {
         app.fs_cache.insert(
             fs_idx,
             crate::fs_animation::FsCacheEntry::Video {
-                player: Box::new(
-                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone()),
-                ),
+                player: Box::new(strip_player_with_audio_for_test(path.clone())),
                 load_seq,
             },
         );
         app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Waveform;
         app.settings.video_seek_strip_span = crate::video::seek_strip_layout::SeekStripSpan::Window;
         app.settings.video_seek_strip_waveform_span_secs = 30.0;
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
         session.owner_fs_idx = fs_idx;
         session.items_generation = app.items_generation;
@@ -17714,6 +17882,8 @@ mod native_video_key_observation_tests {
         // 開けないパスでよい。ここで確かめたいのは旗の所在であって解析結果ではない。
         let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
             dir.path().join("none.mp4"),
+            Some(0),
+            Some(0),
             None,
         );
         assert!(!worker.background_is_paused(), "作った直後は動いている");

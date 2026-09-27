@@ -586,8 +586,12 @@ mod tests {
         let root_path = PathBuf::from(r"C:\videos\root.mp4");
         app.items = vec![GridItem::Video(root_path.clone())];
         app.fullscreen_idx = Some(0);
-        let root_worker =
-            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(root_path.clone(), None);
+        let root_worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            root_path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         app.seed_video_seek_strip_context_for_test(root_path, root_worker, 101, 17, 102);
         let root_context = app.viewer_context_main();
 
@@ -597,6 +601,8 @@ mod tests {
             app.fullscreen_idx = Some(0);
             let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
                 detached_path.clone(),
+                Some(0),
+                Some(0),
                 None,
             );
             app.seed_video_seek_strip_context_for_test(detached_path, worker, 201, 23, 202);

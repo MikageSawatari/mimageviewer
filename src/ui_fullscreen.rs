@@ -47199,7 +47199,7 @@ impl App {
         if let Some(p) = self.fs_music_source_for_idx(fs_idx) {
             // LRU キー用の (mtime, size)。フォルダスキャンで image_metas に入っている。
             let meta = self.image_metas.get(fs_idx).copied().flatten();
-            self.ensure_music_analysis(&p, meta);
+            self.ensure_music_analysis(fs_idx, &p, meta);
             self.ensure_music_bookmarks_loaded(&p);
         }
         self.poll_music_analysis(ctx);

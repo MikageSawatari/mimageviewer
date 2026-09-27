@@ -1,6 +1,17 @@
 #[cfg(windows)]
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
+
+fn music_source_for_test(app: &App, path: PathBuf) -> MusicAnalysisSource {
+    MusicAnalysisSource {
+        owner_context_id: app.projected_viewer_context_id(),
+        fs_idx: 0,
+        player_addr: 0,
+        load_seq: 0,
+        path,
+        stream_index: 0,
+    }
+}
 use crate::archive_converter::ArchiveFormat;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -47559,6 +47570,255 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn music_analysis_follows_applied_track_only_after_switch_commit() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("music-switch.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 1,
+            },
+        );
+        app.ensure_music_analysis(0, &path, Some((1, 15)));
+        let first = app.music_analysis_source.clone().unwrap();
+        let first_cancel = app.music_analysis_pending.as_ref().unwrap().cancel.clone();
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            player.select_audio_track(2).outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        app.ensure_music_analysis(0, &path, Some((1, 15)));
+        assert_eq!(app.music_analysis_source.as_ref(), Some(&first));
+        assert!(!first_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        player.apply_desired_audio_track_for_test();
+        app.ensure_music_analysis(0, &path, Some((1, 15)));
+        assert_eq!(
+            app.music_analysis_source
+                .as_ref()
+                .map(|source| source.stream_index),
+            Some(2)
+        );
+        assert!(first_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            app.music_analysis_pending
+                .as_ref()
+                .map(|pending| pending.source.stream_index),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn music_analysis_clears_own_old_display_while_new_player_is_not_ready() {
+        let mut app = setup_app();
+        app.music_analysis_source = Some(music_source_for_test(
+            &app,
+            PathBuf::from("C:/music/old-track.flac"),
+        ));
+        app.set_music_analysis(Some(std::sync::Arc::new(
+            music_core::TimelineAnalysis::default(),
+        )));
+        app.ensure_music_analysis(0, Path::new("C:/music/new-track.flac"), None);
+        assert!(app.music_analysis_source.is_none());
+        assert!(app.music_analysis.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn music_analysis_message_waits_for_owning_viewer_and_drops_on_retire() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("music-owner.mkv");
+        let mut first = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        first.set_opened_audio_stream_for_test(1, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(first),
+                load_seq: 1,
+            },
+        );
+        let source = app.music_analysis_source_for_player(0).unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pcm = std::sync::Arc::new(crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0));
+        tx.send(MusicAnalysisMsg::Pcm(pcm.clone())).unwrap();
+        app.music_analysis_source = Some(source.clone());
+        app.music_analysis_pending = Some(MusicAnalysisPending {
+            source: source.clone(),
+            cancel: cancel.clone(),
+            rx,
+        });
+        let first_owner = app.stash_mounted_and_start_fresh("test_music_owner");
+        assert_eq!(source.owner_context_id, first_owner);
+        let mut second = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        second.set_opened_audio_stream_for_test(1, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(second),
+                load_seq: 1,
+            },
+        );
+        let ctx = egui::Context::default();
+        app.poll_music_analysis(&ctx);
+        assert!(app.music_pcm.is_none());
+        assert!(app.music_analysis_pending.is_some());
+        app.with_viewer_context(first_owner, |owner| {
+            owner.poll_music_analysis(&ctx);
+            assert!(
+                owner
+                    .music_pcm
+                    .as_ref()
+                    .is_some_and(|got| std::sync::Arc::ptr_eq(got, &pcm))
+            );
+        })
+        .unwrap();
+        app.retire_context(first_owner, "test_music_owner_retire", |_| ())
+            .unwrap();
+        assert!(app.music_analysis_source.is_none());
+        assert!(app.music_pcm.is_none());
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn live_music_fork_keeps_analysis_pcm_and_worker_through_parked_poll_and_old_retire() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("forked-music.mkv");
+        std::fs::write(&path, b"player identity").unwrap();
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(2, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 7,
+            },
+        );
+        app.items.push(GridItem::Audio(path.clone()));
+        app.fullscreen_idx = Some(0);
+        let old_source = app.music_analysis_source_for_player(0).unwrap();
+        assert_eq!(old_source.stream_index, 2);
+        let analysis = std::sync::Arc::new(music_core::TimelineAnalysis::default());
+        let first_pcm =
+            std::sync::Arc::new(crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0));
+        let next_pcm =
+            std::sync::Arc::new(crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(MusicAnalysisMsg::Pcm(next_pcm.clone())).unwrap();
+        app.music_analysis_source = Some(old_source.clone());
+        app.music_analysis_pending = Some(MusicAnalysisPending {
+            source: old_source.clone(),
+            cancel: cancel.clone(),
+            rx,
+        });
+        app.set_music_analysis(Some(analysis.clone()));
+        app.music_pcm = Some(first_pcm.clone());
+        let version = app.music_analysis_version;
+
+        app.bind_mounted_context_for_test(909);
+        let parked = app.fork_mounted_live_media_context(909);
+        assert_ne!(parked, old_source.owner_context_id);
+        let mut moved_source = old_source.clone();
+        moved_source.owner_context_id = parked;
+        assert_eq!(app.music_analysis_source.as_ref(), Some(&moved_source));
+        assert_eq!(
+            app.music_analysis_pending
+                .as_ref()
+                .map(|pending| &pending.source),
+            Some(&moved_source)
+        );
+        assert!(
+            app.music_pcm
+                .as_ref()
+                .is_some_and(|pcm| std::sync::Arc::ptr_eq(pcm, &first_pcm))
+        );
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+
+        let ctx = egui::Context::default();
+        app.with_viewer_context(parked, |owner| {
+            owner.update_parked_live_audio_music_view_state(&ctx);
+            assert_eq!(owner.music_analysis_source.as_ref(), Some(&moved_source));
+            assert_eq!(
+                owner
+                    .music_analysis_pending
+                    .as_ref()
+                    .map(|pending| &pending.source),
+                Some(&moved_source)
+            );
+            assert!(
+                owner
+                    .music_analysis
+                    .as_ref()
+                    .is_some_and(|got| std::sync::Arc::ptr_eq(got, &analysis))
+            );
+            assert!(
+                owner
+                    .music_pcm
+                    .as_ref()
+                    .is_some_and(|got| std::sync::Arc::ptr_eq(got, &next_pcm))
+            );
+            assert_eq!(owner.music_analysis_version, version);
+        })
+        .unwrap();
+        let stashed = app.stash_mounted_and_start_fresh("test_music_fork_old_owner");
+        assert_eq!(stashed, old_source.owner_context_id);
+        app.retire_context(stashed, "test_music_fork_old_owner_retire", |_| ())
+            .unwrap();
+        assert_eq!(app.music_analysis_source.as_ref(), Some(&moved_source));
+        assert_eq!(
+            app.music_analysis_pending
+                .as_ref()
+                .map(|pending| &pending.source),
+            Some(&moved_source)
+        );
+        assert!(
+            app.music_pcm
+                .as_ref()
+                .is_some_and(|got| std::sync::Arc::ptr_eq(got, &next_pcm))
+        );
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        drop(tx);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn live_music_fork_does_not_transfer_an_unrelated_player_source() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("forked-music-other.mkv");
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(2, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 7,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        let mut stale_source = app.music_analysis_source_for_player(0).unwrap();
+        stale_source.stream_index = 1;
+        app.music_analysis_source = Some(stale_source.clone());
+        app.bind_mounted_context_for_test(910);
+        let parked = app.fork_mounted_live_media_context(910);
+        assert_ne!(parked, stale_source.owner_context_id);
+        assert_eq!(app.music_analysis_source.as_ref(), Some(&stale_source));
+    }
+
+    #[test]
     fn normalize_unmeasured_lookup_uses_deferred_scan_only_with_play_intent() {
         use crate::app::normalize::{NormalizeLookupMessage, NormalizeTargetKey};
         use crate::video::normalize_types::NormalizeUiState;
@@ -51796,11 +52056,13 @@ mod still_window_mode_key_tests {
         // 音楽状態は global のままにして、context swap で別 window bundle へ持ち出さない。
         let mut app = setup_app();
         let music_path = PathBuf::from(r"C:\music\a.flac");
-        app.music_analysis_path = Some(music_path.clone());
+        app.music_analysis_source = Some(music_source_for_test(&app, music_path.clone()));
         app.music_analysis_error = Some("keep-global".to_string());
 
         assert_eq!(
-            app.music_analysis_path.as_deref(),
+            app.music_analysis_source
+                .as_ref()
+                .map(|source| source.path.as_path()),
             Some(music_path.as_path())
         );
         assert_eq!(app.music_analysis_error.as_deref(), Some("keep-global"));
@@ -51809,7 +52071,9 @@ mod still_window_mode_key_tests {
         app.with_viewer_context(original, |_| ()).unwrap();
 
         assert_eq!(
-            app.music_analysis_path.as_deref(),
+            app.music_analysis_source
+                .as_ref()
+                .map(|source| source.path.as_path()),
             Some(music_path.as_path())
         );
         assert_eq!(app.music_analysis_error.as_deref(), Some("keep-global"));
@@ -58782,11 +59046,11 @@ mod still_window_mode_key_tests {
         // current 一致 → ビュー状態ごと破棄。ラウドネス測定 (App-global) も path 一致で
         // cancel される (fs_idx は文脈依存なので使わない)。
         let deleting = std::path::PathBuf::from(r"C:\music\deleting.flac");
-        app.music_analysis_path = Some(deleting.clone());
+        app.music_analysis_source = Some(music_source_for_test(&app, deleting.clone()));
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (_tx, rx) = std::sync::mpsc::channel();
         app.music_analysis_pending = Some(MusicAnalysisPending {
-            path: deleting.clone(),
+            source: music_source_for_test(&app, deleting.clone()),
             cancel: std::sync::Arc::clone(&cancel),
             rx,
         });
@@ -58813,7 +59077,7 @@ mod still_window_mode_key_tests {
             "test_delete_music",
         );
         assert!(
-            app.music_analysis_path.is_none(),
+            app.music_analysis_source.is_none(),
             "削除対象を解析中ならビュー状態ごと破棄される"
         );
         assert!(app.music_analysis_pending.is_none());
@@ -58833,11 +59097,11 @@ mod still_window_mode_key_tests {
         // pending のみ一致 (連続切替直後の stale ワーカー) → 解析だけ止まりビューは残る。
         let other = std::path::PathBuf::from(r"C:\music\other.flac");
         let stale = std::path::PathBuf::from(r"C:\music\deleting2.flac");
-        app.music_analysis_path = Some(other.clone());
+        app.music_analysis_source = Some(music_source_for_test(&app, other.clone()));
         let cancel2 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (_tx2, rx2) = std::sync::mpsc::channel();
         app.music_analysis_pending = Some(MusicAnalysisPending {
-            path: stale.clone(),
+            source: music_source_for_test(&app, stale.clone()),
             cancel: std::sync::Arc::clone(&cancel2),
             rx: rx2,
         });
@@ -58847,7 +59111,9 @@ mod still_window_mode_key_tests {
             "test_delete_music_stale",
         );
         assert_eq!(
-            app.music_analysis_path.as_deref(),
+            app.music_analysis_source
+                .as_ref()
+                .map(|source| source.path.as_path()),
             Some(other.as_path()),
             "別ファイルのビュー状態は保持される"
         );
@@ -58979,7 +59245,7 @@ mod still_window_mode_key_tests {
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
         });
         let path = std::path::PathBuf::from(r"C:\music\bgm.flac");
-        app.music_analysis_path = Some(path.clone());
+        app.music_analysis_source = Some(music_source_for_test(&app, path.clone()));
         app.music_pcm = Some(std::sync::Arc::new(
             crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0),
         ));
@@ -58988,7 +59254,12 @@ mod still_window_mode_key_tests {
         assert!(app.detached_music_window_exists());
         app.close_fullscreen();
 
-        assert_eq!(app.music_analysis_path.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            app.music_analysis_source
+                .as_ref()
+                .map(|source| source.path.as_path()),
+            Some(path.as_path())
+        );
         assert!(app.music_pcm.is_some());
         assert_eq!(app.music_analysis_version, 17);
     }
@@ -59291,7 +59562,7 @@ mod still_window_mode_key_tests {
             context.set_detached_window_binding_for_test(Some(97));
         });
         app.transition_detached_window_state(97, DetachedWindowState::ParkedLive, "test_setup");
-        app.music_analysis_path = Some(path.clone());
+        app.music_analysis_source = Some(music_source_for_test(&app, path.clone()));
         app.music_pcm = Some(std::sync::Arc::new(
             crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0),
         ));
@@ -59317,7 +59588,7 @@ mod still_window_mode_key_tests {
         app.close_detached_image_windows_by_ids(&ctx, &[97], "test_close", None);
 
         assert!(app.detached_image_windows.is_empty());
-        assert!(app.music_analysis_path.is_none());
+        assert!(app.music_analysis_source.is_none());
         assert!(app.music_pcm.is_none());
         assert!(app.normalize_state.is_none());
         assert!(scan_cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -64680,7 +64951,10 @@ mod still_window_mode_key_tests {
         app.transition_detached_window_state(103, DetachedWindowState::ParkedLive, "test_setup");
         app.update_detached_window_runtime_flags(103, false, "test_setup");
 
-        app.music_analysis_path = Some(PathBuf::from(r"C:\music\live.flac"));
+        app.music_analysis_source = Some(music_source_for_test(
+            &app,
+            PathBuf::from(r"C:\music\live.flac"),
+        ));
         app.music_pcm = Some(std::sync::Arc::new(
             crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0),
         ));
@@ -64700,7 +64974,7 @@ mod still_window_mode_key_tests {
         assert_eq!(app.last_active_detached_window_id, None);
         assert!(!app.detached_viewer_independent_active);
         assert!(!app.detached_viewer_open_next_still_detached_once);
-        assert!(app.music_analysis_path.is_none());
+        assert!(app.music_analysis_source.is_none());
         assert!(app.music_pcm.is_none());
         assert!(
             !app.main_font_update_pending,
@@ -83823,9 +84097,15 @@ fn only_leaving_the_video_lets_go_of_the_held_wave_worker_without_a_session() {
         app.video_seek_strip_wave_holdover = Some(native_video::HeldSeekStripWaveWorker {
             owner_fs_idx: 0,
             path: path.clone(),
+            audio_stream_index: Some(0),
             source_epoch: 1,
             items_generation: app.items_generation,
-            worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path, None),
+            worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+                path,
+                Some(0),
+                Some(0),
+                None,
+            ),
         });
 
         app.close_video_seek_strip(cause);

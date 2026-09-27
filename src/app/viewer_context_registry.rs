@@ -3548,10 +3548,35 @@ impl App {
         let scan_candidate = self.normalize_state.as_ref().and_then(|state| {
             (state.owner_context_id == source).then(|| (state.fs_idx, state.file_path.clone()))
         });
+        let music_candidate = self
+            .music_analysis_source
+            .as_ref()
+            .filter(|source_key| source_key.owner_context_id == source)
+            .cloned();
         let (id, ops) = self.viewer_contexts.table.plan_fork(policy);
         self.execute_viewer_context_ops(ops, Some(spec));
         let finished = self.viewer_contexts.table.finish_fork();
         assert_eq!(finished, id);
+        // Music analysis lives on App, outside the viewer bundle. Transfer its exact
+        // source and worker inbox only when the same player and applied track moved.
+        if let Some(old_source) = music_candidate {
+            let mut moved_source = old_source.clone();
+            moved_source.owner_context_id = id;
+            let player_moved = self
+                .with_viewer_context(id, |owner| {
+                    owner.music_analysis_source_for_player(moved_source.fs_idx)
+                        == Some(moved_source.clone())
+                })
+                .expect("freshly forked viewer context must mount for music transfer");
+            if player_moved && self.music_analysis_source.as_ref() == Some(&old_source) {
+                self.music_analysis_source = Some(moved_source.clone());
+                if let Some(pending) = self.music_analysis_pending.as_mut()
+                    && pending.source == old_source
+                {
+                    pending.source = moved_source;
+                }
+            }
+        }
         // A fork may move a live player. The scan and unresolved lookup then
         // follow that exact player into the new viewer, regardless of fork policy.
         let norm_enabled = self.settings.audio_normalize_enabled;
@@ -3665,6 +3690,13 @@ impl App {
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_retire();
         self.normalize_lookup_pending.remove(&id);
+        if self
+            .music_analysis_source
+            .as_ref()
+            .is_some_and(|source| source.owner_context_id == id)
+        {
+            self.clear_music_view_state();
+        }
         if self
             .normalize_state
             .as_ref()
@@ -4500,7 +4532,12 @@ mod tests {
         let path = dir.path().join("context-a.mp4");
         let mut app = crate::app::setup_app_for_test();
         app.fullscreen_idx = Some(4);
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let worker_id = worker.identity_for_test();
         app.seed_video_seek_strip_context_for_test(path, worker, 41, 17, 42);
         let owner = app.video_seek_strip_context_owner_for_test().unwrap();
@@ -4542,13 +4579,18 @@ mod tests {
         held_app.fullscreen_idx = Some(6);
         held_app.video_seek_strip_next_session_id = 72;
         let held_path = dir.path().join("held.mp4");
-        let held_worker =
-            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(held_path.clone(), None);
+        let held_worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            held_path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let held_id = held_worker.identity_for_test();
         held_app.video_seek_strip_wave_holdover =
             Some(crate::app::native_video::HeldSeekStripWaveWorker {
                 owner_fs_idx: 6,
                 path: held_path,
+                audio_stream_index: Some(0),
                 source_epoch: 8,
                 items_generation: held_app.items_generation,
                 worker: held_worker,
