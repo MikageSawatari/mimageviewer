@@ -533,6 +533,8 @@ x64 で `+crt-static` なので VC runtime 検査の追加設定は不要 (`chec
 
 2026-09-27 の再レビュー修正では、直接 PDF/EPUB open も列挙成功までは元の rows・surface・selection を保持する。warm `pdf_meta` placeholder は直接 open の未採用表示には使わない。詳細は同じ [履歴 plan §11](folder-history-location-plan.md#11-epub-統合時の履歴-open-所有2026-09-27設計担当決定) を参照。
 
+**2026-09-28 利用者決定（実装前）**: 上の 2026-09-27 の直接 open / placeholder 記述は [履歴 plan §12](folder-history-location-plan.md#12-epub-モーダルと直接-pdf-の採用境界2026-09-28利用者決定実装前設計) により更新する。Ask / Convert の未変換 EPUB は、確認を省く設定でも変換の全相で進捗・取消の modal を表示して他の local open admission を止める。Ignore は変換を開始しない。`pdf_meta` の条件を満たす直接 PDF と固定済み EPUB は placeholder を**可視採用**として address・履歴・A/B と同時に確定し、検証列挙を続ける。cold 直接 open と履歴 staged preflight は成功採用まで旧表示を保つ。warm 本から staged 履歴または cold 直接 open を始めても元の列挙は admission で取り消さず、新しい要求の成功採用または通常の leave / close まで source owner が保持する。単冊変換中の直接-to-直接 hand-off は modal gate により到達不能であり、cold 列挙中の supersession だけが共通 admission で typed restore を消費する。右クリック一括 EPUB→PDF は RAR 一括変換と同様、独立した modal を保つ。Remote は変換せず別 session を閲覧する。§12 の行列・削除対象・回帰テストを実装時の正本とする。
+
 ### S3a 一覧・分類・D5 (2026-09-26)
 
 EPUB の論理パスを `PdfFile` / `PdfPage` に保持する。一覧・検索・評価・コレクションが

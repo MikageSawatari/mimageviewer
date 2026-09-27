@@ -170,3 +170,62 @@ EPUB→PDF 統合との merge は案 A を採用する。変換ダイアログ�
 history の PDF/EPUB preflight は `PdfEnumerateResult` 全体（ページ、綴じ方向、世代 stamp）を渡し、直接 open と共通の prepared-PDF 成功処理で採用する。history の採用に仮ページや一時的な `pdf_enumerate_pending` owner は作らない。worker は既知の item kind があっても実 file／directory を判定し、`.epub` 名の directory を Folder として扱う。page flip と ZIP 内部階層は外側履歴の一点のままである。
 
 ダイアログの「変換して開く」は元の論理 `.epub` target へ戻る。「PDF を保存」は sibling `.pdf` を**明示的な新しい行き先**として再 preflight し、成功時にだけ採用する。Back／Forward の head が EPUB だった場合、その entry を pop しない。Collection root の明示 open では既存の source anchor/provenance を維持できる場合に維持し、EPUB entry の外へ出る Collection child replay は独立した物理行き先となる。fullscreen lock と parked／retired context は同じ staged request の終端で片付ける。
+
+## 12. EPUB モーダルと直接 PDF の採用境界（2026-09-28、利用者決定・実装前設計）
+
+本節は §11 の 2026-09-27 実装記録のうち、**変換中に別の open が直接／履歴 owner を退役できる**という記述と、**warm `pdf_meta` placeholder を直接 open で出さない**という記述を更新する。§11 の typed `Direct(owner)` / `StagedHistory(context, request_id)`、`NotConverted`、staged preflight、Save PDF の独立 destination、detached の context 所有は維持する。本節は設計であり、以下の実装・テスト・実機確認は未実施。
+
+### 12.1 D-A: EPUB 変換中の入力所有
+
+`EpubConvertState` が生成された時点から、その worker の成功・取消・失敗の終端（失敗画面では利用者が閉じるまで）まで、**同じ可視ダイアログと同じ `modal_dialog_block_reason() == Some("epub_convert")`** を維持する。`epub_convert_dialog_visible()` は確認省略設定や `Scanning` 相ではなく typed state の生存から導く。描画側も `Scanning`、`Confirm`、`Converting`、`Saving`、`Stale`、`Error`、`SaveError` の全相でダイアログを描く。必要なら `egui::Modal` に寄せ、ダイアログ内の取消・再試行・閉じる以外の背面 keyboard、mouse、wheel、gamepad、ring、toolbar、bookmark、detached 窓からの open を通さない。取消は走行中も利用可能で、cancel token と owner 終端が一度だけ source を復元する。閉じるボタン、Esc、worker failure、window close も同じ終端を使う。
+
+`archive_file_handling=Ask` は inspect・確認・変換・保存・終端表示まで同じ modal。`Convert`（「確認せず変換する」）は確認画面だけを省略し、開始直後から進捗・取消を表示する。`Ignore` は `NotConverted` を通知して **変換 state を作らず** source を維持する。変換済み EPUB は PDF 読み取り経路へ進み、変換 modal は作らない。直接 open は `Direct(owner)`、Back/Forward/BS と Rating/Collection child replay は `StagedHistory(context, request_id)` を child continuation とする。成功した staged conversion は同じ ID で PDF preflight へ戻り、可視採用前に履歴・A/B を変更しない。Remote は別 session の読み取りのみで変換を開始せず、未変換を PC で開くよう案内する。
+
+右クリックの複数 EPUB「PDF ファイルに変換」は **既存 `EpubBatchPending` の独立した `egui::Modal` を維持**する。単冊 open の論理 `.epub` destination / history continuation を持たず、sibling PDF 保存と一覧更新を行う操作だから単冊ダイアログへ合流させない。RAR の一括 ZIP 変換と同じく全 batch の処理中・結果確認中は背面 open を遮断し、取消は現在の一冊が終わった後に停止する既存規則とする。batch 開始時に同じ context の未採用 direct open または staged transition があれば開始を拒否し、古い要求の completion が batch 中に表示を差し替えないようにする。batch 完了の一覧更新は modal が所有する通常の refresh とし、外側 history を書かない。
+
+UI の modal guard だけでは非同期入口を覆えない。単冊 EPUB / batch の modal owner が生きている間は、**新しい local open を受け付ける全 admission 境界**でも拒否し、どの cancel / rollback / worker spawn より先に判定する。変換自身の `Direct(owner)` または同じ `(context, request_id)` の内部 resume、dialog 内の Cancel / Retry / Save PDF だけを許す。同じ path の再 open も新しい要求なので例外にしない。受け付けなかった入力は source、履歴、A/B、変換 owner を変えない。起動中に single-instance / ファイル関連付けの activation が届いた場合は channel から取り出して resolver を起動・旧 owner を取消す前に保留し、modal 終端後に既存の「最後の activation を優先」規則で最新の path を再検証・admit する。すでに走る resolver の completion も終端まで可視採用させない。初回 startup restore は通常この modal より先に一度だけ始まるが、遅い completion も同じ gate と owner 照合を通す。終了要求は新しい open ではなく、変換を cancel して閉じる。detached の既存 worker completion はその typed context へだけ適用し、modal owner や main history を退役させない。
+
+`epub_convert` は viewer context bundle に入るため、modal gate を投影中の `App.epub_convert` だけから判定しない。main / active detached / parked detached の typed owner を registry から解決し、どの window の入力から来た要求でも現在の単冊 modal owner を見つける。ダイアログは owner window で描き続け、window の投影切替や OS focus 移動だけで見えないまま入力を止めない。`modal_dialog_block_reason` の報告と描画、共有 admission predicate はこの同じ owner に従う。batch は App-global な別 owner だが同じ gate の排他的な候補であり、同時に単冊変換を開始しない。
+
+したがってレビューの `S → direct EPUB A が NotConverted/変換中 → direct PDF B` は、keyboard / mouse / gamepad / toolbar / bookmark / detached の入力でも、activation / startup の非同期入力でも、**B の admission が変換終端まで成立しない**。A の cancel は A 自身の rollback で S へ戻し、その後に B を新規要求として扱う。変換中の直接 open の restore を B へ hand-off する経路は不要である。
+
+### 12.2 D-B: warm 直接 PDF/EPUB の表示を採用として確定する
+
+直接 PDF open は、released `pdf_meta` の stamp・page count・パスワード・綴じ方向条件を満たす warm hit なら、page placeholder の install を**可視採用**として扱う。rows / surface / selection / address / typed 現在地 / Back・Forward / Rating・Collection provenance / A/B の記憶先と active slot は同じ採用境界で確定する。検証列挙は裏で続け、page count 一致なら一覧を再構築せず cache を更新し、異なればその**採用済み PDF 地点の**ページ一覧を修正する。正常な cached EPUB も固定世代 `(generation_id, pdf_size)` と方向条件が一致すれば同じ PDF 経路の warm hit とする。未変換・未固定 EPUB、方向確定待ち、password 不明、cache miss では placeholder を出さない。`pdf_meta` 判定のため UI thread に新たな file / DB probe を足さない。
+
+placeholder を出した時点で旧地点への rollback は**消費済み**であり、列挙失敗・パスワード要求は現在の PDF 地点の明示的な error / password 処理に入る。旧 rows へ戻すための部分的な snapshot は作らない。対して cold 直接 PDF/EPUB は列挙成功まで旧 rows・surface・selection を保ち、早期に変わる address / history 意図等は typed restore が所有する。失敗・Cancel なら元の表示・address・stack・A/B へ復元する。EPUB が `NotConverted` ならその restore を modal child が引き継ぐ。
+
+warm PDF の検証列挙 pending は **採用済み source の owner** であり、後から staged history を受け付けても admission では cancel しない。staged transition は確定した PDF 地点を source として捕捉する。検証結果が staged preflight 中に到着したら、同じ pending owner が結果を保持し、staged が失敗・取消なら source PDF に照合・反映する。staged が成功した時だけ、その採用境界で source の列挙を退役させる（同じ PDF を開く場合は新 waiter を登録してから旧 waiter を外す）。これで source の rows generation を preflight 中に勝手に進めず、staged の source guard と競合させない。通常の leave / close も pending owner を退役させ、遅い completion は採用できない。
+
+新しい **cold 直接 B** を受け付けた場合も、既に可視採用した PDF A の検証 owner を B の可視採用まで保持する。A と B は異なる要求であり、B の列挙・password prompt・EPUB conversion を A の検証 owner と同じ pending slot で上書きしない。per-context の document-open owner を `CommittedVerification(A)` と `CandidateDirect(B, retained_source_verification: A)` のような排他的な相に整理し、同じ要求の二重 owner や独立した `pdf_enumerate_pending` field を増やさない。B が失敗・取消なら A の検証結果を A の地点へ反映し、B が成功採用されたら A を退役させる。新しい B が warm hit で即採用されればその境界で A を退役させる。B の未採用中に A の結果が届いても staged の場合と同じく表示更新を保留する。A が正常な通常の leave / close を受ければ A を退役させる。
+
+### 12.3 D-C: supersession / rollback 行列
+
+表の「直接」は `Navigation`、`RatingPhysical`、`QuickFolderSwitch`、`CollectionGridPhysical`、`MainGridArchive`、`Bookmark` と、その context に解決された startup / activation を含む。「staged」は物理・Collection child・Rating entry/replay・Back/Forward/BS の準備要求を含む。列はいずれも **同じ viewer context の、scope 確認済みで実際に受け付けた新要求**。拒否された scope / modal / 古い request ID / worker 開始失敗は supersession を起こさない。
+
+| 既存の in-flight / source | 新しい直接 open | 新しい staged open |
+| --- | --- | --- |
+| 未採用の cold 直接 PDF/EPUB 列挙（`NotConverted` 到着前） | admission で旧 owner を cancel、旧 typed restore を**一度だけ復元**してから新要求の source を捕捉する。新要求の失敗・取消は旧直接 open より前の地点へ戻る | 同じ順序で復元してから staged source snapshot を取る。失敗・取消で旧地点を維持する |
+| 直接 PDF の password prompt、直接／staged EPUB の inspect・convert・save・error modal、EPUB/RAR batch modal | **admission 不可**。dialog の Cancel / Retry / Close または同一 typed continuation だけ動く | **admission 不可**。Back/Forward head と A/B を消費しない |
+| warm placeholder を可視採用した直接 PDF/固定済み EPUB の検証列挙 | 採用済み本を source とする。cold 直接候補 B と source 検証 A は異なる要求として同じ typed document-open owner に収め、B の可視採用または明示 leave / close まで A を維持する。B 失敗・取消なら A の結果を照合・反映する | 採用済み本を staged source とする。旧検証を admission で cancel せず、staged terminal まで結果を保持。staged 成功採用時に退役、失敗・取消なら PDF view を更新する |
+| 物理・Collection・Rating の staged preflight / replay（可視未採用） | admission で旧 request ID を退役し、旧表示・履歴を source として新要求を準備する。旧 late result は無視する | admission で旧 ID を退役し、旧表示・履歴から新 ID を準備する。Back/Forward pop は勝者の成功採用時だけ |
+| startup restore / activation / bookmark の path resolver、folder pane scan、A/B switch の未採用候補 | admission と同じ context ID / request ID で旧候補を退役し、旧表示・履歴を保持する。scope 拒否・worker 開始失敗なら旧候補を保持する。activation の「最後の要求」は解決後の scope admission まで先行候補を破壊しない | 同じ規則。古い resolver / scan completion は新しい staged owner を採用・cancel できない |
+| 同じ context の ZIP/RAR 等の未採用 open / conversion | 既存の typed owner と modal の規則に従う。modal 中は admission 不可。非 modal の旧準備は採用済み source を変えず退役する | 同左。ZIP 内部移動は外側 history を増やさない |
+| in-flight 無し／前要求が成功採用済み | 採用済み現在地を source として通常の直接 open | 採用済み現在地を source として staged preflight |
+| **別 viewer context** の pending（main 対 detached、detached 同士） | 所有 context のみで処理。sibling の pending、rows、history は触らない | 同左。detached は main の Back/Forward owner にならない |
+| Remote の独立した page / book request | Remote session を変えず、local current と history のみを新要求の成功採用時に変更する | 同左。Remote の未変換 EPUB は変換を起こさない |
+
+入力経路ごとの admission 判定: keyboard（検索/Fullscreen を含む）、mouse の tile・address・folder pane、ring / gamepad、toolbar、A/B、bookmark は可視 modal と同じ gate に入る。pane scan は worker spawn より前に gate を通し、候補 scan / refresh と明示 navigation を区別する。detached は window lease から destination context を決め、main に投影中という理由で main の staged owner を退役させない。single-instance / ファイル関連付け activation は modal 中に保留し、解除後に resolve・scope 判定する。startup restore は初回 owner の completion を同じ gate で照合する。Remote は App の local open admission を使わず別 session で閲覧し、EPUB 変換も local history 書き込みも行わない。Remote の **local control acquisition** がある場合は通常の main context admission として modal gate を通す。新要求の未採用中に別 context の worker が終わっても、各 context ID と request ID で照合して sibling を変えない。
+
+実装時は、scope / owner 有効性確認 → modal admission → 新 worker / preflight の開始可能性を確認 → **accepted admission** で同一 context の未採用直接要求を一か所で settle → 新 source 捕捉 / request 登録、の順とする。拒否や開始失敗は旧 owner を退役させない。warm 採用済み owner は settle の対象外で、source verifier として次の候補へ渡す。現行 `retire_direct_document_open_for_history_admission` の二つの history 専用呼出しを、直接→直接にも共通のこの境界へ移す。直接 EPUB 変換の `finish_epub_convert(Superseded)` restore hand-off、`replace_epub_convert_state` の旧変換 restore 継承、通常 open の `cancel_superseded_epub_convert()`、pane scan の `finish_epub_convert(Superseded)` / `inherited_restore` hand-off、warm owner に残る rollback、history admission 時の無条件 `pdf_enumerate_pending.take()` / placeholder clear は不要にする。pane scan 自身の取消・replaced-result 所有は別途必要なので、`PaneOpenRestoreExit` 全体を機械的に消さず共通 admission と整合させる。一方、**cold** PDF/EPUB の typed restore、単冊 dialog の Cancel 復元、staged child の request ID、warm 列挙 owner と late-result guard、同じ path の waiter 合流は残す。`Option` の有無で未採用/採用済みを推測せず、排他的な owner の相で表す。
+
+### 12.4 実装時に必要な回帰テストと smoke
+
+1. Ask / Convert の直接・staged EPUB で、inspect / progress / save / error の全相に dialog と `epub_convert` block reason が同時にあり、Cancel が source の rows・selection・address・stack・A/B を戻す。Convert は Confirm を出さず progress を出す。Ignore は `NotConverted` を型付き terminal として扱い、変換 worker を作らない。既存の実 EPUB fixture を使い、staged の Rating/Collection/Back/Forward/BS と Save PDF の独立 destination を再確認する。
+2. modal 中の keyboard、mouse、ring/gamepad、toolbar、A/B、bookmark、detached open が新 owner を作らず、直接 EPUB A → 直接 PDF B が成立しない。activation は解除後に最新 path を一回だけ admit し、modal 中は resolver / 旧 owner を退役させない。遅い startup/bookmark completion と同一 continuation の resume を検証する。
+3. RAR 式の EPUB batch dialog は開始から結果を閉じるまで block reason を返し、Cancel after current、同名 PDF skip、一覧 refresh を確認する。既存の未採用 direct / staged がある時は batch を開始しない。
+4. warm `pdf_meta` hit の直接 PDF と固定済み EPUB を実 load し、placeholder の初回 frame で rows・surface・selection・address・history・Rating/Collection provenance・A/B が一致することを確認する。cold miss、未固定 EPUB、綴じ方向待ち、password 不足では placeholder を出さない。PDF count 一致/不一致、失敗/password、後着 result を検証する。性能は `epub_open.first_display` と PDF の同等計測で warm 初回表示を再測定する。
+5. warm PDF → staged history または cold 直接 B の admission → B 失敗/取消では PDF view と source 検証 owner を残し、結果が途中で到着しても terminal 後に反映する。B 成功時は一度だけ source 検証を退役し target を採用する。Back/Forward head と A/B は staged の成功まで動かさない。cold PDF A → direct B と cold A → staged B は、B の失敗/取消で A 前の表示・address・stack・A/B へ戻る。新しい各動作テストは変更前に失敗することを確認する。
+6. main staged pending 中の detached cached archive / bookmark open、別 detached completion、Remote 閲覧は main を変えない。main と detached の sibling invariance、検索中の履歴拒否、ZIP/PDF 内部移動と BS を維持する。
+
+無人 `FolderHistory` portable smoke には、fixture PDF の warm 再 open → placeholder 表示と Back/Forward、staged 失敗/取消時の保持を、test-script が安定した初回表示 checkpoint を観測できる範囲で追加する。EPUB 実変換は WebView2 と dialog の Cancel / progress 操作を要するため無人 smoke へ入れず、利用者が承認する対話的検証 session で Ask、Convert、Ignore、変換中の別 open 拒否、変換取消後の履歴、固定世代の warm 再 open、batch Cancel を確認する。実アプリを agent が起動する前には既存の明示承認 gate に従う。
