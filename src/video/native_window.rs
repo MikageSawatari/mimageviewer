@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
@@ -135,7 +135,9 @@ pub enum NativeVideoWindowEvent {
     /// HUD button-down requested a presenter foreground/focus handoff. The
     /// wndproc only enqueues this; the pump applies USER32 focus work after
     /// message dispatch returns.
-    RequestFocusClaim,
+    RequestFocusClaim {
+        foreground_hwnd_at_down: u64,
+    },
     /// The OS lifetime of this HWND ended. The pump combines this with the
     /// stamped epoch and closes or loses the host without a render ack.
     Destroyed,
@@ -175,7 +177,7 @@ fn native_window_event_latest_slot(event: &NativeVideoWindowEvent) -> Option<usi
         | NativeVideoWindowEvent::MouseLeave
         | NativeVideoWindowEvent::Touch(_)
         | NativeVideoWindowEvent::CursorOwnership(_)
-        | NativeVideoWindowEvent::RequestFocusClaim
+        | NativeVideoWindowEvent::RequestFocusClaim { .. }
         | NativeVideoWindowEvent::Destroyed => None,
     }
 }
@@ -384,7 +386,7 @@ impl NativeVideoWindowEventSink {
                 | NativeVideoWindowEvent::GeometryChanged { .. }
                 | NativeVideoWindowEvent::DpiChanged { .. }
                 | NativeVideoWindowEvent::RequestRaiseHud
-                | NativeVideoWindowEvent::RequestFocusClaim
+                | NativeVideoWindowEvent::RequestFocusClaim { .. }
                 | NativeVideoWindowEvent::Destroyed
                 | NativeVideoWindowEvent::MouseMove(_)
                 | NativeVideoWindowEvent::MouseButton(_)
@@ -1229,6 +1231,182 @@ pub fn foreground_hwnd() -> u64 {
     unsafe { GetForegroundWindow().0 as u64 }
 }
 
+/// Foreground ownership shared by presenter recovery, HUD input and the VST host.
+/// A bridge process is not sufficient evidence: only its registered, visible
+/// editor window (or a child of that window) belongs to this UI group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForegroundUiGroup {
+    OwnProcess,
+    RegisteredEditor,
+    OtherBridgeWindow,
+    External,
+    Unknown,
+}
+
+pub(crate) fn classify_foreground_ui_group(
+    foreground_hwnd: u64,
+    foreground_pid: u32,
+    own_pid: u32,
+    root_hwnd: u64,
+    editor_hwnd_pids: &std::collections::HashMap<u64, u32>,
+    bridge_pids: &std::collections::HashSet<u32>,
+) -> ForegroundUiGroup {
+    if foreground_hwnd == 0 || foreground_pid == 0 {
+        ForegroundUiGroup::Unknown
+    } else if foreground_pid == own_pid {
+        ForegroundUiGroup::OwnProcess
+    } else if editor_hwnd_pids.get(&foreground_hwnd) == Some(&foreground_pid)
+        || editor_hwnd_pids.get(&root_hwnd) == Some(&foreground_pid)
+    {
+        ForegroundUiGroup::RegisteredEditor
+    } else if bridge_pids.contains(&foreground_pid) {
+        ForegroundUiGroup::OtherBridgeWindow
+    } else {
+        ForegroundUiGroup::External
+    }
+}
+
+pub(crate) fn hud_down_should_claim_presenter_focus(group: ForegroundUiGroup) -> bool {
+    group != ForegroundUiGroup::RegisteredEditor
+}
+
+pub(crate) fn foreground_ui_group(
+    editor_hwnd_pids: &std::collections::HashMap<u64, u32>,
+    bridge_pids: &std::collections::HashSet<u32>,
+) -> ForegroundUiGroup {
+    let hwnd = unsafe { GetForegroundWindow() };
+    ui_group_for_hwnd(hwnd.0 as u64, editor_hwnd_pids, bridge_pids)
+}
+
+pub(crate) fn ui_group_for_hwnd(
+    hwnd_raw: u64,
+    editor_hwnd_pids: &std::collections::HashMap<u64, u32>,
+    bridge_pids: &std::collections::HashSet<u32>,
+) -> ForegroundUiGroup {
+    use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
+
+    unsafe {
+        if hwnd_raw == 0 {
+            return ForegroundUiGroup::Unknown;
+        }
+        let hwnd = HWND(hwnd_raw as *mut _);
+        let mut pid = 0_u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let root = GetAncestor(hwnd, GA_ROOT);
+        let candidate = if editor_hwnd_pids.contains_key(&(hwnd.0 as u64)) {
+            hwnd
+        } else {
+            root
+        };
+        let registered_visible = !candidate.0.is_null()
+            && editor_hwnd_pids.contains_key(&(candidate.0 as u64))
+            && IsWindow(Some(candidate)).as_bool()
+            && IsWindowVisible(candidate).as_bool();
+        let empty_editors = std::collections::HashMap::new();
+        classify_foreground_ui_group(
+            hwnd.0 as u64,
+            pid,
+            GetCurrentProcessId(),
+            root.0 as u64,
+            if registered_visible {
+                editor_hwnd_pids
+            } else {
+                &empty_editors
+            },
+            bridge_pids,
+        )
+    }
+}
+
+static VST_BUTTON_TRACE_LINES: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn vst_button_editor_hint(editor_hwnds: &std::collections::HashSet<u64>) -> u64 {
+    use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let root = if foreground.0.is_null() {
+            foreground
+        } else {
+            GetAncestor(foreground, GA_ROOT)
+        };
+        [foreground.0 as u64, root.0 as u64]
+            .into_iter()
+            .find(|raw| editor_hwnds.contains(raw))
+            .or_else(|| editor_hwnds.iter().copied().next())
+            .unwrap_or(0)
+    }
+}
+
+/// Normal-log probe for a VST button edge, bounded across the process. The
+/// editor snapshot comes from the active bridge; no bridge IPC is performed.
+pub(crate) fn log_vst_button_probe(
+    edge: &str,
+    editor_hwnds: &std::collections::HashSet<u64>,
+    editor_raw_hint: Option<u64>,
+    presenter_hwnd: u64,
+    hud_hwnd: u64,
+    toggle_ran: bool,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GW_OWNER, GWL_EXSTYLE, GetWindow, IsIconic, WS_EX_TOPMOST,
+    };
+
+    if editor_hwnds.is_empty() || VST_BUTTON_TRACE_LINES.fetch_add(1, Ordering::Relaxed) >= 64 {
+        return;
+    }
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let foreground_root = if foreground.0.is_null() {
+            HWND(std::ptr::null_mut())
+        } else {
+            windows::Win32::UI::WindowsAndMessaging::GetAncestor(
+                foreground,
+                windows::Win32::UI::WindowsAndMessaging::GA_ROOT,
+            )
+        };
+        let foreground_editor = [foreground.0 as u64, foreground_root.0 as u64]
+            .into_iter()
+            .find(|raw| editor_hwnds.contains(raw));
+        let editor_raw = editor_raw_hint
+            .or(foreground_editor)
+            .or_else(|| editor_hwnds.iter().copied().next())
+            .unwrap_or(0);
+        let editor = HWND(editor_raw as *mut _);
+        let editor_alive = editor_raw != 0 && IsWindow(Some(editor)).as_bool();
+        let mut foreground_pid = 0_u32;
+        if !foreground.0.is_null() {
+            let _ = GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
+        }
+        let owner = if editor_alive {
+            GetWindow(editor, GW_OWNER).unwrap_or_default().0 as u64
+        } else {
+            0
+        };
+        let topmost = |raw: u64| {
+            raw != 0
+                && (GetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0)
+                    != 0
+        };
+        crate::logger::log(format!(
+            "[vst-button] edge={edge} foreground=0x{:x} pid={} editor=0x{:x} editor_alive={} foreground_editor={} editor_count={} owner=0x{:x} visible={} topmost={} iconic={} presenter=0x{:x} presenter_topmost={} hud=0x{:x} hud_topmost={} toggle_ran={toggle_ran}",
+            foreground.0 as u64,
+            foreground_pid,
+            editor_raw,
+            editor_alive,
+            foreground_editor.is_some(),
+            editor_hwnds.len(),
+            owner,
+            editor_alive && IsWindowVisible(editor).as_bool(),
+            editor_alive && topmost(editor_raw),
+            editor_alive && IsIconic(editor).as_bool(),
+            presenter_hwnd,
+            topmost(presenter_hwnd),
+            hud_hwnd,
+            topmost(hud_hwnd),
+        ));
+    }
+}
+
 pub fn thread_focus_hwnd() -> u64 {
     unsafe { GetFocus().0 as u64 }
 }
@@ -1846,7 +2024,9 @@ fn handle_native_touch_pointer_message(
         && ownership.contains(pointer_id)
         && let Some(sink) = sink
     {
-        sink.send(NativeVideoWindowEvent::RequestFocusClaim);
+        sink.send(NativeVideoWindowEvent::RequestFocusClaim {
+            foreground_hwnd_at_down: foreground_hwnd(),
+        });
     }
     Some(LRESULT(0))
 }
@@ -2699,6 +2879,42 @@ fn signed_high_word(value: isize) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registered_editor_is_internal_but_an_external_foreground_is_not() {
+        use super::{ForegroundUiGroup, classify_foreground_ui_group};
+        let editors = std::collections::HashMap::from([(0x301_u64, 42_u32)]);
+        let bridges = std::collections::HashSet::from([42_u32]);
+        assert_eq!(
+            classify_foreground_ui_group(0x302, 42, 7, 0x301, &editors, &bridges),
+            ForegroundUiGroup::RegisteredEditor,
+        );
+        assert_eq!(
+            classify_foreground_ui_group(0x401, 43, 7, 0x401, &editors, &bridges),
+            ForegroundUiGroup::External,
+        );
+        assert_eq!(
+            classify_foreground_ui_group(0x201, 7, 7, 0x201, &editors, &bridges),
+            ForegroundUiGroup::OwnProcess,
+        );
+        assert_eq!(
+            classify_foreground_ui_group(0, 0, 7, 0, &editors, &bridges),
+            ForegroundUiGroup::Unknown,
+        );
+        assert_eq!(
+            classify_foreground_ui_group(0x303, 42, 7, 0x303, &editors, &bridges),
+            ForegroundUiGroup::OtherBridgeWindow,
+        );
+        assert_eq!(
+            classify_foreground_ui_group(0x301, 43, 7, 0x301, &editors, &bridges),
+            ForegroundUiGroup::External,
+        );
+        assert!(!super::hud_down_should_claim_presenter_focus(
+            ForegroundUiGroup::RegisteredEditor,
+        ));
+        assert!(super::hud_down_should_claim_presenter_focus(
+            ForegroundUiGroup::External,
+        ));
+    }
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
@@ -2919,7 +3135,9 @@ mod tests {
             pump_route,
             render_route,
         );
-        sink.send(NativeVideoWindowEvent::RequestFocusClaim);
+        sink.send(NativeVideoWindowEvent::RequestFocusClaim {
+            foreground_hwnd_at_down: 0,
+        });
         sink.send(NativeVideoWindowEvent::MouseButton(
             NativeVideoMouseButtonEvent {
                 receipt: crate::mouse_seek_debug::test_receipt(77),
@@ -3116,7 +3334,9 @@ mod tests {
             shift: false,
             ctrl: false,
         }));
-        sink.send(NativeVideoWindowEvent::RequestFocusClaim);
+        sink.send(NativeVideoWindowEvent::RequestFocusClaim {
+            foreground_hwnd_at_down: 0,
+        });
         sink.send(NativeVideoWindowEvent::CloseRequested { generation: 7 });
 
         let pump = pump_rx.drain();
@@ -3128,7 +3348,7 @@ mod tests {
         assert_eq!(pump[0].source, NativeVideoWindowSource::Presenter);
         assert!(matches!(
             pump[1].event,
-            NativeVideoWindowEvent::RequestFocusClaim
+            NativeVideoWindowEvent::RequestFocusClaim { .. }
         ));
         assert!(matches!(
             pump[2].event,

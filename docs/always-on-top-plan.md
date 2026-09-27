@@ -1,5 +1,22 @@
 # §1.250 「常に最前面」Stage A 設計 / Stage B 実装
 
+## 2026-09-27 VST editor 前面からの HUD 操作
+
+ON 時に VST editor 内をクリックしてから HUD の VST ボタンを押すと、editor だけが消え、
+動画の右上 1/4 表示と VST パネルが残る報告を受けた。source 調査では bridge-process editor を
+presenter 復旧が外部 foreground と誤分類し、HUD down も presenter focus を無条件要求していた。
+登録済み可視 editor HWND と bridge PID を共有分類に使い、editor から HUD への down では
+focus 要求と presenter raise を起こさない。bridge の別 popup と本当の外部アプリは区別し、
+外部アプリからの復旧を維持する。presenter touch は editor 前面でも focus claim を維持し、
+editor の HWND/PID 登録と bridge PID 集合は不変 snapshot を一回で公開し、公開準備中も直前の完全な
+snapshot で HUD focus を分類する。登録済み editor からの HUD 操作では claim を抑え、
+presenter が owner の可視 popup でも未登録なら抑止しない。
+OS 上の実際の hide/occlusion と mouse-up 到達は未測定なので、
+VST ボタン操作に限定した通常ログで HWND owner/可視/topmost/iconic と down/up/toggle を観測する。
+headless の pump/App テストは window level ごとの実際の順序を再現しない。smoke copy には
+VST bridge がない。この事象の ON/OFF での editor 可視性・パネル・compact layout の同期は、
+ユーザーが通常 profile の確認 build で実機確認済み。ON 固有の z-order はこの実機確認に基づく。
+
 作成・改訂: 2026-09-27 / Codex。Stage A の設計は独立レビューの指摘を反映済みで、Stage B の製品コードと smoke シナリオを実装した。実アプリ smoke は設計 owner による実行待ち。対象は mIV の main と閲覧用 top-level host。設定既定 OFF、明示 ON の間だけ host を topmost にする。切替自体は activation を要求しない。仕様は [backlog §1.250](next-release-backlog.md#L438)。
 
 ## 1. 現在の窓と z-order の棚卸し

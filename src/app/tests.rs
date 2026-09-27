@@ -22193,6 +22193,108 @@ mod favorite_adjustment_defaults_tests {
 
     #[cfg(windows)]
     #[test]
+    fn vst_button_toggle_keeps_panel_editor_request_and_compact_mode_together() {
+        // This headless command-bus test cannot model the real VST editor's
+        // foreground/z-order relationship. ON ordering needs a real-profile run.
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = app.items.len();
+        let path = PathBuf::from(r"C:\clips\vst-toggle-test.mp4");
+        app.items.push(GridItem::Video(path.clone()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        let probe = player.install_native_ui_probe_for_test();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.dsp_bridge.mark_enabled_without_bridge_for_test();
+        app.settings.vst3_enabled = true;
+        app.settings.vst3_gui_visible = true;
+        app.settings.vst3_video_compact = true;
+        app.show_vst3_manager = true;
+
+        assert!(app.build_native_video_vst3_panel().is_some());
+        assert!(super::native_video::native_vst_video_compact(
+            true, true, true
+        ));
+
+        app.sync_native_video_vst3_available(idx);
+        app.sync_native_video_vst3_panel(idx);
+        assert!(
+            probe.drain_ui_commands().iter().any(|command| matches!(
+                command,
+                crate::video::NativeUiCommandForTest::Compact(true)
+            ))
+        );
+        let commands = crate::video::native_presenter::overlay_draw::tests::vst_button_pointer_commands_for_test();
+        assert_eq!(commands.len(), 1);
+        for command in commands {
+            probe.send_overlay_command(command);
+        }
+        let events = match app.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.drain_native_presenter_events(),
+            _ => panic!("missing native player"),
+        };
+        assert_eq!(events.len(), 1, "one completed HUD toggle");
+        for event in events {
+            app.handle_native_video_output_event(&ctx, idx, event.source_epoch, event.event);
+        }
+        app.sync_native_video_vst3_available(idx);
+        app.sync_native_video_vst3_panel(idx);
+        assert!(!app.show_vst3_manager);
+        assert!(!app.settings.vst3_gui_visible);
+        assert!(!app.dsp_bridge.gui_all_visible_desired_for_test());
+        assert!(app.build_native_video_vst3_panel().is_none());
+        let sent = probe.drain_ui_commands();
+        assert!(sent.iter().any(|command| matches!(
+            command,
+            crate::video::NativeUiCommandForTest::Compact(false)
+        )));
+        assert!(
+            sent.iter().any(|command| matches!(
+                command,
+                crate::video::NativeUiCommandForTest::Panel(None)
+            ))
+        );
+
+        probe.send_overlay_command(
+            crate::video::native_presenter::NativeOverlayCommand::ToggleVst3Gui,
+        );
+        let events = match app.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.drain_native_presenter_events(),
+            _ => panic!("missing native player"),
+        };
+        assert_eq!(events.len(), 1);
+        for event in events {
+            app.handle_native_video_output_event(&ctx, idx, event.source_epoch, event.event);
+        }
+        app.sync_native_video_vst3_available(idx);
+        app.sync_native_video_vst3_panel(idx);
+        assert!(app.show_vst3_manager);
+        assert!(app.settings.vst3_gui_visible);
+        assert!(app.dsp_bridge.gui_all_visible_desired_for_test());
+        let sent = probe.drain_ui_commands();
+        assert!(
+            sent.iter().any(|command| matches!(
+                command,
+                crate::video::NativeUiCommandForTest::Compact(true)
+            ))
+        );
+        assert!(sent.iter().any(|command| matches!(
+                command,
+                crate::video::NativeUiCommandForTest::Panel(Some(panel)) if panel.visible && panel.video_compact
+            )));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn passive_detached_builder_explicitly_follows_window_level() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

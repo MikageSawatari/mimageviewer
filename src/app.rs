@@ -59562,7 +59562,7 @@ impl App {
                             self.settings.ui_font.clone(),
                             self.settings.fullscreen_cursor_hide_delay_secs,
                             // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
-                            Some(self.dsp_bridge.editor_hwnds_snapshot()),
+                            Some(self.dsp_bridge.editor_ui_snapshot()),
                             self.main_hwnd.unwrap_or(0) as u64,
                             self.creative_lut_library.video_snapshot(
                                 &self.settings.creative_luts,
@@ -81285,9 +81285,7 @@ fn native_video_presenter_config(
     text_contrast: crate::settings::TextContrast,
     ui_font: crate::settings::UiFontSettings,
     cursor_hide_delay_secs: f32,
-    editor_hwnds_snapshot: Option<
-        std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
-    >,
+    editor_ui_snapshot: Option<crate::video::dsp::SharedEditorUiSnapshot>,
     main_hwnd_for_raise: u64,
     video_grade: crate::creative_lut::VideoGradeSnapshot,
     scale_filter: crate::settings::VideoScaleFilter,
@@ -81325,7 +81323,7 @@ fn native_video_presenter_config(
         cursor_hide_delay_secs: crate::settings::clamp_fullscreen_cursor_hide_delay_secs(
             cursor_hide_delay_secs,
         ),
-        editor_hwnds_snapshot,
+        editor_ui_snapshot,
         main_hwnd_for_raise,
         video_grade,
         bar_lock: bar_lock.clamped(),
