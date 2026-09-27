@@ -117,6 +117,9 @@ pub struct GuiSignalChanges {
 /// 各所有者内では `Arc<DspBridge>` 化して audio-pump / worker と制御側から共有アクセス。
 pub struct DspBridge {
     inner: Mutex<DspBridgeInner>,
+    gui_owner_policy: GuiOwnerPolicy,
+    latency_policy: LatencyPolicy,
+    strict_state: bool,
     /// audio-pump thread が高速判定するためのフラグ。Mutex を取らずに読める。
     enabled: AtomicBool,
     /// 「処理対象スロット (= Loaded 且つ bypass=false) の個数」を atomic で公開。
@@ -183,6 +186,18 @@ pub struct DspBridge {
     /// 済みなら新 worker が disable で wipe するため副作用なし、(b) 既に add 済みの
     /// プラグインも新 worker の disable→add ループで上書きされる。
     chain_rebuild_gen: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuiOwnerPolicy {
+    Auto,
+    FixedMain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LatencyPolicy {
+    AutoBypass,
+    ReportOnly,
 }
 
 struct DspBridgeInner {
@@ -260,6 +275,14 @@ pub(crate) struct PluginSlot {
 
 impl DspBridge {
     pub fn new() -> Arc<Self> {
+        Self::new_with_policies(GuiOwnerPolicy::Auto, LatencyPolicy::AutoBypass, false)
+    }
+
+    pub fn new_with_policies(
+        gui_owner_policy: GuiOwnerPolicy,
+        latency_policy: LatencyPolicy,
+        strict_state: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(DspBridgeInner {
                 state: DspState::Disabled,
@@ -267,6 +290,9 @@ impl DspBridge {
                 next_slot_id: 0,
                 last_z_order_snapshot: Vec::new(),
             }),
+            gui_owner_policy,
+            latency_policy,
+            strict_state,
             enabled: AtomicBool::new(false),
             active_slot_count: AtomicUsize::new(0),
             session_disabled_reason: Mutex::new(None),
@@ -427,8 +453,20 @@ impl DspBridge {
         use windows::Win32::System::Threading::GetCurrentProcessId;
         use windows::Win32::UI::WindowsAndMessaging::{
             GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
-            WindowFromPoint,
+            IsWindow, WindowFromPoint,
         };
+
+        if self.gui_owner_policy == GuiOwnerPolicy::FixedMain {
+            let main = self.main_hwnd.load(Ordering::Acquire);
+            if main != 0
+                && unsafe { IsWindow(Some(windows::Win32::Foundation::HWND(main as *mut _))) }
+                    .as_bool()
+            {
+                return main;
+            }
+            crate::logger::log("[VST3 GUI] fixed main owner is unavailable".to_string());
+            return 0;
+        }
 
         // 1. フルスクリーン中は presenter HWND を強制 (= cursor 依存判定をバイパス)。
         let fullscreen = self.fullscreen_owner_hwnd.load(Ordering::Acquire);
@@ -630,7 +668,10 @@ impl DspBridge {
                 ));
                 s.latency_samples = latest;
                 // 個別 plugin 単独で上限超過 → 即 bypass
-                if latest > max_samples && !s.bypass {
+                if self.latency_policy == LatencyPolicy::AutoBypass
+                    && latest > max_samples
+                    && !s.bypass
+                {
                     crate::logger::log(format!(
                         "[VST3 PDC] AUTO-BYPASS (individual): '{}' latency {} samples ({:.1}ms) \
                          exceeds {:.1}s cap.",
@@ -649,7 +690,7 @@ impl DspBridge {
         // ── Step 2: active 合計超過チェック + 最大 latency slot の auto-bypass loop ──
         // 個別では cap 内でも、合計が超えるケース (例: 1973ms + 50ms = 2023ms) に対応。
         // 合計が cap 以下になるまで、active で最大 latency の slot を bypass し続ける。
-        loop {
+        while self.latency_policy == LatencyPolicy::AutoBypass {
             let total: u32 = inner
                 .slots
                 .iter()
@@ -896,7 +937,13 @@ impl DspBridge {
                     }
                 }
                 bridge
-                    .open_audio_pipe(plugin_path, sample_rate, block_size, initial_state)
+                    .open_audio_pipe(
+                        plugin_path,
+                        sample_rate,
+                        block_size,
+                        initial_state,
+                        self.strict_state,
+                    )
                     .map_err(|e| format!("open_audio_pipe: {e}"))?;
                 (Arc::new(bridge), 0)
             }
@@ -910,7 +957,13 @@ impl DspBridge {
 
         if slot_id != 0 {
             bridge_arc
-                .add_plugin_to_chain(slot_id, plugin_path, initial_state, bypass)
+                .add_plugin_to_chain(
+                    slot_id,
+                    plugin_path,
+                    initial_state,
+                    bypass,
+                    self.strict_state,
+                )
                 .map_err(|e| format!("add_plugin_to_chain: {e}"))?;
         }
 
@@ -1105,6 +1158,37 @@ impl DspBridge {
         out
     }
 
+    /// Request the first loaded plugin's state without occupying the normal
+    /// bridge event channel. The receiver may be waited on by a worker.
+    pub fn query_first_state_concurrent(
+        &self,
+    ) -> Result<crossbeam_channel::Receiver<Result<String, String>>, String> {
+        let (bridge, slot_id) = {
+            let inner = self.inner.lock().unwrap();
+            let slot = inner
+                .slots
+                .first()
+                .ok_or_else(|| "no EffeTune plugin loaded".to_string())?;
+            (Arc::clone(&slot.bridge), slot.slot_id)
+        };
+        bridge.query_state_concurrent(slot_id)
+    }
+
+    /// Used only when the dedicated EffeTune host exceeds the exit fence.
+    pub fn terminate_host_now(&self) {
+        let bridges: Vec<Arc<Bridge>> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .slots
+                .iter()
+                .map(|slot| Arc::clone(&slot.bridge))
+                .collect()
+        };
+        for bridge in bridges {
+            bridge.terminate_now();
+        }
+    }
+
     /// 全 Loaded スロットのプラグイン GUI ウィンドウ位置 + 外枠サイズを取得する。
     /// 戻り値: `(plugin_path, x, y, w, h)` のリスト。HWND が無い slot
     /// (= 一度も GUI を開かなかった) や `GetWindowRect` 失敗の slot は含めない。
@@ -1161,6 +1245,17 @@ impl DspBridge {
         if !self.is_enabled() {
             return;
         }
+        if let Err(error) = self.try_reset_plugins_sync() {
+            crate::logger::log(format!(
+                "[VST3] CRITICAL: reset_plugins_sync failed: {error}; pre-seek audio may leak briefly"
+            ));
+        }
+    }
+
+    pub fn try_reset_plugins_sync(&self) -> Result<(), String> {
+        if !self.is_enabled() {
+            return Err("VST3 bridge disabled".to_string());
+        }
         let mut bridges: Vec<Arc<Bridge>> = {
             let inner = self.inner.lock().unwrap();
             inner
@@ -1172,21 +1267,15 @@ impl DspBridge {
         };
         bridges.dedup_by(|a, b| Arc::ptr_eq(a, b));
         if bridges.is_empty() {
-            return;
+            return Ok(());
         }
         // 各 bridge ごとに `reset_sync` (= ID 付き send + ack 照合 wait) を呼ぶ。
         // 順次実行で十分 (= active bridge 数 max 10、各 reset は数 ms-数百 ms)。
         let timeout = std::time::Duration::from_secs(2);
         for b in &bridges {
-            if !b.reset_sync(timeout) {
-                crate::logger::log(
-                    "[VST3] CRITICAL: reset_plugins_sync ResetDone ack timeout (2s), \
-                     pre-seek audio may leak briefly. Plugin may be unresponsive or \
-                     processing too slowly."
-                        .to_string(),
-                );
-            }
+            b.reset_sync_result(timeout)?;
         }
+        Ok(())
     }
 
     /// 全 active プラグインに **無音ブロックを N 個流す**。

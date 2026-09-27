@@ -96,6 +96,8 @@ pub mod edit_preview_cache;
 mod edit_source;
 pub mod editing_addon;
 pub mod editing_addon_download;
+#[cfg(windows)]
+pub mod effetune;
 pub mod egui_focus_policy;
 pub mod exif_reader;
 pub mod explorer_integration;

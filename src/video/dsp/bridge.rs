@@ -16,14 +16,16 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 #[cfg(windows)]
 use windows::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
     PAGE_READWRITE, UnmapViewOfFile,
 };
 #[cfg(windows)]
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, SetEvent, TerminateProcess, WaitForSingleObject,
+};
 #[cfg(windows)]
 use windows::core::{HSTRING, PCWSTR};
 
@@ -34,7 +36,9 @@ use windows::core::{HSTRING, PCWSTR};
 /// **bump 1 → 2** (T09 round 4): 旧 bridge は version 比較を no-op で握り潰していたので
 /// 1 のままだと stale bridge を検出できなかった。2 へ上げることで v0.8.x 以前の
 /// `mimageviewer-vst3-host.exe` (version=1 を返すだけ) を新 Rust 側で reject できる。
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+static NEXT_AUDIO_PIPE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// shared memory header — C++ 側 `crates/vst3-host/include/protocol.h::ShmHeader` と
 /// **同一バイナリレイアウト**でなければならない (cache line aligned 64 byte)。
@@ -84,6 +88,7 @@ pub enum Cmd {
         /// 適用する (= Codex P2-3 race 解消、2026-05-01)。空または None なら no-op。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<String>,
+        strict_state: u32,
     },
     /// プラグインを短時間だけロードし、audio/event bus 数を取得する。
     /// 環境設定のスキャンで「音声入力を受け取れない VST3」を候補から外すために使う。
@@ -237,7 +242,65 @@ pub enum Event {
         state: String,
         #[serde(default)]
         slot_id: u64,
+        #[serde(default)]
+        request_id: Option<u64>,
+        #[serde(default)]
+        error: Option<String>,
     },
+}
+
+type PendingStateQueries =
+    Arc<Mutex<HashMap<u64, crossbeam_channel::Sender<Result<String, String>>>>>;
+
+fn abort_pending_state_queries(pending: &PendingStateQueries, reason: &str) {
+    if let Ok(mut queries) = pending.lock() {
+        for (_, reply) in queries.drain() {
+            let _ = reply.try_send(Err(reason.to_string()));
+        }
+    }
+}
+
+fn route_concurrent_state_result(
+    pending: &PendingStateQueries,
+    request_id: u64,
+    state: Option<String>,
+    error: Option<String>,
+) {
+    let reply = pending
+        .lock()
+        .ok()
+        .and_then(|mut queries| queries.remove(&request_id));
+    if let Some(reply) = reply {
+        let result = match (state, error) {
+            (Some(state), None) => Ok(state),
+            (_, Some(error)) => Err(error),
+            _ => Err("invalid concurrent state response".to_string()),
+        };
+        let _ = reply.try_send(result);
+    }
+}
+
+#[cfg(windows)]
+fn audio_pipe_names(pid: u32, stamp: u128) -> (String, String, String) {
+    let id = NEXT_AUDIO_PIPE_ID.fetch_add(1, Ordering::Relaxed);
+    (
+        format!("miv-vst-shm-{pid}-{stamp}-{id}"),
+        format!("miv-vst-sigin-{pid}-{stamp}-{id}"),
+        format!("miv-vst-sigout-{pid}-{stamp}-{id}"),
+    )
+}
+
+#[cfg(windows)]
+unsafe fn reject_existing_handle(handle: HANDLE, label: &str) -> std::io::Result<HANDLE> {
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let _ = unsafe { CloseHandle(handle) };
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{label} already exists"),
+        ))
+    } else {
+        Ok(handle)
+    }
 }
 
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。
@@ -266,6 +329,8 @@ pub struct Bridge {
     gui_bypass_toggle_rx: crossbeam_channel::Receiver<u64>,
     /// reset_sync helper が使う世代 ID counter。`fetch_add(1)` で発行する。
     next_reset_id: AtomicU64,
+    next_state_query_id: AtomicU64,
+    pending_state_queries: PendingStateQueries,
     #[cfg(windows)]
     shm: Option<SharedMemory>,
     #[cfg(windows)]
@@ -369,6 +434,8 @@ impl Bridge {
         let (reset_ack_tx, reset_ack_rx) = crossbeam_channel::bounded::<u64>(8);
         let (gui_user_hidden_tx, gui_user_hidden_rx) = crossbeam_channel::bounded::<u64>(64);
         let (gui_bypass_toggle_tx, gui_bypass_toggle_rx) = crossbeam_channel::bounded::<u64>(64);
+        let pending_state_queries: PendingStateQueries = Arc::new(Mutex::new(HashMap::new()));
+        let pending_state_queries_for_pump = Arc::clone(&pending_state_queries);
         let cached_latency_for_pump = cached_latency.clone();
         let cached_latency_by_slot_for_pump = cached_latency_by_slot.clone();
         std::thread::Builder::new()
@@ -410,6 +477,19 @@ impl Bridge {
                         Ok(Event::GuiBypassToggle { slot_id }) => {
                             let _ = gui_bypass_toggle_tx.try_send(slot_id);
                         }
+                        Ok(Event::PluginState {
+                            request_id: Some(request_id),
+                            state,
+                            error,
+                            ..
+                        }) => {
+                            route_concurrent_state_result(
+                                &pending_state_queries_for_pump,
+                                request_id,
+                                Some(state),
+                                error,
+                            );
+                        }
                         Ok(other) => {
                             // Loaded を受信したら cached_latency にも反映する
                             // (= 起動直後は LatencyChanged 通知が来ないプラグインに対応)
@@ -432,6 +512,7 @@ impl Bridge {
                             }
                         }
                         Err(e) => {
+                            abort_pending_state_queries(&pending_state_queries_for_pump, "interrupted: bridge exited");
                             let _ = event_tx.send(Err(e));
                             break;  // EOF or error
                         }
@@ -451,6 +532,8 @@ impl Bridge {
             gui_user_hidden_rx,
             gui_bypass_toggle_rx,
             next_reset_id: AtomicU64::new(0),
+            next_state_query_id: AtomicU64::new(0),
+            pending_state_queries,
             #[cfg(windows)]
             shm: None,
             #[cfg(windows)]
@@ -487,6 +570,11 @@ impl Bridge {
     ///
     /// 戻り値: true = ack 一致受信、false = timeout (= 200ms 経っても合致しなかった)。
     pub fn reset_sync(&self, timeout: std::time::Duration) -> bool {
+        self.reset_sync_result(timeout).is_ok()
+    }
+
+    pub fn reset_sync_result(&self, timeout: std::time::Duration) -> Result<(), String> {
+        let _guard = self.sync_call_mutex.lock().unwrap();
         // generation ID 発行 (= 0 から始まらないように +1 してから atomic に格納)。
         // wrapping_add で u64 overflow しても新規 ID として扱える (= 18 京回 reset で
         // overflow なので実用上発生しない)。
@@ -496,24 +584,24 @@ impl Bridge {
             .wrapping_add(1);
         if let Err(e) = self.send(&Cmd::Reset { reset_id: id }) {
             crate::logger::log(format!("[VST3] reset_sync: send failed for id={id}: {e}"));
-            return false;
+            return Err(format!("reset send failed: {e}"));
         }
         // ID 照合 loop (= 一致するまで old/future を drop)
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let now = std::time::Instant::now();
             if now >= deadline {
-                return false;
+                return Err("reset ack timeout".to_string());
             }
             match self.reset_ack_rx.recv_timeout(deadline - now) {
-                Ok(got_id) if got_id == id => return true,
+                Ok(got_id) if got_id == id => return Ok(()),
                 Ok(got_id) => {
                     crate::logger::log(format!(
                         "[VST3] reset_sync: ignored stale ResetDone ack id={got_id}, expected={id}"
                     ));
                     // 続行して expected を待つ
                 }
-                Err(_) => return false, // timeout
+                Err(e) => return Err(format!("reset ack: {e}")),
             }
         }
     }
@@ -539,12 +627,14 @@ impl Bridge {
         plugin_path: &str,
         initial_state: Option<&str>,
         bypass: bool,
+        strict_state: bool,
     ) -> std::io::Result<()> {
         let mut msg = serde_json::json!({
             "cmd": "add_plugin",
             "slot_id": slot_id,
             "plugin_path": plugin_path,
             "bypass": if bypass { 1 } else { 0 },
+            "strict_state": if strict_state { 1 } else { 0 },
         });
         if let Some(state) = initial_state.filter(|s| !s.is_empty()) {
             msg["state"] = serde_json::Value::String(state.to_string());
@@ -639,6 +729,7 @@ impl Bridge {
                 Ok(Ok(Event::PluginState {
                     state,
                     slot_id: got,
+                    ..
                 })) if got == slot_id => {
                     return Ok(state);
                 }
@@ -651,6 +742,48 @@ impl Bridge {
                 Ok(Err(e)) => return Err(format!("io: {e}")),
                 Err(_) => return Err("timeout".to_string()),
             }
+        }
+    }
+
+    /// The receiver has a caller-owned deadline. Dropping it does not cancel
+    /// a running host capture; the host has its own five-second watchdog.
+    pub fn query_state_concurrent(
+        &self,
+        slot_id: u64,
+    ) -> Result<crossbeam_channel::Receiver<Result<String, String>>, String> {
+        let id = self.next_state_query_id.fetch_add(1, Ordering::AcqRel) + 1;
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.pending_state_queries
+            .lock()
+            .unwrap()
+            .insert(id, reply_tx);
+        if let Err(error) = self.send_value(&serde_json::json!({
+            "cmd": "query_state_concurrent",
+            "slot_id": slot_id,
+            "request_id": id,
+        })) {
+            if let Ok(mut queries) = self.pending_state_queries.lock() {
+                queries.remove(&id);
+            }
+            return Err(format!("concurrent state request send failed: {error}"));
+        }
+        Ok(reply_rx)
+    }
+
+    pub fn abort_state_queries(&self) {
+        abort_pending_state_queries(
+            &self.pending_state_queries,
+            "interrupted: bridge shutting down",
+        );
+    }
+
+    /// End the dedicated host when the application's exit fence expires.
+    #[cfg(windows)]
+    pub fn terminate_now(&self) {
+        use std::os::windows::io::AsRawHandle;
+        self.abort_state_queries();
+        unsafe {
+            let _ = TerminateProcess(HANDLE(self.child.as_raw_handle()), 1);
         }
     }
 
@@ -756,6 +889,7 @@ impl Bridge {
         sample_rate: u32,
         block_size: u32,
         initial_state: Option<&str>,
+        strict_state: bool,
     ) -> std::io::Result<()> {
         let pid = std::process::id();
         let stamp = std::time::SystemTime::now()
@@ -768,9 +902,7 @@ impl Bridge {
         // - 付けると JSON シリアライズで `Local\\miv-...` にエスケープされ、
         //   bridge 側の素朴 JSON 抽出 (エスケープ解除なし) で `\\` が
         //   そのまま渡って名前不一致になる。素直に英数字+ハイフンのみで作る。
-        let shm_name = format!("miv-vst-shm-{}-{}", pid, stamp);
-        let sig_in_name = format!("miv-vst-sigin-{}-{}", pid, stamp);
-        let sig_out_name = format!("miv-vst-sigout-{}-{}", pid, stamp);
+        let (shm_name, sig_in_name, sig_out_name) = audio_pipe_names(pid, stamp);
 
         // 容量: block_size * channels * 8 (= 8 ブロック分のマージン) — sample 単位で持つ
         let capacity = block_size * 2 * 8;
@@ -793,6 +925,7 @@ impl Bridge {
                     format!("CreateFileMappingW: {e}"),
                 )
             })?;
+            let handle = reject_existing_handle(handle, &shm_name)?;
             let base = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, shm_size as usize);
             if base.Value.is_null() {
                 let _ = CloseHandle(handle);
@@ -827,6 +960,11 @@ impl Bridge {
                     format!("CreateEventW sig_in: {e}"),
                 )
             })?;
+            let sig_in = reject_existing_handle(sig_in, &sig_in_name)?;
+            self.sig_in = Some(EventHandle {
+                handle: sig_in,
+                name: sig_in_name.clone(),
+            });
             let wout = HSTRING::from(sig_out_name.as_str());
             let sig_out = CreateEventW(None, false, false, PCWSTR(wout.as_ptr())).map_err(|e| {
                 std::io::Error::new(
@@ -834,10 +972,7 @@ impl Bridge {
                     format!("CreateEventW sig_out: {e}"),
                 )
             })?;
-            self.sig_in = Some(EventHandle {
-                handle: sig_in,
-                name: sig_in_name.clone(),
-            });
+            let sig_out = reject_existing_handle(sig_out, &sig_out_name)?;
             self.sig_out = Some(EventHandle {
                 handle: sig_out,
                 name: sig_out_name.clone(),
@@ -855,6 +990,7 @@ impl Bridge {
             state: initial_state
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string()),
+            strict_state: if strict_state { 1 } else { 0 },
         })?;
         Ok(())
     }
@@ -1044,6 +1180,7 @@ impl Bridge {
     /// graceful shutdown: bridge に shutdown 命令を送って exit を待つ。
     /// `&mut self` を取るので、Drop の自動 kill より先にユーザーが明示的に呼ぶ想定。
     pub fn shutdown(&mut self) -> std::io::Result<()> {
+        self.abort_state_queries();
         let _ = self.send(&Cmd::Shutdown);
         let _ = self.child.wait();
         Ok(())
@@ -1053,6 +1190,7 @@ impl Bridge {
     /// 子プロセスは shutdown を受信して自発的に exit するか、Arc の最後の参照が落ちた時点で
     /// Drop 経路で kill される。
     pub fn shutdown_async(&self) -> std::io::Result<()> {
+        self.abort_state_queries();
         let _ = self.send(&Cmd::Shutdown);
         Ok(())
     }
@@ -1061,6 +1199,7 @@ impl Bridge {
 #[cfg(windows)]
 impl Drop for Bridge {
     fn drop(&mut self) {
+        self.abort_state_queries();
         if let Some(s) = self.shm.take() {
             unsafe {
                 let _ = UnmapViewOfFile(s.base);
@@ -1080,5 +1219,97 @@ impl Drop for Bridge {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod concurrent_state_tests {
+    use super::*;
+
+    #[test]
+    fn state_responses_follow_request_ids_and_abort_on_bridge_exit() {
+        let pending: PendingStateQueries = Arc::new(Mutex::new(HashMap::new()));
+        let (first_tx, first_rx) = crossbeam_channel::bounded(1);
+        let (second_tx, second_rx) = crossbeam_channel::bounded(1);
+        pending.lock().unwrap().insert(11, first_tx);
+        pending.lock().unwrap().insert(12, second_tx);
+
+        route_concurrent_state_result(&pending, 12, Some("new".into()), None);
+        assert_eq!(second_rx.try_recv().unwrap().unwrap(), "new");
+        assert!(first_rx.try_recv().is_err());
+        route_concurrent_state_result(&pending, 99, Some("stray".into()), None);
+        assert!(first_rx.try_recv().is_err());
+        abort_pending_state_queries(&pending, "interrupted: bridge exited");
+        assert_eq!(
+            first_rx.try_recv().unwrap().unwrap_err(),
+            "interrupted: bridge exited"
+        );
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn state_error_does_not_enter_legacy_event_channel() {
+        let pending: PendingStateQueries = Arc::new(Mutex::new(HashMap::new()));
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        pending.lock().unwrap().insert(42, reply_tx);
+        route_concurrent_state_result(&pending, 42, None, Some("getState failed".into()));
+        assert_eq!(reply_rx.try_recv().unwrap().unwrap_err(), "getState failed");
+    }
+
+    #[test]
+    fn concurrent_capture_uses_plugin_state_event_with_request_id() {
+        let event: Event =
+            serde_json::from_str(r#"{"event":"plugin_state","request_id":42,"state":"YWJj"}"#)
+                .unwrap();
+        assert!(matches!(
+            event,
+            Event::PluginState {
+                request_id: Some(42),
+                state,
+                ..
+            } if state == "YWJj"
+        ));
+    }
+
+    #[test]
+    fn strict_open_protocol_field_is_explicit() {
+        let command = Cmd::Open {
+            plugin_path: "sample.vst3".into(),
+            sample_rate: 48_000,
+            block_size: 480,
+            shm_name: "shm".into(),
+            shm_size: 4096,
+            sig_in: "in".into(),
+            sig_out: "out".into(),
+            state: Some("invalid".into()),
+            strict_state: 1,
+        };
+        let value = serde_json::to_value(command).unwrap();
+        assert_eq!(value["strict_state"], 1);
+        assert_eq!(value["state"], "invalid");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audio_pipe_names_are_unique_even_at_one_timestamp() {
+        let first = audio_pipe_names(123, 456);
+        let second = audio_pipe_names(123, 456);
+        assert_ne!(first.0, second.0);
+        assert_ne!(first.1, second.1);
+        assert_ne!(first.2, second.2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_named_event_is_rejected() {
+        let (_, event_name, _) = audio_pipe_names(std::process::id(), 0);
+        let wide = HSTRING::from(event_name.as_str());
+        unsafe {
+            let first = CreateEventW(None, false, false, PCWSTR(wide.as_ptr())).unwrap();
+            let second = CreateEventW(None, false, false, PCWSTR(wide.as_ptr())).unwrap();
+            let error = reject_existing_handle(second, &event_name).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            let _ = CloseHandle(first);
+        }
     }
 }

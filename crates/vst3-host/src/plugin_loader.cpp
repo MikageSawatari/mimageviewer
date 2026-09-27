@@ -2293,6 +2293,22 @@ bool PluginLoader::query_state(std::vector<uint8_t>& out_bytes) {
     return true;
 }
 
+void PluginLoader::query_state_concurrent(
+    std::function<bool()> begin,
+    std::function<void(bool, std::vector<uint8_t>)> complete) {
+    gui_thread().post_async([this, begin = std::move(begin), complete = std::move(complete)]() mutable {
+        if (!begin()) return;
+        std::vector<uint8_t> bytes;
+        bool ok = false;
+        try {
+            ok = query_state(bytes);
+        } catch (...) {
+            bytes.clear();
+        }
+        complete(ok, std::move(bytes));
+    });
+}
+
 bool PluginLoader::restore_state(const std::vector<uint8_t>& bytes) {
     if (!is_gui_thread()) {
         if (!gui_thread_) return false;

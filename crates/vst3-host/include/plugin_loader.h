@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -210,6 +211,10 @@ public:
     /// VST3 `IComponent::getState()` を `MemoryStream` 経由でバイト列に書き出す。
     /// 戻り値: true=成功 (= `out_bytes` に空でもないバイト列が入る)、false=失敗。
     bool query_state(std::vector<uint8_t>& out_bytes);
+
+    void query_state_concurrent(
+        std::function<bool()> begin,
+        std::function<void(bool, std::vector<uint8_t>)> complete);
 
     /// プラグイン内部状態をバイト列から復元する (`IComponent::setState`)。
     /// `IEditController::setComponentState` も同期で呼んで UI 表示を合わせる。

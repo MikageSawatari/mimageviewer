@@ -131,6 +131,57 @@ function Copy-IfChanged {
     }
 }
 
+function Copy-EffetuneBundleIfChanged {
+    $source = Join-Path $repoRoot 'vendor\effetune-mixwright\EffeTune Mixwright.vst3'
+    $destination = Join-Path $outputDir 'effetune\EffeTune Mixwright.vst3'
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+        throw "[build-dev] required EffeTune bundle is missing: $source"
+    }
+    $sourceFiles = @(Get-ChildItem -LiteralPath $source -Recurse -File)
+    $destinationFiles = @()
+    if (Test-Path -LiteralPath $destination -PathType Container) {
+        $destinationItem = Get-Item -LiteralPath $destination
+        if (($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "[build-dev] EffeTune destination is a reparse point: $destination"
+        }
+        $destinationFiles = @(Get-ChildItem -LiteralPath $destination -Recurse -File)
+    }
+    $changed = $sourceFiles.Count -ne $destinationFiles.Count
+    if (-not $changed) {
+        foreach ($file in $sourceFiles) {
+            $relative = $file.FullName.Substring($source.Length).TrimStart('\')
+            $target = Join-Path $destination $relative
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                $changed = $true
+                break
+            }
+            $targetInfo = Get-Item -LiteralPath $target
+            if ($file.Length -ne $targetInfo.Length -or
+                $file.LastWriteTimeUtc -ne $targetInfo.LastWriteTimeUtc) {
+                $changed = $true
+                break
+            }
+        }
+    }
+    if (-not $changed) { return }
+
+    $resolvedOutput = [IO.Path]::GetFullPath($outputDir).TrimEnd('\')
+    $resolvedDestination = [IO.Path]::GetFullPath($destination)
+    if (-not $resolvedDestination.StartsWith($resolvedOutput + '\',
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "[build-dev] EffeTune destination is outside dev runtime: $resolvedDestination"
+    }
+    if (Test-Path -LiteralPath $destination) {
+        Remove-Item -LiteralPath $destination -Recurse -Force
+    }
+    $parent = Split-Path -Parent $destination
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        New-Item -ItemType Directory -Path $parent | Out-Null
+    }
+    Copy-Item -LiteralPath $source -Destination $destination -Recurse
+    Write-Host '[build-dev] staged EffeTune Mixwright bundle'
+}
+
 function Wait-ForOtherNativeBuilds {
     # turbojpeg-sys drives cmake/MSBuild from the shared cargo registry copy of
     # libjpeg-turbo. Two worktrees building it at once fail with MSB3191
@@ -220,6 +271,8 @@ try {
             -Source (Join-Path $repoRoot $copy.src) `
             -Destination (Join-Path $outputDir $copy.dst)
     }
+
+    Copy-EffetuneBundleIfChanged
 
     & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
         -InputPaths @($coreExe, $remoteExe) -RequireCompanionRuntime `
