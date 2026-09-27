@@ -500,7 +500,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
     ツールの並べ替えでスロットとの対応が変わるため、設定 UI では番号を明示する。
 - GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P) /
   GridCopyFiles `Ctrl+C` (P) / GridCutFiles `Ctrl+X` (P)
-- GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)
+- GridColumnCount1..10 `Alt+1`..`Alt+0`、GridColumnCount11..20 は既定キーなし、GridToggleDetailsView `Alt+-` (P)
 
 ### Grid (Ph4)
 - GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpenSelected `Enter` (P) / GridOpenExternalPlayer `Shift+Enter` (P) /

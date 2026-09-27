@@ -44465,7 +44465,7 @@ impl App {
             });
 
             if ctrl {
-                // Ctrl+ホイール: 列数を増減（1〜10 の範囲）
+                // Ctrl+ホイール: 列数を増減（1〜20 の範囲）
                 let delta = -scroll_delta_y.signum() as i32;
                 if self.change_grid_cols_by(delta) {
                     self.settings.save();
@@ -78755,7 +78755,7 @@ impl App {
             }
         }
 
-        // ── Alt+1〜0: 列数切り替え / Alt+-: 詳細表示切り替え ─────────
+        // ── 列数切り替え (1〜10 は Alt+数字) / Alt+-: 詳細表示切り替え ─────────
         if !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus
@@ -78769,7 +78769,7 @@ impl App {
             {
                 self.toggle_grid_details_view();
             }
-            let alt_col = [
+            let selected_cols = [
                 (KeyAction::GridColumnCount1, 1),
                 (KeyAction::GridColumnCount2, 2),
                 (KeyAction::GridColumnCount3, 3),
@@ -78780,11 +78780,21 @@ impl App {
                 (KeyAction::GridColumnCount8, 8),
                 (KeyAction::GridColumnCount9, 9),
                 (KeyAction::GridColumnCount10, 10),
+                (KeyAction::GridColumnCount11, 11),
+                (KeyAction::GridColumnCount12, 12),
+                (KeyAction::GridColumnCount13, 13),
+                (KeyAction::GridColumnCount14, 14),
+                (KeyAction::GridColumnCount15, 15),
+                (KeyAction::GridColumnCount16, 16),
+                (KeyAction::GridColumnCount17, 17),
+                (KeyAction::GridColumnCount18, 18),
+                (KeyAction::GridColumnCount19, 19),
+                (KeyAction::GridColumnCount20, 20),
             ]
             .into_iter()
             .find(|(action, _)| self.keymap.pressed_action(ctx, *action))
             .map(|(_, cols)| cols);
-            if let Some(cols) = alt_col {
+            if let Some(cols) = selected_cols {
                 self.set_grid_view_mode(crate::settings::GridViewMode::Thumbnail);
                 if cols != self.settings.grid_cols {
                     self.settings.grid_cols = cols;

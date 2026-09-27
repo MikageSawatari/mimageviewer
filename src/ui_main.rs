@@ -11088,7 +11088,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 ui.separator();
                 ui.label("出す列:");
                 ui.horizontal_wrapped(|ui| {
-                    for cols in 1..=10usize {
+                    for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS {
                         let mut checked = self.settings.toolbar_cols_items.contains(&cols);
                         if ui.checkbox(&mut checked, format!("{cols}")).changed() {
                             if checked {
@@ -22813,6 +22813,18 @@ mod compute_cell_size_tests {
         let (w, _) = compute_cell_size(100.0, 10, 1.0).expect("Some");
         assert!(w >= MIN_CELL_PX);
         assert_eq!(w, MIN_CELL_PX);
+    }
+
+    #[test]
+    fn twenty_columns_keep_the_existing_minimum_cell_width_rule() {
+        let (wide_w, _) = compute_cell_size(3840.0 / 1.75, 20, 1.0).unwrap();
+        assert!(wide_w >= 100.0);
+
+        let (narrow_w, narrow_h) = compute_cell_size(100.0, 20, 1.0).unwrap();
+        assert_eq!((narrow_w, narrow_h), (MIN_CELL_PX, MIN_CELL_PX));
+        // The requested column count remains 20; the existing viewport clips the overflow.
+        assert!(narrow_w * 20.0 > 100.0);
+        assert_eq!(41usize.div_ceil(20), 3);
     }
 
     #[test]
