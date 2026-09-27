@@ -2206,26 +2206,12 @@ impl App {
 
     /// 現在のクエリで検索を spawn する。
     pub(crate) fn spawn_global_search(&mut self, ctx: &egui::Context) {
-        self.spawn_global_search_impl(ctx, true);
-    }
-
-    /// The query did not change; retain tag suggestions rather than reading
-    /// tags.db synchronously from the preferences OK handler.
-    pub(crate) fn respawn_global_search_for_epub_setting(&mut self, ctx: &egui::Context) {
-        self.spawn_global_search_impl(ctx, false);
-    }
-
-    fn spawn_global_search_impl(&mut self, ctx: &egui::Context, refresh_tag_suggestions: bool) {
-        let retained_suggestions = (!refresh_tag_suggestions)
-            .then(|| std::mem::take(&mut self.global_search.tag_bridge_suggestions));
         self.global_search.reset_for_new_query();
         if !self.restart_search_page_edit_prepare(ctx) {
             return;
         }
         self.global_search.last_executed = self.global_search.query.clone();
-        if let Some(retained) = retained_suggestions {
-            self.global_search.tag_bridge_suggestions = retained;
-        } else if let Some(db) = self.tags_db.as_ref() {
+        if let Some(db) = self.tags_db.as_ref() {
             self.global_search.tag_bridge_suggestions = tag_bridge_suggestions_for_query(
                 db,
                 &self.global_search.query,

@@ -3562,6 +3562,36 @@ fn phase_b_rating_rejects_edit_written_without_view_snapshot() {
 }
 
 #[test]
+fn reading_history_filters_ignored_epub_when_entered_again() {
+    let mut app = crate::app::setup_app_for_test();
+    app.folder_thumb_pin_db = None;
+    let entries = ["book.epub", "book.pdf"]
+        .into_iter()
+        .map(|name| {
+            let path = app.tmp.path().join(name);
+            std::fs::write(&path, b"book").unwrap();
+            crate::reading_history_db::ReadingHistoryEntry::new(
+                path,
+                crate::reading_history_db::ReadingHistoryKind::Pdf,
+                None,
+                name.into(),
+                None,
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    app.install_reading_history_entries(entries.clone());
+    assert_eq!(app.items.len(), 2);
+
+    app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+    app.install_reading_history_entries(entries);
+    assert_eq!(app.items.len(), 1);
+    assert!(
+        matches!(&app.items[0], GridItem::PdfFile(path) if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")))
+    );
+}
+
+#[test]
 fn phase_b_reading_history_opened_folder_resolves_masked_member_before_paint() {
     let (mut app, image) = phase_b_masked_image();
     let folder = image.parent().unwrap().to_path_buf();
