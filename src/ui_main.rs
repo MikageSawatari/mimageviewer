@@ -18247,7 +18247,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 // ドラッグ中は両経路ともスキップして生サムネ表示に戻す
                                 // (70 枚毎フレーム再生成は ~200ms のフリーズになるため)。
                                 if !self.adjustment_dragging {
-                                    self.maybe_apply_thumb_adjustment(ctx, idx);
+                                    self.maybe_apply_thumb_adjustment(ctx, idx, "visible");
                                 }
                                 let adjusted_tex = if self.adjustment_dragging {
                                     None

@@ -16390,8 +16390,7 @@ impl App {
             }
             // 差分内容で clear を振り分け (AI 変更 / シャープ化のみ / 色調・post_filter)。
             self.clear_caches_for_param_change(fs_idx, &original, &edit_params);
-            // ドラッグ中に色調が動いたら、release 時のサムネ補正テクスチャ全クリアを
-            // 予約する (シャープ化だけのドラッグではサムネを無駄に再生成しない)。
+            // ドラッグ中に色調が動いたら、release 時の対象ページの失効を予約する。
             if (is_dragging || was_dragging) && !original.color_settings_eq(&edit_params) {
                 self.thumb_adjust_drag_color_dirty = true;
             }
@@ -16415,6 +16414,9 @@ impl App {
                 }
             } else if let Some(session) = self.adjustment_drag_session.take() {
                 let in_memory = self.adjustment_page_params.get(&fs_idx).cloned();
+                if self.thumb_adjust_drag_color_dirty {
+                    self.invalidate_thumb_adjust_for_dragged_page(session.fs_idx);
+                }
                 if session.before != in_memory {
                     // in-memory に書いた最終値を `set_page_params` で永続化
                     // (matches_default の正規化もここで走る)

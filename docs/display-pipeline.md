@@ -233,16 +233,20 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 重なる場合は左下の低優先要素を表示しない。右下の絞り込み件数は左上・左下と重ならない位置まで上げ、余地がなければ省略する。色・角丸・フォントなど各要素の見た目は
 `ui_helpers.rs` の個別描画関数が持つ。
 スタック枚数と絞り込み件数も狭幅では文字を短縮し、`draw_cell` の内容はセル内に clip する。
-補正済みサムネイルの可視セル生成は `thumb.adjustment_build` perf event で色調処理と
-`ctx.load_texture` を分けて計測できる。
+補正済みサムネイルの生成は `thumb.adjustment_build` perf event で色調処理と
+`ctx.load_texture` を分けて計測できる。`origin=visible` は一覧描画中、
+`origin=prefetch` は可視外の先読み、`n` は `frame.begin` と同じ更新フレーム番号。
+元サムネイルが未ロード（トレイ格納による退去を含む）の間は生成しない。
 
 4K・Windows 175% で 10 列と 20 列の実機負荷を比較する場合は、`--perf-log` 付きで起動し、
 同じ画像フォルダと補正設定を使う。各列数で画面を静止させ、補正パネルの**グローバル標準**の
 明るさを変更して確定する。この経路は `copy_params_to_global` → `clear_all_color_caches` を通るので、
 全補正キャッシュ消去直後の可視セル再生成を記録できる。10 列と 20 列はそれぞれ起動し直して個別のログで測り、
 `%APPDATA%\mimageviewer\logs\perf_events.jsonl` を各測定後に別名で保存し、
-`python scripts/analyze_perf.py <perf_events.jsonl> thumbs` で画像寸法別の
-`thumb.adjustment_build` 件数・`apply_ms`・`texture_ms`・`total_ms` と合計を見る。
+`python scripts/analyze_perf.py <perf_events.jsonl> thumbs` で可視/先読み・画像寸法別の
+`thumb.adjustment_build` 件数と、可視セルだけの 1 フレーム合計 (`session` / `n`、
+`apply_ms`・`texture_ms`・`total_ms`) を見る。比較は最大値と上位フレームの `cells` を使い、
+先読みの合計を可視フレームへ混ぜない。
 `python scripts/analyze_perf.py <perf_events.jsonl> hitches --ms 33` でフレーム間隔も確認する。
 イベントの `texture_ms` は egui のテクスチャ作成までで、GPU 転送時間を直接表さない。
 headless の ignored 計測テストも、可視セル補正生成の連続処理だけを測り、フレーム全体の描画時間と GPU 転送は測れない。
@@ -302,14 +306,14 @@ ZipFile / PdfFile / ConvertibleArchive の代表サムネには適用しない (
 
 **適用タイミング**:
 
-1. **可視セル**: `ui_main::render_grid` がセル描画直前に `maybe_apply_thumb_adjustment(idx)`
+1. **可視セル**: `ui_main::render_grid` がセル描画直前に `maybe_apply_thumb_adjustment(ctx, idx, "visible")`
    を同期呼び出し。`thumb_adjust_tex[idx]` がすでにあるか identity ならスキップ。
 2. **先読み分 (keep_range 内, 非可視)**: `update()` 終盤で `process_thumb_adjust_budget(ctx, 8)`
    が最大 8 枚/フレーム処理する (600px で ~3ms/枚 × 8 = 24ms 予算)。
 3. **スライダードラッグ中** (`App::adjustment_dragging == true`): 両経路ともスキップし、
    `draw_cell` も `adjusted_tex = None` を渡して生サムネを表示。
-4. **ドラッグ解放** (`adjustment_dragging` が `true → false` 遷移): `update_thumb_adjust_drag_state`
-   が `thumb_adjust_tex.clear()` → 次フレームで visible 優先で再生成される。
+4. **ドラッグ解放**: ページ個別の色調変更なら対象キーの補正 tex だけ失効させ、
+   次フレームに必要な可視セルだけ再生成する。標準の変更は一括失効する。
 
 **キャッシュ無効化** ([preset-and-adjustment.md §4](preset-and-adjustment.md) の早見表に追補):
 
