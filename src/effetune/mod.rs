@@ -225,6 +225,14 @@ pub struct ExitCaptureFence {
     publication: Arc<PublicationGate>,
 }
 
+enum HostCommand {
+    Disable(Arc<DspBridge>),
+    Hide {
+        bridge: Arc<DspBridge>,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+}
+
 #[derive(Clone)]
 pub struct RemoteCaptureSource {
     queue: Arc<CaptureQueue>,
@@ -250,26 +258,39 @@ impl RemoteCaptureSource {
 
 #[derive(Default)]
 struct PublicationGate {
-    exit_deadline: Mutex<Option<Instant>>,
-    cancelled: AtomicBool,
+    state: Mutex<PublicationState>,
+}
+
+#[derive(Default)]
+struct PublicationState {
+    exit_deadline: Option<Instant>,
+    cancelled: bool,
 }
 
 impl PublicationGate {
     fn begin_exit(&self, deadline: Instant) {
-        *self.exit_deadline.lock().unwrap() = Some(deadline);
+        self.state.lock().unwrap().exit_deadline = Some(deadline);
     }
 
-    fn may_commit(&self) -> bool {
-        !self.cancelled.load(Ordering::Acquire)
-            && self
+    fn commit_with(&self, replace: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+        // Expiry and replacement share one commit boundary. Once the decision
+        // is made, expiry cannot interleave before the rename.
+        let state = self.state.lock().unwrap();
+        if state.cancelled
+            || state
                 .exit_deadline
-                .lock()
-                .unwrap()
-                .is_none_or(|deadline| Instant::now() < deadline)
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "state publication fence expired",
+            ));
+        }
+        replace()
     }
 
     fn expire(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.state.lock().unwrap().cancelled = true;
     }
 }
 
@@ -415,22 +436,11 @@ impl CaptureQueue {
 fn capture_once(bridge: &DspBridge) -> Result<Vec<u8>, CaptureError> {
     let rx = bridge
         .query_first_state_concurrent()
-        .map_err(|error| classify_capture_bridge_error(bridge, error, false))?;
+        .map_err(|error| classify_capture_bridge_error(bridge, error))?;
     let encoded = rx.recv().map_err(|error| {
-        classify_capture_bridge_error(
-            bridge,
-            format!("capture result channel closed: {error}"),
-            true,
-        )
+        CaptureError::Interrupted(format!("capture result channel closed: {error}"))
     })?;
-    let encoded = encoded.map_err(|error| match error {
-        crate::video::dsp::bridge::ConcurrentStateError::Interrupted(reason) => {
-            classify_capture_bridge_error(bridge, reason, true)
-        }
-        crate::video::dsp::bridge::ConcurrentStateError::HostResponse(reason) => {
-            classify_capture_bridge_error(bridge, reason, false)
-        }
-    })?;
+    let encoded = encoded.map_err(|error| classify_capture_bridge_error(bridge, error))?;
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|error| CaptureError::State(format!("state base64 invalid: {error}")))
@@ -438,17 +448,21 @@ fn capture_once(bridge: &DspBridge) -> Result<Vec<u8>, CaptureError> {
 
 fn classify_capture_bridge_error(
     bridge: &DspBridge,
-    error: String,
-    interrupted: bool,
+    error: crate::video::dsp::bridge::ConcurrentStateError,
 ) -> CaptureError {
-    if !bridge.host_alive() {
-        CaptureError::HostExited {
-            watchdog: bridge.host_watchdog_expired(),
+    match error {
+        crate::video::dsp::bridge::ConcurrentStateError::HostExited => {
+            let code = bridge.host_exit_code_after(Duration::from_secs(2));
+            CaptureError::HostExited {
+                watchdog: code == Some(crate::video::dsp::bridge::STATE_WATCHDOG_EXIT_CODE),
+            }
         }
-    } else if interrupted {
-        CaptureError::Interrupted(error)
-    } else {
-        CaptureError::State(error)
+        crate::video::dsp::bridge::ConcurrentStateError::Interrupted(reason) => {
+            CaptureError::Interrupted(reason)
+        }
+        crate::video::dsp::bridge::ConcurrentStateError::HostResponse(reason) => {
+            CaptureError::State(reason)
+        }
     }
 }
 
@@ -464,8 +478,10 @@ fn publish_capture_state(
     if generation <= latest.lock().unwrap().generation {
         return Ok(());
     }
-    write_state_atomic(path, bytes, || publication.may_commit())
-        .map_err(|error| CaptureError::Persistence(format!("state write failed: {error}")))?;
+    write_state_atomic(path, bytes, |temp, path| {
+        publication.commit_with(|| fs::rename(temp, path))
+    })
+    .map_err(|error| CaptureError::Persistence(format!("state write failed: {error}")))?;
     let mut current = latest.lock().unwrap();
     current.generation = generation;
     current.bytes = Some(bytes.to_vec());
@@ -476,7 +492,7 @@ fn publish_capture_state(
 fn write_state_atomic(
     path: &Path,
     bytes: &[u8],
-    may_commit: impl Fn() -> bool,
+    commit: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -491,13 +507,7 @@ fn write_state_atomic(
         file.write_all(bytes)?;
         file.flush()?;
         drop(file);
-        if !may_commit() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "state publication fence expired",
-            ));
-        }
-        fs::rename(&temp, path)
+        commit(&temp, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -549,8 +559,8 @@ pub struct EffetuneController {
     failure_rx: mpsc::Receiver<EffetuneFailure>,
     gui_failure_tx: mpsc::Sender<GuiFailure>,
     gui_failure_rx: mpsc::Receiver<GuiFailure>,
-    cleanup_tx: mpsc::Sender<Arc<DspBridge>>,
-    gui_rect_tx: mpsc::Sender<(u64, Option<(i32, i32)>, Option<(u32, u32)>)>,
+    host_tx: mpsc::Sender<HostCommand>,
+    pending_hide: Option<mpsc::Receiver<Result<(), String>>>,
 }
 
 impl EffetuneController {
@@ -558,24 +568,20 @@ impl EffetuneController {
         let bundle = resolve_bundle();
         let (failure_tx, failure_rx) = mpsc::channel();
         let (gui_failure_tx, gui_failure_rx) = mpsc::channel();
-        let (cleanup_tx, cleanup_rx) = mpsc::channel::<Arc<DspBridge>>();
+        let (host_tx, host_rx) = mpsc::channel::<HostCommand>();
         std::thread::Builder::new()
-            .name("effetune-host-cleanup".into())
+            .name("effetune-host-control".into())
             .spawn(move || {
-                while let Ok(bridge) = cleanup_rx.recv() {
-                    bridge.disable();
+                while let Ok(command) = host_rx.recv() {
+                    match command {
+                        HostCommand::Disable(bridge) => bridge.disable(),
+                        HostCommand::Hide { bridge, reply } => {
+                            let _ = reply.send(bridge.hide_slot_gui_checked(0));
+                        }
+                    }
                 }
             })
-            .expect("EffeTune cleanup worker spawn");
-        let (gui_rect_tx, gui_rect_rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("effetune-gui-rect-save".into())
-            .spawn(move || {
-                while let Ok((generation, pos, size)) = gui_rect_rx.recv() {
-                    crate::settings::Settings::persist_effetune_gui_rect(generation, pos, size);
-                }
-            })
-            .expect("EffeTune GUI rectangle worker spawn");
+            .expect("EffeTune host control worker spawn");
         let runtime = match &bundle {
             Ok(_) => EffetuneRuntime::Idle,
             Err(reason) => EffetuneRuntime::Unavailable(reason.clone()),
@@ -600,8 +606,8 @@ impl EffetuneController {
             failure_rx,
             gui_failure_tx,
             gui_failure_rx,
-            cleanup_tx,
-            gui_rect_tx,
+            host_tx,
+            pending_hide: None,
         }
     }
 
@@ -664,6 +670,10 @@ impl EffetuneController {
         )
     }
 
+    pub fn has_pending_ui_work(&self) -> bool {
+        self.pending_load.is_some() || self.pending_hide.is_some() || self.pending_capture.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_startup_completion(&mut self, result: Result<(), EffetuneFailure>) {
         let (tx, rx) = mpsc::channel();
@@ -678,13 +688,24 @@ impl EffetuneController {
         if let Ok(failure) = self.failure_rx.try_recv() {
             self.fail(failure);
         }
-        #[cfg(windows)]
-        if self
-            .bridge
-            .as_ref()
-            .is_some_and(|bridge| !bridge.host_alive())
-        {
-            self.fail(EffetuneFailure::HostLost("EffeTune host exited".into()));
+        if let Some(rx) = self.pending_hide.as_ref() {
+            let completed = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("hide GUI worker disconnected".into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = completed {
+                self.pending_hide = None;
+                match result {
+                    Ok(()) if matches!(self.runtime, EffetuneRuntime::Running { .. }) => {
+                        self.capture_on_hide();
+                    }
+                    Ok(()) => {}
+                    Err(error) => self.fail(EffetuneFailure::GuiFailed(error)),
+                }
+            }
         }
         if let Some(rx) = self.pending_load.as_ref() {
             let result = match rx.try_recv() {
@@ -736,6 +757,27 @@ impl EffetuneController {
         }
     }
 
+    pub fn request_hide_gui(&mut self) {
+        if self.pending_hide.is_some() || !matches!(self.runtime, EffetuneRuntime::Running { .. }) {
+            return;
+        }
+        let Some(bridge) = self.bridge.as_ref().cloned() else {
+            return;
+        };
+        let (reply, rx) = mpsc::channel();
+        if self
+            .host_tx
+            .send(HostCommand::Hide { bridge, reply })
+            .is_err()
+        {
+            self.fail(EffetuneFailure::GuiFailed(
+                "host control worker disconnected".into(),
+            ));
+            return;
+        }
+        self.pending_hide = Some(rx);
+    }
+
     pub fn remote_capture_source(&self) -> Result<RemoteCaptureSource, String> {
         let bridge = self.bridge.as_ref().ok_or("EffeTune is not running")?;
         Ok(RemoteCaptureSource {
@@ -753,6 +795,40 @@ impl EffetuneController {
     }
 
     fn publish_running(&mut self, bridge: Arc<DspBridge>) {
+        #[cfg(windows)]
+        {
+            let weak = Arc::downgrade(&bridge);
+            let failure_tx = self.slot.failure_tx.lock().unwrap().as_ref().cloned();
+            let spawn = std::thread::Builder::new()
+                .name("effetune-host-monitor".into())
+                .spawn(move || {
+                    while let Some(bridge) = weak.upgrade() {
+                        if !bridge.is_enabled() {
+                            break;
+                        }
+                        if let Some(code) = bridge.host_exit_code_after(Duration::from_secs(1)) {
+                            if let Some(tx) = failure_tx.as_ref() {
+                                let reason = if code
+                                    == crate::video::dsp::bridge::STATE_WATCHDOG_EXIT_CODE
+                                {
+                                    "state watchdog expired".to_string()
+                                } else {
+                                    format!("host exited with code {code:#x}")
+                                };
+                                let _ = tx.send(EffetuneFailure::HostLost(reason));
+                            }
+                            break;
+                        }
+                    }
+                });
+            if let Err(error) = spawn {
+                self.bridge = Some(bridge);
+                self.fail(EffetuneFailure::LoadFailed(format!(
+                    "host monitor worker spawn: {error}"
+                )));
+                return;
+            }
+        }
         self.next_audio_generation += 1;
         self.slot
             .publish(self.next_audio_generation, Arc::clone(&bridge));
@@ -766,23 +842,20 @@ impl EffetuneController {
         self.bundle_path.as_deref()
     }
 
-    pub fn save_gui_rect_async(&self, pos: Option<(i32, i32)>, size: Option<(u32, u32)>) {
-        let generation = crate::settings::Settings::next_effetune_gui_rect_generation();
-        if self.gui_rect_tx.send((generation, pos, size)).is_err() {
-            crate::logger::log("[EffeTune] GUI rectangle writer disconnected");
-        }
-    }
-
     pub fn fail(&mut self, failure: EffetuneFailure) {
         if matches!(self.runtime, EffetuneRuntime::Failed(_)) {
             return;
         }
         crate::logger::log(format!("[EffeTune] failed: {failure:?}"));
         self.slot.clear();
+        self.pending_load = None;
         self.pending_capture = None;
+        self.pending_hide = None;
         if let Some(bridge) = self.bridge.take() {
-            if let Err(error) = self.cleanup_tx.send(bridge) {
-                std::thread::spawn(move || error.0.disable());
+            if let Err(error) = self.host_tx.send(HostCommand::Disable(bridge)) {
+                if let HostCommand::Disable(bridge) = error.0 {
+                    std::thread::spawn(move || bridge.disable());
+                }
             }
         }
         self.runtime = EffetuneRuntime::Failed(failure);
@@ -989,8 +1062,8 @@ mod tests {
     fn state_writer_replaces_without_reusing_temp_name() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("mixwright-state.json");
-        write_state_atomic(&state, b"first", || true).unwrap();
-        write_state_atomic(&state, b"second", || true).unwrap();
+        write_state_atomic(&state, b"first", |temp, path| fs::rename(temp, path)).unwrap();
+        write_state_atomic(&state, b"second", |temp, path| fs::rename(temp, path)).unwrap();
         assert_eq!(fs::read(state).unwrap(), b"second");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
@@ -1078,8 +1151,8 @@ mod tests {
     #[test]
     fn gui_failure_uses_controller_transition_and_queues_host_cleanup() {
         let mut controller = EffetuneController::new();
-        let (cleanup_tx, cleanup_rx) = mpsc::channel();
-        controller.cleanup_tx = cleanup_tx;
+        let (host_tx, host_rx) = mpsc::channel();
+        controller.host_tx = host_tx;
         controller.publish_running(DspBridge::new());
         controller
             .gui_failure_tx
@@ -1091,7 +1164,34 @@ mod tests {
             EffetuneRuntime::Failed(EffetuneFailure::GuiFailed("fixture attach error".into()))
         );
         assert!(controller.slot.snapshot().is_none());
-        assert!(cleanup_rx.try_recv().is_ok());
+        assert!(matches!(host_rx.try_recv(), Ok(HostCommand::Disable(_))));
+    }
+
+    #[test]
+    fn asynchronous_hide_failure_is_applied_by_controller_poll() {
+        let mut controller = EffetuneController::new();
+        controller.publish_running(DspBridge::new());
+        controller.request_hide_gui();
+        assert!(matches!(
+            controller.runtime,
+            EffetuneRuntime::Running { .. }
+        ));
+        let result = controller
+            .pending_hide
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(result.is_err());
+        let (reply, rx) = mpsc::channel();
+        reply.send(result).unwrap();
+        controller.pending_hide = Some(rx);
+        controller.poll();
+        assert!(matches!(
+            controller.runtime,
+            EffetuneRuntime::Failed(EffetuneFailure::GuiFailed(_))
+        ));
+        assert!(controller.slot.snapshot().is_none());
     }
 
     #[test]
@@ -1105,10 +1205,10 @@ mod tests {
         let writer_gate = Arc::clone(&publication);
         let writer_path = path.clone();
         let writer = std::thread::spawn(move || {
-            write_state_atomic(&writer_path, b"late", || {
+            write_state_atomic(&writer_path, b"late", |temp, path| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                writer_gate.may_commit()
+                writer_gate.commit_with(|| fs::rename(temp, path))
             })
         });
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1120,6 +1220,52 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), b"previous");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn exit_expiry_cannot_interleave_between_commit_decision_and_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixwright-state.json");
+        fs::write(&path, b"previous").unwrap();
+        let gate = Arc::new(PublicationGate::default());
+        let writer_gate = Arc::clone(&gate);
+        let writer_path = path.clone();
+        let (decided_tx, decided_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            write_state_atomic(&writer_path, b"committed", |temp, path| {
+                writer_gate.commit_with(|| {
+                    decided_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    fs::rename(temp, path)
+                })
+            })
+        });
+        decided_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let expiry_gate = Arc::clone(&gate);
+        let (expiring_tx, expiring_rx) = mpsc::channel();
+        let (expired_tx, expired_rx) = mpsc::channel();
+        let expiry = std::thread::spawn(move || {
+            expiring_tx.send(()).unwrap();
+            expiry_gate.expire();
+            expired_tx.send(()).unwrap();
+        });
+        expiring_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            expired_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"previous");
+        release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        expiry.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"committed");
+        assert_eq!(
+            gate.commit_with(|| fs::write(&path, b"too late"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
     }
 
     #[test]

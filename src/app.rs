@@ -23486,7 +23486,6 @@ impl App {
         if self.settings.effetune_gui_pos != pos || self.settings.effetune_gui_size != size {
             self.settings.effetune_gui_pos = pos;
             self.settings.effetune_gui_size = size;
-            self.effetune.save_gui_rect_async(pos, size);
         }
     }
 
@@ -23502,9 +23501,8 @@ impl App {
                     return;
                 };
                 if bridge.slot(0).is_some_and(|slot| slot.gui_visible) {
-                    bridge.hide_slot_gui(0);
                     self.save_effetune_gui_rect();
-                    self.effetune.capture_on_hide();
+                    self.effetune.request_hide_gui();
                 } else {
                     if let Some(hwnd) = self.main_hwnd {
                         bridge.set_main_hwnd(hwnd as u64);
@@ -23571,10 +23569,7 @@ impl App {
                 self.resume_deferred_vst3_media_open(ctx);
             }
         }
-        if matches!(
-            self.effetune.runtime,
-            crate::effetune::EffetuneRuntime::Loading { .. }
-        ) {
+        if self.effetune.has_pending_ui_work() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         if let Some(bridge) = self.effetune.bridge().cloned() {

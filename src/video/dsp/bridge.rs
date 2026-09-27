@@ -37,8 +37,7 @@ use windows::core::{HSTRING, PCWSTR};
 /// 1 のままだと stale bridge を検出できなかった。2 へ上げることで v0.8.x 以前の
 /// `mimageviewer-vst3-host.exe` (version=1 を返すだけ) を新 Rust 側で reject できる。
 pub const PROTOCOL_VERSION: u32 = 3;
-#[cfg(windows)]
-const STATE_WATCHDOG_EXIT_CODE: u32 = 0xEFFE_C001;
+pub(crate) const STATE_WATCHDOG_EXIT_CODE: u32 = 0xEFFE_C001;
 
 static NEXT_AUDIO_PIPE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -255,12 +254,14 @@ pub enum Event {
 pub enum ConcurrentStateError {
     Interrupted(String),
     HostResponse(String),
+    HostExited,
 }
 
 impl std::fmt::Display for ConcurrentStateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Interrupted(reason) | Self::HostResponse(reason) => f.write_str(reason),
+            Self::HostExited => f.write_str("host stdout closed"),
         }
     }
 }
@@ -269,9 +270,16 @@ type PendingStateQueries =
     Arc<Mutex<HashMap<u64, crossbeam_channel::Sender<Result<String, ConcurrentStateError>>>>>;
 
 fn abort_pending_state_queries(pending: &PendingStateQueries, reason: &str) {
+    finish_pending_state_queries(
+        pending,
+        ConcurrentStateError::Interrupted(reason.to_string()),
+    );
+}
+
+fn finish_pending_state_queries(pending: &PendingStateQueries, error: ConcurrentStateError) {
     if let Ok(mut queries) = pending.lock() {
         for (_, reply) in queries.drain() {
-            let _ = reply.try_send(Err(ConcurrentStateError::Interrupted(reason.to_string())));
+            let _ = reply.try_send(Err(error.clone()));
         }
     }
 }
@@ -327,7 +335,6 @@ unsafe fn reject_existing_handle(handle: HANDLE, label: &str) -> std::io::Result
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。
 pub struct Bridge {
     child: Child,
-    state_watchdog_expired: Arc<AtomicBool>,
     stdin: Mutex<ChildStdin>,
     /// 同期 event 受信用 channel。spawn 時に起動した event-pump スレッドが
     /// stdout を読んで非同期 (LatencyChanged / ResetDone) 以外の event をここに流す。
@@ -396,28 +403,25 @@ impl Bridge {
         self.child.id()
     }
 
-    pub fn state_watchdog_expired(&self) -> bool {
-        if self.state_watchdog_expired.load(Ordering::Acquire) {
-            return true;
-        }
+    /// Called on a capture worker after stdout EOF. The child handle can lag
+    /// behind pipe closure, so wait for process termination before reading code.
+    pub fn wait_host_exit_code(&self, timeout: std::time::Duration) -> Option<u32> {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            let mut code = 0_u32;
-            if unsafe { GetExitCodeProcess(HANDLE(self.child.as_raw_handle()), &mut code) }.is_ok()
-                && code == STATE_WATCHDOG_EXIT_CODE
-            {
-                return true;
+            let handle = HANDLE(self.child.as_raw_handle());
+            let wait_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+            if unsafe { WaitForSingleObject(handle, wait_ms) }.0 != 0 {
+                return None;
             }
+            let mut code = 0_u32;
+            unsafe { GetExitCodeProcess(handle, &mut code) }.ok()?;
+            Some(code)
         }
-        false
-    }
-
-    #[cfg(windows)]
-    pub fn is_alive(&self) -> bool {
-        use std::os::windows::io::AsRawHandle;
-        unsafe {
-            WaitForSingleObject(HANDLE(self.child.as_raw_handle()), 0).0 == 258 // WAIT_TIMEOUT
+        #[cfg(not(windows))]
+        {
+            let _ = timeout;
+            None
         }
     }
 
@@ -453,17 +457,12 @@ impl Bridge {
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr = child.stderr.take().expect("stderr");
-        let state_watchdog_expired = Arc::new(AtomicBool::new(false));
-        let watchdog_for_stderr = Arc::clone(&state_watchdog_expired);
         std::thread::Builder::new()
             .name("bridge-stderr-pump".into())
             .spawn(move || {
                 use std::io::BufRead;
                 let reader = std::io::BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    if line.contains("concurrent getState watchdog expired") {
-                        watchdog_for_stderr.store(true, Ordering::Release);
-                    }
                     stderr_cb(line);
                 }
             })
@@ -564,7 +563,19 @@ impl Bridge {
                             }
                         }
                         Err(e) => {
-                            abort_pending_state_queries(&pending_state_queries_for_pump, "interrupted: bridge exited");
+                            let query_error = if e.kind() == std::io::ErrorKind::InvalidData {
+                                ConcurrentStateError::HostResponse(format!(
+                                    "invalid host event: {e}"
+                                ))
+                            } else {
+                                // A closed stdout is a host exit even if its
+                                // process handle has not been signalled yet.
+                                ConcurrentStateError::HostExited
+                            };
+                            finish_pending_state_queries(
+                                &pending_state_queries_for_pump,
+                                query_error,
+                            );
                             let _ = event_tx.send(Err(e));
                             break;  // EOF or error
                         }
@@ -575,7 +586,6 @@ impl Bridge {
 
         Ok(Self {
             child,
-            state_watchdog_expired,
             stdin: Mutex::new(stdin),
             event_rx,
             sync_call_mutex: Mutex::new(()),
@@ -809,14 +819,17 @@ impl Bridge {
     pub fn query_state_concurrent(
         &self,
         slot_id: u64,
-    ) -> Result<crossbeam_channel::Receiver<Result<String, ConcurrentStateError>>, String> {
+    ) -> Result<
+        crossbeam_channel::Receiver<Result<String, ConcurrentStateError>>,
+        ConcurrentStateError,
+    > {
         let id = self.next_state_query_id.fetch_add(1, Ordering::AcqRel) + 1;
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.pending_state_queries
             .lock()
             .unwrap()
             .insert(id, reply_tx);
-        if let Err(error) = self.send_value(&serde_json::json!({
+        if let Err(_error) = self.send_value(&serde_json::json!({
             "cmd": "query_state_concurrent",
             "slot_id": slot_id,
             "request_id": id,
@@ -824,7 +837,7 @@ impl Bridge {
             if let Ok(mut queries) = self.pending_state_queries.lock() {
                 queries.remove(&id);
             }
-            return Err(format!("concurrent state request send failed: {error}"));
+            return Err(ConcurrentStateError::HostExited);
         }
         Ok(reply_rx)
     }
@@ -1326,6 +1339,20 @@ mod concurrent_state_tests {
     }
 
     #[test]
+    fn stdout_eof_is_distinct_from_a_requested_capture_interruption() {
+        let pending: PendingStateQueries = Arc::new(Mutex::new(HashMap::new()));
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        pending.lock().unwrap().insert(51, reply_tx);
+        finish_pending_state_queries(&pending, ConcurrentStateError::HostExited);
+        assert_eq!(
+            reply_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            Err(ConcurrentStateError::HostExited)
+        );
+    }
+
+    #[test]
     fn concurrent_capture_uses_plugin_state_event_with_request_id() {
         let event: Event =
             serde_json::from_str(r#"{"event":"plugin_state","request_id":42,"state":"YWJj"}"#)
@@ -1387,6 +1414,8 @@ mod concurrent_state_tests {
 mod effetune_host_handler_tests {
     use super::*;
 
+    use std::os::windows::io::AsRawHandle;
+
     fn host_and_bundle() -> Option<(Bridge, String)> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let host = root.join("vendor/vst3-host/mimageviewer-vst3-host.exe");
@@ -1410,6 +1439,36 @@ mod effetune_host_handler_tests {
             }
         ));
         Some((bridge, bundle.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn native_stdout_eof_resolves_exit_code_on_capture_worker() {
+        let Some((bridge, _)) = host_and_bundle() else {
+            return;
+        };
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        bridge
+            .pending_state_queries
+            .lock()
+            .unwrap()
+            .insert(77, reply_tx);
+        unsafe {
+            TerminateProcess(
+                HANDLE(bridge.child.as_raw_handle()),
+                STATE_WATCHDOG_EXIT_CODE,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            reply_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            Err(ConcurrentStateError::HostExited)
+        );
+        assert_eq!(
+            bridge.wait_host_exit_code(std::time::Duration::from_secs(2)),
+            Some(STATE_WATCHDOG_EXIT_CODE)
+        );
     }
 
     #[test]

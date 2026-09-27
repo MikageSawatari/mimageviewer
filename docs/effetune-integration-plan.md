@@ -360,6 +360,11 @@ enum EffectiveState {
 - 共有メモリ: 同時に 2 本 `open_audio_pipe` しても名前が衝突しない。既存オブジェクトを開いた場合
   (`ERROR_ALREADY_EXISTS`) は失敗として扱う。
 
+実 host の `getState` を GUI スレッド内で任意の位置に停止させる決定的な試験は保留する。
+Mixwright v0.11.1 の取得は短時間で完了し、リポジトリには制御可能な試験用 VST3 plugin がない。
+Rust の取得キューでは未開始／実行中の終了交錯を fake executor で試験し、host 側の loader 寿命と
+5 秒 watchdog の実負荷時の振る舞いは下記の利用者負荷試験で確認する。
+
 実行時の確認は利用者の実機で行う (GUI が開くか、音が処理されるか、ビジュアライザー、空パイプラインの
 遅延と透過性、初回の既定パイプライン)。
 
@@ -376,10 +381,16 @@ enum EffectiveState {
   空と判定する。実 host の strict `open` / `add_plugin` テストで取得形も検査する。
 - controller の失敗処理は音声スロットを先に空にし、host の disable / drop を専用 worker に渡す。
   GUI attach エラーは専用 bridge から型付きで controller に渡し、同じ `fail()` を通す。
+- GUI の位置・サイズは非表示時に `self.settings` のメモリ値だけ更新し、既存の full-save 経路で
+  `settings.db` に保存する。rect 専用 writer / 部分 upsert は置かない。ツールバーからの GUI 非表示は
+  controller の host worker に送り、送信結果を後続 frame で適用する。host の × では既に非表示になった
+  surface を記録し、UI thread から二重の hide コマンドを送らない。
 - 取得 worker は host 応答を期限で「host 異常」と判定しない。リモート受付・終了の期限は
   呼び出し側だけに掛け、host の終了・watchdog は別の結果として扱う。終了の公開 gate は
-  期限を過ぎた結果が状態ファイルへ rename されることを防ぐ。watchdog の終了コードは
-  `0xEFFEC001` とし、stderr の受信順によらず Rust 側が識別する。
+  期限判定と rename を同じ mutex 境界で行い、失効がその間に割り込まない。stdout EOF は
+  `HostExited` として別経路で渡し、取得 worker が子プロセス終了を待って exit code を読む。
+  Running 中の予期しない host 終了も専用 monitor worker が exit code を読んで controller に報告する。
+  watchdog の終了コードは `0xEFFEC001` とし、stderr の受信順によらず Rust 側が識別する。
 - リモートの状態再取得は worker がユーザーチェーン準備を終えた後に投入する。reset も共有の
   絶対期限の残りだけ待つ。pump の失敗報告は音声スロットで世代ごとに 1 回へ集約する。
 - bundle 解決は `src/effetune/mod.rs::resolve_bundle_from_exe` に置いた。通常版と portable 版で

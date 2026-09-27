@@ -1232,33 +1232,29 @@ impl DspBridge {
     /// bridge event channel. The receiver may be waited on by a worker.
     pub fn query_first_state_concurrent(
         &self,
-    ) -> Result<crossbeam_channel::Receiver<Result<String, bridge::ConcurrentStateError>>, String>
-    {
+    ) -> Result<
+        crossbeam_channel::Receiver<Result<String, bridge::ConcurrentStateError>>,
+        bridge::ConcurrentStateError,
+    > {
         let (bridge, slot_id) = {
             let inner = self.inner.lock().unwrap();
-            let slot = inner
-                .slots
-                .first()
-                .ok_or_else(|| "no EffeTune plugin loaded".to_string())?;
+            let slot = inner.slots.first().ok_or_else(|| {
+                bridge::ConcurrentStateError::HostResponse("no EffeTune plugin loaded".to_string())
+            })?;
             (Arc::clone(&slot.bridge), slot.slot_id)
         };
         bridge.query_state_concurrent(slot_id)
     }
 
-    #[cfg(windows)]
-    pub fn host_alive(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        !inner.slots.is_empty() && inner.slots.iter().all(|slot| slot.bridge.is_alive())
-    }
-
-    #[cfg(windows)]
-    pub fn host_watchdog_expired(&self) -> bool {
-        self.inner
+    pub fn host_exit_code_after(&self, timeout: Duration) -> Option<u32> {
+        let host = self
+            .inner
             .lock()
             .unwrap()
             .slots
-            .iter()
-            .any(|slot| slot.bridge.state_watchdog_expired())
+            .first()
+            .map(|slot| Arc::clone(&slot.bridge))?;
+        host.wait_host_exit_code(timeout)
     }
 
     /// Used only when the dedicated EffeTune host exceeds the exit fence.
@@ -1856,6 +1852,40 @@ impl DspBridge {
         self.fire_hud_raise_hook();
     }
 
+    /// EffeTune uses this from its controller worker. Keep the slot visible
+    /// until the pipe write succeeds so the UI observes the completed command.
+    pub fn hide_slot_gui_checked(&self, idx: usize) -> Result<(), String> {
+        let (bridge, slot_id, hwnd) = {
+            let inner = self.inner.lock().unwrap();
+            let slot = inner.slots.get(idx).ok_or("GUI slot is missing")?;
+            (Arc::clone(&slot.bridge), slot.slot_id, slot.gui_hwnd)
+        };
+        if hwnd != 0 {
+            bridge
+                .send_value(&serde_json::json!({
+                    "cmd": "set_gui_visible",
+                    "slot_id": slot_id,
+                    "visible": 0,
+                }))
+                .map_err(|error| format!("hide GUI command: {error}"))?;
+        }
+        if let Some(slot) = self.inner.lock().unwrap().slots.get_mut(idx) {
+            slot.gui_visible = false;
+        }
+        self.refresh_editor_hwnds_snapshot();
+        self.fire_hud_raise_hook();
+        Ok(())
+    }
+
+    fn record_user_hidden_from_host(&self, idx: usize) {
+        if let Some(slot) = self.inner.lock().unwrap().slots.get_mut(idx) {
+            slot.gui_visible = false;
+            slot.user_hidden = true;
+        }
+        self.refresh_editor_hwnds_snapshot();
+        self.fire_hud_raise_hook();
+    }
+
     /// 指定 idx のプラグイン GUI をユーザーが明示的に閉じた。
     /// `user_hidden = true` をセットし、以降の `set_all_guis_visible(true)` (=
     /// VST ボタン全表示) では表示しない (= ユーザー報告 2026-04 「個別に閉じた
@@ -2332,7 +2362,13 @@ impl DspBridge {
             }
         }
         for &idx in &close_targets {
-            self.user_hide_slot_gui(idx);
+            if self.gui_failure_owned_by_controller() {
+                // The dedicated host already hid the surface before sending
+                // GuiUserHidden; no UI-thread pipe write is needed here.
+                self.record_user_hidden_from_host(idx);
+            } else {
+                self.user_hide_slot_gui(idx);
+            }
         }
         // session 切替は bridge に最初に伝える (= 後続の resize より先に状態確定)
         for (idx, active) in session_targets {
