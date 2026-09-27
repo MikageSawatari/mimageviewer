@@ -6284,6 +6284,34 @@ fn decode_fullscreen_resolved_with_permit(
     decode_canonical_resolved(source, options)
 }
 
+fn finish_out_of_keep_thumbnail_request(
+    req: &crate::thumb_loader::LoadRequest,
+    tx: &mpsc::Sender<crate::thumb_loader::ThumbMsg>,
+    gen_done: &AtomicUsize,
+) {
+    let _ = tx.send(crate::thumb_loader::ThumbMsg {
+        idx: req.idx,
+        image: None,
+        origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+        from_edit_preview: false,
+        edit_preview_adjustment: None,
+        source_dims: None,
+        layout_dims: None,
+        canceled: true,
+        finalized: false,
+        input_seq: req.input_seq,
+        items_gen: req.items_gen,
+    });
+    // The initial worker already counted the deferred RAW handoff as unfinished.
+    // Its queued follow-up owns that one completion even when keep changed.
+    if matches!(
+        req.raw_source,
+        crate::thumb_loader::LoadRequestSource::RawHalfDeveloped { .. }
+    ) {
+        gen_done.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Called only by the fullscreen worker after source resolution. RAW dimensions
 /// describe the developed raster, which may differ from the container header.
 fn fullscreen_raw_source_dims(source: &CanonicalResolvedSource<'_>) -> Option<[usize; 2]> {
@@ -6301,6 +6329,110 @@ mod raw_fullscreen_permit_tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn dropped_fs_permit_raw_prefetch_promotes_queued_executor_ticket() {
+        let scheduler = FsPageLoadScheduler::with_limits(1, 0);
+        let fs_ticket = scheduler.request(
+            1,
+            0,
+            FsPageLoadPriority::Normal,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        let permit = fs_ticket.waiter().acquire_cancellable().unwrap();
+        drop(permit);
+        let (_tx, rx) = mpsc::channel();
+        let pending = FsPendingValue::scheduled(fs_ticket, rx, 0, FsLoadPurpose::for_page(true));
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let _blocker = executor.block_one_slot_for_test(started_tx, release_rx);
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (result_tx, _result_rx) = mpsc::channel();
+        let raw_ticket = Arc::new(executor.submit_thumbnail_half(
+            crate::raw::RawOwnedSource::Path(PathBuf::from("vendor/raw-samples/1018.cr2")),
+            crate::raw::RawPriority::Normal,
+            result_tx,
+        ));
+        pending
+            .raw_job
+            .lock()
+            .unwrap()
+            .publish(Arc::clone(&raw_ticket));
+        assert_eq!(
+            executor.queued_priority_for_test(&raw_ticket),
+            Some(crate::raw::RawPriority::Normal)
+        );
+        assert!(pending.promote_to_high(FsPageLoadContract::Sequential));
+        assert_eq!(
+            executor.queued_priority_for_test(&raw_ticket),
+            Some(crate::raw::RawPriority::High)
+        );
+        pending.cancel();
+
+        // Promotion can also precede submission while source resolution is active.
+        let (_tx, rx) = mpsc::channel();
+        let late = FsPendingValue::new(
+            Arc::new(AtomicBool::new(false)),
+            rx,
+            0,
+            FsLoadPurpose::for_page(true),
+        );
+        late.promote_to_high(FsPageLoadContract::Sequential);
+        assert!(matches!(
+            &*late.raw_job.lock().unwrap(),
+            FsRawJobState::Awaiting(crate::raw::RawPriority::High)
+        ));
+        late.cancel();
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        let late_ticket = Arc::new(executor.submit_thumbnail_half(
+            crate::raw::RawOwnedSource::Path(PathBuf::from("vendor/raw-samples/1018.cr2")),
+            crate::raw::RawPriority::Normal,
+            cancelled_tx,
+        ));
+        late.raw_job
+            .lock()
+            .unwrap()
+            .publish(Arc::clone(&late_ticket));
+        assert!(matches!(
+            cancelled_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(Err(crate::raw::RawError::Cancelled))
+        ));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn queued_raw_half_followup_skipped_after_keep_exit_counts_completion() {
+        let mut queue = Vec::new();
+        queue.push(crate::thumb_loader::LoadRequest {
+            idx: 9,
+            input_seq: 42,
+            items_gen: 7,
+            raw_source: crate::thumb_loader::LoadRequestSource::RawHalfDeveloped {
+                image: image::DynamicImage::new_rgb8(2, 2),
+                developed_dims: [2, 2],
+                decode_ms: 0.0,
+                folder_selection_proof: None,
+            },
+            ..Default::default()
+        });
+        let req = queue.pop().unwrap();
+        assert!(!crate::thumb_loader::thumbnail_request_in_current_keep(
+            &req, None, 0, 1
+        ));
+        let (tx, rx) = mpsc::channel();
+        let done = AtomicUsize::new(0);
+        finish_out_of_keep_thumbnail_request(&req, &tx, &done);
+        let message = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(message.canceled && !message.finalized);
+        assert_eq!(
+            (message.idx, message.input_seq, message.items_gen),
+            (9, 42, 7)
+        );
+        assert_eq!(done.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn raw_dims_only_uses_libraw_developed_dimensions() {
@@ -6388,6 +6520,7 @@ mod raw_fullscreen_permit_tests {
                 executor: &raw_executor,
                 brightness: crate::raw::RawBrightness::None,
                 priority: crate::raw::RawPriority::High,
+                on_submitted: None,
             });
             let mut permit = Some(permit);
             let result = decode_fullscreen_resolved_with_permit(source, options, &mut permit);
@@ -6496,10 +6629,53 @@ pub(crate) struct FsPendingValue {
     #[cfg(test)]
     pub(crate) cancel: Arc<AtomicBool>,
     ticket: FsPageLoadTicket,
+    raw_job: Arc<Mutex<FsRawJobState>>,
     pub(crate) rx: mpsc::Receiver<FsLoadResult>,
     pub(crate) load_seq: u64,
     pub(crate) purpose: FsLoadPurpose,
     animation_expansion_started_at: Option<std::time::Instant>,
+}
+
+enum FsRawJobState {
+    Awaiting(crate::raw::RawPriority),
+    Submitted(Arc<crate::raw::RawTicket>),
+    Cancelled,
+}
+
+impl FsRawJobState {
+    fn publish(&mut self, ticket: Arc<crate::raw::RawTicket>) {
+        match self {
+            Self::Awaiting(priority) => {
+                if *priority == crate::raw::RawPriority::High {
+                    ticket.promote_to_high();
+                }
+                *self = Self::Submitted(ticket);
+            }
+            Self::Cancelled => ticket.cancel(),
+            Self::Submitted(_) => unreachable!("one RAW job per fullscreen request"),
+        }
+    }
+
+    fn promote_to_high(&mut self) -> bool {
+        match self {
+            Self::Awaiting(priority) => {
+                *priority = crate::raw::RawPriority::High;
+                false
+            }
+            Self::Submitted(ticket) => {
+                ticket.promote_to_high();
+                true
+            }
+            Self::Cancelled => false,
+        }
+    }
+
+    fn cancel(&mut self) {
+        if let Self::Submitted(ticket) = self {
+            ticket.cancel();
+        }
+        *self = Self::Cancelled;
+    }
 }
 
 impl FsPendingValue {
@@ -6513,6 +6689,9 @@ impl FsPendingValue {
             #[cfg(test)]
             cancel: ticket.cancel_token(),
             ticket,
+            raw_job: Arc::new(Mutex::new(FsRawJobState::Awaiting(
+                crate::raw::RawPriority::Normal,
+            ))),
             rx,
             load_seq,
             purpose,
@@ -6540,10 +6719,12 @@ impl FsPendingValue {
 
     pub(crate) fn cancel(&self) {
         self.ticket.cancel();
+        self.raw_job.lock().unwrap().cancel();
     }
 
     fn promote_to_high(&self, contract: FsPageLoadContract) -> bool {
-        self.ticket.promote_to_high(contract)
+        let raw_promoted = self.raw_job.lock().unwrap().promote_to_high();
+        self.ticket.promote_to_high(contract) || raw_promoted
     }
 
     fn disarm_ticket(&mut self) {
@@ -38567,19 +38748,7 @@ impl App {
                         // canceled=true を送信: UI 側の requested を cleanup し、
                         // Evicted (retriable) に戻す。これを送らないと keep_range が
                         // 戻ったときに再エンキューされず idx がスタックする。
-                        let _ = tx_w.send(crate::thumb_loader::ThumbMsg {
-                            idx: req.idx,
-                            image: None,
-                            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                            from_edit_preview: false,
-                            edit_preview_adjustment: None,
-                            source_dims: None,
-                            layout_dims: None,
-                            canceled: true,
-                            finalized: false,
-                            input_seq: req.input_seq,
-                            items_gen: req.items_gen,
-                        });
+                        finish_out_of_keep_thumbnail_request(&req, &tx_w, &done_w);
                         continue;
                     }
                     let vis = hint_w.load(Ordering::Relaxed);
@@ -60059,10 +60228,9 @@ impl App {
         );
         let cancel = ticket.cancel_token();
         let waiter = ticket.waiter();
-        self.fs_pending.insert(
-            idx,
-            FsPendingValue::scheduled(ticket, rx, perf_seq, purpose),
-        );
+        let pending = FsPendingValue::scheduled(ticket, rx, perf_seq, purpose);
+        let raw_job = Arc::clone(&pending.raw_job);
+        self.fs_pending.insert(idx, pending);
         // 360 度パノラマビュー Phase 2a: 通常画像 (= PDF / ZIP 除く) のみで
         // tee デコード判断を持ち込む (§3.6.2 / §4.6.0)。
         // App 側で「XMP equirect 判定済みか」「approved_max_pixels」「BaseOnly か」を
@@ -60348,6 +60516,9 @@ impl App {
             } else {
                 crate::raw::RawPriority::Normal
             };
+            let publish_raw_ticket = |ticket: Arc<crate::raw::RawTicket>| {
+                raw_job.lock().unwrap().publish(ticket);
+            };
             let mut decode_options = CanonicalDecodeOptions::fullscreen_cancellable(
                 purpose.animation_policy(),
                 &cancel,
@@ -60357,6 +60528,7 @@ impl App {
                 executor: &raw_executor,
                 brightness: raw_brightness,
                 priority: raw_priority,
+                on_submitted: Some(&publish_raw_ticket),
             });
             if matches!(purpose, FsLoadPurpose::Display) {
                 decode_options =

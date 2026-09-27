@@ -68,6 +68,8 @@ pub struct RawDecodeRuntime<'a> {
     pub executor: &'a RawDevelopExecutor,
     pub brightness: RawBrightness,
     pub priority: RawPriority,
+    /// Fullscreen keeps this ticket with its context-owned fs request for promotion.
+    pub on_submitted: Option<&'a dyn Fn(Arc<crate::raw::RawTicket>)>,
 }
 
 impl<'a> CanonicalDecodeOptions<'a> {
@@ -474,14 +476,17 @@ fn decode_canonical_resolved_with_fallbacks(
                     .raw_runtime
                     .ok_or(CanonicalDecodeError::RawRuntimeUnavailable)?;
                 let (tx, rx) = mpsc::channel();
-                let _ticket = runtime.executor.submit_with_cancel_flag(
+                let ticket = Arc::new(runtime.executor.submit_with_cancel_flag(
                     source.raw_owned_source(),
                     RawDevelopScale::Full,
                     runtime.brightness,
                     runtime.priority,
                     tx,
                     options.cancel.cloned(),
-                );
+                ));
+                if let Some(on_submitted) = runtime.on_submitted {
+                    on_submitted(Arc::clone(&ticket));
+                }
                 let output = rx
                     .recv()
                     .map_err(|_| CanonicalDecodeError::RawRuntimeUnavailable)?
@@ -856,6 +861,7 @@ mod tests {
                             executor: &executor,
                             brightness: RawBrightness::None,
                             priority: RawPriority::High,
+                            on_submitted: None,
                         }),
                 )
                 .unwrap(),

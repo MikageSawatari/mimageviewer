@@ -5805,6 +5805,26 @@ impl ContainerEngine {
                 "RAW pages are not supported yet (S2b)",
             ));
         }
+        if !full_page {
+            match crate::thumb_loader::remote_raw_thumbnail_requirement(&request, target_px, None) {
+                Ok(crate::thumb_loader::RemoteRawThumbRequirement::NeedsHalfDevelopment) => {
+                    return Err(media_error(
+                        MediaErrorCode::Unsupported,
+                        "RAW thumbnail requires half development; Remote does not support it yet",
+                    ));
+                }
+                Err(error) => {
+                    return Err(media_error(
+                        MediaErrorCode::Unsupported,
+                        format!("RAW thumbnail information unavailable: {error}"),
+                    ));
+                }
+                Ok(
+                    crate::thumb_loader::RemoteRawThumbRequirement::NotRaw
+                    | crate::thumb_loader::RemoteRawThumbRequirement::PreviewSufficient,
+                ) => {}
+            }
+        }
         // identity は HTTP 要求値の echo ではなく、この描画要求が実際に使う
         // resolved.logical と subresource から画素生成境界で再構成する。
         let identity =
@@ -6724,6 +6744,7 @@ fn decode_remote_ai_canonical(
                 executor: raw_executor,
                 brightness: raw_brightness,
                 priority: crate::raw::RawPriority::High,
+                on_submitted: None,
             }),
         },
     )
@@ -7327,6 +7348,55 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_zip_representative_needing_half_is_typed_unsupported_thumbnail() {
+        use std::io::Write;
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("raw-zip-thumbnail");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let archive = folder.join("book.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file("chapter/page.cr2", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&std::fs::read(source).unwrap()).unwrap();
+        writer.finish().unwrap();
+        let mut settings = crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("RAW".to_owned(), folder)],
+            ..Default::default()
+        };
+        settings.thumb_px = 2048;
+        let engine = ContainerEngine::new(settings);
+        let context = WorkerContext::open();
+        for subresource in [
+            RemoteSubresource::File,
+            RemoteSubresource::ZipEntry {
+                entry_name: "chapter/page.cr2".to_owned(),
+            },
+            RemoteSubresource::ZipDirectory {
+                prefix: "chapter/".to_owned(),
+            },
+        ] {
+            let response = engine.thumbnail(
+                &mimageviewer_ipc::ThumbnailRequest {
+                    address: RemoteAddress {
+                        path: archive.to_string_lossy().into_owned(),
+                        subresource,
+                    },
+                    source_address: None,
+                    target_px: 2048,
+                },
+                &context,
+            );
+            assert!(matches!(response, ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::Unsupported, message,
+            }) if message.contains("requires half development")));
+        }
+    }
 
     #[cfg(windows)]
     #[test]

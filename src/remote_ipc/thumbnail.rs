@@ -317,6 +317,31 @@ impl ThumbnailEngine {
             );
         }
 
+        // Resolve the actual representative before the catalog lookup: cached
+        // half-developed RAW thumbnails are also unsupported by Remote in S2a.
+        match crate::thumb_loader::remote_raw_thumbnail_requirement(
+            &load_request,
+            target_px.min(self.settings.thumb_px.max(1)),
+            context.folder_pin_db.as_ref(),
+        ) {
+            Ok(crate::thumb_loader::RemoteRawThumbRequirement::NeedsHalfDevelopment) => {
+                return Err(error_response(
+                    ThumbnailErrorCode::Unsupported,
+                    "RAW thumbnail requires half development; Remote does not support it yet",
+                ));
+            }
+            Err(error) => {
+                return Err(error_response(
+                    ThumbnailErrorCode::Unsupported,
+                    format!("RAW thumbnail information unavailable: {error}"),
+                ));
+            }
+            Ok(
+                crate::thumb_loader::RemoteRawThumbRequirement::NotRaw
+                | crate::thumb_loader::RemoteRawThumbRequirement::PreviewSufficient,
+            ) => {}
+        }
+
         let catalog = Arc::new(
             crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), parent).map_err(
                 |error| {
@@ -373,26 +398,6 @@ impl ThumbnailEngine {
                 ThumbnailErrorCode::Unsupported,
                 "RAW thumbnail requires half development; Remote does not support it yet",
             ));
-        }
-        if !is_folder && crate::raw_format::is_raw_path(&resolved.logical) {
-            let source = crate::raw::RawSource::Path(&resolved.logical);
-            let info = crate::raw::raw_decoder::info(source).map_err(|error| {
-                error_response(
-                    ThumbnailErrorCode::Unsupported,
-                    format!("RAW thumbnail information unavailable: {error}"),
-                )
-            })?;
-            let required = target_px
-                .min(self.settings.thumb_px.max(1))
-                .min(info.developed_dims[0].max(info.developed_dims[1]));
-            let preview_sufficient = crate::raw::raw_decoder::preview(source)
-                .is_ok_and(|preview| preview.image.width().max(preview.image.height()) >= required);
-            if !preview_sufficient {
-                return Err(error_response(
-                    ThumbnailErrorCode::Unsupported,
-                    "RAW thumbnail requires half development; Remote does not support it yet",
-                ));
-            }
         }
         drop(tx);
         let color_image = rx
@@ -721,6 +726,67 @@ mod tests {
             matches!(result, Err(ThumbnailResponse::Error(ThumbnailError {
             code: ThumbnailErrorCode::Unsupported,
             message,
+        })) if message.contains("requires half development"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_raw_folder_representative_still_returns_typed_unsupported() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("remote-cached-raw-folder");
+        let folder = root.join("pages");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let raw_path = folder.join("page.cr2");
+        std::fs::copy(source, &raw_path).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.thumb_px = 2048;
+        let engine = ThumbnailEngine::new(settings);
+        let resolved = resolve_existing(folder.to_string_lossy().as_ref()).unwrap();
+        let key = crate::thumb_loader::folder_thumb_auto_cache_key_for_path(
+            &resolved.logical,
+            false,
+            engine.settings.folder_thumb_sort,
+            engine.settings.folder_thumb_depth,
+        )
+        .unwrap();
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
+        let cached = image::DynamicImage::new_rgb8(8, 8);
+        let webp = crate::catalog::encode_thumb_webp(&cached, 8, 80.0)
+            .unwrap()
+            .0;
+        let meta = std::fs::metadata(&folder).unwrap();
+        let raw_meta = std::fs::metadata(&raw_path).unwrap();
+        let proof = crate::catalog::FolderSelectionProof {
+            directories: Vec::new(),
+            pin_store: crate::catalog::PinStoreProof::NotConsulted,
+            winner: crate::catalog::FolderSelectionWinner {
+                path: raw_path,
+                mtime: crate::ui_helpers::mtime_secs(&raw_meta),
+                file_size: raw_meta.len() as i64,
+                archive_row_key: None,
+            },
+        };
+        catalog
+            .save_auto_folder_bytes(
+                &key,
+                crate::ui_helpers::mtime_secs(&meta),
+                0,
+                Some((8, 8)),
+                None,
+                &webp,
+                Some(&proof),
+            )
+            .unwrap();
+        assert!(catalog.load_one(&key).unwrap().is_some());
+        let context = WorkerContext::open();
+        let response = engine.generate_catalog_resolved(&resolved, 2048, &context);
+        assert!(
+            matches!(response, Err(ThumbnailResponse::Error(ThumbnailError {
+            code: ThumbnailErrorCode::Unsupported, message,
         })) if message.contains("requires half development"))
         );
     }

@@ -10,7 +10,7 @@
 //! 引数で必要な情報をすべて受け取る純粋な関数として設計されている。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 // -----------------------------------------------------------------------
@@ -506,6 +506,7 @@ pub enum RawThumbHandoff {
 /// One outstanding half development owned by the same context as `requested`.
 pub(crate) struct RawThumbPending {
     ticket: crate::raw::RawTicket,
+    submission_id: u64,
     idx: usize,
     input_seq: u64,
     items_gen: u64,
@@ -513,7 +514,42 @@ pub(crate) struct RawThumbPending {
     gen_done: Arc<AtomicUsize>,
 }
 
+static NEXT_RAW_THUMB_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn take_matching_raw_thumb_pending(
+    map: &mut crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>,
+    idx: usize,
+    submission_id: u64,
+) -> Option<RawThumbPending> {
+    if map
+        .get(&idx)
+        .is_some_and(|pending| pending.submission_id == submission_id)
+    {
+        map.remove(&idx)
+    } else {
+        None
+    }
+}
+
 impl RawThumbPending {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        ticket: crate::raw::RawTicket,
+        tx: mpsc::Sender<ThumbMsg>,
+        gen_done: Arc<AtomicUsize>,
+        items_gen: u64,
+    ) -> Self {
+        Self {
+            ticket,
+            submission_id: NEXT_RAW_THUMB_SUBMISSION_ID.fetch_add(1, Ordering::Relaxed),
+            idx: 0,
+            input_seq: 0,
+            items_gen,
+            tx,
+            gen_done,
+        }
+    }
+
     pub(crate) fn cancel(self) {
         self.ticket.cancel();
         let _ = self.tx.send(ThumbMsg {
@@ -560,6 +596,91 @@ pub(crate) fn cancel_raw_thumb_tickets_outside_keep(
     };
     for pending in exited {
         pending.cancel();
+    }
+}
+
+/// Remote must decide this before consulting any thumbnail cache. The resolver
+/// follows the same folder and archive representative choices as the loader.
+pub(crate) enum RemoteRawThumbRequirement {
+    NotRaw,
+    PreviewSufficient,
+    NeedsHalfDevelopment,
+}
+
+pub(crate) fn remote_raw_thumbnail_requirement(
+    req: &LoadRequest,
+    display_px: u32,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+) -> Result<RemoteRawThumbRequirement, String> {
+    let mut path = req.path.clone();
+    let mut cached_pin_source = false;
+    if let Some(sort) = req.folder_thumb_sort
+        && path.is_dir()
+    {
+        match resolve_folder_thumb_image(&path, sort, req.folder_thumb_depth, pin_db) {
+            Some(FolderThumbResolution::Image(selected)) => path = selected,
+            Some(FolderThumbResolution::CachedPinned(cached)) => {
+                path = cached.source_path;
+                cached_pin_source = true;
+            }
+            None => return Ok(RemoteRawThumbRequirement::NotRaw),
+        }
+    }
+
+    let selected_entry = if let Some(entry) = req.zip_entry.as_deref() {
+        Some(entry.to_owned())
+    } else if let Some(prefix) = req.zip_dir_prefix.as_deref() {
+        let Ok(entries) = crate::zip_loader::enumerate_image_entries(&path) else {
+            return Ok(RemoteRawThumbRequirement::NotRaw);
+        };
+        crate::zip_tree::ZipTree::build(path.clone(), entries)
+            .representative_for_prefix_str(
+                prefix,
+                req.folder_thumb_sort
+                    .unwrap_or(crate::settings::SortOrder::Numeric),
+            )
+            .map(|entry| entry.entry_name.clone())
+    } else if req
+        .cache_key_override
+        .as_deref()
+        .is_some_and(|key| key.starts_with(CACHE_KEY_ZIP))
+        || (cached_pin_source
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    crate::folder_tree::is_zip_extension(&extension.to_ascii_lowercase())
+                }))
+    {
+        crate::zip_loader::read_first_image_bytes(&path).map(|(entry, _)| entry)
+    } else {
+        None
+    };
+    let bytes = if let Some(entry) = selected_entry {
+        if !crate::raw_format::is_raw_path(Path::new(&entry)) {
+            return Ok(RemoteRawThumbRequirement::NotRaw);
+        }
+        Some(
+            crate::zip_loader::read_entry_bytes(&path, &entry)
+                .map_err(|error| error.to_string())?,
+        )
+    } else if crate::raw_format::is_raw_path(&path) {
+        None
+    } else {
+        return Ok(RemoteRawThumbRequirement::NotRaw);
+    };
+    let source = bytes.as_deref().map_or(
+        crate::raw::RawSource::Path(&path),
+        crate::raw::RawSource::Bytes,
+    );
+    let info = crate::raw::raw_decoder::info(source).map_err(|error| error.to_string())?;
+    let required = display_px.min(info.developed_dims[0].max(info.developed_dims[1]));
+    if crate::raw::raw_decoder::preview(source)
+        .is_ok_and(|preview| preview.image.width().max(preview.image.height()) >= required)
+    {
+        Ok(RemoteRawThumbRequirement::PreviewSufficient)
+    } else {
+        Ok(RemoteRawThumbRequirement::NeedsHalfDevelopment)
     }
 }
 
@@ -3513,6 +3634,8 @@ pub fn load_one_cached(
                     if !map.accepts_generation(idx, items_gen) {
                         return Err(raw_image_error(crate::raw::RawError::Cancelled));
                     }
+                    let submission_id =
+                        NEXT_RAW_THUMB_SUBMISSION_ID.fetch_add(1, Ordering::Relaxed);
                     let ticket = handoff
                         .executor
                         .submit_thumbnail_half_with_completion(
@@ -3520,7 +3643,9 @@ pub fn load_one_cached(
                             crate::raw::RawPriority::Normal,
                             move |result| {
                                 let mut map = callback_tickets.lock().unwrap();
-                                if !map.contains_key(&idx) {
+                                if take_matching_raw_thumb_pending(&mut map, idx, submission_id)
+                                    .is_none()
+                                {
                                     return;
                                 }
                                 match result {
@@ -3534,10 +3659,8 @@ pub fn load_one_cached(
                                         let (lock, wake) = &*queue;
                                         lock.lock().unwrap().push(next_req);
                                         wake.notify_one();
-                                        map.remove(&idx);
                                     }
                                     Err(error) => {
-                                        map.remove(&idx);
                                         let _ = tx.send(ThumbMsg {
                                             idx,
                                             image: None,
@@ -3562,6 +3685,7 @@ pub fn load_one_cached(
                         items_gen,
                         RawThumbPending {
                             ticket,
+                            submission_id,
                             idx,
                             input_seq,
                             items_gen,
@@ -4181,6 +4305,46 @@ mod tests {
     use crate::settings::{CachePolicy, Settings, SortOrder};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[cfg(windows)]
+    #[test]
+    fn late_old_raw_completion_cannot_remove_new_same_idx_submission() {
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (old_ticket, old_result) =
+            executor.block_one_slot_with_result_for_test(started_tx, release_rx);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut map = crate::items_generation_cache::ItemsGenerationMap::new("raw_overlap_test");
+        map.set_items_generation(1);
+        let old = RawThumbPending::for_test(old_ticket, tx.clone(), Arc::clone(&done), 1);
+        let old_id = old.submission_id;
+        map.insert(0, old);
+        map.set_items_generation(2);
+        let (result_tx, _result_rx) = mpsc::channel();
+        let new_ticket = executor.submit_thumbnail_half(
+            crate::raw::RawOwnedSource::Path(PathBuf::from("vendor/raw-samples/1018.cr2")),
+            crate::raw::RawPriority::Normal,
+            result_tx,
+        );
+        let new = RawThumbPending::for_test(new_ticket, tx, done, 2);
+        let new_id = new.submission_id;
+        map.insert(0, new);
+        release_tx.send(()).unwrap();
+        old_result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        // This is the old completion callback after the newer submission exists.
+        assert!(take_matching_raw_thumb_pending(&mut map, 0, old_id).is_none());
+        assert_eq!(map.get(&0).unwrap().submission_id, new_id);
+        let current = take_matching_raw_thumb_pending(&mut map, 0, new_id).unwrap();
+        current.ticket.cancel();
+    }
 
     #[cfg(windows)]
     fn raw_thumb_request(

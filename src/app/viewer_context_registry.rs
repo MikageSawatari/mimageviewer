@@ -1685,6 +1685,7 @@ impl App {
         }
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = FolderNavMode::Grid;
+        crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         for (_, pending) in self.fs_pending.drain() {
             pending.cancel();
         }
@@ -3902,6 +3903,48 @@ mod tests {
             SimilarMoveTrace::terminal_reasons_for_test(navigation_id),
             vec!["context_parked"]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parking_mounted_context_cancels_its_raw_thumbnail_ticket() {
+        let mut app = crate::app::setup_app_for_test();
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let _blocker = executor.block_one_slot_for_test(started_tx, release_rx);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (result_tx, _result_rx) = std::sync::mpsc::channel();
+        let ticket = executor.submit_thumbnail_half(
+            crate::raw::RawOwnedSource::Path(PathBuf::from("vendor/raw-samples/1018.cr2")),
+            crate::raw::RawPriority::Normal,
+            result_tx,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let generation = app.items_generation;
+        let pending = crate::thumb_loader::RawThumbPending::for_test(
+            ticket,
+            tx,
+            Arc::clone(&done),
+            generation,
+        );
+        {
+            let mut map = app.raw_thumb_develop.lock().unwrap();
+            map.set_items_generation(generation);
+            map.insert(0, pending);
+        }
+        app.pause_mounted_background_work_keep_current_frame();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .canceled
+        );
+        assert_eq!(done.load(Ordering::Relaxed), 1);
+        assert!(app.raw_thumb_develop.lock().unwrap().is_empty());
+        release_tx.send(()).unwrap();
     }
 
     #[cfg(windows)]

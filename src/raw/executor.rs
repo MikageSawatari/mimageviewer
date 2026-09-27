@@ -357,8 +357,17 @@ impl RawDevelopExecutor {
         started: mpsc::Sender<()>,
         release: mpsc::Receiver<()>,
     ) -> RawTicket {
-        let (result, _receive) = mpsc::channel();
-        self.submit_work(
+        self.block_one_slot_with_result_for_test(started, release).0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_one_slot_with_result_for_test(
+        &self,
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    ) -> (RawTicket, mpsc::Receiver<Result<DynamicImage, RawError>>) {
+        let (result, receive) = mpsc::channel();
+        let ticket = self.submit_work(
             RawPriority::Normal,
             result,
             Box::new(move |_, _| {
@@ -366,7 +375,8 @@ impl RawDevelopExecutor {
                 let _ = release.recv();
                 Ok(DynamicImage::new_rgb8(1, 1))
             }),
-        )
+        );
+        (ticket, receive)
     }
 
     #[cfg(test)]
@@ -380,6 +390,16 @@ impl RawDevelopExecutor {
     #[cfg(test)]
     pub(crate) fn running_jobs_for_test(&self) -> usize {
         self.shared.state.lock().unwrap().running.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_priority_for_test(&self, ticket: &RawTicket) -> Option<RawPriority> {
+        let state = self.shared.state.lock().unwrap();
+        [&state.high, &state.normal, &state.background]
+            .into_iter()
+            .flat_map(|queue| queue.iter())
+            .find(|job| job.id == ticket.id)
+            .map(|job| job.priority)
     }
     pub fn new(parallelism: usize) -> std::io::Result<Self> {
         assert!(

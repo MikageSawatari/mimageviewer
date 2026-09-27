@@ -1457,7 +1457,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 **2026-09-27 RAW thumbnail ticket ownership (S2a)**
 
-`raw_thumb_develop` は `requested` と同じ viewer context が所有する idx / items generation 付き map として `ViewerContextBundle` に加えた。keep range 離脱、一覧世代変更、folder 移動、park、drop でその context の ticket を cancel し、既存の canceled `ThumbMsg` で requested を解放する。別の detached flag や viewport 分岐は追加しない。
+`raw_thumb_develop` は `requested` と同じ viewer context が所有する idx / items generation / submission ID 付き map として `ViewerContextBundle` に加えた。旧世代の完了は同じ idx の新しい ticket を外さない。keep range 離脱、一覧世代変更、folder 移動、mounted context の pause/park（`fs_pending` を drain する境界）、drop でその context の ticket を cancel し、既存の canceled `ThumbMsg` で requested を解放する。別の detached flag や viewport 分岐は追加しない。
 
 **2026-09-27 §1.250 常に最前面**
 
