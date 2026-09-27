@@ -582,9 +582,9 @@ stem を大文字小文字を区別せず比較する。設定は `settings_kv` 
 | `content_identity.rs:115,796` | 台帳に保存する**元ファイル**種別は何か | (d) EPUB は `ContentKind::Epub` として S2c-2 で実装済み。既存 content identity tests |
 | `app.rs:22493,22713` (旧行) | 開く対象がページ本か | (d) S2c-1 から PDF / EPUB とも通過。S3a で共通述語へ移動し、上記の現行行へ統合 |
 | `bin/bench_scroll.rs:137,165`、`bin/bench_dupe.rs:1808` | PDF 専用の診断ベンチ入力か | (d) 製品の一覧 / 操作経路ではないため既存対象を維持 |
-| `remote_ipc/container.rs:2804,3139,3300,4384,4460,5643,5671,6356,7041,7063` | Remote の PDF ページ / subresource / location か | (c) S4。コアの Remote 分岐はこの段階で変更しない |
-| `remote_ipc/thumbnail.rs:644` | Remote 用のコンテナ代表か | (c) S4 |
-| `crates/remote-web/src/store.rs:304,312,690`、`web/app.js:3577,6580,6594,7062` | Remote が受け取る entry 種別と遷移先か | (c) S4。`store.rs:690` が現行の拡張子分類点 |
+| `remote_ipc/container.rs` の PDF ページ / subresource / location 判定 | 論理パスがページ本か | (c) S4 完了。`is_paged_document_path` を使い、実 PDF のパスワードだけ PDF 専用。EPUB の本・ページの Remote address は元 `.epub`。Remote 一覧・ページ数・未変換・綴じ方向・アーカイブ先行分岐のテスト |
+| `remote_ipc/thumbnail.rs` のコンテナ判定 | Remote の本の表紙を本体で生成するか | (c) S4 完了。EPUB も本体のページ 0 を要求し、未変換なら Web の EPUB プレースホルダー。Remote 表紙と Web タイルのテスト |
+| `crates/remote-web/src/store.rs`、`web/app.js` の拡張子再分類 | Remote が受け取る本種別と遷移先か | (c) S4 完了。既存の `pdf` wire kind で EPUB を検証・表示し、EPUB バッジと PDF 本の遷移先を使用。store / JS の回帰テスト |
 
 `PdfFile` variant を直接見るレーティング、タグ、コレクション、履歴、しおり、代表ピンの
 消費側は追加分岐が不要。上記の分類入口と、S2c-2 の論理パス / 世代スタンプの既存テストを
@@ -988,3 +988,10 @@ mIV の通常のファイルコピーと同じ (しおり・コレクション�
 (証明できないものは残す)。検証済みの内容を同じハンドルで照合して置換なしで公開する。設計担当の実 WebView2 27 冊変換 (run10):
 状態・ページ数不変、全出力に OPF の書名、`epub.invalid` 0、外部リンク 80 維持。検収時の全ライブラリテスト 9,323 件・変換器
 テスト成功。残る課題: EPUB 内リンクの PDF 内 GoTo 化、EPUB の書誌情報の検索索引。実機確認は未実施。
+
+### S4 mIV Remote (2026-09-27)
+
+- 本体の通常フォルダー一覧は S3a の共通 materializer と live `skip_epub_if_pdf_exists` を使う。EPUB タイルは既存の `RemoteEntryKind::Pdf`、開いた本は `ContainerKind::Pdf`。本・ページの address と保存キーには元 `.epub` を保持し、ページ描画だけ `pdf_loader` が固定世代へ解決する。アーカイブ先行分岐は EPUB を ZIP と判定せず、アーカイブ変換ジョブも EPUB を受け付けない。
+- Remote のページ数メモリキーと親 catalog の `pdf_meta` は EPUB の世代 ID / 世代 PDF サイズで照合する。Remote のサムネイル要求は worker 内で同じ stamp へ差し替え、見開き用の catalog 寸法もその世代の行だけを読む。通常 PDF のファイル時刻・サイズ、パスワード、読み出し経路は維持する。未変換の本を開いたときは PC での変換を案内し、起動時に EPUB が使えない場合は別の案内を返す。Remote から変換は始めない。
+- Web は既存の `pdf` wire kind を使って EPUB を PDF 本として遷移させ、タイルには EPUB バッジを出す。変換済みの表紙は本体のページ 0 を読み、未変換は EPUB プレースホルダーにする。wire のフィールドと enum 値は同じだが、`pdf` kind が EPUB 論理パスも含むようになったため protocol v61 へ上げ、本体と remote-web の版を揃える。
+- Remote の見開き・綴じ方向は PC と同じ `spread.db` の本キー `x.epub` と共通のページ組みを使う。D10 を有効にした EPUB は、保存済みの本別モード・方向が無いときだけ固定世代の方向を既定値へ適用する。既存の Remote は通常 PDF の `/ViewerPreferences /Direction` を読まず、PDF では D10 の PC との方向差が残る。EPUB の S4 では新しい Remote 設定を設けない。

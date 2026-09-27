@@ -484,6 +484,32 @@ pub(crate) fn pin_epub_for_test(logical: &Path, id: i64, pdf_size: u64) -> TestE
 }
 
 #[cfg(test)]
+static EPUB_TEST_FAILURES: OnceLock<Mutex<HashMap<String, PdfReadError>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct TestEpubFailure(String);
+
+#[cfg(test)]
+impl Drop for TestEpubFailure {
+    fn drop(&mut self) {
+        if let Some(failures) = EPUB_TEST_FAILURES.get() {
+            failures.lock().unwrap().remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_epub_for_test(logical: &Path, error: PdfReadError) -> TestEpubFailure {
+    let key = epub_cache::src_key(logical);
+    EPUB_TEST_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(key.clone(), error);
+    TestEpubFailure(key)
+}
+
+#[cfg(test)]
 pub(crate) fn pin_epub_with_source_for_test(
     logical: &Path,
     id: i64,
@@ -504,6 +530,26 @@ pub(crate) fn pin_epub_with_source_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn pin_epub_with_direction_for_test(
+    logical: &Path,
+    id: i64,
+    pdf_size: u64,
+    direction: PdfReadingDirection,
+) -> TestEpubPin {
+    let guard = pin_epub_for_test(logical, id, pdf_size);
+    with_epub_pin_guard(logical, || {
+        if let Some(target) = epub_pinned()
+            .lock()
+            .unwrap()
+            .get_mut(&epub_cache::src_key(logical))
+        {
+            target.epub_direction = Some(direction);
+        }
+    });
+    guard
+}
+
+#[cfg(test)]
 pub(crate) fn generation_target_for_test(logical: &Path, id: i64, pdf_size: u64) -> ReadTarget {
     ReadTarget {
         read_path: ResolvedReadPath::from_resolution(logical.with_extension("generated.pdf")),
@@ -511,6 +557,30 @@ pub(crate) fn generation_target_for_test(logical: &Path, id: i64, pdf_size: u64)
         display_source_state: None,
         epub_direction: None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn render_resolved_page_in_process_for_test(
+    logical: &Path,
+    page_num: u32,
+) -> std::io::Result<(u32, u32)> {
+    let read = resolve_read_target(logical).map_err(PdfReadError::into_io)?;
+    let dll = Path::new("vendor/pdfium/bin");
+    let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+        dll.to_str().unwrap(),
+    ))
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let pdfium = Pdfium::new(bindings);
+    let mut cache = PdfDocumentCache::new(&pdfium);
+    let (response, _) = ipc_render(
+        &mut cache,
+        &read.read_path.0,
+        page_num,
+        PdfRenderTarget::LongEdge(96),
+        None,
+    )?;
+    let result = PdfWorkerPool::parse_render_response(&response)?;
+    Ok((result.image.width(), result.image.height()))
 }
 
 /// Returns a target only when deciding it requires no filesystem or database I/O.
@@ -542,6 +612,16 @@ fn read_target_without_io(logical: &Path) -> Option<Result<ReadTarget, PdfReadEr
 /// EPUB resolution can stat the source and access SQLite; call that branch only
 /// from a background thread. The PDF passthrough branch performs no I/O.
 pub fn resolve_read_target(logical: &Path) -> Result<ReadTarget, PdfReadError> {
+    #[cfg(test)]
+    if let Some(error) = EPUB_TEST_FAILURES.get().and_then(|failures| {
+        failures
+            .lock()
+            .unwrap()
+            .get(&epub_cache::src_key(logical))
+            .cloned()
+    }) {
+        return Err(error);
+    }
     #[cfg(test)]
     if let Some(read) = pinned_epub_target(logical) {
         // Test seam: worker-entry tests can exercise cache hits without
@@ -4649,6 +4729,16 @@ pub fn get_document_info(
 /// 効かなかった)。
 pub fn get_page_sizes(pdf_path: &Path, password: Option<&str>) -> std::io::Result<Vec<(f32, f32)>> {
     let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
+    get_page_sizes_with_read_target(pdf_path, &read, password)
+}
+
+/// Background-only page sizes using the target that validated the caller's
+/// cache rows. Converted EPUBs must not be resolved a second time here.
+pub fn get_page_sizes_with_read_target(
+    pdf_path: &Path,
+    read: &ReadTarget,
+    password: Option<&str>,
+) -> std::io::Result<Vec<(f32, f32)>> {
     let pool = get_pool();
     let req = encode_page_sizes_request(&read.read_path, password);
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);

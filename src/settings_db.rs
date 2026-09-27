@@ -320,6 +320,7 @@ pub(crate) struct RemoteListingSettings {
 pub(crate) struct RemoteReadingSettings {
     pub(crate) default_spread_mode: crate::settings::SpreadMode,
     pub(crate) default_reading_direction: crate::settings::ReadingDirection,
+    pub(crate) follow_document_reading_direction: bool,
     pub(crate) final_cover_spread_enabled: bool,
     pub(crate) singleton_spread_first_enabled: bool,
     pub(crate) singleton_spread_last_enabled: bool,
@@ -333,6 +334,7 @@ impl RemoteReadingSettings {
         Self {
             default_spread_mode: settings.default_spread_mode,
             default_reading_direction: settings.default_reading_direction,
+            follow_document_reading_direction: settings.follow_document_reading_direction,
             final_cover_spread_enabled: settings.final_cover_spread_enabled,
             singleton_spread_first_enabled: settings.singleton_spread_first_enabled,
             singleton_spread_last_enabled: settings.singleton_spread_last_enabled,
@@ -835,6 +837,11 @@ impl SettingsDb {
                 &inner.conn,
                 "default_reading_direction",
                 || fallback.default_reading_direction,
+            )?,
+            follow_document_reading_direction: read_settings_kv_typed(
+                &inner.conn,
+                "follow_document_reading_direction",
+                || fallback.follow_document_reading_direction,
             )?,
             final_cover_spread_enabled: read_settings_kv_typed(
                 &inner.conn,

@@ -2625,6 +2625,56 @@ test("tapping an audio grid tile opens the shared media viewer route", () => {
   assert.equal(resolveMediaOpenRoute("audio", { kind: "audio", address }, -1), "audio");
 });
 
+test("EPUB source on the PDF wire route has an EPUB placeholder and opens as a book", () => {
+  const address = {
+    path: testPath("books/Book.EPUB"),
+    subresource: { kind: "file" },
+  };
+  const dispatched = [];
+  const tile = createGridTile(
+    { kind: "pdf", name: "Book", address },
+    5,
+    new Map(),
+    null,
+    180,
+    (requested, meta) => dispatched.push({ requested, meta })
+  );
+  const preview = tile.children[0];
+
+  assert.equal(
+    preview.children.find((child) => child.className === "file-glyph")?.textContent,
+    "▤"
+  );
+  assert.equal(
+    preview.children.find((child) => child.className === "type-badge")?.textContent,
+    "epub"
+  );
+  assert.equal(preview.children.some((child) => child.tagName === "IMG"), true);
+  assert.ok(tile._thumbnailBinding);
+
+  tile.dispatchEvent({ type: "click", detail: 1, pointerType: "touch" });
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].requested.payload, {
+    kind: "container",
+    address,
+    entryIndex: 5,
+  });
+
+  const pdfTile = createGridTile(
+    { kind: "pdf", name: "Book", path: testPath("books/Book.pdf") },
+    6,
+    new Map(),
+    null,
+    180,
+    () => {}
+  );
+  assert.equal(
+    pdfTile.children[0].children.find((child) => child.className === "type-badge")?.textContent,
+    "pdf"
+  );
+  assert.ok(pdfTile._thumbnailBinding);
+});
+
 test("session acquisition refreshes favorites and home once without taking the viewer", async () => {
   const previousHome = {
     places: [{ kind: "folder", label: "以前の場所" }],
