@@ -6365,6 +6365,7 @@ impl App {
                 crate::settings::SettingsLoadMeta::default(),
                 || {},
                 config.similar_feature_capability,
+                Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
             );
         // 起動時 purge-retry worker はテストハーネスでは既定オフにする。本番の既定は true
         // (app.rs:9667) だが、テストで有効だと `App::update` を回す並列テストがこの worker を
@@ -23058,7 +23059,7 @@ mod favorite_adjustment_defaults_tests {
         let done = Arc::new(AtomicUsize::new(0));
         let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &app.tx,
             None,
@@ -23071,6 +23072,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &app.keep_start_shared,
             &app.keep_end_shared,
+            None,
             None,
             None,
             None,
@@ -23121,7 +23123,7 @@ mod favorite_adjustment_defaults_tests {
         };
 
         crate::thumb_loader::process_load_request(
-            &next_request,
+            &mut next_request.clone(),
             &cache_map,
             &app.tx,
             None,
@@ -23134,6 +23136,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &app.keep_start_shared,
             &app.keep_end_shared,
+            None,
             None,
             None,
             None,
@@ -28804,7 +28807,7 @@ mod favorite_adjustment_defaults_tests {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(1));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &tx,
             None,
@@ -28817,6 +28820,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -28848,7 +28852,7 @@ mod favorite_adjustment_defaults_tests {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(1));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &tx,
             None,
@@ -28861,6 +28865,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -30092,7 +30097,7 @@ mod favorite_adjustment_defaults_tests {
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(1));
         crate::thumb_loader::process_load_request(
-            &request,
+            &mut request.clone(),
             &cache_map,
             &tx,
             None,
@@ -30105,6 +30110,7 @@ mod favorite_adjustment_defaults_tests {
             None,
             &keep_start,
             &keep_end,
+            None,
             None,
             None,
             None,
@@ -34151,7 +34157,7 @@ mod favorite_adjustment_defaults_tests {
             let keep_start = Arc::new(AtomicUsize::new(0));
             let keep_end = Arc::new(AtomicUsize::new(1));
             crate::thumb_loader::process_load_request(
-                &request,
+                &mut request.clone(),
                 &cache_map,
                 &tx,
                 Some(&catalog),
@@ -34166,6 +34172,7 @@ mod favorite_adjustment_defaults_tests {
                 &keep_end,
                 None,
                 app.folder_thumb_pin_db.as_deref(),
+                None,
                 None,
                 None,
             );

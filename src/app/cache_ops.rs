@@ -277,6 +277,8 @@ impl App {
         let current = Arc::clone(&self.cc.current);
         let thumb_px = self.settings.thumb_px;
         let thumb_quality = self.settings.thumb_quality;
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
+        let raw_brightness = self.settings.raw_brightness;
         let threads = self.settings.parallelism.thread_count();
         let batch_zip = self.settings.batch_cache_zip_contents;
         let batch_pdf = self.settings.batch_cache_pdf_contents;
@@ -411,6 +413,8 @@ impl App {
                                 *file_size,
                                 thumb_px,
                                 thumb_quality,
+                                &raw_executor,
+                                raw_brightness,
                             ) {
                                 size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                             }

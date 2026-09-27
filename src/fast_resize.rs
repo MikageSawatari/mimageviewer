@@ -213,6 +213,12 @@ pub fn resize_dynamic_fit_with_source_aspect(
 /// デコードはせず、PNG/JPEG/GIF/WebP/BMP のヘッダから幅×高さだけ取る。
 /// 失敗したら None (呼び出し側はフルデコード完了まで dims を出さない)。
 pub fn probe_dims(path: &std::path::Path) -> Option<[usize; 2]> {
+    if crate::raw_format::is_raw_path(path) {
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(path))
+            .ok()?
+            .developed_dims;
+        return Some([dims[0] as usize, dims[1] as usize]);
+    }
     let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
@@ -222,7 +228,13 @@ pub fn probe_dims(path: &std::path::Path) -> Option<[usize; 2]> {
 }
 
 /// path を再 open できない検証済み relative page / archive entry 用。
-pub fn probe_dims_from_bytes(bytes: &[u8]) -> Option<[usize; 2]> {
+pub fn probe_dims_from_bytes(bytes: &[u8], extension: &str) -> Option<[usize; 2]> {
+    if crate::raw_format::is_raw_ext(extension) {
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(bytes))
+            .ok()?
+            .developed_dims;
+        return Some([dims[0] as usize, dims[1] as usize]);
+    }
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;

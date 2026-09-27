@@ -52,6 +52,7 @@ pub enum SimilarImageFormat {
     Bmp = 5,
     Tiff = 6,
     Pdf = 7,
+    Raw = 8,
 }
 
 impl SimilarImageFormat {
@@ -61,6 +62,9 @@ impl SimilarImageFormat {
             .and_then(|extension| extension.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        if crate::raw_format::is_raw_ext(&extension) {
+            return Self::Raw;
+        }
         match extension.as_str() {
             "jpg" | "jpeg" | "jpe" | "jfif" => Self::Jpeg,
             "png" => Self::Png,
@@ -82,6 +86,7 @@ impl SimilarImageFormat {
             5 => Self::Bmp,
             6 => Self::Tiff,
             7 => Self::Pdf,
+            8 => Self::Raw,
             _ => Self::Other,
         }
     }
@@ -96,6 +101,7 @@ impl SimilarImageFormat {
             Self::Bmp => "BMP",
             Self::Tiff => "TIFF",
             Self::Pdf => "PDF",
+            Self::Raw => "RAW",
         }
     }
 }
@@ -262,7 +268,15 @@ fn decode_full(
             }
             let wic = file_path
                 .and_then(crate::wic_decoder::decode_to_dynamic_image)
-                .or_else(|| crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes));
+                .or_else(|| {
+                    crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+                        bytes,
+                        Path::new(filename_hint)
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or(""),
+                    )
+                });
             if let Some(image) = wic {
                 (
                     image,

@@ -1298,7 +1298,14 @@ fn decode_file_color_image(path: &Path) -> Result<egui::ColorImage, String> {
 fn decode_bytes_color_image(hint: &str, bytes: &[u8]) -> Result<egui::ColorImage, String> {
     let image = image::load_from_memory(bytes)
         .or_else(|_| {
-            crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes).ok_or_else(|| {
+            crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+                bytes,
+                Path::new(hint)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or(""),
+            )
+            .ok_or_else(|| {
                 image::ImageError::IoError(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "wic decode failed",
@@ -2297,6 +2304,9 @@ fn page_number_from_name(name: &str) -> Option<usize> {
 }
 
 fn is_supported_book_image_path(path: &Path) -> bool {
+    if crate::raw_format::is_raw_path(path) {
+        return true;
+    }
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };

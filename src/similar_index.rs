@@ -6731,6 +6731,9 @@ fn raster_is_large_enough_for_canonical_proxy(
             source_long_edge.min(crate::similar_image::JPEG_DCT_TARGET_EDGE)
         }
         SimilarImageFormat::Pdf => PDF_RENDER_LONG_EDGE,
+        // LibRaw's embedded raster is the intended index input for RAW. It can
+        // be smaller than the developed sensor dimensions.
+        SimilarImageFormat::Raw => 1,
         _ => source_long_edge,
     };
     decoded_long_edge >= required_long_edge

@@ -343,7 +343,7 @@ impl ThumbnailEngine {
         let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
         let effective_target = target_px.min(self.settings.thumb_px.max(1));
         crate::thumb_loader::process_load_request(
-            &load_request,
+            &mut load_request,
             &cache_map,
             &tx,
             Some(&catalog),
@@ -360,6 +360,7 @@ impl ThumbnailEngine {
             context.folder_pin_db.as_ref(),
             None,
             context.adjustment_db.as_ref(),
+            None,
         );
         drop(tx);
         let color_image = rx

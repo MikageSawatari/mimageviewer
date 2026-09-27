@@ -477,7 +477,7 @@ fn remote_page_cache_decision(
 
 #[allow(clippy::too_many_arguments)]
 fn decode_remote_source(
-    request: crate::thumb_loader::LoadRequest,
+    mut request: crate::thumb_loader::LoadRequest,
     cache_map: Arc<RwLock<HashMap<String, crate::catalog::CacheEntry>>>,
     catalog: Arc<crate::catalog::CatalogDb>,
     thumb_px: u32,
@@ -496,7 +496,7 @@ fn decode_remote_source(
     // Remote raw requests never set the folder-pin or page-adjustment fields asserted by
     // RemoteSourceDecodeIdentity, so those DB handles cannot affect this Source raster.
     crate::thumb_loader::process_load_request(
-        &request,
+        &mut request,
         &cache_map,
         &tx,
         Some(&catalog),
@@ -509,6 +509,7 @@ fn decode_remote_source(
         Some(shared_cancel),
         &keep_start,
         &keep_end,
+        None,
         None,
         None,
         None,
@@ -753,6 +754,7 @@ fn remote_auto_trim_cache_key(
 
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
+    raw_develop_executor: Arc<crate::raw::RawDevelopExecutor>,
     listing_settings: RemoteListingSettingsSource,
     reading_settings: RemoteReadingSettingsSource,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
@@ -2150,6 +2152,19 @@ fn collect_zip_entry_dims(
     let mut unresolved = 0usize;
     let mut undecodable = 0usize;
     for entry_name in missing {
+        if crate::raw_format::is_raw_path(Path::new(&entry_name)) {
+            match crate::zip_loader::read_entry_bytes(container_path, &entry_name)
+                .ok()
+                .and_then(|bytes| {
+                    crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes)).ok()
+                }) {
+                Some(info) => {
+                    dims.insert(entry_name, (info.developed_dims[0], info.developed_dims[1]));
+                }
+                None => undecodable += 1,
+            }
+            continue;
+        }
         let head = match crate::zip_loader::read_entry_prefix_from_archive(
             &mut archive,
             &entry_name,
@@ -2184,6 +2199,12 @@ fn collect_zip_entry_dims(
 /// 参照でもある。実ファイル画像だけを扱う — ZIP / PDF は書庫展開と worker 往復が要るので
 /// [`collect_zip_entry_dims`] / [`catalog_free_dims`] が別に持つ。
 fn file_image_dims(path: &Path) -> Option<(u32, u32)> {
+    if crate::raw_format::is_raw_path(path) {
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(path))
+            .ok()?
+            .developed_dims;
+        return Some((dims[0], dims[1]));
+    }
     image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
@@ -2231,12 +2252,27 @@ impl ContainerEngine {
             adjustment_settings,
             listing_settings,
             reading_settings,
+            None,
         )
     }
 
     pub(super) fn new_with_session(
         settings: crate::settings::Settings,
         session: super::session::SessionHandle,
+    ) -> Self {
+        let raw_develop_executor = Arc::new(
+            crate::raw::RawDevelopExecutor::new(
+                settings.raw_develop_parallelism.clamp(1, 10) as usize
+            )
+            .expect("RAW develop worker startup"),
+        );
+        Self::new_with_session_and_raw_executor(settings, session, raw_develop_executor)
+    }
+
+    pub(super) fn new_with_session_and_raw_executor(
+        settings: crate::settings::Settings,
+        session: super::session::SessionHandle,
+        raw_develop_executor: Arc<crate::raw::RawDevelopExecutor>,
     ) -> Self {
         Self::new_inner(
             settings,
@@ -2245,6 +2281,7 @@ impl ContainerEngine {
             AdjustmentSettingsSource::Live,
             RemoteListingSettingsSource::Live,
             RemoteReadingSettingsSource::Live,
+            Some(raw_develop_executor),
         )
     }
 
@@ -2269,6 +2306,7 @@ impl ContainerEngine {
             adjustment_settings,
             listing_settings,
             reading_settings,
+            None,
         )
     }
 
@@ -2279,6 +2317,7 @@ impl ContainerEngine {
         adjustment_settings: AdjustmentSettingsSource,
         listing_settings: RemoteListingSettingsSource,
         reading_settings: RemoteReadingSettingsSource,
+        raw_develop_executor: Option<Arc<crate::raw::RawDevelopExecutor>>,
     ) -> Self {
         let spread_db_path = crate::data_dir::get().join("spread.db");
         let spread_db = crate::spread_db::SpreadDb::open_existing_read_only_at(&spread_db_path)
@@ -2300,6 +2339,14 @@ impl ContainerEngine {
                 }
             };
         Self {
+            raw_develop_executor: raw_develop_executor.unwrap_or_else(|| {
+                Arc::new(
+                    crate::raw::RawDevelopExecutor::new(
+                        settings.raw_develop_parallelism.clamp(1, 10) as usize,
+                    )
+                    .expect("RAW develop worker startup"),
+                )
+            }),
             settings: Arc::new(settings),
             listing_settings,
             reading_settings,
@@ -4416,6 +4463,8 @@ impl ContainerEngine {
                     },
                     page_index,
                     cancel,
+                    &self.raw_develop_executor,
+                    self.settings.raw_brightness,
                 )
             }
             RemoteSubresource::ZipEntry { entry_name } if is_archive_container(resolved) => {
@@ -4426,6 +4475,8 @@ impl ContainerEngine {
                     },
                     page_index,
                     cancel,
+                    &self.raw_develop_executor,
+                    self.settings.raw_brightness,
                 )
             }
             RemoteSubresource::PdfPage { page_number } if is_pdf_path(&resolved.logical) => {
@@ -5745,6 +5796,15 @@ impl ContainerEngine {
                 ));
             }
         };
+        // S2b owns Remote page development. Reject the resolved RAW source before
+        // source/composite cache lookup, so an older embedded-preview cache cannot
+        // turn a page request into a silent preview response.
+        if full_page && remote_page_source_is_raw(&request, resolved, address) {
+            return Err(media_error(
+                MediaErrorCode::Unsupported,
+                "RAW pages are not supported yet (S2b)",
+            ));
+        }
         // identity は HTTP 要求値の echo ではなく、この描画要求が実際に使う
         // resolved.logical と subresource から画素生成境界で再構成する。
         let identity =
@@ -6648,6 +6708,8 @@ fn decode_remote_ai_canonical(
     source: crate::canonical_image_loader::CanonicalImageSource<'_>,
     page_index: usize,
     cancel: &Arc<AtomicBool>,
+    raw_executor: &crate::raw::RawDevelopExecutor,
+    raw_brightness: crate::raw::RawBrightness,
 ) -> Result<(Arc<egui::ColorImage>, [usize; 2]), RemoteAiRunError> {
     let decoded = crate::canonical_image_loader::decode_canonical_image(
         source,
@@ -6657,6 +6719,12 @@ fn decode_remote_ai_canonical(
             cancel: None,
             animation_policy: crate::canonical_image_loader::AnimationPolicy::FullFrames,
             on_animation_confirmed: None,
+            raw_stage: crate::canonical_image_loader::RawStage::Full,
+            raw_runtime: Some(crate::canonical_image_loader::RawDecodeRuntime {
+                executor: raw_executor,
+                brightness: raw_brightness,
+                priority: crate::raw::RawPriority::High,
+            }),
         },
     )
     .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?;
@@ -6683,6 +6751,9 @@ fn decode_remote_ai_canonical(
                 page_index,
             })
         }
+        crate::canonical_image_loader::CanonicalImageDecode::RawPreview { .. } => Err(
+            RemoteAiRunError::Failed("RAW full development returned a preview".to_owned()),
+        ),
     }
 }
 
@@ -7083,6 +7154,36 @@ fn is_zip_path(path: &Path) -> bool {
 
 fn is_archive_container(resolved: &ResolvedPath) -> bool {
     resolved.has_archive_backing() || is_zip_path(&resolved.logical)
+}
+
+fn remote_page_source_is_raw(
+    request: &crate::thumb_loader::LoadRequest,
+    resolved: &ResolvedPath,
+    address: &RemoteAddress,
+) -> bool {
+    if let Some(entry) = request.zip_entry.as_deref() {
+        return crate::raw_format::is_raw_path(Path::new(entry));
+    }
+    if let Some(prefix) = request.zip_dir_prefix.as_deref() {
+        return crate::zip_loader::enumerate_image_entries(&request.path)
+            .ok()
+            .and_then(|entries| {
+                crate::zip_tree::ZipTree::build(request.path.clone(), entries)
+                    .representative_for_prefix_str(
+                        prefix,
+                        request
+                            .folder_thumb_sort
+                            .unwrap_or(crate::settings::SortOrder::Numeric),
+                    )
+                    .map(|entry| crate::raw_format::is_raw_path(Path::new(&entry.entry_name)))
+            })
+            .unwrap_or(false);
+    }
+    if matches!(address.subresource, RemoteSubresource::File) && is_archive_container(resolved) {
+        return crate::zip_loader::read_first_image_bytes(&request.path)
+            .is_some_and(|(entry, _)| crate::raw_format::is_raw_path(Path::new(&entry)));
+    }
+    crate::raw_format::is_raw_path(&request.path)
 }
 
 fn is_pdf_path(path: &Path) -> bool {
@@ -9817,6 +9918,8 @@ mod tests {
             },
             0,
             &cancel,
+            &engine.raw_develop_executor,
+            engine.settings.raw_brightness,
         ) else {
             panic!("verified page bytes must decode canonically");
         };

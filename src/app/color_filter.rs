@@ -778,7 +778,7 @@ fn load_palette_for_request(
         req.force_cache = false;
     }
     crate::thumb_loader::process_load_request(
-        &req,
+        &mut req,
         cache_map,
         &tx,
         catalog,
@@ -793,6 +793,7 @@ fn load_palette_for_request(
         keep_end,
         None,
         pin_db,
+        None,
         None,
         None,
     );

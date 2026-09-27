@@ -45,7 +45,7 @@ pub enum RawDevelopScale {
     Half,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RawBrightness {
     #[default]
     MatchPreview,
@@ -147,15 +147,19 @@ impl std::fmt::Display for RawError {
 impl std::error::Error for RawError {}
 
 pub(crate) struct RawCancellation {
-    pub flag: AtomicBool,
+    pub flag: Arc<AtomicBool>,
     #[cfg(windows)]
     handle: Mutex<usize>,
 }
 
 impl RawCancellation {
     pub(crate) fn new() -> Self {
+        Self::with_flag(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub(crate) fn with_flag(flag: Arc<AtomicBool>) -> Self {
         Self {
-            flag: AtomicBool::new(false),
+            flag,
             #[cfg(windows)]
             handle: Mutex::new(0),
         }

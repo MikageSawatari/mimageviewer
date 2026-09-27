@@ -65,9 +65,7 @@ pub const WIC_SUPPORTED_EXTENSIONS: &[&str] = &[
     // モダン形式
     "heic", "heif", "avif", "jxl",
     // TIFF (image クレートも対応するが WIC の方が高機能)
-    "tiff", "tif", // カメラ RAW (Raw Image Extension が必要)
-    "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx",
-    "rwl", "iiq",
+    "tiff", "tif",
 ];
 
 /// 拡張子が WIC で扱える可能性があるか判定する。
@@ -85,6 +83,10 @@ pub fn is_wic_supported_extension(ext: &str) -> bool {
 /// COM は呼び出しごとに初期化・解放するため、ワーカースレッドから自由に呼べる。
 /// `S_FALSE` (= 既に初期化済み) も成功として扱う。
 pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
+    if crate::raw_format::is_raw_path(path) {
+        debug_assert!(false, "RAW must be routed to LibRaw before WIC");
+        return None;
+    }
     #[cfg(not(windows))]
     {
         let _ = path;
@@ -138,7 +140,14 @@ pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
 ///
 /// 性能面: コピー 1 回 (典型的な 1〜50 MB の画像で 1 ms 未満) は WIC デコード本体
 /// (HEIC/AVIF/RAW で数十〜数百 ms) に比べ無視できる。
-pub fn decode_to_dynamic_image_from_bytes(bytes: &[u8]) -> Option<image::DynamicImage> {
+pub fn decode_to_dynamic_image_from_bytes(
+    bytes: &[u8],
+    extension: &str,
+) -> Option<image::DynamicImage> {
+    if crate::raw_format::is_raw_ext(extension) {
+        debug_assert!(false, "RAW must be routed to LibRaw before WIC");
+        return None;
+    }
     #[cfg(not(windows))]
     {
         let _ = bytes;
@@ -243,6 +252,10 @@ unsafe fn decode_first_frame(
 /// WIC メタデータから EXIF Orientation 値を読み取る。
 /// rexif が対応しない RAW 形式 (ORF, CR2, NEF 等) でも取得できる。
 pub fn read_wic_orientation(path: &Path) -> Option<u16> {
+    if crate::raw_format::is_raw_path(path) {
+        debug_assert!(false, "RAW orientation comes from LibRaw");
+        return None;
+    }
     #[cfg(not(windows))]
     {
         let _ = path;
@@ -328,17 +341,14 @@ mod tests {
         assert!(is_wic_supported_extension("heif"));
         assert!(is_wic_supported_extension("avif"));
         assert!(is_wic_supported_extension("jxl"));
-        assert!(is_wic_supported_extension("dng"));
-        assert!(is_wic_supported_extension("cr2"));
-        assert!(is_wic_supported_extension("nef"));
-        assert!(is_wic_supported_extension("arw"));
+        assert!(is_wic_supported_extension("tiff"));
     }
 
     #[test]
     fn is_wic_supported_extension_uppercase() {
         assert!(is_wic_supported_extension("HEIC"));
         assert!(is_wic_supported_extension("Avif"));
-        assert!(is_wic_supported_extension("CR2"));
+        assert!(is_wic_supported_extension("TIFF"));
     }
 
     #[test]
@@ -350,5 +360,8 @@ mod tests {
         assert!(!is_wic_supported_extension("gif"));
         assert!(!is_wic_supported_extension("txt"));
         assert!(!is_wic_supported_extension(""));
+        for &raw in crate::raw_format::RAW_EXTENSIONS {
+            assert!(!is_wic_supported_extension(raw));
+        }
     }
 }

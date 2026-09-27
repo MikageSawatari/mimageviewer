@@ -8,9 +8,15 @@
 use std::borrow::Cow;
 use std::io::{Cursor, Read};
 use std::path::Path;
+use std::sync::mpsc;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+};
+
+use crate::raw::{
+    RawBrightness, RawDevelopExecutor, RawDevelopScale, RawDevelopSupport, RawError,
+    RawOwnedSource, RawPreview, RawPreviewUnavailableReason, RawPriority, RawSource, raw_decoder,
 };
 
 use crate::fs_animation::{
@@ -46,22 +52,41 @@ pub struct CanonicalDecodeOptions<'a> {
     pub animation_policy: AnimationPolicy,
     /// 複数フレーム形式だと decoder が確認した直後に高々 1 回呼ぶ。
     pub on_animation_confirmed: Option<&'a dyn Fn()>,
+    /// Required at every call site so RAW cannot silently take a non-RAW decoder.
+    pub raw_stage: RawStage,
+    pub raw_runtime: Option<RawDecodeRuntime<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawStage {
+    Preview,
+    Full,
+}
+
+#[derive(Clone, Copy)]
+pub struct RawDecodeRuntime<'a> {
+    pub executor: &'a RawDevelopExecutor,
+    pub brightness: RawBrightness,
+    pub priority: RawPriority,
 }
 
 impl<'a> CanonicalDecodeOptions<'a> {
-    pub const fn fullscreen(animation_policy: AnimationPolicy) -> Self {
+    pub const fn fullscreen(animation_policy: AnimationPolicy, raw_stage: RawStage) -> Self {
         Self {
             susie_priority: true,
             susie_cancel: None,
             cancel: None,
             animation_policy,
             on_animation_confirmed: None,
+            raw_stage,
+            raw_runtime: None,
         }
     }
 
     pub fn fullscreen_cancellable(
         animation_policy: AnimationPolicy,
         cancel: &'a Arc<AtomicBool>,
+        raw_stage: RawStage,
     ) -> CanonicalDecodeOptions<'a> {
         CanonicalDecodeOptions {
             susie_priority: true,
@@ -71,7 +96,14 @@ impl<'a> CanonicalDecodeOptions<'a> {
             cancel: Some(cancel),
             animation_policy,
             on_animation_confirmed: None,
+            raw_stage,
+            raw_runtime: None,
         }
+    }
+
+    pub fn with_raw_runtime(mut self, runtime: RawDecodeRuntime<'a>) -> Self {
+        self.raw_runtime = Some(runtime);
+        self
     }
 
     pub fn with_animation_confirmation(mut self, callback: &'a dyn Fn()) -> Self {
@@ -156,6 +188,12 @@ impl CanonicalStaticImage {
 
 pub enum CanonicalImageDecode {
     Static(CanonicalStaticImage),
+    RawPreview {
+        preview: Option<RawPreview>,
+        unavailable: Option<RawPreviewUnavailableReason>,
+        developed_dims: [usize; 2],
+        develop_support: RawDevelopSupport,
+    },
     Animated {
         format: CanonicalAnimatedFormat,
         frames: Vec<(egui::ColorImage, f64)>,
@@ -167,6 +205,8 @@ pub enum CanonicalDecodeError {
     SourceRead(std::io::Error),
     Decode(DecodeChainFailure),
     Cancelled(CanonicalCancelStage),
+    Raw(RawError),
+    RawRuntimeUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +248,10 @@ impl std::fmt::Display for CanonicalDecodeError {
             Self::SourceRead(error) => write!(formatter, "source read failed: {error}"),
             Self::Decode(error) => write!(formatter, "image decode failed: {error}"),
             Self::Cancelled(stage) => write!(formatter, "image decode cancelled at {stage:?}"),
+            Self::Raw(error) => write!(formatter, "RAW decode failed: {error}"),
+            Self::RawRuntimeUnavailable => {
+                write!(formatter, "RAW development executor unavailable")
+            }
         }
     }
 }
@@ -217,7 +261,7 @@ impl std::error::Error for CanonicalDecodeError {}
 /// WIC / Susie の実装を production から分離し、fallback 順と条件を test で固定する seam。
 trait FallbackDecoder {
     fn wic_path(&self, path: &Path) -> Option<image::DynamicImage>;
-    fn wic_bytes(&self, bytes: &[u8]) -> Option<image::DynamicImage>;
+    fn wic_bytes(&self, bytes: &[u8], extension: &str) -> Option<image::DynamicImage>;
     fn susie_path(
         &self,
         path: &Path,
@@ -238,8 +282,8 @@ impl FallbackDecoder for SystemFallbackDecoder {
         crate::wic_decoder::decode_to_dynamic_image(path)
     }
 
-    fn wic_bytes(&self, bytes: &[u8]) -> Option<image::DynamicImage> {
-        crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes)
+    fn wic_bytes(&self, bytes: &[u8], extension: &str) -> Option<image::DynamicImage> {
+        crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes, extension)
     }
 
     fn susie_path(
@@ -269,14 +313,14 @@ impl FallbackDecoder for SystemFallbackDecoder {
     }
 }
 
-struct ResolvedSource<'a> {
+pub struct CanonicalResolvedSource<'a> {
     path: &'a Path,
     bytes: Option<Cow<'a, [u8]>>,
     filename_hint: Cow<'a, str>,
     extension: String,
 }
 
-impl<'a> ResolvedSource<'a> {
+impl<'a> CanonicalResolvedSource<'a> {
     fn resolve(
         source: CanonicalImageSource<'a>,
         cancel: Option<&Arc<AtomicBool>>,
@@ -335,6 +379,40 @@ impl<'a> ResolvedSource<'a> {
             }
         }
     }
+
+    pub fn needs_raw_development(&self, stage: RawStage) -> bool {
+        crate::raw_format::is_raw_ext(&self.extension) && stage == RawStage::Full
+    }
+
+    pub fn is_raw(&self) -> bool {
+        crate::raw_format::is_raw_ext(&self.extension)
+    }
+
+    pub fn raw_info(&self) -> Result<crate::raw::RawInfo, RawError> {
+        raw_decoder::info(self.raw_source())
+    }
+
+    fn raw_source(&self) -> RawSource<'_> {
+        match self.bytes.as_deref() {
+            Some(bytes) => RawSource::Bytes(bytes),
+            None => RawSource::Path(self.path),
+        }
+    }
+
+    fn raw_owned_source(&self) -> RawOwnedSource {
+        match self.bytes.as_deref() {
+            Some(bytes) => RawOwnedSource::Bytes(Arc::from(bytes)),
+            None => RawOwnedSource::Path(self.path.to_owned()),
+        }
+    }
+}
+
+/// Resolve archive bytes while the caller still owns its I/O admission permit.
+pub fn resolve_canonical_source<'a>(
+    source: CanonicalImageSource<'a>,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<CanonicalResolvedSource<'a>, CanonicalDecodeError> {
+    CanonicalResolvedSource::resolve(source, cancel)
 }
 
 /// 本体 fullscreen と同じ source/animation/fallback/EXIF 規則で native image を読む。
@@ -343,7 +421,15 @@ pub fn decode_canonical_image(
     source: CanonicalImageSource<'_>,
     options: CanonicalDecodeOptions<'_>,
 ) -> Result<CanonicalImageDecode, CanonicalDecodeError> {
-    decode_canonical_image_with_fallbacks(source, options, &SystemFallbackDecoder)
+    let source = resolve_canonical_source(source, options.cancel)?;
+    decode_canonical_resolved(source, options)
+}
+
+pub fn decode_canonical_resolved(
+    source: CanonicalResolvedSource<'_>,
+    options: CanonicalDecodeOptions<'_>,
+) -> Result<CanonicalImageDecode, CanonicalDecodeError> {
+    decode_canonical_resolved_with_fallbacks(source, options, &SystemFallbackDecoder)
 }
 
 fn decode_canonical_image_with_fallbacks(
@@ -351,12 +437,63 @@ fn decode_canonical_image_with_fallbacks(
     options: CanonicalDecodeOptions<'_>,
     fallbacks: &impl FallbackDecoder,
 ) -> Result<CanonicalImageDecode, CanonicalDecodeError> {
-    let source = ResolvedSource::resolve(source, options.cancel)?;
+    let source = resolve_canonical_source(source, options.cancel)?;
+    decode_canonical_resolved_with_fallbacks(source, options, fallbacks)
+}
+
+fn decode_canonical_resolved_with_fallbacks(
+    source: CanonicalResolvedSource<'_>,
+    options: CanonicalDecodeOptions<'_>,
+    fallbacks: &impl FallbackDecoder,
+) -> Result<CanonicalImageDecode, CanonicalDecodeError> {
     let cancel = options.cancel.map(Arc::as_ref);
     if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
         return Err(CanonicalDecodeError::Cancelled(
             CanonicalCancelStage::SourceReadComplete,
         ));
+    }
+    if crate::raw_format::is_raw_ext(&source.extension) {
+        return match options.raw_stage {
+            RawStage::Preview => {
+                let info =
+                    raw_decoder::info(source.raw_source()).map_err(CanonicalDecodeError::Raw)?;
+                let (preview, unavailable) = match raw_decoder::preview(source.raw_source()) {
+                    Ok(preview) => (Some(preview), None),
+                    Err(RawError::NoUsablePreview(reason)) => (None, Some(reason)),
+                    Err(error) => return Err(CanonicalDecodeError::Raw(error)),
+                };
+                Ok(CanonicalImageDecode::RawPreview {
+                    preview,
+                    unavailable,
+                    developed_dims: info.developed_dims.map(|value| value as usize),
+                    develop_support: info.develop_support,
+                })
+            }
+            RawStage::Full => {
+                let runtime = options
+                    .raw_runtime
+                    .ok_or(CanonicalDecodeError::RawRuntimeUnavailable)?;
+                let (tx, rx) = mpsc::channel();
+                let _ticket = runtime.executor.submit_with_cancel_flag(
+                    source.raw_owned_source(),
+                    RawDevelopScale::Full,
+                    runtime.brightness,
+                    runtime.priority,
+                    tx,
+                    options.cancel.cloned(),
+                );
+                let output = rx
+                    .recv()
+                    .map_err(|_| CanonicalDecodeError::RawRuntimeUnavailable)?
+                    .map_err(CanonicalDecodeError::Raw)?;
+                let image = output.image;
+                Ok(CanonicalImageDecode::Static(CanonicalStaticImage {
+                    source_dims: [image.width() as usize, image.height() as usize],
+                    image,
+                    animation: CanonicalStaticAnimation::Still,
+                }))
+            }
+        };
     }
     let bytes = source.bytes.as_deref();
     let static_animation = if options.animation_policy == AnimationPolicy::FirstFrameOnly {
@@ -452,7 +589,7 @@ fn decode_canonical_image_with_fallbacks(
     let image = if let Some(bytes) = bytes {
         match image::load_from_memory(bytes) {
             Ok(image) => Ok(image),
-            Err(primary) => match fallbacks.wic_bytes(bytes) {
+            Err(primary) => match fallbacks.wic_bytes(bytes, &source.extension) {
                 Some(image) => Ok(image),
                 None => fallbacks
                     .susie_bytes(&source.filename_hint, bytes, options)
@@ -501,7 +638,7 @@ fn decode_canonical_image_with_fallbacks(
 /// FirstFrameOnly の static fallback が「本当にアニメの第1フレーム」かを、画素展開せず
 /// コンテナ構造だけで判定する。通常の静止 PNG/WebP を現ページ化のたびに再 decode しないため、
 /// 拡張子だけを sentinel にしない。
-fn probe_static_animation(source: &ResolvedSource<'_>) -> CanonicalStaticAnimation {
+fn probe_static_animation(source: &CanonicalResolvedSource<'_>) -> CanonicalStaticAnimation {
     let probe = |reader: &mut dyn Read| match source.extension.as_str() {
         "gif" => gif_has_multiple_frames(reader).then_some(CanonicalAnimatedFormat::Gif),
         "png" => apng_has_multiple_frames(reader).then_some(CanonicalAnimatedFormat::Apng),
@@ -707,6 +844,7 @@ mod tests {
         match result {
             CanonicalImageDecode::Static(image) => image,
             CanonicalImageDecode::Animated { .. } => panic!("expected static image"),
+            CanonicalImageDecode::RawPreview { .. } => panic!("expected static image"),
         }
     }
 
@@ -958,7 +1096,7 @@ mod tests {
                     path: Path::new(filename),
                     verified_bytes: Some(&bytes),
                 },
-                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames)
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full)
                     .with_animation_confirmation(&on_animation_confirmed),
             )
             .unwrap();
@@ -988,7 +1126,7 @@ mod tests {
                     path: Path::new(filename),
                     verified_bytes: Some(&bytes),
                 },
-                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames)
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full)
                     .with_animation_confirmation(&on_animation_confirmed),
             )
             .unwrap();
@@ -1015,7 +1153,7 @@ mod tests {
                     path: &path,
                     verified_bytes: None,
                 },
-                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             )
             .unwrap(),
         );
@@ -1025,7 +1163,7 @@ mod tests {
                     path: &path,
                     verified_bytes: Some(&bytes),
                 },
-                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             )
             .unwrap(),
         );
@@ -1049,7 +1187,7 @@ mod tests {
                     path,
                     verified_bytes: Some(&bytes),
                 },
-                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             )
             .unwrap(),
         );
@@ -1072,7 +1210,7 @@ mod tests {
                     archive_path: &outer,
                     entry_name: "chapter.zip/page.png",
                 },
-                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             )
             .unwrap(),
         );
@@ -1082,7 +1220,7 @@ mod tests {
                     path: Path::new("page.png"),
                     verified_bytes: Some(&page),
                 },
-                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             )
             .unwrap(),
         );
@@ -1099,7 +1237,7 @@ mod tests {
         let image = static_image(
             decode_canonical_image(
                 source,
-                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FirstFrameOnly),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FirstFrameOnly, RawStage::Full),
             )
             .unwrap(),
         );
@@ -1119,7 +1257,7 @@ mod tests {
     ) {
         let decoded = decode_canonical_image(
             source,
-            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
         )
         .unwrap();
         let CanonicalImageDecode::Animated {
@@ -1283,6 +1421,8 @@ mod tests {
                 cancel: Some(&cancel),
                 animation_policy: AnimationPolicy::FullFrames,
                 on_animation_confirmed: None,
+                raw_stage: RawStage::Full,
+                raw_runtime: None,
             },
         );
 
@@ -1312,6 +1452,8 @@ mod tests {
                 cancel: Some(&cancel),
                 animation_policy: AnimationPolicy::FullFrames,
                 on_animation_confirmed: None,
+                raw_stage: RawStage::Full,
+                raw_runtime: None,
             },
         );
 
@@ -1332,7 +1474,7 @@ mod tests {
                     path: Path::new("wide.png"),
                     verified_bytes: Some(&bytes),
                 },
-                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             )
             .unwrap(),
         );
@@ -1385,7 +1527,7 @@ mod tests {
             matches!(self.wic, BackendResult::Hit).then(Self::image)
         }
 
-        fn wic_bytes(&self, _bytes: &[u8]) -> Option<image::DynamicImage> {
+        fn wic_bytes(&self, _bytes: &[u8], _extension: &str) -> Option<image::DynamicImage> {
             self.calls.lock().unwrap().push("wic_bytes");
             matches!(self.wic, BackendResult::Hit).then(Self::image)
         }
@@ -1430,7 +1572,7 @@ mod tests {
                 path,
                 verified_bytes: Some(invalid),
             },
-            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             &wic_hit,
         )
         .unwrap();
@@ -1447,7 +1589,7 @@ mod tests {
                 path,
                 verified_bytes: Some(invalid),
             },
-            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             &susie_hit,
         )
         .unwrap();
@@ -1470,7 +1612,7 @@ mod tests {
                 path: &path,
                 verified_bytes: None,
             },
-            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             &fallbacks,
         )
         .unwrap();
@@ -1492,7 +1634,7 @@ mod tests {
                 path: Path::new("page.png"),
                 verified_bytes: Some(&bytes),
             },
-            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             &fallbacks,
         )
         .unwrap();
@@ -1514,7 +1656,7 @@ mod tests {
                 path: Path::new("invalid.pi"),
                 verified_bytes: Some(invalid),
             },
-            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             &fallbacks,
         );
 
@@ -1540,7 +1682,7 @@ mod tests {
                 path: Path::new("page.miv-unknown"),
                 verified_bytes: Some(b"not an image"),
             },
-            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames, RawStage::Full),
             &fallbacks,
         );
         let Err(error) = result else {
@@ -1563,7 +1705,7 @@ mod tests {
     fn wic_byte_pixels_match_lossless_png_when_available() {
         let bytes = png_bytes(3, 2);
         let expected = image::load_from_memory(&bytes).unwrap();
-        let Some(actual) = SystemFallbackDecoder.wic_bytes(&bytes) else {
+        let Some(actual) = SystemFallbackDecoder.wic_bytes(&bytes, "tiff") else {
             eprintln!("skipping WIC pixel comparison: decoder unavailable");
             return;
         };

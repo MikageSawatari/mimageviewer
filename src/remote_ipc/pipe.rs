@@ -715,6 +715,7 @@ impl ServerGuard {
         persistent_collection_producer: Option<
             crate::collection_store::CollectionRemoteProducerControl,
         >,
+        raw_develop_executor: Arc<crate::raw::RawDevelopExecutor>,
     ) -> Result<Self, String> {
         // 最初の instance は同名サーバの二重起動検出も兼ねる。他の instance も
         // listener 開始前に作り、起動完了時点で複数本が必ず待機できる形にする。
@@ -741,9 +742,10 @@ impl ServerGuard {
         let favorites = super::live_favorites::LiveFavorites::live(settings.favorites.clone())?;
         let settings_reader_control = favorites.control();
         let thumbnail_engine = Arc::new(ThumbnailEngine::new(settings.clone()));
-        let container_engine = Arc::new(ContainerEngine::new_with_session(
+        let container_engine = Arc::new(ContainerEngine::new_with_session_and_raw_executor(
             settings.clone(),
             session_handle.clone(),
+            raw_develop_executor,
         ));
         let ai_executor = Arc::new(super::ai_job::ContainerRemoteAiExecutor::new(Arc::clone(
             &container_engine,

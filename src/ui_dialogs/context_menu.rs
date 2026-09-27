@@ -2426,7 +2426,15 @@ fn copy_zip_image_to_clipboard(
             };
             let Some(img) = image::load_from_memory(&bytes)
                 .ok()
-                .or_else(|| crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes))
+                .or_else(|| {
+                    crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+                        &bytes,
+                        std::path::Path::new(&entry_name)
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or(""),
+                    )
+                })
                 .or_else(|| {
                     crate::susie_loader::decode_bytes(&entry_name, &bytes, true, None).ok()
                 })

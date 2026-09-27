@@ -28,6 +28,8 @@ pub enum DecodeSource {
     Wic,
     /// Susie プラグイン (32bit ワーカー経由、MAG/PI/PIC/Q4/MAKI など)
     Susie,
+    /// LibRaw embedded preview or half development.
+    Raw,
 }
 
 #[derive(Default, Clone)]
@@ -127,7 +129,7 @@ impl ThumbStats {
 
         // デコーダ経路 (フォーマット集計とは独立。同じ画像は両方に 1 件ずつ加算される。)
         match source {
-            DecodeSource::Native => {}
+            DecodeSource::Native | DecodeSource::Raw => {}
             DecodeSource::Wic => {
                 self.count_wic += 1;
                 self.time_wic += total_ms;

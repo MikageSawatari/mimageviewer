@@ -110,6 +110,7 @@ pub enum ResolveStrategy {
 /// Drive-list thumbnails are cache-only: the UI thread checks the local pin DB
 /// and asks the worker to use an already-cataloged pinned thumbnail. Missing
 /// cache falls back to the fixed drive icon instead of touching the drive.
+#[derive(Clone)]
 pub struct PinnedOnlyRequest {
     pub cache_key_prefix: String,
 }
@@ -359,7 +360,7 @@ impl LoadSourcePolicy {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct LoadRequest {
     pub idx: usize,
     /// 通常画像ならファイルパス、ZIP 画像なら ZIP ファイルのパス
@@ -424,6 +425,128 @@ pub struct LoadRequest {
     /// `pdf_loader::current_render_context_epoch()` を焼き付ける (TOCTOU 防止)。
     /// 0 = epoch チェック対象外 (background 経路の sentinel)。`Default::default()` は 0。
     pub context_epoch: u64,
+    /// A follow-up from RawDevelopExecutor. Only the thumbnail worker may
+    /// resize, cache, count, and signal this image.
+    pub raw_source: LoadRequestSource,
+}
+
+fn raw_half_cache_key(base: &str, brightness: crate::raw::RawBrightness) -> String {
+    let brightness = match brightness {
+        crate::raw::RawBrightness::MatchPreview => "match-preview",
+        crate::raw::RawBrightness::None => "none",
+    };
+    format!("{base}#libraw-half-v1:{brightness}")
+}
+
+fn raw_image_error(error: crate::raw::RawError) -> image::ImageError {
+    image::ImageError::IoError(std::io::Error::other(error))
+}
+
+pub(crate) struct RawThumbnailRaster {
+    pub image: image::DynamicImage,
+    pub developed_dims: (u32, u32),
+    pub half_developed: bool,
+}
+
+/// Cache creator and other dedicated workers may wait for Background half
+/// development. The grid thumbnail pool uses `RawThumbHandoff` instead.
+pub(crate) fn decode_raw_thumbnail_on_worker(
+    source: crate::raw::RawOwnedSource,
+    display_px: u32,
+    executor: &crate::raw::RawDevelopExecutor,
+    brightness: crate::raw::RawBrightness,
+) -> Result<RawThumbnailRaster, crate::raw::RawError> {
+    let info = crate::raw::raw_decoder::info(source.as_source())?;
+    let dims = (info.developed_dims[0], info.developed_dims[1]);
+    let threshold = display_px.min(dims.0.max(dims.1));
+    match crate::raw::raw_decoder::preview(source.as_source()) {
+        Ok(preview) if preview.image.width().max(preview.image.height()) >= threshold => {
+            return Ok(RawThumbnailRaster {
+                image: preview.image,
+                developed_dims: dims,
+                half_developed: false,
+            });
+        }
+        Ok(_) | Err(crate::raw::RawError::NoUsablePreview(_)) => {}
+        Err(error) => return Err(error),
+    }
+    if let crate::raw::RawDevelopSupport::Unsupported(reason) = info.develop_support {
+        return Err(crate::raw::RawError::Unsupported(reason));
+    }
+    let (tx, rx) = mpsc::channel();
+    let _ticket = executor.submit(
+        source,
+        crate::raw::RawDevelopScale::Half,
+        brightness,
+        crate::raw::RawPriority::Background,
+        tx,
+    );
+    let output = rx.recv().map_err(|_| crate::raw::RawError::Cancelled)??;
+    Ok(RawThumbnailRaster {
+        image: output.image,
+        developed_dims: dims,
+        half_developed: true,
+    })
+}
+
+#[derive(Clone, Default)]
+pub enum LoadRequestSource {
+    #[default]
+    Original,
+    RawHalfDeveloped {
+        image: image::DynamicImage,
+        developed_dims: [u32; 2],
+        decode_ms: f64,
+        folder_selection_proof: Option<crate::catalog::FolderSelectionProof>,
+    },
+}
+
+/// Shared handles are scoped to one viewer context and its thumbnail workers.
+#[derive(Clone)]
+pub struct RawThumbHandoff {
+    pub executor: Arc<crate::raw::RawDevelopExecutor>,
+    pub queue: Arc<crate::app::NotifyQueue>,
+    pub tickets: Arc<Mutex<crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>>>,
+    pub brightness: crate::raw::RawBrightness,
+}
+
+/// One outstanding half development owned by the same context as `requested`.
+pub struct RawThumbPending {
+    ticket: crate::raw::RawTicket,
+    idx: usize,
+    input_seq: u64,
+    items_gen: u64,
+    tx: mpsc::Sender<ThumbMsg>,
+    gen_done: Arc<AtomicUsize>,
+}
+
+impl RawThumbPending {
+    pub(crate) fn cancel(self) {
+        self.ticket.cancel();
+        let _ = self.tx.send(ThumbMsg {
+            idx: self.idx,
+            image: None,
+            origin: ThumbLoadOrigin::SourceIntrinsic,
+            from_edit_preview: false,
+            edit_preview_adjustment: None,
+            source_dims: None,
+            layout_dims: None,
+            canceled: true,
+            finalized: false,
+            input_seq: self.input_seq,
+            items_gen: self.items_gen,
+        });
+        self.gen_done.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn cancel_raw_thumb_tickets(
+    tickets: &Arc<Mutex<crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>>>,
+) {
+    let pending: Vec<_> = tickets.lock().unwrap().drain().map(|(_, p)| p).collect();
+    for job in pending {
+        job.cancel();
+    }
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -944,7 +1067,10 @@ fn decode_zip_chain(
     }
     match image::load_from_memory(bytes) {
         Ok(img) => Ok(img),
-        Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes) {
+        Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+            bytes,
+            &ext_lower_str(entry_name),
+        ) {
             Some(img) => {
                 *decode_source = crate::stats::DecodeSource::Wic;
                 Ok(img)
@@ -1092,7 +1218,7 @@ fn send_pinned_only_cached(
 ///   (`ThumbLoadOrigin::SourceGenerated`、段階 E のアップグレード経路)
 #[allow(clippy::too_many_arguments)]
 pub fn process_load_request(
-    req: &LoadRequest,
+    req: &mut LoadRequest,
     cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     tx: &mpsc::Sender<ThumbMsg>,
     // **v1.0.0**: `Arc` 経由で受け取る (= 内部の WebP cache hit catch-up worker が
@@ -1115,7 +1241,59 @@ pub fn process_load_request(
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     edit_preview_db: Option<&Arc<crate::edit_preview_cache::EditPreviewCacheDb>>,
     adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
+    raw_handoff: Option<&RawThumbHandoff>,
 ) {
+    if matches!(req.raw_source, LoadRequestSource::RawHalfDeveloped { .. }) {
+        let raw_source = std::mem::take(&mut req.raw_source);
+        let proof = match &raw_source {
+            LoadRequestSource::RawHalfDeveloped {
+                folder_selection_proof,
+                ..
+            } => folder_selection_proof.clone(),
+            LoadRequestSource::Original => unreachable!(),
+        };
+        let pinned_adjustment = req
+            .pinned_page_adjustment_key
+            .as_deref()
+            .and_then(|key| adjustment_db.and_then(|db| db.get_page_params(key)))
+            .filter(|params| !params.is_color_identity());
+        load_one_cached(
+            &req.path,
+            req.zip_entry.as_deref(),
+            None,
+            None,
+            req.pdf_page,
+            req.pdf_password.as_deref(),
+            req.cache_key_override.as_deref(),
+            req.idx,
+            tx,
+            catalog.map(|arc| arc.as_ref()),
+            Some(cache_map),
+            req.mtime,
+            req.file_size,
+            gen_done,
+            thumb_px,
+            thumb_quality,
+            display_px,
+            cache_decision,
+            stats,
+            cancel,
+            req.priority,
+            req.input_seq,
+            req.items_gen,
+            req.context_epoch,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+            req.force_cache,
+            true,
+            pinned_adjustment.as_ref(),
+            req.folder_thumb_provenance,
+            proof.as_ref(),
+            raw_source,
+            None,
+            None,
+        );
+        return;
+    }
     if let Some(pin) = req.pinned_only.as_ref() {
         if !send_pinned_only_cached(req, pin, cache_map, tx, gen_done) {
             send_thumb_failed(req, tx, gen_done);
@@ -1129,6 +1307,14 @@ pub fn process_load_request(
     // None ケース (path に file_name が無い等の異常) は既存挙動に合わせて空文字 fallback。
     let key_cow = cache_key_for_request(req).unwrap_or(std::borrow::Cow::Borrowed(""));
     let filename: &str = key_cow.as_ref();
+    let raw_half_key = raw_handoff.and_then(|handoff| {
+        let is_raw = req
+            .zip_entry
+            .as_deref()
+            .map(|entry| crate::raw_format::is_raw_path(Path::new(entry)))
+            .unwrap_or_else(|| crate::raw_format::is_raw_path(&req.path));
+        is_raw.then(|| raw_half_cache_key(filename, handoff.brightness))
+    });
 
     // 編集済みページは通常 catalog より先に、source 解像度 edit-result 由来の
     // 永続プレビューを試す。ディスク上は最大辺 2048px / q=90 を保持し、ここで
@@ -1223,7 +1409,9 @@ pub fn process_load_request(
         // WebP デコード (2-3 ms) をロック外で実行することで、
         // 他ワーカーの write (キャッシュ保存) をブロックしない。
         let cached = cache_map.read().ok().and_then(|map| {
-            let entry = map.get(filename)?;
+            let entry = map
+                .get(filename)
+                .or_else(|| raw_half_key.as_ref().and_then(|key| map.get(key)))?;
             if entry.mtime == req.mtime && entry.file_size == req.file_size {
                 Some(entry.clone())
             } else {
@@ -1724,6 +1912,8 @@ pub fn process_load_request(
         None => None,
     };
 
+    let deferred_req = matches!(req.raw_source, LoadRequestSource::Original).then(|| req.clone());
+    let raw_source = req.raw_source.clone();
     load_one_cached(
         load_path,
         zip_entry_ref,
@@ -1755,6 +1945,9 @@ pub fn process_load_request(
         pinned_page_adjustment.as_ref(),
         req.folder_thumb_provenance,
         folder_selection_proof.as_ref(),
+        raw_source,
+        raw_handoff,
+        deferred_req,
     );
     if crate::perf::is_enabled() {
         let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
@@ -3153,6 +3346,9 @@ pub fn load_one_cached(
     pinned_page_adjustment: Option<&crate::adjustment::AdjustParams>,
     folder_provenance: Option<crate::catalog::FolderThumbProvenance>,
     folder_selection_proof: Option<&crate::catalog::FolderSelectionProof>,
+    raw_source: LoadRequestSource,
+    raw_handoff: Option<&RawThumbHandoff>,
+    deferred_req: Option<LoadRequest>,
 ) {
     let total_started = std::time::Instant::now();
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
@@ -3193,7 +3389,170 @@ pub fn load_one_cached(
     let mut byte_orientation: u16 = 1;
     let mut render_ms: Option<f64> = None;
     let has_verified_source = verified_source_bytes.is_some();
-    let img_result = if let Some(page_num) = pdf_page {
+    let is_raw = zip_entry
+        .map(|entry| crate::raw_format::is_raw_path(Path::new(entry)))
+        .unwrap_or_else(|| crate::raw_format::is_raw_path(path));
+    let mut raw_developed_dims = None;
+    let mut raw_decode_ms = None;
+    enum RawHandoffControl {
+        Continue,
+        Deferred,
+    }
+    let mut raw_handoff_control = RawHandoffControl::Continue;
+    let img_result = if let LoadRequestSource::RawHalfDeveloped {
+        image,
+        developed_dims,
+        decode_ms,
+        ..
+    } = raw_source
+    {
+        decode_source = crate::stats::DecodeSource::Raw;
+        raw_developed_dims = Some((developed_dims[0], developed_dims[1]));
+        raw_decode_ms = Some(decode_ms);
+        Ok(image)
+    } else if is_raw {
+        decode_source = crate::stats::DecodeSource::Raw;
+        let source_result: Result<crate::raw::RawOwnedSource, image::ImageError> =
+            if let Some(bytes) = verified_source_bytes {
+                Ok(crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)))
+            } else if let Some(entry_name) = zip_entry {
+                match preloaded_zip_bytes {
+                    Some(bytes) => Ok(bytes),
+                    None => crate::zip_loader::read_entry_bytes(path, entry_name)
+                        .map_err(image::ImageError::IoError),
+                }
+                .map(|bytes| crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)))
+            } else {
+                Ok(crate::raw::RawOwnedSource::Path(path.to_owned()))
+            };
+        source_result.and_then(|source| {
+            let info =
+                crate::raw::raw_decoder::info(source.as_source()).map_err(raw_image_error)?;
+            let developed_dims = info.developed_dims;
+            raw_developed_dims = Some((developed_dims[0], developed_dims[1]));
+            let preview = crate::raw::raw_decoder::preview(source.as_source());
+            let threshold = display_px.min(developed_dims[0].max(developed_dims[1]));
+            match preview {
+                Ok(preview)
+                    if preview.image.width().max(preview.image.height()) >= threshold
+                        || matches!(
+                            info.develop_support,
+                            crate::raw::RawDevelopSupport::Unsupported(_)
+                        ) =>
+                {
+                    Ok(preview.image)
+                }
+                Ok(_) | Err(crate::raw::RawError::NoUsablePreview(_)) => {
+                    if let crate::raw::RawDevelopSupport::Unsupported(reason) = info.develop_support
+                    {
+                        return Err(raw_image_error(crate::raw::RawError::Unsupported(reason)));
+                    }
+                    let Some((handoff, mut next_req)) = raw_handoff.zip(deferred_req) else {
+                        return Err(raw_image_error(crate::raw::RawError::Internal(-1)));
+                    };
+                    if !priority {
+                        let _ = tx.send(ThumbMsg {
+                            idx,
+                            image: None,
+                            origin: ThumbLoadOrigin::SourceIntrinsic,
+                            from_edit_preview: false,
+                            edit_preview_adjustment: None,
+                            source_dims: None,
+                            layout_dims: None,
+                            canceled: true,
+                            finalized: false,
+                            input_seq,
+                            items_gen,
+                        });
+                        gen_done.fetch_add(1, Ordering::Relaxed);
+                        raw_handoff_control = RawHandoffControl::Deferred;
+                        return Err(raw_image_error(crate::raw::RawError::Cancelled));
+                    }
+                    next_req.path = path.to_owned();
+                    next_req.zip_entry = zip_entry.map(str::to_owned);
+                    next_req.source_policy = LoadSourcePolicy::SourceOnly;
+                    next_req.cache_key_override =
+                        Some(raw_half_cache_key(name, handoff.brightness));
+                    let tickets = Arc::clone(&handoff.tickets);
+                    let callback_tickets = Arc::clone(&tickets);
+                    let queue = Arc::clone(&handoff.queue);
+                    let tx = tx.clone();
+                    let pending_tx = tx.clone();
+                    let gen_done = Arc::clone(gen_done);
+                    let pending_gen_done = Arc::clone(&gen_done);
+                    let start = std::time::Instant::now();
+                    let folder_selection_proof = folder_selection_proof.cloned();
+                    let mut map = tickets.lock().unwrap();
+                    if !map.accepts_generation(idx, items_gen) {
+                        return Err(raw_image_error(crate::raw::RawError::Cancelled));
+                    }
+                    let ticket = handoff
+                        .executor
+                        .submit_with_completion(
+                            source,
+                            crate::raw::RawDevelopScale::Half,
+                            handoff.brightness,
+                            crate::raw::RawPriority::Normal,
+                            move |result| {
+                                let mut map = callback_tickets.lock().unwrap();
+                                if !map.contains_key(&idx) {
+                                    return;
+                                }
+                                match result {
+                                    Ok(output) => {
+                                        next_req.raw_source = LoadRequestSource::RawHalfDeveloped {
+                                            image: output.image,
+                                            developed_dims,
+                                            decode_ms: start.elapsed().as_secs_f64() * 1000.0,
+                                            folder_selection_proof,
+                                        };
+                                        let (lock, wake) = &*queue;
+                                        lock.lock().unwrap().push(next_req);
+                                        wake.notify_one();
+                                        map.remove(&idx);
+                                    }
+                                    Err(error) => {
+                                        map.remove(&idx);
+                                        let _ = tx.send(ThumbMsg {
+                                            idx,
+                                            image: None,
+                                            origin: ThumbLoadOrigin::SourceIntrinsic,
+                                            from_edit_preview: false,
+                                            edit_preview_adjustment: None,
+                                            source_dims: None,
+                                            layout_dims: None,
+                                            canceled: error == crate::raw::RawError::Cancelled,
+                                            finalized: false,
+                                            input_seq,
+                                            items_gen,
+                                        });
+                                        gen_done.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            },
+                        )
+                        .map_err(raw_image_error)?;
+                    map.insert_for_generation(
+                        idx,
+                        items_gen,
+                        RawThumbPending {
+                            ticket,
+                            idx,
+                            input_seq,
+                            items_gen,
+                            tx: pending_tx,
+                            gen_done: pending_gen_done,
+                        },
+                    );
+                    // A submitted half job produces no ThumbMsg here. Its completion
+                    // returns to the existing queue after the executor slot is free.
+                    raw_handoff_control = RawHandoffControl::Deferred;
+                    return Err(raw_image_error(crate::raw::RawError::Cancelled));
+                }
+                Err(error) => Err(raw_image_error(error)),
+            }
+        })
+    } else if let Some(page_num) = pdf_page {
         // サムネイル用 PDF レンダ: 可視セル (priority=true) は HighNormal、
         // 先読みは Normal。プールの予約ワーカーはフルスクリーン現在ページ
         // (Critical) 用に空けておく。cancel_policy は caller (process_load_request)
@@ -3402,6 +3761,9 @@ pub fn load_one_cached(
         }
     };
 
+    if matches!(raw_handoff_control, RawHandoffControl::Deferred) {
+        return;
+    }
     let img = match img_result {
         Ok(i) => i,
         Err(e) => {
@@ -3480,7 +3842,7 @@ pub fn load_one_cached(
 
     // EXIF Orientation に基づいて自動回転。
     // ZIP はエントリのバイト列から読み、PDF はレンダ済みページなので常に 1。
-    let orientation: u16 = if pdf_page.is_some() {
+    let orientation: u16 = if is_raw || pdf_page.is_some() {
         1
     } else if zip_entry.is_some() || has_verified_source {
         byte_orientation
@@ -3491,7 +3853,7 @@ pub fn load_one_cached(
     let img = apply_orientation(img, orientation);
     let orientation_ms = orientation_started.elapsed().as_secs_f64() * 1000.0;
 
-    let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let decode_ms = raw_decode_ms.unwrap_or_else(|| t.elapsed().as_secs_f64() * 1000.0);
 
     // source_dims は常にピクセル座標系。PDF page box の正確な比率は layout_dims に
     // 分離し、リリース済みの source_* 契約を別の単位で上書きしない。
@@ -3499,7 +3861,9 @@ pub fn load_one_cached(
     // 使わず、`dct_stats.src_w/src_h` から EXIF 適用後寸法を算出する。
     // 非 DCT 経路 (image::open / WIC / Susie / ZIP image::load_from_memory)
     // は img の現寸法 = 元寸法 (EXIF 適用済み) なので従来通り。
-    let source_dims: Option<(u32, u32)> = if let Some(stats) = dct_stats {
+    let source_dims: Option<(u32, u32)> = if let Some(dims) = raw_developed_dims {
+        Some(dims)
+    } else if let Some(stats) = dct_stats {
         Some(stats.source_dims_after_exif(orientation))
     } else {
         Some((img.width(), img.height()))
@@ -4313,6 +4677,9 @@ mod tests {
             None,
             None,
             None,
+            LoadRequestSource::Original,
+            None,
+            None,
         );
 
         let entry = catalog
@@ -4361,7 +4728,7 @@ mod tests {
                 ..Default::default()
             };
             process_load_request(
-                &req,
+                &mut req.clone(),
                 &cache_map,
                 &tx,
                 None,
@@ -4378,6 +4745,7 @@ mod tests {
                 None,
                 None,
                 Some(&adjustment_db),
+                None,
             );
             rx.try_iter()
                 .find_map(|msg| msg.image)
@@ -5762,7 +6130,34 @@ pub fn build_and_save_one(
     file_size: i64,
     thumb_px: u32,
     thumb_quality: u8,
+    raw_executor: &crate::raw::RawDevelopExecutor,
+    raw_brightness: crate::raw::RawBrightness,
 ) -> Option<usize> {
+    if crate::raw_format::is_raw_path(path) {
+        let raster = decode_raw_thumbnail_on_worker(
+            crate::raw::RawOwnedSource::Path(path.to_owned()),
+            thumb_px,
+            raw_executor,
+            raw_brightness,
+        )
+        .ok()?;
+        let name = path.file_name()?.to_str()?;
+        let key = if raster.half_developed {
+            raw_half_cache_key(name, raw_brightness)
+        } else {
+            name.to_owned()
+        };
+        return encode_and_save_with_source_dims(
+            &raster.image,
+            Some(raster.developed_dims),
+            &key,
+            catalog,
+            mtime,
+            file_size,
+            thumb_px,
+            thumb_quality,
+        );
+    }
     // JPEG なら TurboJPEG DCT scale を先に試す (load_one_cached と同じ方針)。
     // cache creator は UI セルサイズに依存しない bulk worker なので target は thumb_px。
     let mut dct_stats: Option<ScaleStats> = None;
@@ -5924,8 +6319,34 @@ pub fn build_and_save_one_zip(
     file_size: i64,
     thumb_px: u32,
     thumb_quality: u8,
+    raw_executor: &crate::raw::RawDevelopExecutor,
+    raw_brightness: crate::raw::RawBrightness,
 ) -> Option<usize> {
     let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok()?;
+    if crate::raw_format::is_raw_path(Path::new(entry_name)) {
+        let raster = decode_raw_thumbnail_on_worker(
+            crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)),
+            thumb_px,
+            raw_executor,
+            raw_brightness,
+        )
+        .ok()?;
+        let key = if raster.half_developed {
+            raw_half_cache_key(entry_name, raw_brightness)
+        } else {
+            entry_name.to_owned()
+        };
+        return encode_and_save_with_source_dims(
+            &raster.image,
+            Some(raster.developed_dims),
+            &key,
+            catalog,
+            mtime,
+            file_size,
+            thumb_px,
+            thumb_quality,
+        );
+    }
     // JPEG なら DCT scale を試す + 元寸法を source_dims に保存
     let orientation = read_exif_orientation_from_bytes(&bytes);
     let (img, source_dims) = if is_jpeg_entry(entry_name) {

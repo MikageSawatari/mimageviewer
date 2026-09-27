@@ -4219,6 +4219,10 @@ pub struct Settings {
     pub startup_window_state: StartupWindowState,
     #[serde(default)]
     pub parallelism: Parallelism,
+    #[serde(default = "default_raw_develop_parallelism")]
+    pub raw_develop_parallelism: u8,
+    #[serde(default)]
+    pub raw_brightness: crate::raw::RawBrightness,
     /// PDF worker pool のプロセス数。変更は次回起動時に反映される。
     #[serde(default = "default_pdf_worker_count")]
     pub pdf_worker_count: u32,
@@ -6851,11 +6855,14 @@ pub fn default_image_ext_priority() -> Vec<String> {
         "webp", "jxl", "avif", "heic", "heif", // モダン (ロッシー/ロスレス混在)
         "jpg", "jpeg", // ロッシー
         "dng", "cr2", "cr3", "nef", "nrw", "arw", // RAW (現像困難な場合が多い)
-        "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx", "rwl", "iiq",
+        "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx", "rwl", "iiq", "crw", "srw",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+fn default_raw_develop_parallelism() -> u8 {
+    3
 }
 fn default_slideshow_interval() -> f32 {
     3.0
@@ -7076,6 +7083,8 @@ impl Default for Settings {
             always_on_top: false,
             startup_window_state: StartupWindowState::default(),
             parallelism: Parallelism::default(),
+            raw_develop_parallelism: default_raw_develop_parallelism(),
+            raw_brightness: crate::raw::RawBrightness::default(),
             pdf_worker_count: default_pdf_worker_count(),
             prefetch_back: default_prefetch_back(),
             prefetch_forward: default_prefetch_forward(),

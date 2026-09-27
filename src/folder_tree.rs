@@ -88,9 +88,10 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "bmp", "gif", // WIC 経由 (モダン形式)
     "heic", "heif", "avif", "jxl",
     // WIC 経由 (TIFF: image クレートも対応するが WIC の方が高機能)
-    "tiff", "tif", // WIC 経由 (カメラ RAW)
+    "tiff",
+    "tif", // LibRaw 経由 (カメラ RAW)。raw_format::RAW_EXTENSIONS と一致させる。
     "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx",
-    "rwl", "iiq",
+    "rwl", "iiq", "crw", "srw",
 ];
 pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mpg", "mpeg", "mp4", "avi", "mov", "mkv", "wmv"];
 

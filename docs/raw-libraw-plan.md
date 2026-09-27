@@ -747,21 +747,124 @@ final composite** の consumer も点検する。S3 の最初に次を grep で�
 Remote のページは本体と同じ結果にするため、**フル現像**を使う (独立レビューも同じ判断)。
 プレビューに保存済み編集を掛ける案は、決定 5 に反するので採らない。
 
-必要な設計 (S2 の Remote 部分を組み込む前に、ここを詳細化して独立レビューを受ける):
+#### 10.2.1 現状 (2026-09-27 の調査、HEAD `d78e20301`)
 
-- **段階を明示して運ぶ**: Remote のページ生成は `thumb_loader::process_load_request` を通る
-  (`src/remote_ipc/container.rs:479-515,5665-5677`)。`SourceOnly` は段階の選択ではないので、
-  RAW の Full 段を要求に明示的に載せ、ページ生成の single-flight identity (`:1075-1138`) にも含める
-- **heavy worker と HTTP worker を現像待ちで塞がない**: RAW ページの job は 2 段に分ける。
-  1 段目 (heavy worker) は executor へ submit して worker を返す。現像完了で 2 段目 (編集適用・JPEG 化)
-  を同じ job identity と優先度のまま heavy queue へ再投入する。前景の lease と先読みの昇格
-  ([web-remote-plan.md §14](web-remote-plan.md)) は job identity で引き継ぐ
-- **締め切り**: remote-web 側の `PAGE_RESPONSE_TIMEOUT` を超える現像では、ブラウザ側の再要求で同じ
-  job に相乗りできること、需要が無くなった job (lease が 0) は executor の ticket を cancel すること
-  (孤児の現像を残さない)
-- **HTTP worker**: remote-web 側で IPC 応答を待つ HTTP worker が現像時間ぶん占有されないか
-  ([web-remote-plan.md §9.5](web-remote-plan.md)) を確認する。占有されるなら、応答待ちを
-  `IpcAdmission` の既存の上限に入れる等の対策を同じ詳細設計に含める
+- **remote-web の HTTP worker は IPC の往復のあいだ塞がる**。12 本の `remote-http-*` が要求を同期で処理し
+  (`crates/remote-web/src/main.rs:108-133`)、`api_page` は `IpcAdmission` の permit を持ったまま IPC 応答を待つ
+  (`crates/remote-web/src/http.rs:3683-3697`)。`IpcAdmission` は待機列の無い try-semaphore で、全体 6 / heavy 4 /
+  prefetch 3 (prefetch は各上限の 1 つ手前まで)。取れなければ 503 `ipc_busy` + `Retry-After: 1`
+  (`http.rs:222-395`, `3845-3870`)。ページの IPC 締め切り `PAGE_RESPONSE_TIMEOUT` は 10 分
+  (`crates/remote-web/src/ipc_client.rs:43`)。締め切りを過ぎても core の仕事は止まらない (`:40-42`)
+- **core の heavy worker もページ生成のあいだ塞がる**。source の decode は single-flight が起こす専用 thread で
+  走るが、heavy worker はその完了を Condvar で待つ (`src/remote_ipc/container.rs:1349-1378`)。
+  heavy worker 数は設定の並列数 (最小 1、`src/remote_ipc/pipe.rs:973-984`)。heavy queue は
+  Foreground / Interactive / Prefetch の 3 lane で、prefetch は `active < worker_count - 1` のときだけ取り出す
+  (`src/remote_ipc/heavy_queue.rs:205-223`)
+- **取消は別経路**: ブラウザの `abort()` は fetch を止めるだけで、実際の取消は `POST /api/page/demand` の
+  `release` が `page_jobs` の cancel token を立てる (`crates/remote-web/web/app.js:1052-1078`、
+  `src/remote_ipc/page_jobs.rs:258-284`)。昇格も同じ経路 (`promote`)。heavy worker は page job の token を
+  render へ渡す (`pipe.rs:1106-1119`)
+- **worker を返して後で続ける前例は、ページ経路には無い**。AI / 書庫変換の long job は「開始 → job id を即返す →
+  ブラウザが poll」で worker を持たない (`src/remote_ipc/ai_job.rs:232-417`、`archive_job.rs:1100-1226`)。
+  long job は `SessionOperation` を job の終わりまで持ち、session の drain を開いたままにする
+- **session drain**: `begin_drain` が全 operation の cancel flag を立て、`try_finish_drain` は operation が
+  0 になるまで待つ (`src/remote_ipc/session.rs:701-789`)。ページの `Work` は `SessionOperation` を運ぶので、
+  実行中・待機中のページも drain を開いたままにする
+- 同じ source を何度も要求する: 補正プレビューのスライダー、端末の画質 (target_px) 違い、見開きの自動
+  トリムの相方。JPEG ならやり直しても安いが、RAW は 1 回 0.3〜13 秒 (S1 実測、release)
+
+#### 10.2.2 設計 (第2案。第1案「2 段 job で worker を手放す」は設計レビューで却下、§20.1)
+
+**方針: 本体の worker も remote-web の HTTP worker も、現像を待たない。** まだ現像されていない RAW の
+ページ要求には、その場で typed な「現像中」を 1 回返し、ブラウザが同じ job id で再要求する。現像そのものは
+App-global の owner が要求から切り離して進め、結果を短期の cache に置く。再要求が cache に当たったら
+通常のページ生成 (編集適用・リサイズ・JPEG) を同期で行う。
+
+こうすると、**どのページ要求もその場で必ず 1 回だけ応答する** (既存の heavy worker の実行・reply 経路を
+変えない)。heavy queue への再投入、`Work` の move、completion guard の二重実行といった第1案の問題
+(レビュー P1-2 / P1-3) は構造的に起きない。permit も数秒間は塞がれない (P1-4)。
+
+**(1) core: `RemoteRawDevelopOwner` (App-global、Remote と Remote AI が共有)**
+
+- key (`RemoteRawIdentity`): 正規化 path + mtime + file size + ZIP entry (+ 入れ子 prefix) + 明るさの設定値
+  (決定 12)。**target_px は含めない** (出力寸法ごとに現像し直さない。P2-7)
+- 状態 (enum、1 key に 1 つ): `Developing { ticket, demand: set<(connection_id, PageJobId)>, foreground: bool,
+  progress }` / `Ready(Arc<DevelopedRaw>)` / `Failed(RawError)` (同じ identity の間は再試行しない)
+- ページ要求 (heavy worker 上、既存の `page_inner` の source 解決の位置):
+  - `Ready` → そのラスタで通常どおり生成して返す
+  - `Developing` → 要求の (connection, job) を demand に加え、foreground なら ticket を High に上げ、
+    `MediaErrorCode::RawDeveloping { progress }` を返す
+  - 無し → executor へ submit (foreground High / prefetch Normal) して `Developing` を作り、同じく
+    `RawDeveloping` を返す
+  - `Failed` → typed error
+- 需要の管理 (孤児を残さない):
+  - `page_jobs` の release (`src/remote_ipc/page_jobs.rs:258-284`) は、job がすでに終わっていても
+    (= tombstone 経路でも) owner に「(connection, job) の demand を外す」を伝える。ブラウザの coordinator は
+    再試行待ちの job を捨てるときに必ず release を送る (`crates/remote-web/web/app.js:1052-1078`)
+  - 接続断 (`close_connection`)、session drain (`notify_page_job_drain`)、service stop は、その接続 /
+    session の demand をまとめて外す
+  - demand が 0 になった `Developing` は ticket を cancel して entry を消す。`Ready` は demand と無関係に
+    cache の規則 (3) で残る
+  - promote (`page_jobs` の promote) は、その (connection, job) を demand に持つ entry の ticket を High へ上げる
+- 現像の完了 (executor thread) は owner の lock の中で `Developing → Ready / Failed` に遷移させるだけで、
+  reply は送らない (reply は常に次の再要求が送る)
+- `SessionOperation` は現像のあいだ保持しない (要求は短い)。drain は demand を外すことで現像を止める。
+  したがって session の liveness / idle の扱いは変わらない (P2-8)
+
+**(2) wire / remote-web / Web UI (小さな変更)**
+
+- `MediaErrorCode` に `RawDeveloping { progress: u8 }` を加え、protocol version を上げる
+  (`crates/remote-ipc/src/lib.rs:1288-1300`)
+- remote-web は `RawDeveloping` を **503 + 専用の error 名 (`raw_developing`) + 再要求間隔のヘッダ
+  (ミリ秒、前景 250 / 先読み 1000)** に写す
+- Web UI (`command-core.mjs` の再試行判定、`pageRequestIsTransientlyBusy` / `pageAdmissionRetryDelayMs`
+  / `FOREGROUND_ADMISSION_RETRY_LIMIT`、`crates/remote-web/web/command-core.mjs:2655-2696`):
+  `raw_developing` は **前景でも再試行回数に数えない**。間隔は応答ヘッダに従う。前景で待っている間は既存の
+  読み込み表示に「RAW 現像中 NN%」を添える。job の中止 (ページ移動) で再試行も止まる (既存の abort + release)
+- これで RAW の待ちは HTTP worker も `IpcAdmission` の permit も数秒間占有しない。前景の枠は既存の
+  規則どおり確保される (P1-4)
+
+**(3) 現像済みラスタの cache (決定 9 の例外。利用者の決定が要る、§17)**
+
+- (1) の `Ready` を置く場所。**これが無いと、再要求の時点で結果が残っておらず、この方式が成り立たない**
+- 上限は **件数 2 かつ合計 768 MiB** (固定値。実行時の空きメモリで変えない)。最新の 1 件は上限を超えても
+  残し、古い順に外す。100MP の 8bit RGB は 1 件約 300 MB
+- PC のフルスクリーン (S3 の `fs_cache`) からは使わない。Remote のページ・Remote AI だけが使う
+- 明るさの設定変更で全消去。ファイル変更は key の mtime / size で外れる
+
+**(4) 明るさの設定と既存の cache (P1-6)**
+
+- Remote のページ生成の source single-flight identity (`src/remote_ipc/container.rs:1063-1073`)、
+  ページ composite cache の key (`:1023-1033`)、Remote AI の identity (`:1594-1617`) に、RAW の source の
+  ときだけ「明るさの設定値」を含める。composite cache のヒットは source の現像より前に返る
+  (`:5785-5827`) ので、key に含めないと設定変更後も古い明るさが出る
+- 設定値は Remote のページ生成が参照する設定 snapshot 経由で読む (UI thread の `Settings` を直接読まない)
+
+**(5) Remote のサムネイル (`/api/thumb`、P1-5)**
+
+- **Remote では half 現像をしない**。使えるプレビューがあれば、その寸法にかかわらず使う (小さければ
+  拡大される)。使えるプレビューが無い RAW は、catalog に PC 側で作ったサムネイルがあればそれを使い
+  (既存の `CacheOrSource`)、無ければ typed な「サムネイル無し」を返して既存の代替表示にする
+- 理由: `/api/thumb` の IPC 締め切りは 10 秒 (`crates/remote-web/src/ipc_client.rs:36-64`) で、job id も
+  優先度も wire に無い。half 現像を載せるには別の契約が要り、対象は稀な形式 (S1 のサンプルでは使える
+  プレビューが無いものは 0 件。小さいプレビューのものは 5 件) に限られる
+
+**(6) Remote AI**
+
+- AI job は自分の thread を持つ long job なので、owner の「Ready になるまで待つ」API で待ってよい。
+  demand は AI job の identity で登録し、AI job の取消・drain で外す
+
+**(7) テスト**
+
+- owner の状態遷移: submit → Developing → Ready、Developing 中の同 key 要求が 1 つの現像に合流、
+  demand 0 で cancel、release が tombstone 経路でも demand を外す、接続断・drain・stop で外れる、
+  promote で High、Failed を再試行しない、明るさ変更で cache 全消去、件数 2 / 768 MiB の LRU、
+  target_px 違いの要求が 1 つの現像を共有する
+- ページ要求: Developing では heavy worker が即 reply すること (active が増えたままにならない)、
+  reply がちょうど 1 回、Ready で通常生成、composite cache の key に明るさが入ること
+- remote-web: `RawDeveloping` の 503 写像とヘッダ。Web UI (node テスト): `raw_developing` は前景の
+  再試行上限に数えない、間隔はヘッダに従う、abort で止まる
+- 飽和: 先読み 3 本 + サムネイル多数の最中でも前景のページ要求が permit を得られること
 
 ### 10.3 remote-web の旧経路 (D10)
 
@@ -803,8 +906,12 @@ canonical loader の Full (High)。
   近く) に置く。変更は即時反映 (§5.4.1)
 - `raw_brightness: RawBrightnessSetting` (`MatchPreview` 既定 / `None`)。環境設定の同じページに
   「RAW の明るさ: プレビューに合わせる / 補正なし」として置く (決定 12)。変更時は RAW の現像済み
-  Static を keep set ごと失効させて再現像する (サムネイルは埋め込みプレビュー由来なので影響しない。
-  プレビューの無い RAW の half 現像サムネイルは catalog のキーに設定値を含め、切替後に作り直す)。
+  Static を keep set ごと失効させて再現像する。サムネイルは設定の影響を受けない: 埋め込みプレビュー由来の
+  ものは当然として、プレビューの無い RAW の half 現像サムネイルも **設定にかかわらず自動補正 (thr 0.001)** で
+  作る (S2a で判明: ZIP / フォルダの代表サムネイルは代表 entry を決める前に catalog を引く
+  (`src/thumb_loader.rs:1261`, `1546`) ので、設定値を catalog のキーに入れると見つけられない)。
+  「プレビューに合わせる」ではプレビューの無い RAW のフル現像も同じ自動補正になるので一致し、差が出るのは
+  「補正なし」を選んだときのプレビューの無い RAW だけ (サムネイルの方が明るい)。
   S3 で設定 UI と失効経路を実装し、「編集 → OK → 効果」までを通しでテストする
 - それ以外の現像パラメータの設定は v1 では作らない
 
@@ -890,6 +997,7 @@ S1 の実測 (寸法・向き・中断・codec・形式) は S2 / S3 へ進む�
 ### 17.1 利用者の判断が要るもの
 
 1. `3fr erf kdc dcr mrw mos mef` 等の追加 (S1 の調査結果を見て相談)
+3. Remote 用の現像済みラスタ cache (件数 2 / 768 MiB、§10.2.2 (3)) を決定 9 の例外として置いてよいか (第2案では必須)
 2. ~~明るさのパラメータ~~ → 決定 12 (プレビューに合わせる + 補正なしへの切替)
 
 ### 17.2 設計レビュー・S1 で詰めるもの
@@ -944,3 +1052,12 @@ S1 の実測 (寸法・向き・中断・codec・形式) は S2 / S3 へ進む�
 | P2 サムネイルの executor 経路が既存の 2 段通知と idx ごとの取消を欠く | 採用 (コードで確認) | §8 (現像だけを枠で行い後続要求で queue へ戻す、idx ごとの ticket) |
 | P2 S1 の bench が executor 経由の現像規則と矛盾 | 採用 | §5.3.1、§16 (executor 本体を S1 へ) |
 | P3 `N = 1` の待ち時間上限の記述、決定 9 と keep set の関係 | 採用 | §5.4.1 (順序の保証だけ)、§2 決定 9、§7.9 |
+
+### 20.1 Remote の詳細設計レビュー (2026-09-27、第1案)
+
+第1案 (2 段 job で heavy worker を手放し、continuation で再投入、remote-web は変えない) は
+「S2b に着手できない」と判定された (P1×6 / P2×2)。主な指摘: 再投入と completion guard の所有遷移が原子的でない、
+executor の取消・停止・再投入拒否で reply が返らない経路がある、先読み + サムネイルで前景の permit が枯れる、
+サムネイルの wire に優先度も長い締め切りも無い、明るさが既存の source / composite / AI の key に無い、
+LRU が決定 9 と衝突する。第2案 (§10.2.2) は「本体で待たず、現像中を即返して再要求させる」形に組み直し、
+reply と permit の問題を構造的に除いた。LRU は必須になるので利用者の決定を仰ぐ。
