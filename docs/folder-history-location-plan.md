@@ -1,6 +1,6 @@
-# フォルダ履歴の現在地と表示位置 — §1.280 / §1.282 / §1.281 設計案
+# フォルダ履歴の現在地と表示位置 — §1.280 / §1.282 / §1.281
 
-> 2026-09-27、stage A。コード未変更。設計担当の決定を §8 に反映し、独立 Sol reviewer の再レビュー待ち。構造合意後に実装する。参照行は `history-nav` の調査時点。
+> 2026-09-27、stage B 実装・自動 gate 完了（経過は §9）。設計担当の決定を §8 に反映し、独立 Sol reviewer が構造案と completion review を承認済み。実アプリ smoke は利用者承認後に別途実施する。本文の参照行は `history-nav` の stage A 調査時点。
 
 ## 1. 観測、原因、不変条件
 
@@ -105,7 +105,7 @@ Collection は A→C→B→←（C と anchor）→（B、session 維持）、B�
 
 main の back/forward に実 load から有効な target を用意した上で、detached を投影中に back/forward target read が両方 `None`、キー/menu の back/forward dispatch が no-op になることを handler-level で確認する。main と detached を交互に投影し、detached の open/close/BS/page flip/parked completion や失敗が main の各 slot の current / stack / suppress-once と sibling の items/cache/watch を変更しないことを確認する。main 投影に戻せば同じ履歴を読んで往復できる。
 
-**実アプリ smoke は実装・自動 gate 後の承認済み検証枠**: `FolderHistory` scenario を `scripts/ui-smoke.ps1` に追加し、disposable `target/portable-smoke/data` と生成 fixture（A、C、B、D、Rating 済み F）だけを使う。`tap_key("Left", "alt")` / `tap_key("Right", "alt")` / `tap_key("Backspace")` を実入力 route に通し、各着地で `snapshot().grid_surface` と `current_folder_path`、Collection ID/anchor または表示項目名を wait/assert し、`capture()` checkpoint を残す。現在の診断 snapshot は surface と path を持つが、history target と collection child anchor の観測欄は必要に応じて追加する [`src/test_script.rs:904`](../src/test_script.rs)、[`src/ui_fullscreen.rs:27979`](../src/ui_fullscreen.rs)、[`scripts/ui-smoke/rating-sort-collection.rhai:31`](../scripts/ui-smoke/rating-sort-collection.rhai)、[`docs/keymap-spec.md:338`](keymap-spec.md)。通常 profile を起動せず、実行前に [`interactive-release-verification.md`](interactive-release-verification.md) の内容・時間・desktop 使用と使い捨て範囲を提示して利用者の明示承認を得る。
+**実アプリ smoke は実装・自動 gate 後の承認済み検証枠**: `FolderHistory` scenario を `scripts/ui-smoke.ps1` と [`scripts/ui-smoke/folder-history.rhai`](../scripts/ui-smoke/folder-history.rhai) に追加した。disposable `target/portable-smoke/data` に生成する物理 A/F/G・B/D と、B を登録した Collection C、★1 の F を使う。`tap_key("Left", "alt")` / `tap_key("Right", "alt")` / `tap_key("Backspace")` を通常の入力 route に通し、各着地で `snapshot().grid_surface`、`current_folder_path`、Collection ID または表示項目名を wait/assert し、`capture()` checkpoint を残す。Rating と Collection の開始だけを bounded な test-script action で発行し、履歴と BS の判定には使わない [`src/test_script.rs`](../src/test_script.rs)、[`docs/keymap-spec.md:338`](keymap-spec.md)。通常 profile を起動せず、実行前に [`interactive-release-verification.md`](interactive-release-verification.md) の内容・時間・desktop 使用と使い捨て範囲を提示して利用者の明示承認を得る。
 
 狭い state/handler test → shared behavior test → `scripts/test-full.ps1`、fmt、UI glyph（文言変更時）を gate とし、その後に確認 build を作る。UI smoke は自動 gate と分離する [`development-build-and-test.md`](development-build-and-test.md)。
 
@@ -119,4 +119,26 @@ main の back/forward に実 load から有効な target を用意した上で�
 6. Rating→B→←→→ 後の BS は Rating へ戻す。`RatingPhysical` の採用済み親 chain を forward 採用時に再設置する。現行 dispatch の chain clear と単純な `Path(B)` load のままにはしない [`src/app.rs:20619`](../src/app.rs)、[`src/app.rs:25148`](../src/app.rs)。
 7. A/B 切替は記憶済み物理 target へ戻し、Rating/Collection child を自動再開しない。切替で child を再開する per-slot typed current owner は今回の scope に含めない。
 
-独立 reviewer の再レビューで §2 の Rating entry/replay transaction、§5 の slot sequence と detached routing、§7 の検証を含む構造合意を得てから実装する。本案だけで未確認の実機症状を「再現済み」とは扱わない。
+独立 reviewer は §2 の Rating entry/replay transaction、§5 の slot sequence と detached routing、§7 の検証を含む構造案を承認した。stage B の completion review でも重大な設計欠陥と未充足の受入条件はなく、指摘された変換後 ZIP preflight 起動失敗時の DFS 終了処理も修正・再レビュー済み。自動 gate の結果は §9 に記録する。本案だけで未確認の実機症状を「再現済み」とは扱わない。
+
+## 9. Stage B 実装・検証記録（2026-09-27）
+
+`history-nav` worktree では、採用済み表示位置から Rating / Collection root・子 / 通常物理地点を区別する履歴、Rating の直接 entry と replay の offscreen 採用、Collection 子の root anchor 付き履歴、A/B の成功時 slot 切替、main と detached の履歴所有境界、全 ★段共通の Rating sort 保存を実装した。直接 ZIP/PDF と変換書庫は元の論理書庫を外側履歴の一地点とし、内部ページ・階層は既存の書庫 navigation に任せる。グリッドからの ZIP/PDF open が持つ読み取り履歴、★/facet 絞り込み退避、自動 fullscreen 予約も typed request に捕捉し、準備中は旧一覧と旧状態を保持して、可視採用後に確定する。失敗・取消・stale completion では旧状態と履歴を維持する。
+
+現時点の自動検証記録（同じ worktree、実アプリは起動していない）:
+
+| 範囲 | 結果 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib staged_dfs` | 6 件 PASS。ZIP preflight 失敗、PDF password 取消、変換無視・変換開始拒否、items generation 不変での要求置換、ZIP 採用後の queued step を含む。 |
+| `cargo test -p mimageviewer --lib favorite_search_keeps_source_rows_and_nav_stack` | 2 件 PASS。検索からの ZIP 失敗 / PDF password 取消で旧 rows、address、履歴、検索 nav stack、読み取り履歴、★/facet フィルタを保持。 |
+| `cargo test -p mimageviewer --lib grid_virtual_zip_and_pdf_effects_commit_after_prepared_adoption` | 1 件 PASS（ZIP と PDF の両方）。準備中は元 ZipFile/PdfFile rows と各効果が不変。採用後は仮想ページ rows、読み取り履歴、★/facet 退避、自動 fullscreen open または deferred reopen を確認。 |
+| Rating の狭い回帰 | `rating_view_nav_open_dedupes_only_after_visible_adoption_and_close_clears_stack`、`staged_rating_pdf_password`（2 件）、`superseded_rating_pdf_password_submit_cannot_open_the_old_pdf`、`staged_rating_converter`（2 件）は PASS。 |
+| Collection / script | Collection module の focused run は 50 PASS / 1 ignored（以後の ZIP cache pin-key 追加前）。追加した直接 Collection ZIP cache の pin-key test も個別 PASS。`folder_history_smoke_script_parses_without_launching_the_app` と `synthetic_backspace_uses_the_parent_navigation_key` は各 1 PASS。fixture 生成と PowerShell / Python 構文検査も PASS。 |
+
+上記の `phase_c_folder_nav_history_tests::` run には直接検索 ZIP 成功、DFS fullscreen / slideshow 再開、Rating physical child、A/B の回帰も含む。detached の focused 回帰は専用 1/1 PASS。通常・portable/test-script の check、`cargo fmt --all -- --check`、UI glyph check、`scripts/build-dev.ps1` は PASS し、通常 profile の確認 build は未起動。
+
+統合中の broad lib 初回は 9,268 PASS / 20 FAIL だった。失敗の多くは「要求時に表示・履歴・A/B slot や archive dialog が変わる」という旧 test 契約で、成功採用境界へ更新した。更新後の `phase_c_folder_nav_history_tests::` は 81/81 PASS、`rating_view_navigation_tests::` は 12/12 PASS。独立 reviewer が別に見つけた detached Collection の `return_to` fallback と、Similar の RequiredFullscreen ZIP/PDF が保持すべき exact leaf / Snapshot 退出も App 側で修正し、Similar focused 13/13、detached Collection 1/1 が PASS。変換書庫 cache、gamepad の延期効果、起動中 archive 要求置換の focused test も各 1/1 PASS。completion review で見つけた変換後 ZIP preflight 起動失敗時の DFS 待機 step / lock 残留も終了分岐で解消した。追加した失敗注入テストは修正前に `pending_folder_nav_steps=2` で失敗し、修正後 1/1、履歴回帰群 82/82 が PASS。該当差分の独立再レビューも指摘なし。
+
+統合後の初回全 lib suite は **9,288 PASS / 48 ignored / 0 FAIL**。`scripts/test-full.ps1` は release core / Remote の前提 binary と Susie fixture を揃え、`RUST_TEST_THREADS=4` で **PASS**（workspace、vendor egui / egui-wgpu / eframe、UI snapshot を含む）。`multiwindow_scenario_collection_root_async_sibling_result_is_owner_scoped` timeout は、テストが待機状態を検査する前に ready な `Snapshot` を poll で消費する観測競合と特定し、pending を先に検査して `RequestNeeded` だけ poll するよう修正した。最後の DFS 終了処理追加後、ページファイル不足（OS error 1455）で一度 gate compile が止まったが、`CARGO_BUILD_JOBS=1` にして再実行した最終の `scripts/test-full.ps1` は **PASS**。`scripts/build-dev.ps1` は最終ソースで成功し、通常 profile の確認 build は未起動。`scripts/prepare-portable-smoke.ps1 -TestScript` も最終ソースで release core / Remote build と VCRT/PE check を通って成功し、`target/portable-smoke/mimageviewer.exe`（99,276,800 bytes）と隔離 `target/portable-smoke/data/.disposable-smoke-data` を更新した。manifest の flavor は `portable-test-script`、features は `portable`, `test-script`。**実アプリ smoke は未実行**。
+
+`FolderHistory` の無人 scenario と使い捨て fixture は追加済み。←/→/BS は実際のキー入力 route を通し、Rating / Collection の開始だけ bounded test-script action を使う。**実アプリ smoke は未実行**であり、利用者が desktop 使用・所要時間・使い捨てデータ範囲を確認して明示承認した検証枠まで保留する。

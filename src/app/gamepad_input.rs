@@ -7227,13 +7227,17 @@ impl App {
                 if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fullscreen) {
                     return None;
                 }
-                self.note_reading_history_open(idx);
-                if auto_fullscreen {
-                    self.pending_auto_fs_open = true;
+                if crate::folder_tree::is_virtual_folder(&p) {
+                    Some(self.grid_physical_navigation(idx, p, auto_fullscreen))
+                } else {
+                    self.note_reading_history_open(idx);
+                    if auto_fullscreen {
+                        self.pending_auto_fs_open = true;
+                    }
+                    self.maybe_suppress_rating_filter_for_opened_container(idx);
+                    self.maybe_suppress_facet_filter_for_opened_container(idx);
+                    Some(AddressBarNav::Direct(p))
                 }
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
-                Some(AddressBarNav::Direct(p))
             }
             Some(GridItem::Image(_))
             | Some(GridItem::ZipImage { .. })
@@ -7252,7 +7256,7 @@ impl App {
                 None
             }
             Some(GridItem::CollectionPlaceholder { .. }) => None,
-            Some(GridItem::ConvertibleArchive { path, format }) => {
+            Some(GridItem::ConvertibleArchive { path, .. }) => {
                 let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                 if self.settings.archive_file_handling_ignores_convertible() {
                     self.show_feedback_toast(
@@ -7262,11 +7266,9 @@ impl App {
                     // The Smart request owns conversion and adopts its logical source once.
                 } else {
                     let owner = self.main_grid_archive_open_owner(idx, &path);
-                    if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                        self.open_archive_via_cache_owned(path, cached, auto_fs, owner);
-                    } else {
-                        self.request_archive_convert_owned(path, format, auto_fs, owner);
-                    }
+                    self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                        path, auto_fs, owner,
+                    );
                 }
                 None
             }

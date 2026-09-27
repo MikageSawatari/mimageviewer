@@ -265,6 +265,7 @@ const MAX_FOLDER_NAV_STACK: usize = 100;
 const MAX_RECENT_FOLDERS: usize = 20;
 const CURRENT_FOLDER_WATCH_DEBOUNCE_MS: u64 = 700;
 const COLORIZE_MONO_SUMMARY_BUDGET_PER_FRAME: usize = 4;
+static NEXT_HISTORY_ARCHIVE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub(crate) struct FolderNavHistorySnapshot {
@@ -280,18 +281,235 @@ pub(crate) struct FolderNavHistorySnapshot {
     pending_rating_view_zipdir_open: Option<PendingRatingViewZipDirOpen>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderHistoryDirection {
+    Back,
+    Forward,
+}
+
+#[derive(Clone)]
+enum RatingNavigationIntent {
+    Direct {
+        from: Option<FolderNavHistoryTarget>,
+    },
+    Restore,
+    Replay {
+        direction: FolderHistoryDirection,
+        target: FolderNavHistoryTarget,
+    },
+}
+
+/// One pending Rating entry. The source grid remains committed until the worker has a complete
+/// result; the history operation and Rating item install happen in the same UI-thread adoption.
+#[derive(Clone)]
+pub(crate) struct RatingNavigationTransition {
+    intent: RatingNavigationIntent,
+    history_before: FolderNavHistorySnapshot,
+    source_context: ViewerContextId,
+    source_surface_generation: u64,
+    source_items_generation: u64,
+    source_slot: Option<QuickFolderSlotId>,
+    source_slot_switch_sequence: u64,
+    target_stars: u8,
+    target_sort: crate::rating_view::RatingViewSort,
+    saved_folder: Option<PathBuf>,
+    subfolder_restore: Option<subfolder_expansion::SubfolderExpansionRestoreState>,
+    select_opened_path: Option<PathBuf>,
+}
+
+/// Provenance captured by a user open from an adopted Rating root or child. A worker may
+/// preflight the physical destination, but only this exact source may commit its BS chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RatingPhysicalLoadOwner {
+    intent: RatingPhysicalLoadIntent,
+    source_context: ViewerContextId,
+    source_surface_generation: u64,
+    source_items_generation: u64,
+    source_slot: Option<QuickFolderSlotId>,
+    source_slot_switch_sequence: u64,
+    source_location: FolderNavHistoryTarget,
+    target_path: PathBuf,
+    stars: u8,
+    nav_chain: Vec<PathBuf>,
+    saved_folder: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RatingPhysicalLoadIntent {
+    Explicit,
+    Restore,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QuickFolderSwitchLoadOwner {
+    source_context: ViewerContextId,
+    source_surface_generation: u64,
+    source_items_generation: u64,
+    source_slot: Option<QuickFolderSlotId>,
+    source_slot_switch_sequence: u64,
+    target_slot: QuickFolderSlotId,
+    target_path: PathBuf,
+}
+
+enum CollectionHistoryIntent {
+    Replay {
+        direction: FolderHistoryDirection,
+        target: FolderNavHistoryTarget,
+    },
+    Restore,
+}
+
+enum CollectionHistoryPhase {
+    Preparing(collection_grid::CollectionHistoryPrepare),
+    ChildPreflighting {
+        prepared: top_level_grid_view::CollectionGridPreparedInstall,
+        target: collection_grid::CollectionHistoryChildTarget,
+        preflight: collection_navigation::PhysicalHistoryPreflight,
+        pdf_password_submission: Option<(String, bool)>,
+    },
+    ChildPdfPassword {
+        prepared: top_level_grid_view::CollectionGridPreparedInstall,
+        target: collection_grid::CollectionHistoryChildTarget,
+    },
+    ChildArchiveConverting {
+        prepared: top_level_grid_view::CollectionGridPreparedInstall,
+        target: collection_grid::CollectionHistoryChildTarget,
+    },
+    ChildArchivePreflighting {
+        prepared: top_level_grid_view::CollectionGridPreparedInstall,
+        target: collection_grid::CollectionHistoryChildTarget,
+        backing_path: PathBuf,
+        preflight: collection_navigation::PhysicalHistoryPreflight,
+    },
+    Finished,
+}
+
+enum PhysicalHistoryIntent {
+    Navigation {
+        replay: Option<(FolderHistoryDirection, FolderNavHistoryTarget)>,
+        auto_fullscreen: bool,
+    },
+    RequiredFullscreen {
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: HistoryTrigger,
+        navigation_purpose: FsNavigationPurpose,
+    },
+    Rating {
+        owner: RatingPhysicalLoadOwner,
+        restore: Option<top_level_grid_view::RatingPhysicalRestore>,
+        replay: Option<(FolderHistoryDirection, FolderNavHistoryTarget)>,
+        zip_dir_prefix: Option<String>,
+    },
+    CollectionGrid {
+        owner: top_level_grid_view::CollectionGridPhysicalLoadOwner,
+    },
+    QuickFolder {
+        slot: QuickFolderSlotId,
+    },
+    MainGridArchive {
+        owner: MainGridArchiveTransitionIntent,
+        auto_fullscreen: bool,
+    },
+}
+
+pub(crate) struct PhysicalHistoryTransition {
+    request_id: u64,
+    intent: PhysicalHistoryIntent,
+    path: PathBuf,
+    phase: PhysicalHistoryPhase,
+    history_before: FolderNavHistorySnapshot,
+    source_context: ViewerContextId,
+    source_surface_generation: u64,
+    source_items_generation: u64,
+    source_slot: Option<QuickFolderSlotId>,
+    source_slot_switch_sequence: u64,
+    source_location: Option<FolderNavHistoryTarget>,
+    dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
+    favsearch_origin: bool,
+    tag_view_origin: bool,
+    global_search_origin: bool,
+    grid_open_effects: Option<GridVirtualOpenEffects>,
+}
+
+struct PhysicalHistoryDfsContinuation {
+    queued_steps: i32,
+    mode: FolderNavMode,
+    history_trigger: HistoryTrigger,
+    restore_video_tile: bool,
+    resume_slideshow: bool,
+    fullscreen: bool,
+}
+
+enum PhysicalHistoryPhase {
+    Preflighting {
+        preflight: collection_navigation::PhysicalHistoryPreflight,
+        pdf_password_submission: Option<(String, bool)>,
+    },
+    PdfPassword,
+    ArchiveConverting,
+    ArchivePreflighting {
+        backing_path: PathBuf,
+        preflight: collection_navigation::PhysicalHistoryPreflight,
+    },
+}
+
+/// A Collection history destination is prepared while the source grid remains mounted. The
+/// owner travels with that viewer bundle if the context is parked; another navigation drops it.
+pub(crate) struct CollectionHistoryTransition {
+    request_id: u64,
+    intent: CollectionHistoryIntent,
+    target: FolderNavHistoryTarget,
+    history_before: FolderNavHistorySnapshot,
+    source_context: ViewerContextId,
+    source_surface_generation: u64,
+    source_items_generation: u64,
+    source_slot: Option<QuickFolderSlotId>,
+    source_slot_switch_sequence: u64,
+    source_location: Option<FolderNavHistoryTarget>,
+    return_to: Option<top_level_grid_view::TopLevelGridRestore>,
+    phase: CollectionHistoryPhase,
+}
+
+pub(crate) enum HistoryNavigationTransition {
+    Collection(CollectionHistoryTransition),
+    Physical(PhysicalHistoryTransition),
+}
+
 /// One complete destination in the session-local Back/Forward history.
 ///
 /// The variant owns every value needed to restore that destination. In particular, a collection
 /// is never represented by a filesystem-looking sentinel path, and rating/smart metadata cannot
 /// drift out of alignment with a parallel path vector.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) enum FolderNavHistoryTarget {
     Path(PathBuf),
     Rating { stars: u8 },
+    RatingPhysical(top_level_grid_view::RatingPhysicalRestore),
     SmartFolder(top_level_grid_view::SmartFolderViewState),
     Collection(top_level_grid_view::CollectionGridRestore),
+    CollectionPhysical(top_level_grid_view::CollectionGridPhysicalRestore),
 }
+
+impl PartialEq for FolderNavHistoryTarget {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Path(left), Self::Path(right)) => left == right,
+            (Self::Rating { stars: left }, Self::Rating { stars: right }) => left == right,
+            (Self::RatingPhysical(left), Self::RatingPhysical(right)) => {
+                left.visible_path == right.visible_path
+                    && left.stars == right.stars
+                    && left.nav_chain == right.nav_chain
+                    && left.saved_folder == right.saved_folder
+            }
+            (Self::SmartFolder(left), Self::SmartFolder(right)) => left == right,
+            (Self::Collection(left), Self::Collection(right)) => left == right,
+            (Self::CollectionPhysical(left), Self::CollectionPhysical(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FolderNavHistoryTarget {}
 
 impl FolderNavHistoryTarget {
     pub(crate) fn from_restore(restore: &top_level_grid_view::TopLevelGridRestore) -> Option<Self> {
@@ -306,11 +524,17 @@ impl FolderNavHistoryTarget {
             }
             TopLevelGridRestore::Bookmarks => Some(Self::Path(bookmark_view_synthetic_path())),
             TopLevelGridRestore::Rating { stars } => Some(Self::Rating { stars: *stars }),
+            TopLevelGridRestore::RatingPhysical(restore) => {
+                Some(Self::RatingPhysical(restore.clone()))
+            }
             TopLevelGridRestore::SubfolderExpansion(_) => {
                 Some(Self::Path(subfolder_expansion_synthetic_path()))
             }
             TopLevelGridRestore::SmartFolder(state) => Some(Self::SmartFolder(state.clone())),
             TopLevelGridRestore::Collection(restore) => Some(Self::Collection(restore.clone())),
+            TopLevelGridRestore::CollectionPhysical(restore) => {
+                Some(Self::CollectionPhysical(restore.clone()))
+            }
         }
     }
 
@@ -321,6 +545,7 @@ impl FolderNavHistoryTarget {
     pub(crate) fn collection_id(&self) -> Option<crate::collection_store::CollectionId> {
         match self {
             Self::Collection(restore) => Some(restore.identity.collection_id),
+            Self::CollectionPhysical(restore) => Some(restore.root.identity.collection_id),
             _ => None,
         }
     }
@@ -502,6 +727,7 @@ pub(crate) struct MainGridArchiveTransitionIntent {
     suppress_rating_filter: bool,
     suppress_facet_filter: bool,
     pub(crate) smart_folder_owner: SmartGridArchiveOwner,
+    rating_grid_owner: Option<RatingPhysicalLoadOwner>,
     collection_grid_owner: Option<top_level_grid_view::CollectionGridSourceOpenOwner>,
     collection_navigation_continuation: Option<CollectionArchiveNavigationContinuation>,
 }
@@ -543,10 +769,34 @@ pub(crate) enum DetachedGridArchiveOpenOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequestOwner {
     Navigation,
+    RatingPhysical(RatingPhysicalLoadOwner),
+    QuickFolderSwitch(QuickFolderSwitchLoadOwner),
     CollectionGridPhysical(top_level_grid_view::CollectionGridPhysicalLoadOwner),
     MainGridArchive(MainGridArchiveTransitionIntent),
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
     DetachedGridArchive(DetachedGridArchiveOpenRequestOwner),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GridVirtualOpenSource {
+    Direct,
+    Rating(RatingPhysicalLoadOwner),
+    Collection(top_level_grid_view::CollectionGridPhysicalLoadOwner),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GridVirtualOpenEffects {
+    reading_history_return_from: Option<PathBuf>,
+    suppress_rating_filter: bool,
+    suppress_facet_filter: bool,
+    auto_fullscreen: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GridVirtualOpenIntent {
+    pub(crate) path: PathBuf,
+    pub(crate) source: GridVirtualOpenSource,
+    effects: GridVirtualOpenEffects,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3223,6 +3473,29 @@ enum DeferredFsOpenOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PdfPasswordRequest {
     path: PathBuf,
+    owner: PdfPasswordRequestOwner,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PdfPasswordRequestOwner {
+    Legacy,
+    StagedHistory(u64),
+}
+
+impl PdfPasswordRequest {
+    pub(crate) fn legacy(path: PathBuf) -> Self {
+        Self {
+            path,
+            owner: PdfPasswordRequestOwner::Legacy,
+        }
+    }
+
+    fn staged_history(path: PathBuf, request_id: u64) -> Self {
+        Self {
+            path,
+            owner: PdfPasswordRequestOwner::StagedHistory(request_id),
+        }
+    }
 }
 
 /// DFS スレッドから UI スレッドに送るメッセージ。結果 (Option) と、
@@ -3297,6 +3570,9 @@ struct PreparedZipGrid {
 /// cloneable, while the Smart adoption permit owns a potentially large offscreen root payload.
 enum VisibleInstallAuthority<'a> {
     Ordinary,
+    StagedArchive {
+        logical_source: &'a Path,
+    },
     SmartPhysical {
         request_id: u64,
         definition_id: uuid::Uuid,
@@ -13569,6 +13845,8 @@ pub struct App {
     pub(crate) quick_folder_workspaces: [QuickFolderWorkspace; 2],
     /// 現在ナビゲーション履歴を受け持つクイックフォルダスロット。
     pub(crate) active_quick_folder_slot: Option<QuickFolderSlotId>,
+    /// Monotonic switch intent identity; even a same-path Current shortcut retires older replay.
+    pub(crate) quick_folder_switch_sequence: u64,
     /// 検索クローズで検索前フォルダへ復帰する `load_folder` を履歴に積まないための
     /// ワンショット。検索中は `global_search.active` / `favsearch.active` で判定できるが、
     /// `close_global_search` / `close_favsearch` は `active` を false にしてから
@@ -16942,6 +17220,7 @@ impl App {
             folder_nav_subfolder_restore: None,
             quick_folder_workspaces,
             active_quick_folder_slot: Some(QuickFolderSlotId::A),
+            quick_folder_switch_sequence: 0,
             suppress_nav_record_for_search_restore: false,
             folder_history: std::collections::HashMap::new(),
             show_search_bar: false,
@@ -19561,6 +19840,7 @@ impl App {
             suppress_rating_filter,
             suppress_facet_filter,
             smart_folder_owner: self.smart_grid_archive_owner_for_source(source_path),
+            rating_grid_owner: self.rating_view_physical_load_owner(source_path),
             collection_grid_owner: self.collection_grid_source_open_owner(idx, source_path),
             collection_navigation_continuation: None,
         })
@@ -19578,6 +19858,7 @@ impl App {
             suppress_rating_filter: false,
             suppress_facet_filter: false,
             smart_folder_owner: SmartGridArchiveOwner::None,
+            rating_grid_owner: None,
             collection_grid_owner: Some(collection_grid_owner),
             collection_navigation_continuation: continuation,
         })
@@ -19597,6 +19878,9 @@ impl App {
             }
         };
         smart_current
+            && intent.rating_grid_owner.as_ref().is_none_or(|rating| {
+                self.rating_physical_load_owner_is_current(rating, &intent.source_path)
+            })
             && intent
                 .collection_grid_owner
                 .as_ref()
@@ -19856,6 +20140,11 @@ impl App {
                 self.clear_pending_folder_nav_steps();
                 true
             }
+            crate::ui_main::AddressBarNav::GridVirtual(intent) => {
+                self.start_grid_virtual_open(intent);
+                self.clear_pending_folder_nav_steps();
+                true
+            }
             crate::ui_main::AddressBarNav::CollectionSource { path, owner } => {
                 let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                     path,
@@ -19863,6 +20152,10 @@ impl App {
                     OpenRequestOwner::CollectionGridPhysical(owner),
                 );
                 self.clear_pending_folder_nav_steps();
+                true
+            }
+            crate::ui_main::AddressBarNav::RatingSource { owner, .. } => {
+                self.start_rating_physical_open(owner);
                 true
             }
             crate::ui_main::AddressBarNav::DriveList(origin) => {
@@ -19925,6 +20218,15 @@ impl App {
                 FolderNavHistoryTarget::Rating { stars: right },
             ) => left == right,
             (
+                FolderNavHistoryTarget::RatingPhysical(left),
+                FolderNavHistoryTarget::RatingPhysical(right),
+            ) => {
+                left.stars == right.stars
+                    && crate::folder_tree::path_eq(&left.visible_path, &right.visible_path)
+                    && left.nav_chain == right.nav_chain
+                    && left.saved_folder == right.saved_folder
+            }
+            (
                 FolderNavHistoryTarget::SmartFolder(left),
                 FolderNavHistoryTarget::SmartFolder(right),
             ) => left == right,
@@ -19932,7 +20234,30 @@ impl App {
                 FolderNavHistoryTarget::Collection(left),
                 FolderNavHistoryTarget::Collection(right),
             ) => left.identity.collection_id == right.identity.collection_id,
+            (
+                FolderNavHistoryTarget::CollectionPhysical(left),
+                FolderNavHistoryTarget::CollectionPhysical(right),
+            ) => {
+                left.root.identity.collection_id == right.root.identity.collection_id
+                    && left.root.viewport_anchor == right.root.viewport_anchor
+                    && crate::folder_tree::path_eq(&left.root_source_path, &right.root_source_path)
+                    && crate::folder_tree::path_eq(&left.visible_path, &right.visible_path)
+            }
             _ => false,
+        }
+    }
+
+    /// Main Back/Forward stacks live on App, outside ViewerContextBundle. A projected detached
+    /// payload must not observe or mutate them, even while its navigation scope is CollectionRoot.
+    fn main_folder_history_available(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.projected_viewer_context_id() == self.viewer_context_main()
+                && !self.detached_viewer_suppresses_main_history_persistence()
+        }
+        #[cfg(not(windows))]
+        {
+            true
         }
     }
 
@@ -19968,6 +20293,9 @@ impl App {
     }
 
     fn push_active_folder_nav_back_stack(&mut self, target: FolderNavHistoryTarget) {
+        if !self.main_folder_history_available() {
+            return;
+        }
         if let Some(workspace) = self.active_quick_folder_workspace_mut() {
             Self::push_folder_nav_stack(&mut workspace.history.back_stack, target);
         } else {
@@ -19976,6 +20304,9 @@ impl App {
     }
 
     fn clear_active_folder_nav_forward_stack(&mut self) {
+        if !self.main_folder_history_available() {
+            return;
+        }
         if let Some(workspace) = self.active_quick_folder_workspace_mut() {
             workspace.history.forward_stack.clear();
         } else {
@@ -19984,6 +20315,9 @@ impl App {
     }
 
     fn take_active_folder_nav_suppress_record_once(&mut self) -> bool {
+        if !self.main_folder_history_available() {
+            return false;
+        }
         if let Some(workspace) = self.active_quick_folder_workspace_mut() {
             std::mem::take(&mut workspace.history.suppress_record_once)
         } else {
@@ -19992,6 +20326,9 @@ impl App {
     }
 
     pub(crate) fn set_active_folder_nav_suppress_record_once(&mut self, value: bool) {
+        if !self.main_folder_history_available() {
+            return;
+        }
         if let Some(workspace) = self.active_quick_folder_workspace_mut() {
             workspace.history.suppress_record_once = value;
         } else {
@@ -20120,24 +20457,41 @@ impl App {
         &mut self,
         slot: QuickFolderSlotId,
     ) -> QuickFolderSwitchTarget {
+        self.quick_folder_switch_sequence = self.quick_folder_switch_sequence.wrapping_add(1);
+        self.replace_history_navigation_transition(None);
+        if let Some(pending) = self.rating_view_pending.as_ref()
+            && pending.navigation.is_some()
+        {
+            if let Some(pending) = self.rating_view_pending.take() {
+                pending.cancel();
+            }
+        }
         let target = self.quick_folder_target(slot).cloned();
         self.cancel_pending_folder_nav();
-        self.active_quick_folder_slot = Some(slot);
         match target {
             Some(target) => {
-                if !self.items_are_drive_list
-                    && self
-                        .effective_folder()
-                        .is_some_and(|current| crate::folder_tree::path_eq(&current, &target))
+                if matches!(
+                    self.folder_nav_current_target(),
+                    Some(FolderNavHistoryTarget::Path(current))
+                        if crate::folder_tree::path_eq(&current, &target)
+                ) && matches!(
+                    self.top_level_grid_view.surface(),
+                    top_level_grid_view::TopLevelGridSurface::Folder
+                ) && self.rating_view_nav_stack.is_empty()
+                    && self.top_level_grid_view.collection_session().is_none()
                 {
+                    self.active_quick_folder_slot = Some(slot);
                     QuickFolderSwitchTarget::Current
                 } else {
-                    self.set_active_folder_nav_suppress_record_once(true);
                     QuickFolderSwitchTarget::Folder(target)
                 }
             }
-            None if self.items_are_drive_list => QuickFolderSwitchTarget::Current,
+            None if self.items_are_drive_list => {
+                self.active_quick_folder_slot = Some(slot);
+                QuickFolderSwitchTarget::Current
+            }
             None => {
+                self.active_quick_folder_slot = Some(slot);
                 // A/B 切替自体は履歴に積まない。DriveList の通常入口が行う履歴記録を
                 // 新しく active になった空スロット側で 1 回だけ抑止する。
                 self.set_active_folder_nav_suppress_record_once(true);
@@ -20146,7 +20500,29 @@ impl App {
         }
     }
 
+    pub(crate) fn commit_quick_folder_slot_drive_list(&mut self, slot: QuickFolderSlotId) {
+        self.active_quick_folder_slot = Some(slot);
+        self.set_active_folder_nav_suppress_record_once(true);
+    }
+
+    pub(crate) fn start_quick_folder_slot_switch(
+        &mut self,
+        slot: QuickFolderSlotId,
+        path: PathBuf,
+    ) -> bool {
+        if self
+            .quick_folder_target(slot)
+            .is_none_or(|target| !crate::folder_tree::path_eq(target, &path))
+        {
+            return false;
+        }
+        self.start_physical_history_transition(PhysicalHistoryIntent::QuickFolder { slot }, path)
+    }
+
     pub(crate) fn update_active_quick_folder_target(&mut self, target: &Path) {
+        if !self.main_folder_history_available() {
+            return;
+        }
         // 合成ビューは一時的な current_folder marker。A/B の永続ターゲットへ保存しない。
         if is_synthetic_view_path(target) {
             return;
@@ -20172,6 +20548,9 @@ impl App {
     }
 
     pub(crate) fn remember_recent_folder(&mut self, path: &Path) {
+        if !self.main_folder_history_available() {
+            return;
+        }
         // 合成ビューは「履歴▼」の永続 MRU には保存しない。←/→ の session 履歴だけで扱う。
         if is_synthetic_view_path(path) {
             return;
@@ -20240,8 +20619,8 @@ impl App {
         }
         let restore = self.current_top_level_restore_snapshot()?;
         let target = FolderNavHistoryTarget::from_restore(&restore)?;
-        if let FolderNavHistoryTarget::Collection(collection) = &target
-            && !self.collection_catalog_contains(collection.identity.collection_id)
+        if let Some(collection_id) = target.collection_id()
+            && !self.collection_catalog_contains(collection_id)
         {
             // A Ready catalog is authoritative: a mounted Deleted presentation is useful as
             // feedback, but it is no longer a destination that Back/Forward may capture again.
@@ -20261,10 +20640,101 @@ impl App {
         self.record_folder_nav_transition_from_current(target, current);
     }
 
+    /// The collection session is still at `from` when its physical load reaches the visible
+    /// adoption boundary. Keep the root anchor and the physical child as separate locations.
+    pub(crate) fn record_collection_physical_nav_transition(
+        &mut self,
+        from: top_level_grid_view::TopLevelGridRestore,
+        to: top_level_grid_view::CollectionGridPhysicalRestore,
+    ) {
+        let Some(from) = FolderNavHistoryTarget::from_restore(&from) else {
+            return;
+        };
+        self.record_folder_nav_transition_from_current(
+            FolderNavHistoryTarget::CollectionPhysical(to),
+            Some(from),
+        );
+    }
+
     fn folder_nav_rating_view_stars_for_path(&self, path: &Path) -> Option<u8> {
         (crate::folder_tree::path_eq(path, &rating_view_synthetic_path())
             && (1..=5).contains(&self.rating_view_stars))
         .then_some(self.rating_view_stars)
+    }
+
+    pub(crate) fn rating_view_physical_load_owner(
+        &self,
+        path: &Path,
+    ) -> Option<RatingPhysicalLoadOwner> {
+        if !self.main_folder_history_available() || is_synthetic_view_path(path) {
+            return None;
+        }
+        let source_location = self.folder_nav_current_target()?;
+        let (stars, nav_chain, saved_folder) = match &source_location {
+            FolderNavHistoryTarget::Rating { stars }
+                if matches!(
+                    self.top_level_grid_view.surface(),
+                    top_level_grid_view::TopLevelGridSurface::Rating { .. }
+                ) =>
+            {
+                (*stars, Vec::new(), self.rating_view_saved_folder.clone())
+            }
+            FolderNavHistoryTarget::RatingPhysical(restore)
+                if matches!(
+                    self.top_level_grid_view.surface(),
+                    top_level_grid_view::TopLevelGridSurface::Folder
+                ) =>
+            {
+                (
+                    restore.stars,
+                    restore.nav_chain.clone(),
+                    restore.saved_folder.clone(),
+                )
+            }
+            _ => return None,
+        };
+        Some(RatingPhysicalLoadOwner {
+            intent: RatingPhysicalLoadIntent::Explicit,
+            source_context: self.projected_viewer_context_id(),
+            source_surface_generation: self.top_level_grid_view.generation(),
+            source_items_generation: self.items_generation,
+            source_slot: self.active_quick_folder_slot,
+            source_slot_switch_sequence: self.quick_folder_switch_sequence,
+            source_location,
+            target_path: path.to_path_buf(),
+            stars,
+            nav_chain,
+            saved_folder,
+        })
+    }
+
+    fn rating_physical_load_owner_is_current(
+        &self,
+        owner: &RatingPhysicalLoadOwner,
+        path: &Path,
+    ) -> bool {
+        self.main_folder_history_available()
+            && self.projected_viewer_context_id() == owner.source_context
+            && self.top_level_grid_view.generation() == owner.source_surface_generation
+            && self.items_generation == owner.source_items_generation
+            && self.active_quick_folder_slot == owner.source_slot
+            && self.quick_folder_switch_sequence == owner.source_slot_switch_sequence
+            && crate::folder_tree::path_eq(path, &owner.target_path)
+            && self.folder_nav_current_target().as_ref() == Some(&owner.source_location)
+    }
+
+    fn quick_folder_switch_owner_is_current(
+        &self,
+        owner: &QuickFolderSwitchLoadOwner,
+        path: &Path,
+    ) -> bool {
+        self.main_folder_history_available()
+            && self.projected_viewer_context_id() == owner.source_context
+            && self.top_level_grid_view.generation() == owner.source_surface_generation
+            && self.items_generation == owner.source_items_generation
+            && self.active_quick_folder_slot == owner.source_slot
+            && self.quick_folder_switch_sequence == owner.source_slot_switch_sequence
+            && crate::folder_tree::path_eq(path, &owner.target_path)
     }
 
     pub(crate) fn view_return_rating_view_stars_for_path(&self, path: Option<&Path>) -> Option<u8> {
@@ -20294,7 +20764,7 @@ impl App {
             self.top_level_grid_view.surface(),
             TopLevelGridSurface::Collection(_)
         ) {
-            return self.collection_grid_restore_snapshot();
+            return self.collection_grid_current_restore_snapshot();
         }
         if !matches!(
             self.top_level_grid_view.surface(),
@@ -20326,8 +20796,23 @@ impl App {
                 Some(TopLevelGridRestore::Rating { stars: *stars })
             }
             TopLevelGridSurface::Search(_) | TopLevelGridSurface::Snapshot => None,
-            TopLevelGridSurface::Collection(_) => self.collection_grid_restore_snapshot(),
+            TopLevelGridSurface::Collection(_) => self.collection_grid_current_restore_snapshot(),
             TopLevelGridSurface::Folder => self.effective_folder().map(|path| {
+                if self
+                    .rating_view_nav_stack
+                    .last()
+                    .is_some_and(|last| crate::folder_tree::path_eq(last, &path))
+                {
+                    return TopLevelGridRestore::RatingPhysical(
+                        top_level_grid_view::RatingPhysicalRestore {
+                            visible_path: path,
+                            stars: self.rating_view_stars,
+                            nav_chain: self.rating_view_nav_stack.clone(),
+                            saved_folder: self.rating_view_saved_folder.clone(),
+                            subfolder_restore: self.rating_view_subfolder_restore.clone(),
+                        },
+                    );
+                }
                 self.view_return_context_from_parts(
                     Some(path.clone()),
                     None,
@@ -20379,9 +20864,7 @@ impl App {
         target: FolderNavHistoryTarget,
         current: Option<FolderNavHistoryTarget>,
     ) {
-        if self.detached_viewer_suppresses_main_history_persistence() {
-            self.suppress_nav_record_for_search_restore = false;
-            self.set_active_folder_nav_suppress_record_once(false);
+        if !self.main_folder_history_available() {
             return;
         }
         // 検索 (Ctrl+G / Ctrl+S / Ctrl+T) 中の移動、および検索クローズによる検索前フォルダへの
@@ -20462,6 +20945,20 @@ impl App {
     }
 
     pub(crate) fn folder_nav_history_snapshot(&self) -> FolderNavHistorySnapshot {
+        if !self.main_folder_history_available() {
+            return FolderNavHistorySnapshot {
+                back_stack: Vec::new(),
+                forward_stack: Vec::new(),
+                recent_folders: Vec::new(),
+                suppress_record_once: false,
+                quick_folder_workspaces: std::array::from_fn(|_| QuickFolderWorkspace::default()),
+                active_quick_folder_slot: None,
+                favsearch_nav_stack: self.favsearch.nav_stack.clone(),
+                tag_view_nav_stack: self.tag_view.nav_stack.clone(),
+                rating_view_nav_stack: self.rating_view_nav_stack.clone(),
+                pending_rating_view_zipdir_open: self.pending_rating_view_zipdir_open.clone(),
+            };
+        }
         FolderNavHistorySnapshot {
             back_stack: self.folder_nav_back_stack.clone(),
             forward_stack: self.folder_nav_forward_stack.clone(),
@@ -20477,6 +20974,9 @@ impl App {
     }
 
     pub(crate) fn restore_folder_nav_history(&mut self, snapshot: FolderNavHistorySnapshot) {
+        if !self.main_folder_history_available() {
+            return;
+        }
         self.folder_nav_back_stack = snapshot.back_stack;
         self.folder_nav_forward_stack = snapshot.forward_stack;
         self.recent_folders = snapshot.recent_folders;
@@ -20509,6 +21009,9 @@ impl App {
     }
 
     pub(crate) fn folder_history_back_target(&self) -> Option<&FolderNavHistoryTarget> {
+        if !self.main_folder_history_available() {
+            return None;
+        }
         self.active_quick_folder_workspace()
             .and_then(|workspace| workspace.history.back_stack.last())
             .or_else(|| {
@@ -20521,6 +21024,9 @@ impl App {
     }
 
     pub(crate) fn folder_history_forward_target(&self) -> Option<&FolderNavHistoryTarget> {
+        if !self.main_folder_history_available() {
+            return None;
+        }
         self.active_quick_folder_workspace()
             .and_then(|workspace| workspace.history.forward_stack.last())
             .or_else(|| {
@@ -20557,6 +21063,9 @@ impl App {
     }
 
     pub(crate) fn recent_folder_entries(&self) -> &[PathBuf] {
+        if !self.main_folder_history_available() {
+            return &[];
+        }
         // アクティブな A/B スロットの最近開いたフォルダ一覧を返す。
         if let Some(workspace) = self.active_quick_folder_workspace() {
             &workspace.recent_folders
@@ -20566,6 +21075,9 @@ impl App {
     }
 
     pub(crate) fn navigate_folder_history_back(&mut self) -> Option<FolderNavHistoryTarget> {
+        if !self.main_folder_history_available() {
+            return None;
+        }
         let current = self.folder_nav_current_target();
         let target = if let Some(workspace) = self.active_quick_folder_workspace_mut() {
             workspace.history.back_stack.pop()?
@@ -20602,50 +21114,89 @@ impl App {
         history_rollback: &mut Option<FolderNavHistorySnapshot>,
     ) -> SyntheticFolderHistoryDispatch {
         let dispatch = match target {
-            FolderNavHistoryTarget::Collection(restore) => {
-                let collection_id = restore.identity.collection_id;
-                if self.collection_catalog_contains(collection_id) {
-                    self.open_collection_grid(collection_id, Some(restore.clone()));
-                    SyntheticFolderHistoryDispatch::Restored
-                } else {
-                    SyntheticFolderHistoryDispatch::Unavailable
+            FolderNavHistoryTarget::Collection(_)
+            | FolderNavHistoryTarget::CollectionPhysical(_) => {
+                if let Some(snapshot) = history_rollback.take() {
+                    self.restore_folder_nav_history(snapshot);
+                    let direction = if self.folder_history_back_target() == Some(target) {
+                        Some(FolderHistoryDirection::Back)
+                    } else if self.folder_history_forward_target() == Some(target) {
+                        Some(FolderHistoryDirection::Forward)
+                    } else {
+                        None
+                    };
+                    if direction.is_some_and(|direction| {
+                        self.start_collection_history_transition(
+                            target.clone(),
+                            CollectionHistoryIntent::Replay {
+                                direction,
+                                target: target.clone(),
+                            },
+                            None,
+                        )
+                    }) {
+                        return SyntheticFolderHistoryDispatch::Restored;
+                    }
+                    return SyntheticFolderHistoryDispatch::Unavailable;
                 }
+                if self.start_collection_history_transition(
+                    target.clone(),
+                    CollectionHistoryIntent::Restore,
+                    None,
+                ) {
+                    return SyntheticFolderHistoryDispatch::Restored;
+                }
+                return SyntheticFolderHistoryDispatch::Unavailable;
             }
             FolderNavHistoryTarget::Rating { stars } => {
                 if !(1..=5).contains(stars) {
                     return SyntheticFolderHistoryDispatch::Unavailable;
                 }
-                self.reset_details_sort_to_toolbar();
-                self.rating_view_nav_stack.clear();
-                self.pending_rating_view_zipdir_open = None;
-                if self.rating_view_rows_stars == Some(*stars) && self.rating_view_pending.is_none()
-                {
-                    self.rating_view_stars = *stars;
-                    self.address = format!(
-                        "{} レーティング一覧を読み込み中…",
-                        "★".repeat(*stars as usize)
-                    );
-                    self.request_rating_view_build();
-                } else {
-                    self.rating_view_stars = *stars;
-                    self.rating_view_sort = crate::rating_view::RatingViewSort::default();
-                    self.reload_current_rating_view_preserving_sort();
+                if let Some(snapshot) = history_rollback.take() {
+                    // Older callers already selected a target. Put their pre-pop cursor back;
+                    // the staged request will move it only with the visible Rating install.
+                    self.restore_folder_nav_history(snapshot);
+                    let direction = if self.folder_history_back_target() == Some(target) {
+                        Some(FolderHistoryDirection::Back)
+                    } else if self.folder_history_forward_target() == Some(target) {
+                        Some(FolderHistoryDirection::Forward)
+                    } else {
+                        None
+                    };
+                    if direction.is_some_and(|direction| {
+                        self.start_rating_history_replay(direction, *stars)
+                    }) {
+                        return SyntheticFolderHistoryDispatch::Restored;
+                    }
+                    return SyntheticFolderHistoryDispatch::Unavailable;
                 }
-                // 履歴 target の採用時点で current surface も同じ ★N を所有する。
-                // rows の非同期再構築が終わるまで旧 ★ surface を残すと、その間の ← が
-                // forward stack へ旧 stars を積み、typed history target と表示 intent が
-                // 食い違う。install 側も同じ surface を確定するが、ここは navigation
-                // adoption の境界として先に identity を切り替える。
-                if !matches!(
-                    self.top_level_grid_view.surface(),
-                    top_level_grid_view::TopLevelGridSurface::Rating { stars: current }
-                        if current == stars
-                ) {
-                    self.top_level_grid_view.replace_surface(
-                        top_level_grid_view::TopLevelGridSurface::Rating { stars: *stars },
-                    );
+                self.restore_rating_without_history(*stars);
+                return SyntheticFolderHistoryDispatch::Restored;
+            }
+            FolderNavHistoryTarget::RatingPhysical(restore) => {
+                if let Some(snapshot) = history_rollback.take() {
+                    self.restore_folder_nav_history(snapshot);
+                    let direction = if self.folder_history_back_target() == Some(target) {
+                        Some(FolderHistoryDirection::Back)
+                    } else if self.folder_history_forward_target() == Some(target) {
+                        Some(FolderHistoryDirection::Forward)
+                    } else {
+                        None
+                    };
+                    if direction.is_some_and(|direction| {
+                        self.start_rating_physical_restore(
+                            restore.clone(),
+                            Some((direction, target.clone())),
+                        )
+                    }) {
+                        return SyntheticFolderHistoryDispatch::Restored;
+                    }
+                    return SyntheticFolderHistoryDispatch::Unavailable;
                 }
-                SyntheticFolderHistoryDispatch::Restored
+                if self.start_rating_physical_restore(restore.clone(), None) {
+                    return SyntheticFolderHistoryDispatch::Restored;
+                }
+                return SyntheticFolderHistoryDispatch::Unavailable;
             }
             FolderNavHistoryTarget::SmartFolder(state) => {
                 if self
@@ -20855,6 +21406,9 @@ impl App {
     }
 
     pub(crate) fn navigate_folder_history_forward(&mut self) -> Option<FolderNavHistoryTarget> {
+        if !self.main_folder_history_available() {
+            return None;
+        }
         let current = self.folder_nav_current_target();
         let target = if let Some(workspace) = self.active_quick_folder_workspace_mut() {
             workspace.history.forward_stack.pop()?
@@ -21277,13 +21831,7 @@ impl App {
             return;
         }
         if self.items_are_rating_view {
-            if matches!(
-                self.rating_view_sort,
-                crate::rating_view::RatingViewSort::Normal(_)
-            ) {
-                self.rating_view_sort =
-                    crate::rating_view::RatingViewSort::Normal(self.settings.sort_order);
-            }
+            self.rating_view_sort = self.settings.rating_view_sort.normalized_for_rating_view();
             self.request_rating_view_build();
             return;
         }
@@ -21951,6 +22499,28 @@ impl App {
         )
     }
 
+    pub(crate) fn will_stage_archive_navigation(
+        &self,
+        path: &Path,
+        owner: &OpenRequestOwner,
+    ) -> bool {
+        if !self.main_folder_history_available() || !path.is_file() {
+            return false;
+        }
+        match owner {
+            OpenRequestOwner::Navigation => {
+                crate::folder_tree::is_virtual_folder(path)
+                    || crate::folder_tree::is_convertible_archive_path(path)
+            }
+            OpenRequestOwner::MainGridArchive(intent) => {
+                crate::folder_tree::is_convertible_archive_path(path)
+                    && (intent.rating_grid_owner.is_some()
+                        || intent.collection_grid_owner.is_some())
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn load_folder_or_convert_archive_with_auto_fullscreen_owned(
         &mut self,
         path: PathBuf,
@@ -21997,6 +22567,59 @@ impl App {
                     FolderOpenOutcome::Ignored
                 };
             }
+        }
+        if path.is_file()
+            && crate::folder_tree::is_convertible_archive_path(&path)
+            && self.main_folder_history_available()
+            && let OpenRequestOwner::MainGridArchive(intent) = &owner
+            && (intent.rating_grid_owner.is_some() || intent.collection_grid_owner.is_some())
+        {
+            if self.settings.archive_file_handling_ignores_convertible() {
+                self.show_feedback_toast(
+                    "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
+                );
+                return FolderOpenOutcome::Ignored;
+            }
+            if !self.claim_open_request_owner(&path, &owner) {
+                return FolderOpenOutcome::Ignored;
+            }
+            return if self.start_physical_history_transition(
+                PhysicalHistoryIntent::MainGridArchive {
+                    owner: intent.clone(),
+                    auto_fullscreen,
+                },
+                path,
+            ) {
+                FolderOpenOutcome::ConversionDialogOpened
+            } else {
+                FolderOpenOutcome::Ignored
+            };
+        }
+        if path.is_file()
+            && crate::folder_tree::is_convertible_archive_path(&path)
+            && self.main_folder_history_available()
+            && matches!(owner, OpenRequestOwner::Navigation)
+        {
+            if self.settings.archive_file_handling_ignores_convertible() {
+                self.show_feedback_toast(
+                    "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
+                );
+                return FolderOpenOutcome::Ignored;
+            }
+            if !self.claim_open_request_owner(&path, &owner) {
+                return FolderOpenOutcome::Ignored;
+            }
+            return if self.start_physical_history_transition(
+                PhysicalHistoryIntent::Navigation {
+                    replay: None,
+                    auto_fullscreen,
+                },
+                path,
+            ) {
+                FolderOpenOutcome::ConversionDialogOpened
+            } else {
+                FolderOpenOutcome::Ignored
+            };
         }
         // Claim the visible-open lifecycle before dispatching by container type. In particular,
         // archive B must replace an in-flight archive A before request_* observes the old state.
@@ -22121,11 +22744,13 @@ impl App {
         }
         let scope_path = match owner {
             OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
+            OpenRequestOwner::RatingPhysical(rating) => &rating.target_path,
             OpenRequestOwner::Bookmark(bookmark_owner) => match &bookmark_owner.target {
                 crate::bookmark_browser::BookmarkViewReturnTarget::Media(path)
                 | crate::bookmark_browser::BookmarkViewReturnTarget::Book(path) => path,
             },
             OpenRequestOwner::Navigation
+            | OpenRequestOwner::QuickFolderSwitch(_)
             | OpenRequestOwner::CollectionGridPhysical(_)
             | OpenRequestOwner::DetachedGridArchive(_) => path,
         };
@@ -22157,8 +22782,21 @@ impl App {
     fn claim_open_request_owner(&mut self, path: &Path, owner: &OpenRequestOwner) -> bool {
         match owner {
             OpenRequestOwner::Navigation
+            | OpenRequestOwner::RatingPhysical(_)
+            | OpenRequestOwner::QuickFolderSwitch(_)
             | OpenRequestOwner::CollectionGridPhysical(_)
             | OpenRequestOwner::MainGridArchive(_) => {
+                if let OpenRequestOwner::RatingPhysical(rating) = owner
+                    && !self.rating_physical_load_owner_is_current(rating, path)
+                {
+                    self.pending_auto_fs_open = false;
+                    return false;
+                }
+                if let OpenRequestOwner::QuickFolderSwitch(switch) = owner
+                    && !self.quick_folder_switch_owner_is_current(switch, path)
+                {
+                    return false;
+                }
                 if let OpenRequestOwner::CollectionGridPhysical(collection) = owner
                     && !self.collection_grid_physical_load_owner_is_current(collection, path)
                 {
@@ -22183,6 +22821,7 @@ impl App {
                     // own its load without cancelling any of them.
                     return true;
                 }
+                self.replace_history_navigation_transition(None);
                 // A direct navigation owns the next visible location. If an earlier startup,
                 // activation, or bookmark path is still resolving, dispose that request before
                 // the worker can overwrite this navigation with a late completion.
@@ -22262,6 +22901,45 @@ impl App {
         }
     }
 
+    fn commit_rating_physical_load_owner(
+        &mut self,
+        rating: &RatingPhysicalLoadOwner,
+        path: &Path,
+    ) -> bool {
+        if !self.rating_physical_load_owner_is_current(rating, path) {
+            return false;
+        }
+        let mut nav_chain = rating.nav_chain.clone();
+        if !nav_chain
+            .last()
+            .is_some_and(|last| crate::folder_tree::path_eq(last, path))
+        {
+            nav_chain.push(path.to_path_buf());
+            if nav_chain.len() > MAX_FOLDER_NAV_STACK {
+                nav_chain.remove(0);
+            }
+        }
+        let destination = top_level_grid_view::RatingPhysicalRestore {
+            visible_path: path.to_path_buf(),
+            stars: rating.stars,
+            nav_chain: nav_chain.clone(),
+            saved_folder: rating.saved_folder.clone(),
+            subfolder_restore: self.rating_view_subfolder_restore.clone(),
+        };
+        if rating.intent == RatingPhysicalLoadIntent::Explicit {
+            self.record_folder_nav_transition_from_current(
+                FolderNavHistoryTarget::RatingPhysical(destination),
+                Some(rating.source_location.clone()),
+            );
+        }
+        self.rating_view_nav_stack = nav_chain;
+        self.rating_view_stars = rating.stars;
+        self.rating_view_saved_folder = rating.saved_folder.clone();
+        self.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+        true
+    }
+
     /// Adopt a physical destination only after its visible load has proved usable.
     ///
     /// Independent navigation retires a mounted collection at this boundary. A collection-owned
@@ -22288,6 +22966,32 @@ impl App {
             OpenRequestOwner::CollectionGridPhysical(collection) => {
                 self.commit_collection_grid_physical_load(collection, path)
             }
+            OpenRequestOwner::RatingPhysical(rating) => {
+                self.commit_rating_physical_load_owner(rating, path)
+            }
+            OpenRequestOwner::QuickFolderSwitch(switch) => {
+                if !self.quick_folder_switch_owner_is_current(switch, path) {
+                    return false;
+                }
+                self.active_quick_folder_slot = Some(switch.target_slot);
+                self.rating_view_nav_stack.clear();
+                self.rating_view_saved_folder = None;
+                self.rating_view_subfolder_restore = None;
+                if !matches!(
+                    self.top_level_grid_view.surface(),
+                    top_level_grid_view::TopLevelGridSurface::Folder
+                ) || self.top_level_grid_view.collection_session().is_some()
+                {
+                    self.top_level_grid_view
+                        .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+                }
+                true
+            }
+            OpenRequestOwner::MainGridArchive(intent) if intent.rating_grid_owner.is_some() => self
+                .commit_rating_physical_load_owner(
+                    intent.rating_grid_owner.as_ref().unwrap(),
+                    &intent.source_path,
+                ),
             OpenRequestOwner::MainGridArchive(intent) if intent.collection_grid_owner.is_some() => {
                 // Archive conversion owns its existing commit tail. The cached ZIP/direct RAR
                 // load is adopted now, then commit_main_grid_archive_transition advances the
@@ -22297,20 +23001,28 @@ impl App {
             OpenRequestOwner::Navigation
             | OpenRequestOwner::MainGridArchive(_)
             | OpenRequestOwner::Bookmark(_) => {
-                if let Some(origin) = history_origin
-                    && !self.smart_folder_session_owns_load(path)
-                {
+                if !self.smart_folder_session_owns_load(path) {
+                    let logical_path = match owner {
+                        OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
+                        _ => path,
+                    };
                     self.record_folder_nav_transition_from_current(
-                        FolderNavHistoryTarget::Path(path.to_path_buf()),
-                        Some(origin.clone()),
+                        FolderNavHistoryTarget::Path(logical_path.to_path_buf()),
+                        history_origin.cloned(),
                     );
                 }
                 if matches!(
                     self.top_level_grid_view.surface(),
                     top_level_grid_view::TopLevelGridSurface::Collection(_)
+                        | top_level_grid_view::TopLevelGridSurface::Rating { .. }
                 ) {
                     self.top_level_grid_view
                         .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+                }
+                if !self.rating_view_nav_stack.is_empty() {
+                    self.rating_view_nav_stack.clear();
+                    self.rating_view_saved_folder = None;
+                    self.rating_view_subfolder_restore = None;
                 }
                 true
             }
@@ -22326,6 +23038,35 @@ impl App {
         authority: VisibleInstallAuthority<'_>,
     ) -> bool {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        if !detached_physical
+            && self.main_folder_history_available()
+            && let OpenRequestOwner::CollectionGridPhysical(collection) = &owner
+            && path.is_file()
+            && crate::folder_tree::is_virtual_folder(&path)
+        {
+            return self.start_physical_history_transition(
+                PhysicalHistoryIntent::CollectionGrid {
+                    owner: collection.clone(),
+                },
+                path,
+            );
+        }
+        if !detached_physical
+            && self.main_folder_history_available()
+            && matches!(owner, OpenRequestOwner::Navigation)
+            && path.is_file()
+            && crate::folder_tree::is_virtual_folder(&path)
+            && !self.smart_folder_session_owns_load(&path)
+        {
+            let auto_fullscreen = std::mem::take(&mut self.pending_auto_fs_open);
+            return self.start_physical_history_transition(
+                PhysicalHistoryIntent::Navigation {
+                    replay: None,
+                    auto_fullscreen,
+                },
+                path,
+            );
+        }
         let independent_navigation = !detached_physical
             && matches!(
                 &owner,
@@ -22335,6 +23076,10 @@ impl App {
                         collection_grid_owner: None,
                         ..
                     })
+            )
+            && !matches!(
+                &owner,
+                OpenRequestOwner::MainGridArchive(intent) if intent.rating_grid_owner.is_some()
             );
         // Capture before any surface reconciliation. Drive/rating/smart/collection identities are
         // typed by the visible origin; later `replace_surface(Folder)` must not flatten them into
@@ -22342,9 +23087,6 @@ impl App {
         let navigation_history_origin = independent_navigation
             .then(|| self.folder_nav_current_target())
             .flatten();
-        let collection_history_origin = navigation_history_origin.as_ref().and_then(|origin| {
-            matches!(origin, FolderNavHistoryTarget::Collection(_)).then(|| origin.clone())
-        });
         // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
         // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能。
         // 変換 cache ZIP は source archive の実装 alias なので、typed owner が保持する
@@ -22441,12 +23183,14 @@ impl App {
         // お気に入り解決へ混ぜない。解決規則自体は adjustment 標準と同じ最長一致。
         let favorite_path = match &owner {
             OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
+            OpenRequestOwner::RatingPhysical(rating) => &rating.target_path,
             OpenRequestOwner::Bookmark(bookmark_owner) => match &bookmark_owner.target {
                 crate::bookmark_browser::BookmarkViewReturnTarget::Media(path)
                 | crate::bookmark_browser::BookmarkViewReturnTarget::Book(path) => path,
             },
             OpenRequestOwner::DetachedGridArchive(detached_owner) => &detached_owner.source_path,
             OpenRequestOwner::CollectionGridPhysical(collection) => &collection.target_path,
+            OpenRequestOwner::QuickFolderSwitch(switch) => &switch.target_path,
             OpenRequestOwner::Navigation => &path,
         };
         if !self.smart_folder_session_owns_load(&path) {
@@ -22507,23 +23251,6 @@ impl App {
                 let _ = crate::pdf_loader::bump_render_context_epoch();
             }
         }
-        let collection_owned_navigation = matches!(
-            &owner,
-            OpenRequestOwner::CollectionGridPhysical(_)
-                | OpenRequestOwner::MainGridArchive(MainGridArchiveTransitionIntent {
-                    collection_grid_owner: Some(_),
-                    ..
-                })
-        );
-        if collection_history_origin.is_none()
-            && !collection_owned_navigation
-            && !self.smart_folder_session_owns_load(&path)
-        {
-            self.record_folder_nav_transition_from_current(
-                FolderNavHistoryTarget::Path(path.clone()),
-                navigation_history_origin,
-            );
-        }
         // パスが .zip / .cbz / .pdf ファイルなら仮想フォルダとして開く
         if path.is_file() {
             let ext = path
@@ -22535,7 +23262,7 @@ impl App {
                 if !self.adopt_collection_surface_for_physical_load(
                     &path,
                     &owner,
-                    collection_history_origin.as_ref(),
+                    navigation_history_origin.as_ref(),
                 ) {
                     self.pending_auto_fs_open = false;
                     return false;
@@ -22563,7 +23290,7 @@ impl App {
                 if !self.adopt_collection_surface_for_physical_load(
                     &path,
                     &owner,
-                    collection_history_origin.as_ref(),
+                    navigation_history_origin.as_ref(),
                 ) {
                     self.pending_auto_fs_open = false;
                     return false;
@@ -22627,7 +23354,7 @@ impl App {
         if !self.adopt_collection_surface_for_physical_load(
             &path,
             &owner,
-            collection_history_origin.as_ref(),
+            navigation_history_origin.as_ref(),
         ) {
             self.pending_auto_fs_open = false;
             return false;
@@ -24279,7 +25006,23 @@ impl App {
             }
             TopLevelGridRestore::Unavailable => return,
             TopLevelGridRestore::Collection(restore) => {
-                self.open_collection_grid(restore.identity.collection_id, Some(restore));
+                self.start_collection_history_transition(
+                    FolderNavHistoryTarget::Collection(restore),
+                    CollectionHistoryIntent::Restore,
+                    None,
+                );
+                return;
+            }
+            TopLevelGridRestore::RatingPhysical(restore) => {
+                self.start_rating_physical_restore(restore, None);
+                return;
+            }
+            TopLevelGridRestore::CollectionPhysical(restore) => {
+                self.start_collection_history_transition(
+                    FolderNavHistoryTarget::CollectionPhysical(restore),
+                    CollectionHistoryIntent::Restore,
+                    None,
+                );
                 return;
             }
             TopLevelGridRestore::Folder(path) => {
@@ -25018,13 +25761,8 @@ impl App {
         }
     }
 
-    /// メニュー操作でレーティング一覧を開く。
-    ///
-    /// 非同期 build 完了後の `install_rating_view_rows` が current_folder を合成パスへ
-    /// 切り替える前に、直前フォルダを back stack へ記録する。
+    /// Menu and gamepad entry share one staged adoption boundary.
     pub(crate) fn enter_rating_view_from_menu(&mut self, stars: u8) {
-        let stars = stars.clamp(1, 5);
-        self.record_folder_nav_transition_with_rating(&rating_view_synthetic_path(), Some(stars));
         self.enter_rating_view(stars);
     }
 
@@ -25032,55 +25770,1839 @@ impl App {
     pub(crate) fn enter_rating_view(&mut self, stars: u8) {
         let stars = stars.clamp(1, 5);
         crate::logger::log(format!("=== enter_rating_view stars={stars} ==="));
-        self.gamepad_location_picker = None;
-        if let Some(pending) = self.rating_view_pending.take() {
+        let origin = self.current_top_level_restore_snapshot();
+        let from = self.folder_nav_current_target().or_else(|| {
+            origin
+                .as_ref()
+                .and_then(FolderNavHistoryTarget::from_restore)
+        });
+        let saved_folder = if self.items_are_rating_view {
+            self.rating_view_saved_folder.clone()
+        } else {
+            origin
+                .as_ref()
+                .and_then(top_level_grid_view::TopLevelGridRestore::legacy_path)
+                .or_else(|| self.current_folder.clone())
+        };
+        let subfolder_restore = if self.items_are_rating_view {
+            self.rating_view_subfolder_restore.clone()
+        } else {
+            origin
+                .as_ref()
+                .and_then(|restore| restore.subfolder_restore())
+        };
+        self.start_rating_navigation(
+            stars,
+            RatingNavigationIntent::Direct { from },
+            saved_folder,
+            subfolder_restore,
+        );
+    }
+
+    fn start_rating_history_replay(
+        &mut self,
+        direction: FolderHistoryDirection,
+        stars: u8,
+    ) -> bool {
+        let target = FolderNavHistoryTarget::Rating { stars };
+        let head = match direction {
+            FolderHistoryDirection::Back => self.folder_history_back_target(),
+            FolderHistoryDirection::Forward => self.folder_history_forward_target(),
+        };
+        if head != Some(&target) {
+            return false;
+        }
+        let saved_folder = if self.rating_view_nav_context_active() {
+            self.rating_view_saved_folder.clone()
+        } else {
+            self.current_top_level_restore_snapshot()
+                .and_then(|restore| restore.legacy_path())
+        };
+        self.start_rating_navigation(
+            stars,
+            RatingNavigationIntent::Replay { direction, target },
+            saved_folder,
+            self.rating_view_subfolder_restore.clone(),
+        );
+        true
+    }
+
+    fn start_collection_history_transition(
+        &mut self,
+        target: FolderNavHistoryTarget,
+        intent: CollectionHistoryIntent,
+        return_to: Option<top_level_grid_view::TopLevelGridRestore>,
+    ) -> bool {
+        let root = match &target {
+            FolderNavHistoryTarget::Collection(root) => root.clone(),
+            FolderNavHistoryTarget::CollectionPhysical(child) => child.root.clone(),
+            _ => return false,
+        };
+        if !self.main_folder_history_available()
+            || !self.collection_catalog_contains(root.identity.collection_id)
+        {
+            return false;
+        }
+        if let CollectionHistoryIntent::Replay { direction, .. } = &intent {
+            let head = match direction {
+                FolderHistoryDirection::Back => self.folder_history_back_target(),
+                FolderHistoryDirection::Forward => self.folder_history_forward_target(),
+            };
+            if head != Some(&target) {
+                return false;
+            }
+        }
+        let Ok(prepare) = self.start_collection_history_prepare(root) else {
+            return false;
+        };
+        self.cancel_replaced_staged_archive_conversion();
+        if self
+            .rating_view_pending
+            .as_ref()
+            .is_some_and(|pending| pending.navigation.is_some())
+            && let Some(pending) = self.rating_view_pending.take()
+        {
             pending.cancel();
         }
-        self.rating_view_stars = stars;
-        self.rating_view_sort = crate::rating_view::RatingViewSort::default();
-        // ビューの既定ソートを入れ直すのと同じ場所で、詳細表示の列ソートの所有権も
-        // 戻す。別フォルダの列ソートが持ち込まれて★時刻順を上書きしないように (§1.143)。
-        self.reset_details_sort_to_toolbar();
-        self.rating_view_rows.clear();
-        self.rating_view_rows_stars = None;
-        self.rating_view_skipped = 0;
-        self.rating_view_nav_stack.clear();
-        self.pending_rating_view_zipdir_open = None;
-        if !self.items_are_rating_view {
-            self.rating_view_saved_folder = self.current_folder.clone();
-            self.rating_view_subfolder_restore = None;
-        }
+        let transition = CollectionHistoryTransition {
+            request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            intent,
+            target,
+            history_before: self.folder_nav_history_snapshot(),
+            source_context: self.projected_viewer_context_id(),
+            source_surface_generation: self.top_level_grid_view.generation(),
+            source_items_generation: self.items_generation,
+            source_slot: self.active_quick_folder_slot,
+            source_slot_switch_sequence: self.quick_folder_switch_sequence,
+            source_location: self.folder_nav_current_target(),
+            return_to,
+            phase: CollectionHistoryPhase::Preparing(prepare),
+        };
+        self.replace_history_navigation_transition(Some(HistoryNavigationTransition::Collection(
+            transition,
+        )));
+        true
+    }
 
-        if self.global_search.active {
-            self.global_search.saved_folder = None;
-            self.close_global_search();
+    fn collection_history_source_is_current(&self, request: &CollectionHistoryTransition) -> bool {
+        if !self.main_folder_history_available()
+            || self.projected_viewer_context_id() != request.source_context
+            || self.top_level_grid_view.generation() != request.source_surface_generation
+            || self.items_generation != request.source_items_generation
+            || self.active_quick_folder_slot != request.source_slot
+            || self.quick_folder_switch_sequence != request.source_slot_switch_sequence
+            || self.folder_nav_current_target() != request.source_location
+        {
+            return false;
         }
-        if self.favsearch.active {
-            self.favsearch.saved_folder = None;
-            self.close_favsearch();
+        let same_history = match request.source_slot {
+            Some(slot) => {
+                self.quick_folder_workspaces[slot.index()].history
+                    == request.history_before.quick_folder_workspaces[slot.index()].history
+            }
+            None => {
+                self.folder_nav_back_stack == request.history_before.back_stack
+                    && self.folder_nav_forward_stack == request.history_before.forward_stack
+                    && self.suppress_folder_nav_record_once
+                        == request.history_before.suppress_record_once
+            }
+        };
+        if !same_history {
+            return false;
         }
-        if self.tag_view.active {
-            self.tag_view.saved_folder = None;
-            self.close_tag_view();
+        match &request.intent {
+            CollectionHistoryIntent::Restore => true,
+            CollectionHistoryIntent::Replay { direction, target } => {
+                let head = match direction {
+                    FolderHistoryDirection::Back => self.folder_history_back_target(),
+                    FolderHistoryDirection::Forward => self.folder_history_forward_target(),
+                };
+                head == Some(target)
+            }
         }
-        if self.show_search_bar {
-            self.show_search_bar = false;
-            self.search_query.clear();
-            self.search_filter = None;
-            self.search_filter_origin_folder = None;
-            self.search_has_focus = false;
-            self.search_tag_bridge.clear();
-            self.cancel_search_pending();
-        }
+    }
 
-        self.address = format!(
-            "{} レーティング一覧を読み込み中…",
-            "★".repeat(stars as usize)
+    fn start_physical_history_transition(
+        &mut self,
+        intent: PhysicalHistoryIntent,
+        path: PathBuf,
+    ) -> bool {
+        self.start_physical_history_transition_with_dfs(intent, path, None)
+    }
+
+    fn replace_history_navigation_transition(&mut self, next: Option<HistoryNavigationTransition>) {
+        let previous = self
+            .top_level_grid_view
+            .take_history_navigation_transition();
+        if matches!(
+            previous,
+            Some(HistoryNavigationTransition::Physical(
+                PhysicalHistoryTransition {
+                    dfs_continuation: Some(_),
+                    ..
+                }
+            ))
+        ) {
+            self.clear_pending_folder_nav_steps();
+            self.release_fs_nav_lock();
+        }
+        self.top_level_grid_view
+            .set_history_navigation_transition(next);
+    }
+
+    fn start_physical_history_transition_with_dfs(
+        &mut self,
+        intent: PhysicalHistoryIntent,
+        path: PathBuf,
+        dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
+    ) -> bool {
+        if !self.main_folder_history_available() {
+            return false;
+        }
+        let Ok(preflight) = self.start_physical_history_preflight(path.clone(), None) else {
+            return false;
+        };
+        self.cancel_replaced_staged_archive_conversion();
+        if self
+            .rating_view_pending
+            .as_ref()
+            .is_some_and(|pending| pending.navigation.is_some())
+            && let Some(pending) = self.rating_view_pending.take()
+        {
+            pending.cancel();
+        }
+        let request = PhysicalHistoryTransition {
+            request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            intent,
+            path,
+            phase: PhysicalHistoryPhase::Preflighting {
+                preflight,
+                pdf_password_submission: None,
+            },
+            history_before: self.folder_nav_history_snapshot(),
+            source_context: self.projected_viewer_context_id(),
+            source_surface_generation: self.top_level_grid_view.generation(),
+            source_items_generation: self.items_generation,
+            source_slot: self.active_quick_folder_slot,
+            source_slot_switch_sequence: self.quick_folder_switch_sequence,
+            source_location: self.folder_nav_current_target(),
+            dfs_continuation,
+            favsearch_origin: self.favsearch.active,
+            tag_view_origin: self.tag_view.active,
+            global_search_origin: self.global_search.active,
+            grid_open_effects: None,
+        };
+        self.replace_history_navigation_transition(Some(HistoryNavigationTransition::Physical(
+            request,
+        )));
+        true
+    }
+
+    pub(crate) fn start_rating_physical_open(&mut self, owner: RatingPhysicalLoadOwner) -> bool {
+        if !self.rating_physical_load_owner_is_current(&owner, &owner.target_path) {
+            return false;
+        }
+        let path = owner.target_path.clone();
+        self.start_physical_history_transition(
+            PhysicalHistoryIntent::Rating {
+                owner,
+                restore: None,
+                replay: None,
+                zip_dir_prefix: None,
+            },
+            path,
+        )
+    }
+
+    pub(crate) fn start_grid_virtual_open(&mut self, intent: GridVirtualOpenIntent) -> bool {
+        let path = intent.path;
+        let effects = intent.effects;
+        let auto_fullscreen_without_stage =
+            !self.main_folder_history_available() && effects.auto_fullscreen;
+        let started = match intent.source {
+            GridVirtualOpenSource::Direct => matches!(
+                self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    path.clone(),
+                    auto_fullscreen_without_stage,
+                    OpenRequestOwner::Navigation,
+                ),
+                FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened
+            ),
+            GridVirtualOpenSource::Rating(owner) => self.start_rating_physical_open(owner),
+            GridVirtualOpenSource::Collection(owner) => matches!(
+                self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    path.clone(),
+                    auto_fullscreen_without_stage,
+                    OpenRequestOwner::CollectionGridPhysical(owner),
+                ),
+                FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened
+            ),
+        };
+        if !started {
+            return false;
+        }
+        if let Some(HistoryNavigationTransition::Physical(request)) =
+            self.top_level_grid_view.history_navigation_transition()
+            && crate::folder_tree::path_eq(&request.path, &path)
+        {
+            if let Some(HistoryNavigationTransition::Physical(request)) = self
+                .top_level_grid_view
+                .take_history_navigation_transition()
+            {
+                let mut request = request;
+                request.grid_open_effects = Some(effects);
+                self.top_level_grid_view
+                    .set_history_navigation_transition(Some(
+                        HistoryNavigationTransition::Physical(request),
+                    ));
+            }
+        } else {
+            // Detached/legacy loads are synchronous at this boundary. Their grid effects still
+            // belong to the chosen open and are never published for a rejected request.
+            self.commit_grid_virtual_open_effects(&path, effects);
+        }
+        true
+    }
+
+    fn commit_grid_virtual_open_effects(&mut self, path: &Path, effects: GridVirtualOpenEffects) {
+        self.reading_history_return_from = effects.reading_history_return_from;
+        if effects.suppress_rating_filter {
+            self.maybe_suppress_rating_filter_for_opened_container_path(path);
+        }
+        if effects.suppress_facet_filter {
+            self.maybe_suppress_facet_filter_for_opened_container_path(path);
+        }
+    }
+
+    fn start_rating_physical_zipdir_open(
+        &mut self,
+        owner: RatingPhysicalLoadOwner,
+        dir_prefix: String,
+    ) -> bool {
+        if !self.rating_physical_load_owner_is_current(&owner, &owner.target_path) {
+            return false;
+        }
+        let path = owner.target_path.clone();
+        self.start_physical_history_transition(
+            PhysicalHistoryIntent::Rating {
+                owner,
+                restore: None,
+                replay: None,
+                zip_dir_prefix: Some(dir_prefix),
+            },
+            path,
+        )
+    }
+
+    fn start_rating_physical_restore(
+        &mut self,
+        restore: top_level_grid_view::RatingPhysicalRestore,
+        replay: Option<(FolderHistoryDirection, FolderNavHistoryTarget)>,
+    ) -> bool {
+        let path = restore.visible_path.clone();
+        let Some(source_location) = self.folder_nav_current_target() else {
+            return false;
+        };
+        let owner = RatingPhysicalLoadOwner {
+            intent: RatingPhysicalLoadIntent::Restore,
+            source_context: self.projected_viewer_context_id(),
+            source_surface_generation: self.top_level_grid_view.generation(),
+            source_items_generation: self.items_generation,
+            source_slot: self.active_quick_folder_slot,
+            source_slot_switch_sequence: self.quick_folder_switch_sequence,
+            source_location,
+            target_path: path.clone(),
+            stars: restore.stars,
+            nav_chain: restore.nav_chain.clone(),
+            saved_folder: restore.saved_folder.clone(),
+        };
+        if let Some((direction, target)) = replay.as_ref() {
+            let head = match direction {
+                FolderHistoryDirection::Back => self.folder_history_back_target(),
+                FolderHistoryDirection::Forward => self.folder_history_forward_target(),
+            };
+            if head != Some(target) {
+                return false;
+            }
+        }
+        self.start_physical_history_transition(
+            PhysicalHistoryIntent::Rating {
+                owner,
+                restore: Some(restore),
+                replay,
+                zip_dir_prefix: None,
+            },
+            path,
+        )
+    }
+
+    fn start_ordinary_archive_history_replay(
+        &mut self,
+        direction: FolderHistoryDirection,
+        target: FolderNavHistoryTarget,
+    ) -> bool {
+        let FolderNavHistoryTarget::Path(path) = &target else {
+            return false;
+        };
+        let head = match direction {
+            FolderHistoryDirection::Back => self.folder_history_back_target(),
+            FolderHistoryDirection::Forward => self.folder_history_forward_target(),
+        };
+        if head != Some(&target)
+            || !(crate::folder_tree::is_virtual_folder(path)
+                || crate::folder_tree::is_convertible_archive_path(path))
+        {
+            return false;
+        }
+        self.start_physical_history_transition(
+            PhysicalHistoryIntent::Navigation {
+                replay: Some((direction, target.clone())),
+                auto_fullscreen: false,
+            },
+            path.clone(),
+        )
+    }
+
+    fn physical_history_source_is_current(&self, request: &PhysicalHistoryTransition) -> bool {
+        if !self.main_folder_history_available()
+            || self.projected_viewer_context_id() != request.source_context
+            || self.top_level_grid_view.generation() != request.source_surface_generation
+            || self.items_generation != request.source_items_generation
+            || self.active_quick_folder_slot != request.source_slot
+            || self.quick_folder_switch_sequence != request.source_slot_switch_sequence
+            || self.folder_nav_current_target() != request.source_location
+        {
+            return false;
+        }
+        let same_history = match request.source_slot {
+            Some(slot) => {
+                self.quick_folder_workspaces[slot.index()].history
+                    == request.history_before.quick_folder_workspaces[slot.index()].history
+            }
+            None => {
+                self.folder_nav_back_stack == request.history_before.back_stack
+                    && self.folder_nav_forward_stack == request.history_before.forward_stack
+                    && self.suppress_folder_nav_record_once
+                        == request.history_before.suppress_record_once
+            }
+        };
+        if !same_history {
+            return false;
+        }
+        match &request.intent {
+            PhysicalHistoryIntent::RequiredFullscreen { .. } => true,
+            PhysicalHistoryIntent::Navigation { replay, .. } => {
+                if let Some((direction, target)) = replay {
+                    let head = match direction {
+                        FolderHistoryDirection::Back => self.folder_history_back_target(),
+                        FolderHistoryDirection::Forward => self.folder_history_forward_target(),
+                    };
+                    head == Some(target)
+                } else {
+                    true
+                }
+            }
+            PhysicalHistoryIntent::Rating { owner, replay, .. } => {
+                if !self.rating_physical_load_owner_is_current(owner, &request.path) {
+                    return false;
+                }
+                if let Some((direction, target)) = replay {
+                    let head = match direction {
+                        FolderHistoryDirection::Back => self.folder_history_back_target(),
+                        FolderHistoryDirection::Forward => self.folder_history_forward_target(),
+                    };
+                    head == Some(target)
+                } else {
+                    true
+                }
+            }
+            PhysicalHistoryIntent::CollectionGrid { owner } => {
+                self.collection_grid_physical_load_owner_is_current(owner, &request.path)
+            }
+            PhysicalHistoryIntent::QuickFolder { slot } => self
+                .quick_folder_target(*slot)
+                .is_some_and(|target| crate::folder_tree::path_eq(target, &request.path)),
+            PhysicalHistoryIntent::MainGridArchive { owner, .. } => {
+                crate::folder_tree::path_eq(&owner.source_path, &request.path)
+                    && self.main_grid_archive_transition_is_current(
+                        &OpenRequestOwner::MainGridArchive(owner.clone()),
+                    )
+            }
+        }
+    }
+
+    fn poll_collection_history_transition(&mut self, ctx: &egui::Context) {
+        self.discard_stale_staged_pdf_password_request();
+        let Some(transition) = self
+            .top_level_grid_view
+            .take_history_navigation_transition()
+        else {
+            return;
+        };
+        let mut request = match transition {
+            HistoryNavigationTransition::Collection(request) => request,
+            HistoryNavigationTransition::Physical(request) => {
+                self.poll_physical_history_transition(ctx, request);
+                return;
+            }
+        };
+        if !self.collection_history_source_is_current(&request) {
+            return;
+        }
+        match &mut request.phase {
+            CollectionHistoryPhase::Preparing(prepare) => {
+                match self.poll_collection_history_prepare(prepare) {
+                    collection_grid::CollectionHistoryPreparePoll::Pending => {
+                        self.top_level_grid_view
+                            .set_history_navigation_transition(Some(
+                                HistoryNavigationTransition::Collection(request),
+                            ));
+                        ctx.request_repaint();
+                    }
+                    collection_grid::CollectionHistoryPreparePoll::Failed(error) => {
+                        crate::logger::log(format!("collection history prepare failed: {error}"));
+                        self.show_feedback_toast("[コレクションを読み込めませんでした]".into());
+                    }
+                    collection_grid::CollectionHistoryPreparePoll::Ready(prepared) => {
+                        if !self.collection_history_source_is_current(&request) {
+                            return;
+                        }
+                        // A sidecar restore may have started while the offscreen actor worked.
+                        // It owns the visible context until its own adoption completes.
+                        if self.sidecar_restore_active() {
+                            return;
+                        }
+                        match request.target.clone() {
+                            FolderNavHistoryTarget::Collection(restore) => {
+                                self.adopt_collection_history_root(
+                                    restore,
+                                    prepared,
+                                    request.return_to.take(),
+                                );
+                                if let CollectionHistoryIntent::Replay { direction, target } =
+                                    &request.intent
+                                {
+                                    self.commit_staged_history_replay_after_adoption(
+                                        *direction,
+                                        target,
+                                        request.source_location,
+                                    );
+                                }
+                            }
+                            FolderNavHistoryTarget::CollectionPhysical(saved) => {
+                                let Some(target) =
+                                    collection_grid::resolve_collection_history_child(
+                                        &saved, &prepared,
+                                    )
+                                else {
+                                    return;
+                                };
+                                let Ok(preflight) =
+                                    self.start_collection_history_child_preflight(&target)
+                                else {
+                                    return;
+                                };
+                                request.phase = CollectionHistoryPhase::ChildPreflighting {
+                                    prepared,
+                                    target,
+                                    preflight,
+                                    pdf_password_submission: None,
+                                };
+                                self.top_level_grid_view
+                                    .set_history_navigation_transition(Some(
+                                        HistoryNavigationTransition::Collection(request),
+                                    ));
+                                ctx.request_repaint();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            CollectionHistoryPhase::ChildPreflighting { preflight, .. } => {
+                match preflight.poll() {
+                    collection_navigation::PhysicalHistoryPreflightPoll::Pending => {
+                        self.top_level_grid_view
+                            .set_history_navigation_transition(Some(
+                                HistoryNavigationTransition::Collection(request),
+                            ));
+                        ctx.request_repaint();
+                    }
+                    collection_navigation::PhysicalHistoryPreflightPoll::Failed(error) => {
+                        crate::logger::log(format!("collection child preflight failed: {error}"));
+                        self.show_feedback_toast(
+                            "[コレクションの項目を読み込めませんでした]".into(),
+                        );
+                    }
+                    collection_navigation::PhysicalHistoryPreflightPoll::Ready(payload) => {
+                        let (payload, cached_backing) = Self::split_cached_zip_preflight(payload);
+                        if !self.collection_history_source_is_current(&request) {
+                            return;
+                        }
+                        if matches!(payload, collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired) {
+                            let CollectionHistoryPhase::ChildPreflighting { prepared, target, .. } =
+                                std::mem::replace(&mut request.phase, CollectionHistoryPhase::Finished)
+                            else { unreachable!() };
+                            self.pdf_password_request = Some(PdfPasswordRequest::staged_history(
+                                target.visible_path.clone(), request.request_id,
+                            ));
+                            self.show_pdf_password_dialog = true;
+                            self.pdf_password_error = None;
+                            request.phase = CollectionHistoryPhase::ChildPdfPassword { prepared, target };
+                            self.top_level_grid_view.set_history_navigation_transition(Some(
+                                HistoryNavigationTransition::Collection(request),
+                            ));
+                            ctx.request_repaint();
+                            return;
+                        }
+                        if matches!(payload,
+                            collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(_)
+                                | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired
+                        ) {
+                            let CollectionHistoryPhase::ChildPreflighting { prepared, target, .. } =
+                                std::mem::replace(&mut request.phase, CollectionHistoryPhase::Finished)
+                            else { unreachable!() };
+                            if self.start_staged_archive_conversion(request.request_id, &target.visible_path) {
+                                request.phase = CollectionHistoryPhase::ChildArchiveConverting { prepared, target };
+                                self.top_level_grid_view.set_history_navigation_transition(Some(
+                                    HistoryNavigationTransition::Collection(request),
+                                ));
+                            }
+                            return;
+                        }
+                        let CollectionHistoryPhase::ChildPreflighting {
+                            prepared,
+                            target,
+                            pdf_password_submission,
+                            ..
+                        } = std::mem::replace(&mut request.phase, CollectionHistoryPhase::Finished)
+                        else {
+                            unreachable!();
+                        };
+                        if self.sidecar_restore_active() {
+                            return;
+                        }
+                        let prior_pdf_password = if matches!(
+                            &payload,
+                            collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(_)
+                        ) {
+                            self.prepare_staged_pdf_password_for_adoption(
+                                &target.visible_path,
+                                pdf_password_submission.as_ref(),
+                            )
+                        } else {
+                            None
+                        };
+                        if self.adopt_collection_history_child_with_backing(
+                            &target,
+                            prepared,
+                            payload,
+                            request.return_to.take(),
+                            cached_backing,
+                            pdf_password_submission
+                                .as_ref()
+                                .map(|(password, _)| password.clone()),
+                        ) {
+                            if let CollectionHistoryIntent::Replay { direction, target } =
+                                &request.intent
+                            {
+                                self.commit_staged_history_replay_after_adoption(
+                                    *direction,
+                                    target,
+                                    request.source_location,
+                                );
+                            }
+                        } else {
+                            self.restore_staged_pdf_password_after_failed_adoption(
+                                prior_pdf_password,
+                            );
+                        }
+                    }
+                }
+            }
+            CollectionHistoryPhase::ChildPdfPassword { .. } => {
+                self.top_level_grid_view
+                    .set_history_navigation_transition(Some(
+                        HistoryNavigationTransition::Collection(request),
+                    ));
+            }
+            CollectionHistoryPhase::ChildArchiveConverting { .. } => {
+                if self.staged_archive_conversion_is_current(request.request_id) {
+                    self.top_level_grid_view
+                        .set_history_navigation_transition(Some(
+                            HistoryNavigationTransition::Collection(request),
+                        ));
+                }
+            }
+            CollectionHistoryPhase::ChildArchivePreflighting { preflight, .. } => {
+                match preflight.poll() {
+                    collection_navigation::PhysicalHistoryPreflightPoll::Pending => {
+                        self.top_level_grid_view
+                            .set_history_navigation_transition(Some(
+                                HistoryNavigationTransition::Collection(request),
+                            ));
+                        ctx.request_repaint();
+                    }
+                    collection_navigation::PhysicalHistoryPreflightPoll::Failed(error) => {
+                        crate::logger::log(format!(
+                            "collection archive backing preflight failed: {error}"
+                        ));
+                        self.show_feedback_toast("[書庫を読み込めませんでした]".into());
+                    }
+                    collection_navigation::PhysicalHistoryPreflightPoll::Ready(payload) => {
+                        let (payload, cached_backing) = Self::split_cached_zip_preflight(payload);
+                        if !self.collection_history_source_is_current(&request)
+                            || self.sidecar_restore_active()
+                        {
+                            return;
+                        }
+                        let CollectionHistoryPhase::ChildArchivePreflighting {
+                            prepared,
+                            target,
+                            backing_path,
+                            ..
+                        } = std::mem::replace(&mut request.phase, CollectionHistoryPhase::Finished)
+                        else {
+                            unreachable!()
+                        };
+                        if self.adopt_collection_history_child_with_backing(
+                            &target,
+                            prepared,
+                            payload,
+                            request.return_to.take(),
+                            Some(cached_backing.unwrap_or(backing_path)),
+                            None,
+                        ) {
+                            if let CollectionHistoryIntent::Replay { direction, target } =
+                                &request.intent
+                            {
+                                self.commit_staged_history_replay_after_adoption(
+                                    *direction,
+                                    target,
+                                    request.source_location,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            CollectionHistoryPhase::Finished => {}
+        }
+    }
+
+    fn discard_stale_staged_pdf_password_request(&mut self) {
+        let request_id =
+            self.pdf_password_request
+                .as_ref()
+                .and_then(|request| match request.owner {
+                    PdfPasswordRequestOwner::StagedHistory(id) => Some(id),
+                    PdfPasswordRequestOwner::Legacy => None,
+                });
+        let Some(request_id) = request_id else { return };
+        let current = match self.top_level_grid_view.history_navigation_transition() {
+            Some(HistoryNavigationTransition::Physical(request)) => {
+                request.request_id == request_id
+                    && matches!(request.phase, PhysicalHistoryPhase::PdfPassword)
+            }
+            Some(HistoryNavigationTransition::Collection(request)) => {
+                request.request_id == request_id
+                    && matches!(
+                        request.phase,
+                        CollectionHistoryPhase::ChildPdfPassword { .. }
+                    )
+            }
+            None => false,
+        };
+        if !current {
+            self.pdf_password_request = None;
+            self.show_pdf_password_dialog = false;
+            self.pdf_password_input.clear();
+            self.pdf_password_error = None;
+        }
+    }
+
+    fn poll_physical_history_transition(
+        &mut self,
+        ctx: &egui::Context,
+        mut request: PhysicalHistoryTransition,
+    ) {
+        if !self.physical_history_source_is_current(&request) {
+            if request.dfs_continuation.is_some() {
+                self.clear_pending_folder_nav_steps();
+                self.release_fs_nav_lock();
+            }
+            return;
+        }
+        if matches!(request.phase, PhysicalHistoryPhase::ArchiveConverting) {
+            if self.staged_archive_conversion_is_current(request.request_id) {
+                self.top_level_grid_view
+                    .set_history_navigation_transition(Some(
+                        HistoryNavigationTransition::Physical(request),
+                    ));
+            } else if request.dfs_continuation.is_some() {
+                self.clear_pending_folder_nav_steps();
+                self.release_fs_nav_lock();
+            }
+            return;
+        }
+        if let PhysicalHistoryPhase::ArchivePreflighting { preflight, .. } = &mut request.phase {
+            match preflight.poll() {
+                collection_navigation::PhysicalHistoryPreflightPoll::Pending => {
+                    self.top_level_grid_view
+                        .set_history_navigation_transition(Some(
+                            HistoryNavigationTransition::Physical(request),
+                        ));
+                    ctx.request_repaint();
+                }
+                collection_navigation::PhysicalHistoryPreflightPoll::Failed(error) => {
+                    crate::logger::log(format!(
+                        "converted history backing preflight failed: {error}"
+                    ));
+                    self.show_feedback_toast("[書庫を読み込めませんでした]".into());
+                    if request.dfs_continuation.is_some() {
+                        self.clear_pending_folder_nav_steps();
+                        self.release_fs_nav_lock();
+                    }
+                }
+                collection_navigation::PhysicalHistoryPreflightPoll::Ready(payload) => {
+                    let (payload, cached_backing) = Self::split_cached_zip_preflight(payload);
+                    if let PhysicalHistoryPhase::ArchivePreflighting { backing_path, .. } =
+                        std::mem::replace(&mut request.phase, PhysicalHistoryPhase::PdfPassword)
+                    {
+                        self.commit_converted_physical_history_transition(
+                            ctx,
+                            request,
+                            cached_backing.unwrap_or(backing_path),
+                            payload,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        let PhysicalHistoryPhase::Preflighting { preflight, .. } = &mut request.phase else {
+            self.top_level_grid_view
+                .set_history_navigation_transition(Some(HistoryNavigationTransition::Physical(
+                    request,
+                )));
+            return;
+        };
+        match preflight.poll() {
+            collection_navigation::PhysicalHistoryPreflightPoll::Pending => {
+                self.top_level_grid_view
+                    .set_history_navigation_transition(Some(
+                        HistoryNavigationTransition::Physical(request),
+                    ));
+                ctx.request_repaint();
+            }
+            collection_navigation::PhysicalHistoryPreflightPoll::Failed(error) => {
+                crate::logger::log(format!("physical history preflight failed: {error}"));
+                self.show_feedback_toast("[フォルダを読み込めませんでした]".into());
+                if request.dfs_continuation.is_some() {
+                    self.clear_pending_folder_nav_steps();
+                    self.release_fs_nav_lock();
+                }
+            }
+            collection_navigation::PhysicalHistoryPreflightPoll::Ready(payload) => {
+                let (payload, cached_backing) = Self::split_cached_zip_preflight(payload);
+                if self.physical_history_source_is_current(&request) {
+                    if matches!(
+                        payload,
+                        collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired
+                    ) {
+                        self.pdf_password_request = Some(PdfPasswordRequest::staged_history(
+                            request.path.clone(),
+                            request.request_id,
+                        ));
+                        self.show_pdf_password_dialog = true;
+                        self.pdf_password_error = None;
+                        request.phase = PhysicalHistoryPhase::PdfPassword;
+                        self.top_level_grid_view
+                            .set_history_navigation_transition(Some(
+                                HistoryNavigationTransition::Physical(request),
+                            ));
+                        ctx.request_repaint();
+                    } else {
+                        if matches!(payload, collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(_)
+                            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired) {
+                            if self.start_staged_archive_conversion(request.request_id, &request.path) {
+                                request.phase = PhysicalHistoryPhase::ArchiveConverting;
+                                self.top_level_grid_view.set_history_navigation_transition(Some(
+                                    HistoryNavigationTransition::Physical(request),
+                                ));
+                            } else if request.dfs_continuation.is_some() {
+                                self.clear_pending_folder_nav_steps();
+                                self.release_fs_nav_lock();
+                            }
+                            return;
+                        }
+                        let PhysicalHistoryPhase::Preflighting {
+                            pdf_password_submission,
+                            ..
+                        } = std::mem::replace(
+                            &mut request.phase,
+                            PhysicalHistoryPhase::PdfPassword,
+                        )
+                        else {
+                            unreachable!()
+                        };
+                        self.commit_physical_history_transition(
+                            ctx,
+                            request,
+                            payload,
+                            pdf_password_submission,
+                            cached_backing,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn split_cached_zip_preflight(
+        payload: collection_navigation::PhysicalHistoryPreflightPayload,
+    ) -> (
+        collection_navigation::PhysicalHistoryPreflightPayload,
+        Option<PathBuf>,
+    ) {
+        match payload {
+            collection_navigation::PhysicalHistoryPreflightPayload::ZipCached {
+                enumeration,
+                backing_path,
+            } => (
+                collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration),
+                Some(backing_path),
+            ),
+            payload => (payload, None),
+        }
+    }
+
+    fn staged_archive_conversion_is_current(&self, request_id: u64) -> bool {
+        self.archive_convert.as_ref().is_some_and(|state| {
+            matches!(state.completion,
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(id)
+                    if id == request_id)
+        })
+    }
+
+    fn cancel_replaced_staged_archive_conversion(&mut self) {
+        if self.archive_convert.as_ref().is_some_and(|state| {
+            matches!(
+                state.completion,
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(
+                    _
+                )
+            )
+        }) {
+            self.cancel_archive_convert_for_navigation("staged_history_replaced");
+        }
+    }
+
+    pub(crate) fn discard_stale_staged_history_archive_conversion(&mut self) -> bool {
+        let request_id = self.archive_convert.as_ref().and_then(|state| {
+            match state.completion {
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(id) => Some(id),
+                _ => None,
+            }
+        });
+        let Some(request_id) = request_id else {
+            return false;
+        };
+        let current = match self.top_level_grid_view.history_navigation_transition() {
+            Some(HistoryNavigationTransition::Physical(request)) => {
+                request.request_id == request_id && self.physical_history_source_is_current(request)
+            }
+            Some(HistoryNavigationTransition::Collection(request)) => {
+                request.request_id == request_id
+                    && self.collection_history_source_is_current(request)
+            }
+            None => false,
+        };
+        !current && self.cancel_archive_convert_for_navigation("staged_history_owner_stale")
+    }
+
+    fn start_staged_archive_conversion(&mut self, request_id: u64, path: &Path) -> bool {
+        if self.settings.archive_file_handling_ignores_convertible() {
+            self.show_feedback_toast("設定により RAR / 7z / LZH アーカイブを無視しています".into());
+            return false;
+        }
+        let format = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(crate::archive_converter::ArchiveFormat::from_extension);
+        let Some(format) = format else { return false };
+        let started = if format == crate::archive_converter::ArchiveFormat::Rar {
+            self.request_rar_open_owned(
+                path.to_path_buf(),
+                false,
+                self.try_archive_cache_lookup(path),
+                OpenRequestOwner::Navigation,
+            )
+        } else {
+            self.request_archive_convert_owned(
+                path.to_path_buf(),
+                format,
+                false,
+                OpenRequestOwner::Navigation,
+            )
+        };
+        if started {
+            if let Some(state) = self.archive_convert.as_mut() {
+                state.completion =
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(request_id);
+            }
+        }
+        started
+    }
+
+    pub(crate) fn complete_staged_history_archive_conversion(
+        &mut self,
+        request_id: u64,
+        backing_path: PathBuf,
+    ) {
+        let Some(transition) = self
+            .top_level_grid_view
+            .take_history_navigation_transition()
+        else {
+            return;
+        };
+        let matches_owner = match &transition {
+            HistoryNavigationTransition::Physical(request) => {
+                request.request_id == request_id
+                    && matches!(request.phase, PhysicalHistoryPhase::ArchiveConverting)
+                    && self.physical_history_source_is_current(request)
+            }
+            HistoryNavigationTransition::Collection(request) => {
+                request.request_id == request_id
+                    && matches!(
+                        request.phase,
+                        CollectionHistoryPhase::ChildArchiveConverting { .. }
+                    )
+                    && self.collection_history_source_is_current(request)
+            }
+        };
+        if !matches_owner {
+            self.top_level_grid_view
+                .set_history_navigation_transition(Some(transition));
+            return;
+        }
+        let preflight = self.start_physical_history_preflight(
+            backing_path.clone(),
+            Some(crate::collection_store::CollectionResolvedKind::Zip),
         );
-        self.request_rating_view_build();
+        self.finish_staged_history_archive_preflight_start(transition, backing_path, preflight);
+    }
+
+    fn finish_staged_history_archive_preflight_start(
+        &mut self,
+        mut transition: HistoryNavigationTransition,
+        backing_path: PathBuf,
+        preflight: Result<collection_navigation::PhysicalHistoryPreflight, String>,
+    ) {
+        let preflight = match preflight {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "converted history backing preflight could not start: {error}"
+                ));
+                self.show_feedback_toast("[書庫を読み込めませんでした]".into());
+                if matches!(&transition,
+                    HistoryNavigationTransition::Physical(request)
+                        if request.dfs_continuation.is_some())
+                {
+                    self.clear_pending_folder_nav_steps();
+                    self.release_fs_nav_lock();
+                }
+                return;
+            }
+        };
+        match &mut transition {
+            HistoryNavigationTransition::Physical(request) => {
+                request.phase = PhysicalHistoryPhase::ArchivePreflighting {
+                    backing_path,
+                    preflight,
+                };
+            }
+            HistoryNavigationTransition::Collection(request) => {
+                let phase = std::mem::replace(&mut request.phase, CollectionHistoryPhase::Finished);
+                let CollectionHistoryPhase::ChildArchiveConverting { prepared, target } = phase
+                else {
+                    unreachable!();
+                };
+                request.phase = CollectionHistoryPhase::ChildArchivePreflighting {
+                    prepared,
+                    target,
+                    backing_path,
+                    preflight,
+                };
+            }
+        }
+        self.top_level_grid_view
+            .set_history_navigation_transition(Some(transition));
+    }
+
+    fn resume_staged_pdf_password_request(
+        &mut self,
+        request_id: u64,
+        path: &Path,
+        password: String,
+        save: bool,
+    ) -> bool {
+        let Some(mut transition) = self
+            .top_level_grid_view
+            .take_history_navigation_transition()
+        else {
+            return false;
+        };
+        let handled = match &mut transition {
+            HistoryNavigationTransition::Physical(request)
+                if request.request_id == request_id
+                    && matches!(request.phase, PhysicalHistoryPhase::PdfPassword)
+                    && crate::folder_tree::path_eq(&request.path, path)
+                    && self.physical_history_source_is_current(request) =>
+            {
+                let Ok(preflight) = self.start_physical_history_preflight_with_password(
+                    request.path.clone(),
+                    None,
+                    Some(password.clone()),
+                ) else {
+                    if request.dfs_continuation.is_some() {
+                        self.clear_pending_folder_nav_steps();
+                        self.release_fs_nav_lock();
+                    }
+                    self.show_feedback_toast("[PDF を読み込めませんでした]".into());
+                    return true;
+                };
+                request.phase = PhysicalHistoryPhase::Preflighting {
+                    preflight,
+                    pdf_password_submission: Some((password, save)),
+                };
+                true
+            }
+            HistoryNavigationTransition::Collection(request)
+                if request.request_id == request_id
+                    && self.collection_history_source_is_current(request) =>
+            {
+                let CollectionHistoryPhase::ChildPdfPassword { target, .. } = &request.phase else {
+                    self.top_level_grid_view
+                        .set_history_navigation_transition(Some(transition));
+                    return false;
+                };
+                if !crate::folder_tree::path_eq(&target.visible_path, path) {
+                    false
+                } else {
+                    let phase =
+                        std::mem::replace(&mut request.phase, CollectionHistoryPhase::Finished);
+                    let CollectionHistoryPhase::ChildPdfPassword { prepared, target } = phase
+                    else {
+                        unreachable!();
+                    };
+                    let Ok(preflight) = self
+                        .start_collection_history_child_preflight_with_password(
+                            &target,
+                            Some(password.clone()),
+                        )
+                    else {
+                        self.show_feedback_toast("[PDF を読み込めませんでした]".into());
+                        return true;
+                    };
+                    request.phase = CollectionHistoryPhase::ChildPreflighting {
+                        prepared,
+                        target,
+                        preflight,
+                        pdf_password_submission: Some((password, save)),
+                    };
+                    true
+                }
+            }
+            _ => false,
+        };
+        if handled {
+            if !matches!(&transition, HistoryNavigationTransition::Collection(request) if matches!(request.phase, CollectionHistoryPhase::Finished))
+            {
+                self.top_level_grid_view
+                    .set_history_navigation_transition(Some(transition));
+            }
+        } else {
+            self.top_level_grid_view
+                .set_history_navigation_transition(Some(transition));
+        }
+        handled
+    }
+
+    fn cancel_staged_pdf_password_request(&mut self, request_id: u64, path: &Path) -> bool {
+        let Some(transition) = self
+            .top_level_grid_view
+            .take_history_navigation_transition()
+        else {
+            return false;
+        };
+        let handled = match &transition {
+            HistoryNavigationTransition::Physical(request) => {
+                request.request_id == request_id
+                    && matches!(request.phase, PhysicalHistoryPhase::PdfPassword)
+                    && crate::folder_tree::path_eq(&request.path, path)
+            }
+            HistoryNavigationTransition::Collection(request) => {
+                request.request_id == request_id
+                    && matches!(&request.phase, CollectionHistoryPhase::ChildPdfPassword { target, .. }
+                    if crate::folder_tree::path_eq(&target.visible_path, path))
+            }
+        };
+        if !handled {
+            self.top_level_grid_view
+                .set_history_navigation_transition(Some(transition));
+        } else if matches!(&transition,
+            HistoryNavigationTransition::Physical(request) if request.dfs_continuation.is_some())
+        {
+            self.clear_pending_folder_nav_steps();
+            self.release_fs_nav_lock();
+        }
+        handled
+    }
+
+    fn commit_staged_history_replay_after_adoption(
+        &mut self,
+        direction: FolderHistoryDirection,
+        target: &FolderNavHistoryTarget,
+        source: Option<FolderNavHistoryTarget>,
+    ) {
+        if !self.main_folder_history_available() {
+            return;
+        }
+        let stack = if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+            &mut workspace.history
+        } else {
+            // The normal workspace has separate legacy vectors. Handle it below.
+            let popped = match direction {
+                FolderHistoryDirection::Back => self.folder_nav_back_stack.pop(),
+                FolderHistoryDirection::Forward => self.folder_nav_forward_stack.pop(),
+            };
+            if popped.as_ref() != Some(target) {
+                return;
+            }
+            if let Some(source) =
+                source.filter(|source| !Self::folder_nav_targets_eq(source, target))
+            {
+                match direction {
+                    FolderHistoryDirection::Back => {
+                        Self::push_folder_nav_stack(&mut self.folder_nav_forward_stack, source)
+                    }
+                    FolderHistoryDirection::Forward => {
+                        Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, source)
+                    }
+                }
+            }
+            self.suppress_folder_nav_record_once = false;
+            return;
+        };
+        let popped = match direction {
+            FolderHistoryDirection::Back => stack.back_stack.pop(),
+            FolderHistoryDirection::Forward => stack.forward_stack.pop(),
+        };
+        if popped.as_ref() != Some(target) {
+            return;
+        }
+        if let Some(source) = source.filter(|source| !Self::folder_nav_targets_eq(source, target)) {
+            match direction {
+                FolderHistoryDirection::Back => {
+                    Self::push_folder_nav_stack(&mut stack.forward_stack, source)
+                }
+                FolderHistoryDirection::Forward => {
+                    Self::push_folder_nav_stack(&mut stack.back_stack, source)
+                }
+            }
+        }
+        stack.suppress_record_once = false;
+    }
+
+    fn commit_physical_history_transition(
+        &mut self,
+        ctx: &egui::Context,
+        request: PhysicalHistoryTransition,
+        payload: collection_navigation::PhysicalHistoryPreflightPayload,
+        pdf_password_submission: Option<(String, bool)>,
+        backing_path: Option<PathBuf>,
+    ) {
+        if self.sidecar_restore_active() {
+            if request.dfs_continuation.is_some() {
+                self.clear_pending_folder_nav_steps();
+                self.release_fs_nav_lock();
+            }
+            return;
+        }
+        let prior_pdf_password = if matches!(
+            &payload,
+            collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(_)
+        ) {
+            self.prepare_staged_pdf_password_for_adoption(
+                &request.path,
+                pdf_password_submission.as_ref(),
+            )
+        } else {
+            None
+        };
+        let grid_effects = request.grid_open_effects.clone();
+        if let PhysicalHistoryIntent::RequiredFullscreen {
+            target,
+            history_trigger,
+            navigation_purpose,
+        } = &request.intent
+        {
+            if !matches!(
+                &payload,
+                collection_navigation::PhysicalHistoryPreflightPayload::Zip(_)
+                    | collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(_)
+            ) {
+                return;
+            }
+            // The required leaf belongs to this prepared destination. Keep the old viewer and
+            // snapshot mounted until the archive is usable, then begin the fullscreen handoff
+            // and resolve the exact leaf against the installed items.
+            if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose.clone()) {
+                self.show_feedback_toast("画像の場所を開けません".to_string());
+                return;
+            }
+            let adopted = self.adopt_prepared_ordinary_archive_navigation(
+                &request.path,
+                payload,
+                backing_path.as_deref(),
+                request.source_location.as_ref(),
+                false,
+                None,
+                pdf_password_submission
+                    .as_ref()
+                    .map(|(password, _)| password.clone()),
+                false,
+            );
+            if adopted {
+                self.finish_required_fullscreen_load(target.clone(), *history_trigger);
+            } else {
+                self.restore_staged_pdf_password_after_failed_adoption(prior_pdf_password);
+                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+            }
+            return;
+        }
+        if let PhysicalHistoryIntent::Navigation {
+            replay,
+            auto_fullscreen,
+        } = &request.intent
+        {
+            let previous_suppress =
+                request
+                    .source_slot
+                    .map_or(request.history_before.suppress_record_once, |slot| {
+                        request.history_before.quick_folder_workspaces[slot.index()]
+                            .history
+                            .suppress_record_once
+                    });
+            if replay.is_some() {
+                self.set_active_folder_nav_suppress_record_once(true);
+            }
+            let adopted = self.adopt_prepared_ordinary_archive_navigation(
+                &request.path,
+                payload,
+                backing_path.as_deref(),
+                request.source_location.as_ref(),
+                *auto_fullscreen
+                    || grid_effects
+                        .as_ref()
+                        .is_some_and(|effects| effects.auto_fullscreen),
+                grid_effects.as_ref(),
+                pdf_password_submission
+                    .as_ref()
+                    .map(|(password, _)| password.clone()),
+                request
+                    .dfs_continuation
+                    .as_ref()
+                    .is_some_and(|dfs| dfs.fullscreen),
+            );
+            if adopted {
+                if replay.is_none() {
+                    self.commit_staged_search_navigation_effects(
+                        &request.path,
+                        request.favsearch_origin,
+                        request.tag_view_origin,
+                        request.global_search_origin,
+                    );
+                }
+                if let Some((direction, target)) = replay {
+                    self.commit_staged_history_replay_after_adoption(
+                        *direction,
+                        target,
+                        request.source_location,
+                    );
+                }
+                if let Some(dfs) = request.dfs_continuation {
+                    if dfs.fullscreen {
+                        let _ = self.reopen_fullscreen_after_folder_nav_load(
+                            ctx,
+                            dfs.restore_video_tile,
+                            dfs.resume_slideshow,
+                            dfs.history_trigger,
+                        );
+                    }
+                    self.chain_folder_nav_if_pending(dfs.queued_steps, dfs.mode);
+                }
+            } else {
+                self.set_active_folder_nav_suppress_record_once(previous_suppress);
+                self.restore_staged_pdf_password_after_failed_adoption(prior_pdf_password);
+                self.clear_pending_folder_nav_steps();
+                self.release_fs_nav_lock();
+            }
+            return;
+        }
+        if let PhysicalHistoryIntent::QuickFolder { slot } = &request.intent {
+            if self.commit_quick_folder_switch(
+                &request,
+                *slot,
+                payload,
+                backing_path.clone(),
+                pdf_password_submission
+                    .as_ref()
+                    .map(|(password, _)| password.clone()),
+            ) {
+                if let Some(backing) = backing_path.as_deref() {
+                    self.adopt_staged_archive_source_alias(&request.path, backing);
+                }
+            } else {
+                self.restore_staged_pdf_password_after_failed_adoption(prior_pdf_password);
+            }
+            return;
+        }
+        if let PhysicalHistoryIntent::MainGridArchive {
+            owner,
+            auto_fullscreen,
+        } = &request.intent
+        {
+            let open_owner = OpenRequestOwner::MainGridArchive(owner.clone());
+            let collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) = payload
+            else {
+                return;
+            };
+            if !self.snapshot_scope_allows_open(&request.path, &open_owner)
+                || !self.main_grid_archive_transition_is_current(&open_owner)
+                || !self.adopt_collection_surface_for_physical_load(
+                    &request.path,
+                    &open_owner,
+                    None,
+                )
+            {
+                return;
+            }
+            let backing = backing_path.unwrap_or_else(|| request.path.clone());
+            if *auto_fullscreen {
+                self.pending_auto_fs_open = true;
+            }
+            self.load_zip_as_folder_prepared_with_logical_source(
+                backing.clone(),
+                enumeration,
+                Some(&request.path),
+            );
+            self.adopt_staged_archive_source_alias(&request.path, &backing);
+            self.commit_main_grid_archive_transition(&open_owner);
+            self.commit_staged_search_navigation_effects(
+                &request.path,
+                request.favsearch_origin,
+                request.tag_view_origin,
+                request.global_search_origin,
+            );
+            return;
+        }
+        if let PhysicalHistoryIntent::CollectionGrid { owner } = &request.intent {
+            let open_owner = OpenRequestOwner::CollectionGridPhysical(owner.clone());
+            if !matches!(
+                &payload,
+                collection_navigation::PhysicalHistoryPreflightPayload::Zip(_)
+                    | collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(_)
+            ) || !self.snapshot_scope_allows_open(&request.path, &open_owner)
+                || !self.adopt_collection_surface_for_physical_load(
+                    &request.path,
+                    &open_owner,
+                    None,
+                )
+            {
+                self.restore_staged_pdf_password_after_failed_adoption(prior_pdf_password);
+                return;
+            }
+            if grid_effects
+                .as_ref()
+                .is_some_and(|effects| effects.auto_fullscreen)
+            {
+                self.pending_auto_fs_open = true;
+            }
+            let path = request.path;
+            if let Some(effects) = grid_effects {
+                self.commit_grid_virtual_open_effects(&path, effects);
+            }
+            match payload {
+                collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) => {
+                    let backing = backing_path.as_deref().unwrap_or(&path);
+                    self.load_zip_as_folder_prepared_with_logical_source(
+                        backing.to_path_buf(),
+                        enumeration,
+                        backing_path.is_some().then_some(path.as_path()),
+                    );
+                    if backing_path.is_some() {
+                        self.adopt_staged_archive_source_alias(&path, backing);
+                    }
+                }
+                collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(pages) => {
+                    self.load_pdf_as_folder_prepared_with_password(
+                        path.clone(),
+                        pages,
+                        pdf_password_submission
+                            .as_ref()
+                            .map(|(password, _)| password.clone()),
+                    );
+                    self.poll_pdf_enumerate();
+                }
+                _ => unreachable!("collection grid archive must have a prepared payload"),
+            }
+            return;
+        }
+        let PhysicalHistoryIntent::Rating {
+            owner,
+            restore,
+            replay,
+            zip_dir_prefix,
+        } = request.intent
+        else {
+            return;
+        };
+        let path = request.path;
+        let adopted = match payload {
+            collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => self
+                .load_folder_with_scan_owned(
+                    path.clone(),
+                    Some(scan),
+                    OpenRequestOwner::RatingPhysical(owner.clone()),
+                ),
+            collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) => {
+                if !self.adopt_collection_surface_for_physical_load(
+                    &path,
+                    &OpenRequestOwner::RatingPhysical(owner.clone()),
+                    None,
+                ) {
+                    false
+                } else {
+                    if let Some(effects) = grid_effects.clone() {
+                        self.commit_grid_virtual_open_effects(&path, effects);
+                    }
+                    if grid_effects
+                        .as_ref()
+                        .is_some_and(|effects| effects.auto_fullscreen)
+                    {
+                        self.pending_auto_fs_open = true;
+                    }
+                    if let Some(dir_prefix) = zip_dir_prefix {
+                        self.pending_rating_view_zipdir_open = Some(PendingRatingViewZipDirOpen {
+                            source_path: path.clone(),
+                            dir_prefix,
+                        });
+                    }
+                    self.load_zip_as_folder_prepared_with_logical_source(
+                        backing_path.clone().unwrap_or_else(|| path.clone()),
+                        enumeration,
+                        backing_path.as_ref().map(|_| path.as_path()),
+                    );
+                    true
+                }
+            }
+            collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(pages) => {
+                if !self.adopt_collection_surface_for_physical_load(
+                    &path,
+                    &OpenRequestOwner::RatingPhysical(owner.clone()),
+                    None,
+                ) {
+                    false
+                } else {
+                    if let Some(effects) = grid_effects.clone() {
+                        self.commit_grid_virtual_open_effects(&path, effects);
+                    }
+                    if grid_effects
+                        .as_ref()
+                        .is_some_and(|effects| effects.auto_fullscreen)
+                    {
+                        self.pending_auto_fs_open = true;
+                    }
+                    self.load_pdf_as_folder_prepared_with_password(
+                        path.clone(),
+                        pages,
+                        pdf_password_submission
+                            .as_ref()
+                            .map(|(password, _)| password.clone()),
+                    );
+                    self.poll_pdf_enumerate();
+                    true
+                }
+            }
+            collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired
+            | collection_navigation::PhysicalHistoryPreflightPayload::ZipCached { .. }
+            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired
+            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(_) => {
+                self.show_feedback_toast("[書庫の開封を続けられませんでした]".into());
+                false
+            }
+        };
+        if !adopted {
+            self.restore_staged_pdf_password_after_failed_adoption(prior_pdf_password);
+            return;
+        }
+        if let Some(backing) = backing_path.as_deref() {
+            self.adopt_staged_archive_source_alias(&path, backing);
+        }
+        if let Some(restore) = restore {
+            self.rating_view_stars = restore.stars;
+            self.rating_view_nav_stack = restore.nav_chain;
+            self.rating_view_saved_folder = restore.saved_folder;
+            self.rating_view_subfolder_restore = restore.subfolder_restore;
+        }
+        if let Some((direction, target)) = replay {
+            self.commit_staged_history_replay_after_adoption(
+                direction,
+                &target,
+                request.source_location,
+            );
+        }
+    }
+
+    fn adopt_prepared_ordinary_archive_navigation(
+        &mut self,
+        logical_path: &Path,
+        payload: collection_navigation::PhysicalHistoryPreflightPayload,
+        backing_path: Option<&Path>,
+        history_origin: Option<&FolderNavHistoryTarget>,
+        auto_fullscreen: bool,
+        grid_effects: Option<&GridVirtualOpenEffects>,
+        pdf_password_override: Option<String>,
+        close_fullscreen_before_load: bool,
+    ) -> bool {
+        if !matches!(
+            &payload,
+            collection_navigation::PhysicalHistoryPreflightPayload::Zip(_)
+                | collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(_)
+        ) {
+            return false;
+        }
+        let owner = OpenRequestOwner::Navigation;
+        if !self.snapshot_scope_allows_open(logical_path, &owner)
+            || !self.adopt_collection_surface_for_physical_load(
+                logical_path,
+                &owner,
+                history_origin,
+            )
+        {
+            return false;
+        }
+        if auto_fullscreen {
+            self.pending_auto_fs_open = true;
+        }
+        if let Some(effects) = grid_effects {
+            self.commit_grid_virtual_open_effects(logical_path, effects.clone());
+        }
+        if close_fullscreen_before_load {
+            self.close_fullscreen_for_folder_nav_reopen();
+        }
+        match payload {
+            collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) => {
+                let backing = backing_path.unwrap_or(logical_path);
+                self.load_zip_as_folder_prepared_with_logical_source(
+                    backing.to_path_buf(),
+                    enumeration,
+                    backing_path.map(|_| logical_path),
+                );
+                if backing_path.is_some() {
+                    self.adopt_staged_archive_source_alias(logical_path, backing);
+                }
+                true
+            }
+            collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(pages) => {
+                self.load_pdf_as_folder_prepared_with_password(
+                    logical_path.to_path_buf(),
+                    pages,
+                    pdf_password_override,
+                );
+                self.poll_pdf_enumerate();
+                true
+            }
+            _ => {
+                self.pending_auto_fs_open = false;
+                false
+            }
+        }
+    }
+
+    fn commit_quick_folder_switch(
+        &mut self,
+        request: &PhysicalHistoryTransition,
+        slot: QuickFolderSlotId,
+        payload: collection_navigation::PhysicalHistoryPreflightPayload,
+        backing_path: Option<PathBuf>,
+        pdf_password_override: Option<String>,
+    ) -> bool {
+        let owner = QuickFolderSwitchLoadOwner {
+            source_context: request.source_context,
+            source_surface_generation: request.source_surface_generation,
+            source_items_generation: request.source_items_generation,
+            source_slot: request.source_slot,
+            source_slot_switch_sequence: request.source_slot_switch_sequence,
+            target_slot: slot,
+            target_path: request.path.clone(),
+        };
+        let path = request.path.clone();
+        match payload {
+            collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
+                return self.load_folder_with_scan_owned(
+                    path,
+                    Some(scan),
+                    OpenRequestOwner::QuickFolderSwitch(owner),
+                );
+            }
+            collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) => {
+                if self.adopt_collection_surface_for_physical_load(
+                    &path,
+                    &OpenRequestOwner::QuickFolderSwitch(owner),
+                    None,
+                ) {
+                    self.load_zip_as_folder_prepared_with_logical_source(
+                        backing_path.clone().unwrap_or_else(|| path.clone()),
+                        enumeration,
+                        backing_path.as_ref().map(|_| path.as_path()),
+                    );
+                    return true;
+                }
+            }
+            collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(pages) => {
+                if self.adopt_collection_surface_for_physical_load(
+                    &path,
+                    &OpenRequestOwner::QuickFolderSwitch(owner),
+                    None,
+                ) {
+                    self.load_pdf_as_folder_prepared_with_password(
+                        path,
+                        pages,
+                        pdf_password_override,
+                    );
+                    self.poll_pdf_enumerate();
+                    return true;
+                }
+            }
+            collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired
+            | collection_navigation::PhysicalHistoryPreflightPayload::ZipCached { .. }
+            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired
+            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(_) => {
+                self.show_feedback_toast("[書庫の開封を続けられませんでした]".into());
+            }
+        }
+        false
+    }
+
+    fn adopt_staged_archive_source_alias(&mut self, logical_source: &Path, backing: &Path) {
+        self.archive_source_override = Some(logical_source.to_path_buf());
+        self.address = logical_source.to_string_lossy().to_string();
+        if !(self.global_search.active || self.favsearch.active) {
+            self.forget_recent_folder(backing);
+            self.remember_recent_folder(logical_source);
+        }
+        self.update_active_quick_folder_target(logical_source);
+        self.transition_favorite_view_for_path(Some(logical_source));
+    }
+
+    fn commit_staged_search_navigation_effects(
+        &mut self,
+        path: &Path,
+        favsearch_origin: bool,
+        tag_view_origin: bool,
+        global_search_origin: bool,
+    ) {
+        if favsearch_origin && self.favsearch.active {
+            self.favsearch.nav_stack.push(path.to_path_buf());
+            self.update_favsearch_address();
+        }
+        if tag_view_origin && self.tag_view.active {
+            self.record_tag_view_nav_open(path);
+            self.update_tag_view_address();
+        }
+        if global_search_origin && self.global_search.active {
+            self.advance_drilled_current_path(path);
+        }
+    }
+
+    fn commit_converted_physical_history_transition(
+        &mut self,
+        ctx: &egui::Context,
+        request: PhysicalHistoryTransition,
+        backing_path: PathBuf,
+        payload: collection_navigation::PhysicalHistoryPreflightPayload,
+    ) {
+        if !matches!(
+            payload,
+            collection_navigation::PhysicalHistoryPreflightPayload::Zip(_)
+        ) {
+            return;
+        }
+        if self.physical_history_source_is_current(&request) {
+            self.commit_physical_history_transition(
+                ctx,
+                request,
+                payload,
+                None,
+                Some(backing_path),
+            );
+        }
+    }
+
+    fn prepare_staged_pdf_password_for_adoption(
+        &mut self,
+        path: &Path,
+        submission: Option<&(String, bool)>,
+    ) -> Option<(Option<String>, Option<(PathBuf, String)>)> {
+        let Some((password, save)) = submission else {
+            return None;
+        };
+        let previous = (
+            self.pdf_current_password.clone(),
+            self.pdf_password_pending_save.clone(),
+        );
+        self.pdf_current_password = Some(password.clone());
+        self.pdf_password_pending_save = save.then(|| (path.to_path_buf(), password.clone()));
+        Some(previous)
+    }
+
+    fn restore_staged_pdf_password_after_failed_adoption(
+        &mut self,
+        previous: Option<(Option<String>, Option<(PathBuf, String)>)>,
+    ) {
+        if let Some((password, pending_save)) = previous {
+            self.pdf_current_password = password;
+            self.pdf_password_pending_save = pending_save;
+        }
+    }
+
+    fn restore_rating_without_history(&mut self, stars: u8) {
+        self.start_rating_navigation(
+            stars,
+            RatingNavigationIntent::Restore,
+            self.rating_view_saved_folder.clone(),
+            self.rating_view_subfolder_restore.clone(),
+        );
     }
 
     pub(crate) fn close_rating_view(&mut self) {
+        // A navigation prepare still belongs to its source location. Backspace during that
+        // prepare cancels the request; it must not close or rewrite the visible source grid.
+        if self
+            .rating_view_pending
+            .as_ref()
+            .is_some_and(|pending| pending.navigation.is_some())
+        {
+            if let Some(pending) = self.rating_view_pending.take() {
+                pending.cancel();
+            }
+            self.rating_view_request_sequence = self.rating_view_request_sequence.wrapping_add(1);
+            return;
+        }
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
         }
@@ -25118,23 +27640,6 @@ impl App {
         self.rating_view_nav_context_active() || self.rating_view_pending.is_some()
     }
 
-    pub(crate) fn record_rating_view_nav_open(&mut self, path: &Path) {
-        if !self.rating_view_nav_context_active() || is_synthetic_view_path(path) {
-            return;
-        }
-        if self
-            .rating_view_nav_stack
-            .last()
-            .is_some_and(|last| crate::folder_tree::path_eq(last, path))
-        {
-            return;
-        }
-        self.rating_view_nav_stack.push(path.to_path_buf());
-        if self.rating_view_nav_stack.len() > MAX_FOLDER_NAV_STACK {
-            self.rating_view_nav_stack.remove(0);
-        }
-    }
-
     pub(crate) fn rating_view_parent_nav(&mut self) {
         if !self.rating_view_nav_stack.is_empty() {
             self.rating_view_back();
@@ -25152,22 +27657,31 @@ impl App {
         if self.rating_view_nav_stack.is_empty() {
             return;
         }
-        let popped = self.rating_view_nav_stack.pop();
-        self.cancel_pending_folder_nav();
-        self.pending_rating_view_zipdir_open = None;
-        if let Some(popped_path) = popped.as_ref()
-            && let Some(name) = popped_path.file_name().and_then(|n| n.to_str())
-        {
-            self.select_after_load = Some(name.to_string());
-        }
-        if let Some(top) = self.rating_view_nav_stack.last().cloned() {
-            let _ = self.load_folder_or_convert_archive(top);
-        } else {
-            self.request_rating_view_build();
-            if let Some(popped_path) = popped.as_ref() {
-                self.select_rating_view_row_for_opened_path(popped_path);
+        let opened = self.rating_view_nav_stack.last().cloned().unwrap();
+        if self.rating_view_nav_stack.len() == 1 {
+            self.start_rating_navigation(
+                self.rating_view_stars.clamp(1, 5),
+                RatingNavigationIntent::Restore,
+                self.rating_view_saved_folder.clone(),
+                self.rating_view_subfolder_restore.clone(),
+            );
+            if let Some(pending) = self.rating_view_pending.as_mut()
+                && let Some(transition) = pending.navigation.as_mut()
+            {
+                transition.select_opened_path = Some(opened);
             }
+            return;
         }
+        let mut nav_chain = self.rating_view_nav_stack.clone();
+        nav_chain.pop();
+        let restore = top_level_grid_view::RatingPhysicalRestore {
+            visible_path: nav_chain.last().cloned().unwrap(),
+            stars: self.rating_view_stars,
+            nav_chain,
+            saved_folder: self.rating_view_saved_folder.clone(),
+            subfolder_restore: self.rating_view_subfolder_restore.clone(),
+        };
+        self.start_rating_physical_restore(restore, None);
     }
 
     fn select_rating_view_row_for_opened_path(&mut self, path: &Path) {
@@ -25191,8 +27705,202 @@ impl App {
         }
     }
 
+    fn rating_navigation_source_is_current(&self, transition: &RatingNavigationTransition) -> bool {
+        if self.projected_viewer_context_id() != transition.source_context
+            || self.top_level_grid_view.generation() != transition.source_surface_generation
+            || self.items_generation != transition.source_items_generation
+            || self.active_quick_folder_slot != transition.source_slot
+            || self.quick_folder_switch_sequence != transition.source_slot_switch_sequence
+        {
+            return false;
+        }
+        if !self.main_folder_history_available() {
+            return matches!(
+                transition.intent,
+                RatingNavigationIntent::Direct { .. } | RatingNavigationIntent::Restore
+            );
+        }
+        let same_history = match transition.source_slot {
+            Some(slot) => {
+                self.quick_folder_workspaces[slot.index()].history
+                    == transition.history_before.quick_folder_workspaces[slot.index()].history
+            }
+            None => {
+                self.folder_nav_back_stack == transition.history_before.back_stack
+                    && self.folder_nav_forward_stack == transition.history_before.forward_stack
+                    && self.suppress_folder_nav_record_once
+                        == transition.history_before.suppress_record_once
+            }
+        };
+        if !same_history {
+            return false;
+        }
+        match &transition.intent {
+            RatingNavigationIntent::Direct { .. } | RatingNavigationIntent::Restore => true,
+            RatingNavigationIntent::Replay { direction, target } => {
+                let head = match direction {
+                    FolderHistoryDirection::Back => self.folder_history_back_target(),
+                    FolderHistoryDirection::Forward => self.folder_history_forward_target(),
+                };
+                head.is_some_and(|head| head == target)
+            }
+        }
+    }
+
+    fn poll_staged_rating_navigation(&mut self) {
+        let Some(pending) = self.rating_view_pending.as_ref() else {
+            return;
+        };
+        let Some(mut transition) = pending.navigation.clone() else {
+            return;
+        };
+        if !self.rating_navigation_source_is_current(&transition)
+            || pending.sequence != self.rating_view_request_sequence
+        {
+            if let Some(pending) = self.rating_view_pending.take() {
+                pending.cancel();
+            }
+            return;
+        }
+        let chosen_sort = self.settings.rating_view_sort.normalized_for_rating_view();
+        if chosen_sort != transition.target_sort {
+            transition.target_sort = chosen_sort;
+            self.start_rating_build(
+                transition.target_stars,
+                chosen_sort,
+                crate::rating_view::RatingViewBuildIntent::Reorder,
+                Some(transition),
+            );
+            return;
+        }
+        let result = pending.rx.try_recv();
+        match result {
+            Ok(Ok(result)) => {
+                let read_generation = pending.rating_write_generation;
+                self.rating_view_pending = None;
+                if result.prepared.as_ref().is_some_and(|prepared| {
+                    crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+                        .accepts(prepared.page_edits.stamp)
+                        && crate::tags_db::TAG_WRITES.accepts(prepared.tag_stamp)
+                }) {
+                    self.rating_view_accepted_write_generation = result
+                        .prepared
+                        .as_ref()
+                        .unwrap()
+                        .rating_stamp
+                        .completed_writes;
+                    self.commit_staged_rating_navigation(transition, result, read_generation);
+                } else {
+                    self.start_rating_build(
+                        transition.target_stars,
+                        transition.target_sort,
+                        crate::rating_view::RatingViewBuildIntent::Reorder,
+                        Some(transition),
+                    );
+                }
+            }
+            Ok(Err(msg)) => {
+                self.rating_view_pending = None;
+                if msg == "page-edit read changed during rating prepare"
+                    || msg == "tag read changed during rating prepare"
+                {
+                    self.start_rating_build(
+                        transition.target_stars,
+                        transition.target_sort,
+                        crate::rating_view::RatingViewBuildIntent::Reorder,
+                        Some(transition),
+                    );
+                } else if msg != "cancelled" {
+                    crate::logger::log(format!("rating-view: staged build failed: {msg}"));
+                    self.show_feedback_toast(
+                        "[レーティング一覧を読み込めませんでした]".to_string(),
+                    );
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.rating_view_pending = None;
+                self.show_feedback_toast("[レーティング一覧を読み込めませんでした]".to_string());
+            }
+        }
+    }
+
+    fn commit_staged_rating_navigation(
+        &mut self,
+        transition: RatingNavigationTransition,
+        result: crate::rating_view::RatingViewBuildResult,
+        read_generation: u64,
+    ) {
+        if !self.rating_navigation_source_is_current(&transition) {
+            return;
+        }
+        match &transition.intent {
+            RatingNavigationIntent::Direct { from } => {
+                self.record_folder_nav_transition_from_current(
+                    FolderNavHistoryTarget::Rating {
+                        stars: transition.target_stars,
+                    },
+                    from.clone(),
+                );
+            }
+            RatingNavigationIntent::Restore => {}
+            RatingNavigationIntent::Replay { direction, target } => {
+                let adopted = match direction {
+                    FolderHistoryDirection::Back => self.navigate_folder_history_back(),
+                    FolderHistoryDirection::Forward => self.navigate_folder_history_forward(),
+                };
+                if adopted.as_ref() != Some(target) {
+                    return;
+                }
+                self.set_active_folder_nav_suppress_record_once(false);
+            }
+        }
+        let _ = self.dismiss_snapshot_without_restore();
+        if self.global_search.active {
+            let _ = self.dismiss_global_search_without_restore();
+        }
+        if self.favsearch.active {
+            let _ = self.dismiss_favsearch_without_restore();
+        }
+        if self.tag_view.active {
+            let _ = self.dismiss_tag_view_without_restore();
+        }
+        if self.show_search_bar {
+            self.show_search_bar = false;
+            self.search_query.clear();
+            self.search_filter = None;
+            self.search_filter_origin_folder = None;
+            self.search_has_focus = false;
+            self.search_tag_bridge.clear();
+            self.cancel_search_pending();
+        }
+        self.gamepad_location_picker = None;
+        self.rating_view_stars = transition.target_stars;
+        self.rating_view_sort = transition.target_sort;
+        self.rating_view_saved_folder = transition.saved_folder;
+        self.rating_view_subfolder_restore = transition.subfolder_restore;
+        self.rating_view_nav_stack.clear();
+        self.pending_rating_view_zipdir_open = None;
+        self.reset_details_sort_to_toolbar();
+        self.persist_pending_view_trim_state();
+        self.apply_rating_view_result(result);
+        self.overlay_rating_session_writes_since(read_generation);
+        self.rebuild_visible_indices_after_rating_publication();
+        if let Some(path) = transition.select_opened_path.as_deref() {
+            self.select_rating_view_row_for_opened_path(path);
+        }
+    }
+
     pub(crate) fn poll_rating_view(&mut self) {
         if self.sidecar_restore_active() {
+            return;
+        }
+        if self
+            .rating_view_pending
+            .as_ref()
+            .is_some_and(|pending| pending.navigation.is_some())
+        {
+            self.poll_staged_rating_navigation();
             return;
         }
         if self.rating_view_pending.is_none() {
@@ -25316,20 +28024,66 @@ impl App {
         &mut self,
         intent: crate::rating_view::RatingViewBuildIntent,
     ) {
+        self.start_rating_build(
+            self.rating_view_stars.clamp(1, 5),
+            self.rating_view_sort,
+            intent,
+            None,
+        );
+    }
+
+    fn start_rating_navigation(
+        &mut self,
+        stars: u8,
+        intent: RatingNavigationIntent,
+        saved_folder: Option<PathBuf>,
+        subfolder_restore: Option<subfolder_expansion::SubfolderExpansionRestoreState>,
+    ) {
+        self.cancel_replaced_staged_archive_conversion();
+        self.replace_history_navigation_transition(None);
+        let transition = RatingNavigationTransition {
+            intent,
+            history_before: self.folder_nav_history_snapshot(),
+            source_context: self.projected_viewer_context_id(),
+            source_surface_generation: self.top_level_grid_view.generation(),
+            source_items_generation: self.items_generation,
+            source_slot: self.active_quick_folder_slot,
+            source_slot_switch_sequence: self.quick_folder_switch_sequence,
+            target_stars: stars,
+            target_sort: self.settings.rating_view_sort.normalized_for_rating_view(),
+            saved_folder,
+            subfolder_restore,
+            select_opened_path: None,
+        };
+        self.start_rating_build(
+            transition.target_stars,
+            transition.target_sort,
+            crate::rating_view::RatingViewBuildIntent::Reorder,
+            Some(transition),
+        );
+    }
+
+    fn start_rating_build(
+        &mut self,
+        stars: u8,
+        sort: crate::rating_view::RatingViewSort,
+        intent: crate::rating_view::RatingViewBuildIntent,
+        navigation: Option<RatingNavigationTransition>,
+    ) {
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
         }
         self.rating_view_request_sequence = self.rating_view_request_sequence.wrapping_add(1);
-        self.rating_view_pending = Some(crate::rating_view::spawn_rating_view_build(
+        let mut pending = crate::rating_view::spawn_rating_view_build(
             crate::rating_db::RatingDb::db_path(),
-            self.rating_view_stars.clamp(1, 5),
+            stars,
             self.rating_view_request_sequence,
             self.items_generation,
             self.projected_viewer_context_id(),
             self.rating_session_write_generation,
             crate::rating_view::RatingViewPrepareOptions {
                 intent,
-                sort: self.rating_view_sort,
+                sort,
                 display_order: self.settings.grid_display_order.clone(),
                 pin_db: self.folder_thumb_pin_db.clone(),
                 folder_thumb_sort: self.settings.folder_thumb_sort,
@@ -25340,7 +28094,9 @@ impl App {
                     .as_ref()
                     .map(|_| crate::tags_db::TagsDb::db_path()),
             },
-        ));
+        );
+        pending.navigation = navigation;
+        self.rating_view_pending = Some(pending);
     }
 
     fn apply_rating_view_result(&mut self, result: crate::rating_view::RatingViewBuildResult) {
@@ -25361,8 +28117,23 @@ impl App {
     }
 
     pub(crate) fn set_rating_view_sort(&mut self, sort: crate::rating_view::RatingViewSort) {
+        let requested_normal = match sort {
+            crate::rating_view::RatingViewSort::Normal(order) => Some(order),
+            _ => None,
+        };
+        let sort = sort.normalized_for_rating_view();
+        let effective_changed = self.rating_view_sort != sort;
+        let persisted_changed = self.settings.rating_view_sort != sort
+            || requested_normal.is_some_and(|order| self.settings.sort_order != order);
         self.rating_view_sort = sort;
-        if self.items_are_rating_view {
+        self.settings.rating_view_sort = sort;
+        if let Some(order) = requested_normal {
+            self.settings.sort_order = order;
+        }
+        if persisted_changed {
+            self.settings.save();
+        }
+        if self.items_are_rating_view && effective_changed {
             self.request_rating_view_build();
         }
     }
@@ -25610,6 +28381,7 @@ impl App {
             input_seq,
             None,
             ZipCacheRouting::Lookup,
+            None,
         );
     }
 
@@ -25622,6 +28394,7 @@ impl App {
             self.input_seq,
             None,
             ZipCacheRouting::ProvenBacking,
+            None,
         );
     }
 
@@ -25635,6 +28408,22 @@ impl App {
             self.input_seq,
             Some(enumeration),
             ZipCacheRouting::Lookup,
+            None,
+        );
+    }
+
+    pub(in crate::app) fn load_zip_as_folder_prepared_with_logical_source(
+        &mut self,
+        zip_path: PathBuf,
+        enumeration: crate::zip_loader::ZipEnumeration,
+        logical_source: Option<&Path>,
+    ) {
+        self.load_zip_as_folder_with_prepared_enumeration(
+            zip_path,
+            self.input_seq,
+            Some(enumeration),
+            ZipCacheRouting::ProvenBacking,
+            logical_source,
         );
     }
 
@@ -25644,13 +28433,14 @@ impl App {
         input_seq: u64,
         prepared: Option<crate::zip_loader::ZipEnumeration>,
         cache_routing: ZipCacheRouting,
+        logical_source: Option<&Path>,
     ) {
         crate::logger::log(format!(
             "=== load_zip_as_folder: {} ===",
             zip_path.display()
         ));
         if !self.smart_folder_session_owns_load(&zip_path) {
-            self.transition_favorite_view_for_path(Some(&zip_path));
+            self.transition_favorite_view_for_path(Some(logical_source.unwrap_or(&zip_path)));
         }
 
         #[cfg(windows)]
@@ -25793,12 +28583,16 @@ impl App {
         // zip_enumerate_pending を含めることで担保する。
 
         if let Some(enumeration) = prepared {
+            let authority = logical_source
+                .map_or(VisibleInstallAuthority::Ordinary, |logical_source| {
+                    VisibleInstallAuthority::StagedArchive { logical_source }
+                });
             self.finalize_zip_enumerate(
                 zip_path,
                 input_seq,
                 Ok(enumeration),
-                None,
-                VisibleInstallAuthority::Ordinary,
+                logical_source,
+                authority,
             );
             return;
         }
@@ -26486,10 +29280,13 @@ impl App {
         if dir_prefix.is_empty() {
             return;
         }
+        if let Some(owner) = self.rating_view_physical_load_owner(&zip_path) {
+            self.start_rating_physical_zipdir_open(owner, dir_prefix);
+            return;
+        }
         let rollback = self
             .rating_view_nav_context_active()
             .then(|| self.folder_nav_history_snapshot());
-        self.record_rating_view_nav_open(&zip_path);
         self.pending_rating_view_zipdir_open = Some(PendingRatingViewZipDirOpen {
             source_path: zip_path.clone(),
             dir_prefix,
@@ -26700,13 +29497,23 @@ impl App {
     /// 「保存しない」を選んだ PDF を開けなくなる。開く経路と外部ツールの実体化が
     /// **同じ順序**で解決するよう、綴りは 1 か所に置く (Codex Sol 指摘 #10)。
     pub(crate) fn pdf_open_password(&self, pdf_path: &Path) -> Option<String> {
+        // A validated password from the current PDF session wins over an older saved value.
+        // New destinations still consult their per-file saved value first below.
+        if self
+            .current_folder
+            .as_ref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, pdf_path))
+            && let Some(password) = &self.pdf_current_password
+        {
+            return Some(password.clone());
+        }
         self.pdf_passwords
             .get(pdf_path)
             .or_else(|| self.pdf_current_password.clone())
     }
 
     pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
-        self.load_pdf_as_folder_with_prepared_pages(pdf_path, None);
+        self.load_pdf_as_folder_with_prepared_pages(pdf_path, None, None);
     }
 
     pub(in crate::app) fn load_pdf_as_folder_prepared(
@@ -26714,13 +29521,23 @@ impl App {
         pdf_path: PathBuf,
         pages: Vec<crate::pdf_loader::PdfPageEntry>,
     ) {
-        self.load_pdf_as_folder_with_prepared_pages(pdf_path, Some(pages));
+        self.load_pdf_as_folder_with_prepared_pages(pdf_path, Some(pages), None);
+    }
+
+    pub(in crate::app) fn load_pdf_as_folder_prepared_with_password(
+        &mut self,
+        pdf_path: PathBuf,
+        pages: Vec<crate::pdf_loader::PdfPageEntry>,
+        password_override: Option<String>,
+    ) {
+        self.load_pdf_as_folder_with_prepared_pages(pdf_path, Some(pages), password_override);
     }
 
     fn load_pdf_as_folder_with_prepared_pages(
         &mut self,
         pdf_path: PathBuf,
         prepared_pages: Option<Vec<crate::pdf_loader::PdfPageEntry>>,
+        password_override: Option<String>,
     ) {
         crate::logger::log(format!(
             "=== load_pdf_as_folder: {} ===",
@@ -26783,7 +29600,8 @@ impl App {
         // こと (= Codex P1 対策。session password の居座りで他 PDF の保護を bypass
         // しないため)。
         let saved_password: Option<String> = self.pdf_passwords.get(&pdf_path);
-        let password: Option<String> = self.pdf_open_password(&pdf_path);
+        let password: Option<String> =
+            password_override.or_else(|| self.pdf_open_password(&pdf_path));
         if previous_pdf_enumerate
             .as_ref()
             .is_some_and(|(_, previous_password, _)| previous_password != &password)
@@ -27335,7 +30153,7 @@ impl App {
                             crate::empty_items_reason::EmptyItemsReason::PdfPasswordRequired,
                         );
                     }
-                    self.pdf_password_request = Some(PdfPasswordRequest { path: pdf_path });
+                    self.pdf_password_request = Some(PdfPasswordRequest::legacy(pdf_path));
                     self.show_pdf_password_dialog = true;
                     self.pdf_password_input.clear();
                     // password が渡されていた = 入力済みのパスワードが誤っていた
@@ -27433,6 +30251,11 @@ impl App {
         let Some(request) = self.pdf_password_request.take() else {
             return false;
         };
+        if let PdfPasswordRequestOwner::StagedHistory(request_id) = request.owner {
+            let _ =
+                self.resume_staged_pdf_password_request(request_id, &request.path, password, save);
+            return true;
+        }
         if self.resume_collection_pdf_password_request(&request.path, password.clone(), save) {
             return true;
         }
@@ -27471,6 +30294,10 @@ impl App {
         let Some(request) = self.pdf_password_request.take() else {
             return false;
         };
+        if let PdfPasswordRequestOwner::StagedHistory(request_id) = request.owner {
+            let _ = self.cancel_staged_pdf_password_request(request_id, &request.path);
+            return true;
+        }
         if self.cancel_collection_pdf_password_request() {
             self.pdf_password_pending_save = None;
             return true;
@@ -27956,6 +30783,9 @@ impl App {
         let detached_physical = self.navigation_scope.is_detached_physical();
         let smart_open_path = match &authority {
             VisibleInstallAuthority::Ordinary => None,
+            VisibleInstallAuthority::StagedArchive { logical_source } => {
+                Some((*logical_source).to_path_buf())
+            }
             VisibleInstallAuthority::SmartPhysical {
                 request_id,
                 definition_id,
@@ -27979,7 +30809,7 @@ impl App {
             }
         };
         let preserve_smart_folder_session = match &authority {
-            VisibleInstallAuthority::Ordinary => {
+            VisibleInstallAuthority::Ordinary | VisibleInstallAuthority::StagedArchive { .. } => {
                 !detached_physical
                     && !smart_folder::is_smart_folder_synthetic_path(&source_path)
                     && self.preserve_smart_folder_session_for_load(&source_path)
@@ -30364,6 +33194,14 @@ impl App {
             && !self.items_are_tag_view
         {
             paths.push(current.clone());
+            if let Some(logical) = self.effective_folder()
+                && !crate::folder_tree::path_eq(&logical, current)
+            {
+                // A prepared converted ZIP installs while current_folder names its backing.
+                // The pin button and book key already name the logical source in this same
+                // generation, so fetch both identities in the one batch lookup.
+                paths.push(logical);
+            }
         }
         // ZIP本を開いている場合は、現在の本そのもののpin keyも必要。
         if self.zip_nav.is_some()
@@ -41441,15 +44279,7 @@ impl App {
                             if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fs) {
                                 return None;
                             }
-                            // detached に採用されず、通常の main navigation が確定した境界で更新する。
-                            self.note_reading_history_open(idx);
-                            if auto_fs {
-                                self.pending_auto_fs_open = true;
-                            }
-                            self.maybe_suppress_rating_filter_for_opened_container(idx);
-                            self.maybe_suppress_facet_filter_for_opened_container(idx);
-                            self.record_rating_view_nav_open(&p);
-                            return Some(self.grid_physical_navigation(idx, p));
+                            return Some(self.grid_physical_navigation(idx, p, auto_fs));
                         }
                         Some(GridItem::Video(p)) if external_player_video => {
                             crate::ui_helpers::open_external_player(p);
@@ -41483,6 +44313,7 @@ impl App {
                                 return None;
                             }
                             let owner = self.main_grid_archive_open_owner(idx, &pf);
+                            let deferred_archive = self.will_stage_archive_navigation(&pf, &owner);
                             let search_rollback = if self.favsearch.active
                                 || self.tag_view.active
                                 || self.rating_view_nav_context_active()
@@ -41491,19 +44322,20 @@ impl App {
                             } else {
                                 None
                             };
-                            if self.favsearch.active {
+                            if self.favsearch.active && !deferred_archive {
                                 self.favsearch.nav_stack.push(pf.clone());
                             }
-                            if self.tag_view.active {
+                            if self.tag_view.active && !deferred_archive {
                                 self.record_tag_view_nav_open(&pf);
                             }
-                            self.record_rating_view_nav_open(&pf);
                             let open_outcome = self
                                 .load_folder_or_convert_archive_with_auto_fullscreen_owned(
                                     pf, auto_fs, owner,
                                 );
                             match (open_outcome, search_rollback) {
-                                (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
+                                (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot))
+                                    if !deferred_archive =>
+                                {
                                     self.attach_archive_convert_nav_history_rollback(snapshot);
                                 }
                                 (FolderOpenOutcome::Ignored, Some(snapshot)) => {
@@ -41513,11 +44345,13 @@ impl App {
                             }
                             if self.favsearch.active
                                 && matches!(open_outcome, FolderOpenOutcome::Loaded)
+                                && !deferred_archive
                             {
                                 self.update_favsearch_address();
                             }
                             if self.tag_view.active
                                 && matches!(open_outcome, FolderOpenOutcome::Loaded)
+                                && !deferred_archive
                             {
                                 self.update_tag_view_address();
                             }
@@ -43140,18 +45974,14 @@ impl App {
                 if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fs) {
                     return None;
                 }
-                self.note_reading_history_open(idx);
-                self.pending_auto_fs_open = auto_fs;
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
-                self.record_rating_view_nav_open(&p);
-                Some(self.grid_physical_navigation(idx, p))
+                Some(self.grid_physical_navigation(idx, p, auto_fs))
             }
             GridItem::ConvertibleArchive { path, .. } => {
                 if self.begin_smart_grid_container_navigation(idx, path.clone(), auto_fs) {
                     return None;
                 }
                 let owner = self.main_grid_archive_open_owner(idx, &path);
+                let deferred_archive = self.will_stage_archive_navigation(&path, &owner);
                 let search_rollback = if self.favsearch.active
                     || self.tag_view.active
                     || self.rating_view_nav_context_active()
@@ -43160,18 +45990,19 @@ impl App {
                 } else {
                     None
                 };
-                if self.favsearch.active {
+                if self.favsearch.active && !deferred_archive {
                     self.favsearch.nav_stack.push(path.clone());
                 }
-                if self.tag_view.active {
+                if self.tag_view.active && !deferred_archive {
                     self.record_tag_view_nav_open(&path);
                 }
-                self.record_rating_view_nav_open(&path);
                 let open_outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                     path, auto_fs, owner,
                 );
                 match (open_outcome, search_rollback) {
-                    (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
+                    (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot))
+                        if !deferred_archive =>
+                    {
                         self.attach_archive_convert_nav_history_rollback(snapshot);
                     }
                     (FolderOpenOutcome::Ignored, Some(snapshot)) => {
@@ -43179,10 +46010,16 @@ impl App {
                     }
                     _ => {}
                 }
-                if self.favsearch.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                if self.favsearch.active
+                    && matches!(open_outcome, FolderOpenOutcome::Loaded)
+                    && !deferred_archive
+                {
                     self.update_favsearch_address();
                 }
-                if self.tag_view.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                if self.tag_view.active
+                    && matches!(open_outcome, FolderOpenOutcome::Loaded)
+                    && !deferred_archive
+                {
                     self.update_tag_view_address();
                 }
                 None
@@ -43618,6 +46455,57 @@ impl App {
                 return;
             }
         };
+        if !self.navigation_scope.is_detached_physical()
+            && self.main_folder_history_available()
+            && matches!(
+                result.mode,
+                FolderNavMode::Grid
+                    | FolderNavMode::SiblingGrid
+                    | FolderNavMode::Fullscreen
+                    | FolderNavMode::SiblingFullscreen
+                    | FolderNavMode::SlideshowNext
+            )
+            && matches!(&route, FolderNavRoute::FullFeature(destination)
+                if crate::folder_tree::is_virtual_folder(destination)
+                    || crate::folder_tree::is_convertible_archive_path(destination))
+        {
+            let fullscreen = matches!(
+                result.mode,
+                FolderNavMode::Fullscreen
+                    | FolderNavMode::SiblingFullscreen
+                    | FolderNavMode::SlideshowNext
+            );
+            #[cfg(windows)]
+            let restore_video_tile = fullscreen && self.video_tile_mode_active;
+            #[cfg(not(windows))]
+            let restore_video_tile = false;
+            let continuation = PhysicalHistoryDfsContinuation {
+                queued_steps,
+                mode: continuation_mode,
+                history_trigger,
+                restore_video_tile,
+                resume_slideshow: matches!(result.mode, FolderNavMode::SlideshowNext),
+                fullscreen,
+            };
+            let owner = OpenRequestOwner::Navigation;
+            let staged = self.snapshot_scope_allows_open(&path, &owner)
+                && self.claim_open_request_owner(&path, &owner)
+                && self.start_physical_history_transition_with_dfs(
+                    PhysicalHistoryIntent::Navigation {
+                        replay: None,
+                        auto_fullscreen: false,
+                    },
+                    path,
+                    Some(continuation),
+                );
+            if !staged {
+                self.clear_pending_folder_nav_steps();
+                self.release_fs_nav_lock();
+                self.show_feedback_toast("フォルダを読み取れませんでした".into());
+            }
+            emit_end(apply_t0, apply_seq, apply_mode_tag, "physical_staged");
+            return;
+        }
         match result.mode {
             FolderNavMode::Grid | FolderNavMode::SiblingGrid => {
                 if !matches!(
@@ -76420,6 +79308,11 @@ impl App {
                 }
             }
             if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::OpenRatingOne,
+            ) {
+                self.enter_rating_view_from_menu(1);
+            }
+            if crate::test_script::take_smoke_action(
                 crate::test_script::UiSmokeAction::AlwaysOnTopOn,
             ) {
                 self.set_always_on_top(ctx, true, ActionSurface::MainWindow);
@@ -77194,7 +80087,13 @@ impl App {
             // pending 中は毎フレーム bump して、検索完了後に自然再開させる。
             self.activity_gate.bump();
         }
-        if self.tag_view_pending.is_some() || self.rating_view_pending.is_some() {
+        if self.tag_view_pending.is_some()
+            || self.rating_view_pending.is_some()
+            || self
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        {
             self.activity_gate.bump();
         }
         if self.rating_view_pending.is_some() {
@@ -77665,7 +80564,18 @@ impl App {
                 // この経路では menubar / toolbar を描画していないので必ず None で OK
                 // (= 競合なし、folder_nav が常に勝つ)。`keyboard_nav` / `gamepad_nav` は
                 // 早期 return より前で確定済みなので使える。
-                if let Some(crate::ui_main::AddressBarNav::Direct(path)) = gamepad_nav {
+                if let Some(crate::ui_main::AddressBarNav::RatingSource { owner, .. }) =
+                    gamepad_nav.as_ref()
+                {
+                    self.start_rating_physical_open(owner.clone());
+                    self.clear_pending_folder_nav_steps();
+                } else if let Some(crate::ui_main::AddressBarNav::GridVirtual(intent)) = gamepad_nav
+                {
+                    self.start_grid_virtual_open(intent);
+                    self.clear_pending_folder_nav_steps();
+                } else if let Some(crate::ui_main::AddressBarNav::Direct(path)) = gamepad_nav {
+                    let deferred_archive =
+                        self.will_stage_archive_navigation(&path, &OpenRequestOwner::Navigation);
                     let search_rollback = if self.favsearch.active
                         || self.tag_view.active
                         || self.rating_view_nav_context_active()
@@ -77674,20 +80584,21 @@ impl App {
                     } else {
                         None
                     };
-                    if self.favsearch.active {
+                    if self.favsearch.active && !deferred_archive {
                         self.favsearch.nav_stack.push(path.clone());
                     }
-                    if self.tag_view.active {
+                    if self.tag_view.active && !deferred_archive {
                         self.record_tag_view_nav_open(&path);
                     }
-                    self.record_rating_view_nav_open(&path);
                     let open_target = path.clone();
                     let open_outcome = self.load_folder_or_convert_archive(path);
-                    if matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                    if matches!(open_outcome, FolderOpenOutcome::Loaded) && !deferred_archive {
                         self.advance_drilled_current_path(&open_target);
                     }
                     match (open_outcome, search_rollback) {
-                        (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
+                        (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot))
+                            if !deferred_archive =>
+                        {
                             self.attach_archive_convert_nav_history_rollback(snapshot);
                         }
                         (FolderOpenOutcome::Ignored, Some(snapshot)) => {
@@ -77696,10 +80607,16 @@ impl App {
                         _ => {}
                     }
                     self.clear_pending_folder_nav_steps();
-                    if self.favsearch.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                    if self.favsearch.active
+                        && matches!(open_outcome, FolderOpenOutcome::Loaded)
+                        && !deferred_archive
+                    {
                         self.update_favsearch_address();
                     }
-                    if self.tag_view.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                    if self.tag_view.active
+                        && matches!(open_outcome, FolderOpenOutcome::Loaded)
+                        && !deferred_archive
+                    {
                         self.update_tag_view_address();
                     }
                 } else if let Some(result) = self.poll_folder_nav() {
@@ -78435,9 +81352,17 @@ impl App {
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
                     crate::ui_main::AddressBarNav::Direct(path) => Some(path),
+                    crate::ui_main::AddressBarNav::GridVirtual(intent) => {
+                        self.start_grid_virtual_open(intent);
+                        None
+                    }
                     crate::ui_main::AddressBarNav::CollectionSource { path, owner } => {
                         navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
                         Some(path)
+                    }
+                    crate::ui_main::AddressBarNav::RatingSource { owner, .. } => {
+                        self.start_rating_physical_open(owner);
+                        None
                     }
                     crate::ui_main::AddressBarNav::DriveList(origin) => {
                         self.enter_drive_list_from_navigation(origin);
@@ -78473,7 +81398,9 @@ impl App {
                         None
                     }
                     crate::ui_main::AddressBarNav::HistoryBack => {
-                        if let Some(action) = self
+                        if !self.main_folder_history_available() {
+                            None
+                        } else if let Some(action) = self
                             .advance_staged_smart_history(smart_folder::SmartHistoryDirection::Back)
                         {
                             self.dispatch_staged_smart_history_action(
@@ -78486,6 +81413,36 @@ impl App {
                             self.begin_smart_history_navigation(
                                 state,
                                 smart_folder::SmartHistoryDirection::Back,
+                            );
+                            None
+                        } else if let Some(FolderNavHistoryTarget::Rating { stars }) =
+                            self.folder_history_back_target().cloned()
+                        {
+                            self.start_rating_history_replay(FolderHistoryDirection::Back, stars);
+                            None
+                        } else if let Some(
+                            target @ (FolderNavHistoryTarget::Collection(_)
+                            | FolderNavHistoryTarget::CollectionPhysical(_)),
+                        ) = self.folder_history_back_target().cloned()
+                        {
+                            self.start_collection_history_transition(
+                                target.clone(),
+                                CollectionHistoryIntent::Replay {
+                                    direction: FolderHistoryDirection::Back,
+                                    target,
+                                },
+                                None,
+                            );
+                            None
+                        } else if let Some(target @ FolderNavHistoryTarget::Path(_)) =
+                            self.folder_history_back_target().cloned()
+                            && matches!(&target, FolderNavHistoryTarget::Path(path)
+                                if crate::folder_tree::is_virtual_folder(path)
+                                    || crate::folder_tree::is_convertible_archive_path(path))
+                        {
+                            self.start_ordinary_archive_history_replay(
+                                FolderHistoryDirection::Back,
+                                target,
                             );
                             None
                         } else {
@@ -78516,7 +81473,9 @@ impl App {
                         }
                     }
                     crate::ui_main::AddressBarNav::HistoryForward => {
-                        if let Some(action) = self.advance_staged_smart_history(
+                        if !self.main_folder_history_available() {
+                            None
+                        } else if let Some(action) = self.advance_staged_smart_history(
                             smart_folder::SmartHistoryDirection::Forward,
                         ) {
                             self.dispatch_staged_smart_history_action(
@@ -78529,6 +81488,39 @@ impl App {
                             self.begin_smart_history_navigation(
                                 state,
                                 smart_folder::SmartHistoryDirection::Forward,
+                            );
+                            None
+                        } else if let Some(FolderNavHistoryTarget::Rating { stars }) =
+                            self.folder_history_forward_target().cloned()
+                        {
+                            self.start_rating_history_replay(
+                                FolderHistoryDirection::Forward,
+                                stars,
+                            );
+                            None
+                        } else if let Some(
+                            target @ (FolderNavHistoryTarget::Collection(_)
+                            | FolderNavHistoryTarget::CollectionPhysical(_)),
+                        ) = self.folder_history_forward_target().cloned()
+                        {
+                            self.start_collection_history_transition(
+                                target.clone(),
+                                CollectionHistoryIntent::Replay {
+                                    direction: FolderHistoryDirection::Forward,
+                                    target,
+                                },
+                                None,
+                            );
+                            None
+                        } else if let Some(target @ FolderNavHistoryTarget::Path(_)) =
+                            self.folder_history_forward_target().cloned()
+                            && matches!(&target, FolderNavHistoryTarget::Path(path)
+                                if crate::folder_tree::is_virtual_folder(path)
+                                    || crate::folder_tree::is_convertible_archive_path(path))
+                        {
+                            self.start_ordinary_archive_history_replay(
+                                FolderHistoryDirection::Forward,
+                                target,
                             );
                             None
                         } else {
@@ -78576,9 +81568,17 @@ impl App {
                         .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
                         .and_then(|nav| match nav {
                             crate::ui_main::AddressBarNav::Direct(path) => Some(path),
+                            crate::ui_main::AddressBarNav::GridVirtual(intent) => {
+                                self.start_grid_virtual_open(intent);
+                                None
+                            }
                             crate::ui_main::AddressBarNav::CollectionSource { path, owner } => {
                                 navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
                                 Some(path)
+                            }
+                            crate::ui_main::AddressBarNav::RatingSource { owner, .. } => {
+                                self.start_rating_physical_open(owner);
+                                None
                             }
                             crate::ui_main::AddressBarNav::DriveList(origin) => {
                                 self.enter_drive_list_from_navigation(origin);
@@ -78699,9 +81699,17 @@ impl App {
             } else {
                 match grid_nav {
                     Some(crate::ui_main::AddressBarNav::Direct(path)) => Some(path),
+                    Some(crate::ui_main::AddressBarNav::GridVirtual(intent)) => {
+                        self.start_grid_virtual_open(intent);
+                        None
+                    }
                     Some(crate::ui_main::AddressBarNav::CollectionSource { path, owner }) => {
                         navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
                         Some(path)
+                    }
+                    Some(crate::ui_main::AddressBarNav::RatingSource { owner, .. }) => {
+                        self.start_rating_physical_open(owner);
+                        None
                     }
                     Some(crate::ui_main::AddressBarNav::DriveList(origin)) => {
                         self.enter_drive_list_from_navigation(origin);
@@ -78741,6 +81749,7 @@ impl App {
                 }
             };
             if let Some(p) = navigate {
+                let deferred_archive = self.will_stage_archive_navigation(&p, &navigate_owner);
                 let search_rollback = if self.favsearch.active
                     || self.tag_view.active
                     || self.rating_view_nav_context_active()
@@ -78751,13 +81760,12 @@ impl App {
                 };
                 // 検索コンテキスト中の前方ナビゲーションはスタックに積む。
                 // 実 load が保留/失敗した場合は snapshot で元に戻す。
-                if self.favsearch.active {
+                if self.favsearch.active && !deferred_archive {
                     self.favsearch.nav_stack.push(p.clone());
                 }
-                if self.tag_view.active {
+                if self.tag_view.active && !deferred_archive {
                     self.record_tag_view_nav_open(&p);
                 }
-                self.record_rating_view_nav_open(&p);
                 let open_target = p.clone();
                 let open_outcome = match navigate_pre_scan.take() {
                     Some(scan) => {
@@ -78778,12 +81786,14 @@ impl App {
                 // Aggregated」の 2 段階で戻れるようにする修正 (2026-04 ユーザー報告)。
                 // 変換確認ダイアログで実ナビゲーションが保留された場合は、キャンセル時に
                 // 位置だけ進んだ扱いにならないようここでは進めない。
-                if matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                if matches!(open_outcome, FolderOpenOutcome::Loaded) && !deferred_archive {
                     self.advance_drilled_current_path(&open_target);
                 }
                 let rollback = history_nav_rollback.or(search_rollback);
                 match (open_outcome, rollback) {
-                    (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
+                    (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot))
+                        if !deferred_archive =>
+                    {
                         self.attach_archive_convert_nav_history_rollback(snapshot);
                     }
                     (FolderOpenOutcome::Ignored, Some(snapshot)) => {
@@ -78795,10 +81805,16 @@ impl App {
                 // (start_loading_items が folder_nav_pending と累積をリセット済みだが、
                 //  folder_nav_result が Some かつ他 nav 優先のケースを拾うため明示)
                 self.clear_pending_folder_nav_steps();
-                if self.favsearch.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                if self.favsearch.active
+                    && matches!(open_outcome, FolderOpenOutcome::Loaded)
+                    && !deferred_archive
+                {
                     self.update_favsearch_address();
                 }
-                if self.tag_view.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                if self.tag_view.active
+                    && matches!(open_outcome, FolderOpenOutcome::Loaded)
+                    && !deferred_archive
+                {
                     self.update_tag_view_address();
                 }
             }
@@ -79340,6 +82356,7 @@ impl eframe::App for App {
         // update_frame returns through a fullscreen or native-video presentation path.
         self.poll_collection_ui(ctx);
         self.poll_collection_grid(ctx);
+        self.poll_collection_history_transition(ctx);
         self.poll_collection_navigation(ctx);
         // A settings-family mutation may already hold the exclusive DB permit. Defer only a
         // process-exit root close until that exact worker reaches terminal; ordinary tray-hide

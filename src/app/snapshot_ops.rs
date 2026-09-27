@@ -1631,7 +1631,7 @@ impl App {
         self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::ViewerExited);
     }
 
-    fn prepare_required_fullscreen_navigation(
+    pub(super) fn prepare_required_fullscreen_navigation(
         &mut self,
         ctx: &egui::Context,
         navigation_purpose: crate::app::FsNavigationPurpose,
@@ -1652,7 +1652,7 @@ impl App {
         true
     }
 
-    fn finish_required_fullscreen_load(
+    pub(super) fn finish_required_fullscreen_load(
         &mut self,
         target: crate::snapshot::SnapshotTarget,
         history_trigger: crate::app::HistoryTrigger,
@@ -1689,6 +1689,29 @@ impl App {
         history_trigger: crate::app::HistoryTrigger,
         navigation_purpose: crate::app::FsNavigationPurpose,
     ) {
+        if self.main_folder_history_available()
+            && folder_path.is_file()
+            && crate::folder_tree::is_virtual_folder(&folder_path)
+        {
+            // A prepared ZIP/PDF has no legacy enumerate receiver yet. Carry the required
+            // page into the staged owner so exact-leaf resolution runs after visible adoption.
+            self.snapshot_internal_nav = true;
+            let started = self
+                .claim_open_request_owner(&folder_path, &crate::app::OpenRequestOwner::Navigation)
+                && self.start_physical_history_transition(
+                    crate::app::PhysicalHistoryIntent::RequiredFullscreen {
+                        target,
+                        history_trigger,
+                        navigation_purpose,
+                    },
+                    folder_path,
+                );
+            self.snapshot_internal_nav = false;
+            if !started {
+                self.show_feedback_toast("画像の場所を開けません".to_string());
+            }
+            return;
+        }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
             self.show_feedback_toast("画像の場所を開けません".to_string());
             return;

@@ -347,9 +347,20 @@ pub(crate) enum TopLevelGridRestore {
     ReadingHistory,
     Bookmarks,
     Rating { stars: u8 },
+    RatingPhysical(RatingPhysicalRestore),
     SubfolderExpansion(SubfolderExpansionRestoreState),
     SmartFolder(SmartFolderViewState),
     Collection(CollectionGridRestore),
+    CollectionPhysical(CollectionGridPhysicalRestore),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RatingPhysicalRestore {
+    pub(crate) visible_path: PathBuf,
+    pub(crate) stars: u8,
+    pub(crate) nav_chain: Vec<PathBuf>,
+    pub(crate) saved_folder: Option<PathBuf>,
+    pub(crate) subfolder_restore: Option<SubfolderExpansionRestoreState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,6 +380,15 @@ pub(crate) struct CollectionGridRestore {
     /// Minimum revision hint. The actor may return any newer revision.
     pub(crate) revision_at_open: u64,
     pub(crate) viewport_anchor: Option<CollectionGridViewportAnchor>,
+}
+
+/// A visible physical child of a Collection root. The root restore keeps the stable collection
+/// and entry anchor for BS; the visible path is the independent Back/Forward location.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridPhysicalRestore {
+    pub(crate) root: CollectionGridRestore,
+    pub(crate) root_source_path: PathBuf,
+    pub(crate) visible_path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -427,6 +447,13 @@ pub(crate) struct CollectionGridPhysicalLoadOwner {
     pub(crate) root_source_path: PathBuf,
     pub(crate) target_path: PathBuf,
     pub(crate) origin: CollectionGridPhysicalLoadOrigin,
+    pub(crate) intent: CollectionGridPhysicalLoadIntent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionGridPhysicalLoadIntent {
+    Explicit,
+    Playback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1143,11 +1170,13 @@ impl TopLevelGridRestore {
             Self::ReadingHistory => Some(super::reading_history_synthetic_path()),
             Self::Bookmarks => Some(super::bookmark_view_synthetic_path()),
             Self::Rating { .. } => Some(super::rating_view_synthetic_path()),
+            Self::RatingPhysical(restore) => Some(restore.visible_path.clone()),
             Self::SubfolderExpansion(_) => Some(super::subfolder_expansion_synthetic_path()),
             Self::SmartFolder(state) => Some(super::smart_folder::smart_folder_synthetic_path(
                 state.definition_id,
             )),
             Self::Collection(_) => None,
+            Self::CollectionPhysical(restore) => Some(restore.visible_path.clone()),
         }
     }
 
@@ -1261,6 +1290,9 @@ pub(crate) struct TopLevelGridView {
     /// cloned into duplicated contexts; dropping/replacing a surface cancels its workers.
     collection_navigation_pending:
         Option<super::collection_navigation::CollectionNavigationPending>,
+    /// History replay preparation travels with its viewer bundle during park/mount and is never
+    /// copied into a sibling context. The transition owns its cancellation and old-view intent.
+    history_navigation_transition: Option<super::HistoryNavigationTransition>,
     /// Monotonic intent identity for collection playback requests in this viewer context.
     /// Navigation producers and terminal actions advance it so an index ABA cannot make an old
     /// asynchronous result current again.
@@ -1283,6 +1315,7 @@ impl Clone for TopLevelGridView {
             smart_folder_session: None,
             collection_session: self.collection_session.clone(),
             collection_navigation_pending: None,
+            history_navigation_transition: None,
             collection_navigation_sequence: self.collection_navigation_sequence,
             collection_navigation_retired_fs_lock: false,
             collection_navigation_retired_pdf_password: false,
@@ -1295,6 +1328,7 @@ impl Drop for TopLevelGridView {
         if let Some(pending) = self.collection_navigation_pending.as_ref() {
             pending.cancel();
         }
+        self.history_navigation_transition.take();
     }
 }
 
@@ -1322,6 +1356,7 @@ impl Default for TopLevelGridView {
             smart_folder_session: None,
             collection_session: None,
             collection_navigation_pending: None,
+            history_navigation_transition: None,
             collection_navigation_sequence: 0,
             collection_navigation_retired_fs_lock: false,
             collection_navigation_retired_pdf_password: false,
@@ -1332,6 +1367,25 @@ impl Default for TopLevelGridView {
 impl TopLevelGridView {
     pub(crate) fn surface(&self) -> &TopLevelGridSurface {
         &self.surface
+    }
+
+    pub(crate) fn history_navigation_transition(
+        &self,
+    ) -> Option<&super::HistoryNavigationTransition> {
+        self.history_navigation_transition.as_ref()
+    }
+
+    pub(crate) fn take_history_navigation_transition(
+        &mut self,
+    ) -> Option<super::HistoryNavigationTransition> {
+        self.history_navigation_transition.take()
+    }
+
+    pub(crate) fn set_history_navigation_transition(
+        &mut self,
+        transition: Option<super::HistoryNavigationTransition>,
+    ) {
+        self.history_navigation_transition = transition;
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -1347,6 +1401,7 @@ impl TopLevelGridView {
         self.advance_collection_navigation_sequence();
         self.smart_folder_session = None;
         self.set_collection_navigation_pending(None);
+        self.history_navigation_transition.take();
         self.collection_session = match &surface {
             TopLevelGridSurface::Collection(identity) => {
                 Some(CollectionGridSession::new(*identity))
@@ -1372,6 +1427,7 @@ impl TopLevelGridView {
             self.smart_folder_session = None;
         }
         self.set_collection_navigation_pending(None);
+        self.history_navigation_transition.take();
         self.collection_session = match &surface {
             TopLevelGridSurface::Collection(identity) => {
                 Some(CollectionGridSession::new(*identity))
@@ -1388,6 +1444,7 @@ impl TopLevelGridView {
         self.advance_collection_navigation_sequence();
         self.smart_folder_session = None;
         self.set_collection_navigation_pending(None);
+        self.history_navigation_transition.take();
         self.collection_session = None;
         self.surface = TopLevelGridSurface::Folder;
         self.return_to.take()
@@ -1724,6 +1781,35 @@ mod tests {
             view.return_to(),
             Some(TopLevelGridRestore::Folder(path)) if path == Path::new(r"D:\origin")
         ));
+    }
+
+    #[test]
+    fn physical_restore_variants_keep_visible_path_and_distinct_origin() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let root = CollectionGridRestore {
+            identity: CollectionGridIdentity {
+                collection_id: crate::collection_store::CollectionId::new(),
+            },
+            revision_at_open: 7,
+            viewport_anchor: None,
+        };
+        let child = PathBuf::from(r"C:\books\child");
+        let collection = TopLevelGridRestore::CollectionPhysical(CollectionGridPhysicalRestore {
+            root,
+            root_source_path: child.clone(),
+            visible_path: child.clone(),
+        });
+        assert_eq!(collection.legacy_path().as_deref(), Some(child.as_path()));
+
+        let rating = TopLevelGridRestore::RatingPhysical(RatingPhysicalRestore {
+            visible_path: child.clone(),
+            stars: 3,
+            nav_chain: vec![child.clone()],
+            saved_folder: Some(PathBuf::from(r"C:\prior")),
+            subfolder_restore: None,
+        });
+        assert_eq!(rating.legacy_path().as_deref(), Some(child.as_path()));
+        assert_eq!(rating.rating_stars(), None);
     }
 
     #[test]

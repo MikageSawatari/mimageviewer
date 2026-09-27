@@ -27923,6 +27923,7 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::Home => KeyName::Home,
                     crate::key_input::SyntheticNavigationKey::End => KeyName::End,
                     crate::key_input::SyntheticNavigationKey::Enter => KeyName::Enter,
+                    crate::key_input::SyntheticNavigationKey::Backspace => KeyName::Backspace,
                     crate::key_input::SyntheticNavigationKey::Escape => KeyName::Esc,
                     crate::key_input::SyntheticNavigationKey::F12 => KeyName::F12,
                 };

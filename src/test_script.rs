@@ -1284,6 +1284,7 @@ pub(crate) enum UiSmokeAction {
     OpenThumbnailPreferences,
     OpenFirstSmartFolder,
     OpenSeededCollection,
+    OpenRatingOne,
     AlwaysOnTopOn,
     AlwaysOnTopOff,
     MinimizeRoot,
@@ -2419,6 +2420,7 @@ fn parse_navigation_key(name: &str) -> Result<SyntheticNavigationKey, Box<EvalAl
         "home" => SyntheticNavigationKey::Home,
         "end" => SyntheticNavigationKey::End,
         "enter" => SyntheticNavigationKey::Enter,
+        "backspace" => SyntheticNavigationKey::Backspace,
         "escape" | "esc" => SyntheticNavigationKey::Escape,
         "f12" => SyntheticNavigationKey::F12,
         _ => {
@@ -2577,6 +2579,23 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                     .map_err(rhai_error),
                 _ => Err(rhai_error(format!(
                     "unknown Collection sort smoke action: {name}"
+                ))),
+            }
+        },
+    );
+    let folder_history_bridge = bridge.clone();
+    engine.register_fn(
+        "folder_history_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            match name.as_str() {
+                "open_rating_one" => folder_history_bridge
+                    .send(UiCommand::SmokeAction(UiSmokeAction::OpenRatingOne))
+                    .map_err(rhai_error),
+                "open_seeded_collection" => folder_history_bridge
+                    .send(UiCommand::SmokeAction(UiSmokeAction::OpenSeededCollection))
+                    .map_err(rhai_error),
+                _ => Err(rhai_error(format!(
+                    "unknown folder-history smoke action: {name}"
                 ))),
             }
         },
@@ -4955,6 +4974,14 @@ mod tests {
     #[test]
     fn collection_sort_smoke_script_parses_without_launching_the_app() {
         let script = include_str!("../scripts/ui-smoke/rating-sort-collection.rhai");
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine.compile(script).unwrap();
+    }
+
+    #[test]
+    fn folder_history_smoke_script_parses_without_launching_the_app() {
+        let script = include_str!("../scripts/ui-smoke/folder-history.rhai");
         let mut engine = rhai::Engine::new();
         engine.set_max_expr_depths(64, 64);
         engine.compile(script).unwrap();

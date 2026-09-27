@@ -1764,6 +1764,9 @@ impl App {
             crate::app::FolderNavHistoryTarget::Rating { stars } => {
                 format!("レーティング: {}", "★".repeat(usize::from(*stars)))
             }
+            crate::app::FolderNavHistoryTarget::RatingPhysical(restore) => {
+                restore.visible_path.to_string_lossy().into_owned()
+            }
             crate::app::FolderNavHistoryTarget::SmartFolder(state) => {
                 format!("スマートフォルダ: {}", state.definition_id)
             }
@@ -1782,6 +1785,9 @@ impl App {
                         || format!("コレクション: {id:?}"),
                         |definition| format!("コレクション: {}", definition.name),
                     )
+            }
+            crate::app::FolderNavHistoryTarget::CollectionPhysical(restore) => {
+                restore.visible_path.to_string_lossy().into_owned()
             }
         }
     }

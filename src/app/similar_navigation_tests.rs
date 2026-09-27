@@ -1585,7 +1585,7 @@ fn password_wait_can_resume_and_true_cancel_releases_the_viewer_owner() {
     assert!(app.suspend_fs_navigation_sequence_for_password());
     app.fullscreen_idx = None;
     let pdf = PathBuf::from(r"C:\pdf\locked.pdf");
-    app.pdf_password_request = Some(PdfPasswordRequest { path: pdf.clone() });
+    app.pdf_password_request = Some(PdfPasswordRequest::legacy(pdf.clone()));
     app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
@@ -1624,16 +1624,22 @@ fn similar_hit_pdf_handler_polls_and_missing_required_page_never_falls_back() {
     );
 
     app.open_similar_hit_for_test(&ctx, &hit);
-    let (pending_path, password, pending_handle) = app
-        .pdf_enumerate_pending
-        .take()
-        .expect("PDF handler must start asynchronous enumeration");
-    assert!(crate::folder_tree::path_eq(&pending_path, &pdf));
-    pending_handle.cancel();
-    drop(pending_handle);
-    let completed = crate::pdf_loader::completed_enumerate_handle_for_test(
-        &pdf,
-        Ok(vec![
+    assert_eq!(
+        app.fullscreen_idx,
+        Some(0),
+        "source viewer stays mounted during preflight"
+    );
+    assert_eq!(app.current_folder.as_deref(), Some(old_folder.as_path()));
+    let Some(HistoryNavigationTransition::Physical(mut request)) =
+        app.top_level_grid_view.take_history_navigation_transition()
+    else {
+        panic!("PDF handler must stage its required destination");
+    };
+    let PhysicalHistoryPhase::Preflighting { preflight, .. } = &mut request.phase else {
+        panic!("PDF handler must preflight before visible adoption");
+    };
+    *preflight = collection_navigation::PhysicalHistoryPreflight::ready_for_test(
+        collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(vec![
             crate::pdf_loader::PdfPageEntry {
                 page_num: 0,
                 mtime: 1,
@@ -1646,9 +1652,9 @@ fn similar_hit_pdf_handler_polls_and_missing_required_page_never_falls_back() {
             },
         ]),
     );
-    app.pdf_enumerate_pending = Some((pending_path, password, completed));
-
-    app.poll_pdf_enumerate();
+    app.top_level_grid_view
+        .set_history_navigation_transition(Some(HistoryNavigationTransition::Physical(request)));
+    app.poll_collection_history_transition(&ctx);
 
     assert_eq!(app.fullscreen_idx, None);
     assert!(app.pdf_enumerate_pending.is_none());
@@ -1679,39 +1685,43 @@ fn similar_book_page_zip_handler_polls_then_materializes_real_case_and_exact_lea
             entry_name: "booka/sub/p01.jpg".to_owned(),
         },
     );
-    let pending = app
-        .zip_enumerate_pending
-        .take()
-        .expect("ZIP handler must start asynchronous enumeration");
-    assert!(crate::folder_tree::path_eq(&pending.zip_path, &zip_path));
-    pending.cancel.store(true, Ordering::Relaxed);
-    let input_seq = pending.input_seq;
-    let (tx, rx) = mpsc::channel();
-    tx.send(Ok(crate::zip_loader::ZipEnumeration {
-        entries: vec![
-            crate::zip_loader::ZipImageEntry {
-                entry_name: "BookA/Sub/P01.JPG".to_owned(),
-                uncompressed_size: 1,
-                mtime: 0,
+    let Some(HistoryNavigationTransition::Physical(mut request)) =
+        app.top_level_grid_view.take_history_navigation_transition()
+    else {
+        panic!("ZIP handler must stage its required destination");
+    };
+    let PhysicalHistoryPhase::Preflighting { preflight, .. } = &mut request.phase else {
+        panic!("ZIP handler must preflight before visible adoption");
+    };
+    *preflight = collection_navigation::PhysicalHistoryPreflight::ready_for_test(
+        collection_navigation::PhysicalHistoryPreflightPayload::Zip(
+            crate::zip_loader::ZipEnumeration {
+                entries: vec![
+                    crate::zip_loader::ZipImageEntry {
+                        entry_name: "BookA/Sub/P01.JPG".to_owned(),
+                        uncompressed_size: 1,
+                        mtime: 0,
+                    },
+                    crate::zip_loader::ZipImageEntry {
+                        entry_name: "BookB/P02.JPG".to_owned(),
+                        uncompressed_size: 1,
+                        mtime: 0,
+                    },
+                ],
+                has_foreign_archives: false,
+                legacy_renames: Vec::new(),
             },
-            crate::zip_loader::ZipImageEntry {
-                entry_name: "BookB/P02.JPG".to_owned(),
-                uncompressed_size: 1,
-                mtime: 0,
-            },
-        ],
-        has_foreign_archives: false,
-        legacy_renames: Vec::new(),
-    }))
-    .unwrap();
-    app.zip_enumerate_pending = Some(ZipEnumeratePending {
-        zip_path: zip_path.clone(),
-        input_seq,
-        cancel: Arc::new(AtomicBool::new(false)),
-        rx,
-    });
-
-    app.poll_zip_enumerate();
+        ),
+    );
+    assert_eq!(
+        app.fullscreen_idx,
+        Some(0),
+        "source viewer stays mounted during preflight"
+    );
+    assert_eq!(app.current_folder.as_deref(), Some(old_folder.as_path()));
+    app.top_level_grid_view
+        .set_history_navigation_transition(Some(HistoryNavigationTransition::Physical(request)));
+    app.poll_collection_history_transition(&ctx);
 
     let opened = app
         .fullscreen_idx

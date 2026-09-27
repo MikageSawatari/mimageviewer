@@ -49,6 +49,7 @@ pub(crate) enum ArchiveConvertCompletionPolicy {
     MainGridArchive(crate::app::MainGridArchiveTransitionIntent),
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
     DetachedGridArchive(crate::app::DetachedGridArchiveOpenRequestOwner),
+    StagedHistory(u64),
     SiblingZip,
 }
 
@@ -65,6 +66,7 @@ impl ArchiveConvertCompletionPolicy {
             Self::Navigation
             | Self::MainGridArchive(_)
             | Self::DetachedGridArchive(_)
+            | Self::StagedHistory(_)
             | Self::SiblingZip => None,
         }
     }
@@ -74,9 +76,11 @@ impl ArchiveConvertCompletionPolicy {
     ) -> Option<&crate::app::DetachedGridArchiveOpenRequestOwner> {
         match self {
             Self::DetachedGridArchive(owner) => Some(owner),
-            Self::Navigation | Self::MainGridArchive(_) | Self::Bookmark(_) | Self::SiblingZip => {
-                None
-            }
+            Self::Navigation
+            | Self::MainGridArchive(_)
+            | Self::Bookmark(_)
+            | Self::StagedHistory(_)
+            | Self::SiblingZip => None,
         }
     }
 
@@ -87,7 +91,7 @@ impl ArchiveConvertCompletionPolicy {
                 intent.clone(),
             )),
             Self::Bookmark(owner) => Some(crate::app::OpenRequestOwner::Bookmark(owner.clone())),
-            Self::DetachedGridArchive(_) | Self::SiblingZip => None,
+            Self::DetachedGridArchive(_) | Self::StagedHistory(_) | Self::SiblingZip => None,
         }
     }
 }
@@ -493,6 +497,14 @@ impl App {
                     );
                     ArchiveConvertCompletionPolicy::Navigation
                 }
+                crate::app::OpenRequestOwner::RatingPhysical(_) => {
+                    debug_assert!(false, "convertible Rating items use MainGridArchive owner");
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::QuickFolderSwitch(_) => {
+                    debug_assert!(false, "quick-folder switch preflights convertible archives");
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
                 crate::app::OpenRequestOwner::MainGridArchive(intent) => {
                     ArchiveConvertCompletionPolicy::MainGridArchive(intent)
                 }
@@ -559,6 +571,14 @@ impl App {
                         false,
                         "convertible collection items use MainGridArchive owner"
                     );
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::RatingPhysical(_) => {
+                    debug_assert!(false, "convertible Rating items use MainGridArchive owner");
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::QuickFolderSwitch(_) => {
+                    debug_assert!(false, "quick-folder switch preflights convertible archives");
                     ArchiveConvertCompletionPolicy::Navigation
                 }
                 crate::app::OpenRequestOwner::MainGridArchive(intent) => {
@@ -832,6 +852,9 @@ impl App {
 
     /// 毎フレーム呼ばれるダイアログ描画・メッセージ処理のエントリポイント。
     pub(crate) fn show_archive_convert_dialog(&mut self, ctx: &egui::Context) {
+        if self.discard_stale_staged_history_archive_conversion() {
+            return;
+        }
         if self.discard_stale_main_grid_archive_request() {
             return;
         }
@@ -872,6 +895,11 @@ impl App {
             let completion = state.completion.clone();
             let nav_history_rollback = state.nav_history_rollback.clone();
             drop(state);
+            if let ArchiveConvertCompletionPolicy::StagedHistory(request_id) = &completion {
+                self.complete_staged_history_archive_conversion(*request_id, src);
+                ctx.request_repaint();
+                return;
+            }
             if crate::perf::is_enabled() {
                 let archive_key = crate::path_key::normalize_keep_drive(&src);
                 crate::perf::event(
@@ -1110,6 +1138,14 @@ impl App {
                     .as_ref()
                     .and_then(|s| s.nav_history_rollback.clone());
                 self.archive_convert = None;
+                if let ArchiveConvertCompletionPolicy::StagedHistory(request_id) = &completion {
+                    if let Some(source) = src {
+                        let _ = source;
+                        self.complete_staged_history_archive_conversion(*request_id, nav);
+                        ctx.request_repaint();
+                    }
+                    return;
+                }
                 if let ArchiveConvertCompletionPolicy::DetachedGridArchive(owner) = &completion {
                     #[cfg(windows)]
                     let outcome = self.open_converted_grid_archive_in_detached_context(
@@ -1171,7 +1207,8 @@ impl App {
                         ),
                         ArchiveConvertCompletionPolicy::Navigation
                         | ArchiveConvertCompletionPolicy::MainGridArchive(_)
-                        | ArchiveConvertCompletionPolicy::Bookmark(_) => {}
+                        | ArchiveConvertCompletionPolicy::Bookmark(_)
+                        | ArchiveConvertCompletionPolicy::StagedHistory(_) => {}
                     }
                     return;
                 };

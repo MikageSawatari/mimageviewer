@@ -2420,6 +2420,7 @@ impl App {
                 suppress_rating_filter: false,
                 suppress_facet_filter: false,
                 smart_folder_owner: super::SmartGridArchiveOwner::Transition(transition.request_id),
+                rating_grid_owner: None,
                 collection_grid_owner: None,
                 collection_navigation_continuation: None,
             });

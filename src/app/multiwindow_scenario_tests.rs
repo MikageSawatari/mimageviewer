@@ -2821,13 +2821,24 @@ fn multiwindow_scenario_collection_root_async_sibling_result_is_owner_scoped() {
             std::time::Duration::from_secs(5),
             || {
                 app.with_active_viewer_context(|owner| {
-                owner.poll_collection_navigation(&driver.ctx);
-                matches!(
-                    owner.top_level_grid_view.collection_navigation_pending_for_test(),
-                    Some(super::collection_navigation::CollectionNavigationPending::Snapshot { .. })
-                )
-            })
-            .unwrap_or(false)
+                    if matches!(
+                        owner.top_level_grid_view.collection_navigation_pending_for_test(),
+                        Some(super::collection_navigation::CollectionNavigationPending::Snapshot { .. })
+                    ) {
+                        return true;
+                    }
+                    if matches!(
+                        owner.top_level_grid_view.collection_navigation_pending_for_test(),
+                        Some(super::collection_navigation::CollectionNavigationPending::RequestNeeded { .. })
+                    ) {
+                        owner.poll_collection_navigation(&driver.ctx);
+                    }
+                    matches!(
+                        owner.top_level_grid_view.collection_navigation_pending_for_test(),
+                        Some(super::collection_navigation::CollectionNavigationPending::Snapshot { .. })
+                    )
+                })
+                .unwrap_or(false)
             },
         );
         collection_order_open(&mut app, &mut driver, true, 2, &c);

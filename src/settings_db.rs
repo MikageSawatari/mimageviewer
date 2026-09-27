@@ -6521,19 +6521,21 @@ mod tests {
             )
             .unwrap()
         };
-        let mut statement = conn.prepare("SELECT value FROM settings_kv").unwrap();
-        let persisted_json = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .join("|");
-
-        assert!(!persisted_json.contains("RatedAt"));
+        for key in [
+            "details_sort_key",
+            "details_column_order",
+            "details_column_widths",
+            "details_selection_bar_column_order",
+            "details_selection_bar_column_widths",
+        ] {
+            assert!(
+                !read(key).contains("RatedAt"),
+                "{key} must remain readable by older details settings"
+            );
+        }
         assert_eq!(read("details_sort_key"), r#""Toolbar""#);
         assert_eq!(read("details_rated_at_width"), "154.0");
         assert_eq!(read("details_selection_bar_rated_at_width"), "176.0");
-        drop(statement);
         drop(conn);
 
         let mut loaded = db.load_into_settings().unwrap();
