@@ -15271,9 +15271,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             None
         };
         if activation_allowed {
-            if self.reject_ignored_epub_grid_item(idx).is_some() {
-                return nav;
-            }
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
             if self.stack_try_open_from_grid(ctx, idx, true) {

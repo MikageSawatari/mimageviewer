@@ -8381,6 +8381,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn epub_modal_blocks_ring_and_keyboard_history_dispatch() {
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("ring-modal-source");
+        std::fs::create_dir(&folder).unwrap();
+        app.load_folder(folder.clone());
+        app.active_quick_folder_slot = None;
+        let back = app.tmp.path().join("ring-modal-back");
+        std::fs::create_dir(&back).unwrap();
+        app.folder_nav_back_stack
+            .push(super::super::FolderNavHistoryTarget::Path(back));
+        let before = app.folder_nav_back_stack.clone();
+        let epub = app.tmp.path().join("ring-modal.epub");
+        assert_eq!(
+            app.route_pdf_open_failure(
+                super::super::OpenRequestOwner::Navigation,
+                &epub,
+                super::super::PdfOpenFailure::NotConverted,
+            ),
+            super::super::PdfOpenFailureRoute::ConversionDialogOpened
+        );
+        let ctx = egui::Context::default();
+        let ring = app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::GridHistoryBack,
+            "modal-ring-test",
+        );
+        if matches!(ring, Some(crate::ui_main::AddressBarNav::HistoryBack)) {
+            let mut rollback = None;
+            assert!(
+                app.dispatch_main_folder_history_input(
+                    super::super::FolderHistoryDirection::Back,
+                    &mut rollback,
+                )
+                .is_none()
+            );
+        }
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            }],
+            ..Default::default()
+        });
+        let keyboard = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+        assert!(keyboard.is_none());
+        assert_eq!(app.folder_nav_back_stack, before);
+        assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+        assert!(app.epub_convert.is_some());
+    }
+
     /// 「ゲームパッドの操作を受け付ける」を切ったら、本当に届かない。
     ///
     /// `GamepadRuntime` 側の停止契約とは別に、**App がその設定を渡しているか**を見る。

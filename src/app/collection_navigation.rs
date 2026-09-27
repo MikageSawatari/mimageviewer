@@ -3451,7 +3451,7 @@ impl App {
                             history_trigger,
                         );
                     }
-                    FolderOpenOutcome::ConversionDialogOpened => {
+                    FolderOpenOutcome::Classifying | FolderOpenOutcome::ConversionDialogOpened => {
                         let _ = self.attach_archive_convert_deferred_fullscreen(
                             restore_video_tile,
                             resume_slideshow,
@@ -3471,7 +3471,7 @@ impl App {
                             history_trigger,
                         );
                     }
-                    FolderOpenOutcome::ConversionDialogOpened => {
+                    FolderOpenOutcome::Classifying | FolderOpenOutcome::ConversionDialogOpened => {
                         let _ = self.attach_archive_convert_deferred_fullscreen(
                             restore_video_tile,
                             true,

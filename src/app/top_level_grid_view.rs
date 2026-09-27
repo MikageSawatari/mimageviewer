@@ -1293,6 +1293,9 @@ pub(crate) struct TopLevelGridView {
     /// History replay preparation travels with its viewer bundle during park/mount and is never
     /// copied into a sibling context. The transition owns its cancellation and old-view intent.
     history_navigation_transition: Option<Box<super::HistoryNavigationTransition>>,
+    /// Classification is a cancellable candidate, separate from the accepted history owner.
+    /// Its worker may finish while an earlier owner remains active.
+    open_path_classification: Option<Box<super::OpenPathClassification>>,
     /// Monotonic intent identity for collection playback requests in this viewer context.
     /// Navigation producers and terminal actions advance it so an index ABA cannot make an old
     /// asynchronous result current again.
@@ -1316,6 +1319,7 @@ impl Clone for TopLevelGridView {
             collection_session: self.collection_session.clone(),
             collection_navigation_pending: None,
             history_navigation_transition: None,
+            open_path_classification: None,
             collection_navigation_sequence: self.collection_navigation_sequence,
             collection_navigation_retired_fs_lock: false,
             collection_navigation_retired_pdf_password: false,
@@ -1329,6 +1333,7 @@ impl Drop for TopLevelGridView {
             pending.cancel();
         }
         self.history_navigation_transition.take();
+        self.open_path_classification.take();
     }
 }
 
@@ -1357,6 +1362,7 @@ impl Default for TopLevelGridView {
             collection_session: None,
             collection_navigation_pending: None,
             history_navigation_transition: None,
+            open_path_classification: None,
             collection_navigation_sequence: 0,
             collection_navigation_retired_fs_lock: false,
             collection_navigation_retired_pdf_password: false,
@@ -1388,6 +1394,31 @@ impl TopLevelGridView {
         transition: Option<super::HistoryNavigationTransition>,
     ) {
         self.history_navigation_transition = transition.map(Box::new);
+    }
+
+    pub(crate) fn set_open_path_classification(
+        &mut self,
+        candidate: Option<super::OpenPathClassification>,
+    ) {
+        self.open_path_classification = candidate.map(Box::new);
+    }
+
+    pub(crate) fn take_open_path_classification(
+        &mut self,
+    ) -> Option<super::OpenPathClassification> {
+        self.open_path_classification
+            .take()
+            .map(|candidate| *candidate)
+    }
+
+    pub(crate) fn open_path_classification(&self) -> Option<&super::OpenPathClassification> {
+        self.open_path_classification.as_deref()
+    }
+
+    pub(crate) fn open_path_classification_mut(
+        &mut self,
+    ) -> Option<&mut super::OpenPathClassification> {
+        self.open_path_classification.as_deref_mut()
     }
 
     pub(crate) fn generation(&self) -> u64 {

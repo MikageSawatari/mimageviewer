@@ -113,10 +113,23 @@ impl App {
     }
 
     pub(crate) fn start_batch_convert_to_pdf_at(&mut self, clicked_index: Option<usize>) {
-        if self.epub_batch_convert.is_some()
-            || self.epub_convert.is_some()
+        if self.document_open_modal_admission_blocked()
             || self.batch_convert.is_some()
             || self.archive_convert.is_some()
+            || self.pdf_enumerate_pending.as_ref().is_some_and(|pending| {
+                matches!(pending.5, crate::app::PdfOpenPhase::ColdCandidate { .. })
+            })
+            || self
+                .top_level_grid_view
+                .open_path_classification()
+                .is_some()
+            || self.folder_open_preparation_pending()
+            || self.startup_open_path_resolve_pending.is_some()
+            || self.bookmark_open_pending.is_some()
+            || self
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
         {
             return;
         }

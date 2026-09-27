@@ -30,7 +30,8 @@ pub(crate) enum EpubConvertPhase {
     SaveError(String),
 }
 
-/// Abort restores the view left by this request. A later open already owns a superseded view.
+/// Abort restores the view owned by this request. Superseded only rejects a stale same-owner
+/// completion or a context-close result; modal admission prevents an independent open here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EpubConvertExit {
     Abort,
@@ -448,17 +449,7 @@ impl App {
     }
 
     pub(crate) fn epub_convert_dialog_visible(&self) -> bool {
-        self.epub_convert.as_ref().is_some_and(|state| {
-            !matches!(state.phase, EpubConvertPhase::Scanning)
-                || !self.settings.epub_convert_suppresses_confirm()
-        })
-    }
-
-    pub(crate) fn cancel_superseded_epub_convert(&mut self) {
-        // Every accepted later open is a new request, including a reload of the same path.
-        if self.epub_convert.is_some() {
-            self.finish_epub_convert(EpubConvertExit::Superseded);
-        }
+        self.epub_convert.is_some()
     }
 
     pub(crate) fn restore_epub_open(&mut self, restore: EpubOpenRestore) {
@@ -473,13 +464,12 @@ impl App {
         }
     }
 
-    pub(crate) fn finish_epub_convert(&mut self, exit: EpubConvertExit) -> Option<EpubOpenRestore> {
+    pub(crate) fn finish_epub_convert(&mut self, exit: EpubConvertExit) {
         let Some(mut state) = self.epub_convert.take() else {
-            return None;
+            return;
         };
         let had_deferred = state.deferred_fullscreen.take().is_some();
         let continuation = state.continuation.clone();
-        let active_logical = state.src_path.clone();
         let restore = std::mem::replace(
             &mut state.open_restore,
             EpubOpenRestore {
@@ -511,26 +501,18 @@ impl App {
         }
         match exit {
             EpubConvertExit::Abort => {
-                // A replacement may have updated the address to its own EPUB path while
-                // retaining the first request's rollback snapshot.
                 if matches!(continuation, EpubOpenContinuation::Direct(_)) {
-                    self.restore_address_after_epub_open_aborted(&active_logical);
                     self.restore_epub_open(restore);
                 }
-                None
             }
-            EpubConvertExit::Superseded => {
-                matches!(continuation, EpubOpenContinuation::Direct(_)).then_some(restore)
-            }
+            EpubConvertExit::Superseded => {}
         }
     }
 
-    fn replace_epub_convert_state(&mut self, mut state: EpubConvertState) {
-        if let Some(restore) = self.finish_epub_convert(EpubConvertExit::Superseded) {
-            if matches!(state.continuation, EpubOpenContinuation::Direct(_)) {
-                state.open_restore = restore;
-            }
-        }
+    fn replace_epub_convert_state(&mut self, state: EpubConvertState) {
+        // A different open cannot be admitted while the modal owns the current conversion.
+        // This terminal only rejects a stale same-owner child completion.
+        self.finish_epub_convert(EpubConvertExit::Superseded);
         self.epub_convert = Some(state);
     }
 
@@ -694,8 +676,6 @@ impl App {
         let mut close = false;
         let mut convert = false;
         let mut save = false;
-        if !matches!(state.phase, EpubConvertPhase::Scanning)
-            || !self.settings.epub_convert_suppresses_confirm()
         {
             let escape = self.dialog_escape_pressed(ctx);
             let enter = self.dialog_enter_pressed(ctx);
@@ -859,6 +839,58 @@ mod tests {
             tx,
             cancel,
         )
+    }
+
+    #[test]
+    fn convert_mode_scanning_keeps_visible_modal_and_input_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.epub_file_handling = crate::settings::EpubFileHandling::Convert;
+        let (state, _sender, _cancel) = fake_state(EpubConvertPhase::Scanning);
+        app.epub_convert = Some(state);
+        assert!(app.epub_convert_dialog_visible());
+        assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
+        let output = egui::Context::default().run(Default::default(), |ctx| {
+            app.show_epub_convert_dialog(ctx);
+        });
+        assert!(!output.shapes.is_empty());
+    }
+
+    #[test]
+    fn every_conversion_phase_keeps_visible_modal_in_ask_and_convert_modes() {
+        let phases = || {
+            vec![
+                EpubConvertPhase::Scanning,
+                EpubConvertPhase::Confirm(EpubInspectSummary {
+                    layout: "fixed".into(),
+                    direction: "ltr".into(),
+                    spine_count: 1,
+                    sibling_pdf_exists: false,
+                }),
+                EpubConvertPhase::Converting(None),
+                EpubConvertPhase::Saving(None),
+                EpubConvertPhase::Stale,
+                EpubConvertPhase::Error("failure".into()),
+                EpubConvertPhase::SaveError("failure".into()),
+            ]
+        };
+        for handling in [
+            crate::settings::EpubFileHandling::Ask,
+            crate::settings::EpubFileHandling::Convert,
+        ] {
+            for phase in phases() {
+                let mut app = crate::app::setup_app_for_test();
+                app.settings.epub_file_handling = handling;
+                let (state, _sender, _cancel) = fake_state(phase);
+                app.epub_convert = Some(state);
+                assert!(app.epub_convert_dialog_visible());
+                assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
+                let output = egui::Context::default().run(Default::default(), |ctx| {
+                    app.show_epub_convert_dialog(ctx);
+                });
+                assert!(!output.shapes.is_empty());
+                assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
+            }
+        }
     }
 
     #[test]

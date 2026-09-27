@@ -1129,6 +1129,15 @@ impl<'a> ContextRef<'a> {
         }
     }
 
+    pub(in crate::app) fn epub_convert(
+        self,
+    ) -> Option<&'a crate::ui_dialogs::epub_convert::EpubConvertState> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.epub_convert.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.epub_convert.as_ref(),
+        }
+    }
+
     pub(in crate::app) fn current_folder(self) -> Option<&'a Path> {
         match self.source {
             ContextRefSource::Mounted(app) => app.current_folder.as_deref(),
@@ -3170,6 +3179,21 @@ impl App {
         self.viewer_contexts.table.ids()
     }
 
+    /// Modal admission can be checked while a detached context is being built. Unlike `ids`,
+    /// reading the projected payload and parked slots does not require a settled table operation.
+    pub(in crate::app) fn document_modal_owners_in_any_context(&self) -> (bool, bool) {
+        let mut epub = self.epub_convert.is_some();
+        let mut password = self.pdf_password_request.is_some();
+        for slot in self.viewer_contexts.table.slots.values() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            epub |= bundle.epub_convert.is_some();
+            password |= bundle.pdf_password_request.is_some();
+        }
+        (epub, password)
+    }
+
     /// Every context except the one currently projected onto `App`. See `ContextTable::other_ids`.
     pub(in crate::app) fn other_viewer_context_ids(&self) -> Vec<ViewerContextId> {
         self.viewer_contexts.table.other_ids()
@@ -3949,6 +3973,7 @@ mod tests {
             },
             epub.clone(),
         ));
+        app.settle_open_path_classification_for_test();
         let Some(super::super::HistoryNavigationTransition::Physical(mut request)) =
             app.top_level_grid_view.take_history_navigation_transition()
         else {

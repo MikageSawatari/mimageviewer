@@ -1635,6 +1635,9 @@ impl App {
     /// as physical folders. Actor refreshes, toolbar Add, and collection-owned child navigation
     /// continue to call `open_collection_grid` directly and therefore do not create entries.
     pub(crate) fn open_collection_grid_from_navigation(&mut self, collection_id: CollectionId) {
+        if self.document_open_modal_admission_blocked() {
+            return;
+        }
         let revision_at_open = self.collection_catalog_revision(collection_id).unwrap_or(0);
         let restore = CollectionGridRestore {
             identity: CollectionGridIdentity { collection_id },
@@ -3384,6 +3387,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !condition(app) {
             assert!(Instant::now() < deadline, "{message}");
+            app.settle_open_path_classification_for_test();
             app.poll_collection_ui(&ctx);
             app.poll_collection_grid(&ctx);
             app.poll_collection_history_transition(&ctx);
@@ -3645,6 +3649,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut seeded = false;
         loop {
+            app.settle_open_path_classification_for_test();
             seed_real_pdf_preflight_if_ready(app, pdf_pages, &mut seeded);
             app.poll_collection_ui(&ctx);
             seed_real_pdf_preflight_if_ready(app, pdf_pages, &mut seeded);
@@ -5438,6 +5443,7 @@ mod tests {
                 None,
                 super::super::OpenRequestOwner::CollectionGridPhysical(owner),
             ));
+            app.settle_open_path_classification_for_test();
             assert!(
                 matches!(
                     app.top_level_grid_view.history_navigation_transition(),
@@ -5571,6 +5577,65 @@ mod tests {
     #[cfg(windows)]
     fn real_epub_pages_and_outer_history_from_collection() {
         assert_real_virtual_history(false, true, true);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn real_cached_epub_direct_warm_placeholder_commits_before_worker_result() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let epub = temp.path().join("warm-book.epub");
+        let (_pin, _backend, stamp) = real_cached_epub_history_fixture(&epub, temp.path());
+        let target = crate::pdf_loader::pinned_epub_target(&epub).unwrap();
+        let pages = read_real_pdf_pages_for_history(target.read_path.as_path());
+        let (generation_id, generation_size) = stamp.generation_catalog_pair().unwrap();
+        let mut app = crate::app::setup_app_for_test();
+        app.get_or_open_catalog(temp.path())
+            .unwrap()
+            .set_pdf_meta("warm-book.epub", generation_id, generation_size, 2, false)
+            .unwrap();
+        app.load_folder(temp.path().to_path_buf());
+        let source = app.folder_nav_current_target();
+        assert!(app.peek_pdf_meta_cache(&epub, false).is_some());
+        assert_eq!(
+            app.load_pdf_as_folder_with_prepared_pages(
+                epub.clone(),
+                None,
+                super::super::OpenRequestOwner::Navigation,
+                None,
+                Some(source.clone()),
+            ),
+            super::super::FolderOpenOutcome::Loaded
+        );
+        assert!(matches!(
+            app.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
+            Some(super::super::PdfOpenPhase::CommittedVerification {
+                placeholder_count: 2
+            })
+        ));
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::PdfPage { .. }, GridItem::PdfPage { .. }]
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(epub.as_path()));
+        assert_eq!(app.folder_history_back_target(), source.as_ref());
+        let placeholder_generation = app.items_generation;
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &epub,
+                Ok(crate::pdf_loader::PdfEnumerateResult {
+                    pages,
+                    direction: Some(crate::pdf_loader::PdfReadingDirection::R2L),
+                    stamp: Some(stamp),
+                }),
+            );
+        app.poll_pdf_enumerate();
+        assert_eq!(app.items_generation, placeholder_generation);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Ltr
+        );
+        assert_eq!(app.folder_history_back_target(), source.as_ref());
     }
 
     #[test]
@@ -5842,15 +5907,13 @@ mod tests {
             false,
             owner,
         );
-        assert!(
-            app.top_level_grid_view
-                .history_navigation_transition()
-                .is_some()
-        );
+        app.settle_open_path_classification_for_test();
         poll_until(&mut app, "stale Collection tile did not settle", |app| {
-            app.top_level_grid_view
-                .history_navigation_transition()
-                .is_none()
+            app.current_folder.as_deref() == Some(source.as_path())
+                && app
+                    .top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
         });
 
         assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));

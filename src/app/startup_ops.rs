@@ -29,6 +29,11 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn poll_activation_open_paths(&mut self, ctx: &egui::Context) {
+        // Keep the channel queued while a document dialog owns local admission. Draining it
+        // after terminal naturally applies the existing last-activation-wins rule.
+        if self.document_open_modal_admission_blocked() {
+            return;
+        }
         let paths: Vec<PathBuf> = self.activation_open_path_rx.try_iter().collect();
         if self.sidecar_restore_active() {
             if !paths.is_empty() {
@@ -56,6 +61,19 @@ impl App {
         source: StartupOpenPathSource,
         ctx: &egui::Context,
     ) {
+        if self.document_open_modal_admission_blocked() {
+            match source {
+                StartupOpenPathSource::Activation => {
+                    #[cfg(windows)]
+                    let _ = self.activation_open_path_tx.send(requested);
+                    #[cfg(not(windows))]
+                    let _ = requested;
+                }
+                StartupOpenPathSource::InitialStartup => self.startup_open_path = Some(requested),
+                StartupOpenPathSource::Bookmark => {}
+            }
+            return;
+        }
         let Some(owner) = self.startup_open_path_owner(source) else {
             crate::logger::log(format!(
                 "startup open: reject ownerless resolve source={} requested={}",
@@ -186,7 +204,7 @@ impl App {
         // This request was accepted before the restore modal started. Keep the receiver and its
         // owner intact so the ordinary completion tail runs exactly once after restore terminal;
         // taking it here would let `load_folder` replace the restore target mid-transaction.
-        if self.sidecar_restore_active() {
+        if self.sidecar_restore_active() || self.document_open_modal_admission_blocked() {
             return;
         }
         let recv = match self.startup_open_path_resolve_pending.as_ref() {
@@ -719,7 +737,8 @@ impl App {
         };
 
         let openable = resolution.path;
-        if matches!(owner, StartupOpenPathOwner::Bookmark(_))
+        if matches!(resolution.kind, crate::folder_tree::OpenablePathKind::File)
+            && matches!(owner, StartupOpenPathOwner::Bookmark(_))
             && let Some(reason) = self.pdf_open_refusal(&openable)
         {
             self.show_pdf_open_refusal(reason);
@@ -759,9 +778,9 @@ impl App {
                     self.open_startup_file_if_visible(&result.requested);
                 }
                 return match outcome {
-                    FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened => {
-                        StartupOpenApplyOutcome::Opened
-                    }
+                    FolderOpenOutcome::Loaded
+                    | FolderOpenOutcome::Classifying
+                    | FolderOpenOutcome::ConversionDialogOpened => StartupOpenApplyOutcome::Opened,
                     FolderOpenOutcome::Ignored => StartupOpenApplyOutcome::NotOpenable,
                     FolderOpenOutcome::Refused(reason) => StartupOpenApplyOutcome::Refused(reason),
                 };
@@ -841,7 +860,9 @@ impl App {
             FolderOpenOutcome::Refused(reason) => {
                 return StartupOpenApplyOutcome::Refused(reason);
             }
-            FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened => {}
+            FolderOpenOutcome::Loaded
+            | FolderOpenOutcome::Classifying
+            | FolderOpenOutcome::ConversionDialogOpened => {}
         }
         if matches!(source, StartupOpenPathSource::Bookmark)
             && matches!(outcome, FolderOpenOutcome::Loaded)
