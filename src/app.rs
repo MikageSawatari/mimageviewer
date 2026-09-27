@@ -11865,6 +11865,7 @@ struct MediaResumeUpdate {
     position: f64,
     duration: f64,
     at_eof: bool,
+    audio_track_choice: Option<crate::video::SavedAudioTrackChoice>,
 }
 
 #[cfg(windows)]
@@ -11972,6 +11973,7 @@ fn viewer_context_media_teardown_plan(
                 position: video_resume_position_for_save(player, audio_mode_without_vst),
                 duration: player.duration(),
                 at_eof: player.is_at_eof(),
+                audio_track_choice: player.take_confirmed_audio_track_choice(),
             });
         }
     }
@@ -12059,10 +12061,14 @@ fn pause_viewer_context_bundle_media_for_remote_session(context: ContextRef<'_>)
 #[cfg(windows)]
 fn apply_viewer_context_media_resume_updates(
     map: &mut std::collections::HashMap<String, f64>,
+    choices: &mut std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>,
     updates: &[MediaResumeUpdate],
 ) -> Vec<String> {
     let mut removed = Vec::new();
     for update in updates {
+        if let Some(choice) = &update.audio_track_choice {
+            choices.insert(update.key.clone(), choice.clone());
+        }
         if !save_video_resume_position(
             map,
             update.key.clone(),
@@ -32706,6 +32712,9 @@ impl App {
         self.settings
             .video_resume_positions
             .retain(|key, _| !matches_key(key));
+        self.settings
+            .video_audio_track_choices
+            .retain(|key, _| !matches_key(key));
         #[cfg(windows)]
         self.video_resume_thumb_last_request
             .retain(|key, _| !matches_key(key));
@@ -34885,6 +34894,7 @@ impl App {
             return;
         }
         migrate_key_map_for_rename(&mut self.settings.video_resume_positions, &old_k, &new_k);
+        migrate_key_map_for_rename(&mut self.settings.video_audio_track_choices, &old_k, &new_k);
         #[cfg(windows)]
         migrate_key_map_for_rename(&mut self.video_resume_thumb_last_request, &old_k, &new_k);
     }
@@ -46922,6 +46932,7 @@ impl App {
             .collect();
         let removed = apply_viewer_context_media_resume_updates(
             &mut self.settings.video_resume_positions,
+            &mut self.settings.video_audio_track_choices,
             &updates,
         );
         for key in removed {
@@ -58960,6 +58971,17 @@ impl App {
         Some(Box::new(player))
     }
 
+    /// Both video and music builders read the same in-memory, normalized-path choice.
+    fn saved_audio_track_choice_for_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<crate::video::SavedAudioTrackChoice> {
+        self.settings
+            .video_audio_track_choices
+            .get(&crate::adjustment_db::normalize_path(path))
+            .cloned()
+    }
+
     /// フルスクリーン通常 open 用の動画プレイヤーを構築する。
     fn build_video_player_for_open(
         &mut self,
@@ -59012,6 +59034,7 @@ impl App {
         let play_test_start = play_test_for_video.and_then(|state| state.config.start_secs);
         let play_test_mute = play_test_for_video.is_some_and(|state| state.config.mute);
         let saved_resume = self.settings.video_resume_positions.get(&path_key).copied();
+        let initial_audio_track = self.saved_audio_track_choice_for_path(&vp);
         let resume = if ignore_resume {
             play_test_start
         } else {
@@ -59034,6 +59057,7 @@ impl App {
             false,
             autoplay,
             resume,
+            initial_audio_track,
             video_hw_decode,
             video_deinterlace,
             #[cfg(windows)]
@@ -59467,6 +59491,7 @@ impl App {
         // `video_resume_for_open` を音声設定で共有)。
         let path_key = crate::adjustment_db::normalize_path(&path);
         let saved_resume = self.settings.video_resume_positions.get(&path_key).copied();
+        let initial_audio_track = self.saved_audio_track_choice_for_path(&path);
         let resume = video_resume_for_open(
             saved_resume,
             from_grid,
@@ -59484,7 +59509,8 @@ impl App {
             false,
             autoplay,
             resume, // 音声 resume 設定に従う (既定=最初から)
-            false,  // hw_decode (音声のみ、GPU 不要)
+            initial_audio_track,
+            false, // hw_decode (音声のみ、GPU 不要)
             self.settings.video_deinterlace,
             #[cfg(windows)]
             None, // gpu_video_device (headless)
@@ -74591,6 +74617,11 @@ impl App {
     /// 手動 flush と定期保存が共有する、再生位置更新の唯一の適用入口。
     fn apply_media_resume_updates(&mut self, updates: Vec<MediaResumeUpdate>) {
         for update in updates {
+            if let Some(choice) = update.audio_track_choice {
+                self.settings
+                    .video_audio_track_choices
+                    .insert(update.key.clone(), choice);
+            }
             self.update_reading_history_media_progress(
                 &update.path,
                 update.position,
@@ -74634,6 +74665,7 @@ impl App {
                     position: pos,
                     duration: player.duration(),
                     at_eof: player.is_at_eof(),
+                    audio_track_choice: player.take_confirmed_audio_track_choice(),
                 });
             }
         }
@@ -76054,6 +76086,11 @@ impl App {
                 if let Some(d) = player.tick(ctx) {
                     merge_repaint_deadline(&mut next_repaint, Some(d));
                 }
+                if let Some(choice) = player.take_confirmed_audio_track_choice() {
+                    self.settings
+                        .video_audio_track_choices
+                        .insert(crate::adjustment_db::normalize_path(player.path()), choice);
+                }
                 resume_save_playing |= player.is_playing();
                 #[cfg(windows)]
                 if !anime4k_info_was_ready && player.native_video_info_for_anime4k().is_some() {
@@ -76124,6 +76161,7 @@ impl App {
                         position: pos,
                         duration: player.duration(),
                         at_eof: player.is_at_eof(),
+                        audio_track_choice: player.take_confirmed_audio_track_choice(),
                     });
                 }
                 if continuous_enabled
@@ -76334,7 +76372,10 @@ impl App {
             // wheel / 前-次項目ボタンが pending 中に押されたケースで「反応しない」
             // 体感バグを防ぐ (実機 fb 2026-05-26)。
             self.maybe_apply_deferred_native_video_nav(ctx);
-            if let Some(message) = self.take_audio_track_failure_toast(fs_idx) {
+            if let Some(message) = self
+                .take_audio_track_open_notice_toast(fs_idx)
+                .or_else(|| self.take_audio_track_failure_toast(fs_idx))
+            {
                 let message = message.to_string();
                 if self.fs_music_view_active(fs_idx) {
                     self.show_feedback_toast(message);

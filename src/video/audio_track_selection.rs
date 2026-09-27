@@ -2,6 +2,55 @@
 
 use std::sync::Mutex;
 
+/// File-scoped choice. Unlike `AudioTrackChoice`, it has no request generation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SavedAudioTrackChoice {
+    pub stream_index: usize,
+    pub codec: String,
+    pub language: Option<String>,
+    pub channels: Option<u32>,
+    pub title: Option<String>,
+}
+
+impl From<&crate::video::decoder::AudioTrackInfo> for SavedAudioTrackChoice {
+    fn from(track: &crate::video::decoder::AudioTrackInfo) -> Self {
+        Self {
+            stream_index: track.stream_index,
+            codec: track.codec.clone(),
+            language: track.language.clone(),
+            channels: track.channels,
+            title: track.title.clone(),
+        }
+    }
+}
+
+pub(crate) fn resolve_initial_audio_track(
+    tracks: &[crate::video::decoder::AudioTrackInfo],
+    default: Option<usize>,
+    saved: Option<&SavedAudioTrackChoice>,
+) -> Option<usize> {
+    saved
+        .and_then(|saved| {
+            tracks.iter().find(|track| {
+                track.stream_index == saved.stream_index
+                    && track.codec == saved.codec
+                    && saved
+                        .language
+                        .as_ref()
+                        .is_none_or(|value| track.language.as_ref() == Some(value))
+                    && saved
+                        .channels
+                        .is_none_or(|value| track.channels == Some(value))
+                    && saved
+                        .title
+                        .as_ref()
+                        .is_none_or(|value| track.title.as_ref() == Some(value))
+            })
+        })
+        .map(|track| track.stream_index)
+        .or(default)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioTrackChoice {
     pub generation: u64,
@@ -31,7 +80,6 @@ pub struct AudioTrackSelectionSnapshot {
     pub desired: AudioTrackChoice,
     pub applied: AudioTrackChoice,
     pub last_failure: Option<AudioTrackSwitchFailure>,
-    pub open_notice: Option<AudioTrackOpenNotice>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,7 +165,6 @@ impl AudioTrackSelection {
                     desired: choice,
                     applied: choice,
                     last_failure: None,
-                    open_notice: None,
                 },
                 lane: AudioLaneState::Active,
                 notified_failure_generation: 0,
@@ -202,6 +249,63 @@ impl AudioTrackSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_track_identity_requires_present_metadata_and_title() {
+        let track = crate::video::decoder::AudioTrackInfo {
+            stream_index: 2,
+            ordinal: 1,
+            language: Some("jpn".into()),
+            title: Some("Commentary".into()),
+            codec: "aac".into(),
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            disposition_default: false,
+        };
+        let tracks = [track.clone()];
+        let saved = SavedAudioTrackChoice::from(&track);
+        assert_eq!(
+            resolve_initial_audio_track(&tracks, Some(1), Some(&saved)),
+            Some(2)
+        );
+        for changed in [
+            SavedAudioTrackChoice {
+                stream_index: 3,
+                ..saved.clone()
+            },
+            SavedAudioTrackChoice {
+                codec: "ac3".into(),
+                ..saved.clone()
+            },
+            SavedAudioTrackChoice {
+                language: Some("eng".into()),
+                ..saved.clone()
+            },
+            SavedAudioTrackChoice {
+                channels: Some(6),
+                ..saved.clone()
+            },
+            SavedAudioTrackChoice {
+                title: Some("New title".into()),
+                ..saved.clone()
+            },
+        ] {
+            assert_eq!(
+                resolve_initial_audio_track(&tracks, Some(1), Some(&changed)),
+                Some(1)
+            );
+        }
+        let sparse = SavedAudioTrackChoice {
+            language: None,
+            channels: None,
+            title: None,
+            ..saved
+        };
+        assert_eq!(
+            resolve_initial_audio_track(&tracks, Some(1), Some(&sparse)),
+            Some(2)
+        );
+    }
 
     #[test]
     fn failure_notification_is_once_per_desired_generation() {

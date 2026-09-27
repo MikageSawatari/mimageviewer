@@ -1747,6 +1747,15 @@ impl App {
         if result.outcome == crate::video::AudioTrackSelectOutcome::Rejected {
             return result;
         }
+        if result.outcome == crate::video::AudioTrackSelectOutcome::Unchanged {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                if let Some(choice) = player.explicit_unchanged_audio_track_choice() {
+                    self.settings
+                        .video_audio_track_choices
+                        .insert(crate::adjustment_db::normalize_path(player.path()), choice);
+                }
+            }
+        }
         self.cancel_blocking_normalize_scan_for_other_track(fs_idx, stream_index);
         if result.normalize_unresolved {
             self.start_normalize_lookup_for_stream(fs_idx, stream_index);
@@ -1788,6 +1797,17 @@ impl App {
                 if player.take_audio_track_failure_notification() =>
             {
                 Some("音声トラックを切り替えられませんでした")
+            }
+            _ => None,
+        })
+    }
+
+    pub(crate) fn take_audio_track_open_notice_toast(&self, fs_idx: usize) -> Option<&'static str> {
+        self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. }
+                if player.take_audio_track_open_notice().is_some() =>
+            {
+                Some("保存した音声トラックを開けなかったため、既定のトラックで再生します")
             }
             _ => None,
         })

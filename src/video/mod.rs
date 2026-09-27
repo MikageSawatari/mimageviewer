@@ -96,7 +96,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use audio_track_selection::{AudioTrackRequestOutcome, AudioTrackSelection};
 pub use audio_track_selection::{
     AudioTrackSelectOutcome, AudioTrackSelectResult, AudioTrackSelectionDisplayState,
-    AudioTrackSelectionSnapshot, AudioTrackSwitchFailureReason,
+    AudioTrackSelectionSnapshot, AudioTrackSwitchFailureReason, SavedAudioTrackChoice,
 };
 use clock::AvClock;
 use decoder::{DecodeHandles, VideoFrame, VideoFrameData, VideoInfo};
@@ -333,6 +333,9 @@ pub struct VideoPlayer {
     /// Created by demux only after audio setup succeeds and accepted here only
     /// when the output device is active.
     audio_track_selection: Option<Arc<AudioTrackSelection>>,
+    /// InfoReceived から 1 回だけ UI へ渡す。音声出力 lane とは独立。
+    audio_track_open_notice: Mutex<Option<audio_track_selection::AudioTrackOpenNotice>>,
+    last_saved_audio_track_generation: AtomicU64,
     /// open 失敗 / DLL ロード失敗のメッセージ。Some なら UI は赤字エラー表示する。
     error: Option<String>,
     /// シーク先サムネ抽出ワーカー。Drop で停止する。
@@ -8310,6 +8313,8 @@ impl VideoPlayer {
             audio: None,
             info: None,
             audio_track_selection: None,
+            audio_track_open_notice: Mutex::new(None),
+            last_saved_audio_track_generation: AtomicU64::new(0),
             error: None,
             thumb_worker: None,
             remote_seek_thumbnail_request: Mutex::new(None),
@@ -8376,6 +8381,7 @@ impl VideoPlayer {
             }],
             default_audio_stream_index: Some(1),
             opened_audio_stream_index: Some(1),
+            open_notice: None,
             has_video: true,
             hw_decode_active: false,
             gpu_path_active: false,
@@ -8443,6 +8449,12 @@ impl VideoPlayer {
             selection.snapshot().desired,
             AudioTrackSwitchFailureReason::SetupFailed,
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_saved_audio_track_open_notice_for_test(&self) {
+        *self.audio_track_open_notice.lock().unwrap() =
+            Some(audio_track_selection::AudioTrackOpenNotice::SavedTrackUnavailable);
     }
 
     #[cfg(test)]
@@ -8605,6 +8617,7 @@ impl VideoPlayer {
         initial_audio_preroll_suspended: bool,
         autoplay: bool,
         resume_secs: Option<f64>,
+        initial_audio_track: Option<SavedAudioTrackChoice>,
         hw_decode: bool,
         deinterlace: crate::settings::VideoDeinterlaceMode,
         #[cfg(windows)] gpu_video_device: Option<
@@ -8621,6 +8634,7 @@ impl VideoPlayer {
             initial_audio_preroll_suspended,
             autoplay,
             resume_secs,
+            initial_audio_track,
             hw_decode,
             deinterlace,
             #[cfg(windows)]
@@ -8641,6 +8655,7 @@ impl VideoPlayer {
         initial_audio_preroll_suspended: bool,
         autoplay: bool,
         resume_secs: Option<f64>,
+        initial_audio_track: Option<SavedAudioTrackChoice>,
         hw_decode: bool,
         deinterlace: crate::settings::VideoDeinterlaceMode,
         #[cfg(windows)] gpu_video_device: Option<
@@ -8707,6 +8722,8 @@ impl VideoPlayer {
                 audio: None,
                 info: None,
                 audio_track_selection: None,
+                audio_track_open_notice: Mutex::new(None),
+                last_saved_audio_track_generation: AtomicU64::new(0),
                 error: Some(format!("FFmpeg DLL のロードに失敗しました: {e}")),
                 thumb_worker: None,
                 remote_seek_thumbnail_request: Mutex::new(None),
@@ -8809,7 +8826,7 @@ impl VideoPlayer {
         // 共有するための atomic 群。VideoInfo にも同じ Arc を載せて UI が読む。
         let dynamic = Arc::new(crate::video::decoder::VideoDynamicState::default());
 
-        let decode = decoder::spawn(
+        let decode = decoder::spawn_with_initial_audio_track(
             path.clone(),
             clock.clone(),
             cancel.clone(),
@@ -8822,6 +8839,7 @@ impl VideoPlayer {
             engine_event_tx.clone(),
             decoder_dropped_full_count.clone(),
             Arc::clone(&dynamic),
+            initial_audio_track,
         );
 
         // 音声出力起動。失敗してもプレイヤーは生きる (映像のみ再生)。
@@ -8975,6 +8993,8 @@ impl VideoPlayer {
             audio,
             info: None,
             audio_track_selection: None,
+            audio_track_open_notice: Mutex::new(None),
+            last_saved_audio_track_generation: AtomicU64::new(0),
             error: headless_init_error.or(native_init_error),
             thumb_worker,
             remote_seek_thumbnail_request: Mutex::new(None),
@@ -9268,6 +9288,50 @@ impl VideoPlayer {
         self.audio_track_selection
             .as_ref()
             .map(|selection| selection.snapshot())
+    }
+
+    fn saved_audio_track_for_stream(&self, stream_index: usize) -> Option<SavedAudioTrackChoice> {
+        self.info
+            .as_ref()?
+            .audio_tracks
+            .iter()
+            .find(|track| track.stream_index == stream_index)
+            .map(SavedAudioTrackChoice::from)
+    }
+
+    /// UI-thread writer harvests a completed explicit request, including during retirement.
+    pub(crate) fn take_confirmed_audio_track_choice(&self) -> Option<SavedAudioTrackChoice> {
+        let snapshot = self.audio_track_selection()?;
+        if snapshot.applied.generation == 0
+            || snapshot.desired.generation != snapshot.applied.generation
+            || self
+                .last_saved_audio_track_generation
+                .load(Ordering::Acquire)
+                >= snapshot.applied.generation
+        {
+            return None;
+        }
+        let choice = self.saved_audio_track_for_stream(snapshot.applied.stream_index)?;
+        self.last_saved_audio_track_generation
+            .store(snapshot.applied.generation, Ordering::Release);
+        Some(choice)
+    }
+
+    pub(crate) fn explicit_unchanged_audio_track_choice(&self) -> Option<SavedAudioTrackChoice> {
+        let snapshot = self.audio_track_selection()?;
+        if snapshot.desired != snapshot.applied {
+            return None;
+        }
+        let choice = self.saved_audio_track_for_stream(snapshot.applied.stream_index)?;
+        self.last_saved_audio_track_generation
+            .fetch_max(snapshot.applied.generation, Ordering::Release);
+        Some(choice)
+    }
+
+    pub fn take_audio_track_open_notice(
+        &self,
+    ) -> Option<audio_track_selection::AudioTrackOpenNotice> {
+        self.audio_track_open_notice.lock().unwrap().take()
     }
 
     pub fn audio_track_display_state(&self) -> Option<AudioTrackSelectionDisplayState> {
@@ -10925,7 +10989,8 @@ impl VideoPlayer {
         if self.info.is_none() {
             if let Ok(result) = self.decode.info_rx.try_recv() {
                 match result {
-                    Ok(info) => {
+                    Ok(mut info) => {
+                        *self.audio_track_open_notice.lock().unwrap() = info.open_notice.take();
                         if self.audio.is_some()
                             && info.opened_audio_stream_index.is_some()
                             && !self.clock.audio_lane_lost()
@@ -12010,6 +12075,45 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_choice_is_harvested_once_but_pending_and_failed_are_not() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(false);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!(player.take_confirmed_audio_track_choice().is_none());
+        assert!(player.explicit_unchanged_audio_track_choice().is_none());
+        player.apply_desired_audio_track_for_test();
+        let choice = player.take_confirmed_audio_track_choice().unwrap();
+        assert_eq!(choice.stream_index, 2);
+        assert!(player.take_confirmed_audio_track_choice().is_none());
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Unchanged);
+        assert_eq!(player.explicit_unchanged_audio_track_choice(), Some(choice));
+
+        let player = selection_player(false);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        player.fail_desired_audio_track_for_test();
+        assert!(player.take_confirmed_audio_track_choice().is_none());
+
+        let player = selection_player(true);
+        player.engine.lock().unwrap().handle_decoder_event(
+            super::engine::state::DecoderEvent::EofReached {
+                epoch: 0,
+                duration_secs: 30.0,
+            },
+        );
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Deferred);
+        assert!(player.take_confirmed_audio_track_choice().is_none());
+
+        let player = selection_player(false);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        player.apply_desired_audio_track_for_test();
+        assert_eq!(player.select_audio_track(1).outcome, Outcome::Requested);
+        assert!(
+            player.take_confirmed_audio_track_choice().is_none(),
+            "old generation"
+        );
+    }
+
+    #[test]
     fn audio_select_paused_seek_uses_unshown_target_instead_of_old_display() {
         use super::AudioTrackSelectOutcome as Outcome;
         let player = selection_player(false);
@@ -12164,6 +12268,25 @@ mod tests {
             super::engine::actor::state_code::IDLE
         );
         assert!(player.cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn saved_track_open_notice_survives_audio_output_start_failure() {
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("saved-track.mkv"),
+        );
+        let mut info = player.info.take().unwrap();
+        info.open_notice =
+            Some(super::audio_track_selection::AudioTrackOpenNotice::SavedTrackUnavailable);
+        player.audio = None;
+        let (info_tx, info_rx) = crossbeam_channel::bounded(1);
+        info_tx.send(Ok(info)).unwrap();
+        player.decode.info_rx = info_rx;
+
+        player.tick(&egui::Context::default());
+        assert!(player.audio_track_selection.is_none());
+        assert!(player.take_audio_track_open_notice().is_some());
+        assert_eq!(player.take_audio_track_open_notice(), None);
     }
 
     #[cfg(windows)]

@@ -82,6 +82,7 @@ const COMPLEX_FIELDS: &[&str] = &[
     "favorites",
     "tags",
     "video_resume_positions",
+    "video_audio_track_choices",
     "vst3_plugins",
     "vst3_chain_slots",
     "recent_open_with_apps",
@@ -941,6 +942,7 @@ impl SettingsDb {
         write_favorites(&tx, &settings.favorites)?;
         write_tags(&tx, &settings.tags)?;
         write_video_resume_positions(&tx, &settings.video_resume_positions)?;
+        write_video_audio_track_choices(&tx, &settings.video_audio_track_choices)?;
         // `custom_open_with_apps` は移行元の照合用にテーブルと既存行を残すが、
         // 外部ツール UI への載せ替え後は更新しない。
         write_external_tools(&tx, &settings.external_tools)?;
@@ -1613,6 +1615,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             path_normalized TEXT PRIMARY KEY,
             position_secs   REAL NOT NULL,
             updated_at      INTEGER NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS video_audio_track_choices (
+            path_normalized TEXT PRIMARY KEY,
+            stream_index INTEGER NOT NULL,
+            codec TEXT NOT NULL,
+            language TEXT,
+            channels INTEGER,
+            title TEXT,
+            updated_at INTEGER NOT NULL
          );
 
          CREATE TABLE IF NOT EXISTS vst3_plugins (
@@ -2294,6 +2306,65 @@ fn read_video_resume_positions(
     Ok(out)
 }
 
+fn write_video_audio_track_choices(
+    tx: &rusqlite::Transaction<'_>,
+    map: &std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>,
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM video_audio_track_choices", [])?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut stmt = tx.prepare(
+        "INSERT INTO video_audio_track_choices
+         (path_normalized, stream_index, codec, language, channels, title, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for (path, choice) in map {
+        stmt.execute(params![
+            path,
+            choice.stream_index as i64,
+            choice.codec,
+            choice.language,
+            choice.channels.map(i64::from),
+            choice.title,
+            now,
+        ])?;
+    }
+    Ok(())
+}
+
+fn read_video_audio_track_choices(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>, SettingsDbError>
+{
+    let mut stmt = conn.prepare(
+        "SELECT path_normalized, stream_index, codec, language, channels, title
+         FROM video_audio_track_choices",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let index: i64 = row.get(1)?;
+        let channels: Option<i64> = row.get(4)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            crate::video::SavedAudioTrackChoice {
+                stream_index: usize::try_from(index)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, index))?,
+                codec: row.get(2)?,
+                language: row.get(3)?,
+                channels: channels
+                    .map(|value| {
+                        u32::try_from(value)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, value))
+                    })
+                    .transpose()?,
+                title: row.get(5)?,
+            },
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
 // ---------------------------------------------------------------------------
 // vst3_plugins
 // ---------------------------------------------------------------------------
@@ -2855,6 +2926,7 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     let favorites = read_favorites(conn)?;
     let tags = read_tags(conn)?;
     let video_resume_positions = read_video_resume_positions(conn)?;
+    let video_audio_track_choices = read_video_audio_track_choices(conn)?;
     let vst3_plugins = read_vst3_plugins(conn)?;
     let vst3_chain_slots = read_vst3_chain_slots(conn)?;
     let custom_apps = read_legacy_open_with_apps(conn)?;
@@ -2865,6 +2937,10 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     map.insert(
         "video_resume_positions".into(),
         serde_json::to_value(video_resume_positions)?,
+    );
+    map.insert(
+        "video_audio_track_choices".into(),
+        serde_json::to_value(video_audio_track_choices)?,
     );
     map.insert("vst3_plugins".into(), serde_json::to_value(vst3_plugins)?);
     map.insert(
@@ -4714,6 +4790,50 @@ mod tests {
         db.save_full(&original).unwrap();
         let loaded = db.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
+    }
+
+    #[test]
+    fn saved_audio_track_choices_roundtrip_clear_and_upgrade_old_db() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        // A released database predates this additional table.
+        let conn = Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute("DROP TABLE video_audio_track_choices", [])
+            .unwrap();
+        drop(conn);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .video_audio_track_choices
+                .is_empty()
+        );
+        let choice = crate::video::SavedAudioTrackChoice {
+            stream_index: 3,
+            codec: "flac".into(),
+            language: Some("jpn".into()),
+            channels: Some(2),
+            title: Some("日本語の解説".into()),
+        };
+        let mut settings = Settings::default();
+        settings
+            .video_audio_track_choices
+            .insert("test-path".into(), choice.clone());
+        db.save_full(&settings).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().video_audio_track_choices["test-path"],
+            choice
+        );
+        settings.video_audio_track_choices.clear();
+        db.save_full(&settings).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .video_audio_track_choices
+                .is_empty()
+        );
     }
 
     #[test]

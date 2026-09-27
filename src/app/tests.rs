@@ -59363,6 +59363,7 @@ mod still_window_mode_key_tests {
                 position: 37.5,
                 duration: 120.0,
                 at_eof: false,
+                audio_track_choice: None,
             },
             MediaResumeUpdate {
                 path: PathBuf::from(r"C:\clips\finished.mp4"),
@@ -59370,11 +59371,16 @@ mod still_window_mode_key_tests {
                 position: 118.0,
                 duration: 120.0,
                 at_eof: false,
+                audio_track_choice: None,
             },
         ];
         let mut resume = std::collections::HashMap::from([(finished.clone(), 10.0)]);
 
-        let removed = apply_viewer_context_media_resume_updates(&mut resume, &updates);
+        let removed = apply_viewer_context_media_resume_updates(
+            &mut resume,
+            &mut Default::default(),
+            &updates,
+        );
 
         assert_eq!(resume.get(&kept), Some(&37.5));
         assert!(!resume.contains_key(&finished));
@@ -59383,6 +59389,148 @@ mod still_window_mode_key_tests {
             &[PathBuf::from(r"C:\Music\BGM.FLAC")],
             std::path::Path::new(r"c:\music\bgm.flac")
         ));
+    }
+
+    #[test]
+    fn audio_choice_retirement_and_path_lifecycle_share_resume_owner() {
+        let mut app = setup_app();
+        let old = app.tmp.path().join("audio-choice.mkv");
+        let new = app.tmp.path().join("renamed-choice.mkv");
+        let old_key = crate::adjustment_db::normalize_path(&old);
+        let new_key = crate::adjustment_db::normalize_path(&new);
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(old.clone());
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.set_opened_audio_stream_for_test(2, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        assert_eq!(
+            app.select_video_audio_track(0, 2).outcome,
+            crate::video::AudioTrackSelectOutcome::Unchanged
+        );
+        assert_eq!(
+            app.settings.video_audio_track_choices[&old_key].stream_index,
+            2
+        );
+        assert_eq!(
+            app.select_video_audio_track(0, 1).outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        player.apply_desired_audio_track_for_test();
+        // Retirement before the next poll (close / evict / swap paths call this writer).
+        app.save_all_video_resume_positions();
+        assert_eq!(
+            app.settings.video_audio_track_choices[&old_key].stream_index,
+            1
+        );
+        app.migrate_video_resume_positions_for_renamed_path(&old, &new);
+        assert!(
+            !app.settings
+                .video_audio_track_choices
+                .contains_key(&old_key)
+        );
+        assert_eq!(
+            app.settings.video_audio_track_choices[&new_key].stream_index,
+            1
+        );
+        app.purge_video_resume_positions_for_removed_paths(&[new]);
+        assert!(
+            !app.settings
+                .video_audio_track_choices
+                .contains_key(&new_key)
+        );
+    }
+
+    #[test]
+    fn saved_audio_open_notice_is_separate_and_delivered_once() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("saved-unavailable.mkv");
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.set_saved_audio_track_open_notice_for_test();
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        assert!(app.take_audio_track_open_notice_toast(0).is_some());
+        assert_eq!(app.take_audio_track_open_notice_toast(0), None);
+        assert_eq!(app.take_audio_track_failure_toast(0), None);
+    }
+
+    #[test]
+    fn both_media_builders_open_saved_nondefault_tracks() {
+        let mut app = setup_app();
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tracks");
+        let ctx = egui::Context::default();
+        let wait_for_info = |player: &mut crate::video::VideoPlayer| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while player.info().is_none() && std::time::Instant::now() < deadline {
+                player.tick(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            player
+                .info()
+                .expect("fixture demux info")
+                .opened_audio_stream_index
+        };
+        let audio_path = fixtures.join("multi-audio.m4a");
+        app.settings.video_audio_track_choices.insert(
+            crate::adjustment_db::normalize_path(&audio_path),
+            crate::video::SavedAudioTrackChoice {
+                stream_index: 0,
+                codec: "aac".into(),
+                language: Some("jpn".into()),
+                channels: Some(1),
+                title: None,
+            },
+        );
+        let mut audio = app.build_audio_player_for_open(audio_path, true, false);
+        assert_eq!(wait_for_info(&mut audio), Some(0));
+        drop(audio);
+
+        let video_path = fixtures.join("multi.mkv");
+        app.settings.video_audio_track_choices.insert(
+            crate::adjustment_db::normalize_path(&video_path),
+            crate::video::SavedAudioTrackChoice {
+                stream_index: 3,
+                codec: "flac".into(),
+                language: None,
+                channels: Some(1),
+                title: None,
+            },
+        );
+        let mut remote = app.try_build_remote_video_player(&video_path).unwrap();
+        assert_eq!(wait_for_info(&mut remote), Some(3));
+        let start = remote.remote_stream_start_inputs().unwrap();
+        assert_eq!(start.audio_stream_index, 3);
+        assert_eq!(start.default_audio_stream_index, Some(2));
+        let db_path = app.tmp.path().join("remote-choice-norm.db");
+        let db = crate::audio_normalize_db::AudioNormalizeDb::open_at(&db_path).unwrap();
+        let result = |gain_db| crate::video::normalize_types::NormalizeResult {
+            gain_db,
+            integrated_lufs: -20.0,
+            true_peak_db: -5.0,
+            target_lufs_milli: -14000,
+        };
+        db.upsert(&video_path, 2, &result(6.0)).unwrap();
+        db.upsert(&video_path, 3, &result(-6.0)).unwrap();
+        let (stream, gain) =
+            crate::video::stream::session::stream_and_gain_for_start_inputs_for_test(
+                video_path, start, db_path,
+            );
+        assert_eq!(stream, 3);
+        assert!((gain - 10.0_f64.powf(-6.0 / 20.0)).abs() < 1e-6);
     }
 
     #[test]
@@ -59573,10 +59721,58 @@ mod still_window_mode_key_tests {
         assert_eq!(plan.resume_updates[0].duration, 0.0);
         let mut resume = std::collections::HashMap::from([(key.clone(), 13.046)]);
 
-        let removed = apply_viewer_context_media_resume_updates(&mut resume, &plan.resume_updates);
+        let removed = apply_viewer_context_media_resume_updates(
+            &mut resume,
+            &mut Default::default(),
+            &plan.resume_updates,
+        );
 
         assert!(!resume.contains_key(&key));
         assert_eq!(removed, vec![key]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_teardown_plan_carries_confirmed_choice_before_next_tick() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("teardown-choice.mkv");
+        let key = crate::adjustment_db::normalize_path(&path);
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.set_opened_audio_stream_for_test(2, 1);
+        assert_eq!(
+            player.select_audio_track(1).outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        player.apply_desired_audio_track_for_test();
+        app.build_active_context_for_test(None, DetachedSource::Video, move |context| {
+            context.items.push(GridItem::Video(path));
+            context.fullscreen_idx = Some(0);
+            context.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+        });
+        let plan = app
+            .with_active_viewer_context(|context| {
+                viewer_context_media_teardown_plan(
+                    context.projected_viewer_context_id(),
+                    ContextRef::mounted(context),
+                )
+            })
+            .unwrap();
+        let mut positions = Default::default();
+        let mut choices = Default::default();
+        apply_viewer_context_media_resume_updates(
+            &mut positions,
+            &mut choices,
+            &plan.resume_updates,
+        );
+        assert_eq!(choices[&key].stream_index, 1);
     }
 
     #[test]

@@ -241,6 +241,23 @@ viewer context registry の window binding を保ったまま main から独立�
 同時に main context 側の `poll_video()` は抑止し、native presenter のイベントや source
 swap pending を detached 動画ではない `fullscreen_idx` で処理しないようにする。
 
+### 音声トラックの選択と記憶
+
+利用者が明示した音声トラックは `settings.db` の `video_audio_track_choices` に正規化 path ごとに保持する。
+保存する `SavedAudioTrackChoice` は stream index、codec、任意の language / channels / title を持ち、
+demux は列挙済みトラックとの一致を確認してから初期 `AudioSetup` を開く。一致しない場合は既定トラック、
+一致したトラックの setup が失敗した場合は既定で開き直し、App が 1 回通知する。
+この通知は demux の `VideoInfo.open_notice` から `VideoPlayer` が受け取り、音声出力
+device の起動に失敗して selection lane を受け取れない場合も App へ 1 回渡す。
+動画と Remote headless は `build_video_player_for_open`、音声ファイルと音楽ビューは
+`build_audio_player_for_open` から共通の in-memory lookup を使う。切り替え要求の世代が
+`applied` に確定したときに App が収穫し、close / evict / source swap / teardown では
+再生位置の保存単位に未収穫の選択を載せる。再生位置が EOF 等で消えても選択は残る。
+環境設定の「保存済み位置の管理」はクリア操作の有無を編集意図として保持する。クリアせず
+OK ならダイアログ表示中に更新された再生位置と、確定・削除・リネームされた選択を
+live Settings から引き継ぎ、
+クリアして OK なら再生位置と選択の両方を消す。
+
 ### HUD overlay HWND (v0.9.0+ 後期 — CP1-8 で導入)
 
 複数の再生可能な音声トラックがある動画では、下部 HUD の速度とミュートの間に
@@ -249,6 +266,7 @@ swap pending を detached 動画ではない `fullscreen_idx` で処理しない
 ラベル・stream index・現在行・導出状態を render thread へ渡す。popup の実描画 rect は
 `compute_hud_regions` が `SetWindowRgn` に渡す領域にも追加し、開いている間は HUD を
 表示し続ける。幅が足りないときは Full / NoCapture ではボタンを残し、NoMarkers から隠す。
+
 音声モード HUD でも左右クラスタが重なる幅ではボタンを隠す。popup は viewport 内に収め、
 多数の行は popup 上のホイールでスクロールする。長い行は hover で全文を確認できる。
 native HUD はソース切り替え時に popup のスクロール位置も破棄し、再オープン時は現在行を表示する。

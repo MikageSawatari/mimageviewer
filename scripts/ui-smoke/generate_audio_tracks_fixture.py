@@ -47,6 +47,19 @@ def generate_multi_timebase(output: Path) -> None:
     )
 
 
+def generate_multi_audio_only(output: Path) -> None:
+    run_ffmpeg(
+        output / "multi-audio.m4a",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=44100:duration=6",
+        "-map", "0:a", "-map", "1:a", "-c:a", "aac", "-b:a", "48k",
+        "-metadata:s:a:0", "language=jpn",
+        "-metadata:s:a:1", "language=eng",
+        "-disposition:a:0", "0",
+        "-disposition:a:1", "default",
+    )
+
+
 def generate(output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     run_ffmpeg(
@@ -74,6 +87,7 @@ def generate(output: Path) -> None:
         "-shortest",
     )
     generate_multi_timebase(output)
+    generate_multi_audio_only(output)
     run_ffmpeg(
         output / "single.mp4",
         "-f", "lavfi", "-i", VIDEO_SOURCE,

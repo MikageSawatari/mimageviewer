@@ -172,8 +172,12 @@ struct AudioTrackSelectionState {
    `Pending` が seek の公開より前から効いている (§6.1 の遷移 1)。
 4. 末尾の保留条件 (§7.3) に当たるなら seek は発行しない。`Deferred` を返す。
 5. それ以外は、**3 の後で**、位置を保つ seek を 1 回発行する:
-   - 基準位置: 一時停止中 (frame-step pause を含む) は `last_displayed_pts_secs()`、それ以外は
-     `user_seek_base_secs()` (coalesce 中の pending target を優先、無ければ `position()`)。
+   - 基準位置 (再生中・一時停止中とも同じ規則): まだ表示されていない進行中の seek target (coalesce 中の pending
+     target、または発行済みで未表示の seek target) があればそれ。無ければ `last_displayed_pts_secs()` (いま画面に
+     出ているフレームの時刻。実在するフレームなので、seek 後に必ず最初のフレームが届き、末尾付近でも
+     「シーク中...」が固着しない)。frame-step pause は常に表示中の PTS。表示フレームが無い (音声のみ) ときは
+     `position()`。(2026-09-27 利用者の実機確認で、再生中の切り替えが末尾 drain の保留に入って効かない不具合が
+     判明し、§7.3 の保留条件と合わせて改めた。)
    - 再生状態: `seek_with_play_state(base, self.intent_playing())`。一時停止中は一時停止のまま、再生中は再生のまま。
      `seek_with_play_state` は coalesce を挟まず即時に `request_seek` する。coalesce 待ちの pending target が
      あれば基準位置としてそれを使い、その pending は clear する (同じ位置への seek を 2 回出さない)。
@@ -460,16 +464,17 @@ seek を取り出していなければ要求は上書きされ (latest-value)、
 
 ### 7.3 再生終了 (EOF) と重なった場合
 
-保留 (`Deferred`) にするのは次の 2 つだけ:
+保留 (`Deferred`) にするのは **engine の published state が `Eof` (末尾で停止済み) のときだけ**。
 
-| 状態 | 判定 | 扱い |
-|---|---|---|
-| 再生中の末尾 drain | demux が末尾に達し (`clock.is_eof_reached()`)、再生 intent がある (engine の `Eof` 確定前) | 保留。この間に seek すると末尾の音声を切り、既存の「シーク中...固着」経路 (`seek_eof_stuck_since`) も踏む。drain は旧トラックのまま完了させる |
-| 末尾で停止済み | engine の published state が `Eof` | 保留。末尾への seek は同じ固着経路を踏む |
-
-- 一時停止中 (frame-step pause を含む) は、demux が末尾に達していても保留しない。表示中の PTS へ一時停止の
-  まま seek して即時に反映する (一時停止中は drain が進まず engine の `Eof` も確定しないので、保留すると
-  次の seek まで無期限に待つことになる)。
+- 旧版 (第7版) は「demux が末尾に達し (`clock.is_eof_reached()`)、再生 intent がある」も保留にしていた。
+  demux は再生より先に読むので、短い動画では再生開始の直後から、長い動画でも末尾の先読み分の間、再生中の
+  選択がすべて保留になり切り替わらなかった (2026-09-27 利用者の実機確認、6 秒の素材で再生中の切り替えが効かず、
+  一時停止中は効いた。ログでは再生中の選択の直後に `audio setup` が無く、先頭へ戻る seek でまとめて切り替わって
+  いた)。この条件は削除する。
+- demux が末尾に達していても、再生中・一時停止中とも §5.1 の基準位置 (表示中のフレームの時刻) へ seek して
+  即時に反映する。`request_seek` が `eof_reached` を戻し、demux は seek 先から読み直す。基準位置が実在する
+  フレームなので、seek 後の最初のフレームが届かずに「シーク中...」が固着することは無い。
+- 末尾で停止済み (engine の `Eof`) は保留する。末尾への seek は既存の固着経路を踏むため。
 - 次に seek が発生したとき (利用者の seek、ループ再生の先頭 seek、再生ボタンによる先頭からの再開) に demux が
   反映する。
 - demux が EOF idle wait 中に `desired` だけ変わっても起床は不要 (seek 要求で起床する既存の設計どおり)。
@@ -579,6 +584,9 @@ Remote で続きを見るときも、同じトラックで始める。
   読み書きし、知らない表には触れないこと (実装者がコードで確認し、S5 の報告に根拠の行を示す)。
 - 件数の上限は再生位置と同じく設けない。環境設定「保存済み位置の管理」の「動画・音声の再生位置をすべてクリア」
   で、この表も一緒にクリアする (文言も「再生位置と音声トラックの選択」に合わせる)。
+  環境設定の編集中に別ウィンドウで選択が確定・削除・リネームされ得るため、クリア操作の有無を編集意図として
+  保持する。再生位置も定期保存・close 時保存で同じく更新されるため、クリアせず OK なら再生位置と選択の
+  両 map は live Settings の最新版を採り、クリアして OK なら両 map を空にする。
 - path のライフサイクルは再生位置の map と同じ owner で処理する: ファイル削除時の破棄
   (`purge_video_resume_positions_for_removed_paths`、`app.rs:32641`) とリネーム時の移行
   (`migrate_video_resume_positions_for_renamed_path`、`app.rs:34820`) に、この map も含める。
@@ -611,8 +619,10 @@ Remote で続きを見るときも、同じトラックで始める。
     みなしてよい。構成が変わった場合は上の項目のいずれかが変わって一致しない。
 - 一致しない / 無い → 既定トラック (`best(Audio)`) で開く。保存された行は消さない (次の選択で上書きされる)。
 - 一致したが開けなかった (decoder open 失敗) → 既定トラックで開き直す。これは切り替えの失敗 (`last_failure`) とは
-  別の、open 時 1 回だけの通知 `open_notice: Option<SavedTrackUnavailable>` として selection に持つ (初期状態
-  `desired = applied = (0, 既定)` は「確定」で、失敗表示とは重ならない)。App はこれを 1 回トーストで通知する。
+  別の、open 時 1 回だけの通知 `open_notice: Option<SavedTrackUnavailable>` として `VideoInfo` で demux から
+  player へ渡す。player は音声出力 lane と独立に受け取り、App が 1 回トーストで通知する。音声出力 device が
+  起動せず selection lane を受け取れない場合も通知する (S5 独立レビュー P2)。初期状態
+  `desired = applied = (0, 既定)` は「確定」で、失敗表示とは重ならない。
 - `applied` の初期値は実際に開いたトラック。
 - 保存用の型は `SavedAudioTrackChoice { stream_index, codec, language, channels, title }` とし、切り替え要求の型
   (`AudioTrackChoice { generation, stream_index }`、§4.2) とは別にする (意味が違う)。

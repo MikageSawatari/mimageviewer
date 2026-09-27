@@ -699,6 +699,8 @@ impl Drop for ExternalToolPathCheckPending {
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
+    /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
+    video_media_memory_clear_requested: bool,
     /// この編集ダイアログを開いた時点の通常ホイール割り当て。
     ///
     /// `ring_shortcuts` の他項目は操作カスタマイズが所有するため、OK 前に live から
@@ -940,6 +942,11 @@ pub(crate) struct PreferencesState {
 }
 
 impl PreferencesState {
+    fn clear_video_media_memory(&mut self) {
+        self.video_media_memory_clear_requested = true;
+        self.settings.video_resume_positions.clear();
+        self.settings.video_audio_track_choices.clear();
+    }
     pub(super) fn select_external_tool(
         &mut self,
         selected: Option<crate::external_tool::ExternalToolId>,
@@ -1246,6 +1253,7 @@ impl PreferencesState {
 
         Self {
             settings: s.preferences_snapshot(),
+            video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
             context_menu_preview_scenario:
@@ -1919,6 +1927,27 @@ fn prepare_preferences_state_settings_for_commit(
         state.initial_video_normal_wheel_action,
         live,
     );
+    merge_video_media_memory_for_preferences(
+        &mut state.settings,
+        live,
+        state.video_media_memory_clear_requested,
+    );
+}
+
+fn merge_video_media_memory_for_preferences(
+    edited: &mut crate::settings::Settings,
+    live: &mut crate::settings::Settings,
+    clear_requested: bool,
+) {
+    if clear_requested {
+        edited.video_resume_positions.clear();
+        edited.video_audio_track_choices.clear();
+    } else {
+        // 再生位置の保存と選択の確定・削除・リネームはダイアログ表示中も live を更新する。
+        // 環境設定側の編集意図はクリアだけなので、OK 時には両方の最新 map を移す。
+        edited.video_resume_positions = std::mem::take(&mut live.video_resume_positions);
+        edited.video_audio_track_choices = std::mem::take(&mut live.video_audio_track_choices);
+    }
 }
 
 impl App {
@@ -1941,6 +1970,11 @@ impl App {
             &mut edited,
             state.initial_video_normal_wheel_action,
             &mut live,
+        );
+        merge_video_media_memory_for_preferences(
+            &mut edited,
+            &mut live,
+            state.video_media_memory_clear_requested,
         );
         !settings_equal_for_close_prompt(&edited, &self.settings)
     }
@@ -3483,6 +3517,141 @@ mod tests {
             0,
             0,
         )
+    }
+
+    fn saved_audio_choice_for_preferences_test(
+        index: usize,
+    ) -> crate::video::SavedAudioTrackChoice {
+        crate::video::SavedAudioTrackChoice {
+            stream_index: index,
+            codec: "aac".to_owned(),
+            language: None,
+            channels: Some(2),
+            title: None,
+        }
+    }
+
+    #[test]
+    fn preferences_ok_keeps_track_choice_confirmed_while_dialog_is_open() {
+        let mut app = crate::app::setup_app_for_test();
+        let key = crate::adjustment_db::normalize_path(std::path::Path::new("media/confirmed.mkv"));
+        let state = preferences_state_for_test(&app.settings);
+        app.settings
+            .video_audio_track_choices
+            .insert(key.clone(), saved_audio_choice_for_preferences_test(2));
+        app.pref_state = Some(state);
+        assert!(!app.preferences_dialog_has_unsaved_changes());
+        let mut state = app.pref_state.take().unwrap();
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.settings = state.settings;
+        assert_eq!(
+            app.settings.video_audio_track_choices.get(&key),
+            Some(&saved_audio_choice_for_preferences_test(2))
+        );
+    }
+
+    #[test]
+    fn preferences_ok_and_cancel_keep_resume_position_saved_while_dialog_is_open() {
+        let path = std::path::PathBuf::from("media/resume-during-preferences.mkv");
+        let key = crate::adjustment_db::normalize_path(&path);
+        for commit in [true, false] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.video_resume_positions.insert(key.clone(), 7.0);
+            let state = preferences_state_for_test(&app.settings);
+            let player = crate::video::VideoPlayer::disconnected_for_test(path.clone(), 18.0);
+            app.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            // 周期保存と close 時保存が共有する App の書き手を、ダイアログ表示中に実行。
+            app.save_all_video_resume_positions();
+            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&18.0));
+
+            if commit {
+                let mut state = state;
+                prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+                app.settings = state.settings;
+            } else {
+                app.pref_state = Some(state);
+                assert!(!app.preferences_dialog_has_unsaved_changes());
+                app.discard_preferences_dialog();
+            }
+            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&18.0));
+        }
+    }
+
+    #[test]
+    fn preferences_ok_and_cancel_follow_live_track_choice_delete_and_rename() {
+        let old_path = std::path::Path::new("media/old.mkv");
+        let new_path = std::path::Path::new("media/new.mkv");
+        let old_key = crate::adjustment_db::normalize_path(old_path);
+        let new_key = crate::adjustment_db::normalize_path(new_path);
+        for rename in [false, true] {
+            for commit in [false, true] {
+                let mut app = crate::app::setup_app_for_test();
+                app.settings
+                    .video_audio_track_choices
+                    .insert(old_key.clone(), saved_audio_choice_for_preferences_test(2));
+                let state = preferences_state_for_test(&app.settings);
+                if rename {
+                    app.migrate_video_resume_positions_for_renamed_path(old_path, new_path);
+                } else {
+                    app.purge_video_resume_positions_for_removed_paths(&[old_path.to_path_buf()]);
+                }
+                let expected = app.settings.video_audio_track_choices.clone();
+                if commit {
+                    let mut state = state;
+                    prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+                    app.settings = state.settings;
+                } else {
+                    app.pref_state = Some(state);
+                    app.discard_preferences_dialog();
+                }
+                assert_eq!(app.settings.video_audio_track_choices, expected);
+                assert_eq!(
+                    app.settings
+                        .video_audio_track_choices
+                        .contains_key(&old_key),
+                    false
+                );
+                assert_eq!(
+                    app.settings
+                        .video_audio_track_choices
+                        .contains_key(&new_key),
+                    rename
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preferences_cancel_keeps_confirmed_choice_and_clear_ok_clears_both_maps() {
+        let mut app = crate::app::setup_app_for_test();
+        let key = crate::adjustment_db::normalize_path(std::path::Path::new("media/clear.mkv"));
+        let state = preferences_state_for_test(&app.settings);
+        app.settings
+            .video_audio_track_choices
+            .insert(key.clone(), saved_audio_choice_for_preferences_test(2));
+        app.pref_state = Some(state);
+        app.discard_preferences_dialog();
+        assert!(app.settings.video_audio_track_choices.contains_key(&key));
+
+        let mut state = preferences_state_for_test(&app.settings);
+        state.clear_video_media_memory();
+        app.settings
+            .video_resume_positions
+            .insert(key.clone(), 12.0);
+        app.settings.video_audio_track_choices.insert(
+            "later.mkv".to_owned(),
+            saved_audio_choice_for_preferences_test(3),
+        );
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.settings = state.settings;
+        assert!(app.settings.video_resume_positions.is_empty());
+        assert!(app.settings.video_audio_track_choices.is_empty());
     }
 
     #[test]

@@ -1732,6 +1732,8 @@ pub struct VideoInfo {
     pub default_audio_stream_index: Option<usize>,
     /// demux が open 時に実際に開いた stream。音声出力 device の成否とは独立。
     pub opened_audio_stream_index: Option<usize>,
+    /// 保存済みトラックの open 失敗。音声出力 device の成否とは独立して UI へ渡す。
+    pub open_notice: Option<crate::video::audio_track_selection::AudioTrackOpenNotice>,
     /// timed playable video stream を持つか。audio-only ファイル (映像トラック無し /
     /// 添付画像 = cover art のみ) では false。false のとき width/height/avg_fps は 0、
     /// video_codec/video_decoder は "none"。engine 側の readiness gate
@@ -1913,6 +1915,39 @@ pub(crate) fn spawn(
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
     dynamic: Arc<VideoDynamicState>,
 ) -> DecodeHandles {
+    spawn_with_initial_audio_track(
+        path,
+        clock,
+        cancel,
+        target_audio_sample_rate,
+        hw_decode,
+        deinterlace,
+        #[cfg(windows)]
+        gpu_video_device,
+        engine_state,
+        engine_event_tx,
+        skipped_frame_count,
+        dynamic,
+        None,
+    )
+}
+
+pub(crate) fn spawn_with_initial_audio_track(
+    path: PathBuf,
+    clock: Arc<AvClock>,
+    cancel: Arc<AtomicBool>,
+    target_audio_sample_rate: u32,
+    hw_decode: bool,
+    deinterlace: crate::settings::VideoDeinterlaceMode,
+    #[cfg(windows)] gpu_video_device: Option<
+        std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
+    >,
+    engine_state: Arc<std::sync::atomic::AtomicU8>,
+    engine_event_tx: crate::video::EngineEventSender,
+    skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
+    dynamic: Arc<VideoDynamicState>,
+    initial_audio_track: Option<crate::video::SavedAudioTrackChoice>,
+) -> DecodeHandles {
     // 60fps 1080p で 8 フレーム = 約 130ms のバッファ。decoder pacing の閾値
     // (100ms) と組み合わせて「pacing 直前に 1-2 フレーム余裕がある」状態を
     // 維持し、vsync 1 周期で取り損ねた分を次周期に displayable な状態で
@@ -1971,6 +2006,7 @@ pub(crate) fn spawn(
                     skipped_frame_count,
                     dynamic,
                     prep_progress_for_worker,
+                    initial_audio_track,
                 );
             }));
             if outcome.is_err() {
@@ -2194,6 +2230,7 @@ fn run_decoder(
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
     dynamic: Arc<VideoDynamicState>,
     prep_progress: Arc<crate::video::avio_progress::PreparingProgress>,
+    initial_audio_track: Option<crate::video::SavedAudioTrackChoice>,
 ) {
     use ffmpeg_the_third as ffmpeg;
     // Phase B: Pixel / ScaleContext / ScaleFlags / Video は run_video_decode に移管。
@@ -2453,13 +2490,25 @@ fn run_decoder(
     let has_video = video_setup.is_some();
 
     // ── 音声ストリーム選択 (任意) ──
-    let selected_audio_stream = input.streams().best(MediaType::Audio);
-    let default_audio_stream_index = selected_audio_stream.as_ref().map(|s| s.index());
+    let default_audio_stream_index = input.streams().best(MediaType::Audio).map(|s| s.index());
+    let initial_stream_index = crate::video::audio_track_selection::resolve_initial_audio_track(
+        &audio_tracks,
+        default_audio_stream_index,
+        initial_audio_track.as_ref(),
+    );
+    let saved_matched = initial_audio_track.as_ref().is_some_and(|choice| {
+        crate::video::audio_track_selection::resolve_initial_audio_track(
+            &audio_tracks,
+            None,
+            Some(choice),
+        ) == Some(choice.stream_index)
+    });
+    let selected_audio_stream = initial_stream_index.and_then(|index| input.stream(index));
     #[cfg(test)]
     let injected_open_setup_failure = clock.take_audio_setup_failure_for_test();
     #[cfg(not(test))]
     let injected_open_setup_failure = false;
-    let audio_setup = selected_audio_stream.and_then(|stream| {
+    let mut audio_setup = selected_audio_stream.and_then(|stream| {
         (if injected_open_setup_failure {
             Err("injected AudioSetup failure".to_string())
         } else {
@@ -2468,6 +2517,16 @@ fn run_decoder(
         .inspect_err(|error| crate::logger::log(format!("audio setup failed: {error}")))
         .ok()
     });
+    let saved_open_failed = saved_matched && audio_setup.is_none();
+    if saved_open_failed {
+        audio_setup = default_audio_stream_index.and_then(|index| {
+            build_audio_setup(&input, index, target_audio_sample_rate)
+                .inspect_err(|error| {
+                    crate::logger::log(format!("default audio setup failed: {error}"))
+                })
+                .ok()
+        });
+    }
     let audio_track_selection = audio_setup.as_ref().map(|setup| {
         Arc::new(crate::video::audio_track_selection::AudioTrackSelection::new(setup.stream_idx))
     });
@@ -2634,6 +2693,9 @@ fn run_decoder(
         audio_tracks,
         default_audio_stream_index,
         opened_audio_stream_index,
+        open_notice: saved_open_failed.then_some(
+            crate::video::audio_track_selection::AudioTrackOpenNotice::SavedTrackUnavailable,
+        ),
         has_video,
         hw_decode_active: vi_hw_active,
         gpu_path_active,
@@ -8475,7 +8537,7 @@ fn try_gpu_blit_path(
 mod audio_track_fixture_tests {
     use super::{
         AudioTrackInfo, DecodeHandles, VideoInfo, enumerate_audio_tracks,
-        enumerate_audio_tracks_with_decoder, spawn,
+        enumerate_audio_tracks_with_decoder, spawn, spawn_with_initial_audio_track,
     };
     use crate::video::audio_track_selection::{
         AudioTrackRequestOutcome, AudioTrackSelection, AudioTrackSwitchFailureReason,
@@ -8519,6 +8581,101 @@ mod audio_track_fixture_tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(super::VideoDynamicState::default()),
         )
+    }
+
+    fn spawn_with_saved_track(
+        name: &str,
+        clock: Arc<AvClock>,
+        cancel: Arc<AtomicBool>,
+        saved: crate::video::SavedAudioTrackChoice,
+    ) -> DecodeHandles {
+        let (event_tx, _event_rx) = bounded(64);
+        spawn_with_initial_audio_track(
+            fixture_path(name),
+            clock,
+            cancel,
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::VideoDynamicState::default()),
+            Some(saved),
+        )
+    }
+
+    #[test]
+    fn saved_nondefault_opens_in_video_and_audio_only_files() {
+        for (name, index) in [("multi.mkv", 3), ("multi-audio.m4a", 0)] {
+            let input = ffmpeg_the_third::format::input(&fixture_path(name)).unwrap();
+            let tracks = enumerate_audio_tracks(&input);
+            let saved = crate::video::SavedAudioTrackChoice::from(
+                tracks
+                    .iter()
+                    .find(|track| track.stream_index == index)
+                    .unwrap(),
+            );
+            let cancel = Arc::new(AtomicBool::new(false));
+            let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+            let handles = spawn_with_saved_track(name, clock, Arc::clone(&cancel), saved);
+            let info = handles
+                .info_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert_eq!(info.opened_audio_stream_index, Some(index));
+            assert_ne!(
+                info.opened_audio_stream_index,
+                info.default_audio_stream_index
+            );
+            assert_eq!(info.has_video, name == "multi.mkv");
+            assert_eq!(
+                handles
+                    .audio_track_selection_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .snapshot()
+                    .applied
+                    .stream_index,
+                index
+            );
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn saved_setup_failure_reopens_default_and_notifies_once() {
+        let input = ffmpeg_the_third::format::input(&fixture_path("multi.mkv")).unwrap();
+        let tracks = enumerate_audio_tracks(&input);
+        let saved = crate::video::SavedAudioTrackChoice::from(&tracks[2]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        clock.fail_next_audio_setup_for_test();
+        let handles = spawn_with_saved_track("multi.mkv", clock, Arc::clone(&cancel), saved);
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            info.opened_audio_stream_index,
+            info.default_audio_stream_index
+        );
+        let selection = handles
+            .audio_track_selection_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let snapshot = selection.snapshot();
+        assert_eq!(snapshot.desired, snapshot.applied);
+        assert!(snapshot.last_failure.is_none());
+        assert_eq!(
+            info.open_notice,
+            Some(crate::video::audio_track_selection::AudioTrackOpenNotice::SavedTrackUnavailable)
+        );
+        cancel.store(true, Ordering::Release);
     }
 
     fn wait_video_frame(

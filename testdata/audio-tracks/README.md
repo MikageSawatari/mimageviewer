@@ -14,6 +14,8 @@
 | `short-audio.mp4` | 1 | 440 Hz | 1 | 48000 Hz | 1/48000 | aac | なし | なし | はい | sine 既定 |
 | `silent.mp4` | なし | — | — | — | — | — | — | — | — | — |
 | `audio-only.flac` | 1 | 440 Hz | 1 | 48000 Hz | 1/48000 | flac | なし | なし | いいえ | sine 既定 |
+| `multi-audio.m4a` | 1 | 440 Hz | 1 | 48000 Hz | 1/48000 | aac | jpn | なし | いいえ | sine 既定 |
+| `multi-audio.m4a` | 2 | 880 Hz | 1 | 44100 Hz | 1/44100 | aac | eng | なし | はい | sine 既定 |
 
 `sine` の既定ピークは約 -18 dBFS です。`multi.mkv` は入力に異なる gain をかけ、後続の LUFS 差のテストでも区別できるようにしています。
 `multi-timebase.mp4` は同じ周波数・音量・channels / sample rate の組み合わせを AAC で作り、異なる time base 間の切り替えを検証します (267,351 bytes)。

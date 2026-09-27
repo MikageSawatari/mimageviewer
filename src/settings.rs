@@ -5398,6 +5398,10 @@ pub struct Settings {
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
     #[serde(default)]
     pub video_resume_positions: std::collections::HashMap<String, f64>,
+    /// 明示的に選んだ音声トラック。再生位置とは独立してファイルごとに保持する。
+    #[serde(default)]
+    pub video_audio_track_choices:
+        std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>,
     /// 一覧から明示的に動画を開いたとき、保存済み resume 位置を使わず先頭から開くか。
     /// (v0.9.0 リリース済みの bool。位置復元マトリクスの「動画 × 一覧から開く」セルの保存先を
     /// 兼ねる。互換のため enum 化せず bool のまま残す。アクセスは `Settings::video_open_resume`
@@ -7358,6 +7362,7 @@ impl Default for Settings {
             video_anime4k_measurement: None,
             video_preset_slots: crate::creative_lut::VideoPresetSlots::default(),
             video_resume_positions: std::collections::HashMap::new(),
+            video_audio_track_choices: std::collections::HashMap::new(),
             video_grid_open_starts_from_beginning: false,
             video_nav_resume: ResumeMode::Resume,
             book_open_resume: ResumeMode::Resume,

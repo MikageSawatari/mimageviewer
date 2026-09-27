@@ -709,6 +709,35 @@ fn remote_generation_normalize_gain(config: &GenerationConfig) -> f64 {
 }
 
 #[cfg(test)]
+pub(crate) fn stream_and_gain_for_start_inputs_for_test(
+    path: std::path::PathBuf,
+    inputs: crate::video::RemoteStreamStartInputs,
+    db_path: std::path::PathBuf,
+) -> (usize, f64) {
+    let config = GenerationConfig {
+        generation: StreamingGeneration(1),
+        path,
+        encoder: EncoderPreference::Auto,
+        quality: QualityPreset::Standard,
+        source_origin_secs: inputs.source_origin_secs,
+        segment_capacity: 4,
+        hw_decode: false,
+        audio_stream_index: inputs.audio_stream_index,
+        default_audio_stream_index: inputs.default_audio_stream_index,
+        normalize_snapshot: RemoteNormalizeSnapshot {
+            enabled: true,
+            target_lufs_milli: -14000,
+            db_path,
+        },
+        audio_processing: ClocklessAudioProcessing::without_vst3(1.0),
+    };
+    (
+        generation_transcode_options(&config).audio_stream_index,
+        remote_generation_normalize_gain(&config),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::video::stream::audio_encoder::open_aac_encoder;
