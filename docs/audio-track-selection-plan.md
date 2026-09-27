@@ -567,7 +567,7 @@ Remote で続きを見るときも、同じトラックで始める。
 
 - 新テーブル `video_audio_track_choices (path_normalized TEXT PRIMARY KEY, stream_index INTEGER NOT NULL,
   codec TEXT NOT NULL, language TEXT, channels INTEGER, title TEXT, updated_at INTEGER NOT NULL)`
-  (`CREATE TABLE IF NOT EXISTS`)。`Settings.video_audio_track_choices: HashMap<String, AudioTrackChoice>`、
+  (`CREATE TABLE IF NOT EXISTS`)。`Settings.video_audio_track_choices: HashMap<String, SavedAudioTrackChoice>`、
   key は再生位置と同じ `adjustment_db::normalize_path`。
 - 再生位置の表 (`video_resume_positions`) の列にしない理由: 再生位置は先頭 3 秒未満・末尾 5 秒以内・EOF で
   行ごと消える (`save_video_resume_position`)。トラックの選択は見終わった後も (次に開いたときも) 有効であるべきで、
@@ -602,7 +602,7 @@ Remote で続きを見るときも、同じトラックで始める。
 
 ### 9.3 開くときの初期トラック
 
-- `VideoPlayer::open` に `initial_audio_track: Option<AudioTrackChoice>` を渡す。demux は open 時にトラックを
+- `VideoPlayer::open` に `initial_audio_track: Option<SavedAudioTrackChoice>` を渡す。demux は open 時にトラックを
   列挙した後、`resolve_initial_audio_track` (§4.1) で開くトラックを決める。
 - 一致規則: 保存された選択の `stream_index` のトラックがあり、codec が同じで、保存時に language / channels /
   title があればそれぞれ同じこと。保存時に無かった項目は比較しない。
@@ -614,8 +614,12 @@ Remote で続きを見るときも、同じトラックで始める。
   別の、open 時 1 回だけの通知 `open_notice: Option<SavedTrackUnavailable>` として selection に持つ (初期状態
   `desired = applied = (0, 既定)` は「確定」で、失敗表示とは重ならない)。App はこれを 1 回トーストで通知する。
 - `applied` の初期値は実際に開いたトラック。
-- source swap・通常 open・タイル・遅延 open・Remote の headless player のすべてが `build_video_player_for_open` を
-  通るので、そこで表を引いて渡す (メモリ上の HashMap の参照だけで I/O は無い)。
+- 保存用の型は `SavedAudioTrackChoice { stream_index, codec, language, channels, title }` とし、切り替え要求の型
+  (`AudioTrackChoice { generation, stream_index }`、§4.2) とは別にする (意味が違う)。
+- 表を引く helper を 1 つ置き (path → `Option<SavedAudioTrackChoice>`、メモリ上の HashMap の参照だけで I/O は無い)、
+  動画の `build_video_player_for_open` (通常 open・source swap・タイル・遅延 open・Remote の headless player) と、音声
+  ファイル / 音楽ビューの `build_audio_player_for_open` の両方がそれを使って `initial_audio_track` を渡す
+  (S5 の実装前確認で、音声の入口が別 builder と判明)。
 
 ## 9A. mIV Remote
 
