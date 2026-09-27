@@ -144,11 +144,28 @@ impl InternalByteCopyDeclineRecorder {
 
 /// A3b worker の batch 入口。全候補の mapping を先に集約し、shared STORES と
 /// runtime update の各 DB は候補数にかかわらず 1 回ずつだけ開く。
-pub(crate) fn restore_candidates_at(
+#[cfg(test)]
+fn restore_candidates_at(
     data_dir: &Path,
     selected: &[SelectedRestore],
     declined: &[DeclinedRestore],
     load_sidecar_bases: bool,
+) -> ContentRestoreReport {
+    restore_candidates_at_with_progress(
+        data_dir,
+        selected,
+        declined,
+        load_sidecar_bases,
+        |_, _, _| {},
+    )
+}
+
+pub(crate) fn restore_candidates_at_with_progress(
+    data_dir: &Path,
+    selected: &[SelectedRestore],
+    declined: &[DeclinedRestore],
+    load_sidecar_bases: bool,
+    mut on_progress: impl FnMut(&'static str, usize, usize),
 ) -> ContentRestoreReport {
     let mappings = selected
         .iter()
@@ -156,7 +173,11 @@ pub(crate) fn restore_candidates_at(
             restore_copy_mappings(data_dir, &selection.candidate, &selection.source)
         })
         .collect::<Vec<_>>();
-    let copied = crate::rename_key_migration::copy_stores_at(data_dir, &mappings);
+    let copied = crate::rename_key_migration::copy_stores_at_with_progress(
+        data_dir,
+        &mappings,
+        |processed, total| on_progress("copy", processed, total),
+    );
     let mut report = ContentRestoreReport {
         requested_restores: selected.len(),
         requested_declines: declined.len(),
@@ -166,7 +187,7 @@ pub(crate) fn restore_candidates_at(
         ..ContentRestoreReport::default()
     };
 
-    apply_batch_ledger_updates(data_dir, selected, declined, &mut report);
+    apply_batch_ledger_updates(data_dir, selected, declined, &mut report, &mut on_progress);
 
     match load_restore_runtime_updates(data_dir, selected) {
         Ok((sidecar_mirrors, presence, database_opens)) => {
@@ -179,6 +200,7 @@ pub(crate) fn restore_candidates_at(
         }
         Err(error) => report.errors.push(format!("sidecar mirror: {error}")),
     }
+    on_progress("runtime", 1, 1);
     report
 }
 
@@ -199,6 +221,7 @@ fn apply_batch_ledger_updates(
     selected: &[SelectedRestore],
     declined: &[DeclinedRestore],
     report: &mut ContentRestoreReport,
+    on_progress: &mut impl FnMut(&'static str, usize, usize),
 ) {
     if selected.is_empty() && declined.is_empty() {
         return;
@@ -211,6 +234,8 @@ fn apply_batch_ledger_updates(
             return;
         }
     };
+    let total = selected.len() + declined.len();
+    let mut processed = 0;
     for selection in selected {
         match mark_restored_origin(&db, &selection.candidate, &selection.source) {
             Ok((entry, changed)) => {
@@ -222,6 +247,8 @@ fn apply_batch_ledger_updates(
                 selection.candidate.target_path.display()
             )),
         }
+        processed += 1;
+        on_progress("ledger", processed, total);
     }
     for refusal in declined {
         match record_restore_declined(&db, refusal) {
@@ -231,6 +258,8 @@ fn apply_batch_ledger_updates(
                 refusal.target_key
             )),
         }
+        processed += 1;
+        on_progress("ledger", processed, total);
     }
 }
 
@@ -290,10 +319,19 @@ fn restore_copy_mappings(
     candidate: &RestoreCandidate,
     source: &RestoreSourceCandidate,
 ) -> Vec<StoreCopyPathMapping> {
-    let mut mappings = vec![
-        StoreCopyPathMapping::exact(&source.path, &candidate.target_path),
-        StoreCopyPathMapping::virtual_prefix(&source.path, &candidate.target_path),
-    ];
+    let mut mappings = vec![StoreCopyPathMapping::exact(
+        &source.path,
+        &candidate.target_path,
+    )];
+    if matches!(
+        source.kind,
+        ContentKind::Zip | ContentKind::Pdf | ContentKind::Convertible
+    ) {
+        mappings.push(StoreCopyPathMapping::virtual_prefix(
+            &source.path,
+            &candidate.target_path,
+        ));
+    }
     if source.kind == ContentKind::Convertible && candidate.target_kind == ContentKind::Convertible
     {
         let old_cache = crate::archive_cache::cache_zip_path_for_data_dir(data_dir, &source.path);
@@ -423,19 +461,35 @@ fn query_family_rows(
     let conn = rusqlite::Connection::open(&path).map_err(|error| error.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|error| error.to_string())?;
-    let sql = format!(
-        "SELECT {key_column}, {selected_columns} FROM {table}
-          WHERE {key_column} = ?1 OR substr({key_column}, 1, ?2) = ?3"
-    );
-    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let select = format!("SELECT {key_column}, {selected_columns} FROM {table}");
+    let mut exact = conn
+        .prepare(&format!("{select} WHERE {key_column} = ?1"))
+        .map_err(|error| error.to_string())?;
+    let mut range = conn
+        .prepare(&format!(
+            "{select} WHERE {key_column} >= ?1 AND {key_column} < ?2"
+        ))
+        .map_err(|error| error.to_string())?;
+    let mut no_upper = conn
+        .prepare(&format!(
+            "{select} WHERE {key_column} >= ?1 AND substr({key_column}, 1, ?2) = ?1"
+        ))
+        .map_err(|error| error.to_string())?;
     for family in families {
         let prefix = format!("{}::", family.base_key);
-        let mut rows = statement
-            .query(rusqlite::params![
-                family.base_key,
-                prefix.chars().count() as i64,
-                prefix,
-            ])
+        let mut rows = exact
+            .query([&family.base_key])
+            .map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            visit(row)?;
+        }
+        drop(rows);
+        let mut rows =
+            if let Some(upper) = crate::rename_key_migration::prefix_upper_bound(&prefix) {
+                range.query(rusqlite::params![prefix, upper])
+            } else {
+                no_upper.query(rusqlite::params![prefix, prefix.chars().count() as i64])
+            }
             .map_err(|error| error.to_string())?;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             visit(row)?;
@@ -721,6 +775,154 @@ mod tests {
         }
     }
 
+    #[test]
+    fn image_mappings_skip_virtual_prefix_and_containers_keep_it() {
+        let data = tempfile::tempdir().unwrap();
+        for (kind, expected) in [
+            (ContentKind::Image, 1),
+            (ContentKind::Zip, 2),
+            (ContentKind::Pdf, 2),
+            (ContentKind::Convertible, 4),
+        ] {
+            let (candidate, source) = candidate(
+                PathBuf::from(r"C:\本\old.ext"),
+                PathBuf::from(r"D:\本\new.ext"),
+                kind,
+                "hash",
+            );
+            let mappings = restore_copy_mappings(data.path(), &candidate, &source);
+            assert_eq!(mappings.len(), expected, "{kind:?}");
+            assert_eq!(
+                mappings
+                    .iter()
+                    .filter(|mapping| matches!(mapping, StoreCopyPathMapping::VirtualPrefix { .. }))
+                    .count(),
+                if kind == ContentKind::Convertible {
+                    2
+                } else {
+                    expected - 1
+                },
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_family_exact_and_prefix_query_plans_search_key_index() {
+        let data = tempfile::tempdir().unwrap();
+        create_all_unique_store_schemas(data.path());
+        for (file, table, column) in [
+            ("adjustment.db", "page_params", "page_path"),
+            ("mask.db", "masks", "path"),
+            ("conceal.db", "conceal_entries", "page_path"),
+            ("local_adjust.db", "local_adjust_pages", "page_path"),
+            ("export_crop.db", "export_crop_pages", "page_path"),
+            ("comic.db", "comic_entries", "page_path"),
+            ("rotation.db", "rotations", "path"),
+        ] {
+            let connection = rusqlite::Connection::open(data.path().join(file)).unwrap();
+            for predicate in [
+                format!("{column} = ?1"),
+                format!("{column} >= ?1 AND {column} < ?2"),
+                format!("{column} >= ?1 AND substr({column}, 1, ?2) = ?1"),
+            ] {
+                let sql =
+                    format!("EXPLAIN QUERY PLAN SELECT {column} FROM {table} WHERE {predicate}");
+                let mut statement = connection.prepare(&sql).unwrap();
+                let plan: String = if predicate == format!("{column} = ?1") {
+                    statement
+                        .query_row(["c:/日本/本::"], |row| row.get(3))
+                        .unwrap()
+                } else {
+                    statement
+                        .query_row(
+                            rusqlite::params!["c:/日本/本::", "c:/日本/本:;"],
+                            |row| row.get(3),
+                        )
+                        .unwrap()
+                };
+                assert!(
+                    plan.contains("SEARCH") && plan.contains("INDEX") && !plan.contains("SCAN"),
+                    "{file}.{table}: {plan}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_family_rows_match_legacy_or_substr_for_unicode_and_case() {
+        let data = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(data.path().join("rotation.db")).unwrap();
+        connection
+            .execute_batch("CREATE TABLE rotations (path TEXT PRIMARY KEY, angle INTEGER NOT NULL)")
+            .unwrap();
+        for (index, key) in [
+            "c:/日本/本.zip",
+            "c:/日本/本.zip::一.jpg",
+            "c:/日本/本.zip::二.jpg",
+            "c:/日本/本.zip:;outside",
+            "c:/A.zip",
+            "c:/A.zip::upper",
+            "c:/a.zip",
+            "c:/a.zip::lower",
+            "c:/\u{10ffff}.zip::edge",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            connection
+                .execute(
+                    "INSERT INTO rotations VALUES (?1, ?2)",
+                    rusqlite::params![key, index as i64],
+                )
+                .unwrap();
+        }
+        for base in [
+            "c:/日本/本.zip",
+            "c:/A.zip",
+            "c:/a.zip",
+            "c:/\u{10ffff}.zip",
+        ] {
+            let family = DestinationEditFamily {
+                base_path: PathBuf::from(base),
+                base_key: base.to_owned(),
+            };
+            let mut actual = Vec::new();
+            query_family_rows(
+                data.path(),
+                "rotation.db",
+                "rotations",
+                "path",
+                "angle",
+                &[family],
+                |row| {
+                    actual.push((
+                        row.get::<_, String>(0).map_err(|error| error.to_string())?,
+                        row.get::<_, i64>(1).map_err(|error| error.to_string())?,
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let prefix = format!("{base}::");
+            let mut expected = connection
+                .prepare(
+                    "SELECT path, angle FROM rotations WHERE path = ?1 OR substr(path, 1, ?2) = ?3",
+                )
+                .unwrap()
+                .query_map(
+                    rusqlite::params![base, prefix.chars().count() as i64, prefix],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected, "{base}");
+        }
+    }
+
     fn create_all_unique_store_schemas(data_dir: &Path) {
         for descriptor in crate::rename_key_migration::STORES
             .iter()
@@ -836,9 +1038,29 @@ mod tests {
             selected.push(SelectedRestore { candidate, source });
         }
         drop(db);
-        let report = restore_candidates_at(data.path(), &selected, &[], true);
+        let mut progress = Vec::new();
+        let report = restore_candidates_at_with_progress(
+            data.path(),
+            &selected,
+            &[],
+            true,
+            |stage, processed, total| progress.push((stage, processed, total)),
+        );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.ledger_entries.len(), candidate_count);
+        for stage in ["copy", "ledger", "runtime"] {
+            let events = progress
+                .iter()
+                .filter(|event| event.0 == stage)
+                .collect::<Vec<_>>();
+            assert!(!events.is_empty(), "{stage}");
+            assert!(events.windows(2).all(|events| events[0].1 <= events[1].1));
+            assert_eq!(
+                events.last().unwrap().1,
+                events.last().unwrap().2,
+                "{stage}"
+            );
+        }
         report.database_opens
     }
 

@@ -473,3 +473,46 @@ A2 / A3 を実装している間に開発機の台帳が埋まり、A3 の実機
   `delete_missing_originals` / `clear_all` / `prune_to_size_limit_locked` / `total_size` の
   すべてが「1 行 = 1 ファイル所有」を前提にしており、参照カウント導入が必要になる。
   §4 のとおりキー付け替えだけで足りるので不要。
+
+---
+
+## 12. §1.289 大量復元の prefix 検索 (2026-09-27 実装)
+
+利用者の 12,403 件復元で、候補ごとに各 DB 表を読む `substr(key,1,n)=prefix` が
+全件スキャンになっていた。`copy_prefix`、`move_prefix`、復元後の 7 表の
+`query_family_rows` を、BINARY のキー索引を使う `[prefix, prefix_upper_bound(prefix))`
+へ変更した。上限が表現できない Unicode 境界は `key >= prefix AND substr(...)` とし、
+文字数で判定する旧結果を維持しながら索引の下限を使う。`query_family_rows` の
+exact と virtual prefix は別クエリに分け、`OR substr(...)` を残さない。
+`ratings.source_path` の改名後・コピー後の再計算対象も同じ範囲に変更した。
+値を導出する `substr(path,1,instr(path,'::')-1)` 自体は検索条件ではなく維持する。
+
+`STORES` のキー列は下表のとおりすべて既定 BINARY collation。`TEXT PRIMARY KEY`
+またはキー列先頭の複合 PK を持つ。非一意の `video_bookmarks.path` は
+`idx_video_bookmarks_path` を持つ。索引追加・schema version 変更は不要。
+
+| DB | 対象表・キー列 | 索引 |
+| --- | --- | --- |
+| rating.db | ratings.path | PK |
+| content_identity.db | edit_origin.file_key | PK |
+| adjustment.db | page_params.page_path、sidecar_sync.folder_key | 各 PK |
+| mask.db / conceal.db / local_adjust.db / comic.db | masks.path、conceal_entries.page_path、local_adjust_pages.page_path、comic_entries.page_path | 各 PK |
+| export_crop.db / edit_preview_cache.db / rotation.db | export_crop_pages.page_path、edit_previews.item_key、rotations.path | 各 PK |
+| tags.db | item_tags.item_key、tag_item_state.item_key、tag_sidecar_sync.folder_key | 先頭列の複合 PK、他は PK |
+| view_trim.db | view_trim_pages.page_path、view_trim_books.book_key | 各 PK |
+| video_pins.db / video_bookmarks.db | video_pins.path、video_bookmarks.path | PK、`idx_video_bookmarks_path` |
+| folder_thumb_pins.db / book_resume.db | folder_thumb_pins.container_key、book_resume.path | 各 PK |
+| spread.db | spreads.path、final_cover_spreads.path、singleton_spread_placements.path、singleton_spread_endpoint_placements.path、page_alone_preferences.path | 各 PK |
+| reading_history.db | reading_history.key | PK |
+
+画像は Exact mapping のみ。ZIP / PDF は Exact と VirtualPrefix、変換アーカイブは
+元パスと予測 cache ZIP の各 Exact / VirtualPrefix の 4 面を維持する。分類には
+`ContentKind` を使う。worker は開始、コピー mapping 操作・台帳項目の 1,000 件ごとの
+進捗、完了を通常ログと `content_identity` perf event に記録する。進捗の
+`processed/total` は `stage=copy` なら表×mapping 操作、`stage=ledger` なら候補と
+辞退の件数であり、画面の進捗ではない。Quiescing の文言・中断設計は別レビューに残す。
+
+計測用 `#[ignore]` テスト `measure_thousand_restores_against_hundred_thousand_rows` は
+メモリ上の 1 表に 10 万行を置き、1,000 件のコンテナ prefix コピーと destination
+family 読込を旧/新 SQL で実行した。開発機の同一実行で **旧 19.998 秒 / 新 36.5 ms**。
+行の準備時間は除外。実 DB 群・台帳更新・sidecar 処理・HDD I/O を含む総復元時間ではない。
