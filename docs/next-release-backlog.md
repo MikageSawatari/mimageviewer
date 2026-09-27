@@ -106,6 +106,46 @@
   A/B クイックフォルダ、削除済みコレクションの prune。
 - 規模 / 優先度: Small〜Medium / P2 (§1.280 と同時に)。
 
+### 1.288 多数のファイルをエクスプローラへドラッグしてコピーすると、コピーが終わるまで mIV が操作できない — コード調査 + 通常ログ (2026-09-27)
+
+- 出典: 利用者 (開発者本人) の報告。mIV で多数のファイルを選んでエクスプローラへドラッグ＆ドロップでコピーすると、
+  その間 mIV が固まって操作できない。
+- ログ (利用者環境の `%APPDATA%\mimageviewer\logs\mimageviewer.log`、同日のセッション): UI スレッドが
+  `SHDoDragDrop` から戻るまでの時間が、2606 件で約 108 秒、6220 件で約 324 秒。どちらも `effect=1` (COPY)
+  で、ドロップ自体は成立している。
+  ```
+  [2329.148s][t26584] file_drag: SHDoDragDrop start (2606 item(s))
+  [2437.527s][t26584] file_drag: SHDoDragDrop done effect=1
+  [2638.509s][t26584] file_drag: SHDoDragDrop start (6220 item(s))
+  [2962.340s][t26584] file_drag: SHDoDragDrop done effect=1
+  ```
+- コードから確定したこと: `App::update` の末尾で `file_drag::start_file_drag` を UI スレッドから同期で呼び
+  (`src/app.rs` の「native ファイル D&D の実行」)、その中の `SHDoDragDrop` (`src/file_drag.rs`) が戻るまで
+  UI スレッドが止まる。`SHDoDragDrop` は受け取り側の `IDropTarget::Drop` が戻るまで戻らない。ログの時間から、
+  エクスプローラはコピーを `Drop` の中で最後まで行っている。`src/file_drag.rs` 冒頭のコメントは
+  「モーダルブロックは不可避」としているが、不可避なのは**ドラッグ中** (マウスボタン押下中) の部分だけで、
+  **ドロップ後のコピー中**の部分は Windows の非同期ドロップで外せる。
+- 方針候補: データオブジェクトを `IDataObjectAsyncCapability` 対応にし、`GetAsyncMode` が TRUE を返すようにする
+  (Microsoft の文書「Dragging and Dropping Shell Objects Asynchronously」)。受け取り側はデータを取り出したあと
+  自分のバックグラウンドスレッドで処理し、`Drop` をすぐ返すので、mIV は `SHDoDragDrop` からすぐ戻る。
+  1. 現在は Shell の `IDataObject` (`BHID_DataObject`) を借りている。まずこれを `IDataObjectAsyncCapability` へ
+     `QueryInterface` できるか確かめ、できれば `SetAsyncMode(TRUE)` してから渡す。Shell のデータオブジェクトが
+     対応しているかはコードからは分からない (未確認)。
+  2. 対応していなければ、`IDataObject` の 9 メソッドを Shell の実体へ委譲し、`IDataObjectAsyncCapability`
+     (SetAsyncMode / GetAsyncMode / StartOperation / InOperation / EndOperation) を足した薄いラッパーを
+     windows-rs の `#[implement]` で作る。
+  - 非同期では、`SHDoDragDrop` が戻った後もエクスプローラが mIV のデータオブジェクトを呼ぶ (プロセス間呼び出しは
+    UI スレッドの STA に届く)。winit のメッセージループが回り続けるので受けられる見込みだが、未確認。
+  - ドラッグ中の固まり (押下中の OLE モーダルループ) はこの修正では残る。
+- 回帰確認 (利用者の実機): 数千件をエクスプローラへドロップ中に mIV を操作できる、同名ファイルがあるときの
+  エクスプローラの確認ダイアログ、エクスプローラ側のコピーのキャンセル、mIV 自身へのドロップ
+  (`internal_drop_pending` の判定)、1 件だけのドラッグ、Esc でのドラッグ中止。
+  `docs/file-drag-drop-design.md` §6.2 と `docs/ui-responsiveness.md` の「native D&D のモーダルブロックは
+  意図的な例外」の記述も、残る範囲 (ドラッグ中のみ) に合わせて直す。
+- 回避策 (コード上の見込み、未確認): mIV でコピー (Ctrl+C / 右クリックのコピー、`OleSetClipboard` 経路) して
+  エクスプローラで貼り付ければ、コピーはエクスプローラ側で進み mIV は止まらないはず。
+- 規模 / 優先度: Small〜Medium / P2 (大量コピーのたびに数分操作できなくなる)。
+
 ### 1.287 常に最前面 ON で、VST プラグイン画面にフォーカスがある状態で VST ボタンを押すと中途半端な状態になる — §1.250 の追補 (2026-09-27)
 
 - 出典: 利用者 (開発者本人) が §1.250 の実機確認で観測。常に最前面 ON で HUD の VST ボタンからプラグイン画面を開き
