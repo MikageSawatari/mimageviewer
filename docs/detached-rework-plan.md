@@ -1457,7 +1457,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 **2026-09-27 履歴 preflight と直接 open の admission**
 
-独立 integration review の指摘に従い、`OpenRequestOwner` の各 variant が承認された後に、main の staged 履歴要求を一か所で退役させる。既存の `navigation_scope.is_detached_physical()` 境界を維持し、detached の直接 open は main の staged 要求を退役させない。detached 判定・viewport・window の状態や再試行は追加していない。これは同じ surface の要求所有権を統一する変更であり、detached 表示症状の局所回避ではない。
+独立 integration review の指摘に従い、`OpenRequestOwner` の各 variant が承認された後に、同じ viewer context が所有する staged 履歴要求だけを一か所で退役させる。`DetachedGridArchive` と detached lease を持つ `Bookmark` は型付き owner の window ID から registry の context ID を引き、通常 owner は投影中の context ID を使う。履歴 transition 自身の `source_context` も照合する。変換 cache 命中時の detached archive open は main App 上で admission を呼ぶが、宛先 context が detached なので main の staged 履歴・表示を変更しない。以前の `navigation_scope.is_detached_physical()` だけの判定ではこの経路を見落としていた。viewport / window の再作成や再試行は追加していない。これは要求と表示の context 所有権を揃える変更であり、detached 表示症状の局所回避ではない。
 
 **2026-09-27 §1.280 / §1.282 Collection 履歴と detached 外側 navigation**
 

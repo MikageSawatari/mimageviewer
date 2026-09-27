@@ -531,6 +531,8 @@ x64 で `+crt-static` なので VC runtime 検査の追加設定は不要 (`chec
 
 履歴 navigation との統合時の typed continuation、成功採用境界、未変換 EPUB と「PDF を保存」の履歴規則は [folder-history-location-plan.md §11](folder-history-location-plan.md#11-epub-統合時の履歴-open-所有2026-09-27設計担当決定) を正本とする。直接 open の非同期 PDF 列挙と、履歴の staged preflight は一つの要求を二重に所有しない。直接 EPUB が未完了のときに history request が受け付けられた場合は、直接 open の rollback を staged source の記録前に消費する。
 
+2026-09-27 の再レビュー修正では、直接 PDF/EPUB open も列挙成功までは元の rows・surface・selection を保持する。warm `pdf_meta` placeholder は直接 open の未採用表示には使わない。詳細は同じ [履歴 plan §11](folder-history-location-plan.md#11-epub-統合時の履歴-open-所有2026-09-27設計担当決定) を参照。
+
 ### S3a 一覧・分類・D5 (2026-09-26)
 
 EPUB の論理パスを `PdfFile` / `PdfPage` に保持する。一覧・検索・評価・コレクションが

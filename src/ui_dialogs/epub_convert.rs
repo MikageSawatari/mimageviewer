@@ -42,6 +42,9 @@ pub(crate) struct EpubOpenRestore {
     pub(crate) logical: PathBuf,
     pub(crate) history: Option<FolderNavHistorySnapshot>,
     pub(crate) address_before: Option<String>,
+    /// Direct PDF/EPUB adoption survives the NotConverted dialog and resumes with the same
+    /// source origin. Staged history carries its own transition instead.
+    pub(crate) adoption: Option<Box<crate::app::DirectPdfAdoption>>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +131,7 @@ impl EpubConvertState {
                 logical,
                 history: None,
                 address_before: None,
+                adoption: None,
             },
             deferred_fullscreen: None,
             phase: EpubConvertPhase::Converting(None),
@@ -155,6 +159,7 @@ impl EpubConvertState {
                 logical,
                 history: None,
                 address_before: None,
+                adoption: None,
             },
             deferred_fullscreen: None,
             phase: EpubConvertPhase::Saving(None),
@@ -397,6 +402,7 @@ impl App {
                         logical: logical.to_owned(),
                         history: None,
                         address_before: None,
+                        adoption: None,
                     },
                     deferred_fullscreen: None,
                     phase: EpubConvertPhase::Scanning,
@@ -466,6 +472,7 @@ impl App {
                 logical: state.src_path.clone(),
                 history: None,
                 address_before: None,
+                adoption: None,
             },
         );
         drop(state);
@@ -532,6 +539,7 @@ impl App {
                 logical: state.src_path.clone(),
                 history: None,
                 address_before: None,
+                adoption: None,
             },
         );
         let deferred = state.deferred_fullscreen.take();
@@ -587,7 +595,7 @@ impl App {
         if reopened
             && let Some(pending) = self.pdf_enumerate_pending.as_mut()
             && crate::folder_tree::path_eq(&pending.0, &path)
-            && pending.3 == owner
+            && pending.3.as_ref() == &owner
         {
             pending.4 = Some(restore);
             if deferred.is_some() {
@@ -792,6 +800,7 @@ mod tests {
                     logical: PathBuf::from("C:/books/book.epub"),
                     history: None,
                     address_before: None,
+                    adoption: None,
                 },
                 deferred_fullscreen: None,
                 phase,
@@ -935,7 +944,7 @@ mod tests {
         assert!(
             app.pdf_enumerate_pending
                 .as_ref()
-                .is_some_and(|pending| { pending.0 == source && pending.3 == owner })
+                .is_some_and(|pending| { pending.0 == source && pending.3.as_ref() == &owner })
         );
         assert!(app.fs_nav_after_pdf_enumerate.is_some());
         assert_eq!(app.fs_nav_locked_gen, Some(7));
@@ -971,7 +980,7 @@ mod tests {
         assert!(
             app.pdf_enumerate_pending
                 .as_ref()
-                .is_some_and(|pending| pending.0 == pdf && pending.3 == owner)
+                .is_some_and(|pending| pending.0 == pdf && pending.3.as_ref() == &owner)
         );
         assert!(app.fs_nav_after_pdf_enumerate.is_some());
     }

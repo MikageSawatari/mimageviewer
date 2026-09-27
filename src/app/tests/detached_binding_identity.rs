@@ -49,7 +49,9 @@ fn detached_binding_identity_book_start_resolves_published_window() {
     let root = app.tmp.path().to_path_buf();
     let (_, window) = start_cached_pdf(&mut app, &root);
     app.with_active_viewer_context(|mounted| {
-        assert_eq!(mounted.pdf_placeholder_count, Some(2));
+        // A direct open keeps the source display until verified enumeration is adopted.
+        assert_eq!(mounted.pdf_placeholder_count, None);
+        assert!(mounted.pdf_enumerate_pending.is_some());
         assert_eq!(
             mounted.viewer_context_window(mounted.projected_viewer_context_id()),
             Some(window)
@@ -78,7 +80,7 @@ fn detached_binding_identity_pdf_load_poll_open_uses_published_window() {
             .collect()))
             .unwrap();
         // Replace only the external worker response. Keep load_pdf_as_folder's request,
-        // placeholder, deferred open, registry build/commit/mount and the real poll handler.
+        // deferred open, registry build/commit/mount and the real poll handler.
         mounted.pdf_enumerate_pending.as_mut().unwrap().2.rx = rx;
         mounted.poll_pdf_enumerate();
         assert_eq!(mounted.fullscreen_idx, Some(0));

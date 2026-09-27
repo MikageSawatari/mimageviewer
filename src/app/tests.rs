@@ -10,12 +10,29 @@ use tempfile::TempDir;
 #[test]
 fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     use std::mem::size_of;
+    println!(
+        "sizes App={} FolderNavHistoryTarget={} OpenRequestOwner={} DirectPdfAdoption={} EpubOpenRestore={} PdfPasswordRequestOwner={} PdfPasswordRequest={} PdfEnumeratePending={}",
+        size_of::<App>(),
+        size_of::<FolderNavHistoryTarget>(),
+        size_of::<OpenRequestOwner>(),
+        size_of::<DirectPdfAdoption>(),
+        size_of::<crate::ui_dialogs::epub_convert::EpubOpenRestore>(),
+        size_of::<PdfPasswordRequestOwner>(),
+        size_of::<PdfPasswordRequest>(),
+        size_of::<PdfEnumeratePending>(),
+    );
     // A staged history request is rarely active and must not be stored inline in every App.
     // The capture/fullscreen input test creates several App values on a default test stack.
     assert_eq!(
         size_of::<Option<Box<HistoryNavigationTransition>>>(),
         size_of::<usize>()
     );
+    assert_eq!(
+        size_of::<Option<Box<DirectPdfAdoption>>>(),
+        size_of::<usize>()
+    );
+    assert!(size_of::<PdfPasswordRequestOwner>() < 32);
+    assert!(size_of::<PdfEnumeratePending>() < 1_200);
     assert!(size_of::<top_level_grid_view::TopLevelGridView>() < 3_200);
     assert!(size_of::<App>() < 110_000);
 }
@@ -1236,11 +1253,12 @@ fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
         source.clone(),
         None,
         handle,
-        OpenRequestOwner::Navigation,
+        Box::new(OpenRequestOwner::Navigation),
         Some(crate::ui_dialogs::epub_convert::EpubOpenRestore {
             logical: source.clone(),
             history: Some(snapshot),
             address_before: Some(previous.to_string_lossy().into_owned()),
+            adoption: None,
         }),
     ));
     app.poll_pdf_enumerate();
@@ -10684,6 +10702,348 @@ mod startup_open_path_resolve_tests {
     }
 
     #[test]
+    fn warm_pdf_direct_open_superseded_by_failed_or_cancelled_history_preserves_display() {
+        for fail_preflight in [true, false] {
+            let mut app = setup_app();
+            let folder = app.tmp.path().join("warm-pdf-source");
+            let staged = app.tmp.path().join("warm-pdf-history-target");
+            std::fs::create_dir(&folder).unwrap();
+            if !fail_preflight {
+                std::fs::create_dir(&staged).unwrap();
+            }
+            let pdf = folder.join("warm.pdf");
+            std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+            let metadata = std::fs::metadata(&pdf).unwrap();
+            app.get_or_open_catalog(&folder)
+                .unwrap()
+                .set_pdf_meta(
+                    "warm.pdf",
+                    crate::ui_helpers::mtime_secs(&metadata),
+                    metadata.len() as i64,
+                    2,
+                    false,
+                )
+                .unwrap();
+            assert!(app.peek_pdf_meta_cache(&pdf, false).is_some());
+            app.load_folder(folder.clone());
+            app.set_quick_folder_slot_target(super::QuickFolderSlotId::A, folder);
+            app.set_quick_folder_slot_target(super::QuickFolderSlotId::B, staged.clone());
+            app.active_quick_folder_slot = Some(super::QuickFolderSlotId::A);
+            app.enter_drive_list(None);
+            app.selected = Some(0);
+            let rows = app.items.clone();
+            let visible = app.visible_indices.clone();
+            let selection = app.selected;
+            let surface = app.top_level_grid_view.surface().clone();
+            let current_folder = app.current_folder.clone();
+            let address = app.address.clone();
+            let history = app.folder_nav_history_snapshot();
+
+            let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(27);
+            arm_book_bookmark(&mut app, owner_id, pdf.clone(), std::time::Instant::now());
+            assert!(app.load_folder_with_scan_owned(
+                pdf.clone(),
+                None,
+                OpenRequestOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
+                    request_id: owner_id,
+                    target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(pdf),
+                    #[cfg(windows)]
+                    detached_lease: None,
+                }),
+            ));
+            assert!(app.pdf_enumerate_pending.is_some());
+            assert_eq!(app.items, rows, "direct preflight changed visible rows");
+            assert_eq!(app.top_level_grid_view.surface(), &surface);
+            assert_eq!(app.selected, selection);
+
+            assert!(app.start_physical_history_transition(
+                super::PhysicalHistoryIntent::Navigation {
+                    replay: None,
+                    auto_fullscreen: false,
+                },
+                staged,
+            ));
+            if fail_preflight {
+                let ctx = egui::Context::default();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while app
+                    .top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some()
+                {
+                    assert!(std::time::Instant::now() < deadline);
+                    app.poll_collection_history_transition(&ctx);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            } else {
+                app.replace_history_navigation_transition(None);
+            }
+            assert_eq!(app.items, rows);
+            assert_eq!(app.visible_indices, visible);
+            assert_eq!(app.selected, selection);
+            assert_eq!(app.top_level_grid_view.surface(), &surface);
+            assert_eq!(app.current_folder, current_folder);
+            assert_eq!(app.address, address);
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+            assert_eq!(
+                app.active_quick_folder_slot,
+                history.active_quick_folder_slot
+            );
+            for slot in 0..2 {
+                assert_eq!(
+                    app.quick_folder_workspaces[slot].target,
+                    history.quick_folder_workspaces[slot].target,
+                );
+                assert_eq!(
+                    app.quick_folder_workspaces[slot].history,
+                    history.quick_folder_workspaces[slot].history,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_pdf_rows_and_surface_commit_with_enumeration_result() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("direct-pdf-source");
+        std::fs::create_dir(&folder).unwrap();
+        let pdf = folder.join("book.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.load_folder(folder);
+        app.enter_drive_list(None);
+        let rows = app.items.clone();
+        let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(28);
+        arm_book_bookmark(&mut app, owner_id, pdf.clone(), std::time::Instant::now());
+        assert!(app.load_folder_with_scan_owned(
+            pdf.clone(),
+            None,
+            OpenRequestOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
+                request_id: owner_id,
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(pdf.clone()),
+                #[cfg(windows)]
+                detached_lease: None,
+            }),
+        ));
+        assert_eq!(app.items, rows);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            super::top_level_grid_view::TopLevelGridSurface::DriveList
+        ));
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Ok(crate::pdf_loader::PdfEnumerateResult {
+                    pages: vec![crate::pdf_loader::PdfPageEntry {
+                        page_num: 0,
+                        mtime: 1,
+                        file_size: 1,
+                    }],
+                    direction: None,
+                    stamp: None,
+                }),
+            );
+        app.poll_pdf_enumerate();
+        assert_eq!(app.current_folder.as_deref(), Some(pdf.as_path()));
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            super::top_level_grid_view::TopLevelGridSurface::Folder
+        ));
+        assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(
+                super::drive_list_synthetic_path()
+            ))
+        );
+    }
+
+    #[test]
+    fn direct_epub_conversion_resumes_deferred_surface_adoption() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("direct-epub-source");
+        std::fs::create_dir(&folder).unwrap();
+        let epub = folder.join("book.epub");
+        write_history_review_epub(&epub);
+        app.load_folder(folder);
+        app.enter_drive_list(None);
+        let rows = app.items.clone();
+        let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(29);
+        arm_book_bookmark(&mut app, owner_id, epub.clone(), std::time::Instant::now());
+        assert!(app.load_folder_with_scan_owned(
+            epub.clone(),
+            None,
+            OpenRequestOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
+                request_id: owner_id,
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(epub.clone()),
+                #[cfg(windows)]
+                detached_lease: None,
+            }),
+        ));
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &epub,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    crate::pdf_loader::PdfReadError::NotConverted,
+                )),
+            );
+        app.poll_pdf_enumerate();
+        assert!(app.epub_convert.is_some());
+        assert_eq!(app.items, rows);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            super::top_level_grid_view::TopLevelGridSurface::DriveList
+        ));
+        app.epub_convert
+            .as_mut()
+            .unwrap()
+            .fake_published_sender_for_test()();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        assert!(
+            app.pdf_enumerate_pending
+                .as_ref()
+                .and_then(|pending| pending.4.as_ref())
+                .and_then(|restore| restore.adoption.as_ref())
+                .is_some()
+        );
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &epub,
+                Ok(crate::pdf_loader::PdfEnumerateResult {
+                    pages: vec![crate::pdf_loader::PdfPageEntry {
+                        page_num: 0,
+                        mtime: 1,
+                        file_size: 1,
+                    }],
+                    direction: None,
+                    stamp: Some(crate::pdf_loader::DocumentStamp::Generation {
+                        id: 29,
+                        pdf_size: 1,
+                    }),
+                }),
+            );
+        app.poll_pdf_enumerate();
+        assert_eq!(app.current_folder.as_deref(), Some(epub.as_path()));
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            super::top_level_grid_view::TopLevelGridSurface::Folder
+        ));
+        assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(
+                super::drive_list_synthetic_path()
+            ))
+        );
+    }
+
+    #[test]
+    fn direct_pdf_password_continuation_keeps_source_until_retry_or_cancel() {
+        for terminal in ["retry", "cancel", "history"] {
+            let mut app = setup_app();
+            let folder = app.tmp.path().join("password-source");
+            std::fs::create_dir(&folder).unwrap();
+            let pdf = folder.join("book.pdf");
+            std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+            app.load_folder(folder);
+            app.enter_drive_list(None);
+            let rows = app.items.clone();
+            let address = app.address.clone();
+            let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(30);
+            arm_book_bookmark(&mut app, owner_id, pdf.clone(), std::time::Instant::now());
+            assert!(app.load_folder_with_scan_owned(
+                pdf.clone(),
+                None,
+                OpenRequestOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
+                    request_id: owner_id,
+                    target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(pdf.clone()),
+                    #[cfg(windows)]
+                    detached_lease: None,
+                }),
+            ));
+            app.pdf_enumerate_pending.as_mut().unwrap().2 =
+                crate::pdf_loader::completed_enumerate_result_handle(
+                    &pdf,
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        crate::pdf_loader::PdfReadError::PasswordRequired,
+                    )),
+                );
+            app.poll_pdf_enumerate();
+            assert!(matches!(
+                app.pdf_password_request
+                    .as_ref()
+                    .map(|request| &request.owner),
+                Some(super::PdfPasswordRequestOwner::Direct(_))
+            ));
+            assert_eq!(app.items, rows);
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                super::top_level_grid_view::TopLevelGridSurface::DriveList
+            ));
+            if terminal == "retry" {
+                assert!(app.retry_pdf_password_request_in_mounted_context("pw".into(), false));
+                assert!(
+                    app.pdf_enumerate_pending
+                        .as_ref()
+                        .and_then(|pending| pending.4.as_ref())
+                        .and_then(|restore| restore.adoption.as_ref())
+                        .is_some()
+                );
+                app.pdf_enumerate_pending.as_mut().unwrap().2 =
+                    crate::pdf_loader::completed_enumerate_result_handle(
+                        &pdf,
+                        Ok(crate::pdf_loader::PdfEnumerateResult {
+                            pages: vec![crate::pdf_loader::PdfPageEntry {
+                                page_num: 0,
+                                mtime: 1,
+                                file_size: 1,
+                            }],
+                            direction: None,
+                            stamp: None,
+                        }),
+                    );
+                app.poll_pdf_enumerate();
+                assert_eq!(app.current_folder.as_deref(), Some(pdf.as_path()));
+                assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
+            } else {
+                if terminal == "cancel" {
+                    assert!(app.cancel_pdf_password_request_in_mounted_context());
+                } else {
+                    let missing = app.tmp.path().join("missing-history-target");
+                    assert!(app.start_physical_history_transition(
+                        super::PhysicalHistoryIntent::Navigation {
+                            replay: None,
+                            auto_fullscreen: false,
+                        },
+                        missing,
+                    ));
+                    let ctx = egui::Context::default();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while app
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some()
+                    {
+                        assert!(std::time::Instant::now() < deadline);
+                        app.poll_collection_history_transition(&ctx);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    assert!(app.pdf_password_request.is_none());
+                }
+                assert_eq!(app.items, rows);
+                assert_eq!(app.address, address);
+                assert!(matches!(
+                    app.top_level_grid_view.surface(),
+                    super::top_level_grid_view::TopLevelGridSurface::DriveList
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn bookmark_direct_open_retires_pending_history_preflight() {
         let mut app = setup_app();
         let old = app.tmp.path().join("before-bookmark");
@@ -10718,7 +11078,9 @@ mod startup_open_path_resolve_tests {
                 .is_none()
         );
         assert!(matches!(
-            app.pdf_enumerate_pending.as_ref().map(|pending| &pending.3),
+            app.pdf_enumerate_pending
+                .as_ref()
+                .map(|pending| pending.3.as_ref()),
             Some(super::OpenRequestOwner::Bookmark(_))
         ));
         assert_eq!(app.address, book.to_string_lossy());
@@ -57093,6 +57455,77 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn detached_cached_archive_keeps_main_staged_history_and_display() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("cached-staged.7z");
+        let backing = app.tmp.path().join("cached-staged.zip");
+        let staged = app.tmp.path().join("main-staged-target");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&backing, b"cache").unwrap();
+        std::fs::create_dir(&staged).unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                ArchiveFormat::SevenZ,
+                &backing,
+                std::fs::metadata(&backing).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        let (_folder, _) =
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
+        assert!(app.start_physical_history_transition(
+            super::PhysicalHistoryIntent::Navigation {
+                replay: None,
+                auto_fullscreen: false,
+            },
+            staged,
+        ));
+        let rows = app.items.clone();
+        let visible = app.visible_indices.clone();
+        let selection = app.selected;
+        let surface = app.top_level_grid_view.surface().clone();
+        let folder = app.current_folder.clone();
+        let address = app.address.clone();
+        let history = app.folder_nav_history_snapshot();
+        let generation = app.items_generation;
+        assert!(
+            app.open_grid_item_in_detached_book_context_with_auto_fullscreen(
+                &egui::Context::default(),
+                0,
+                false,
+            )
+        );
+        complete_detached_archive_page_enumeration(
+            &mut app,
+            &backing,
+            &["cached-cover.jpg", "cached-page-002.png"],
+        );
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some(),
+            "detached admission retired the main staged request"
+        );
+        assert_eq!(app.items, rows);
+        assert_eq!(app.visible_indices, visible);
+        assert_eq!(app.selected, selection);
+        assert_eq!(app.top_level_grid_view.surface(), &surface);
+        assert_eq!(app.current_folder, folder);
+        assert_eq!(app.address, address);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_grid_rar_conversion_cache_hit_opens_detached_after_probe() {
         let mut app = setup_app();
         let source = app.tmp.path().join("cached-solid.rar");
@@ -78376,8 +78809,13 @@ mod smart_folder_transition_tests {
         let index = select_real_path(&mut app, &target);
         let old_handle =
             crate::pdf_loader::completed_enumerate_handle_for_test(&old, Ok(Vec::new()));
-        app.pdf_enumerate_pending =
-            Some((old, None, old_handle, OpenRequestOwner::Navigation, None));
+        app.pdf_enumerate_pending = Some((
+            old,
+            None,
+            old_handle,
+            Box::new(OpenRequestOwner::Navigation),
+            None,
+        ));
 
         assert!(app.begin_smart_grid_container_navigation(index, target.clone(), true));
         assert!(
@@ -78567,7 +79005,7 @@ mod smart_folder_transition_tests {
             old_pdf,
             None,
             old_handle,
-            OpenRequestOwner::Navigation,
+            Box::new(OpenRequestOwner::Navigation),
             None,
         ));
         app.poll_pdf_enumerate();

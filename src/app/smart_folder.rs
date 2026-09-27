@@ -3331,7 +3331,7 @@ impl App {
                         collection_navigation_continuation: None,
                     },
                 );
-                self.pdf_enumerate_pending = Some((path, password, handle, owner, None));
+                self.pdf_enumerate_pending = Some((path, password, handle, Box::new(owner), None));
                 true
             }
             SmartPhysicalReady::PdfWarm {
@@ -3374,7 +3374,7 @@ impl App {
                         collection_navigation_continuation: None,
                     },
                 );
-                self.pdf_enumerate_pending = Some((path, password, handle, owner, None));
+                self.pdf_enumerate_pending = Some((path, password, handle, Box::new(owner), None));
                 true
             }
             SmartPhysicalReady::ZipPrepared(prepared) => {

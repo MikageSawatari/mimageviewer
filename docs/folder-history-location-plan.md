@@ -163,6 +163,10 @@ EPUB→PDF 統合との merge は案 A を採用する。変換ダイアログ�
 
 直接 EPUB open が未完了のまま history request を受け付けた場合、直接列挙または変換が保持する履歴・アドレスの rollback を一度だけ復元し、その後に staged request の source を記録する。staged request の失敗・取消で戻る先は直接 EPUB を始める前の表示である。直接 open の owner は `Navigation`、`RatingPhysical`、`QuickFolderSwitch`、`CollectionGridPhysical`、`MainGridArchive`、`Bookmark`、`DetachedGridArchive` を同じ admission 境界で扱い、承認された main surface の要求は旧 staged preflight を退役させる。detached physical scope は main の要求を退役させない。
 
+2026-09-27 再レビュー修正: 直接 PDF/EPUB の非同期列挙は、採用前に元の rows・surface・selection を変更しない。warm `pdf_meta` の仮ページも直接 open では先出しせず、列挙成功と owner 採用後にページを表示する。元表示の巨大な複製を rollback に持たせず、未採用要求の可視変更をしない単一規則とする。直接 EPUB 変換と PDF パスワード確認は同じ typed restore に採用元を保持し、再開・取消・history supersession まで運ぶ。失敗・取消・後続 history 要求では元の display と履歴・address・A/B が残る。detached cache archive の admission は owner の window lease から context ID を解決し、同じ context の staged transition のみ退役させる。`navigation_scope` はこの判断の正本ではない。
+
+この typed continuation は使用中だけ heap に置く。直接採用元、PDF 列挙 owner、PDF パスワード継続値を `App` に inline 保持すると、default-stack の fullscreen capture 回帰が overflow した。boxed 化で `size_of::<App>()` は 111,872 → 108,296 byte、同テストは既定 stack で成功した。
+
 history の PDF/EPUB preflight は `PdfEnumerateResult` 全体（ページ、綴じ方向、世代 stamp）を渡し、直接 open と共通の prepared-PDF 成功処理で採用する。history の採用に仮ページや一時的な `pdf_enumerate_pending` owner は作らない。worker は既知の item kind があっても実 file／directory を判定し、`.epub` 名の directory を Folder として扱う。page flip と ZIP 内部階層は外側履歴の一点のままである。
 
 ダイアログの「変換して開く」は元の論理 `.epub` target へ戻る。「PDF を保存」は sibling `.pdf` を**明示的な新しい行き先**として再 preflight し、成功時にだけ採用する。Back／Forward の head が EPUB だった場合、その entry を pop しない。Collection root の明示 open では既存の source anchor/provenance を維持できる場合に維持し、EPUB entry の外へ出る Collection child replay は独立した物理行き先となる。fullscreen lock と parked／retired context は同じ staged request の終端で片付ける。

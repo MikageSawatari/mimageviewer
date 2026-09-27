@@ -836,9 +836,15 @@ pub(crate) type PdfEnumeratePending = (
     PathBuf,
     Option<String>,
     crate::pdf_loader::PdfEnumerateHandle,
-    OpenRequestOwner,
+    Box<OpenRequestOwner>,
     Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
 );
+
+/// The direct PDF request keeps its source until enumeration proves the destination usable.
+/// No visible grid/surface change belongs to an unadopted request.
+pub(crate) struct DirectPdfAdoption {
+    history_origin: Option<FolderNavHistoryTarget>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GridContainerOpenMode {
@@ -3511,16 +3517,20 @@ enum DeferredFsOpenOutcome {
     RequiredTargetMissing,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PdfPasswordRequest {
     path: PathBuf,
     owner: PdfPasswordRequestOwner,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 enum PdfPasswordRequestOwner {
     Legacy,
+    Direct(Box<DirectPdfPasswordContinuation>),
     StagedHistory(u64),
+}
+
+struct DirectPdfPasswordContinuation {
+    open_owner: OpenRequestOwner,
+    restore: crate::ui_dialogs::epub_convert::EpubOpenRestore,
 }
 
 impl PdfPasswordRequest {
@@ -3528,6 +3538,20 @@ impl PdfPasswordRequest {
         Self {
             path,
             owner: PdfPasswordRequestOwner::Legacy,
+        }
+    }
+
+    fn direct(
+        path: PathBuf,
+        open_owner: OpenRequestOwner,
+        restore: crate::ui_dialogs::epub_convert::EpubOpenRestore,
+    ) -> Self {
+        Self {
+            path,
+            owner: PdfPasswordRequestOwner::Direct(Box::new(DirectPdfPasswordContinuation {
+                open_owner,
+                restore,
+            })),
         }
     }
 
@@ -23172,11 +23196,35 @@ impl App {
                 true
             }
         };
-        // All accepted direct owners (Navigation, RatingPhysical, QuickFolderSwitch,
-        // CollectionGridPhysical, MainGridArchive, Bookmark, DetachedGridArchive) retire the
-        // staged request for this main surface at the same admission boundary.
-        if claimed && !self.navigation_scope.is_detached_physical() {
-            self.replace_history_navigation_transition(None);
+        // Admission is scoped to the typed destination, not whichever bundle happens to be
+        // projected on App. A cached detached archive is admitted while main is projected.
+        if claimed {
+            let owner_context = match owner {
+                #[cfg(windows)]
+                OpenRequestOwner::DetachedGridArchive(detached) => self
+                    .locate_window_context(detached.lease.window_id)
+                    .map(|(context, _)| context),
+                #[cfg(windows)]
+                OpenRequestOwner::Bookmark(bookmark) if bookmark.detached_lease.is_some() => self
+                    .locate_window_context(bookmark.detached_lease.unwrap().window_id)
+                    .map(|(context, _)| context),
+                _ => Some(self.projected_viewer_context_id()),
+            };
+            if owner_context == Some(self.projected_viewer_context_id())
+                && self
+                    .top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some_and(|transition| match transition {
+                        HistoryNavigationTransition::Physical(transition) => {
+                            Some(transition.source_context) == owner_context
+                        }
+                        HistoryNavigationTransition::Collection(transition) => {
+                            Some(transition.source_context) == owner_context
+                        }
+                    })
+            {
+                self.replace_history_navigation_transition(None);
+            }
         }
         claimed
     }
@@ -23410,13 +23458,6 @@ impl App {
                 path,
             );
         }
-        let pdf_open_restore = crate::folder_tree::is_paged_document_path(&path).then(|| {
-            crate::ui_dialogs::epub_convert::EpubOpenRestore {
-                logical: path.clone(),
-                history: Some(self.folder_nav_history_snapshot()),
-                address_before: Some(self.address.clone()),
-            }
-        });
         let independent_navigation = !detached_physical
             && matches!(
                 &owner,
@@ -23448,6 +23489,23 @@ impl App {
             self.reject_snapshot_out_of_scope_open();
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
             return false;
+        }
+        // A direct PDF/EPUB request owns its enumeration but has not adopted the destination.
+        // Keep the source rows, surface and selection intact until the worker proves the book.
+        if pre_scan.is_none()
+            && crate::folder_tree::is_paged_document_path(&path)
+            && !self.visible_grid_item_is_folder(&path)
+            && path.is_file()
+        {
+            self.load_pdf_as_folder_owned(path, owner);
+            if let Some(pending) = self.pdf_enumerate_pending.as_mut() {
+                if let Some(restore) = pending.4.as_mut() {
+                    restore.adoption = Some(Box::new(DirectPdfAdoption {
+                        history_origin: navigation_history_origin,
+                    }));
+                }
+            }
+            return true;
         }
         // A converted cache ZIP is an implementation alias outside the source archive's smart
         // scope. Keep the resident session mounted here; the typed owner commits the logical
@@ -23637,39 +23695,6 @@ impl App {
                                 serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0),
                             ),
                             ("kind", serde_json::Value::from("zip")),
-                            ("path", serde_json::Value::from(lf_path_disp)),
-                        ],
-                    );
-                }
-                return true;
-            }
-            if crate::folder_tree::is_paged_document_path(&path) {
-                if !self.adopt_collection_surface_for_physical_load(
-                    &path,
-                    &owner,
-                    navigation_history_origin.as_ref(),
-                ) {
-                    self.pending_auto_fs_open = false;
-                    self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
-                    return false;
-                }
-                self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
-                self.load_pdf_as_folder_owned(path, owner);
-                if let Some(pending) = self.pdf_enumerate_pending.as_mut() {
-                    pending.4 = pdf_open_restore;
-                }
-                if crate::perf::is_enabled() {
-                    crate::perf::event(
-                        "nav",
-                        "load_folder_end",
-                        None,
-                        lf_seq,
-                        &[
-                            (
-                                "ms",
-                                serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0),
-                            ),
-                            ("kind", serde_json::Value::from("pdf")),
                             ("path", serde_json::Value::from(lf_path_disp)),
                         ],
                     );
@@ -26345,7 +26370,24 @@ impl App {
             .pdf_enumerate_pending
             .take()
             .and_then(|pending| pending.4);
-        if let Some(restore) = conversion_restore.or(enumeration_restore) {
+        let password_restore = if self
+            .pdf_password_request
+            .as_ref()
+            .is_some_and(|request| matches!(request.owner, PdfPasswordRequestOwner::Direct(_)))
+        {
+            self.show_pdf_password_dialog = false;
+            self.pdf_password_pending_save = None;
+            match self.pdf_password_request.take().unwrap().owner {
+                PdfPasswordRequestOwner::Direct(continuation) => Some(continuation.restore),
+                _ => unreachable!(),
+            }
+        } else {
+            None
+        };
+        if let Some(restore) = conversion_restore
+            .or(enumeration_restore)
+            .or(password_restore)
+        {
             self.restore_epub_open(restore);
         }
     }
@@ -26929,9 +26971,9 @@ impl App {
         let request_id =
             self.pdf_password_request
                 .as_ref()
-                .and_then(|request| match request.owner {
-                    PdfPasswordRequestOwner::StagedHistory(id) => Some(id),
-                    PdfPasswordRequestOwner::Legacy => None,
+                .and_then(|request| match &request.owner {
+                    PdfPasswordRequestOwner::StagedHistory(id) => Some(*id),
+                    PdfPasswordRequestOwner::Legacy | PdfPasswordRequestOwner::Direct(_) => None,
                 });
         let Some(request_id) = request_id else { return };
         let current = match self.top_level_grid_view.history_navigation_transition() {
@@ -30294,6 +30336,78 @@ impl App {
         );
     }
 
+    fn prepare_pdf_visible_adoption(&mut self, pdf_path: &Path) {
+        if !self.smart_folder_session_owns_load(pdf_path) {
+            self.transition_favorite_view_for_path(Some(pdf_path));
+        }
+        #[cfg(windows)]
+        if self.should_preserve_active_detached_image_window_for_main_context_change() {
+            self.preserve_active_detached_image_window_for_main_context_change();
+            self.close_fullscreen();
+        }
+        crate::zip_loader::clear_nested_cache();
+        self.zip_nav = None;
+        self.cancel_token.store(true, Ordering::Relaxed);
+        self.wake_all_workers();
+    }
+
+    fn finish_direct_pdf_visible_adoption(&mut self, path: &Path, owner: &OpenRequestOwner) {
+        if !self.navigation_scope.is_detached_physical() {
+            if self.smart_folder_pending.is_some()
+                || self.smart_folder_prepare_pending.is_some()
+                || self.smart_folder_confirm_pending.is_some()
+            {
+                self.cancel_smart_folder_pending();
+            }
+            if !self.smart_folder_session_owns_load(path)
+                && (self.items_are_smart_folder_view
+                    || self.top_level_grid_view.smart_folder().is_some())
+            {
+                self.clear_smart_folder_view_state();
+            }
+        }
+        if matches!(
+            self.top_level_grid_view.surface(),
+            top_level_grid_view::TopLevelGridSurface::DriveList
+                | top_level_grid_view::TopLevelGridSurface::ReadingHistory
+                | top_level_grid_view::TopLevelGridSurface::Bookmarks
+        ) {
+            self.top_level_grid_view
+                .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+        }
+        if !self.smart_folder_session_owns_load(path)
+            && self
+                .reading_history_return_from
+                .as_ref()
+                .is_some_and(|from| !crate::folder_tree::path_eq(from, path))
+        {
+            self.reading_history_return_from = None;
+        }
+        if !self.navigation_scope.is_detached_physical()
+            && !self.smart_folder_session_owns_load(path)
+            && matches!(
+                owner,
+                OpenRequestOwner::Navigation
+                    | OpenRequestOwner::CollectionGridPhysical(_)
+                    | OpenRequestOwner::MainGridArchive(_)
+            )
+        {
+            self.reconcile_bookmark_return_target_for_folder_load(path);
+        }
+        if self
+            .current_folder
+            .as_ref()
+            .is_none_or(|current| !crate::folder_tree::path_eq(current, path))
+        {
+            self.stack_mode_requested = false;
+            if !self.navigation_scope.is_detached_physical() {
+                self.clear_archive_convert_nav_history_rollback();
+                crate::thumb_loader::bump_catchup_epoch();
+                let _ = crate::pdf_loader::bump_render_context_epoch();
+            }
+        }
+    }
+
     fn load_pdf_as_folder_with_prepared_pages(
         &mut self,
         pdf_path: PathBuf,
@@ -30301,44 +30415,35 @@ impl App {
         owner: OpenRequestOwner,
         password_override: Option<String>,
     ) {
-        let open_restore =
+        let mut open_restore =
             prepared_pages
                 .is_none()
                 .then(|| crate::ui_dialogs::epub_convert::EpubOpenRestore {
                     logical: pdf_path.clone(),
                     history: Some(self.folder_nav_history_snapshot()),
                     address_before: Some(self.address.clone()),
+                    adoption: None,
                 });
         self.cancel_superseded_epub_convert();
         crate::logger::log(format!(
             "=== load_pdf_as_folder: {} ===",
             pdf_path.display()
         ));
-        if !self.smart_folder_session_owns_load(&pdf_path) {
-            self.transition_favorite_view_for_path(Some(&pdf_path));
+        if prepared_pages.is_some() {
+            self.prepare_pdf_visible_adoption(&pdf_path);
         }
-
-        #[cfg(windows)]
-        if self.should_preserve_active_detached_image_window_for_main_context_change() {
-            self.preserve_active_detached_image_window_for_main_context_change();
-            self.close_fullscreen();
-        }
-
-        // PDF を開く際、直前に ZIP を見ていた可能性があるためネスト ZIP キャッシュを破棄する。
-        crate::zip_loader::clear_nested_cache();
-        // ZIP を出るのでツリーナビ状態も破棄。
-        self.zip_nav = None;
-
-        // 旧サムネイルワーカーを即座にキャンセルして PDF ワーカーキューの渋滞を防ぐ。
-        // start_loading_items は enumerate 完了後に呼ばれるため、ここで先行キャンセルする。
-        self.cancel_token.store(true, Ordering::Relaxed);
-        self.wake_all_workers();
 
         // 同じ PDF の再 open では、旧 handle を新しい waiter の登録まで保持する。
         // 先に drop すると一瞬だけ全 waiter が 0 になり、合流すべき source request を
         // cancel してしまう。別 path は従来どおりここで直ちに cancel する。
         // ZIP 側 pending も一緒に捨てる (ZIP → PDF 遷移時の取り残し防止、Codex P2)。
         let mut previous_pdf_enumerate = self.pdf_enumerate_pending.take();
+        if let Some(restore) = previous_pdf_enumerate
+            .as_mut()
+            .and_then(|pending| pending.4.take())
+        {
+            open_restore = Some(restore);
+        }
         if previous_pdf_enumerate
             .as_ref()
             .is_some_and(|(path, _, _, _, _)| !crate::path_key::eq_keep_drive(path, &pdf_path))
@@ -30370,18 +30475,8 @@ impl App {
             });
         }
 
-        // ── パスワード確認 ──
-        // **`saved_password`** = この PDF 固有の保存パスワード (`pdf_passwords` 経由)。
-        // **`password`** = enumerate に渡す実値 (saved_password 優先、無ければ
-        // session-level の `pdf_current_password` フォールバック)。
-        // メタキャッシュの placeholder gate には `saved_password.is_some()` を使う
-        // こと (= Codex P1 対策。session password の居座りで他 PDF の保護を bypass
-        // しないため)。
-        let saved_password: Option<String> = pdf_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .filter(|ext| crate::folder_tree::is_pdf_extension(&ext.to_ascii_lowercase()))
-            .and_then(|_| self.pdf_passwords.get(&pdf_path));
+        // Password resolution stays on the existing per-book/session path; the result remains
+        // unadopted until enumeration succeeds.
         let password: Option<String> =
             password_override.or_else(|| self.pdf_open_password(&pdf_path));
         if previous_pdf_enumerate
@@ -30396,23 +30491,16 @@ impl App {
         // ここでは簡易判定: 保存済みパスワードがなければ非同期で check_password を含めて
         // enumerate を試みる。パスワードエラーは結果受信時にハンドルする。
 
-        // ── 隣接 PDF の ±1 を items から先に取り出す (Codex P2 round 1 対応) ──
-        // 次の `try_apply_pdf_meta_cache` が cache hit すると start_loading_items で
-        // `self.items` が PDF ページに置き換わるため、PdfFile の隣接探索は **その前**
-        // に済ませる必要がある。pre-fetch 自体の kick は文中の最後 (placeholder 適用 +
-        // pending セット完了後) にまとめて行う。
+        // Collect neighboring books while the source grid is still mounted.
         let neighbor_pdf_paths = self.collect_neighbor_pdf_paths(&pdf_path);
 
-        // ── PDF メタキャッシュ (v1.0.0) lookup ──
-        // 過去に enumerate or サムネ render に成功した PDF はページ数が catalog DB に
-        // 永続化されている。mtime/file_size 一致なら即座に N セルの placeholder grid に
-        // 遷移して「キビキビ動く」体感を実現する (= PDFium 開封の 100ms〜1.3s を裏に隠す)。
-        // 検証 enumerate は並行して必ず走らせ、結果を `poll_pdf_enumerate` で照合する。
+        // Cache metadata may inform a worker, but an unverified placeholder must not replace
+        // the source display. This is the same visible-adoption rule as staged history.
         let is_epub = pdf_path
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
-        let (want_direction, allow_placeholder) = pdf_open_direction_policy(
+        let (want_direction, _) = pdf_open_direction_policy(
             &pdf_path,
             self.settings.follow_document_reading_direction,
             || {
@@ -30422,11 +30510,6 @@ impl App {
                 })
             },
         );
-        let placeholder_built = if prepared_pages.is_none() && allow_placeholder {
-            self.try_apply_pdf_meta_cache(&pdf_path, saved_password.is_some())
-        } else {
-            None
-        };
 
         if let Some(pages) = prepared_pages {
             // The staged request has already proved this destination usable. Its own owner
@@ -30450,15 +30533,16 @@ impl App {
                 want_direction: want_direction && !is_epub,
             },
         );
-        self.pdf_enumerate_pending =
-            Some((pdf_path.clone(), password, handle, owner, open_restore));
+        self.pdf_enumerate_pending = Some((
+            pdf_path.clone(),
+            password,
+            handle,
+            Box::new(owner),
+            open_restore,
+        ));
         // 同じ key なら新 handle が既に waiter として登録済みなので、ここで旧 handle を
         // drop しても source request は継続する。
         drop(previous_pdf_enumerate);
-        if placeholder_built.is_some() {
-            // 検証用に覚えておく: 一致なら grid 再構築 skip、不一致なら再構築する。
-            self.pdf_placeholder_count = placeholder_built;
-        }
 
         // アドレスバーを即座に更新 (ローディング中であることを示す)
         self.address = pdf_path.to_string_lossy().to_string();
@@ -30613,57 +30697,9 @@ impl App {
         }
     }
 
-    /// PDF メタキャッシュ (catalog DB の `pdf_meta` テーブル) を引いて、ヒットすれば
-    /// 即座に N セルの placeholder `PdfPage` GridItem を構築して `start_loading_items`
-    /// で表示する (= Enter→ページ一覧の体感を瞬時にする)。
-    ///
-    /// 戻り値: 表示した placeholder の page_count。cache miss / 利用不可なら `None`。
-    /// 呼び出し側は `self.pdf_placeholder_count` に保管し、`poll_pdf_enumerate` で
-    /// 実 enumerate の結果と照合する (一致なら再構築 skip、不一致なら通常経路で再構築)。
-    ///
-    /// `has_password` は呼び出し側で計算済みの「保存パスワードがあるか」フラグ。
-    /// cache が `password_required=1` のとき、保存パスワードが無い状態で placeholder を
-    /// 立てると後で正しくレンダできないので skip する (Codex P1 対応)。
-    fn try_apply_pdf_meta_cache(
-        &mut self,
-        pdf_path: &Path,
-        has_saved_password: bool,
-    ) -> Option<u32> {
-        let (page_count, mtime, file_size) =
-            self.peek_pdf_meta_cache(pdf_path, has_saved_password)?;
-        let (items, image_metas, existing_keys) =
-            Self::build_pdf_meta_placeholder_rows(pdf_path, page_count, mtime, file_size);
-        crate::logger::log(format!(
-            "  pdf meta cache hit: {} page_count={page_count} (instant placeholder)",
-            pdf_path.file_name()?.to_string_lossy()
-        ));
-        self.start_loading_items(
-            pdf_path.to_path_buf(),
-            items,
-            image_metas,
-            existing_keys,
-            Vec::new(),
-            None,
-        );
-        if pdf_stamp_policy_for_path(pdf_path)
-            == crate::thumb_loader::PdfStampPolicy::ResolveInWorker
-            && crate::perf::is_enabled()
-        {
-            let key = crate::grid_item::pdf_file_perf_key(pdf_path);
-            crate::perf::event(
-                "epub_open",
-                "first_display",
-                Some(&key),
-                self.input_seq,
-                &[("placeholder", serde_json::Value::from(true))],
-            );
-        }
-        Some(page_count)
-    }
-
     /// Read only the metadata already available through the warm catalog. Staged Smart opens
-    /// use this before committing a placeholder; ordinary PDF opens still perform exactly one
-    /// lookup and one row build through `try_apply_pdf_meta_cache`.
+    /// may use this when their prepared owner adopts a placeholder. Direct opens wait for the
+    /// enumerated result while the source display remains mounted.
     fn peek_pdf_meta_cache(
         &mut self,
         pdf_path: &Path,
@@ -30973,7 +31009,13 @@ impl App {
         // ここに None で到達するが、将来 pending を cancel 後に再利用する経路が
         // 追加されても古い結果を適用しないための念押し。
         if handle.cancel.load(Ordering::Relaxed) {
-            self.pdf_enumerate_pending = None;
+            let restore = self
+                .pdf_enumerate_pending
+                .take()
+                .and_then(|pending| pending.4);
+            if let Some(restore) = restore {
+                self.restore_epub_open(restore);
+            }
             // cancel された pending では deferred fullscreen reopen も不成立。
             // 放置すると `shortcuts_blocked_by_text_input` / `embedded_fs_pending` /
             // `poll_fs_nav_lock` の defer 経路がフラグを見て永続的に grid を抑止する
@@ -30991,28 +31033,37 @@ impl App {
             Err(mpsc::TryRecvError::Disconnected) => {
                 // ワーカーが切断 (通常起きない)
                 let path = pdf_path.clone();
-                self.pdf_enumerate_pending = None;
+                let restore = self
+                    .pdf_enumerate_pending
+                    .take()
+                    .and_then(|pending| pending.4);
+                let preserve_source = restore.is_some();
+                if let Some(restore) = restore {
+                    self.restore_epub_open(restore);
+                }
                 self.fs_nav_after_pdf_enumerate = None;
                 self.pdf_placeholder_count = None;
                 self.finish_visible_container_fs_nav_failed();
-                self.start_loading_items(
-                    path,
-                    Vec::new(),
-                    Vec::new(),
-                    std::collections::HashSet::new(),
-                    Vec::new(),
-                    None,
-                );
-                self.set_empty_items_reason(
-                    crate::empty_items_reason::EmptyItemsReason::PdfWorkerLost,
-                );
+                if !preserve_source {
+                    self.start_loading_items(
+                        path,
+                        Vec::new(),
+                        Vec::new(),
+                        std::collections::HashSet::new(),
+                        Vec::new(),
+                        None,
+                    );
+                    self.set_empty_items_reason(
+                        crate::empty_items_reason::EmptyItemsReason::PdfWorkerLost,
+                    );
+                }
                 #[cfg(windows)]
                 self.terminate_active_detached_open_before_viewport("pdf_enumerate_disconnected");
                 return;
             }
         };
 
-        let (pdf_path, password, _handle, owner, open_restore) =
+        let (pdf_path, password, _handle, owner, mut open_restore) =
             self.pdf_enumerate_pending.take().unwrap();
 
         // cancel 経由の Interrupted は late-arriving な stale 結果なので適用しない
@@ -31027,6 +31078,9 @@ impl App {
                 // 残すと grid 抑止 / holdover 維持が永続化して UI フリーズに見える。
                 self.fs_nav_after_pdf_enumerate = None;
                 self.finish_visible_container_fs_nav_failed();
+                if let Some(restore) = open_restore {
+                    self.restore_epub_open(restore);
+                }
                 #[cfg(windows)]
                 self.terminate_active_detached_open_before_viewport("pdf_enumerate_interrupted");
                 return;
@@ -31034,10 +31088,31 @@ impl App {
         }
 
         match result {
-            Ok(pages) => self.finish_pdf_enumerate_success(pdf_path, password, pages),
+            Ok(pages) => {
+                if let Some(adoption) = open_restore
+                    .as_mut()
+                    .and_then(|restore| restore.adoption.take())
+                {
+                    if !self.adopt_collection_surface_for_physical_load(
+                        &pdf_path,
+                        &owner,
+                        adoption.history_origin.as_ref(),
+                    ) {
+                        if let Some(restore) = open_restore {
+                            self.restore_epub_open(restore);
+                        }
+                        self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+                        return;
+                    }
+                    self.finish_direct_pdf_visible_adoption(&pdf_path, &owner);
+                    self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
+                }
+                self.prepare_pdf_visible_adoption(&pdf_path);
+                self.finish_pdf_enumerate_success(pdf_path, password, pages);
+            }
             Err(e) => {
                 let failure = PdfOpenFailure::from(e.clone());
-                let route = self.route_pdf_open_failure(owner, &pdf_path, failure);
+                let route = self.route_pdf_open_failure(owner.as_ref().clone(), &pdf_path, failure);
                 if route != PdfOpenFailureRoute::Unhandled {
                     match route {
                         PdfOpenFailureRoute::ConversionDialogOpened => {
@@ -31060,6 +31135,7 @@ impl App {
                     self.pdf_placeholder_count = None;
                     return;
                 }
+                let preserve_source = open_restore.is_some();
                 let err_msg = format!("{e}");
                 if matches!(e, crate::pdf_loader::PdfReadError::PasswordRequired)
                     && pdf_path
@@ -31085,7 +31161,7 @@ impl App {
                     // できない N セルがそのまま残るので空に戻す (Codex P1 対応)。
                     // 空に戻すと render_grid の中央表示が「表示するファイルがありません」
                     // になりつつ、パスワードダイアログがその上に出る。
-                    if self.pdf_placeholder_count.take().is_some() {
+                    if self.pdf_placeholder_count.take().is_some() && !preserve_source {
                         self.start_loading_items(
                             pdf_path.clone(),
                             Vec::new(),
@@ -31098,7 +31174,10 @@ impl App {
                             crate::empty_items_reason::EmptyItemsReason::PdfPasswordRequired,
                         );
                     }
-                    self.pdf_password_request = Some(PdfPasswordRequest::legacy(pdf_path));
+                    self.pdf_password_request = Some(match open_restore {
+                        Some(restore) => PdfPasswordRequest::direct(pdf_path, *owner, restore),
+                        None => PdfPasswordRequest::legacy(pdf_path),
+                    });
                     self.show_pdf_password_dialog = true;
                     self.pdf_password_input.clear();
                     // password が渡されていた = 入力済みのパスワードが誤っていた
@@ -31110,24 +31189,29 @@ impl App {
                     self.pdf_password_save = false;
                     return;
                 }
+                if let Some(restore) = open_restore {
+                    self.restore_epub_open(restore);
+                }
                 // その他の失敗: deferred 意図と placeholder count をクリアして
                 // グリッド表示にフォールバック
                 self.fs_nav_after_pdf_enumerate = None;
                 self.pdf_placeholder_count = None;
                 self.finish_visible_container_fs_nav_failed();
-                self.start_loading_items(
-                    pdf_path,
-                    Vec::new(),
-                    Vec::new(),
-                    std::collections::HashSet::new(),
-                    Vec::new(),
-                    None,
-                );
-                self.set_empty_items_reason(
-                    crate::empty_items_reason::EmptyItemsReason::PdfEnumerateFailed {
-                        detail: err_msg,
-                    },
-                );
+                if !preserve_source {
+                    self.start_loading_items(
+                        pdf_path,
+                        Vec::new(),
+                        Vec::new(),
+                        std::collections::HashSet::new(),
+                        Vec::new(),
+                        None,
+                    );
+                    self.set_empty_items_reason(
+                        crate::empty_items_reason::EmptyItemsReason::PdfEnumerateFailed {
+                            detail: err_msg,
+                        },
+                    );
+                }
                 #[cfg(windows)]
                 self.terminate_active_detached_open_before_viewport("pdf_enumerate_failed");
             }
@@ -31196,10 +31280,29 @@ impl App {
         let Some(request) = self.pdf_password_request.take() else {
             return false;
         };
-        if let PdfPasswordRequestOwner::StagedHistory(request_id) = request.owner {
-            let _ =
-                self.resume_staged_pdf_password_request(request_id, &request.path, password, save);
-            return true;
+        match request.owner {
+            PdfPasswordRequestOwner::StagedHistory(request_id) => {
+                let _ = self.resume_staged_pdf_password_request(
+                    request_id,
+                    &request.path,
+                    password,
+                    save,
+                );
+                return true;
+            }
+            PdfPasswordRequestOwner::Direct(continuation) => {
+                self.pdf_current_password = Some(password.clone());
+                self.pdf_password_pending_save = save.then(|| (request.path.clone(), password));
+                self.resume_fs_navigation_sequence_after_password();
+                self.load_pdf_as_folder_owned(request.path.clone(), continuation.open_owner);
+                if let Some(pending) = self.pdf_enumerate_pending.as_mut()
+                    && crate::folder_tree::path_eq(&pending.0, &request.path)
+                {
+                    pending.4 = Some(continuation.restore);
+                }
+                return true;
+            }
+            PdfPasswordRequestOwner::Legacy => {}
         }
         if self.resume_collection_pdf_password_request(&request.path, password.clone(), save) {
             return true;
@@ -31239,13 +31342,20 @@ impl App {
         let Some(request) = self.pdf_password_request.take() else {
             return false;
         };
-        if let PdfPasswordRequestOwner::StagedHistory(request_id) = request.owner {
-            let _ = self.cancel_staged_pdf_password_request(request_id, &request.path);
-            return true;
-        }
-        if self.cancel_collection_pdf_password_request() {
-            self.pdf_password_pending_save = None;
-            return true;
+        match request.owner {
+            PdfPasswordRequestOwner::StagedHistory(request_id) => {
+                let _ = self.cancel_staged_pdf_password_request(request_id, &request.path);
+                return true;
+            }
+            PdfPasswordRequestOwner::Direct(continuation) => {
+                self.restore_epub_open(continuation.restore);
+            }
+            PdfPasswordRequestOwner::Legacy => {
+                if self.cancel_collection_pdf_password_request() {
+                    self.pdf_password_pending_save = None;
+                    return true;
+                }
+            }
         }
         self.pdf_password_pending_save = None;
         self.fs_nav_after_pdf_enumerate = None;
