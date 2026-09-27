@@ -371,6 +371,17 @@ enum EffectiveState {
 
 ### 実装事実 (2026-09-27)
 
+- v0.11.1 の実 bundle を host で開き `getState` した JSON は `pipelineA: []`、未初期化の
+  `pipelineB: null` だった。`EffectiveState` は codec のこの配列形を読み、選択中の未初期化 B は
+  空と判定する。実 host の strict `open` / `add_plugin` テストで取得形も検査する。
+- controller の失敗処理は音声スロットを先に空にし、host の disable / drop を専用 worker に渡す。
+  GUI attach エラーは専用 bridge から型付きで controller に渡し、同じ `fail()` を通す。
+- 取得 worker は host 応答を期限で「host 異常」と判定しない。リモート受付・終了の期限は
+  呼び出し側だけに掛け、host の終了・watchdog は別の結果として扱う。終了の公開 gate は
+  期限を過ぎた結果が状態ファイルへ rename されることを防ぐ。watchdog の終了コードは
+  `0xEFFEC001` とし、stderr の受信順によらず Rust 側が識別する。
+- リモートの状態再取得は worker がユーザーチェーン準備を終えた後に投入する。reset も共有の
+  絶対期限の残りだけ待つ。pump の失敗報告は音声スロットで世代ごとに 1 回へ集約する。
 - bundle 解決は `src/effetune/mod.rs::resolve_bundle_from_exe` に置いた。通常版と portable 版で
   `current_exe` の親から同じ相対パスを使い、`native_assets` には触れていない。
 - GUI タイトルバーの電源ボタンは bridge ごとの `show_editor_bypass_button` で切り替える。

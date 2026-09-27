@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde_json::Value;
 
-use crate::video::dsp::{DspBridge, GuiOwnerPolicy, LatencyPolicy};
+use crate::video::dsp::{DspBridge, GuiFailure, GuiOwnerPolicy, LatencyPolicy};
 
 pub mod composition;
 
 const BUNDLE_NAME: &str = "EffeTune Mixwright.vst3";
-const CAPTURE_WAIT: Duration = Duration::from_secs(6);
+const INITIAL_CAPTURE_WAIT: Duration = Duration::from_secs(6);
 const EXIT_FENCE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,6 +39,29 @@ pub enum EffetuneFailure {
     ProcessFailed(String),
     LatencyExceeded { total_secs: f64 },
     HostLost(String),
+    GuiFailed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureError {
+    CallerDeadline,
+    HostExited { watchdog: bool },
+    Interrupted(String),
+    State(String),
+    Persistence(String),
+}
+
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CallerDeadline => write!(f, "caller deadline expired"),
+            Self::HostExited { watchdog: true } => write!(f, "host state watchdog expired"),
+            Self::HostExited { watchdog: false } => write!(f, "host exited"),
+            Self::Interrupted(reason) | Self::State(reason) | Self::Persistence(reason) => {
+                f.write_str(reason)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,11 +110,11 @@ impl EffectiveState {
             Some("B") => "pipelineB",
             _ => return Err("invalid currentPipeline".into()),
         };
-        let plugins = document
-            .get(pipeline_name)
-            .and_then(|pipeline| pipeline.get("plugins"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("{pipeline_name}.plugins missing"))?;
+        let plugins = match document.get(pipeline_name) {
+            Some(Value::Array(plugins)) => plugins.as_slice(),
+            Some(Value::Null) if pipeline_name == "pipelineB" => &[],
+            _ => return Err(format!("{pipeline_name} missing or invalid")),
+        };
         let mut section_enabled = true;
         for plugin in plugins {
             let name = plugin
@@ -117,11 +140,16 @@ impl EffectiveState {
 pub struct EffetuneAudioSlot {
     current: Mutex<Option<(u64, Arc<DspBridge>)>>,
     failure_tx: Mutex<Option<mpsc::Sender<EffetuneFailure>>>,
+    failed_generation: AtomicU64,
 }
 
 impl EffetuneAudioSlot {
     pub fn snapshot(&self) -> Option<(u64, Arc<DspBridge>)> {
-        self.current.lock().unwrap().clone()
+        self.current
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|(generation, _)| *generation > self.failed_generation.load(Ordering::Acquire))
     }
 
     fn publish(&self, generation: u64, bridge: Arc<DspBridge>) {
@@ -132,7 +160,22 @@ impl EffetuneAudioSlot {
         *self.current.lock().unwrap() = None;
     }
 
-    pub fn report_failure(&self, failure: EffetuneFailure) {
+    pub fn report_failure_once(&self, generation: u64, failure: EffetuneFailure) {
+        let mut previous = self.failed_generation.load(Ordering::Acquire);
+        loop {
+            if previous >= generation {
+                return;
+            }
+            match self.failed_generation.compare_exchange_weak(
+                previous,
+                generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => previous = actual,
+            }
+        }
         if let Some(tx) = self.failure_tx.lock().unwrap().as_ref() {
             let _ = tx.send(failure);
         }
@@ -159,7 +202,7 @@ impl Default for LatestCapture {
 struct CaptureJob {
     generation: u64,
     bridge: Arc<DspBridge>,
-    reply: mpsc::Sender<Result<Vec<u8>, String>>,
+    reply: mpsc::Sender<Result<Vec<u8>, CaptureError>>,
 }
 
 enum CaptureCommand {
@@ -172,28 +215,89 @@ pub struct CaptureQueue {
     next_generation: AtomicU64,
     accepting: AtomicBool,
     latest: Arc<Mutex<LatestCapture>>,
+    publication: Arc<PublicationGate>,
 }
 
 pub struct ExitCaptureFence {
     bridge: Arc<DspBridge>,
-    rx: mpsc::Receiver<Result<Vec<u8>, String>>,
+    rx: mpsc::Receiver<Result<Vec<u8>, CaptureError>>,
     deadline: Instant,
+    publication: Arc<PublicationGate>,
+}
+
+#[derive(Clone)]
+pub struct RemoteCaptureSource {
+    queue: Arc<CaptureQueue>,
+    bridge: Arc<DspBridge>,
+}
+
+impl RemoteCaptureSource {
+    pub fn request(&self) -> Result<mpsc::Receiver<Result<Vec<u8>, CaptureError>>, CaptureError> {
+        self.queue.request(Arc::clone(&self.bridge))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_fake_capture(
+        state_path: PathBuf,
+        capture: impl Fn(&DspBridge) -> Result<Vec<u8>, CaptureError> + Send + 'static,
+    ) -> Self {
+        Self {
+            queue: Arc::new(CaptureQueue::new_with_capture(state_path, capture)),
+            bridge: DspBridge::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PublicationGate {
+    exit_deadline: Mutex<Option<Instant>>,
+    cancelled: AtomicBool,
+}
+
+impl PublicationGate {
+    fn begin_exit(&self, deadline: Instant) {
+        *self.exit_deadline.lock().unwrap() = Some(deadline);
+    }
+
+    fn may_commit(&self) -> bool {
+        !self.cancelled.load(Ordering::Acquire)
+            && self
+                .exit_deadline
+                .lock()
+                .unwrap()
+                .is_none_or(|deadline| Instant::now() < deadline)
+    }
+
+    fn expire(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
 }
 
 impl CaptureQueue {
     pub fn new(state_path: PathBuf) -> Self {
+        Self::new_with_capture(state_path, capture_once)
+    }
+
+    fn new_with_capture(
+        state_path: PathBuf,
+        capture: impl Fn(&DspBridge) -> Result<Vec<u8>, CaptureError> + Send + 'static,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<CaptureCommand>();
         let latest = Arc::new(Mutex::new(LatestCapture::default()));
         let worker_latest = Arc::clone(&latest);
+        let publication = Arc::new(PublicationGate::default());
+        let worker_publication = Arc::clone(&publication);
         std::thread::Builder::new()
             .name("effetune-state-capture".into())
             .spawn(move || {
                 while let Ok(CaptureCommand::Capture(job)) = rx.recv() {
                     let started = Instant::now();
-                    let result = capture_once(&job.bridge).and_then(|bytes| {
+                    let result = capture(&job.bridge).and_then(|bytes| {
                         let effective = EffectiveState::from_bytes(&bytes);
                         if let EffectiveState::Unparseable(reason) = &effective {
-                            return Err(format!("state classification failed: {reason}"));
+                            return Err(CaptureError::State(format!(
+                                "state classification failed: {reason}"
+                            )));
                         }
                         publish_capture_state(
                             &worker_latest,
@@ -201,6 +305,7 @@ impl CaptureQueue {
                             job.generation,
                             &bytes,
                             effective.clone(),
+                            &worker_publication,
                         )?;
                         crate::logger::log(format!(
                             "[EffeTune] capture generation={} state={effective:?} bytes={} elapsed_ms={}",
@@ -226,15 +331,18 @@ impl CaptureQueue {
             next_generation: AtomicU64::new(0),
             accepting: AtomicBool::new(true),
             latest,
+            publication,
         }
     }
 
     pub fn request(
         &self,
         bridge: Arc<DspBridge>,
-    ) -> Result<mpsc::Receiver<Result<Vec<u8>, String>>, String> {
+    ) -> Result<mpsc::Receiver<Result<Vec<u8>, CaptureError>>, CaptureError> {
         if !self.accepting.load(Ordering::Acquire) {
-            return Err("state capture is stopping".into());
+            return Err(CaptureError::Interrupted(
+                "state capture is stopping".into(),
+            ));
         }
         self.enqueue(bridge)
     }
@@ -242,7 +350,7 @@ impl CaptureQueue {
     fn enqueue(
         &self,
         bridge: Arc<DspBridge>,
-    ) -> Result<mpsc::Receiver<Result<Vec<u8>, String>>, String> {
+    ) -> Result<mpsc::Receiver<Result<Vec<u8>, CaptureError>>, CaptureError> {
         let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let (reply, rx) = mpsc::channel();
         self.tx
@@ -251,7 +359,7 @@ impl CaptureQueue {
                 bridge,
                 reply,
             }))
-            .map_err(|_| "state capture worker disconnected".to_string())?;
+            .map_err(|_| CaptureError::Interrupted("state capture worker disconnected".into()))?;
         Ok(rx)
     }
 
@@ -271,6 +379,7 @@ impl CaptureQueue {
     pub fn begin_final_capture(&self, bridge: Arc<DspBridge>) -> Option<ExitCaptureFence> {
         self.accepting.store(false, Ordering::Release);
         let deadline = Instant::now() + EXIT_FENCE;
+        self.publication.begin_exit(deadline);
         let rx = self.enqueue(Arc::clone(&bridge));
         let _ = self.tx.send(CaptureCommand::Stop);
         match rx {
@@ -278,6 +387,7 @@ impl CaptureQueue {
                 bridge,
                 rx,
                 deadline,
+                publication: Arc::clone(&self.publication),
             }),
             Err(error) => {
                 crate::logger::log(format!("[EffeTune] exit capture enqueue: {error}"));
@@ -292,6 +402,7 @@ impl CaptureQueue {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => crate::logger::log(format!("[EffeTune] exit capture: {error}")),
             Err(_) => {
+                fence.publication.expire();
                 crate::logger::log(
                     "[EffeTune] exit capture fence expired; previous state retained",
                 );
@@ -301,14 +412,44 @@ impl CaptureQueue {
     }
 }
 
-fn capture_once(bridge: &DspBridge) -> Result<Vec<u8>, String> {
-    let rx = bridge.query_first_state_concurrent()?;
-    let encoded = rx
-        .recv_timeout(CAPTURE_WAIT)
-        .map_err(|error| format!("state capture interrupted: {error}"))??;
+fn capture_once(bridge: &DspBridge) -> Result<Vec<u8>, CaptureError> {
+    let rx = bridge
+        .query_first_state_concurrent()
+        .map_err(|error| classify_capture_bridge_error(bridge, error, false))?;
+    let encoded = rx.recv().map_err(|error| {
+        classify_capture_bridge_error(
+            bridge,
+            format!("capture result channel closed: {error}"),
+            true,
+        )
+    })?;
+    let encoded = encoded.map_err(|error| match error {
+        crate::video::dsp::bridge::ConcurrentStateError::Interrupted(reason) => {
+            classify_capture_bridge_error(bridge, reason, true)
+        }
+        crate::video::dsp::bridge::ConcurrentStateError::HostResponse(reason) => {
+            classify_capture_bridge_error(bridge, reason, false)
+        }
+    })?;
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(|error| format!("state base64 invalid: {error}"))
+        .map_err(|error| CaptureError::State(format!("state base64 invalid: {error}")))
+}
+
+fn classify_capture_bridge_error(
+    bridge: &DspBridge,
+    error: String,
+    interrupted: bool,
+) -> CaptureError {
+    if !bridge.host_alive() {
+        CaptureError::HostExited {
+            watchdog: bridge.host_watchdog_expired(),
+        }
+    } else if interrupted {
+        CaptureError::Interrupted(error)
+    } else {
+        CaptureError::State(error)
+    }
 }
 
 fn publish_capture_state(
@@ -317,12 +458,14 @@ fn publish_capture_state(
     generation: u64,
     bytes: &[u8],
     effective: EffectiveState,
-) -> Result<(), String> {
+    publication: &PublicationGate,
+) -> Result<(), CaptureError> {
     // Only this serial worker writes the file, so the generation check and I/O need no lock.
     if generation <= latest.lock().unwrap().generation {
         return Ok(());
     }
-    write_state_atomic(path, bytes).map_err(|error| format!("state write failed: {error}"))?;
+    write_state_atomic(path, bytes, || publication.may_commit())
+        .map_err(|error| CaptureError::Persistence(format!("state write failed: {error}")))?;
     let mut current = latest.lock().unwrap();
     current.generation = generation;
     current.bytes = Some(bytes.to_vec());
@@ -330,7 +473,11 @@ fn publish_capture_state(
     Ok(())
 }
 
-fn write_state_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_state_atomic(
+    path: &Path,
+    bytes: &[u8],
+    may_commit: impl Fn() -> bool,
+) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("state path has no parent"))?;
@@ -344,6 +491,12 @@ fn write_state_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.flush()?;
         drop(file);
+        if !may_commit() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "state publication fence expired",
+            ));
+        }
         fs::rename(&temp, path)
     })();
     if result.is_err() {
@@ -392,14 +545,37 @@ pub struct EffetuneController {
     captures: Arc<CaptureQueue>,
     pending_load: Option<mpsc::Receiver<Result<Option<LoadDone>, EffetuneFailure>>>,
     next_audio_generation: u64,
-    pending_capture: Option<mpsc::Receiver<Result<Vec<u8>, String>>>,
+    pending_capture: Option<mpsc::Receiver<Result<Vec<u8>, CaptureError>>>,
     failure_rx: mpsc::Receiver<EffetuneFailure>,
+    gui_failure_tx: mpsc::Sender<GuiFailure>,
+    gui_failure_rx: mpsc::Receiver<GuiFailure>,
+    cleanup_tx: mpsc::Sender<Arc<DspBridge>>,
+    gui_rect_tx: mpsc::Sender<(u64, Option<(i32, i32)>, Option<(u32, u32)>)>,
 }
 
 impl EffetuneController {
     pub fn new() -> Self {
         let bundle = resolve_bundle();
         let (failure_tx, failure_rx) = mpsc::channel();
+        let (gui_failure_tx, gui_failure_rx) = mpsc::channel();
+        let (cleanup_tx, cleanup_rx) = mpsc::channel::<Arc<DspBridge>>();
+        std::thread::Builder::new()
+            .name("effetune-host-cleanup".into())
+            .spawn(move || {
+                while let Ok(bridge) = cleanup_rx.recv() {
+                    bridge.disable();
+                }
+            })
+            .expect("EffeTune cleanup worker spawn");
+        let (gui_rect_tx, gui_rect_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("effetune-gui-rect-save".into())
+            .spawn(move || {
+                while let Ok((generation, pos, size)) = gui_rect_rx.recv() {
+                    crate::settings::Settings::persist_effetune_gui_rect(generation, pos, size);
+                }
+            })
+            .expect("EffeTune GUI rectangle worker spawn");
         let runtime = match &bundle {
             Ok(_) => EffetuneRuntime::Idle,
             Err(reason) => EffetuneRuntime::Unavailable(reason.clone()),
@@ -409,6 +585,7 @@ impl EffetuneController {
             slot: Arc::new(EffetuneAudioSlot {
                 current: Mutex::new(None),
                 failure_tx: Mutex::new(Some(failure_tx)),
+                failed_generation: AtomicU64::new(0),
             }),
             bridge: None,
             bundle_path: bundle.ok(),
@@ -421,6 +598,10 @@ impl EffetuneController {
             next_audio_generation: 0,
             pending_capture: None,
             failure_rx,
+            gui_failure_tx,
+            gui_failure_rx,
+            cleanup_tx,
+            gui_rect_tx,
         }
     }
 
@@ -452,6 +633,7 @@ impl EffetuneController {
             open_gui_when_ready,
         };
         let captures = Arc::clone(&self.captures);
+        let gui_failure_tx = self.gui_failure_tx.clone();
         let path = crate::data_dir::get()
             .join("effetune")
             .join("mixwright-state.json");
@@ -460,7 +642,8 @@ impl EffetuneController {
         let spawn = std::thread::Builder::new()
             .name("effetune-load".into())
             .spawn(move || {
-                let result = load_worker(&bundle, &path, &captures, origin, pos, size);
+                let result =
+                    load_worker(&bundle, &path, &captures, origin, pos, size, gui_failure_tx);
                 let _ = tx.send(result);
             });
         if let Err(error) = spawn {
@@ -481,7 +664,20 @@ impl EffetuneController {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_startup_completion(&mut self, result: Result<(), EffetuneFailure>) {
+        let (tx, rx) = mpsc::channel();
+        self.pending_load = Some(rx);
+        tx.send(result.map(|()| None)).unwrap();
+    }
+
     pub fn poll(&mut self) -> bool {
+        if let Ok(GuiFailure::Attach(detail)) = self.gui_failure_rx.try_recv() {
+            self.fail(EffetuneFailure::GuiFailed(detail));
+        }
+        if let Ok(failure) = self.failure_rx.try_recv() {
+            self.fail(failure);
+        }
         #[cfg(windows)]
         if self
             .bridge
@@ -489,9 +685,6 @@ impl EffetuneController {
             .is_some_and(|bridge| !bridge.host_alive())
         {
             self.fail(EffetuneFailure::HostLost("EffeTune host exited".into()));
-        }
-        if let Ok(failure) = self.failure_rx.try_recv() {
-            self.fail(failure);
         }
         if let Some(rx) = self.pending_load.as_ref() {
             let result = match rx.try_recv() {
@@ -518,15 +711,15 @@ impl EffetuneController {
                 Ok(Ok(_)) => self.pending_capture = None,
                 Ok(Err(error)) => {
                     self.pending_capture = None;
-                    if error.contains("bridge exited") || error.contains("interrupted") {
-                        self.fail(EffetuneFailure::HostLost(error));
+                    if matches!(error, CaptureError::HostExited { .. }) {
+                        self.fail(EffetuneFailure::HostLost(error.to_string()));
+                    } else {
+                        crate::logger::log(format!("[EffeTune] hide capture: {error}"));
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_capture = None;
-                    self.fail(EffetuneFailure::HostLost(
-                        "capture worker disconnected".into(),
-                    ));
+                    crate::logger::log("[EffeTune] capture worker disconnected");
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -543,11 +736,12 @@ impl EffetuneController {
         }
     }
 
-    pub fn request_remote_capture(
-        &self,
-    ) -> Result<mpsc::Receiver<Result<Vec<u8>, String>>, String> {
+    pub fn remote_capture_source(&self) -> Result<RemoteCaptureSource, String> {
         let bridge = self.bridge.as_ref().ok_or("EffeTune is not running")?;
-        self.captures.request(Arc::clone(bridge))
+        Ok(RemoteCaptureSource {
+            queue: Arc::clone(&self.captures),
+            bridge: Arc::clone(bridge),
+        })
     }
 
     pub fn effective_state(&self) -> Option<EffectiveState> {
@@ -572,6 +766,13 @@ impl EffetuneController {
         self.bundle_path.as_deref()
     }
 
+    pub fn save_gui_rect_async(&self, pos: Option<(i32, i32)>, size: Option<(u32, u32)>) {
+        let generation = crate::settings::Settings::next_effetune_gui_rect_generation();
+        if self.gui_rect_tx.send((generation, pos, size)).is_err() {
+            crate::logger::log("[EffeTune] GUI rectangle writer disconnected");
+        }
+    }
+
     pub fn fail(&mut self, failure: EffetuneFailure) {
         if matches!(self.runtime, EffetuneRuntime::Failed(_)) {
             return;
@@ -580,7 +781,9 @@ impl EffetuneController {
         self.slot.clear();
         self.pending_capture = None;
         if let Some(bridge) = self.bridge.take() {
-            bridge.disable();
+            if let Err(error) = self.cleanup_tx.send(bridge) {
+                std::thread::spawn(move || error.0.disable());
+            }
         }
         self.runtime = EffetuneRuntime::Failed(failure);
     }
@@ -605,6 +808,7 @@ fn load_worker(
     origin: LoadOrigin,
     pos: Option<(i32, i32)>,
     size: Option<(u32, u32)>,
+    gui_failure_tx: mpsc::Sender<GuiFailure>,
 ) -> Result<Option<LoadDone>, EffetuneFailure> {
     let saved = match fs::read(path) {
         Ok(bytes) => Some(bytes),
@@ -625,6 +829,7 @@ fn load_worker(
         true,
         false,
     );
+    bridge.set_gui_failure_sink(gui_failure_tx);
     bridge.enable().map_err(EffetuneFailure::LoadFailed)?;
     let state = saved
         .as_ref()
@@ -654,10 +859,32 @@ fn load_worker(
         .map_err(EffetuneFailure::ProcessFailed)?;
     let rx = captures
         .request(Arc::clone(&bridge))
-        .map_err(EffetuneFailure::LoadFailed)?;
-    rx.recv_timeout(CAPTURE_WAIT)
-        .map_err(|error| EffetuneFailure::HostLost(format!("initial capture: {error}")))?
-        .map_err(EffetuneFailure::HostLost)?;
+        .map_err(|error| EffetuneFailure::LoadFailed(error.to_string()))?;
+    match rx.recv_timeout(INITIAL_CAPTURE_WAIT) {
+        Ok(Ok(_)) => {}
+        Ok(Err(CaptureError::HostExited { watchdog })) => {
+            return Err(EffetuneFailure::HostLost(format!(
+                "initial capture: {}",
+                CaptureError::HostExited { watchdog }
+            )));
+        }
+        Ok(Err(error)) => {
+            return Err(EffetuneFailure::LoadFailed(format!(
+                "initial capture: {error}"
+            )));
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(EffetuneFailure::LoadFailed(format!(
+                "initial capture: {}",
+                CaptureError::CallerDeadline
+            )));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(EffetuneFailure::LoadFailed(
+                "initial capture worker disconnected".into(),
+            ));
+        }
+    }
     Ok(Some(LoadDone { bridge }))
 }
 
@@ -670,9 +897,10 @@ mod tests {
     use super::*;
 
     // Fixture shape: Frieve-A/effetune-mixwright v0.11.1,
-    // src/bridge/state_codec.cpp, StateCodec::encode.
+    // src/bridge/state_codec.cpp, StateCodec::encode. Confirmed against bytes
+    // returned by the bundled v0.11.1 plug-in through the real host handler.
     fn fixture(a: &str, b: &str, current: &str, bypass: bool) -> Vec<u8> {
-        format!(r#"{{"formatVersion":1,"pipelineA":{{"plugins":{a}}},"pipelineB":{{"plugins":{b}}},"currentPipeline":"{current}","masterBypass":{bypass}}}"#).into_bytes()
+        format!(r#"{{"appVersion":"0.11.1","formatVersion":1,"pipelineA":{a},"pipelineB":{b},"currentPipeline":"{current}","masterBypass":{bypass},"oversampling":{{"factor":1,"phase":"linear","quality":"medium"}},"ui":{{"columns":1,"zoom":1}}}}"#).into_bytes()
     }
 
     #[test]
@@ -682,6 +910,10 @@ mod tests {
             r#"[{"name":"Section","enabled":false},{"name":"Gain","enabled":true}]"#;
         assert_eq!(
             EffectiveState::from_bytes(&fixture("[]", "[]", "A", false)),
+            EffectiveState::Inert
+        );
+        assert_eq!(
+            EffectiveState::from_bytes(&fixture("[]", "null", "A", false)),
             EffectiveState::Inert
         );
         assert_eq!(
@@ -738,6 +970,7 @@ mod tests {
             EffetuneFailure::ProcessFailed("process".into()),
             EffetuneFailure::LatencyExceeded { total_secs: 2.1 },
             EffetuneFailure::HostLost("host".into()),
+            EffetuneFailure::GuiFailed("attach".into()),
         ] {
             let mut controller = EffetuneController::new();
             controller.runtime = EffetuneRuntime::Loading {
@@ -756,8 +989,8 @@ mod tests {
     fn state_writer_replaces_without_reusing_temp_name() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("mixwright-state.json");
-        write_state_atomic(&state, b"first").unwrap();
-        write_state_atomic(&state, b"second").unwrap();
+        write_state_atomic(&state, b"first", || true).unwrap();
+        write_state_atomic(&state, b"second", || true).unwrap();
         assert_eq!(fs::read(state).unwrap(), b"second");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
@@ -767,8 +1000,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mixwright-state.json");
         let latest = Mutex::new(LatestCapture::default());
-        publish_capture_state(&latest, &path, 2, b"new", EffectiveState::Effective).unwrap();
-        publish_capture_state(&latest, &path, 1, b"old", EffectiveState::Inert).unwrap();
+        let publication = PublicationGate::default();
+        publish_capture_state(
+            &latest,
+            &path,
+            2,
+            b"new",
+            EffectiveState::Effective,
+            &publication,
+        )
+        .unwrap();
+        publish_capture_state(
+            &latest,
+            &path,
+            1,
+            b"old",
+            EffectiveState::Inert,
+            &publication,
+        )
+        .unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new");
         assert_eq!(latest.lock().unwrap().generation, 2);
         assert_eq!(
@@ -783,6 +1033,7 @@ mod tests {
             3,
             b"not written",
             EffectiveState::Inert,
+            &publication,
         );
         assert!(error.is_err());
         assert_eq!(fs::read(&path).unwrap(), b"new");
@@ -796,9 +1047,164 @@ mod tests {
             bridge: DspBridge::new(),
             rx,
             deadline: Instant::now(),
+            publication: Arc::new(PublicationGate::default()),
         };
         let start = Instant::now();
         CaptureQueue::wait_final_capture(fence);
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn pump_failure_is_reported_once_and_stops_that_generation_immediately() {
+        let slot = EffetuneAudioSlot::default();
+        let (tx, rx) = mpsc::channel();
+        *slot.failure_tx.lock().unwrap() = Some(tx);
+        slot.publish(7, DspBridge::new());
+        assert!(slot.snapshot().is_some());
+        slot.report_failure_once(7, EffetuneFailure::ProcessFailed("first".into()));
+        slot.report_failure_once(7, EffetuneFailure::LatencyExceeded { total_secs: 2.5 });
+        assert!(slot.snapshot().is_none());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            EffetuneFailure::ProcessFailed("first".into())
+        );
+        assert!(rx.try_recv().is_err());
+        slot.publish(8, DspBridge::new());
+        assert!(slot.snapshot().is_some());
+        slot.report_failure_once(7, EffetuneFailure::ProcessFailed("stale".into()));
+        assert!(slot.snapshot().is_some());
+    }
+
+    #[test]
+    fn gui_failure_uses_controller_transition_and_queues_host_cleanup() {
+        let mut controller = EffetuneController::new();
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        controller.cleanup_tx = cleanup_tx;
+        controller.publish_running(DspBridge::new());
+        controller
+            .gui_failure_tx
+            .send(GuiFailure::Attach("fixture attach error".into()))
+            .unwrap();
+        controller.poll();
+        assert_eq!(
+            controller.runtime,
+            EffetuneRuntime::Failed(EffetuneFailure::GuiFailed("fixture attach error".into()))
+        );
+        assert!(controller.slot.snapshot().is_none());
+        assert!(cleanup_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn exit_fence_rejects_a_capture_waiting_before_file_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixwright-state.json");
+        fs::write(&path, b"previous").unwrap();
+        let publication = Arc::new(PublicationGate::default());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer_gate = Arc::clone(&publication);
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            write_state_atomic(&writer_path, b"late", || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                writer_gate.may_commit()
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        publication.expire();
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            writer.join().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"previous");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn remote_caller_deadline_does_not_end_running_local_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let queue = Arc::new(CaptureQueue::new_with_capture(
+            dir.path().join("mixwright-state.json"),
+            move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(fixture("[]", "[]", "A", false))
+            },
+        ));
+        let mut controller = EffetuneController::new();
+        controller.captures = queue;
+        controller.publish_running(DspBridge::new());
+        let capture = controller
+            .remote_capture_source()
+            .unwrap()
+            .request()
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            capture.recv_timeout(Duration::from_millis(10)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            controller.runtime,
+            EffetuneRuntime::Running { .. }
+        ));
+        assert!(controller.slot.snapshot().is_some());
+        release_tx.send(()).unwrap();
+        assert!(
+            capture
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(matches!(
+            controller.runtime,
+            EffetuneRuntime::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn close_cancels_queued_fake_capture_and_blocks_running_capture_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixwright-state.json");
+        fs::write(&path, b"previous").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicU64::new(0));
+        let closing = Arc::new(AtomicBool::new(false));
+        let worker_calls = Arc::clone(&calls);
+        let worker_closing = Arc::clone(&closing);
+        let queue = CaptureQueue::new_with_capture(path.clone(), move |_| {
+            if worker_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(fixture("[]", "[]", "A", false))
+            } else if worker_closing.load(Ordering::Acquire) {
+                Err(CaptureError::Interrupted("queued capture cancelled".into()))
+            } else {
+                unreachable!("queued job ran before the running capture completed")
+            }
+        });
+        let bridge = DspBridge::new();
+        let running = queue.request(Arc::clone(&bridge)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let queued = queue.request(Arc::clone(&bridge)).unwrap();
+        let mut fence = queue.begin_final_capture(bridge).unwrap();
+        fence.deadline = Instant::now();
+        closing.store(true, Ordering::Release);
+        CaptureQueue::wait_final_capture(fence);
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            running.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(CaptureError::Persistence(_))
+        ));
+        assert_eq!(
+            queued.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(CaptureError::Interrupted("queued capture cancelled".into()))
+        );
+        assert_eq!(fs::read(path).unwrap(), b"previous");
     }
 }

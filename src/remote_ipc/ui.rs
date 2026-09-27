@@ -1140,17 +1140,17 @@ impl crate::app::App {
             };
             if effetune_requested {
                 if let Some(bundle) = self.effetune.bundle_path() {
-                    let capture = match self.effetune.request_remote_capture() {
-                        Ok(capture) => capture,
+                    let capture_source = match self.effetune.remote_capture_source() {
+                        Ok(source) => source,
                         Err(error) => {
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            let _ = tx.send(Err(error));
-                            rx
+                            return config.with_effetune_warning(format!(
+                                "EffeTune の状態取得を準備できませんでした: {error}"
+                            ));
                         }
                     };
                     config = config.with_remote_effetune(
                         bundle.to_path_buf(),
-                        capture,
+                        capture_source,
                         sample_rate,
                         deadline,
                     );

@@ -1356,13 +1356,16 @@ fn run_pump(
                 if seen_valid_audio_frame
                     && !cancel.load(Ordering::Acquire)
                     && let Some(slot) = effetune_slot.as_ref()
-                    && let Some((_, bridge)) = slot.snapshot()
+                    && let Some((generation, bridge)) = slot.snapshot()
                     && let Err(error) = bridge.try_reset_plugins_sync()
                 {
                     effetune_reset_failed_serial = Some(frame_seek_serial);
-                    slot.report_failure(crate::effetune::EffetuneFailure::ProcessFailed(format!(
-                        "seek reset: {error}"
-                    )));
+                    slot.report_failure_once(
+                        generation,
+                        crate::effetune::EffetuneFailure::ProcessFailed(format!(
+                            "seek reset: {error}"
+                        )),
+                    );
                 }
                 last_seen_seek_serial = frame_seek_serial;
                 seen_valid_audio_frame = true;
@@ -1729,7 +1732,8 @@ fn run_pump(
                             effetune_latency_secs,
                         ) {
                             Err(total_secs) => {
-                                slot.report_failure(
+                                slot.report_failure_once(
+                                    generation,
                                     crate::effetune::EffetuneFailure::LatencyExceeded {
                                         total_secs,
                                     },
@@ -1754,7 +1758,8 @@ fn run_pump(
                                             ));
                                         }
                                         if threshold_reached {
-                                            slot.report_failure(
+                                            slot.report_failure_once(
+                                                generation,
                                                 crate::effetune::EffetuneFailure::ProcessFailed(
                                                     error,
                                                 ),

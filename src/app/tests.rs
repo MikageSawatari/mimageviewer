@@ -4500,6 +4500,7 @@ fn effetune_and_vst_startup_gate_releases_deferred_media_once_in_either_order() 
 
     for vst_finishes_first in [true, false] {
         let mut app = phase_c_support::setup_app();
+        let ctx = egui::Context::default();
         app.items = vec![GridItem::Video(PathBuf::from(r"C:\fixture\movie.mp4"))];
         app.fullscreen_idx = Some(0);
         app.vst3_deferred_media_open = Some(0);
@@ -4516,25 +4517,33 @@ fn effetune_and_vst_startup_gate_releases_deferred_media_once_in_either_order() 
         assert!(app.media_startup_load_pending());
 
         if vst_finishes_first {
-            app.vst3_startup_load = None;
+            vst_tx.send(()).unwrap();
+            app.poll_vst3_startup_load(&ctx);
         } else {
-            app.effetune.runtime = EffetuneRuntime::Idle;
+            app.effetune.set_test_startup_completion(Ok(()));
+            app.poll_effetune(&ctx);
         }
         assert!(app.media_startup_load_pending());
+        assert_eq!(app.vst3_deferred_media_open, Some(0));
         if vst_finishes_first {
-            app.effetune.runtime = EffetuneRuntime::Failed(
+            app.effetune.set_test_startup_completion(Err(
                 crate::effetune::EffetuneFailure::LoadFailed("fixture".into()),
-            );
+            ));
+            app.poll_effetune(&ctx);
         } else {
             drop(vst_tx); // disconnected worker also settles the VST side
-            app.vst3_startup_load = None;
+            app.poll_vst3_startup_load(&ctx);
         }
         assert!(!app.media_startup_load_pending());
+        assert_eq!(app.vst3_deferred_media_open, None);
 
         let mut resumed = Vec::new();
         app.consume_deferred_vst3_media_open_in_all_contexts(|_, idx| resumed.push(idx));
         app.consume_deferred_vst3_media_open_in_all_contexts(|_, idx| resumed.push(idx));
-        assert_eq!(resumed, vec![0]);
+        assert!(
+            resumed.is_empty(),
+            "the real completion handler already resumed media"
+        );
     }
 
     let mut app = phase_c_support::setup_app();
@@ -4544,7 +4553,8 @@ fn effetune_and_vst_startup_gate_releases_deferred_media_once_in_either_order() 
         open_gui_when_ready: false,
     };
     assert!(app.media_startup_load_pending());
-    app.effetune.runtime = EffetuneRuntime::Idle;
+    app.effetune.set_test_startup_completion(Ok(()));
+    app.poll_effetune(&egui::Context::default());
     assert!(!app.media_startup_load_pending());
 }
 

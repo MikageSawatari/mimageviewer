@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
@@ -24,7 +24,7 @@ use windows::Win32::System::Memory::{
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
-    CreateEventW, SetEvent, TerminateProcess, WaitForSingleObject,
+    CreateEventW, GetExitCodeProcess, SetEvent, TerminateProcess, WaitForSingleObject,
 };
 #[cfg(windows)]
 use windows::core::{HSTRING, PCWSTR};
@@ -37,6 +37,8 @@ use windows::core::{HSTRING, PCWSTR};
 /// 1 のままだと stale bridge を検出できなかった。2 へ上げることで v0.8.x 以前の
 /// `mimageviewer-vst3-host.exe` (version=1 を返すだけ) を新 Rust 側で reject できる。
 pub const PROTOCOL_VERSION: u32 = 3;
+#[cfg(windows)]
+const STATE_WATCHDOG_EXIT_CODE: u32 = 0xEFFE_C001;
 
 static NEXT_AUDIO_PIPE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -249,13 +251,27 @@ pub enum Event {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConcurrentStateError {
+    Interrupted(String),
+    HostResponse(String),
+}
+
+impl std::fmt::Display for ConcurrentStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interrupted(reason) | Self::HostResponse(reason) => f.write_str(reason),
+        }
+    }
+}
+
 type PendingStateQueries =
-    Arc<Mutex<HashMap<u64, crossbeam_channel::Sender<Result<String, String>>>>>;
+    Arc<Mutex<HashMap<u64, crossbeam_channel::Sender<Result<String, ConcurrentStateError>>>>>;
 
 fn abort_pending_state_queries(pending: &PendingStateQueries, reason: &str) {
     if let Ok(mut queries) = pending.lock() {
         for (_, reply) in queries.drain() {
-            let _ = reply.try_send(Err(reason.to_string()));
+            let _ = reply.try_send(Err(ConcurrentStateError::Interrupted(reason.to_string())));
         }
     }
 }
@@ -273,8 +289,13 @@ fn route_concurrent_state_result(
     if let Some(reply) = reply {
         let result = match (state, error) {
             (Some(state), None) => Ok(state),
-            (_, Some(error)) => Err(error),
-            _ => Err("invalid concurrent state response".to_string()),
+            (_, Some(error)) if error == "interrupted" => {
+                Err(ConcurrentStateError::Interrupted(error))
+            }
+            (_, Some(error)) => Err(ConcurrentStateError::HostResponse(error)),
+            _ => Err(ConcurrentStateError::HostResponse(
+                "invalid concurrent state response".to_string(),
+            )),
         };
         let _ = reply.try_send(result);
     }
@@ -306,6 +327,7 @@ unsafe fn reject_existing_handle(handle: HANDLE, label: &str) -> std::io::Result
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。
 pub struct Bridge {
     child: Child,
+    state_watchdog_expired: Arc<AtomicBool>,
     stdin: Mutex<ChildStdin>,
     /// 同期 event 受信用 channel。spawn 時に起動した event-pump スレッドが
     /// stdout を読んで非同期 (LatencyChanged / ResetDone) 以外の event をここに流す。
@@ -374,6 +396,23 @@ impl Bridge {
         self.child.id()
     }
 
+    pub fn state_watchdog_expired(&self) -> bool {
+        if self.state_watchdog_expired.load(Ordering::Acquire) {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            let mut code = 0_u32;
+            if unsafe { GetExitCodeProcess(HANDLE(self.child.as_raw_handle()), &mut code) }.is_ok()
+                && code == STATE_WATCHDOG_EXIT_CODE
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     #[cfg(windows)]
     pub fn is_alive(&self) -> bool {
         use std::os::windows::io::AsRawHandle;
@@ -414,12 +453,17 @@ impl Bridge {
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr = child.stderr.take().expect("stderr");
+        let state_watchdog_expired = Arc::new(AtomicBool::new(false));
+        let watchdog_for_stderr = Arc::clone(&state_watchdog_expired);
         std::thread::Builder::new()
             .name("bridge-stderr-pump".into())
             .spawn(move || {
                 use std::io::BufRead;
                 let reader = std::io::BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
+                    if line.contains("concurrent getState watchdog expired") {
+                        watchdog_for_stderr.store(true, Ordering::Release);
+                    }
                     stderr_cb(line);
                 }
             })
@@ -531,6 +575,7 @@ impl Bridge {
 
         Ok(Self {
             child,
+            state_watchdog_expired,
             stdin: Mutex::new(stdin),
             event_rx,
             sync_call_mutex: Mutex::new(()),
@@ -582,7 +627,14 @@ impl Bridge {
     }
 
     pub fn reset_sync_result(&self, timeout: std::time::Duration) -> Result<(), String> {
+        self.reset_sync_result_until(std::time::Instant::now() + timeout)
+    }
+
+    pub fn reset_sync_result_until(&self, deadline: std::time::Instant) -> Result<(), String> {
         let _guard = self.sync_call_mutex.lock().unwrap();
+        if std::time::Instant::now() >= deadline {
+            return Err("reset deadline expired".to_string());
+        }
         // generation ID 発行 (= 0 から始まらないように +1 してから atomic に格納)。
         // wrapping_add で u64 overflow しても新規 ID として扱える (= 18 京回 reset で
         // overflow なので実用上発生しない)。
@@ -595,7 +647,6 @@ impl Bridge {
             return Err(format!("reset send failed: {e}"));
         }
         // ID 照合 loop (= 一致するまで old/future を drop)
-        let deadline = std::time::Instant::now() + timeout;
         loop {
             let now = std::time::Instant::now();
             if now >= deadline {
@@ -758,7 +809,7 @@ impl Bridge {
     pub fn query_state_concurrent(
         &self,
         slot_id: u64,
-    ) -> Result<crossbeam_channel::Receiver<Result<String, String>>, String> {
+    ) -> Result<crossbeam_channel::Receiver<Result<String, ConcurrentStateError>>, String> {
         let id = self.next_state_query_id.fetch_add(1, Ordering::AcqRel) + 1;
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.pending_state_queries
@@ -1250,7 +1301,7 @@ mod concurrent_state_tests {
         abort_pending_state_queries(&pending, "interrupted: bridge exited");
         assert_eq!(
             first_rx.try_recv().unwrap().unwrap_err(),
-            "interrupted: bridge exited"
+            ConcurrentStateError::Interrupted("interrupted: bridge exited".into())
         );
         assert!(pending.lock().unwrap().is_empty());
     }
@@ -1261,7 +1312,17 @@ mod concurrent_state_tests {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         pending.lock().unwrap().insert(42, reply_tx);
         route_concurrent_state_result(&pending, 42, None, Some("getState failed".into()));
-        assert_eq!(reply_rx.try_recv().unwrap().unwrap_err(), "getState failed");
+        assert_eq!(
+            reply_rx.try_recv().unwrap().unwrap_err(),
+            ConcurrentStateError::HostResponse("getState failed".into())
+        );
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        pending.lock().unwrap().insert(43, reply_tx);
+        route_concurrent_state_result(&pending, 43, None, Some("interrupted".into()));
+        assert_eq!(
+            reply_rx.try_recv().unwrap().unwrap_err(),
+            ConcurrentStateError::Interrupted("interrupted".into())
+        );
     }
 
     #[test]
@@ -1319,5 +1380,112 @@ mod concurrent_state_tests {
             assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
             let _ = CloseHandle(first);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod effetune_host_handler_tests {
+    use super::*;
+
+    fn host_and_bundle() -> Option<(Bridge, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let host = root.join("vendor/vst3-host/mimageviewer-vst3-host.exe");
+        let bundle = root.join("vendor/effetune-mixwright/EffeTune Mixwright.vst3");
+        if !host.is_file() || !bundle.is_dir() {
+            eprintln!("EffeTune host handler fixture unavailable; skipping native case");
+            return None;
+        }
+        let bridge = Bridge::spawn(&host, |_| {}).unwrap();
+        bridge
+            .send(&Cmd::Hello {
+                version: PROTOCOL_VERSION,
+            })
+            .unwrap();
+        assert!(matches!(
+            bridge
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            Event::Ready {
+                version: PROTOCOL_VERSION
+            }
+        ));
+        Some((bridge, bundle.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn strict_open_handler_rejects_invalid_restore_without_loaded_event() {
+        let Some((mut bridge, bundle)) = host_and_bundle() else {
+            return;
+        };
+        bridge
+            .open_audio_pipe(&bundle, 48_000, 480, Some("not-base64!"), true)
+            .unwrap();
+        assert!(matches!(
+            bridge.recv_timeout(std::time::Duration::from_secs(25)).unwrap(),
+            Event::Error { detail } if detail.contains("restore_state: invalid base64")
+        ));
+        bridge
+            .open_audio_pipe(&bundle, 48_000, 480, None, true)
+            .unwrap();
+        assert!(matches!(
+            bridge
+                .recv_timeout(std::time::Duration::from_secs(25))
+                .unwrap(),
+            Event::Loaded { slot_id: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn strict_add_handler_rejects_invalid_restore_and_keeps_first_plugin() {
+        let Some((mut bridge, bundle)) = host_and_bundle() else {
+            return;
+        };
+        bridge
+            .open_audio_pipe(&bundle, 48_000, 480, None, true)
+            .unwrap();
+        assert!(matches!(
+            bridge
+                .recv_timeout(std::time::Duration::from_secs(25))
+                .unwrap(),
+            Event::Loaded { slot_id: 0, .. }
+        ));
+        bridge
+            .add_plugin_to_chain(1, &bundle, Some("not-base64!"), false, true)
+            .unwrap();
+        assert!(matches!(
+            bridge.recv_timeout(std::time::Duration::from_secs(25)).unwrap(),
+            Event::Error { detail } if detail.contains("add_plugin restore_state: invalid base64")
+        ));
+        let state = bridge.query_state_concurrent(0).unwrap();
+        let encoded = state
+            .recv_timeout(std::time::Duration::from_secs(6))
+            .unwrap()
+            .unwrap();
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for key in [
+            "formatVersion",
+            "pipelineA",
+            "pipelineB",
+            "currentPipeline",
+            "masterBypass",
+        ] {
+            assert!(document.get(key).is_some(), "v0.11.1 codec field {key}");
+        }
+        assert_eq!(
+            crate::effetune::EffectiveState::from_bytes(&bytes),
+            crate::effetune::EffectiveState::Inert
+        );
+        assert_eq!(
+            bridge
+                .reset_sync_result_until(
+                    std::time::Instant::now() - std::time::Duration::from_millis(1)
+                )
+                .unwrap_err(),
+            "reset deadline expired"
+        );
     }
 }

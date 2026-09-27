@@ -23486,7 +23486,7 @@ impl App {
         if self.settings.effetune_gui_pos != pos || self.settings.effetune_gui_size != size {
             self.settings.effetune_gui_pos = pos;
             self.settings.effetune_gui_size = size;
-            self.settings.save();
+            self.effetune.save_gui_rect_async(pos, size);
         }
     }
 

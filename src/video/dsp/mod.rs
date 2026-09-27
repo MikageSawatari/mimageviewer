@@ -74,6 +74,19 @@ mod effetune_policy_tests {
         assert!(effect.strict_state);
         assert!(!effect.show_editor_bypass_button);
     }
+
+    #[test]
+    fn gui_attach_handler_reports_typed_error_to_registered_owner() {
+        let bridge = DspBridge::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        bridge.set_gui_failure_sink(tx);
+        assert!(bridge.show_slot_gui(0).is_err());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiFailure::Attach(detail) if detail.contains("スロット範囲外")
+        ));
+        assert_eq!(bridge.state(), DspState::Disabled);
+    }
 }
 
 /// PDC (Plugin Delay Compensation) で許容する最大遅延 (秒)。
@@ -135,6 +148,11 @@ pub struct GuiSignalChanges {
     pub bypass_updates: Vec<(String, bool)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuiFailure {
+    Attach(String),
+}
+
 /// DspBridge — 1 本の VST3 チェーンホスト bridge との対話を管理する。
 ///
 /// ローカル再生用はアプリ起動から終了まで 1 個を保持する。時計なしリモート配信は
@@ -146,6 +164,7 @@ pub struct DspBridge {
     latency_policy: LatencyPolicy,
     strict_state: bool,
     show_editor_bypass_button: bool,
+    gui_failure_sink: Mutex<Option<std::sync::mpsc::Sender<GuiFailure>>>,
     /// audio-pump thread が高速判定するためのフラグ。Mutex を取らずに読める。
     enabled: AtomicBool,
     /// 「処理対象スロット (= Loaded 且つ bypass=false) の個数」を atomic で公開。
@@ -329,6 +348,7 @@ impl DspBridge {
             latency_policy,
             strict_state,
             show_editor_bypass_button,
+            gui_failure_sink: Mutex::new(None),
             enabled: AtomicBool::new(false),
             active_slot_count: AtomicUsize::new(0),
             session_disabled_reason: Mutex::new(None),
@@ -371,6 +391,20 @@ impl DspBridge {
 
     pub fn set_main_hwnd(&self, hwnd: u64) {
         self.main_hwnd.store(hwnd, Ordering::Release);
+    }
+
+    pub fn set_gui_failure_sink(&self, sink: std::sync::mpsc::Sender<GuiFailure>) {
+        *self.gui_failure_sink.lock().unwrap() = Some(sink);
+    }
+
+    fn gui_failure_owned_by_controller(&self) -> bool {
+        self.gui_failure_sink.lock().unwrap().is_some()
+    }
+
+    fn report_gui_failure(&self, detail: String) {
+        if let Some(sink) = self.gui_failure_sink.lock().unwrap().as_ref() {
+            let _ = sink.send(GuiFailure::Attach(detail));
+        }
     }
 
     /// フルスクリーン動画再生開始時に presenter HWND を登録。
@@ -1198,7 +1232,8 @@ impl DspBridge {
     /// bridge event channel. The receiver may be waited on by a worker.
     pub fn query_first_state_concurrent(
         &self,
-    ) -> Result<crossbeam_channel::Receiver<Result<String, String>>, String> {
+    ) -> Result<crossbeam_channel::Receiver<Result<String, bridge::ConcurrentStateError>>, String>
+    {
         let (bridge, slot_id) = {
             let inner = self.inner.lock().unwrap();
             let slot = inner
@@ -1214,6 +1249,16 @@ impl DspBridge {
     pub fn host_alive(&self) -> bool {
         let inner = self.inner.lock().unwrap();
         !inner.slots.is_empty() && inner.slots.iter().all(|slot| slot.bridge.is_alive())
+    }
+
+    #[cfg(windows)]
+    pub fn host_watchdog_expired(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .slots
+            .iter()
+            .any(|slot| slot.bridge.state_watchdog_expired())
     }
 
     /// Used only when the dedicated EffeTune host exceeds the exit fence.
@@ -1295,6 +1340,10 @@ impl DspBridge {
     }
 
     pub fn try_reset_plugins_sync(&self) -> Result<(), String> {
+        self.try_reset_plugins_before(Instant::now() + std::time::Duration::from_secs(2))
+    }
+
+    pub fn try_reset_plugins_before(&self, deadline: Instant) -> Result<(), String> {
         if !self.is_enabled() {
             return Err("VST3 bridge disabled".to_string());
         }
@@ -1313,9 +1362,11 @@ impl DspBridge {
         }
         // 各 bridge ごとに `reset_sync` (= ID 付き send + ack 照合 wait) を呼ぶ。
         // 順次実行で十分 (= active bridge 数 max 10、各 reset は数 ms-数百 ms)。
-        let timeout = std::time::Duration::from_secs(2);
         for b in &bridges {
-            b.reset_sync_result(timeout)?;
+            if Instant::now() >= deadline {
+                return Err("reset deadline expired".to_string());
+            }
+            b.reset_sync_result_until(deadline)?;
         }
         Ok(())
     }
@@ -1546,6 +1597,7 @@ impl DspBridge {
             crate::logger::log(format!(
                 "[VST3 GUI] failed to spawn async show-slot idx={idx}: {err}"
             ));
+            self.report_gui_failure(format!("GUI attach worker spawn: {err}"));
         }
     }
 
@@ -1554,6 +1606,21 @@ impl DspBridge {
     }
 
     fn ensure_slot_gui_attached(
+        &self,
+        idx: usize,
+        visible: bool,
+        clear_user_hidden: bool,
+    ) -> Result<(), String> {
+        let result = self.ensure_slot_gui_attached_inner(idx, visible, clear_user_hidden);
+        if let Err(error) = &result {
+            if error != "main HWND not ready" {
+                self.report_gui_failure(error.clone());
+            }
+        }
+        result
+    }
+
+    fn ensure_slot_gui_attached_inner(
         &self,
         idx: usize,
         visible: bool,
@@ -1640,9 +1707,11 @@ impl DspBridge {
                 Err(e) => {
                     crate::logger::log(format!("vst3 query_gui_size: {e}, fallback 1200x800"));
                     drop(gui_sync_guard.take());
-                    self.disable_with_reason(Some(format!(
-                        "GUI size query timed out for {plugin_name}: {e}"
-                    )));
+                    if !self.gui_failure_owned_by_controller() {
+                        self.disable_with_reason(Some(format!(
+                            "GUI size query timed out for {plugin_name}: {e}"
+                        )));
+                    }
                     return Err(format!("query_gui_size recv: {e}"));
                 }
             };
@@ -1709,7 +1778,8 @@ impl DspBridge {
                 }
             }
             Ok(Event::Error { detail }) => {
-                if Self::is_bridge_poison_detail(&detail) {
+                if Self::is_bridge_poison_detail(&detail) && !self.gui_failure_owned_by_controller()
+                {
                     drop(gui_sync_guard.take());
                     self.disable_with_reason(Some(format!(
                         "GUI attach failed for {plugin_name}: {detail}"
@@ -1722,9 +1792,11 @@ impl DspBridge {
             }
             Err(e) => {
                 drop(gui_sync_guard.take());
-                self.disable_with_reason(Some(format!(
-                    "GUI attach timed out for {plugin_name}: {e}"
-                )));
+                if !self.gui_failure_owned_by_controller() {
+                    self.disable_with_reason(Some(format!(
+                        "GUI attach timed out for {plugin_name}: {e}"
+                    )));
+                }
                 return Err(format!("attach recv: {e}"));
             }
         }

@@ -869,6 +869,36 @@ impl SettingsDb {
         )
     }
 
+    /// Persist only the EffeTune editor rectangle. A pending older request is
+    /// checked after acquiring the DB lock so it cannot overwrite a newer save.
+    pub(crate) fn save_effetune_gui_rect(
+        &self,
+        pos: Option<(i32, i32)>,
+        size: Option<(u32, u32)>,
+        still_current: impl Fn() -> bool,
+    ) -> Result<bool, SettingsDbError> {
+        let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        if !still_current() {
+            return Ok(false);
+        }
+        if existing_bootstrap_marker_present(&inner.conn)? {
+            if !singleton_endpoint_marker_present(&inner.conn)? {
+                return Err(SettingsDbError::SaveSuppressed);
+            }
+            read_singleton_endpoint_settings(&inner.conn)?;
+        }
+        let tx = inner.conn.transaction()?;
+        let mut statement = tx.prepare(
+            "INSERT INTO settings_kv(key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        )?;
+        statement.execute(params!["effetune_gui_pos", serde_json::to_string(&pos)?])?;
+        statement.execute(params!["effetune_gui_size", serde_json::to_string(&size)?])?;
+        drop(statement);
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// `Settings` を全テーブルに書き出す。
     ///
     /// rotation には触れない (= bootstrap save と user save 両方が共有)。
@@ -4305,6 +4335,27 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn effetune_rect_worker_write_updates_only_its_keys_and_rejects_stale_request() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.grid_cols = 7;
+        db.save_full(&settings).unwrap();
+        assert!(
+            !db.save_effetune_gui_rect(Some((1, 2)), Some((300, 400)), || false)
+                .unwrap()
+        );
+        assert!(
+            db.save_effetune_gui_rect(Some((10, 20)), Some((800, 600)), || true)
+                .unwrap()
+        );
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.grid_cols, 7);
+        assert_eq!(loaded.effetune_gui_pos, Some((10, 20)));
+        assert_eq!(loaded.effetune_gui_size, Some((800, 600)));
+    }
 
     fn sample_settings() -> Settings {
         let mut s = Settings::default();

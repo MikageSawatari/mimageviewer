@@ -468,7 +468,9 @@ private:
                                      "[BRIDGE] concurrent getState watchdog expired request=%llu\n",
                                      static_cast<unsigned long long>(id));
                         std::fflush(stderr);
-                        ::ExitProcess(1);
+                        // Distinct process exit status lets the Rust controller
+                        // distinguish the capture watchdog from another host exit.
+                        ::ExitProcess(0xEFFEC001u);
                     }
                 }
             }

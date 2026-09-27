@@ -7515,6 +7515,7 @@ static MAIN_UNREADABLE_THIS_SESSION: AtomicBool = AtomicBool::new(false);
 /// 項目)。これは本仕組み以前からある挙動で、先送りの判定としては正しく働く
 /// (上書き後の live 値こそが保存すべき値になるため)。
 static SAVE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static EFFETUNE_GUI_RECT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// 直近までに成功した `Settings::save()` の世代。詳細は [`SAVE_GENERATION`]。
 pub(crate) fn save_generation() -> u64 {
@@ -9768,6 +9769,47 @@ impl Settings {
     /// 必要かどうかは future Phase 7 で検討する。
     pub fn save(&self) {
         self.save_internal(/* allow_rotation = */ true);
+    }
+
+    pub(crate) fn next_effetune_gui_rect_generation() -> u64 {
+        EFFETUNE_GUI_RECT_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Called only by the EffeTune settings worker, never from an egui frame.
+    pub(crate) fn persist_effetune_gui_rect(
+        generation: u64,
+        pos: Option<(i32, i32)>,
+        size: Option<(u32, u32)>,
+    ) -> bool {
+        if MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed)
+            || crate::settings_db::save_suppressed()
+            || EFFETUNE_GUI_RECT_GENERATION.load(Ordering::Acquire) != generation
+        {
+            return false;
+        }
+        let data_dir = crate::data_dir::get();
+        let did_rotate = !BACKUP_DONE_THIS_SESSION.swap(true, Ordering::Relaxed);
+        let result = crate::settings_db::with_db_result(|db| {
+            if did_rotate && let Err(error) = db.rotate_backups(&data_dir) {
+                settings_diag_log(&format!(
+                    "settings: rotate_backups failed (continuing with EffeTune rect save): {error}"
+                ));
+            }
+            db.save_effetune_gui_rect(pos, size, || {
+                EFFETUNE_GUI_RECT_GENERATION.load(Ordering::Acquire) == generation
+            })
+        });
+        match result {
+            Ok(true) => {
+                SAVE_GENERATION.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                settings_diag_log(&format!("settings: EffeTune rect save failed: {error}"));
+                false
+            }
+        }
     }
 
     /// 永続化成否を呼び出し元へ返す必要がある typed write 境界向け。
