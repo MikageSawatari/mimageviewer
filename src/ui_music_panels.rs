@@ -1746,11 +1746,7 @@ impl App {
         #[cfg(windows)]
         if toggle_normalize {
             use crate::video::normalize_types::NormalizeUiState;
-            let st = self
-                .normalize_ui_states
-                .get(&fs_idx)
-                .copied()
-                .unwrap_or_default();
+            let st = self.normalize_ui_state_for_player(fs_idx);
             if matches!(st, NormalizeUiState::OnUnmeasured) {
                 self.handle_disable_normalize(&ctx, fs_idx);
             } else {

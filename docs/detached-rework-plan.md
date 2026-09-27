@@ -1455,6 +1455,19 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-27 §1.251 S3-A: 音量正規化 (Norm) の測定値 lookup を所有 viewer context へ配送**
+
+音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §6.1) で、Norm の測定値の
+lookup を UI thread から worker へ移した。worker の完了通知は App 共通の受信箱で受けるが、結果は
+`ViewerContextId` と path・request epoch を持ち、**所有 context の poll でだけ**適用する (mount 中の
+`fs_cache` に対象が無いという理由で別 context 宛ての結果を捨てない)。context の retire で未適用の結果を
+破棄し、viewer context の fork で player が移った場合は移動先の context から lookup を再発行する。Norm 全体の
+ON / OFF は全 viewer context の player の gain 表に同じ遷移を適用し、epoch で古い request を失効させる。
+detached の述語、host / park / focus の lifecycle、viewport の生成・終了には変更を加えない。
+判断: context 固有の resource (lookup 結果・gain 表) を所有 context だけに作用させる構造的修正であり、
+guard・遅延・再試行・一括 reset で症状を隠すものではない (§2 の禁止事項に抵触しない)。独立レビュー (Sol) と
+ClaudeCode の双方がこの判断に合意した。
+
 **2026-09-26 実アプリ smoke の viewport スクリーンショット証跡**
 
 `portable,test-script` のみで egui の viewport Screenshot 応答を受け、main と別窓の画像を

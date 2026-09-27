@@ -1060,9 +1060,12 @@ pub(in crate::app) struct ViewerContextBundle {
         crate::ui_erase::EraseInpaintPending,
     >,
     ai_classify_cache: std::collections::HashMap<usize, crate::ai::ImageCategory>,
-    normalize_ui_states:
-        std::collections::HashMap<usize, crate::video::normalize_types::NormalizeUiState>,
-    normalize_auto_scan_suppressed: std::collections::HashSet<usize>,
+    normalize_ui_states: std::collections::HashMap<
+        crate::app::normalize::NormalizeTargetKey,
+        crate::video::normalize_types::NormalizeUiState,
+    >,
+    normalize_auto_scan_suppressed:
+        std::collections::HashSet<crate::app::normalize::NormalizeTargetKey>,
     music_bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
     music_bookmarks_loaded_for: Option<PathBuf>,
     last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
@@ -1233,8 +1236,32 @@ impl<'a> ContextRef<'a> {
         idx: usize,
     ) -> Option<crate::video::normalize_types::NormalizeUiState> {
         match self.source {
-            ContextRefSource::Mounted(app) => app.normalize_ui_states.get(&idx).copied(),
-            ContextRefSource::AtRest(bundle) => bundle.normalize_ui_states.get(&idx).copied(),
+            ContextRefSource::Mounted(app) => {
+                let player = match app.fs_cache.get(&idx)? {
+                    crate::app::FsCacheEntry::Video { player, .. } => player,
+                    _ => return None,
+                };
+                let stream = player.applied_audio_stream_index()?;
+                let key = crate::app::normalize::NormalizeTargetKey::new(
+                    idx,
+                    player.path().clone(),
+                    stream,
+                );
+                app.normalize_ui_states.get(&key).copied()
+            }
+            ContextRefSource::AtRest(bundle) => {
+                let player = match bundle.fs_cache.get(&idx)? {
+                    crate::app::FsCacheEntry::Video { player, .. } => player,
+                    _ => return None,
+                };
+                let stream = player.applied_audio_stream_index()?;
+                let key = crate::app::normalize::NormalizeTargetKey::new(
+                    idx,
+                    player.path().clone(),
+                    stream,
+                );
+                bundle.normalize_ui_states.get(&key).copied()
+            }
         }
     }
 
@@ -3450,9 +3477,18 @@ impl App {
     }
 
     fn abort_viewer_context_build(&mut self) {
+        let abandoned = self.projected_viewer_context_id();
         let ops = self.viewer_contexts.table.plan_abort_build();
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_abort_build();
+        self.normalize_lookup_pending.remove(&abandoned);
+        if self
+            .normalize_state
+            .as_ref()
+            .is_some_and(|state| state.owner_context_id == abandoned)
+        {
+            self.normalize_state.take().unwrap().cancel();
+        }
         let session = self.active_detached_session;
         let binding = session.and_then(|value| {
             self.viewer_context_window_binding_probe(value.window_id)
@@ -3508,10 +3544,50 @@ impl App {
         policy: ForkPolicy,
         spec: ProductionForkSpec,
     ) -> ViewerContextId {
+        let source = self.projected_viewer_context_id();
+        let scan_candidate = self.normalize_state.as_ref().and_then(|state| {
+            (state.owner_context_id == source).then(|| (state.fs_idx, state.file_path.clone()))
+        });
         let (id, ops) = self.viewer_contexts.table.plan_fork(policy);
         self.execute_viewer_context_ops(ops, Some(spec));
         let finished = self.viewer_contexts.table.finish_fork();
         assert_eq!(finished, id);
+        // A fork may move a live player. The scan and unresolved lookup then
+        // follow that exact player into the new viewer, regardless of fork policy.
+        let norm_enabled = self.settings.audio_normalize_enabled;
+        if norm_enabled || scan_candidate.is_some() {
+            let scan_moved = self
+                .with_viewer_context(id, |owner| {
+                    let scan_moved = scan_candidate.as_ref().is_some_and(|(idx, path)| {
+                        matches!(owner.fs_cache.get(idx),
+                            Some(crate::app::FsCacheEntry::Video { player, .. })
+                                if player.path() == path.as_path())
+                    });
+                    if norm_enabled {
+                        let pending: Vec<(usize, usize)> = owner
+                            .fs_cache
+                            .iter()
+                            .filter_map(|(idx, entry)| {
+                                let crate::app::FsCacheEntry::Video { player, .. } = entry else {
+                                    return None;
+                                };
+                                let streams =
+                                    player.rearm_normalize_lookups_after_context_transfer();
+                                Some(streams.into_iter().map(|stream| (*idx, stream)))
+                            })
+                            .flatten()
+                            .collect();
+                        for (idx, stream) in pending {
+                            owner.start_normalize_lookup_for_stream(idx, stream);
+                        }
+                    }
+                    scan_moved
+                })
+                .expect("freshly forked viewer context must mount for Norm transfer");
+            if scan_moved {
+                self.normalize_state.as_mut().unwrap().owner_context_id = id;
+            }
+        }
         id
     }
 
@@ -3588,6 +3664,14 @@ impl App {
         let ops = self.viewer_contexts.table.plan_finish_retire(id);
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_retire();
+        self.normalize_lookup_pending.remove(&id);
+        if self
+            .normalize_state
+            .as_ref()
+            .is_some_and(|state| state.owner_context_id == id)
+        {
+            self.normalize_state.take().unwrap().cancel();
+        }
         Ok(value)
     }
 
@@ -3618,6 +3702,18 @@ impl App {
 impl App {
     pub(in crate::app) fn viewer_context_main(&self) -> ViewerContextId {
         ViewerContextId::single_context()
+    }
+
+    pub(in crate::app) fn viewer_context_ids(&self) -> Vec<ViewerContextId> {
+        vec![ViewerContextId::single_context()]
+    }
+
+    pub(in crate::app) fn viewer_context_residence(&self, id: ViewerContextId) -> ContextResidence {
+        if id == ViewerContextId::single_context() {
+            ContextResidence::Mounted
+        } else {
+            ContextResidence::Unknown
+        }
     }
 
     /// Non-Windows builds have one viewer payload and therefore one projected identity.

@@ -1434,6 +1434,7 @@ const VIDEO_RESUME_PREVIEW_SESSION_CACHE_CAP: usize = 8;
 pub(super) fn apply_normalize_gain_with_perf(
     player: &crate::video::VideoPlayer,
     fs_idx: usize,
+    stream_index: usize,
     new_gain_linear: f64,
     new_gain_db: f32,
     reason: &'static str,
@@ -1472,7 +1473,7 @@ pub(super) fn apply_normalize_gain_with_perf(
     // set_normalize_gain は atomic store だけで buffer は触らないので、
     // 既存 processed (~100ms) は旧 gain で鳴り続け、その後 raw_pending 経由で
     // 新 gain に切り替わる。A/V offset は連続性を保つ。
-    player.set_normalize_gain(new_gain_linear);
+    player.set_normalize_gain_for_stream(stream_index, new_gain_linear);
     if crate::perf::is_enabled() {
         crate::perf::event(
             "video",
@@ -1500,6 +1501,280 @@ pub(super) fn apply_normalize_gain_with_perf(
 }
 
 impl App {
+    pub(crate) fn normalize_key_for_player(
+        &self,
+        fs_idx: usize,
+    ) -> Option<crate::app::normalize::NormalizeTargetKey> {
+        let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&fs_idx)? else {
+            return None;
+        };
+        Some(crate::app::normalize::NormalizeTargetKey::new(
+            fs_idx,
+            player.path().clone(),
+            player.applied_audio_stream_index()?,
+        ))
+    }
+
+    pub(crate) fn normalize_ui_state_for_player(
+        &self,
+        fs_idx: usize,
+    ) -> crate::video::normalize_types::NormalizeUiState {
+        self.normalize_key_for_player(fs_idx)
+            .and_then(|key| self.normalize_ui_states.get(&key).copied())
+            .unwrap_or(crate::video::normalize_types::NormalizeUiState::Off)
+    }
+
+    pub(super) fn set_normalize_ui_state_for_player(
+        &mut self,
+        fs_idx: usize,
+        state: crate::video::normalize_types::NormalizeUiState,
+    ) {
+        if let Some(key) = self.normalize_key_for_player(fs_idx) {
+            self.normalize_ui_states.insert(key, state);
+        }
+    }
+
+    pub(super) fn start_normalize_lookup_for_stream(&mut self, fs_idx: usize, stream_index: usize) {
+        if !self.settings.audio_normalize_enabled {
+            return;
+        }
+        let target = self.settings.clamped_audio_normalize_target_lufs_milli();
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let Some(info) = player.info() else { return };
+        let Some(request) = player.begin_normalize_lookup(stream_index, target) else {
+            return;
+        };
+        let key = crate::app::normalize::NormalizeTargetKey::new(
+            fs_idx,
+            player.path().clone(),
+            stream_index,
+        );
+        let owner_context_id = self.projected_viewer_context_id();
+        self.normalize_ui_states.insert(
+            key.clone(),
+            crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
+        );
+        let default_stream_index = info.default_audio_stream_index;
+        let tx = self.normalize_lookup_tx.clone();
+        let wake = player.ui_wake_handle();
+        let db_path = crate::audio_normalize_db::AudioNormalizeDb::db_path();
+        let worker_key = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("normalize-lookup".to_owned())
+            .spawn(move || {
+                let result =
+                    crate::audio_normalize_db::AudioNormalizeDb::open_read_only_at(&db_path)
+                        .map_err(|error| error.to_string())
+                        .and_then(|db| {
+                            db.lookup_checked(
+                                &worker_key.file_path,
+                                target,
+                                stream_index,
+                                default_stream_index,
+                            )
+                        });
+                let _ = tx.send(crate::app::normalize::NormalizeLookupMessage {
+                    owner_context_id,
+                    key: worker_key,
+                    request,
+                    result,
+                });
+                wake.wake();
+            });
+        if let Err(error) = spawned {
+            crate::logger::log(format!("normalize lookup worker spawn failed: {error}"));
+            if player.resolve_normalize_lookup(request, 1.0) {
+                self.normalize_ui_states.insert(
+                    key,
+                    crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
+                );
+            }
+        }
+    }
+
+    /// Resolve only tracks that can currently supply audio. A switch keeps the
+    /// applied track audible until demux commits the desired one, so both may
+    /// need a lookup after a global Norm reset.
+    pub(super) fn start_normalize_lookups_for_selected_tracks(&mut self, fs_idx: usize) {
+        use crate::video::normalize_gain::NormalizeTrackGain;
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let applied = player.applied_audio_stream_index();
+        let desired = player
+            .audio_track_selection()
+            .and_then(|selection| selection.switch_candidate())
+            .map(|choice| choice.stream_index);
+        let unresolved =
+            [applied, desired.filter(|stream| Some(*stream) != applied)].map(|track| {
+                track.filter(|stream| {
+                    matches!(
+                        player.normalize_track_gain(*stream),
+                        NormalizeTrackGain::Pending(None)
+                    )
+                })
+            });
+        for stream in unresolved.into_iter().flatten() {
+            self.start_normalize_lookup_for_stream(fs_idx, stream);
+        }
+    }
+
+    pub(super) fn poll_normalize_lookups(&mut self) {
+        use crate::app::viewer_context_registry::ContextResidence;
+        use crate::video::normalize_types::NormalizeUiState;
+        while let Ok(message) = self.normalize_lookup_rx.try_recv() {
+            if matches!(
+                self.viewer_context_residence(message.owner_context_id),
+                ContextResidence::Mounted | ContextResidence::AtRest | ContextResidence::Building
+            ) {
+                self.normalize_lookup_pending
+                    .entry(message.owner_context_id)
+                    .or_default()
+                    .push(message);
+            }
+        }
+        // A worker may finish after its viewer was retired; never retain its result.
+        let live_ids = self.viewer_context_ids();
+        self.normalize_lookup_pending
+            .retain(|owner, _| live_ids.contains(owner));
+        let owner = self.projected_viewer_context_id();
+        for message in self
+            .normalize_lookup_pending
+            .remove(&owner)
+            .unwrap_or_default()
+        {
+            let mut key = message.key;
+            // Snapshot reorder can change fs_idx while the worker is running.
+            // The request epoch identifies the player table; locate it within
+            // the owning viewer before updating per-index UI state.
+            let Some(fs_idx) = self.fs_cache.iter().find_map(|(&idx, entry)| {
+                let FsCacheEntry::Video { player, .. } = entry else {
+                    return None;
+                };
+                (player.path() == key.file_path.as_path()
+                    && matches!(player.normalize_track_gain(key.stream_index),
+                        crate::video::normalize_gain::NormalizeTrackGain::Pending(Some(request))
+                            if request == message.request))
+                .then_some(idx)
+            }) else {
+                continue;
+            };
+            key.fs_idx = fs_idx;
+            let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+                unreachable!("lookup owner disappeared during one UI poll")
+            };
+            #[cfg(windows)]
+            let applied = player.applied_audio_stream_index() == Some(key.stream_index);
+            match message.result {
+                Ok(Some(result)) => {
+                    let gain = 10.0_f64.powf(result.gain_db as f64 / 20.0);
+                    if player.resolve_normalize_lookup(message.request, gain) {
+                        self.normalize_ui_states.insert(
+                            key,
+                            NormalizeUiState::OnApplied {
+                                gain_db: result.gain_db,
+                            },
+                        );
+                    }
+                }
+                outcome => {
+                    let should_scan = matches!(outcome, Ok(None));
+                    let lookup_failed = outcome.is_err();
+                    if let Err(error) = outcome {
+                        crate::logger::log(format!("normalize lookup failed: {error}"));
+                    }
+                    // Establish scan suspension before exposing unity to the pump.
+                    let matches_request = matches!(
+                        player.normalize_track_gain(key.stream_index),
+                        crate::video::normalize_gain::NormalizeTrackGain::Pending(Some(request)) if request == message.request
+                    );
+                    if !matches_request {
+                        continue;
+                    }
+                    self.normalize_ui_states
+                        .insert(key.clone(), NormalizeUiState::OnUnmeasured);
+                    if lookup_failed {
+                        self.normalize_auto_scan_suppressed.insert(key.clone());
+                    }
+                    #[cfg(windows)]
+                    if should_scan
+                        && applied
+                        && self.normalize_auto_scan_policy_ready(key.fs_idx)
+                        && player.intent_playing()
+                    {
+                        self.start_normalize_scan(key.fs_idx);
+                    }
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&key.fs_idx)
+                    {
+                        player.resolve_normalize_lookup(message.request, 1.0);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn select_video_audio_track(
+        &mut self,
+        fs_idx: usize,
+        stream_index: usize,
+    ) -> crate::video::AudioTrackSelectResult {
+        let result = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.select_audio_track(stream_index),
+            _ => {
+                return crate::video::AudioTrackSelectResult {
+                    outcome: crate::video::AudioTrackSelectOutcome::Rejected,
+                    normalize_unresolved: false,
+                };
+            }
+        };
+        if result.outcome == crate::video::AudioTrackSelectOutcome::Rejected {
+            return result;
+        }
+        self.cancel_blocking_normalize_scan_for_other_track(fs_idx, stream_index);
+        if result.normalize_unresolved {
+            self.start_normalize_lookup_for_stream(fs_idx, stream_index);
+        }
+        result
+    }
+
+    pub(super) fn cancel_blocking_normalize_scan_for_other_track(
+        &mut self,
+        fs_idx: usize,
+        stream_index: usize,
+    ) {
+        let should_cancel = self.normalize_state.as_ref().is_some_and(|state| {
+            state.owner_context_id == self.projected_viewer_context_id()
+                && state.fs_idx == fs_idx
+                && state.stream_index != stream_index
+                && !state.provisional_applied
+                && matches!(
+                    self.fs_cache.get(&fs_idx),
+                    Some(FsCacheEntry::Video { player, .. }) if player.path() == state.file_path.as_path()
+                )
+        });
+        if !should_cancel {
+            return;
+        }
+        let state = self.normalize_state.take().unwrap();
+        state.cancel();
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            if state.was_playing {
+                player.set_playing(true);
+            }
+            player.set_audio_preroll_suspended(false);
+        }
+        self.normalize_ui_states.insert(
+            crate::app::normalize::NormalizeTargetKey::new(
+                fs_idx,
+                state.file_path,
+                state.stream_index,
+            ),
+            crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
+        );
+    }
+
     #[cfg(windows)]
     fn emit_audio_output_binding(
         &self,
@@ -1517,11 +1792,7 @@ impl App {
             return;
         };
         let source_key = crate::path_key::normalize_keep_drive(player.path());
-        let ui_state = self
-            .normalize_ui_states
-            .get(&fs_idx)
-            .copied()
-            .unwrap_or(crate::video::normalize_types::NormalizeUiState::Off);
+        let ui_state = self.normalize_ui_state_for_player(fs_idx);
         let normalize_state = match ui_state {
             crate::video::normalize_types::NormalizeUiState::Off => "off",
             crate::video::normalize_types::NormalizeUiState::OnApplied { .. } => "applied",
@@ -1539,7 +1810,8 @@ impl App {
             )
         });
         let scan_active = self.normalize_state.as_ref().is_some_and(|state| {
-            state.fs_idx == fs_idx
+            state.owner_context_id == self.projected_viewer_context_id()
+                && state.fs_idx == fs_idx
                 && crate::path_key::eq_keep_drive(&state.file_path, player.path())
         });
         crate::perf::event(
@@ -3619,7 +3891,7 @@ impl App {
         let source_epoch = self.next_native_video_source_epoch();
         let started_at = std::time::Instant::now();
         self.activity_gate.bump();
-        let (mut new_player, start_normalize_scan_before_play) = self.build_video_player_for_open(
+        let mut new_player = self.build_video_player_for_open(
             target_idx,
             target_path.clone(),
             false,
@@ -3654,13 +3926,7 @@ impl App {
                 parked_live_window_id,
                 history_trigger,
             );
-        if start_normalize_scan_before_play {
-            if !self.start_normalize_scan_for_deferred_play_intent(target_idx) {
-                self.resume_deferred_normalize_playback_without_scan(target_idx);
-            }
-        } else {
-            self.maybe_start_normalize_scan_for_play_intent(target_idx);
-        }
+        self.maybe_start_normalize_scan_for_play_intent(target_idx);
 
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
             crate::logger::log(format!(
@@ -7012,20 +7278,15 @@ impl App {
         }
         // [Scanning] のモーダル段階だけクリック無効。仮 gain 適用後のバックグラウンド
         // scan 中は、クリック OFF で scan cancel + 全体 OFF にできる。
-        if self
-            .normalize_state
-            .as_ref()
-            .is_some_and(|state| !state.provisional_applied)
-        {
+        if self.normalize_state.as_ref().is_some_and(|state| {
+            state.owner_context_id == self.projected_viewer_context_id()
+                && !state.provisional_applied
+        }) {
             return;
         }
         use crate::video::normalize_types::NormalizeUiState;
         // ── snapshot phase: self の借用を短くする ──
-        let current_state = self
-            .normalize_ui_states
-            .get(&fs_idx)
-            .copied()
-            .unwrap_or(NormalizeUiState::Off);
+        let current_state = self.normalize_ui_state_for_player(fs_idx);
         let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
         let current_path: Option<PathBuf> = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => Some(player.path().to_path_buf()),
@@ -7049,13 +7310,24 @@ impl App {
                 // [Off] → [OnApplied] or [Scanning]: グローバル ON 化、現在動画 DB lookup
                 self.settings.audio_normalize_enabled = true;
                 self.settings.save();
-                let lookup = self
-                    .audio_normalize_db
-                    .as_ref()
-                    .and_then(|db| db.lookup(&current_path, target_milli));
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.reset_normalize_gains(true);
+                }
+                let lookup = self.audio_normalize_db.as_ref().and_then(|db| {
+                    let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&fs_idx)? else {
+                        return None;
+                    };
+                    let info = player.info()?;
+                    db.lookup(
+                        &current_path,
+                        target_milli,
+                        player.applied_audio_stream_index()?,
+                        info.default_audio_stream_index,
+                    )
+                });
                 if let Some(result) = lookup {
                     self.apply_normalize_gain_db_to_player(fs_idx, result.gain_db);
-                    self.normalize_ui_states.insert(
+                    self.set_normalize_ui_state_for_player(
                         fs_idx,
                         NormalizeUiState::OnApplied {
                             gain_db: result.gain_db,
@@ -7064,8 +7336,19 @@ impl App {
                 } else {
                     self.start_normalize_scan(fs_idx);
                 }
-                // 他の動画にも反映 (ヒットしたものから順に適用)
-                self.apply_normalize_to_all_videos_except(fs_idx, target_milli);
+                self.start_normalize_lookups_for_selected_tracks(fs_idx);
+                // Every viewer owns its own player tables. Resolve the other
+                // players through their owner's async lookup route.
+                let current_context = self.projected_viewer_context_id();
+                self.start_normalize_lookups_in_mounted_context_except(Some(fs_idx));
+                for context_id in self.viewer_context_ids() {
+                    if context_id != current_context {
+                        self.with_viewer_context(context_id, |context| {
+                            context.start_normalize_lookups_in_mounted_context_except(None);
+                        })
+                        .expect("live viewer context must mount for global Norm ON");
+                    }
+                }
             }
             NormalizeUiState::Scanning => {
                 // is_some() ガードで通常到達しない
@@ -7091,7 +7374,7 @@ impl App {
         let should_drop = self
             .normalize_state
             .as_ref()
-            .map(|s| s.fs_idx == fs_idx)
+            .map(|s| s.owner_context_id == self.projected_viewer_context_id() && s.fs_idx == fs_idx)
             .unwrap_or(false);
         if !should_drop {
             return;
@@ -7105,16 +7388,29 @@ impl App {
                 "user_cancelled",
                 state.provisional_result.map(|result| result.gain_db),
             );
-            self.normalize_auto_scan_suppressed.insert(state.fs_idx);
+            self.normalize_auto_scan_suppressed.insert(
+                crate::app::normalize::NormalizeTargetKey::new(
+                    state.fs_idx,
+                    state.file_path.clone(),
+                    state.stream_index,
+                ),
+            );
             // 元再生状態に復帰
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&state.fs_idx) {
-                if state.was_playing {
+                player.set_normalize_gain_for_stream(state.stream_index, 1.0);
+                if state.was_playing
+                    && player.applied_audio_stream_index() == Some(state.stream_index)
+                {
                     player.set_playing(true);
                     player.set_audio_preroll_suspended(false);
                 }
             }
             self.normalize_ui_states.insert(
-                state.fs_idx,
+                crate::app::normalize::NormalizeTargetKey::new(
+                    state.fs_idx,
+                    state.file_path,
+                    state.stream_index,
+                ),
                 crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
             );
             // worker は cancel atomic を見て早期 return、_join + rx も drop で解放される
@@ -7122,11 +7418,10 @@ impl App {
         self.mark_native_video_hud_activity(ctx);
     }
 
-    /// 全 fs_cache の VideoPlayer に gain=1.0 を即時適用 + Settings 保存。
+    /// 全 viewer context の VideoPlayer に gain=1.0 を即時適用 + Settings 保存。
     /// DB エントリは残す (= 次回 ON 復帰で即適用できる)。
     #[cfg(windows)]
     pub(super) fn disable_normalize_globally(&mut self) {
-        use crate::video::normalize_types::NormalizeUiState;
         if let Some(state) = self.normalize_state.take() {
             state.cancel();
             self.emit_normalize_scan_diagnostic(
@@ -7136,24 +7431,70 @@ impl App {
                 "normalize_disabled",
                 state.provisional_result.map(|result| result.gain_db),
             );
-            if state.was_playing {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&state.fs_idx) {
-                    if player.path() == state.file_path.as_path() {
-                        player.set_playing(true);
-                        player.set_audio_preroll_suspended(false);
-                    }
-                }
-            }
+            self.resume_cancelled_normalize_scan_owner(&state);
         }
         self.settings.audio_normalize_enabled = false;
         self.settings.save();
+        self.disable_normalize_in_mounted_context();
+        let current_context = self.projected_viewer_context_id();
+        for context_id in self.viewer_context_ids() {
+            if context_id != current_context {
+                self.with_viewer_context(context_id, |context| {
+                    context.disable_normalize_in_mounted_context();
+                })
+                .expect("live viewer context must mount for global Norm OFF");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn disable_normalize_in_mounted_context(&mut self) {
+        use crate::video::normalize_types::NormalizeUiState;
         self.normalize_auto_scan_suppressed.clear();
+        self.normalize_ui_states.clear();
         let fs_idxs: Vec<usize> = self.fs_cache.keys().copied().collect();
         for idx in fs_idxs {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
-                apply_normalize_gain_with_perf(player, idx, 1.0, 0.0, "toggle_off");
-                self.normalize_ui_states.insert(idx, NormalizeUiState::Off);
+                player.reset_normalize_gains(false);
+                if let Some(stream) = player.applied_audio_stream_index() {
+                    apply_normalize_gain_with_perf(player, idx, stream, 1.0, 0.0, "toggle_off");
+                }
+                self.set_normalize_ui_state_for_player(idx, NormalizeUiState::Off);
             }
+        }
+    }
+
+    #[cfg(windows)]
+    fn resume_cancelled_normalize_scan_owner(
+        &mut self,
+        state: &crate::app::normalize::NormalizeScanState,
+    ) {
+        let resume = |owner: &mut Self| {
+            if let Some(FsCacheEntry::Video { player, .. }) = owner.fs_cache.get(&state.fs_idx) {
+                if player.path() == state.file_path.as_path() {
+                    if state.was_playing {
+                        player.set_playing(true);
+                    }
+                    player.set_audio_preroll_suspended(false);
+                    owner.normalize_ui_states.insert(
+                        crate::app::normalize::NormalizeTargetKey::new(
+                            state.fs_idx,
+                            state.file_path.clone(),
+                            state.stream_index,
+                        ),
+                        crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
+                    );
+                }
+            }
+        };
+        if state.owner_context_id == self.projected_viewer_context_id() {
+            resume(self);
+        } else if matches!(
+            self.viewer_context_residence(state.owner_context_id),
+            crate::app::viewer_context_registry::ContextResidence::AtRest
+        ) {
+            self.with_viewer_context(state.owner_context_id, resume)
+                .expect("scan owner must mount to release preroll");
         }
     }
 
@@ -7165,50 +7506,38 @@ impl App {
     pub(super) fn apply_normalize_gain_db_to_player(&mut self, fs_idx: usize, gain_db: f32) {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             let linear = 10.0_f64.powf(gain_db as f64 / 20.0);
-            apply_normalize_gain_with_perf(player, fs_idx, linear, gain_db, "toggle_on");
+            if let Some(stream) = player.applied_audio_stream_index() {
+                apply_normalize_gain_with_perf(
+                    player,
+                    fs_idx,
+                    stream,
+                    linear,
+                    gain_db,
+                    "toggle_on",
+                );
+            }
         }
     }
 
-    /// 他の fs_cache entry (= except_fs_idx 以外) について DB lookup → ヒットなら適用、
-    /// ミスなら OnUnmeasured 設定。トグル ON 時の同期適用に使う。
+    /// Other players enter a new table epoch and resolve in their viewer context.
     #[cfg(windows)]
-    pub(super) fn apply_normalize_to_all_videos_except(
-        &mut self,
-        except_fs_idx: usize,
-        target_milli: i32,
-    ) {
-        use crate::video::normalize_types::NormalizeUiState;
+    fn start_normalize_lookups_in_mounted_context_except(&mut self, except_fs_idx: Option<usize>) {
+        self.normalize_auto_scan_suppressed.clear();
+        self.normalize_ui_states
+            .retain(|key, _| Some(key.fs_idx) == except_fs_idx);
         let other_idxs: Vec<usize> = self
             .fs_cache
-            .keys()
-            .copied()
-            .filter(|i| *i != except_fs_idx)
+            .iter()
+            .filter_map(|(idx, entry)| match entry {
+                FsCacheEntry::Video { .. } if Some(*idx) != except_fs_idx => Some(*idx),
+                _ => None,
+            })
             .collect();
         for idx in other_idxs {
-            let path = match self.fs_cache.get(&idx) {
-                Some(FsCacheEntry::Video { player, .. }) => Some(player.path().to_path_buf()),
-                _ => None,
-            };
-            let Some(path) = path else { continue };
-            let lookup = self
-                .audio_normalize_db
-                .as_ref()
-                .and_then(|db| db.lookup(&path, target_milli));
-            match lookup {
-                Some(result) => {
-                    self.apply_normalize_gain_db_to_player(idx, result.gain_db);
-                    self.normalize_ui_states.insert(
-                        idx,
-                        NormalizeUiState::OnApplied {
-                            gain_db: result.gain_db,
-                        },
-                    );
-                }
-                None => {
-                    self.normalize_ui_states
-                        .insert(idx, NormalizeUiState::OnUnmeasured);
-                }
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                player.reset_normalize_gains(true);
             }
+            self.start_normalize_lookups_for_selected_tracks(idx);
         }
     }
 
@@ -7263,14 +7592,35 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn normalize_auto_scan_target_ready(&self, fs_idx: usize) -> bool {
+    pub(super) fn normalize_auto_scan_target_ready(&self, fs_idx: usize) -> bool {
+        if !self.normalize_auto_scan_policy_ready(fs_idx) {
+            return false;
+        }
+        let Some(key) = self.normalize_key_for_player(fs_idx) else {
+            return false;
+        };
+        matches!(self.fs_cache.get(&fs_idx),
+            Some(FsCacheEntry::Video { player, .. }) if matches!(
+                player.normalize_track_gain(key.stream_index),
+                crate::video::normalize_gain::NormalizeTrackGain::Gain(_)))
+    }
+
+    #[cfg(windows)]
+    fn normalize_auto_scan_policy_ready(&self, fs_idx: usize) -> bool {
         use crate::video::normalize_types::NormalizeUiState;
+        let Some(key) = self.normalize_key_for_player(fs_idx) else {
+            return false;
+        };
         self.settings.audio_normalize_enabled
             && self.fullscreen_idx == Some(fs_idx)
-            && !self.normalize_auto_scan_suppressed.contains(&fs_idx)
-            && self.normalize_ui_states.get(&fs_idx).copied()
-                == Some(NormalizeUiState::OnUnmeasured)
-            && matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }))
+            && !self.normalize_auto_scan_suppressed.contains(&key)
+            && self.normalize_ui_states.get(&key).copied() == Some(NormalizeUiState::OnUnmeasured)
+            && matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { player, .. })
+                if player.audio_track_selection().is_none_or(|selection|
+                    selection.desired == selection.applied
+                        && selection.applied.stream_index == key.stream_index
+                        && selection.display_state(false)
+                            == crate::video::AudioTrackSelectionDisplayState::Applied))
     }
 
     #[cfg(windows)]
@@ -7278,11 +7628,14 @@ impl App {
         let Some(state) = self.normalize_state.as_ref() else {
             return false;
         };
-        if state.fs_idx != fs_idx {
+        if state.owner_context_id != self.projected_viewer_context_id() || state.fs_idx != fs_idx {
             return false;
         }
         match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.path() == state.file_path.as_path(),
+            Some(FsCacheEntry::Video { player, .. }) => {
+                player.path() == state.file_path.as_path()
+                    && player.applied_audio_stream_index() == Some(state.stream_index)
+            }
             _ => false,
         }
     }
@@ -7323,21 +7676,28 @@ impl App {
     #[cfg(windows)]
     fn start_normalize_scan_inner(&mut self, fs_idx: usize, was_playing_override: Option<bool>) {
         use crate::video::normalize_types::NormalizeUiState;
-        let (path, was_playing, ui_wake) = match self.fs_cache.get(&fs_idx) {
+        let (path, stream_index, was_playing, ui_wake) = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
+                let Some(stream_index) = player.applied_audio_stream_index() else {
+                    return;
+                };
                 let was_playing = was_playing_override.unwrap_or_else(|| player.intent_playing());
                 (
                     player.path().to_path_buf(),
+                    stream_index,
                     was_playing,
                     player.ui_wake_handle(),
                 )
             }
             _ => return,
         };
-        self.normalize_auto_scan_suppressed.remove(&fs_idx);
+        let key =
+            crate::app::normalize::NormalizeTargetKey::new(fs_idx, path.clone(), stream_index);
+        self.normalize_auto_scan_suppressed.remove(&key);
         // 既存 state を捨てる (cancel を立てておく) — 通常は is_some() で弾かれているが defensive
         if let Some(prev) = self.normalize_state.take() {
             prev.cancel();
+            self.resume_cancelled_normalize_scan_owner(&prev);
             self.emit_normalize_scan_diagnostic(
                 prev.fs_idx,
                 &prev.file_path,
@@ -7345,16 +7705,6 @@ impl App {
                 "superseded",
                 prev.provisional_result.map(|result| result.gain_db),
             );
-            let prev_still_current = matches!(
-                self.fs_cache.get(&prev.fs_idx),
-                Some(FsCacheEntry::Video { player, .. }) if player.path() == prev.file_path.as_path()
-            );
-            if prev_still_current {
-                self.normalize_ui_states
-                    .insert(prev.fs_idx, NormalizeUiState::OnUnmeasured);
-            } else {
-                self.normalize_ui_states.remove(&prev.fs_idx);
-            }
         }
         // 再生中なら一時停止し、測定前の raw→processed 先読みも止める。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
@@ -7362,6 +7712,9 @@ impl App {
                 player.set_audio_preroll_suspended(true);
                 player.set_playing(false);
             }
+            // A manual scan can supersede an in-flight lookup. Invalidate its exact request
+            // after suspension so a late cache result cannot replace this scan's gain.
+            player.set_normalize_gain_for_stream(stream_index, 1.0);
         }
         let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -7385,6 +7738,7 @@ impl App {
                     };
                 let result = crate::video::normalize_scanner::scan_audio_loudness_with_provisional(
                     &path_clone,
+                    stream_index,
                     target_milli,
                     cancel_clone,
                     progress_clone,
@@ -7411,19 +7765,27 @@ impl App {
                 // Codex P2: spawn 失敗時は元再生状態に戻し、UI 状態も OnUnmeasured に
                 if was_playing {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                        player.set_normalize_gain_for_stream(stream_index, 1.0);
                         player.set_playing(true);
                         player.set_audio_preroll_suspended(false);
                     }
                 }
+                if !was_playing {
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                        player.set_normalize_gain_for_stream(stream_index, 1.0);
+                    }
+                }
                 self.normalize_ui_states
-                    .insert(fs_idx, NormalizeUiState::OnUnmeasured);
-                self.normalize_auto_scan_suppressed.insert(fs_idx);
+                    .insert(key.clone(), NormalizeUiState::OnUnmeasured);
+                self.normalize_auto_scan_suppressed.insert(key);
                 return;
             }
         };
         self.emit_normalize_scan_diagnostic(fs_idx, &path, "normalize_scan_start", "running", None);
         self.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            owner_context_id: self.projected_viewer_context_id(),
             fs_idx,
+            stream_index,
             cancel,
             progress,
             rx,
@@ -7435,13 +7797,20 @@ impl App {
             _join: join,
         });
         self.normalize_ui_states
-            .insert(fs_idx, NormalizeUiState::Scanning);
+            .insert(key, NormalizeUiState::Scanning);
     }
 
     /// スキャン完了 / キャンセル / エラーを検知して後処理する。`App::update` から毎フレーム呼ぶ。
     #[cfg(windows)]
     pub(super) fn poll_normalize_scan(&mut self, _ctx: &egui::Context) {
         use crate::video::normalize_types::NormalizeUiState;
+        if self
+            .normalize_state
+            .as_ref()
+            .is_some_and(|state| state.owner_context_id != self.projected_viewer_context_id())
+        {
+            return;
+        }
         // 1. メッセージ peek (try_recv)
         let msg = match self.normalize_state.as_ref() {
             Some(state) => match state.rx.try_recv() {
@@ -7452,10 +7821,15 @@ impl App {
             None => return,
         };
         if let Some(Ok(crate::app::normalize::NormalizeMessage::Provisional(result))) = msg {
-            let Some((fs_idx, file_path, was_playing)) = self
-                .normalize_state
-                .as_ref()
-                .map(|state| (state.fs_idx, state.file_path.clone(), state.was_playing))
+            let Some((fs_idx, file_path, stream_index, was_playing)) =
+                self.normalize_state.as_ref().map(|state| {
+                    (
+                        state.fs_idx,
+                        state.file_path.clone(),
+                        state.stream_index,
+                        state.was_playing,
+                    )
+                })
             else {
                 return;
             };
@@ -7469,23 +7843,31 @@ impl App {
                     apply_normalize_gain_with_perf(
                         player,
                         fs_idx,
+                        stream_index,
                         linear,
                         result.gain_db,
                         "scan_provisional",
                     );
-                    if was_playing {
+                    if was_playing && player.applied_audio_stream_index() == Some(stream_index) {
                         player.set_playing(true);
                         player.set_audio_preroll_suspended(false);
                     }
                 }
                 self.normalize_ui_states.insert(
-                    fs_idx,
+                    crate::app::normalize::NormalizeTargetKey::new(
+                        fs_idx,
+                        file_path.clone(),
+                        stream_index,
+                    ),
                     NormalizeUiState::ProvisionalApplied {
                         gain_db: result.gain_db,
                     },
                 );
                 if let Some(state) = self.normalize_state.as_mut() {
-                    if state.fs_idx == fs_idx && state.file_path == file_path {
+                    if state.fs_idx == fs_idx
+                        && state.file_path == file_path
+                        && state.stream_index == stream_index
+                    {
                         state.provisional_applied = true;
                         state.provisional_result = Some(result);
                     }
@@ -7510,13 +7892,18 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) => player.path() == state.file_path.as_path(),
             _ => false,
         };
+        let key = crate::app::normalize::NormalizeTargetKey::new(
+            state.fs_idx,
+            state.file_path.clone(),
+            state.stream_index,
+        );
         match msg {
             Some(Ok(crate::app::normalize::NormalizeMessage::Done(result))) => {
-                // 測定値はファイル単位なので、stale でも DB に保存しておく (= 次回開いたとき即適用)
+                // A completed scan belongs to its exact stream, even after a later selection.
                 if let Some(db) = self.audio_normalize_db.as_ref() {
-                    let _ = db.upsert(&state.file_path, &result);
+                    let _ = db.upsert(&state.file_path, state.stream_index, &result);
                 }
-                self.normalize_auto_scan_suppressed.remove(&state.fs_idx);
+                self.normalize_auto_scan_suppressed.remove(&key);
                 if still_valid {
                     if let Some(FsCacheEntry::Video { player, .. }) =
                         self.fs_cache.get(&state.fs_idx)
@@ -7525,17 +7912,20 @@ impl App {
                         apply_normalize_gain_with_perf(
                             player,
                             state.fs_idx,
+                            state.stream_index,
                             linear,
                             result.gain_db,
                             "scan_done",
                         );
-                        if state.was_playing {
+                        if state.was_playing
+                            && player.applied_audio_stream_index() == Some(state.stream_index)
+                        {
                             player.set_playing(true);
                             player.set_audio_preroll_suspended(false);
                         }
                     }
                     self.normalize_ui_states.insert(
-                        state.fs_idx,
+                        key.clone(),
                         NormalizeUiState::OnApplied {
                             gain_db: result.gain_db,
                         },
@@ -7562,12 +7952,12 @@ impl App {
                     Some(Err(())) => "disconnected",
                     _ => "unknown",
                 };
-                self.normalize_auto_scan_suppressed.insert(state.fs_idx);
+                self.normalize_auto_scan_suppressed.insert(key.clone());
                 // DB に書かない、グローバル ON は維持、UI 状態を OnUnmeasured に戻す
                 if still_valid {
                     if let Some(provisional) = state.provisional_result {
                         self.normalize_ui_states.insert(
-                            state.fs_idx,
+                            key.clone(),
                             NormalizeUiState::ProvisionalApplied {
                                 gain_db: provisional.gain_db,
                             },
@@ -7576,13 +7966,16 @@ impl App {
                         if let Some(FsCacheEntry::Video { player, .. }) =
                             self.fs_cache.get(&state.fs_idx)
                         {
-                            if state.was_playing {
+                            player.set_normalize_gain_for_stream(state.stream_index, 1.0);
+                            if state.was_playing
+                                && player.applied_audio_stream_index() == Some(state.stream_index)
+                            {
                                 player.set_playing(true);
                                 player.set_audio_preroll_suspended(false);
                             }
                         }
                         self.normalize_ui_states
-                            .insert(state.fs_idx, NormalizeUiState::OnUnmeasured);
+                            .insert(key, NormalizeUiState::OnUnmeasured);
                     }
                 }
                 self.emit_normalize_scan_diagnostic(
@@ -7609,13 +8002,15 @@ impl App {
     /// fs_idx 単位の normalize state を cleanup (close_fullscreen / fs_cache evict 時に呼ぶ)。
     #[cfg(windows)]
     pub(super) fn cleanup_normalize_state_for_fs_idx(&mut self, fs_idx: usize) {
-        self.normalize_ui_states.remove(&fs_idx);
-        self.normalize_auto_scan_suppressed.remove(&fs_idx);
+        self.normalize_ui_states
+            .retain(|key, _| key.fs_idx != fs_idx);
+        self.normalize_auto_scan_suppressed
+            .retain(|key| key.fs_idx != fs_idx);
         // 同 fs_idx のスキャン中なら state を持ち去って捨てる (= 新規スキャン即開始可能に)
         let should_drop = self
             .normalize_state
             .as_ref()
-            .map(|s| s.fs_idx == fs_idx)
+            .map(|s| s.owner_context_id == self.projected_viewer_context_id() && s.fs_idx == fs_idx)
             .unwrap_or(false);
         if should_drop {
             if let Some(state) = self.normalize_state.take() {
@@ -7631,38 +8026,30 @@ impl App {
         }
     }
 
-    /// 動画 open 時の自動適用。Settings ON + DB ヒットなら gain を即適用、ミスなら
-    /// OnUnmeasured 表示。OFF なら Off 状態で初期化。
+    /// Open installs the Pending default; VideoInfo later starts the stream-specific lookup.
     #[cfg(windows)]
     pub(super) fn init_normalize_state_for_opened_video(&mut self, fs_idx: usize) {
         use crate::video::normalize_types::NormalizeUiState;
-        self.normalize_auto_scan_suppressed.remove(&fs_idx);
-        let path = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.path().to_path_buf(),
+        self.normalize_ui_states
+            .retain(|key, _| key.fs_idx != fs_idx);
+        self.normalize_auto_scan_suppressed
+            .retain(|key| key.fs_idx != fs_idx);
+        let stream = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                player.reset_normalize_gains(self.settings.audio_normalize_enabled);
+                player
+                    .info()
+                    .and_then(|info| info.opened_audio_stream_index)
+            }
             _ => return,
         };
-        let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
-        let ui_state = if self.settings.audio_normalize_enabled {
-            let lookup = self
-                .audio_normalize_db
-                .as_ref()
-                .and_then(|db| db.lookup(&path, target_milli));
-            if let Some(result) = lookup {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let linear = 10.0_f64.powf(result.gain_db as f64 / 20.0);
-                    // 再生開始前なので flush 不要
-                    player.set_normalize_gain(linear);
-                }
-                NormalizeUiState::OnApplied {
-                    gain_db: result.gain_db,
-                }
+        if let Some(stream_index) = stream {
+            if self.settings.audio_normalize_enabled {
+                self.start_normalize_lookup_for_stream(fs_idx, stream_index);
             } else {
-                NormalizeUiState::OnUnmeasured
+                self.set_normalize_ui_state_for_player(fs_idx, NormalizeUiState::Off);
             }
-        } else {
-            NormalizeUiState::Off
-        };
-        self.normalize_ui_states.insert(fs_idx, ui_state);
+        }
         self.emit_audio_output_binding(
             fs_idx,
             "normalize_state_initialized",
@@ -7680,15 +8067,15 @@ impl App {
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
         };
-        let ui_state = self
-            .normalize_ui_states
-            .get(&fs_idx)
-            .copied()
-            .unwrap_or(NormalizeUiState::Off);
+        let ui_state = self.normalize_ui_state_for_player(fs_idx);
         let progress = if matches!(ui_state, NormalizeUiState::Scanning) {
             self.normalize_state
                 .as_ref()
-                .filter(|s| s.fs_idx == fs_idx)
+                .filter(|s| {
+                    s.owner_context_id == self.projected_viewer_context_id()
+                        && s.fs_idx == fs_idx
+                        && player.applied_audio_stream_index() == Some(s.stream_index)
+                })
                 .map(|s| NormalizeProgressSnapshot {
                     pts_processed_ms: s
                         .progress
@@ -14293,7 +14680,7 @@ impl App {
         // demux thread の avformat_open_input より前に bump する必要がある
         // (Codex P2 第 16 ラウンド指摘)。
         self.activity_gate.bump();
-        let (mut new_player, start_normalize_scan_before_play) = self.build_video_player_for_open(
+        let mut new_player = self.build_video_player_for_open(
             target_idx,
             target_path.clone(),
             false,
@@ -14320,18 +14707,12 @@ impl App {
         // `init_normalize_state_for_opened_video(target_idx)` を呼ぶが、fast-swap で
         // `fs_cache` に直接 insert した場合 `open_fullscreen` 内の cache-hit 分岐で
         // この初期化がスキップされ、ノーマライズ DB lookup + UI 状態セットが走らない。
-        // 初期 gain は `build_video_player_for_open` で open 前に渡し、ここでは UI 状態と
-        // 抑止状態を新しい動画に同期する。
+        // player の表は open 時から Pending。ここでは UI 状態と抑止状態を同期し、
+        // VideoInfo が届いていれば stream 別 lookup を起動する。
         self.init_normalize_state_for_opened_video(target_idx);
 
         self.open_fullscreen(target_idx, history_trigger);
-        if start_normalize_scan_before_play {
-            if !self.start_normalize_scan_for_deferred_play_intent(target_idx) {
-                self.resume_deferred_normalize_playback_without_scan(target_idx);
-            }
-        } else {
-            self.maybe_start_normalize_scan_for_play_intent(target_idx);
-        }
+        self.maybe_start_normalize_scan_for_play_intent(target_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
             crate::logger::log(format!(
                 "[video-debug] post-swap state: idx={target_idx} engine_state={} seek_serial={} clock_is_playing={} pos={:.3} video_rx_len={} audio_rx_len={} pending_frames={}",

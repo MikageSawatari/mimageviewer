@@ -61,6 +61,7 @@ pub(crate) mod native_window_host;
 mod native_window_pump;
 #[cfg(all(test, windows))]
 mod native_window_thread_spike;
+pub(crate) mod normalize_gain;
 pub mod normalize_scanner;
 pub mod normalize_types;
 pub mod screenshot;
@@ -205,7 +206,8 @@ pub(crate) struct RemoteStreamStartInputs {
     pub(crate) has_video: bool,
     pub(crate) has_audio: bool,
     pub(crate) source_origin_secs: f64,
-    pub(crate) normalize_gain: f64,
+    pub(crate) audio_stream_index: usize,
+    pub(crate) default_audio_stream_index: Option<usize>,
 }
 
 fn engine_state_code_name(code: u8) -> &'static str {
@@ -8381,6 +8383,43 @@ impl VideoPlayer {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_opened_audio_stream_for_test(
+        &mut self,
+        stream_index: usize,
+        default_stream_index: usize,
+    ) {
+        let info = self.info.as_mut().expect("stream-ready test player");
+        if !info
+            .audio_tracks
+            .iter()
+            .any(|track| track.stream_index == stream_index)
+        {
+            info.audio_tracks.push(decoder::AudioTrackInfo {
+                stream_index,
+                ordinal: info.audio_tracks.len() + 1,
+                language: None,
+                title: None,
+                codec: "aac".to_owned(),
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                disposition_default: false,
+            });
+        }
+        info.opened_audio_stream_index = Some(stream_index);
+        info.default_audio_stream_index = Some(default_stream_index);
+        self.audio_track_selection = Some(Arc::new(AudioTrackSelection::new(stream_index)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_desired_audio_track_for_test(&self) {
+        let selection = self
+            .audio_track_selection
+            .as_ref()
+            .expect("audio selection");
+        selection.apply(selection.snapshot().desired);
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_panorama_metadata_for_test(
         &mut self,
         width: u32,
@@ -8522,8 +8561,9 @@ impl VideoPlayer {
     ///
     /// `initial_volume` は線形ゲイン (0.0..+18dB 相当)。1.0 超は音声ポンプ側の
     /// 手動 boost として扱う。
-    /// `initial_normalize_gain` は線形ゲイン (1.0 = 素通し)。open 前に DB hit が
-    /// 分かっている場合、音声ワーカー起動前に設定して最初の chunk から反映する。
+    /// `initial_normalize_gain` は既存 `open` 呼び出し用の初期値。
+    /// Norm ON の App 経路は `open_with_output_consumer` へ `normalize_enabled=true` を
+    /// 渡し、stream 別の解決まで表の既定 `Pending` で音声を止める。
     /// `initial_audio_preroll_suspended` が true の間は、測定前 Norm などのために
     /// audio-pump の raw→processed 先読みを一時停止する。
     /// `resume_secs` を指定すると、最初の動画情報受領後に自動的にその位置へシークする。
@@ -8551,6 +8591,7 @@ impl VideoPlayer {
             path,
             initial_volume,
             initial_normalize_gain,
+            false,
             initial_audio_preroll_suspended,
             autoplay,
             resume_secs,
@@ -8570,6 +8611,7 @@ impl VideoPlayer {
         path: PathBuf,
         initial_volume: f64,
         initial_normalize_gain: f64,
+        normalize_enabled: bool,
         initial_audio_preroll_suspended: bool,
         autoplay: bool,
         resume_secs: Option<f64>,
@@ -8593,8 +8635,12 @@ impl VideoPlayer {
             // begin_loading は呼ばない (= Phase 3+ で resume 適用も走らない)。
             // 共有 seek_serial を 1 個作り、AvClock と EngineActor 双方に clone を渡す。
             let seek_serial = Arc::new(AtomicU64::new(0));
-            let dummy_clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
-            dummy_clock.set_normalize_gain(initial_normalize_gain);
+            let dummy_clock = Arc::new(AvClock::new_with_normalize(
+                initial_volume,
+                seek_serial.clone(),
+                normalize_enabled,
+                initial_normalize_gain,
+            ));
             dummy_clock.set_audio_preroll_suspended(initial_audio_preroll_suspended);
             let engine = Arc::new(Mutex::new(EngineActor::new(
                 OpenOptions {
@@ -8680,10 +8726,14 @@ impl VideoPlayer {
         // 渡す。これで両者の seek 世代が構造的に常に一致する (= 旧版の「2 つのカウンタを
         // 規律で同期」設計を撤去)。詳細は EngineActor.seek_serial の doc コメント参照。
         let seek_serial = Arc::new(AtomicU64::new(0));
-        let clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
+        let clock = Arc::new(AvClock::new_with_normalize(
+            initial_volume,
+            seek_serial.clone(),
+            normalize_enabled,
+            initial_normalize_gain,
+        ));
         // DB hit 済みの Norm gain は audio pump 起動前に入れる。open / source-swap 直後の
         // 最初の processed chunk から反映されるので、旧 gain の一瞬の鳴りを避けられる。
-        clock.set_normalize_gain(initial_normalize_gain);
         clock.set_audio_preroll_suspended(initial_audio_preroll_suspended);
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -9199,6 +9249,7 @@ impl VideoPlayer {
     pub fn select_audio_track(&self, stream_index: usize) -> AudioTrackSelectResult {
         let rejected = AudioTrackSelectResult {
             outcome: AudioTrackSelectOutcome::Rejected,
+            normalize_unresolved: false,
         };
         let Some(selection) = self.audio_track_selection.as_ref() else {
             return rejected;
@@ -9215,6 +9266,10 @@ impl VideoPlayer {
             AudioTrackRequestOutcome::Unchanged => {
                 return AudioTrackSelectResult {
                     outcome: AudioTrackSelectOutcome::Unchanged,
+                    normalize_unresolved: self
+                        .clock
+                        .normalize_gain_for_stream(stream_index)
+                        .is_none(),
                 };
             }
             AudioTrackRequestOutcome::Accepted => {}
@@ -9225,6 +9280,7 @@ impl VideoPlayer {
         {
             return AudioTrackSelectResult {
                 outcome: AudioTrackSelectOutcome::Deferred,
+                normalize_unresolved: self.clock.normalize_gain_for_stream(stream_index).is_none(),
             };
         }
         let base = if should_play {
@@ -9243,6 +9299,7 @@ impl VideoPlayer {
         self.seek_with_play_state(base, should_play);
         AudioTrackSelectResult {
             outcome: AudioTrackSelectOutcome::Requested,
+            normalize_unresolved: self.clock.normalize_gain_for_stream(stream_index).is_none(),
         }
     }
 
@@ -9556,9 +9613,8 @@ impl VideoPlayer {
     /// `position_secs`, so the source origin is already final even though a paused player can keep
     /// its seek override indefinitely. We therefore must not wait for `clock.is_seeking()` here.
     ///
-    /// The remote player is opened with autoplay disabled, which also disables deferred normalize
-    /// scanning. Its gain is installed before decoder/audio workers start; copying it into this
-    /// snapshot fixes the value used by the independent generation.
+    /// The remote player is opened with autoplay disabled and is metadata-only. The opened audio
+    /// stream is fixed here for both transcode and the generation worker's independent Norm lookup.
     pub(crate) fn remote_stream_start_inputs(&self) -> Option<RemoteStreamStartInputs> {
         let info = self.info.as_ref()?;
         if self.pending_resume_secs.is_some() {
@@ -9569,7 +9625,8 @@ impl VideoPlayer {
             has_video: info.has_video,
             has_audio: info.has_audio,
             source_origin_secs: self.position_secs(),
-            normalize_gain: self.normalize_gain(),
+            audio_stream_index: info.opened_audio_stream_index?,
+            default_audio_stream_index: info.default_audio_stream_index,
         })
     }
 
@@ -9998,7 +10055,9 @@ impl VideoPlayer {
 
     /// 音量ノーマライズの線形ゲイン (1.0 = 素通し)。
     pub fn normalize_gain(&self) -> f64 {
-        self.clock.normalize_gain()
+        self.applied_audio_stream_index()
+            .and_then(|stream| self.clock.normalize_gain_for_stream(stream))
+            .unwrap_or(1.0)
     }
 
     /// 出力セーフティリミッターが天井 (0 dBFS) を叩いた累積回数。
@@ -10023,12 +10082,69 @@ impl VideoPlayer {
     /// **A/V offset = −5000ms 級の永続ズレ**が残った (= 1 回の Norm toggle で 5 秒、
     /// 累積で 10 秒 / 15 秒 / 20 秒 と永続的にズレた)。
     ///
-    /// 本 method 単独では `processed` / `raw_pending` のいずれも触らない atomic store
+    /// 本 method 単独では `processed` / `raw_pending` のいずれも触らない表の更新
     /// なので、上記問題は起きない。詳細は `docs/video-architecture.md` の
     /// 「Norm clear で audio が 5+ 秒先行する」節と
     /// `src/app/native_video.rs::apply_normalize_gain_with_perf` を参照。
     pub fn set_normalize_gain(&self, gain: f64) {
-        self.clock.set_normalize_gain(gain);
+        if let Some(stream) = self.applied_audio_stream_index() {
+            self.clock.normalize_gain_table().set_gain(stream, gain);
+        }
+    }
+
+    pub(crate) fn applied_audio_stream_index(&self) -> Option<usize> {
+        self.audio_track_selection()
+            .map(|selection| selection.applied.stream_index)
+            .or_else(|| {
+                self.info
+                    .as_ref()
+                    .and_then(|info| info.opened_audio_stream_index)
+            })
+    }
+
+    pub(crate) fn begin_normalize_lookup(
+        &self,
+        stream_index: usize,
+        target_lufs_milli: i32,
+    ) -> Option<normalize_gain::NormalizeLookupRequest> {
+        self.clock
+            .normalize_gain_table()
+            .begin_lookup(stream_index, target_lufs_milli)
+    }
+
+    pub(crate) fn normalize_track_gain(
+        &self,
+        stream_index: usize,
+    ) -> normalize_gain::NormalizeTrackGain {
+        self.clock.normalize_gain_table().get(stream_index)
+    }
+
+    pub(crate) fn normalize_gain_for_stream(&self, stream_index: usize) -> Option<f64> {
+        self.clock.normalize_gain_for_stream(stream_index)
+    }
+
+    pub(crate) fn resolve_normalize_lookup(
+        &self,
+        request: normalize_gain::NormalizeLookupRequest,
+        gain: f64,
+    ) -> bool {
+        self.clock.normalize_gain_table().resolve(request, gain)
+    }
+
+    pub(crate) fn set_normalize_gain_for_stream(&self, stream_index: usize, gain: f64) {
+        self.clock
+            .normalize_gain_table()
+            .set_gain(stream_index, gain);
+    }
+
+    pub(crate) fn reset_normalize_gains(&self, enabled: bool) {
+        self.clock.normalize_gain_table().reset(enabled);
+    }
+
+    pub(crate) fn rearm_normalize_lookups_after_context_transfer(&self) -> Vec<usize> {
+        self.clock
+            .normalize_gain_table()
+            .rearm_pending_after_context_transfer()
     }
 
     pub fn audio_preroll_suspended(&self) -> bool {

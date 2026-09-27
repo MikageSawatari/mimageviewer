@@ -1058,8 +1058,12 @@ impl crate::app::App {
         if speed_changed {
             player.set_playback_speed(1.0);
         }
-        let audio_processing = self
-            .remote_clockless_audio_processing(start_inputs.normalize_gain, start_budget_remaining);
+        let audio_processing = self.remote_clockless_audio_processing(1.0, start_budget_remaining);
+        let normalize_snapshot = crate::video::stream::session::RemoteNormalizeSnapshot {
+            enabled: self.settings.audio_normalize_enabled,
+            target_lufs_milli: self.settings.clamped_audio_normalize_target_lufs_milli(),
+            db_path: crate::audio_normalize_db::AudioNormalizeDb::db_path(),
+        };
         let session = match RemoteVideoStreamingSession::start(
             owner,
             &player,
@@ -1068,6 +1072,7 @@ impl crate::app::App {
             quality,
             segment_capacity,
             self.settings.video_hw_decode,
+            normalize_snapshot,
             audio_processing,
         ) {
             Ok(session) => session,

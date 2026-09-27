@@ -46768,7 +46768,9 @@ mod still_window_mode_key_tests {
         file_path: PathBuf,
     ) -> crate::app::normalize::NormalizeScanState {
         crate::app::normalize::NormalizeScanState {
+            owner_context_id: ViewerContextId::for_test(0),
             fs_idx,
+            stream_index: 1,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             progress: std::sync::Arc::new(
                 crate::video::normalize_scanner::NormalizeScanProgress::default(),
@@ -46781,6 +46783,1126 @@ mod still_window_mode_key_tests {
             provisional_result: None,
             _join: std::thread::spawn(|| {}),
         }
+    }
+
+    fn normalize_key_for_test(
+        fs_idx: usize,
+        path: &str,
+    ) -> crate::app::normalize::NormalizeTargetKey {
+        crate::app::normalize::NormalizeTargetKey::new(fs_idx, PathBuf::from(path), 1)
+    }
+
+    #[test]
+    fn normalize_open_resolves_the_stream_actually_opened() {
+        use crate::video::normalize_types::{NormalizeResult, NormalizeUiState};
+        let mut app = setup_app();
+        let path = app.tmp.path().join("opened-nondefault.mkv");
+        std::fs::write(&path, b"test source identity").unwrap();
+        app.settings.audio_normalize_enabled = true;
+        let target = app.settings.clamped_audio_normalize_target_lufs_milli();
+        for (stream, gain_db) in [(1, -6.0), (2, 6.0)] {
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .upsert(
+                    &path,
+                    stream,
+                    &NormalizeResult {
+                        gain_db,
+                        integrated_lufs: -20.0,
+                        true_peak_db: -5.0,
+                        target_lufs_milli: target,
+                    },
+                )
+                .unwrap();
+        }
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(2, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        app.init_normalize_state_for_opened_video(0);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            player.normalize_gain_for_stream(2),
+            None,
+            "open must gate the first audio frame"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.poll_normalize_lookups();
+            if matches!(
+                app.normalize_ui_state_for_player(0),
+                NormalizeUiState::OnApplied { .. }
+            ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "async lookup did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            (player.normalize_gain_for_stream(2).unwrap() - 10.0_f64.powf(6.0 / 20.0)).abs() < 1e-6
+        );
+        assert_eq!(player.normalize_gain_for_stream(1), None);
+
+        // A saved nondefault choice can fail to open; the actual default stream then owns gain.
+        let mut fallback =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        fallback.set_opened_audio_stream_for_test(1, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(fallback),
+                load_seq: 1,
+            },
+        );
+        app.init_normalize_state_for_opened_video(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.poll_normalize_lookups();
+            if matches!(
+                app.normalize_ui_state_for_player(0),
+                NormalizeUiState::OnApplied { .. }
+            ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "default lookup did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            (player.normalize_gain_for_stream(1).unwrap() - 10.0_f64.powf(-6.0 / 20.0)).abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn normalize_lookup_message_requires_the_current_request() {
+        use crate::app::normalize::{NormalizeLookupMessage, NormalizeTargetKey};
+        use crate::video::normalize_types::NormalizeResult;
+        let mut app = setup_app();
+        let path = app.tmp.path().join("request.mkv");
+        std::fs::write(&path, b"test source identity").unwrap();
+        app.settings.audio_normalize_enabled = true;
+        let target = app.settings.clamped_audio_normalize_target_lufs_milli();
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.reset_normalize_gains(true);
+        let old = player.begin_normalize_lookup(2, target).unwrap();
+        player.reset_normalize_gains(false);
+        player.reset_normalize_gains(true);
+        let current = player.begin_normalize_lookup(2, target).unwrap();
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        let key = NormalizeTargetKey::new(0, path, 2);
+        let result = |gain_db| {
+            Ok(Some(NormalizeResult {
+                gain_db,
+                integrated_lufs: -20.0,
+                true_peak_db: -5.0,
+                target_lufs_milli: target,
+            }))
+        };
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: app.projected_viewer_context_id(),
+                key: key.clone(),
+                request: current,
+                result: result(6.0),
+            })
+            .unwrap();
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: app.projected_viewer_context_id(),
+                key: key.clone(),
+                request: old,
+                result: result(-12.0),
+            })
+            .unwrap();
+        app.poll_normalize_lookups();
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            (player.normalize_gain_for_stream(2).unwrap() - 10.0_f64.powf(6.0 / 20.0)).abs() < 1e-6
+        );
+        assert_eq!(
+            app.normalize_ui_states.get(&key),
+            Some(&crate::video::normalize_types::NormalizeUiState::OnApplied { gain_db: 6.0 })
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_lookup_waits_for_its_viewer_even_with_identical_source_and_index() {
+        use crate::app::normalize::{NormalizeLookupMessage, NormalizeTargetKey};
+        use crate::video::normalize_types::NormalizeResult;
+        let mut app = setup_app();
+        app.settings.audio_normalize_enabled = true;
+        let path = app.tmp.path().join("shared-source.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        let target = app.settings.clamped_audio_normalize_target_lufs_milli();
+        let mut first = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        first.set_opened_audio_stream_for_test(1, 1);
+        first.reset_normalize_gains(true);
+        let first_request = first.begin_normalize_lookup(1, target).unwrap();
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(first),
+                load_seq: 0,
+            },
+        );
+        let first_owner = app.stash_mounted_and_start_fresh("test_norm_lookup_owner");
+        let mut second =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        second.set_opened_audio_stream_for_test(1, 1);
+        second.reset_normalize_gains(true);
+        let second_request = second.begin_normalize_lookup(1, target).unwrap();
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(second),
+                load_seq: 0,
+            },
+        );
+        let second_owner = app.projected_viewer_context_id();
+        assert_ne!(first_owner, second_owner);
+        let key = NormalizeTargetKey::new(0, path, 1);
+        let result = |gain_db| {
+            Ok(Some(NormalizeResult {
+                gain_db,
+                integrated_lufs: -20.0,
+                true_peak_db: -5.0,
+                target_lufs_milli: target,
+            }))
+        };
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: first_owner,
+                key: key.clone(),
+                request: first_request,
+                result: result(-6.0),
+            })
+            .unwrap();
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: second_owner,
+                key: key.clone(),
+                request: second_request,
+                result: result(6.0),
+            })
+            .unwrap();
+        app.poll_normalize_lookups();
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            (player.normalize_gain_for_stream(1).unwrap() - 10.0_f64.powf(6.0 / 20.0)).abs() < 1e-6
+        );
+        assert_eq!(
+            app.normalize_lookup_pending.get(&first_owner).map(Vec::len),
+            Some(1)
+        );
+        app.with_viewer_context(first_owner, |owner| {
+            let FsCacheEntry::Video { player, .. } = owner.fs_cache.get(&0).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(player.normalize_gain_for_stream(1), None);
+            owner.poll_normalize_lookups();
+            let FsCacheEntry::Video { player, .. } = owner.fs_cache.get(&0).unwrap() else {
+                unreachable!()
+            };
+            assert!(
+                (player.normalize_gain_for_stream(1).unwrap() - 10.0_f64.powf(-6.0 / 20.0)).abs()
+                    < 1e-6
+            );
+        })
+        .unwrap();
+        assert!(!app.normalize_lookup_pending.contains_key(&first_owner));
+        app.retire_context(first_owner, "test_norm_lookup_retire", |_| ())
+            .unwrap();
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: first_owner,
+                key,
+                request: first_request,
+                result: result(12.0),
+            })
+            .unwrap();
+        app.poll_normalize_lookups();
+        assert!(!app.normalize_lookup_pending.contains_key(&first_owner));
+    }
+
+    #[test]
+    fn normalize_lookup_follows_the_player_when_snapshot_remaps_fs_index() {
+        use crate::app::normalize::{NormalizeLookupMessage, NormalizeTargetKey};
+        use crate::video::normalize_types::{NormalizeResult, NormalizeUiState};
+        let mut app = setup_app();
+        app.settings.audio_normalize_enabled = true;
+        let path = app.tmp.path().join("remapped-lookup.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        let target = app.settings.clamped_audio_normalize_target_lufs_milli();
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        let request = player.begin_normalize_lookup(1, target).unwrap();
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        let old_key = NormalizeTargetKey::new(0, path.clone(), 1);
+        app.normalize_ui_states
+            .insert(old_key.clone(), NormalizeUiState::OnUnmeasured);
+        let moved = app.fs_cache.remove(&0).unwrap();
+        app.fs_cache.insert(3, moved);
+        app.normalize_ui_states.remove(&old_key);
+        let new_key = NormalizeTargetKey::new(3, path, 1);
+        app.normalize_ui_states
+            .insert(new_key.clone(), NormalizeUiState::OnUnmeasured);
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: app.projected_viewer_context_id(),
+                key: old_key,
+                request,
+                result: Ok(Some(NormalizeResult {
+                    gain_db: -6.0,
+                    integrated_lufs: -20.0,
+                    true_peak_db: -5.0,
+                    target_lufs_milli: target,
+                })),
+            })
+            .unwrap();
+        app.poll_normalize_lookups();
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&3).unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            (player.normalize_gain_for_stream(1).unwrap() - 10.0_f64.powf(-6.0 / 20.0)).abs()
+                < 1e-6
+        );
+        assert_eq!(
+            app.normalize_ui_states.get(&new_key),
+            Some(&NormalizeUiState::OnApplied { gain_db: -6.0 })
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn live_media_fork_reissues_pending_lookup_from_new_viewer() {
+        use crate::app::normalize::{NormalizeLookupMessage, NormalizeTargetKey};
+        use crate::video::normalize_types::NormalizeResult;
+        let mut app = setup_app();
+        app.settings.audio_normalize_enabled = true;
+        let path = app.tmp.path().join("forked-lookup.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        let target = app.settings.clamped_audio_normalize_target_lufs_milli();
+        app.audio_normalize_db
+            .as_ref()
+            .unwrap()
+            .upsert(
+                &path,
+                1,
+                &NormalizeResult {
+                    gain_db: -6.0,
+                    integrated_lufs: -20.0,
+                    true_peak_db: -5.0,
+                    target_lufs_milli: target,
+                },
+            )
+            .unwrap();
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        let old_request = player.begin_normalize_lookup(1, target).unwrap();
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        let old_owner = app.projected_viewer_context_id();
+        app.bind_mounted_context_for_test(907);
+        let new_owner = app.fork_mounted_live_media_context(907);
+        assert_ne!(old_owner, new_owner);
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: old_owner,
+                key: NormalizeTargetKey::new(0, path, 1),
+                request: old_request,
+                result: Ok(Some(NormalizeResult {
+                    gain_db: 12.0,
+                    integrated_lufs: -20.0,
+                    true_peak_db: -5.0,
+                    target_lufs_milli: target,
+                })),
+            })
+            .unwrap();
+        app.poll_normalize_lookups();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let gain = app
+                .with_viewer_context(new_owner, |owner| {
+                    owner.poll_normalize_lookups();
+                    let FsCacheEntry::Video { player, .. } = owner.fs_cache.get(&0).unwrap() else {
+                        unreachable!()
+                    };
+                    player.normalize_gain_for_stream(1)
+                })
+                .unwrap();
+            if let Some(gain) = gain {
+                assert!((gain - 10.0_f64.powf(-6.0 / 20.0)).abs() < 1e-6);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "forked player lookup did not resolve"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn live_media_fork_transfers_the_active_scan_owner() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("forked-scan.mkv");
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    path.clone(),
+                    0.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        let scan = normalize_scan_state_for_test(0, path);
+        let cancelled = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+        let old_owner = app.projected_viewer_context_id();
+        app.bind_mounted_context_for_test(908);
+        let new_owner = app.fork_mounted_live_media_context(908);
+        assert_ne!(old_owner, new_owner);
+        assert_eq!(
+            app.normalize_state.as_ref().unwrap().owner_context_id,
+            new_owner
+        );
+        assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn teardown_of_same_source_in_other_viewer_keeps_scan_owner() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("same-source-teardown.mkv");
+        let owner = app.projected_viewer_context_id();
+        let scan = normalize_scan_state_for_test(0, path.clone());
+        let cancelled = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+        let plan = ViewerContextMediaTeardownPlan {
+            owner_context_id: ViewerContextId::for_test(owner.serial() + 1),
+            resume_updates: Vec::new(),
+            media_paths: vec![path.clone()],
+            music_consumer: false,
+        };
+        app.cancel_viewer_context_teardown_normalize(&[plan], "test_other_viewer_close");
+        assert!(app.normalize_state.is_some());
+        assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+        let own_plan = ViewerContextMediaTeardownPlan {
+            owner_context_id: owner,
+            resume_updates: Vec::new(),
+            media_paths: vec![path],
+            music_consumer: false,
+        };
+        app.cancel_viewer_context_teardown_normalize(&[own_plan], "test_owner_close");
+        assert!(app.normalize_state.is_none());
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_global_off_and_on_reach_at_rest_player_and_invalidate_old_request() {
+        use crate::app::normalize::NormalizeLookupMessage;
+        use crate::video::normalize_types::{NormalizeResult, NormalizeUiState};
+        let mut app = setup_app();
+        app.settings.audio_normalize_enabled = true;
+        let target = app.settings.clamped_audio_normalize_target_lufs_milli();
+        let parked_path = app.tmp.path().join("at-rest-norm.mkv");
+        let active_path = app.tmp.path().join("active-norm.mkv");
+        for path in [&parked_path, &active_path] {
+            std::fs::write(path, b"source identity").unwrap();
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .upsert(
+                    path,
+                    1,
+                    &NormalizeResult {
+                        gain_db: -6.0,
+                        integrated_lufs: -20.0,
+                        true_peak_db: -5.0,
+                        target_lufs_milli: target,
+                    },
+                )
+                .unwrap();
+        }
+        let mut parked =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(parked_path.clone());
+        parked.set_opened_audio_stream_for_test(1, 1);
+        parked.reset_normalize_gains(true);
+        let stale_request = parked.begin_normalize_lookup(1, target).unwrap();
+        parked.set_audio_preroll_suspended(true);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(parked),
+                load_seq: 0,
+            },
+        );
+        let parked_owner = app.stash_mounted_and_start_fresh("test_norm_global_toggle");
+        let mut scan = normalize_scan_state_for_test(0, parked_path.clone());
+        scan.owner_context_id = parked_owner;
+        let scan_cancelled = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+        let mut active = crate::video::VideoPlayer::stream_ready_disconnected_for_test(active_path);
+        active.set_opened_audio_stream_for_test(1, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(active),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        app.disable_normalize_globally();
+        assert!(scan_cancelled.load(std::sync::atomic::Ordering::Acquire));
+        app.with_viewer_context(parked_owner, |owner| {
+            let FsCacheEntry::Video { player, .. } = owner.fs_cache.get(&0).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(player.normalize_gain_for_stream(1), Some(1.0));
+            assert!(!player.audio_preroll_suspended());
+            assert_eq!(
+                owner.normalize_ui_state_for_player(0),
+                NormalizeUiState::Off
+            );
+        })
+        .unwrap();
+        app.handle_toggle_normalize(&egui::Context::default(), 0);
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: parked_owner,
+                key: crate::app::normalize::NormalizeTargetKey::new(0, parked_path, 1),
+                request: stale_request,
+                result: Ok(Some(NormalizeResult {
+                    gain_db: 12.0,
+                    integrated_lufs: -20.0,
+                    true_peak_db: -5.0,
+                    target_lufs_milli: target,
+                })),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.poll_normalize_lookups();
+            let applied = app
+                .with_viewer_context(parked_owner, |owner| {
+                    owner.poll_normalize_lookups();
+                    let FsCacheEntry::Video { player, .. } = owner.fs_cache.get(&0).unwrap() else {
+                        unreachable!()
+                    };
+                    player.normalize_gain_for_stream(1)
+                })
+                .unwrap();
+            if let Some(gain) = applied {
+                assert!((gain - 10.0_f64.powf(-6.0 / 20.0)).abs() < 1e-6);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "at-rest lookup did not resolve"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_reon_resolves_nondefault_applied_track_in_another_viewer() {
+        use crate::video::normalize_types::NormalizeResult;
+        let mut app = setup_app();
+        app.settings.audio_normalize_enabled = true;
+        let target = app.settings.clamped_audio_normalize_target_lufs_milli();
+        let parked_path = app.tmp.path().join("parked-nondefault.mkv");
+        let active_path = app.tmp.path().join("active-default.mkv");
+        for (path, stream, gain_db) in [(&parked_path, 2, 6.0), (&active_path, 1, -6.0)] {
+            std::fs::write(path, b"source identity").unwrap();
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .upsert(
+                    path,
+                    stream,
+                    &NormalizeResult {
+                        gain_db,
+                        integrated_lufs: -20.0,
+                        true_peak_db: -5.0,
+                        target_lufs_milli: target,
+                    },
+                )
+                .unwrap();
+        }
+        let mut parked = crate::video::VideoPlayer::stream_ready_disconnected_for_test(parked_path);
+        parked.set_opened_audio_stream_for_test(2, 1);
+        parked.set_opened_audio_stream_for_test(1, 1);
+        assert_eq!(
+            parked.select_audio_track(2).outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        parked.apply_desired_audio_track_for_test();
+        assert_eq!(parked.info().unwrap().opened_audio_stream_index, Some(1));
+        assert_eq!(parked.applied_audio_stream_index(), Some(2));
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(parked),
+                load_seq: 0,
+            },
+        );
+        let parked_owner = app.stash_mounted_and_start_fresh("test_norm_reon_nondefault");
+        let mut active = crate::video::VideoPlayer::stream_ready_disconnected_for_test(active_path);
+        active.set_opened_audio_stream_for_test(1, 1);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(active),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        app.disable_normalize_globally();
+        app.handle_toggle_normalize(&egui::Context::default(), 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.poll_normalize_lookups();
+            let gain = app
+                .with_viewer_context(parked_owner, |owner| {
+                    owner.poll_normalize_lookups();
+                    let FsCacheEntry::Video { player, .. } = owner.fs_cache.get(&0).unwrap() else {
+                        unreachable!()
+                    };
+                    player.normalize_gain_for_stream(2)
+                })
+                .unwrap();
+            if let Some(gain) = gain {
+                assert!((gain - 10.0_f64.powf(6.0 / 20.0)).abs() < 1e-6);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nondefault track stayed Pending"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_poll_resolves_applied_and_desired_during_audio_switch() {
+        use crate::video::normalize_types::NormalizeResult;
+        let mut app = setup_app();
+        app.settings.audio_normalize_enabled = true;
+        let target = app.settings.clamped_audio_normalize_target_lufs_milli();
+        let path = app.tmp.path().join("poll-switch-norm.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        for (stream, gain_db) in [(1, -6.0), (2, 6.0)] {
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .upsert(
+                    &path,
+                    stream,
+                    &NormalizeResult {
+                        gain_db,
+                        integrated_lufs: -20.0,
+                        true_peak_db: -5.0,
+                        target_lufs_milli: target,
+                    },
+                )
+                .unwrap();
+        }
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        assert_eq!(
+            player.select_audio_track(2).outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        assert_eq!(player.applied_audio_stream_index(), Some(1));
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        app.poll_video(&egui::Context::default());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.poll_normalize_lookups();
+            let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+                unreachable!()
+            };
+            let applied = player.normalize_gain_for_stream(1);
+            let desired = player.normalize_gain_for_stream(2);
+            if let (Some(applied), Some(desired)) = (applied, desired) {
+                assert!((applied - 10.0_f64.powf(-6.0 / 20.0)).abs() < 1e-6);
+                assert!((desired - 10.0_f64.powf(6.0 / 20.0)).abs() < 1e-6);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "switch target stayed Pending"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_reon_starts_desired_lookup_for_switching_current_player() {
+        use crate::video::normalize_gain::NormalizeTrackGain;
+        use crate::video::normalize_types::NormalizeResult;
+        let mut app = setup_app();
+        app.settings.audio_normalize_enabled = true;
+        let target = app.settings.clamped_audio_normalize_target_lufs_milli();
+        let path = app.tmp.path().join("reon-switching.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        app.audio_normalize_db
+            .as_ref()
+            .unwrap()
+            .upsert(
+                &path,
+                1,
+                &NormalizeResult {
+                    gain_db: -6.0,
+                    integrated_lufs: -20.0,
+                    true_peak_db: -5.0,
+                    target_lufs_milli: target,
+                },
+            )
+            .unwrap();
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        assert_eq!(
+            player.select_audio_track(2).outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        app.disable_normalize_globally();
+        app.handle_toggle_normalize(&egui::Context::default(), 0);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            (player.normalize_gain_for_stream(1).unwrap() - 10.0_f64.powf(-6.0 / 20.0)).abs()
+                < 1e-6
+        );
+        assert!(matches!(
+            player.normalize_track_gain(2),
+            NormalizeTrackGain::Pending(Some(_))
+        ));
+    }
+
+    #[test]
+    fn normalize_unmeasured_lookup_uses_deferred_scan_only_with_play_intent() {
+        use crate::app::normalize::{NormalizeLookupMessage, NormalizeTargetKey};
+        use crate::video::normalize_types::NormalizeUiState;
+        let mut app = setup_app();
+        let path = app.tmp.path().join("unmeasured.mkv");
+        std::fs::write(&path, b"not decoded by this state test").unwrap();
+        app.settings.audio_normalize_enabled = true;
+        let target = app.settings.clamped_audio_normalize_target_lufs_milli();
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        let paused_request = player.begin_normalize_lookup(1, target).unwrap();
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        let key = NormalizeTargetKey::new(0, path.clone(), 1);
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: app.projected_viewer_context_id(),
+                key: key.clone(),
+                request: paused_request,
+                result: Ok(None),
+            })
+            .unwrap();
+        app.poll_normalize_lookups();
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(player.normalize_gain_for_stream(1), Some(1.0));
+        assert_eq!(
+            app.normalize_ui_states.get(&key),
+            Some(&NormalizeUiState::OnUnmeasured)
+        );
+        assert!(app.normalize_state.is_none());
+
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        player.reset_normalize_gains(true);
+        let playing_request = player.begin_normalize_lookup(1, target).unwrap();
+        // Cached grid resume requests play while the lookup is still Pending.
+        app.resume_deferred_normalize_playback_without_scan(0);
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: app.projected_viewer_context_id(),
+                key,
+                request: playing_request,
+                result: Ok(None),
+            })
+            .unwrap();
+        app.poll_normalize_lookups();
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(player.normalize_gain_for_stream(1), Some(1.0));
+        assert!(player.audio_preroll_suspended());
+        assert!(
+            app.normalize_state.is_some(),
+            "playing lookup miss must begin scan before unity is exposed"
+        );
+        app.normalize_state.take().unwrap().cancel();
+    }
+
+    #[test]
+    fn normalize_lookup_error_releases_pending_without_auto_scan() {
+        use crate::app::normalize::{NormalizeLookupMessage, NormalizeTargetKey};
+        let mut app = setup_app();
+        let path = app.tmp.path().join("lookup-error.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        app.settings.audio_normalize_enabled = true;
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        player.set_playing(true);
+        let request = player
+            .begin_normalize_lookup(1, app.settings.clamped_audio_normalize_target_lufs_milli())
+            .unwrap();
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        let key = NormalizeTargetKey::new(0, path, 1);
+        app.normalize_lookup_tx
+            .send(NormalizeLookupMessage {
+                owner_context_id: app.projected_viewer_context_id(),
+                key: key.clone(),
+                request,
+                result: Err("injected I/O failure".to_owned()),
+            })
+            .unwrap();
+        app.poll_normalize_lookups();
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(player.normalize_gain_for_stream(1), Some(1.0));
+        assert!(app.normalize_auto_scan_suppressed.contains(&key));
+        assert!(app.normalize_state.is_none());
+    }
+
+    #[test]
+    fn music_view_open_starts_with_pending_norm_and_autoplay_intent() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("music-view-open.flac");
+        std::fs::write(&path, b"decoder may reject this isolated open fixture").unwrap();
+        app.settings.audio_normalize_enabled = true;
+        let player = app.build_audio_player_for_open(path, true, true);
+        assert_eq!(player.normalize_gain_for_stream(0), None);
+        assert!(player.intent_playing());
+    }
+
+    #[test]
+    fn audio_selection_cancels_only_the_other_blocking_normalize_scan() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("selection.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        app.settings.audio_normalize_enabled = true;
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        player.set_playing(true);
+        player.set_audio_preroll_suspended(true);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        let scan = normalize_scan_state_for_test(0, path);
+        let cancel = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+        let result = app.select_video_audio_track(0, 2);
+        assert_ne!(
+            result.outcome,
+            crate::video::AudioTrackSelectOutcome::Rejected
+        );
+        assert!(result.normalize_unresolved);
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(app.normalize_state.is_none());
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert!(!player.audio_preroll_suspended());
+        assert!(matches!(
+            player.normalize_track_gain(2),
+            crate::video::normalize_gain::NormalizeTrackGain::Pending(Some(_))
+        ));
+        let pending = player.normalize_track_gain(2);
+        let again = app.select_video_audio_track(0, 2);
+        assert_eq!(
+            again.outcome,
+            crate::video::AudioTrackSelectOutcome::Unchanged
+        );
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            player.normalize_track_gain(2),
+            pending,
+            "reselection must reuse the lookup"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn switching_track_does_not_restart_old_auto_scan_during_poll_video() {
+        use crate::video::normalize_types::NormalizeUiState;
+        let mut app = setup_app();
+        let path = app.tmp.path().join("switching-scan.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        app.settings.audio_normalize_enabled = true;
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        player.set_normalize_gain_for_stream(1, 1.0);
+        player.set_playing(true);
+        assert_eq!(
+            player.select_audio_track(2).outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        app.normalize_ui_states.insert(
+            crate::app::normalize::NormalizeTargetKey::new(0, path, 1),
+            NormalizeUiState::OnUnmeasured,
+        );
+        assert!(
+            !app.normalize_auto_scan_target_ready(0),
+            "the old applied stream is ineligible while the desired stream differs"
+        );
+        app.poll_video(&egui::Context::default());
+        assert!(
+            app.normalize_state.is_none(),
+            "old applied track must not scan while desired differs"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn newly_applied_track_cancels_lingering_old_scan_and_releases_suspension() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("applied-scan.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        app.settings.audio_normalize_enabled = true;
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        player.set_playing(false);
+        player.set_audio_preroll_suspended(true);
+        assert_eq!(
+            player.select_audio_track(2).outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        player.apply_desired_audio_track_for_test();
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        let scan = normalize_scan_state_for_test(0, path);
+        let cancelled = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+        app.poll_video(&egui::Context::default());
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(app.normalize_state.is_none());
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert!(!player.audio_preroll_suspended());
+    }
+
+    #[test]
+    fn normalize_auto_scan_suppression_is_per_stream() {
+        use crate::app::normalize::NormalizeTargetKey;
+        use crate::video::normalize_types::NormalizeUiState;
+        let mut app = setup_app();
+        let path = app.tmp.path().join("per-stream-suppression.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        app.settings.audio_normalize_enabled = true;
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.reset_normalize_gains(true);
+        player.set_normalize_gain_for_stream(2, 1.0);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        app.normalize_auto_scan_suppressed
+            .insert(NormalizeTargetKey::new(0, path.clone(), 1));
+        let current = NormalizeTargetKey::new(0, path, 2);
+        app.normalize_ui_states
+            .insert(current.clone(), NormalizeUiState::OnUnmeasured);
+        assert!(app.normalize_auto_scan_target_ready(0));
+        app.normalize_auto_scan_suppressed.insert(current);
+        assert!(!app.normalize_auto_scan_target_ready(0));
+    }
+
+    #[test]
+    fn normalize_scan_completion_updates_only_its_stream() {
+        use crate::app::normalize::NormalizeMessage;
+        use crate::video::normalize_types::NormalizeResult;
+        let mut app = setup_app();
+        let path = app.tmp.path().join("scan-target.mkv");
+        std::fs::write(&path, b"source identity").unwrap();
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.reset_normalize_gains(true);
+        player.set_normalize_gain_for_stream(2, 3.0);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        let mut scan = normalize_scan_state_for_test(0, path.clone());
+        scan.was_playing = false;
+        let (tx, rx) = std::sync::mpsc::channel();
+        scan.rx = rx;
+        app.normalize_state = Some(scan);
+        tx.send(NormalizeMessage::Done(NormalizeResult {
+            gain_db: -6.0,
+            integrated_lufs: -8.0,
+            true_peak_db: -2.0,
+            target_lufs_milli: -14_000,
+        }))
+        .unwrap();
+        app.poll_normalize_scan(&egui::Context::default());
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            (player.normalize_gain_for_stream(1).unwrap() - 10.0_f64.powf(-6.0 / 20.0)).abs()
+                < 1e-6
+        );
+        assert_eq!(player.normalize_gain_for_stream(2), Some(3.0));
+        assert!(
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .lookup(&path, -14_000, 1, Some(1))
+                .is_some()
+        );
+        assert!(
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .lookup(&path, -14_000, 2, Some(1))
+                .is_none()
+        );
     }
 
     fn set_detached_host_for_test(app: &mut App, window_id: u64, hwnd: u64, live: bool) {
@@ -56394,16 +57516,19 @@ mod still_window_mode_key_tests {
         );
         // 音量ノーマライズ / ループ位置の idx-keyed 状態も shift 対象 (Codex fix-review P2)。
         app.normalize_ui_states.insert(
-            video,
+            normalize_key_for_test(video, r"C:\clips\b.mp4"),
             crate::video::normalize_types::NormalizeUiState::OnApplied { gain_db: -1.5 },
         );
-        app.normalize_auto_scan_suppressed.insert(video);
+        app.normalize_auto_scan_suppressed
+            .insert(normalize_key_for_test(video, r"C:\clips\b.mp4"));
         app.last_loop_pos.insert(video, (12.5, 3));
         // 進行中の音量スキャン (dummy worker) と VST シェル / 保留 open も shift 対象
         // (Codex fix-review2)。
         let scan_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            owner_context_id: app.projected_viewer_context_id(),
             fs_idx: video,
+            stream_index: 1,
             cancel: std::sync::Arc::clone(&scan_cancel),
             progress: std::sync::Arc::new(
                 crate::video::normalize_scanner::NormalizeScanProgress::default(),
@@ -56447,12 +57572,16 @@ mod still_window_mode_key_tests {
         assert!(matches!(app.items.get(video - 1), Some(GridItem::Video(_))));
         assert!(
             matches!(
-                app.normalize_ui_states.get(&(video - 1)),
+                app.normalize_ui_states
+                    .get(&normalize_key_for_test(video - 1, r"C:\clips\b.mp4")),
                 Some(crate::video::normalize_types::NormalizeUiState::OnApplied { .. })
             ),
             "normalize UI 状態は shift された新 idx に付く"
         );
-        assert!(app.normalize_auto_scan_suppressed.contains(&(video - 1)));
+        assert!(
+            app.normalize_auto_scan_suppressed
+                .contains(&normalize_key_for_test(video - 1, r"C:\clips\b.mp4"))
+        );
         assert_eq!(app.last_loop_pos.get(&(video - 1)), Some(&(12.5, 3)));
         assert_eq!(
             app.normalize_state.as_ref().map(|s| s.fs_idx),
@@ -57663,7 +58792,9 @@ mod still_window_mode_key_tests {
         });
         let scan_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            owner_context_id: app.projected_viewer_context_id(),
             fs_idx: 0,
+            stream_index: 1,
             cancel: std::sync::Arc::clone(&scan_cancel),
             progress: std::sync::Arc::new(
                 crate::video::normalize_scanner::NormalizeScanProgress::default(),
@@ -57979,7 +59110,10 @@ mod still_window_mode_key_tests {
         });
         let plan = app
             .with_active_viewer_context(|context| {
-                viewer_context_media_teardown_plan(ContextRef::mounted(context))
+                viewer_context_media_teardown_plan(
+                    context.projected_viewer_context_id(),
+                    ContextRef::mounted(context),
+                )
             })
             .unwrap();
         assert_eq!(plan.resume_updates[0].position, 55.0);
@@ -58071,7 +59205,10 @@ mod still_window_mode_key_tests {
         let key = crate::adjustment_db::normalize_path(&path);
         let plan = app
             .with_active_viewer_context(|context| {
-                viewer_context_media_teardown_plan(ContextRef::mounted(context))
+                viewer_context_media_teardown_plan(
+                    context.projected_viewer_context_id(),
+                    ContextRef::mounted(context),
+                )
             })
             .unwrap();
         assert_eq!(plan.resume_updates.len(), 1);
@@ -58159,8 +59296,11 @@ mod still_window_mode_key_tests {
             crate::ui_music_spectrum::MusicPcm::with_capacity(48_000, 0),
         ));
         let scan_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked_owner = app.locate_window_context(97).unwrap().0;
         app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            owner_context_id: parked_owner,
             fs_idx: audio,
+            stream_index: 1,
             cancel: std::sync::Arc::clone(&scan_cancel),
             progress: std::sync::Arc::new(
                 crate::video::normalize_scanner::NormalizeScanProgress::default(),
@@ -65914,10 +67054,11 @@ mod still_window_mode_key_tests {
         });
         app.vst3_deferred_media_open = Some(video);
         app.normalize_ui_states.insert(
-            video,
+            normalize_key_for_test(video, r"C:\session\playing.mp4"),
             crate::video::normalize_types::NormalizeUiState::OnApplied { gain_db: -2.25 },
         );
-        app.normalize_auto_scan_suppressed.insert(video);
+        app.normalize_auto_scan_suppressed
+            .insert(normalize_key_for_test(video, r"C:\session\playing.mp4"));
         app.last_loop_pos.insert(video, (19.0, 8));
         app.video_continuous_last_eof = Some((video, 13));
         let scan_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -65979,8 +67120,14 @@ mod still_window_mode_key_tests {
             Some(new_idx)
         );
         assert_eq!(app.vst3_deferred_media_open, Some(new_idx));
-        assert!(app.normalize_ui_states.contains_key(&new_idx));
-        assert!(app.normalize_auto_scan_suppressed.contains(&new_idx));
+        assert!(
+            app.normalize_ui_states
+                .contains_key(&normalize_key_for_test(new_idx, r"C:\session\playing.mp4"))
+        );
+        assert!(
+            app.normalize_auto_scan_suppressed
+                .contains(&normalize_key_for_test(new_idx, r"C:\session\playing.mp4"))
+        );
         assert_eq!(
             app.normalize_state.as_ref().map(|s| s.fs_idx),
             Some(new_idx)

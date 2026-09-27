@@ -11841,8 +11841,9 @@ struct MediaResumeUpdate {
 }
 
 #[cfg(windows)]
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct ViewerContextMediaTeardownPlan {
+    owner_context_id: ViewerContextId,
     resume_updates: Vec<MediaResumeUpdate>,
     media_paths: Vec<PathBuf>,
     music_consumer: bool,
@@ -11902,10 +11903,15 @@ fn merge_repaint_deadline(
 }
 
 #[cfg(windows)]
-fn viewer_context_media_teardown_plan(context: ContextRef<'_>) -> ViewerContextMediaTeardownPlan {
+fn viewer_context_media_teardown_plan(
+    owner_context_id: ViewerContextId,
+    context: ContextRef<'_>,
+) -> ViewerContextMediaTeardownPlan {
     let mut plan = ViewerContextMediaTeardownPlan {
+        owner_context_id,
         music_consumer: viewer_context_is_music_consumer(context),
-        ..Default::default()
+        resume_updates: Vec::new(),
+        media_paths: Vec::new(),
     };
     let mut push_media_path = |path: &std::path::Path| {
         if !plan
@@ -13733,11 +13739,23 @@ pub struct App {
     pub(crate) normalize_state: Option<crate::app::normalize::NormalizeScanState>,
     /// fs_idx 単位のボタン UI 状態。動画 open / トグル / スキャン完了で更新する。
     /// stale 防止のため close_fullscreen / fs_cache evict / フォルダ再ロードで cleanup する。
-    pub(crate) normalize_ui_states:
-        std::collections::HashMap<usize, crate::video::normalize_types::NormalizeUiState>,
+    pub(crate) normalize_ui_states: std::collections::HashMap<
+        crate::app::normalize::NormalizeTargetKey,
+        crate::video::normalize_types::NormalizeUiState,
+    >,
     /// ユーザーキャンセル / スキャン失敗後に、同じ fullscreen セッションで自動スキャンを
     /// 即再発火させないための fs_idx 集合。手動 Norm クリックでは再試行できる。
-    pub(crate) normalize_auto_scan_suppressed: std::collections::HashSet<usize>,
+    pub(crate) normalize_auto_scan_suppressed:
+        std::collections::HashSet<crate::app::normalize::NormalizeTargetKey>,
+    pub(crate) normalize_lookup_tx:
+        std::sync::mpsc::Sender<crate::app::normalize::NormalizeLookupMessage>,
+    pub(crate) normalize_lookup_rx:
+        std::sync::mpsc::Receiver<crate::app::normalize::NormalizeLookupMessage>,
+    /// Completed lookups routed to their viewer before any mounted player is inspected.
+    pub(crate) normalize_lookup_pending: std::collections::HashMap<
+        ViewerContextId,
+        Vec<crate::app::normalize::NormalizeLookupMessage>,
+    >,
 
     // ── 動画ピン / ブックマーク DB ───────────────────────────
     /// 動画フレーム ピン留め DB (= ユーザーが固定したフレーム = 動画グリッドサムネ
@@ -16224,6 +16242,7 @@ impl App {
 
         let t = std::time::Instant::now();
         let audio_normalize_db = crate::audio_normalize_db::AudioNormalizeDb::open().ok();
+        let (normalize_lookup_tx, normalize_lookup_rx) = std::sync::mpsc::channel();
         crate::perf::emit_ms("startup", "db_open_audio_normalize", 0, t);
 
         let t = std::time::Instant::now();
@@ -17001,6 +17020,9 @@ impl App {
             normalize_state: None,
             normalize_ui_states: std::collections::HashMap::new(),
             normalize_auto_scan_suppressed: std::collections::HashSet::new(),
+            normalize_lookup_tx,
+            normalize_lookup_rx,
+            normalize_lookup_pending: std::collections::HashMap::new(),
             video_pin_db,
             collection_thumbnail_source_epoch: 0,
             video_bookmark_db,
@@ -32274,12 +32296,19 @@ impl App {
         // 音量ノーマライズ / ループ位置の idx-keyed 状態も同様に shift (Codex fix-review P2)。
         self.normalize_ui_states = std::mem::take(&mut self.normalize_ui_states)
             .into_iter()
-            .filter_map(|(i, v)| shift(i).map(|ni| (ni, v)))
+            .filter_map(|(mut key, v)| {
+                key.fs_idx = shift(key.fs_idx)?;
+                Some((key, v))
+            })
             .collect();
         self.normalize_auto_scan_suppressed = self
             .normalize_auto_scan_suppressed
             .iter()
-            .filter_map(|&i| shift(i))
+            .filter_map(|key| {
+                let mut key = key.clone();
+                key.fs_idx = shift(key.fs_idx)?;
+                Some(key)
+            })
             .collect();
         self.last_loop_pos = std::mem::take(&mut self.last_loop_pos)
             .into_iter()
@@ -46834,7 +46863,7 @@ impl App {
                 continue;
             };
             match self.retire_context(id, reason, |mut context| {
-                let plan = viewer_context_media_teardown_plan(context.as_ref());
+                let plan = viewer_context_media_teardown_plan(id, context.as_ref());
                 context.clear_normalize_state();
                 plan
             }) {
@@ -47083,7 +47112,11 @@ impl App {
         let plans = self
             .other_viewer_context_ids()
             .into_iter()
-            .filter_map(|id| self.with_viewer_context_ref(id, viewer_context_media_teardown_plan))
+            .filter_map(|id| {
+                self.with_viewer_context_ref(id, |context| {
+                    viewer_context_media_teardown_plan(id, context)
+                })
+            })
             .collect::<Vec<_>>();
         self.save_viewer_context_media_teardown_resumes(&plans);
     }
@@ -47104,14 +47137,12 @@ impl App {
         plans: &[ViewerContextMediaTeardownPlan],
         reason: &'static str,
     ) {
-        let paths: Vec<PathBuf> = plans
-            .iter()
-            .flat_map(|plan| plan.media_paths.iter().cloned())
-            .collect();
-        let matches = self
-            .normalize_state
-            .as_ref()
-            .is_some_and(|state| viewer_context_teardown_paths_contain(&paths, &state.file_path));
+        let matches = self.normalize_state.as_ref().is_some_and(|state| {
+            plans.iter().any(|plan| {
+                plan.owner_context_id == state.owner_context_id
+                    && viewer_context_teardown_paths_contain(&plan.media_paths, &state.file_path)
+            })
+        });
         if matches {
             self.cancel_matching_viewer_context_normalize(reason);
         }
@@ -58888,7 +58919,7 @@ impl App {
             return None;
         }
         self.activity_gate.bump();
-        let (player, deferred_normalize_scan) = self.build_video_player_for_open(
+        let player = self.build_video_player_for_open(
             0,
             path.to_path_buf(),
             true,
@@ -58898,7 +58929,6 @@ impl App {
             #[cfg(windows)]
             None,
         );
-        debug_assert!(!deferred_normalize_scan);
         Some(Box::new(player))
     }
 
@@ -58912,7 +58942,7 @@ impl App {
         ignore_resume: bool,
         output_consumer: crate::video::VideoOutputConsumer,
         #[cfg(windows)] native_output_config: Option<crate::video::NativeVideoOutputConfig>,
-    ) -> (crate::video::VideoPlayer, bool) {
+    ) -> crate::video::VideoPlayer {
         // 通常 open の spawn 制限は呼び出し側 (`start_fs_load` →
         // `defer_native_video_open_if_decoder_busy`) で行う。ここに到達した時点では
         // live decoder 数が上限未満か、HW decode 無効の経路。ここでは診断用に
@@ -58968,27 +58998,13 @@ impl App {
         };
         let video_hw_decode = self.settings.video_hw_decode;
         let video_deinterlace = self.settings.video_deinterlace;
-        let initial_normalize_lookup = if self.settings.audio_normalize_enabled {
-            let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
-            self.audio_normalize_db
-                .as_ref()
-                .and_then(|db| db.lookup(&vp, target_milli))
-        } else {
-            None
-        };
-        let initial_normalize_gain = initial_normalize_lookup
-            .as_ref()
-            .map(|result| 10.0_f64.powf(result.gain_db as f64 / 20.0))
-            .unwrap_or(1.0);
-        let start_normalize_scan_before_play =
-            self.settings.audio_normalize_enabled && initial_normalize_lookup.is_none() && autoplay;
-        let open_autoplay = autoplay && !start_normalize_scan_before_play;
         let player = crate::video::VideoPlayer::open_with_output_consumer(
             vp,
             vol,
-            initial_normalize_gain,
-            start_normalize_scan_before_play,
-            open_autoplay,
+            1.0,
+            self.settings.audio_normalize_enabled,
+            false,
+            autoplay,
             resume,
             video_hw_decode,
             video_deinterlace,
@@ -59018,7 +59034,7 @@ impl App {
         if play_test_mute || self.video_session_muted {
             player.set_muted(true);
         }
-        (player, start_normalize_scan_before_play)
+        player
     }
 
     /// 音楽ビューを開いている間、対象パスのタイムライン解析を確実に走らせる (Inc 3b)。
@@ -59339,8 +59355,8 @@ impl App {
     /// 渡し、audio pump が `normalize -> VST3 -> limiter` を通す (Inc 6、「音声=映像なし動画」
     /// パリティ)。有効化・チェーン定義はプロセス共有の `DspBridge` singleton に従うので、
     /// 環境設定/動画側で設定したチェーンがそのまま音声にも効く (音楽ビュー自体に VST UI は
-    /// 持たない = 追加の HWND 配線なし)。音量ノーマライズは既存 `audio_normalize_db` の cache 値があれば適用するが、
-    /// スキャン起動はしない (Inc 3a; スキャン連携は後続)。再生位置の復元は音声の resume 設定
+    /// 持たない = 追加の HWND 配線なし)。音量ノーマライズは VideoInfo の opened stream
+    /// を worker で引き、未測定なら既存の scan 条件を評価する。再生位置の復元は音声の resume 設定
     /// (`music_open_resume` / `music_nav_resume`、既定=最初から) に従う。位置は動画と同じ
     /// `video_resume_positions` に path キーで保存済み (poll_video)。
     fn build_audio_player_for_open(
@@ -59348,38 +59364,10 @@ impl App {
         path: PathBuf,
         from_grid: bool,
         autoplay: bool,
-    ) -> (crate::video::VideoPlayer, bool) {
+    ) -> crate::video::VideoPlayer {
         let vol = crate::settings::clamp_video_volume(self.settings.video_volume);
-        // 音量ノーマライズ (D13、「映像なし動画」パリティ): グローバル ON なら DB を引き、
-        // ヒットすれば gain を即適用する。ミスなら動画と同じく「再生前スキャン」に入るため
-        // ここでは gain=1.0 のまま開き、preroll を suspended + autoplay off で開始して、
-        // start_fs_load 側でスキャンを起動→完了時に補正 gain 付きで再生を始める
-        // (未補正音の一瞬の burst を避ける)。スキャン機構は windows 限定。
-        let normalize_lookup = if self.settings.audio_normalize_enabled {
-            let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
-            self.audio_normalize_db
-                .as_ref()
-                .and_then(|db| db.lookup(&path, target_milli))
-        } else {
-            None
-        };
-        let normalize_gain = normalize_lookup
-            .as_ref()
-            .map(|r| 10.0_f64.powf(r.gain_db as f64 / 20.0))
-            .unwrap_or(1.0);
-        // ON + 未測定 + autoplay のときだけ再生前スキャンする (動画 build_video_player_for_open と同型)。
-        let start_normalize_scan_before_play = {
-            #[cfg(windows)]
-            {
-                self.settings.audio_normalize_enabled && normalize_lookup.is_none() && autoplay
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = &normalize_lookup;
-                false
-            }
-        };
-        let open_autoplay = autoplay && !start_normalize_scan_before_play;
+        // Stream identity is available only after VideoInfo. The per-player table gates audio
+        // until a worker resolves that stream; autoplay intent remains intact.
         // 一覧から開いた (`fs_open_intent_from_grid`) か移動 (↓↑/ホイール/Ctrl+↑↓) かで
         // 音声 resume 設定を選び、保存済み位置を使うか先頭からかを決める (動画の
         // `video_resume_for_open` を音声設定で共有)。
@@ -59394,19 +59382,21 @@ impl App {
             ),
             self.settings.music_nav_resume,
         );
-        let player = crate::video::VideoPlayer::open(
+        let player = crate::video::VideoPlayer::open_with_output_consumer(
             path,
             vol,
-            normalize_gain,
-            start_normalize_scan_before_play, // audio_preroll_suspended (スキャン完了まで先読み停止)
-            open_autoplay,                    // 再生前スキャン時は false = 補正確定後に再生開始
-            resume,                           // 音声 resume 設定に従う (既定=最初から)
-            false,                            // hw_decode (音声のみ、GPU 不要)
+            1.0,
+            self.settings.audio_normalize_enabled,
+            false,
+            autoplay,
+            resume, // 音声 resume 設定に従う (既定=最初から)
+            false,  // hw_decode (音声のみ、GPU 不要)
             self.settings.video_deinterlace,
             #[cfg(windows)]
             None, // gpu_video_device (headless)
             #[cfg(windows)]
             Some(self.dsp_bridge.clone()), // dsp_bridge: 動画と同じ VST3 チェーンを共有 (Inc 6)
+            crate::video::VideoOutputConsumer::Presentation,
             #[cfg(windows)]
             None, // native_output_config (headless = 音楽ビューは egui 描画)
         );
@@ -59418,7 +59408,7 @@ impl App {
         }
         // ループ/連続の設定は共有 video_loop_mode / video_continuous_mode に従い、
         // fs_cache へ insert した後に apply_music_loop_mode で反映する (start_fs_load 音声 branch)。
-        (player, start_normalize_scan_before_play)
+        player
     }
 
     /// ページ読み込みスケジューラへ渡す projected viewer context の識別子。
@@ -59590,17 +59580,16 @@ impl App {
                 // (fast-swap で再帰的に呼ばれる場合) の保険として明示的に bump する。
                 self.activity_gate.bump();
                 #[allow(unused_mut)]
-                let (mut player, start_normalize_scan_before_play) = self
-                    .build_video_player_for_open(
-                        idx,
-                        vp,
-                        from_grid,
-                        autoplay_override,
-                        ignore_resume,
-                        crate::video::VideoOutputConsumer::Presentation,
-                        #[cfg(windows)]
-                        native_config,
-                    );
+                let mut player = self.build_video_player_for_open(
+                    idx,
+                    vp,
+                    from_grid,
+                    autoplay_override,
+                    ignore_resume,
+                    crate::video::VideoOutputConsumer::Presentation,
+                    #[cfg(windows)]
+                    native_config,
+                );
                 #[cfg(windows)]
                 if native_config_missing {
                     player.fail_native_init(
@@ -59619,13 +59608,7 @@ impl App {
                 #[cfg(windows)]
                 self.init_normalize_state_for_opened_video(idx);
                 #[cfg(windows)]
-                if start_normalize_scan_before_play {
-                    if !self.start_normalize_scan_for_deferred_play_intent(idx) {
-                        self.resume_deferred_normalize_playback_without_scan(idx);
-                    }
-                } else {
-                    self.maybe_start_normalize_scan_for_play_intent(idx);
-                }
+                self.maybe_start_normalize_scan_for_play_intent(idx);
             }
             return;
         }
@@ -59661,7 +59644,7 @@ impl App {
                 // 一覧から開いた (grid) か移動 (nav) かのワンショットフラグを消費する
                 // (動画分岐と同じ std::mem::take 規約)。resume 設定の選択に使う。
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
-                let (player, start_normalize_scan_before_play) = self.build_audio_player_for_open(
+                let player = self.build_audio_player_for_open(
                     ap,
                     from_grid,
                     !self.remote_session_blocks_local_control(),
@@ -59678,21 +59661,13 @@ impl App {
                 self.apply_music_loop_mode(idx);
                 // 音量ノーマライズ (D13、「映像なし動画」パリティ): 動画の start_fs_load 分岐
                 // (init_normalize_state_for_opened_video + 再生前 / 再生 intent スキャン) と同型に
-                // 揃える。DB ヒットなら build 時に gain 適用済み + ここで OnApplied 表示、ミスなら
-                // OnUnmeasured → 初回スキャン (再生前スキャンなら deferred、それ以外は intent 経路)。
+                // 揃える。VideoInfo で開いた stream が分かった後に worker lookup し、
+                // 未測定なら再生 intent に応じて scan へ進む。
                 #[cfg(windows)]
                 {
                     self.init_normalize_state_for_opened_video(idx);
-                    if start_normalize_scan_before_play {
-                        if !self.start_normalize_scan_for_deferred_play_intent(idx) {
-                            self.resume_deferred_normalize_playback_without_scan(idx);
-                        }
-                    } else {
-                        self.maybe_start_normalize_scan_for_play_intent(idx);
-                    }
+                    self.maybe_start_normalize_scan_for_play_intent(idx);
                 }
-                #[cfg(not(windows))]
-                let _ = start_normalize_scan_before_play;
             }
             return;
         }
@@ -61026,7 +61001,11 @@ impl App {
         {
             self.video_presentation_transition
                 .sync_stable(self.viewer_presentation);
-            let fs_idxs: Vec<usize> = self.normalize_ui_states.keys().copied().collect();
+            let fs_idxs: Vec<usize> = self
+                .normalize_ui_states
+                .keys()
+                .map(|key| key.fs_idx)
+                .collect();
             for idx in fs_idxs {
                 self.cleanup_normalize_state_for_fs_idx(idx);
             }
@@ -76075,6 +76054,23 @@ impl App {
                     continuous_eof_events.push((*idx, player.current_seek_serial(), kind));
                 }
             }
+        }
+        #[cfg(windows)]
+        for idx in &active_video_indices {
+            if let Some(stream_index) = self.fs_cache.get(idx).and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => player.applied_audio_stream_index(),
+                _ => None,
+            }) {
+                self.cancel_blocking_normalize_scan_for_other_track(*idx, stream_index);
+            }
+        }
+        for idx in &active_video_indices {
+            self.start_normalize_lookups_for_selected_tracks(*idx);
+        }
+        self.poll_normalize_lookups();
+        #[cfg(windows)]
+        for idx in &active_video_indices {
+            self.maybe_start_normalize_scan_for_play_intent(*idx);
         }
         // in-window モードでは presenter は WS_CHILD なので VST GUI の owner には
         // しない (z-order / focus が壊れる)。VST owner 同期は全画面モード限定

@@ -194,11 +194,11 @@ pub struct AvClock {
     /// safety limiter が最終出力 ceiling 超過を検出した回数。
     /// audio-pump thread が増やし、UI thread / native overlay が差分を一時表示する。
     limiter_ceiling_hit_seq: AtomicU64,
-    /// 音量ノーマライズの線形ゲイン (f64 bits)。1.0 = 素通し、>1.0 = boost、<1.0 = attenuation。
-    /// `[10^(-24/20), 10^(24/20)]` (= 約 0.063 〜 15.85) にクランプされる。
-    /// 状態判定 (Off / OnApplied / OnUnmeasured) はこの値で行わず、App 側の
+    /// 音量ノーマライズの stream 別の確定 gain または Pending。
+    /// 確定値は `[10^(-24/20), 10^(24/20)]` (= 約 0.063 〜 15.85) にクランプされる。
+    /// 状態判定 (Off / OnApplied / OnUnmeasured) は gain 値で行わず、App 側の
     /// `NormalizeUiState` enum で扱う (gain = 1.0 でも測定済みのケースがあるため)。
-    normalize_gain_bits: AtomicU64,
+    normalize_gain_table: super::normalize_gain::NormalizeGainTable,
 }
 
 const SEEK_NONE: u64 = u64::MAX;
@@ -263,6 +263,15 @@ impl AvClock {
     /// `seek_serial` は `EngineActor` と共有する `Arc<AtomicU64>`。
     /// 構築側 (`VideoPlayer::open`) が 1 個作って両方に clone を渡す。
     pub fn new(initial_volume: f64, seek_serial: Arc<AtomicU64>) -> Self {
+        Self::new_with_normalize(initial_volume, seek_serial, false, 1.0)
+    }
+
+    pub(crate) fn new_with_normalize(
+        initial_volume: f64,
+        seek_serial: Arc<AtomicU64>,
+        normalize_enabled: bool,
+        initial_normalize_gain: f64,
+    ) -> Self {
         // 初期 anchor は (pts=0.0、wall=now、Frozen)。
         // playing=false / audio_active=false の間は now_secs() が anchor PTS を
         // そのまま返す挙動を再現するため、Frozen で開始するのが等価。
@@ -301,7 +310,10 @@ impl AvClock {
             remote_local_mute_owner: AtomicU64::new(0),
             next_remote_local_mute_owner: AtomicU64::new(1),
             limiter_ceiling_hit_seq: AtomicU64::new(0),
-            normalize_gain_bits: AtomicU64::new(1.0_f64.to_bits()),
+            normalize_gain_table: super::normalize_gain::NormalizeGainTable::new(
+                normalize_enabled,
+                initial_normalize_gain,
+            ),
         }
     }
 
@@ -1089,13 +1101,20 @@ impl AvClock {
 
     /// 音量ノーマライズ用の線形ゲイン (1.0 = 素通し)。
     pub fn normalize_gain(&self) -> f64 {
-        f64::from_bits(self.normalize_gain_bits.load(Ordering::Acquire))
+        self.normalize_gain_for_stream(0).unwrap_or(1.0)
     }
 
     /// 音量ノーマライズ用の線形ゲインを設定 (内部で `[10^(-24/20), 10^(24/20)]` にクランプ)。
     pub fn set_normalize_gain(&self, gain: f64) {
-        self.normalize_gain_bits
-            .store(clamp_normalize_gain(gain).to_bits(), Ordering::Release);
+        self.normalize_gain_table.set_gain(0, gain);
+    }
+
+    pub(crate) fn normalize_gain_for_stream(&self, stream_index: usize) -> Option<f64> {
+        self.normalize_gain_table.gain(stream_index)
+    }
+
+    pub(crate) fn normalize_gain_table(&self) -> &super::normalize_gain::NormalizeGainTable {
+        &self.normalize_gain_table
     }
 
     /// audio-pump の先読み停止フラグ。解除後の raw→processed はその時点の Norm gain を使う。

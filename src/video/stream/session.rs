@@ -119,7 +119,17 @@ struct GenerationConfig {
     source_origin_secs: f64,
     segment_capacity: usize,
     hw_decode: bool,
+    audio_stream_index: usize,
+    default_audio_stream_index: Option<usize>,
+    normalize_snapshot: RemoteNormalizeSnapshot,
     audio_processing: ClocklessAudioProcessing,
+}
+
+#[derive(Clone)]
+pub(crate) struct RemoteNormalizeSnapshot {
+    pub(crate) enabled: bool,
+    pub(crate) target_lufs_milli: i32,
+    pub(crate) db_path: PathBuf,
 }
 
 struct GenerationWorkerCompletion {
@@ -230,6 +240,9 @@ impl StreamingGenerationHandle {
         quality: QualityPreset,
         segment_capacity: usize,
         hw_decode: bool,
+        audio_stream_index: usize,
+        default_audio_stream_index: Option<usize>,
+        normalize_snapshot: RemoteNormalizeSnapshot,
         audio_processing: ClocklessAudioProcessing,
     ) -> Result<Self, String> {
         let config = GenerationConfig {
@@ -240,6 +253,9 @@ impl StreamingGenerationHandle {
             source_origin_secs,
             segment_capacity,
             hw_decode,
+            audio_stream_index,
+            default_audio_stream_index,
+            normalize_snapshot,
             audio_processing,
         };
         let audio_status = config.audio_processing.vst3_status();
@@ -472,6 +488,9 @@ pub(crate) struct RemoteVideoStreamingSession {
     quality: QualityPreset,
     segment_capacity: usize,
     hw_decode: bool,
+    audio_stream_index: usize,
+    default_audio_stream_index: Option<usize>,
+    normalize_snapshot: RemoteNormalizeSnapshot,
     audio_processing: ClocklessAudioProcessing,
     next_generation: u64,
     current: StreamingGenerationHandle,
@@ -492,6 +511,7 @@ impl RemoteVideoStreamingSession {
         quality: QualityPreset,
         segment_capacity: usize,
         hw_decode: bool,
+        normalize_snapshot: RemoteNormalizeSnapshot,
         audio_processing: ClocklessAudioProcessing,
     ) -> Result<Self, String> {
         if segment_capacity == 0 {
@@ -508,6 +528,9 @@ impl RemoteVideoStreamingSession {
             quality,
             segment_capacity,
             hw_decode,
+            inputs.audio_stream_index,
+            inputs.default_audio_stream_index,
+            normalize_snapshot.clone(),
             audio_processing.clone(),
         )?;
         Ok(Self {
@@ -518,6 +541,9 @@ impl RemoteVideoStreamingSession {
             quality,
             segment_capacity,
             hw_decode,
+            audio_stream_index: inputs.audio_stream_index,
+            default_audio_stream_index: inputs.default_audio_stream_index,
+            normalize_snapshot,
             audio_processing,
             next_generation: 2,
             current,
@@ -581,6 +607,9 @@ impl RemoteVideoStreamingSession {
             self.quality,
             self.segment_capacity,
             self.hw_decode,
+            self.audio_stream_index,
+            self.default_audio_stream_index,
+            self.normalize_snapshot.clone(),
             self.audio_processing.clone(),
         )?;
         self.next_generation = self.next_generation.saturating_add(1);
@@ -624,15 +653,24 @@ fn run_generation_worker(
     output: ClocklessStreamOutput,
     on_ready: impl FnOnce(ClocklessOutputInfo),
 ) -> Result<(), String> {
+    let normalize_gain = remote_generation_normalize_gain(&config);
+    let mut audio_processing = config.audio_processing.clone();
+    audio_processing.normalize_gain = normalize_gain;
+    let options = generation_transcode_options(&config);
+    run_clockless_stream(&options, control, output, audio_processing, on_ready).map(|_| ())
+}
+
+fn generation_transcode_options(config: &GenerationConfig) -> ClocklessTranscodeOptions {
     let quality = match config.quality {
         QualityPreset::Minimum => crate::video::clockless_transcode::ClocklessQuality::Minimum,
         QualityPreset::Low => crate::video::clockless_transcode::ClocklessQuality::Low,
         QualityPreset::Standard => crate::video::clockless_transcode::ClocklessQuality::Standard,
         QualityPreset::High => crate::video::clockless_transcode::ClocklessQuality::High,
     };
-    let options = ClocklessTranscodeOptions {
-        path: config.path,
+    ClocklessTranscodeOptions {
+        path: config.path.clone(),
         include_audio: true,
+        audio_stream_index: config.audio_stream_index,
         hw_decode: config.hw_decode,
         quality,
         encoder: config.encoder,
@@ -641,8 +679,33 @@ fn run_generation_worker(
         profile_swscale: false,
         source_origin_secs: config.source_origin_secs,
         diagnostic_generation: Some(config.generation.0),
-    };
-    run_clockless_stream(&options, control, output, config.audio_processing, on_ready).map(|_| ())
+    }
+}
+
+fn remote_generation_normalize_gain(config: &GenerationConfig) -> f64 {
+    if !config.normalize_snapshot.enabled {
+        return 1.0;
+    }
+    let result = crate::audio_normalize_db::AudioNormalizeDb::open_read_only_at(
+        &config.normalize_snapshot.db_path,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|db| {
+        db.lookup_checked(
+            &config.path,
+            config.normalize_snapshot.target_lufs_milli,
+            config.audio_stream_index,
+            config.default_audio_stream_index,
+        )
+    });
+    match result {
+        Ok(Some(result)) => 10.0_f64.powf(result.gain_db as f64 / 20.0),
+        Ok(None) => 1.0,
+        Err(error) => {
+            crate::logger::log(format!("remote-stream Norm lookup failed: {error}"));
+            1.0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -659,8 +722,54 @@ mod tests {
             has_video,
             has_audio,
             source_origin_secs: 0.0,
-            normalize_gain: 1.0,
+            audio_stream_index: 1,
+            default_audio_stream_index: Some(1),
         }
+    }
+
+    #[test]
+    fn remote_generation_stream_and_norm_use_the_same_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("normalize.db");
+        let db = crate::audio_normalize_db::AudioNormalizeDb::open_at(&db_path).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks/multi.mkv");
+        let result = |gain_db| crate::video::normalize_types::NormalizeResult {
+            gain_db,
+            integrated_lufs: -20.0,
+            true_peak_db: -5.0,
+            target_lufs_milli: -14000,
+        };
+        db.upsert(&path, 2, &result(6.0)).unwrap();
+        db.upsert(&path, 3, &result(-6.0)).unwrap();
+        let mut config = GenerationConfig {
+            generation: StreamingGeneration(1),
+            path,
+            encoder: EncoderPreference::Auto,
+            quality: QualityPreset::Standard,
+            source_origin_secs: 0.0,
+            segment_capacity: 4,
+            hw_decode: false,
+            audio_stream_index: 2,
+            default_audio_stream_index: Some(2),
+            normalize_snapshot: RemoteNormalizeSnapshot {
+                enabled: true,
+                target_lufs_milli: -14000,
+                db_path,
+            },
+            audio_processing: ClocklessAudioProcessing::without_vst3(1.0),
+        };
+        assert_eq!(generation_transcode_options(&config).audio_stream_index, 2);
+        assert!(
+            (remote_generation_normalize_gain(&config) - 10.0_f64.powf(6.0 / 20.0)).abs() < 1e-6
+        );
+        config.audio_stream_index = 3;
+        assert_eq!(generation_transcode_options(&config).audio_stream_index, 3);
+        assert!(
+            (remote_generation_normalize_gain(&config) - 10.0_f64.powf(-6.0 / 20.0)).abs() < 1e-6
+        );
+        config.normalize_snapshot.enabled = false;
+        assert_eq!(remote_generation_normalize_gain(&config), 1.0);
     }
 
     #[test]

@@ -63,6 +63,7 @@ impl ClocklessQuality {
 pub struct ClocklessTranscodeOptions {
     pub path: PathBuf,
     pub include_audio: bool,
+    pub audio_stream_index: usize,
     pub hw_decode: bool,
     pub quality: ClocklessQuality,
     pub(crate) encoder: EncoderPreference,
@@ -79,10 +80,12 @@ pub struct ClocklessTranscodeOptions {
 }
 
 impl ClocklessTranscodeOptions {
-    pub fn benchmark(path: impl Into<PathBuf>) -> Self {
+    pub fn benchmark(path: impl Into<PathBuf>, audio_stream_index: usize) -> Self {
+        let path = path.into();
         Self {
-            path: path.into(),
+            path,
             include_audio: true,
+            audio_stream_index,
             hw_decode: true,
             quality: ClocklessQuality::Standard,
             encoder: EncoderPreference::Auto,
@@ -1521,8 +1524,9 @@ fn run_clockless_stream_inner(
 
     let audio_stream = options
         .include_audio
-        .then(|| input.streams().best(MediaType::Audio))
-        .flatten();
+        .then(|| input.stream(options.audio_stream_index))
+        .flatten()
+        .filter(|stream| stream.parameters().medium() == MediaType::Audio);
     let audio_stream_index = audio_stream.as_ref().map(|stream| stream.index());
     let audio_start_secs = audio_stream.as_ref().map(stream_start_secs);
     let source_start_secs = audio_start_secs
@@ -2463,7 +2467,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("finite-audio.avi");
         write_finite_audio_fixture(&path, 10);
-        let mut options = ClocklessTranscodeOptions::benchmark(path);
+        let mut options = ClocklessTranscodeOptions::benchmark(path, 0);
         options.hw_decode = false;
         options.quality = ClocklessQuality::Low;
         options.max_source_secs = None;
@@ -2512,7 +2516,7 @@ mod tests {
             write_finite_av_fixture(&generated_path, 5);
             generated_path
         });
-        let mut options = ClocklessTranscodeOptions::benchmark(path);
+        let mut options = ClocklessTranscodeOptions::benchmark(path, 1);
         options.hw_decode = false;
         options.quality = ClocklessQuality::Minimum;
         options.max_source_secs = None;
@@ -2581,7 +2585,7 @@ mod tests {
         // one-segment live target this reproduces a browser that fetched the visible live edge
         // but does not ask for an unpublished terminal fragment.
         write_finite_av_fixture(&path, 9);
-        let mut options = ClocklessTranscodeOptions::benchmark(path);
+        let mut options = ClocklessTranscodeOptions::benchmark(path, 1);
         options.hw_decode = false;
         options.quality = ClocklessQuality::Minimum;
         options.max_source_secs = None;

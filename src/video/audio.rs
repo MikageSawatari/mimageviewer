@@ -1183,6 +1183,9 @@ fn run_pump(
     let mut safety_limiter = SafetyLimiter::new(sample_rate, 2);
     let mut time_stretcher = TimeStretcher::new(sample_rate);
     let mut normalize_gain_ramp = NormalizeGainRamp::new(sample_rate, 2);
+    let mut last_processed_normalize_stream: Option<usize> = None;
+    let mut pending_normalize_stream: Option<usize> = None;
+    let mut snap_next_normalize_gain = true;
     // preroll 解除エッジ検出。preroll 中 (測定前待機) は毎ブロック snap_to_target するが、
     // UI スレッドは「set_normalize_gain(確定 gain) → set_audio_preroll_suspended(false)」を
     // 連続で store するため、pump が preroll=true のまま新 gain を snap するブロックを
@@ -1194,7 +1197,6 @@ fn run_pump(
     // 読んでから gain を snap する。preroll=false 観測時は直前に Release された確定 gain も
     // 必ず可視 (clock.rs の set_normalize_gain / set_audio_preroll_suspended は共に Release)。
     let mut was_preroll_suspended = clock.audio_preroll_suspended();
-    normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
 
     let mut activated = false;
     let mut active_audio_tap = None;
@@ -1546,7 +1548,6 @@ fn run_pump(
 
         let preroll_now = clock.audio_preroll_suspended();
         if preroll_now {
-            normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
             was_preroll_suspended = true;
             if let Ok(buf) = buffer.lock() {
                 publish_buffer_secs(&buf, &clock);
@@ -1554,9 +1555,8 @@ fn run_pump(
             continue;
         }
         if preroll_release_edge(was_preroll_suspended, preroll_now) {
-            // preroll 解除エッジ: 測定確定 gain で即再生開始する (4 秒 ramp を避ける)。
-            // ここで snap しておけば直後の apply_to_samples は target 一致で ramp を arm しない。
-            normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
+            // The next decoded stream owns the target gain. Snap when that frame is processed.
+            snap_next_normalize_gain = true;
         }
         was_preroll_suspended = preroll_now;
 
@@ -1573,6 +1573,13 @@ fn run_pump(
                     + remaining_first_chunk_secs(&buf);
                 if cur_secs >= TARGET_PROCESSED_SECS {
                     (cur_secs, None, buf.pump_seek_serial)
+                } else if buf
+                    .raw_pending
+                    .front()
+                    .is_some_and(|raw| clock.normalize_gain_for_stream(raw.stream_index).is_none())
+                {
+                    pending_normalize_stream = buf.raw_pending.front().map(|raw| raw.stream_index);
+                    (cur_secs, None, buf.pump_seek_serial)
                 } else if let Some(raw) = buf.raw_pending.pop_front() {
                     (cur_secs, Some(raw), buf.pump_seek_serial)
                 } else {
@@ -1586,6 +1593,24 @@ fn run_pump(
                 None => break,
             };
 
+            let Some(normalize_gain) = clock.normalize_gain_for_stream(raw.stream_index) else {
+                // A toggle may have reset the table between the head check and this load.
+                let mut buf = buffer.lock().unwrap();
+                if raw.seek_serial == buf.pump_seek_serial {
+                    buf.raw_pending.push_front(raw);
+                }
+                break;
+            };
+            if snap_next_normalize_gain
+                || last_processed_normalize_stream != Some(raw.stream_index)
+                || pending_normalize_stream == Some(raw.stream_index)
+            {
+                normalize_gain_ramp.snap_to_target(normalize_gain as f32);
+                snap_next_normalize_gain = false;
+            }
+            last_processed_normalize_stream = Some(raw.stream_index);
+            pending_normalize_stream = None;
+
             // ── Time stretch → normalize gain → VST process_block (mutex 解放中) ──
             let playback_speed = clock.playback_speed();
             let mut stretched =
@@ -1594,8 +1619,8 @@ fn run_pump(
             // VST3 (Pro-L2 等) が「-14 LUFS に揃った入力」を見られるよう前段に置く。
             // 目標変更は dB 空間で ramp する。測定前待機からの解除時は上の
             // `snap_to_target` により、最初の可聴 chunk から仮 gain で始まる。
-            let max_normalize_gain_in_block = normalize_gain_ramp
-                .apply_to_samples(&mut stretched.samples, clock.normalize_gain() as f32);
+            let max_normalize_gain_in_block =
+                normalize_gain_ramp.apply_to_samples(&mut stretched.samples, normalize_gain as f32);
             #[cfg(windows)]
             let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
                 Vec<f32>,
@@ -1830,7 +1855,7 @@ fn run_pump(
         //   - PDC 等で audible < target → max は target. anchor が target で固定
         //   - 失敗 / 初期 open: pump_anchor_target = None → audible 単独 (既存挙動)
         //   - BufferStarved (再 buffering): audible は再生位置 >> 旧 target → audible 採用
-        let (processed_secs, cur_audible_pts, cur_serial) = {
+        let (processed_secs, cur_audible_pts, cur_serial, pending_at_head) = {
             let buf = buffer.lock().unwrap();
             publish_buffer_secs(&buf, &clock);
             let secs: f64 = buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
@@ -1842,7 +1867,11 @@ fn run_pump(
             } else {
                 buf.next_pts_secs
             };
-            (secs, audible, buf.pump_seek_serial)
+            let pending_at_head = buf
+                .raw_pending
+                .front()
+                .is_some_and(|raw| clock.normalize_gain_for_stream(raw.stream_index).is_none());
+            (secs, audible, buf.pump_seek_serial, pending_at_head)
         };
         // 音声実長が閾値未満のファイル (0.1 秒未満の SFX 等 / 極短音声トラックの動画) は
         // processed がこの閾値に永久に届かず、BufferReady が一度も emit されないまま
@@ -1850,7 +1879,7 @@ fn run_pump(
         // (`is_eof_reached`) ならこれ以上 processed が増える見込みは無いので、残量に
         // 関わらず readiness を通知する (review-v2.3.0 P2-6)。post-seek で末尾間際に
         // 到達した場合も同様 (残り実データが閾値未満でも開始してよい)。
-        if processed_secs >= READY_THRESHOLD_SECS || clock.is_eof_reached() {
+        if !pending_at_head && (processed_secs >= READY_THRESHOLD_SECS || clock.is_eof_reached()) {
             // T15 (Codex R-VENG-001): BufferReady を **engine が待っている state でのみ** 送る。
             // 旧コードは Playing 中も pump loop ごと (audio frame rate ≈ 100-200Hz) に
             // BufferReady を try_send していた。engine 側はそれを epoch < current 早期 return
@@ -3032,6 +3061,198 @@ mod tests {
     #[test]
     fn disconnected_pump_with_raw_pending_allows_loop_seek() {
         disconnected_pump_releases_eof_gate(true);
+    }
+
+    #[test]
+    fn pending_track_gates_only_its_frames_and_blocks_eof_ready() {
+        use crate::video::engine::EngineEvent;
+        use crate::video::engine::state::AudioEvent;
+        let clock = Arc::new(AvClock::new_with_normalize(
+            1.0,
+            Arc::new(AtomicU64::new(0)),
+            true,
+            1.0,
+        ));
+        clock.normalize_gain_table().set_gain(1, 1.0);
+        let request = clock
+            .normalize_gain_table()
+            .begin_lookup(2, -14000)
+            .unwrap();
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(8);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, event_rx) = bounded(16);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let state = Arc::new(AtomicU8::new(state_code::BUFFERING));
+        let worker = {
+            let clock = Arc::clone(&clock);
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                )
+            })
+        };
+        let frame = |stream_index, pts_secs| AudioFrame {
+            samples: vec![0.1; 4_800],
+            pts_secs,
+            seek_serial: 0,
+            stream_index,
+            duration_secs: 0.05,
+            queued_wall_secs: 0.0,
+            audio_tx_accounting_epoch: 0,
+            seek_target_secs: None,
+        };
+        audio_tx.send(frame(1, 0.0)).unwrap();
+        audio_tx.send(frame(2, 0.05)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while (buffer.lock().unwrap().processed.is_empty()
+            || buffer.lock().unwrap().raw_pending.is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            !buffer.lock().unwrap().processed.is_empty(),
+            "resolved stream must process"
+        );
+        assert_eq!(
+            buffer
+                .lock()
+                .unwrap()
+                .raw_pending
+                .front()
+                .unwrap()
+                .stream_index,
+            2
+        );
+        clock.notify_eof_reached();
+        assert!(
+            event_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "EOF must not publish readiness while a Pending frame blocks raw"
+        );
+        assert!(clock.normalize_gain_table().resolve(request, 2.0));
+        let ready = event_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(matches!(
+            ready,
+            EngineEvent::Audio(AudioEvent::BufferReady { .. })
+        ));
+        // Readiness can be published as soon as the head is resolved, before
+        // the worker finishes draining that frame into processed audio.
+        let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !buffer.lock().unwrap().raw_pending.is_empty()
+            && std::time::Instant::now() < drain_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(buffer.lock().unwrap().raw_pending.is_empty());
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn selected_track_is_pending_before_seek_publication_and_pump_processing() {
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("selection-pump-seam.mkv"),
+        );
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        player.set_normalize_gain_for_stream(1, 1.0);
+        let selection = player.select_audio_track(2);
+        assert_eq!(
+            selection.outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        assert!(selection.normalize_unresolved);
+        let seek = player
+            .clock
+            .take_seek_request()
+            .expect("selection publishes seek");
+        assert_eq!(player.normalize_gain_for_stream(2), None);
+
+        let clock = Arc::clone(&player.clock);
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(8);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, _event_rx) = bounded(16);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let state = Arc::new(AtomicU8::new(state_code::BUFFERING));
+        let worker = {
+            let clock = Arc::clone(&clock);
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                )
+            })
+        };
+        audio_tx
+            .send(AudioFrame {
+                samples: vec![0.1; 4_800],
+                pts_secs: 0.0,
+                seek_serial: seek.serial,
+                stream_index: 2,
+                duration_secs: 0.05,
+                queued_wall_secs: 0.0,
+                audio_tx_accounting_epoch: 0,
+                seek_target_secs: Some(0.0),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while buffer.lock().unwrap().raw_pending.is_empty() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let pending = buffer.lock().unwrap();
+        assert!(
+            pending.processed.is_empty(),
+            "selected stream cannot process at unity"
+        );
+        assert_eq!(pending.raw_pending.front().unwrap().stream_index, 2);
+        drop(pending);
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        worker.join().unwrap();
     }
 
     #[test]

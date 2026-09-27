@@ -787,6 +787,9 @@ session owner、生存 timeout、放置 timeout は A/V と audio-only で同じ
 保持し、空きが無ければ `Condvar` wait、consumer release で resume する。cancel は各 FFmpeg
 段の前後で同じ flag を検査するため、長い段の途中へ別 state field を持ち込まない。本番の
 remote session と `dev-tools` の `clockless_transcode_bench` は同じ driver と終端 flush を使う。
+音声 stream index は driver の入力で明示する。診断 CLI は既定 stream を入口で決め、
+必要なら `--audio-stream-index N` で指定できる。本番 session は headless player の
+opened stream を渡し、driver 内では選び直さない。
 
 ## モジュール構成 (現行責務)
 
@@ -3107,29 +3110,50 @@ cache 自身の 1 本 + decoder に渡した 1 本で `2` になる。`2` より
 | 通常 seek | ✓ | ✓ (`handle_seek_request`) | ✓ |
 | Norm toggle | ✗ | ✗ | ✗ (= 2026-05-11 削除、上の「既知の症状 (修正済)」節参照) |
 
-Norm では `set_normalize_gain` の atomic store のみ行い、`processed` / `raw_pending` /
-`audio_tx_queued` のいずれも触らない。audio-pump は目標 gain 変更を dB 空間で 4 秒 ramp
-するため、仮 gain → 確定 gain や手動 ON/OFF の段差を滑らかにする (= 既存 `processed`
-の最大 ~100ms は旧 gain で鳴り続けるが、A/V offset は連続性を保つ)。
-ただし open / source-swap 時点で `audio_normalize.db` の測定値が見つかる場合は、
-`build_video_player_for_open` で `VideoPlayer::open` に初期 Norm gain を渡し、音声ワーカー
-起動前の `AvClock` に設定する。これにより再生開始直後の最初の processed chunk から
-測定済み gain が使われ、動画切り替え時に旧 gain の音が一瞬鳴ることを避ける。
+Norm の gain は player の `NormalizeGainTable` が音声 stream ごとに保持する。pump は
+`AudioFrame.stream_index` で値を選び、`Gain` の変更を同一トラック内では dB 空間で
+4 秒 ramp する。トラック境界、`Pending` 解決後の最初の frame、preroll suspension
+解除直後は snap する。Norm の gain 変更で `processed` / `raw_pending` /
+`audio_tx_queued` を clear しない。既存 `processed` の最大 ~100ms は旧 gain で
+鳴り続けるが、A/V offset は連続性を保つ。
 
-グローバル Norm が ON で `audio_normalize.db` に測定値が無い動画は、open / source swap /
+Norm ON の open / source-swap では表の既定値を最初から `Pending` にする。
+`VideoInfo.opened_audio_stream_index` を受け取った後、App が読み取り専用 DB 接続を持つ
+worker でそのトラックの測定値を引く。pump は該当トラックの raw frame を保持し、
+解決前に unity gain で processed にしない。別トラックの frame は流れる。
+`Pending` が raw の先頭を塞ぐ間は EOF でも `BufferReady` を出さない。
+lookup の完了通知は開始元の `ViewerContextId` に振り分け、所有 context が mount
+された poll でのみ取り出す。ファイル path・stream と player の table epoch / request
+が一致する場合だけ適用する。一覧再配置で `fs_idx` が変わった場合はその identity から
+現在の index を求める。context が閉じられた通知は破棄する。
+測定値は `audio_normalize_track` に保存し、旧 `audio_normalize` の行は既定トラック
+についてのみ後方互換として読む。open 時の同期 lookup と autoplay の一時 false は廃止した。
+
+Norm 全体 OFF は main・F12・ParkedLive を含む各 viewer context の player 表を
+unity に reset し、全 request を epoch で失効させる。全体 ON では操作中の player の
+既存の同期 lookup / scan 経路を保ち、他の context と player は Pending に reset して
+所有 context から非同期 lookup を始める。再 ON と通常の poll は open 時の stream
+ではなく、現在の `applied` と、切り替えが未確定なら `desired` のうち未解決の
+トラックを lookup 対象にする。同じトラックの実行中 request は再起動しない。
+
+グローバル Norm が ON で選択トラックの測定値が無い動画は、lookup 完了後、open / source swap /
 seek / play toggle 等で `VideoPlayer::intent_playing()` が true になった時点で自動スキャンを
 開始する。判定は `maybe_start_normalize_scan_for_play_intent` に集約し、
 `OnUnmeasured` / fullscreen 中 / スキャン未実行 / auto-scan 抑止なし、の条件を満たす場合だけ
-`start_normalize_scan` へ進む。スキャン開始時の再開可否も `is_playing()` ではなく
+`start_normalize_scan` へ進む。
+トラック選択の `desired` と `applied` が一致する確定状態だけを自動スキャン対象にする。
+切り替え中の旧トラックには再起動せず、新トラックが applied になった poll で
+旧トラックのブロッキング scan が残っていれば cancel して preroll suspension を解く。
+スキャン開始時の再開可否も `is_playing()` ではなく
 `intent_playing()` を保存するため、Loading / Buffering 中の autoplay でも scan 完了後に再生を
-正しく再開できる。ユーザーキャンセルや scan 失敗後は fs_idx 単位で自動再発火を抑止し、
-手動 Norm クリックだけで再試行できる。抑止は fs_idx 単位で保持し、同 fs_idx への新規
+正しく再開できる。ユーザーキャンセルや scan 失敗後は fs_idx・path・stream 単位で自動再発火を抑止し、
+手動 Norm クリックだけで再試行できる。同 fs_idx への新規
 open / source swap、fullscreen 終了、または全体 OFF で解除する。
 
-未測定かつ open/source-swap 時点で autoplay する動画は、`VideoPlayer::open` へ渡す
-autoplay を一時的に false にしてから fs_cache に挿入し、`init_normalize_state_for_opened_video`
-後に `start_normalize_scan_for_deferred_play_intent` で scan を開始する。この経路では
-`NormalizeScanState.was_playing=true` を明示しておく。長尺動画では scanner が
+未測定かつ open/source-swap 時点で autoplay する動画は、worker lookup の結果を
+受け取った時に既存の deferred-play scan 経路へ渡す。scan の suspension を立ててから
+その stream を `Gain(1.0)` に解決する。この経路では `NormalizeScanState.was_playing=true`
+を保持する。長尺動画では scanner が
 `PROVISIONAL_SCAN_AFTER_SECS` (= 10 分) に到達した時点で `Provisional` を返し、App は
 仮 gain を DB 保存せず現在 player へ適用して再生 intent と `audio_preroll_suspended` を
 復帰する。scanner はそのまま継続し、最終 `Done` のみ `audio_normalize.db` に保存して

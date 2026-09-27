@@ -18352,11 +18352,7 @@ impl App {
         let show_vst = self.music_chrome_should_show_vst(fs_idx);
         #[cfg(not(windows))]
         let show_vst = false;
-        let normalize_ui_state = self
-            .normalize_ui_states
-            .get(&fs_idx)
-            .copied()
-            .unwrap_or_default();
+        let normalize_ui_state = self.normalize_ui_state_for_player(fs_idx);
         let bookmark_secs: Vec<f64> = self.music_bookmarks.iter().map(|b| b.pts_secs).collect();
         MusicChromeViewState {
             title,
@@ -47611,11 +47607,7 @@ impl App {
         if show_spectrum {
             let pcm = self.music_pcm.clone();
             // Norm (ラウドネス正規化) 適用中のゲインを鍵盤の明るさ (presence) に反映する。未適用は 0dB。
-            let norm_gain_db = self
-                .normalize_ui_states
-                .get(&fs_idx)
-                .map(|s| s.applied_gain_db())
-                .unwrap_or(0.0);
+            let norm_gain_db = self.normalize_ui_state_for_player(fs_idx).applied_gain_db();
             // 上の Bass グラフと同じ推定 (ピッチクラス + 信頼度) を playhead から取り、鍵盤上の ▼ に渡す。
             let bass_marker = self.music_analysis.as_ref().and_then(|a| {
                 let idx = (pos.max(0.0) / a.config.bin_secs.max(1.0e-3)) as usize;

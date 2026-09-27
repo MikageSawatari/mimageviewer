@@ -185,12 +185,19 @@ impl App {
         });
         self.normalize_ui_states = std::mem::take(&mut self.normalize_ui_states)
             .into_iter()
-            .filter_map(|(idx, state)| remap(idx).map(|new_idx| (new_idx, state)))
+            .filter_map(|(mut key, state)| {
+                key.fs_idx = remap(key.fs_idx)?;
+                Some((key, state))
+            })
             .collect();
         self.normalize_auto_scan_suppressed = self
             .normalize_auto_scan_suppressed
             .iter()
-            .filter_map(|&idx| remap(idx))
+            .filter_map(|key| {
+                let mut key = key.clone();
+                key.fs_idx = remap(key.fs_idx)?;
+                Some(key)
+            })
             .collect();
         self.last_loop_pos = std::mem::take(&mut self.last_loop_pos)
             .into_iter()

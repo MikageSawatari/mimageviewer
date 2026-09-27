@@ -79,6 +79,7 @@ pub enum AudioTrackSelectOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioTrackSelectResult {
     pub outcome: AudioTrackSelectOutcome,
+    pub normalize_unresolved: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

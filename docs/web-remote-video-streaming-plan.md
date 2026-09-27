@@ -155,8 +155,11 @@ generation worker が同じファイルを独立 open する。
 
 ### 4.1 時計なし音声 — normalize → VST3 → safety limiter
 
-production の時計なし worker は decoded PCM に `VideoPlayer::normalize_gain()` の確定値を
-固定 gain として掛け、リモートセッション専用 `DspBridge` の active plugin、既存
+production の時計なし worker は、session 開始時に選んだ `opened_audio_stream_index` を
+transcode に渡す。generation worker が同じ stream について読み取り専用 Norm DB 接続で
+測定値を引き、開始時の Norm ON/OFF と目標 LUFS の snapshot から固定 gain を決める。
+未測定または Norm OFF なら unity gain を使う。decoded PCM にこの gain を掛け、
+リモートセッション専用 `DspBridge` の active plugin、既存
 `SafetyLimiter` の順に通してから AAC encoder へ渡す。これは PC の
 **time stretch → normalize gain → VST3 `process_block` → safety limiter** から時計依存の
 time stretch だけを除いた順序である。VST の sample rate に PCM を resample し、VST PDC と
@@ -554,18 +557,18 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 ([web-remote-plan.md](web-remote-plan.md) §12.1)。
 
 `VideoStreamStart` の `address` は照合用ではなく、再生対象を指定する正本である。本体 UI
-thread は headless `VideoPlayer` を開き、metadata、duration、pending resume、normalize gain が
+thread は headless `VideoPlayer` を開き、metadata、duration、pending resume、opened audio stream が
 確定するまで typed `Opening` state を poll する。player は pause のまま transport には使わず、
 typed `Starting` が同じファイルを独立 open する時計なし worker の encoder と最初の playlist
 readiness を確認してから generation を publish する。
 
 `Opening` の門は `RemoteStreamStartInputs` (duration、video/audio track、source origin、
-normalize gain) の確定である。`pending_resume_secs` は metadata から duration を得た後に
+opened audio stream index) の確定である。`pending_resume_secs` は metadata から duration を得た後に
 末尾 guard を含む正規化を行ってから消費され、採用した seek target は `request_seek` が
 `position_secs()` へ同期的に公開する。このため `pending_resume_secs == None` になった時点で
 source origin は確定している。pause のままでは frame/audio を再生消費しないため
 `clock.is_seeking()` が残り得るが、これは metadata player の transport 状態であって generation
-入力ではなく、門には含めない。normalize gain は player open 前の DB lookup で決まり、
+入力ではなく、門には含めない。Norm gain は generation worker の DB lookup で決まり、
 remote player は autoplay=false のため deferred normalize scan を開始しない。門を通る際に
 これらを同じ typed snapshot へ固定し、generation は player の後続 transport 状態を再読しない。
 音声 track は必須、timed video track は任意とする。後者の有無だけで video decode / H.264 encode を
@@ -1019,9 +1022,10 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
   generation 切替中も **ローカル 1 + リモート 1 = 最大 2 host** であり、新旧世代に比例して増えない。
   bypass plugin はリモート host へ load せず、設定順を保った active plugin だけを一度 load する。
   load 時間は start 残予算から後段用 3 秒を予約した値（上限 10 秒）に制限する
-- **音量正規化**: remote player は autoplay=false で開くため deferred scan を持たず、open 前の
-  DB lookup (未測定なら 1.0) で `normalize_gain` が確定する。`RemoteStreamStartInputs` を
-  generation 作成時に snapshot し、時計なし PCM の AAC 前段で固定 gain として適用する
+- **音量正規化**: remote player は autoplay=false で開くため deferred scan を持たない。
+  session の opened audio stream index を配信 stream と Norm lookup の双方に使う。generation
+  worker は開始時の Norm 設定 snapshot と専用の読み取り専用 DB 接続から gain を解決し、
+  未測定なら 1.0 を時計なし PCM の AAC 前段で適用する
 - **位置**: server は generation、source origin、生成済み範囲、ring の earliest/latest、duration、
   再生 intent を所有する。実 playhead は端末の media element が source of truth であり、
   `/api/video/state` の本体位置を端末位置として返さない。resume/history が必要なときだけ端末が
@@ -1146,7 +1150,7 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
   active な別 ID は停止しないこと
 - Web: generation mismatch 409 後に state の current generation へ URL を更新して回復し、
   mismatch が続く場合は有限回で利用者向け失敗表示になること。session mismatch と区別すること
-- metadata player: streaming 中も pause のまま duration / resume origin / normalize gain /
+- metadata player: streaming 中も pause のまま duration / resume origin / opened audio stream /
   seek thumbnail を提供し、frame/audio transport は clockless worker だけが所有すること。
   resume origin 確定後も paused player の `clock.is_seeking()` が true のままのケースで
   `poll_remote_video_opening` が `Starting` へ進むこと

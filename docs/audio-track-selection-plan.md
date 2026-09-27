@@ -418,6 +418,12 @@ gain は「その音声がどのトラックのものか」で決まる値にす
    (他のトラックは切り替え時に解決する)。この lookup は既存の ON 操作の UI thread I/O で、本機能で新たに足す
    ものではない (§12)。
 
+- 自動 scan を始めるのは、対象トラックが `applied` かつ `desired` と一致し、選択が確定状態 (切り替え中・保留・失敗で
+  ない) のときだけ。切り替え中は旧トラックの scan を始めない。新トラックが `applied` になった時点で旧トラックを
+  対象にしたブロッキング中の scan が残っていれば、既存の cancel 経路で止めて suspension を解消する
+  (S3 区切り A の独立レビュー P1)。
+- lookup の結果は所有 viewer context (と player / source の identity) を持ち、その context の poll でだけ適用する。
+  Norm 全体の ON / OFF は全 viewer context の player に同じ遷移を適用する (S3 区切り A の独立レビュー P1)。
 - 「トラック確定待ち」のための App の bool / Option は足さない。状態は player の表と、既存の per-fs_idx Norm 状態
   (stream index を key に含めたもの) だけにある。
 
