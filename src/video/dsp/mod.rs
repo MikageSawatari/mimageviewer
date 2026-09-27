@@ -79,12 +79,18 @@ mod effetune_policy_tests {
     fn gui_attach_handler_reports_typed_error_to_registered_owner() {
         let bridge = DspBridge::new();
         let (tx, rx) = std::sync::mpsc::channel();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let wake_count_for_callback = Arc::clone(&wake_count);
+        bridge.set_gui_result_wake(Arc::new(move || {
+            wake_count_for_callback.fetch_add(1, Ordering::SeqCst);
+        }));
         bridge.set_gui_failure_sink(tx);
         assert!(bridge.show_slot_gui(0).is_err());
         assert!(matches!(
             rx.try_recv().unwrap(),
             GuiFailure::Attach(detail) if detail.contains("スロット範囲外")
         ));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
         assert_eq!(bridge.state(), DspState::Disabled);
     }
 }
@@ -165,6 +171,8 @@ pub struct DspBridge {
     strict_state: bool,
     show_editor_bypass_button: bool,
     gui_failure_sink: Mutex<Option<std::sync::mpsc::Sender<GuiFailure>>>,
+    gui_result_wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    gui_command_dispatch: Mutex<Option<Arc<dyn Fn(Arc<Bridge>, serde_json::Value) + Send + Sync>>>,
     /// audio-pump thread が高速判定するためのフラグ。Mutex を取らずに読める。
     enabled: AtomicBool,
     /// 「処理対象スロット (= Loaded 且つ bypass=false) の個数」を atomic で公開。
@@ -349,6 +357,8 @@ impl DspBridge {
             strict_state,
             show_editor_bypass_button,
             gui_failure_sink: Mutex::new(None),
+            gui_result_wake: Mutex::new(None),
+            gui_command_dispatch: Mutex::new(None),
             enabled: AtomicBool::new(false),
             active_slot_count: AtomicUsize::new(0),
             session_disabled_reason: Mutex::new(None),
@@ -397,6 +407,25 @@ impl DspBridge {
         *self.gui_failure_sink.lock().unwrap() = Some(sink);
     }
 
+    pub fn set_gui_result_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        *self.gui_result_wake.lock().unwrap() = Some(wake);
+    }
+
+    pub fn set_gui_command_dispatch(
+        &self,
+        dispatch: Arc<dyn Fn(Arc<Bridge>, serde_json::Value) + Send + Sync>,
+    ) {
+        *self.gui_command_dispatch.lock().unwrap() = Some(dispatch);
+    }
+
+    fn dispatch_gui_value(&self, bridge: Arc<Bridge>, value: serde_json::Value) {
+        if let Some(dispatch) = self.gui_command_dispatch.lock().unwrap().as_ref() {
+            dispatch(bridge, value);
+        } else {
+            let _ = bridge.send_value(&value);
+        }
+    }
+
     fn gui_failure_owned_by_controller(&self) -> bool {
         self.gui_failure_sink.lock().unwrap().is_some()
     }
@@ -404,6 +433,9 @@ impl DspBridge {
     fn report_gui_failure(&self, detail: String) {
         if let Some(sink) = self.gui_failure_sink.lock().unwrap().as_ref() {
             let _ = sink.send(GuiFailure::Attach(detail));
+        }
+        if let Some(wake) = self.gui_result_wake.lock().unwrap().as_ref() {
+            wake();
         }
     }
 
@@ -1461,11 +1493,14 @@ impl DspBridge {
             inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
         };
         if let Some((bridge, slot_id)) = slot {
-            let _ = bridge.send_value(&serde_json::json!({
-                "cmd": "set_gui_app_active",
-                "slot_id": slot_id,
-                "active": if active { 1 } else { 0 },
-            }));
+            self.dispatch_gui_value(
+                bridge,
+                serde_json::json!({
+                    "cmd": "set_gui_app_active",
+                    "slot_id": slot_id,
+                    "active": if active { 1 } else { 0 },
+                }),
+            );
         }
     }
 
@@ -1496,11 +1531,14 @@ impl DspBridge {
                 .map(u64::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            let _ = bridge.send_value(&serde_json::json!({
-                "cmd": "set_chain_z_order",
-                "topmost": if topmost { 1 } else { 0 },
-                "ordered_slots": ordered_slots,
-            }));
+            self.dispatch_gui_value(
+                bridge,
+                serde_json::json!({
+                    "cmd": "set_chain_z_order",
+                    "topmost": if topmost { 1 } else { 0 },
+                    "ordered_slots": ordered_slots,
+                }),
+            );
         }
     }
 
@@ -1585,6 +1623,9 @@ impl DspBridge {
                 bridge
                     .gui_show_all_in_progress
                     .store(false, Ordering::Release);
+                if let Some(wake) = bridge.gui_result_wake.lock().unwrap().as_ref() {
+                    wake();
+                }
                 crate::logger::log(format!("[VST3 GUI] async show-slot end idx={idx}"));
             })
         {
@@ -2377,11 +2418,14 @@ impl DspBridge {
                 inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
             };
             if let Some((b, slot_id)) = slot {
-                let _ = b.send_value(&serde_json::json!({
-                    "cmd": "set_user_resizing",
-                    "slot_id": slot_id,
-                    "active": if active { 1 } else { 0 },
-                }));
+                self.dispatch_gui_value(
+                    b,
+                    serde_json::json!({
+                        "cmd": "set_user_resizing",
+                        "slot_id": slot_id,
+                        "active": if active { 1 } else { 0 },
+                    }),
+                );
             }
         }
         // resize は bridge に send (Mutex 外で bridge clone してから)
@@ -2419,17 +2463,22 @@ impl DspBridge {
                 inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
             };
             if let Some((b, slot_id)) = slot {
-                let _ = b.send_value(&serde_json::json!({
-                    "cmd": "notify_host_resize",
-                    "slot_id": slot_id,
-                    "width": w,
-                    "height": h,
-                }));
+                self.dispatch_gui_value(
+                    b,
+                    serde_json::json!({
+                        "cmd": "notify_host_resize",
+                        "slot_id": slot_id,
+                        "width": w,
+                        "height": h,
+                    }),
+                );
             }
         }
         let mut bypass_updates = Vec::with_capacity(bypass_toggle_targets.len());
         for (idx, path, requested_bypass) in bypass_toggle_targets {
-            self.set_bypass(idx, requested_bypass);
+            if !self.gui_failure_owned_by_controller() {
+                self.set_bypass(idx, requested_bypass);
+            }
             let actual_bypass = {
                 let inner = self.inner.lock().unwrap();
                 inner

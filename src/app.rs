@@ -23545,6 +23545,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn poll_effetune(&mut self, ctx: &egui::Context) {
+        self.effetune.set_repaint_context(ctx);
         let startup_pending = self.effetune.startup_pending();
         let open_gui_when_ready = matches!(
             self.effetune.runtime,

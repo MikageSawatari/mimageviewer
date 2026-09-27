@@ -387,7 +387,8 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   surface を記録し、UI thread から二重の hide コマンドを送らない。
 - 取得 worker は host 応答を期限で「host 異常」と判定しない。リモート受付・終了の期限は
   呼び出し側だけに掛け、host の終了・watchdog は別の結果として扱う。終了の公開 gate は
-  期限判定と rename を同じ mutex 境界で行い、失効がその間に割り込まない。stdout EOF は
+  `Open` → `Committing` / `Expired` の遷移だけを mutex で決め、rename は mutex 外で行う。
+  期限前に認めた rename が進行中なら終了側は待たず、その結果を許容する。stdout EOF は
   `HostExited` として別経路で渡し、取得 worker が子プロセス終了を待って exit code を読む。
   Running 中の予期しない host 終了も専用 monitor worker が exit code を読んで controller に報告する。
   watchdog の終了コードは `0xEFFEC001` とし、stderr の受信順によらず Rust 側が識別する。
@@ -397,6 +398,9 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   `current_exe` の親から同じ相対パスを使い、`native_assets` には触れていない。
 - GUI タイトルバーの電源ボタンは bridge ごとの `show_editor_bypass_button` で切り替える。
   既定値は表示、EffeTune 専用 bridge だけ非表示。
+- EffeTune の GUI signal pump は UI frame で行うが、focus、resize、resize session に伴う
+  host コマンドは専用 `effetune-host-control` worker に送る。host monitor と GUI attach worker は
+  結果が届いた時に egui の repaint を要求し、アイドル中の失敗も controller の `fail()` に渡す。
 - ローカル音声の引き渡し型は `AudioDspChain { user, effetune }`。`EffetuneAudioSlot` は
   `Mutex` をブロックごとに 1 回読んで世代と bridge を取得する。
 - 終了時の EffeTune 最終取得は `ExitCaptureFence` を先に作り、既存 VST3 スナップショットと

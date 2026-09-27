@@ -227,6 +227,10 @@ pub struct ExitCaptureFence {
 
 enum HostCommand {
     Disable(Arc<DspBridge>),
+    Gui {
+        bridge: Arc<crate::video::dsp::bridge::Bridge>,
+        value: Value,
+    },
     Hide {
         bridge: Arc<DspBridge>,
         reply: mpsc::Sender<Result<(), String>>,
@@ -264,33 +268,75 @@ struct PublicationGate {
 #[derive(Default)]
 struct PublicationState {
     exit_deadline: Option<Instant>,
-    cancelled: bool,
+    phase: PublicationPhase,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum PublicationPhase {
+    #[default]
+    Open,
+    Committing,
+    Committed,
+    Expired,
 }
 
 impl PublicationGate {
     fn begin_exit(&self, deadline: Instant) {
-        self.state.lock().unwrap().exit_deadline = Some(deadline);
+        let mut state = self.state.lock().unwrap();
+        state.exit_deadline = Some(deadline);
+        if state.phase == PublicationPhase::Committed {
+            state.phase = PublicationPhase::Open;
+        }
     }
 
     fn commit_with(&self, replace: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
-        // Expiry and replacement share one commit boundary. Once the decision
-        // is made, expiry cannot interleave before the rename.
-        let state = self.state.lock().unwrap();
-        if state.cancelled
-            || state
-                .exit_deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "state publication fence expired",
-            ));
+            let mut state = self.state.lock().unwrap();
+            if state.phase == PublicationPhase::Committing {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "state replacement already in progress",
+                ));
+            }
+            if state.phase == PublicationPhase::Expired
+                || state
+                    .exit_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                state.phase = PublicationPhase::Expired;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "state publication fence expired",
+                ));
+            }
+            state.phase = PublicationPhase::Committing;
         }
-        replace()
+        // Admission and expiry are ordered by the mutex; file I/O never holds it.
+        let result = replace();
+        let mut state = self.state.lock().unwrap();
+        state.phase = if result.is_ok() {
+            PublicationPhase::Committed
+        } else if state
+            .exit_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            PublicationPhase::Expired
+        } else {
+            PublicationPhase::Open
+        };
+        result
     }
 
-    fn expire(&self) {
-        self.state.lock().unwrap().cancelled = true;
+    /// Returns whether a replacement was already admitted before expiry.
+    fn expire(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        match state.phase {
+            PublicationPhase::Committing | PublicationPhase::Committed => true,
+            PublicationPhase::Open | PublicationPhase::Expired => {
+                state.phase = PublicationPhase::Expired;
+                false
+            }
+        }
     }
 }
 
@@ -423,10 +469,12 @@ impl CaptureQueue {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => crate::logger::log(format!("[EffeTune] exit capture: {error}")),
             Err(_) => {
-                fence.publication.expire();
-                crate::logger::log(
-                    "[EffeTune] exit capture fence expired; previous state retained",
-                );
+                let admitted = fence.publication.expire();
+                crate::logger::log(if admitted {
+                    "[EffeTune] exit capture fence expired; admitted state replacement may finish"
+                } else {
+                    "[EffeTune] exit capture fence expired; previous state retained"
+                });
                 fence.bridge.terminate_host_now();
             }
         }
@@ -561,6 +609,13 @@ pub struct EffetuneController {
     gui_failure_rx: mpsc::Receiver<GuiFailure>,
     host_tx: mpsc::Sender<HostCommand>,
     pending_hide: Option<mpsc::Receiver<Result<(), String>>>,
+    repaint_context: Arc<Mutex<Option<egui::Context>>>,
+}
+
+fn wake_ui(context: &Mutex<Option<egui::Context>>) {
+    if let Some(ctx) = context.lock().unwrap().as_ref() {
+        ctx.request_repaint();
+    }
 }
 
 impl EffetuneController {
@@ -569,14 +624,26 @@ impl EffetuneController {
         let (failure_tx, failure_rx) = mpsc::channel();
         let (gui_failure_tx, gui_failure_rx) = mpsc::channel();
         let (host_tx, host_rx) = mpsc::channel::<HostCommand>();
+        let repaint_context = Arc::new(Mutex::new(None));
+        let host_repaint = Arc::clone(&repaint_context);
+        let host_failure_tx = failure_tx.clone();
         std::thread::Builder::new()
             .name("effetune-host-control".into())
             .spawn(move || {
                 while let Ok(command) = host_rx.recv() {
                     match command {
                         HostCommand::Disable(bridge) => bridge.disable(),
+                        HostCommand::Gui { bridge, value } => {
+                            if let Err(error) = bridge.send_value(&value) {
+                                let _ = host_failure_tx.send(EffetuneFailure::GuiFailed(format!(
+                                    "GUI command failed: {error}"
+                                )));
+                                wake_ui(&host_repaint);
+                            }
+                        }
                         HostCommand::Hide { bridge, reply } => {
                             let _ = reply.send(bridge.hide_slot_gui_checked(0));
+                            wake_ui(&host_repaint);
                         }
                     }
                 }
@@ -608,6 +675,14 @@ impl EffetuneController {
             gui_failure_rx,
             host_tx,
             pending_hide: None,
+            repaint_context,
+        }
+    }
+
+    pub fn set_repaint_context(&self, ctx: &egui::Context) {
+        let mut context = self.repaint_context.lock().unwrap();
+        if context.is_none() {
+            *context = Some(ctx.clone());
         }
     }
 
@@ -640,6 +715,8 @@ impl EffetuneController {
         };
         let captures = Arc::clone(&self.captures);
         let gui_failure_tx = self.gui_failure_tx.clone();
+        let host_tx = self.host_tx.clone();
+        let repaint_context = Arc::clone(&self.repaint_context);
         let path = crate::data_dir::get()
             .join("effetune")
             .join("mixwright-state.json");
@@ -648,9 +725,19 @@ impl EffetuneController {
         let spawn = std::thread::Builder::new()
             .name("effetune-load".into())
             .spawn(move || {
-                let result =
-                    load_worker(&bundle, &path, &captures, origin, pos, size, gui_failure_tx);
+                let result = load_worker(
+                    &bundle,
+                    &path,
+                    &captures,
+                    origin,
+                    pos,
+                    size,
+                    gui_failure_tx,
+                    host_tx,
+                    repaint_context.clone(),
+                );
                 let _ = tx.send(result);
+                wake_ui(&repaint_context);
             });
         if let Err(error) = spawn {
             self.pending_load = None;
@@ -799,6 +886,7 @@ impl EffetuneController {
         {
             let weak = Arc::downgrade(&bridge);
             let failure_tx = self.slot.failure_tx.lock().unwrap().as_ref().cloned();
+            let repaint_context = Arc::clone(&self.repaint_context);
             let spawn = std::thread::Builder::new()
                 .name("effetune-host-monitor".into())
                 .spawn(move || {
@@ -816,6 +904,7 @@ impl EffetuneController {
                                     format!("host exited with code {code:#x}")
                                 };
                                 let _ = tx.send(EffetuneFailure::HostLost(reason));
+                                wake_ui(&repaint_context);
                             }
                             break;
                         }
@@ -882,6 +971,8 @@ fn load_worker(
     pos: Option<(i32, i32)>,
     size: Option<(u32, u32)>,
     gui_failure_tx: mpsc::Sender<GuiFailure>,
+    host_tx: mpsc::Sender<HostCommand>,
+    repaint_context: Arc<Mutex<Option<egui::Context>>>,
 ) -> Result<Option<LoadDone>, EffetuneFailure> {
     let saved = match fs::read(path) {
         Ok(bytes) => Some(bytes),
@@ -902,7 +993,17 @@ fn load_worker(
         true,
         false,
     );
-    bridge.set_gui_failure_sink(gui_failure_tx);
+    bridge.set_gui_failure_sink(gui_failure_tx.clone());
+    let gui_repaint = Arc::clone(&repaint_context);
+    bridge.set_gui_result_wake(Arc::new(move || wake_ui(&gui_repaint)));
+    bridge.set_gui_command_dispatch(Arc::new(move |bridge, value| {
+        if host_tx.send(HostCommand::Gui { bridge, value }).is_err() {
+            let _ = gui_failure_tx.send(GuiFailure::Attach(
+                "host control worker disconnected".into(),
+            ));
+            wake_ui(&repaint_context);
+        }
+    }));
     bridge.enable().map_err(EffetuneFailure::LoadFailed)?;
     let state = saved
         .as_ref()
@@ -1223,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_expiry_cannot_interleave_between_commit_decision_and_rename() {
+    fn admitted_replacement_does_not_hold_exit_fence_past_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mixwright-state.json");
         fs::write(&path, b"previous").unwrap();
@@ -1242,23 +1343,27 @@ mod tests {
             })
         });
         decided_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let expiry_gate = Arc::clone(&gate);
-        let (expiring_tx, expiring_rx) = mpsc::channel();
-        let (expired_tx, expired_rx) = mpsc::channel();
-        let expiry = std::thread::spawn(move || {
-            expiring_tx.send(()).unwrap();
-            expiry_gate.expire();
-            expired_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let exit_gate = Arc::clone(&gate);
+        let (exit_done_tx, exit_done_rx) = mpsc::channel();
+        let exit = std::thread::spawn(move || {
+            let started = Instant::now();
+            exit_gate.begin_exit(deadline);
+            let (_reply_tx, reply_rx) = mpsc::channel();
+            CaptureQueue::wait_final_capture(ExitCaptureFence {
+                bridge: DspBridge::new(),
+                rx: reply_rx,
+                deadline,
+                publication: exit_gate,
+            });
+            exit_done_tx.send(started.elapsed()).unwrap();
         });
-        expiring_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(
-            expired_rx.recv_timeout(Duration::from_millis(20)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
+        let exit_elapsed = exit_done_rx.recv_timeout(Duration::from_millis(200));
         assert_eq!(fs::read(&path).unwrap(), b"previous");
         release_tx.send(()).unwrap();
         writer.join().unwrap().unwrap();
-        expiry.join().unwrap();
+        exit.join().unwrap();
+        assert!(exit_elapsed.unwrap() < Duration::from_millis(200));
         assert_eq!(fs::read(&path).unwrap(), b"committed");
         assert_eq!(
             gate.commit_with(|| fs::write(&path, b"too late"))
