@@ -723,6 +723,7 @@ final composite** の consumer も点検する。S3 の最初に次を grep で�
 | # | 方針 |
 | --- | --- |
 | D1 canonical loader | `CanonicalDecodeOptions` に **既定値の無い** `raw_stage: RawStage::{Preview, Full}` を足す。Preview は `CanonicalDecodeResult::RawPreview { preview: Option<..>, developed_dims, develop_support }` を返す。Full は executor へ submit して結果を待つ (canonical loader を呼ぶ thread は他の permit を持たないこと、§5.4.2)。fullscreen の先読み / 表示は Preview、Remote AI は Full、類似候補プレビューは Preview (比較用の表示なので) |
+| D1 の permit 境界 (S2a で確定) | フルスクリーンの worker は `FsPageLoadScheduler` の permit を取ってから `decode_canonical_image` を呼ぶ (`src/app.rs:59859`, `60070`)。**RAW の現像待ちをこの permit の中に置かない**。canonical loader を「source の解決 (ZIP entry の読み出し・verified bytes)」と「decode」の 2 段 API に分け、worker は source 解決までを permit の中で行い、RAW で現像が要る場合は **permit を明示的に drop してから** executor へ submit して結果を待つ。permit の役割 (書庫の読み出し・通常 decode の同時実行数の制限) は変えない。取消は fs ticket の cancel flag を executor の job と共有して伝える (待っている worker は結果 channel の受信で起きる。sleep / 定期確認は使わない)。現像待ちの間 `FsPageLoadScheduler` の running には数えない。現像の同時実行は executor の枠が別に制限する。プレビュー (S3) は安いので permit の中で行ってよい。S2a の暫定: フルスクリーンは表示ページ High / 先読み Normal で Full を待つ (S3 で preview → develop に置き換える) |
 | D3 | Preview (サムネイル用途、§8 の条件) |
 | D4 / D9 | サムネイルと同じ (§8) |
 | D5 書き出し / 外部ツール | Full 現像 (High)。書き出しは `SrcFormat::Other` でメタデータ転記を拒否している (`src/save_with_metadata.rs:40-45,200`) ので、RAW からの EXIF 転記は現状どおり無し |
