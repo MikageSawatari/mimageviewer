@@ -1014,3 +1014,11 @@ mIV の通常のファイルコピーと同じ (しおり・コレクション�
 - 公開文言の利用者判断: 製品ページ「安心して使えます」は元の見出し・説明文を維持し、EPUB の通信と明示保存を短く追記した。EPUB 以外の画像送信・Remote・外部ツールの既存文言は 38006d8cd に戻した。プライバシー文書の日本語・英語には、EPUB 内の外部サイト要求の遮断、一時データ、ポリシー、キャッシュ PDF、明示保存時だけの元 EPUB の隣 (ネットワークフォルダを含む) への出力を追記した。保存 PDF は EPUB の書名と、存在すれば最初の著者をメタデータに記録し、書名が無ければ元ファイル名を使う。キャッシュ削除は同じデータフォルダを使う全アプリ終了後の起動時と明記した。
 - 初回の自動検査: `test-build-dev-safety.ps1`、`test-release-build-safety.ps1`、fmt、glyph lint、HTML パーサ、PowerShell 変更行の ASCII 確認、`git diff --check` が成功。初回の launcher unit test は worktree に内包元の release exe 3 本がないため build.rs の事前検査で停止。実装担当は配布・release・portable ビルドを実行していない。
 - 独立レビュー 1 回目の P2/P3 修正: launcher は EPUB worker と CRT を、版別 runtime の `.sha256` が現行でも毎起動時に実体ハッシュで照合し、core・remote・FFmpeg は従来の sidecar 近道を保つ。同じ長さで壊した worker と現行 sidecar の回帰テストは修正前に失敗、修正後に成功した。製品ページの明示保存文言は右クリック変換も含む短文にし、手順書の段数と前提ファイル数の表現を直した。設計担当が release 入力 exe を作成した後、launcher 11 件、fmt、glyph lint、HTML パーサ、`git diff --check` が成功した。独立再レビュー待ち。
+
+### S5 検収 (2026-09-27)
+
+独立レビュー 2 回目で差分を承認 (`1bf4a52a1`)。利用者決定: EPUB 以外の既存の公開文言は変えない (正確さの見直しは別課題)、
+製品ページの EPUB は短く、詳細は privacy.html。設計担当の検証: release の core・remote・worker・launcher を署名なしでビルド、
+launcher テスト 11 件成功、portable の core・worker をコンパイル。**未実施**: `build-portable.ps1` / `build-dist.ps1` の通し実行と
+署名 (他の mImageViewer が起動中で `-PreserveRuntime` が停止を拒否したため)。リリース前に mImageViewer を閉じて実行し、
+配布成果物 (単体 exe・インストーラ・portable zip) に worker が入り署名されていることを確かめる。
