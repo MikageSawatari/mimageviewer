@@ -363,7 +363,10 @@ fn epub_d10_off_pdf_open_policy_skips_spread_lookup() {
     let mut app = setup_app_for_test();
     app.settings.follow_document_reading_direction = false;
     app.spread_db = Err("この経路では参照しない".into());
-    app.load_pdf_as_folder_owned(pdf.to_path_buf(), OpenRequestOwner::Navigation);
+    assert_eq!(
+        app.load_pdf_as_folder_owned(pdf.to_path_buf(), OpenRequestOwner::Navigation),
+        FolderOpenOutcome::Loaded
+    );
     assert!(
         app.pdf_enumerate_pending
             .as_ref()
@@ -467,7 +470,10 @@ fn epub_failure_replacement_does_not_restore_superseded_history_or_address() {
 fn epub_published_stale_smart_owner_does_not_reopen_current_view() {
     let mut app = setup_app_for_test();
     let other = PathBuf::from("C:/books/current.pdf");
-    app.load_pdf_as_folder_owned(other.clone(), OpenRequestOwner::Navigation);
+    assert_eq!(
+        app.load_pdf_as_folder_owned(other.clone(), OpenRequestOwner::Navigation),
+        FolderOpenOutcome::Loaded
+    );
     let path = PathBuf::from("C:/books/stale.epub");
     let owner = OpenRequestOwner::MainGridArchive(MainGridArchiveTransitionIntent {
         source_path: path.clone(),
@@ -870,7 +876,10 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
     };
     let mut app = setup_app_for_test();
     let other = PathBuf::from("C:/books/current.pdf");
-    app.load_pdf_as_folder_owned(other.clone(), OpenRequestOwner::Navigation);
+    assert_eq!(
+        app.load_pdf_as_folder_owned(other.clone(), OpenRequestOwner::Navigation),
+        FolderOpenOutcome::Loaded
+    );
     let path = PathBuf::from("C:/books/stale.epub");
     let source_key = crate::collection_store::CollectionSourcePath::from_trusted(&path)
         .unwrap()
@@ -1013,18 +1022,8 @@ fn ignored_epub_in_stale_search_view_does_not_advance_normal_navigation() {
     app.recent_folders = vec![folder.clone()];
     app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
 
-    let outcome = app.open_direct_navigation_target(
-        epub.clone(),
-        None,
-        OpenRequestOwner::Navigation,
-        None,
-        None,
-    );
+    app.open_direct_navigation_target(epub.clone(), None, OpenRequestOwner::Navigation, None, None);
 
-    assert_eq!(
-        outcome,
-        FolderOpenOutcome::Refused(FolderOpenRefusal::EpubIgnoredBySetting)
-    );
     assert_eq!(
         app.global_search.drill.as_ref().unwrap().current_path,
         folder
@@ -1069,7 +1068,9 @@ fn ignored_epub_grid_preflight_preserves_reading_history_return() {
 
     assert_eq!(
         app.reject_ignored_epub_grid_item(0),
-        Some(FolderOpenRefusal::EpubIgnoredBySetting)
+        Some(FolderOpenOutcome::Refused(
+            FolderOpenRefusal::EpubIgnoredBySetting
+        ))
     );
     assert_eq!(app.reading_history_return_from, Some(previous));
     assert_eq!(app.address, "閲覧履歴");
@@ -1104,15 +1105,8 @@ fn ignored_convertible_archives_in_stale_search_view_keep_normal_navigation() {
         app.settings
             .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
 
-        let outcome = app.open_direct_navigation_target(
-            archive,
-            None,
-            OpenRequestOwner::Navigation,
-            None,
-            None,
-        );
+        app.open_direct_navigation_target(archive, None, OpenRequestOwner::Navigation, None, None);
 
-        assert_eq!(outcome, FolderOpenOutcome::Ignored, "{extension}");
         assert_eq!(
             app.global_search.drill.as_ref().unwrap().current_path,
             folder
@@ -21269,6 +21263,241 @@ fn arm_detached_bookmark_book_open(
             stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
         },
     ));
+}
+
+#[cfg(windows)]
+#[test]
+fn ignored_epub_bookmark_row_keeps_existing_detached_window_and_bookmark_position() {
+    let mut app = phase_c_support::setup_app();
+    let epub = app.tmp.path().join("saved-page.epub");
+    std::fs::write(&epub, b"book").unwrap();
+    let bookmark = crate::book_bookmarks::BookBookmark {
+        id: 91,
+        container_key: crate::adjustment_db::normalize_path(&epub),
+        container_path: epub.clone(),
+        container_kind: crate::book_bookmarks::BookContainerKind::Pdf,
+        page_identity: crate::book_bookmarks::PageIdentity::PdfPage(2),
+        page_index_hint: 2,
+        created_at_ms: 1,
+        title: None,
+    };
+    let row = crate::bookmark_browser::BookmarkBrowserRow {
+        source: crate::bookmark_browser::BookmarkRowSource::Book(bookmark),
+        item: GridItem::PdfPage {
+            pdf_path: epub,
+            page_num: 2,
+            content_type: None,
+        },
+        relative_page_provenance: None,
+        image_meta: None,
+        marker_thumbnail: None,
+        created_at_ms: 1,
+        missing: false,
+    };
+    app.items = vec![row.item.clone()];
+    app.visible_indices = vec![0];
+    app.selected = Some(0);
+    app.bookmark_browser_rows = vec![row.clone()];
+    app.items_are_bookmark_view = true;
+    app.current_folder = Some(super::bookmark_view_synthetic_path());
+    app.address = "ブックマーク".into();
+    app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(app.tmp.path().into())];
+    app.settings.detached_viewer_open_images_in_window = true;
+    let existing_context =
+        app.build_active_context_for_test(Some(9101), DetachedSource::Image, |detached| {
+            detached.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            detached.viewer_presentation = ViewerPresentation::DetachedWindow;
+            detached.detached_viewer_independent_active = true;
+        });
+    let existing_window = app.active_detached_window_id();
+    let existing_state = existing_window.and_then(|window| app.detached_window_state(window));
+    app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+
+    app.open_bookmark_browser_row(&egui::Context::default(), &row);
+
+    assert_eq!(app.active_viewer_context_id(), Some(existing_context));
+    assert_eq!(app.active_detached_window_id(), existing_window);
+    assert_eq!(
+        existing_window.and_then(|window| app.detached_window_state(window)),
+        existing_state
+    );
+    assert!(app.bookmark_open_pending.is_none());
+    assert!(app.startup_open_path_resolve_pending.is_none());
+    assert!(app.bookmark_view_state.is_none());
+    assert_eq!(app.bookmark_open_request_seq, 0);
+    assert_eq!(
+        app.current_folder,
+        Some(super::bookmark_view_synthetic_path())
+    );
+    assert_eq!(app.selected, Some(0));
+    assert_eq!(app.address, "ブックマーク");
+    assert_eq!(
+        app.folder_nav_back_stack,
+        vec![FolderNavHistoryTarget::Path(app.tmp.path().into())]
+    );
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("EPUB を無視"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn ignored_epub_bookmark_after_resolve_does_not_park_existing_window() {
+    let mut app = phase_c_support::setup_app();
+    let epub = app.tmp.path().join("resolved-page.epub");
+    std::fs::write(&epub, b"book").unwrap();
+    arm_detached_bookmark_book_open(
+        &mut app,
+        epub.clone(),
+        crate::book_bookmarks::BookContainerKind::Pdf,
+        crate::book_bookmarks::PageIdentity::PdfPage(0),
+    );
+    let existing_context =
+        app.build_active_context_for_test(Some(9102), DetachedSource::Image, |_| {});
+    let existing_window = app.active_detached_window_id();
+    app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+
+    assert_eq!(
+        app.open_bookmark_book_in_detached_context(
+            &egui::Context::default(),
+            epub,
+            crate::folder_tree::OpenablePathKind::File,
+        ),
+        Some(false)
+    );
+    assert_eq!(app.active_viewer_context_id(), Some(existing_context));
+    assert_eq!(app.active_detached_window_id(), existing_window);
+    assert!(app.bookmark_open_pending.is_none());
+    assert!(app.bookmark_view_state.is_none());
+    assert!(app.pdf_enumerate_pending.is_none());
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("EPUB を無視"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn ignored_epub_bookmark_loading_context_ends_without_page_wait() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let epub = app.tmp.path().join("loading-page.epub");
+    std::fs::write(&epub, b"book").unwrap();
+    arm_detached_bookmark_book_open(
+        &mut app,
+        epub.clone(),
+        crate::book_bookmarks::BookContainerKind::Pdf,
+        crate::book_bookmarks::PageIdentity::PdfPage(0),
+    );
+    app.bookmark_open_request_seq = 1;
+    let pending = app.bookmark_open_pending.take().unwrap();
+    assert!(app.start_detached_bookmark_loading_context(
+        &ctx,
+        pending,
+        crate::bookmark_browser::BookmarkViewReturnTarget::Book(epub.clone()),
+        DetachedSource::Book,
+        epub.clone(),
+    ));
+    let window_id = app.active_detached_window_id().unwrap();
+    app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+
+    let opened = app
+        .with_active_viewer_context(|mounted| {
+            mounted.continue_active_detached_book_context_from_descriptor(
+                ViewerContextDescriptor::Pdf {
+                    path: epub,
+                    page_num: None,
+                },
+            )
+        })
+        .unwrap();
+
+    assert!(!opened);
+    assert_eq!(
+        app.detached_window_state(window_id),
+        Some(DetachedWindowState::Closing)
+    );
+    app.with_active_viewer_context(|mounted| {
+        assert!(mounted.bookmark_open_pending.is_none());
+        assert!(mounted.pdf_enumerate_pending.is_none());
+        assert!(mounted.fs_nav_after_pdf_enumerate.is_none());
+    })
+    .unwrap();
+    assert!(app.items_are_bookmark_view);
+    assert_eq!(
+        app.current_folder,
+        Some(super::bookmark_view_synthetic_path())
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn ignored_epub_grid_detached_open_keeps_existing_window() {
+    let mut app = phase_c_support::setup_app();
+    let epub = app.tmp.path().join("grid-book.epub");
+    std::fs::write(&epub, b"book").unwrap();
+    app.settings.detached_viewer_open_images_in_window = true;
+    let existing_context =
+        app.build_active_context_for_test(Some(9104), DetachedSource::Image, |_| {});
+    app.items = vec![GridItem::PdfFile(epub)];
+    app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+
+    assert!(
+        app.open_grid_item_in_detached_book_context_with_auto_fullscreen(
+            &egui::Context::default(),
+            0,
+            true,
+        )
+    );
+
+    assert_eq!(app.active_viewer_context_id(), Some(existing_context));
+    assert_eq!(app.active_detached_window_id(), Some(9104));
+    assert!(app.detached_image_windows.is_empty());
+    assert!(app.pdf_enumerate_pending.is_none());
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("EPUB を無視"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn ignored_epub_passive_window_reopen_preserves_active_and_parked_windows() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let epub = app.tmp.path().join("parked-book.epub");
+    std::fs::write(&epub, b"book").unwrap();
+    let existing_context =
+        app.build_active_context_for_test(Some(9105), DetachedSource::Image, |_| {});
+    let mut snapshot = contextless_test_window(&ctx, 9106);
+    snapshot.reopen_descriptor = Some(ViewerContextDescriptor::Pdf {
+        path: epub,
+        page_num: None,
+    });
+    app.detached_image_windows.push(snapshot);
+    app.transition_detached_window_state(9106, DetachedWindowState::Parked, "test_setup");
+    app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+
+    assert!(!app.activate_detached_image_window_snapshot(&ctx, 9106));
+
+    assert_eq!(app.active_viewer_context_id(), Some(existing_context));
+    assert_eq!(app.active_detached_window_id(), Some(9105));
+    assert_eq!(
+        app.detached_window_state(9106),
+        Some(DetachedWindowState::Parked)
+    );
+    assert_eq!(app.detached_image_windows.len(), 1);
+    assert_eq!(app.detached_image_windows[0].id, 9106);
+    assert!(app.pdf_enumerate_pending.is_none());
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("EPUB を無視"))
+    );
 }
 
 #[cfg(windows)]

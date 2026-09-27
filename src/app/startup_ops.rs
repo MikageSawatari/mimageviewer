@@ -697,6 +697,13 @@ impl App {
         };
 
         let openable = resolution.path;
+        if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner
+            && let Some(reason) = self.pdf_open_refusal(&openable)
+        {
+            self.show_pdf_open_refusal(reason);
+            self.cancel_bookmark_open_request(bookmark_owner.request_id, "epub_ignored");
+            return false;
+        }
         crate::logger::log(format!(
             "startup open: requested={} resolved={} resolve_ms={:.1}",
             result.requested.display(),
@@ -885,7 +892,15 @@ impl App {
             return None;
         }
 
+        let request_id = pending.request_id;
         let descriptor = self.bookmark_detached_descriptor(&openable, kind)?;
+        if let ViewerContextDescriptor::Pdf { path, .. } = &descriptor
+            && let Some(reason) = self.pdf_open_refusal(path)
+        {
+            self.show_pdf_open_refusal(reason);
+            self.cancel_bookmark_open_request(request_id, "epub_ignored");
+            return Some(false);
+        }
 
         let pending = match self.bookmark_open_pending.take() {
             Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending)) => pending,
@@ -1087,10 +1102,18 @@ impl App {
             // にそのまま乗る (名前でケース無視照合 → フィルタで隠れていれば直近の可視 idx)。
             // 代入が無条件なのは、起動フォルダを開く時点で `select_after_load` に意見を
             // 持つ経路が他に無いため (BS 戻りも親フォルダボタンも、まだ 1 度も動いていない)。
+            let previous_selection = self.select_after_load.clone();
+            let previous_scroll = self.scroll_selected_to_rows_above;
             let hint = crate::known_folders::startup_cursor_hint(&self.settings, &folder);
             self.select_after_load = hint.as_ref().map(|(name, _)| name.clone());
             self.scroll_selected_to_rows_above = hint.and_then(|(_, rows)| rows);
-            let _ = self.load_folder_or_convert_archive(folder);
+            if matches!(
+                self.load_folder_or_convert_archive(folder),
+                FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+            ) {
+                self.select_after_load = previous_selection;
+                self.scroll_selected_to_rows_above = previous_scroll;
+            }
         }
     }
 

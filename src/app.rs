@@ -391,6 +391,7 @@ pub(crate) struct QuickFolderWorkspace {
     pub drive_current_dirs: BTreeMap<String, PathBuf>,
 }
 
+#[must_use = "folder open outcomes must be handled before committing navigation state"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FolderOpenOutcome {
     Loaded,
@@ -19980,17 +19981,36 @@ impl App {
     ) -> bool {
         match nav {
             crate::ui_main::AddressBarNav::Direct(path) => {
-                self.load_folder_or_convert_archive(path);
+                let outcome = self.load_folder_or_convert_archive(path);
                 self.clear_pending_folder_nav_steps();
+                // The bool means this one-shot close navigation was consumed.  A rejected
+                // destination already reported its reason and must not be replayed next frame.
+                if matches!(
+                    outcome,
+                    FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+                ) {
+                    crate::logger::log(format!(
+                        "fullscreen close navigation rejected: {outcome:?}"
+                    ));
+                }
                 true
             }
             crate::ui_main::AddressBarNav::CollectionSource { path, owner } => {
-                let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                     path,
                     false,
                     OpenRequestOwner::CollectionGridPhysical(owner),
                 );
                 self.clear_pending_folder_nav_steps();
+                // A refusal consumes the request without adopting another collection source.
+                if matches!(
+                    outcome,
+                    FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+                ) {
+                    crate::logger::log(format!(
+                        "fullscreen collection navigation rejected: {outcome:?}"
+                    ));
+                }
                 true
             }
             crate::ui_main::AddressBarNav::DriveList(origin) => {
@@ -21465,16 +21485,23 @@ impl App {
             return;
         }
         if let Some(path) = self.current_folder.clone() {
-            self.folder_history.remove(&path);
+            let previous_history = self.folder_history.remove(&path);
             match physical_mode {
                 PhysicalFolderSortReload::Immediate => {
                     let owner = self
                         .collection_grid_physical_reload_owner(&path)
                         .map(OpenRequestOwner::CollectionGridPhysical)
                         .unwrap_or(OpenRequestOwner::Navigation);
-                    let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                        path, false, owner,
+                    let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                        path.clone(),
+                        false,
+                        owner,
                     );
+                    if !matches!(outcome, FolderOpenOutcome::Loaded)
+                        && let Some(history) = previous_history
+                    {
+                        self.folder_history.insert(path, history);
+                    }
                 }
                 PhysicalFolderSortReload::WorkerScan => {
                     // PDF は enumerate 順固定で全項目が同じ Image カテゴリなので、
@@ -22057,12 +22084,20 @@ impl App {
             .then_some(FolderOpenRefusal::EpubIgnoredBySetting)
     }
 
+    fn show_pdf_open_refusal(&mut self, reason: FolderOpenRefusal) {
+        match reason {
+            FolderOpenRefusal::EpubIgnoredBySetting => {
+                self.show_feedback_toast("設定により EPUB を無視しています".into());
+            }
+        }
+    }
+
     /// A grid activation can stage history and view changes before normal navigation runs.
     /// Reject an ignored EPUB before those changes, using the same typed refusal as the loader.
     pub(crate) fn reject_ignored_epub_grid_item(
         &mut self,
         idx: usize,
-    ) -> Option<FolderOpenRefusal> {
+    ) -> Option<FolderOpenOutcome> {
         let refusal = self.items.get(idx).and_then(|item| match item {
             GridItem::PdfFile(path) => self
                 .pdf_open_refusal(path)
@@ -22070,8 +22105,7 @@ impl App {
             _ => None,
         });
         if let Some((path, reason)) = refusal {
-            let _ = self.report_pdf_open_refusal(&path, reason);
-            Some(reason)
+            Some(self.report_pdf_open_refusal(&path, reason))
         } else {
             None
         }
@@ -22083,12 +22117,8 @@ impl App {
         reason: FolderOpenRefusal,
     ) -> FolderOpenOutcome {
         self.pending_auto_fs_open = false;
-        match reason {
-            FolderOpenRefusal::EpubIgnoredBySetting => {
-                self.show_feedback_toast("設定により EPUB を無視しています".into());
-                self.restore_address_after_epub_open_aborted(path);
-            }
-        }
+        self.show_pdf_open_refusal(reason);
+        self.restore_address_after_epub_open_aborted(path);
         FolderOpenOutcome::Refused(reason)
     }
 
@@ -22101,7 +22131,7 @@ impl App {
         owner: OpenRequestOwner,
         history_nav_rollback: Option<FolderNavHistorySnapshot>,
         pane_epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
-    ) -> FolderOpenOutcome {
+    ) {
         let search_rollback = if self.favsearch.active
             || self.tag_view.active
             || self.rating_view_nav_context_active()
@@ -22154,7 +22184,6 @@ impl App {
         if self.tag_view.active && matches!(outcome, FolderOpenOutcome::Loaded) {
             self.update_tag_view_address();
         }
-        outcome
     }
 
     fn load_folder_nav_target(
@@ -24773,16 +24802,28 @@ impl App {
         if self.tag_view.nav_stack.is_empty() {
             return;
         }
+        let old_select_after_load = self.select_after_load.clone();
+        let old_address = self.address.clone();
         let popped = self.tag_view.nav_stack.pop();
         self.cancel_pending_folder_nav();
-        if let Some(popped_path) = popped
+        if let Some(popped_path) = popped.as_ref()
             && let Some(name) = popped_path.file_name().and_then(|n| n.to_str())
         {
             self.select_after_load = Some(name.to_string());
         }
         if let Some(top) = self.tag_view.nav_stack.last().cloned() {
-            let _ = self.load_folder_or_convert_archive(top);
-            self.update_tag_view_address();
+            match self.load_folder_or_convert_archive(top) {
+                FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened => {
+                    self.update_tag_view_address();
+                }
+                FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_) => {
+                    if let Some(popped_path) = popped {
+                        self.tag_view.nav_stack.push(popped_path);
+                    }
+                    self.select_after_load = old_select_after_load;
+                    self.address = old_address;
+                }
+            }
         } else {
             self.execute_tag_view();
         }
@@ -25553,6 +25594,8 @@ impl App {
         if self.rating_view_nav_stack.is_empty() {
             return;
         }
+        let old_select_after_load = self.select_after_load.clone();
+        let old_address = self.address.clone();
         let popped = self.rating_view_nav_stack.pop();
         self.cancel_pending_folder_nav();
         self.pending_rating_view_zipdir_open = None;
@@ -25562,7 +25605,16 @@ impl App {
             self.select_after_load = Some(name.to_string());
         }
         if let Some(top) = self.rating_view_nav_stack.last().cloned() {
-            let _ = self.load_folder_or_convert_archive(top);
+            match self.load_folder_or_convert_archive(top) {
+                FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened => {}
+                FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_) => {
+                    if let Some(popped_path) = popped {
+                        self.rating_view_nav_stack.push(popped_path);
+                    }
+                    self.select_after_load = old_select_after_load;
+                    self.address = old_address;
+                }
+            }
         } else {
             self.request_rating_view_build();
             if let Some(popped_path) = popped.as_ref() {
@@ -27114,10 +27166,6 @@ impl App {
             .or_else(|| self.pdf_current_password.clone())
     }
 
-    pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
-        let _ = self.load_pdf_as_folder_owned(pdf_path, OpenRequestOwner::Navigation);
-    }
-
     pub(crate) fn load_pdf_as_folder_owned(
         &mut self,
         pdf_path: PathBuf,
@@ -28015,11 +28063,34 @@ impl App {
         if self.resume_collection_pdf_password_request(&request.path, password.clone(), save) {
             return true;
         }
+        if let Some(reason) = self.pdf_open_refusal(&request.path) {
+            // A setting can change while the password prompt is open.  No password or
+            // navigation state should be committed for a refused retry.
+            let outcome = self.report_pdf_open_refusal(&request.path, reason);
+            debug_assert!(matches!(outcome, FolderOpenOutcome::Refused(_)));
+            self.pdf_password_pending_save = None;
+            self.fs_nav_after_pdf_enumerate = None;
+            self.finish_visible_container_fs_nav_failed();
+            self.restore_rating_filter_suppression();
+            #[cfg(windows)]
+            self.terminate_active_detached_open_before_viewport("pdf_password_retry_refused");
+            return false;
+        }
         self.pdf_current_password = Some(password.clone());
         self.pdf_password_pending_save = save.then(|| (request.path.clone(), password));
         self.resume_fs_navigation_sequence_after_password();
-        self.load_pdf_as_folder(request.path);
-        true
+        match self.load_pdf_as_folder_owned(request.path, OpenRequestOwner::Navigation) {
+            FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened => true,
+            FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_) => {
+                self.pdf_password_pending_save = None;
+                self.fs_nav_after_pdf_enumerate = None;
+                self.finish_visible_container_fs_nav_failed();
+                self.restore_rating_filter_suppression();
+                #[cfg(windows)]
+                self.terminate_active_detached_open_before_viewport("pdf_password_retry_failed");
+                false
+            }
+        }
     }
 
     pub(crate) fn retry_pdf_password_dialog_request(
@@ -37226,6 +37297,13 @@ impl App {
             self.show_feedback_toast(
                 "ブックマーク先が見つかりません（記録は保持されます）".to_string(),
             );
+            return;
+        }
+        // A detached bookmark parks the current window before its path resolver runs.
+        if let crate::bookmark_browser::BookmarkRowSource::Book(bookmark) = &row.source
+            && let Some(reason) = self.pdf_open_refusal(&bookmark.container_path)
+        {
+            self.show_pdf_open_refusal(reason);
             return;
         }
         if let Some(previous_request_id) = self
@@ -48909,6 +48987,46 @@ impl App {
         )
     }
 
+    /// Load a descriptor in its mounted detached context and preserve PDF refusal reasons.
+    #[cfg(windows)]
+    fn load_detached_book_descriptor(
+        &mut self,
+        descriptor: ViewerContextDescriptor,
+    ) -> FolderOpenOutcome {
+        match descriptor {
+            ViewerContextDescriptor::Zip {
+                path,
+                archive_source_override,
+                ..
+            } => {
+                self.load_zip_as_folder(path);
+                if let Some(source) = archive_source_override {
+                    self.archive_source_override = Some(source.clone());
+                    self.address = source.to_string_lossy().to_string();
+                }
+                FolderOpenOutcome::Loaded
+            }
+            ViewerContextDescriptor::Pdf { path, .. } => {
+                self.load_pdf_as_folder_owned(path, OpenRequestOwner::Navigation)
+            }
+            ViewerContextDescriptor::BookFolder { path } => {
+                self.start_detached_folder_open(path);
+                FolderOpenOutcome::Loaded
+            }
+            ViewerContextDescriptor::Image { path } => {
+                if self.start_detached_image_folder_open(path.clone()) {
+                    FolderOpenOutcome::Loaded
+                } else {
+                    self.log_detached_image_window_debug(format!(
+                        "image_reopen_no_parent_for_async_folder_scan path={}",
+                        path.display()
+                    ));
+                    FolderOpenOutcome::Ignored
+                }
+            }
+        }
+    }
+
     /// Continue a descriptor-backed open in the already-published detached loading context.
     /// The caller must have mounted the context named by the request's window lease.
     #[cfg(windows)]
@@ -48917,6 +49035,26 @@ impl App {
         descriptor: ViewerContextDescriptor,
     ) -> bool {
         let target = Self::detached_book_context_target(&descriptor);
+        let bookmark_open = self.bookmark_open_pending.is_some();
+        let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
+        self.pending_auto_fs_open = !is_image_reopen && !bookmark_open;
+        self.fs_open_intent_from_grid = !is_image_reopen && !bookmark_open;
+
+        let outcome = self.with_detached_viewer_main_history_suppressed(|app| {
+            app.load_detached_book_descriptor(descriptor.clone())
+        });
+        if !matches!(outcome, FolderOpenOutcome::Loaded) {
+            if let Some(request_id) = self
+                .bookmark_open_pending
+                .as_ref()
+                .map(crate::bookmark_browser::PendingBookmarkOpen::request_id)
+            {
+                self.cancel_bookmark_open_request(request_id, "detached_descriptor_open_refused");
+            }
+            self.fs_open_intent_from_grid = false;
+            self.terminate_active_detached_open_before_viewport("detached_descriptor_open_refused");
+            return false;
+        }
         if let Some(pending) = self
             .bookmark_open_pending
             .as_mut()
@@ -48924,37 +49062,6 @@ impl App {
         {
             pending.begin_page_wait();
         }
-        let bookmark_open = self.bookmark_open_pending.is_some();
-        let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
-        self.pending_auto_fs_open = !is_image_reopen && !bookmark_open;
-        self.fs_open_intent_from_grid = !is_image_reopen && !bookmark_open;
-
-        self.with_detached_viewer_main_history_suppressed(|app| match descriptor.clone() {
-            ViewerContextDescriptor::Zip {
-                path,
-                archive_source_override,
-                ..
-            } => {
-                app.load_zip_as_folder(path);
-                if let Some(source) = archive_source_override {
-                    app.archive_source_override = Some(source.clone());
-                    app.address = source.to_string_lossy().to_string();
-                }
-            }
-            ViewerContextDescriptor::Pdf { path, .. } => app.load_pdf_as_folder(path),
-            ViewerContextDescriptor::BookFolder { path } => app.start_detached_folder_open(path),
-            ViewerContextDescriptor::Image { path } => {
-                if !app.start_detached_image_folder_open(path.clone()) {
-                    app.log_detached_image_window_debug(format!(
-                        "image_reopen_no_parent_for_async_folder_scan path={}",
-                        path.display()
-                    ));
-                    app.terminate_active_detached_open_before_viewport(
-                        "detached_image_open_no_parent",
-                    );
-                }
-            }
-        });
 
         if !bookmark_open
             && !is_image_reopen
@@ -48998,7 +49105,6 @@ impl App {
             return false;
         }
         let target = Self::detached_book_context_target(&descriptor);
-        let mut initializer_failed = false;
         let built =
             self.build_viewer_context("start_active_detached_book_context", |app, reserved| {
                 // From this point until the bundle is captured, all loads belong to the
@@ -49058,51 +49164,29 @@ impl App {
                 app.pending_auto_fs_open = !is_image_reopen && !bookmark_open;
                 app.fs_open_intent_from_grid = !is_image_reopen && !bookmark_open;
 
-                app.with_detached_viewer_main_history_suppressed(|app| match start {
-                    DetachedBookContextStart::Descriptor(descriptor) => match descriptor {
-                        ViewerContextDescriptor::Zip {
-                            path,
-                            archive_source_override,
-                            ..
-                        } => {
-                            app.load_zip_as_folder(path);
-                            if let Some(source) = archive_source_override {
-                                app.archive_source_override = Some(source.clone());
-                                app.address = source.to_string_lossy().to_string();
-                            }
-                        }
-                        ViewerContextDescriptor::Pdf { path, .. } => {
-                            app.load_pdf_as_folder(path);
-                        }
-                        ViewerContextDescriptor::BookFolder { path } => {
-                            app.start_detached_folder_open(path);
-                        }
-                        ViewerContextDescriptor::Image { path } => {
-                            // 仮想一覧の backing snapshot は使わず、親フォルダを worker で完全走査する。
-                            // 対象画像は scan request 自身が所有し、結果を detached bundle 内で
-                            // materialize した後に物理順の index へ解決する。
-                            if !app.start_detached_image_folder_open(path.clone()) {
-                                app.log_detached_image_window_debug(format!(
-                                    "image_reopen_no_parent_for_async_folder_scan path={}",
-                                    path.display()
-                                ));
-                                // The session lease is intentionally published only after this
-                                // build commits, so a synchronous initializer failure must abort
-                                // the typed build instead of attempting a pre-session close.
-                                initializer_failed = true;
-                            }
-                        }
-                    },
+                let outcome = app.with_detached_viewer_main_history_suppressed(|app| match start {
+                    DetachedBookContextStart::Descriptor(descriptor) => {
+                        app.load_detached_book_descriptor(descriptor)
+                    }
                     DetachedBookContextStart::ScannedFolder { path, scan } => {
                         // The main-owned preflight already established that this is an image book.
                         // Transfer the completed scan exactly once; do not re-read the directory or
                         // publish a detached session for mixed folders.
                         app.load_folder_with_scan(path, Some(scan));
+                        FolderOpenOutcome::Loaded
                     }
                 });
-
-                if initializer_failed {
-                    return BuildOutcome::Abort("detached_image_open_no_parent");
+                match outcome {
+                    FolderOpenOutcome::Loaded => {}
+                    FolderOpenOutcome::Refused(_) => {
+                        return BuildOutcome::Abort("detached_pdf_open_refused");
+                    }
+                    FolderOpenOutcome::Ignored => {
+                        return BuildOutcome::Abort("detached_descriptor_open_ignored");
+                    }
+                    FolderOpenOutcome::ConversionDialogOpened => {
+                        return BuildOutcome::Abort("detached_descriptor_conversion_pending");
+                    }
                 }
 
                 if let Some(restore) = collection_restore {
@@ -49410,6 +49494,12 @@ impl App {
                 descriptor,
                 collection_restore,
             } => {
+                if let ViewerContextDescriptor::Pdf { path, .. } = &descriptor
+                    && let Some(reason) = self.pdf_open_refusal(path)
+                {
+                    self.show_pdf_open_refusal(reason);
+                    return true;
+                }
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_descriptor",
                 );
@@ -49462,6 +49552,10 @@ impl App {
                 path,
                 collection_restore,
             } => {
+                if self.settings.archive_file_handling_ignores_convertible() {
+                    self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
+                    return true;
+                }
                 let base_placement = self.active_detached_viewer_current_placement();
                 let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
@@ -49497,22 +49591,6 @@ impl App {
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .and_then(crate::archive_converter::ArchiveFormat::from_extension);
-
-                if self.settings.archive_file_handling_ignores_convertible() {
-                    let _ = self.with_window_viewer_context(window_id, |app| {
-                        app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                            path,
-                            auto_fullscreen,
-                            open_owner,
-                        )
-                    });
-                    self.cancel_detached_grid_archive_open_owner(
-                        &owner,
-                        "archive_handling_ignored",
-                    );
-                    ctx.request_repaint();
-                    return true;
-                }
 
                 // Non-RAR cache hits are already classified, so they can create the detached
                 // context synchronously. RAR still probes first because a valid direct-read path
@@ -49920,6 +49998,18 @@ impl App {
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         };
+        if let ViewerContextDescriptor::Pdf { path, .. } = &descriptor
+            && let Some(reason) = self.pdf_open_refusal(path)
+        {
+            self.show_pdf_open_refusal(reason);
+            self.transition_detached_window_state(
+                snapshot.id,
+                DetachedWindowState::Parked,
+                "passive_activate_pdf_refused",
+            );
+            self.detached_image_windows.insert(pos, snapshot);
+            return false;
+        }
         // Image フォールバックは親フォルダが読めることを先に確認する。handoff を始めた
         // 後で load に失敗すると表示文脈を失うため、無理なら parked のまま残す。
         // (ユーザーのクリック 1 回につき is_dir 1 回の同期 I/O。恒常経路ではない。)
