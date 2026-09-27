@@ -4463,6 +4463,8 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 false,
                 VideoThumbnailIndicator::PlayIcon,
+                true,
+                None,
             );
             crate::app::draw_cell(
                 ui,
@@ -4474,7 +4476,6 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 item,
                 thumbnail,
                 crate::rotation_db::Rotation::None,
-                None,
                 None,
                 false,
                 VideoThumbnailIndicator::PlayIcon,
@@ -18165,18 +18166,26 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         row.badge_label()
                                     }
                                 });
-                                let overlay_layout = crate::app::layout_cell_overlays(
+                                let is_checked = self.checked.contains(&idx);
+                                let filter_match = if self.items_are_drive_list {
+                                    None
+                                } else {
+                                    self.folder_rating_match(idx)
+                                };
+                                let filter_match_count = filter_match.map(|(count, _)| count);
+                                let edit_flags = crate::thumb_overlay_layout::EditBadgeFlags {
+                                    page_override: badges.page_override,
+                                    local_adjust: badges.local_adjust,
+                                    mask: badges.mask,
+                                    conceal: badges.conceal,
+                                    comic: badges.comic,
+                                    crop: badges.crop,
+                                    pin: has_pin,
+                                };
+                                let mut overlay_layout = crate::app::layout_cell_overlays(
                                     ui.painter(),
                                     cell_rect,
-                                    crate::thumb_overlay_layout::EditBadgeFlags {
-                                        page_override: badges.page_override,
-                                        local_adjust: badges.local_adjust,
-                                        mask: badges.mask,
-                                        conceal: badges.conceal,
-                                        comic: badges.comic,
-                                        crop: badges.crop,
-                                        pin: has_pin,
-                                    },
+                                    edit_flags,
                                     rating,
                                     &self.items[idx],
                                     &self.thumbnails[idx],
@@ -18184,6 +18193,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     bookmark_time.as_deref(),
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
+                                    is_checked,
+                                    filter_match_count,
                                 );
 
                                 primary_click_hit_cell |=
@@ -18211,6 +18222,24 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 if idx >= self.items.len() || idx >= self.thumbnails.len() {
                                     break;
                                 }
+                                // A click may toggle the check state during interaction. Re-layout only
+                                // that changed cell so the new check and its reserved area agree in this frame.
+                                if self.checked.contains(&idx) != is_checked {
+                                    overlay_layout = crate::app::layout_cell_overlays(
+                                        ui.painter(),
+                                        cell_rect,
+                                        edit_flags,
+                                        rating,
+                                        &self.items[idx],
+                                        &self.thumbnails[idx],
+                                        &tags,
+                                        bookmark_time.as_deref(),
+                                        self.items_are_drive_list,
+                                        self.settings.video_thumbnail_indicator,
+                                        self.checked.contains(&idx),
+                                        filter_match_count,
+                                    );
+                                }
 
                                 let rot = self.get_rotation(idx);
                                 // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
@@ -18225,12 +18254,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 } else {
                                     self.thumb_adjust_tex.get(&idx)
                                 };
-                                let filter_match = if self.items_are_drive_list {
-                                    None
-                                } else {
-                                    self.folder_rating_match(idx)
-                                };
-                                let filter_match_count = filter_match.map(|(c, _)| c);
                                 // 📌 バッジ (金色) — ユーザーが Pin 操作した対象アイテムの
                                 // 目印。「現在表示中のコンテナの pin source = この item」
                                 // (= ユーザーがこのアイテムを選択して P / 📌 を押した) のとき
@@ -18256,7 +18279,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     &self.thumbnails[idx],
                                     rot,
                                     adjusted_tex,
-                                    filter_match_count,
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
                                     is_cut,

@@ -96,6 +96,8 @@ pub enum BottomContainerKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BadgeKind {
+    StackCount,
+    FilterMatchCount,
     BookmarkTime,
     UpscaledVideo,
     Edit(EditBadgeKind),
@@ -110,6 +112,7 @@ pub enum BadgeKind {
 /// callers can verify the policy without inferring it from coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BadgePriority {
+    StackCount,
     BookmarkTime,
     UpscaledVideo,
     EditState,
@@ -117,6 +120,7 @@ pub enum BadgePriority {
     BottomContainer,
     Filename,
     Rating,
+    FilterMatchCount,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -176,8 +180,21 @@ impl BottomLeftOverlayLayout {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ThumbnailOverlayLayout {
+    pub check: Option<egui::Rect>,
+    pub stack_count: Option<BadgePlacement>,
     pub top_left: TopLeftOverlayLayout,
     pub bottom_left: BottomLeftOverlayLayout,
+    pub filter_match_count: Option<BadgePlacement>,
+}
+
+impl ThumbnailOverlayLayout {
+    pub fn badge_placements(&self) -> impl Iterator<Item = &BadgePlacement> {
+        self.stack_count
+            .iter()
+            .chain(self.top_left.placements())
+            .chain(self.bottom_left.placements())
+            .chain(self.filter_match_count.iter())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -217,6 +234,9 @@ pub struct BottomContainerInput<'a> {
 pub struct ThumbnailOverlayLayoutInput<'a> {
     pub cell: egui::Rect,
     pub inner: egui::Rect,
+    pub checked: bool,
+    pub stack_count: Option<usize>,
+    pub filter_match_count: Option<u32>,
     pub bookmark_time: Option<&'a str>,
     pub upscaled_video: bool,
     pub edit_badges: EditBadgeFlags,
@@ -331,6 +351,27 @@ pub fn filename_badge_style() -> BadgeTextStyle {
     }
 }
 
+pub fn stack_count_style(inner: egui::Rect) -> BadgeTextStyle {
+    BadgeTextStyle {
+        font_size: (inner.height() * 0.09).clamp(11.0, 16.0),
+        family: BadgeFontFamily::Proportional,
+        padding: BadgePadding::symmetric(6.0, 3.0),
+    }
+}
+
+pub fn filter_match_count_style() -> BadgeTextStyle {
+    BadgeTextStyle {
+        font_size: 11.0,
+        family: BadgeFontFamily::Proportional,
+        padding: BadgePadding::symmetric(5.0, 2.0),
+    }
+}
+
+pub fn check_overlay_rect(cell: egui::Rect) -> egui::Rect {
+    let center = egui::pos2(cell.max.x - 16.0, cell.min.y + 16.0);
+    egui::Rect::from_center_size(center, egui::vec2(24.0, 24.0))
+}
+
 pub fn combine_tags(tags: &[String]) -> String {
     let mut combined = String::new();
     for tag in tags.iter().filter(|tag| tag.starts_with('#')) {
@@ -348,7 +389,7 @@ pub fn combine_tags(tags: &[String]) -> String {
     combined
 }
 
-/// Lay out the currently visible top-left and bottom-left overlays.
+/// Lay out all four cell corners in one pass.
 ///
 /// `measure` is the only connection to font machinery. The function performs no painting and is
 /// deterministic for a given rectangle, input, and measurement callback.
@@ -356,10 +397,43 @@ pub fn layout_thumbnail_overlays(
     input: ThumbnailOverlayLayoutInput<'_>,
     mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> ThumbnailOverlayLayout {
+    // The check state is the fixed-size interaction marker. Reserve its painted circle before
+    // measuring any lower-priority badge, including the edit overflow summary.
+    let check = input.checked.then(|| check_overlay_rect(input.cell));
+    let stack_count = input.stack_count.and_then(|count| {
+        let style = stack_count_style(input.inner);
+        let available = input.inner.width() - 4.0 - style.padding.left - style.padding.right;
+        [format!("{count} 枚"), count.to_string(), "…".to_owned()]
+            .into_iter()
+            .find(|text| measure(text, style).x <= available)
+            .map(|text| {
+                let size = measured_badge_size(&text, style, &mut measure);
+                let pos = egui::pos2(input.inner.max.x - 4.0 - size.x, input.inner.min.y + 4.0);
+                BadgePlacement {
+                    kind: BadgeKind::StackCount,
+                    priority: BadgePriority::StackCount,
+                    rect: egui::Rect::from_min_size(pos, size),
+                    text,
+                    style,
+                }
+            })
+            .filter(|badge| {
+                input.cell.contains_rect(badge.rect)
+                    && !check.is_some_and(|rect| rect.intersects(badge.rect))
+            })
+    });
     let mut top_left = TopLeftOverlayLayout::default();
     let mut cursor_x = input.cell.min.x + TOP_LEFT_OFFSET;
     let top_y = input.cell.min.y + TOP_LEFT_OFFSET;
-    let top_right = input.cell.max.x - TOP_LEFT_OFFSET;
+    let top_right = check
+        .iter()
+        .map(|rect| rect.min.x - TOP_LEFT_GAP)
+        .chain(
+            stack_count
+                .iter()
+                .map(|badge| badge.rect.min.x - TOP_LEFT_GAP),
+        )
+        .fold(input.cell.max.x - TOP_LEFT_OFFSET, f32::min);
 
     if let Some(text) = input.bookmark_time {
         let style = bookmark_time_style();
@@ -440,8 +514,7 @@ pub fn layout_thumbnail_overlays(
     let combined_tags = combine_tags(input.tags);
     if !combined_tags.is_empty() {
         let style = tag_badge_style();
-        let max_text_width = input.cell.max.x
-            - TOP_RIGHT_RESERVE
+        let max_text_width = (input.cell.max.x - TOP_RIGHT_RESERVE).min(top_right)
             - cursor_x
             - style.padding.left
             - style.padding.right;
@@ -462,6 +535,15 @@ pub fn layout_thumbnail_overlays(
     let mut bottom_left = BottomLeftOverlayLayout::default();
     let bottom_y = input.inner.max.y - BOTTOM_LEFT_OFFSET;
     let left_x = input.inner.min.x + BOTTOM_LEFT_OFFSET;
+    let blocked_by_top = |rect: egui::Rect| {
+        check.is_some_and(|check| check.intersects(rect))
+            || stack_count
+                .as_ref()
+                .is_some_and(|badge| badge.rect.intersects(rect))
+            || top_left
+                .placements()
+                .any(|badge| badge.rect.intersects(rect))
+    };
 
     if let Some(container) = input.bottom_container {
         let style = match container.kind {
@@ -482,10 +564,7 @@ pub fn layout_thumbnail_overlays(
                 text,
                 style,
             };
-            if !top_left
-                .placements()
-                .any(|top| top.rect.intersects(placement.rect))
-            {
+            if !blocked_by_top(placement.rect) {
                 bottom_left.container = Some(placement);
             }
         }
@@ -515,10 +594,7 @@ pub fn layout_thumbnail_overlays(
                 text,
                 style,
             };
-            if !top_left
-                .placements()
-                .any(|top| top.rect.intersects(placement.rect))
-            {
+            if !blocked_by_top(placement.rect) {
                 bottom_left.filename = Some(placement);
             }
         }
@@ -568,9 +644,7 @@ pub fn layout_thumbnail_overlays(
             } else {
                 corner
             };
-            if rect.min.y >= input.cell.min.y
-                && !top_left.placements().any(|top| top.rect.intersects(rect))
-            {
+            if rect.min.y >= input.cell.min.y && !blocked_by_top(rect) {
                 bottom_left.rating = Some(BadgePlacement {
                     kind: BadgeKind::Rating,
                     priority: BadgePriority::Rating,
@@ -582,9 +656,59 @@ pub fn layout_thumbnail_overlays(
         }
     }
 
+    let occupied: Vec<egui::Rect> = check
+        .iter()
+        .copied()
+        .chain(stack_count.iter().map(|badge| badge.rect))
+        .chain(top_left.placements().map(|badge| badge.rect))
+        .chain(bottom_left.placements().map(|badge| badge.rect))
+        .collect();
+    let filter_match_count = input
+        .filter_match_count
+        .filter(|&count| count > 0)
+        .and_then(|count| {
+            let style = filter_match_count_style();
+            let available = input.cell.width() - 6.0 - style.padding.left - style.padding.right;
+            let full = if count >= 1000 {
+                "999+".to_owned()
+            } else {
+                count.to_string()
+            };
+            [full, "…".to_owned()]
+                .into_iter()
+                .find(|text| measure(text, style).x <= available)
+                .and_then(|text| {
+                    let size = measured_badge_size(&text, style, &mut measure);
+                    let x = input.cell.max.x - size.x - 3.0;
+                    let mut y = input.cell.max.y - size.y - 3.0;
+                    let mut rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
+                    // Keep the count in the right column and lift it above occupied bottom badges.
+                    // At the 32pt floor there may be no free row; then the count yields to the
+                    // check, rating, and existing left-lane content.
+                    for _ in 0..occupied.len() {
+                        let blocker = occupied.iter().find(|other| other.intersects(rect));
+                        let Some(blocker) = blocker else { break };
+                        y = blocker.min.y - BOTTOM_ITEM_GAP - size.y;
+                        rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
+                    }
+                    (input.cell.contains_rect(rect)
+                        && !occupied.iter().any(|other| other.intersects(rect)))
+                    .then_some(BadgePlacement {
+                        kind: BadgeKind::FilterMatchCount,
+                        priority: BadgePriority::FilterMatchCount,
+                        rect,
+                        text,
+                        style,
+                    })
+                })
+        });
+
     ThumbnailOverlayLayout {
+        check,
+        stack_count,
         top_left,
         bottom_left,
+        filter_match_count,
     }
 }
 
@@ -686,11 +810,10 @@ mod tests {
     }
 
     fn assert_placements_inside_cell(layout: &ThumbnailOverlayLayout, cell: egui::Rect) {
-        for placement in layout
-            .top_left
-            .placements()
-            .chain(layout.bottom_left.placements())
-        {
+        if let Some(check) = layout.check {
+            assert!(cell.contains_rect(check), "check escaped cell");
+        }
+        for placement in layout.badge_placements() {
             assert!(
                 cell.contains_rect(placement.rect),
                 "{:?} escaped {:?}: {:?}",
@@ -702,6 +825,124 @@ mod tests {
     }
 
     #[test]
+    fn checked_cell_four_corners_never_overlap_at_32_or_100_points() {
+        for width in [32.0, 100.0] {
+            let (cell, inner) = square_cell(width);
+            let layout = layout_thumbnail_overlays(
+                ThumbnailOverlayLayoutInput {
+                    cell,
+                    inner,
+                    checked: true,
+                    stack_count: None,
+                    filter_match_count: Some(123),
+                    bookmark_time: None,
+                    upscaled_video: false,
+                    edit_badges: EditBadgeFlags {
+                        page_override: true,
+                        local_adjust: true,
+                        mask: true,
+                        conceal: true,
+                        comic: true,
+                        crop: true,
+                        pin: true,
+                    },
+                    tags: &["#tag".to_owned()],
+                    bottom_container: Some(BottomContainerInput {
+                        kind: BottomContainerKind::Format(FormatBadgeKind::Pdf),
+                        label: "PDF",
+                    }),
+                    rating_text: Some("📁★★★★★"),
+                    filename: Some("long-name.pdf"),
+                },
+                measure,
+            );
+            assert_placements_inside_cell(&layout, cell);
+            assert!(layout.check.is_some());
+            let occupied: Vec<_> = layout
+                .check
+                .iter()
+                .copied()
+                .chain(layout.badge_placements().map(|badge| badge.rect))
+                .collect();
+            for (index, first) in occupied.iter().enumerate() {
+                for second in &occupied[index + 1..] {
+                    assert!(
+                        !first.intersects(*second),
+                        "{width}pt: {first:?} overlaps {second:?}"
+                    );
+                }
+            }
+            if width == 32.0 {
+                assert!(layout.top_left.edit_badges.is_empty());
+            } else {
+                let summary = layout.top_left.edit_badges.last().unwrap();
+                assert_eq!(summary.kind, BadgeKind::EditOverflow);
+                assert!(!summary.rect.intersects(layout.check.unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn stack_count_reserves_right_corner_before_edit_overflow() {
+        for width in [32.0, 100.0] {
+            let (cell, inner) = square_cell(width);
+            let layout = layout_thumbnail_overlays(
+                ThumbnailOverlayLayoutInput {
+                    cell,
+                    inner,
+                    checked: false,
+                    stack_count: Some(120),
+                    filter_match_count: None,
+                    bookmark_time: None,
+                    upscaled_video: false,
+                    edit_badges: EditBadgeFlags {
+                        page_override: true,
+                        local_adjust: true,
+                        mask: true,
+                        conceal: true,
+                        comic: true,
+                        crop: true,
+                        pin: true,
+                    },
+                    tags: &[],
+                    bottom_container: None,
+                    rating_text: None,
+                    filename: None,
+                },
+                measure,
+            );
+            assert_placements_inside_cell(&layout, cell);
+            assert_pairwise_non_intersecting(layout.badge_placements());
+        }
+    }
+
+    #[test]
+    fn filter_count_lifts_above_rating_when_both_fit() {
+        let (cell, inner) = square_cell(100.0);
+        let layout = layout_thumbnail_overlays(
+            ThumbnailOverlayLayoutInput {
+                cell,
+                inner,
+                checked: false,
+                stack_count: None,
+                filter_match_count: Some(42),
+                bookmark_time: None,
+                upscaled_video: false,
+                edit_badges: EditBadgeFlags::default(),
+                tags: &[],
+                bottom_container: None,
+                rating_text: Some("📁★★★★★"),
+                filename: None,
+            },
+            measure,
+        );
+        let rating = layout.bottom_left.rating.as_ref().unwrap();
+        let count = layout.filter_match_count.as_ref().unwrap();
+        assert_placements_inside_cell(&layout, cell);
+        assert!(!rating.rect.intersects(count.rect));
+    }
+
+    #[test]
     fn edit_markers_fit_at_minimum_and_twenty_column_cell_widths() {
         for width in [32.0, 100.0] {
             let (cell, inner) = square_cell(width);
@@ -709,6 +950,9 @@ mod tests {
                 ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    checked: false,
+                    stack_count: None,
+                    filter_match_count: None,
                     bookmark_time: None,
                     upscaled_video: false,
                     edit_badges: EditBadgeFlags {
@@ -745,6 +989,9 @@ mod tests {
                 ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    checked: false,
+                    stack_count: None,
+                    filter_match_count: None,
                     bookmark_time: Some("12:34"),
                     upscaled_video: true,
                     edit_badges: EditBadgeFlags {
@@ -800,6 +1047,9 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                checked: false,
+                stack_count: None,
+                filter_match_count: None,
                 bookmark_time: Some("12:34"),
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
@@ -830,6 +1080,9 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                checked: false,
+                stack_count: None,
+                filter_match_count: None,
                 bookmark_time: Some("0:07"),
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
@@ -870,6 +1123,9 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                checked: false,
+                stack_count: None,
+                filter_match_count: None,
                 bookmark_time: Some("12:34"),
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
@@ -898,6 +1154,9 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                checked: false,
+                stack_count: None,
+                filter_match_count: None,
                 bookmark_time: None,
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
@@ -930,6 +1189,9 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell: cell_rect,
                 inner,
+                checked: false,
+                stack_count: None,
+                filter_match_count: None,
                 bookmark_time: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
@@ -959,6 +1221,9 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell: cell_rect,
                 inner,
+                checked: false,
+                stack_count: None,
+                filter_match_count: None,
                 bookmark_time: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
@@ -988,6 +1253,9 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell: cell_rect,
                 inner,
+                checked: false,
+                stack_count: None,
+                filter_match_count: None,
                 bookmark_time: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
@@ -1017,6 +1285,9 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                checked: false,
+                stack_count: None,
+                filter_match_count: None,
                 bookmark_time: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags {

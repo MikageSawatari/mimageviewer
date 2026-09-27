@@ -20,7 +20,7 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     priority            可視サムネイルが未 decode のうちに非可視が先に処理された違反を検出
     dump <seq>          指定 seq に紐づく全イベントを時系列で列挙
     timeline [seq]      ガントチャート (matplotlib が必要)。seq 指定可
-    thumbs              サムネイル decode 時間の分布 (priority=H/L 別)
+    thumbs              サムネイル decode と可視セル補正生成の時間分布
     remote-page         mIV Remote のページ生成を段・同時本数・lock 待ち別に集計
     colorize            カラー化 / final effect の段階別時間を解像度・方式別に集計
     nav                 Ctrl+↑↓ ナビの区間別 wall time (DFS / apply / load_folder /
@@ -1225,7 +1225,7 @@ def cmd_dump(events: list[dict], seq: int, include_frames: bool) -> None:
 # -----------------------------------------------------------------------
 
 def cmd_thumbs(events: list[dict]) -> None:
-    """thumb.decode_end の時間分布を priority=H/L、from_cache=True/False 別に表示。"""
+    """サムネイル decode と可視セル補正生成の時間分布を表示。"""
     # idx → 最後の priority (enqueue から取る)
     idx_priority: dict[int, bool] = {}
     buckets: dict[tuple[str, bool], list[float]] = defaultdict(list)
@@ -1263,6 +1263,16 @@ def cmd_thumbs(events: list[dict]) -> None:
         for cached in (True, False):
             label = f"priority={pri}  from_cache={cached}"
             stats(label, buckets.get((pri, cached), []))
+
+    adjustment_by_size: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    for event in events:
+        if event.get("cat") == "thumb" and event.get("kind") == "adjustment_build":
+            adjustment_by_size[(event.get("width", 0), event.get("height", 0))].append(event)
+    print("可視セル補正生成 (画像寸法別、GPU 転送時間は含まない):")
+    for (width, height), rows in sorted(adjustment_by_size.items()):
+        print(f"  {width}x{height}: {len(rows)} 件、total 合計={sum(row.get('total_ms', 0.0) for row in rows):.1f} ms")
+        for field in ("apply_ms", "texture_ms", "total_ms"):
+            stats(field, [row.get(field, 0.0) for row in rows])
 
 
 # -----------------------------------------------------------------------

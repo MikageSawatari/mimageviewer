@@ -18735,7 +18735,12 @@ mod phase_c_drill_nav_tests {
         app.settings.global_preset.brightness = 20.0;
         let ctx = egui::Context::default();
 
-        for (cols, rows, side) in [(10, 6, 384usize), (20, 11, 192usize)] {
+        let dpi = 1.75;
+        let logical_width = 3840.0 / dpi;
+        for (cols, rows) in [(10usize, 6usize), (20, 11)] {
+            let cell_points = logical_width / cols as f32;
+            let side =
+                crate::thumb_loader::compute_display_px(cell_points, cell_points, dpi) as usize;
             let cells = cols * rows;
             app.items = (0..cells)
                 .map(|idx| GridItem::Image(format!("C:/grid20-bench/{idx}.jpg").into()))
@@ -18761,7 +18766,7 @@ mod phase_c_drill_nav_tests {
                 app.maybe_apply_thumb_adjustment(&ctx, idx);
                 assert!(app.thumb_adjust_tex.contains_key(&idx));
             }
-            let frame_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let batch_ms = started.elapsed().as_secs_f64() * 1000.0;
             crate::perf::flush();
             let events: Vec<serde_json::Value> = std::fs::read_to_string(&log_path)
                 .unwrap()
@@ -18783,11 +18788,11 @@ mod phase_c_drill_nav_tests {
             let (texture_mean, texture_max) = stats("texture_ms");
             let (cell_mean, cell_max) = stats("total_ms");
             println!(
-                "cols={cols} cells={cells} pixels={side}x{side} frame_ms={frame_ms:.3} \
+                "cols={cols} cells={cells} pixels={side}x{side} batch_ms={batch_ms:.3} \
                  apply_mean/max_ms={apply_mean:.3}/{apply_max:.3} \
                  texture_mean/max_ms={texture_mean:.3}/{texture_max:.3} \
                  cell_mean/max_ms={cell_mean:.3}/{cell_max:.3} \
-                 conservative_frame_ms={:.3}",
+                 conservative_batch_ms={:.3}",
                 cell_max * cells as f64
             );
         }

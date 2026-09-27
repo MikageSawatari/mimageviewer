@@ -104,28 +104,22 @@ fn draw_thumb(
 /// ファイル名スタックの集約セル右上に「N 枚」バッジを描く (v2.0.0)。
 /// スタックは複数枚画像をまとめた仮想コンテナなので、通常画像との見分けを付ける。
 /// スタックはチェック非対象なので右上のチェックオーバーレイとは衝突しない。
-fn draw_stack_count_badge(painter: &egui::Painter, inner: egui::Rect, count: usize) {
-    let font = egui::FontId::proportional((inner.height() * 0.09).clamp(11.0, 16.0));
-    let pad = egui::vec2(6.0, 3.0);
-    let available = inner.width() - 4.0 - pad.x * 2.0;
-    let galley = [format!("{count} 枚"), count.to_string(), "…".to_owned()]
-        .into_iter()
-        .map(|text| painter.layout_no_wrap(text, font.clone(), egui::Color32::WHITE))
-        .find(|galley| galley.size().x <= available);
-    let Some(galley) = galley else { return };
-    let size = galley.size() + pad * 2.0;
-    // バッジの右上をセル右上 (inner.max.x-4, inner.min.y+4) に合わせる。
-    let anchor = egui::pos2(inner.max.x - 4.0, inner.min.y + 4.0);
-    let badge_rect = egui::Rect::from_min_max(
-        egui::pos2(anchor.x - size.x, anchor.y),
-        egui::pos2(anchor.x, anchor.y + size.y),
-    );
+fn draw_stack_count_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    let badge_rect = placement.rect;
     painter.rect_filled(
         badge_rect,
         4.0,
         egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190),
     );
-    painter.galley(badge_rect.min + pad, galley, egui::Color32::WHITE);
+    let galley = painter.layout_no_wrap(
+        placement.text.clone(),
+        egui::FontId::proportional(placement.style.font_size),
+        egui::Color32::WHITE,
+    );
+    painter.galley(placement.text_pos(), galley, egui::Color32::WHITE);
 }
 
 /// What the bottom-left lane shows for one item: a container badge, a filename plate, or both.
@@ -268,6 +262,8 @@ pub(crate) fn layout_cell_overlays(
     bookmark_time: Option<&str>,
     is_drive_list: bool,
     video_indicator: VideoThumbnailIndicator,
+    is_checked: bool,
+    filter_match_count: Option<u32>,
 ) -> ThumbnailOverlayLayout {
     let inner = rect.shrink(4.0);
     let item_name = match item {
@@ -317,6 +313,12 @@ pub(crate) fn layout_cell_overlays(
         ThumbnailOverlayLayoutInput {
             cell: rect,
             inner,
+            checked: is_checked,
+            stack_count: match item {
+                GridItem::Stack { count, .. } => Some(*count),
+                _ => None,
+            },
+            filter_match_count: filter_match_count.filter(|_| item.is_container_ratable()),
             bookmark_time,
             upscaled_video,
             edit_badges,
@@ -389,8 +391,6 @@ pub(crate) fn draw_cell(
     // Some(tex) なら `ThumbnailState::Loaded.tex` の代わりにこちらを描画する
     // (色調補正済みサムネイルテクスチャ)。None または Loaded 以外なら生サムネ。
     adjusted_tex: Option<&egui::TextureHandle>,
-    // コンテナセルに出す「フィルタ一致の子孫件数」。None ならバッジ非表示。
-    filter_match_count: Option<u32>,
     is_drive_list: bool,
     video_indicator: VideoThumbnailIndicator,
     is_cut: bool,
@@ -711,12 +711,11 @@ pub(crate) fn draw_cell(
                 );
             }
         }
-        GridItem::Stack { count, .. } => {
+        GridItem::Stack { .. } => {
             // ファイル名スタックの集約セル: 代表画像を通常サムネと同様に描き、
             // 右上に枚数バッジ (= スタックの目印)。単独グループは GridItem::Image で
             // 描かれるのでここには来ない (= count は常に 2 以上)。
             draw_thumb(painter, inner, thumb, rotation, dark, adjusted_tex);
-            draw_stack_count_badge(painter, inner, *count);
         }
         GridItem::CollectionPlaceholder { path, reason, .. } => {
             let bg = if dark {
@@ -778,9 +777,9 @@ pub(crate) fn draw_cell(
     }
 
     // チェックマークオーバーレイ
-    if is_checked {
-        let check_r = 12.0;
-        let check_center = egui::pos2(rect.max.x - check_r - 4.0, rect.min.y + check_r + 4.0);
+    if let Some(check_rect) = overlay_layout.check {
+        let check_r = check_rect.width() * 0.5;
+        let check_center = check_rect.center();
         painter.circle_filled(check_center, check_r, egui::Color32::from_rgb(40, 140, 40));
         // チェックマーク (✓)
         let s = check_r * 0.55;
@@ -802,6 +801,10 @@ pub(crate) fn draw_cell(
     }
 
     let painter = &content_painter;
+
+    if let Some(placement) = overlay_layout.stack_count.as_ref() {
+        draw_stack_count_badge(painter, placement);
+    }
 
     if let Some(placement) = overlay_layout.top_left.upscaled_video.as_ref() {
         crate::ui_helpers::draw_overlay_upscaled_video_badge(painter, placement);
@@ -843,10 +846,8 @@ pub(crate) fn draw_cell(
         );
     }
 
-    if let Some(count) = filter_match_count {
-        if item.is_container_ratable() && count > 0 {
-            draw_filter_match_badge(painter, rect, count);
-        }
+    if let Some(placement) = overlay_layout.filter_match_count.as_ref() {
+        draw_filter_match_badge(painter, placement);
     }
 }
 
@@ -934,30 +935,18 @@ fn draw_dashed_segment(
     }
 }
 
-fn draw_filter_match_badge(painter: &egui::Painter, cell_rect: egui::Rect, count: u32) {
-    let text = if count >= 1000 {
-        "999+".to_string()
-    } else {
-        count.to_string()
-    };
-    let font = egui::FontId::proportional(11.0);
-    let pad_x = 5.0;
-    let pad_y = 2.0;
-    let available = cell_rect.width() - 6.0 - pad_x * 2.0;
-    let galley = [text, "…".to_owned()]
-        .into_iter()
-        .map(|text| painter.layout_no_wrap(text, font.clone(), egui::Color32::WHITE))
-        .find(|galley| galley.size().x <= available);
-    let Some(galley) = galley else { return };
-    let bg_w = galley.size().x + pad_x * 2.0;
-    let bg_h = galley.size().y + pad_y * 2.0;
-    let bg_rect = egui::Rect::from_min_size(
-        egui::pos2(cell_rect.max.x - bg_w - 3.0, cell_rect.max.y - bg_h - 3.0),
-        egui::vec2(bg_w, bg_h),
-    );
+fn draw_filter_match_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    let bg_rect = placement.rect;
     painter.rect_filled(bg_rect, 3.0, egui::Color32::from_rgb(0xE6, 0x7E, 0x22));
-    let text_pos = bg_rect.left_top() + egui::vec2(pad_x, pad_y);
-    painter.galley(text_pos, galley, egui::Color32::WHITE);
+    let galley = painter.layout_no_wrap(
+        placement.text.clone(),
+        egui::FontId::proportional(placement.style.font_size),
+        egui::Color32::WHITE,
+    );
+    painter.galley(placement.text_pos(), galley, egui::Color32::WHITE);
 }
 
 pub(crate) fn primary_grid_tag_for_badge(tags: &[String]) -> Option<&str> {
@@ -1007,11 +996,13 @@ mod cut_content_paint_tests {
                             true,
                             true,
                             false,
-                            &ThumbnailOverlayLayout::default(),
+                            &ThumbnailOverlayLayout {
+                                check: Some(crate::thumb_overlay_layout::check_overlay_rect(cell)),
+                                ..Default::default()
+                            },
                             &GridItem::Image(PathBuf::from(r"C:\cut.jpg")),
                             &ThumbnailState::Pending,
                             crate::rotation_db::Rotation::None,
-                            None,
                             None,
                             false,
                             VideoThumbnailIndicator::default(),
@@ -1095,7 +1086,6 @@ mod cut_content_paint_tests {
                                 &GridItem::Video(PathBuf::from(r"C:\cut.mp4")),
                                 &ThumbnailState::Pending,
                                 crate::rotation_db::Rotation::None,
-                                None,
                                 None,
                                 false,
                                 VideoThumbnailIndicator::PlayIcon,
@@ -1214,13 +1204,17 @@ pub fn draw_collection_placeholder_snapshot_fixture(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         for (index, (name, reason)) in cases.into_iter().enumerate() {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(145.0, 118.0), egui::Sense::hover());
+            let layout = ThumbnailOverlayLayout {
+                check: (index == 1).then(|| crate::thumb_overlay_layout::check_overlay_rect(rect)),
+                ..Default::default()
+            };
             draw_cell(
                 ui,
                 rect,
                 index == 0,
                 index == 1,
                 false,
-                &ThumbnailOverlayLayout::default(),
+                &layout,
                 &GridItem::CollectionPlaceholder {
                     path: std::path::PathBuf::from(name),
                     last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
@@ -1228,7 +1222,6 @@ pub fn draw_collection_placeholder_snapshot_fixture(ui: &mut egui::Ui) {
                 },
                 &ThumbnailState::Failed,
                 crate::rotation_db::Rotation::None,
-                None,
                 None,
                 false,
                 VideoThumbnailIndicator::default(),
@@ -1263,6 +1256,8 @@ fn draw_video_indicator_snapshot_cell(
         None,
         false,
         indicator,
+        false,
+        None,
     );
     draw_cell(
         ui,
@@ -1274,7 +1269,6 @@ fn draw_video_indicator_snapshot_cell(
         item,
         thumb,
         crate::rotation_db::Rotation::None,
-        None,
         None,
         false,
         indicator,
