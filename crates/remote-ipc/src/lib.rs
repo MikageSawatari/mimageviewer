@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 61;
+pub const PROTOCOL_VERSION: u32 = 62;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -203,6 +203,9 @@ pub struct FolderListPayload {
     pub root_name: String,
     pub thumb_aspect_height_ratio: f64,
     pub sort_state: RemoteGridSortState,
+    /// Visible when a requested rating order fell back to name order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_notice: Option<String>,
     pub entries: Vec<FolderListEntry>,
     /// Time spent scanning the directory and reading metadata.
     pub scan_ms: f64,
@@ -3258,7 +3261,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 61);
+        assert_eq!(PROTOCOL_VERSION, 62);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3407,6 +3410,7 @@ mod tests {
                 root_name: "Fixture".to_owned(),
                 thumb_aspect_height_ratio: 9.0 / 16.0,
                 sort_state: test_sort_state(None),
+                sort_notice: None,
                 entries: vec![FolderListEntry {
                     address: video,
                     thumbnail_address: sidecar,
@@ -3433,8 +3437,30 @@ mod tests {
     }
 
     #[test]
+    fn folder_sort_notice_is_additive_and_old_payloads_remain_readable() {
+        let payload = serde_json::json!({
+            "effective_address": RemoteAddress::file("C:/Pictures"),
+            "root_name": "Pictures",
+            "thumb_aspect_height_ratio": 1.0,
+            "sort_state": test_sort_state(None),
+            "entries": [],
+            "scan_ms": 0.0,
+            "materialize_ms": 0.0
+        });
+        let old: FolderListPayload = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(old.sort_notice, None);
+        let mut with_notice = payload;
+        with_notice["sort_notice"] = serde_json::json!("評価順を読み込めませんでした");
+        let current: FolderListPayload = serde_json::from_value(with_notice).unwrap();
+        assert_eq!(
+            current.sort_notice.as_deref(),
+            Some("評価順を読み込めませんでした")
+        );
+    }
+
+    #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 61);
+        assert_eq!(PROTOCOL_VERSION, 62);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -4458,7 +4484,7 @@ mod tests {
 
     #[test]
     fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
-        assert_eq!(PROTOCOL_VERSION, 61);
+        assert_eq!(PROTOCOL_VERSION, 62);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();

@@ -2256,10 +2256,10 @@ impl App {
                 ui.horizontal(|ui| {
                     let font_ready = state.ui_font_apply_ready();
                     let lut_ready = state.creative_lut_import_rx.is_none();
-                    if ui
-                        .add_enabled(font_ready && lut_ready, egui::Button::new("  OK  "))
-                        .clicked()
-                    {
+                    let ok = ui.add_enabled(font_ready && lut_ready, egui::Button::new("  OK  "));
+                    #[cfg(all(windows, feature = "test-script"))]
+                    crate::test_script::register_clickable_widget("OK", &ok);
+                    if ok.clicked() {
                         apply = true;
                         // (note: 「TRT 全エンジンビルド」ボタンのフラグは下のブロックで処理する)
                     }
@@ -2299,6 +2299,7 @@ impl App {
                     self.settings.archive_file_handling_resolved(),
                 );
                 let old_grid_display_order = self.settings.grid_display_order.clone();
+                let old_rating_sort_unrated_position = self.settings.rating_sort_unrated_position;
                 let old_show_hidden_files = self.settings.show_hidden_files;
                 let old_exif = self.settings.exif_hidden_tags.clone();
 
@@ -2627,9 +2628,12 @@ impl App {
                     old_show_hidden_files != self.settings.show_hidden_files;
                 let grid_display_order_changed =
                     old_grid_display_order != self.settings.grid_display_order;
+                let rating_sort_position_changed = old_rating_sort_unrated_position
+                    != self.settings.rating_sort_unrated_position
+                    && self.settings.sort_order.is_rating();
                 if duplicate_settings_changed || file_visibility_changed {
                     self.reload_current_folder_preserving_override();
-                } else if grid_display_order_changed {
+                } else if grid_display_order_changed || rating_sort_position_changed {
                     self.apply_sort_change_reload();
                 }
                 if old_exif != self.settings.exif_hidden_tags {
@@ -4682,6 +4686,62 @@ mod tests {
             assert!(!edited.thumb_tooltip_show_filename);
             assert_eq!(edited.details_column_order, vec![DetailsColumnId::Name]);
         }
+    }
+
+    #[test]
+    fn unrated_position_survives_preferences_ok_save_reopen_and_orders_folder() {
+        use crate::rating_sort::{
+            ListingOrderRequest, RatingSortDirection, RatingSortSpec, RatingSortUnratedPosition,
+        };
+        use crate::settings::{Settings, SortOrder};
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sort_order = SortOrder::RatingDesc;
+        let folder = app.tmp.path().join("preferences-unrated-position");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in ["one.jpg", "unrated.jpg", "two.jpg"] {
+            std::fs::write(folder.join(name), b"image").unwrap();
+        }
+        for (name, stars) in [("one.jpg", 1), ("two.jpg", 2)] {
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(
+                    &crate::adjustment_db::normalize_path(&folder.join(name)),
+                    stars,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let mut state = preferences_state_for_test(&app.settings);
+        state.settings.rating_sort_unrated_position = RatingSortUnratedPosition::BelowAll;
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.settings = state.settings;
+        app.settings.save();
+
+        let reloaded = Settings::load();
+        let reopened = preferences_state_for_test(&reloaded);
+        assert_eq!(
+            reopened.settings.rating_sort_unrated_position,
+            RatingSortUnratedPosition::BelowAll,
+        );
+        assert_eq!(
+            ListingOrderRequest::from_settings(&reloaded),
+            ListingOrderRequest::Rating(RatingSortSpec {
+                direction: RatingSortDirection::Desc,
+                unrated_position: RatingSortUnratedPosition::BelowAll,
+            }),
+        );
+        app.settings = reloaded;
+        app.load_folder_with_scan(folder, None);
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["two.jpg", "one.jpg", "unrated.jpg"],
+        );
     }
 
     #[test]

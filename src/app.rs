@@ -163,6 +163,8 @@ pub(crate) use metadata_ops::{probe_image_dims_from_bytes, tag_item_path};
 thread_local! {
     pub(crate) static RATING_INSTALL_UI_PREWARMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static RATING_INSTALL_UI_TAG_PREWARMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Exercise the boundary between a complete read and installing its cache.
+    pub(crate) static RATING_AFTER_MATERIALIZE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&mut App)>>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(windows)]
 mod native_video;
@@ -959,6 +961,19 @@ impl DetachedImageWindowSnapshot {
 
 #[cfg(windows)]
 impl App {
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn test_script_smart_folder_root_visible(&self) -> bool {
+        self.items_are_smart_folder_view
+            && matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::SmartFolder(_)
+            )
+            && self
+                .top_level_grid_view
+                .smart_folder_session()
+                .is_some_and(|session| session.test_script_phase() == "Root")
+    }
+
     const EGUI_VIEWPORT_CLASS: &'static str = "Window Class";
     const DETACHED_PHYSICAL_ACTIVATION_MAX_DRAG_PX: i32 = 8;
 
@@ -10498,6 +10513,8 @@ impl PageOrderViewKind {
 pub(crate) enum GridSortLockReason {
     /// 本として表示中 / 閲覧履歴。ページ順そのものが固定されている。
     PageOrderFixed,
+    /// この一覧は固有の順序を持ち、一覧 sort は適用されない。
+    FixedOrder,
     /// 詳細一覧の列ヘッダが並びを所有している。
     DetailsHeaderSort,
     /// 手動順のコレクションでは列ヘッダが順序を上書きできない。
@@ -10523,6 +10540,7 @@ impl GridSortLockReason {
     pub(crate) fn short_label(self) -> &'static str {
         match self {
             Self::PageOrderFixed => "固定",
+            Self::FixedOrder => "並べ替え固定",
             Self::DetailsHeaderSort => "列ヘッダ",
             Self::CollectionManualOrder => "手動順",
             Self::CollectionShuffleOrder => "シャッフル",
@@ -10541,6 +10559,7 @@ impl GridSortLockReason {
             Self::PageOrderFixed => {
                 "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。"
             }
+            Self::FixedOrder => "この一覧は並べ替え固定です。",
             Self::DetailsHeaderSort => {
                 "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。"
             }
@@ -12988,6 +13007,10 @@ pub struct App {
     /// 旧フォルダ用ワーカーが新 items の同じ idx に違う画像を書き込む race を防ぐ。
     pub(crate) items_generation: u64,
 
+    /// Counts top-level load requests before cancellation or install can hide a duplicate.
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) test_script_folder_load_requests: u64,
+
     /// 最上位一覧 surface の所有者、復元先、遷移世代の正本。
     /// 既存の `items_are_*` / search active flag は描画互換の派生状態として段階移行中。
     pub(crate) top_level_grid_view: top_level_grid_view::TopLevelGridView,
@@ -14021,6 +14044,8 @@ pub struct App {
     /// 現在 mount 中の context が `rating_session_writes` を反映済みの世代。
     /// idx cache と同じ context ownership なので `ViewerContextBundle` と交換する。
     pub(crate) rating_session_write_seen_generation: u64,
+    #[cfg(test)]
+    pub(crate) rating_publication_count: usize,
     /// modal import中だけ保持する、path keyから現在context cache indexへの逆引き。
     /// import開始前に1回構築し、streaming refresh batchごとの全items走査を避ける。
     metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
@@ -14514,7 +14539,7 @@ pub struct App {
     pub(crate) stack_request_sequence: u64,
     /// スタックを ON にした瞬間のカーソル画像パス。集約完了時にこの画像を含むスタックセルへ
     /// カーソルを移す (トグルで被写体が飛ばないように)。OFF 側は `select_after_load` で扱う。
-    pub(crate) stack_toggle_select_path: Option<std::path::PathBuf>,
+    pub(crate) stack_selection_target: Option<crate::filename_stack_ui::StackSelectionTarget>,
 
     // ── サブフォルダ展開ビュー (snapshot flat view) ───────────────
     /// サブ展開ビューの実 root。`current_folder` は synthetic path になるため、戻り先や
@@ -16768,6 +16793,8 @@ impl App {
             fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
             colorize_mono_summary_cache: std::collections::HashMap::new(),
             items_generation: 0,
+            #[cfg(all(windows, feature = "test-script"))]
+            test_script_folder_load_requests: 0,
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             items_are_global_search_view: false,
             empty_items_reason: None,
@@ -17151,6 +17178,8 @@ impl App {
             rating_session_write_generation: 0,
             rating_session_writes: std::collections::HashMap::new(),
             rating_session_write_seen_generation: 0,
+            #[cfg(test)]
+            rating_publication_count: 0,
             metadata_import_refresh_index: None,
             current_folder_rating_cache: None,
             rating_counts_cache: None,
@@ -17335,7 +17364,7 @@ impl App {
             stack_script_error: None,
             stack_script_pending: None,
             stack_request_sequence: 0,
-            stack_toggle_select_path: None,
+            stack_selection_target: None,
             subfolder_expansion_root: None,
             subfolder_expansion_roots: Vec::new(),
             subfolder_expansion_saved_folder: None,
@@ -21384,8 +21413,12 @@ impl App {
                 self.bookmark_view_sort,
                 crate::bookmark_browser::BookmarkViewSort::Normal(_)
             ) {
-                self.bookmark_view_sort =
-                    crate::bookmark_browser::BookmarkViewSort::Normal(self.settings.sort_order);
+                if let crate::rating_sort::ListingOrderRequest::Standard(sort) =
+                    crate::rating_sort::ListingOrderRequest::from_settings(&self.settings)
+                {
+                    self.bookmark_view_sort =
+                        crate::bookmark_browser::BookmarkViewSort::Normal(sort);
+                }
             }
             self.install_bookmark_view_rows();
             return;
@@ -22090,6 +22123,11 @@ impl App {
             self.reject_snapshot_out_of_scope_open();
             return FolderOpenOutcome::Ignored;
         }
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            self.test_script_folder_load_requests =
+                self.test_script_folder_load_requests.saturating_add(1);
+        }
         if matches!(owner, OpenRequestOwner::Navigation)
             && !self.navigation_scope.is_detached_physical()
             && let Some(kind) = self.smart_physical_target_kind(&path)
@@ -22208,6 +22246,11 @@ impl App {
             self.reject_snapshot_out_of_scope_open();
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
             return false;
+        }
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            self.test_script_folder_load_requests =
+                self.test_script_folder_load_requests.saturating_add(1);
         }
         if matches!(owner, OpenRequestOwner::Navigation)
             && !self.navigation_scope.is_detached_physical()
@@ -22554,6 +22597,25 @@ impl App {
                 return true;
             }
         }
+        if self.stack_mode_requested
+            && self.stack_selection_target.is_none()
+            && self
+                .stack_view
+                .as_ref()
+                .is_some_and(|view| crate::folder_tree::path_eq(&view.folder, &path))
+        {
+            self.stack_selection_target = self.selected.and_then(|idx| {
+                let view = self.stack_view.as_ref()?;
+                let key = if self.stack_showing_flat {
+                    view.group_key_at_flat_index(idx)
+                } else {
+                    view.group_key_at_aggregated_index(idx)
+                }?;
+                Some(crate::filename_stack_ui::StackSelectionTarget::GroupKey(
+                    key.to_owned(),
+                ))
+            });
+        }
         if matches!(
             self.top_level_grid_view.surface(),
             top_level_grid_view::TopLevelGridSurface::DriveList
@@ -22833,7 +22895,31 @@ impl App {
         // `start_loading_items` に引数として渡す。
         let folder_signature = signature_from_scan(&scan);
         let scan_ms = scan_t0.elapsed().as_secs_f64() * 1000.0;
-        let materialized = materialize_local_folder_listing(&path, scan, &self.settings);
+        let order_request = crate::rating_sort::ListingOrderRequest::from_settings(&self.settings);
+        let rating_generation_before_read = self.rating_session_write_generation;
+        let materialized = folder_scan::materialize_local_folder_listing_with_order(
+            &path,
+            scan,
+            &self.settings,
+            order_request,
+            |keys| {
+                self.rating_db
+                    .as_ref()
+                    .ok_or_else(|| "レーティング DB を利用できません".to_owned())?
+                    .get_many_complete(keys, rating_generation_before_read)
+                    .map_err(|error| error.to_string())
+            },
+        );
+        #[cfg(test)]
+        if matches!(
+            order_request,
+            crate::rating_sort::ListingOrderRequest::Rating(_)
+        ) {
+            let hook = RATING_AFTER_MATERIALIZE_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        }
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -22905,6 +22991,31 @@ impl App {
         }
 
         let folder_sort = materialized.folder_sort;
+        let (prepared_folder_rating, rating_order_failed) = match materialized.rating_order {
+            folder_scan::FolderRatingOrder::Standard => (None, false),
+            folder_scan::FolderRatingOrder::Prepared {
+                cache,
+                write_generation,
+                requested_count,
+                read_ms,
+            } => {
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "nav",
+                        "lf_rating_sort",
+                        None,
+                        lf_seq,
+                        &[
+                            ("count", serde_json::Value::from(requested_count)),
+                            ("read_ms", serde_json::Value::from(read_ms)),
+                            ("rating_sort", serde_json::Value::from(true)),
+                        ],
+                    );
+                }
+                (Some((cache, write_generation, read_ms)), false)
+            }
+            folder_scan::FolderRatingOrder::Failed => (None, true),
+        };
         self.video_thumb_overrides.clear();
         for (video, image) in materialized.video_thumb_overrides {
             self.video_thumb_overrides.insert(stem_lower(&video), image);
@@ -22975,6 +23086,40 @@ impl App {
         // キーを保持するので delete_missing が非代表メンバーを巻き添えで消さない)、ワーカー完了時に
         // start_loading_items へ渡すため消費前に複製しておく。
         let stack_on = self.stack_mode_requested;
+        let stack_rating_source = stack_on
+            .then(|| prepared_folder_rating.as_ref())
+            .flatten()
+            .map(|(cache, _, _)| {
+                crate::filename_stack_ui::StackRatingSource::Prepared(std::sync::Arc::new(
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, item)| {
+                            let key = crate::rating_sort::physical_item_key(item)?;
+                            let stars = *cache.get(&idx).expect("complete physical rating cache");
+                            Some((
+                                key,
+                                crate::rating_sort::RatingSortKey::supported(stars).unwrap(),
+                            ))
+                        })
+                        .collect::<std::collections::HashMap<_, _>>(),
+                ))
+            })
+            .unwrap_or_else(|| {
+                if rating_order_failed {
+                    crate::filename_stack_ui::StackRatingSource::ReadFailed
+                } else {
+                    crate::filename_stack_ui::StackRatingSource::Standard
+                }
+            });
+        let stack_order_request = if matches!(
+            stack_rating_source,
+            crate::filename_stack_ui::StackRatingSource::Prepared(_)
+        ) {
+            order_request
+        } else {
+            crate::rating_sort::ListingOrderRequest::Standard(folder_sort)
+        };
         let stack_async_prep = if stack_on {
             // スクリプト本文の読み込み (ファイル I/O) はワーカー側で行うので、ここでは
             // 「スクリプトを使うか」のフラグだけを渡す (UI スレッドの同期 read_to_string 回避)。
@@ -22982,9 +23127,10 @@ impl App {
             Some((
                 script_enabled,
                 self.settings.stack_separator,
-                crate::filename_stack_ui::StackListingSource::Normal(std::sync::Arc::new(
-                    listing_sort_metas,
-                )),
+                crate::filename_stack_ui::StackListingSource::Normal(
+                    std::sync::Arc::new(listing_sort_metas),
+                    stack_rating_source,
+                ),
                 existing_keys.clone(),
                 path.clone(),
             ))
@@ -23006,8 +23152,14 @@ impl App {
             None,
             None,
             None,
+            prepared_folder_rating,
             authority,
         );
+        if rating_order_failed {
+            self.show_feedback_toast(
+                "評価順を読み取れなかったため、名前順で表示しました".to_owned(),
+            );
+        }
         if let Some((script_enabled, separator, listing, stack_existing, stack_folder)) =
             stack_async_prep
         {
@@ -23016,10 +23168,9 @@ impl App {
             self.stack_mode_requested = true;
             self.spawn_stack_script_worker(
                 stack_folder.clone(),
-                stack_folder,
                 listing,
                 separator,
-                folder_sort,
+                stack_order_request,
                 stack_existing,
                 Some(folder_signature),
                 script_enabled,
@@ -25268,7 +25419,7 @@ impl App {
                 && self.rating_view_accepted_write_generation
                     != crate::rating_db::RATING_WRITES.sample().completed_writes
             {
-                self.request_rating_view_build();
+                self.request_rating_view_membership_refresh();
             }
             return;
         }
@@ -25282,7 +25433,6 @@ impl App {
             return;
         }
         let stale = pending.sequence != self.rating_view_request_sequence
-            || pending.rating_write_generation != self.rating_session_write_generation
             || pending.sort != self.rating_view_sort
             || pending.stars != self.rating_view_stars
             || pending.source_generation != self.items_generation;
@@ -25292,6 +25442,18 @@ impl App {
         }
         match pending.rx.try_recv() {
             Ok(Ok(result)) => {
+                let read_generation = pending.rating_write_generation;
+                let rating_header_survivors = (pending.membership_only
+                    && self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+                    && self.settings.details_sort_key == crate::settings::DetailsSortKey::Rating)
+                    .then(|| {
+                        self.details_order
+                            .iter()
+                            .filter_map(|&index| {
+                                self.rating_view_rows.get(index).map(|row| row.key.clone())
+                            })
+                            .collect::<Vec<_>>()
+                    });
                 self.rating_view_pending = None;
                 // The generic item install clears the outgoing edit maps. Finish its pending
                 // trim write before validating the worker's DB-read stamp.
@@ -25299,7 +25461,6 @@ impl App {
                 if result.prepared.as_ref().is_some_and(|prepared| {
                     crate::page_edit_write_epoch::PAGE_EDIT_WRITES
                         .accepts(prepared.page_edits.stamp)
-                        && crate::rating_db::RATING_WRITES.accepts(prepared.rating_stamp)
                         && crate::tags_db::TAG_WRITES.accepts(prepared.tag_stamp)
                 }) {
                     self.rating_view_accepted_write_generation = result
@@ -25309,6 +25470,20 @@ impl App {
                         .rating_stamp
                         .completed_writes;
                     self.apply_rating_view_result(result);
+                    self.overlay_rating_session_writes_since(read_generation);
+                    if let Some(keys) = rating_header_survivors {
+                        let positions = self
+                            .rating_view_rows
+                            .iter()
+                            .enumerate()
+                            .map(|(index, row)| (row.key.as_str(), index))
+                            .collect::<std::collections::HashMap<_, _>>();
+                        self.details_order = keys
+                            .iter()
+                            .filter_map(|key| positions.get(key.as_str()).copied())
+                            .collect();
+                    }
+                    self.rebuild_visible_indices_after_rating_publication();
                 } else {
                     self.request_rating_view_build();
                 }
@@ -25316,7 +25491,6 @@ impl App {
             Ok(Err(msg)) => {
                 self.rating_view_pending = None;
                 if msg == "page-edit read changed during rating prepare"
-                    || msg == "rating read changed during rating prepare"
                     || msg == "tag read changed during rating prepare"
                     || msg == "cancelled"
                 {
@@ -25341,6 +25515,26 @@ impl App {
     }
 
     fn request_rating_view_build(&mut self) {
+        self.request_rating_view_build_with_intent(
+            crate::rating_view::RatingViewBuildIntent::Reorder,
+        );
+    }
+
+    fn request_rating_view_membership_refresh(&mut self) {
+        let survivor_keys = self
+            .rating_view_rows
+            .iter()
+            .map(|row| row.key.clone())
+            .collect();
+        self.request_rating_view_build_with_intent(
+            crate::rating_view::RatingViewBuildIntent::Membership { survivor_keys },
+        );
+    }
+
+    fn request_rating_view_build_with_intent(
+        &mut self,
+        intent: crate::rating_view::RatingViewBuildIntent,
+    ) {
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
         }
@@ -25353,6 +25547,7 @@ impl App {
             self.projected_viewer_context_id(),
             self.rating_session_write_generation,
             crate::rating_view::RatingViewPrepareOptions {
+                intent,
                 sort: self.rating_view_sort,
                 display_order: self.settings.grid_display_order.clone(),
                 pin_db: self.folder_thumb_pin_db.clone(),
@@ -25397,14 +25592,6 @@ impl App {
         self.items_are_rating_view
             .then(|| self.rating_view_rows.get(idx))
             .flatten()
-    }
-
-    pub(crate) fn refresh_rating_view_after_rating_changes(&mut self, changes: &[(String, u8)]) {
-        if changes.is_empty() {
-            self.rebuild_visible_indices();
-        } else {
-            self.request_rating_view_build();
-        }
     }
 
     pub(crate) fn reload_current_rating_view_preserving_sort(&mut self) {
@@ -25469,7 +25656,7 @@ impl App {
         // Normal sort は従来どおり再配置し、rows も再配置後の順序へ揃え直す。
         let (items, image_metas) = crate::rating_view::sort_and_materialize_rows(
             &mut self.rating_view_rows,
-            self.rating_view_sort,
+            self.rating_view_sort.normalized_for_rating_view(),
             &self.settings.grid_display_order,
         );
         let video_items: Vec<(usize, PathBuf, u64)> = items
@@ -26129,6 +26316,7 @@ impl App {
                     None,
                     None,
                     None,
+                    None,
                     authority,
                 );
                 self.set_empty_items_reason(
@@ -26168,6 +26356,7 @@ impl App {
             image_metas,
             existing_keys,
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -28021,6 +28210,7 @@ impl App {
             None,
             None,
             None,
+            None,
             VisibleInstallAuthority::Ordinary,
         );
     }
@@ -28055,6 +28245,7 @@ impl App {
             Some((edits.snapshot, edits.projection)),
             Some(pin_map),
             Some((rating_cache, tags_cache)),
+            None,
             VisibleInstallAuthority::Ordinary,
         );
     }
@@ -28075,6 +28266,7 @@ impl App {
             video_items,
             None,
             Some(metadata),
+            None,
             None,
             None,
             None,
@@ -28109,6 +28301,7 @@ impl App {
             Some((page_edits.snapshot, page_edits.projection)),
             Some(pin_map),
             Some((rating_cache, tags_cache)),
+            None,
             VisibleInstallAuthority::Ordinary,
         );
     }
@@ -28133,6 +28326,7 @@ impl App {
             std::collections::HashMap<usize, u8>,
             std::collections::HashMap<String, Vec<String>>,
         )>,
+        prepared_folder_rating: Option<(std::collections::HashMap<usize, u8>, u64, f64)>,
         authority: VisibleInstallAuthority<'_>,
     ) {
         // An earlier accepted load owns the sole restore continuation.  Results from sibling
@@ -28569,7 +28763,11 @@ impl App {
         // これにより rebuild_visible_indices や draw_cell からの初回 get_rating が
         // SQLite を叩かずに済む (大量フォルダで初フレームが詰まるのを防ぐ)。
         let prewarm_rating_t0 = std::time::Instant::now();
-        if let Some(prepared) = prepared_subfolder.as_mut() {
+        let prepared_rating_read_ms = prepared_folder_rating.as_ref().map(|(_, _, ms)| *ms);
+        if let Some((cache, generation, _)) = prepared_folder_rating {
+            self.rating_cache = cache;
+            self.overlay_rating_session_writes_since(generation);
+        } else if let Some(prepared) = prepared_subfolder.as_mut() {
             self.rating_cache = std::mem::take(&mut prepared.rating_cache);
         } else if let Some((rating_cache, _)) = prepared_rating_tags.as_mut() {
             self.rating_cache = std::mem::take(rating_cache);
@@ -28585,10 +28783,24 @@ impl App {
                 "sli_prewarm_rating",
                 None,
                 sli_seq,
-                &[(
-                    "ms",
-                    serde_json::Value::from(prewarm_rating_t0.elapsed().as_secs_f64() * 1000.0),
-                )],
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(
+                            prepared_rating_read_ms.unwrap_or_else(|| {
+                                prewarm_rating_t0.elapsed().as_secs_f64() * 1000.0
+                            }),
+                        ),
+                    ),
+                    ("count", serde_json::Value::from(self.items.len())),
+                    (
+                        "rating_sort",
+                        serde_json::Value::from(matches!(
+                            crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
+                            crate::rating_sort::ListingOrderRequest::Rating(_)
+                        )),
+                    ),
+                ],
             );
         }
         // タグバッジ用も同様に tags.db から一括 prewarm。
@@ -32246,6 +32458,7 @@ impl App {
         if sorted_desc_idxs.is_empty() {
             return;
         }
+        self.remove_smart_folder_rating_masks(sorted_desc_idxs);
         let previous_items_generation = self.items_generation;
         let removed_snapshot_paths: Vec<std::path::PathBuf> = sorted_desc_idxs
             .iter()
@@ -36218,7 +36431,10 @@ impl App {
         &self,
         bookmark: &crate::book_bookmarks::BookBookmark,
     ) -> Option<usize> {
-        (0..self.items.len()).find(|idx| self.book_bookmark_matches_item(bookmark, *idx))
+        (0..self.items.len()).find(|idx| {
+            self.smart_folder_rule_qualifies_index(*idx)
+                && self.book_bookmark_matches_item(bookmark, *idx)
+        })
     }
 
     fn resolve_current_archive_bookmark_target(
@@ -54839,17 +55055,28 @@ impl App {
     /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
-        self.rebuild_visible_indices_impl(true);
+        self.rebuild_visible_indices_impl(true, false);
     }
 
     /// DB / bookmarkなど外部snapshotの更新で、現在mount中のcontext-owned表示集合だけを
     /// 再計算する。`facet_filter_scope`とsuppressionはApp-globalなので、detached/pausedを
     /// 一時mountする経路ではnavigation扱いのscope同期を行わない。
     fn rebuild_visible_indices_preserving_facet_scope(&mut self) {
-        self.rebuild_visible_indices_impl(false);
+        self.rebuild_visible_indices_impl(false, false);
     }
 
-    fn rebuild_visible_indices_impl(&mut self, sync_facet_scope: bool) {
+    /// A rating publication changes membership, but the rating header retains
+    /// the order established by its last explicit sort or items install.
+    pub(crate) fn rebuild_visible_indices_after_rating_publication(&mut self) {
+        self.rebuild_visible_indices_impl(false, true);
+        self.refresh_smart_folder_rating_navigation_entries();
+    }
+
+    fn rebuild_visible_indices_impl(
+        &mut self,
+        sync_facet_scope: bool,
+        preserve_rating_details_order: bool,
+    ) {
         if matches!(self.navigation_scope, ViewerNavigationScope::CollectionRoot) {
             // The root's installed prepared order is the navigation domain. App-global search,
             // rating, and facet filters belong to the main grid and must not trim this owner.
@@ -54926,12 +55153,33 @@ impl App {
             };
 
         let n = self.items.len();
+        let smart_rating_membership = self.smart_folder_rating_membership_flags();
+        let mut smart_rule_total = 0;
+        let mut smart_rule_search_matches = 0;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
+            if smart_rating_membership
+                .as_ref()
+                .is_some_and(|flags| !flags[i])
+            {
+                continue;
+            }
+            if smart_rating_membership.is_some() {
+                smart_rule_total += 1;
+                if search_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.contains(&i))
+                {
+                    smart_rule_search_matches += 1;
+                }
+            }
             if let Some(ref f) = search_filter {
                 if !f.contains(&i) {
                     continue;
                 }
+            }
+            if self.items_are_rating_view && self.get_rating(i) != self.rating_view_stars {
+                continue;
             }
             if rating_filter_active {
                 let stars = self.get_rating(i);
@@ -54952,6 +55200,12 @@ impl App {
                 continue;
             }
             result.push(i);
+        }
+        if smart_rating_membership.is_some()
+            && let Some(session) = self.top_level_grid_view.smart_folder_session_mut()
+        {
+            session.rating_rule_qualifying_count = smart_rule_total;
+            session.rating_rule_search_match_count = smart_rule_search_matches;
         }
         self.visible_indices = result;
         if let Some(t0) = facet_name_filter_t0 {
@@ -55010,7 +55264,29 @@ impl App {
             }
         }
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
-            self.rebuild_details_order();
+            if preserve_rating_details_order
+                && self.settings.details_sort_key == crate::settings::DetailsSortKey::Rating
+                && self.details_header_sort_active()
+            {
+                let visible = self.visible_indices.iter().copied().collect::<HashSet<_>>();
+                let mut retained = self
+                    .details_order
+                    .iter()
+                    .copied()
+                    .filter(|idx| visible.contains(idx))
+                    .collect::<Vec<_>>();
+                let already = retained.iter().copied().collect::<HashSet<_>>();
+                retained.extend(
+                    self.visible_indices
+                        .iter()
+                        .copied()
+                        .filter(|idx| !already.contains(idx)),
+                );
+                self.details_order = retained;
+                self.details_order_revision = self.details_order_revision.wrapping_add(1);
+            } else {
+                self.rebuild_details_order();
+            }
         } else {
             self.details_order.clear();
         }
@@ -55086,6 +55362,9 @@ impl App {
             && !rating_filter.iter().all(|&b| b);
         let mut out = Vec::new();
         for i in 0..self.items.len() {
+            if !self.smart_folder_rule_qualifies_index(i) {
+                continue;
+            }
             if let Some(ref f) = search_filter {
                 if !f.contains(&i) {
                     continue;
@@ -55997,6 +56276,16 @@ impl App {
     /// 何も起きない入口が残る (§1.143(a): メニューの「ソート順」は列ヘッダ並べ替え中でも
     /// 選べてしまい、選んでも表示は変わらなかった)。
     pub(crate) fn grid_sort_lock_reason(&self) -> Option<GridSortLockReason> {
+        use top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+        if matches!(
+            self.top_level_grid_view.surface(),
+            TopLevelGridSurface::Search(TopLevelSearchView::Favorite | TopLevelSearchView::Tag)
+                | TopLevelGridSurface::ReadingHistory
+                | TopLevelGridSurface::Snapshot
+                | TopLevelGridSurface::DriveList
+        ) {
+            return Some(GridSortLockReason::FixedOrder);
+        }
         if let Some(order) = self.collection_grid_root_order() {
             return match order {
                 Err(reason) => Some(reason),
@@ -56606,6 +56895,9 @@ impl App {
         // あるが、検索は低頻度操作なので許容範囲。xmp_cache は既読分のルックアップ
         // 専用で、スレッドは自分が読み取った分は `xmp_additions` で UI に返す。
         let items_snapshot = self.items.clone();
+        // Keep raw indices stable while the worker searches only rows in this root's rule.
+        // Publication will intersect any completed match set with current membership again.
+        let smart_rule_membership = self.smart_folder_rating_membership_flags();
         let xmp_snapshot = self.xmp_cache.clone();
         // PDF document info 照合 (§4.1.1) はワーカースレッドで保存済みパスワードを
         // 引く。ストアごと clone してスレッドへ渡す (decrypt は照合対象 PDF だけ遅延)。
@@ -56631,6 +56923,7 @@ impl App {
         let cancel_w = Arc::clone(&cancel);
         let progress = Arc::new(SearchProgressShared::new(ctrl_f_progress_total(
             &items_snapshot,
+            smart_rule_membership.as_deref(),
         )));
         let progress_w = Arc::clone(&progress);
         let (tx, rx) = mpsc::channel();
@@ -56643,6 +56936,7 @@ impl App {
                 let result = run_metadata_search(
                     &tokens,
                     &items_snapshot,
+                    smart_rule_membership.as_deref(),
                     &xmp_snapshot,
                     fts_meta_clone.as_ref(),
                     &pdf_passwords,
@@ -57148,9 +57442,6 @@ impl App {
     ) {
         self.rating_session_write_generation =
             self.rating_session_write_generation.wrapping_add(1).max(1);
-        // Every successful rating DB write, including metadata panel and fullscreen keys,
-        // invalidates a prepared rating order at the shared publication boundary.
-        self.rating_view_request_sequence = self.rating_view_request_sequence.wrapping_add(1);
         self.rating_session_writes.insert(
             key,
             RatingSessionWrite {
@@ -57171,6 +57462,17 @@ impl App {
         stars: u8,
         meta: Option<&crate::rating_db::RatingMeta>,
     ) -> Result<(), String> {
+        self.write_user_rating_shared_deferred(key, stars, meta)?;
+        self.publish_current_context_rating_writes();
+        Ok(())
+    }
+
+    fn write_user_rating_shared_deferred(
+        &mut self,
+        key: &str,
+        stars: u8,
+        meta: Option<&crate::rating_db::RatingMeta>,
+    ) -> Result<(), String> {
         self.rating_db
             .as_ref()
             .ok_or_else(|| "レーティング DB を利用できません".to_string())?
@@ -57180,7 +57482,6 @@ impl App {
         // counter. Detached/main contexts may consume it only after SQLite is
         // the durable source of truth.
         self.record_rating_session_write(key.to_string(), stars, true);
-        self.sync_current_context_rating_session_writes();
         Ok(())
     }
 
@@ -57207,7 +57508,7 @@ impl App {
         for (key, stars, _) in writes {
             self.record_rating_session_write(key.clone(), *stars, true);
         }
-        self.sync_current_context_rating_session_writes();
+        self.publish_current_context_rating_writes();
         Ok(())
     }
 
@@ -57298,6 +57599,71 @@ impl App {
         changed
     }
 
+    /// Publish durable path-key writes into the mounted context's display state.
+    /// Parked contexts run this same step on mount after their bundle is swapped in.
+    pub(crate) fn publish_current_context_rating_writes(&mut self) {
+        let seen = self.rating_session_write_seen_generation;
+        if seen == self.rating_session_write_generation {
+            return;
+        }
+        let updates = self.rating_session_writes_after(seen);
+        self.sync_current_context_rating_session_writes();
+        if updates.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.rating_publication_count += 1;
+        }
+        self.invalidate_rating_counts_cache();
+        self.publish_search_rating_writes(&updates);
+        if self.items_are_rating_view && self.rating_view_pending.is_none() {
+            self.request_rating_view_membership_refresh();
+        }
+        self.schedule_smart_folder_rating_membership();
+        self.rebuild_visible_indices_after_rating_publication();
+    }
+
+    pub(crate) fn rating_session_writes_after(&self, generation: u64) -> Vec<(String, u8)> {
+        self.rating_session_writes
+            .iter()
+            .filter_map(|(key, write)| {
+                (write.generation > generation).then_some((key.clone(), write.stars))
+            })
+            .collect()
+    }
+
+    pub(crate) fn rating_session_value_for_key(&self, key: &str) -> Option<u8> {
+        self.rating_session_writes.get(key).map(|write| write.stars)
+    }
+
+    /// The R4 refresh control uses this surface rule; Snapshot has no reload
+    /// action in `reload_top_level_grid` and must never show an active refresh icon.
+    pub(crate) fn grid_sort_refresh_available(&self) -> bool {
+        !matches!(
+            self.top_level_grid_view.surface(),
+            top_level_grid_view::TopLevelGridSurface::Snapshot
+        )
+    }
+
+    /// A prepared rating order carries its own pre-read stamp. The context's
+    /// seen generation may already have advanced while that order was prepared.
+    pub(crate) fn overlay_rating_session_writes_since(&mut self, generation: u64) {
+        let updates = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, _)| {
+                let key = self.rating_path_key(idx)?;
+                let write = self.rating_session_writes.get(&key)?;
+                (write.generation > generation).then_some((idx, write.stars))
+            })
+            .collect::<Vec<_>>();
+        for (idx, stars) in updates {
+            self.rating_cache.insert(idx, stars);
+        }
+    }
+
     /// 指定 idx のレーティング (0..=5) を取得する (キャッシュ + DB)。
     /// 動画 / セパレータ等は常に 0 を返す (レーティング対象外)。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
@@ -57352,11 +57718,26 @@ impl App {
     }
 
     fn set_rating_result(&mut self, idx: usize, stars: u8) -> Result<bool, String> {
+        self.set_rating_result_inner(idx, stars, true)
+    }
+
+    fn set_rating_result_deferred(&mut self, idx: usize, stars: u8) -> Result<bool, String> {
+        self.set_rating_result_inner(idx, stars, false)
+    }
+
+    fn set_rating_result_inner(
+        &mut self,
+        idx: usize,
+        stars: u8,
+        publish: bool,
+    ) -> Result<bool, String> {
         let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
         if !accepts {
             return Ok(false);
         }
-        self.sync_current_context_rating_session_writes();
+        if publish {
+            self.sync_current_context_rating_session_writes();
+        }
         let stars = stars.min(5);
         let key = match self.rating_path_key(idx) {
             Some(k) => k,
@@ -57369,7 +57750,7 @@ impl App {
         // DB write と App-global path generation の記録を同じ ownership
         // boundary に通す。detached unmount 時は swap 境界が main / parked
         // cache へ同じ値を反映する。
-        self.write_user_rating_shared(&key, stars, meta.as_ref())?;
+        self.write_user_rating_shared_deferred(&key, stars, meta.as_ref())?;
         self.rating_cache.insert(idx, stars);
         self.invalidate_rating_counts_cache();
         // コンテナ自身の★は子孫集計と別軸なので、単一ファイルレーティング (画像 / 動画 /
@@ -57402,6 +57783,9 @@ impl App {
             idx,
             crate::content_identity::ContentIdentityTrigger::Edit,
         );
+        if publish {
+            self.publish_current_context_rating_writes();
+        }
         Ok(true)
     }
 
@@ -58546,7 +58930,7 @@ impl App {
         for (key, stars) in imported_writes {
             self.record_rating_session_write(key, stars, false);
         }
-        self.sync_current_context_rating_session_writes();
+        self.publish_current_context_rating_writes();
         if rating_written {
             self.schedule_current_smart_folder_metadata_refresh(
                 smart_folder::SmartFolderMetadataDependency::Rating,
@@ -58929,7 +59313,7 @@ impl App {
         let mut undo_records = Vec::with_capacity(targets.len());
         let mut first_error = None;
         for record @ (idx, _, after) in pending_records {
-            match self.set_rating_result(idx, after) {
+            match self.set_rating_result_deferred(idx, after) {
                 Ok(true) => {
                     successful_targets.push((idx, after));
                     undo_records.push(record);
@@ -58973,14 +59357,6 @@ impl App {
         if matches!(edit, RatingEdit::Step(_)) {
             self.show_feedback_toast(format!("[{summary}]"));
         }
-        let rating_view_changes: Vec<(String, u8)> = if self.items_are_rating_view {
-            successful_targets
-                .iter()
-                .filter_map(|&(idx, after)| self.rating_path_key(idx).map(|key| (key, after)))
-                .collect()
-        } else {
-            Vec::new()
-        };
         let bulk = successful_targets.len() > 1;
         if bulk {
             crate::logger::log(format!(
@@ -58999,53 +59375,7 @@ impl App {
         if bulk || (matches!(edit, RatingEdit::Step(_)) && !self.checked.is_empty()) {
             self.checked.clear();
         }
-        // Ctrl+G ヒットの stars はバッチ受信時の snapshot。レーティング変更後に
-        // drilled view のサブフォルダ件数 / 枝刈りが古いまま残らないよう、
-        // 該当する all_hits エントリを最新値で書き換える (Codex P3)。
-        // 合成ビューを再構築するのは現在 items が合成ビュー由来のときだけ:
-        // Ctrl+G から実フォルダ/ZIP/PDF を開いた直後は items が PDF ページ等の
-        // 実体ビューなので、ここで rebuild_items_from_global_search を呼ぶと
-        // ページ一覧が検索 drilled view の合成 items に置き換わる事故になる
-        // (Codex P2)。
-        if self.global_search.active {
-            self.refresh_global_search_hit_stars(
-                &successful_targets
-                    .iter()
-                    .map(|&(idx, _)| idx)
-                    .collect::<Vec<_>>(),
-            );
-        }
-        if self.items_are_rating_view {
-            self.refresh_rating_view_after_rating_changes(&rating_view_changes);
-        } else if self.global_search.active && self.items_are_global_search_view {
-            self.rebuild_items_from_global_search();
-        } else {
-            self.rebuild_visible_indices();
-        }
-    }
-
-    /// `set_rating` で書き換えた idx 群について、Ctrl+G の `all_hits` 中の対応する
-    /// hit エントリの `stars` を最新値で更新する。drilled view バッジ件数 / 枝刈り /
-    /// 直下ファイルフィルタが snapshot のまま古くならないようにする (Codex P3)。
-    fn refresh_global_search_hit_stars(&mut self, idxs: &[usize]) {
-        // 対象 idx → (rating_db キー, 新 stars) の対応を作る
-        let mut updates: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
-        for &idx in idxs {
-            let Some(key) = self.rating_path_key(idx) else {
-                continue;
-            };
-            let new_stars = self.rating_cache.get(&idx).copied().unwrap_or(0);
-            updates.insert(key, new_stars);
-        }
-        if updates.is_empty() {
-            return;
-        }
-        for h in self.global_search.all_hits.iter_mut() {
-            let hit_key = crate::global_search_ui::hit_rating_key(&h.path);
-            if let Some(&v) = updates.get(&hit_key) {
-                h.stars = v;
-            }
-        }
+        self.publish_current_context_rating_writes();
     }
 
     /// 現在動画の mute を反転し、セッション状態と次回起動用の保存状態にも反映する。
@@ -59751,7 +60081,7 @@ impl App {
                             self.settings.ui_font.clone(),
                             self.settings.fullscreen_cursor_hide_delay_secs,
                             // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
-                            Some(self.dsp_bridge.editor_hwnds_snapshot()),
+                            Some(self.dsp_bridge.editor_ui_snapshot()),
                             self.main_hwnd.unwrap_or(0) as u64,
                             self.creative_lut_library.video_snapshot(
                                 &self.settings.creative_luts,
@@ -69816,6 +70146,32 @@ impl App {
         ));
     }
 
+    pub(crate) fn set_always_on_top(
+        &mut self,
+        ctx: &egui::Context,
+        enabled: bool,
+        surface: ActionSurface,
+    ) {
+        if self.settings.always_on_top == enabled {
+            return;
+        }
+        self.settings.always_on_top = enabled;
+        // The root is created once. Child host commands come only from their builder diff.
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::WindowLevel(crate::settings::viewer_window_level(enabled)),
+        );
+        self.show_feedback_toast_on(
+            format!("常に最前面 {}", if enabled { "ON" } else { "OFF" }),
+            surface,
+        );
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+
+    pub(crate) fn toggle_always_on_top(&mut self, ctx: &egui::Context, surface: ActionSurface) {
+        self.set_always_on_top(ctx, !self.settings.always_on_top, surface);
+    }
+
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
         #[cfg(windows)]
         self.log_detached_image_window_debug(format!(
@@ -70619,6 +70975,9 @@ impl App {
         let mut indices: Vec<usize> = Vec::new();
         let mut keys: Vec<String> = Vec::new();
         for idx in 0..self.items.len() {
+            if !self.smart_folder_rule_qualifies_index(idx) {
+                continue;
+            }
             match self.items.get(idx) {
                 Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })
@@ -70642,6 +71001,9 @@ impl App {
         let mut map: std::collections::HashMap<std::path::PathBuf, Vec<String>> =
             std::collections::HashMap::new();
         for idx in 0..self.items.len() {
+            if !self.smart_folder_rule_qualifies_index(idx) {
+                continue;
+            }
             match self.items.get(idx) {
                 Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })
@@ -70770,12 +71132,14 @@ impl App {
     fn snapshot_inherited_default_params(&self) -> Vec<(usize, crate::adjustment::AdjustParams)> {
         (0..self.items.len())
             .filter(|idx| {
-                matches!(
-                    self.items.get(*idx),
-                    Some(GridItem::Image(_))
-                        | Some(GridItem::ZipImage { .. })
-                        | Some(GridItem::PdfPage { .. })
-                ) && !self.adjustment_page_params.contains_key(idx)
+                self.smart_folder_rule_qualifies_index(*idx)
+                    && matches!(
+                        self.items.get(*idx),
+                        Some(GridItem::Image(_))
+                            | Some(GridItem::ZipImage { .. })
+                            | Some(GridItem::PdfPage { .. })
+                    )
+                    && !self.adjustment_page_params.contains_key(idx)
             })
             .map(|idx| (idx, self.effective_default_for_idx(idx).clone()))
             .collect()
@@ -70812,9 +71176,11 @@ impl App {
     fn prune_page_params_matching_default(&mut self) {
         let redundant: Vec<usize> = (0..self.items.len())
             .filter(|idx| {
-                self.adjustment_page_params
-                    .get(idx)
-                    .is_some_and(|p| p == self.effective_default_for_idx(*idx))
+                self.smart_folder_rule_qualifies_index(*idx)
+                    && self
+                        .adjustment_page_params
+                        .get(idx)
+                        .is_some_and(|p| p == self.effective_default_for_idx(*idx))
             })
             .collect();
         for idx in redundant {
@@ -70851,7 +71217,9 @@ impl App {
     fn remaining_page_override_count(&self, exclude_idx: Option<usize>) -> usize {
         (0..self.items.len())
             .filter(|idx| {
-                Some(*idx) != exclude_idx && self.adjustment_page_params.contains_key(idx)
+                self.smart_folder_rule_qualifies_index(*idx)
+                    && Some(*idx) != exclude_idx
+                    && self.adjustment_page_params.contains_key(idx)
             })
             .count()
     }
@@ -76525,6 +76893,34 @@ fn write_epub_pdf_meta_row(
 // -----------------------------------------------------------------------
 
 impl App {
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn open_seeded_collection_for_smoke(&mut self) -> Result<(), String> {
+        if !self.initialized
+            || self.startup_open_path.is_some()
+            || self.startup_open_path_resolve_pending.is_some()
+        {
+            return Err("startup folder open is still pending".into());
+        }
+        match self.collection_store_client_for_read() {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err("Collection runtime is inert".into()),
+            Err(error) => return Err(format!("Collection runtime is unavailable: {error}")),
+        }
+        let id = crate::test_script::seeded_collection_smoke_id();
+        if self.collection_catalog_revision(id).is_none() {
+            return Err(format!(
+                "seeded Collection {} is missing from the ready catalog",
+                crate::test_script::SEEDED_COLLECTION_SMOKE_ID
+            ));
+        }
+        self.open_collection_grid(id, None);
+        crate::logger::log(format!(
+            "[test-script] opened seeded Collection {}",
+            crate::test_script::SEEDED_COLLECTION_SMOKE_ID
+        ));
+        Ok(())
+    }
+
     /// [`eframe::App::update`] の本体。
     ///
     /// **早期 return を複数持つ。** frame の最後に必ず走らせたい処理は、ここではなく
@@ -76553,6 +76949,89 @@ impl App {
             let snapshot = self.test_script_snapshot(ctx);
             if crate::test_script::ui_update(ctx, snapshot) {
                 ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::OpenThumbnailPreferences,
+            ) {
+                self.open_preferences_page(
+                    crate::ui_dialogs::preferences::PreferencesPage::Thumbnail,
+                );
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::OpenFirstSmartFolder,
+            ) {
+                if let Some(id) = self.settings.smart_folders.first().map(|folder| folder.id) {
+                    self.open_smart_folder_staged(id, false);
+                }
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::OpenSeededCollection,
+            ) {
+                if let Err(error) = self.open_seeded_collection_for_smoke() {
+                    crate::logger::log(format!(
+                        "[test-script] seeded Collection open rejected: {error}"
+                    ));
+                }
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::AlwaysOnTopOn,
+            ) {
+                self.set_always_on_top(ctx, true, ActionSurface::MainWindow);
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::AlwaysOnTopOff,
+            ) {
+                self.set_always_on_top(ctx, false, ActionSurface::MainWindow);
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::MinimizeRoot,
+            ) {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Minimized(true),
+                );
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            if crate::test_script::take_smoke_action(crate::test_script::UiSmokeAction::RestoreRoot)
+            {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Minimized(false),
+                );
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            if crate::test_script::take_smoke_action(crate::test_script::UiSmokeAction::HideToTray)
+            {
+                self.hide_to_tray(ctx);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::RestoreFromTray,
+            ) {
+                if let Some(controller) = self.tray_controller.as_ref() {
+                    if let Err(error) = controller.open_for_smoke() {
+                        crate::logger::log(format!("[test-script] {error}"));
+                    }
+                } else {
+                    crate::logger::log(
+                        "[test-script] tray restore requested without a tray controller",
+                    );
+                }
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::CloseFullscreen,
+            ) {
+                self.close_fullscreen_to_completion(ctx);
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::ToggleDetachedMode,
+            ) {
+                self.toggle_detached_viewer_mode();
+            }
+            if crate::test_script::take_smoke_action(
+                crate::test_script::UiSmokeAction::EnableIndependentWindows,
+            ) {
+                self.settings.detached_viewer_open_images_in_window = true;
             }
         }
         self.edit_preview_repaint_ctx = Some(ctx.clone());
@@ -78071,6 +78550,20 @@ impl App {
         }
 
         // ── F12: 画像・動画ビューア別ウィンドウモード ───────────────
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && !self.tag_view.has_focus
+            && !main_viewer_blocked
+            && !self.any_dialog_open()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::ToggleAlwaysOnTop)
+        {
+            self.toggle_always_on_top(ctx, ActionSurface::MainWindow);
+        }
+
         if !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus
@@ -81415,9 +81908,7 @@ fn native_video_presenter_config(
     text_contrast: crate::settings::TextContrast,
     ui_font: crate::settings::UiFontSettings,
     cursor_hide_delay_secs: f32,
-    editor_hwnds_snapshot: Option<
-        std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
-    >,
+    editor_ui_snapshot: Option<crate::video::dsp::SharedEditorUiSnapshot>,
     main_hwnd_for_raise: u64,
     video_grade: crate::creative_lut::VideoGradeSnapshot,
     scale_filter: crate::settings::VideoScaleFilter,
@@ -81455,7 +81946,7 @@ fn native_video_presenter_config(
         cursor_hide_delay_secs: crate::settings::clamp_fullscreen_cursor_hide_delay_secs(
             cursor_hide_delay_secs,
         ),
-        editor_hwnds_snapshot,
+        editor_ui_snapshot,
         main_hwnd_for_raise,
         video_grade,
         bar_lock: bar_lock.clamped(),
@@ -81953,6 +82444,31 @@ mod favorite_view_state_tests {
 #[cfg(test)]
 mod rated_at_details_sort_tests {
     use super::*;
+
+    #[test]
+    fn rating_publication_keeps_header_survivors_and_appends_new_members() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = setup_app_for_test();
+        app.items = (0..5)
+            .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\rating-order\{idx}.jpg"))))
+            .collect();
+        app.image_metas = vec![Some((0, 0)); 5];
+        app.thumbnails = vec![ThumbnailState::Pending; 5];
+        app.rating_cache = HashMap::from([(0, 4), (1, 0), (2, 5), (3, 0), (4, 4)]);
+        app.settings.rating_filter = [false, false, false, false, true, true];
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_show_rating = true;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Rating;
+        app.settings.details_sort_ascending = false;
+        app.rebuild_visible_indices();
+        assert_eq!(app.details_order, vec![2, 0, 4]);
+
+        app.rating_cache.extend([(0, 5), (1, 5), (2, 4), (3, 4)]);
+        app.rebuild_visible_indices_after_rating_publication();
+        assert_eq!(app.details_order, vec![2, 0, 4, 1, 3]);
+        app.rebuild_details_order();
+        assert_eq!(app.details_order, vec![0, 1, 2, 3, 4]);
+    }
 
     fn row(name: &str, rated_at_ms: Option<i64>) -> crate::rating_view::RatingViewRow {
         let path = PathBuf::from(format!(r"C:\rating-view\{name}"));

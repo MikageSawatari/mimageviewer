@@ -1437,6 +1437,7 @@ const state = {
   archiveOpenController: null,
   thumbnailNotice: null,
   gridActionNotice: null,
+  gridSortNotice: null,
   screenContext: "loading",
   gridIndex: 0,
   authCountdownTimer: 0,
@@ -5891,7 +5892,7 @@ async function refreshViewerItemState() {
   }
 }
 
-async function setViewerRating(stars) {
+export async function setViewerRating(stars) {
   const target = currentRemotePageTarget();
   if (!target) return;
   state.commandMenu?.setItemState(null, true);
@@ -6558,6 +6559,7 @@ export async function loadFolder(
       subresource: { kind: "file" },
     },
   };
+  state.gridSortNotice = typeof data.sort_notice === "string" ? data.sort_notice : null;
   state.gridReturnHash = rootReturnHash;
   state.favoriteName =
     data.root_name ??
@@ -6599,7 +6601,7 @@ export async function loadFolder(
   };
 }
 
-function renderFolder(listMetrics = null, preserveRequestController = null) {
+export function renderFolder(listMetrics = null, preserveRequestController = null) {
   const renderStartedAt = performance.now();
   cleanupScreen(preserveRequestController);
   state.screenContext = "grid";
@@ -6661,6 +6663,10 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   gridActionNotice.hidden = true;
   gridActionNotice.setAttribute("role", "status");
   gridActionNotice.setAttribute("aria-live", "polite");
+  if (!state.collection && !state.container && state.gridSortNotice) {
+    gridActionNotice.textContent = state.gridSortNotice;
+    gridActionNotice.hidden = false;
+  }
   state.gridActionNotice = gridActionNotice;
   const collectionLimitNotice = textElement(
     "p",

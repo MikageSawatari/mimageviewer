@@ -51,9 +51,10 @@ ZIP / PDF / 動画は Ctrl+S と Ctrl+G の両方に出る。フォルダは Ctr
 ### 2.2 結果の見せ方
 
 - **Ctrl+F**: 現グリッドの可視フィルタ (`search_filter: Option<HashSet<usize>>`)。
-  別ビューは作らず `visible_indices` を絞るだけ。構造アイテム (Folder / ZipFile /
-  PdfFile / SearchContainer) は **常にマッチ扱い** で絞り込まれない
-  (`run_metadata_search` Pass 1)。
+  別ビューは作らず `visible_indices` を絞るだけ。構造アイテムも持っている検索次元で
+  判定する (`run_metadata_search` Pass 1)。
+  評価条件付き Smart Folder の root では、現在その条件を満たす行だけを検索ワーカー・進捗・
+  完了後のヒット件数の対象にする。条件から外れて raw `items` に保持された行は数えない。
 - **Ctrl+S**: `start_loading_items` で検索結果 (GridItem::Folder / ZipFile / PdfFile /
   Video) のフラットな単一リストにグリッドを置換。display_name 昇順。
 - **Ctrl+G**: 2 階層。`Aggregated` (SearchContainer セルをヒット件数降順で並べる) ⇄

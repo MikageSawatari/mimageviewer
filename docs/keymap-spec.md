@@ -14,6 +14,8 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 `keymap.ini.imported*.bak` へ退避する。Action 名・書式・固定扱いの入力は
 [keymap.ini.default](keymap.ini.default) と、コマンド設定画面の表示を正とする。マウス、ゲームパッド、
 OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対象外。
+
+`ToggleAlwaysOnTop` は Global / Press の操作で、既定キーはない。操作カスタマイズでキーを割り当てると、main・egui フルスクリーン・native 動画の発火面から同じ設定を切り替える。設定メニュー先頭のチェック項目からも操作でき、ON/OFF の通知は発火した面だけに表示する。
 ゲームパッド全体は `Settings::gamepad_enabled` で無効にできる (操作カスタマイズ →
 設定 → ゲームパッド)。これは割り当ての変更ではなく**デバイスを読むかどうか**の設定で、
 無効の間は `GamepadRuntime` が読み取りスレッドごと止まる。読み捨てるだけにすると、

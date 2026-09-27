@@ -968,7 +968,7 @@ impl PumpRuntime {
             event_sink: hud_sink,
         })?;
         let create_ms = create_t0.elapsed().as_secs_f64() * 1000.0;
-        window.set_editor_hwnds_snapshot(self.config.editor_hwnds_snapshot.clone());
+        window.set_editor_ui_snapshot(self.config.editor_ui_snapshot.clone());
         window.set_main_hwnd_for_raise_check(self.config.main_hwnd_for_raise);
         let actual_spec = WindowHostSpec {
             placement: spec.placement,
@@ -1505,9 +1505,12 @@ impl PumpRuntime {
                     }
                 }
                 NativeVideoWindowEvent::RequestRaiseHud => self.schedule_hud_raise(epoch),
-                NativeVideoWindowEvent::RequestFocusClaim => {
+                NativeVideoWindowEvent::RequestFocusClaim {
+                    foreground_hwnd_at_down,
+                } => {
                     if self.z_order_recovery_permitted
                         && let Some(window) = self.hosts.get(&epoch)
+                        && focus_claim_allowed(window, envelope.source, foreground_hwnd_at_down)
                     {
                         window.apply_render_intents(&[NativeWindowIntent::ClaimTextInputFocus]);
                     }
@@ -1803,6 +1806,15 @@ impl PumpRuntime {
     }
 }
 
+fn focus_claim_allowed(
+    window: &NativeWindowHost,
+    source: NativeVideoWindowSource,
+    foreground_hwnd_at_down: u64,
+) -> bool {
+    source != NativeVideoWindowSource::Hud
+        || !window.should_skip_hud_focus_claim(foreground_hwnd_at_down)
+}
+
 fn cursor_routing_event_for_epoch(
     active_epoch: Option<WindowEpoch>,
     envelope: &NativeVideoWindowEventEnvelope,
@@ -1878,6 +1890,7 @@ fn cursor_input_epoch(state: WindowHostState) -> Option<WindowEpoch> {
 mod tests {
     use super::super::NativeVideoInitialVisibility;
     use super::*;
+    use std::io::{BufRead, Write};
     use std::process::Command;
     use std::sync::mpsc;
     use std::thread;
@@ -1885,12 +1898,448 @@ mod tests {
     use windows::Win32::Foundation::{HINSTANCE, HWND};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, IsWindow, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW,
+        CreateWindowExW, DestroyWindow, GW_OWNER, GetWindow, IsWindow, IsWindowVisible,
+        SW_SHOWNOACTIVATE, ShowWindow, WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW,
+        WS_POPUP,
     };
     use windows::core::w;
 
     const STALL_TEST: &str = "video::native_window_pump::tests::production_parent_destroy_remains_bounded_during_render_stall";
     const STALL_CHILD_ENV: &str = "MIV_STAGE4_PRODUCTION_STALL_CHILD";
+    const HUD_FOCUS_CHILD_ENV: &str = "MIV_HUD_FOCUS_TEST_CHILD";
+
+    #[test]
+    fn hud_focus_claim_uses_registered_editor_and_preserves_presenter_return() {
+        if let Ok(owner) = std::env::var(HUD_FOCUS_CHILD_ENV) {
+            run_hud_focus_child(owner.parse().expect("presenter HWND"));
+            return;
+        }
+        run_hud_focus_case();
+    }
+
+    fn run_hud_focus_case() {
+        let fault = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_events) = native_window_event_route(16, Arc::clone(&fault));
+        let (render_route, render_events) = native_window_event_route(16, Arc::clone(&fault));
+        let hud_sink = super::super::native_window::NativeVideoWindowEventSink::new(
+            1,
+            1,
+            NativeVideoWindowSource::Hud,
+            pump_route.clone(),
+            render_route.clone(),
+        );
+        let presenter_sink = super::super::native_window::NativeVideoWindowEventSink::new(
+            1,
+            1,
+            NativeVideoWindowSource::Presenter,
+            pump_route.clone(),
+            render_route.clone(),
+        );
+        let mut window = NativeWindowHost::create(NativeWindowHostConfig {
+            window: super::super::native_window::NativeVideoWindowConfig {
+                mode: super::super::native_window::NativeVideoWindowMode::Borderless {
+                    rect: windows::Win32::Foundation::RECT {
+                        left: -2000,
+                        top: -2000,
+                        right: -1680,
+                        bottom: -1820,
+                    },
+                },
+                owner_hwnd: 0,
+                initially_visible: false,
+                activate_on_show: false,
+                close_on_escape: false,
+                event_sink: Some(presenter_sink.clone()),
+                generation: 1,
+            },
+            hud: NativeHudWindowRequest::Enabled {
+                width: 320,
+                height: 180,
+            },
+            event_sink: hud_sink.clone(),
+        })
+        .expect("hidden presenter/HUD host");
+        assert!(window.has_hud());
+
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "video::native_window_pump::tests::hud_focus_claim_uses_registered_editor_and_preserves_presenter_return",
+                "--nocapture",
+            ])
+            .env(HUD_FOCUS_CHILD_ENV, (window.hwnd().0 as usize as u64).to_string())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn disposable editor process");
+        let child_out = child.stdout.take().expect("child stdout");
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            let mut child_out = std::io::BufReader::new(child_out);
+            let mut published = false;
+            loop {
+                let mut line = String::new();
+                if child_out.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if !published && let Some(values) = line.trim().strip_prefix("MIV_FOCUS_WINDOWS ") {
+                    let mut values = values.split_whitespace();
+                    let parsed = values
+                        .next()
+                        .zip(values.next())
+                        .zip(values.next())
+                        .and_then(|((editor, unregistered_owned), external)| {
+                            Some((
+                                editor.parse::<u64>().ok()?,
+                                unregistered_owned.parse::<u64>().ok()?,
+                                external.parse::<u64>().ok()?,
+                            ))
+                        });
+                    let _ = ready_tx.send(parsed);
+                    published = true;
+                }
+            }
+            if !published {
+                let _ = ready_tx.send(None);
+            }
+        });
+        let (editor_hwnd, unregistered_owned_hwnd, external_hwnd) =
+            match ready_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Some(windows)) => windows,
+                other => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("disposable editor did not publish HWNDs: {other:?}");
+                }
+            };
+        unsafe {
+            let unregistered = HWND(unregistered_owned_hwnd as *mut _);
+            assert!(IsWindow(Some(unregistered)).as_bool());
+            assert!(IsWindowVisible(unregistered).as_bool());
+            assert_eq!(
+                GetWindow(unregistered, GW_OWNER).unwrap_or_default(),
+                window.hwnd(),
+            );
+        }
+        let mut editor_pid = 0;
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                HWND(editor_hwnd as *mut _),
+                Some(&mut editor_pid),
+            );
+        }
+        assert_ne!(editor_pid, 0);
+        let editor_snapshot = Arc::new(std::sync::RwLock::new(Arc::new(
+            super::super::dsp::EditorUiSnapshot {
+                hwnds: std::collections::HashSet::from([editor_hwnd]),
+                hwnd_pids: std::collections::HashMap::from([(editor_hwnd, editor_pid)]),
+                bridge_pids: std::collections::HashSet::from([editor_pid]),
+            },
+        )));
+        window.set_editor_ui_snapshot(Some(Arc::clone(&editor_snapshot)));
+        let focus_probe = window.install_focus_claim_probe_for_test();
+        let hud_hwnd = window.hud_hwnd();
+        let _ = pump_events.drain(); // Ignore creation-time geometry/raise notifications.
+        let _ = render_events.drain();
+        let (command_tx, command_rx) = crossbeam_channel::bounded(4);
+        let (lifecycle_tx, _lifecycle_rx) = crossbeam_channel::bounded(4);
+        let (ui_tx, _ui_rx) = super::super::native_output_event_bus(
+            4,
+            Arc::clone(&fault),
+            Arc::new(super::super::VideoUiWake::default()),
+        );
+        let spawn = NativeWindowPumpSpawn {
+            config: focus_test_config(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            hwnd_out: Arc::new(AtomicU64::new(0)),
+            hud_hwnd_out: Arc::new(AtomicU64::new(0)),
+            closed: Arc::new(AtomicBool::new(false)),
+            presenter_visibility: NativePresenterVisibility::new(
+                NativeVideoInitialVisibility::Visible,
+            ),
+            source_epoch: Arc::new(AtomicU64::new(0)),
+            ui_event_tx: ui_tx,
+            init_error: Arc::new(Mutex::new(None)),
+            channel_fault: Arc::clone(&fault),
+            health: super::super::native_window_health::NativeWindowHealth::new_registered(),
+            #[cfg(feature = "test-script")]
+            ui_smoke_output_id: super::super::native_ui_smoke::allocate_output_id(),
+        };
+        let mut runtime = PumpRuntime::new(
+            spawn,
+            command_rx,
+            lifecycle_tx,
+            Arc::new(LatestPumpValues::default()),
+            pump_route,
+            render_route,
+            pump_events,
+        );
+        runtime.hosts.insert(WindowEpoch(1), window);
+        let _command_tx = command_tx;
+        let mut claim_count = 0;
+        for (source, foreground, expected_claim) in [
+            (NativeVideoWindowSource::Hud, editor_hwnd, false),
+            (NativeVideoWindowSource::Presenter, editor_hwnd, true),
+            (NativeVideoWindowSource::Hud, unregistered_owned_hwnd, true),
+            (NativeVideoWindowSource::Hud, external_hwnd, true),
+        ] {
+            let sink = if source == NativeVideoWindowSource::Hud {
+                &hud_sink
+            } else {
+                &presenter_sink
+            };
+            sink.send(NativeVideoWindowEvent::MouseButton(
+                super::super::native_window::NativeVideoMouseButtonEvent {
+                    receipt: crate::mouse_seek_debug::test_receipt(1),
+                    owner: super::super::native_window::NativeVideoMouseInputOwner {
+                        window_source: source,
+                        receiver_hwnd: hud_hwnd,
+                        window_generation: 1,
+                    },
+                    button: NativeVideoMouseButton::Left,
+                    down: true,
+                    double_click: false,
+                    x: 10,
+                    y: 10,
+                    shift: false,
+                    ctrl: false,
+                    #[cfg(feature = "test-script")]
+                    smoke_metadata: None,
+                },
+            ));
+            sink.send(NativeVideoWindowEvent::RequestFocusClaim {
+                foreground_hwnd_at_down: foreground,
+            });
+            sink.send(NativeVideoWindowEvent::MouseButton(
+                super::super::native_window::NativeVideoMouseButtonEvent {
+                    receipt: crate::mouse_seek_debug::test_receipt(2),
+                    owner: super::super::native_window::NativeVideoMouseInputOwner {
+                        window_source: source,
+                        receiver_hwnd: hud_hwnd,
+                        window_generation: 1,
+                    },
+                    button: NativeVideoMouseButton::Left,
+                    down: false,
+                    double_click: false,
+                    x: 10,
+                    y: 10,
+                    shift: false,
+                    ctrl: false,
+                    #[cfg(feature = "test-script")]
+                    smoke_metadata: None,
+                },
+            ));
+            let events = render_events.drain();
+            assert_eq!(events.len(), 2);
+            assert!(
+                matches!(events[0].event, NativeVideoWindowEvent::MouseButton(button) if button.down)
+            );
+            assert!(
+                matches!(events[1].event, NativeVideoWindowEvent::MouseButton(button) if !button.down)
+            );
+            assert!(events.iter().all(|event| event.source == source));
+            runtime.drain_window_events().expect("pump HUD input");
+            claim_count += usize::from(expected_claim);
+            assert_eq!(
+                focus_probe.load(Ordering::Relaxed),
+                claim_count,
+                "source={source:?}",
+            );
+        }
+        // Hold the publisher after constructing a new registration that adds
+        // the second owned popup, but before the swap. The old complete
+        // identity remains readable until publication completes.
+        let before = super::super::dsp::read_editor_ui_snapshot(&editor_snapshot);
+        let (staged_tx, staged_rx) = mpsc::sync_channel(1);
+        let (publish_tx, publish_rx) = mpsc::sync_channel(1);
+        let (locked_tx, locked_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let shared = Arc::clone(&editor_snapshot);
+        let publisher = thread::spawn(move || {
+            let next = super::super::dsp::EditorUiSnapshot {
+                hwnds: std::collections::HashSet::from([editor_hwnd, unregistered_owned_hwnd]),
+                hwnd_pids: std::collections::HashMap::from([
+                    (editor_hwnd, editor_pid),
+                    (unregistered_owned_hwnd, editor_pid),
+                ]),
+                bridge_pids: std::collections::HashSet::from([editor_pid]),
+            };
+            staged_tx.send(()).expect("publisher staged");
+            publish_rx.recv().expect("release publisher");
+            let mut guard = shared.write().expect("publication write lock");
+            locked_tx.send(()).expect("publication write lock held");
+            release_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release publication write lock");
+            *guard = Arc::new(next);
+        });
+        staged_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("publisher staged before swap");
+        for (foreground, expected_claim) in [
+            (editor_hwnd, false),
+            (unregistered_owned_hwnd, true),
+            (external_hwnd, true),
+        ] {
+            assert_eq!(
+                focus_claim_allowed(
+                    runtime.hosts.get(&WindowEpoch(1)).unwrap(),
+                    NativeVideoWindowSource::Hud,
+                    foreground,
+                ),
+                expected_claim,
+            );
+            hud_sink.send(NativeVideoWindowEvent::RequestFocusClaim {
+                foreground_hwnd_at_down: foreground,
+            });
+            runtime
+                .drain_window_events()
+                .expect("staged publication focus claim");
+            claim_count += usize::from(expected_claim);
+            assert_eq!(focus_probe.load(Ordering::Relaxed), claim_count);
+        }
+        assert!(Arc::ptr_eq(
+            &before,
+            &super::super::dsp::read_editor_ui_snapshot(&editor_snapshot)
+        ));
+        publish_tx.send(()).expect("publish next editor identity");
+        locked_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("publication write lock acquired");
+        assert!(editor_snapshot.try_read().is_err());
+        hud_sink.send(NativeVideoWindowEvent::RequestFocusClaim {
+            foreground_hwnd_at_down: editor_hwnd,
+        });
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(1));
+            release_tx.send(()).expect("release publication");
+        });
+        let focus_started = Instant::now();
+        runtime
+            .drain_window_events()
+            .expect("focus decision during publication lock");
+        // The old try_read fallback would return immediately and claim focus.
+        assert_eq!(focus_probe.load(Ordering::Relaxed), claim_count);
+        assert!(focus_started.elapsed() >= Duration::from_millis(100));
+        releaser.join().expect("publication releaser");
+        publisher.join().expect("publisher completed");
+        let after = super::super::dsp::read_editor_ui_snapshot(&editor_snapshot);
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.hwnds.len(), after.hwnd_pids.len());
+        assert!(!focus_claim_allowed(
+            runtime.hosts.get(&WindowEpoch(1)).unwrap(),
+            NativeVideoWindowSource::Hud,
+            editor_hwnd,
+        ));
+        assert!(!focus_claim_allowed(
+            runtime.hosts.get(&WindowEpoch(1)).unwrap(),
+            NativeVideoWindowSource::Hud,
+            unregistered_owned_hwnd,
+        ));
+        assert!(focus_claim_allowed(
+            runtime.hosts.get(&WindowEpoch(1)).unwrap(),
+            NativeVideoWindowSource::Hud,
+            external_hwnd,
+        ));
+        child.stdin.take().unwrap().write_all(b"done\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll editor child") {
+                assert!(status.success(), "editor child exit: {status}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("disposable editor child did not exit");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        reader.join().expect("child stdout reader");
+        runtime.hosts.get_mut(&WindowEpoch(1)).unwrap().destroy();
+    }
+
+    fn run_hud_focus_child(owner_raw: u64) {
+        let module = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let create = |owner| {
+            unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE,
+                    w!("STATIC"),
+                    w!("mIV disposable focus fixture"),
+                    WS_POPUP,
+                    -2000,
+                    -2000,
+                    40,
+                    40,
+                    owner,
+                    None,
+                    Some(HINSTANCE(module.0)),
+                    None,
+                )
+            }
+            .expect("create popup")
+        };
+        let editor = create(Some(HWND(owner_raw as *mut _)));
+        let unregistered_owned = create(Some(HWND(owner_raw as *mut _)));
+        let external = create(None);
+        unsafe {
+            let _ = ShowWindow(editor, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(unregistered_owned, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(external, SW_SHOWNOACTIVATE);
+        }
+        println!(
+            "MIV_FOCUS_WINDOWS {} {} {}",
+            editor.0 as usize as u64,
+            unregistered_owned.0 as usize as u64,
+            external.0 as usize as u64
+        );
+        std::io::stdout().flush().unwrap();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        unsafe {
+            DestroyWindow(editor).expect("destroy editor");
+            DestroyWindow(unregistered_owned).expect("destroy unregistered owned popup");
+            DestroyWindow(external).expect("destroy external");
+        }
+    }
+
+    fn focus_test_config() -> NativeVideoOutputConfig {
+        NativeVideoOutputConfig {
+            rect: windows::Win32::Foundation::RECT {
+                left: -2000,
+                top: -2000,
+                right: -1680,
+                bottom: -1820,
+            },
+            owner_hwnd: 0,
+            fallback_file_name: "focus-test".to_string(),
+            sync_interval: 0,
+            perf_overlay_visible: false,
+            initial_tile_overlay: false,
+            vst3_available: true,
+            checked: false,
+            cursor_hide_delay_secs: 2.0,
+            ui_scale: 1.0,
+            text_contrast: crate::settings::TextContrast::Standard,
+            ui_font: crate::settings::UiFontSettings::default(),
+            video_grade: crate::creative_lut::VideoGradeSnapshot::default(),
+            scale_filter: crate::settings::VideoScaleFilter::OsDefault,
+            downscale_smoothing_percent: 0,
+            anime4k_variant: None,
+            anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+            bar_lock: crate::video::NativeBarLockState::default(),
+            editor_ui_snapshot: None,
+            main_hwnd_for_raise: 0,
+            hud_overlay_enabled: true,
+            placement: NativeVideoPlacement::FullscreenBorderless,
+            activate_on_show: false,
+            initial_visibility: NativeVideoInitialVisibility::Visible,
+            in_main_window: true,
+            audio_only: false,
+            video_canvas_color: [0, 0, 0],
+        }
+    }
 
     #[test]
     fn cursor_route_rejects_stale_epoch_and_generation() {
@@ -2027,7 +2476,7 @@ mod tests {
             anime4k_variant: None,
             anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
             bar_lock: crate::video::NativeBarLockState::default(),
-            editor_hwnds_snapshot: None,
+            editor_ui_snapshot: None,
             main_hwnd_for_raise: 0,
             hud_overlay_enabled: false,
             placement: NativeVideoPlacement::MainWindowChild,
@@ -2115,6 +2564,7 @@ mod tests {
                             height: attach.2,
                             os_pixels_per_point: attach.3,
                             initial_observation: attach.4,
+                            editor_ui_snapshot: None,
                             test_overlay: false,
                             egui_overlay: false,
                             cursor_hide_delay_secs: 2.0,

@@ -213,15 +213,18 @@ struct SearchViewWish {
     through_batch: u64,
     view: GlobalSearchView,
     sort_mode: ContainerSortMode,
-    sort_order: crate::settings::SortOrder,
+    order_request: crate::rating_sort::ListingOrderRequest,
+    rating_write_generation: u64,
     rating_filter: [bool; 6],
     done: bool,
+    survivor_order: Option<Vec<String>>,
 }
 
 enum SearchPrepareCommand {
     Batch(u64, Vec<GlobalHit>),
     Mtime(MtimeLookupResult),
     View(SearchViewWish),
+    RatingWrites(Vec<(String, u8)>),
 }
 
 enum SearchPrepareOutput {
@@ -236,6 +239,9 @@ struct SearchPreparedItems {
     image_metas: Vec<Option<(i64, i64)>>,
     drilled_counts: HashMap<String, [u32; 6]>,
     page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,
+    ratings: Option<(HashMap<usize, u8>, u64)>,
+    hit_rating_values: Option<HashMap<String, u8>>,
+    rating_sort_failed: bool,
     #[cfg(test)]
     lookup_passes: usize,
     #[cfg(test)]
@@ -1139,6 +1145,123 @@ fn build_drilled_zip_items(
     (items, image_metas)
 }
 
+fn search_item_rating_key(item: &GridItem) -> Option<String> {
+    match item {
+        GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        } => Some(crate::adjustment_db::zip_entry_key(zip_path, entry_name)),
+        _ => crate::rating_sort::physical_item_key(item),
+    }
+}
+
+fn retain_search_survivor_order_and_append_candidates(
+    items: &mut Vec<GridItem>,
+    image_metas: &mut Vec<Option<(i64, i64)>>,
+    survivors: &[String],
+) {
+    let candidates = std::mem::take(items)
+        .into_iter()
+        .zip(std::mem::take(image_metas))
+        .collect::<Vec<_>>();
+    let positions = survivors
+        .iter()
+        .enumerate()
+        .map(|(i, key)| (key.as_str(), i))
+        .collect::<HashMap<_, _>>();
+    let mut retained = Vec::new();
+    let mut added = Vec::new();
+    for (item, meta) in candidates {
+        if let Some(&position) = positions.get(item.perf_key().as_str()) {
+            retained.push((position, item, meta));
+        } else {
+            added.push((item, meta));
+        }
+    }
+    retained.sort_by_key(|(position, _, _)| *position);
+    for (_, item, meta) in retained {
+        items.push(item);
+        image_metas.push(meta);
+    }
+    for (item, meta) in added {
+        items.push(item);
+        image_metas.push(meta);
+    }
+}
+
+fn search_rating_keys_for_view(state: &GlobalSearchState, view: &GlobalSearchView) -> Vec<String> {
+    let mut keys = state
+        .all_hits
+        .iter()
+        .map(|hit| hit_rating_key(&hit.path))
+        .collect::<Vec<_>>();
+    if let GlobalSearchView::DrilledInto {
+        current_path,
+        is_zip: false,
+        ..
+    } = view
+    {
+        for hit in &state.all_hits {
+            if is_zip_hit_path(&hit.path) {
+                continue;
+            }
+            let path = Path::new(&hit.path);
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            if !path_is_under_or_eq(parent, current_path) || parent == current_path {
+                continue;
+            }
+            if let Ok(relative) = parent.strip_prefix(current_path)
+                && let Some(first) = relative.components().next()
+            {
+                keys.push(crate::adjustment_db::normalize_path(
+                    &current_path.join(first.as_os_str()),
+                ));
+            }
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+fn sort_search_items_by_rating(
+    items: &mut Vec<GridItem>,
+    image_metas: &mut Vec<Option<(i64, i64)>>,
+    view: &GlobalSearchView,
+    spec: crate::rating_sort::RatingSortSpec,
+    facts: &crate::rating_db::CompleteRatingFacts,
+) {
+    let rows = std::mem::take(items)
+        .into_iter()
+        .zip(std::mem::take(image_metas))
+        .map(|(item, meta)| {
+            let key = search_item_rating_key(&item)
+                .map(|key| facts.key_for_requested(&key))
+                .unwrap_or(crate::rating_sort::RatingSortKey::Unsupported);
+            let name = crate::filename_sort::SortNameKey::file_name(item.name().as_ref());
+            let category = if matches!(view, GlobalSearchView::DrilledInto { is_zip: false, .. })
+                && matches!(item, GridItem::Folder(_))
+            {
+                0u8
+            } else {
+                1u8
+            };
+            (item, meta, key, name, category)
+        })
+        .collect::<Vec<_>>();
+    let mut rows = rows;
+    rows.sort_by(|a, b| {
+        a.4.cmp(&b.4)
+            .then_with(|| spec.compare(a.2, &a.3, b.2, &b.3))
+    });
+    for (item, meta, _, _, _) in rows {
+        items.push(item);
+        image_metas.push(meta);
+    }
+}
+
 /// `child` が `ancestor` と等しいか配下にあれば true。
 fn path_is_under_or_eq(child: &Path, ancestor: &Path) -> bool {
     child == ancestor || child.starts_with(ancestor)
@@ -1309,16 +1432,36 @@ fn search_prepare_worker(
             break;
         }
         match command {
+            SearchPrepareCommand::RatingWrites(updates) => {
+                let values: HashMap<_, _> = updates.into_iter().collect();
+                for hit in &mut state.all_hits {
+                    if let Some(stars) = values.get(&hit_rating_key(&hit.path)) {
+                        hit.stars = *stars;
+                    }
+                }
+            }
             SearchPrepareCommand::Batch(sequence, mut hits) => {
                 if let Some(db) = rating_db.as_ref() {
                     let keys = hits
                         .iter()
                         .map(|hit| hit_rating_key(&hit.path))
                         .collect::<Vec<_>>();
-                    let ratings = db.get_many(&keys);
-                    for (hit, key) in hits.iter_mut().zip(&keys) {
-                        if let Some(&stars) = ratings.get(key) {
-                            hit.stars = stars;
+                    match db.get_many_complete(&keys, 0) {
+                        Ok(facts) => {
+                            for (hit, key) in hits.iter_mut().zip(&keys) {
+                                hit.stars = facts.value_for_requested(key);
+                            }
+                        }
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "search: complete batch rating read failed: {error}"
+                            ));
+                            let ratings = db.get_many(&keys);
+                            for (hit, key) in hits.iter_mut().zip(&keys) {
+                                if let Some(&stars) = ratings.get(key) {
+                                    hit.stars = stars;
+                                }
+                            }
                         }
                     }
                 }
@@ -1340,10 +1483,38 @@ fn search_prepare_worker(
             }
             SearchPrepareCommand::View(wish) => {
                 state.sort_mode = wish.sort_mode;
-                let (items, image_metas, drilled_counts) = match &wish.view {
+                let rating_order_applies = matches!(
+                    wish.order_request,
+                    crate::rating_sort::ListingOrderRequest::Rating(_)
+                ) && !matches!(wish.view, GlobalSearchView::Aggregated);
+                let rating_facts = match wish.order_request {
+                    crate::rating_sort::ListingOrderRequest::Standard(_) => None,
+                    crate::rating_sort::ListingOrderRequest::Rating(_) if rating_order_applies => {
+                        let keys = search_rating_keys_for_view(&state, &wish.view);
+                        rating_db.as_ref().and_then(|db| {
+                            match db.get_many_complete(&keys, wish.rating_write_generation) {
+                                Ok(facts) => Some(facts),
+                                Err(error) => {
+                                    crate::logger::log(format!(
+                                        "search: rating order read failed: {error}"
+                                    ));
+                                    None
+                                }
+                            }
+                        })
+                    }
+                    crate::rating_sort::ListingOrderRequest::Rating(_) => None,
+                };
+                let rating_sort_failed = rating_order_applies && rating_facts.is_none();
+                if let Some(facts) = rating_facts.as_ref() {
+                    for hit in &mut state.all_hits {
+                        hit.stars = facts.value_for_requested(&hit_rating_key(&hit.path));
+                    }
+                }
+                let sort = wish.order_request.standard_fallback();
+                let (mut items, mut image_metas, drilled_counts) = match &wish.view {
                     GlobalSearchView::Flat => {
-                        let (items, metas) =
-                            build_flat_items(&state, wish.sort_order, &wish.rating_filter);
+                        let (items, metas) = build_flat_items(&state, sort, &wish.rating_filter);
                         (items, metas, HashMap::new())
                     }
                     GlobalSearchView::Aggregated => {
@@ -1361,12 +1532,53 @@ fn search_prepare_worker(
                             &state,
                             current_path,
                             *is_zip,
-                            wish.sort_order,
+                            sort,
                             &wish.rating_filter,
                         );
                         (items, metas, counts)
                     }
                 };
+                if let (crate::rating_sort::ListingOrderRequest::Rating(spec), Some(facts)) =
+                    (wish.order_request, rating_facts.as_ref())
+                    && !matches!(wish.view, GlobalSearchView::Aggregated)
+                {
+                    sort_search_items_by_rating(
+                        &mut items,
+                        &mut image_metas,
+                        &wish.view,
+                        spec,
+                        facts,
+                    );
+                }
+                if let Some(survivors) = wish.survivor_order.as_ref() {
+                    retain_search_survivor_order_and_append_candidates(
+                        &mut items,
+                        &mut image_metas,
+                        survivors,
+                    );
+                }
+                let ratings = rating_facts.as_ref().map(|facts| {
+                    let cache = items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, item)| {
+                            let key = search_item_rating_key(item)?;
+                            Some((idx, facts.value_for_requested(&key)))
+                        })
+                        .collect();
+                    (cache, facts.write_generation())
+                });
+                let hit_rating_values = rating_facts.as_ref().map(|facts| {
+                    state
+                        .all_hits
+                        .iter()
+                        .map(|hit| {
+                            let key = hit_rating_key(&hit.path);
+                            let stars = facts.value_for_requested(&key);
+                            (key, stars)
+                        })
+                        .collect()
+                });
                 let before = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
                 if cache_completion != before.completed_writes {
                     snapshot = Default::default();
@@ -1423,6 +1635,9 @@ fn search_prepare_worker(
                             image_metas,
                             drilled_counts,
                             page_edits,
+                            ratings,
+                            hit_rating_values,
+                            rating_sort_failed,
                             #[cfg(test)]
                             lookup_passes,
                             #[cfg(test)]
@@ -1460,6 +1675,16 @@ impl App {
         &mut self,
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
+    ) {
+        self.replace_search_view_items_with_ratings(items, image_metas, None, false);
+    }
+
+    fn replace_search_view_items_with_ratings(
+        &mut self,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        prepared_ratings: Option<(HashMap<usize, u8>, u64)>,
+        preserve_rating_details_order: bool,
     ) {
         use std::sync::atomic::Ordering;
         debug_assert_eq!(items.len(), image_metas.len());
@@ -1541,6 +1766,15 @@ impl App {
             .iter()
             .filter_map(|&i| self.items.get(i).and_then(thumb_reuse_key))
             .collect();
+        let detail_keys = (preserve_rating_details_order
+            && self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && self.settings.details_sort_key == crate::settings::DetailsSortKey::Rating)
+            .then(|| {
+                self.details_order
+                    .iter()
+                    .filter_map(|&index| self.items.get(index).map(GridItem::perf_key))
+                    .collect::<Vec<_>>()
+            });
         // PDF render pool に残っている旧 search 結果の render ジョブを stale prune
         // する。`bump_render_epoch_only` は cancel_token / catchup を touch しないので、
         // worker 再 spawn なしの replace 経路で worker を殺さない。
@@ -1558,6 +1792,10 @@ impl App {
         // reload_queue / heavy_io_queue / tag_prewarm_*) を一括破棄。
         // (`self.checked` も中で clear される。下で content-key から復元)
         self.invalidate_idx_state_and_queues();
+        if let Some((cache, generation)) = prepared_ratings {
+            self.rating_cache = cache;
+            self.overlay_rating_session_writes_since(generation);
+        }
         // 旧 thumbnails を新位置にマージ。Loaded のままなら upload backlog に乗らず、
         // 同一フレームで前回のテクスチャがそのまま見え続けるのでちらつかない。
         // 補正用 source pixels も同じ content-key で移し、補正済み tex は再生成させる。
@@ -1628,7 +1866,21 @@ impl App {
             self.scroll_to_selected = false;
         }
         self.scroll_hint.store(0, Ordering::Relaxed);
-        self.rebuild_visible_indices();
+        if let Some(keys) = detail_keys {
+            let positions = self
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| (item.perf_key(), index))
+                .collect::<HashMap<_, _>>();
+            self.details_order = keys
+                .iter()
+                .filter_map(|key| positions.get(key).copied())
+                .collect();
+            self.rebuild_visible_indices_after_rating_publication();
+        } else {
+            self.rebuild_visible_indices();
+        }
         // auto_aspect: invalidate で samples を全クリアしたが、Ctrl+G では preserved
         // で thumbnails が新 idx に復元されている。Auto モードならそれらから samples を
         // 再構築 (Codex P3 2026-05)。
@@ -2169,6 +2421,7 @@ impl App {
             return;
         };
         let mut rebuild = false;
+        let mut writes_after_read = Vec::new();
         for _ in 0..MAX_EVENTS_PER_FRAME {
             #[cfg(test)]
             if prepare.hold_ready_for_test && prepare.held_ready_for_test.is_some() {
@@ -2200,7 +2453,13 @@ impl App {
                             prepare.metrics.rated_batches = sequence;
                         }
                         for hit in &hits {
-                            self.global_search.accumulate_hit(hit);
+                            let mut hit = hit.clone();
+                            if let Some(stars) =
+                                self.rating_session_value_for_key(&hit_rating_key(&hit.path))
+                            {
+                                hit.stars = stars;
+                            }
+                            self.global_search.accumulate_hit(&hit);
                         }
                         let should_resort = self.global_search.last_sort_at.is_none_or(|at| {
                             at.elapsed() >= Duration::from_millis(RESORT_INTERVAL_MS)
@@ -2236,7 +2495,10 @@ impl App {
                             || !self.global_search.last_executed.is_empty())
                         && wish.view == self.global_search.view()
                         && wish.sort_mode == self.global_search.sort_mode
-                        && wish.sort_order == self.settings.sort_order
+                        && wish.order_request
+                            == crate::rating_sort::ListingOrderRequest::from_settings(
+                                &self.settings,
+                            )
                         && wish.rating_filter == self.effective_rating_filter()
                         && wish.done == self.global_search.done;
                     if latest && same_surface {
@@ -2257,8 +2519,27 @@ impl App {
                             prepare.metrics.lookup_passes = prepared.lookup_passes;
                             prepare.metrics.looked_up_keys = prepared.looked_up_keys;
                         }
+                        if let Some(values) = prepared.hit_rating_values.as_ref() {
+                            for hit in &mut self.global_search.all_hits {
+                                if let Some(stars) = values.get(&hit_rating_key(&hit.path)) {
+                                    hit.stars = *stars;
+                                }
+                            }
+                        }
+                        writes_after_read =
+                            self.rating_session_writes_after(wish.rating_write_generation);
                         self.search_drilled_folder_counts = prepared.drilled_counts;
-                        self.replace_search_view_items(prepared.items, prepared.image_metas);
+                        self.replace_search_view_items_with_ratings(
+                            prepared.items,
+                            prepared.image_metas,
+                            prepared.ratings,
+                            wish.survivor_order.is_some(),
+                        );
+                        if prepared.rating_sort_failed {
+                            self.show_feedback_toast(
+                                "評価順を読み込めなかったため名前順で表示しました".into(),
+                            );
+                        }
                         self.install_prepared_page_edits(prepared.page_edits);
                         self.restore_search_selection_after_prepare();
                         self.update_global_search_address();
@@ -2315,6 +2596,26 @@ impl App {
             }
         }
         self.global_search.page_edit_prepare = Some(prepare);
+        if !writes_after_read.is_empty() {
+            let values = writes_after_read
+                .iter()
+                .map(|(key, stars)| (key.as_str(), *stars))
+                .collect::<HashMap<_, _>>();
+            let changed_rows = (0..self.items.len())
+                .filter_map(|index| {
+                    let key = self.rating_path_key(index)?;
+                    values
+                        .get(key.as_str())
+                        .copied()
+                        .map(|stars| (index, stars))
+                })
+                .collect::<Vec<_>>();
+            for (index, stars) in changed_rows {
+                self.rating_cache.insert(index, stars);
+            }
+            self.publish_search_rating_writes(&writes_after_read);
+            self.rebuild_visible_indices_after_rating_publication();
+        }
         if rebuild {
             self.rebuild_items_from_global_search();
         }
@@ -2422,6 +2723,49 @@ impl App {
     /// thumbnails / visible_indices と、Codex P2-1/P2-2 で指摘された
     /// search_filter / checked を整合させるだけに留める。
     pub(crate) fn rebuild_items_from_global_search(&mut self) {
+        self.request_search_view_build(None);
+    }
+
+    pub(crate) fn publish_search_rating_writes(&mut self, updates: &[(String, u8)]) {
+        if updates.is_empty() || !self.global_search.active {
+            return;
+        }
+        let values: HashMap<_, _> = updates
+            .iter()
+            .map(|(key, stars)| (key.as_str(), *stars))
+            .collect();
+        for hit in &mut self.global_search.all_hits {
+            if let Some(stars) = values.get(hit_rating_key(&hit.path).as_str()) {
+                hit.stars = *stars;
+            }
+        }
+        if let GlobalSearchView::DrilledInto {
+            current_path,
+            is_zip,
+            ..
+        } = self.global_search.view()
+        {
+            self.search_drilled_folder_counts =
+                compute_drilled_subfolder_counts(&self.global_search, &current_path, is_zip);
+        }
+        if let Some(prepare) = self.global_search.page_edit_prepare.as_ref() {
+            let _ = prepare
+                .tx
+                .send(SearchPrepareCommand::RatingWrites(updates.to_vec()));
+        }
+        if self.items_are_global_search_view
+            && self
+                .global_search
+                .page_edit_prepare
+                .as_ref()
+                .is_none_or(|prepare| prepare.in_flight.is_none())
+        {
+            let survivors = self.items.iter().map(GridItem::perf_key).collect();
+            self.request_search_view_build(Some(survivors));
+        }
+    }
+
+    fn request_search_view_build(&mut self, survivor_order: Option<Vec<String>>) {
         if self.global_search.page_edit_prepare.is_some() {
             self.global_search.maybe_auto_switch_aggregate();
             ensure_container_mtime_populated(&mut self.global_search);
@@ -2440,9 +2784,13 @@ impl App {
                 through_batch: prepare.raw_batch_sequence,
                 view,
                 sort_mode: self.global_search.sort_mode,
-                sort_order: self.settings.sort_order,
+                order_request: crate::rating_sort::ListingOrderRequest::from_settings(
+                    &self.settings,
+                ),
+                rating_write_generation: self.rating_session_write_generation,
                 rating_filter,
                 done: self.global_search.done,
+                survivor_order,
             });
             prepare.send_next();
             return;
@@ -2461,7 +2809,14 @@ impl App {
         // にも反映。旧版は settings.rating_filter を直接使っていたため、suppress 発動して
         // も drill 内で未評価 hits が build_drilled_items 側で落とされていた。
         let rating_filter = self.effective_rating_filter();
-        let sort_order = self.settings.sort_order;
+        let order_request = crate::rating_sort::ListingOrderRequest::from_settings(&self.settings);
+        let sort_order = order_request.standard_fallback();
+        if matches!(
+            order_request,
+            crate::rating_sort::ListingOrderRequest::Rating(_)
+        ) {
+            self.show_feedback_toast("評価順を準備できなかったため名前順で表示しました".into());
+        }
         let (items, image_metas) = match self.global_search.view() {
             GlobalSearchView::Flat => {
                 // 一覧ビューはサブフォルダバッジを使わない。残骸を破棄する。
@@ -3261,6 +3616,200 @@ mod tests {
     use super::*;
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
+
+    #[test]
+    fn search_membership_keeps_survivor_order_and_appends_candidates() {
+        let make = |name: &str| GridItem::Image(PathBuf::from(format!(r"C:\search\{name}.jpg")));
+        let mut items = vec![make("a"), make("c"), make("d")];
+        let mut metas = vec![Some((1, 1)), Some((2, 2)), Some((3, 3))];
+        retain_search_survivor_order_and_append_candidates(
+            &mut items,
+            &mut metas,
+            &[
+                make("b").perf_key(),
+                make("c").perf_key(),
+                make("a").perf_key(),
+            ],
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["c.jpg", "a.jpg", "d.jpg"]
+        );
+        assert_eq!(metas, [Some((2, 2)), Some((1, 1)), Some((3, 3))]);
+    }
+
+    #[test]
+    fn rating_search_complete_read_failure_after_first_chunk_uses_name_fallback() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-search-read-failure");
+        let paths = (0..501)
+            .map(|index| root.join(format!("{index:03}.jpg")))
+            .collect::<Vec<_>>();
+        let rated_key = crate::adjustment_db::normalize_path(&paths[499]);
+        let bad_key = crate::adjustment_db::normalize_path(&paths[500]);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&rated_key, 5, None)
+            .unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&bad_key, 2, None)
+            .unwrap();
+        let conn = rusqlite::Connection::open(crate::rating_db::RatingDb::db_path()).unwrap();
+        conn.execute(
+            "UPDATE ratings SET stars = 'broken' WHERE path = ?1",
+            [&bad_key],
+        )
+        .unwrap();
+        let hits = paths
+            .iter()
+            .map(|path| GlobalHit {
+                path: path.to_string_lossy().into_owned(),
+                score: 1.0,
+                stars: 0,
+                mtime: 0,
+                file_size: Some(0),
+            })
+            .collect::<Vec<_>>();
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+        };
+        let wish = SearchViewWish {
+            sequence: 1,
+            run_sequence: 1,
+            query: "test".into(),
+            filters: GlobalSearchFilters::default(),
+            source_generation: 0,
+            context: app.virtual_list_context_id(),
+            through_batch: 1,
+            view: GlobalSearchView::Flat,
+            sort_mode: ContainerSortMode::HitCount,
+            order_request: crate::rating_sort::ListingOrderRequest::Rating(spec),
+            rating_write_generation: 0,
+            rating_filter: [true; 6],
+            done: true,
+            survivor_order: None,
+        };
+        let (command_tx, command_rx) = mpsc::channel();
+        let (output_tx, output_rx) = mpsc::channel();
+        let epoch = crate::page_edit_write_epoch::TestEpochScope::capture().unwrap();
+        let worker = std::thread::spawn(move || {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::enter(epoch);
+            search_prepare_worker(
+                command_rx,
+                output_tx,
+                Arc::new(AtomicBool::new(false)),
+                egui::Context::default(),
+                crate::app::page_edit_snapshot::PageEditAvailability::default(),
+            );
+        });
+        command_tx
+            .send(SearchPrepareCommand::Batch(1, hits))
+            .unwrap();
+        command_tx
+            .send(SearchPrepareCommand::View(wish.clone()))
+            .unwrap();
+        let mut filtered = wish;
+        filtered.sequence = 2;
+        filtered.rating_filter = [false; 6];
+        filtered.rating_filter[5] = true;
+        command_tx
+            .send(SearchPrepareCommand::View(filtered))
+            .unwrap();
+        drop(command_tx);
+        worker.join().unwrap();
+        let mut rated_batch = None;
+        let mut ready = Vec::new();
+        for output in output_rx.try_iter() {
+            match output {
+                SearchPrepareOutput::RatedBatch(_, hits) => rated_batch = Some(hits),
+                SearchPrepareOutput::Ready(_, prepared) => ready.push(prepared),
+                SearchPrepareOutput::Retry(_) => panic!("unexpected retry"),
+                SearchPrepareOutput::Failed(_, message) => panic!("{message}"),
+            }
+        }
+        let rated_batch = rated_batch.unwrap();
+        assert_eq!(rated_batch[499].stars, 5);
+        assert_eq!(rated_batch[500].stars, 0);
+        assert_eq!(ready.len(), 2);
+        assert!(ready[0].rating_sort_failed);
+        assert_eq!(ready[0].items[0].name(), "000.jpg");
+        assert!(ready[0].ratings.is_none());
+        assert!(ready[0].hit_rating_values.is_none());
+        assert!(ready[1].rating_sort_failed);
+        assert_eq!(ready[1].items.len(), 1);
+        assert_eq!(ready[1].items[0].name(), "499.jpg");
+    }
+
+    #[test]
+    fn rating_sort_covers_flat_drilled_folders_and_zip_hits() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::rating_db::RatingDb::open_at(tmp.path().join("ratings.db")).unwrap();
+        let root = tmp.path().join("search");
+        let a = GridItem::Image(root.join("a.jpg"));
+        let b = GridItem::Image(root.join("b.jpg"));
+        let folder = GridItem::Folder(root.join("folder"));
+        let zip = GridItem::ZipImage {
+            zip_path: root.join("book.zip"),
+            entry_name: "z.jpg".into(),
+        };
+        let keys = [&a, &b, &folder, &zip].map(|item| search_item_rating_key(item).unwrap());
+        db.set_user_rating(&keys[0], 1, None).unwrap();
+        db.set_user_rating(&keys[1], 5, None).unwrap();
+        db.set_user_rating(&keys[2], 4, None).unwrap();
+        db.set_user_rating(&keys[3], 3, None).unwrap();
+        let facts = db.get_many_complete(&keys.to_vec(), 4).unwrap();
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: Default::default(),
+        };
+        let mut flat = vec![a.clone(), b.clone()];
+        let mut metas = vec![Some((1, 1)), Some((2, 2))];
+        sort_search_items_by_rating(&mut flat, &mut metas, &GlobalSearchView::Flat, spec, &facts);
+        assert!(matches!(&flat[0], GridItem::Image(path) if path.ends_with("b.jpg")));
+        assert_eq!(metas, [Some((2, 2)), Some((1, 1))]);
+
+        let mut drill = vec![a, folder.clone(), b];
+        let mut drill_metas = vec![None; 3];
+        let drill_view = GlobalSearchView::DrilledInto {
+            container_root: root.clone(),
+            current_path: root.clone(),
+            is_zip: false,
+        };
+        sort_search_items_by_rating(&mut drill, &mut drill_metas, &drill_view, spec, &facts);
+        assert!(matches!(&drill[0], GridItem::Folder(path) if path.ends_with("folder")));
+        assert!(matches!(&drill[1], GridItem::Image(path) if path.ends_with("b.jpg")));
+
+        let mut zip_rows = vec![
+            zip,
+            GridItem::ZipImage {
+                zip_path: root.join("book.zip"),
+                entry_name: "a.jpg".into(),
+            },
+        ];
+        let second_key = search_item_rating_key(&zip_rows[1]).unwrap();
+        let zip_facts = db
+            .get_many_complete(&[keys[3].clone(), second_key], 5)
+            .unwrap();
+        let mut zip_metas = vec![None; 2];
+        let zip_view = GlobalSearchView::DrilledInto {
+            container_root: root.clone(),
+            current_path: root.join("book.zip"),
+            is_zip: true,
+        };
+        sort_search_items_by_rating(&mut zip_rows, &mut zip_metas, &zip_view, spec, &zip_facts);
+        assert!(
+            matches!(&zip_rows[0], GridItem::ZipImage { entry_name, .. } if entry_name == "z.jpg")
+        );
+    }
 
     #[cfg(windows)]
     #[test]

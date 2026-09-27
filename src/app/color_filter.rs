@@ -546,6 +546,9 @@ impl App {
             && !rating_filter.iter().all(|&b| b);
         let mut out = Vec::new();
         for i in 0..self.items.len() {
+            if !self.smart_folder_rule_qualifies_index(i) {
+                continue;
+            }
             if !self.items.get(i).is_some_and(color_filter_item_supported) {
                 continue;
             }

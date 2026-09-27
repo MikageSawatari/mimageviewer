@@ -3065,6 +3065,16 @@ impl App {
         };
         let sort_order = match grid_sort_target {
             RingPickerGridSortTarget::Collection(target) => target.standard_sort,
+            RingPickerGridSortTarget::Global if self.items_are_bookmark_view => {
+                match self.bookmark_view_sort {
+                    crate::bookmark_browser::BookmarkViewSort::Normal(sort)
+                        if !sort.is_rating() =>
+                    {
+                        sort
+                    }
+                    _ => crate::settings::SortOrder::FileName,
+                }
+            }
             RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Locked(_) => {
                 self.settings.sort_order
             }
@@ -3776,7 +3786,16 @@ impl App {
                 if matches!(picker.grid_sort_target, RingPickerGridSortTarget::Locked(_)) {
                     return;
                 }
-                picker.sort_order = cycle_value(SortOrder::all(), picker.sort_order, delta);
+                let options = if matches!(
+                    picker.grid_sort_target,
+                    RingPickerGridSortTarget::Collection(_)
+                ) || self.items_are_bookmark_view
+                {
+                    SortOrder::collection_options()
+                } else {
+                    SortOrder::all()
+                };
+                picker.sort_order = cycle_value(options, picker.sort_order, delta);
                 mark_picker_dirty(picker, row);
             }
             RingPickerRowId::GridThumbAspect => {
@@ -4038,6 +4057,7 @@ impl App {
         picker: &RingPickerState,
         stars: u8,
     ) -> (Vec<usize>, Option<String>) {
+        self.sync_current_context_rating_session_writes();
         let target_keys = picker
             .original
             .item_rating_records
@@ -4062,7 +4082,7 @@ impl App {
                 });
                 continue;
             };
-            match self.set_rating_result(idx, stars) {
+            match self.set_rating_result_deferred(idx, stars) {
                 Ok(true) => touched.push(idx),
                 Ok(false) => {
                     first_error.get_or_insert_with(|| {
@@ -4077,6 +4097,9 @@ impl App {
                 }
             }
         }
+        if !touched.is_empty() {
+            self.publish_current_context_rating_writes();
+        }
         (touched, first_error)
     }
 
@@ -4084,17 +4107,9 @@ impl App {
         if picker.original.item_rating_records.is_empty() {
             return;
         }
-        let (touched, error) = self.apply_picker_item_rating_targets(picker, stars);
+        let (_, error) = self.apply_picker_item_rating_targets(picker, stars);
         if let Some(error) = error {
             self.report_rating_write_error(&error);
-        }
-        if self.global_search.active {
-            self.refresh_global_search_hit_stars(&touched);
-        }
-        if self.global_search.active && self.items_are_global_search_view {
-            self.rebuild_items_from_global_search();
-        } else {
-            self.rebuild_visible_indices();
         }
     }
 
@@ -4762,11 +4777,8 @@ impl App {
         Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
     ) {
         let item_rating_dirty = picker.dirty_rows.contains(&RingPickerRowId::ItemRating);
-        let mut touched = Vec::new();
         if item_rating_dirty {
-            let (written, error) =
-                self.apply_picker_item_rating_targets(picker, picker.item_rating);
-            touched = written;
+            let (_, error) = self.apply_picker_item_rating_targets(picker, picker.item_rating);
             if let Some(error) = error {
                 self.report_rating_write_error(&error);
             }
@@ -4782,20 +4794,6 @@ impl App {
         }
         let (item_changes, container_record) = self.published_live_picker_rating_changes(picker);
         if item_rating_dirty {
-            if self.global_search.active {
-                self.refresh_global_search_hit_stars(&touched);
-            }
-            if self.items_are_rating_view {
-                let changes = item_changes
-                    .iter()
-                    .map(|change| (change.path_key.clone(), change.after))
-                    .collect::<Vec<_>>();
-                self.refresh_rating_view_after_rating_changes(&changes);
-            } else if self.global_search.active && self.items_are_global_search_view {
-                self.rebuild_items_from_global_search();
-            } else {
-                self.rebuild_visible_indices();
-            }
             if item_changes.len() > 1 {
                 self.checked.clear();
             }
@@ -8193,6 +8191,32 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bookmark_picker_opens_on_its_supported_active_sort() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sort_order = crate::settings::SortOrder::RatingDesc;
+        app.items_are_bookmark_view = true;
+        app.bookmark_view_sort =
+            crate::bookmark_browser::BookmarkViewSort::Normal(crate::settings::SortOrder::DateDesc);
+        let picker = app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        assert_eq!(picker.sort_order, crate::settings::SortOrder::DateDesc);
+        app.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::CreatedAtDesc;
+        let picker = app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        assert_eq!(picker.sort_order, crate::settings::SortOrder::FileName);
+    }
+
+    #[test]
+    fn collection_picker_cycle_never_enters_rating_order() {
+        use crate::settings::SortOrder;
+        assert_eq!(
+            super::cycle_value(SortOrder::collection_options(), SortOrder::SizeDesc, 1),
+            SortOrder::FileName
+        );
+        assert_eq!(
+            super::cycle_value(SortOrder::all(), SortOrder::SizeDesc, 1),
+            SortOrder::RatingAsc
+        );
+    }
     use super::{
         GamepadFrameBatch, Instant, MouseMiddleInputSample, POST_FILTER_GROUPS, PadDir,
         RingPickerRatingTarget, RingPickerRowId, continuous_reading_stick_axis, cycle_rating,
@@ -8206,6 +8230,33 @@ mod tests {
         update_mouse_middle_click_state, video_seek_ring_action,
     };
     use crate::adjustment::PostFilter;
+
+    #[test]
+    fn multi_item_ring_rating_publishes_once() {
+        use crate::grid_item::GridItem;
+        use crate::ring_shortcut::RingShortcutContext;
+
+        let mut app = crate::app::setup_app_for_test();
+        let paths = [
+            app.tmp.path().join("ring-a.jpg"),
+            app.tmp.path().join("ring-b.jpg"),
+        ];
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.thumbnails = vec![
+            crate::app::ThumbnailState::Pending,
+            crate::app::ThumbnailState::Pending,
+        ];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+        app.checked.extend([0, 1]);
+        let picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        assert_eq!(picker.original.item_rating_records.len(), 2);
+        let (touched, error) = app.apply_picker_item_rating_targets(&picker, 4);
+        assert_eq!(touched.len(), 2);
+        assert!(error.is_none());
+        assert_eq!(app.rating_publication_count, 1);
+    }
 
     #[test]
     fn stale_aggregate_gamepad_item_actions_wait_for_acceptance() {

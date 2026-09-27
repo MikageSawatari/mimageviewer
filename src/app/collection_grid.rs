@@ -2595,6 +2595,84 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn seeded_collection_smoke_action_opens_python_seeded_root_after_startup() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target = repo.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("rating-sort-collection-lib-")
+            .tempdir_in(target)
+            .unwrap();
+        std::fs::write(
+            temp.path().join(".disposable-smoke-data"),
+            "mimageviewer-disposable-smoke-v1;test-script=true",
+        )
+        .unwrap();
+        let fixture = temp.path().join("rating-sort-collection").join("fixture");
+        std::fs::create_dir_all(&fixture).unwrap();
+        let names = ["01-one.png", "02-unrated.png", "03-two.png"];
+        for name in names {
+            std::fs::copy(
+                repo.join("testdata/rating-sort").join(name),
+                fixture.join(name),
+            )
+            .unwrap();
+        }
+        let seed_script = repo.join("scripts/ui-smoke/seed_rating_sort_collection.py");
+        let seed = std::process::Command::new("python")
+            .args([&seed_script, &fixture])
+            .arg("--seed-db")
+            .arg(temp.path())
+            .output()
+            .expect("Python Collection smoke seeder");
+        assert!(
+            seed.status.success(),
+            "seed failed: {}",
+            String::from_utf8_lossy(&seed.stderr)
+        );
+
+        let (mut app, _client) = start_ready_app(&temp.path().join("collection.db"));
+        assert_eq!(
+            app.open_seeded_collection_for_smoke().unwrap_err(),
+            "startup folder open is still pending"
+        );
+        app.initialized = true;
+        app.startup_open_path = Some(fixture.clone());
+        assert_eq!(
+            app.open_seeded_collection_for_smoke().unwrap_err(),
+            "startup folder open is still pending"
+        );
+        app.startup_open_path = None;
+        app.open_seeded_collection_for_smoke().unwrap();
+        let id = crate::test_script::seeded_collection_smoke_id();
+        wait_for_grid(&mut app, id);
+        let root = app.collection_grid_root_order().unwrap().unwrap();
+        assert_eq!(root.content.stamp.collection_id, id);
+        assert_eq!(format!("{:?}", root.mode), "Manual");
+        assert_eq!(format!("{:?}", root.standard_sort), "FileName");
+        assert_eq!(root.content.expected_revision, 1);
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            names.map(str::to_owned).to_vec()
+        );
+        let verify = std::process::Command::new("python")
+            .args([&seed_script, &fixture])
+            .arg("--verify-db")
+            .arg(temp.path())
+            .output()
+            .expect("Python Collection smoke verifier");
+        assert!(
+            verify.status.success(),
+            "verify failed: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+    }
+
     fn poll_until(app: &mut App, message: &str, mut condition: impl FnMut(&App) -> bool) {
         let ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(5);

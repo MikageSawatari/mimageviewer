@@ -1409,6 +1409,7 @@ pub enum KeyAction {
     GlobalMetadataSearch,
     GlobalOpenFolder,
     ToggleDetachedViewerMode,
+    ToggleAlwaysOnTop,
     HelpShowContextShortcuts,
     GridFavoritePrev,
     GridFavoriteNext,
@@ -1961,6 +1962,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalMetadataSearch,
     KeyAction::GlobalOpenFolder,
     KeyAction::ToggleDetachedViewerMode,
+    KeyAction::ToggleAlwaysOnTop,
     KeyAction::HelpShowContextShortcuts,
     KeyAction::GridFavoritePrev,
     KeyAction::GridFavoriteNext,
@@ -2630,6 +2632,7 @@ pub enum MenuCommandId {
     TagsManagePinned,
     TagsTagView,
     SettingsThumbnailCache,
+    SettingsAlwaysOnTop,
     SettingsArchiveCache,
     SettingsThumbnailQuality,
     SettingsStats,
@@ -2684,6 +2687,7 @@ impl MenuCommandId {
         Self::TagsManagePinned,
         Self::TagsTagView,
         Self::SettingsThumbnailCache,
+        Self::SettingsAlwaysOnTop,
         Self::SettingsArchiveCache,
         Self::SettingsThumbnailQuality,
         Self::SettingsStats,
@@ -2738,6 +2742,7 @@ impl MenuCommandId {
             MenuCommandId::TagsManagePinned => "TagsManagePinned",
             MenuCommandId::TagsTagView => "TagsTagView",
             MenuCommandId::SettingsThumbnailCache => "SettingsThumbnailCache",
+            MenuCommandId::SettingsAlwaysOnTop => "SettingsAlwaysOnTop",
             MenuCommandId::SettingsArchiveCache => "SettingsArchiveCache",
             MenuCommandId::SettingsThumbnailQuality => "SettingsThumbnailQuality",
             MenuCommandId::SettingsStats => "SettingsStats",
@@ -3001,6 +3006,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         action: Some(KeyAction::GridTagView),
     },
     MenuCommandSpec {
+        id: MenuCommandId::SettingsAlwaysOnTop,
+        parent: TopMenuId::Settings,
+        label: "常に最前面",
+        action: Some(KeyAction::ToggleAlwaysOnTop),
+    },
+    MenuCommandSpec {
         id: MenuCommandId::SettingsThumbnailCache,
         parent: TopMenuId::Settings,
         label: "サムネイルキャッシュ管理",
@@ -3238,7 +3249,21 @@ fn resolve_menu_commands_for_parent(
         }
     }
 
+    pin_settings_always_on_top_command(parent, &mut out);
+
     out
+}
+
+/// The checked Settings item precedes the fixed controls, including for saved old menu orders.
+pub fn pin_settings_always_on_top_command(parent: TopMenuId, commands: &mut Vec<MenuCommandId>) {
+    if parent == TopMenuId::Settings
+        && let Some(index) = commands
+            .iter()
+            .position(|id| *id == MenuCommandId::SettingsAlwaysOnTop)
+    {
+        commands.remove(index);
+        commands.insert(0, MenuCommandId::SettingsAlwaysOnTop);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3913,6 +3938,7 @@ impl KeyAction {
             GlobalMetadataSearch => "GlobalMetadataSearch",
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
+            ToggleAlwaysOnTop => "ToggleAlwaysOnTop",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
             GridOpenCurrentDriveRoot => "GridOpenCurrentDriveRoot",
             GridFavoritePrev => "GridFavoritePrev",
@@ -4622,6 +4648,7 @@ impl KeyAction {
             GlobalMetadataSearch => "全フォルダのメタデータを検索する",
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
             ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
+            ToggleAlwaysOnTop => "常に最前面を切り替える",
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
             GridFavoritePrev => "前のお気に入りへ移動する",
             GridFavoriteNext => "次のお気に入りへ移動する",
@@ -5167,6 +5194,7 @@ impl KeyAction {
             | GlobalMetadataSearch
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
+            | ToggleAlwaysOnTop
             | HelpShowContextShortcuts => KeyContext::Global,
             GridFavoritePrev
             | GridFavoriteNext
@@ -5658,6 +5686,7 @@ impl KeyAction {
             | GlobalMetadataSearch
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
+            | ToggleAlwaysOnTop
             | HelpShowContextShortcuts
             | GridFavoritePrev
             | GridFavoriteNext
@@ -6189,6 +6218,7 @@ impl KeyAction {
             GlobalMetadataSearch => ChordList::one(Chord::ctrl(G)),
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
+            ToggleAlwaysOnTop => ChordList::EMPTY,
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
             GridFavoritePrev
             | GridFavoriteNext
@@ -8245,7 +8275,10 @@ impl Keymap {
             matches!(
                 action.context(),
                 KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
-            ) || *action == KeyAction::ToggleDetachedViewerMode
+            ) || matches!(
+                action,
+                KeyAction::ToggleDetachedViewerMode | KeyAction::ToggleAlwaysOnTop
+            )
         }) {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
@@ -9320,7 +9353,10 @@ pub fn native_video_fullscreen_shortcut_key(
             matches!(
                 action.context(),
                 KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
-            ) || *action == KeyAction::ToggleDetachedViewerMode
+            ) || matches!(
+                action,
+                KeyAction::ToggleDetachedViewerMode | KeyAction::ToggleAlwaysOnTop
+            )
         })
         .any(|action| fallback.matches_vk_action(action, key))
 }
@@ -10832,6 +10868,84 @@ mod tests {
             .position(|id| *id == MenuCommandId::SettingsRemoteConnection)
             .unwrap();
         assert!(remote > preferences);
+    }
+
+    #[test]
+    fn always_on_top_is_pinned_for_saved_settings_orders_and_can_be_hidden() {
+        let mut settings = MenuLayoutSettings {
+            command_order: vec![MenuCommandOrderSettings {
+                parent: "Settings".into(),
+                commands: vec![
+                    "SettingsPreferences".into(),
+                    "SettingsStats".into(),
+                    "SettingsAlwaysOnTop".into(),
+                ],
+            }],
+            ..MenuLayoutSettings::default()
+        };
+        let settings_commands = |settings: &MenuLayoutSettings| {
+            resolve_menu_layout(settings)
+                .menus
+                .into_iter()
+                .find(|menu| menu.id == TopMenuId::Settings)
+                .unwrap()
+                .commands
+        };
+        let commands = settings_commands(&settings);
+        assert_eq!(commands[0], MenuCommandId::SettingsAlwaysOnTop);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|id| **id == MenuCommandId::SettingsAlwaysOnTop)
+                .count(),
+            1
+        );
+        settings.hidden_commands.push("SettingsAlwaysOnTop".into());
+        let hidden = settings_commands(&settings);
+        assert!(!hidden.contains(&MenuCommandId::SettingsAlwaysOnTop));
+        assert!(hidden.contains(&MenuCommandId::SettingsPreferences));
+        assert!(KeyAction::ToggleAlwaysOnTop.default_chords().is_empty());
+        assert_eq!(KeyAction::ToggleAlwaysOnTop.context(), KeyContext::Global);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn always_on_top_has_no_default_key_and_rebound_key_reaches_egui_and_native() {
+        let _guard = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let ctx = egui::Context::default();
+        let default = Keymap::empty();
+        begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
+        assert!(!default.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
+        let _ = ctx.end_pass();
+
+        let rebound = Keymap::from_ini_str("[Global]\nToggleAlwaysOnTop = F16\n");
+        assert!(rebound.warnings().is_empty());
+        assert_eq!(
+            rebound.effective_chords(KeyAction::ToggleAlwaysOnTop),
+            vec![Chord::key(KeyName::F16)]
+        );
+        let ctx = egui::Context::default();
+        begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
+        assert!(rebound.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
+        assert!(!rebound.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
+        let _ = ctx.end_pass();
+
+        let key = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key: 0x7f,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        assert!(rebound.matches_vk_action(KeyAction::ToggleAlwaysOnTop, &key));
+        Keymap::empty().install_global_native_video_shortcuts();
+        assert!(!native_video_fullscreen_shortcut_key(&key));
+        rebound.install_global_native_video_shortcuts();
+        assert!(native_video_fullscreen_shortcut_key(&key));
     }
 
     #[test]

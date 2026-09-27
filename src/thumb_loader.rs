@@ -206,7 +206,9 @@ pub fn folder_thumb_cache_key(
         crate::settings::SortOrder::FileNameDesc
         | crate::settings::SortOrder::NumericDesc
         | crate::settings::SortOrder::SizeAsc
-        | crate::settings::SortOrder::SizeDesc => "name",
+        | crate::settings::SortOrder::SizeDesc
+        | crate::settings::SortOrder::RatingAsc
+        | crate::settings::SortOrder::RatingDesc => "name",
     };
     let version = match provenance {
         crate::catalog::FolderThumbProvenance::AutoSelected => FOLDER_THUMB_AUTO_ALGO_VERSION,
@@ -3263,7 +3265,9 @@ fn resolve_folder_thumb_image_inner(
             | crate::settings::SortOrder::Numeric
             | crate::settings::SortOrder::NumericDesc
             | crate::settings::SortOrder::SizeAsc
-            | crate::settings::SortOrder::SizeDesc => 0,
+            | crate::settings::SortOrder::SizeDesc
+            | crate::settings::SortOrder::RatingAsc
+            | crate::settings::SortOrder::RatingDesc => 0,
         }
     }
 

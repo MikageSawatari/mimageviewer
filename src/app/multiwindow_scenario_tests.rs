@@ -12,7 +12,278 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+#[test]
+fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let mut app = super::tests::phase_c_support::setup_app();
+    let nav_root = app.tmp.path().join("r2-navigation");
+    let main_folder = nav_root.join("a");
+    let next_folder = nav_root.join("b");
+    std::fs::create_dir_all(&main_folder).unwrap();
+    std::fs::create_dir_all(&next_folder).unwrap();
+    for name in ["a.jpg", "b.jpg"] {
+        std::fs::write(main_folder.join(name), b"image").unwrap();
+        std::fs::write(next_folder.join(name), b"image").unwrap();
+    }
+    let a_key = crate::adjustment_db::normalize_path(&main_folder.join("a.jpg"));
+    let b_key = crate::adjustment_db::normalize_path(&main_folder.join("b.jpg"));
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&b_key, 5, None)
+        .unwrap();
+    let spec = crate::rating_sort::RatingSortSpec {
+        direction: crate::rating_sort::RatingSortDirection::Desc,
+        unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+    };
+    crate::rating_sort::with_test_rating_order(spec, || {
+        app.load_folder_with_scan(main_folder.clone(), None)
+    });
+    let main_order = app
+        .items
+        .iter()
+        .map(|item| item.name().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(main_order, ["b.jpg", "a.jpg"]);
+    let main_generation = app.items_generation;
+    let main_rating_cache = app.rating_cache.clone();
+    let main_seen_generation = app.rating_session_write_seen_generation;
+    let detached = app.build_active_context_for_test(Some(902), DetachedSource::Image, |_| {});
+    crate::rating_sort::with_test_rating_order(spec, || {
+        app.with_viewer_context(detached, |mounted| {
+            mounted.load_folder_with_scan(main_folder.clone(), None)
+        })
+        .unwrap();
+    });
+    app.with_viewer_context(detached, |mounted| {
+        assert_eq!(
+            mounted
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+    })
+    .unwrap();
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&a_key, 5, None)
+        .unwrap();
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&b_key, 4, None)
+        .unwrap();
+    crate::rating_sort::with_test_rating_order(spec, || {
+        app.with_viewer_context(detached, |mounted| {
+            mounted.load_folder_with_scan(main_folder.clone(), None)
+        })
+        .unwrap();
+    });
+    assert_eq!(app.items_generation, main_generation);
+    assert_eq!(app.rating_cache, main_rating_cache);
+    assert_eq!(
+        app.rating_session_write_seen_generation,
+        main_seen_generation
+    );
+    assert_eq!(
+        app.items
+            .iter()
+            .map(|item| item.name().into_owned())
+            .collect::<Vec<_>>(),
+        main_order
+    );
+    app.with_viewer_context(detached, |mounted| {
+        assert_eq!(
+            mounted
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["a.jpg", "b.jpg"]
+        );
+        assert_eq!(mounted.rating_cache.get(&0), Some(&5));
+        assert_eq!(mounted.rating_cache.get(&1), Some(&4));
+    })
+    .unwrap();
+
+    // The detached folder-navigation entry must materialize Rating order in its
+    // own bundle, without changing the main bundle still showing the first folder.
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(
+            &crate::adjustment_db::normalize_path(&next_folder.join("b.jpg")),
+            5,
+            None,
+        )
+        .unwrap();
+    let ctx = egui::Context::default();
+    app.with_viewer_context(detached, |mounted| {
+        mounted.start_folder_nav(main_folder.clone(), true, FolderNavMode::Grid);
+    })
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    crate::rating_sort::with_test_rating_order(spec, || {
+        loop {
+            let applied = app
+                .with_viewer_context(detached, |mounted| {
+                    if let Some(result) = mounted.poll_folder_nav() {
+                        mounted.apply_folder_nav_result(&ctx, result);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap();
+            if applied {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached folder nav timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    app.with_viewer_context(detached, |mounted| {
+        assert_eq!(
+            mounted.current_folder.as_deref(),
+            Some(next_folder.as_path())
+        );
+        assert_eq!(
+            mounted
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+        assert_eq!(mounted.rating_cache.get(&0), Some(&5));
+        assert_eq!(mounted.rating_cache.get(&1), Some(&0));
+    })
+    .unwrap();
+    assert_eq!(app.items_generation, main_generation);
+    assert_eq!(app.rating_cache, main_rating_cache);
+}
+
 const ROOT_SIZE: egui::Vec2 = egui::vec2(1200.0, 800.0);
+
+#[test]
+fn rating_publication_reaches_main_and_two_detached_without_reordering_siblings() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let mut app = super::tests::phase_c_support::setup_app();
+    let folder = app.tmp.path().join("r3-shared-ratings");
+    std::fs::create_dir_all(&folder).unwrap();
+    for name in ["a.jpg", "b.jpg"] {
+        std::fs::write(folder.join(name), b"image").unwrap();
+    }
+    let a_key = crate::adjustment_db::normalize_path(&folder.join("a.jpg"));
+    let b_key = crate::adjustment_db::normalize_path(&folder.join("b.jpg"));
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set_user_rating(&b_key, 5, None)
+        .unwrap();
+    let spec = crate::rating_sort::RatingSortSpec {
+        direction: crate::rating_sort::RatingSortDirection::Desc,
+        unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+    };
+    let mut filter = [false; 6];
+    filter[5] = true;
+    app.settings.rating_filter = filter;
+    crate::rating_sort::with_test_rating_order(spec, || {
+        app.load_folder_with_scan(folder.clone(), None)
+    });
+    let main_generation = app.items_generation;
+    let first = app.build_active_context_for_test(Some(911), DetachedSource::Image, |_| {});
+    let second = app.build_active_context_for_test(Some(912), DetachedSource::Image, |_| {});
+    for id in [first, second] {
+        crate::rating_sort::with_test_rating_order(spec, || {
+            app.with_viewer_context(id, |mounted| {
+                mounted.load_folder_with_scan(folder.clone(), None)
+            })
+            .unwrap();
+        });
+    }
+    app.with_viewer_context(first, |mounted| {
+        mounted
+            .write_user_ratings_shared(&[(a_key.clone(), 5, None), (b_key.clone(), 4, None)])
+            .unwrap();
+        assert_eq!(
+            mounted
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+        assert_eq!(mounted.rating_cache.get(&0), Some(&4));
+        assert_eq!(mounted.rating_cache.get(&1), Some(&5));
+        assert_eq!(mounted.visible_indices, [1]);
+    })
+    .unwrap();
+    assert_eq!(app.items_generation, main_generation);
+    assert_eq!(
+        app.items
+            .iter()
+            .map(|item| item.name().into_owned())
+            .collect::<Vec<_>>(),
+        ["b.jpg", "a.jpg"]
+    );
+    assert_eq!(app.rating_cache.get(&0), Some(&4));
+    assert_eq!(app.rating_cache.get(&1), Some(&5));
+    assert_eq!(app.visible_indices, [1]);
+    let second_generation = app
+        .with_viewer_context(second, |mounted| {
+            assert_eq!(
+                mounted
+                    .items
+                    .iter()
+                    .map(|item| item.name().into_owned())
+                    .collect::<Vec<_>>(),
+                ["b.jpg", "a.jpg"]
+            );
+            assert_eq!(mounted.rating_cache.get(&0), Some(&4));
+            assert_eq!(mounted.rating_cache.get(&1), Some(&5));
+            assert_eq!(mounted.visible_indices, [1]);
+            mounted.items_generation
+        })
+        .unwrap();
+    crate::rating_sort::with_test_rating_order(spec, || {
+        app.with_viewer_context(first, |mounted| {
+            mounted.load_folder_with_scan(folder.clone(), None)
+        })
+        .unwrap();
+    });
+    app.with_viewer_context(first, |mounted| {
+        assert_eq!(
+            mounted
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["a.jpg", "b.jpg"]
+        );
+    })
+    .unwrap();
+    assert_eq!(app.items_generation, main_generation);
+    app.with_viewer_context(second, |mounted| {
+        assert_eq!(mounted.items_generation, second_generation);
+        assert_eq!(
+            mounted
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+    })
+    .unwrap();
+}
+
 const CHILD_SIZE: egui::Vec2 = egui::vec2(960.0, 720.0);
 
 struct ScenarioFrame {

@@ -23,7 +23,9 @@ bench_thumbs.tsv
 /vendor/bench_baseline.json
 /crates/vst3-host/build
 /dev/
-/testdata/
+# Keep local test data ignored while tracking the small rating-order smoke fixture.
+/testdata/*
+!/testdata/rating-sort/
 # Local tooling / scratch (Claude Code, Codex レビューメモ)
 /.claude/
 /codex-review*.md

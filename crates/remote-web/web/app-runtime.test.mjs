@@ -9,7 +9,7 @@ import {
 class FakeElement {
   constructor(tag = "div") {
     this.tagName = tag.toUpperCase();
-    this.style = {};
+    this.style = { setProperty(name, value) { this[name] = value; } };
     this.dataset = {};
     const classes = new Set();
     this.classList = {
@@ -48,6 +48,7 @@ class FakeElement {
     for (const listener of this.listeners.get(event.type) ?? []) listener(event);
   }
   setAttribute() {}
+  removeAttribute() {}
   append(...nodes) { nodes.forEach((node) => { node.parent = this; this.children.push(node); }); }
   prepend(...nodes) { nodes.forEach((node) => { node.parent = this; }); this.children.unshift(...nodes); }
   replaceChildren(...nodes) { this.children = []; this.append(...nodes); }
@@ -73,6 +74,9 @@ globalThis.document = {
   },
   createElementNS(_namespace, tag) {
     return new FakeElement(tag);
+  },
+  createDocumentFragment() {
+    return new FakeElement("fragment");
   },
 };
 let reloadCalls = 0;
@@ -163,6 +167,8 @@ const {
   invalidateViewerPendingLoad,
   isStreamMediaKind,
   loadFolder,
+  renderFolder,
+  setViewerRating,
   normalizeRemoteAdjustmentValues,
   normalizeRemoteBookBookmarkList,
   normalizeRemoteColorizeParams,
@@ -811,6 +817,15 @@ test("sort state accepts only server-provided options and keeps a visible lock r
   assert.equal(sort.options.length, 2);
   assert.equal(sort.locked_reason, "本として表示中は名前順固定です");
   assert.equal(normalizeRemoteGridSortState({ selected: "Numeric", options: [] }), null);
+  const rating = normalizeRemoteGridSortState({
+    selected: "RatingDesc",
+    options: [
+      { value: "FileName", label: "名前（昇順）", short_label: "名前↑" },
+      { value: "RatingDesc", label: "評価（高い順）", short_label: "評価↓" },
+    ],
+  });
+  assert.equal(rating.selected, "RatingDesc");
+  assert.equal(rating.options[1].label, "評価（高い順）");
 });
 
 test("session identity revocation tolerates a video viewer without page-load invalidation", () => {
@@ -4418,6 +4433,108 @@ test("final-cover writes keep the effective container address and typed preferen
     preference: "follow_global",
   });
   assert.equal(finalCoverSpreadWriteRequest(address, "unknown"), null);
+});
+
+test("folder rating fallback notice is visible on the rendered grid", async () => {
+  const noticeText = "評価順を読み込めなかったため名前順で表示しました";
+  globalThis.fetch = async (input) => {
+    const url = new URL(input, testLocation.origin);
+    if (url.pathname === "/api/list") {
+      return Response.json({
+        path: testPath("rating-fallback"),
+        sort_notice: noticeText,
+        entries: [],
+      });
+    }
+    if (url.pathname === "/api/container") return new Promise(() => {});
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+  try {
+    const loaded = await loadFolder(testPath("rating-fallback"));
+    renderFolder(null, loaded.requestController);
+    const findNotice = (node) => {
+      if (node.classList?.contains("grid-action-notice") ||
+          String(node.className ?? "").split(/\s+/).includes("grid-action-notice")) return node;
+      for (const child of node.children ?? []) {
+        const found = findNotice(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    const notice = findNotice(app);
+    assert.ok(notice);
+    assert.equal(notice.hidden, false);
+    assert.equal(notice.textContent, noticeText);
+  } finally {
+    globalThis.fetch = imageFetch;
+  }
+});
+
+test("Remote rating write keeps rendered folder rows fixed until explicit reload", async () => {
+  const folder = testPath("rating-order");
+  const before = ["b.jpg", "a.jpg"];
+  const after = ["a.jpg", "b.jpg"];
+  let serverOrder = before;
+  const writes = [];
+  const previousResizeObserver = globalThis.ResizeObserver;
+  const previousHistory = globalThis.history;
+  globalThis.history = { state: {} };
+  globalThis.ResizeObserver = class {
+    observe() {}
+    disconnect() {}
+  };
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(input, testLocation.origin);
+    if (url.pathname === "/api/list") {
+      return Response.json({
+        path: folder,
+        entries: serverOrder.map((name) => ({
+          kind: "image",
+          name,
+          path: `${folder}/${name}`,
+        })),
+      });
+    }
+    if (url.pathname === "/api/container") return new Promise(() => {});
+    if (url.pathname === "/api/write") {
+      const body = JSON.parse(init.body);
+      writes.push(body);
+      if (body.kind === "set_rating") serverOrder = after;
+      return Response.json({ applied: true });
+    }
+    if (url.pathname === "/api/telemetry") return Response.json({});
+    return imageFetch(input, init);
+  };
+  const renderedOrder = () => {
+    const names = [];
+    const visit = (node) => {
+      if (node.classList?.contains("grid-tile") ||
+          String(node.className ?? "").split(/\s+/).includes("grid-tile")) names.push(node.title);
+      for (const child of node.children ?? []) visit(child);
+    };
+    visit(app);
+    return names;
+  };
+  try {
+    const first = await loadFolder(folder);
+    renderFolder(null, first.requestController);
+    assert.deepEqual(renderedOrder(), before);
+    const initialModelOrder = containerRuntimeStateForTest().entries;
+    assert.equal(openViewerPagePositionForTest({ destroy() {} }, 0), true);
+    await setViewerRating(5);
+    assert.equal(writes.filter((write) => write.kind === "set_rating").length, 1);
+    assert.deepEqual(containerRuntimeStateForTest().entries, initialModelOrder);
+    assert.deepEqual(renderedOrder(), before);
+
+    const reloaded = await loadFolder(folder);
+    renderFolder(null, reloaded.requestController);
+    assert.notDeepEqual(containerRuntimeStateForTest().entries, initialModelOrder);
+    assert.deepEqual(renderedOrder(), after);
+  } finally {
+    globalThis.ResizeObserver = previousResizeObserver;
+    globalThis.history = previousHistory;
+    globalThis.fetch = imageFetch;
+  }
 });
 
 test("endpoint placement menus and writes keep first and last independent", () => {

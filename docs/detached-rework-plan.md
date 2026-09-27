@@ -1455,6 +1455,100 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-27 §1.250 常に最前面**
+
+`Settings.always_on_top` を唯一の希望状態とし、active / loading / holdover / cleanup と passive / parked の閲覧用 viewport builder に `Normal` または `AlwaysOnTop` を明示する。root への切替 command と、子 host の builder diff を別の発行 owner にして二重送信を避ける。同一 ViewportId を active session が所有する間は passive snapshot を重ねて登録せず、handoff 後に passive が所有する。別の detached 状態 flag、時間待ち、Focus、個別 HWND への症状的な `SetWindowPos` は追加しない。これは他機能の level 設定が viewport builder 経路へ到達する構造変更であり、§2 の同一 host ownership を維持する。復帰時の再 assert は style 実測で欠落が確認された edge に限り、現時点では追加していない。設計は [always-on-top-plan.md](always-on-top-plan.md) を参照。
+
+Stage B probe の再確認では、parked still host が viewer context から unbind されても OS viewport は生存するため、test-script の style / capture は frozen snapshot と active session の ID を重複排除し、backend witness で生存 host を確認する。描画・活性化の predicate は変更しない。また fullscreen viewport の再生成で共有 wgpu painter の全 surface が消され root capture が `SurfaceAbsent` になったため、`set_window(id, None)` は当該 ID の surface のみ破棄する。複数 viewport の資源所有境界を正す変更であり、時間待ち・再試行・host 再作成による症状抑止は加えない。
+
+**2026-09-27 smoke screenshot の frozen parked capture 判定**
+
+計装した MultiWindowPdf run `20260926T152033476Z-227256-MultiWindowPdf-7e5d76c3` では、
+先行別窓 `detached-1-1` は `Parked` / `AtRest`、visible、非最小化で、eframe の
+Deferred viewport に Screenshot action が queue されたが、その後の native pass が
+一度もなく timeout した。test-script は command 発行時に対象 ViewportId へ egui の
+`request_repaint_of` を既に送っていた。eframe の action queue 境界で当該 window に
+`request_redraw` する案も実窓 run `20260926T153506671Z-221916-MultiWindowPdf-dea8c081`
+で反証された (redraw 要求後も Deferred pass は 0)。この無効な renderer 変更は撤去する。
+capture harness は App の `Parked` / `AtRest` と passive frozen view の組から導く typed
+presentation の場合だけ、`parked frozen view (not re-rendered by egui)` を manifest に
+`status=skipped` と記録し、Screenshot を発行しない。active / その他の描画対象は従来の
+capture と timeout 失敗を維持する。detached の状態遷移、host、viewport の生成・終了、
+  描画内容は変更しない。2026-09-27 00:55 JST の隔離 portable 実窓確認では
+  MultiWindowPdf / MultiWindowStills / MultiWindowRarNav / RatingSort /
+  RatingSortCollection の 5 scenario がすべて exit 0。証跡は
+  `target/ui-smoke-runs/20260926T155430402Z-211364-MultiWindowPdf-062bab16`
+  からの連続 5 run にある。PDF manifest の `two-detached` は先行窓を
+  `status=skipped` / `parked frozen view (not re-rendered by egui)` と記録し、
+  root と active 別窓の PNG を取得した。レビュー後、`test-script` 専用
+  capture probe の App / eframe 詳細行を capture session あたり 128 行に制限し、
+  終了時に出力・抑制行数を記録する。detached の振る舞いは変更しない。
+
+**2026-09-26 smoke screenshot 第 3 回失敗の限定診断**
+
+`20260926T144546234Z-175420-MultiWindowPdf-1d955946` でも先行別窓
+`detached-1-1` の batch 2 capture だけが timeout した。repaint と passive deferred
+callback の input 処理だけでは説明できないため、追加の挙動修正は行わず、
+`test-script` capture 中に限る `[capture-probe]` を App、eframe、egui-wgpu に追加した。
+対象 identity と residence、描画 presentation、各 frame の viewport pass、Screenshot
+command の output/queue/painter 境界、wgpu の readback 完成、event の配送先を記録する。
+プローブは batch 終了時に無効になり、通常 build では有効にならない。detached の
+状態遷移、host、viewport の生成・終了、描画内容は変更しない。実窓の再実行結果に
+基づいて欠落境界を特定する。
+
+**2026-09-26 smoke screenshot の passive deferred 配送修正**
+
+MultiWindowPdf 再実行 `20260926T135827388Z-22136-MultiWindowPdf-9e598672` で、active
+immediate 別窓の PNG は取得できたが、2 窓目を開いた後の先行別窓 (passive deferred)
+だけが timeout した。HWND の `InvalidateRect` も試したが、次の実窓 run
+`20260926T141955613Z-185920-MultiWindowPdf-c7477a1b` で同じ timeout となり、
+HWND `InvalidateRect` での解決仮説は棄却した。ログでは window 1 が `pause_active_context` で
+`AtRest` に移り、window 2 が mounted active になる。製品コードは window 1 の凍結表示を
+`show_viewport_deferred` で登録しており、egui 描画の対象である。eframe は screenshot
+応答を次に描画する native viewport の input に入れるが、test-script は root と active
+immediate の input だけを読んでいた。passive deferred の callback でも同じ応答処理を
+行い、capture 対象は eframe の native viewport 登録表と既存の identity を突き合わせる。
+表に無い窓・非表示・最小化窓は理由付き skip、表示可能な窓の timeout は失敗を維持する。
+誤った仮説に基づく `InvalidateRect` は撤去した。製品の detached 状態、host/park/focus、
+viewport 生成・終了には触れない。実窓再確認は別途必要。
+
+**2026-09-26 smoke screenshot の immediate viewport 配送修正**
+
+MultiWindowPdf 実アプリ run `20260926T131312679Z-225084-MultiWindowPdf-3b245082` で
+main の PNG だけ保存され、別窓 PDF の Screenshot event が 5 秒以内に届かなかった。
+原因は `vendor/eframe` の native backend で、root は保留された Screenshot command を
+paint へ渡す一方、immediate child は wgpu paint に空の capture list を渡し、glow でも
+paint 後の readback を行わなかったこと。両 backend の immediate paint 境界で
+その viewport の Screenshot command を消費し、同じ viewport ID を持つ event を返す。
+App の detached 判定、viewport 生成/終了、host/park/focus、context 状態は変更しない。
+描画済みの同一 surface に対応する command を処理する修正で、§2 の時間窓・再試行・
+症状隠しは追加しない。実窓再確認は別途必要。
+
+**2026-09-26 実アプリ smoke の viewport スクリーンショット証跡**
+
+`portable,test-script` のみで egui の viewport Screenshot 応答を受け、main と別窓の画像を
+run ごとの証跡へ保存する。egui callback は viewport ID 付き Screenshot event を診断 runner に
+渡すだけで、PNG 化・ファイル I/O は worker が行う。capture 対象は既存の window identity と
+viewport ID の read-only snapshot から選ぶ。detached の述語、host/park/focus lifecycle、
+viewport 生成・終了、App の context 状態には変更を加えない。既存の別窓症状を判定で
+隠すパッチではなく、表示結果を記録するテスト専用の観測経路である。
+
+**2026-09-26 §1.237B R3: rating publication at context swap**
+
+`swap_viewer_context_bundle` の rating cache 同期を、mount 中の書き込みと同じ
+`publish_current_context_rating_writes` に接続した。書き込み ledger は App 全体、
+`rating_cache`・検索 hit・Rating view・visible/Details state は各 viewer context が所有する。
+swap 前は退避する context、swap 後は復元した context だけに未反映世代を適用し、
+`items` の既存順や sibling の generation を変更しない。Rating view の新規行は既存 worker、
+Ctrl+G の membership は既存 prepare worker が作り、UI thread で stat/DB 読み取りを増やさない。
+評価条件を持つ Smart Folder は session が root の候補 snapshot・行ごとの評価適合 mask・
+membership worker を所有する。別 context での書き込みは mount 時に同じ publication を通り、
+root 復帰時も prepared 世代以降の書き込みを重ねる。
+評価条件のない定義は mask を持たない。評価条件から外れた root 行は session 中に raw items
+から消さず、可視一覧・root 移動先から外す。新規に入る行は末尾へ追加し、既存 index と
+動画サムネイルの世代を保つ。再び条件を満たした既存行は元の位置へ戻る。
+detached predicate、viewport、focus、host lifecycle は変更しないため §2 の症状パッチではない。
+
 **2026-09-25 §1.237 part A: rating step actions**
 
 `src/ui_fullscreen.rs` の既存 Rating key dispatch と `src/app/native_video.rs` の native key dispatch に、直接★指定と同じ context-local rating edit を接続。main / detached 共通の `App` 書き込み・session publication・Undo・表示更新経路を使用し、detached predicate、viewport identity、host、focus、lifecycle は変更しない。追加の detached 状態、時間窓、retry、repaint、reset は設けず、各 mounted context の既存 rating owner を使う機能追加なので §2 の症状パッチではない。
@@ -3756,3 +3850,4 @@ foreground ownership を扱う際の観測として残す。
 | 2026-09-22 | 非 Windows CI 面の viewer-context identity / mutable dispatch を、既存の単一 context owner へ集約 | `src/app/viewer_context_registry.rs` に `cfg(not(windows))` の `viewer_context_main` / `projected_viewer_context_id` / `with_viewer_context` facade を置き、唯一の `ViewerContextId::single_context()` だけを現在 owner とする。`tools/viewer_context_audit` の A4 surface も同じ 3 API の非 Windows fingerprint を明示する。コレクションの物理 folder scan 完了は既存 `collection_owner` を navigation / sort refresh へ欠落なく渡す。Windows の registry、detached predicate、viewport / host / geometry / focus / lifecycle は変更しない | 親と独立 Sol / xhigh reviewer が、各 caller への cfg 分岐追加ではなく platform ownership boundary で既存の一所有者モデルを表す構造修正と確認。不正 ID は Windows の未登録 ID と同じ `MountError { residence: Unknown }` で拒否し、正規 ID だけ closure を直接実行する。新規状態、bool / Option、guard、delay / retry / repaint を追加せず、Windows 実行時のコードと意味を変えないため、detached の症状パッチではなく §2 に適合する |
 | 2026-09-22 | fresh detached open の async sidecar restore 待ちを、既存 runtime reducer の `Opening` / `Resuming` が初回 viewport render まで所有 | `begin_active_detached_session` は publish 時に pre-viewport state を `Active` へ上書きせず、`mark_active_detached_viewport_rendered` だけがその initial open / resume の `Opening` / `Resuming -> Active` を確定する。Image / BookFolder / ZIP / PDF と、それらへ収束する変換書庫・コレクション・bookmark の共通 constructor / scan / enumerate / sidecar continuation を対象とし、scan・enumerate・password・deferred-open・sidecar identity の失敗 / cancel / discard は projected context の一つの typed terminal event から `Closing` へ進める。Active detached navigation の既存 pending owner、通常 fullscreen、F12 の既存 anchor、fullscreen folder navigation / 連結読みの §1.233 owner は変更しない | v4.0.0 実機ログでは session publish 後、sidecar restore 開始と同じ update 内に `active_terminal_before_viewport -> target disappeared` が10回反復した。`should_drop` 到達は `fullscreen_idx=None && !active_detached_transition_outstanding() && !fs_viewport_shown` を確定し、ログの `transition=0` は outstanding 件数ではなく presentation observer ID だった。根因は `Opening` を早期消去し、初回 open の lifetime を sidecar continuation を含まない複数 pending の OR から再構成した BA-7、同一 update の premature terminal は BA-5 の表出。App-global sidecar guard、新規 bool / Option、時間窓、delay / retry / repaint / reset / silent fallback は追加せず、context-owned lifecycle と producer terminal を一つの reducer 契約へ揃えたため §2 に適合する。live `SidecarLoadContinuation` を用いた begin -> wait -> resume -> viewport 回帰、identity mismatch の Closing / sibling isolation、bookmark failure terminal を追加し、detached 回帰群を通過した。履歴監査では async sidecar 化を含む v3.10.0 にも同じ構造欠陥があり、`a81f13ced` は根因導入ではなく発現 timing への影響候補と判定。親と独立 Sol / xhigh reviewer は、bookmark terminal と passive HWND 再生成を含む lifecycle 棚卸し後に §2 適合・残存 finding なしで合意 |
 | 2026-09-22 | detached の fresh open / F12 で、内容 producer の完了前に安定 window を公開し、通常 fullscreen と同じ loading placeholder から同一 window の通常表示へ遷移 | `src/ui_fullscreen.rs` の通常 fresh-load placeholder を共通 helper 化し、既存 detached builder・visibility・activation/focus protocol と同じ stable `ViewportId` で最初の host を描く。実 callback 後だけ `Opening / Resuming -> Active` とし、`ActiveDetachedSession::content_phase` の `Preparing / Ready` が loading render 後から最初の通常 content render までの owner を表す。`src/app.rs` / `startup_ops.rs` / `bookmark_browser.rs` / `ui_dialogs/archive_convert.rs` で Image・BookFolder / 画像フォルダ・ZIP・PDF・変換書庫・Collection・bookmark book/media の producer を `DetachedSessionLease` へ接続し、成功は同一 context / window を継続、失敗・cancel・timeout・X / Esc・replacement は exact lease だけを terminal にする。Folder candidate の scan は main の既存 navigation arbitration owner に残し、purpose が detached lease と collection owner を運ぶため、画像本は shell を充填し、mixed は shell を閉じて完了 scan を通常 navigation tail へ一度だけ渡し、新しい main 操作や stale collection revision が勝つ場合は巻き戻さない。PDF/background の同時実行数は変更しない | 遅い PDF open 自体を短縮・再試行・別 queue 化する変更ではなく、「操作時点で window identity と initial-open owner が未作成」という lifecycle / ownership 境界を修正した。App-global detached bool / `Option` sentinel、時間窓、delay、polling workaround、別 loading UI は追加せず、既存 runtime reducer・typed request owner・canonical fullscreen placeholder に統合している。loading viewport を実際に描く前は `Active` にせず、描画後も `Preparing` が複数 frame の producer 生存を所有し、通常 content の実描画だけが `Ready` にするため、`1ffce8118` の「viewport 前 Active による同一 update 破棄」を再導入しない。sidecar wait/mismatch、sync build failure、folder arbitration、変換 / bookmark terminal と stale sibling isolation、password dialog cleanup を状態遷移回帰で固定する構造修正であり §2 に適合する |
+| 2026-09-25 | §1.237B R2: ファイル名スタックの reload 後の選択復元を、パスではなく typed な group key で行うため、`ViewerContextBundle` の `stack_toggle_select_path: Option<PathBuf>` を `stack_selection_target: Option<StackSelectionTarget>` へ置き換え | `src/app/viewer_context_registry.rs` の bundle field、mount / deposit / swap の field 列挙だけ。物理フォルダの評価順は main と detached が共有する既存の folder load 経路の中で読み取りと並べ替えを行い、detached predicate、viewport / host / geometry / focus / lifecycle は変更しない | 評価順では reload で代表 member が変わり stack の `perf_key` (代表の path) が一致しなくなるため、同じ一覧内で不変な group key を選択の identity にした。既存 field の型を置き換えるだけで新規 bool / Option / delay / retry を足さず、所有 context と寿命は旧 field と同じ。独立 Sol / xhigh reviewer が R2 レビューで「選択 target を所有 bundle に保つ」変更として確認し ACCEPT、親 (ClaudeCode) も同意。main + detached で sibling の items / cache / generation が不変な回帰を `multiwindow_scenario_tests.rs` に追加したため §2 に適合 |

@@ -23,7 +23,15 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use crate::filename_stack::{StackMember, StackView};
 use crate::grid_item::GridItem;
-use crate::settings::{ListingSortMetadata, SortOrder};
+use crate::settings::ListingSortMetadata;
+#[cfg(test)]
+use crate::settings::SortOrder;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StackSelectionTarget {
+    MemberPath(PathBuf),
+    GroupKey(String),
+}
 
 /// ユーザー定義スクリプトによるグループ分けを **ワーカーで** 実行する際の保留状態
 /// (`docs/filename-stack-scripting-plan.md`)。スクリプトは任意に重くなり得る (10 万件で
@@ -67,12 +75,11 @@ impl StackPreparePending {
 
 struct StackGroupingSource {
     folder: PathBuf,
-    sort_path: PathBuf,
     items: Vec<GridItem>,
     image_metas: Vec<Option<(i64, i64)>>,
     listing: StackListingSource,
     separator: char,
-    sort: SortOrder,
+    order: crate::rating_sort::ListingOrderRequest,
     script_enabled: bool,
     group_per_parent: bool,
     display_order: crate::settings::GridDisplayOrder,
@@ -87,8 +94,30 @@ struct StackGroupingSource {
 
 #[derive(Clone)]
 pub(crate) enum StackListingSource {
-    Normal(Arc<Vec<ListingSortMetadata>>),
-    Subfolder(Arc<Vec<crate::app::SubfolderExpansionEntry>>),
+    Normal(Arc<Vec<ListingSortMetadata>>, StackRatingSource),
+    Subfolder(
+        Arc<Vec<crate::app::SubfolderExpansionEntry>>,
+        StackRatingSource,
+    ),
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) enum StackRatingSource {
+    #[default]
+    Standard,
+    Prepared(Arc<std::collections::HashMap<String, crate::rating_sort::RatingSortKey>>),
+    ReadFailed,
+}
+
+impl StackRatingSource {
+    fn keys(
+        &self,
+    ) -> Option<&std::collections::HashMap<String, crate::rating_sort::RatingSortKey>> {
+        match self {
+            Self::Prepared(keys) => Some(keys),
+            Self::Standard | Self::ReadFailed => None,
+        }
+    }
 }
 
 pub(crate) struct StackExtractPending {
@@ -544,24 +573,30 @@ impl crate::app::App {
     pub(crate) fn spawn_stack_script_worker(
         &mut self,
         folder: PathBuf,
-        sort_path: PathBuf,
         listing: StackListingSource,
         separator: char,
-        sort: SortOrder,
+        order: crate::rating_sort::ListingOrderRequest,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<u64>,
         script_enabled: bool,
         group_per_parent: bool,
     ) {
         self.cancel_stack_script_pending();
+        debug_assert!(
+            matches!(order, crate::rating_sort::ListingOrderRequest::Standard(sort) if !sort.is_rating())
+                || matches!(
+                    &listing,
+                    StackListingSource::Normal(_, StackRatingSource::Prepared(_))
+                        | StackListingSource::Subfolder(_, StackRatingSource::Prepared(_))
+                )
+        );
         let source = StackGroupingSource {
             folder,
-            sort_path,
             items: Vec::new(),
             image_metas: Vec::new(),
             listing,
             separator,
-            sort,
+            order,
             script_enabled,
             group_per_parent,
             display_order: self.settings.grid_display_order.clone(),
@@ -615,8 +650,8 @@ impl crate::app::App {
                     runs.fetch_add(1, Ordering::Relaxed);
                 }
                 let listing_sort_metas = match &worker_source.listing {
-                    StackListingSource::Normal(metas) => metas.as_ref().clone(),
-                    StackListingSource::Subfolder(entries) => {
+                    StackListingSource::Normal(metas, _) => metas.as_ref().clone(),
+                    StackListingSource::Subfolder(entries, _) => {
                         crate::app::listing_sort_metas_for_entries(entries, &worker_source.items)
                     }
                 };
@@ -650,6 +685,10 @@ impl crate::app::App {
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
+                let rating_keys = match &worker_source.listing {
+                    StackListingSource::Normal(_, rating) => rating.keys(),
+                    StackListingSource::Subfolder(_, rating) => rating.keys(),
+                };
                 let (groups, rule, error) = match grouping {
                     Ok((keys, rule)) => {
                         let mut full = vec![String::new(); media.len()];
@@ -657,10 +696,11 @@ impl crate::app::App {
                             full[index] = key;
                         }
                         (
-                            crate::filename_stack::group_by_keys(
+                            crate::filename_stack::group_by_keys_with_order(
                                 media.clone(),
                                 &full,
-                                worker_source.sort,
+                                worker_source.order,
+                                rating_keys,
                             ),
                             rule,
                             None,
@@ -671,31 +711,65 @@ impl crate::app::App {
                             "stack script failed (async), fallback to builtin: {error}"
                         ));
                         let groups = if worker_source.group_per_parent {
-                            crate::filename_stack::group_media_by_parent(
-                                media.clone(),
+                            let keys = crate::filename_stack::parent_scoped_group_keys(
+                                &media,
                                 worker_source.separator,
-                                worker_source.sort,
+                            );
+                            crate::filename_stack::group_by_keys_with_order(
+                                media.clone(),
+                                &keys,
+                                worker_source.order,
+                                rating_keys,
                             )
                         } else {
-                            crate::filename_stack::group_media(
-                                media.clone(),
-                                worker_source.separator,
-                                worker_source.sort,
-                            )
+                            {
+                                let keys = media
+                                    .iter()
+                                    .map(|member| {
+                                        let stem = member
+                                            .path
+                                            .file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("");
+                                        crate::filename_stack::prefix_of(
+                                            stem,
+                                            worker_source.separator,
+                                        )
+                                        .to_owned()
+                                    })
+                                    .collect::<Vec<_>>();
+                                crate::filename_stack::group_by_keys_with_order(
+                                    media.clone(),
+                                    &keys,
+                                    worker_source.order,
+                                    rating_keys,
+                                )
+                            }
                         };
                         (groups, None, Some(error))
                     }
                 };
-                let view = Arc::new(StackView::from_groups_with_display_order(
+                let mut view = StackView::from_groups_with_display_order(
                     worker_source.folder.clone(),
                     passthrough,
                     passthrough_metas,
                     passthrough_sort_metas,
                     worker_source.separator,
-                    worker_source.sort,
+                    worker_source.order.standard_fallback(),
                     groups,
                     worker_source.display_order.clone(),
-                ));
+                );
+                if let crate::rating_sort::ListingOrderRequest::Rating(spec) = worker_source.order {
+                    let keys = match &worker_source.listing {
+                        StackListingSource::Normal(_, StackRatingSource::Prepared(keys))
+                        | StackListingSource::Subfolder(_, StackRatingSource::Prepared(keys)) => {
+                            keys
+                        }
+                        _ => unreachable!("rating stack view requires complete keys"),
+                    };
+                    view.set_rating_order(spec, Arc::clone(keys));
+                }
+                let view = Arc::new(view);
                 let (items, metas) = view.materialize_aggregated();
                 let mut order = StackCandidateOrder::new(items, metas);
                 #[cfg(test)]
@@ -835,8 +909,8 @@ impl crate::app::App {
                 .as_ref()
                 .is_some_and(|folder| crate::folder_tree::path_eq(folder, &pending.source.folder))
             && match &pending.source.listing {
-                StackListingSource::Normal(_) => true,
-                StackListingSource::Subfolder(entries) => self
+                StackListingSource::Normal(_, _) => true,
+                StackListingSource::Subfolder(entries, _) => self
                     .subfolder_expansion_snapshot
                     .as_ref()
                     .is_some_and(|snapshot| Arc::ptr_eq(&snapshot.entries, entries)),
@@ -885,7 +959,6 @@ impl crate::app::App {
     fn stack_group_config_current(&self, source: &StackGroupingSource) -> bool {
         source.separator == self.settings.stack_separator
             && source.script_enabled == self.settings.stack_script_enabled
-            && source.sort == self.book_sort_order_for_path(&source.sort_path)
             && source.display_order == self.settings.grid_display_order
     }
 
@@ -895,13 +968,13 @@ impl crate::app::App {
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<u64>,
     ) {
-        let sort = self.book_sort_order_for_path(&source.sort_path);
+        // Separator, script and display-order changes re-group the same listing. Its captured
+        // sort request remains valid until an explicit listing preparation replaces it.
         self.spawn_stack_script_worker(
             source.folder.clone(),
-            source.sort_path.clone(),
             source.listing.clone(),
             self.settings.stack_separator,
-            sort,
+            source.order,
             existing_keys,
             folder_signature,
             self.settings.stack_script_enabled,
@@ -918,8 +991,8 @@ impl crate::app::App {
             && self.items.len() == pending.item_count
             && self.stack_request_sequence == pending.sequence
             && match &pending.source.listing {
-                StackListingSource::Normal(_) => true,
-                StackListingSource::Subfolder(entries) => self
+                StackListingSource::Normal(_, _) => true,
+                StackListingSource::Subfolder(entries, _) => self
                     .subfolder_expansion_snapshot
                     .as_ref()
                     .is_some_and(|snapshot| Arc::ptr_eq(&snapshot.entries, entries)),
@@ -1024,6 +1097,10 @@ impl crate::app::App {
             prepared,
             rule,
             error,
+            matches!(
+                &pending.source.listing,
+                StackListingSource::Normal(_, StackRatingSource::ReadFailed)
+            ),
         );
     }
 
@@ -1036,6 +1113,7 @@ impl crate::app::App {
         prepared: StackPreparedItems,
         rule: Option<String>,
         error: Option<String>,
+        rating_read_failed: bool,
     ) {
         let collapsible = view.has_collapsible_stack();
         let is_subfolder_expansion_stack =
@@ -1049,25 +1127,38 @@ impl crate::app::App {
         self.stack_view = Some(view);
         self.stack_active_rule = rule.clone();
         self.stack_script_error = error.clone();
-        if let Some(target) = self.stack_toggle_select_path.take()
-            && let Some(idx) = self
-                .stack_view
-                .as_ref()
-                .and_then(|view| view.aggregated_index_for_member_path(&target))
+        if let Some(target) = self.stack_selection_target.take()
+            && let Some(idx) = self.stack_view.as_ref().and_then(|view| match target {
+                StackSelectionTarget::MemberPath(path) => {
+                    view.aggregated_index_for_member_path(&path)
+                }
+                StackSelectionTarget::GroupKey(key) => view.aggregated_index_for_group_key(&key),
+            })
         {
             self.selected = Some(idx);
             self.scroll_to_selected = true;
         }
-        if error.is_some() {
-            self.show_feedback_toast(
-                "スタックのスクリプトでエラー。既定ルールで表示します (詳細はヘルプ参照)".into(),
-            );
+        let stack_notice = if error.is_some() {
+            Some(
+                "スタックのスクリプトでエラー。既定ルールで表示します (詳細はヘルプ参照)"
+                    .to_owned(),
+            )
         } else if !collapsible {
-            self.show_feedback_toast(
-                "まとめられるスタックがありませんでした (分類ルールはヘルプ参照)".into(),
-            );
+            Some("まとめられるスタックがありませんでした (分類ルールはヘルプ参照)".to_owned())
         } else if let Some(rule) = rule {
-            self.show_feedback_toast(format!("スタック: 「{rule}」でまとめました"));
+            Some(format!("スタック: 「{rule}」でまとめました"))
+        } else {
+            None
+        };
+        if rating_read_failed {
+            let mut notice = "評価順を読み取れなかったため、名前順で表示しました".to_owned();
+            if let Some(stack_notice) = stack_notice {
+                notice.push('\n');
+                notice.push_str(&stack_notice);
+            }
+            self.show_feedback_toast(notice);
+        } else if let Some(stack_notice) = stack_notice {
+            self.show_feedback_toast(stack_notice);
         }
     }
 
@@ -1530,8 +1621,8 @@ impl crate::app::App {
             self.select_after_load = Some(name.to_string());
         }
         self.stack_mode_requested = !self.stack_mode_requested;
-        self.stack_toggle_select_path = if self.stack_mode_requested {
-            target
+        self.stack_selection_target = if self.stack_mode_requested {
+            target.map(StackSelectionTarget::MemberPath)
         } else {
             None
         };
@@ -1572,7 +1663,7 @@ impl crate::app::App {
 
         if self.stack_mode_requested {
             self.stack_mode_requested = false;
-            self.stack_toggle_select_path = None;
+            self.stack_selection_target = None;
             self.stack_view = None;
             self.stack_return_state = None;
             self.stack_showing_flat = false;
@@ -1604,27 +1695,22 @@ impl crate::app::App {
             return;
         }
 
-        let listing = StackListingSource::Subfolder(Arc::clone(
-            &self.subfolder_expansion_snapshot.as_ref().unwrap().entries,
-        ));
+        let snapshot = self.subfolder_expansion_snapshot.as_ref().unwrap();
+        let listing = StackListingSource::Subfolder(
+            Arc::clone(&snapshot.entries),
+            snapshot.stack_rating_source.clone(),
+        );
         self.stack_mode_requested = true;
-        self.stack_toggle_select_path = target;
+        self.stack_selection_target = target.map(StackSelectionTarget::MemberPath);
         self.stack_showing_flat = false;
         self.stack_view = None;
         self.stack_return_state = None;
-        let sort_path = self
-            .subfolder_expansion_root
-            .as_deref()
-            .or(self.current_folder.as_deref())
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(crate::app::subfolder_expansion_synthetic_path);
-        let sort = self.book_sort_order_for_path(&sort_path);
+        let order = snapshot.stack_order_request;
         self.spawn_stack_script_worker(
             crate::app::subfolder_expansion_synthetic_path(),
-            sort_path,
             listing,
             self.settings.stack_separator,
-            sort,
+            order,
             std::collections::HashSet::new(),
             None,
             self.settings.stack_script_enabled,
@@ -1843,6 +1929,485 @@ impl crate::app::App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rating_subfolder_stack_toggle_keeps_prepared_order_in_aggregate_and_flat_views() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("rating-subfolder-stack");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (name, stars) in [
+            ("a_1.jpg", 1),
+            ("a_2.jpg", 2),
+            ("b_1.jpg", 5),
+            ("b_2.jpg", 4),
+        ] {
+            let path = folder.join(name);
+            image::RgbImage::new(1, 1).save(&path).unwrap();
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&crate::adjustment_db::normalize_path(&path), stars, None)
+                .unwrap();
+        }
+        app.settings.sort_order = SortOrder::RatingDesc;
+        app.start_subfolder_expansion_scan_roots(folder.clone(), vec![folder]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.items_are_subfolder_expansion_view && std::time::Instant::now() < deadline {
+            app.poll_subfolder_expansion(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.items_are_subfolder_expansion_view);
+        assert!(matches!(
+            app.subfolder_expansion_snapshot
+                .as_ref()
+                .unwrap()
+                .stack_rating_source,
+            StackRatingSource::Prepared(_)
+        ));
+        app.toggle_subfolder_stack_mode();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let view = app.stack_view.as_ref().expect("subfolder stack prepared");
+        assert_eq!(
+            view.groups
+                .iter()
+                .map(|group| group
+                    .representative()
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy())
+                .collect::<Vec<_>>(),
+            ["b_1.jpg", "a_2.jpg"]
+        );
+        assert_eq!(
+            view.materialize_flat()
+                .0
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b_1.jpg", "b_2.jpg", "a_2.jpg", "a_1.jpg"]
+        );
+        app.stack_enter_flat_fullscreen(&ctx, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.stack_showing_flat && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.stack_showing_flat);
+        assert_eq!(app.items[1].name(), "b_2.jpg");
+    }
+
+    #[test]
+    fn subfolder_stack_toggle_keeps_prepared_sort_across_global_sort_changes() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let ctx = egui::Context::default();
+        for (initial, changed, expected) in [
+            (
+                SortOrder::FileName,
+                SortOrder::RatingDesc,
+                ["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"],
+            ),
+            (
+                SortOrder::RatingDesc,
+                SortOrder::FileName,
+                ["b_1.jpg", "b_2.jpg", "a_2.jpg", "a_1.jpg"],
+            ),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join(format!("subfolder-sort-{initial:?}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            for (name, stars) in [
+                ("a_1.jpg", 1),
+                ("a_2.jpg", 2),
+                ("b_1.jpg", 5),
+                ("b_2.jpg", 4),
+            ] {
+                let path = folder.join(name);
+                image::RgbImage::new(1, 1).save(&path).unwrap();
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&crate::adjustment_db::normalize_path(&path), stars, None)
+                    .unwrap();
+            }
+            app.settings.sort_order = initial;
+            app.start_subfolder_expansion_scan_roots(folder.clone(), vec![folder]);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.items_are_subfolder_expansion_view && std::time::Instant::now() < deadline {
+                app.poll_subfolder_expansion(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(app.items_are_subfolder_expansion_view, "{initial:?}");
+            let captured = app
+                .subfolder_expansion_snapshot
+                .as_ref()
+                .unwrap()
+                .stack_order_request;
+            assert_eq!(
+                captured,
+                crate::rating_sort::ListingOrderRequest::from_sort(
+                    initial,
+                    app.settings.rating_sort_unrated_position,
+                )
+            );
+            app.settings.sort_order = changed;
+            app.toggle_subfolder_stack_mode();
+            let Some(StackPreparePending::Extracting(pending)) = app.stack_script_pending.as_ref()
+            else {
+                panic!("stack toggle must capture prepared source: {initial:?}");
+            };
+            assert_eq!(pending.source.order, captured);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.stack_view.is_none() && std::time::Instant::now() < deadline {
+                app.poll_stack_script(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let view = app.stack_view.as_ref().expect("subfolder stack grouping");
+            assert_eq!(
+                view.materialize_flat()
+                    .0
+                    .iter()
+                    .map(|item| item.name().into_owned())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{initial:?} -> {changed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_stack_rebase_keeps_prepared_sort_across_global_sort_changes() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let ctx = egui::Context::default();
+        for (initial, changed, expected) in [
+            (
+                SortOrder::FileName,
+                SortOrder::RatingDesc,
+                ["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"],
+            ),
+            (
+                SortOrder::RatingDesc,
+                SortOrder::FileName,
+                ["b_1.jpg", "b_2.jpg", "a_2.jpg", "a_1.jpg"],
+            ),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app
+                .tmp
+                .path()
+                .join(format!("pending-stack-sort-{initial:?}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            for (name, stars) in [
+                ("a_1.jpg", 1),
+                ("a_2.jpg", 2),
+                ("b_1.jpg", 5),
+                ("b_2.jpg", 4),
+            ] {
+                let path = folder.join(name);
+                image::RgbImage::new(1, 1).save(&path).unwrap();
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&crate::adjustment_db::normalize_path(&path), stars, None)
+                    .unwrap();
+            }
+            app.settings.sort_order = initial;
+            app.load_folder_with_scan(folder.clone(), None);
+            app.stack_mode_requested = true;
+            app.load_folder_with_scan(folder, None);
+            let Some(StackPreparePending::Extracting(pending)) = app.stack_script_pending.as_ref()
+            else {
+                panic!("physical listing must start stack extraction: {initial:?}");
+            };
+            let captured = pending.source.order;
+            app.settings.sort_order = changed;
+            let Some(StackPreparePending::Extracting(pending)) = app.stack_script_pending.as_ref()
+            else {
+                unreachable!()
+            };
+            assert!(app.stack_group_config_current(&pending.source));
+            app.settings
+                .grid_display_order
+                .assign(crate::settings::GridItemDisplayKind::Image, 2);
+            app.poll_stack_script(&ctx);
+            let Some(StackPreparePending::Extracting(rebased)) = app.stack_script_pending.as_ref()
+            else {
+                panic!("display-order change must rebase stack extraction: {initial:?}");
+            };
+            assert_eq!(rebased.source.order, captured);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.stack_view.is_none() && std::time::Instant::now() < deadline {
+                app.poll_stack_script(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let view = app.stack_view.as_ref().expect("rebased stack grouping");
+            assert_eq!(
+                view.materialize_flat()
+                    .0
+                    .iter()
+                    .map(|item| item.name().into_owned())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{initial:?} -> {changed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_rating_request_reaches_async_stack_grouping_without_re_reading_sort_keys() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("rating-stack-r2");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (name, stars) in [
+            ("a_1.jpg", 4),
+            ("a_2.jpg", 1),
+            ("b_1.jpg", 5),
+            ("b_2.jpg", 3),
+        ] {
+            let path = folder.join(name);
+            image::RgbImage::new(1, 1).save(&path).unwrap();
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&crate::adjustment_db::normalize_path(&path), stars, None)
+                .unwrap();
+        }
+        app.load_folder_with_scan(folder.clone(), None);
+        app.stack_mode_requested = true;
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+        };
+        crate::rating_sort::with_test_rating_order(spec, || {
+            app.load_folder_with_scan(folder.clone(), None)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let pending = match app.stack_script_pending.as_ref() {
+            Some(StackPreparePending::Extracting(_)) => "extracting",
+            Some(StackPreparePending::Grouping(_)) => "grouping",
+            Some(StackPreparePending::Switching(_)) => "switching",
+            Some(StackPreparePending::Retry(_)) => "retry",
+            None => "none",
+        };
+        let view = app.stack_view.as_ref().unwrap_or_else(|| panic!(
+            "rating stack grouping incomplete: pending={pending} requested={} items={} folder={:?} toast={:?}",
+            app.stack_mode_requested, app.items.len(), app.current_folder,
+            app.fs_feedback_toast.as_ref().map(|toast| &toast.0)
+        ));
+        assert_eq!(view.groups.len(), 2);
+        assert_eq!(view.index_map_builds, 2, "Rating installs a retained order");
+        assert_eq!(
+            view.groups[0].representative().path.file_name().unwrap(),
+            "b_1.jpg"
+        );
+        assert_eq!(
+            view.groups[1].representative().path.file_name().unwrap(),
+            "a_1.jpg"
+        );
+        assert_eq!(
+            view.materialize_flat()
+                .0
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b_1.jpg", "b_2.jpg", "a_1.jpg", "a_2.jpg"]
+        );
+        app.selected = Some(0);
+        app.stack_enter_flat_fullscreen(&ctx, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.stack_showing_flat && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.stack_showing_flat);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(
+            app.stack_view.as_ref().unwrap().group_key_at_flat_index(1),
+            Some("b")
+        );
+
+        for (name, stars) in [("a_1.jpg", 1), ("a_2.jpg", 5), ("b_1.jpg", 2)] {
+            let key = crate::adjustment_db::normalize_path(&folder.join(name));
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&key, stars, None)
+                .unwrap();
+            app.record_rating_session_write(key, stars, true);
+        }
+        app.publish_current_context_rating_writes();
+        assert_eq!(app.stack_view.as_ref().unwrap().groups[0].key, "b");
+        assert_eq!(
+            app.stack_view.as_ref().unwrap().groups[0]
+                .representative()
+                .path
+                .file_name()
+                .unwrap(),
+            "b_1.jpg"
+        );
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b_1.jpg", "b_2.jpg", "a_1.jpg", "a_2.jpg"]
+        );
+
+        crate::rating_sort::with_test_rating_order(spec, || {
+            app.load_folder_with_scan(folder, None)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let view = app.stack_view.as_ref().expect("reloaded stack view");
+        assert_eq!(view.groups[0].key, "a");
+        assert_eq!(
+            view.groups[0].representative().path.file_name().unwrap(),
+            "a_2.jpg"
+        );
+        assert_eq!(app.selected, view.aggregated_index_for_group_key("b"));
+    }
+
+    #[test]
+    fn rating_read_failure_notice_survives_successful_async_stack_grouping() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("rating-stack-fallback");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in ["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"] {
+            std::fs::write(folder.join(name), b"image").unwrap();
+        }
+        app.load_folder_with_scan(folder.clone(), None);
+        let db_path = app.tmp.path().join("stack-failed-rating.db");
+        app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("DROP TABLE ratings;")
+            .unwrap();
+        app.stack_mode_requested = true;
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+        };
+        crate::rating_sort::with_test_rating_order(spec, || {
+            app.load_folder_with_scan(folder, None)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.stack_view.as_ref().unwrap().groups.len(), 2);
+        assert_eq!(
+            app.stack_view.as_ref().unwrap().index_map_builds,
+            1,
+            "Standard fallback builds each index map once"
+        );
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("評価順を読み取れなかった")
+        );
+    }
+
+    #[test]
+    fn failed_rating_stack_keeps_name_order_across_saved_sort_and_rebase() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("rating-stack-name-fallback");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in ["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"] {
+            std::fs::write(folder.join(name), b"image").unwrap();
+        }
+        app.settings.sort_order = SortOrder::FileNameDesc;
+        app.load_folder_with_scan(folder.clone(), None);
+        let db_path = app.tmp.path().join("rating-stack-name-fallback.db");
+        app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("DROP TABLE ratings;")
+            .unwrap();
+        app.stack_mode_requested = true;
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+        };
+        crate::rating_sort::with_test_rating_order(spec, || {
+            app.load_folder_with_scan(folder, None)
+        });
+        let names = |items: &[GridItem]| {
+            items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&app.items),
+            ["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"]
+        );
+        let Some(StackPreparePending::Extracting(pending)) = app.stack_script_pending.as_ref()
+        else {
+            panic!("fallback must start stack extraction");
+        };
+        let initial_order = pending.source.order;
+        let initial_config_current = app.stack_group_config_current(&pending.source);
+
+        // A different stack setting still requires a rebase; the failed Rating
+        // request's name order remains pinned across that transition.
+        app.settings.stack_separator = '-';
+        app.poll_stack_script(&ctx);
+        let Some(StackPreparePending::Extracting(pending)) = app.stack_script_pending.as_ref()
+        else {
+            panic!("changed separator must rebase stack extraction");
+        };
+        let rebased_order = pending.source.order;
+        let rebased_config_current = app.stack_group_config_current(&pending.source);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let view = app.stack_view.as_ref().expect("fallback stack grouping");
+        assert_eq!(
+            names(&view.materialize_flat().0),
+            ["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"]
+        );
+        assert_eq!(
+            initial_order,
+            crate::rating_sort::ListingOrderRequest::Standard(SortOrder::FileName)
+        );
+        assert!(initial_config_current);
+        assert_eq!(
+            rebased_order,
+            crate::rating_sort::ListingOrderRequest::Standard(SortOrder::FileName)
+        );
+        assert!(rebased_config_current);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("評価順を読み取れなかった")
+        );
+    }
 
     fn stack_page_edit_fixture(app: &mut crate::app::App, folder: PathBuf, pages: &[PathBuf]) {
         let media = pages
@@ -2085,13 +2650,12 @@ mod tests {
         app.stack_view = None;
         app.stack_mode_requested = true;
         let source = Arc::new(StackGroupingSource {
-            sort_path: folder.clone(),
             folder,
             items: Vec::new(),
             image_metas: Vec::new(),
-            listing: StackListingSource::Normal(Arc::new(Vec::new())),
+            listing: StackListingSource::Normal(Arc::new(Vec::new()), StackRatingSource::Standard),
             separator: '_',
-            sort: SortOrder::FileName,
+            order: crate::rating_sort::ListingOrderRequest::Standard(SortOrder::FileName),
             script_enabled: false,
             group_per_parent: false,
             display_order: app.settings.grid_display_order.clone(),
@@ -2174,9 +2738,9 @@ mod tests {
     }
 
     #[test]
-    fn a2_stack_grouping_rebases_when_each_captured_setting_changes() {
+    fn a2_stack_grouping_rebases_when_non_sort_settings_change() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
-        for changed in 0..4 {
+        for changed in 0..3 {
             let mut app = crate::app::setup_app_for_test();
             let ctx = egui::Context::default();
             let folder = app.tmp.path().join(format!("config-{changed}"));
@@ -2189,8 +2753,7 @@ mod tests {
             match changed {
                 0 => app.settings.stack_separator = '-',
                 1 => app.settings.stack_script_enabled = true,
-                2 => app.settings.sort_order = SortOrder::FileNameDesc,
-                3 => app
+                2 => app
                     .settings
                     .grid_display_order
                     .assign(crate::settings::GridItemDisplayKind::Image, 2),
@@ -2223,10 +2786,9 @@ mod tests {
         let metas = vec![ListingSortMetadata::new(0, None); app.items.len()];
         app.spawn_stack_script_worker(
             folder.clone(),
-            folder,
-            StackListingSource::Normal(Arc::new(metas)),
+            StackListingSource::Normal(Arc::new(metas), StackRatingSource::Standard),
             '_',
-            SortOrder::FileName,
+            crate::rating_sort::ListingOrderRequest::Standard(SortOrder::FileName),
             Default::default(),
             None,
             false,
@@ -2265,10 +2827,12 @@ mod tests {
         let script_enabled = app.settings.stack_script_enabled;
         app.spawn_stack_script_worker(
             folder.clone(),
-            folder,
-            StackListingSource::Normal(Arc::new(vec![ListingSortMetadata::new(0, None); 2])),
+            StackListingSource::Normal(
+                Arc::new(vec![ListingSortMetadata::new(0, None); 2]),
+                StackRatingSource::Standard,
+            ),
             separator,
-            sort,
+            crate::rating_sort::ListingOrderRequest::Standard(sort),
             Default::default(),
             None,
             script_enabled,
@@ -2493,7 +3057,7 @@ mod tests {
 
     #[test]
     fn audit_a2_stack_grouping_rebase_with_foreign_edit_rating_tag_writes() {
-        with_foreign_epoch_writers(a2_stack_grouping_rebases_when_each_captured_setting_changes);
+        with_foreign_epoch_writers(a2_stack_grouping_rebases_when_non_sort_settings_change);
     }
 
     fn image(path: &str) -> StackMember {

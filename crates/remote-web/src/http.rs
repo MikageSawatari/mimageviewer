@@ -3348,6 +3348,7 @@ fn api_list(
                 "root_name": payload.root_name,
                 "thumb_aspect_height_ratio": payload.thumb_aspect_height_ratio,
                 "sort_state": payload.sort_state,
+                "sort_notice": payload.sort_notice,
                 "entries": entries,
             });
             match HttpResponse::json(&response) {

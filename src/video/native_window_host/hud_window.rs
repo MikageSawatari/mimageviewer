@@ -851,6 +851,11 @@ unsafe extern "system" fn hud_wnd_proc(
                 let y = signed_high_word(lparam.0);
                 let shift = mouse_shift(wparam);
                 let ctrl = mouse_ctrl(wparam);
+                let foreground_hwnd_at_down = if down {
+                    crate::video::native_window::foreground_hwnd()
+                } else {
+                    0
+                };
 
                 // CP9 実機 debug: button event は rare なので毎回 log。
                 if super::hud_debug_enabled() {
@@ -891,7 +896,9 @@ unsafe extern "system" fn hud_wnd_proc(
                     // 3. focus handoff は wndproc 内で実行せず pump task に enqueue する。
                     state
                         .event_sink
-                        .send(NativeVideoWindowEvent::RequestFocusClaim);
+                        .send(NativeVideoWindowEvent::RequestFocusClaim {
+                            foreground_hwnd_at_down,
+                        });
                     // 4. SetCapture(hud_hwnd) で region 外の up も拾えるようにする。
                     let _ = unsafe { SetCapture(hwnd) };
                     let cur = unsafe { GetCapture() };

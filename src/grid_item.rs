@@ -714,6 +714,49 @@ pub(crate) fn arrange_grid_items_with_sort_metadata(
     listing_metas.append(&mut other_listing_metas);
 }
 
+/// Rating keys travel with rows through the display-row permutation. An
+/// unsupported row is distinct from a confirmed zero-star row.
+pub(crate) fn arrange_grid_items_with_rating_keys(
+    items: &mut Vec<GridItem>,
+    image_metas: &mut Vec<Option<(i64, i64)>>,
+    listing_metas: &mut Vec<crate::settings::ListingSortMetadata>,
+    rating_keys: &mut Vec<crate::rating_sort::RatingSortKey>,
+    display_order: &crate::settings::GridDisplayOrder,
+    spec: crate::rating_sort::RatingSortSpec,
+) {
+    assert_eq!(items.len(), image_metas.len());
+    assert_eq!(items.len(), listing_metas.len());
+    assert_eq!(items.len(), rating_keys.len());
+    let display_order = display_order.normalized();
+    let mut rows: [Vec<_>; 5] = std::array::from_fn(|_| Vec::new());
+    for (((item, meta), listing_meta), rating_key) in items
+        .drain(..)
+        .zip(image_metas.drain(..))
+        .zip(listing_metas.drain(..))
+        .zip(rating_keys.drain(..))
+    {
+        let row = display_kind(&item)
+            .map(|kind| display_order.row_for(kind))
+            .unwrap_or(4);
+        let name = crate::settings::SortOrder::FileName.name_key(&item.name());
+        rows[row].push((item, meta, listing_meta, rating_key, name));
+    }
+    for row in &mut rows[..4] {
+        row.sort_by(|a, b| spec.compare(a.3, &a.4, b.3, &b.4));
+    }
+    for row in rows {
+        for (item, meta, listing_meta, rating_key, _) in row {
+            items.push(item);
+            image_metas.push(meta);
+            listing_metas.push(listing_sort_metadata_for_item(
+                items.last().unwrap(),
+                listing_meta,
+            ));
+            rating_keys.push(rating_key);
+        }
+    }
+}
+
 /// ソート済みのビュー行から grid の items と同位置メタデータを作る。
 ///
 /// `arrange` が真のときだけ [`arrange_grid_items`] を通し、行の並びも再配置結果へ

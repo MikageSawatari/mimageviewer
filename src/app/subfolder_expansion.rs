@@ -345,6 +345,11 @@ pub(crate) struct SubfolderExpansionSnapshot {
     pub(crate) entries: Arc<Vec<SubfolderExpansionEntry>>,
     pub(crate) video_thumb_overrides: HashMap<String, PathBuf>,
     pub(crate) diag: SubfolderExpansionDiag,
+    /// Immutable rating keys captured with the currently installed order, for a later stack toggle.
+    pub(crate) stack_rating_source: crate::filename_stack_ui::StackRatingSource,
+    /// Effective order installed with these entries; later global settings changes do not
+    /// reinterpret the existing snapshot when stacks are toggled on.
+    pub(crate) stack_order_request: crate::rating_sort::ListingOrderRequest,
 }
 
 /// 現在 materialize 済みのサブ展開 items と、走査時に確定した size availability を
@@ -493,6 +498,7 @@ pub(crate) struct PreparedSubfolderExpansion {
     pub(crate) video_items: Vec<(usize, PathBuf, u64)>,
     pub(crate) metadata: PreparedSubfolderMetadata,
     page_edit_revision: u64,
+    rating_write_generation: Option<u64>,
 }
 
 pub(crate) enum SubfolderExpansionPrepareEvent {
@@ -867,6 +873,7 @@ struct SubfolderEntrySortKey {
     name: crate::filename_sort::SortNameKey,
     parent: crate::filename_sort::SortNameKey,
     row: usize,
+    rating: Option<crate::rating_sort::RatingSortKey>,
 }
 
 fn compare_subfolder_entry_indices(
@@ -874,7 +881,7 @@ fn compare_subfolder_entry_indices(
     bi: usize,
     entries: &[SubfolderExpansionEntry],
     keys: &[SubfolderEntrySortKey],
-    sort: crate::settings::SortOrder,
+    request: crate::rating_sort::ListingOrderRequest,
     order: crate::settings::SubfolderExpansionOrder,
 ) -> std::cmp::Ordering {
     use crate::settings::SubfolderExpansionOrder;
@@ -894,7 +901,17 @@ fn compare_subfolder_entry_indices(
         );
         ak.row
             .cmp(&bk.row)
-            .then_with(|| sort.compare_listing_keys(&ak.name, a_meta, &bk.name, b_meta))
+            .then_with(|| match request {
+                crate::rating_sort::ListingOrderRequest::Standard(sort) => {
+                    sort.compare_listing_keys(&ak.name, a_meta, &bk.name, b_meta)
+                }
+                crate::rating_sort::ListingOrderRequest::Rating(spec) => spec.compare(
+                    ak.rating.expect("complete rating facts for subfolder row"),
+                    &ak.name,
+                    bk.rating.expect("complete rating facts for subfolder row"),
+                    &bk.name,
+                ),
+            })
             .then_with(|| a.path.cmp(&b.path))
     };
     match order {
@@ -989,6 +1006,31 @@ fn sorted_entry_indices_for_view(
     mut progress: Option<&mut dyn FnMut(usize)>,
     chunk_size: usize,
 ) -> Option<Vec<usize>> {
+    sorted_entry_indices_for_request(
+        entries,
+        crate::rating_sort::ListingOrderRequest::Standard(sort),
+        None,
+        order,
+        display_order,
+        root,
+        cancel,
+        progress,
+        chunk_size,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sorted_entry_indices_for_request(
+    entries: &[SubfolderExpansionEntry],
+    request: crate::rating_sort::ListingOrderRequest,
+    facts: Option<&crate::rating_db::CompleteRatingFacts>,
+    order: crate::settings::SubfolderExpansionOrder,
+    display_order: &crate::settings::GridDisplayOrder,
+    root: &Path,
+    cancel: Option<&AtomicBool>,
+    mut progress: Option<&mut dyn FnMut(usize)>,
+    chunk_size: usize,
+) -> Option<Vec<usize>> {
     let total = entries.len();
     if total == 0 {
         report_subfolder_sort_progress(&mut progress, 0);
@@ -1020,10 +1062,22 @@ fn sorted_entry_indices_for_view(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let kind = entry.kind.display_kind();
+        let rating = match request {
+            crate::rating_sort::ListingOrderRequest::Standard(_) => None,
+            crate::rating_sort::ListingOrderRequest::Rating(_) => {
+                let key = crate::adjustment_db::normalize_path(&entry.path);
+                Some(
+                    facts
+                        .expect("rating request needs complete facts")
+                        .key_for_requested(&key),
+                )
+            }
+        };
         keys.push(SubfolderEntrySortKey {
-            name: sort.name_key(name),
+            name: request.standard_fallback().name_key(name),
             parent: crate::filename_sort::SortNameKey::file_name(&parent),
             row: display_order.row_for(kind),
+            rating,
         });
     }
     report_subfolder_sort_progress(&mut progress, key_stage_end);
@@ -1034,7 +1088,7 @@ fn sorted_entry_indices_for_view(
     let chunk_size = chunk_size.max(1);
     let chunk_count = total.div_ceil(chunk_size);
     let mut indices: Vec<usize> = (0..total).collect();
-    let compare = |ai, bi| compare_subfolder_entry_indices(ai, bi, entries, &keys, sort, order);
+    let compare = |ai, bi| compare_subfolder_entry_indices(ai, bi, entries, &keys, request, order);
     for (chunk_index, chunk) in indices.chunks_mut(chunk_size).enumerate() {
         if cancel.is_some_and(cancelled) {
             return None;
@@ -1143,7 +1197,8 @@ pub(crate) fn sort_entries_for_view(
 
 #[derive(Clone)]
 struct SubfolderExpansionPrepareOptions {
-    sort: crate::settings::SortOrder,
+    request: crate::rating_sort::ListingOrderRequest,
+    rating_write_generation: u64,
     order: crate::settings::SubfolderExpansionOrder,
     display_order: crate::settings::GridDisplayOrder,
     load_ratings: bool,
@@ -1179,7 +1234,7 @@ fn cancelled(cancel: &AtomicBool) -> bool {
 }
 
 fn prepare_subfolder_expansion(
-    snapshot: SubfolderExpansionSnapshot,
+    mut snapshot: SubfolderExpansionSnapshot,
     show_toast: bool,
     options: SubfolderExpansionPrepareOptions,
     cancel: &AtomicBool,
@@ -1187,6 +1242,66 @@ fn prepare_subfolder_expansion(
 ) -> Result<Option<PreparedSubfolderExpansion>, String> {
     let reused_metadata = options.reused_metadata.as_ref();
     let total = snapshot.entries.len();
+    let rating_order = matches!(
+        options.request,
+        crate::rating_sort::ListingOrderRequest::Rating(_)
+    );
+    let needs_fresh_ratings = rating_order;
+    let rating_keys = needs_fresh_ratings
+        .then(|| {
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| crate::adjustment_db::normalize_path(&entry.path))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let rating_db = (needs_fresh_ratings && options.load_ratings)
+        .then(|| crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path()))
+        .transpose();
+    let rating_facts = rating_db
+        .as_ref()
+        .ok()
+        .and_then(|db| db.as_ref())
+        .and_then(|db| {
+            db.get_many_complete(&rating_keys, options.rating_write_generation)
+                .ok()
+        });
+    let rating_sort_failed = matches!(
+        options.request,
+        crate::rating_sort::ListingOrderRequest::Rating(_)
+    ) && rating_facts.is_none();
+    snapshot.stack_rating_source = match (rating_order, rating_facts.as_ref()) {
+        (false, _) => crate::filename_stack_ui::StackRatingSource::Standard,
+        (true, None) => crate::filename_stack_ui::StackRatingSource::ReadFailed,
+        (true, Some(facts)) => crate::filename_stack_ui::StackRatingSource::Prepared(Arc::new(
+            facts
+                .iter_requested_ratings()
+                .map(|(key, stars)| {
+                    (
+                        key.to_owned(),
+                        crate::rating_sort::RatingSortKey::supported(stars)
+                            .expect("database ratings are clamped to 0..=5"),
+                    )
+                })
+                .collect(),
+        )),
+    };
+    let effective_request = if rating_sort_failed {
+        crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName)
+    } else {
+        options.request
+    };
+    snapshot.stack_order_request = effective_request;
+    let fallback_ratings = if rating_order && rating_facts.is_none() {
+        rating_db
+            .ok()
+            .flatten()
+            .map(|db| db.get_many(&rating_keys))
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     prepare_progress(tx, SubfolderExpansionPreparePhase::Sorting, 0, total);
     let mut report_sort_progress = |completed| {
         prepare_progress(
@@ -1196,9 +1311,10 @@ fn prepare_subfolder_expansion(
             total,
         );
     };
-    let Some(indices) = sorted_entry_indices_for_view(
+    let Some(indices) = sorted_entry_indices_for_request(
         snapshot.entries.as_slice(),
-        options.sort,
+        effective_request,
+        rating_facts.as_ref(),
         options.order,
         &options.display_order,
         &snapshot.root,
@@ -1242,10 +1358,23 @@ fn prepare_subfolder_expansion(
         let item = entry.kind.to_grid_item(entry.path.clone());
         items.push(item);
         image_metas.push(Some((entry.mtime, entry.file_size)));
-        if let Some(reused) = reused_metadata {
+        if let Some(facts) = rating_facts.as_ref() {
+            let stars = facts.value_for_requested(&path_key);
+            if stars > 0 {
+                rating_cache.insert(display_idx, stars);
+            }
+        } else if let Some(reused) = reused_metadata {
             if let Some(stars) = reused.ratings_by_path.get(&path_key) {
                 rating_cache.insert(display_idx, *stars);
             }
+        } else if let Some(stars) = fallback_ratings
+            .get(&path_key)
+            .copied()
+            .filter(|stars| *stars > 0)
+        {
+            rating_cache.insert(display_idx, stars);
+        }
+        if let Some(reused) = reused_metadata {
             if reused.local_adjust_paths.contains(&path_key) {
                 local_adjust_pages.insert(display_idx);
             }
@@ -1255,7 +1384,9 @@ fn prepare_subfolder_expansion(
     }
     let video_items = crate::filename_stack_ui::stack_video_items(&items, &image_metas);
 
-    if reused_metadata.is_none() && options.load_ratings {
+    // Ordinary opens keep the previous bounded read, cancellation, progress,
+    // and DB-open failure behavior. Complete facts are needed only by Rating order.
+    if reused_metadata.is_none() && options.load_ratings && !rating_order {
         prepare_progress(tx, SubfolderExpansionPreparePhase::Ratings, 0, total);
         let db = crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
             .map_err(|e| format!("レーティング DB を読み込めませんでした: {e}"))?;
@@ -1392,6 +1523,7 @@ fn prepare_subfolder_expansion(
             aggregate: None,
         },
         page_edit_revision: options.page_edit_revision,
+        rating_write_generation: Some(options.rating_write_generation),
     }))
 }
 
@@ -1877,6 +2009,10 @@ impl App {
             entries: Arc::new(entries),
             video_thumb_overrides,
             diag,
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         self.queue_or_install_subfolder_expansion_snapshot(snapshot, true, ctx);
     }
@@ -1934,7 +2070,14 @@ impl App {
             Some(&snapshot.scan_filter),
         );
         let options = SubfolderExpansionPrepareOptions {
-            sort: self.book_sort_order_for_path(&snapshot.root),
+            request: if self.book_sort_order_for_path(&snapshot.root) != self.settings.sort_order {
+                crate::rating_sort::ListingOrderRequest::Standard(
+                    self.book_sort_order_for_path(&snapshot.root),
+                )
+            } else {
+                crate::rating_sort::ListingOrderRequest::from_settings(&self.settings)
+            },
+            rating_write_generation: self.rating_session_write_generation,
             order: self.settings.subfolder_expansion_order,
             display_order: self.settings.grid_display_order.clone(),
             load_ratings: self.rating_db.is_some(),
@@ -2151,6 +2294,7 @@ impl App {
             video_items,
             metadata,
             page_edit_revision: _,
+            rating_write_generation,
         } = prepared;
         let entry_count = items.len();
         if perf_on {
@@ -2185,6 +2329,16 @@ impl App {
             video_items,
             metadata,
         );
+        if let Some(generation) = rating_write_generation {
+            self.overlay_rating_session_writes_since(generation);
+            self.rebuild_visible_indices_after_rating_publication();
+        }
+        if matches!(
+            snapshot.stack_rating_source,
+            crate::filename_stack_ui::StackRatingSource::ReadFailed
+        ) {
+            self.show_feedback_toast("評価順を読み込めなかったため名前順で表示しました".into());
+        }
         if perf_on {
             crate::perf::event(
                 "subfolder",
@@ -2531,6 +2685,10 @@ mod tests {
             }]),
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         app.start_subfolder_expansion_prepare(snapshot, false);
         app.finish_subfolder_expansion_prepare_for_test();
@@ -2567,6 +2725,10 @@ mod tests {
             }]),
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         app.start_subfolder_expansion_prepare(snapshot, false);
         let pending = app.subfolder_expansion_install_pending.take().unwrap();
@@ -3143,9 +3305,16 @@ mod tests {
             entries: Arc::new(entries),
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         let options = SubfolderExpansionPrepareOptions {
-            sort: crate::settings::SortOrder::FileName,
+            request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+            rating_write_generation: 0,
             order: crate::settings::SubfolderExpansionOrder::Flat,
             display_order: crate::settings::GridDisplayOrder::default(),
             load_ratings: false,
@@ -3521,9 +3690,16 @@ mod tests {
             entries: Arc::clone(&entries),
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         let options = SubfolderExpansionPrepareOptions {
-            sort: crate::settings::SortOrder::FileName,
+            request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+            rating_write_generation: 0,
             order: crate::settings::SubfolderExpansionOrder::FolderGrouped,
             display_order: crate::settings::GridDisplayOrder::default(),
             load_ratings: false,
@@ -3591,9 +3767,16 @@ mod tests {
             entries,
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         let options = SubfolderExpansionPrepareOptions {
-            sort: crate::settings::SortOrder::FileName,
+            request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+            rating_write_generation: 0,
             order: crate::settings::SubfolderExpansionOrder::FolderGrouped,
             display_order: crate::settings::GridDisplayOrder::default(),
             // reuse が効いていれば DB を open せずに完了する。
@@ -3666,6 +3849,204 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rating_sort_uses_complete_facts_before_subfolder_ordering() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::rating_db::RatingDb::open_at(tmp.path().join("ratings.db")).unwrap();
+        let root = tmp.path().join("root");
+        let entries = ["a.jpg", "b.jpg", "c.jpg"].map(|name| SubfolderExpansionEntry {
+            path: root.join(name),
+            kind: SubfolderExpansionEntryKind::Image,
+            mtime: 0,
+            file_size: 0,
+        });
+        let keys = entries
+            .iter()
+            .map(|entry| crate::adjustment_db::normalize_path(&entry.path))
+            .collect::<Vec<_>>();
+        db.set_user_rating(&keys[0], 1, None).unwrap();
+        db.set_user_rating(&keys[1], 5, None).unwrap();
+        let facts = db.get_many_complete(&keys, 7).unwrap();
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: Default::default(),
+        };
+        let indices = sorted_entry_indices_for_request(
+            &entries,
+            crate::rating_sort::ListingOrderRequest::Rating(spec),
+            Some(&facts),
+            crate::settings::SubfolderExpansionOrder::Flat,
+            &crate::settings::GridDisplayOrder::default(),
+            &root,
+            None,
+            None,
+            SUBFOLDER_SORT_CHUNK_SIZE,
+        )
+        .unwrap();
+        assert_eq!(indices, [1, 2, 0]);
+        assert_eq!(facts.write_generation(), 7);
+    }
+
+    #[test]
+    fn rating_subfolder_prepare_overlays_batch_write_after_read_without_reordering() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-subfolder-race");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.jpg");
+        let b = root.join("b.jpg");
+        for path in [&a, &b] {
+            std::fs::write(path, b"image").unwrap();
+        }
+        let a_key = crate::adjustment_db::normalize_path(&a);
+        let b_key = crate::adjustment_db::normalize_path(&b);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&a_key, 1, None)
+            .unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&b_key, 5, None)
+            .unwrap();
+        let snapshot = SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
+            entries: Arc::new(
+                vec![a, b]
+                    .into_iter()
+                    .map(|path| SubfolderExpansionEntry {
+                        path,
+                        kind: SubfolderExpansionEntryKind::Image,
+                        mtime: 1,
+                        file_size: 5,
+                    })
+                    .collect(),
+            ),
+            video_thumb_overrides: HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+        };
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+        };
+        crate::rating_sort::with_test_rating_order(spec, || {
+            app.start_subfolder_expansion_prepare(snapshot, false);
+        });
+        let pending = app.subfolder_expansion_install_pending.take().unwrap();
+        let prepared = loop {
+            match pending.rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                SubfolderExpansionPrepareEvent::Progress(_) => {}
+                SubfolderExpansionPrepareEvent::Done(prepared) => break *prepared,
+                SubfolderExpansionPrepareEvent::Cancelled => panic!("prepare cancelled"),
+                SubfolderExpansionPrepareEvent::Error(message) => panic!("{message}"),
+            }
+        };
+        assert_eq!(
+            prepared
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+        app.write_user_ratings_shared(&[(a_key, 5, None), (b_key, 4, None)])
+            .unwrap();
+        let generation = app.items_generation;
+        app.install_prepared_subfolder_expansion(prepared, None);
+        assert!(app.items_generation > generation);
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+        assert_eq!(app.rating_cache.get(&0), Some(&4));
+        assert_eq!(app.rating_cache.get(&1), Some(&5));
+    }
+
+    #[test]
+    fn rating_subfolder_complete_read_failure_after_first_chunk_uses_name_fallback() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-subfolder-read-failure");
+        let entries = (0..501)
+            .map(|index| SubfolderExpansionEntry {
+                path: root.join(format!("{index:03}.jpg")),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 0,
+                file_size: 0,
+            })
+            .collect::<Vec<_>>();
+        let rated_key = crate::adjustment_db::normalize_path(&entries[499].path);
+        let bad_key = crate::adjustment_db::normalize_path(&entries[500].path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&rated_key, 5, None)
+            .unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&bad_key, 2, None)
+            .unwrap();
+        let conn = rusqlite::Connection::open(crate::rating_db::RatingDb::db_path()).unwrap();
+        conn.execute(
+            "UPDATE ratings SET stars = 'broken' WHERE path = ?1",
+            [&bad_key],
+        )
+        .unwrap();
+        let snapshot = SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
+            entries: Arc::new(entries),
+            video_thumb_overrides: HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+        };
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+        };
+        crate::rating_sort::with_test_rating_order(spec, || {
+            app.start_subfolder_expansion_prepare(snapshot, false);
+        });
+        let pending = app.subfolder_expansion_install_pending.take().unwrap();
+        let prepared = loop {
+            match pending.rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                SubfolderExpansionPrepareEvent::Progress(_) => {}
+                SubfolderExpansionPrepareEvent::Done(prepared) => break *prepared,
+                SubfolderExpansionPrepareEvent::Cancelled => panic!("prepare cancelled"),
+                SubfolderExpansionPrepareEvent::Error(message) => panic!("{message}"),
+            }
+        };
+        assert!(matches!(
+            prepared.snapshot.stack_rating_source,
+            crate::filename_stack_ui::StackRatingSource::ReadFailed
+        ));
+        assert_eq!(prepared.items[0].name(), "000.jpg");
+        assert_eq!(prepared.metadata.rating_cache.get(&499), Some(&5));
+        assert!(!prepared.metadata.rating_cache.contains_key(&500));
+        app.install_prepared_subfolder_expansion(prepared, None);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(message, _, _)| message.contains("名前順"))
+        );
+    }
+
     fn chunked_sort_test_entries(root: &Path, count: usize) -> Vec<SubfolderExpansionEntry> {
         (0..count)
             .rev()
@@ -3709,6 +4090,7 @@ mod tests {
                     name: sort.name_key(name),
                     parent: crate::filename_sort::SortNameKey::file_name(&parent),
                     row: display_order.row_for(kind),
+                    rating: None,
                 }
             })
             .collect()
@@ -3747,7 +4129,14 @@ mod tests {
             let keys = sort_keys_for_test(&entries, sort, &display_order, &root);
             let mut expected: Vec<usize> = (0..entries.len()).collect();
             expected.sort_unstable_by(|ai, bi| {
-                compare_subfolder_entry_indices(*ai, *bi, &entries, &keys, sort, order)
+                compare_subfolder_entry_indices(
+                    *ai,
+                    *bi,
+                    &entries,
+                    &keys,
+                    crate::rating_sort::ListingOrderRequest::Standard(sort),
+                    order,
+                )
             });
             assert_eq!(actual, expected);
             assert_eq!(progress.last(), Some(&entries.len()));
@@ -3862,6 +4251,10 @@ mod tests {
                 items_found: 3,
                 ..Default::default()
             },
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         let removed = HashSet::from([crate::path_key::normalize_keep_drive(&removed_video)]);
 

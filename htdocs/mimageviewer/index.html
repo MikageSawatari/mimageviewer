@@ -32,6 +32,7 @@
     "applicationSubCategory": "画像ビューア",
     "operatingSystem": "Windows 11 (64bit)",
     "softwareVersion": "4.1.0",
+    "dateModified": "2026-09-25",
     "inLanguage": "ja",
     "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。AI 処理はすべて利用者の PC 内で完結します。",
     "screenshot": "https://mikage.to/mimageviewer/ogp.jpg",
@@ -806,6 +807,7 @@
     <nav class="site-nav">
       <a href="/">Home</a>
       <a href="manual/index.html">マニュアル</a>
+      <a href="manual/faq.html">よくある質問</a>
       <a href="manual/changelog.html">更新履歴</a>
     </nav>
   </div>
@@ -1210,7 +1212,9 @@
           ご自分で有効にしたとき。この 3 つ以外に通信しません。</p>
         <p style="margin-top:0.5rem;">EPUB の変換も PC の中だけで行い、通信は増えません。</p>
         <p style="margin-top:0.5rem;">リモート閲覧は<strong>初期状態ではオフ</strong>で、接続には
-          <strong>PIN が必須</strong>です。画像が<strong>開発者や第三者のサーバーへ送られることはありません</strong>。</p>
+          <strong>PIN が必須</strong>です。外出先との通信は暗号化され、接続状況によっては暗号化されたまま
+          Tailscale の中継サーバーを通ることがありますが、中継サーバーは内容を読めません。
+          画像が<strong>開発者のサーバーへ送られることはありません</strong>。</p>
       </div>
       <div class="trust-item">
         <h3>✅ コード署名済み</h3>
@@ -1337,10 +1341,30 @@
     </div>
   </section>
 
+  <!-- ===== Use-case Guides ===== -->
+  <section id="guides">
+    <h2>使い方ガイド</h2>
+    <p style="margin-bottom:1rem;">目的別に、始め方と使いどころをまとめています。使い始める前の疑問は <a href="manual/faq.html#before">よくある質問（使い始める前に）</a> をご覧ください。</p>
+    <div class="migration-guides">
+      <a class="migration-card" href="guide-ai-images.html">
+        <h3>AI 生成画像を整理・検索する</h3>
+        <p>Stable Diffusion / ComfyUI の画像を、埋め込まれたプロンプトを見ながら閲覧し、キーワード検索・★・タグで整理する方法です。</p>
+      </a>
+      <a class="migration-card" href="guide-remote.html">
+        <h3>外出先のスマホから自宅 PC を見る</h3>
+        <p>Tailscale を使って、NAS やポート開放なしで自宅 PC の画像・漫画・動画をブラウザから開く手順です。</p>
+      </a>
+      <a class="migration-card" href="guide-fast-browsing.html">
+        <h3>大量の画像を高速に一覧できるしくみ</h3>
+        <p>数万枚のフォルダでも待たされにくい理由と、計測した表示時間をまとめています。</p>
+      </a>
+    </div>
+  </section>
+
   <!-- ===== Migration Guides ===== -->
   <section id="migration-guides">
     <h2>他ビューアからの移行ガイド</h2>
-    <p style="margin-bottom:1rem;">ViX、Leeyes、マンガミーヤ、ZipPla から乗り換える方向けに、引き継げる操作・見開き表示・整理機能・おすすめ初期設定の違いをまとめています。</p>
+    <p style="margin-bottom:1rem;">ViX、Leeyes、マンガミーヤ、ZipPla、Honeyview、MassiGra、Windows フォトから乗り換える方向けに、引き継げる操作・見開き表示・整理機能・おすすめ初期設定の違いをまとめています。</p>
     <div class="migration-guides">
       <a class="migration-card" href="migrate-vix.html">
         <h3>ViX からの移行</h3>
@@ -1357,6 +1381,18 @@
       <a class="migration-card" href="migrate-zippla.html">
         <h3>ZipPla からの移行</h3>
         <p>タグ・★評価・検索の対応、本棚に当たる「お気に入り」、Z キーの部分拡大ズーム、音声ファイルの再生をまとめています。</p>
+      </a>
+      <a class="migration-card" href="migrate-honeyview.html">
+        <h3>Honeyview からの移行</h3>
+        <p>書庫の扱いの違い、エクスプローラーからの開き方、よく使う操作の対応をまとめています。</p>
+      </a>
+      <a class="migration-card" href="migrate-massigra.html">
+        <h3>MassiGra からの移行</h3>
+        <p>Susie プラグインの引き継ぎ、よく使う操作の対応、元のファイルを変えない補正と書き出しをまとめています。</p>
+      </a>
+      <a class="migration-card" href="migrate-photos.html">
+        <h3>Windows フォトからの移行</h3>
+        <p>一覧で見渡す・漫画を読む・★やタグで整理する使い方と、エクスプローラーからの開き方をまとめています。</p>
       </a>
     </div>
   </section>

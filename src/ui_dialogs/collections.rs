@@ -2320,6 +2320,23 @@ impl App {
         }
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn collection_smoke_runtime_status(&self) -> (String, String, bool) {
+        let (phase, error) = match &self.collection_ui.phase {
+            CollectionRuntimePhase::Inert => ("Inert", String::new()),
+            CollectionRuntimePhase::Starting => ("Starting", String::new()),
+            CollectionRuntimePhase::Ready => ("Ready", String::new()),
+            CollectionRuntimePhase::Failed(error) => ("Failed", error.clone()),
+            CollectionRuntimePhase::Closed => ("Closed", String::new()),
+        };
+        (
+            phase.into(),
+            error,
+            self.collection_catalog_revision(crate::test_script::seeded_collection_smoke_id())
+                .is_some(),
+        )
+    }
+
     pub(crate) fn collection_store_client_for_migration(
         &self,
     ) -> Result<Option<CollectionStoreClient>, CollectionStoreError> {

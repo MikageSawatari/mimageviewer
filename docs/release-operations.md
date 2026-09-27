@@ -263,7 +263,7 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
     で **現在の tagName** を特定し、immutable でないことを確認してから
     `gh release edit <current-tagName> --tag vX.Y.Z --draft=false --latest` で再関連付けし、再度全項目を照合する。
 - **アプリ内更新通知は body 先頭 8KB (UTF-8 バイト) で切られる** (`update_check.rs` の `BODY_CAP`)。
-  README の該当セクションが 8KB を超える版は、**`docs/release-body-<version>.md` に 8KB 以内の
+  CHANGELOG.md の該当セクションが 8KB を超える版は、**`docs/release-body-<version>.md` に 8KB 以内の
   短縮版を別途作り、それを Release body に使う** (目玉→主な改善→主なバグ修正の順で前方に重要
   項目を寄せる)。8KB 上限は受信側 (旧バイナリ) に焼かれているので、今版で `BODY_CAP` を
   上げても今回の通知には効かない (効くのは次版以降)。

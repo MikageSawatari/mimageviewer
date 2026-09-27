@@ -203,6 +203,7 @@ pub(crate) mod page_edit_write_epoch;
 mod process_memory_test_support;
 pub mod rar_loader;
 pub mod rating_db;
+mod rating_sort;
 pub mod rating_view;
 pub mod rating_write_worker;
 mod remote_ipc;
@@ -280,10 +281,12 @@ pub use ui_fullscreen::{
     draw_music_panel_reach_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
     draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
+mod ui_details_icon;
 pub mod ui_helpers;
 mod ui_main;
 #[doc(hidden)]
 pub use ui_main::draw_cut_item_appearance_snapshot_fixture;
+pub use ui_main::draw_details_icons_snapshot_fixture;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{
@@ -928,11 +931,14 @@ pub fn run() -> eframe::Result {
         std::process::exit(2);
     }
     #[cfg(all(feature = "test-script", windows))]
-    let test_script_path = {
+    let (test_script_path, test_evidence_dir) = {
         let args = std::env::args_os().collect::<Vec<_>>();
-        match test_script::cli_script_path_from(&args) {
-            Ok(path) => path,
-            Err(error) => {
+        match (
+            test_script::cli_script_path_from(&args),
+            test_script::cli_capture_dir_from(&args),
+        ) {
+            (Ok(path), Ok(dir)) => (path, dir),
+            (Err(error), _) | (_, Err(error)) => {
                 write_to_parent_console(&format!("error: {error}\n"));
                 std::process::exit(2);
             }
@@ -1238,6 +1244,7 @@ pub fn run() -> eframe::Result {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
+        .with_window_level(crate::settings::viewer_window_level(saved.always_on_top))
         .with_inner_size(size)
         .with_min_inner_size(MIN_INNER_SIZE)
         .with_icon(icon);
@@ -1501,7 +1508,14 @@ pub fn run() -> eframe::Result {
             #[cfg(all(feature = "test-script", windows))]
             if let Some(path) = test_script_path.clone() {
                 app.prepare_test_script_run();
-                test_script::start(path, &cc.egui_ctx).map_err(std::io::Error::other)?;
+                test_script::start(
+                    path,
+                    test_evidence_dir
+                        .clone()
+                        .expect("validated test-script evidence directory"),
+                    &cc.egui_ctx,
+                )
+                .map_err(std::io::Error::other)?;
             }
             emit_startup("creator_exit", None);
             Ok(Box::new(app))
@@ -1703,6 +1717,10 @@ fn absolutize_startup_open_path(path: std::path::PathBuf) -> std::path::PathBuf 
 }
 
 fn cli_flag_takes_value(flag: &str) -> bool {
+    #[cfg(all(feature = "test-script", windows))]
+    if flag == "--test-evidence-dir" {
+        return true;
+    }
     matches!(
         flag,
         "--data-dir"

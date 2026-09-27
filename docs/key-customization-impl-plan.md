@@ -11,6 +11,8 @@
 > settings.db に保存し、`keymap.ini.imported*.bak` へ退避する。設定メニュー「操作カスタマイズ…」から
 > `Settings.keymap` を編集できる。`keymap.ini.default` は Action 名と既定キーの参照として引き続き生成する。
 
+> §1.250: `ToggleAlwaysOnTop` は Global / Press / 既定 `none`。main、egui fullscreen、native video の各入力経路へ配線し、native presenter 用の allowlist と chord snapshot にも含める。
+
 関連: [keymap-spec.md](keymap-spec.md) (現行キー仕様 = アクション洗い出しの元ネタ)、
 [archive/ui-input/key-customization-plan.md](archive/ui-input/key-customization-plan.md) §8 (簡易版の設計確定事項)。
 

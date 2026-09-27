@@ -51,7 +51,7 @@ const RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY: &str = "recent_open_with_apps_
 const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v2";
 const SINGLETON_ENDPOINT_MIGRATION_META_KEY: &str = "singleton_spread_endpoints_v1";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
-    'sort_order', 'show_hidden_files', 'grid_display_order',
+    'sort_order', 'rating_sort_unrated_position', 'show_hidden_files', 'grid_display_order',
     'archive_file_handling', 'archive_convert_without_dialog',
     'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists', 'skip_epub_if_pdf_exists',
     'skip_image_if_video_exists', 'video_thumb_use_sidecar_image',
@@ -290,6 +290,7 @@ pub struct SettingsDb {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RemoteListingSettings {
     sort_order: crate::settings::SortOrder,
+    rating_sort_unrated_position: crate::rating_sort::RatingSortUnratedPosition,
     show_hidden_files: bool,
     grid_display_order: crate::settings::GridDisplayOrder,
     archive_file_handling: crate::settings::ArchiveFileHandling,
@@ -349,6 +350,7 @@ impl RemoteListingSettings {
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         Self {
             sort_order: settings.sort_order,
+            rating_sort_unrated_position: settings.rating_sort_unrated_position,
             show_hidden_files: settings.show_hidden_files,
             grid_display_order: settings.grid_display_order.clone(),
             archive_file_handling: settings.archive_file_handling,
@@ -371,6 +373,7 @@ impl RemoteListingSettings {
 
     pub(crate) fn apply_to(self, settings: &mut Settings) {
         settings.sort_order = self.sort_order;
+        settings.rating_sort_unrated_position = self.rating_sort_unrated_position;
         settings.show_hidden_files = self.show_hidden_files;
         settings.grid_display_order = self.grid_display_order;
         settings.archive_file_handling = self.archive_file_handling;
@@ -2925,6 +2928,7 @@ fn apply_remote_listing_setting(
     }
     match key {
         "sort_order" => assign!(sort_order),
+        "rating_sort_unrated_position" => assign!(rating_sort_unrated_position),
         "show_hidden_files" => assign!(show_hidden_files),
         "grid_display_order" => assign!(grid_display_order),
         "archive_file_handling" => assign!(archive_file_handling),
@@ -5219,7 +5223,8 @@ mod tests {
 
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         let mut live = Settings::default();
-        live.sort_order = SortOrder::DateDesc;
+        live.sort_order = SortOrder::RatingDesc;
+        live.rating_sort_unrated_position = crate::rating_sort::RatingSortUnratedPosition::BelowAll;
         live.show_hidden_files = true;
         live.grid_display_order = GridDisplayOrder::from_rows([
             vec![GridItemDisplayKind::Image],
@@ -7454,6 +7459,73 @@ mod tests {
             )
             .unwrap();
         assert!(stored.contains("FutureEncoder"), "main DB was replaced");
+    }
+
+    #[test]
+    fn older_reader_treats_rating_sort_as_incompatible_without_quarantine() {
+        #[derive(serde::Deserialize)]
+        enum OldSortOrder {
+            FileName,
+            FileNameDesc,
+            Numeric,
+            NumericDesc,
+            DateAsc,
+            DateDesc,
+            SizeAsc,
+            SizeDesc,
+        }
+        let written = serde_json::to_string(&crate::settings::SortOrder::RatingDesc).unwrap();
+        assert!(serde_json::from_str::<OldSortOrder>(&written).is_err());
+
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            let settings = Settings {
+                sort_order: crate::settings::SortOrder::RatingDesc,
+                rating_sort_unrated_position:
+                    crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+                ..Default::default()
+            };
+            db.save_full(&settings).unwrap();
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.sort_order, settings.sort_order);
+            assert_eq!(
+                loaded.rating_sort_unrated_position,
+                settings.rating_sort_unrated_position
+            );
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        }
+        // A future variant stands in for RatingDesc when this code is the old reader.
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        conn.execute(
+            "UPDATE settings_kv SET value = '\"FutureRatingDesc\"' WHERE key = 'sort_order'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let outcome = boot_settings_db(dir);
+        assert_eq!(outcome.source, BootSource::IncompatibleSettings);
+        assert!(save_suppressed());
+        assert!(dir.join("settings.db").is_file());
+        assert!(dir.join("settings.db.bak1").is_file());
+        assert_eq!(
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| { entry.file_name().to_string_lossy().contains(".corrupted-") })
+                .count(),
+            0
+        );
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM settings_kv WHERE key = 'sort_order'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "\"FutureRatingDesc\"");
     }
 
     #[test]

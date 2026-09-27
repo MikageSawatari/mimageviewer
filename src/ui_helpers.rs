@@ -604,6 +604,18 @@ fn show_offset_tooltip(
     anchor: Option<egui::Rect>,
     text: impl Into<egui::WidgetText>,
 ) {
+    show_offset_tooltip_with_observer(ctx, tip, dark, anchor, text, |_, _| {});
+}
+
+#[allow(dead_code)]
+fn show_offset_tooltip_with_observer(
+    ctx: &egui::Context,
+    tip: egui::Tooltip<'_>,
+    dark: bool,
+    anchor: Option<egui::Rect>,
+    text: impl Into<egui::WidgetText>,
+    on_render: impl FnOnce(&egui::Ui, &egui::Response),
+) {
     let mut tip = tip.gap(TOOLTIP_GAP);
     match anchor {
         Some(rect) => tip.popup = tip.popup.anchor(rect),
@@ -621,8 +633,29 @@ fn show_offset_tooltip(
         if dark {
             crate::os_theme::apply_dark_ui(ui);
         }
-        ui.add(egui::Label::new(text));
+        let label = ui.add(egui::Label::new(text));
+        on_render(ui, &label);
     });
+}
+
+/// Test-script readback runs from the actual tooltip content closure. A hovered
+/// disabled row alone is not evidence that its tooltip was shown.
+#[cfg(all(windows, feature = "test-script"))]
+pub(crate) fn hover_tip_disabled_observed(
+    response: egui::Response,
+    text: &'static str,
+    on_render: impl FnOnce(&egui::Ui, &egui::Response, &'static str),
+) -> egui::Response {
+    let anchor = anchor_for(&response);
+    show_offset_tooltip_with_observer(
+        &response.ctx,
+        egui::Tooltip::for_disabled(&response),
+        false,
+        anchor,
+        text,
+        |ui, label| on_render(ui, label, text),
+    );
+    response
 }
 
 /// `egui::Response` にカーソルと重ならないツールチップを足す拡張トレイト。

@@ -1393,13 +1393,18 @@ SW fallback で隠さず再生エラーとして表示する。
 2 行目が「画像 + 動画・音声」で、従来のコンテナ先頭 / メディア後続と同じになる。
 
 全行で同じソート順を使い、グループ別のソート設定は持たない:
-名前昇順 / 名前降順 / 番号昇順 / 番号降順 / 更新日昇順 / 更新日降順 / サイズ昇順 / サイズ降順。
+名前昇順 / 名前降順 / 番号昇順 / 番号降順 / 更新日昇順 / 更新日降順 / サイズ昇順 / サイズ降順 / 評価昇順 / 評価降順。
 名前順は Windows のファイル名比較に寄せ、数字列を数値として扱い、
 半角/全角・大文字/小文字・かな種別を強く分けない。詳細表示の `名前`
 列ヘッダも同じ比較器を使う。番号順は漫画/連番ファイル向けの mIV 独自自然順で、
 記号・空白などの区切りを無視して番号本体を比較する。降順でも主 key だけを反転し、
 番号 key、日時、サイズが同じ項目は名前昇順で安定させる。サイズが取得できない項目は
 昇順・降順とも同じ行の末尾へ置き、実在する0バイトファイルとは区別する。
+評価順は一覧を開くか明示的に更新した時点の評価で items を並べる。表示中の評価変更は
+バッジとフィルタへ反映し、既存行は動かさない。同値は名前昇順、評価非対応の行は末尾。
+未評価の既定位置は★3と★2の間で、設定により評価可能な行の末尾へ変更できる。
+低い順は評価可能な行を完全に逆順にする。Collection、ブックマーク、固定順の一覧、
+本のページ順には評価順を適用しない。Remote の物理フォルダも同じ規則を使う。
 
 このカテゴリ表示順は通常フォルダ、ZIP 内の階層、ファイル名スタック、レーティング一覧、
 サブフォルダ展開ビューへ適用する。全文検索結果はフォルダ / ファイルを区別しない一律ソートを維持する。
@@ -1912,7 +1917,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `thumb_tooltip_show_full_location` | bool | false | 選択情報に場所をフルパスで表示するか。スマートフィルタの場所表示と同じラベルを使う |
 | `thumb_tooltip_show_reading_history_last_read` | bool | true | 閲覧履歴ビューの選択情報に最終閲覧日時を表示するか |
 | `thumb_tooltip_show_reading_history_progress` | bool | true | 閲覧履歴ビューの選択情報に閲覧位置を表示するか |
-| `sort_order` | SortOrder | FileName | 通常一覧のソート順（FileName / FileNameDesc / Numeric / NumericDesc / DateAsc / DateDesc / SizeAsc / SizeDesc）。名前 / 番号 / 日付の表示名はフォルダツリーと共通。番号順は記号・空白などの区切りを無視する。サイズ不明は両方向とも同じカテゴリ行の末尾。本として表示中や閲覧履歴では UI を無効化し、文脈ごとのページ順に固定 |
+| `sort_order` | SortOrder | FileName | 通常一覧のソート順（FileName / FileNameDesc / Numeric / NumericDesc / DateAsc / DateDesc / SizeAsc / SizeDesc / RatingAsc / RatingDesc）。番号順は記号・空白などの区切りを無視する。サイズ不明は両方向とも同じカテゴリ行の末尾。本として表示中や閲覧履歴では UI を無効化し、文脈ごとのページ順に固定 |
+| `rating_sort_unrated_position` | RatingSortUnratedPosition | BetweenThreeAndTwo | 評価順での未評価位置。`BelowAll` は評価可能な行の末尾。昇順は降順の逆順 |
 | `subfolder_expansion_max_depth` | u32 | 40 | サブ展開で各走査起点から読む最大階層。0 は起点ディレクトリだけ、1 は起点と直下 1 階層。UI は 0 / 1 / 2 / 3 / 4 / 5 / 10 / 40 を「起点のみ」〜「無制限」として選ばせ、40 は従来どおり reparse point ループ対策を兼ねる実効上限。実行前のダイアログで選んで保存し、次回ダイアログの初期値と走査に適用する。スマートフォルダは参照しない |
 | `subfolder_expansion_filter_kinds` | BTreeSet\<FacetItemKind\> | [] | サブ展開の走査時に snapshot へ入れる種類。空は全種類。UI は Folder / Image / Video / Zip / Pdf だけを表示する |
 | `subfolder_expansion_filter_date_preset` | Option\<FacetDatePreset\> | None | サブ展開の走査時にファイルへ適用する更新日条件。画像フォルダ本には適用しない。既存 facet と同じプリセット / ラベルを使い、None は条件なし |
@@ -2105,6 +2111,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `rating_filter` | `[bool; 6]` | `[true; 6]` | レーティングフィルタ（index 0=未評価, 1〜5=★の数）。全 true ならフィルタなし |
 | `window_pos` / `window_size` | Option | None | 通常ウィンドウの位置・サイズ（自動保存）。最大化中は更新しないので、最大化を解いたときに戻る矩形として残る |
 | `window_maximized` | bool | false | 前回終了時（トレイ退避を含む）に最大化していたか（自動保存）。復元矩形を潰さないよう `window_pos` / `window_size` とは別に持つ |
+| `always_on_top` | bool | false | 設定メニュー先頭の「常に最前面」。ON 中は main と閲覧用 top-level host（独立フルスクリーン・別ウィンドウを含む）を最前面にする。既定は OFF、再起動後も保持する。操作カスタマイズの `ToggleAlwaysOnTop` にキーを割り当て可能。切替自体は他アプリからフォーカスを奪わない |
 | `startup_window_state` | StartupWindowState | RememberLast | 起動時のウィンドウ状態。`RememberLast`=前回終了時が最大化なら最大化、`Normal`=常に通常ウィンドウ、`Maximized`=常に最大化。位置・サイズはどの選択でも復元する。`--window-size` 指定時はこの設定より優先して通常ウィンドウで起動する。v3.2.0 以前の設定には field も `window_maximized` も無いため、更新直後の初回起動は通常ウィンドウになる |
 
 ### 8.5 メタデータ・検索設定（v0.3 追加）

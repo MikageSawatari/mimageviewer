@@ -2005,9 +2005,19 @@ struct RecomputedFolderListing {
     image_only: bool,
     compiled: bool,
     sort_order: crate::settings::SortOrder,
+    sort_notice: Option<String>,
     thumb_aspect_height_ratio: f64,
     sort_locked: bool,
     auto_fullscreen_image_folders_enabled: bool,
+}
+
+fn read_complete_folder_ratings(
+    keys: &[String],
+) -> Result<crate::rating_db::CompleteRatingFacts, String> {
+    crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
+        .map_err(|error| error.to_string())?
+        .get_many_complete(keys, 0)
+        .map_err(|error| error.to_string())
 }
 fn folder_thumb_aspect_height_ratio(settings: &crate::settings::Settings, folder: &Path) -> f64 {
     let aspect = if settings.thumb_aspect_auto {
@@ -2731,6 +2741,14 @@ impl ContainerEngine {
     }
 
     pub(super) fn folder_list(&self, request: FolderListRequest) -> FolderListResponse {
+        self.folder_list_with_rating_read(request, read_complete_folder_ratings)
+    }
+
+    fn folder_list_with_rating_read(
+        &self,
+        request: FolderListRequest,
+        read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
+    ) -> FolderListResponse {
         let started = Instant::now();
         let resolved = match self.resolve(&request.address) {
             Ok(resolved) => resolved,
@@ -2744,12 +2762,13 @@ impl ContainerEngine {
                 "フォルダ一覧のアドレスが不正です",
             ));
         }
-        let listing = match self.recompute_folder_listing(&resolved.logical) {
-            Ok(listing) => listing,
-            Err(error) => {
-                return FolderListResponse::Error(media_error_from_remote_write(error));
-            }
-        };
+        let listing =
+            match self.recompute_folder_listing_with_rating_read(&resolved.logical, read_rating) {
+                Ok(listing) => listing,
+                Err(error) => {
+                    return FolderListResponse::Error(media_error_from_remote_write(error));
+                }
+            };
         let thumbnail_sources =
             super::RemoteThumbnailSources::from_pairs(&listing.video_thumb_overrides);
         let entries = listing
@@ -2772,6 +2791,7 @@ impl ContainerEngine {
                 },
                 listing.sort_locked.then_some(super::BOOK_SORT_LOCK_REASON),
             ),
+            sort_notice: listing.sort_notice.clone(),
             entries,
             scan_ms: listing.scan_ms,
             materialize_ms: listing.materialize_ms,
@@ -3415,6 +3435,14 @@ impl ContainerEngine {
         &self,
         folder: &Path,
     ) -> Result<RecomputedFolderListing, RemoteWriteError> {
+        self.recompute_folder_listing_with_rating_read(folder, read_complete_folder_ratings)
+    }
+
+    fn recompute_folder_listing_with_rating_read(
+        &self,
+        folder: &Path,
+        read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
+    ) -> Result<RecomputedFolderListing, RemoteWriteError> {
         let settings = self.settings_for_listing()?;
         let scan_started = Instant::now();
         let scan = crate::app::folder_scan::scan_directory_with_settings(folder, &settings)
@@ -3437,7 +3465,25 @@ impl ContainerEngine {
             )
         };
         let materialize_started = Instant::now();
-        let materialized = crate::app::materialize_local_folder_listing(folder, scan, &settings);
+        let materialized = crate::app::folder_scan::materialize_local_folder_listing_with_order(
+            folder,
+            scan,
+            &settings,
+            crate::rating_sort::ListingOrderRequest::from_settings(&settings),
+            read_rating,
+        );
+        let sort_notice = if matches!(
+            materialized.rating_order,
+            crate::app::folder_scan::FolderRatingOrder::Failed
+        ) {
+            crate::logger::log(format!(
+                "remote_ipc: rating order unavailable for {}; using name order",
+                folder.display()
+            ));
+            Some("評価順を読み込めなかったため名前順で表示しました".to_owned())
+        } else {
+            None
+        };
         let materialize_ms = materialize_started.elapsed().as_secs_f64() * 1000.0;
         let thumb_aspect_height_ratio = folder_thumb_aspect_height_ratio(&settings, folder);
         let sort_locked =
@@ -3453,6 +3499,7 @@ impl ContainerEngine {
             image_only,
             compiled,
             sort_order: settings.sort_order,
+            sort_notice,
             thumb_aspect_height_ratio,
             sort_locked,
             auto_fullscreen_image_folders_enabled,
@@ -7453,6 +7500,111 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_physical_rating_order_is_an_immutable_listing_until_explicit_recompute() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("rating-order");
+        std::fs::create_dir_all(&folder).unwrap();
+        let a = folder.join("a.png");
+        let b = folder.join("b.png");
+        std::fs::write(&a, b"image-a").unwrap();
+        std::fs::write(&b, b"image-b").unwrap();
+        let db = crate::rating_db::RatingDb::open_at(data_dir.path().join("rating.db")).unwrap();
+        db.set(&crate::adjustment_db::normalize_path(&a), 1)
+            .unwrap();
+        db.set(&crate::adjustment_db::normalize_path(&b), 5)
+            .unwrap();
+        let settings = crate::settings::Settings {
+            sort_order: crate::settings::SortOrder::RatingDesc,
+            favorites: vec![FavoriteEntry::new("Ratings".to_owned(), folder.clone())],
+            ..Default::default()
+        };
+        let engine = ContainerEngine::new(settings);
+        let request = FolderListRequest {
+            address: RemoteAddress::file(folder.to_string_lossy().into_owned()),
+        };
+        let FolderListResponse::Success(first_payload) = engine.folder_list(request.clone()) else {
+            panic!("remote folder list failed");
+        };
+        assert_eq!(
+            first_payload
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b.png", "a.png"]
+        );
+        let wire = serde_json::to_value(&first_payload).unwrap();
+        assert!(wire["entries"][0].get("rating").is_none());
+        assert_eq!(first_payload.sort_notice, None);
+        let first = engine.recompute_folder_listing(&folder).unwrap();
+        let names = |items: &[crate::grid_item::GridItem]| -> Vec<String> {
+            items.iter().map(|item| item.name().into_owned()).collect()
+        };
+        assert_eq!(names(&first.items), ["b.png", "a.png"]);
+        db.set(&crate::adjustment_db::normalize_path(&a), 5)
+            .unwrap();
+        db.set(&crate::adjustment_db::normalize_path(&b), 1)
+            .unwrap();
+        assert_eq!(
+            first_payload
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b.png", "a.png"]
+        );
+        assert_eq!(names(&first.items), ["b.png", "a.png"]);
+        let FolderListResponse::Success(second_payload) = engine.folder_list(request) else {
+            panic!("remote folder reload failed");
+        };
+        assert_eq!(
+            second_payload
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a.png", "b.png"]
+        );
+        let second = engine.recompute_folder_listing(&folder).unwrap();
+        assert_eq!(names(&second.items), ["a.png", "b.png"]);
+    }
+
+    #[test]
+    fn remote_physical_rating_read_failure_returns_name_order_with_visible_notice() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("rating-read-failure");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("b.png"), b"image-b").unwrap();
+        std::fs::write(folder.join("a.png"), b"image-a").unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            sort_order: crate::settings::SortOrder::RatingDesc,
+            favorites: vec![FavoriteEntry::new("Ratings".to_owned(), folder.clone())],
+            ..Default::default()
+        });
+        let FolderListResponse::Success(payload) = engine.folder_list_with_rating_read(
+            FolderListRequest {
+                address: RemoteAddress::file(folder.to_string_lossy().into_owned()),
+            },
+            |_| Err("injected complete-read failure".to_owned()),
+        ) else {
+            panic!("remote folder list failed");
+        };
+        assert_eq!(
+            payload
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a.png", "b.png"]
+        );
+        assert_eq!(payload.sort_state.selected, "RatingDesc");
+        assert_eq!(
+            payload.sort_notice.as_deref(),
+            Some("評価順を読み込めなかったため名前順で表示しました")
+        );
+    }
     use crate::settings::FavoriteEntry;
     use std::io::{Cursor, Write};
 

@@ -5,23 +5,87 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>FAQ（よくある質問） — mImageViewer マニュアル</title>
   <!-- meta:begin (generated) -->
-  <meta name="description" content="mImageViewer のよくある質問と回答。RAR / 7z / LZH の対応、対応フォーマット、AI 機能、設定の保存場所、他ソフトとの併用などをまとめています。">
+  <meta name="description" content="mImageViewer のよくある質問と回答。どんな人に向いているか、無料か・画像を外部に送らないか、Windows 10 で使えるか、AI 生成画像のプロンプト検索、スマホからのリモート閲覧、RAR / 7z / LZH の対応などをまとめています。">
   <link rel="canonical" href="https://mikage.to/mimageviewer/manual/faq.html">
   <meta property="og:type" content="article">
   <meta property="og:site_name" content="mImageViewer">
   <meta property="og:locale" content="ja_JP">
   <meta property="og:url" content="https://mikage.to/mimageviewer/manual/faq.html">
   <meta property="og:title" content="FAQ（よくある質問）｜mImageViewer">
-  <meta property="og:description" content="mImageViewer のよくある質問と回答。RAR / 7z / LZH の対応、対応フォーマット、AI 機能、設定の保存場所、他ソフトとの併用などをまとめています。">
+  <meta property="og:description" content="mImageViewer のよくある質問と回答。どんな人に向いているか、無料か・画像を外部に送らないか、Windows 10 で使えるか、AI 生成画像のプロンプト検索、スマホからのリモート閲覧、RAR / 7z / LZH の対応などをまとめています。">
   <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="FAQ（よくある質問）｜mImageViewer">
-  <meta name="twitter:description" content="mImageViewer のよくある質問と回答。RAR / 7z / LZH の対応、対応フォーマット、AI 機能、設定の保存場所、他ソフトとの併用などをまとめています。">
+  <meta name="twitter:description" content="mImageViewer のよくある質問と回答。どんな人に向いているか、無料か・画像を外部に送らないか、Windows 10 で使えるか、AI 生成画像のプロンプト検索、スマホからのリモート閲覧、RAR / 7z / LZH の対応などをまとめています。">
   <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <!-- meta:end -->
   <link rel="stylesheet" href="style.css">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "mImageViewer はどんなソフトですか？どんな人に向いていますか？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Windows 用の無料の画像ビューアです。フォルダを開くと、中の画像・動画・音声・ZIP・PDF がサムネイルで一覧され、クリックでフルスクリーン表示に切り替わります。ZIP や PDF はディスクに展開せずにそのままページをめくれます。\n次のような方に向いています。\n・大量の画像や写真を、一覧で見渡しながら目当ての 1 枚を探したい\n・ZIP / PDF にまとめた漫画や同人誌を、見開き・右→左読みで読みたい\n・Stable Diffusion や ComfyUI で作った画像を、プロンプトを見ながら整理・検索したい\n・外出先のスマートフォンやタブレットから、自宅 PC の画像・漫画・動画を見たい\n・ViX・Leeyes・マンガミーヤなど、長く使ってきたビューアからの乗り換え先を探している\n一方で、次のような方には向いていません。\n・Windows 11 以外（Mac・Linux など）で使いたい方\n・英語など日本語以外の画面で使いたい方（画面は日本語のみです）\n・タグを画像ファイルに書き込み、他の写真管理ソフトと共有したい方（タグは mImageViewer の中で管理し、ファイルには書き込みません。★は設定を有効にすると JPEG / PNG / WebP の XMP にも書き込めます）\n・描画やレイヤーを重ねたレタッチを本格的に行いたい方（補正・消しゴム・注釈はできますが、ペイントソフトの代わりにはなりません）\n・配布ファイルが小さいことを重視する方（AI モデルや動画再生用の部品を内蔵しているため、インストーラで約 240 MB あります）"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "無料ですか？広告はありますか？画像が外部に送られることはありませんか？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "無料です。MIT ライセンスのオープンソースで、ソースコードを GitHub で公開しています。広告・アクセス解析・利用状況の送信は含まず、アカウント登録も不要です。\nAI アップスケールなどの AI 処理はすべて PC の中で行い、画像を外部のサーバーへ送りません。外部と通信するのは、新しいバージョンの確認（設定でオフにできます）、AI を高速化する追加コンポーネントを自分で選んでダウンロードするとき、リモート閲覧を自分で有効にしたとき、の 3 つだけです。リモート閲覧の通信は Tailscale によって暗号化されます。つながり方によっては Tailscale の中継サーバーを通りますが、中継側は画像の内容を読めません。画像が開発者のサーバーへ送られることはありません。詳しくは プライバシーポリシー をご覧ください。"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Windows 10 で使えますか？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "公式の動作環境は Windows 11（64bit）です。Windows 10 は開発側で動作を確認していないため、動作は保証できません。Windows 10 で使えたというご報告もいただいていますが、Windows 10 だけで起きる不具合には対応できないことがあります。32bit 版の Windows では動きません。"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "AI 生成画像のプロンプトを表示・検索できますか？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "できます。Stable Diffusion（AUTOMATIC1111 / Forge など）・ComfyUI・NovelAI などが PNG に埋め込んだプロンプトや生成パラメータを、フルスクリーン表示の右パネルに表示します。JPEG の EXIF に保存された形式にも対応しています。\nCtrl+F で開いているフォルダをプロンプトのキーワードで絞り込め、Ctrl+G ではお気に入りに登録した場所全体から探せます（事前に索引の作成が必要です）。ネガティブプロンプトは検索対象に含めません。使い方の流れは AI 生成画像を整理・検索する にまとめています。"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "スマホやタブレットから、自宅 PC の画像・漫画・動画を見られますか？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "見られます。自宅 PC で mImageViewer を起動したままにしておくと、外出先のスマートフォン・タブレットのブラウザから、画像・漫画（ZIP / PDF）・動画を開けます。ファイルを端末へコピーする必要はありません。\n接続には Tailscale（自分の端末どうしをつなぐソフト。個人で数台をつなぐ範囲なら、通常は無料のプランで使えます）と PIN を使うので、NAS やルーターのポート開放は不要です。この機能は既定でオフで、自分で有効にするまで待ち受けません。リモートからはファイルの削除・移動などはできません。手順は 外出先のスマホから自宅 PC の画像・漫画を見る をご覧ください。"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "何万枚も入ったフォルダでも軽く動きますか？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "一覧は画面に見えている行だけを描き、サムネイルも見えている分から先に作ります。フォルダの中のファイル一覧を読む時間は件数に応じて増えますが、時間のかかるサムネイル作りは画面に並ぶ分から順に進むので、全部がそろうのを待たずに見始められます。読み込みに時間のかかった画像などのサムネイルは PC に保存するので、同じフォルダを開き直したときは画像を読み直さずに表示します。\nただし、初めて開くフォルダでは、サムネイルを作るぶんの時間がかかります。1 枚が大きいカメラの写真や、HDD・ネットワーク上のフォルダでは特に時間がかかります。しくみと計測した表示時間は 大量の画像を高速に一覧できるしくみ にまとめています。"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "ViX / Honeyview / MassiGra などの代わりに使えますか？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "多くの場合、代わりとして使えます。フォルダをサムネイルで見渡して目当ての画像を開く使い方や、フルスクリーンでの画像送り・拡大・回転・スライドショーといった基本操作に対応し、Susie プラグイン（32bit の .spi）で PI / MAG などの画像も表示できます。\nただし、操作や設計の違いもあります。たとえば 7z / LZH などの書庫は最初に開くときに一度 ZIP へまとめ直してから表示し、画像の補正は元のファイルを書き換えない方式です。乗り換え元ごとの違いは移行ガイドにまとめています。\n・ViX からの移行 ／ Leeyes からの移行 ／ マンガミーヤからの移行 ／ ZipPla からの移行\n・Honeyview からの移行 ／ MassiGra からの移行 ／ Windows フォトからの移行"
+        }
+      }
+    ]
+  }
+  </script>
 </head>
 <body>
 
@@ -77,11 +141,22 @@
 
   <main class="content">
     <h1 class="page-title">FAQ（よくある質問）</h1>
-    <p class="page-desc">mImageViewer でよくいただく質問と回答をまとめています。</p>
+    <p class="page-desc">mImageViewer でよくいただく質問と回答をまとめています。使い始める前の疑問は<a href="#before">「使い始める前に」</a>をご覧ください。</p>
 
     <nav class="page-toc">
       <div class="page-toc-title">目次</div>
       <ul>
+        <li><a href="#before">使い始める前に</a>
+          <ul>
+            <li><a href="#before-what">mImageViewer はどんなソフトですか？どんな人に向いていますか？</a></li>
+            <li><a href="#before-free">無料ですか？広告はありますか？画像が外部に送られることはありませんか？</a></li>
+            <li><a href="#before-win10">Windows 10 で使えますか？</a></li>
+            <li><a href="#before-ai">AI 生成画像のプロンプトを表示・検索できますか？</a></li>
+            <li><a href="#before-remote">スマホやタブレットから、自宅 PC の画像・漫画・動画を見られますか？</a></li>
+            <li><a href="#before-large">何万枚も入ったフォルダでも軽く動きますか？</a></li>
+            <li><a href="#before-replace">ViX / Honeyview / MassiGra などの代わりに使えますか？</a></li>
+          </ul>
+        </li>
         <li><a href="#archive">アーカイブ・フォーマットについて</a>
           <ul>
             <li><a href="#archive-7z-lzh">RAR / 7z / LZH アーカイブに対応していますか？</a></li>
@@ -125,6 +200,54 @@
         </li>
       </ul>
     </nav>
+
+    <h2 id="before">使い始める前に</h2>
+
+    <h3 id="before-what">mImageViewer はどんなソフトですか？どんな人に向いていますか？</h3>
+    <p>Windows 用の無料の画像ビューアです。フォルダを開くと、中の画像・動画・音声・ZIP・PDF がサムネイルで一覧され、クリックでフルスクリーン表示に切り替わります。ZIP や PDF はディスクに展開せずにそのままページをめくれます。</p>
+    <p>次のような方に向いています。</p>
+    <ul>
+      <li>大量の画像や写真を、一覧で見渡しながら目当ての 1 枚を探したい</li>
+      <li>ZIP / PDF にまとめた漫画や同人誌を、見開き・右→左読みで読みたい</li>
+      <li>Stable Diffusion や ComfyUI で作った画像を、プロンプトを見ながら整理・検索したい</li>
+      <li>外出先のスマートフォンやタブレットから、自宅 PC の画像・漫画・動画を見たい</li>
+      <li>ViX・Leeyes・マンガミーヤなど、長く使ってきたビューアからの乗り換え先を探している</li>
+    </ul>
+    <p>一方で、次のような方には向いていません。</p>
+    <ul>
+      <li>Windows 11 以外（Mac・Linux など）で使いたい方</li>
+      <li>英語など日本語以外の画面で使いたい方（画面は日本語のみです）</li>
+      <li>タグを画像ファイルに書き込み、他の写真管理ソフトと共有したい方（タグは mImageViewer の中で管理し、ファイルには書き込みません。★は設定を有効にすると JPEG / PNG / WebP の XMP にも書き込めます）</li>
+      <li>描画やレイヤーを重ねたレタッチを本格的に行いたい方（補正・消しゴム・注釈はできますが、ペイントソフトの代わりにはなりません）</li>
+      <li>配布ファイルが小さいことを重視する方（AI モデルや動画再生用の部品を内蔵しているため、インストーラで約 240 MB あります）</li>
+    </ul>
+
+    <h3 id="before-free">無料ですか？広告はありますか？画像が外部に送られることはありませんか？</h3>
+    <p>無料です。MIT ライセンスのオープンソースで、ソースコードを GitHub で公開しています。広告・アクセス解析・利用状況の送信は含まず、アカウント登録も不要です。</p>
+    <p>AI アップスケールなどの AI 処理はすべて PC の中で行い、画像を外部のサーバーへ送りません。外部と通信するのは、新しいバージョンの確認（設定でオフにできます）、AI を高速化する追加コンポーネントを自分で選んでダウンロードするとき、リモート閲覧を自分で有効にしたとき、の 3 つだけです。リモート閲覧の通信は Tailscale によって暗号化されます。つながり方によっては Tailscale の中継サーバーを通りますが、中継側は画像の内容を読めません。画像が開発者のサーバーへ送られることはありません。詳しくは <a href="../privacy.html">プライバシーポリシー</a> をご覧ください。</p>
+
+    <h3 id="before-win10">Windows 10 で使えますか？</h3>
+    <p>公式の動作環境は Windows 11（64bit）です。Windows 10 は開発側で動作を確認していないため、動作は保証できません。Windows 10 で使えたというご報告もいただいていますが、Windows 10 だけで起きる不具合には対応できないことがあります。32bit 版の Windows では動きません。</p>
+
+    <h3 id="before-ai">AI 生成画像のプロンプトを表示・検索できますか？</h3>
+    <p>できます。Stable Diffusion（AUTOMATIC1111 / Forge など）・ComfyUI・NovelAI などが PNG に埋め込んだプロンプトや生成パラメータを、フルスクリーン表示の右パネルに表示します。JPEG の EXIF に保存された形式にも対応しています。</p>
+    <p><kbd>Ctrl</kbd>+<kbd>F</kbd> で開いているフォルダをプロンプトのキーワードで絞り込め、<kbd>Ctrl</kbd>+<kbd>G</kbd> ではお気に入りに登録した場所全体から探せます（事前に索引の作成が必要です）。ネガティブプロンプトは検索対象に含めません。使い方の流れは <a href="../guide-ai-images.html">AI 生成画像を整理・検索する</a> にまとめています。</p>
+
+    <h3 id="before-remote">スマホやタブレットから、自宅 PC の画像・漫画・動画を見られますか？</h3>
+    <p>見られます。自宅 PC で mImageViewer を起動したままにしておくと、外出先のスマートフォン・タブレットのブラウザから、画像・漫画（ZIP / PDF）・動画を開けます。ファイルを端末へコピーする必要はありません。</p>
+    <p>接続には Tailscale（自分の端末どうしをつなぐソフト。個人で数台をつなぐ範囲なら、通常は無料のプランで使えます）と PIN を使うので、NAS やルーターのポート開放は不要です。この機能は既定でオフで、自分で有効にするまで待ち受けません。リモートからはファイルの削除・移動などはできません。手順は <a href="../guide-remote.html">外出先のスマホから自宅 PC の画像・漫画を見る</a> をご覧ください。</p>
+
+    <h3 id="before-large">何万枚も入ったフォルダでも軽く動きますか？</h3>
+    <p>一覧は画面に見えている行だけを描き、サムネイルも見えている分から先に作ります。フォルダの中のファイル一覧を読む時間は件数に応じて増えますが、時間のかかるサムネイル作りは画面に並ぶ分から順に進むので、全部がそろうのを待たずに見始められます。読み込みに時間のかかった画像などのサムネイルは PC に保存するので、同じフォルダを開き直したときは画像を読み直さずに表示します。</p>
+    <p>ただし、初めて開くフォルダでは、サムネイルを作るぶんの時間がかかります。1 枚が大きいカメラの写真や、HDD・ネットワーク上のフォルダでは特に時間がかかります。しくみと計測した表示時間は <a href="../guide-fast-browsing.html">大量の画像を高速に一覧できるしくみ</a> にまとめています。</p>
+
+    <h3 id="before-replace">ViX / Honeyview / MassiGra などの代わりに使えますか？</h3>
+    <p>多くの場合、代わりとして使えます。フォルダをサムネイルで見渡して目当ての画像を開く使い方や、フルスクリーンでの画像送り・拡大・回転・スライドショーといった基本操作に対応し、Susie プラグイン（32bit の <code>.spi</code>）で PI / MAG などの画像も表示できます。</p>
+    <p>ただし、操作や設計の違いもあります。たとえば 7z / LZH などの書庫は最初に開くときに一度 ZIP へまとめ直してから表示し、画像の補正は元のファイルを書き換えない方式です。乗り換え元ごとの違いは移行ガイドにまとめています。</p>
+    <ul>
+      <li><a href="../migrate-vix.html">ViX からの移行</a> ／ <a href="../migrate-leeyes.html">Leeyes からの移行</a> ／ <a href="../migrate-mangameeya.html">マンガミーヤからの移行</a> ／ <a href="../migrate-zippla.html">ZipPla からの移行</a></li>
+      <li><a href="../migrate-honeyview.html">Honeyview からの移行</a> ／ <a href="../migrate-massigra.html">MassiGra からの移行</a> ／ <a href="../migrate-photos.html">Windows フォトからの移行</a></li>
+    </ul>
 
     <h2 id="archive">アーカイブ・フォーマットについて</h2>
 

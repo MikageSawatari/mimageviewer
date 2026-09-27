@@ -16473,7 +16473,12 @@ impl App {
         #[cfg(test)]
         FINAL_COVER_ELIGIBILITY_SCAN_COUNT
             .set(FINAL_COVER_ELIGIBILITY_SCAN_COUNT.get().saturating_add(1));
-        if nav.len() != self.items.len() || !self.items.iter().all(GridItem::has_page_data) {
+        if nav.len() != self.smart_folder_rule_total()
+            || !nav.iter().all(|&idx| {
+                self.smart_folder_rule_qualifies_index(idx)
+                    && self.items.get(idx).is_some_and(GridItem::has_page_data)
+            })
+        {
             return false;
         }
         let mut unique = std::collections::HashSet::with_capacity(nav.len());
@@ -17347,15 +17352,17 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn build_detached_image_window_builder(
+    pub(crate) fn build_detached_image_window_builder(
         window: &crate::app::DetachedImageWindowSnapshot,
         placement: crate::settings::DetachedViewerWindowPlacement,
         apply_initial_placement: bool,
         visible: bool,
         ui_scale: f32,
+        always_on_top: bool,
     ) -> egui::ViewportBuilder {
         let builder = egui::ViewportBuilder::default()
             .with_title(window.title.clone())
+            .with_window_level(crate::settings::viewer_window_level(always_on_top))
             .with_decorations(true)
             .with_transparent(false)
             .with_taskbar(true)
@@ -19419,6 +19426,18 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn passive_detached_registration_windows(
+        windows: Vec<crate::app::DetachedImageWindowSnapshot>,
+        active_window_id: Option<u64>,
+    ) -> impl Iterator<Item = crate::app::DetachedImageWindowSnapshot> {
+        // The active immediate renderer and the passive snapshot can overlap
+        // during handoff. Only one builder may own the native ViewportId.
+        windows
+            .into_iter()
+            .filter(move |window| Some(window.id) != active_window_id)
+    }
+
+    #[cfg(windows)]
     pub(crate) fn render_detached_image_windows(&mut self, ctx: &egui::Context) {
         // Active -> Passive handoff は OS window を閉じず同じ ViewportId を引き継ぐ。
         // active 静止画が auto-hide 中だった場合の window 単位 cursor flag を、passive
@@ -19478,9 +19497,11 @@ impl App {
         self.test_script_publish_window_snapshots();
 
         let windows = self.detached_image_windows.clone();
-        let mut deferred_windows = Vec::new();
-        let mut parked_live_windows = Vec::new();
-        for window in windows {
+        let active_window_id = self
+            .active_detached_session
+            .map(|session| session.window_id);
+        let (mut deferred_windows, mut parked_live_windows) = (Vec::new(), Vec::new());
+        for window in Self::passive_detached_registration_windows(windows, active_window_id) {
             if self.detached_window_state_is_parked_live(window.id) {
                 parked_live_windows.push(window);
             } else {
@@ -19499,6 +19520,22 @@ impl App {
                 })
                 .flatten();
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
+            #[cfg(feature = "test-script")]
+            if eframe::miv_test_script_window_witness::capture_probe_active()
+                && crate::test_script::capture_pending_for(viewport_id)
+                && eframe::miv_test_script_window_witness::capture_probe_detail_allowed()
+            {
+                crate::logger::log(format!(
+                    "[capture-probe] app_presentation frame={} window_id={} viewport={viewport_id:?} state={:?} bundle={:?} presentation=passive_deferred viewport_class=Deferred host={}",
+                    self.frame_counter,
+                    window.id,
+                    self.detached_window_state(window.id),
+                    self.locate_window_context(window.id),
+                    self.detached_window_hwnd_alive_for_window_id(window.id)
+                        .map(Self::win32_hwnd_debug_state)
+                        .unwrap_or_else(|| "none".into())
+                ));
+            }
             let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
             if !self.deferred_detached_window_registration_allowed(
                 window.id,
@@ -19533,6 +19570,7 @@ impl App {
                 apply_initial_placement,
                 self.window_visible,
                 self.settings.ui_scale_factor,
+                self.settings.always_on_top,
             );
             let view = self.deferred_detached_image_window_view(
                 window,
@@ -19542,6 +19580,8 @@ impl App {
             let shared = self.deferred_detached_image_window_shared(view);
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_deferred(viewport_id, builder, move |vp_ctx, _class| {
+                #[cfg(feature = "test-script")]
+                crate::test_script::receive_screenshot_events(vp_ctx, "deferred");
                 if sidecar_restore_presentation.is_some() {
                     App::consume_sidecar_restore_viewport_input(vp_ctx);
                 }
@@ -19670,6 +19710,25 @@ impl App {
         }
 
         for window in parked_live_windows {
+            #[cfg(feature = "test-script")]
+            {
+                let viewport_id = Self::detached_image_window_viewport_id(window.id);
+                if eframe::miv_test_script_window_witness::capture_probe_active()
+                    && crate::test_script::capture_pending_for(viewport_id)
+                    && eframe::miv_test_script_window_witness::capture_probe_detail_allowed()
+                {
+                    crate::logger::log(format!(
+                        "[capture-probe] app_presentation frame={} window_id={} viewport={viewport_id:?} state={:?} bundle={:?} presentation=parked_live viewport_class=Immediate host={}",
+                        self.frame_counter,
+                        window.id,
+                        self.detached_window_state(window.id),
+                        self.locate_window_context(window.id),
+                        self.detached_window_hwnd_alive_for_window_id(window.id)
+                            .map(Self::win32_hwnd_debug_state)
+                            .unwrap_or_else(|| "none".into())
+                    ));
+                }
+            }
             let sidecar_restore_presentation = self
                 .sidecar_restore_blocks_window(window.id)
                 .then(|| {
@@ -19707,6 +19766,7 @@ impl App {
                 apply_initial_placement,
                 self.window_visible,
                 self.settings.ui_scale_factor,
+                self.settings.always_on_top,
             );
             let mut viewport_close_requested = false;
             let mut bar_close_requested = false;
@@ -19745,6 +19805,8 @@ impl App {
                 .flatten();
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+                #[cfg(feature = "test-script")]
+                crate::test_script::receive_screenshot_events(vp_ctx, "parked_live_immediate");
                 if sidecar_restore_presentation.is_some() {
                     Self::consume_sidecar_restore_viewport_input(vp_ctx);
                 }
@@ -22758,6 +22820,9 @@ impl App {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
                 #[cfg(all(windows, feature = "test-script"))]
                 {
+                    if !embedded {
+                        crate::test_script::receive_screenshot_events(ctx, "active_immediate");
+                    }
                     test_script_current_item_paint =
                         eframe::miv_test_script_window_witness::active()
                             .map(|witness| (ctx.viewport_id(), witness, None));
@@ -27022,6 +27087,9 @@ impl App {
                 // 静止画 fullscreen の属性だけを合わせ、geometry は触らない。
                 egui::ViewportBuilder::default()
                     .with_decorations(false)
+                    .with_window_level(crate::settings::viewer_window_level(
+                        self.settings.always_on_top,
+                    ))
                     .with_transparent(true)
                     .with_taskbar(true)
             }
@@ -27059,6 +27127,9 @@ impl App {
 
         let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
+            .with_window_level(crate::settings::viewer_window_level(
+                self.settings.always_on_top,
+            ))
             .with_decorations(!borderless)
             .with_transparent(false)
             .with_taskbar(true);
@@ -27192,6 +27263,9 @@ impl App {
 
         egui::ViewportBuilder::default()
             .with_decorations(false)
+            .with_window_level(crate::settings::viewer_window_level(
+                self.settings.always_on_top,
+            ))
             .with_transparent(transparent)
             .with_taskbar(taskbar)
             .with_position(position)
@@ -27850,6 +27924,7 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::End => KeyName::End,
                     crate::key_input::SyntheticNavigationKey::Enter => KeyName::Enter,
                     crate::key_input::SyntheticNavigationKey::Escape => KeyName::Esc,
+                    crate::key_input::SyntheticNavigationKey::F12 => KeyName::F12,
                 };
                 crate::test_script::KeymapLevelObservation {
                     frame_nr: observation.frame_nr,
@@ -27898,17 +27973,99 @@ impl App {
             .len()
             .saturating_add(self.texture_backlog.len())
             .saturating_add(self.fs_upload_backlog.len());
+        let collection_root_order = self.collection_grid_root_order().and_then(Result::ok);
+        let (collection_runtime_phase, collection_runtime_error, collection_seeded_id_present) =
+            self.collection_smoke_runtime_status();
+        let grid_surface = match self.top_level_grid_view.surface() {
+            crate::app::top_level_grid_view::TopLevelGridSurface::Folder => "Folder".to_string(),
+            crate::app::top_level_grid_view::TopLevelGridSurface::Collection(identity) => {
+                format!("Collection({})", identity.collection_id.as_uuid())
+            }
+            other => format!("{other:?}"),
+        };
 
         crate::test_script::TestScriptSnapshot {
+            always_on_top: self.settings.always_on_top,
+            window_visible: self.window_visible,
             is_fullscreen: fs_idx.is_some(),
             fs_idx: fs_idx.map_or(-1, |idx| idx as i64),
             items_generation: self.items_generation as i64,
+            folder_load_requests: i64::try_from(self.test_script_folder_load_requests)
+                .unwrap_or(i64::MAX),
             focused,
             target_viewport,
             target_registered: target.is_some(),
             // A child callback publishes true after it is actually reached.
             target_rendered: target.is_some_and(|target| target.viewport == egui::ViewportId::ROOT),
             items_len: i64::try_from(self.items.len()).unwrap_or(i64::MAX),
+            item_names: self
+                .items
+                .iter()
+                .take(crate::test_script::MAX_ITEM_ROWS_IN_SNAPSHOT)
+                .map(|item| item.name().into_owned())
+                .collect(),
+            item_ratings: (0..self
+                .items
+                .len()
+                .min(crate::test_script::MAX_ITEM_ROWS_IN_SNAPSHOT))
+                .map(|index| i64::from(self.rating_cache.get(&index).copied().unwrap_or(0)))
+                .collect(),
+            sort_order: format!("{:?}", self.settings.sort_order),
+            collection_runtime_phase,
+            collection_runtime_error,
+            collection_seeded_id_present,
+            grid_surface,
+            current_folder_path: self
+                .current_folder
+                .as_ref()
+                .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+            startup_open_pending: !self.initialized
+                || self.startup_open_path.is_some()
+                || self.startup_open_path_resolve_pending.is_some(),
+            collection_root_visible: collection_root_order.is_some(),
+            collection_id: collection_root_order.map_or_else(String::new, |root| {
+                root.content.stamp.collection_id.to_string()
+            }),
+            collection_order_mode: collection_root_order
+                .map_or_else(String::new, |root| format!("{:?}", root.mode)),
+            collection_standard_sort: collection_root_order
+                .map_or_else(String::new, |root| format!("{:?}", root.standard_sort)),
+            collection_revision: collection_root_order.map_or(-1, |root| {
+                i64::try_from(root.content.expected_revision).unwrap_or(i64::MAX)
+            }),
+            collection_sort_popup: crate::test_script::collection_sort_popup_snapshot(ctx),
+            rating_sort_unrated_position: format!(
+                "{:?}",
+                self.settings.rating_sort_unrated_position
+            ),
+            preferences_open: self.show_preferences,
+            preferences_page: self
+                .pref_state
+                .as_ref()
+                .map(|state| format!("{:?}", state.selected))
+                .unwrap_or_default(),
+            preferences_draft_unrated_position: self
+                .pref_state
+                .as_ref()
+                .map(|state| format!("{:?}", state.settings.rating_sort_unrated_position))
+                .unwrap_or_default(),
+            smart_folder_busy: self.smart_folder_busy(),
+            smart_folder_root_visible: self.test_script_smart_folder_root_visible(),
+            smart_folder_session_phase: self
+                .top_level_grid_view
+                .smart_folder_session()
+                .map(|session| session.test_script_phase().to_owned())
+                .unwrap_or_default(),
+            smart_folder_name: self
+                .current_smart_folder_id
+                .and_then(|id| {
+                    self.settings
+                        .smart_folders
+                        .iter()
+                        .find(|folder| folder.id == id)
+                })
+                .map(|folder| folder.name.clone())
+                .unwrap_or_default(),
             pending_thumbs: i64::try_from(pending_thumbs).unwrap_or(i64::MAX),
             spread_mode: format!("{:?}", self.spread_mode),
             continuous_reading,
@@ -27944,6 +28101,7 @@ impl App {
                 .unwrap_or_default(),
             keymap_level_observations,
             windows: self.test_script_window_snapshots(),
+            host_styles: self.test_script_host_styles(),
         }
     }
 
@@ -28046,6 +28204,16 @@ impl App {
                 self.show_feedback_toast("範囲コピーをキャンセルしました".to_string());
                 ctx.request_repaint();
             }
+            return action;
+        }
+
+        if !self.ime_input_active(ctx)
+            && !self.is_overlay_edit_mode_active()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::ToggleAlwaysOnTop)
+        {
+            self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
             return action;
         }
 
@@ -44398,6 +44566,7 @@ impl App {
         };
         indices.sort_unstable();
         indices.dedup();
+        indices.retain(|&index| self.smart_folder_rule_qualifies_index(index));
         indices
     }
 
@@ -45076,10 +45245,15 @@ impl App {
 
     /// 覚えた index がまだ同じページを指しているか。違えば同じキーの項目を探し直す。
     fn export_batch_index_for_key(&self, idx: usize, page_key: &str) -> Option<usize> {
-        if self.page_path_key(idx).as_deref() == Some(page_key) {
+        if self.smart_folder_rule_qualifies_index(idx)
+            && self.page_path_key(idx).as_deref() == Some(page_key)
+        {
             return Some(idx);
         }
-        (0..self.items.len()).find(|&idx| self.page_path_key(idx).as_deref() == Some(page_key))
+        (0..self.items.len()).find(|&idx| {
+            self.smart_folder_rule_qualifies_index(idx)
+                && self.page_path_key(idx).as_deref() == Some(page_key)
+        })
     }
 
     /// `Ok(None)` は対象外 (フォルダ / 動画 / 音声 / アーカイブ本体など)。
@@ -46326,6 +46500,14 @@ impl App {
     ) {
         // IME 変換中はショートカットを発火させない
         if self.ime_input_active(ctx) {
+            return;
+        }
+
+        if self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::ToggleAlwaysOnTop)
+        {
+            self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
             return;
         }
 
@@ -47625,6 +47807,50 @@ mod tests {
     mod still_seek_menu;
     mod still_seek_rotation;
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn active_and_inactive_viewer_builders_follow_saved_window_level() {
+        let mut app = crate::app::setup_app_for_test();
+        for enabled in [false, true] {
+            app.settings.always_on_top = enabled;
+            let expected = Some(crate::settings::viewer_window_level(enabled));
+
+            app.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
+            assert_eq!(
+                app.build_fullscreen_viewport_builder().window_level,
+                expected
+            );
+            assert_eq!(
+                app.build_still_fullscreen_viewport_builder().window_level,
+                expected
+            );
+            assert_eq!(
+                app.build_inactive_fullscreen_viewport_builder(0)
+                    .window_level,
+                expected
+            );
+
+            app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+            assert_eq!(
+                app.build_detached_viewer_viewport_builder(
+                    0,
+                    Some(true),
+                    DetachedViewportBuilderVisibility::Preserve,
+                    false,
+                    None,
+                    "window_level_test",
+                )
+                .window_level,
+                expected
+            );
+            assert_eq!(
+                app.build_inactive_fullscreen_viewport_builder(0)
+                    .window_level,
+                expected
+            );
+        }
+    }
 
     #[cfg(all(windows, feature = "test-script"))]
     #[test]

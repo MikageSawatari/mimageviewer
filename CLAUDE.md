@@ -1671,7 +1671,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 判断材料 / 進め方:
 
-- 前回リリースの範囲は **README.md の更新履歴** と **GitHub Releases** で確認する。
+- 前回リリースの範囲は **CHANGELOG.md の更新履歴** と **GitHub Releases** で確認する。
   どのバージョンで出した機能か不明なら git log / git tag で追う。
 - コード上は完成して見えても「リリース済み」とは限らない。実装済みでも未出荷の
   サブシステムがあり得る。判断に迷ったら **ユーザーに確認する** (推測で決め打ちしない)。
@@ -1702,7 +1702,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 表示される (= GitHub Releases の `body` がユーザーに読まれる)。誤字・内部用語の
 混入・粗い表現があると公開後に取り返しが付かないので、以下の順で進める。
 
-- **README.md の更新履歴セクション** にこのバージョンの新エントリを追加 (旧版と
+- **CHANGELOG.md の更新履歴セクション** にこのバージョンの新エントリを追加 (旧版と
   同じ `### vX.Y.Z (YYYY-MM-DD)` ヘッダ + 箇条書きフォーマット)。書き方は CLAUDE.md
   「マニュアル・製品ページの記述方針」に従う:
   - **見出しにリリース日を `(YYYY-MM-DD)` 形式で付ける** (他バージョンと揃える)。
@@ -1713,23 +1713,25 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   - バージョン番号タグ (v0.8.2+ 等) は本文に書かない (見出しに 1 回だけ)
   - 過去のユーザー報告日付 / コミットハッシュは書かない
   - 「⚠️ 」プレフィックスは初回起動時に何かが起きる注意 (索引再構築等) に限定
-- **ユーザーに README.md の更新履歴を見せて承認を得る**。OK が出るまで Phase 1 へ
+  - 更新履歴は 2026-09 に README.md から `CHANGELOG.md` へ移した。README には書かない
+    (README は概要・特長・ダウンロードを冒頭に置く入口で、更新履歴へはリンクだけ置く)
+- **ユーザーに CHANGELOG.md の更新履歴を見せて承認を得る**。OK が出るまで Phase 1 へ
   進まない。
-- (任意) GitHub Release 用 body は基本 README.md の該当セクションをそのまま
+- (任意) GitHub Release 用 body は基本 CHANGELOG.md の該当セクションをそのまま
   コピペで OK。手作業で別途書き直さない (= 表記ゆれを生まない)。
 - **⚠️ 8KB 上限チェック (大型リリースで必須)**: アプリ内更新通知は
   `update_check.rs` の `BODY_CAP = 8 * 1024` で **先頭 8KB (UTF-8 バイト)** に切られる。
-  README の該当セクションが 8KB を超えると、後半の項目 (= 末尾に置きがちな新機能 /
+  CHANGELOG.md の該当セクションが 8KB を超えると、後半の項目 (= 末尾に置きがちな新機能 /
   バグ修正) が通知に出ない。リリース前に必ずバイト数を測る:
   ```bash
   # 見出しは "### vX.Y.Z (YYYY-MM-DD)" 形式なので、版番号の後ろは空白か行末で区切る
-  awk '/^### vX\.Y\.Z( |$)/{f=1} /^### v<前版>( |$)/{f=0} f' README.md | wc -c
+  awk '/^### vX\.Y\.Z( |$)/{f=1} /^### v<前版>( |$)/{f=0} f' CHANGELOG.md | wc -c
   ```
-  - **8KB 以内**: README セクションをそのまま Release body に使う (上記)。
-  - **8KB 超過**: README はフル版のまま残し、**`docs/release-body-<version>.md` に
+  - **8KB 以内**: CHANGELOG.md のセクションをそのまま Release body に使う (上記)。
+  - **8KB 超過**: CHANGELOG.md はフル版のまま残し、**`docs/release-body-<version>.md` に
     8KB 以内の短縮版を別途作成**する (BOM なし、Markdown。通知ダイアログは Markdown
     レンダリング対応なので見出し・箇条書き可)。短縮版は「目玉の新機能 → 主な改善 →
-    主なバグ修正」の順で前方に重要項目を寄せ、全項目は README を参照する旨のリンクを
+    主なバグ修正」の順で前方に重要項目を寄せ、全項目は CHANGELOG.md を参照する旨のリンクを
     冒頭に入れる。**この短縮版ファイルを Phase 4 の Release body に使う** (下記)。
     作成後 `wc -c docs/release-body-<version>.md` で 8192 以下を確認。
     - 注意: 8KB 上限は **更新を受け取る側 (= 旧バージョンのバイナリ)** に焼かれている
@@ -1750,9 +1752,11 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    リリース日 (= GitHub Release 公開日と揃える) を記入する。
    **ポータブル版のダウンロードリンク URL もバージョンを含む** (`mImageViewer_portable_v<VER>.zip`)
    ので、バージョン表記と一緒に link href も更新すること (単体exe / setup.exe は非バージョン名で固定)。
-4.5. **マニュアルの更新履歴ページを再生成** — Phase 0 で README の更新履歴セクションが
+   同じファイル冒頭の JSON-LD (`SoftwareApplication`) の **`softwareVersion` と `dateModified`** も
+   揃えて更新する (`dateModified` は「最終更新」と同じ日付)。
+4.5. **マニュアルの更新履歴ページを再生成** — Phase 0 で CHANGELOG.md の更新履歴セクションが
    承認されたら、`python scripts/gen-changelog-html.py` を実行して
-   `htdocs/mimageviewer/manual/changelog.html` を作り直す。changelog.html は README の
+   `htdocs/mimageviewer/manual/changelog.html` を作り直す。changelog.html は CHANGELOG.md の
    `## 更新履歴` から生成される**生成物**なので手で編集しない (編集すると次回再生成で消える)。
    生成後 `git diff` で最新版エントリが反映されていることを確認する。
 5. `htdocs/mimageviewer/manual/index.html` — マニュアルのバージョン表記
@@ -1992,10 +1996,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 13. ローカルで `git tag v<VERSION>` → `git push origin v<VERSION>` (GitHub `main` も同期)
 14. GitHub Releases UI で新リリースを作成。**body の出所は Phase 0 で確定した版に従う**:
-    - **通常 (README セクションが 8KB 以内)**: README.md の該当 `### vX.Y.Z` セクション
+    - **通常 (CHANGELOG.md のセクションが 8KB 以内)**: CHANGELOG.md の該当 `### vX.Y.Z` セクション
       本文をそのままコピペ。
-    - **短縮版を作った場合 (README セクションが 8KB 超)**: Phase 0 で作成した
-      `docs/release-body-<version>.md` の本文をコピペする (README フル版ではなく
+    - **短縮版を作った場合 (CHANGELOG.md のセクションが 8KB 超)**: Phase 0 で作成した
+      `docs/release-body-<version>.md` の本文をコピペする (CHANGELOG.md のフル版ではなく
       **こちらを使う**)。短縮版が存在するかは `ls docs/release-body-<version>.md` で確認。
       別セッションで Phase 4 を実施する場合もこのファイルの有無で判断できる。
     - どちらの場合も、この body がアプリ内アップデート通知にそのまま表示される。
@@ -2008,7 +2012,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
     - 実例: v1.0.0 は短縮版 [docs/archive/release/release-body-v1.0.0.md](docs/archive/release/release-body-v1.0.0.md) を使用。
 15. **表示崩れの確認は自動テストが持つ。目視は任意。**
     `changelog_markdown::tests::the_newest_changelog_entry_only_uses_markup_this_renderer_handles`
-    が README の最新節を読み、更新通知ダイアログの描画器が解釈できない記法
+    が CHANGELOG.md の最新節を読み、更新通知ダイアログの描画器が解釈できない記法
     (リンク・画像・閉じ忘れた `**` など) が混ざっていないかを機械的に見る。
     `cargo test` で毎回走るので、**公開前**に落ちる。
     - 以前はここを「公開後に別マシンで目視」としていたが、目視は体裁しか見られず、

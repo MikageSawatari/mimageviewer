@@ -14,6 +14,14 @@ pub const PDF_WORKER_COUNT_MIN: u32 = 3;
 pub const PDF_WORKER_COUNT_MAX: u32 = 10;
 pub const PDF_WORKER_COUNT_DEFAULT: u32 = 5;
 
+pub fn viewer_window_level(always_on_top: bool) -> egui::WindowLevel {
+    if always_on_top {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    }
+}
+
 fn default_ui_scale_factor() -> f32 {
     1.0
 }
@@ -1907,6 +1915,8 @@ pub enum SortOrder {
     DateDesc,     // 日付順（降順）
     SizeAsc,      // サイズ順（昇順、不明は末尾）
     SizeDesc,     // サイズ順（降順、不明は末尾）
+    RatingAsc,    // 評価順（低い順）
+    RatingDesc,   // 評価順（高い順）
 }
 
 /// 一覧の並び替えだけが使うmetadata snapshot。
@@ -1936,6 +1946,8 @@ impl SortOrder {
             Self::DateDesc => "日付（新しい順）",
             Self::SizeAsc => "サイズ順（小さい順）",
             Self::SizeDesc => "サイズ順（大きい順）",
+            Self::RatingAsc => "評価（低い順）",
+            Self::RatingDesc => "評価（高い順）",
         }
     }
 
@@ -1949,6 +1961,8 @@ impl SortOrder {
             Self::DateDesc => "日付↓",
             Self::SizeAsc => "サイズ↑",
             Self::SizeDesc => "サイズ↓",
+            Self::RatingAsc => "評価↑",
+            Self::RatingDesc => "評価↓",
         }
     }
 
@@ -1962,6 +1976,12 @@ impl SortOrder {
             Self::DateDesc => "更新日時が新しいものから並び替えます",
             Self::SizeAsc => "ファイルサイズが小さいものから並び替えます（不明は末尾）",
             Self::SizeDesc => "ファイルサイズが大きいものから並び替えます（不明は末尾）",
+            Self::RatingAsc => {
+                "評価の低い順。未評価は既定で★2と★3の間、設定で★1より下にもできます。評価を変えても、更新するまで並びは変わりません"
+            }
+            Self::RatingDesc => {
+                "評価の高い順。未評価は既定で★3と★2の間、設定で★1より下にもできます。評価を変えても、更新するまで並びは変わりません"
+            }
         }
     }
 
@@ -1975,7 +1995,17 @@ impl SortOrder {
             Self::DateDesc,
             Self::SizeAsc,
             Self::SizeDesc,
+            Self::RatingAsc,
+            Self::RatingDesc,
         ]
+    }
+
+    pub fn collection_options() -> &'static [Self] {
+        &Self::all()[..8]
+    }
+
+    pub const fn is_rating(self) -> bool {
+        matches!(self, Self::RatingAsc | Self::RatingDesc)
     }
 
     /// フォルダ代表サムネイルの探索に使える既存4候補。
@@ -2063,6 +2093,10 @@ impl SortOrder {
                 );
                 name_a.compare_file_name(name_b)
             }
+            Self::RatingAsc | Self::RatingDesc => {
+                debug_assert!(false, "rating list sort requires complete rating facts");
+                name_a.compare_file_name(name_b)
+            }
         }
     }
 
@@ -2093,6 +2127,10 @@ impl SortOrder {
                     (None, None) => Ordering::Equal,
                 };
                 size_order.then_with(name_tie)
+            }
+            Self::RatingAsc | Self::RatingDesc => {
+                debug_assert!(false, "rating list sort requires complete rating facts");
+                name_tie()
             }
         }
     }
@@ -4173,6 +4211,9 @@ pub struct Settings {
     /// 復元先が最大化サイズで潰れて戻れなくなる (detached 側の §1.115 と同じ根)。
     #[serde(default)]
     pub window_maximized: bool,
+    /// Keep the main and viewer host windows above other applications when requested.
+    #[serde(default)]
+    pub always_on_top: bool,
     /// 起動時にメインウィンドウを最大化するか。既定は従来どおり通常ウィンドウ。
     #[serde(default)]
     pub startup_window_state: StartupWindowState,
@@ -4196,6 +4237,8 @@ pub struct Settings {
     /// サムネイルグリッドのソート順
     #[serde(default)]
     pub sort_order: SortOrder,
+    #[serde(default)]
+    pub rating_sort_unrated_position: crate::rating_sort::RatingSortUnratedPosition,
     /// サブフォルダ展開ビューでフォルダ境界を優先するか。
     #[serde(default)]
     pub subfolder_expansion_order: SubfolderExpansionOrder,
@@ -4963,6 +5006,9 @@ pub struct Settings {
     /// custom順、部分集合、空vectorは変更せず、補完後に候補を隠した状態も復活させない。
     #[serde(default)]
     pub(crate) toolbar_sort_name_numeric_desc_options_migrated: bool,
+    /// 既定の8候補だけに評価順を一度追加する。利用者が変更した候補には触れない。
+    #[serde(default)]
+    pub(crate) toolbar_sort_rating_options_migrated: bool,
     /// スマートフィルタバーに表示するボタン。
     /// 空 Vec は「ボタンを全部隠す」。アクティブ条件のチップと全解除は引き続き表示する。
     #[serde(default = "default_toolbar_facet_filter_items")]
@@ -7032,6 +7078,7 @@ impl Default for Settings {
             window_pos: None,
             window_size: None,
             window_maximized: false,
+            always_on_top: false,
             startup_window_state: StartupWindowState::default(),
             parallelism: Parallelism::default(),
             pdf_worker_count: default_pdf_worker_count(),
@@ -7040,6 +7087,7 @@ impl Default for Settings {
             folder_skip_limit: default_folder_skip_limit(),
             show_hidden_files: false,
             sort_order: SortOrder::default(),
+            rating_sort_unrated_position: Default::default(),
             subfolder_expansion_order: SubfolderExpansionOrder::default(),
             subfolder_expansion_max_depth: default_subfolder_expansion_max_depth(),
             subfolder_expansion_filter_kinds: std::collections::BTreeSet::new(),
@@ -7236,6 +7284,7 @@ impl Default for Settings {
             toolbar_sort_items: default_toolbar_sort_items(),
             toolbar_sort_size_options_migrated: true,
             toolbar_sort_name_numeric_desc_options_migrated: true,
+            toolbar_sort_rating_options_migrated: true,
             toolbar_facet_filter_items: default_toolbar_facet_filter_items(),
             toolbar_facet_name_filter_index_stash: None,
             facet_name_filter_width: FacetNameFilterWidth::default(),
@@ -7843,6 +7892,7 @@ pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_legacy_archive_file_handling();
     settings.migrate_toolbar_sort_size_options();
     settings.migrate_toolbar_sort_name_numeric_desc_options();
+    settings.migrate_toolbar_sort_rating_options();
     settings.sanitize();
 }
 
@@ -8472,9 +8522,20 @@ impl Settings {
             SortOrder::SizeDesc,
         ];
         if self.toolbar_sort_items == LEGACY_DEFAULT_SORT_ITEMS {
-            self.toolbar_sort_items = default_toolbar_sort_items();
+            self.toolbar_sort_items = SortOrder::collection_options().to_vec();
         }
         self.toolbar_sort_name_numeric_desc_options_migrated = true;
+        true
+    }
+
+    fn migrate_toolbar_sort_rating_options(&mut self) -> bool {
+        if self.toolbar_sort_rating_options_migrated {
+            return false;
+        }
+        if self.toolbar_sort_items == SortOrder::collection_options() {
+            self.toolbar_sort_items = default_toolbar_sort_items();
+        }
+        self.toolbar_sort_rating_options_migrated = true;
         true
     }
 
@@ -8530,6 +8591,7 @@ impl Settings {
         let toolbar_sort_size_options_migrated = settings.migrate_toolbar_sort_size_options();
         let toolbar_sort_name_numeric_desc_options_migrated =
             settings.migrate_toolbar_sort_name_numeric_desc_options();
+        let toolbar_sort_rating_options_migrated = settings.migrate_toolbar_sort_rating_options();
         settings.sanitize();
         let legacy_keymap_ini_path = data_dir.join("keymap.ini");
         let legacy_keymap_import =
@@ -8673,6 +8735,7 @@ impl Settings {
             || ai_prefetch_forward_migrated
             || toolbar_sort_size_options_migrated
             || toolbar_sort_name_numeric_desc_options_migrated
+            || toolbar_sort_rating_options_migrated
             || legacy_keymap_import.changed
             || version_marker_changed;
         let bootstrap_saved = if bootstrap_save_needed {
@@ -9543,6 +9606,7 @@ impl Settings {
         self.toolbar_sort_size_options_migrated = src.toolbar_sort_size_options_migrated;
         self.toolbar_sort_name_numeric_desc_options_migrated =
             src.toolbar_sort_name_numeric_desc_options_migrated;
+        self.toolbar_sort_rating_options_migrated = src.toolbar_sort_rating_options_migrated;
         self.toolbar_facet_filter_items = std::mem::take(&mut src.toolbar_facet_filter_items);
         self.toolbar_facet_name_filter_index_stash =
             src.toolbar_facet_name_filter_index_stash.take();
@@ -9618,6 +9682,7 @@ impl Settings {
         // 最大化 flag は環境設定に出さない実行時状態。`startup_window_state` の方は
         // 利用者が編集する設定なので、ここで live 値へ巻き戻してはいけない。
         self.window_maximized = src.window_maximized;
+        self.always_on_top = src.always_on_top;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
         // お気に入り表示 overlay は runtime 状態。環境設定を開いている間に viewer context
@@ -9831,6 +9896,38 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn always_on_top_defaults_off_roundtrips_and_survives_preferences_merge() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!old.always_on_top);
+        assert_eq!(viewer_window_level(false), egui::WindowLevel::Normal);
+        assert_eq!(viewer_window_level(true), egui::WindowLevel::AlwaysOnTop);
+
+        let mut live = Settings {
+            always_on_top: true,
+            ..Settings::default()
+        };
+        let saved = serde_json::to_string(&live).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&saved)
+                .unwrap()
+                .always_on_top
+        );
+        let mut draft = Settings::default();
+        draft.overwrite_non_preferences_from(&mut live);
+        assert!(draft.always_on_top);
+
+        let mut previous =
+            egui::ViewportBuilder::default().with_window_level(viewer_window_level(false));
+        let (commands, _) = previous
+            .patch(egui::ViewportBuilder::default().with_window_level(viewer_window_level(true)));
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)
+        ));
+    }
 
     #[test]
     fn page_alone_key_action_writes_opposite_effective_value() {
@@ -15060,6 +15157,14 @@ mod tests {
             serde_json::to_string(&SortOrder::NumericDesc).unwrap(),
             "\"NumericDesc\""
         );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::RatingAsc).unwrap(),
+            "\"RatingAsc\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::RatingDesc).unwrap(),
+            "\"RatingDesc\""
+        );
     }
 
     #[test]
@@ -15213,7 +15318,7 @@ mod tests {
         );
         assert!(defaults.migrate_toolbar_sort_name_numeric_desc_options());
         defaults.sanitize();
-        assert_eq!(defaults.toolbar_sort_items, SortOrder::all());
+        assert_eq!(defaults.toolbar_sort_items, SortOrder::collection_options());
         assert!(defaults.toolbar_sort_size_options_migrated);
         assert!(defaults.toolbar_sort_name_numeric_desc_options_migrated);
         assert_eq!(defaults.folder_thumb_sort, SortOrder::FileName);
@@ -15273,7 +15378,46 @@ mod tests {
 
         let current = Settings::default();
         assert!(current.toolbar_sort_name_numeric_desc_options_migrated);
-        assert_eq!(current.toolbar_sort_items.len(), 8);
+        assert_eq!(current.toolbar_sort_items.len(), 10);
+    }
+
+    #[test]
+    fn rating_toolbar_migration_only_extends_untouched_eight_options_once() {
+        let canonical = SortOrder::collection_options().to_vec();
+        let mut old: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_sort_items": canonical
+        }))
+        .unwrap();
+        assert!(old.migrate_toolbar_sort_rating_options());
+        assert_eq!(old.toolbar_sort_items, SortOrder::all());
+        assert!(!old.migrate_toolbar_sort_rating_options());
+        old.toolbar_sort_items.retain(|sort| !sort.is_rating());
+        let mut later_hidden: Settings =
+            serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
+        assert!(!later_hidden.migrate_toolbar_sort_rating_options());
+        assert_eq!(
+            later_hidden.toolbar_sort_items,
+            SortOrder::collection_options()
+        );
+
+        for items in [
+            vec![],
+            vec![SortOrder::FileName],
+            canonical.iter().copied().rev().collect(),
+            canonical
+                .iter()
+                .copied()
+                .filter(|sort| *sort != SortOrder::DateAsc)
+                .collect(),
+        ] {
+            let mut custom: Settings = serde_json::from_value(serde_json::json!({
+                "toolbar_sort_items": items,
+            }))
+            .unwrap();
+            let before = custom.toolbar_sort_items.clone();
+            assert!(custom.migrate_toolbar_sort_rating_options());
+            assert_eq!(custom.toolbar_sort_items, before);
+        }
     }
 
     // -- CachePolicy --
@@ -15393,6 +15537,7 @@ mod tests {
         let mut previous_release = Settings::default();
         previous_release.toolbar_sort_items = canonical_six.clone();
         previous_release.toolbar_sort_name_numeric_desc_options_migrated = false;
+        previous_release.toolbar_sort_rating_options_migrated = false;
         previous_release.save();
 
         reset_backup_state_for_test();
@@ -15406,6 +15551,27 @@ mod tests {
         let reloaded = Settings::load();
         assert_eq!(reloaded.toolbar_sort_items, canonical_six);
         assert!(reloaded.toolbar_sort_name_numeric_desc_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_rating_options_marker_survives_settings_db_reload() {
+        let _env = setup_backup_env();
+        let mut old = Settings::default();
+        old.toolbar_sort_items = SortOrder::collection_options().to_vec();
+        old.toolbar_sort_rating_options_migrated = false;
+        old.save();
+
+        reset_backup_state_for_test();
+        let mut loaded = Settings::load();
+        assert_eq!(loaded.toolbar_sort_items, SortOrder::all());
+        assert!(loaded.toolbar_sort_rating_options_migrated);
+        loaded.toolbar_sort_items = SortOrder::collection_options().to_vec();
+        loaded.save();
+
+        reset_backup_state_for_test();
+        let hidden = Settings::load();
+        assert_eq!(hidden.toolbar_sort_items, SortOrder::collection_options());
+        assert!(hidden.toolbar_sort_rating_options_migrated);
     }
 
     #[test]

@@ -22,6 +22,15 @@ impl Default for RatingViewSort {
 }
 
 impl RatingViewSort {
+    pub(crate) fn normalized_for_rating_view(self) -> Self {
+        match self {
+            Self::Normal(order) if order.is_rating() => {
+                Self::Normal(crate::settings::SortOrder::FileName)
+            }
+            _ => self,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal(order) => order.label(),
@@ -80,12 +89,20 @@ pub(crate) struct RatingViewPreparedItems {
 
 pub(crate) struct RatingViewPrepareOptions {
     pub(crate) sort: RatingViewSort,
+    pub(crate) intent: RatingViewBuildIntent,
     pub(crate) display_order: crate::settings::GridDisplayOrder,
     pub(crate) pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
     pub(crate) folder_thumb_sort: crate::settings::SortOrder,
     pub(crate) folder_thumb_depth: u32,
     pub(crate) edits: crate::app::page_edit_snapshot::PageEditAvailability,
     pub(crate) tags_db_path: Option<PathBuf>,
+}
+
+/// A rating write changes membership without replacing the installed order.
+/// Explicit open, sort and reload requests instead establish a new order.
+pub(crate) enum RatingViewBuildIntent {
+    Reorder,
+    Membership { survivor_keys: Vec<String> },
 }
 
 pub struct RatingViewPending {
@@ -95,6 +112,7 @@ pub struct RatingViewPending {
     pub(crate) context: crate::app::ViewerContextId,
     pub rating_write_generation: u64,
     pub sort: RatingViewSort,
+    pub(crate) membership_only: bool,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<RatingViewBuildResult, String>>,
 }
@@ -115,6 +133,7 @@ pub(crate) fn spawn_rating_view_build(
     options: RatingViewPrepareOptions,
 ) -> RatingViewPending {
     let options_sort = options.sort;
+    let membership_only = matches!(options.intent, RatingViewBuildIntent::Membership { .. });
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
@@ -137,6 +156,7 @@ pub(crate) fn spawn_rating_view_build(
         context,
         rating_write_generation,
         sort: options_sort,
+        membership_only,
         cancel,
         rx,
     }
@@ -180,26 +200,28 @@ fn prepare_rating_view(
     cancel: &AtomicBool,
 ) -> Result<RatingViewBuildResult, String> {
     let rating_before = crate::rating_db::RATING_WRITES.sample();
-    if rating_before.active_writers != 0 {
-        return Err("rating read changed during rating prepare".into());
-    }
     let mut result = match build_rating_view_rows(db_path, stars, cancel) {
         Ok(result) => result,
-        Err(error) => {
-            if !crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(
-                rating_before,
-                crate::rating_db::RATING_WRITES.sample(),
-            ) {
-                return Err("rating read changed during rating prepare".into());
-            }
-            return Err(error.to_string());
-        }
+        Err(error) => return Err(error.to_string()),
     };
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
-    let (items, image_metas) =
-        sort_and_materialize_rows(&mut result.rows, options.sort, &options.display_order);
+    let (mut items, mut image_metas) = sort_and_materialize_rows(
+        &mut result.rows,
+        options.sort.normalized_for_rating_view(),
+        &options.display_order,
+    );
+    if let RatingViewBuildIntent::Membership { survivor_keys } = options.intent {
+        retain_rating_view_survivors_and_append_candidates(&mut result.rows, &survivor_keys);
+        (items, image_metas) = crate::grid_item::materialize_view_rows(
+            &mut result.rows,
+            &options.display_order,
+            false,
+            |row| &row.item,
+            |row| row.image_meta,
+        );
+    }
     let video_items = items
         .iter()
         .enumerate()
@@ -275,10 +297,7 @@ fn prepare_rating_view(
     if !crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(tag_before, tag_stamp) {
         return Err("tag read changed during rating prepare".into());
     }
-    let rating_stamp = crate::rating_db::RATING_WRITES.sample();
-    if !crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(rating_before, rating_stamp) {
-        return Err("rating read changed during rating prepare".into());
-    }
+    let rating_stamp = rating_before;
     result.prepared = Some(RatingViewPreparedItems {
         items,
         image_metas,
@@ -292,6 +311,28 @@ fn prepare_rating_view(
         tags_cache,
     });
     Ok(result)
+}
+
+fn retain_rating_view_survivors_and_append_candidates(
+    rows: &mut Vec<RatingViewRow>,
+    survivor_keys: &[String],
+) {
+    let candidates = std::mem::take(rows);
+    let mut by_key = candidates
+        .iter()
+        .cloned()
+        .map(|row| (row.key.clone(), row))
+        .collect::<std::collections::HashMap<_, _>>();
+    for key in survivor_keys {
+        if let Some(row) = by_key.remove(key) {
+            rows.push(row);
+        }
+    }
+    for candidate in candidates {
+        if let Some(row) = by_key.remove(&candidate.key) {
+            rows.push(row);
+        }
+    }
 }
 
 pub fn sort_rows(rows: &mut [RatingViewRow], sort: RatingViewSort) {
@@ -622,6 +663,72 @@ mod tests {
     use super::*;
     use crate::rating_db::{RatingItemKind, RatingRow};
     use std::io::Write;
+
+    #[test]
+    fn rating_view_normalizes_its_selected_rating_sort_only() {
+        let mut rows = vec![
+            RatingViewRow {
+                key: "b".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\rating\b.jpg")),
+                image_meta: Some((20, 1)),
+                rated_at_ms: Some(20),
+            },
+            RatingViewRow {
+                key: "a".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\rating\a.jpg")),
+                image_meta: Some((10, 1)),
+                rated_at_ms: Some(10),
+            },
+        ];
+        sort_rows(
+            &mut rows,
+            RatingViewSort::Normal(crate::settings::SortOrder::DateDesc)
+                .normalized_for_rating_view(),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        sort_rows(
+            &mut rows,
+            RatingViewSort::Normal(crate::settings::SortOrder::RatingDesc)
+                .normalized_for_rating_view(),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        sort_rows(
+            &mut rows,
+            RatingViewSort::RatedAtDesc.normalized_for_rating_view(),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+    }
+
+    #[test]
+    fn rating_membership_keeps_survivors_and_appends_newcomers() {
+        let make = |key: &str| RatingViewRow {
+            key: key.into(),
+            item: GridItem::Image(PathBuf::from(format!(r"C:\rating\{key}.jpg"))),
+            image_meta: None,
+            rated_at_ms: None,
+        };
+        let mut candidates = vec![make("a"), make("c"), make("d")];
+        retain_rating_view_survivors_and_append_candidates(
+            &mut candidates,
+            &["b".into(), "c".into(), "a".into()],
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|row| row.key.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "a", "d"]
+        );
+    }
 
     fn row(key: String, kind: Option<RatingItemKind>, source_path: Option<String>) -> RatingRow {
         RatingRow {

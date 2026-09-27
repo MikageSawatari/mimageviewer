@@ -271,6 +271,28 @@ fn snapshot_with_theme_at_size(
 }
 
 #[test]
+fn details_icons_light() {
+    snapshot_with_theme_at_size(
+        "details_icons_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 480.0),
+        Some(egui::pos2(28.0, 120.0)),
+        mimageviewer::draw_details_icons_snapshot_fixture,
+    );
+}
+
+#[test]
+fn details_icons_dark() {
+    snapshot_with_theme_at_size(
+        "details_icons_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(480.0, 480.0),
+        Some(egui::pos2(28.0, 120.0)),
+        mimageviewer::draw_details_icons_snapshot_fixture,
+    );
+}
+
+#[test]
 fn fullscreen_page_wait_indicator_dark() {
     snapshot_with_theme(
         "fullscreen_page_wait_indicator_dark",
