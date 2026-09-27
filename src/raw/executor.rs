@@ -1,6 +1,10 @@
+#[cfg(any(test, feature = "dev-tools"))]
 use super::raw_decoder::{
-    RawBrightness, RawCancellation, RawDevelopScale, RawError, RawMatchPreviewOutput,
-    RawOwnedSource, develop, develop_match_preview,
+    RawBenchBrightness, RawMatchPreviewOutput, develop_bench, develop_match_preview,
+};
+use super::raw_decoder::{
+    RawBrightness, RawCancellation, RawDevelopOutput, RawDevelopScale, RawError, RawOwnedSource,
+    develop,
 };
 use image::DynamicImage;
 use std::collections::{HashMap, VecDeque};
@@ -10,7 +14,11 @@ use std::time::{Duration, Instant};
 
 type RawResult = Result<DynamicImage, RawError>;
 type Work = Box<dyn FnOnce(&RawCancellation, &AtomicU8) -> RawResult + Send + 'static>;
+type ProductResult = Result<RawDevelopOutput, RawError>;
+type ProductWork = Box<dyn FnOnce(&RawCancellation, &AtomicU8) -> ProductResult + Send + 'static>;
+#[cfg(any(test, feature = "dev-tools"))]
 type MatchResult = Result<RawMatchPreviewOutput, RawError>;
+#[cfg(any(test, feature = "dev-tools"))]
 type MatchWork = Box<dyn FnOnce(&RawCancellation, &AtomicU8) -> MatchResult + Send + 'static>;
 
 enum JobAction {
@@ -18,6 +26,11 @@ enum JobAction {
         result: mpsc::Sender<RawResult>,
         work: Work,
     },
+    Product {
+        result: mpsc::Sender<ProductResult>,
+        work: ProductWork,
+    },
+    #[cfg(any(test, feature = "dev-tools"))]
     Match {
         result: mpsc::Sender<MatchResult>,
         work: MatchWork,
@@ -26,6 +39,8 @@ enum JobAction {
 
 enum Completion {
     Image(mpsc::Sender<RawResult>, RawResult),
+    Product(mpsc::Sender<ProductResult>, ProductResult),
+    #[cfg(any(test, feature = "dev-tools"))]
     Match(mpsc::Sender<MatchResult>, MatchResult),
 }
 
@@ -35,6 +50,10 @@ impl JobAction {
             Self::Image { result, .. } => {
                 let _ = result.send(Err(RawError::Cancelled));
             }
+            Self::Product { result, .. } => {
+                let _ = result.send(Err(RawError::Cancelled));
+            }
+            #[cfg(any(test, feature = "dev-tools"))]
             Self::Match { result, .. } => {
                 let _ = result.send(Err(RawError::Cancelled));
             }
@@ -44,6 +63,8 @@ impl JobAction {
     fn run(self, cancel: &RawCancellation, progress: &AtomicU8) -> Completion {
         match self {
             Self::Image { result, work } => Completion::Image(result, work(cancel, progress)),
+            Self::Product { result, work } => Completion::Product(result, work(cancel, progress)),
+            #[cfg(any(test, feature = "dev-tools"))]
             Self::Match { result, work } => Completion::Match(result, work(cancel, progress)),
         }
     }
@@ -59,6 +80,14 @@ impl Completion {
                     result
                 });
             }
+            Self::Product(sender, result) => {
+                let _ = sender.send(if cancelled {
+                    Err(RawError::Cancelled)
+                } else {
+                    result
+                });
+            }
+            #[cfg(any(test, feature = "dev-tools"))]
             Self::Match(sender, result) => {
                 let _ = sender.send(if cancelled {
                     Err(RawError::Cancelled)
@@ -366,17 +395,38 @@ impl RawDevelopExecutor {
         scale: RawDevelopScale,
         brightness: RawBrightness,
         priority: RawPriority,
+        result: mpsc::Sender<ProductResult>,
+    ) -> RawTicket {
+        self.submit_action(
+            priority,
+            JobAction::Product {
+                result,
+                work: Box::new(move |cancel, progress| {
+                    develop(source.as_source(), scale, brightness, cancel, progress)
+                }),
+            },
+        )
+    }
+
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn submit_bench(
+        &self,
+        source: RawOwnedSource,
+        scale: RawDevelopScale,
+        brightness: RawBenchBrightness,
+        priority: RawPriority,
         result: mpsc::Sender<RawResult>,
     ) -> RawTicket {
         self.submit_work(
             priority,
             result,
             Box::new(move |cancel, progress| {
-                develop(source.as_source(), scale, brightness, cancel, progress)
+                develop_bench(source.as_source(), scale, brightness, cancel, progress)
             }),
         )
     }
 
+    #[cfg(any(test, feature = "dev-tools"))]
     pub fn submit_match_preview(
         &self,
         source: RawOwnedSource,
@@ -402,6 +452,7 @@ impl RawDevelopExecutor {
         )
     }
 
+    #[cfg(any(test, feature = "dev-tools"))]
     fn submit_work(
         &self,
         priority: RawPriority,

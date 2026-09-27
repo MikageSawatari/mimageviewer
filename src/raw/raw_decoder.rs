@@ -45,13 +45,33 @@ pub enum RawDevelopScale {
     Half,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RawBrightness {
-    Auto001,
-    Auto0001,
+    #[default]
+    MatchPreview,
     None,
 }
 
+#[cfg(any(test, feature = "dev-tools"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawBenchBrightness {
+    Auto001,
+    Auto0001,
+}
+
+#[derive(Debug)]
+pub struct RawDevelopOutput {
+    pub image: DynamicImage,
+    pub brightness: AppliedBrightness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AppliedBrightness {
+    Match(super::brightness::MatchDecision),
+    None,
+}
+
+#[cfg(any(test, feature = "dev-tools"))]
 pub struct RawMatchPreviewOutput {
     pub no_auto: DynamicImage,
     pub matched: DynamicImage,
@@ -59,13 +79,13 @@ pub struct RawMatchPreviewOutput {
     pub developed_median: Option<f64>,
 }
 
-impl RawBrightness {
+#[cfg(any(test, feature = "dev-tools"))]
+impl RawBenchBrightness {
     #[cfg(windows)]
     fn code(self) -> i32 {
         match self {
             Self::Auto001 => 0,
             Self::Auto0001 => 1,
-            Self::None => 2,
         }
     }
 }
@@ -313,7 +333,7 @@ mod windows {
         length: usize,
     }
 
-    fn jpeg_preview_layout(bytes: &[u8]) -> Result<JpegLayout, RawError> {
+    fn jpeg_preview_layout(bytes: &[u8], statistic: bool) -> Result<JpegLayout, RawError> {
         let header = turbojpeg::read_header(bytes)
             .map_err(|_| RawError::Corrupt("Invalid preview JPEG header".into()))?;
         if header.width == 0
@@ -335,6 +355,9 @@ mod windows {
             .into_iter()
             .find(|factor| {
                 (!header.is_lossless || *factor == turbojpeg::ScalingFactor::ONE)
+                    && (!statistic
+                        || *factor == turbojpeg::ScalingFactor::ONE_EIGHTH
+                        || header.is_lossless)
                     && factor.scale(header.width.max(header.height)) <= MAX_PREVIEW_EDGE as usize
             })
             .unwrap_or(turbojpeg::ScalingFactor::ONE);
@@ -467,6 +490,10 @@ mod windows {
     }
 
     pub fn preview(source: RawSource<'_>) -> Result<RawPreview, RawError> {
+        preview_impl(source, false)
+    }
+
+    fn preview_impl(source: RawSource<'_>, statistic: bool) -> Result<RawPreview, RawError> {
         let raw_info = info(source)?;
         let mut candidates = raw_info.previews;
         let had_candidate = !candidates.is_empty();
@@ -491,7 +518,7 @@ mod windows {
             };
             let image = match meta.format {
                 RawPreviewFormat::Jpeg => {
-                    let layout = match jpeg_preview_layout(&bytes) {
+                    let layout = match jpeg_preview_layout(&bytes, statistic) {
                         Ok(layout) => layout,
                         Err(RawError::TooLarge) => {
                             rejected_too_large = true;
@@ -554,8 +581,9 @@ mod windows {
                 }
             };
             if let Some(image) = image {
-                let image = if image.width().max(image.height()) > MAX_PREVIEW_EDGE {
-                    image.thumbnail(MAX_PREVIEW_EDGE, MAX_PREVIEW_EDGE)
+                let edge = if statistic { 1024 } else { MAX_PREVIEW_EDGE };
+                let image = if image.width().max(image.height()) > edge {
+                    image.thumbnail(edge, edge)
                 } else {
                     image
                 };
@@ -564,7 +592,14 @@ mod windows {
                     .filter(|&flip| flip != 0)
                     .unwrap_or(raw_info.flip);
                 let image = orient(image, flip)?;
-                if orientation_mismatch([image.width(), image.height()], raw_info.developed_dims) {
+                // DCT scaling can round near-square edges differently; classify the
+                // source preview in its oriented, unscaled dimensions.
+                let oriented_dims = if flip & 4 != 0 {
+                    [meta.dims[1], meta.dims[0]]
+                } else {
+                    meta.dims
+                };
+                if orientation_mismatch(oriented_dims, raw_info.developed_dims) {
                     orientation_mismatched = true;
                     continue;
                 }
@@ -618,7 +653,7 @@ mod windows {
     fn process(
         handle: &Handle<'_>,
         scale: RawDevelopScale,
-        brightness: RawBrightness,
+        bright_mode: i32,
         cancel: &RawCancellation,
         progress: &AtomicU8,
     ) -> Result<(), RawError> {
@@ -627,7 +662,7 @@ mod windows {
             ffi::miv_raw_develop(
                 handle.raw,
                 i32::from(scale == RawDevelopScale::Half),
-                brightness.code(),
+                bright_mode,
                 Some(on_progress),
                 (&callback_state as *const CallbackState<'_>)
                     .cast_mut()
@@ -700,19 +735,75 @@ mod windows {
         brightness: RawBrightness,
         cancel: &RawCancellation,
         progress: &AtomicU8,
+    ) -> Result<RawDevelopOutput, RawError> {
+        if cancel.flag.load(Ordering::Acquire) {
+            return Err(RawError::Cancelled);
+        }
+        let preview_median = if brightness == RawBrightness::MatchPreview {
+            match preview_impl(source, true) {
+                Ok(preview) => crate::raw::brightness::median_linear_luma(&preview.image),
+                Err(RawError::OutOfMemory) => return Err(RawError::OutOfMemory),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if cancel.flag.load(Ordering::Acquire) {
+            return Err(RawError::Cancelled);
+        }
+        let handle = Handle::open(source)?;
+        let _binding = cancel.bind(handle.raw);
+        process(&handle, scale, 2, cancel, progress)?;
+        let (width, height, length) = dimensions(&handle)?;
+        let (image, applied) = match brightness {
+            RawBrightness::None => (
+                copy_image(&handle, width, height, length, None, cancel)?,
+                AppliedBrightness::None,
+            ),
+            RawBrightness::MatchPreview => {
+                let first = copy_image(&handle, width, height, length, None, cancel)?;
+                let developed_median = crate::raw::brightness::median_linear_luma(&first);
+                // The product job owns at most one developed RGB buffer at a time.
+                drop(first);
+                let decision = crate::raw::brightness::match_gain(preview_median, developed_median);
+                let adjusted = match decision {
+                    crate::raw::brightness::MatchDecision::Gain { gain, .. } => (3, gain as f32),
+                    crate::raw::brightness::MatchDecision::Fallback(_) => (1, 1.0),
+                };
+                (
+                    copy_image(&handle, width, height, length, Some(adjusted), cancel)?,
+                    AppliedBrightness::Match(decision),
+                )
+            }
+        };
+        progress.store(100, Ordering::Release);
+        Ok(RawDevelopOutput {
+            image,
+            brightness: applied,
+        })
+    }
+
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(in crate::raw) fn develop_bench(
+        source: RawSource<'_>,
+        scale: RawDevelopScale,
+        brightness: RawBenchBrightness,
+        cancel: &RawCancellation,
+        progress: &AtomicU8,
     ) -> Result<DynamicImage, RawError> {
         if cancel.flag.load(Ordering::Acquire) {
             return Err(RawError::Cancelled);
         }
         let handle = Handle::open(source)?;
         let _binding = cancel.bind(handle.raw);
-        process(&handle, scale, brightness, cancel, progress)?;
+        process(&handle, scale, brightness.code(), cancel, progress)?;
         let (width, height, length) = dimensions(&handle)?;
         let image = copy_image(&handle, width, height, length, None, cancel)?;
         progress.store(100, Ordering::Release);
         Ok(image)
     }
 
+    #[cfg(any(test, feature = "dev-tools"))]
     pub(in crate::raw) fn develop_match_preview(
         source: RawSource<'_>,
         scale: RawDevelopScale,
@@ -725,7 +816,7 @@ mod windows {
         }
         let handle = Handle::open(source)?;
         let _binding = cancel.bind(handle.raw);
-        process(&handle, scale, RawBrightness::None, cancel, progress)?;
+        process(&handle, scale, 2, cancel, progress)?;
         let (width, height, length) = dimensions(&handle)?;
         let no_auto = copy_image(&handle, width, height, length, None, cancel)?;
         let developed_median = crate::raw::brightness::median_linear_luma(&no_auto);
@@ -792,7 +883,7 @@ mod windows {
             .expect("sample JPEG has a baseline or progressive SOF");
         jpeg[sof + 5..sof + 9].copy_from_slice(&[0x7f, 0xff, 0x7f, 0xff]);
         // 32,767 x 32,767 must not allocate a full decoded image.
-        let layout = jpeg_preview_layout(&jpeg).unwrap();
+        let layout = jpeg_preview_layout(&jpeg, false).unwrap();
         assert_eq!(layout.scale, turbojpeg::ScalingFactor::ONE_QUARTER);
         assert_eq!((layout.width, layout.height), (8192, 8192));
         assert!(layout.length <= MAX_PREVIEW_BYTES);
@@ -801,7 +892,9 @@ mod windows {
 
 #[cfg(windows)]
 pub(in crate::raw) use windows::develop;
-#[cfg(windows)]
+#[cfg(all(windows, any(test, feature = "dev-tools")))]
+pub(in crate::raw) use windows::develop_bench;
+#[cfg(all(windows, any(test, feature = "dev-tools")))]
 pub(in crate::raw) use windows::develop_match_preview;
 #[cfg(windows)]
 pub use windows::{info, preview};
@@ -823,11 +916,22 @@ pub(in crate::raw) fn develop(
     _brightness: RawBrightness,
     _cancel: &RawCancellation,
     _progress: &AtomicU8,
+) -> Result<RawDevelopOutput, RawError> {
+    Err(RawError::Unsupported(RawUnsupportedReason::Platform))
+}
+
+#[cfg(all(not(windows), any(test, feature = "dev-tools")))]
+pub(in crate::raw) fn develop_bench(
+    _source: RawSource<'_>,
+    _scale: RawDevelopScale,
+    _brightness: RawBenchBrightness,
+    _cancel: &RawCancellation,
+    _progress: &AtomicU8,
 ) -> Result<DynamicImage, RawError> {
     Err(RawError::Unsupported(RawUnsupportedReason::Platform))
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), any(test, feature = "dev-tools")))]
 pub(in crate::raw) fn develop_match_preview(
     _source: RawSource<'_>,
     _scale: RawDevelopScale,

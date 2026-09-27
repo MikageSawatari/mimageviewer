@@ -2,7 +2,7 @@
 use image::{DynamicImage, GenericImage, GenericImageView, RgbaImage};
 use mimageviewer::raw::brightness::{MatchDecision, median_linear_luma};
 use mimageviewer::raw::raw_decoder::{
-    self, RawBrightness, RawDevelopScale, RawDevelopSupport, RawOwnedSource, RawSource,
+    self, RawBenchBrightness, RawDevelopScale, RawDevelopSupport, RawOwnedSource, RawSource,
 };
 use mimageviewer::raw::{RawDevelopExecutor, RawPriority};
 use serde_json::{Value, json};
@@ -14,11 +14,11 @@ fn develop(
     executor: &RawDevelopExecutor,
     path: &Path,
     scale: RawDevelopScale,
-    brightness: RawBrightness,
+    brightness: RawBenchBrightness,
 ) -> Result<(DynamicImage, f64), String> {
     let (sender, receiver) = mpsc::channel();
     let start = Instant::now();
-    let _ticket = executor.submit(
+    let _ticket = executor.submit_bench(
         RawOwnedSource::Path(path.to_path_buf()),
         scale,
         brightness,
@@ -55,10 +55,10 @@ fn develop_match_preview(
 
 fn cancel_latency(executor: &RawDevelopExecutor, path: &Path) -> Option<f64> {
     let (sender, receiver) = mpsc::channel();
-    let ticket = executor.submit(
+    let ticket = executor.submit_bench(
         RawOwnedSource::Path(path.to_path_buf()),
         RawDevelopScale::Full,
-        RawBrightness::Auto001,
+        RawBenchBrightness::Auto001,
         RawPriority::High,
         sender,
     );
@@ -145,7 +145,7 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         executor,
         &path,
         RawDevelopScale::Full,
-        RawBrightness::Auto001,
+        RawBenchBrightness::Auto001,
     ) {
         Ok(value) => value,
         Err(error) => {
@@ -156,7 +156,7 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         executor,
         &path,
         RawDevelopScale::Half,
-        RawBrightness::Auto001,
+        RawBenchBrightness::Auto001,
     ) {
         Ok(value) => value,
         Err(error) => return json!({"id":id,"error":error,"full_ms":full_ms}),
@@ -165,7 +165,7 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         executor,
         &path,
         RawDevelopScale::Full,
-        RawBrightness::Auto0001,
+        RawBenchBrightness::Auto0001,
     ) {
         Ok(value) => value,
         Err(error) => return json!({"id":id,"error":error,"full_ms":full_ms}),

@@ -3,6 +3,17 @@
 This document records the S1 vendor setup, isolated decoder and executor, and
 sample measurements. Product loading paths and UI were not changed.
 
+## Decision
+
+On 2026-09-27, the user chose **match the embedded preview** as the product
+brightness default, with a setting to choose **none**. The product `develop`
+API now measures a cheaply decoded usable preview, develops once without
+auto-bright, measures its first RGB copy, drops that copy, and re-copies from
+the same LibRaw process with the clamped linear-light gain. It returns the
+applied gain, clamp state, or fallback reason with the image. If no usable
+preview or either median is zero/invalid, it falls back to LibRaw auto-bright
+threshold 0.001. The setting and UI connection belong to S3.
+
 ## Codec and build decisions
 
 LibRaw 0.22.2 is built from its `Makefile.msvc` `LIB_OBJECTS` source list. The
@@ -100,8 +111,8 @@ medians. Gain is clamped to [0.125, 8]. LibRaw's `copy_mem_image` computes
 `r = linear_input / imax`, so `bright` multiplies linear input before the sRGB
 curve. The shim updates `bright` after `dcraw_process` and copies again;
 demosaicing is not repeated. An unusable preview or zero/invalid median falls
-back to auto-bright threshold 0.001. These are measurement rules only;
-product brightness defaults are unchanged.
+back to auto-bright threshold 0.001. Auto 0.01 and auto 0.001 remain
+benchmark-only standalone choices; the latter is an internal product fallback.
 
 The first four ΔL columns compare sampled **mean sRGB-encoded** luminance to
 the preview, preserving the earlier benchmark's visual screening measure.

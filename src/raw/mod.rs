@@ -4,8 +4,9 @@ pub mod raw_decoder;
 
 pub use executor::{RawDevelopExecutor, RawPriority, RawTicket};
 pub use raw_decoder::{
-    RawBrightness, RawDevelopScale, RawDevelopSupport, RawError, RawInfo, RawOwnedSource,
-    RawPreview, RawPreviewInfo, RawPreviewUnavailableReason, RawSource, RawUnsupportedReason,
+    AppliedBrightness, RawBrightness, RawDevelopOutput, RawDevelopScale, RawDevelopSupport,
+    RawError, RawInfo, RawOwnedSource, RawPreview, RawPreviewInfo, RawPreviewUnavailableReason,
+    RawSource, RawUnsupportedReason,
 };
 
 #[cfg(test)]
@@ -39,10 +40,10 @@ mod tests {
             brightness::MatchDecision::Fallback(brightness::MatchFallback::NoPreview)
         );
         let (auto_sender, auto_receiver) = mpsc::channel();
-        let _ticket = executor.submit(
+        let _ticket = executor.submit_bench(
             RawOwnedSource::Path(path),
             RawDevelopScale::Full,
-            RawBrightness::Auto0001,
+            raw_decoder::RawBenchBrightness::Auto0001,
             RawPriority::High,
             auto_sender,
         );
@@ -51,6 +52,67 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(output.matched.as_bytes(), auto.as_bytes());
+    }
+
+    #[test]
+    fn product_brightness_has_only_the_selected_choices() {
+        assert_eq!(RawBrightness::default(), RawBrightness::MatchPreview);
+        let describe = |choice| match choice {
+            RawBrightness::MatchPreview => "match preview",
+            RawBrightness::None => "none",
+        };
+        assert_eq!(describe(RawBrightness::None), "none");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn product_match_preview_and_none_develop() {
+        let executor = RawDevelopExecutor::new(1).unwrap();
+        for file in ["1018.cr2", "3502.dng", "1386.nef"] {
+            let path = PathBuf::from("vendor/raw-samples").join(file);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let info = raw_decoder::info(RawSource::Path(&path)).unwrap();
+            let (send, receive) = mpsc::channel();
+            let _ticket = executor.submit(
+                RawOwnedSource::Path(path),
+                RawDevelopScale::Full,
+                RawBrightness::MatchPreview,
+                RawPriority::High,
+                send,
+            );
+            let output = receive
+                .recv_timeout(Duration::from_secs(180))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                [output.image.width(), output.image.height()],
+                info.developed_dims
+            );
+            assert!(
+                matches!(
+                    output.brightness,
+                    AppliedBrightness::Match(brightness::MatchDecision::Gain { .. })
+                ),
+                "{file}: {:?}",
+                output.brightness
+            );
+        }
+
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        let (send, receive) = mpsc::channel();
+        let _ticket = executor.submit(
+            RawOwnedSource::Path(path),
+            RawDevelopScale::Half,
+            RawBrightness::None,
+            RawPriority::High,
+            send,
+        );
+        let output = receive
+            .recv_timeout(Duration::from_secs(180))
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.brightness, AppliedBrightness::None);
+        assert!(output.image.width() > 0 && output.image.height() > 0);
     }
 
     #[cfg(windows)]
@@ -144,7 +206,7 @@ mod tests {
                 let _ticket = executor.submit(
                     RawOwnedSource::Path(path.clone()),
                     RawDevelopScale::Full,
-                    RawBrightness::Auto001,
+                    RawBrightness::None,
                     RawPriority::High,
                     send,
                 );
@@ -163,7 +225,7 @@ mod tests {
             let _ticket = executor.submit(
                 RawOwnedSource::Path(path.clone()),
                 RawDevelopScale::Full,
-                RawBrightness::Auto001,
+                RawBrightness::None,
                 RawPriority::High,
                 send,
             );
@@ -172,7 +234,7 @@ mod tests {
                 .unwrap()
                 .unwrap_or_else(|error| panic!("{} develop: {error}", path.display()));
             assert_eq!(
-                [image.width(), image.height()],
+                [image.image.width(), image.image.height()],
                 info.developed_dims,
                 "{} developed dimensions",
                 path.display()
@@ -207,7 +269,7 @@ mod tests {
         let ticket = executor.submit(
             RawOwnedSource::Path(path),
             RawDevelopScale::Full,
-            RawBrightness::Auto001,
+            RawBrightness::None,
             RawPriority::High,
             send,
         );
