@@ -5,6 +5,8 @@
   - 第2版 `ce97951ac` → 同セッションで再レビュー (P1×3 / P2×3 / P3×1、全件採用)。対応表は §19
   - 再レビューの判定: **S1 (LibRaw 単体のビルドと decoder) は着手してよい**。fullscreen と executor の
     指摘は S2 / S3 の統合前に直すこと、Remote は予定どおり別途 admission のレビューを受けること
+- **S1 完了 (2026-09-27、`3d00650a0`)**: 独立レビュー (GPT-6 Sol / xhigh、実装者とは別セッション) が受け入れ判定。
+  実測と判断の記録は [raw-libraw-s1-results.md](raw-libraw-s1-results.md)。ubuntu CI は push 時に確認する
 - 作業場所: worktree `C:\home\mimageviewer-raw` / branch `raw-libraw` (master `edbac5f37` から分岐)
 - 引き継ぎ元: [raw-libraw-handoff.md](raw-libraw-handoff.md)。本書が完成したら handoff の内容は本書へ吸収済みとして削除してよい
 - 実装: Codex GPT-6 Sol / xhigh に段ごとに委任。独立レビュー: 実装者とは別の GPT-6 Sol / xhigh
