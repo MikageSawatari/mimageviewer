@@ -1341,6 +1341,7 @@ impl ThumbnailClient {
         owner: &RemoteSessionIdentity,
         address: RemoteAddress,
         quality: VideoStreamQuality,
+        audio_track: Option<usize>,
     ) -> Result<IpcSuccess<VideoStreamStartPayload>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamStart {
@@ -1348,6 +1349,7 @@ impl ThumbnailClient {
                 owner: owner.clone(),
                 address: address.clone(),
                 quality,
+                audio_track,
             },
             |message| match message {
                 ServerMessage::VideoStreamStart { response, .. } => Some(response),
@@ -2536,6 +2538,7 @@ mod tests {
             owner: test_owner(),
             address: RemoteAddress::file("C:/Movies/movie.mp4"),
             quality: VideoStreamQuality::Standard,
+            audio_track: None,
         };
         assert_eq!(
             response_timeout_for(&request),

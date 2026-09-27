@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { CommandName } from "./command-core.mjs";
 
 import {
   IOS_VOLUME_NOTICE,
@@ -122,6 +123,7 @@ test("video start ends a busy attempt visibly instead of retrying forever", asyn
   const notices = [];
   const failures = [];
   let startRequests = 0;
+  let startBody;
   const busy = Object.assign(new Error("busy"), {
     status: 503,
     code: "stream_busy",
@@ -136,8 +138,9 @@ test("video start ends a busy attempt visibly instead of retrying forever", asyn
     clearHealthTelemetry: () => {},
     rememberPlaybackError: () => {},
     showNotice: (...args) => notices.push(args),
-    apiPostJson: async () => {
+    apiPostJson: async (_path, body) => {
       startRequests += 1;
+      startBody = body;
       throw busy;
     },
     requestWithWaiting: () => {
@@ -149,11 +152,262 @@ test("video start ends a busy attempt visibly instead of retrying forever", asyn
     },
   };
 
-  await VideoStreamViewer.prototype.start.call(viewer);
+  await VideoStreamViewer.prototype.start.call(viewer, null, true, 2);
 
   assert.equal(startRequests, 1);
+  assert.deepEqual(startBody, { quality: "standard", audio_track: 2 });
   assert.deepEqual(notices, [["動画を準備しています。", "waiting"]]);
   assert.deepEqual(failures, [busy]);
+});
+
+test("audio track menu command uses core labels and selected server state", () => {
+  const tracks = [
+    { stream_index: 1, label: "1: 日本語 — aac 2ch", is_default: false },
+    { stream_index: 2, label: "2: English — ac3 6ch (既定)", is_default: true },
+  ];
+  const menu = { mediaState: () => ({ audioTracks: tracks, audioTrack: 2, hasVideo: true }) };
+  const actions = VideoStreamMenu.prototype.definition.call(menu, "controls").actions;
+  assert.deepEqual(actions.filter(([name]) => name === CommandName.MEDIA_AUDIO_TRACK), [
+    [CommandName.MEDIA_AUDIO_TRACK, tracks[0].label, "音声トラック", { streamIndex: 1 }],
+    [CommandName.MEDIA_AUDIO_TRACK, tracks[1].label, "音声トラック", { streamIndex: 2 }],
+  ]);
+  menu.mediaState = () => ({ audioTracks: tracks.slice(0, 1), audioTrack: 1 });
+  assert.equal(VideoStreamMenu.prototype.definition.call(menu, "controls").actions
+    .some(([name]) => name === CommandName.MEDIA_AUDIO_TRACK), false);
+  const button = () => ({
+    selected: false,
+    classList: { toggle(name, value) { if (name === "is-current") this.owner.selected = value; } },
+    setAttribute(name, value) { if (name === "aria-pressed") this.pressed = value; },
+  });
+  const first = button();
+  const second = button();
+  first.classList.owner = first;
+  second.classList.owner = second;
+  VideoStreamMenu.prototype.setMediaState.call({
+    qualityButtons: new Map(), audioTrackButtons: new Map([[1, first], [2, second]]),
+  }, { audioTrack: 2 });
+  assert.equal(first.selected, false);
+  assert.equal(second.selected, true);
+  assert.equal(second.pressed, "true");
+  const routed = [];
+  assert.equal(VideoStreamViewer.prototype.execute.call({
+    setAudioTrack: async (index) => { routed.push(index); },
+    hasVideo: true,
+  }, { name: CommandName.MEDIA_AUDIO_TRACK, payload: { streamIndex: 2 } }), true);
+  assert.deepEqual(routed, [2]);
+});
+
+test("an open controls page rebuilds track rows when start or state supplies a new list", () => {
+  class FakeElement {
+    constructor(tag) {
+      this.tagName = tag.toUpperCase();
+      this.children = [];
+      this.classList = { toggle() {} };
+    }
+    setAttribute() {}
+    addEventListener() {}
+    append(...nodes) { this.children.push(...nodes); }
+    replaceChildren(...nodes) { this.children = [...nodes]; }
+    get firstElementChild() { return this.children[0] ?? null; }
+    get lastElementChild() { return this.children.at(-1) ?? null; }
+  }
+  const previousDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => new FakeElement(tag) };
+  try {
+    let tracks = [];
+    const menu = Object.create(VideoStreamMenu.prototype);
+    menu.mediaState = () => ({ audioTracks: tracks, audioTrack: 2, hasVideo: true, volume: 1 });
+    menu.setSelectedTab = () => {};
+    menu.tabButtons = new Map();
+    menu.functionsPanel = new FakeElement("section");
+    menu.jumpPanel = new FakeElement("section");
+    menu.title = new FakeElement("h2");
+    menu.panel = new FakeElement("section");
+    menu.actions = new FakeElement("div");
+    menu.shortcuts = new FakeElement("dl");
+    menu.shortcutTitle = new FakeElement("h3");
+    menu.keyboardAvailable = true;
+    menu.send = () => {};
+    menu.close = () => {};
+    menu.showPage("controls");
+    assert.equal(menu.audioTrackButtons.size, 0);
+
+    tracks = [
+      { stream_index: 1, label: "日本語" },
+      { stream_index: 2, label: "English" },
+    ];
+    menu.setMediaState(menu.mediaState());
+    assert.equal(menu.audioTrackButtons.size, 2);
+    assert.equal(menu.audioTrackButtons.get(2).firstElementChild.textContent, "English");
+    tracks = [{ stream_index: 1, label: "日本語 (更新)" }, tracks[1]];
+    menu.setMediaState(menu.mediaState());
+    assert.equal(menu.audioTrackButtons.get(1).firstElementChild.textContent, "日本語 (更新)");
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("start response immediately updates the open controls page state", async () => {
+  let shown;
+  const tracks = [{ stream_index: 0, label: "日本語" }, { stream_index: 2, label: "English" }];
+  const viewer = {
+    destroyed: false, hasVideo: true, quality: "standard", volume: 1,
+    address: { path: "C:/movie.m4a" }, abortController: { signal: null },
+    clearPoll() {}, clearHealthTelemetry() {}, showNotice() {},
+    transitionPlaybackControl() {}, updateAudioProcessing() {}, updateDiagnostics() {},
+    seekInput: {}, menuState() { return VideoStreamViewer.prototype.menuState.call(this); },
+    video: { paused: true },
+    menu: { setSession() {}, setMediaState(state) { shown = state; } },
+    apiPostJson: async () => ({ session: 12, generation: 1, playlist: "/stream/12/1",
+      audio_tracks: tracks, audio_track: 2, duration_secs: 30, buffer_target_secs: 6 }),
+    switchGeneration: async () => false,
+  };
+  await VideoStreamViewer.prototype.start.call(viewer);
+  assert.deepEqual(shown.audioTracks, tracks);
+  assert.equal(shown.audioTrack, 2);
+});
+
+test("audio track command sends generation and ignores older success and 409 replies", async () => {
+  const requests = [];
+  const pending = [];
+  const viewer = {
+    session: 11, generation: 4, destroyed: false, audioTrack: 0,
+    audioTracks: [{ stream_index: 0 }, { stream_index: 1 }, { stream_index: 2 }],
+    audioTrackOperation: 0, abortController: { signal: null }, playRequested: true,
+    currentPosition: () => 25.5, showNotice: () => {},
+    apiPostJson: (path, body) => {
+      requests.push([path, body]);
+      return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+    },
+    refreshGeneration: async () => { viewer.refreshed = (viewer.refreshed ?? 0) + 1; },
+    restartAt: async () => { viewer.restarted = true; },
+  };
+  const first = VideoStreamViewer.prototype.setAudioTrack.call(viewer, 1);
+  const second = VideoStreamViewer.prototype.setAudioTrack.call(viewer, 2);
+  assert.deepEqual(requests[1], ["/api/video/control", {
+    session: 11, action: "audio_track", stream_index: 2,
+    position_secs: 25.5, expected_generation: 4,
+  }]);
+  pending[0].reject(Object.assign(new Error("stale"), { status: 409 }));
+  await first;
+  assert.equal(viewer.restarted, undefined);
+  pending[1].resolve({});
+  await second;
+  assert.equal(viewer.refreshed, 1);
+  const third = VideoStreamViewer.prototype.setAudioTrack.call(viewer, 1);
+  const fourth = VideoStreamViewer.prototype.setAudioTrack.call(viewer, 2);
+  pending[2].resolve({});
+  await third;
+  assert.equal(viewer.refreshed, 1);
+  pending[3].resolve({});
+  await fourth;
+  assert.equal(viewer.refreshed, 2);
+});
+
+test("server state owns displayed remote audio track after switching", () => {
+  let menuState;
+  const viewer = {
+    hasVideo: true, generation: 1, duration: 20, bufferTargetSecs: 10,
+    volume: 1, video: {}, encoder: "", codecs: "", playRequested: true,
+    seekInput: {}, timelineAnchorGeneration: 1,
+    audioTrack: 0, audioTracks: [],
+    setHasVideo: () => {}, updateAudioProcessing: () => {},
+    transitionPlaybackControl: () => {}, syncHealthTelemetry: () => {},
+    updateProgress: () => {}, updateDiagnostics: () => {},
+    menuState() { return VideoStreamViewer.prototype.menuState.call(this); },
+    menu: { setMediaState(state) { menuState = state; } },
+  };
+  const tracks = [{ stream_index: 0, label: "1" }, { stream_index: 2, label: "2" }];
+  VideoStreamViewer.prototype.applyServerState.call(viewer, {
+    session: 11, generation: 2, has_video: true, duration_secs: 20,
+    buffer_target_secs: 10, volume: 1, play_intent: true,
+    source_origin_secs: 0, audio_tracks: tracks, audio_track: 2,
+  });
+  assert.equal(viewer.audioTrack, 2);
+  assert.deepEqual(menuState.audioTracks, tracks);
+  assert.equal(menuState.audioTrack, 2);
+});
+
+test("current audio track 409 restarts with selected stream in start body", async () => {
+  const requests = [];
+  const viewer = {
+    session: 11, generation: 4, destroyed: false, audioTrack: 0,
+    audioTracks: [{ stream_index: 0 }, { stream_index: 1 }],
+    audioTrackOperation: 0, abortController: { signal: null }, playRequested: false,
+    currentPosition: () => 36, showNotice: () => {},
+    apiPostJson: async (path, body) => {
+      requests.push([path, body]);
+      throw Object.assign(new Error("mismatch"), { status: 409 });
+    },
+    restartAt: async (...args) => { viewer.restartArgs = args; },
+  };
+  await VideoStreamViewer.prototype.setAudioTrack.call(viewer, 1);
+  assert.deepEqual(viewer.restartArgs, [36, false, 1]);
+  assert.equal(requests[0][1].expected_generation, 4);
+});
+
+test("a later track click survives a delayed 409 restart response", async () => {
+  const controls = [];
+  let releaseStart;
+  const startResponse = new Promise((resolve) => { releaseStart = resolve; });
+  const viewer = {
+    session: 11, generation: 4, destroyed: false,
+    audioTracks: [{ stream_index: 0 }, { stream_index: 1 }, { stream_index: 2 }],
+    audioTrackOperation: 0, restartRequest: null,
+    abortController: { signal: null }, playRequested: true,
+    currentPosition: () => 23, showNotice() {}, clearPoll() {}, clearHealthTelemetry() {},
+    generationSwitch: { cancel() {} }, stopPlaylistPlayback() {},
+    menu: { setSession() {} },
+    apiPostJson: async (path, body) => {
+      if (path === "/api/video/stop") return {};
+      controls.push(body);
+      if (controls.length === 1) throw Object.assign(new Error("stale"), { status: 409 });
+      return {};
+    },
+    async start(...args) {
+      this.startArgs = args;
+      await startResponse;
+      this.session = 22;
+      this.generation = 1;
+    },
+    refreshGeneration: async () => { viewer.refreshed = true; },
+    restartAt: VideoStreamViewer.prototype.restartAt,
+    setAudioTrack: VideoStreamViewer.prototype.setAudioTrack,
+  };
+  const first = viewer.setAudioTrack(1);
+  await Promise.resolve();
+  assert.deepEqual(viewer.startArgs, [23, true, 1]);
+  assert.equal(viewer.session, null);
+  await viewer.setAudioTrack(2);
+  assert.equal(controls.length, 1, "the later choice waits for the new session");
+  releaseStart();
+  await first;
+  assert.equal(controls.length, 2);
+  assert.equal(controls[1].session, 22);
+  assert.equal(controls[1].stream_index, 2);
+  assert.equal(controls[1].expected_generation, 1);
+  assert.equal(viewer.refreshed, true);
+});
+
+test("clicking the server-current track supersedes an earlier pending switch", async () => {
+  const pending = [];
+  const viewer = {
+    session: 11, generation: 4, destroyed: false, audioTrack: 0,
+    audioTracks: [{ stream_index: 0 }, { stream_index: 1 }],
+    audioTrackOperation: 0, abortController: { signal: null }, playRequested: true,
+    currentPosition: () => 12, showNotice: () => {},
+    apiPostJson: () => new Promise((resolve, reject) => pending.push({ resolve, reject })),
+    refreshGeneration: async () => { viewer.refreshed = true; },
+    restartAt: async (...args) => { viewer.restarted = args; },
+  };
+  const old = VideoStreamViewer.prototype.setAudioTrack.call(viewer, 1);
+  const latest = VideoStreamViewer.prototype.setAudioTrack.call(viewer, 0);
+  pending[0].resolve({});
+  await old;
+  assert.equal(viewer.refreshed, undefined);
+  pending[1].reject(Object.assign(new Error("generation mismatch"), { status: 409 }));
+  await latest;
+  assert.deepEqual(viewer.restarted, [12, true, 0]);
 });
 
 test("stage 4 video panel exposes functions and jump tabs in that order", () => {

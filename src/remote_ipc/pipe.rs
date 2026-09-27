@@ -1447,6 +1447,7 @@ fn execute_video_stream_request(
             owner,
             address,
             quality,
+            audio_track,
         } => {
             let budget = VideoStreamStartBudget::from_enqueued_at(enqueued_at);
             if let Some(error) = budget.expired_error(VideoStreamStartStage::Queue) {
@@ -1462,6 +1463,7 @@ fn execute_video_stream_request(
                         owner,
                         path,
                         quality,
+                        audio_track,
                         budget,
                     },
                     operation,

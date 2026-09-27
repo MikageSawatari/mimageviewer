@@ -991,6 +991,7 @@ pub(crate) struct VideoStreamPlaybackSnapshot {
 pub(crate) struct PublishedVideoStream {
     pub(crate) session: StreamingSessionId,
     pub(crate) generation: StreamingGenerationAccess,
+    pub(crate) audio_tracks: Arc<Vec<mimageviewer_ipc::RemoteAudioTrack>>,
     pub(crate) playback: Arc<VideoStreamPlaybackState>,
     pub(crate) buffer_target_secs: f64,
     pub(crate) end_behavior: mimageviewer_ipc::VideoStreamEndBehavior,
@@ -1009,6 +1010,7 @@ pub(crate) enum VideoStreamUiRequest {
         owner: RemoteSessionIdentity,
         path: PathBuf,
         quality: VideoStreamQuality,
+        audio_track: Option<usize>,
         budget: VideoStreamStartBudget,
     },
     Control {
@@ -1040,6 +1042,7 @@ impl VideoStreamUiRequest {
             owner,
             path,
             quality,
+            audio_track: None,
             budget: VideoStreamStartBudget::from_enqueued_at(Instant::now()),
         }
     }

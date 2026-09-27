@@ -1490,6 +1490,8 @@ struct SessionPingBody {
 #[derive(Deserialize)]
 struct VideoStartBody {
     quality: VideoStreamQuality,
+    #[serde(default)]
+    audio_track: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1547,7 +1549,7 @@ fn api_video_start(
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
         state
             .thumbnail_client
-            .video_stream_start(owner, address, body.quality)
+            .video_stream_start(owner, address, body.quality, body.audio_track)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -1567,6 +1569,8 @@ fn api_video_start(
                 "encoder": payload.encoder,
                 "video_size": payload.video_size,
                 "audio_processing": payload.audio_processing,
+                "audio_tracks": payload.audio_tracks,
+                "audio_track": payload.audio_track,
                 "end_behavior": payload.end_behavior,
             }))
             .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
@@ -4850,6 +4854,36 @@ mod tests {
     use tiny_http::TestRequest;
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn video_control_body_flattens_audio_track_action() {
+        let body: VideoControlBody = serde_json::from_value(serde_json::json!({
+            "session": 17,
+            "action": "audio_track",
+            "stream_index": 3,
+            "position_secs": 12.5,
+            "expected_generation": 9
+        }))
+        .unwrap();
+        assert_eq!(body.session, 17);
+        assert!(matches!(
+            body.action,
+            VideoStreamControlAction::AudioTrack {
+                stream_index: 3,
+                position_secs: 12.5,
+                expected_generation: 9,
+            }
+        ));
+        assert!(
+            serde_json::from_value::<VideoControlBody>(serde_json::json!({
+                "session": 17,
+                "action": "audio_track",
+                "stream_index": 3,
+                "position_secs": 12.5
+            }))
+            .is_err()
+        );
+    }
 
     fn test_state(temp: &tempfile::TempDir) -> AppState {
         let protected = temp.path().join("data");

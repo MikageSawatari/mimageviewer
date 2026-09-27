@@ -503,11 +503,11 @@ thumbnail を含めない。
 
 | エンドポイント | 内容 |
 |---|---|
-| `POST /api/video/start` | `{fav, path, quality}` → `{session, generation, playlist, duration_secs, source_origin_secs, buffer_target_secs, codec, encoder, end_behavior}` |
-| `POST /api/video/control` | `{session, action: play\|pause\|volume\|quality}`。quality は端末の `position_secs` も送る |
+| `POST /api/video/start` | path query と `{quality, audio_track?}` → `{session, generation, playlist, duration_secs, source_origin_secs, buffer_target_secs, codec, encoder, end_behavior, audio_tracks, audio_track}`。指定トラックは列挙内にある場合だけ保存済み選択より優先 |
+| `POST /api/video/control` | `{session, action: play\|pause\|volume\|quality\|audio_track}`。quality は端末の `position_secs`、audio_track は `stream_index`, `position_secs`, `expected_generation` を送る |
 | `POST /api/video/seek` | `{session, position_secs}` → 新 `generation` と `playlist` |
 | `POST /api/video/thumbnail` | `{session, position_secs, bar_width_px}`。`bar_width_px` は端末の物理 px 幅。実 frame PTS 付き WebP、生成中は 202、`position_secs: null` は要求解除 |
-| `GET /api/video/state` | generation、source origin、生成済み/ring 範囲、尺、先読み目標、実効ビットレート、終端、再生 intent。実 playhead は返さない |
+| `GET /api/video/state` | generation、source origin、生成済み/ring 範囲、尺、先読み目標、実効ビットレート、終端、再生 intent、`audio_tracks`、`audio_track`。実 playhead は返さない |
 | `POST /api/video/stop` | セッション終了。本体はストリーミングを止める |
 | `GET /stream/<session>/<gen>/index.m3u8` | CODECS を宣言する Master Playlist |
 | `GET /stream/<session>/<gen>/media.m3u8` | MEDIA-SEQUENCE を持つ live Media Playlist |
@@ -516,6 +516,7 @@ thumbnail を含めない。
 
 - `/stream/` 配下も**認証必須**。同一オリジンなので Cookie は `<video>` / hls.js の
   どちらからも送られる
+- protocol v62 では core が `RemoteAudioTrack { stream_index, label, is_default }` を作り、端末は 2 本以上のときだけ「操作」に並べる。選択表示は Ready になった server state の `audio_track` に従う。control の generation 不一致は `stream_generation_mismatch` (409) とし、端末は選んだ `audio_track` を start に載せて再開する。選択の保存は App が、選択 generation の Ready と実際の音声 stream index の一致を確認した後にだけ行う。Norm gain は generation worker がその stream の値を読み取り専用 DB 接続で解決する。
 - セグメントは `Cache-Control: no-store`、init segment だけ `immutable`
 - 未生成 / 存在しないセグメントは 404、ring から巻き取られたセグメントは 410 Gone、
   session / generation 不一致はどちらも 409 とするが、JSON の `error` をそれぞれ
@@ -532,7 +533,7 @@ thumbnail を含めない。
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
-### 6.2 IPC (動画 API v15、timeout v17、thumbnail v18、時計なし v19、終端 v20、VST 状態 v21、audio-only v39、seek preview 幅 v51)
+### 6.2 IPC (動画 API v15、timeout v17、thumbnail v18、時計なし v19、終端 v20、VST 状態 v21、audio-only v39、seek preview 幅 v51、音声トラック v62)
 
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
@@ -541,13 +542,13 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 
 | request | response |
 |---|---|
-| `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, has_video, encoder, video_size, audio_processing, end_behavior }` |
+| `VideoStreamStart { address, quality, audio_track? }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, has_video, encoder, video_size, audio_processing, audio_tracks, audio_track, end_behavior }` |
 | `VideoStreamControl { session, action }` | `SessionStatus` |
 | `VideoStreamSeek { session, position_secs }` | `{ generation }` |
 | `VideoStreamThumbnail { session, position_secs, bar_width_px }` | `Pending` / 実 frame PTS + WebP / `Cleared`。要求時は端末の物理 bar 幅を渡す |
 | `VideoStreamPlaylist { session, generation, kind }` | master / media m3u8 本文 |
 | `VideoStreamSegment { session, generation, index }` | セグメントのバイト列 / `NotFound` / `Gone` |
-| `VideoStreamState { session }` | generation/source origin、生成済み/ring 範囲、先読み目標、終端、再生 intent、バッファ/ビットレート実績、最新の `audio_processing` |
+| `VideoStreamState { session }` | generation/source origin、生成済み/ring 範囲、先読み目標、終端、再生 intent、バッファ/ビットレート実績、最新の `audio_processing` と `audio_tracks` / `audio_track` |
 | `VideoStreamStop { session }` | — |
 
 セグメント IPC は既存の **heavy queue ではなく専用 lane** に置く。エンコード済みバイトを
@@ -1026,6 +1027,14 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
   session の opened audio stream index を配信 stream と Norm lookup の双方に使う。generation
   worker は開始時の Norm 設定 snapshot と専用の読み取り専用 DB 接続から gain を解決し、
   未測定なら 1.0 を時計なし PCM の AAC 前段で適用する
+- **音声トラック選択**: App は現行 generation が Ready / Ended で実際の音声 stream と
+  要求 index が一致した時だけファイル別選択を記憶する。worker の Ready 公開と旧
+  generation の退役は同じ状態 lock で直列化する。退役は最後に公開された Ready 情報を
+  読んでから停止を確定し、確定済みの選択を App に返す。失敗した generation の Ready
+  記録は採用しない。画質・音声トラック変更、seek、stop、新しい start、所有権の移動、
+  終了はこの退役境界を使う。端末は操作ページを開いたままでも
+  start 応答または state のトラック一覧を反映する。409 後の再開中に別のトラックを選んだら
+  最新の選択を保持し、新 session の開始後に適用する
 - **位置**: server は generation、source origin、生成済み範囲、ring の earliest/latest、duration、
   再生 intent を所有する。実 playhead は端末の media element が source of truth であり、
   `/api/video/state` の本体位置を端末位置として返さない。resume/history が必要なときだけ端末が

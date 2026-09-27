@@ -32,6 +32,8 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 `MIV_NATIVE_VIDEO_PRESENTER` フォールバック環境変数は削除済み)。例外は mIV Remote session が
 所有する headless player だけで、画面を作らず専用 consumer が通常出力 queue を drain する。
 
+mIV Remote の音声は headless player が開いた stream index で始まり、明示的な start 指定が列挙済みならそれを優先する。トラック切り替えは配信 session が新 generation を作り、実際に開いた音声 stream index を Ready 情報へ載せる。App は現行 generation の Ready と要求 index が一致した時だけ `settings.db` のファイル別選択を更新する。worker の Ready 公開と generation の退役は同じ状態 lock で直列化し、退役時に確定済みの選択を App へ返す。画質・音声トラック変更、seek、stop、新しい start、所有権移動、終了はこの境界を使う。Remote service は設定の書き手にならない。詳細は [audio-track-selection-plan.md](audio-track-selection-plan.md) §9A と [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md) §6 を参照。
+
 ```
 [起動時]
   GpuVideoDevice 作成 (mIV 専用の D3D11 device + VideoProcessor + Fence)
