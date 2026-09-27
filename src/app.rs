@@ -1930,6 +1930,9 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn detached_window_can_activate(&self, window_id: u64) -> bool {
+        if self.document_open_modal_admission_blocked() {
+            return false;
+        }
         self.detached_image_windows
             .iter()
             .find(|window| window.id == window_id)
@@ -3620,6 +3623,12 @@ enum PdfPasswordRequestOwner {
     Legacy,
     Direct(Box<DirectPdfPasswordContinuation>),
     StagedHistory(u64),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PdfPasswordExit {
+    Cancel,
+    Parked,
 }
 
 struct DirectPdfPasswordContinuation {
@@ -14878,7 +14887,6 @@ pub struct App {
 
     // ── PDF パスワード管理 ───────────────────────────────────────
     pub(crate) pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
-    pub(crate) show_pdf_password_dialog: bool,
     pub(crate) pdf_password_input: String,
     /// 「パスワードを保存する」チェックボックス (デフォルト OFF)
     pub(crate) pdf_password_save: bool,
@@ -17746,7 +17754,6 @@ impl App {
             #[cfg(windows)]
             gpu_video_device: None,
             pdf_passwords,
-            show_pdf_password_dialog: false,
             pdf_password_input: String::new(),
             pdf_password_save: false,
             pdf_password_error: None,
@@ -19604,7 +19611,7 @@ impl App {
             self.edit_bundle_apply_pending.is_some() => "edit_bundle_apply_pending",
             self.edit_bundle_bulk_pending.is_some() => "edit_bundle_bulk_pending",
             self.show_rotation_reset_confirm => "rotation_reset_confirm",
-            self.pdf_password_request_pending_in_any_context() || self.show_pdf_password_dialog => "pdf_password",
+            self.pdf_password_dialog_path().is_some() => "pdf_password",
             self.show_about_dialog => "about",
             self.show_update_dialog => "update",
             self.show_tray_enabled_notice => "tray_enabled_notice",
@@ -21632,8 +21639,7 @@ impl App {
             || self.current_folder_last_mtime.is_none()
             || self.pdf_enumerate_pending.is_some()
             || self.zip_enumerate_pending.is_some()
-            || self.show_pdf_password_dialog
-            || self.pdf_password_request_pending_in_any_context()
+            || self.pdf_password_dialog_path().is_some()
         {
             return None;
         }
@@ -23146,48 +23152,24 @@ impl App {
     }
 
     /// Advance the requests stored in the currently projected viewer bundle. Callers mount the
-    /// owner first; the same routine serves main, active detached, and parked contexts.
+    /// owner first. Parked contexts are terminal and are never serviced.
     fn poll_mounted_document_open_owners(&mut self, ctx: &egui::Context) {
-        self.poll_open_path_classification(ctx);
-        self.poll_collection_history_transition(ctx);
-    }
-
-    #[cfg(windows)]
-    fn poll_parked_document_open_owners(&mut self, ctx: &egui::Context) {
-        let active = self.active_viewer_context_id();
-        for id in self.other_viewer_context_ids() {
-            if Some(id) == active || self.viewer_context_residence(id) != ContextResidence::AtRest {
-                continue;
+        #[cfg(windows)]
+        for owner in viewer_context_registry::ContextAsyncOwner::ALL {
+            if owner.needs_mounted_service(viewer_context_registry::ContextRef::mounted(self)) {
+                owner.service(
+                    self,
+                    ctx,
+                    viewer_context_registry::ContextAsyncServicePhase::Background,
+                );
             }
-            // Passive still windows render a frozen snapshot. Their pending owner still needs to
-            // progress; a conversion dialog is presented on root while the bundle is parked so
-            // Cancel and progress remain accessible without activating or mutating a sibling.
-            let needs_service = self
-                .with_viewer_context_ref(id, |owner| owner.document_open_needs_service())
-                .unwrap_or(false);
-            if !needs_service {
-                continue;
-            }
-            self.with_viewer_context(id, |app| {
-                app.poll_mounted_document_open_owners(ctx);
-                if let Some(result) = app.poll_folder_nav() {
-                    app.apply_folder_nav_result(ctx, result);
-                }
-                app.poll_pdf_enumerate();
-                app.poll_zip_enumerate();
-                app.poll_collection_grid(ctx);
-                app.poll_collection_navigation(ctx);
-                app.show_epub_convert_dialog(ctx);
-                if app.folder_nav_pending.is_some()
-                    || app.pdf_enumerate_pending.is_some()
-                    || app.zip_enumerate_pending.is_some()
-                {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
-                }
-            })
-            .unwrap_or_else(|error| {
-                panic!("parked document owner {id:?} failed to mount: {error:?}")
-            });
+        }
+        #[cfg(not(windows))]
+        {
+            self.poll_open_path_classification(ctx);
+            self.poll_collection_history_transition(ctx);
+            self.poll_collection_grid(ctx);
+            self.poll_collection_navigation(ctx);
         }
     }
 
@@ -27884,7 +27866,6 @@ impl App {
                             self.pdf_password_request = Some(PdfPasswordRequest::staged_history(
                                 target.visible_path.clone(), request.request_id,
                             ));
-                            self.show_pdf_password_dialog = true;
                             self.pdf_password_error = None;
                             request.phase = CollectionHistoryPhase::ChildPdfPassword { prepared, target };
                             self.top_level_grid_view.set_history_navigation_transition(Some(
@@ -28061,7 +28042,6 @@ impl App {
         };
         if !current {
             self.pdf_password_request = None;
-            self.show_pdf_password_dialog = false;
             self.pdf_password_input.clear();
             self.pdf_password_error = None;
         }
@@ -28204,7 +28184,6 @@ impl App {
                             request.path.clone(),
                             request.request_id,
                         ));
-                        self.show_pdf_password_dialog = true;
                         self.pdf_password_error = None;
                         request.phase = PhysicalHistoryPhase::PdfPassword;
                         self.top_level_grid_view
@@ -32400,7 +32379,6 @@ impl App {
                         Some(restore) => PdfPasswordRequest::direct(pdf_path, *owner, restore),
                         None => PdfPasswordRequest::legacy(pdf_path),
                     });
-                    self.show_pdf_password_dialog = true;
                     self.pdf_password_input.clear();
                     // password が渡されていた = 入力済みのパスワードが誤っていた
                     self.pdf_password_error = if password.is_some() {
@@ -32507,6 +32485,32 @@ impl App {
             .is_some_and(|id| self.pdf_password_request_context_id() == Some(id))
     }
 
+    #[cfg(windows)]
+    pub(crate) fn mounted_context_owns_selected_pdf_password_prompt(&self) -> bool {
+        self.pdf_password_request_context_id() == Some(self.projected_viewer_context_id())
+    }
+
+    pub(crate) fn service_mounted_document_open_dialogs(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            for owner in [
+                viewer_context_registry::ContextAsyncOwner::EpubConversion,
+                viewer_context_registry::ContextAsyncOwner::PdfPassword,
+            ] {
+                owner.service(
+                    self,
+                    ctx,
+                    viewer_context_registry::ContextAsyncServicePhase::Dialog,
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.show_epub_convert_dialog(ctx);
+            self.show_pdf_password_dialog_window(ctx);
+        }
+    }
+
     pub(crate) fn pdf_password_request_pending_in_any_context(&self) -> bool {
         self.document_modal_owners_in_any_context().1
     }
@@ -32518,7 +32522,7 @@ impl App {
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
         self.epub_convert_pending_in_any_context()
             || self.pdf_password_request_pending_in_any_context()
-            || self.show_pdf_password_dialog
+            || self.smart_pdf_password_dialog_path().is_some()
             || self.epub_batch_convert.is_some()
     }
 
@@ -32612,7 +32616,6 @@ impl App {
         // The typed prompt's own Retry is its terminal continuation. Release its visible
         // admission lease before the continuation re-enters the shared open boundary; an
         // incorrect password will create a fresh prompt from the next worker result.
-        let visible_before_retry = std::mem::take(&mut self.show_pdf_password_dialog);
         #[cfg(windows)]
         if let Some(id) = self.pdf_password_request_context_id() {
             let accepted = if id == self.projected_viewer_context_id() {
@@ -32623,12 +32626,6 @@ impl App {
                 })
                 .unwrap_or(false)
             };
-            if !accepted
-                && (self.pdf_password_request_pending_in_any_context()
-                    || self.smart_pdf_password_dialog_path().is_some())
-            {
-                self.show_pdf_password_dialog = visible_before_retry;
-            }
             return accepted;
         }
         if self.pdf_password_request.is_none()
@@ -32636,21 +32633,13 @@ impl App {
         {
             return true;
         }
-        let accepted = self.retry_pdf_password_request_in_mounted_context(password, save);
-        if !accepted
-            && (self.pdf_password_request_pending_in_any_context()
-                || self.smart_pdf_password_dialog_path().is_some())
-        {
-            self.show_pdf_password_dialog = visible_before_retry;
-        }
-        accepted
+        self.retry_pdf_password_request_in_mounted_context(password, save)
     }
 
-    fn cancel_pdf_password_request_in_mounted_context(&mut self) -> bool {
+    fn finish_pdf_password_request_in_mounted_context(&mut self, exit: PdfPasswordExit) -> bool {
         let Some(request) = self.pdf_password_request.take() else {
             return false;
         };
-        self.show_pdf_password_dialog = false;
         match request.owner {
             PdfPasswordRequestOwner::StagedHistory(request_id) => {
                 let _ = self.cancel_staged_pdf_password_request(request_id, &request.path);
@@ -32671,8 +32660,14 @@ impl App {
         self.finish_visible_container_fs_nav_failed();
         self.restore_rating_filter_suppression();
         #[cfg(windows)]
-        self.terminate_active_detached_open_before_viewport("pdf_password_cancelled");
+        if exit == PdfPasswordExit::Cancel {
+            self.terminate_active_detached_open_before_viewport("pdf_password_cancelled");
+        }
         true
+    }
+
+    fn cancel_pdf_password_request_in_mounted_context(&mut self) -> bool {
+        self.finish_pdf_password_request_in_mounted_context(PdfPasswordExit::Cancel)
     }
 
     pub(crate) fn cancel_pdf_password_dialog_request(&mut self) -> bool {
@@ -51305,7 +51300,6 @@ impl App {
         // PDF password dialog の UI state 自体は App-global だが、request owner は bundle。
         // viewport 作成前の terminal close で owner を捨てた後に orphan dialog を残さない。
         if summary.had_pdf_password_request && self.pdf_password_request.is_none() {
-            self.show_pdf_password_dialog = false;
             self.pdf_password_input.clear();
             self.pdf_password_error = None;
             self.pdf_password_save = false;
@@ -52947,6 +52941,9 @@ impl App {
 
     #[cfg(windows)]
     fn activate_parked_live_media_window_snapshot(&mut self, ctx: &egui::Context, id: u64) -> bool {
+        if self.document_open_modal_admission_blocked() {
+            return false;
+        }
         let Some(pos) = self
             .detached_image_windows
             .iter()
@@ -53227,6 +53224,9 @@ impl App {
         ctx: &egui::Context,
         preserve_fullfeature_linked_still: bool,
     ) -> bool {
+        if self.document_open_modal_admission_blocked() {
+            return false;
+        }
         if self.other_active_viewer_context_contains_video()
             && self
                 .park_active_detached_context_as_live_media(ctx, "park_active_context_live_media")
@@ -54503,6 +54503,11 @@ impl App {
         ctx: &egui::Context,
         id: u64,
     ) -> bool {
+        // The active EPUB/password continuation must finish in its owner before another
+        // context can be mounted. This is the same gate used by direct-open admission.
+        if self.document_open_modal_admission_blocked() {
+            return false;
+        }
         if self.detached_window_state_is_parked_live(id) {
             return self.activate_parked_live_media_window_snapshot(ctx, id);
         }
@@ -54884,23 +54889,11 @@ impl App {
                     ));
                 }
                 app.poll_mounted_document_open_owners(ctx);
-                if let Some(result) = app.poll_folder_nav() {
-                    app.apply_folder_nav_result(ctx, result);
-                }
-                match app.poll_detached_physical_folder_open(ctx) {
-                    DetachedPhysicalFolderOpenPoll::Failed => {
-                        app.terminate_active_detached_open_before_viewport(
-                            "detached_physical_open_failed",
-                        );
-                    }
-                    DetachedPhysicalFolderOpenPoll::Waiting
-                    | DetachedPhysicalFolderOpenPoll::Applied => {}
-                }
-                app.poll_pdf_enumerate();
-                app.poll_zip_enumerate();
-                app.poll_collection_grid(ctx);
-                app.poll_collection_navigation(ctx);
-                app.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel);
+                viewer_context_registry::ContextAsyncOwner::FullscreenDecode.service(
+                    app,
+                    ctx,
+                    viewer_context_registry::ContextAsyncServicePhase::Background,
+                );
                 // Thumbnail results belong to the context whose worker generation and rx
                 // produced them. Consume them while that detached owner is mounted so image
                 // pixels can become pass-through renditions without leaking state into the main
@@ -54912,8 +54905,6 @@ impl App {
                 if app.current_viewer_context_contains_video() {
                     app.poll_video(ctx);
                 }
-                app.poll_bookmark_media_open(ctx);
-                app.poll_bookmark_book_open(ctx);
                 // metadata / tag hydrate は表示 context ごとの cache と pending を持つ。
                 // active bundle を mount している間に回収し、main grid へ結果を混入させない。
                 app.poll_metadata_load();
@@ -55028,7 +55019,6 @@ impl App {
             };
             if let Some(closed) = closed {
                 if closed.had_pdf_password_request && self.pdf_password_request.is_none() {
-                    self.show_pdf_password_dialog = false;
                     self.pdf_password_input.clear();
                     self.pdf_password_error = None;
                     self.pdf_password_save = false;
@@ -82748,6 +82738,13 @@ impl App {
         // スクロールすると新しく入ってきた idx 分が少しずつキューに積まれる。
         self.enqueue_visible_tag_prewarms();
 
+        #[cfg(windows)]
+        viewer_context_registry::ContextAsyncOwner::FullscreenDecode.service(
+            self,
+            ctx,
+            viewer_context_registry::ContextAsyncServicePhase::Background,
+        );
+        #[cfg(not(windows))]
         self.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel);
         mark_update_perf(&mut update_perf, UpdatePerfStage::PrefetchPoll);
         self.poll_main_video_context(ctx);
@@ -84921,15 +84918,11 @@ impl eframe::App for App {
         // Collection startup/revision/worker responses must likewise progress even when
         // update_frame returns through a fullscreen or native-video presentation path.
         self.poll_collection_ui(ctx);
-        self.poll_collection_grid(ctx);
         self.poll_mounted_document_open_owners(ctx);
-        self.poll_collection_navigation(ctx);
         // A settings-family mutation may already hold the exclusive DB permit. Defer only a
         // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
         // remains under the established close policy.
         self.defer_settings_family_root_close(ctx);
-        #[cfg(windows)]
-        self.poll_similar_preview_workers_in_all_contexts(ctx);
         #[cfg(not(windows))]
         {
             // Non-Windows builds have one mounted viewer context and therefore no
@@ -84939,25 +84932,36 @@ impl eframe::App for App {
             self.similar_panel.preview.poll_background(ctx, &passwords);
         }
         self.update_frame(ctx, frame);
-        #[cfg(windows)]
-        self.poll_parked_document_open_owners(ctx);
-        // Dedicated viewer viewports draw the same owner dialog inside their own callback.
-        // Root/embedded and parked fallbacks draw here.
+        // Dedicated viewer viewports draw their mounted owner's dialog in their callback.
+        // Root and embedded presentations draw here; parked contexts are not serviced.
         if self.fullscreen_idx.is_none()
             || self.fullscreen_embedded_still_active()
             || self.current_viewer_context_contains_video()
         {
+            #[cfg(windows)]
+            viewer_context_registry::ContextAsyncOwner::EpubConversion.service(
+                self,
+                ctx,
+                viewer_context_registry::ContextAsyncServicePhase::Dialog,
+            );
+            #[cfg(not(windows))]
             self.show_epub_convert_dialog(ctx);
         }
         // `update_frame` can return before its menu/dialog section. Keep the global password
         // input visible through those paths; a dedicated viewport draws it in its own callback.
         #[cfg(windows)]
-        if !self.active_detached_owns_pdf_password_prompt()
-            && (self.fullscreen_idx.is_none()
-                || self.fullscreen_embedded_still_active()
-                || self.current_viewer_context_contains_video())
-        {
-            self.show_pdf_password_dialog_window(ctx);
+        if !self.active_detached_owns_pdf_password_prompt() {
+            viewer_context_registry::ContextAsyncOwner::PdfPassword.service(
+                self,
+                ctx,
+                viewer_context_registry::ContextAsyncServicePhase::Dialog,
+            );
+            // Smart-folder password preflight has its own global typed owner.
+            if !self.pdf_password_request_pending_in_any_context()
+                && self.smart_pdf_password_dialog_path().is_some()
+            {
+                self.show_pdf_password_dialog_window(ctx);
+            }
         }
         #[cfg(not(windows))]
         self.show_pdf_password_dialog_window(ctx);

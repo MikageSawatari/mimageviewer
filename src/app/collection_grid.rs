@@ -3304,6 +3304,68 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn collection_grid_snapshot_is_terminal_when_its_viewer_is_parked() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collections.db"));
+        let created = recv(client.create_collection("Parked grid".into()).unwrap());
+        let ctx = egui::Context::default();
+        app.open_collection_grid(created.collection_id(), None);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app
+            .top_level_grid_view
+            .collection_session()
+            .is_some_and(|session| {
+                matches!(
+                    session.load,
+                    CollectionGridLoadState::Snapshot { .. }
+                        | CollectionGridLoadState::Preparing { .. }
+                )
+            })
+        {
+            assert!(
+                Instant::now() < deadline,
+                "collection snapshot did not start"
+            );
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    matches!(
+                        session.load,
+                        CollectionGridLoadState::Snapshot { .. }
+                            | CollectionGridLoadState::Preparing { .. }
+                    )
+                })
+        );
+        let address = app.address.clone();
+        let rows = app.items.clone();
+        let back = app.folder_nav_back_stack.clone();
+        let forward = app.folder_nav_forward_stack.clone();
+        app.pause_mounted_background_work_keep_current_frame();
+        assert!(
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    !matches!(
+                        session.load,
+                        CollectionGridLoadState::Snapshot { .. }
+                            | CollectionGridLoadState::Preparing { .. }
+                    )
+                })
+        );
+        assert_eq!(app.address, address);
+        assert_eq!(app.items, rows);
+        assert_eq!(app.folder_nav_back_stack, back);
+        assert_eq!(app.folder_nav_forward_stack, forward);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
     #[cfg(all(windows, feature = "test-script"))]
     #[test]
     fn seeded_collection_smoke_action_opens_python_seeded_root_after_startup() {

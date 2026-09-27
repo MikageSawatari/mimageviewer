@@ -1455,21 +1455,28 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
-**2026-09-28 §1.280 履歴 / EPUB の context-owned 非同期処理 (review #8)**
+**2026-09-28 §1.280 履歴 / EPUB の context-owned 非同期処理 (review #8/#9 改訂)**
 
-分類 candidate、staged 履歴 transition、EPUB 変換、DFS 結果、PDF/ZIP 列挙は表示先
-`ViewerContextBundle` が所有する。main の `App::update` だけで分類と変換を処理すると、
-detached の PDF enumeration が生成した変換は見えない modal になり、detached 入力の
-`.epub` / archive suffix 分類は完了しても採用されなかった。main、active detached、
-parked の各 bundle を所有 context として投影し、分類と履歴は共通
-`poll_mounted_document_open_owners`、その他の worker は各既存 poll / dialog で処理する。
-active detached の変換・PDF password prompt はその viewport callback に描き、passive
-parked は frozen renderer を変更せず、root に出す dialog の操作時だけ当該 bundle を mount
-して Cancel / Retry と worker result を処理する。窓の host / placement / viewport identity
-や park / resume の state machine は変更しない。これは非同期要求の所有者と処理 context
-を一致させる修正で、表示症状に対する時間待ちや別フラグは加えない。自動テストは
-detached suffix directory の入力から採用、および active / parked EPUB 変換の表示・進捗・
-取消・完了を対象とする。WebView2 実変換の窓操作は対話的検証 session に残す。
+分類 candidate、staged 履歴 transition、Collection navigation、detached folder scan、
+DFS、PDF/ZIP 列挙、EPUB 変換、PDF password request は表示先の
+`ViewerContextBundle` が所有する。root と active detached の **mounted** context だけが
+typed owner registry の `service` を呼ぶ。parked still context は frozen frame のまま
+一切 poll / dialog 描画を行わない。park transaction は同じ registry の
+`terminate_on_park` を全 owner に適用し、staged 履歴は旧表示・履歴を保持、未採用
+direct open は所有 rollback を返し、分類・DFS・scan・enumeration は取消、EPUB 変換と
+password request と Similar preview preparation は terminal にする。以前の root から parked bundle を一時 mount して
+poll / dialog 描画する実装と、その coverage claim は撤回した。
+
+EPUB 変換または PDF password prompt の owner がある間、passive window click、activation
+watcher、deferred activation、keyboard/gamepad の窓選択が到達する共通 activation 境界は
+別 context への切替を拒否する。よって通常入力から modal owner が park されない。
+password の表示・Retry/Cancel は context ごとの typed request から一件を決定的に選び、
+active detached viewport は自身が選択 owner の時だけ描く。global visibility flag は置かない。
+bundle 内の cache / write worker は従来の resume・永続化契約を保ち、registry の source audit
+で明示した例外とする（[folder history plan §12.5](folder-history-location-plan.md#125-detached-owner-servicing-と-warm-stamp-の-review-8-修正)）。
+tray/taskbar の root 復帰は viewer context を切り替えない。窓 host、placement、viewport
+identity は変更しない。これは非同期要求の所有 context と park terminal を揃える修正で、
+時間待ちや repaint による症状緩和は加えない。WebView2 実変換の窓操作は対話的検証に残す。
 
 **2026-09-27 履歴 preflight と直接 open の admission**
 

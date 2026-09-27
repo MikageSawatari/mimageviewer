@@ -262,8 +262,7 @@ impl App {
             || self.current_folder_last_mtime.is_none()
             || self.pdf_enumerate_pending.is_some()
             || self.zip_enumerate_pending.is_some()
-            || self.show_pdf_password_dialog
-            || self.pdf_password_request_pending_in_any_context()
+            || self.pdf_password_dialog_path().is_some()
         {
             return None;
         }

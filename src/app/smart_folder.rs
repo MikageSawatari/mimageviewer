@@ -1774,7 +1774,6 @@ impl App {
         if self.pdf_password_request_pending_in_any_context() {
             return;
         }
-        self.show_pdf_password_dialog = false;
         self.pdf_password_input.clear();
         self.pdf_password_error = None;
     }
@@ -3794,22 +3793,6 @@ impl App {
         }
         let mut adopted_folder_nav = false;
         let mut launch_archive_conversion = false;
-        if let SmartFolderTransitionPhase::ChildPreflight {
-            child:
-                SmartPhysicalPreflight::PdfPassword {
-                    invalid_password, ..
-                },
-            ..
-        } = &transition.phase
-            && !self.pdf_password_request_pending_in_any_context()
-            && !self.show_pdf_password_dialog
-        {
-            self.pdf_password_input.clear();
-            self.pdf_password_error =
-                (*invalid_password).then(|| "パスワードが正しくありません".to_owned());
-            self.pdf_password_save = false;
-            self.show_pdf_password_dialog = true;
-        }
         if self.sidecar_restore_active() {
             self.smart_folder_transition = Some(transition);
             return;
@@ -4189,13 +4172,21 @@ impl App {
                 SmartPhysicalPoll::PasswordRequired {
                     path,
                     invalid_password,
-                } => Some(SmartFolderTransitionPhase::ChildPreflight {
-                    root,
-                    child: SmartPhysicalPreflight::PdfPassword {
-                        path,
-                        invalid_password,
-                    },
-                }),
+                } => {
+                    if !self.pdf_password_request_pending_in_any_context() {
+                        self.pdf_password_input.clear();
+                        self.pdf_password_error =
+                            invalid_password.then(|| "パスワードが正しくありません".to_owned());
+                        self.pdf_password_save = false;
+                    }
+                    Some(SmartFolderTransitionPhase::ChildPreflight {
+                        root,
+                        child: SmartPhysicalPreflight::PdfPassword {
+                            path,
+                            invalid_password,
+                        },
+                    })
+                }
                 SmartPhysicalPoll::OpenFailure { path, failure } => {
                     let owner = super::OpenRequestOwner::MainGridArchive(
                         super::MainGridArchiveTransitionIntent {

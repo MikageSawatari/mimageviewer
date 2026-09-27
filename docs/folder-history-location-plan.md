@@ -245,17 +245,33 @@ WebView2 変換は引き続き対話的 session の対象である。
 
 ### 12.5 Detached owner servicing と warm stamp の review #8 修正
 
-`TopLevelGridView` の分類 candidate と staged 履歴 transition は main / mounted
-detached / parked の各投影 owner で同じ poll routine を呼ぶ。DFS result と PDF/ZIP
-enumeration は各 context の既存 poll を使い、parked bundle も root frame から一時 mount
-して drain する。EPUB 変換は active detached viewport 内で `show_epub_convert_dialog`
-を呼び、passive parked window の frozen renderer 中はその bundle を mount して root
-dialog を描く。これにより進捗・Cancel・成功 continuation は同じ owner で進む。
-PDF password prompt は global UI 入力欄だが typed request は context-local なので、
-表示先の path と Retry / Cancel は request を所有する mounted / parked context ID
-を選び、その bundle を直接または一時 mount して処理する。root / active detached
-viewport の表示は prompt owner に合わせて一度だけ行う。Collection grid / navigation
-worker も parked poll に含める。いずれも sibling の表示・履歴を交換しない。
+review #9 後の設計担当決定は、既存の park 契約を維持する。main / active detached の
+mounted context だけが typed registry の `service` で async owner を進める。
+parked still は frozen frame で、root から一時 mount して poll / dialog 描画しない。
+park transaction は同じ registry の `terminate_on_park` を通し、分類 candidate、
+staged 履歴、Collection grid/navigation、Rating navigation、bookmark open、DFS、
+detached folder scan、PDF/ZIP enumeration、EPUB 変換、PDF password request を terminal
+にする。fullscreen decode、AI/edit preview と Similar preview も既存の park
+取消を registry に集約する。staged request の取消では旧表示・履歴を維持し、未採用 direct cold open は
+所有 rollback を返す。取消済み worker の late result は request ID / generation で捨てる。
+root の `poll_parked_document_open_owners` と parked dialog の描画は廃止する。
+
+modal owner（EPUB 変換、PDF password）がいずれかの context に存在する間は、別 viewer
+context の activation を共通 gate で拒否する。passive click、activation watcher と
+deferred commit、keyboard/gamepad の window switching、grid からの既存窓再利用はこの
+境界を通る。taskbar / tray の root 復帰は viewer context の切替ではない。
+PDF password の可視性と Retry / Cancel は context-local typed request から、active
+context 優先・残りは安定 ID 順で一件を選ぶ。選択 request の terminal 後は次の request
+が可視になり、request がなくなれば gate は外れる。active detached viewport は自分が
+選択 owner の時だけ prompt を描く。入力文字列は dialog の逐次 UI 値であり、visibility
+flag として使わない。park で modal を終了するのは既に開始した内部 terminal 処理または
+テストの強制 park だけであり、通常入力から modal owner を park できない。
+bundle の他の cache / write pending は、park 後の resume・DB 永続化契約が異なるため
+既存の mounted frame / worker owner に残す。registry の audit test は bundle の
+`*_pending` field を登録済み owner と明示した cache/write field に分け、新しい field
+が無分類で追加された場合に失敗する。
+multiwindow Collection の旧「parked request が残って再開時に採用される」回帰期待は撤回し、
+park 時に request が terminal となり、復帰時も最後に表示済みのページを保つ期待に更新した。
 
 plain PDF の warm `pdf_meta` 照合 stamp は master の released direct-open と同じ
 requested-file `std::fs::metadata` 1 回から取る。これは既存 UI-thread コストであり、
@@ -287,6 +303,9 @@ timeout した。active loading viewport の EPUB dialog 呼び出しを外す�
 `warm_pdf_direct_open_absent_from_current_rows_adopts_placeholders` は旧 source に留まり、
 plain PDF Navigation を staged 分岐へ戻すと
 `warm_pdf_navigation_absent_from_rows_adopts_before_worker` は旧 source に留まった。
+review #8 の parked-poll fail-before はその時点の設計に対する履歴記録であり、
+review #9 の park terminal 契約では期待結果を逆転した。新規テストは pending owner を
+park した時点で terminal になり、parked update が何も進めないことを検査する。
 全 lib gate では旧 staged 前提の PDF テスト 2 件と旧 placeholder 前提の detached
 binding テスト 1 件が失敗した。cold direct の grid 効果を早期確定するコードを
 `DirectPdfAdoption` への預託に変え、前者は直接 PDF worker の成功・password Cancel を

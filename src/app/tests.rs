@@ -11251,7 +11251,6 @@ mod startup_open_path_resolve_tests {
         let _id = app.build_active_context_for_test(Some(8106), DetachedSource::Book, |detached| {
             detached.viewer_presentation = ViewerPresentation::DetachedWindow;
             detached.pdf_password_request = Some(super::PdfPasswordRequest::legacy(pdf.clone()));
-            detached.show_pdf_password_dialog = true;
         });
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| {
@@ -11277,37 +11276,81 @@ mod startup_open_path_resolve_tests {
             app.update_active_viewer_context(ctx, None);
         });
         assert!(app.pdf_password_dialog_path().is_none());
-        assert!(!app.show_pdf_password_dialog);
     }
 
     #[test]
     #[cfg(windows)]
-    fn parked_detached_pdf_password_prompt_routes_cancel_to_owning_context() {
+    fn two_context_pdf_password_prompts_advance_one_owner_at_a_time() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let pdf = app.tmp.path().join("parked-password.pdf");
-        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
-        let id = app.push_window_context_for_test(&ctx, 8104, |detached| {
-            detached.pdf_password_request = Some(super::PdfPasswordRequest::legacy(pdf.clone()));
-            detached.show_pdf_password_dialog = true;
+        let _parked = app.push_window_context_for_test(&ctx, 8107, |_| {});
+        let main_pdf = app.tmp.path().join("main-password.pdf");
+        let detached_pdf = app.tmp.path().join("detached-password.pdf");
+        std::fs::write(&main_pdf, b"%PDF-1.4\n").unwrap();
+        std::fs::write(&detached_pdf, b"%PDF-1.4\n").unwrap();
+        app.pdf_password_request = Some(super::PdfPasswordRequest::legacy(main_pdf.clone()));
+        let id = app.build_active_context_for_test(Some(8104), DetachedSource::Book, |detached| {
+            detached.pdf_password_request =
+                Some(super::PdfPasswordRequest::legacy(detached_pdf.clone()));
         });
         assert_eq!(
             app.pdf_password_dialog_path().as_deref(),
-            Some(pdf.as_path())
+            Some(detached_pdf.as_path())
         );
         assert_eq!(app.modal_dialog_block_reason(), Some("pdf_password"));
+        assert!(app.active_detached_owns_pdf_password_prompt());
+        assert!(!app.detached_window_can_activate(8107));
+        assert!(!app.activate_detached_image_window_snapshot(&ctx, 8107));
         assert!(app.cancel_pdf_password_dialog_request());
         assert!(
             app.with_viewer_context_ref(id, |owner| owner.pdf_password_request().is_none())
                 .unwrap()
         );
+        assert_eq!(
+            app.pdf_password_dialog_path().as_deref(),
+            Some(main_pdf.as_path())
+        );
+        assert_eq!(app.modal_dialog_block_reason(), Some("pdf_password"));
+        assert!(!app.active_detached_owns_pdf_password_prompt());
+        assert!(!app.detached_window_can_activate(8107));
+        let output = ctx.run(Default::default(), |ctx| {
+            app.show_pdf_password_dialog_window(ctx);
+        });
+        assert!(!output.shapes.is_empty());
+        assert!(app.cancel_pdf_password_dialog_request());
         assert!(app.pdf_password_request.is_none());
+        assert!(app.pdf_password_dialog_path().is_none());
+        assert!(!app.document_open_modal_admission_blocked());
+        assert!(app.detached_window_can_activate(8107));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn pdf_password_request_park_terminal_keeps_current_display() {
+        let mut app = setup_app();
+        let address = app.address.clone();
+        let rows = app.items.clone();
+        let back = app.folder_nav_back_stack.clone();
+        let forward = app.folder_nav_forward_stack.clone();
+        app.pdf_password_request = Some(super::PdfPasswordRequest::legacy(
+            app.tmp.path().join("password-on-park.pdf"),
+        ));
+        assert!(app.document_open_modal_admission_blocked());
+        app.pause_mounted_background_work_keep_current_frame();
+        assert!(app.pdf_password_request.is_none());
+        assert!(!app.document_open_modal_admission_blocked());
+        assert_eq!(app.address, address);
+        assert_eq!(app.items, rows);
+        assert_eq!(app.folder_nav_back_stack, back);
+        assert_eq!(app.folder_nav_forward_stack, forward);
     }
 
     #[test]
     #[cfg(windows)]
     fn detached_epub_conversion_is_serviced_in_active_viewport() {
         let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let parked_id = app.push_window_context_for_test(&ctx, 8105, |_| {});
         let epub = app.tmp.path().join("active-convert.epub");
         write_history_review_epub(&epub);
         app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ask;
@@ -11323,10 +11366,15 @@ mod startup_open_path_resolve_tests {
                 super::PdfOpenFailureRoute::ConversionDialogOpened
             );
         });
-        let ctx = egui::Context::default();
         let output = ctx.run(Default::default(), |ctx| {
             assert!(app.update_active_viewer_context(ctx, None).updated);
         });
+        assert!(!app.detached_window_can_activate(8105));
+        app.queue_deferred_detached_window_activation(8105, "modal_gate_test");
+        assert!(!app.commit_pending_deferred_detached_window_activation(&ctx));
+        assert!(!app.activate_detached_image_window_snapshot(&ctx, 8105));
+        assert!(app.active_viewer_context_id().is_some());
+        assert!(app.with_viewer_context_ref(parked_id, |_| true).unwrap());
         assert!(
             app.with_active_viewer_context(|detached| detached.fs_viewport_shown)
                 .unwrap_or(false),
@@ -11363,97 +11411,96 @@ mod startup_open_path_resolve_tests {
             app.with_viewer_context_ref(active, |owner| owner.epub_convert().is_none())
                 .unwrap_or(true)
         }));
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 8105));
     }
 
     #[test]
     #[cfg(windows)]
-    fn detached_epub_conversion_parked_dialog_progress_cancel_and_completion() {
+    fn detached_epub_conversion_park_is_terminal_without_parked_service() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let epub = app.tmp.path().join("parked-convert.epub");
         write_history_review_epub(&epub);
         app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ask;
         let id = app.push_window_context_for_test(&ctx, 8102, |_| {});
-        for complete in [false, true] {
-            app.with_window_viewer_context(8102, |detached| {
-                assert_eq!(
-                    detached.route_pdf_open_failure(
-                        OpenRequestOwner::Navigation,
-                        &epub,
-                        super::PdfOpenFailure::NotConverted,
-                    ),
-                    super::PdfOpenFailureRoute::ConversionDialogOpened
-                );
-            })
-            .unwrap();
-            assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
-            let output = ctx.run(Default::default(), |ctx| {
-                app.poll_parked_document_open_owners(ctx)
-            });
-            assert!(
-                !output.shapes.is_empty(),
-                "parked conversion must draw a dialog"
+        app.with_window_viewer_context(8102, |detached| {
+            assert_eq!(
+                detached.route_pdf_open_failure(
+                    OpenRequestOwner::Navigation,
+                    &epub,
+                    super::PdfOpenFailure::NotConverted,
+                ),
+                super::PdfOpenFailureRoute::ConversionDialogOpened
             );
-            let send_done = app
-                .with_window_viewer_context(8102, |detached| {
-                    let state = detached.epub_convert.as_mut().unwrap();
-                    state.phase =
-                        crate::ui_dialogs::epub_convert::EpubConvertPhase::Converting(None);
-                    state.fake_published_sender_for_test()
-                })
-                .unwrap();
-            let progress_output = ctx.run(Default::default(), |ctx| {
-                app.poll_parked_document_open_owners(ctx)
-            });
-            assert!(
-                !progress_output.shapes.is_empty(),
-                "progress must remain visible"
-            );
-            assert!(
-                app.with_viewer_context_ref(id, |owner| owner.epub_convert().is_some())
-                    .unwrap()
-            );
-            if complete {
-                send_done();
-                let _ = ctx.run(Default::default(), |ctx| {
-                    app.poll_parked_document_open_owners(ctx)
-                });
-                app.with_window_viewer_context(8102, |detached| {
-                    assert!(detached.epub_convert.is_none());
-                    assert!(detached.pdf_enumerate_pending.is_some());
-                })
-                .unwrap();
-            } else {
-                let mut input = egui::RawInput::default();
-                input.events.push(egui::Event::Key {
-                    key: egui::Key::Escape,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                });
-                let _ = ctx.run(input, |ctx| app.poll_parked_document_open_owners(ctx));
-                app.with_window_viewer_context(8102, |detached| {
-                    assert!(detached.epub_convert.is_none());
-                    assert!(detached.pdf_enumerate_pending.is_none());
-                })
-                .unwrap();
-                assert_eq!(app.modal_dialog_block_reason(), None);
-            }
-        }
+        })
+        .unwrap();
+        assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
+        app.with_window_viewer_context(8102, |detached| {
+            detached.pause_mounted_background_work_keep_current_frame();
+            assert!(detached.epub_convert.is_none());
+            assert!(detached.pdf_enumerate_pending.is_none());
+        })
+        .unwrap();
+        assert!(
+            app.with_viewer_context_ref(id, |owner| owner
+                .pending_context_async_owners()
+                .is_empty())
+                .unwrap()
+        );
+        let output = ctx.run(Default::default(), |_| {});
+        assert!(output.shapes.is_empty());
+        assert_eq!(app.modal_dialog_block_reason(), None);
     }
 
     #[test]
     #[cfg(windows)]
-    fn detached_suffix_directory_input_is_classified_and_adopted_while_parked() {
+    fn detached_epub_modal_completion_releases_context_activation() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.push_window_context_for_test(&ctx, 8108, |_| {});
+        let epub = app.tmp.path().join("complete-convert.epub");
+        write_history_review_epub(&epub);
+        app.settings.epub_file_handling = crate::settings::EpubFileHandling::Convert;
+        app.build_active_context_for_test(Some(8109), DetachedSource::Book, |detached| {
+            assert_eq!(
+                detached.route_pdf_open_failure(
+                    OpenRequestOwner::Navigation,
+                    &epub,
+                    super::PdfOpenFailure::NotConverted,
+                ),
+                super::PdfOpenFailureRoute::ConversionDialogOpened
+            );
+        });
+        assert!(!app.activate_detached_image_window_snapshot(&ctx, 8108));
+        let send_done = app
+            .with_active_viewer_context(|active| {
+                let state = active.epub_convert.as_mut().unwrap();
+                state.phase = crate::ui_dialogs::epub_convert::EpubConvertPhase::Converting(None);
+                state.fake_published_sender_for_test()
+            })
+            .unwrap();
+        send_done();
+        let _ = ctx.run(Default::default(), |ctx| {
+            app.update_active_viewer_context(ctx, None);
+        });
+        assert!(
+            app.with_active_viewer_context(|active| active.epub_convert.is_none())
+                .unwrap_or(true)
+        );
+        assert!(!app.document_open_modal_admission_blocked());
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 8108));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_suffix_directory_input_is_classified_and_adopted_while_mounted() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let suffix_dir = app.tmp.path().join("detached-book.epub");
         std::fs::create_dir(&suffix_dir).unwrap();
         std::fs::write(suffix_dir.join("page.png"), b"image").unwrap();
         app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
-        let id = app.push_window_context_for_test(&ctx, 8101, |_| {});
-        app.with_window_viewer_context(8101, |detached| {
+        let id = app.build_active_context_for_test(Some(8101), DetachedSource::Book, |detached| {
             assert!(matches!(
                 detached.load_folder_or_convert_archive(suffix_dir.clone()),
                 super::FolderOpenOutcome::Classifying
@@ -11464,19 +11511,20 @@ mod startup_open_path_resolve_tests {
                     .open_path_classification()
                     .is_some()
             );
-        })
-        .unwrap();
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let done = app
-                .with_viewer_context_ref(id, |owner| !owner.document_open_needs_service())
+                .with_viewer_context_ref(id, |owner| {
+                    owner.pending_context_async_owners().is_empty()
+                })
                 .unwrap();
             if done {
                 break;
             }
             assert!(std::time::Instant::now() < deadline);
             let _ = ctx.run(Default::default(), |ctx| {
-                app.poll_parked_document_open_owners(ctx)
+                app.update_active_viewer_context(ctx, None);
             });
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -11489,6 +11537,110 @@ mod startup_open_path_resolve_tests {
         })
         .unwrap();
         assert_ne!(app.current_folder.as_deref(), Some(suffix_dir.as_path()));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn park_terminates_classification_history_pdf_and_zip_without_adopting() {
+        for kind in ["classification", "history", "pdf", "zip"] {
+            let mut app = setup_app();
+            let source = app.tmp.path().join(format!("park-source-{kind}"));
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("keep.jpg"), []).unwrap();
+            app.load_folder(source);
+            let address = app.address.clone();
+            let rows = app.items.clone();
+            let selected = app.selected;
+            let back = app.folder_nav_back_stack.clone();
+            let forward = app.folder_nav_forward_stack.clone();
+            let slot = app.active_quick_folder_slot;
+            let a_target = app.quick_folder_workspaces[0].target.clone();
+            let b_target = app.quick_folder_workspaces[1].target.clone();
+            let a_history = app.quick_folder_workspaces[0].history.clone();
+            let b_history = app.quick_folder_workspaces[1].history.clone();
+            let surface = format!("{:?}", app.top_level_grid_view.surface());
+            let target = app.tmp.path().join(format!("park-target-{kind}.pdf"));
+            match kind {
+                "classification" => {
+                    let directory = app.tmp.path().join("park-target.epub");
+                    std::fs::create_dir(&directory).unwrap();
+                    assert!(matches!(
+                        app.load_folder_or_convert_archive(directory),
+                        FolderOpenOutcome::Classifying
+                    ));
+                    assert!(app.top_level_grid_view.open_path_classification().is_some());
+                }
+                "history" => {
+                    std::fs::write(&target, b"%PDF-1.4\n").unwrap();
+                    assert!(app.start_physical_history_transition(
+                        super::PhysicalHistoryIntent::Navigation {
+                            replay: None,
+                            auto_fullscreen: false,
+                        },
+                        target,
+                    ));
+                    assert!(
+                        app.top_level_grid_view
+                            .history_navigation_transition()
+                            .is_some()
+                    );
+                }
+                "pdf" => {
+                    std::fs::write(&target, b"%PDF-1.4\n").unwrap();
+                    assert!(matches!(
+                        app.load_pdf_as_folder_owned(target, OpenRequestOwner::Navigation),
+                        FolderOpenOutcome::Loaded
+                    ));
+                    assert!(app.pdf_enumerate_pending.is_some());
+                }
+                "zip" => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    app.zip_enumerate_pending = Some(ZipEnumeratePending {
+                        zip_path: app.tmp.path().join("park-target.zip"),
+                        input_seq: app.input_seq,
+                        cancel: std::sync::Arc::clone(&cancel),
+                        rx,
+                    });
+                    app.pause_mounted_background_work_keep_current_frame();
+                    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+                    drop(tx);
+                }
+                _ => unreachable!(),
+            }
+            if kind != "zip" {
+                app.pause_mounted_background_work_keep_current_frame();
+            }
+            assert!(app.top_level_grid_view.open_path_classification().is_none());
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
+            );
+            assert!(app.pdf_enumerate_pending.is_none());
+            assert!(app.zip_enumerate_pending.is_none());
+            assert!(
+                super::viewer_context_registry::ContextRef::mounted(&app)
+                    .pending_context_async_owners()
+                    .is_empty(),
+                "owner remains after park: {kind}"
+            );
+            assert_eq!(app.address, address, "{kind}");
+            assert_eq!(app.items, rows, "{kind}");
+            assert_eq!(app.selected, selected, "{kind}");
+            assert_eq!(app.folder_nav_back_stack, back, "{kind}");
+            assert_eq!(app.folder_nav_forward_stack, forward, "{kind}");
+            assert_eq!(app.active_quick_folder_slot, slot, "{kind}");
+            assert_eq!(app.quick_folder_workspaces[0].target, a_target, "{kind}");
+            assert_eq!(app.quick_folder_workspaces[1].target, b_target, "{kind}");
+            assert_eq!(app.quick_folder_workspaces[0].history, a_history, "{kind}");
+            assert_eq!(app.quick_folder_workspaces[1].history, b_history, "{kind}");
+            assert_eq!(
+                format!("{:?}", app.top_level_grid_view.surface()),
+                surface,
+                "{kind}"
+            );
+        }
     }
 
     #[test]
@@ -12039,7 +12191,6 @@ mod startup_open_path_resolve_tests {
         let before = app.folder_nav_history_snapshot();
         let rows = app.items.clone();
         app.pdf_password_request = Some(super::PdfPasswordRequest::legacy(prompt.clone()));
-        app.show_pdf_password_dialog = true;
         assert_eq!(app.modal_dialog_block_reason(), Some("pdf_password"));
         assert_eq!(
             app.load_pdf_as_folder_owned(other, OpenRequestOwner::Navigation),
@@ -12052,7 +12203,7 @@ mod startup_open_path_resolve_tests {
             before.back_stack
         );
         assert!(app.retry_pdf_password_dialog_request("secret".into(), false));
-        assert!(!app.show_pdf_password_dialog);
+        assert!(app.pdf_password_dialog_path().is_none());
         assert!(app.pdf_password_request.is_none());
         assert!(
             app.pdf_enumerate_pending
@@ -57900,7 +58051,6 @@ mod still_window_mode_key_tests {
             context.detached_viewer_independent_active = true;
             context.detached_viewer_open_next_still_detached_once = false;
         });
-        app.show_pdf_password_dialog = true;
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.update_active_viewer_context(ctx, None).updated;
@@ -57968,7 +58118,6 @@ mod still_window_mode_key_tests {
             if main_has_request {
                 app.pdf_password_request = Some(PdfPasswordRequest::legacy(main_pdf.clone()));
             }
-            app.show_pdf_password_dialog = true;
             app.pdf_password_input = "entered-password".to_owned();
             app.pdf_password_error = Some("wrong password".to_owned());
             app.pdf_password_save = true;
@@ -57982,7 +58131,7 @@ mod still_window_mode_key_tests {
 
             assert!(summary.had_pdf_password_request);
             if main_has_request {
-                assert!(app.show_pdf_password_dialog);
+                assert!(app.pdf_password_dialog_path().is_some());
                 assert_eq!(app.pdf_password_input, "entered-password");
                 assert_eq!(app.pdf_password_error.as_deref(), Some("wrong password"));
                 assert!(app.pdf_password_save);
@@ -57993,7 +58142,7 @@ mod still_window_mode_key_tests {
                     Some(main_pdf.as_path())
                 );
             } else {
-                assert!(!app.show_pdf_password_dialog);
+                assert!(app.pdf_password_dialog_path().is_none());
                 assert!(app.pdf_password_input.is_empty());
                 assert!(app.pdf_password_error.is_none());
                 assert!(!app.pdf_password_save);

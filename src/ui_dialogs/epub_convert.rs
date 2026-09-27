@@ -35,6 +35,7 @@ pub(crate) enum EpubConvertPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EpubConvertExit {
     Abort,
+    Parked,
     Superseded,
 }
 
@@ -492,7 +493,7 @@ impl App {
             }
         }
         if had_deferred {
-            if exit == EpubConvertExit::Abort {
+            if matches!(exit, EpubConvertExit::Abort | EpubConvertExit::Parked) {
                 self.finish_visible_container_fs_nav_failed();
             }
             // Archive conversion uses this same terminal path. No replacement conversion or
@@ -500,7 +501,7 @@ impl App {
             self.release_fs_nav_lock();
         }
         match exit {
-            EpubConvertExit::Abort => {
+            EpubConvertExit::Abort | EpubConvertExit::Parked => {
                 if matches!(continuation, EpubOpenContinuation::Direct(_)) {
                     self.restore_epub_open(restore);
                 }

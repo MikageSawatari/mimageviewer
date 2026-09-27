@@ -825,6 +825,20 @@ impl SimilarPreviewState {
         }
     }
 
+    pub(crate) fn has_pending_background_work(&self) -> bool {
+        matches!(
+            self.preparation,
+            SimilarPreviewPreparation::Running(_) | SimilarPreviewPreparation::Draining { .. }
+        )
+    }
+
+    /// A parked still viewer has no input or render service. Release its cancelled receiver
+    /// at the park boundary so a late completion cannot require a parked-context poll.
+    pub(crate) fn terminate_on_park(&mut self) {
+        self.invalidate();
+        self.preparation = SimilarPreviewPreparation::Idle;
+    }
+
     pub(crate) fn has_active_gesture(&self) -> bool {
         matches!(self.gesture, SimilarPreviewGesture::Holding { .. })
     }
@@ -839,10 +853,7 @@ impl SimilarPreviewState {
 
     #[cfg(test)]
     pub(crate) fn has_pending_worker_for_test(&self) -> bool {
-        matches!(
-            self.preparation,
-            SimilarPreviewPreparation::Running(_) | SimilarPreviewPreparation::Draining { .. }
-        )
+        self.has_pending_background_work()
     }
 
     /// Queue a deterministic completion receiver for the next production press path.

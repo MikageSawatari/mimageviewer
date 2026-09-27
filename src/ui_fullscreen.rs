@@ -21707,8 +21707,7 @@ impl App {
                         );
                     });
                 self.show_sidecar_restore_dialog(vp_ctx);
-                self.show_epub_convert_dialog(vp_ctx);
-                self.show_pdf_password_dialog_window(vp_ctx);
+                self.service_mounted_document_open_dialogs(vp_ctx);
             });
             self.register_detached_window_hwnd_after_show(
                 ctx,
@@ -21833,8 +21832,7 @@ impl App {
                         );
                     });
                 self.show_sidecar_restore_dialog(ctx);
-                self.show_epub_convert_dialog(ctx);
-                self.show_pdf_password_dialog_window(ctx);
+                self.service_mounted_document_open_dialogs(ctx);
             });
             #[cfg(windows)]
             if let Some(window_id) = keep_alive_window_id {
@@ -22191,8 +22189,7 @@ impl App {
                     }
                 });
             self.show_sidecar_restore_dialog(vp_ctx);
-            self.show_epub_convert_dialog(vp_ctx);
-            self.show_pdf_password_dialog_window(vp_ctx);
+            self.service_mounted_document_open_dialogs(vp_ctx);
             inner_t0.elapsed().as_secs_f64() * 1000.0
         });
         let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
@@ -24934,8 +24931,7 @@ impl App {
                 // The open owner is the mounted viewer bundle. A detached viewport must draw
                 // and drain its conversion here; the root update only sees the main bundle.
                 if !embedded {
-                    self.show_epub_convert_dialog(ctx);
-                    self.show_pdf_password_dialog_window(ctx);
+                    self.service_mounted_document_open_dialogs(ctx);
                 }
 
                 // 外部ツールへ渡すファイルの準備進捗も、押された viewport 上に出す。

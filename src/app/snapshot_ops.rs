@@ -1598,7 +1598,6 @@ impl App {
         self.zip_enumerate_pending = None;
         self.pdf_password_request = None;
         self.pdf_password_pending_save = None;
-        self.show_pdf_password_dialog = false;
         self.pdf_password_input.clear();
         self.pdf_password_error = None;
         self.pdf_password_save = false;
@@ -1624,7 +1623,6 @@ impl App {
             self.zip_enumerate_pending = None;
             self.pdf_password_request = None;
             self.pdf_password_pending_save = None;
-            self.show_pdf_password_dialog = false;
             self.pdf_password_input.clear();
             self.pdf_password_error = None;
             self.pdf_password_save = false;

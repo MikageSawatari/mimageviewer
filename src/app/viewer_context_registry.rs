@@ -1080,6 +1080,279 @@ pub(in crate::app) struct ContextRef<'a> {
     source: ContextRefSource<'a>,
 }
 
+/// Context-owned requests that must reach a terminal when a still viewer is parked. The variant
+/// list is the single inventory for mounted service and park termination. Long-lived cache and
+/// write workers have separate resume contracts, audited by the test below.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum ContextAsyncOwner {
+    PathClassification,
+    HistoryTransition,
+    CollectionGrid,
+    CollectionNavigation,
+    RatingNavigation,
+    BookmarkOpen,
+    FolderNavigation,
+    FolderPaneScan,
+    PdfEnumeration,
+    ZipEnumeration,
+    EpubConversion,
+    PdfPassword,
+    FullscreenDecode,
+    FinalAi,
+    LocalAdjustment,
+    ComicBake,
+    EraseInpaint,
+    SimilarPreview,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) enum ContextAsyncServicePhase {
+    Background,
+    Dialog,
+}
+
+#[cfg(windows)]
+impl ContextAsyncOwner {
+    pub(in crate::app) const ALL: [Self; 18] = [
+        Self::EpubConversion,
+        Self::PdfPassword,
+        Self::PathClassification,
+        Self::HistoryTransition,
+        Self::CollectionGrid,
+        Self::CollectionNavigation,
+        Self::RatingNavigation,
+        Self::BookmarkOpen,
+        Self::FolderNavigation,
+        Self::FolderPaneScan,
+        Self::PdfEnumeration,
+        Self::ZipEnumeration,
+        Self::FullscreenDecode,
+        Self::FinalAi,
+        Self::LocalAdjustment,
+        Self::ComicBake,
+        Self::EraseInpaint,
+        Self::SimilarPreview,
+    ];
+
+    pub(in crate::app) fn is_pending(self, context: ContextRef<'_>) -> bool {
+        macro_rules! pending {
+            ($owner:ident) => {
+                match self {
+                    Self::PathClassification => $owner
+                        .top_level_grid_view
+                        .open_path_classification()
+                        .is_some(),
+                    Self::HistoryTransition => $owner
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some(),
+                    Self::CollectionGrid => $owner
+                        .top_level_grid_view
+                        .collection_session()
+                        .is_some_and(|session| {
+                            matches!(
+                                &session.load,
+                                top_level_grid_view::CollectionGridLoadState::Snapshot { .. }
+                                    | top_level_grid_view::CollectionGridLoadState::Preparing { .. }
+                            )
+                        }),
+                    Self::CollectionNavigation => {
+                        $owner.top_level_grid_view.collection_navigation_pending()
+                    }
+                    Self::RatingNavigation => $owner.rating_view_pending.is_some(),
+                    Self::BookmarkOpen => $owner.bookmark_open_pending.is_some(),
+                    Self::FolderNavigation => $owner.folder_nav_pending.is_some(),
+                    Self::FolderPaneScan => $owner.folder_pane_open_pending.is_some(),
+                    Self::PdfEnumeration => $owner.pdf_enumerate_pending.is_some(),
+                    Self::ZipEnumeration => $owner.zip_enumerate_pending.is_some(),
+                    Self::EpubConversion => $owner.epub_convert.is_some(),
+                    Self::PdfPassword => $owner.pdf_password_request.is_some(),
+                    Self::FullscreenDecode => $owner.fs_pending.iter().next().is_some(),
+                    Self::FinalAi => !$owner.final_ai_pending.is_empty(),
+                    Self::LocalAdjustment => !$owner.local_adjust_pending.is_empty(),
+                    Self::ComicBake => !$owner.comic_bake_pending.is_empty(),
+                    Self::EraseInpaint => !$owner.erase_inpaint_pending.is_empty(),
+                    Self::SimilarPreview => {
+                        $owner.similar_panel.preview.has_pending_background_work()
+                    }
+                }
+            };
+        }
+        match context.source {
+            ContextRefSource::Mounted(owner) => pending!(owner),
+            ContextRefSource::AtRest(owner) => pending!(owner),
+        }
+    }
+
+    /// Collection/rating/bookmark polls also create or retire work from their visible surface.
+    /// All other owners need a live request before a mounted frame calls their worker service.
+    pub(in crate::app) fn needs_mounted_service(self, context: ContextRef<'_>) -> bool {
+        if self == Self::FullscreenDecode {
+            // Prefetch depends on the frame's freshly computed keep range. The frame calls
+            // this variant's service at that exact point instead of the early open-owner poll.
+            return false;
+        }
+        matches!(
+            self,
+            Self::CollectionGrid | Self::CollectionNavigation | Self::RatingNavigation
+        ) || self.is_pending(context)
+    }
+
+    pub(in crate::app) fn service(
+        self,
+        app: &mut App,
+        ctx: &egui::Context,
+        phase: ContextAsyncServicePhase,
+    ) {
+        if phase == ContextAsyncServicePhase::Dialog {
+            match self {
+                Self::EpubConversion if app.epub_convert.is_some() => {
+                    app.show_epub_convert_dialog(ctx)
+                }
+                Self::PdfPassword if app.mounted_context_owns_selected_pdf_password_prompt() => {
+                    app.show_pdf_password_dialog_window(ctx);
+                }
+                _ => {}
+            }
+            return;
+        }
+        match self {
+            Self::PathClassification => app.poll_open_path_classification(ctx),
+            Self::HistoryTransition => app.poll_collection_history_transition(ctx),
+            Self::CollectionGrid => app.poll_collection_grid(ctx),
+            Self::CollectionNavigation => app.poll_collection_navigation(ctx),
+            Self::RatingNavigation => app.poll_rating_view(),
+            Self::BookmarkOpen => {
+                app.poll_bookmark_media_open(ctx);
+                app.poll_bookmark_book_open(ctx);
+            }
+            Self::FolderNavigation if app.navigation_scope.is_detached_physical() => {
+                if let Some(result) = app.poll_folder_nav() {
+                    app.apply_folder_nav_result(ctx, result);
+                }
+            }
+            Self::FolderPaneScan if app.navigation_scope.is_detached_physical() => {
+                if matches!(
+                    app.poll_detached_physical_folder_open(ctx),
+                    DetachedPhysicalFolderOpenPoll::Failed
+                ) {
+                    app.terminate_active_detached_open_before_viewport(
+                        "detached_physical_open_failed",
+                    );
+                }
+            }
+            Self::PdfEnumeration => app.poll_pdf_enumerate(),
+            Self::ZipEnumeration => app.poll_zip_enumerate(),
+            Self::EpubConversion | Self::PdfPassword => {}
+            Self::FullscreenDecode => app.poll_prefetch(ctx, PollPrefetchOrigin::TopLevel),
+            Self::FinalAi => app.poll_final_ai(ctx),
+            Self::LocalAdjustment => app.poll_local_adjust_render(ctx),
+            Self::ComicBake => {
+                app.poll_comic_bake(ctx);
+            }
+            Self::EraseInpaint => app.poll_erase_inpaint(ctx),
+            Self::SimilarPreview => {
+                let passwords = app.pdf_passwords.clone();
+                app.similar_panel.preview.poll_background(ctx, &passwords);
+            }
+            Self::FolderNavigation | Self::FolderPaneScan => {}
+        }
+    }
+
+    pub(in crate::app) fn terminate_on_park(self, app: &mut App) {
+        match self {
+            Self::PathClassification => {
+                if let Some(candidate) = app.top_level_grid_view.take_open_path_classification() {
+                    app.finish_rejected_open_path_classification(&candidate);
+                }
+            }
+            Self::HistoryTransition => app.replace_history_navigation_transition(None),
+            Self::CollectionGrid => {
+                if let Some(session) = app.top_level_grid_view.collection_session_mut() {
+                    session.cancel_pending();
+                }
+            }
+            Self::CollectionNavigation => app.cancel_collection_navigation_intent(),
+            Self::RatingNavigation => {
+                if let Some(pending) = app.rating_view_pending.take() {
+                    pending.cancel();
+                }
+            }
+            Self::BookmarkOpen => {
+                if let Some(request_id) = app
+                    .bookmark_open_pending
+                    .as_ref()
+                    .map(|pending| pending.request_id())
+                {
+                    app.cancel_bookmark_open_request(request_id, "context_parked");
+                }
+            }
+            Self::FolderNavigation => {
+                if let Some(pending) = app.folder_nav_pending.take() {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+                app.clear_pending_folder_nav_steps();
+                app.release_fs_nav_lock();
+            }
+            Self::FolderPaneScan => {
+                if let Some(mut pending) = app.folder_pane_open_pending.take() {
+                    let restore = pending.epub_restore.take();
+                    pending.cancel_with_diagnostic("context_parked");
+                    app.finish_pane_open_restore(restore, PaneOpenRestoreExit::Abandoned);
+                }
+            }
+            Self::PdfEnumeration => {
+                if let Some(mut pending) = app.pdf_enumerate_pending.take() {
+                    pending.2.cancel.store(true, Ordering::Relaxed);
+                    if let Some(restore) = pending.4.take() {
+                        app.restore_epub_open(restore);
+                    }
+                }
+            }
+            Self::ZipEnumeration => {
+                if let Some(pending) = app.zip_enumerate_pending.take() {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Self::EpubConversion => {
+                app.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Parked);
+            }
+            Self::PdfPassword => {
+                let _ = app.finish_pdf_password_request_in_mounted_context(PdfPasswordExit::Parked);
+            }
+            Self::FullscreenDecode => {
+                for (_, pending) in app.fs_pending.drain() {
+                    pending.cancel();
+                }
+            }
+            Self::FinalAi => {
+                for pending in app.final_ai_pending.values() {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+                app.final_ai_pending.clear();
+            }
+            Self::LocalAdjustment => {
+                for (_, pending) in app.local_adjust_pending.drain() {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Self::ComicBake => {
+                for (_, pending) in app.comic_bake_pending.drain() {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Self::EraseInpaint => {
+                for (_, pending) in app.erase_inpaint_pending.drain() {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Self::SimilarPreview => app.similar_panel.preview.terminate_on_park(),
+        }
+    }
+}
+
 #[cfg(windows)]
 impl<'a> ContextRef<'a> {
     pub(in crate::app) fn mounted(app: &'a App) -> Self {
@@ -1138,34 +1411,11 @@ impl<'a> ContextRef<'a> {
         }
     }
 
-    pub(in crate::app) fn document_open_needs_service(self) -> bool {
-        match self.source {
-            ContextRefSource::Mounted(app) => {
-                app.top_level_grid_view.open_path_classification().is_some()
-                    || app
-                        .top_level_grid_view
-                        .history_navigation_transition()
-                        .is_some()
-                    || app.epub_convert.is_some()
-                    || app.folder_nav_pending.is_some()
-                    || app.pdf_enumerate_pending.is_some()
-                    || app.zip_enumerate_pending.is_some()
-            }
-            ContextRefSource::AtRest(bundle) => {
-                bundle
-                    .top_level_grid_view
-                    .open_path_classification()
-                    .is_some()
-                    || bundle
-                        .top_level_grid_view
-                        .history_navigation_transition()
-                        .is_some()
-                    || bundle.epub_convert.is_some()
-                    || bundle.folder_nav_pending.is_some()
-                    || bundle.pdf_enumerate_pending.is_some()
-                    || bundle.zip_enumerate_pending.is_some()
-            }
-        }
+    pub(in crate::app) fn pending_context_async_owners(self) -> Vec<ContextAsyncOwner> {
+        ContextAsyncOwner::ALL
+            .into_iter()
+            .filter(|owner| owner.is_pending(self))
+            .collect()
     }
 
     pub(in crate::app) fn current_folder(self) -> Option<&'a Path> {
@@ -1687,7 +1937,12 @@ impl ViewerContextBundle {
 impl App {
     #[cfg(windows)]
     pub(in crate::app) fn pause_mounted_background_work_keep_current_frame(&mut self) {
-        self.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
+        if let Some(holdover) = self.fs_holdover_tex.as_mut() {
+            holdover.finish_navigation_diagnostic("context_parked");
+        }
+        for owner in ContextAsyncOwner::ALL {
+            owner.terminate_on_park(self);
+        }
         self.slideshow_playing = false;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
@@ -1698,42 +1953,18 @@ impl App {
         self.pending_return_to_parent = false;
         self.fs_nav_after_pdf_enumerate = None;
         self.fs_nav_locked_gen = None;
-        if let Some(holdover) = self.fs_holdover_tex.as_mut() {
-            holdover.finish_navigation_diagnostic("context_parked");
-        }
         self.fs_holdover_tex = None;
         self.fs_nav_dropped_block_signature = None;
         self.fs_nav_dropped_block_count = 0;
         self.continuous_page_transitions.clear();
-        self.pdf_enumerate_pending = None;
-        self.zip_enumerate_pending = None;
-        if let Some(pending) = self.folder_nav_pending.take() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        if let Some(mut pending) = self.folder_pane_open_pending.take() {
-            let restore = pending.epub_restore.take();
-            pending.cancel_with_diagnostic("context_parked");
-            self.finish_pane_open_restore(restore, super::PaneOpenRestoreExit::Abandoned);
-        }
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = FolderNavMode::Grid;
-        for (_, pending) in self.fs_pending.drain() {
-            pending.cancel();
-        }
         self.texture_backlog.clear();
-        for pending in self.final_ai_pending.values() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        self.final_ai_pending.clear();
-        for (_, pending) in self.local_adjust_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        for (_, pending) in self.comic_bake_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        for (_, pending) in self.erase_inpaint_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
+        debug_assert!(
+            ContextAsyncOwner::ALL
+                .into_iter()
+                .all(|owner| { !owner.is_pending(ContextRef::mounted(self)) })
+        );
     }
 
     #[cfg(windows)]
@@ -3229,24 +3460,6 @@ impl App {
         self.viewer_contexts.table.other_ids()
     }
 
-    /// Poll only the viewer-owned Similar preview workers without mounting parked contexts.
-    pub(in crate::app) fn poll_similar_preview_workers_in_all_contexts(
-        &mut self,
-        ctx: &egui::Context,
-    ) {
-        let passwords = self.pdf_passwords.clone();
-        self.similar_panel.preview.poll_background(ctx, &passwords);
-        for id in self.viewer_contexts.table.other_ids() {
-            let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) else {
-                continue;
-            };
-            bundle
-                .similar_panel
-                .preview
-                .poll_background(ctx, &passwords);
-        }
-    }
-
     /// A global final-cover setting is shared by every viewer context, while the geometry and
     /// interaction owners it changes are context-local. Reset parked owners in place without
     /// mounting them or cancelling unrelated workers; their navigation demand is rebound by the
@@ -3949,6 +4162,204 @@ mod tests {
             SimilarMoveTrace::terminal_reasons_for_test(navigation_id),
             vec!["context_parked"]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn collection_navigation_continuation_is_terminal_on_park() {
+        use crate::app::collection_navigation::CollectionNavigationPending;
+        let mut app = crate::app::setup_app_for_test();
+        let address = app.address.clone();
+        let rows = app.items.clone();
+        let back = app.folder_nav_back_stack.clone();
+        let forward = app.folder_nav_forward_stack.clone();
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(
+                CollectionNavigationPending::AwaitingOuterContinuation {
+                    steps: 1,
+                    fullscreen: false,
+                    resume_slideshow: false,
+                    native_toast: false,
+                },
+            ));
+        assert!(ContextAsyncOwner::CollectionNavigation.is_pending(ContextRef::mounted(&app)));
+        app.pause_mounted_background_work_keep_current_frame();
+        assert!(!app.top_level_grid_view.collection_navigation_pending());
+        assert!(
+            ContextRef::mounted(&app)
+                .pending_context_async_owners()
+                .is_empty()
+        );
+        assert_eq!(app.address, address);
+        assert_eq!(app.items, rows);
+        assert_eq!(app.folder_nav_back_stack, back);
+        assert_eq!(app.folder_nav_forward_stack, forward);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_dfs_request_is_terminal_on_park() {
+        let mut app = crate::app::setup_app_for_test();
+        let address = app.address.clone();
+        let rows = app.items.clone();
+        let back = app.folder_nav_back_stack.clone();
+        let forward = app.folder_nav_forward_stack.clone();
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.folder_nav_pending = Some(FolderNavPending {
+            cancel: Arc::clone(&cancel),
+            rx: receiver,
+            forward: true,
+            mode: FolderNavMode::Grid,
+        });
+        app.pending_folder_nav_steps = 2;
+        assert!(ContextAsyncOwner::FolderNavigation.is_pending(ContextRef::mounted(&app)));
+
+        app.pause_mounted_background_work_keep_current_frame();
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.folder_nav_pending.is_none());
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        assert!(
+            ContextRef::mounted(&app)
+                .pending_context_async_owners()
+                .is_empty()
+        );
+        assert_eq!(app.address, address);
+        assert_eq!(app.items, rows);
+        assert_eq!(app.folder_nav_back_stack, back);
+        assert_eq!(app.folder_nav_forward_stack, forward);
+        drop(sender);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rating_request_reaches_park_terminal() {
+        let mut rating = crate::app::setup_app_for_test();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("keep.jpg"), []).unwrap();
+        rating.load_folder(source.path().to_path_buf());
+        rating.enter_rating_view(5);
+        assert!(rating.rating_view_pending.is_some());
+        let rating_address = rating.address.clone();
+        let rating_rows = rating.items.clone();
+        rating.pause_mounted_background_work_keep_current_frame();
+        assert!(rating.rating_view_pending.is_none());
+        assert_eq!(rating.address, rating_address);
+        assert_eq!(rating.items, rating_rows);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bookmark_request_reaches_park_terminal() {
+        let mut bookmark = crate::app::setup_app_for_test();
+        let source = tempfile::tempdir().unwrap();
+        let address = bookmark.address.clone();
+        let rows = bookmark.items.clone();
+        bookmark.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Media(
+            crate::bookmark_browser::PendingMediaOpen {
+                request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
+                path: source.path().join("later.mp4"),
+                pts_secs: 0.0,
+                started_at: std::time::Instant::now(),
+                last_wait: None,
+            },
+        ));
+        assert!(ContextAsyncOwner::BookmarkOpen.is_pending(ContextRef::mounted(&bookmark)));
+        bookmark.pause_mounted_background_work_keep_current_frame();
+        assert!(bookmark.bookmark_open_pending.is_none());
+        assert_eq!(bookmark.address, address);
+        assert_eq!(bookmark.items, rows);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn context_async_owner_registry_audits_bundle_pending_fields() {
+        // This source audit forces an explicit registration or a documented cache-only
+        // exception whenever a pending field is added to ViewerContextBundle.
+        let source = include_str!("viewer_context_registry.rs").replace("\r\n", "\n");
+        let bundle = source
+            .split_once("pub(in crate::app) struct ViewerContextBundle {")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let fields = bundle
+            .lines()
+            .filter_map(|line| line.trim().split_once(':').map(|(name, _)| name))
+            .filter(|name| name.ends_with("pending"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let registered = [
+            "folder_nav_pending",
+            "folder_pane_open_pending",
+            "fs_pending",
+            "rating_view_pending",
+            "bookmark_open_pending",
+            "pdf_enumerate_pending",
+            "zip_enumerate_pending",
+            "local_adjust_pending",
+            "final_ai_pending",
+            "comic_bake_pending",
+            "erase_inpaint_pending",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        // These are cache/write workers, not a document-open or fullscreen request. Their
+        // established mounted frame and resume lifecycles remain separate from park terminal.
+        let cache_or_write = [
+            "stack_script_pending",
+            "facet_name_cache_pending",
+            "details_meta_pending",
+            "metadata_pending",
+            "tag_prewarm_pending",
+            "converted_archive_cache_paths_pending",
+            "view_trim_save_pending",
+            "page_edit_reconcile_pending",
+            "final_effect_pending",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        assert!(registered.is_disjoint(&cache_or_write));
+        assert_eq!(fields, registered.union(&cache_or_write).copied().collect());
+
+        let names = ContextAsyncOwner::ALL
+            .into_iter()
+            .map(|owner| format!("{owner:?}"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names.len(), ContextAsyncOwner::ALL.len());
+        for owner in [
+            ContextAsyncOwner::PathClassification,
+            ContextAsyncOwner::HistoryTransition,
+            ContextAsyncOwner::CollectionGrid,
+            ContextAsyncOwner::CollectionNavigation,
+            ContextAsyncOwner::RatingNavigation,
+            ContextAsyncOwner::BookmarkOpen,
+            ContextAsyncOwner::FolderNavigation,
+            ContextAsyncOwner::FolderPaneScan,
+            ContextAsyncOwner::PdfEnumeration,
+            ContextAsyncOwner::ZipEnumeration,
+            ContextAsyncOwner::EpubConversion,
+            ContextAsyncOwner::PdfPassword,
+            ContextAsyncOwner::FullscreenDecode,
+            ContextAsyncOwner::FinalAi,
+            ContextAsyncOwner::LocalAdjustment,
+            ContextAsyncOwner::ComicBake,
+            ContextAsyncOwner::EraseInpaint,
+            ContextAsyncOwner::SimilarPreview,
+        ] {
+            assert!(ContextAsyncOwner::ALL.contains(&owner));
+        }
+        let grid_source = include_str!("top_level_grid_view.rs");
+        for field in [
+            "collection_session:",
+            "collection_navigation_pending:",
+            "history_navigation_transition:",
+            "open_path_classification:",
+        ] {
+            assert!(grid_source.contains(field));
+        }
+        assert!(bundle.contains("similar_panel:"));
     }
 
     #[cfg(windows)]
