@@ -4,7 +4,7 @@ pub mod raw_decoder;
 pub use executor::{RawDevelopExecutor, RawPriority, RawTicket};
 pub use raw_decoder::{
     RawBrightness, RawDevelopScale, RawDevelopSupport, RawError, RawInfo, RawOwnedSource,
-    RawPreview, RawPreviewInfo, RawSource, RawUnsupportedReason,
+    RawPreview, RawPreviewInfo, RawPreviewUnavailableReason, RawSource, RawUnsupportedReason,
 };
 
 #[cfg(test)]
@@ -55,10 +55,18 @@ mod tests {
             if let Some(flip) = sample["expected"]["flip"].as_u64() {
                 assert_eq!(u64::from(info.flip), flip, "{} flip", path.display());
             }
+            let expected_preview = sample["expected"]["has_usable_preview"]
+                .as_bool()
+                .expect("manifest preview expectation");
             match raw_decoder::preview(RawSource::Path(&path)) {
                 Ok(preview) => {
+                    assert!(expected_preview, "{} unexpected preview", path.display());
                     let [width, height] = preview.info.dims;
-                    let flip = preview.info.tflip.unwrap_or(info.flip);
+                    let flip = preview
+                        .info
+                        .tflip
+                        .filter(|&flip| flip != 0)
+                        .unwrap_or(info.flip);
                     let expected_dims = if flip & 4 != 0 {
                         (height, width)
                     } else {
@@ -70,8 +78,17 @@ mod tests {
                         "{} preview orientation",
                         path.display()
                     );
+                    if sample["expected"]["portrait_preview"].as_bool() == Some(true) {
+                        assert!(
+                            preview.image.height() > preview.image.width(),
+                            "{} should have a portrait preview",
+                            path.display()
+                        );
+                    }
                 }
-                Err(RawError::NoUsablePreview) => {}
+                Err(RawError::NoUsablePreview(_)) => {
+                    assert!(!expected_preview, "{} missing preview", path.display());
+                }
                 Err(error) => panic!("{} preview: {error}", path.display()),
             }
             if !supported {
@@ -83,12 +100,13 @@ mod tests {
                     RawPriority::High,
                     send,
                 );
+                let actual = receive.recv_timeout(Duration::from_secs(30));
                 assert!(
                     matches!(
-                        receive.recv_timeout(Duration::from_secs(30)),
+                        &actual,
                         Ok(Err(RawError::Unsupported(RawUnsupportedReason::Decoder)))
                     ),
-                    "{} unsupported develop",
+                    "{} unsupported develop: {actual:?}",
                     path.display()
                 );
                 continue;

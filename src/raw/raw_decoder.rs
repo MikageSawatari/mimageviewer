@@ -93,12 +93,19 @@ pub struct RawPreview {
     pub info: RawPreviewInfo,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawPreviewUnavailableReason {
+    NoSupportedCandidate,
+    DecodeFailed,
+    OrientationMismatch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawError {
     Io(String),
     Corrupt(String),
     Unsupported(RawUnsupportedReason),
-    NoUsablePreview,
+    NoUsablePreview(RawPreviewUnavailableReason),
     OutOfMemory,
     Cancelled,
     TooLarge,
@@ -355,9 +362,22 @@ mod windows {
         Ok(DynamicImage::ImageRgb8(out))
     }
 
+    fn orientation_mismatch(preview: [u32; 2], developed: [u32; 2]) -> bool {
+        let not_square = |[width, height]: [u32; 2]| {
+            let long = u64::from(width.max(height));
+            let short = u64::from(width.min(height));
+            (long - short) * 100 > long * 5
+        };
+        not_square(preview)
+            && not_square(developed)
+            && (preview[0] > preview[1]) != (developed[0] > developed[1])
+    }
+
     pub fn preview(source: RawSource<'_>) -> Result<RawPreview, RawError> {
         let raw_info = info(source)?;
         let mut candidates = raw_info.previews;
+        let had_candidate = !candidates.is_empty();
+        let mut orientation_mismatched = false;
         candidates.sort_by_key(|preview| {
             std::cmp::Reverse(u64::from(preview.dims[0]) * u64::from(preview.dims[1]))
         });
@@ -401,14 +421,26 @@ mod windows {
                 }
             };
             if let Some(image) = image {
-                let flip = meta.tflip.unwrap_or(raw_info.flip);
-                return Ok(RawPreview {
-                    image: orient(image, flip)?,
-                    info: meta,
-                });
+                let flip = meta
+                    .tflip
+                    .filter(|&flip| flip != 0)
+                    .unwrap_or(raw_info.flip);
+                let image = orient(image, flip)?;
+                if orientation_mismatch([image.width(), image.height()], raw_info.developed_dims) {
+                    orientation_mismatched = true;
+                    continue;
+                }
+                return Ok(RawPreview { image, info: meta });
             }
         }
-        Err(RawError::NoUsablePreview)
+        let reason = if orientation_mismatched {
+            RawPreviewUnavailableReason::OrientationMismatch
+        } else if had_candidate {
+            RawPreviewUnavailableReason::DecodeFailed
+        } else {
+            RawPreviewUnavailableReason::NoSupportedCandidate
+        };
+        Err(RawError::NoUsablePreview(reason))
     }
 
     struct CallbackState<'a> {
@@ -500,7 +532,7 @@ mod windows {
         progress.store(100, Ordering::Release);
         RgbImage::from_raw(width, height, rgb)
             .map(DynamicImage::ImageRgb8)
-            .ok_or_else(|| RawError::Internal(-1))
+            .ok_or(RawError::Internal(-1))
     }
 
     #[cfg(test)]
@@ -519,6 +551,16 @@ mod windows {
         assert_eq!(flipped_five.get_pixel(2, 0)[0], 5);
         assert_eq!(flipped_six.get_pixel(0, 0)[0], 4);
         assert_eq!(flipped_six.get_pixel(2, 0)[0], 0);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn orientation_mismatch_rejects_only_clear_landscape_portrait_conflicts() {
+        assert!(orientation_mismatch([4928, 3280], [3292, 4940]));
+        assert!(!orientation_mismatch([3280, 4928], [3292, 4940]));
+        assert!(!orientation_mismatch([1000, 951], [3292, 4940]));
+        assert!(!orientation_mismatch([1000, 950], [3292, 4940]));
+        assert!(orientation_mismatch([1000, 949], [949, 1000]));
     }
 }
 

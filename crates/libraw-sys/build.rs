@@ -15,6 +15,11 @@ fn main() {
     }
     println!("cargo:rerun-if-changed={}", makefile.display());
     println!("cargo:rerun-if-changed={}", root.join("VERSION").display());
+    println!("cargo:rerun-if-changed=shim/miv_libraw.cpp");
+    println!("cargo:rerun-if-changed=shim/miv_libraw.h");
+    println!("cargo:rerun-if-changed={}", root.join("libraw").display());
+    println!("cargo:rerun-if-changed={}", root.join("src").display());
+    println!("cargo:rerun-if-changed={}", zlib.display());
     let version = std::fs::read_to_string(root.join("VERSION")).expect("LibRaw VERSION");
     assert_eq!(version.trim(), "0.22.2", "Unexpected LibRaw source version");
 
@@ -24,7 +29,9 @@ fn main() {
         "adler32", "compress", "crc32", "deflate", "gzclose", "gzlib", "gzread", "gzwrite",
         "infback", "inffast", "inflate", "inftrees", "trees", "uncompr", "zutil",
     ] {
-        z.file(zlib.join(format!("{name}.c")));
+        let file = zlib.join(format!("{name}.c"));
+        println!("cargo:rerun-if-changed={}", file.display());
+        z.file(file);
     }
     z.compile("miv_zlib");
 
@@ -77,6 +84,7 @@ fn main() {
             .unwrap_or_else(|| panic!("No Makefile.msvc source rule for {object}"));
         let file = root.join(source);
         assert!(file.is_file(), "LibRaw source missing: {}", file.display());
+        println!("cargo:rerun-if-changed={}", file.display());
         cpp.file(file);
     }
     cpp.file("shim/miv_libraw.cpp");

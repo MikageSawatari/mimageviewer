@@ -102,6 +102,7 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
     let start = Instant::now();
     let preview = raw_decoder::preview(RawSource::Path(&path));
     let preview_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let preview_error = preview.as_ref().err().map(ToString::to_string);
     let preview_dims = preview
         .as_ref()
         .ok()
@@ -114,6 +115,7 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
     if info.develop_support != RawDevelopSupport::Supported {
         return json!({"id":id,"case":sample["case"],"info_ms":info_ms,
             "preview_ms":preview_ms,"preview_dims":preview_size,
+            "preview_error":preview_error,
             "develop_support":format!("{:?}",info.develop_support),
             "flip":info.flip,"previews":info.previews.len()});
     }
@@ -178,6 +180,8 @@ fn benchmark(sample: &Value, executor: &RawDevelopExecutor, output: &Path) -> Va
         "info_dims":info.developed_dims,"full_dims":[full.width(),full.height()],
         "half_dims":[half.width(),half.height()],"dims_match":info.developed_dims==[full.width(),full.height()],
         "flip":info.flip,"preview_dims":preview_size,"preview_count":info.previews.len(),
+        "preview_error":preview_error,
+        "selected_preview_tflip":preview.as_ref().ok().and_then(|preview|preview.info.tflip),
         "zero_dim_cr3_thumb_candidate":zero_dim_cr3_thumb,
         "info_ms":info_ms,"preview_ms":preview_ms,"full_ms":full_ms,"half_ms":half_ms,
         "auto0001_ms":auto0001_ms,"no_auto_ms":no_auto_ms,"cancel_ms":cancel_ms,

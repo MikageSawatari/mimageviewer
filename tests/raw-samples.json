@@ -13,7 +13,7 @@
       "camera": "Canon EOS 5D Mark III",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -29,7 +29,7 @@
       "camera": "Canon EOS 20D",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -45,7 +45,7 @@
       "camera": "Adobe DNG Converter Canon EOS 5D Mark III",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -61,8 +61,9 @@
       "camera": "Canon EOS Digital Rebel XT",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
-        "flip": 5
+        "has_usable_preview": true,
+        "flip": 5,
+        "portrait_preview": true
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
     },
@@ -78,7 +79,8 @@
       "expected": {
         "develop_supported": true,
         "has_usable_preview": true,
-        "flip": 6
+        "flip": 6,
+        "portrait_preview": true
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
     },
@@ -93,7 +95,7 @@
       "camera": "Sony ILCE-7S",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -109,7 +111,7 @@
       "camera": "Canon PowerShot G1",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -125,7 +127,7 @@
       "camera": "Pentax K10D",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -141,7 +143,7 @@
       "camera": "Canon EOS M50",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -157,8 +159,9 @@
       "camera": "Ricoh GXR",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
-        "flip": 6
+        "has_usable_preview": true,
+        "flip": 6,
+        "portrait_preview": true
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
     },
@@ -173,7 +176,7 @@
       "camera": "Leica D-LUX 5",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -189,7 +192,7 @@
       "camera": "Google Pixel 4 XL",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -205,7 +208,7 @@
       "camera": "Samsung NX500",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -221,7 +224,7 @@
       "camera": "Fujifilm X-T4",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -237,7 +240,7 @@
       "camera": "Canon EOS R6",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -253,7 +256,7 @@
       "camera": "Nikon D2H",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -269,7 +272,7 @@
       "camera": "Olympus E-10",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -285,7 +288,7 @@
       "camera": "Nikon Z 8",
       "expected": {
         "develop_supported": false,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -301,7 +304,7 @@
       "camera": "Panasonic DMC-LX7",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -317,7 +320,7 @@
       "camera": "Sony ILCE-1M2",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
@@ -333,7 +336,7 @@
       "camera": "Phase One P40+",
       "expected": {
         "develop_supported": true,
-        "has_usable_preview": null,
+        "has_usable_preview": true,
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
