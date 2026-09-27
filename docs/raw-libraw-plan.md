@@ -56,6 +56,8 @@ HEIC / HEIF / AVIF / JXL / TIFF は従来どおり WIC のまま。
     「サムネイルにカラー化・LUT を掛けた低解像度の代役」を出す (Q1 案A、2026-09-27)
 11. **埋め込みプレビューが無い RAW** は、フルスクリーンでは「現像中」を出してフル現像を待つ。
     サムネイルだけ半分の解像度の現像 (以下 half 現像) で作る (Q2 案A、2026-09-27)
+12. **現像の明るさ**は既定で「埋め込みプレビューの明るさに合わせる」。環境設定で「補正なし」へ切り替え
+    られる (比較画像を見て利用者が選択、2026-09-27)
 
 用語の固定: 「先 / 前」は **表示順 (現在の一覧・読書順) での進行方向 / 逆方向**。
 既存設定の `prefetch_forward` (既定 12) / `prefetch_back` (既定 4) (`src/settings.rs:4226-4230`,
@@ -333,7 +335,7 @@ pub enum RawError {
 | `gamm` | `{1/2.4, 12.92}` | sRGB 曲線 (LibRaw 既定は BT.709) |
 | `highlight` | 0 (clip) | カメラ JPEG に近い |
 | `user_qual` | -1 (AHD。Fuji SuperCCD は PPG、X-Trans は Markesteijn) | 既定。AHD は中断の応答が最も良い (§5.4.3) |
-| 明るさ | **S1 で決める** | 候補: 自動 (thr 0.01 = LibRaw 既定) / 自動 (thr 0.001 = 公式文書の推奨範囲) / 自動なし。サンプル全件でプレビューとの平均輝度差を測り、利用者の目視で決める。数値は未計測 |
+| 明るさ | **既定 = プレビューに合わせる** (決定 12)。設定で「補正なし」へ切替 | 自動補正なし (`bright = 1`) で現像し、リニア光の輝度中央値を埋め込みプレビューと比べた倍率を LibRaw の `bright` (sRGB ガンマの前に掛かる線形倍率) として出力時に掛ける。demosaic はやり直さない。倍率は 1/8〜8 に制限。使えるプレビューが無い / 中央値が 0 のときは自動補正 (thr 0.001) で代用。S1 の 20 サンプルで倍率 1.00〜3.48 (中央値 2.10)、制限・代用ともに 0 件、プレビューとの平均輝度差 0.022 (自動 0.001 は 0.066)。詳細は [raw-libraw-s1-results.md](raw-libraw-s1-results.md) |
 | `half_size` | 用途で指定 | サムネイル・類似索引の代替だけ |
 
 LibRaw の現像はカメラ JPEG と色・トーンが一致しない (README: production-quality rendering ではない、
@@ -796,7 +798,12 @@ canonical loader の Full (High)。
 
 - `raw_develop_parallelism: u8` (既定 3、1〜10)。環境設定の「ファイル処理」系ページ (PDF ワーカー数の
   近く) に置く。変更は即時反映 (§5.4.1)
-- 現像パラメータの設定は v1 では作らない
+- `raw_brightness: RawBrightnessSetting` (`MatchPreview` 既定 / `None`)。環境設定の同じページに
+  「RAW の明るさ: プレビューに合わせる / 補正なし」として置く (決定 12)。変更時は RAW の現像済み
+  Static を keep set ごと失効させて再現像する (サムネイルは埋め込みプレビュー由来なので影響しない。
+  プレビューの無い RAW の half 現像サムネイルは catalog のキーに設定値を含め、切替後に作り直す)。
+  S3 で設定 UI と失効経路を実装し、「編集 → OK → 効果」までを通しでテストする
+- それ以外の現像パラメータの設定は v1 では作らない
 
 ## 14. 配布・ライセンス (S4)
 
@@ -866,7 +873,7 @@ canonical loader の Full (High)。
 
 | 段 | 内容 | 受入条件 |
 | --- | --- | --- |
-| **S1** | `crates/libraw-sys` (shim + cc ビルド、`USE_ZLIB` / `USE_JPEG`)、`setup-libraw.sh`、`raw_decoder` (info / preview / develop / 中断 / 進捗)、**`RawDevelopExecutor` の本体 (枠・優先度・取消・進捗・`submit` API。App との接続は S2)**、明るさの決定 (§5.3.4)、`bench_raw` (executor の `submit` 経由で現像する)、サンプル manifest | §15 の `raw_decoder` テストが緑。**lossy DNG と deflate DNG のフル現像が通る**。全サンプルの寸法一致・向き・プレビューと現像の縦横比差・所要時間・中断遅延の表を本書へ記録。core が VC runtime DLL を import しないこと (`check-vcrt-pe-dependencies.ps1`)。ubuntu CI の `cargo check` が通ること。`3fr erf kdc dcr mrw mos mef` の対応とサンプルの有無の報告 |
+| **S1** | `crates/libraw-sys` (shim + cc ビルド、`USE_ZLIB` / `USE_JPEG`)、`setup-libraw.sh`、`raw_decoder` (info / preview / develop / 中断 / 進捗)、**`RawDevelopExecutor` の本体 (枠・優先度・取消・進捗・`submit` API。App との接続は S2)**、明るさの決定 (§5.3.4)、`bench_raw` (executor の `submit` 経由で現像する)、サンプル manifest | §15 の `raw_decoder` テストが緑。**lossy DNG と deflate DNG のフル現像が通る**。全サンプルの寸法一致・向き・プレビューと現像の縦横比差・所要時間・中断遅延の表を本書へ記録。core が VC runtime DLL を import しないこと (`check-vcrt-pe-dependencies.ps1`)。ubuntu CI の `cargo check` は、ブランチを push したときに確認する (利用者判断 2026-09-27: Windows 専用ソフトなので S1 の合格条件にしない)。`3fr erf kdc dcr mrw mos mef` の対応とサンプルの有無の報告 |
 | **S2** | `raw_format` と WIC 境界の拒否、`RawDevelopExecutor` の App への接続 (設定値・App-global 所有)、入口 D1〜D11・P1〜P4 の振り分け、サムネイル (worker を塞がない half 現像)、ZIP 内 RAW、類似索引、書き出し / コピー / 外部ツール / 製本、Remote (§10.2 の詳細設計を独立レビューしてから) | 入口ごとの回帰テスト、executor テスト。`is_raw_ext` を通らずに RAW を decode する経路が無いことを grep 手順と test で示す |
 | **S3** | `RawPageStore`、`FsCacheEntry::RawPreview`、読み込み状態、現像窓、差し替えの layout (§7.5 の全経路)、色の gate、ページ送り / フォルダ移動、編集 gate、進捗表示と先読み行、設定 UI、§7.7 の consumer 点検 | `RawPageStore` の状態遷移テスト (§15 の全項目)、context 分離テスト、UI スナップショット (進捗表示と設定)。`build-dev.ps1` で利用者の実機確認 |
 | **S4** | ライセンス文書・バージョン情報・対応ソース・マニュアル・製品ページ・spec・readme・リリースチェックリスト・bootstrap | 文書差分のレビュー。`build-dist.ps1 -NoSign` 相当で同梱物に `LIBRAW-LICENSE.txt` が入ること |
@@ -880,7 +887,7 @@ S1 の実測 (寸法・向き・中断・codec・形式) は S2 / S3 へ進む�
 ### 17.1 利用者の判断が要るもの
 
 1. `3fr erf kdc dcr mrw mos mef` 等の追加 (S1 の調査結果を見て相談)
-2. 明るさのパラメータ (S1 の比較結果を見て目視で)
+2. ~~明るさのパラメータ~~ → 決定 12 (プレビューに合わせる + 補正なしへの切替)
 
 ### 17.2 設計レビュー・S1 で詰めるもの
 
