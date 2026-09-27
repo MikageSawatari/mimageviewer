@@ -583,6 +583,121 @@ pub(crate) fn render_resolved_page_in_process_for_test(
     Ok((result.image.width(), result.image.height()))
 }
 
+#[cfg(test)]
+type RemotePdfTestDirectionLog = std::sync::Arc<std::sync::Mutex<Vec<bool>>>;
+
+#[cfg(test)]
+type RemotePdfTestPaths =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, RemotePdfTestDirectionLog>>;
+
+#[cfg(test)]
+static REMOTE_PDF_TEST_PATHS: std::sync::OnceLock<RemotePdfTestPaths> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct RemotePdfTestBackend {
+    path: PathBuf,
+    directions: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+#[cfg(test)]
+static REMOTE_RESOLVE_TEST_COUNTS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct RemoteResolveTestCounter {
+    path: PathBuf,
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl RemoteResolveTestCounter {
+    pub(crate) fn for_path(path: &Path) -> Self {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        REMOTE_RESOLVE_TEST_COUNTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), count.clone());
+        Self {
+            path: path.to_path_buf(),
+            count,
+        }
+    }
+
+    pub(crate) fn take(&self) -> usize {
+        self.count.swap(0, Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Drop for RemoteResolveTestCounter {
+    fn drop(&mut self) {
+        REMOTE_RESOLVE_TEST_COUNTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+impl RemotePdfTestBackend {
+    pub(crate) fn for_path(path: &Path) -> Self {
+        let directions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        REMOTE_PDF_TEST_PATHS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), directions.clone());
+        Self {
+            path: path.to_path_buf(),
+            directions,
+        }
+    }
+
+    pub(crate) fn direction_requests(&self) -> Vec<bool> {
+        self.directions.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl Drop for RemotePdfTestBackend {
+    fn drop(&mut self) {
+        REMOTE_PDF_TEST_PATHS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+fn remote_pdf_test_capture(path: &Path) -> Option<std::sync::Arc<std::sync::Mutex<Vec<bool>>>> {
+    REMOTE_PDF_TEST_PATHS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(path)
+        .cloned()
+}
+
+#[cfg(test)]
+fn remote_pdf_test_run<T>(
+    operation: impl FnOnce(&mut PdfDocumentCache<'_>) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let dll = Path::new("vendor/pdfium/bin");
+    let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+        dll.to_str().unwrap(),
+    ))
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let pdfium = Pdfium::new(bindings);
+    let mut cache = PdfDocumentCache::new(&pdfium);
+    operation(&mut cache)
+}
+
 /// Returns a target only when deciding it requires no filesystem or database I/O.
 /// The pinned-table lock covers only an in-memory lookup, never source or DB I/O.
 fn read_target_without_io(logical: &Path) -> Option<Result<ReadTarget, PdfReadError>> {
@@ -612,6 +727,16 @@ fn read_target_without_io(logical: &Path) -> Option<Result<ReadTarget, PdfReadEr
 /// EPUB resolution can stat the source and access SQLite; call that branch only
 /// from a background thread. The PDF passthrough branch performs no I/O.
 pub fn resolve_read_target(logical: &Path) -> Result<ReadTarget, PdfReadError> {
+    #[cfg(test)]
+    if let Some(count) = REMOTE_RESOLVE_TEST_COUNTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(logical)
+        .cloned()
+    {
+        count.fetch_add(1, Ordering::SeqCst);
+    }
     #[cfg(test)]
     if let Some(error) = EPUB_TEST_FAILURES.get().and_then(|failures| {
         failures
@@ -4739,6 +4864,12 @@ pub fn get_page_sizes_with_read_target(
     read: &ReadTarget,
     password: Option<&str>,
 ) -> std::io::Result<Vec<(f32, f32)>> {
+    #[cfg(test)]
+    if remote_pdf_test_capture(read.read_path.as_path()).is_some() {
+        let bytes =
+            remote_pdf_test_run(|cache| ipc_page_sizes(cache, read.read_path.as_path(), password))?;
+        return PdfWorkerPool::parse_page_sizes_response(&bytes);
+    }
     let pool = get_pool();
     let req = encode_page_sizes_request(&read.read_path, password);
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
@@ -4819,6 +4950,21 @@ pub fn enumerate_pages_with_read_target(
     cancel: Option<Arc<AtomicBool>>,
     options: EnumerateOptions,
 ) -> std::io::Result<PdfEnumerateResult> {
+    #[cfg(test)]
+    if let Some(directions) = remote_pdf_test_capture(read.read_path.as_path()) {
+        directions.lock().unwrap().push(options.want_direction);
+        let bytes = remote_pdf_test_run(|cache| {
+            ipc_enumerate(
+                cache,
+                read.read_path.as_path(),
+                password,
+                enumerate_worker_options(read, options),
+            )
+        })?;
+        let mut result = PdfWorkerPool::parse_enumerate_response(&bytes)?;
+        display_enumerated_pages(&mut result, read);
+        return Ok(result);
+    }
     let pool = get_pool();
     let worker_options = enumerate_worker_options(&read, options);
     let req = encode_enumerate_request(&read.read_path, password, worker_options);
@@ -5118,6 +5264,13 @@ fn render_page_resolved_target(
     context_epoch: u64,
     cancel_policy: CancelWaitPolicy,
 ) -> std::io::Result<RenderResult> {
+    #[cfg(test)]
+    if remote_pdf_test_capture(read.read_path.as_path()).is_some() {
+        let (bytes, _) = remote_pdf_test_run(|cache| {
+            ipc_render(cache, read.read_path.as_path(), page_num, target, password)
+        })?;
+        return PdfWorkerPool::parse_render_response(&bytes);
+    }
     let perf_enabled = crate::perf::is_enabled();
     let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);
     let t0 = std::time::Instant::now();

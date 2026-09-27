@@ -394,11 +394,13 @@ impl LoadSourcePolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum PdfStampPolicy {
     #[default]
     CallerFileAttributes,
     ResolveInWorker,
+    /// The caller already pinned the target and stamped this request before queueing it.
+    Resolved(crate::pdf_loader::ReadTarget),
 }
 
 pub(crate) fn stamp_resolved_pdf_request(
@@ -427,7 +429,8 @@ pub struct LoadRequest {
     pub relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     pub mtime: i64,
     pub file_size: i64,
-    /// EPUB requests carry no cache identity from `image_metas`; resolve on the worker.
+    /// EPUB requests carry no cache identity from `image_metas`; the caller either
+    /// resolves before queueing or asks the worker to resolve.
     pub pdf_stamp_policy: PdfStampPolicy,
     /// 非破壊編集プレビューのページキー。編集済み画像系アイテムだけに設定する。
     pub edit_preview_key: Option<String>,
@@ -1425,22 +1428,34 @@ pub fn process_load_request(
         }
     };
 
-    let resolved_request = if req.pdf_stamp_policy == PdfStampPolicy::ResolveInWorker {
-        match crate::pdf_loader::resolve_read_target(&req.path) {
-            Ok(read) => {
-                let Some(stamped) = stamp_resolved_pdf_request(req, &read) else {
+    let resolved_request = match &req.pdf_stamp_policy {
+        PdfStampPolicy::ResolveInWorker => {
+            match crate::pdf_loader::resolve_read_target(&req.path) {
+                Ok(read) => {
+                    let Some(stamped) = stamp_resolved_pdf_request(req, &read) else {
+                        fallback_or_fail();
+                        return;
+                    };
+                    Some((stamped, read))
+                }
+                Err(_) => {
                     fallback_or_fail();
                     return;
-                };
-                Some((stamped, read))
+                }
             }
-            Err(_) => {
+        }
+        PdfStampPolicy::Resolved(read) => {
+            if read
+                .stamp
+                .generation_catalog_pair()
+                .is_some_and(|stamp| (req.mtime, req.file_size) != stamp)
+            {
                 fallback_or_fail();
                 return;
             }
+            Some((req.clone(), read.clone()))
         }
-    } else {
-        None
+        PdfStampPolicy::CallerFileAttributes => None,
     };
     let epub_read = resolved_request.as_ref().map(|(_, read)| read);
     let req = resolved_request
@@ -1471,7 +1486,10 @@ pub fn process_load_request(
         // epoch while holding the same connection mutex after DELETE succeeds, so a successful
         // pre-clear read is always distinguishable when its message reaches the UI later.
         let epoch = db.epoch();
-        let preview = if req.pdf_stamp_policy == PdfStampPolicy::ResolveInWorker {
+        let preview = if matches!(
+            req.pdf_stamp_policy,
+            PdfStampPolicy::ResolveInWorker | PdfStampPolicy::Resolved(_)
+        ) {
             db.load_for_container(item_key, req.mtime, req.file_size, display_px)
         } else if req.edit_preview_validate_container {
             std::fs::metadata(&req.path).ok().and_then(|meta| {
