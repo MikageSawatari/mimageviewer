@@ -983,6 +983,202 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retry_after_partial_store_commits_matches_uninterrupted_restore_rows() {
+        let files = tempfile::tempdir().unwrap();
+        let uninterrupted = tempfile::tempdir().unwrap();
+        let resumed = tempfile::tempdir().unwrap();
+        let source_path = files.path().join("origin.zip");
+        let target_path = files.path().join("target.zip");
+        std::fs::write(&source_path, b"same archive bytes").unwrap();
+        std::fs::write(&target_path, b"same archive bytes").unwrap();
+        let source_key = crate::path_key::normalize_keep_drive(&source_path);
+        let target_key = crate::path_key::normalize_keep_drive(&target_path);
+        let metadata = std::fs::metadata(&target_path).unwrap();
+        let full_hash = "same-full-hash";
+        let fixture = |data_dir: &Path| {
+            create_all_unique_store_schemas(data_dir);
+            let ledger = ContentIdentityDb::open_at(&data_dir.join("content_identity.db")).unwrap();
+            ledger
+                .upsert(
+                    &ContentIdentitySource::new(&source_path, ContentKind::Zip),
+                    &RecordedFileState {
+                        file_key: source_key.clone(),
+                        size: metadata.len(),
+                        hashed_mtime: 1,
+                    },
+                    "head",
+                    full_hash,
+                    99,
+                    ObservationRole::RestorableContent,
+                )
+                .unwrap();
+            ledger
+                .upsert(
+                    &ContentIdentitySource::new(&target_path, ContentKind::Zip),
+                    &RecordedFileState {
+                        file_key: target_key.clone(),
+                        size: metadata.len(),
+                        hashed_mtime: metadata_mtime(&metadata).unwrap(),
+                    },
+                    "head",
+                    full_hash,
+                    0,
+                    ObservationRole::DetectionCache,
+                )
+                .unwrap();
+            drop(ledger);
+
+            let ratings = rusqlite::Connection::open(data_dir.join("rating.db")).unwrap();
+            for key in [source_key.clone(), format!("{source_key}::一.jpg")] {
+                ratings
+                    .execute(
+                        "INSERT INTO ratings(path, source_path) VALUES (?1, ?2)",
+                        rusqlite::params![key, source_key],
+                    )
+                    .unwrap();
+            }
+            let rotations = rusqlite::Connection::open(data_dir.join("rotation.db")).unwrap();
+            for key in [source_key.clone(), format!("{source_key}::一.jpg")] {
+                rotations
+                    .execute("INSERT INTO rotations(path, angle) VALUES (?1, 90)", [key])
+                    .unwrap();
+            }
+            rusqlite::Connection::open(data_dir.join("reading_history.db"))
+                .unwrap()
+                .execute(
+                    "INSERT INTO reading_history(key, path) VALUES (?1, ?2)",
+                    rusqlite::params![source_key, source_path.to_string_lossy()],
+                )
+                .unwrap();
+        };
+        fixture(uninterrupted.path());
+        fixture(resumed.path());
+
+        let (candidate, source) = candidate(source_path, target_path, ContentKind::Zip, full_hash);
+        let selection = SelectedRestore { candidate, source };
+        let selected = [selection.clone()];
+        let complete = restore_candidates_at(uninterrupted.path(), &selected, &[], false);
+        assert!(complete.errors.is_empty(), "{:?}", complete.errors);
+
+        // Simulate process exit after rating.db committed, before later stores or ledger update.
+        let paused_files = ["rotation.db", "reading_history.db"].map(|name| {
+            (
+                resumed.path().join(name),
+                resumed.path().join(format!("{name}.paused")),
+            )
+        });
+        for (path, paused) in &paused_files {
+            std::fs::rename(path, paused).unwrap();
+        }
+        let mappings =
+            restore_copy_mappings(resumed.path(), &selection.candidate, &selection.source);
+        let partial = crate::rename_key_migration::copy_stores_at(resumed.path(), &mappings);
+        assert!(partial.errors.is_empty(), "{:?}", partial.errors);
+        assert_eq!(partial.rows, 2, "rating exact and virtual rows committed");
+        let ledger =
+            ContentIdentityDb::open_at(&resumed.path().join("content_identity.db")).unwrap();
+        assert!(
+            !ledger
+                .ledger_entry(&target_key)
+                .unwrap()
+                .unwrap()
+                .has_restorable_content,
+            "target ledger must still be unrecorded at interruption"
+        );
+        drop(ledger);
+        for (path, paused) in &paused_files {
+            std::fs::rename(paused, path).unwrap();
+        }
+        let retried = restore_candidates_at(resumed.path(), &selected, &[], false);
+        assert!(retried.errors.is_empty(), "{:?}", retried.errors);
+
+        let snapshot = |data_dir: &Path| {
+            let mut databases = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(data_dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_none_or(|extension| extension != "db") {
+                    continue;
+                }
+                let connection = rusqlite::Connection::open(&path).unwrap();
+                let table_names = connection
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let mut tables = std::collections::BTreeMap::new();
+                for table in table_names {
+                    let mut statement = connection
+                        .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
+                        .unwrap();
+                    let column_count = statement.column_count();
+                    let mut rows = statement
+                        .query_map([], |row| {
+                            (0..column_count)
+                                .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .unwrap()
+                        .map(|row| format!("{:?}", row.unwrap()))
+                        .collect::<Vec<_>>();
+                    rows.sort();
+                    tables.insert(table, rows);
+                }
+                databases.insert(
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    tables,
+                );
+            }
+            databases
+        };
+        assert_eq!(
+            snapshot(uninterrupted.path()),
+            snapshot(resumed.path()),
+            "every DB table row, including ledger and rating source_path, must match"
+        );
+        for data_dir in [uninterrupted.path(), resumed.path()] {
+            let ratings = rusqlite::Connection::open(data_dir.join("rating.db")).unwrap();
+            for key in [&target_key, &format!("{target_key}::一.jpg")] {
+                let source_path: String = ratings
+                    .query_row(
+                        "SELECT source_path FROM ratings WHERE path = ?1",
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(source_path, target_key);
+            }
+            let rotation = rusqlite::Connection::open(data_dir.join("rotation.db")).unwrap();
+            let angle: i64 = rotation
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [format!("{target_key}::一.jpg")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(angle, 90, "a later store must be copied on retry");
+            let history = rusqlite::Connection::open(data_dir.join("reading_history.db")).unwrap();
+            let raw_path: String = history
+                .query_row(
+                    "SELECT path FROM reading_history WHERE key = ?1",
+                    [&target_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(raw_path, selection.candidate.target_path.to_string_lossy());
+            let ledger = ContentIdentityDb::open_at(&data_dir.join("content_identity.db")).unwrap();
+            assert!(
+                ledger
+                    .ledger_entry(&target_key)
+                    .unwrap()
+                    .unwrap()
+                    .has_restorable_content
+            );
+        }
+    }
+
     fn sample_comic_objects() -> Vec<AnnotationObject> {
         vec![AnnotationObject::new_text(
             1,
