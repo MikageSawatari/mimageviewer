@@ -514,12 +514,13 @@ sidecar sync、mask、export crop、edit preview、video pins/bookmarks、folder
 spread、reading history を含む。読み取り専用・既存 DB 専用の open 経路はスキーマを
 作成・移行せず、通常の open 経路で初期化済みの DB を参照する。
 
-画像は Exact mapping のみ。ZIP / PDF は Exact と VirtualPrefix、変換アーカイブは
+画像は Exact mapping のみ。ZIP / PDF / EPUB は Exact と VirtualPrefix、変換アーカイブは
 元パスと予測 cache ZIP の各 Exact / VirtualPrefix の 4 面を維持する。分類には
 `ContentKind` を使う。worker は開始、コピー mapping 操作・台帳項目の 1,000 件ごとの
 進捗、完了を通常ログと `content_identity` perf event に記録する。進捗の
 `processed/total` は `stage=copy` なら表×mapping 操作、`stage=ledger` なら候補と
-辞退の件数であり、画面の進捗ではない。Quiescing の文言・中断設計は別レビューに残す。
+辞退の件数、`stage=epub` なら EPUB 専用コピーの表×mapping 操作と台帳昇格の合計であり、
+画面の進捗ではない。Quiescing の文言・中断設計は別レビューに残す。
 
 計測用 `#[ignore]` テスト `measure_thousand_restores_against_hundred_thousand_rows` は
 メモリ上の 1 表に 10 万行を置き、1,000 件のコンテナ prefix コピーと destination

@@ -1207,6 +1207,31 @@ fn publish_delete_invalidation(removed: bool, notify_if_missing: bool) -> bool {
     removed || notify_if_missing
 }
 
+fn preview_save_stamp(
+    source_mtime: i64,
+    source_size: i64,
+    container: Option<&Path>,
+    resolve_epub: impl FnOnce(&Path) -> Option<(i64, i64)>,
+) -> Option<(i64, i64, Option<i64>)> {
+    match container {
+        Some(path)
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
+        {
+            let (generation_id, generation_size) = resolve_epub(path)?;
+            Some((generation_id, generation_size, Some(generation_size)))
+        }
+        other => Some((
+            source_mtime,
+            source_size,
+            other
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|meta| meta.len() as i64),
+        )),
+    }
+}
+
 pub struct EditPreviewCacheService {
     db: Arc<EditPreviewCacheDb>,
     tx: mpsc::Sender<EditPreviewCommand>,
@@ -1252,10 +1277,24 @@ impl EditPreviewCacheService {
                                             "edit preview WebP encode failed".to_string()
                                         })
                                 });
-                            let source_container_size = source_container_path
-                                .as_deref()
-                                .and_then(|path| std::fs::metadata(path).ok())
-                                .map(|meta| meta.len() as i64);
+                            let Some((source_mtime, source_size, source_container_size)) =
+                                preview_save_stamp(
+                                    source_mtime,
+                                    source_size,
+                                    source_container_path.as_deref(),
+                                    |path| {
+                                        crate::pdf_loader::resolve_read_target(path)
+                                            .ok()
+                                            .and_then(|read| read.stamp.generation_catalog_pair())
+                                    },
+                                )
+                            else {
+                                crate::logger::log(
+                                    "edit_preview_cache: EPUB generation unavailable",
+                                );
+                                worker_pending_commands.fetch_sub(1, Ordering::AcqRel);
+                                continue;
+                            };
                             match result.and_then(|(source_dims, base_webp, encoded_layers)| {
                                 worker_db.save_encoded(
                                     &item_key,
@@ -1681,6 +1720,39 @@ mod tests {
             "a replaced archive must invalidate its edited representative preview"
         );
         assert_eq!(db.total_bytes(), 0);
+    }
+
+    #[test]
+    fn epub_preview_save_and_load_use_generation_in_existing_integer_columns() {
+        let (_temp, db) = test_db();
+        let webp = encode_preview(&egui::ColorImage::filled(
+            [8, 4],
+            egui::Color32::from_rgb(20, 80, 140),
+        ))
+        .unwrap();
+        let path = Path::new("book.epub");
+        let stamp = preview_save_stamp(123, 456, Some(path), |_| Some((17, 4096))).unwrap();
+        assert_eq!(stamp, (17, 4096, Some(4096)));
+        db.save_encoded(
+            "book.epub::page_0",
+            stamp.0,
+            stamp.1,
+            stamp.2,
+            (8, 4),
+            &webp,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            db.load_for_container("book.epub::page_0", 17, 4096, 2048)
+                .is_some()
+        );
+        assert!(
+            db.load_for_container("book.epub::page_0", 18, 4096, 2048)
+                .is_none()
+        );
+        let pdf = preview_save_stamp(123, 456, None, |_| panic!("PDF must not resolve EPUB"));
+        assert_eq!(pdf, Some((123, 456, None)));
     }
 
     #[test]

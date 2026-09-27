@@ -49,6 +49,7 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
   - ZIP 内画像のブラウズ（展開不要）
   - RAR / CBR / 7z / LZH の ZIP 変換閲覧（RAR / CBR はパスワード付きにも対応）
   - PDF 表示（PDF 表示エンジン内蔵、パスワード付き対応）
+  - DRM のない EPUB を PDF に変換して閲覧（音声・動画は含まれません）
   - RAW / HEIC / AVIF / JPEG XL 表示（Windows WIC 経由）
   - Susie 画像プラグイン（.spi、32bit）対応
   - 動画インライン再生（MP4 / MKV / MOV / AVI / WMV / MPG / HEVC / AV1 等、
@@ -84,7 +85,8 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
               （最新のグラフィックドライバを推奨）
   ストレージ: インストール時 約 200 MB
 
-追加ソフト: 不要
+追加ソフト: EPUB の変換には Microsoft Edge WebView2 Runtime が必要です。
+          Windows 11 には標準で含まれています。
 
 AI アップスケール / JPEG ノイズ除去 / 消しゴム (画像修復) 等の
 AI 機能は DirectML（Microsoft 公式）を利用します。
@@ -148,6 +150,9 @@ Windows の「設定」→「アプリ」→「インストールされている
   - mimageviewer-susie32.exe
                      : Susie プラグイン用 32bit ワーカー
                       （初回展開）
+  - runtime\<version>\mimageviewer-epub-pdf.exe
+                     : EPUB 変換用プログラム（初回展開）
+  - epub_cache\      : EPUB から変換した PDF（管理画面で削除予約）
 
 また、お気に入りに登録したフォルダの更新を検知するため、
 内部的に Windows API の ReadDirectoryChangesW による

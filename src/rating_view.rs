@@ -488,15 +488,14 @@ fn item_from_legacy_key(row: &RatingRow) -> Option<GridItem> {
         return item_from_plain_path(&existing_path(PathBuf::from(&row.key))?);
     };
     let container = existing_path(PathBuf::from(left))?;
-    let ext = ext_lower(&container);
-    if ext == "pdf" {
-        if let Some(page_num) = parse_page_key(right) {
-            return Some(GridItem::PdfPage {
-                pdf_path: container,
-                page_num,
-                content_type: None,
-            });
-        }
+    if crate::folder_tree::is_paged_document_path(&container)
+        && let Some(page_num) = parse_page_key(right)
+    {
+        return Some(GridItem::PdfPage {
+            pdf_path: container,
+            page_num,
+            content_type: None,
+        });
     }
     if entry_is_image(right) {
         let entry_name = resolve_legacy_zip_entry_name(&container, right)?;
@@ -525,7 +524,7 @@ fn item_from_plain_path(path: &Path) -> Option<GridItem> {
         Some(GridItem::Audio(path.to_path_buf()))
     } else if crate::folder_tree::is_zip_extension(&ext) {
         Some(GridItem::ZipFile(path.to_path_buf()))
-    } else if ext == "pdf" {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         Some(GridItem::PdfFile(path.to_path_buf()))
     } else if let Some(format) = crate::archive_converter::ArchiveFormat::from_extension(&ext) {
         Some(GridItem::ConvertibleArchive {
@@ -957,6 +956,21 @@ mod tests {
             GridItem::PdfPage { page_num, .. } => assert_eq!(page_num, 0),
             _ => panic!("expected PdfPage"),
         }
+        let epub = temp.path().join("Book.EPUB");
+        std::fs::write(&epub, b"epub").unwrap();
+        let mut rated_page = row(
+            "ignored".to_string(),
+            Some(RatingItemKind::PdfPage),
+            Some(epub.to_string_lossy().to_string()),
+        );
+        rated_page.page_num = Some(0);
+        assert!(
+            matches!(rating_row_to_view_row(&rated_page).unwrap().item, GridItem::PdfPage { pdf_path, page_num: 0, .. } if pdf_path == epub)
+        );
+        let rated_book = row(epub.to_string_lossy().to_string(), None, None);
+        assert!(
+            matches!(rating_row_to_view_row(&rated_book).unwrap().item, GridItem::PdfFile(path) if path == epub)
+        );
     }
 
     #[test]

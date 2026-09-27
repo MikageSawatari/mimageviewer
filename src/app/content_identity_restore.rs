@@ -573,6 +573,7 @@ mod tests {
     fn candidate(name: &str) -> crate::content_identity::RestoreCandidate {
         let target_path = PathBuf::from(format!("C:/copied/{name}.png"));
         crate::content_identity::RestoreCandidate {
+            epub_source_state: None,
             target_key: crate::path_key::normalize_keep_drive(&target_path),
             target_path,
             target_kind: crate::content_identity::ContentKind::Image,

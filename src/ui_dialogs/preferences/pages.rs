@@ -1111,7 +1111,7 @@ pub(super) fn association_extension_groups() -> [(&'static str, &'static [&'stat
         ("画像", crate::folder_tree::SUPPORTED_EXTENSIONS),
         ("動画", crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS),
         ("音声", crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS),
-        ("書庫 / PDF", &["zip", "cbz", "pdf"]),
+        ("書庫 / PDF / EPUB", &["zip", "cbz", "pdf", "epub"]),
     ]
 }
 
@@ -8667,7 +8667,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         let s = &mut state.settings;
         ui.checkbox(
             &mut s.skip_zip_if_folder_exists,
-            "同名の ZIP/PDF/RAR/7z/LZH ファイルとフォルダがある場合、アーカイブ側をスキップ",
+            "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
         );
     });
     ui.add_space(4.0);
@@ -8676,6 +8676,13 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         ui.checkbox(
             &mut s.skip_archive_if_zip_exists,
             "同名の ZIP/CBZ と RAR/7z/LZH がある場合、ZIP/CBZ だけ表示",
+        );
+    });
+    ui.add_space(4.0);
+    anchored(ui, state, "duplicate/epub-pdf", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.skip_epub_if_pdf_exists,
+            "同名の EPUB と PDF がある場合、PDF だけ表示",
         );
     });
     ui.add_space(4.0);
@@ -9309,6 +9316,13 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     ui.selectable_value(&mut s.default_spread_mode, mode, mode.label());
                 }
             });
+    });
+    anchored(ui, state, "spread/document-direction", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.follow_document_reading_direction,
+            "PDF / EPUB の右開き指定に従う",
+        );
+        ui.small("本ごとに保存した見開き設定がある場合は、その設定を優先します。");
     });
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);

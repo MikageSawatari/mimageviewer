@@ -1,8 +1,8 @@
 //! Small launcher for the distributable `mimageviewer.exe`.
 //!
 //! The real application binary (`mimageviewer-core.exe`) imports FFmpeg DLLs at
-//! process load time and starts `mimageviewer-remote.exe` from its own directory.
-//! The launcher therefore extracts both executables, FFmpeg DLLs, and the app-local VC runtime into
+//! process load time and starts `mimageviewer-remote.exe` and `mimageviewer-epub-pdf.exe`
+//! from its own directory. The launcher therefore extracts all three executables, FFmpeg DLLs, and the app-local VC runtime into
 //! `%APPDATA%/mimageviewer/runtime/<version>/` first, then spawns the core there.
 
 #![windows_subsystem = "windows"]
@@ -21,6 +21,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static CORE_EXE: &[u8] = include_bytes!(env!("MIMV_CORE_EXE"));
 static REMOTE_EXE: &[u8] = include_bytes!(env!("MIMV_REMOTE_EXE"));
+static EPUB_PDF_EXE: &[u8] = include_bytes!(env!("MIMV_EPUB_PDF_EXE"));
 static AVCODEC_DLL: &[u8] = include_bytes!(env!("MIMV_AVCODEC_DLL"));
 static AVFORMAT_DLL: &[u8] = include_bytes!(env!("MIMV_AVFORMAT_DLL"));
 static AVUTIL_DLL: &[u8] = include_bytes!(env!("MIMV_AVUTIL_DLL"));
@@ -89,6 +90,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         REMOTE_EXE,
         env!("MIMV_REMOTE_EXE_SHA256"),
     ),
+    (
+        "mimageviewer-epub-pdf.exe",
+        EPUB_PDF_EXE,
+        env!("MIMV_EPUB_PDF_EXE_SHA256"),
+    ),
 ];
 
 fn main() {
@@ -144,7 +150,13 @@ fn extract_assets(runtime_dir: &Path) -> Result<(), String> {
 fn extract_asset(runtime_dir: &Path, asset: &(&str, &[u8], &str)) -> Result<(), String> {
     let (name, bytes, expected_hash) = *asset;
     let path = runtime_dir.join(name);
-    ensure_asset(&path, bytes, expected_hash, is_vcrt_asset(name)).map_err(|e| {
+    ensure_asset(
+        &path,
+        bytes,
+        expected_hash,
+        requires_content_hash_on_launch(name),
+    )
+    .map_err(|e| {
         format!(
             "extract {name} failed: {e}\n(runtime dir: {})",
             runtime_dir.display()
@@ -237,10 +249,14 @@ fn appdata_runtime_dir() -> Result<PathBuf, String> {
         .join(VERSION))
 }
 
-fn is_vcrt_asset(name: &str) -> bool {
+fn requires_content_hash_on_launch(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "msvcp140.dll" | "msvcp140_1.dll" | "vcruntime140.dll" | "vcruntime140_1.dll"
+        "mimageviewer-epub-pdf.exe"
+            | "msvcp140.dll"
+            | "msvcp140_1.dll"
+            | "vcruntime140.dll"
+            | "vcruntime140_1.dll"
     )
 }
 
@@ -271,9 +287,9 @@ fn asset_hash_matches(
     expected_hash: &str,
     always_verify_contents: bool,
 ) -> std::io::Result<bool> {
-    // Large embedded executables/FFmpeg assets retain the versioned sidecar shortcut. The four
-    // small app-local CRT files are loader-critical and are hashed on every launch, so a stale
-    // valid sidecar can never bless a replaced DLL.
+    // Core, remote, and FFmpeg assets retain the versioned sidecar shortcut. The small EPUB
+    // worker and four loader-critical app-local CRT files are hashed on every launch, so a
+    // current sidecar cannot bless same-length corruption in those assets.
     if !always_verify_contents && let Ok(stored) = std::fs::read_to_string(hash_path) {
         return Ok(stored.trim().eq_ignore_ascii_case(expected_hash));
     }
@@ -609,6 +625,24 @@ mod tests {
     }
 
     #[test]
+    fn embedded_epub_worker_extracts_beside_core_and_matches_core_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime").join(super::VERSION);
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        super::extract_assets(&runtime_dir).unwrap();
+
+        let core = runtime_dir.join("mimageviewer-core.exe");
+        let worker = core.with_file_name("mimageviewer-epub-pdf.exe");
+        let asset = super::ASSETS
+            .iter()
+            .find(|(name, _, _)| *name == "mimageviewer-epub-pdf.exe")
+            .expect("EPUB worker must be embedded");
+        assert!(core.is_file());
+        assert!(worker.is_file());
+        assert_eq!(super::sha256_file_hex(&worker).unwrap(), asset.2);
+    }
+
+    #[test]
     fn embedded_vcrt_extracts_beside_both_runtime_executables() {
         let expected = [
             "msvcp140.dll",
@@ -670,5 +704,28 @@ mod tests {
         permissions.set_readonly(false);
         std::fs::set_permissions(&extracted, permissions).unwrap();
         result.expect("a current CRT must not be rewritten");
+    }
+
+    #[test]
+    fn embedded_epub_worker_repairs_same_length_corruption_even_with_a_current_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime").join(super::VERSION);
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let asset = super::ASSETS
+            .iter()
+            .find(|(name, _, _)| *name == "mimageviewer-epub-pdf.exe")
+            .expect("EPUB worker must be embedded");
+        super::extract_asset(&runtime_dir, asset).unwrap();
+
+        let extracted = runtime_dir.join(asset.0);
+        let sidecar = super::sidecar_hash_path(&extracted);
+        let mut corrupt = std::fs::read(&extracted).unwrap();
+        corrupt[0] ^= 0xff;
+        std::fs::write(&extracted, &corrupt).unwrap();
+        assert_eq!(corrupt.len(), asset.1.len());
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap().trim(), asset.2);
+
+        super::extract_asset(&runtime_dir, asset).unwrap();
+        assert_eq!(super::sha256_file_hex(&extracted).unwrap(), asset.2);
     }
 }

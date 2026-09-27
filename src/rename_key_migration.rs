@@ -173,6 +173,50 @@ pub(crate) enum JournalPersistStatus {
 /// SQLite の既定可変長 parameter 上限 (999) を十分下回る exact purge の batch 幅。
 const PURGE_EXACT_BATCH_SIZE: usize = 500;
 
+fn with_identity_epub_coverage<T>(
+    descriptor: &StoreDescriptor,
+    coverage: &[(PathBuf, IdentityCoverageShape)],
+    action: impl FnOnce() -> T,
+) -> T {
+    if descriptor.file == "content_identity.db"
+        && descriptor.table == "edit_origin"
+        && descriptor.column == "file_key"
+    {
+        let ranges = coverage
+            .iter()
+            .filter_map(|(path, shape)| match shape {
+                IdentityCoverageShape::Exact
+                    if !path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
+                {
+                    None
+                }
+                IdentityCoverageShape::Exact => {
+                    Some(crate::pdf_loader::EpubPinCoverage::Exact(path.clone()))
+                }
+                IdentityCoverageShape::PathAndDescendants => Some(
+                    crate::pdf_loader::EpubPinCoverage::PathAndDescendants(path.clone()),
+                ),
+                IdentityCoverageShape::VirtualDescendants => Some(
+                    crate::pdf_loader::EpubPinCoverage::VirtualDescendants(path.clone()),
+                ),
+            })
+            .collect::<Vec<_>>();
+        crate::pdf_loader::with_epub_pin_ranges(&ranges, action)
+    } else {
+        action()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IdentityCoverageShape {
+    Exact,
+    PathAndDescendants,
+    VirtualDescendants,
+}
+
 /// 移行結果。`rows` = 書き換えた行数合計 (sidecar / パスワードは 1 件 = 1)。
 pub struct RenameMigrationReport {
     pub rows: usize,
@@ -1151,16 +1195,50 @@ pub(crate) fn copy_stores_at(
 pub(crate) fn copy_stores_at_with_progress(
     data_dir: &Path,
     mappings: &[StoreCopyPathMapping],
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, true, on_progress)
+}
+
+/// EPUB restore promotes its ledger row under the book guard after copying.
+/// Copying edit_origin here would recursively enter the EPUB range guard.
+pub(crate) fn copy_restore_stores_without_identity_at(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+) -> StoreCopyReport {
+    copy_restore_stores_without_identity_at_with_progress(data_dir, mappings, |_, _| {})
+}
+
+pub(crate) fn copy_restore_stores_without_identity_at_with_progress(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, false, on_progress)
+}
+
+fn copy_stores_impl(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    include_identity: bool,
     mut on_progress: impl FnMut(usize, usize),
 ) -> StoreCopyReport {
     let mut report = StoreCopyReport::default();
-    let total = STORES.iter().filter(|store| store.unique).count() * mappings.len();
+    let total = STORES
+        .iter()
+        .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
+        .count()
+        * mappings.len();
     let mut processed = 0;
     // A prepared virtual list must not observe a mixture of copied stores.
     let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
     let _rating_write = crate::rating_db::RATING_WRITES.begin();
     let _tag_write = crate::tags_db::TAG_WRITES.begin();
-    for descriptor in STORES.iter().copied().filter(|store| store.unique) {
+    for descriptor in STORES
+        .iter()
+        .copied()
+        .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
+    {
         let normalized = mappings
             .iter()
             .filter_map(|mapping| match mapping {
@@ -1308,6 +1386,17 @@ pub fn run(old_path: &Path, new_path: &Path) -> RenameMigrationReport {
 
 /// data_dir を差し替え可能にしたテスト用エントリポイント。
 pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrationReport {
+    run_at_with_shape(data_dir, old_path, new_path, false)
+}
+
+/// The queued operation retains its source shape, but generic store SQL
+/// migrates exact, slash descendants and virtual entries for either shape.
+pub(crate) fn run_at_with_shape(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    _tree: bool,
+) -> RenameMigrationReport {
     let mut report = RenameMigrationReport {
         rows: 0,
         errors: Vec::new(),
@@ -1402,19 +1491,98 @@ pub(crate) struct PurgeReport {
 /// [`STORES`] を走査し、exact + `<key>/` + `<key>::` を素の `DELETE` にする。
 /// `pdf_paths` は SHA-256 キーの逆引きができない PDF password 用に、worker が削除前に
 /// 列挙した実 path 群。
+#[cfg(test)]
 pub(crate) fn purge_removed_paths_at(
     data_dir: &Path,
     removed: &[PathBuf],
     pdf_paths: &[PathBuf],
 ) -> PurgeReport {
+    let scopes = removed
+        .iter()
+        .cloned()
+        .map(crate::delete_worker::DeleteSourceScope::Tree)
+        .collect::<Vec<_>>();
+    purge_removed_scopes_at(data_dir, &scopes, pdf_paths)
+}
+
+/// The retry journal has no source shape; its paths conservatively cover trees.
+pub(crate) fn purge_removed_paths_guarded_at(
+    data_dir: &Path,
+    removed: &[PathBuf],
+    pdf_paths: &[PathBuf],
+    guard: &crate::pdf_loader::EpubRangeLease,
+) -> PurgeReport {
+    let scopes = removed
+        .iter()
+        .cloned()
+        .map(crate::delete_worker::DeleteSourceScope::Tree)
+        .collect::<Vec<_>>();
+    purge_removed_scopes_guarded_at(data_dir, &scopes, pdf_paths, guard)
+}
+
+/// Acquire once before Shell, then pass this guard through every purge attempt.
+pub(crate) fn acquire_delete_epub_guard(
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+) -> crate::pdf_loader::EpubRangeLease {
+    let paths = scopes
+        .iter()
+        .map(|scope| match scope {
+            crate::delete_worker::DeleteSourceScope::Exact(path)
+            | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
+        })
+        .collect::<Vec<_>>();
+    crate::pdf_loader::acquire_epub_pin_coverage(&paths)
+}
+
+/// The SQL uses exact, slash-descendant and virtual-descendant keys for both
+/// source shapes, even if a deleted file or folder no longer exists on disk.
+#[cfg(test)]
+pub(crate) fn purge_removed_scopes_at(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+) -> PurgeReport {
+    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, None)
+}
+
+pub(crate) fn purge_removed_scopes_guarded_at(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+    guard: &crate::pdf_loader::EpubRangeLease,
+) -> PurgeReport {
+    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, Some(guard))
+}
+
+fn purge_removed_scopes_impl(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
+) -> PurgeReport {
     let mut report = PurgeReport::default();
-    if removed.is_empty() {
+    if scopes.is_empty() {
         return report;
     }
 
-    let keep_drive_keys = normalized_removed_keys(removed, StoreKeyNormalization::KeepDrive);
+    let removed = scopes
+        .iter()
+        .map(|scope| match scope {
+            crate::delete_worker::DeleteSourceScope::Exact(path)
+            | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        guard.is_none_or(|guard| guard.covers_paths_and_descendants(&removed)),
+        "delete purge must keep the Shell range guard"
+    );
+
+    let keep_drive_keys = normalized_removed_keys(&removed, StoreKeyNormalization::KeepDrive);
     let drive_stripped_keys =
-        normalized_removed_keys(removed, StoreKeyNormalization::DriveStripped);
+        normalized_removed_keys(&removed, StoreKeyNormalization::DriveStripped);
+    let keep_drive_coverage = normalized_removed_coverage(scopes, StoreKeyNormalization::KeepDrive);
+    let drive_stripped_coverage =
+        normalized_removed_coverage(scopes, StoreKeyNormalization::DriveStripped);
     let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
     let rating_write = crate::rating_db::RATING_WRITES.begin();
     let tag_write = crate::tags_db::TAG_WRITES.begin();
@@ -1423,7 +1591,11 @@ pub(crate) fn purge_removed_paths_at(
             StoreKeyNormalization::KeepDrive => &keep_drive_keys,
             StoreKeyNormalization::DriveStripped => &drive_stripped_keys,
         };
-        purge_store(data_dir, descriptor, keys, &mut report);
+        let coverage = match descriptor.normalization {
+            StoreKeyNormalization::KeepDrive => &keep_drive_coverage,
+            StoreKeyNormalization::DriveStripped => &drive_stripped_coverage,
+        };
+        purge_store(data_dir, descriptor, keys, coverage, guard, &mut report);
     }
     drop(rating_write);
     drop(tag_write);
@@ -1433,7 +1605,7 @@ pub(crate) fn purge_removed_paths_at(
         Ok(rows) => report.rows += rows,
         Err(error) => report.errors.push(format!("pdf_passwords.json: {error}")),
     }
-    purge_sidecar_backups(removed, &mut report);
+    purge_sidecar_backups(&removed, &mut report);
     report
 }
 
@@ -1499,6 +1671,32 @@ fn normalized_removed_keys(
     keys
 }
 
+fn normalized_removed_coverage(
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    normalization: StoreKeyNormalization,
+) -> Vec<(PathBuf, IdentityCoverageShape)> {
+    scopes
+        .iter()
+        .filter_map(|scope| {
+            let path = match scope {
+                crate::delete_worker::DeleteSourceScope::Exact(path)
+                | crate::delete_worker::DeleteSourceScope::Tree(path) => path,
+            };
+            let key = match normalization {
+                StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(path),
+                StoreKeyNormalization::DriveStripped => crate::path_key::normalize(path),
+            };
+            // Both source shapes use exact + `key/` + `key::` SQL deletes.
+            (!key.is_empty()).then(|| {
+                (
+                    PathBuf::from(key),
+                    IdentityCoverageShape::PathAndDescendants,
+                )
+            })
+        })
+        .collect()
+}
+
 /// BINARY collation で `prefix` から始まる文字列の排他的 upper bound を返す。
 ///
 /// UTF-8 の辞書順は Unicode code point 順を保つため、最後の scalar value を次へ進めれば
@@ -1521,69 +1719,102 @@ fn purge_store(
     data_dir: &Path,
     descriptor: &StoreDescriptor,
     removed_keys: &[String],
+    coverage: &[(PathBuf, IdentityCoverageShape)],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
     report: &mut PurgeReport,
+) {
+    purge_store_with_before_sql(
+        data_dir,
+        descriptor,
+        removed_keys,
+        coverage,
+        guard,
+        report,
+        || {},
+    );
+}
+
+fn purge_store_with_before_sql(
+    data_dir: &Path,
+    descriptor: &StoreDescriptor,
+    removed_keys: &[String],
+    coverage: &[(PathBuf, IdentityCoverageShape)],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
+    report: &mut PurgeReport,
+    before_sql: impl FnOnce(),
 ) {
     let db_path = data_dir.join(descriptor.file);
     if removed_keys.is_empty() || !db_path.exists() {
         return;
     }
     report.db_open_count += 1;
-    let result = (|| -> Result<usize, rusqlite::Error> {
-        let mut conn = rusqlite::Connection::open(&db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let table_exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            [descriptor.table],
-            |row| row.get(0),
-        )?;
-        if !table_exists {
-            return Ok(0);
-        }
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-        let _rating_write =
-            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
-        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-        let tx = conn.transaction()?;
-        let mut changed = 0usize;
+    let action = || {
+        before_sql();
+        (|| -> Result<usize, rusqlite::Error> {
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            let table_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [descriptor.table],
+                |row| row.get(0),
+            )?;
+            if !table_exists {
+                return Ok(0);
+            }
+            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            let _rating_write =
+                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+            let _tag_write =
+                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+            let tx = conn.transaction()?;
+            let mut changed = 0usize;
 
-        // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
-        // 上限 999 より小さくし、削除数に比例した statement 数を抑える。
-        for keys in removed_keys.chunks(PURGE_EXACT_BATCH_SIZE) {
-            let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "DELETE FROM {} WHERE {} IN ({placeholders})",
+            // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
+            // 上限 999 より小さくし、削除数に比例した statement 数を抑える。
+            for keys in removed_keys.chunks(PURGE_EXACT_BATCH_SIZE) {
+                let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "DELETE FROM {} WHERE {} IN ({placeholders})",
+                    descriptor.table, descriptor.column
+                );
+                changed += tx.execute(&sql, rusqlite::params_from_iter(keys.iter()))?;
+            }
+
+            // 全 STORES のキー列は既定 BINARY collation で、PK または path index を持つ。
+            // substr(col, ...) を列へ適用せず、同じ collation 上の range scan にする。
+            let range_sql = format!(
+                "DELETE FROM {} WHERE {} >= ?1 AND {} < ?2",
+                descriptor.table, descriptor.column, descriptor.column
+            );
+            let fallback_sql = format!(
+                "DELETE FROM {} WHERE substr({}, 1, ?1) = ?2",
                 descriptor.table, descriptor.column
             );
-            changed += tx.execute(&sql, rusqlite::params_from_iter(keys.iter()))?;
-        }
-
-        // 全 STORES のキー列は既定 BINARY collation で、PK または path index を持つ。
-        // substr(col, ...) を列へ適用せず、同じ collation 上の range scan にする。
-        let range_sql = format!(
-            "DELETE FROM {} WHERE {} >= ?1 AND {} < ?2",
-            descriptor.table, descriptor.column, descriptor.column
-        );
-        let fallback_sql = format!(
-            "DELETE FROM {} WHERE substr({}, 1, ?1) = ?2",
-            descriptor.table, descriptor.column
-        );
-        {
-            let mut range_statement = tx.prepare(&range_sql)?;
-            let mut fallback_statement = tx.prepare(&fallback_sql)?;
-            for key in removed_keys {
-                for prefix in [format!("{key}/"), format!("{key}::")] {
-                    if let Some(upper) = prefix_upper_bound(&prefix) {
-                        changed += range_statement.execute(rusqlite::params![prefix, upper])?;
-                    } else {
-                        changed += fallback_statement
-                            .execute(rusqlite::params![prefix.chars().count() as i64, prefix,])?;
+            {
+                let mut range_statement = tx.prepare(&range_sql)?;
+                let mut fallback_statement = tx.prepare(&fallback_sql)?;
+                for key in removed_keys {
+                    for prefix in [format!("{key}/"), format!("{key}::")] {
+                        if let Some(upper) = prefix_upper_bound(&prefix) {
+                            changed += range_statement.execute(rusqlite::params![prefix, upper])?;
+                        } else {
+                            changed += fallback_statement.execute(rusqlite::params![
+                                prefix.chars().count() as i64,
+                                prefix,
+                            ])?;
+                        }
                     }
                 }
             }
-        }
-        tx.commit()?;
-        Ok(changed)
-    })();
+            tx.commit()?;
+            Ok(changed)
+        })()
+    };
+    let result = if guard.is_some() {
+        action()
+    } else {
+        with_identity_epub_coverage(descriptor, coverage, action)
+    };
     match result {
         Ok(rows) => {
             report.rows += rows;
@@ -1594,6 +1825,34 @@ fn purge_store(
             descriptor.file, descriptor.table, descriptor.column
         )),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn purge_exact_identity_with_before_sql_for_test(
+    data_dir: &Path,
+    removed: &Path,
+    before_sql: impl FnOnce(),
+) -> PurgeReport {
+    let descriptor = STORES
+        .iter()
+        .find(|store| store.file == "content_identity.db" && store.table == "edit_origin")
+        .unwrap();
+    let scopes = [crate::delete_worker::DeleteSourceScope::Exact(
+        removed.to_path_buf(),
+    )];
+    let keys = normalized_removed_keys(&[removed.to_path_buf()], descriptor.normalization);
+    let coverage = normalized_removed_coverage(&scopes, descriptor.normalization);
+    let mut report = PurgeReport::default();
+    purge_store_with_before_sql(
+        data_dir,
+        descriptor,
+        &keys,
+        &coverage,
+        None,
+        &mut report,
+        before_sql,
+    );
+    report
 }
 
 /// 1 ストア分の移行: exact + `<old>/` prefix + `<old>::` prefix。
@@ -1607,64 +1866,75 @@ fn migrate_store(
     if !db_path.exists() {
         return;
     }
-    let result = (|| -> Result<usize, rusqlite::Error> {
-        let mut conn = rusqlite::Connection::open(db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-        let _rating_write =
-            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
-        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-        let tx = conn.transaction()?;
-        let columns = table_columns(&tx, descriptor.table)?;
-        if columns.is_empty()
-            && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
-        {
-            return Ok(0);
-        }
-        if !columns.iter().any(|column| column == descriptor.column) {
-            return Err(rusqlite::Error::InvalidColumnName(
-                descriptor.column.to_string(),
-            ));
-        }
-        let mut changed = 0usize;
-        changed += move_exact(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            old_key,
-            new_key,
-        )?;
-        changed += move_prefix(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            &format!("{old_key}/"),
-            &format!("{new_key}/"),
-        )?;
-        changed += move_prefix(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            &format!("{old_key}::"),
-            &format!("{new_key}::"),
-        )?;
-        // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
-        // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
-        // "::" より前、無ければキー自身)。
-        if descriptor.table == "ratings" && changed > 0 {
-            tx.execute(
-                &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
-                [new_key],
+    // The SQL below migrates exact, slash descendants and virtual entries for
+    // both files and folders, so the guard must cover those same key families.
+    let shape = IdentityCoverageShape::PathAndDescendants;
+    let coverage = [
+        (PathBuf::from(old_key), shape),
+        (PathBuf::from(new_key), shape),
+    ];
+    let result = with_identity_epub_coverage(descriptor, &coverage, || {
+        (|| -> Result<usize, rusqlite::Error> {
+            let mut conn = rusqlite::Connection::open(db_path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            let _rating_write =
+                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+            let _tag_write =
+                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+            let tx = conn.transaction()?;
+            let columns = table_columns(&tx, descriptor.table)?;
+            if columns.is_empty()
+                && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+            {
+                return Ok(0);
+            }
+            if !columns.iter().any(|column| column == descriptor.column) {
+                return Err(rusqlite::Error::InvalidColumnName(
+                    descriptor.column.to_string(),
+                ));
+            }
+            let mut changed = 0usize;
+            changed += move_exact(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                old_key,
+                new_key,
             )?;
-            update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
-            update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
-        }
-        tx.commit()?;
-        Ok(changed)
-    })();
+            changed += move_prefix(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                &format!("{old_key}/"),
+                &format!("{new_key}/"),
+            )?;
+            changed += move_prefix(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                &format!("{old_key}::"),
+                &format!("{new_key}::"),
+            )?;
+            // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
+            // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
+            // "::" より前、無ければキー自身)。
+            if descriptor.table == "ratings" && changed > 0 {
+                tx.execute(
+                    &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
+                    [new_key],
+                )?;
+                update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
+                update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        })()
+    });
+
     match result {
         Ok(n) => {
             report.rows += n;
@@ -1740,7 +2010,34 @@ fn copy_store(
         return;
     }
     report.database_opens += 1;
-    let result = copy_store_transaction(db_path, descriptor, mappings, on_mapping);
+    let coverage = mappings
+        .iter()
+        .flat_map(|mapping| match mapping {
+            NormalizedStoreCopyMapping::Exact {
+                old_key, new_key, ..
+            } => [
+                (PathBuf::from(old_key), IdentityCoverageShape::Exact),
+                (PathBuf::from(new_key), IdentityCoverageShape::Exact),
+            ],
+            NormalizedStoreCopyMapping::Prefix {
+                old_prefix,
+                new_prefix,
+            } => [
+                (
+                    PathBuf::from(old_prefix.trim_end_matches("::")),
+                    IdentityCoverageShape::VirtualDescendants,
+                ),
+                (
+                    PathBuf::from(new_prefix.trim_end_matches("::")),
+                    IdentityCoverageShape::VirtualDescendants,
+                ),
+            ],
+        })
+        .collect::<Vec<_>>();
+    let result = with_identity_epub_coverage(&descriptor, &coverage, || {
+        copy_store_transaction(db_path, descriptor, mappings, on_mapping)
+    });
+
     match result {
         Ok(rows) => report.rows += rows,
         Err(error) => report.errors.push(format!(
@@ -2109,6 +2406,83 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+
+    #[test]
+    fn pdf_and_image_store_copy_does_not_wait_for_nonoverlapping_epub_range() {
+        let data = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(data.path().join("content_identity.db")).unwrap();
+        db.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let range = data.path().join("unrelated-shelf");
+        let holder = std::thread::spawn(move || {
+            crate::pdf_loader::with_epub_pin_coverage(&[range], || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let data_path = data.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let mut errors = Vec::new();
+            for extension in ["pdf", "png"] {
+                let old = data_path.join(format!("old.{extension}"));
+                let new = data_path.join(format!("new.{extension}"));
+                let migrated = run_at(&data_path, &old, &new);
+                errors.extend(migrated.errors);
+                let report = copy_stores_at(&data_path, &[StoreCopyPathMapping::exact(old, new)]);
+                errors.extend(report.errors);
+            }
+            done_tx.send(errors).unwrap();
+        });
+        let completed = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "PDF store copy waited for an EPUB range operation"
+        );
+        assert!(completed.unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_purge_keeps_slash_and_virtual_descendant_deletion() {
+        let data = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(data.path().join("content_identity.db")).unwrap();
+        db.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)")
+            .unwrap();
+        let removed = data.path().join("cover.png");
+        let key = crate::adjustment_db::normalize_path(&removed);
+        let nearby = format!("{key}x/book.epub");
+        for row in [
+            key.clone(),
+            format!("{key}/book.epub"),
+            format!("{key}::page_0"),
+            nearby.clone(),
+        ] {
+            db.execute("INSERT INTO edit_origin(file_key) VALUES (?1)", [&row])
+                .unwrap();
+        }
+        drop(db);
+        let report = purge_removed_scopes_at(
+            data.path(),
+            &[crate::delete_worker::DeleteSourceScope::Exact(removed)],
+            &[],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let db = rusqlite::Connection::open(data.path().join("content_identity.db")).unwrap();
+        let rows = db
+            .prepare("SELECT file_key FROM edit_origin ORDER BY file_key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![nearby]);
+    }
 
     fn open(dir: &Path, file: &str) -> rusqlite::Connection {
         rusqlite::Connection::open(dir.join(file)).unwrap()
@@ -2940,7 +3314,14 @@ mod tests {
             table_availability: StoreTableAvailability::Required,
         };
         let mut report = PurgeReport::default();
-        purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
+        purge_store(
+            dir.path(),
+            &descriptor,
+            &removed_keys,
+            &[],
+            None,
+            &mut report,
+        );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, legacy_changed);
         assert_eq!(
@@ -3005,7 +3386,14 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let mut report = PurgeReport::default();
-        purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
+        purge_store(
+            dir.path(),
+            &descriptor,
+            &removed_keys,
+            &[],
+            None,
+            &mut report,
+        );
         let elapsed = started.elapsed();
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);

@@ -102,8 +102,8 @@ allowlist チェックする (= command / event / polling のすべての raise 
 **foreground HWND** を以下で判定:
 
 - **許可**: `presenter HWND` / `HUD HWND` / `main HWND` の既知 mIV HWND 3 つ、または
-  `editor_hwnds: Arc<RwLock<HashSet<u64>>>` snapshot (= 現在 visible な editor container
-  HWND) に含まれる HWND (`GA_ROOT` で正規化、`IsWindow` + `IsWindowVisible` で stale 排除)
+  `EditorUiSnapshot.hwnds` (= 現在 visible な editor container HWND) に含まれる HWND
+  (`GA_ROOT` で正規化、`IsWindow` + `IsWindowVisible` で stale 排除)
 - **skip**:
   - file dialog 等 plugin 外の top-level: foreground 自身も `GA_ROOT` も editor allowlist に
     無いので不一致で skip。
@@ -118,9 +118,10 @@ allowlist チェックする (= command / event / polling のすべての raise 
 **`GA_ROOTOWNER` は使わない** — editor を owner にする modal popup を辿ると editor 本体に
 戻るため誤許可リスクがある。`GA_ROOT` までで止める。
 
-既存の `foreground_belongs_to_miv_or_bridge` (PID ベース、`set_all_guis_app_active` で
-「bridge が foreground」判定として使用中) は変更せず、HUD raise 用に別 helper
-`foreground_allows_hud_raise` を新規追加してセマンティクスを分離 (Codex P1 反映)。
+`foreground_belongs_to_miv_or_bridge` は editor の HWND→PID 登録と bridge PID 集合を
+同じ snapshot から読み、共通の `foreground_ui_group` 分類を使う。登録 editor と bridge の
+別 popup は区別する。HUD raise の `foreground_allows_hud_raise` は editor HWND allowlist を
+使い、foreground 分類と raise 許可の判定目的を分ける。
 
 **`current_gui_owner_hwnd` の fullscreen 強制**:
 
@@ -131,18 +132,21 @@ HUD HWND を `WindowFromPoint` が拾って VST が HUD owned になり、目的
 HUD HWND は `set_hud_hwnd` で別系統に登録し、**`current_gui_owner_hwnd` の候補からは
 絶対に出ない**。
 
-**`editor_hwnds` snapshot の更新タイミング**:
+**editor UI snapshot の更新タイミングと公開順序**:
 
-allowlist 判定で参照される `editor_hwnds: Arc<RwLock<HashSet<u64>>>` は、editor 表示状態が
-変わる全経路で `refresh_editor_hwnds_snapshot()` 経由で再構築する (= slot add / show / hide /
-user_hidden / remove / bridge disconnect / 一括 visibility 変更)。「現在 `gui_visible == true`
-かつ `IsWindow` で生存している HWND だけ」を含める (= `gui_hwnd` は hidden 後も残るので
-slot に HWND があるだけでは入れない)。`disable_with_reason` でも明示的に `editor_hwnds.clear()`
-する (= HWND 再利用時の誤許可リスク排除、Codex P2 反映)。
+`EditorUiSnapshot` は可視 editor HWND の集合、HWND→bridge PID 対応、稼働中 bridge PID の
+集合を一つの不変値に持つ。共有先は `Arc<RwLock<Arc<EditorUiSnapshot>>>`。slot add / show /
+hide / user_hidden / remove / bridge disconnect / 一括 visibility 変更で
+`refresh_editor_hwnds_snapshot()` が再構築する。editor 集合には `gui_visible == true` かつ
+`IsWindow` で生存する HWND だけを含める (`gui_hwnd` は hidden 後も残る)。
 
-Lock 取得順序として `DspBridgeInner` の lock を握ったまま Windows API (`IsWindow`) や
-`hud_raise_hook` を呼ばない (inner lock → ローカル `Vec` にコピー → inner 解放 → API 呼び出し →
-`editor_hwnds.write()` の順序、deadlock 防止)。
+refresh は `DspBridgeInner` の lock 下で revision と候補を取得し、lock 外で `IsWindow` を
+検査して次の不変値を作る。再度 inner lock 下で revision・editor 候補・bridge PID 候補を
+検証し、一回の短い write lock で Arc を差し替える。古い refresh は公開しない。
+`disable_with_reason` は同じ inner lock 下で revision を進め、空 snapshot を公開する。
+reader は短い read lock で Arc を clone し、lock を離してから Windows API や別 lock を使う。
+公開中の reader は swap の完了を待って完全な snapshot で分類し、`try_read` の失敗分岐はない。
+inner lock を保持して `IsWindow` や `hud_raise_hook` は呼ばない。
 
 **フォールバック**: 環境変数 `MIV_HUD_OVERLAY=0` で HUD 経路を無効化できる。HUD HWND 作らず、
 従来通り egui overlay を presenter HWND の DComp tree に attach する経路 (= CP8 以前と等価)。
