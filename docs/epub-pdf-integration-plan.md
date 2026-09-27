@@ -532,6 +532,16 @@ x64 で `+crt-static` なので VC runtime 検査の追加設定は不要 (`chec
 
 ## 9. 段階の記録
 
+2026-09-28 の §12 実装では、拡張子だけでは種別が確定しない `.epub` と RAR / 7z / LZH を worker で file / directory に分類してから既存 owner の退役や Ignore 拒否を行う。directory は Ignore 下でも folder として開き、EPUB file の Ignore は typed refusal として PDF worker・cache・可視採用より先に終える。分類中は旧要求を維持し、結果を context と request ID で照合する。下の 2026-09-27 の warm placeholder 禁止記録は §12.2 の可視採用規則により置き換わった。
+
+履歴 navigation との統合時の typed continuation、成功採用境界、未変換 EPUB と「PDF を保存」の履歴規則は [folder-history-location-plan.md §11](folder-history-location-plan.md#11-epub-統合時の履歴-open-所有2026-09-27設計担当決定) を正本とする。直接 open の非同期 PDF 列挙と、履歴の staged preflight は一つの要求を二重に所有しない。直接 EPUB が未完了のときに history request が受け付けられた場合は、直接 open の rollback を staged source の記録前に消費する。
+
+2026-09-27 の再レビュー修正では、直接 PDF/EPUB open も列挙成功までは元の rows・surface・selection を保持する。warm `pdf_meta` placeholder は直接 open の未採用表示には使わない。詳細は同じ [履歴 plan §11](folder-history-location-plan.md#11-epub-統合時の履歴-open-所有2026-09-27設計担当決定) を参照。
+
+**2026-09-28 利用者決定・実装**: 上の 2026-09-27 の直接 open / placeholder 記述は [履歴 plan §12](folder-history-location-plan.md#12-epub-モーダルと直接-pdf-の採用境界2026-09-28利用者決定実装) により更新する。Ask / Convert の未変換 EPUB は、確認を省く設定でも変換の全相で進捗・取消の modal を表示して他の local open admission を止める。Ignore は変換を開始しない。`pdf_meta` の条件を満たす直接 PDF と固定済み EPUB は placeholder を**可視採用**として address・履歴・A/B と同時に確定し、検証列挙を続ける。cold 直接 open と履歴 staged preflight は成功採用まで旧表示を保つ。warm 本から staged 履歴または cold 直接 open を始めても元の列挙は admission で取り消さず、新しい要求の成功採用または通常の leave / close まで source owner が保持する。単冊変換中の直接-to-直接 hand-off は modal gate により到達不能であり、cold 列挙中の supersession だけが共通 admission で typed restore を消費する。右クリック一括 EPUB→PDF は RAR 一括変換と同様、独立した modal を保つ。Remote は変換せず別 session を閲覧する。§12 の行列・削除対象・回帰テストを実装の正本とする。
+
+§12 の modal / warm 採用は下記 D13 を前提とする。`epub_file_handling=Ignore` は変換済み EPUB も cache 参照・placeholder 採用・staged preparation・古い grid tile の副作用より前に typed `Refused` として拒否する。PDF password prompt も typed owner による共有 modal admission gate の対象とし、先行 DFS folder navigation の result は accepted EPUB open が退役させる。詳細な owner 行列とテストは [履歴 plan §12.1–12.4](folder-history-location-plan.md#12-epub-モーダルと直接-pdf-の採用境界2026-09-28利用者決定実装) を正本とする。
+
 ### S3a 一覧・分類・D5 (2026-09-26)
 
 EPUB の論理パスを `PdfFile` / `PdfPage` に保持する。一覧・検索・評価・コレクションが
@@ -561,7 +571,7 @@ stem を大文字小文字を区別せず比較する。設定は `settings_kv` 
 | `app.rs:6250` | スマートフォルダーから開く子の種別は本か | (a) 既存 `epub_valid_smart_pdf_child_published_restarts_pdf_preflight` の owner 経路 |
 | `app.rs:22173` | 仮想フォルダーを開いたとき自動全画面へ進むか | (a) `is_virtual_folder` の共通述語を使用。`paged_document_navigation_skips_same_name_epub_with_pdf` で仮想フォルダー分類を検証。全画面遷移は UI 結合状態なので単体テストを増やさない |
 | `app.rs:21437` | ソート変更でページ列の物理フォルダー再走査を避けるか | (a) 共通述語。別の単体テストは reload の UI 状態を複製するだけなので追加しない |
-| `app.rs:22489,22708` | 開く要求が PDF 系の列挙と履歴 snapshot を使うか | (a) `unconverted_epub_grid_open_routes_to_owned_conversion_dialog`、既存 `epub_openable_path_uses_the_pdf_enumeration_route` |
+| `app.rs:22489,22708` | 開く要求が PDF 系の列挙と履歴 snapshot を使うか | (a) `unconverted_epub_grid_open_routes_to_owned_conversion_dialog`、`epub_openable_path_uses_staged_pdf_preflight`。main history の open は staged request が所有する |
 | `app/cache_ops.rs:421` | フォルダー代表の候補はページ本か | (a) 共通述語の再利用。候補選別は非同期バッチ worker 内の単純分岐で、独立した単体テストは述語だけの再検査になる。世代境界は既存 `epub_batch_parent_row_requires_generation_while_pdf_keeps_presence_check` と S2c-2 の代表ピンテストで検証 |
 | `thumb_loader.rs:565,3212,3288` | 本のサムネイルキャッシュ・ピンの候補か | (a) `cache_decision_auto_webp_always_caches`、`unconverted_epub_tile_uses_icon_fallback_without_recording_failure`、既存の世代スタンプ / ピン test 群 |
 | `global_search_ui.rs:672,1158` | Ctrl+G の代表 / 行はページ本か | (a) `build_drilled_items_classifies_pdf_zip_and_image_by_extension`、`build_flat_items_sorts_classifies_and_skips_zip` |

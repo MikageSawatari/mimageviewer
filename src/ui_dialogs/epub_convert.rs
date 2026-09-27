@@ -9,6 +9,7 @@ use eframe::egui;
 
 use crate::app::{
     App, FolderNavHistorySnapshot, OpenRequestOwner, PdfOpenFailure, PdfOpenFailureRoute,
+    ViewerContextId,
 };
 use crate::epub_cache::PublishOutcome;
 use crate::epub_convert::{
@@ -29,10 +30,12 @@ pub(crate) enum EpubConvertPhase {
     SaveError(String),
 }
 
-/// Abort restores the view left by this request. A later open already owns a superseded view.
+/// Abort restores the view owned by this request. Superseded only rejects a stale same-owner
+/// completion or a context-close result; modal admission prevents an independent open here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EpubConvertExit {
     Abort,
+    Parked,
     Superseded,
 }
 
@@ -40,6 +43,19 @@ pub(crate) enum EpubConvertExit {
 pub(crate) struct EpubOpenRestore {
     pub(crate) logical: PathBuf,
     pub(crate) history: Option<FolderNavHistorySnapshot>,
+    pub(crate) address_before: Option<String>,
+    /// Direct PDF/EPUB adoption survives the NotConverted dialog and resumes with the same
+    /// source origin. Staged history carries its own transition instead.
+    pub(crate) adoption: Option<Box<crate::app::DirectPdfAdoption>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum EpubOpenContinuation {
+    Direct(OpenRequestOwner),
+    StagedHistory {
+        context: ViewerContextId,
+        request_id: u64,
+    },
 }
 
 enum EpubConvertMsg {
@@ -51,7 +67,7 @@ enum EpubConvertMsg {
 
 pub(crate) struct EpubConvertState {
     pub(crate) src_path: PathBuf,
-    pub(crate) owner: OpenRequestOwner,
+    pub(crate) continuation: EpubOpenContinuation,
     // Existing viewer-context surface identity and Smart staged-request identity. Item
     // refreshes do not supersede an open, but another top-level surface or staged Smart open does.
     pub(crate) surface_generation: u64,
@@ -91,6 +107,24 @@ impl EpubConvertState {
         }
     }
 
+    pub(crate) fn fake_stale_sender_for_test(&mut self) -> impl FnOnce() + use<> {
+        let (tx, rx) = mpsc::channel();
+        self.rx = rx;
+        self.phase = EpubConvertPhase::Converting(None);
+        move || {
+            let _ = tx.send(EpubConvertMsg::ConvertDone(Ok(PublishOutcome::Stale)));
+        }
+    }
+
+    pub(crate) fn fake_error_sender_for_test(&mut self) -> impl FnOnce() + use<> {
+        let (tx, rx) = mpsc::channel();
+        self.rx = rx;
+        self.phase = EpubConvertPhase::Converting(None);
+        move || {
+            let _ = tx.send(EpubConvertMsg::ConvertDone(Err(EpubConvertError::Drm)));
+        }
+    }
+
     pub(crate) fn completed_for_test(
         src_path: PathBuf,
         owner: OpenRequestOwner,
@@ -103,12 +137,14 @@ impl EpubConvertState {
         let logical = src_path.clone();
         Self {
             src_path,
-            owner,
+            continuation: EpubOpenContinuation::Direct(owner),
             surface_generation,
             smart_transition_sequence,
             open_restore: EpubOpenRestore {
                 logical,
                 history: None,
+                address_before: None,
+                adoption: None,
             },
             deferred_fullscreen: None,
             phase: EpubConvertPhase::Converting(None),
@@ -130,12 +166,14 @@ impl EpubConvertState {
         let logical = src_path.clone();
         Self {
             src_path,
-            owner,
+            continuation: EpubOpenContinuation::Direct(owner),
             surface_generation,
             smart_transition_sequence,
             open_restore: EpubOpenRestore {
                 logical,
                 history: None,
+                address_before: None,
+                adoption: None,
             },
             deferred_fullscreen: None,
             phase: EpubConvertPhase::Saving(None),
@@ -323,27 +361,63 @@ impl App {
         logical: &Path,
         failure: PdfOpenFailure,
     ) -> PdfOpenFailureRoute {
+        self.route_pdf_open_failure_with_continuation(
+            EpubOpenContinuation::Direct(owner),
+            logical,
+            failure,
+        )
+    }
+
+    pub(crate) fn route_staged_epub_open_failure(
+        &mut self,
+        context: ViewerContextId,
+        request_id: u64,
+        logical: &Path,
+        failure: PdfOpenFailure,
+    ) -> PdfOpenFailureRoute {
+        self.route_pdf_open_failure_with_continuation(
+            EpubOpenContinuation::StagedHistory {
+                context,
+                request_id,
+            },
+            logical,
+            failure,
+        )
+    }
+
+    fn route_pdf_open_failure_with_continuation(
+        &mut self,
+        continuation: EpubOpenContinuation,
+        logical: &Path,
+        failure: PdfOpenFailure,
+    ) -> PdfOpenFailureRoute {
         match failure {
             PdfOpenFailure::NotConverted => {
                 if self.settings.epub_file_handling_ignores_epub() {
                     self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
-                    self.restore_address_after_epub_open_aborted(logical);
+                    if matches!(continuation, EpubOpenContinuation::Direct(_)) {
+                        self.restore_address_after_epub_open_aborted(logical);
+                    }
                     return PdfOpenFailureRoute::Handled;
                 }
                 let Ok(cancel) = CancelToken::new() else {
                     self.show_feedback_toast("EPUB の変換を開始できませんでした".into());
-                    self.restore_address_after_epub_open_aborted(logical);
+                    if matches!(continuation, EpubOpenContinuation::Direct(_)) {
+                        self.restore_address_after_epub_open_aborted(logical);
+                    }
                     return PdfOpenFailureRoute::Handled;
                 };
                 let (_, rx) = mpsc::channel();
                 let mut state = EpubConvertState {
                     src_path: logical.to_owned(),
-                    owner,
+                    continuation,
                     surface_generation: self.top_level_grid_view.generation(),
                     smart_transition_sequence: self.smart_folder_transition_sequence,
                     open_restore: EpubOpenRestore {
                         logical: logical.to_owned(),
                         history: None,
+                        address_before: None,
+                        adoption: None,
                     },
                     deferred_fullscreen: None,
                     phase: EpubConvertPhase::Scanning,
@@ -364,7 +438,9 @@ impl App {
             }
             PdfOpenFailure::EpubUnavailable(reason) => {
                 self.show_feedback_toast(format!("EPUB 変換が無効です: {reason}"));
-                self.restore_address_after_epub_open_aborted(logical);
+                if matches!(continuation, EpubOpenContinuation::Direct(_)) {
+                    self.restore_address_after_epub_open_aborted(logical);
+                }
                 PdfOpenFailureRoute::Handled
             }
             PdfOpenFailure::PasswordRequired | PdfOpenFailure::Other(_) => {
@@ -374,48 +450,50 @@ impl App {
     }
 
     pub(crate) fn epub_convert_dialog_visible(&self) -> bool {
-        self.epub_convert.as_ref().is_some_and(|state| {
-            !matches!(state.phase, EpubConvertPhase::Scanning)
-                || !self.settings.epub_convert_suppresses_confirm()
-        })
-    }
-
-    pub(crate) fn cancel_superseded_epub_convert(
-        &mut self,
-        _path: &Path,
-        _owner: &OpenRequestOwner,
-    ) {
-        // Every accepted later open is a new request, including a reload of the same path.
-        if self.epub_convert.is_some() {
-            self.finish_epub_convert(EpubConvertExit::Superseded);
-        }
+        self.epub_convert.is_some()
     }
 
     pub(crate) fn restore_epub_open(&mut self, restore: EpubOpenRestore) {
         if let Some(snapshot) = restore.history {
             self.restore_folder_nav_history(snapshot);
         }
-        self.restore_address_after_epub_open_aborted(&restore.logical);
+        if let Some(address) = restore.address_before {
+            self.address = address;
+            self.update_global_search_address();
+        } else {
+            self.restore_address_after_epub_open_aborted(&restore.logical);
+        }
     }
 
-    pub(crate) fn finish_epub_convert(&mut self, exit: EpubConvertExit) -> Option<EpubOpenRestore> {
+    pub(crate) fn finish_epub_convert(&mut self, exit: EpubConvertExit) {
         let Some(mut state) = self.epub_convert.take() else {
-            return None;
+            return;
         };
         let had_deferred = state.deferred_fullscreen.take().is_some();
-        let owner = state.owner.clone();
-        let active_logical = state.src_path.clone();
+        let continuation = state.continuation.clone();
         let restore = std::mem::replace(
             &mut state.open_restore,
             EpubOpenRestore {
                 logical: state.src_path.clone(),
                 history: None,
+                address_before: None,
+                adoption: None,
             },
         );
         drop(state);
-        self.abort_smart_archive_open_for_owner(&owner);
+        match &continuation {
+            EpubOpenContinuation::Direct(owner) => {
+                self.abort_smart_archive_open_for_owner(owner);
+            }
+            EpubOpenContinuation::StagedHistory {
+                context,
+                request_id,
+            } => {
+                self.abort_staged_history_epub_conversion(*context, *request_id);
+            }
+        }
         if had_deferred {
-            if exit == EpubConvertExit::Abort {
+            if matches!(exit, EpubConvertExit::Abort | EpubConvertExit::Parked) {
                 self.finish_visible_container_fs_nav_failed();
             }
             // Archive conversion uses this same terminal path. No replacement conversion or
@@ -423,21 +501,19 @@ impl App {
             self.release_fs_nav_lock();
         }
         match exit {
-            EpubConvertExit::Abort => {
-                // A replacement may have updated the address to its own EPUB path while
-                // retaining the first request's rollback snapshot.
-                self.restore_address_after_epub_open_aborted(&active_logical);
-                self.restore_epub_open(restore);
-                None
+            EpubConvertExit::Abort | EpubConvertExit::Parked => {
+                if matches!(continuation, EpubOpenContinuation::Direct(_)) {
+                    self.restore_epub_open(restore);
+                }
             }
-            EpubConvertExit::Superseded => Some(restore),
+            EpubConvertExit::Superseded => {}
         }
     }
 
-    fn replace_epub_convert_state(&mut self, mut state: EpubConvertState) {
-        if let Some(restore) = self.finish_epub_convert(EpubConvertExit::Superseded) {
-            state.open_restore = restore;
-        }
+    fn replace_epub_convert_state(&mut self, state: EpubConvertState) {
+        // A different open cannot be admitted while the modal owns the current conversion.
+        // This terminal only rejects a stale same-owner child completion.
+        self.finish_epub_convert(EpubConvertExit::Superseded);
         self.epub_convert = Some(state);
     }
 
@@ -448,7 +524,7 @@ impl App {
         saved_sibling: bool,
         user_data_errors: Vec<String>,
     ) {
-        let mut owner = state.owner.clone();
+        let continuation = state.continuation.clone();
         if !self.epub_conversion_owner_is_current(&state) {
             self.epub_convert = Some(state);
             self.finish_epub_convert(EpubConvertExit::Superseded);
@@ -459,19 +535,38 @@ impl App {
             EpubOpenRestore {
                 logical: state.src_path.clone(),
                 history: None,
+                address_before: None,
+                adoption: None,
             },
         );
         let deferred = state.deferred_fullscreen.take();
         let source = state.src_path.clone();
         drop(state);
-        if saved_sibling && let OpenRequestOwner::CollectionGridPhysical(collection) = &mut owner {
-            collection.target_path = path.clone();
-        }
         if !user_data_errors.is_empty() {
             self.show_feedback_toast(format!(
                 "PDF は保存されましたが、一部の設定を引き継げませんでした: {}",
                 user_data_errors.join("; ")
             ));
+        }
+        if let EpubOpenContinuation::StagedHistory {
+            context,
+            request_id,
+        } = continuation
+        {
+            self.complete_staged_history_epub_conversion(
+                context,
+                request_id,
+                &source,
+                path,
+                saved_sibling,
+            );
+            return;
+        }
+        let EpubOpenContinuation::Direct(mut owner) = continuation else {
+            unreachable!()
+        };
+        if saved_sibling && let OpenRequestOwner::CollectionGridPhysical(collection) = &mut owner {
+            collection.target_path = path.clone();
         }
         if matches!(
             &owner,
@@ -499,9 +594,9 @@ impl App {
         if reopened
             && let Some(pending) = self.pdf_enumerate_pending.as_mut()
             && crate::folder_tree::path_eq(&pending.0, &path)
-            && pending.3 == owner
+            && pending.3.as_ref() == &owner
         {
-            pending.4 = restore.history;
+            pending.4 = Some(restore);
             if deferred.is_some() {
                 self.fs_nav_after_pdf_enumerate = deferred;
             }
@@ -582,8 +677,6 @@ impl App {
         let mut close = false;
         let mut convert = false;
         let mut save = false;
-        if !matches!(state.phase, EpubConvertPhase::Scanning)
-            || !self.settings.epub_convert_suppresses_confirm()
         {
             let escape = self.dialog_escape_pressed(ctx);
             let enter = self.dialog_enter_pressed(ctx);
@@ -729,12 +822,14 @@ mod tests {
         (
             EpubConvertState {
                 src_path: PathBuf::from("C:/books/book.epub"),
-                owner: OpenRequestOwner::Navigation,
+                continuation: EpubOpenContinuation::Direct(OpenRequestOwner::Navigation),
                 surface_generation: 0,
                 smart_transition_sequence: 0,
                 open_restore: EpubOpenRestore {
                     logical: PathBuf::from("C:/books/book.epub"),
                     history: None,
+                    address_before: None,
+                    adoption: None,
                 },
                 deferred_fullscreen: None,
                 phase,
@@ -745,6 +840,58 @@ mod tests {
             tx,
             cancel,
         )
+    }
+
+    #[test]
+    fn convert_mode_scanning_keeps_visible_modal_and_input_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.epub_file_handling = crate::settings::EpubFileHandling::Convert;
+        let (state, _sender, _cancel) = fake_state(EpubConvertPhase::Scanning);
+        app.epub_convert = Some(state);
+        assert!(app.epub_convert_dialog_visible());
+        assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
+        let output = egui::Context::default().run(Default::default(), |ctx| {
+            app.show_epub_convert_dialog(ctx);
+        });
+        assert!(!output.shapes.is_empty());
+    }
+
+    #[test]
+    fn every_conversion_phase_keeps_visible_modal_in_ask_and_convert_modes() {
+        let phases = || {
+            vec![
+                EpubConvertPhase::Scanning,
+                EpubConvertPhase::Confirm(EpubInspectSummary {
+                    layout: "fixed".into(),
+                    direction: "ltr".into(),
+                    spine_count: 1,
+                    sibling_pdf_exists: false,
+                }),
+                EpubConvertPhase::Converting(None),
+                EpubConvertPhase::Saving(None),
+                EpubConvertPhase::Stale,
+                EpubConvertPhase::Error("failure".into()),
+                EpubConvertPhase::SaveError("failure".into()),
+            ]
+        };
+        for handling in [
+            crate::settings::EpubFileHandling::Ask,
+            crate::settings::EpubFileHandling::Convert,
+        ] {
+            for phase in phases() {
+                let mut app = crate::app::setup_app_for_test();
+                app.settings.epub_file_handling = handling;
+                let (state, _sender, _cancel) = fake_state(phase);
+                app.epub_convert = Some(state);
+                assert!(app.epub_convert_dialog_visible());
+                assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
+                let output = egui::Context::default().run(Default::default(), |ctx| {
+                    app.show_epub_convert_dialog(ctx);
+                });
+                assert!(!output.shapes.is_empty());
+                assert_eq!(app.modal_dialog_block_reason(), Some("epub_convert"));
+            }
+        }
     }
 
     #[test]
@@ -859,7 +1006,9 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut state, tx, _) = fake_state(EpubConvertPhase::Converting(None));
         let source = state.src_path.clone();
-        let owner = state.owner.clone();
+        let EpubOpenContinuation::Direct(owner) = state.continuation.clone() else {
+            unreachable!()
+        };
         state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
@@ -877,7 +1026,7 @@ mod tests {
         assert!(
             app.pdf_enumerate_pending
                 .as_ref()
-                .is_some_and(|pending| { pending.0 == source && pending.3 == owner })
+                .is_some_and(|pending| { pending.0 == source && pending.3.as_ref() == &owner })
         );
         assert!(app.fs_nav_after_pdf_enumerate.is_some());
         assert_eq!(app.fs_nav_locked_gen, Some(7));
@@ -889,7 +1038,9 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut state, tx, _) = fake_state(EpubConvertPhase::Saving(None));
         let pdf = state.src_path.with_extension("pdf");
-        let owner = state.owner.clone();
+        let EpubOpenContinuation::Direct(owner) = state.continuation.clone() else {
+            unreachable!()
+        };
         state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
@@ -911,7 +1062,7 @@ mod tests {
         assert!(
             app.pdf_enumerate_pending
                 .as_ref()
-                .is_some_and(|pending| pending.0 == pdf && pending.3 == owner)
+                .is_some_and(|pending| pending.0 == pdf && pending.3.as_ref() == &owner)
         );
         assert!(app.fs_nav_after_pdf_enumerate.is_some());
     }

@@ -36,6 +36,7 @@
 | [folder-tree-sort-plan.md](folder-tree-sort-plan.md) | §2.25 ツリー専用の並び順と、展開・現在位置を保持するworker再列挙の設計。§2.24の一覧サイズ順に先行 |
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
 | [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
+| [folder-history-location-plan.md](folder-history-location-plan.md) | **Stage B 実装・自動 gate 完了**。§1.280 / §1.281 / §1.282 の Rating・Collection子の表示位置とフォルダ履歴、A/B・detached の所有境界、Rating 一覧ソート保存の設計・検証台帳。実アプリ smoke は未実行 |
 | [collection-rereview-fixes-20260921.md](collection-rereview-fixes-20260921.md) | v4.0.0再レビューの追加修正。指摘の妥当性、直列の実装範囲、バックアップ・復旧・待機要求の設計合意と検証記録 |
 | [collection-migration-journal-recovery.md](collection-migration-journal-recovery.md) | M-2/M-1 の復旧記録保護。読込失敗時の物理変更の事前停止、旧記録保持、再読込・終了と名前変更 scope の所有境界 |
 | [collection-playback-plan.md](collection-playback-plan.md) | Phase 4のPC向けCtrl+上下、通常next / prev、slideshow、三媒体EOFを最新prepared順へ接続した所有設計と検収記録 |

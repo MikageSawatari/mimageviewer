@@ -30,6 +30,48 @@ const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) const MAX_ITEM_ROWS_IN_SNAPSHOT: usize = 16;
 const EXIT_NOT_SET: i32 = -1;
+
+/// Durable diagnostic event: a fast PDF adoption may be verified by its worker before the
+/// script's next snapshot. The sequence records that placeholders were visibly committed,
+/// independently of how long enumeration took.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) enum PdfWarmAdoptionPhase {
+    #[default]
+    None,
+    CommittedPlaceholder,
+}
+
+impl PdfWarmAdoptionPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::CommittedPlaceholder => "CommittedPlaceholder",
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PdfWarmAdoptionCheckpoint {
+    pub(crate) sequence: i64,
+    pub(crate) path: String,
+    pub(crate) phase: PdfWarmAdoptionPhase,
+}
+
+fn pdf_warm_adoption_checkpoint_slot() -> &'static Mutex<PdfWarmAdoptionCheckpoint> {
+    static SLOT: OnceLock<Mutex<PdfWarmAdoptionCheckpoint>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(PdfWarmAdoptionCheckpoint::default()))
+}
+
+pub(crate) fn record_pdf_warm_adoption(path: &Path) {
+    let mut checkpoint = pdf_warm_adoption_checkpoint_slot().lock().unwrap();
+    checkpoint.sequence = checkpoint.sequence.saturating_add(1);
+    checkpoint.path = path.to_string_lossy().into_owned();
+    checkpoint.phase = PdfWarmAdoptionPhase::CommittedPlaceholder;
+}
+
+pub(crate) fn pdf_warm_adoption_checkpoint() -> PdfWarmAdoptionCheckpoint {
+    pdf_warm_adoption_checkpoint_slot().lock().unwrap().clone()
+}
 const EXIT_SCRIPT_FAILURE: i32 = 1;
 const EXIT_ENVIRONMENT_FAILURE: i32 = 2;
 // App-owned workers get two seconds to join during normal shutdown. Six
@@ -886,6 +928,9 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) fs_idx: i64,
     pub(crate) items_generation: i64,
     pub(crate) folder_load_requests: i64,
+    pub(crate) pdf_warm_adoption_sequence: i64,
+    pub(crate) pdf_warm_adoption_path: String,
+    pub(crate) pdf_warm_adoption_phase: String,
     pub(crate) focused: bool,
     pub(crate) target_viewport: String,
     pub(crate) target_registered: bool,
@@ -1008,6 +1053,9 @@ impl Default for TestScriptSnapshot {
             fs_idx: -1,
             items_generation: 0,
             folder_load_requests: 0,
+            pdf_warm_adoption_sequence: 0,
+            pdf_warm_adoption_path: String::new(),
+            pdf_warm_adoption_phase: "None".into(),
             focused: false,
             target_viewport: "unregistered".to_string(),
             target_registered: false,
@@ -1078,6 +1126,9 @@ impl TestScriptSnapshot {
         insert!(fs_idx);
         insert!(items_generation);
         insert!(folder_load_requests);
+        insert!(pdf_warm_adoption_sequence);
+        insert!(pdf_warm_adoption_path);
+        insert!(pdf_warm_adoption_phase);
         insert!(focused);
         insert!(target_viewport);
         insert!(target_registered);
@@ -1284,6 +1335,7 @@ pub(crate) enum UiSmokeAction {
     OpenThumbnailPreferences,
     OpenFirstSmartFolder,
     OpenSeededCollection,
+    OpenRatingOne,
     AlwaysOnTopOn,
     AlwaysOnTopOff,
     MinimizeRoot,
@@ -2419,6 +2471,7 @@ fn parse_navigation_key(name: &str) -> Result<SyntheticNavigationKey, Box<EvalAl
         "home" => SyntheticNavigationKey::Home,
         "end" => SyntheticNavigationKey::End,
         "enter" => SyntheticNavigationKey::Enter,
+        "backspace" => SyntheticNavigationKey::Backspace,
         "escape" | "esc" => SyntheticNavigationKey::Escape,
         "f12" => SyntheticNavigationKey::F12,
         _ => {
@@ -2577,6 +2630,23 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                     .map_err(rhai_error),
                 _ => Err(rhai_error(format!(
                     "unknown Collection sort smoke action: {name}"
+                ))),
+            }
+        },
+    );
+    let folder_history_bridge = bridge.clone();
+    engine.register_fn(
+        "folder_history_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            match name.as_str() {
+                "open_rating_one" => folder_history_bridge
+                    .send(UiCommand::SmokeAction(UiSmokeAction::OpenRatingOne))
+                    .map_err(rhai_error),
+                "open_seeded_collection" => folder_history_bridge
+                    .send(UiCommand::SmokeAction(UiSmokeAction::OpenSeededCollection))
+                    .map_err(rhai_error),
+                _ => Err(rhai_error(format!(
+                    "unknown folder-history smoke action: {name}"
                 ))),
             }
         },
@@ -4955,6 +5025,14 @@ mod tests {
     #[test]
     fn collection_sort_smoke_script_parses_without_launching_the_app() {
         let script = include_str!("../scripts/ui-smoke/rating-sort-collection.rhai");
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine.compile(script).unwrap();
+    }
+
+    #[test]
+    fn folder_history_smoke_script_parses_without_launching_the_app() {
+        let script = include_str!("../scripts/ui-smoke/folder-history.rhai");
         let mut engine = rhai::Engine::new();
         engine.set_max_expr_depths(64, 64);
         engine.compile(script).unwrap();

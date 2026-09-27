@@ -166,6 +166,11 @@ enum PinButtonClick {
 #[derive(Debug)]
 pub(crate) enum AddressBarNav {
     Direct(PathBuf),
+    GridVirtual(crate::app::GridVirtualOpenIntent),
+    RatingSource {
+        path: PathBuf,
+        owner: crate::app::RatingPhysicalLoadOwner,
+    },
     CollectionSource {
         path: PathBuf,
         owner: crate::app::top_level_grid_view::CollectionGridPhysicalLoadOwner,
@@ -7550,7 +7555,6 @@ impl App {
                                                         crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
                                                     );
                                                 } else if self.items_are_rating_view {
-                                                    self.settings.sort_order = order;
                                                     self.set_rating_view_sort(
                                                         crate::rating_view::RatingViewSort::Normal(order),
                                                     );
@@ -9288,6 +9292,31 @@ impl App {
             });
     }
 
+    /// Keep the source grid visible while a location is prepared offscreen.
+    fn render_location_navigation_wait_overlay(&self, ctx: &egui::Context) {
+        if !self.location_navigation_pending() {
+            return;
+        }
+        egui::Area::new("location_navigation_wait_overlay".into())
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(PROGRESS_BG_COLOR)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new("移動先を読み込み中…")
+                                    .color(PROGRESS_LABEL_COLOR),
+                            );
+                        });
+                    });
+            });
+        ctx.request_repaint();
+    }
+
     // ── ツールバー ───────────────────────────────────────────────────
 
     /// Single product dispatch seam for toolbar pointer intents. Drawing only creates one typed
@@ -9987,8 +10016,6 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                             crate::bookmark_browser::BookmarkViewSort::Normal(order),
                                         );
                                     } else if self.items_are_rating_view {
-                                        self.settings.sort_order = order;
-                                        self.settings.save();
                                         self.set_rating_view_sort(
                                             crate::rating_view::RatingViewSort::Normal(order),
                                         );
@@ -10164,8 +10191,6 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                                         crate::bookmark_browser::BookmarkViewSort::Normal(order),
                                                     );
                                                 } else if self.items_are_rating_view {
-                                                    self.settings.sort_order = order;
-                                                    self.settings.save();
                                                     self.set_rating_view_sort(
                                                         crate::rating_view::RatingViewSort::Normal(order),
                                                     );
@@ -13601,12 +13626,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         if let Some(resolved) =
                                             resolve_folder_bar_nav_path(&raw_target)
                                         {
-                                            result = Some(AddressBarNav::Direct(resolved));
+                                            self.start_quick_folder_slot_switch(slot, resolved);
                                         } else {
                                             self.show_feedback_toast(format!(
                                                 "{label} の最後の場所が見つかりません。ドライブ一覧へ切り替えます: {}",
                                                 raw_target.to_string_lossy()
                                             ));
+                                            self.commit_quick_folder_slot_drive_list(slot);
                                             result = Some(AddressBarNav::DriveList(None));
                                         }
                                     }
@@ -13647,8 +13673,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             } else {
                                 match parent_nav_target.as_ref() {
                                     Some(AddressBarNav::Direct(p))
+                                    | Some(AddressBarNav::RatingSource { path: p, .. })
                                     | Some(AddressBarNav::CollectionSource { path: p, .. }) => {
                                         format!("親フォルダへ [BS]\n{}", p.to_string_lossy())
+                                    }
+                                    Some(AddressBarNav::GridVirtual(intent)) => {
+                                        format!("親フォルダへ [BS]\n{}", intent.path.to_string_lossy())
                                     }
                                     Some(AddressBarNav::DriveList(Some(origin))) => {
                                         format!("ドライブ一覧へ [BS]\n{}", origin.to_string_lossy())
@@ -15241,9 +15271,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             None
         };
         if activation_allowed {
-            if self.reject_ignored_epub_grid_item(idx).is_some() {
-                return nav;
-            }
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
             if self.stack_try_open_from_grid(ctx, idx, true) {
@@ -15276,11 +15303,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         self.note_reading_history_open(idx);
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
                         self.maybe_suppress_facet_filter_for_opened_container(idx);
-                        self.record_rating_view_nav_open(&p);
                         if auto_fs {
                             self.pending_auto_fs_open = true;
                         }
-                        nav = Some(self.grid_physical_navigation(idx, p));
+                        nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
                     }
                 }
                 Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
@@ -15294,15 +15320,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fs) {
                         return nav;
                     }
-                    self.note_reading_history_open(idx);
-                    self.maybe_suppress_rating_filter_for_opened_container(idx);
-                    self.maybe_suppress_facet_filter_for_opened_container(idx);
-                    self.record_rating_view_nav_open(&p);
-                    // 環境設定 ON なら、ページ一覧を経由せず 1 ページ目を即フルスクリーンで開く。
-                    if auto_fs {
-                        self.pending_auto_fs_open = true;
-                    }
-                    nav = Some(self.grid_physical_navigation(idx, p));
+                    nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
                 }
                 Some(GridItem::Image(_))
                 | Some(GridItem::Audio(_))
@@ -15351,21 +15369,22 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
                     let owner = self.main_grid_archive_open_owner(idx, &pf);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
-                    let search_rollback = if self.favsearch.active
-                        || self.tag_view.active
-                        || self.rating_view_nav_context_active()
+                    let staged = self.will_stage_archive_navigation(&pf, &owner);
+                    let search_rollback = if !staged
+                        && (self.favsearch.active
+                            || self.tag_view.active
+                            || self.rating_view_nav_context_active())
                     {
                         Some(self.folder_nav_history_snapshot())
                     } else {
                         None
                     };
-                    if self.favsearch.active {
+                    if !staged && self.favsearch.active {
                         self.favsearch.nav_stack.push(pf.clone());
                     }
-                    if self.tag_view.active {
+                    if !staged && self.tag_view.active {
                         self.record_tag_view_nav_open(&pf);
                     }
-                    self.record_rating_view_nav_open(&pf);
                     let open_outcome = self
                         .load_folder_or_convert_archive_with_auto_fullscreen_owned(
                             pf, auto_fs, owner,
@@ -15383,12 +15402,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                         _ => {}
                     }
-                    if self.favsearch.active
+                    if !staged
+                        && self.favsearch.active
                         && matches!(open_outcome, crate::app::FolderOpenOutcome::Loaded)
                     {
                         self.update_favsearch_address();
                     }
-                    if self.tag_view.active
+                    if !staged
+                        && self.tag_view.active
                         && matches!(open_outcome, crate::app::FolderOpenOutcome::Loaded)
                     {
                         self.update_tag_view_address();
@@ -17568,7 +17589,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             Self::cancel_details_best_fit_job(ctx);
         }
 
-        egui::CentralPanel::default()
+        let nav = egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<AddressBarNav> {
                 if !self.grid_item_input_allowed() {
                     ui.disable();
@@ -18432,7 +18453,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
                 nav
             })
-            .inner
+            .inner;
+        self.render_location_navigation_wait_overlay(ctx);
+        nav
     }
 
     // ── 選択情報オーバーレイ ─────────────────────────────────────────

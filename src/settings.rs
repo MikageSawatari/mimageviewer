@@ -4273,6 +4273,9 @@ pub struct Settings {
     /// サムネイルグリッドのソート順
     #[serde(default)]
     pub sort_order: SortOrder,
+    /// ★1〜★5 のレーティング一覧で共通に使うソート順。
+    #[serde(default)]
+    pub rating_view_sort: crate::rating_view::RatingViewSort,
     #[serde(default)]
     pub rating_sort_unrated_position: crate::rating_sort::RatingSortUnratedPosition,
     /// サブフォルダ展開ビューでフォルダ境界を優先するか。
@@ -7126,6 +7129,7 @@ impl Default for Settings {
             folder_skip_limit: default_folder_skip_limit(),
             show_hidden_files: false,
             sort_order: SortOrder::default(),
+            rating_view_sort: crate::rating_view::RatingViewSort::default(),
             rating_sort_unrated_position: Default::default(),
             subfolder_expansion_order: SubfolderExpansionOrder::default(),
             subfolder_expansion_max_depth: default_subfolder_expansion_max_depth(),
@@ -9612,6 +9616,7 @@ impl Settings {
         self.thumb_aspect = src.thumb_aspect;
         self.thumb_aspect_auto = src.thumb_aspect_auto;
         self.sort_order = src.sort_order;
+        self.rating_view_sort = src.rating_view_sort;
         self.subfolder_expansion_order = src.subfolder_expansion_order;
         self.subfolder_expansion_max_depth = src.subfolder_expansion_max_depth;
         self.subfolder_expansion_filter_kinds = src.subfolder_expansion_filter_kinds.clone();
@@ -9952,6 +9957,36 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rating_view_sort_defaults_roundtrips_and_survives_preferences_merge() {
+        use crate::rating_view::RatingViewSort;
+
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.rating_view_sort, RatingViewSort::RatedAtDesc);
+        assert_eq!(
+            Settings::default().rating_view_sort,
+            RatingViewSort::RatedAtDesc
+        );
+
+        let mut live = Settings::default();
+        live.rating_view_sort = RatingViewSort::Normal(SortOrder::DateAsc);
+        live.sort_order = SortOrder::FileName;
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+        assert_eq!(
+            restored.rating_view_sort,
+            RatingViewSort::Normal(SortOrder::DateAsc)
+        );
+        assert_eq!(restored.sort_order, SortOrder::FileName);
+
+        let mut stale_draft = Settings::default();
+        stale_draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            stale_draft.rating_view_sort,
+            RatingViewSort::Normal(SortOrder::DateAsc)
+        );
+    }
 
     #[test]
     fn always_on_top_defaults_off_roundtrips_and_survives_preferences_merge() {
@@ -12671,7 +12706,19 @@ mod tests {
         persisted.stash_details_place_for_persist();
         persisted.stash_details_page_count_for_persist();
         let json = serde_json::to_string(&persisted).unwrap();
-        assert!(!json.contains("RatedAt"));
+        let persisted_fields: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for key in [
+            "details_sort_key",
+            "details_column_order",
+            "details_column_widths",
+            "details_selection_bar_column_order",
+            "details_selection_bar_column_widths",
+        ] {
+            assert!(
+                !persisted_fields[key].to_string().contains("RatedAt"),
+                "{key} must remain readable by older details settings"
+            );
+        }
 
         let mut loaded: Settings = serde_json::from_str(&json).unwrap();
         loaded.sanitize();
@@ -16225,6 +16272,25 @@ mod tests {
             // env は tempdir を保持しているが path 取得は data_dir::get() でできる。
             let _ = env;
             crate::data_dir::get().join("settings.db")
+        }
+
+        #[test]
+        fn rating_view_sort_db_roundtrip_is_independent_of_normal_sort() {
+            use crate::rating_view::RatingViewSort;
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.sort_order = SortOrder::DateDesc;
+            settings.rating_view_sort = RatingViewSort::RatedAtAsc;
+            settings.save();
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(loaded.sort_order, SortOrder::DateDesc);
+            assert_eq!(loaded.rating_view_sort, RatingViewSort::RatedAtAsc);
         }
         fn db_bak_path(env: &BackupTestEnv, n: usize) -> PathBuf {
             let _ = env;

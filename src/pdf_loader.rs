@@ -549,6 +549,17 @@ pub(crate) fn pin_epub_with_direction_for_test(
     guard
 }
 
+/// Resolve a real published cache row without the process-global startup gate, then keep that
+/// immutable generation pinned while a lib test exercises the ordinary PDF worker entry point.
+#[cfg(test)]
+pub(crate) fn pin_cached_epub_for_test(
+    logical: &Path,
+    data_dir: &Path,
+) -> Result<(TestEpubPin, ReadTarget), PdfReadError> {
+    let target = resolve_epub_at(logical, data_dir, epub_pinned())?;
+    Ok((TestEpubPin(epub_cache::src_key(logical)), target))
+}
+
 #[cfg(test)]
 pub(crate) fn generation_target_for_test(logical: &Path, id: i64, pdf_size: u64) -> ReadTarget {
     ReadTarget {

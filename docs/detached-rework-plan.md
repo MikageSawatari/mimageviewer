@@ -1455,6 +1455,41 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-28 §1.280 履歴 / EPUB の context-owned 非同期処理 (review #8/#9 改訂)**
+
+分類 candidate、staged 履歴 transition、Collection navigation、detached folder scan、
+DFS、PDF/ZIP 列挙、EPUB 変換、PDF password request は表示先の
+`ViewerContextBundle` が所有する。root と active detached の **mounted** context だけが
+typed owner registry の `service` を呼ぶ。parked still context は frozen frame のまま
+一切 poll / dialog 描画を行わない。park transaction は同じ registry の
+`terminate_on_park` を全 owner に適用し、staged 履歴は旧表示・履歴を保持、未採用
+direct open は所有 rollback を返し、分類・DFS・scan・enumeration は取消、EPUB 変換と
+password request と Similar preview preparation は terminal にする。以前の root から parked bundle を一時 mount して
+poll / dialog 描画する実装と、その coverage claim は撤回した。
+Collection grid の Snapshot / Preparing だけを park で取り消し、Ready / Empty / Failed /
+Deleted は変更しない。特に物理子表示中の Deleted tombstone を維持するので、復帰後も
+Backspace と復元 snapshot は実フォルダとして扱う。Similar preview も進行中 worker
+だけを取消し、完成 cache と terminal failure を維持する。
+
+EPUB 変換または PDF password prompt の owner がある間、passive window click、activation
+watcher、deferred activation、keyboard/gamepad の窓選択が到達する共通 activation 境界は
+別 context への切替を拒否する。よって通常入力から modal owner が park されない。
+password の表示・Retry/Cancel は context ごとの typed request から一件を決定的に選び、
+active detached viewport は自身が選択 owner の時だけ描く。global visibility flag は置かない。
+bundle 内の cache / write worker は従来の resume・永続化契約を保ち、registry の source audit
+で明示した例外とする（[folder history plan §12.5](folder-history-location-plan.md#125-detached-owner-servicing-と-warm-stamp-の-review-8-修正)）。
+tray/taskbar の root 復帰は viewer context を切り替えない。窓 host、placement、viewport
+identity は変更しない。これは非同期要求の所有 context と park terminal を揃える修正で、
+時間待ちや repaint による症状緩和は加えない。WebView2 実変換の窓操作は対話的検証に残す。
+
+**2026-09-27 履歴 preflight と直接 open の admission**
+
+独立 integration review の指摘に従い、`OpenRequestOwner` の各 variant が承認された後に、同じ viewer context が所有する staged 履歴要求だけを一か所で退役させる。`DetachedGridArchive` と detached lease を持つ `Bookmark` は型付き owner の window ID から registry の context ID を引き、通常 owner は投影中の context ID を使う。履歴 transition 自身の `source_context` も照合する。変換 cache 命中時の detached archive open は main App 上で admission を呼ぶが、宛先 context が detached なので main の staged 履歴・表示を変更しない。以前の `navigation_scope.is_detached_physical()` だけの判定ではこの経路を見落としていた。viewport / window の再作成や再試行は追加していない。これは要求と表示の context 所有権を揃える変更であり、detached 表示症状の局所回避ではない。
+
+**2026-09-27 §1.280 / §1.282 Collection 履歴と detached 外側 navigation**
+
+Collection fullscreen から外側へ移動する要求は、root session が一時的に `return_to=Collection` へ移った後も同じ viewer context が所有する。`collection_navigation_request_is_current` は live session がある場合、その collection ID と非 `Deleted` を検証し、session がない場合だけ typed `return_to=Collection` の同じ ID を認めるようにした。session が別 ID または `Deleted` の場合は fallback しない。これにより要求の context / surface / sequence / items generation / fullscreen index の既存照合を保ったまま、正規の detached Collection 外側移動を継続し、別窓や main の結果を採用しない。新しい detached flag、待機、retry、viewport 再作成は加えない。独立 reviewer は owner 境界の修正であり症状パッチではないと確認した。detached Collection の focused 回帰 1/1 と `scripts/test-full.ps1` は PASS。実窓 smoke は未実行。
+
 **2026-09-27 D13: EPUB しおりの開封拒否を別ウィンドウ確定前に処理**
 
 設計担当の D13 5 回目の指示に従い、しおり行の EPUB Ignore 判定を既存ウィンドウの退避・loading context 作成より前に置く。解決中に設定が変わった場合は、同じ bookmark request ID の待機を終了する。detached descriptor の PDF 開封は理由付きの `FolderOpenOutcome` を返し、拒否時は既存の build abort / Preparing session terminal へ渡す。グリッドからの別ウィンドウ開封と parked 窓の descriptor 再開でも、PDF の拒否を既存ウィンドウの退避前に処理する。新しい detached 状態や時間待ちは足さず、viewport ID・host・placement・focus の所有規則も変更しない。Codex は開封結果を捨てて成功扱いした境界を直す構造修正として §2 に適合すると判断した。独立レビューは未実施。

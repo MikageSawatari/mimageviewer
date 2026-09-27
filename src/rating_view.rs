@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use crate::grid_item::GridItem;
 use crate::rating_db::{RatingItemKind, RatingRow};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RatingViewSort {
     Normal(crate::settings::SortOrder),
     RatedAtDesc,
@@ -114,6 +114,9 @@ pub struct RatingViewPending {
     pub rating_write_generation: u64,
     pub sort: RatingViewSort,
     pub(crate) membership_only: bool,
+    /// Direct/history entry keeps its outgoing grid mounted until prepared rows are adopted.
+    /// Ordinary reorder and membership refreshes leave this empty.
+    pub(crate) navigation: Option<crate::app::RatingNavigationTransition>,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<RatingViewBuildResult, String>>,
 }
@@ -158,6 +161,7 @@ pub(crate) fn spawn_rating_view_build(
         rating_write_generation,
         sort: options_sort,
         membership_only,
+        navigation: None,
         cancel,
         rx,
     }

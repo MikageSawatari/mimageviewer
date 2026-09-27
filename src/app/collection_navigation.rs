@@ -196,6 +196,78 @@ enum CollectionNavigationPreflightPayload {
     ConvertiblePasswordRequired,
 }
 
+/// Offscreen physical destination probe shared by Collection child replay, Rating child replay,
+/// and A/B switches. The result still requires a caller-owned visible adoption transaction.
+pub(crate) enum PhysicalHistoryPreflightPayload {
+    Folder(ScannedDir),
+    Zip(crate::zip_loader::ZipEnumeration),
+    ZipCached {
+        enumeration: crate::zip_loader::ZipEnumeration,
+        backing_path: std::path::PathBuf,
+    },
+    PdfPages(crate::pdf_loader::PdfEnumerateResult),
+    PdfPasswordRequired,
+    PdfOpenFailure(super::PdfOpenFailure),
+    ConvertibleArchive(crate::archive_converter::ArchiveImageSummary),
+    ConvertiblePasswordRequired,
+}
+
+pub(crate) enum PhysicalHistoryPreflightPoll {
+    Pending,
+    Ready(PhysicalHistoryPreflightPayload),
+    Failed(String),
+}
+
+pub(crate) struct PhysicalHistoryPreflight {
+    cancel: Arc<AtomicBool>,
+    receiver: std::sync::mpsc::Receiver<Result<PhysicalHistoryPreflightPayload, String>>,
+}
+
+impl PhysicalHistoryPreflight {
+    #[cfg(test)]
+    pub(crate) fn ready_for_test(payload: PhysicalHistoryPreflightPayload) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender.send(Ok(payload)).expect("seed physical preflight");
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            receiver,
+        }
+    }
+
+    pub(crate) fn poll(&mut self) -> PhysicalHistoryPreflightPoll {
+        match self.receiver.try_recv() {
+            Ok(Ok(payload)) => PhysicalHistoryPreflightPoll::Ready(payload),
+            Ok(Err(message)) => PhysicalHistoryPreflightPoll::Failed(message),
+            Err(std::sync::mpsc::TryRecvError::Empty) => PhysicalHistoryPreflightPoll::Pending,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                PhysicalHistoryPreflightPoll::Failed("移動先の準備結果が失われました".into())
+            }
+        }
+    }
+}
+
+impl Drop for PhysicalHistoryPreflight {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) type CollectionHistoryChildPreflightPoll = PhysicalHistoryPreflightPoll;
+pub(crate) type CollectionHistoryChildPreflightPayload = PhysicalHistoryPreflightPayload;
+
+fn physical_history_file_kind(extension: &str) -> Option<CollectionResolvedKind> {
+    let extension = extension.to_ascii_lowercase();
+    if crate::folder_tree::is_zip_extension(&extension) {
+        Some(CollectionResolvedKind::Zip)
+    } else if crate::folder_tree::is_pdf_extension(&extension) || extension == "epub" {
+        Some(CollectionResolvedKind::Pdf)
+    } else if crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some() {
+        Some(CollectionResolvedKind::ConvertibleArchive)
+    } else {
+        None
+    }
+}
+
 pub(in crate::app) struct CollectionNavigationPreflightReady {
     target: CollectionPreparedNavigationTarget,
     payload: CollectionNavigationPreflightPayload,
@@ -806,6 +878,225 @@ fn preflight_candidates(
 }
 
 impl App {
+    pub(crate) fn start_collection_history_child_preflight(
+        &self,
+        target: &super::collection_grid::CollectionHistoryChildTarget,
+    ) -> Result<PhysicalHistoryPreflight, String> {
+        self.start_collection_history_child_preflight_with_password(target, None)
+    }
+
+    pub(crate) fn start_collection_history_child_preflight_with_password(
+        &self,
+        target: &super::collection_grid::CollectionHistoryChildTarget,
+        password: Option<String>,
+    ) -> Result<PhysicalHistoryPreflight, String> {
+        // The prepared kind belongs to the Collection entry. A saved descendant may be a
+        // different container (for example a ZIP inside a Folder entry).
+        let kind = crate::folder_tree::path_eq(&target.visible_path, &target.root_source_path)
+            .then_some(target.kind);
+        self.start_physical_history_preflight_with_password(
+            target.visible_path.clone(),
+            kind,
+            password,
+        )
+    }
+
+    /// Probe a physical destination on a worker while the old grid remains mounted. `kind` is
+    /// authoritative for a prepared Collection entry; Rating and A/B callers pass None and let
+    /// the worker classify the path. No result is visible until the caller adopts it.
+    pub(crate) fn start_physical_history_preflight(
+        &self,
+        path: std::path::PathBuf,
+        kind: Option<CollectionResolvedKind>,
+    ) -> Result<PhysicalHistoryPreflight, String> {
+        self.start_physical_history_preflight_with_password(path, kind, None)
+    }
+
+    pub(crate) fn start_physical_history_preflight_with_password(
+        &self,
+        path: std::path::PathBuf,
+        kind: Option<CollectionResolvedKind>,
+        password: Option<String>,
+    ) -> Result<PhysicalHistoryPreflight, String> {
+        let tree_options = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
+        let show_hidden_files = self.settings.show_hidden_files;
+        let archive_cache_db = self.archive_cache_db.clone();
+        let use_archive_cache = !self.settings.archive_file_handling_ignores_convertible();
+        let pdf_password = password.clone().or_else(|| self.pdf_open_password(&path));
+        let (want_direction, _) = super::pdf_open_direction_policy(
+            &path,
+            self.settings.follow_document_reading_direction,
+            || {
+                self.spread_db.as_ref().is_ok_and(|db| {
+                    let stored = db.get_state_with_fallback(&path, None);
+                    stored.mode.is_some() || stored.direction.is_some()
+                })
+            },
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let spawn = std::thread::Builder::new()
+            .name("physical-history-preflight".into())
+            .spawn(move || {
+                let result = (|| {
+                    if worker_cancel.load(Ordering::Acquire) {
+                        return Err("移動先の準備を取り消しました".to_string());
+                    }
+                    // A prepared item kind is a hint about a file, never authority over the
+                    // filesystem's file-versus-directory result. In particular book.epub may
+                    // be a real directory and must remain a Folder destination.
+                    let metadata = std::fs::metadata(&path)
+                        .map_err(|error| format!("移動先を確認できません: {error}"))?;
+                    let resolved_kind = if metadata.is_dir() {
+                        CollectionResolvedKind::Folder
+                    } else if metadata.is_file() {
+                        match kind {
+                            Some(kind) => kind,
+                            None => {
+                                let extension = path
+                                    .extension()
+                                    .and_then(|value| value.to_str())
+                                    .unwrap_or_default();
+                                physical_history_file_kind(extension).ok_or_else(|| {
+                                    "移動先は物理コンテナではありません".to_string()
+                                })?
+                            }
+                        }
+                    } else {
+                        return Err("移動先は物理コンテナではありません".to_string());
+                    };
+                    match resolved_kind {
+                        CollectionResolvedKind::Folder => {
+                            super::folder_scan::scan_directory_with_convertible_archives_cancel(
+                                &path,
+                                tree_options
+                                    .archive_policy
+                                    .includes_convertible_in_directory_scan(),
+                                tree_options.include_epub,
+                                show_hidden_files,
+                                Some(&worker_cancel),
+                            )
+                            .map(PhysicalHistoryPreflightPayload::Folder)
+                            .map_err(|error| format!("フォルダを読み込めません: {error}"))
+                        }
+                        CollectionResolvedKind::Zip => {
+                            // A ZIP with converted nested archives can have a cached ZIP backing.
+                            // Keep DB and filesystem work off the UI thread; if the cache became
+                            // unreadable, the original ZIP remains a valid destination.
+                            if use_archive_cache
+                                && let Some(db) = archive_cache_db.as_ref()
+                                && let Ok(metadata) = std::fs::metadata(&path)
+                                && let Some(backing_path) = db.lookup(
+                                    &path,
+                                    crate::ui_helpers::mtime_secs(&metadata),
+                                    metadata.len() as i64,
+                                )
+                                && !crate::folder_tree::path_eq(&backing_path, &path)
+                                && let Ok(enumeration) =
+                                    crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
+                                        &backing_path,
+                                        Some(&worker_cancel),
+                                    )
+                            {
+                                return Ok(PhysicalHistoryPreflightPayload::ZipCached {
+                                    enumeration,
+                                    backing_path,
+                                });
+                            }
+                            crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
+                                &path,
+                                Some(&worker_cancel),
+                            )
+                            .map(PhysicalHistoryPreflightPayload::Zip)
+                            .map_err(|error| format!("書庫を読み込めません: {error}"))
+                        }
+                        CollectionResolvedKind::Pdf => {
+                            match crate::pdf_loader::enumerate_pages_with_options(
+                                &path,
+                                pdf_password.as_deref(),
+                                Some(Arc::clone(&worker_cancel)),
+                                crate::pdf_loader::EnumerateOptions { want_direction },
+                            ) {
+                                Ok(pages) if !pages.pages.is_empty() => {
+                                    Ok(PhysicalHistoryPreflightPayload::PdfPages(pages))
+                                }
+                                Ok(_) => Err("PDF に表示できるページがありません".into()),
+                                Err(error)
+                                    if crate::pdf_loader::is_password_required_error(&error) =>
+                                {
+                                    Ok(PhysicalHistoryPreflightPayload::PdfPasswordRequired)
+                                }
+                                Err(error) => match crate::pdf_loader::typed_read_error(&error) {
+                                    Some(
+                                        failure @ (crate::pdf_loader::PdfReadError::NotConverted
+                                        | crate::pdf_loader::PdfReadError::EpubUnavailable { .. }),
+                                    ) => Ok(PhysicalHistoryPreflightPayload::PdfOpenFailure(
+                                        failure.into(),
+                                    )),
+                                    _ => Err(format!("PDF を読み込めません: {error}")),
+                                },
+                            }
+                        }
+                        CollectionResolvedKind::ConvertibleArchive => {
+                            let extension = path
+                                .extension()
+                                .and_then(|value| value.to_str())
+                                .unwrap_or_default()
+                                .to_ascii_lowercase();
+                            let format =
+                                crate::archive_converter::ArchiveFormat::from_extension(&extension)
+                                    .ok_or_else(|| "対応していない書庫です".to_string())?;
+                            // A valid converted backing is already the prepared destination.
+                            // Check it on this worker before probing the original archive; a
+                            // source may no longer be readable even though its stamped cache is.
+                            if use_archive_cache
+                                && format != crate::archive_converter::ArchiveFormat::Rar
+                                && let Some(db) = archive_cache_db.as_ref()
+                                && let Ok(metadata) = std::fs::metadata(&path)
+                                && let Some(backing_path) = db.lookup(
+                                    &path,
+                                    crate::ui_helpers::mtime_secs(&metadata),
+                                    metadata.len() as i64,
+                                )
+                                && !crate::folder_tree::path_eq(&backing_path, &path)
+                                && let Ok(enumeration) =
+                                    crate::zip_loader::enumerate_image_entries_detailed_with_cancel(
+                                        &backing_path,
+                                        Some(&worker_cancel),
+                                    )
+                            {
+                                return Ok(PhysicalHistoryPreflightPayload::ZipCached {
+                                    enumeration,
+                                    backing_path,
+                                });
+                            }
+                            match crate::archive_converter::scan_summary_with_password_cancelable(
+                                &path,
+                                format,
+                                password.as_deref(),
+                                &worker_cancel,
+                            ) {
+                                Ok(summary) => {
+                                    Ok(PhysicalHistoryPreflightPayload::ConvertibleArchive(summary))
+                                }
+                                Err(crate::archive_converter::ConvertError::PasswordRequired) => {
+                                    Ok(PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired)
+                                }
+                                Err(error) => Err(format!("書庫を読み込めません: {error}")),
+                            }
+                        }
+                        _ => Err("移動先は物理コンテナではありません".to_string()),
+                    }
+                })();
+                let _ = sender.send(result);
+            });
+        match spawn {
+            Ok(_) => Ok(PhysicalHistoryPreflight { cancel, receiver }),
+            Err(error) => Err(format!("移動先の準備を開始できません: {error}")),
+        }
+    }
+
     pub(crate) fn cancel_collection_navigation_intent(&mut self) {
         self.cancel_transferred_collection_archive_navigation("collection_navigation_cancelled");
         self.top_level_grid_view
@@ -915,6 +1206,9 @@ impl App {
             None
         };
         let session = self.top_level_grid_view.collection_session()?;
+        if matches!(session.load, CollectionGridLoadState::Deleted { .. }) {
+            return None;
+        }
         if !matches!(session.position, CollectionGridPosition::Root)
             || session.installed_items_generation != Some(self.items_generation)
         {
@@ -951,6 +1245,9 @@ impl App {
         current_idx: Option<usize>,
     ) -> Option<CollectionNavigationOrigin> {
         if let Some(session) = self.top_level_grid_view.collection_session() {
+            if matches!(session.load, CollectionGridLoadState::Deleted { .. }) {
+                return None;
+            }
             let anchor = match &session.position {
                 CollectionGridPosition::PhysicalSource {
                     entry_id,
@@ -2233,9 +2530,9 @@ impl App {
                             request.lease.pause(Instant::now(), "pdf_password_input");
                             self.pdf_current_password = None;
                             self.pdf_password_pending_save = None;
-                            self.pdf_password_request = Some(super::PdfPasswordRequest {
-                                path: target.source_path.clone(),
-                            });
+                            self.pdf_password_request = Some(super::PdfPasswordRequest::legacy(
+                                target.source_path.clone(),
+                            ));
                             let revision_wake = CollectionRevisionWake::spawn(ctx, &watch);
                             self.top_level_grid_view
                                 .set_collection_navigation_pending(Some(
@@ -2423,6 +2720,20 @@ impl App {
         &self,
         request: &CollectionNavigationRequest,
     ) -> bool {
+        let owner_current = match self.top_level_grid_view.collection_session() {
+            Some(session) => {
+                session.identity.collection_id == request.origin.collection_id
+                    && !matches!(session.load, CollectionGridLoadState::Deleted { .. })
+            }
+            None => matches!(
+                self.top_level_grid_view.return_to(),
+                Some(TopLevelGridRestore::Collection(restore))
+                    if restore.identity.collection_id == request.origin.collection_id
+            ),
+        };
+        if !owner_current {
+            return false;
+        }
         if self.collection_grid_context_id() != request.origin.context_id
             || self.top_level_grid_view.generation() != request.origin.surface_generation
             || self.top_level_grid_view.collection_navigation_sequence()
@@ -2996,9 +3307,9 @@ impl App {
             CollectionNavigationPreflightPayload::PdfPasswordRequired
         ) {
             request.lease.pause(Instant::now(), "pdf_password_input");
-            self.pdf_password_request = Some(super::PdfPasswordRequest {
-                path: ready.target.source_path.clone(),
-            });
+            self.pdf_password_request = Some(super::PdfPasswordRequest::legacy(
+                ready.target.source_path.clone(),
+            ));
             let revision_wake = CollectionRevisionWake::spawn(ctx, &watch);
             self.top_level_grid_view
                 .set_collection_navigation_pending(Some(
@@ -3140,7 +3451,7 @@ impl App {
                             history_trigger,
                         );
                     }
-                    FolderOpenOutcome::ConversionDialogOpened => {
+                    FolderOpenOutcome::Classifying | FolderOpenOutcome::ConversionDialogOpened => {
                         let _ = self.attach_archive_convert_deferred_fullscreen(
                             restore_video_tile,
                             resume_slideshow,
@@ -3160,7 +3471,7 @@ impl App {
                             history_trigger,
                         );
                     }
-                    FolderOpenOutcome::ConversionDialogOpened => {
+                    FolderOpenOutcome::Classifying | FolderOpenOutcome::ConversionDialogOpened => {
                         let _ = self.attach_archive_convert_deferred_fullscreen(
                             restore_video_tile,
                             true,
@@ -3218,7 +3529,7 @@ impl App {
                 CollectionNavigationPreflightPayload::Folder(scan) => {
                     let path = ready.target.source_path.clone();
                     let owner = self
-                        .collection_grid_physical_load_owner(target_idx, &path)
+                        .collection_grid_playback_physical_load_owner(target_idx, &path)
                         .map(super::OpenRequestOwner::CollectionGridPhysical);
                     if let Some(owner) = owner {
                         if self.load_folder_with_scan_owned(path, Some(scan), owner) {
@@ -3643,6 +3954,172 @@ mod tests {
     use crate::app::{AppTestEnvForTest, setup_app_for_test};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn write_single_page_zip(path: &std::path::Path, page: &str) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(page, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"page").unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn await_physical_preflight(
+        pending: &mut PhysicalHistoryPreflight,
+    ) -> PhysicalHistoryPreflightPayload {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match pending.poll() {
+                PhysicalHistoryPreflightPoll::Pending => {
+                    assert!(Instant::now() < deadline, "physical preflight timed out");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                PhysicalHistoryPreflightPoll::Ready(payload) => return payload,
+                PhysicalHistoryPreflightPoll::Failed(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn physical_zip_preflight_uses_cached_backing_and_falls_back_on_bad_cache() {
+        let app = setup_app_for_test();
+        let source = app.tmp.path().join("nested.zip");
+        let cached = app.tmp.path().join("nested-cached.zip");
+        write_single_page_zip(&source, "original.jpg");
+        write_single_page_zip(&cached, "converted.jpg");
+        let metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .expect("archive cache DB")
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                crate::archive_converter::ArchiveFormat::Zip,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+
+        let mut pending = app
+            .start_physical_history_preflight(source.clone(), Some(CollectionResolvedKind::Zip))
+            .unwrap();
+        assert!(matches!(
+            await_physical_preflight(&mut pending),
+            PhysicalHistoryPreflightPayload::ZipCached { backing_path, .. }
+                if backing_path == cached
+        ));
+
+        std::fs::write(&cached, b"invalid cached ZIP").unwrap();
+        let mut pending = app
+            .start_physical_history_preflight(source, Some(CollectionResolvedKind::Zip))
+            .unwrap();
+        assert!(matches!(
+            await_physical_preflight(&mut pending),
+            PhysicalHistoryPreflightPayload::Zip(_)
+        ));
+    }
+
+    #[test]
+    fn physical_history_preflight_classifies_uppercase_extensions() {
+        assert!(matches!(
+            super::physical_history_file_kind("ZIP"),
+            Some(CollectionResolvedKind::Zip)
+        ));
+        assert!(matches!(
+            super::physical_history_file_kind("PDF"),
+            Some(CollectionResolvedKind::Pdf)
+        ));
+        assert!(matches!(
+            super::physical_history_file_kind("EPUB"),
+            Some(CollectionResolvedKind::Pdf)
+        ));
+    }
+
+    #[test]
+    fn epub_preflight_keeps_not_converted_typed_and_directory_named_epub_is_a_folder() {
+        let app = setup_app_for_test();
+        let source = app.tmp.path().join("book.epub");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&source).unwrap());
+        writer
+            .start_file(
+                "mimetype",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"application/epub+zip").unwrap();
+        writer
+            .start_file(
+                "META-INF/container.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"<container/>").unwrap();
+        writer.finish().unwrap();
+        let _failure = crate::pdf_loader::fail_epub_for_test(
+            &source,
+            crate::pdf_loader::PdfReadError::NotConverted,
+        );
+        let mut pending = app.start_physical_history_preflight(source, None).unwrap();
+        assert!(matches!(
+            await_physical_preflight(&mut pending),
+            PhysicalHistoryPreflightPayload::PdfOpenFailure(
+                super::super::PdfOpenFailure::NotConverted
+            )
+        ));
+
+        let directory = app.tmp.path().join("directory.epub");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("page.jpg"), b"image").unwrap();
+        let mut pending = app
+            .start_physical_history_preflight(directory, Some(CollectionResolvedKind::Pdf))
+            .unwrap();
+        assert!(matches!(
+            await_physical_preflight(&mut pending),
+            PhysicalHistoryPreflightPayload::Folder(_)
+        ));
+    }
+
+    #[test]
+    fn history_child_preflight_accepts_an_empty_folder_without_visible_mutation() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("empty");
+        std::fs::create_dir(&folder).unwrap();
+        let app = setup_app_for_test();
+        let surface = app.top_level_grid_view.surface().clone();
+        let target = super::super::collection_grid::CollectionHistoryChildTarget {
+            root: super::super::top_level_grid_view::CollectionGridRestore {
+                identity: CollectionGridIdentity {
+                    collection_id: CollectionId::new(),
+                },
+                revision_at_open: 1,
+                viewport_anchor: None,
+            },
+            root_source_path: folder.clone(),
+            visible_path: folder,
+            kind: CollectionResolvedKind::Folder,
+        };
+        let mut pending = app
+            .start_collection_history_child_preflight(&target)
+            .expect("start offscreen preflight");
+        loop {
+            match pending.poll() {
+                CollectionHistoryChildPreflightPoll::Pending => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                CollectionHistoryChildPreflightPoll::Ready(
+                    CollectionHistoryChildPreflightPayload::Folder(_),
+                ) => break,
+                CollectionHistoryChildPreflightPoll::Ready(_) => panic!("wrong child payload"),
+                CollectionHistoryChildPreflightPoll::Failed(message) => panic!("{message}"),
+            }
+        }
+        assert_eq!(app.top_level_grid_view.surface(), &surface);
+    }
 
     #[test]
     fn audit_collection_navigation_readers_with_foreign_writers() {
@@ -5591,7 +6068,7 @@ mod tests {
         let ctx = egui::Context::default();
         let revision_wake = CollectionRevisionWake::spawn(&ctx, &watch);
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Pdf);
-        app.pdf_password_request = Some(super::super::PdfPasswordRequest { path: pdf });
+        app.pdf_password_request = Some(super::super::PdfPasswordRequest::legacy(pdf));
         app.top_level_grid_view
             .set_collection_navigation_pending(Some(
                 CollectionNavigationPending::AwaitingPdfPassword {
@@ -5803,7 +6280,7 @@ mod tests {
         let ctx = egui::Context::default();
         let revision_wake = CollectionRevisionWake::spawn(&ctx, &watch);
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Pdf);
-        app.pdf_password_request = Some(super::super::PdfPasswordRequest { path: pdf });
+        app.pdf_password_request = Some(super::super::PdfPasswordRequest::legacy(pdf));
         app.top_level_grid_view
             .set_collection_navigation_pending(Some(
                 CollectionNavigationPending::AwaitingPdfPassword {

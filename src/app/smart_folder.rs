@@ -1719,8 +1719,9 @@ impl App {
             return false;
         };
         if self.epub_convert.as_ref().is_some_and(|state| {
-            matches!(&state.owner,
-                super::OpenRequestOwner::MainGridArchive(intent)
+            matches!(&state.continuation,
+                crate::ui_dialogs::epub_convert::EpubOpenContinuation::Direct(
+                    super::OpenRequestOwner::MainGridArchive(intent))
                     if matches!(intent.smart_folder_owner,
                         super::SmartGridArchiveOwner::Transition(id) if id == transition.request_id))
         }) {
@@ -1773,7 +1774,6 @@ impl App {
         if self.pdf_password_request_pending_in_any_context() {
             return;
         }
-        self.show_pdf_password_dialog = false;
         self.pdf_password_input.clear();
         self.pdf_password_error = None;
     }
@@ -2426,12 +2426,49 @@ impl App {
         if self.top_level_grid_view.smart_folder_session().is_none() {
             return false;
         }
+        if self.document_open_modal_admission_blocked() {
+            return true;
+        }
+        if super::App::path_needs_open_classification(&path) {
+            return self.start_open_path_classification(
+                path,
+                super::ClassifiedOpenContinuation::SmartGrid {
+                    index,
+                    auto_fullscreen,
+                },
+            );
+        }
+        self.begin_smart_grid_container_navigation_classified(
+            index,
+            path,
+            auto_fullscreen,
+            super::OpenPathKind::File,
+            None,
+        )
+    }
+
+    pub(in crate::app) fn begin_smart_grid_container_navigation_classified(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        auto_fullscreen: bool,
+        classified_kind: super::OpenPathKind,
+        pre_scan: Option<super::ScannedDir>,
+    ) -> bool {
+        if self.top_level_grid_view.smart_folder_session().is_none() {
+            return false;
+        }
         let kind = match self.items.get(index) {
             Some(GridItem::Folder(_)) => SmartChildKind::Folder,
             Some(GridItem::PdfFile(_)) => SmartChildKind::Pdf,
             Some(GridItem::ZipFile(_)) => SmartChildKind::Zip,
             Some(GridItem::ConvertibleArchive { .. }) => SmartChildKind::ConvertibleArchive,
             _ => return false,
+        };
+        let kind = if classified_kind == super::OpenPathKind::Directory {
+            SmartChildKind::Folder
+        } else {
+            kind
         };
         if kind == SmartChildKind::ConvertibleArchive
             && self.settings.archive_file_handling_ignores_convertible()
@@ -2450,7 +2487,13 @@ impl App {
             return true;
         }
         if self
-            .begin_smart_physical_navigation(path.clone(), kind, auto_fullscreen, None, Some(index))
+            .begin_smart_physical_navigation(
+                path.clone(),
+                kind,
+                auto_fullscreen,
+                pre_scan,
+                Some(index),
+            )
             .is_err()
         {
             self.show_feedback_toast("コンテナの読み取りを開始できませんでした".into());
@@ -2486,6 +2529,7 @@ impl App {
                 suppress_rating_filter: false,
                 suppress_facet_filter: false,
                 smart_folder_owner: super::SmartGridArchiveOwner::Transition(transition.request_id),
+                rating_grid_owner: None,
                 collection_grid_owner: None,
                 collection_navigation_continuation: None,
             });
@@ -3335,10 +3379,20 @@ impl App {
                         suppress_facet_filter: false,
                         smart_folder_owner: super::SmartGridArchiveOwner::Transition(request_id),
                         collection_grid_owner: None,
+                        rating_grid_owner: None,
                         collection_navigation_continuation: None,
                     },
                 );
-                self.pdf_enumerate_pending = Some((path, password, handle, owner, None));
+                self.pdf_enumerate_pending = Some((
+                    path,
+                    password,
+                    handle,
+                    Box::new(owner),
+                    None,
+                    super::PdfOpenPhase::CommittedVerification {
+                        placeholder_count: page_count,
+                    },
+                ));
                 true
             }
             SmartPhysicalReady::PdfWarm {
@@ -3377,10 +3431,20 @@ impl App {
                         suppress_facet_filter: false,
                         smart_folder_owner: super::SmartGridArchiveOwner::Transition(request_id),
                         collection_grid_owner: None,
+                        rating_grid_owner: None,
                         collection_navigation_continuation: None,
                     },
                 );
-                self.pdf_enumerate_pending = Some((path, password, handle, owner, None));
+                self.pdf_enumerate_pending = Some((
+                    path,
+                    password,
+                    handle,
+                    Box::new(owner),
+                    None,
+                    super::PdfOpenPhase::CommittedVerification {
+                        placeholder_count: page_count,
+                    },
+                ));
                 true
             }
             SmartPhysicalReady::ZipPrepared(prepared) => {
@@ -3729,22 +3793,6 @@ impl App {
         }
         let mut adopted_folder_nav = false;
         let mut launch_archive_conversion = false;
-        if let SmartFolderTransitionPhase::ChildPreflight {
-            child:
-                SmartPhysicalPreflight::PdfPassword {
-                    invalid_password, ..
-                },
-            ..
-        } = &transition.phase
-            && !self.pdf_password_request_pending_in_any_context()
-            && !self.show_pdf_password_dialog
-        {
-            self.pdf_password_input.clear();
-            self.pdf_password_error =
-                (*invalid_password).then(|| "パスワードが正しくありません".to_owned());
-            self.pdf_password_save = false;
-            self.show_pdf_password_dialog = true;
-        }
         if self.sidecar_restore_active() {
             self.smart_folder_transition = Some(transition);
             return;
@@ -4124,13 +4172,21 @@ impl App {
                 SmartPhysicalPoll::PasswordRequired {
                     path,
                     invalid_password,
-                } => Some(SmartFolderTransitionPhase::ChildPreflight {
-                    root,
-                    child: SmartPhysicalPreflight::PdfPassword {
-                        path,
-                        invalid_password,
-                    },
-                }),
+                } => {
+                    if !self.pdf_password_request_pending_in_any_context() {
+                        self.pdf_password_input.clear();
+                        self.pdf_password_error =
+                            invalid_password.then(|| "パスワードが正しくありません".to_owned());
+                        self.pdf_password_save = false;
+                    }
+                    Some(SmartFolderTransitionPhase::ChildPreflight {
+                        root,
+                        child: SmartPhysicalPreflight::PdfPassword {
+                            path,
+                            invalid_password,
+                        },
+                    })
+                }
                 SmartPhysicalPoll::OpenFailure { path, failure } => {
                     let owner = super::OpenRequestOwner::MainGridArchive(
                         super::MainGridArchiveTransitionIntent {
@@ -4142,6 +4198,7 @@ impl App {
                                 transition.request_id,
                             ),
                             collection_grid_owner: None,
+                            rating_grid_owner: None,
                             collection_navigation_continuation: None,
                         },
                     );
@@ -7111,6 +7168,11 @@ impl App {
         refresh: bool,
         intent: SmartTransitionIntent,
     ) -> Option<u64> {
+        if matches!(&intent, SmartTransitionIntent::Direct(_))
+            && self.document_open_modal_admission_blocked()
+        {
+            return None;
+        }
         let Some(definition) = self
             .settings
             .smart_folders
@@ -9286,6 +9348,7 @@ mod tests {
             suppress_facet_filter: false,
             smart_folder_owner: SmartGridArchiveOwner::Transition(request_id),
             collection_grid_owner: None,
+            rating_grid_owner: None,
             collection_navigation_continuation: None,
         });
         app.settings
@@ -9433,15 +9496,20 @@ mod tests {
     }
 
     #[test]
-    fn epub_smart_wait_ends_on_superseding_open() {
+    fn epub_smart_modal_blocks_superseding_open_until_cancel() {
         let mut app = crate::app::setup_app_for_test();
         stage_smart_epub_conversion(&mut app);
         let temp = tempfile::TempDir::new().unwrap();
         let next = temp.path().join("next-folder");
         std::fs::create_dir(&next).unwrap();
-        app.load_folder(next);
-        assert!(app.epub_convert.is_none());
-        assert!(!smart_epub_waiting(&app));
+        let before = app.current_folder.clone();
+        app.load_folder(next.clone());
+        assert!(app.epub_convert.is_some());
+        assert!(smart_epub_waiting(&app));
+        assert_eq!(app.current_folder, before);
+        app.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
+        app.load_folder(next.clone());
+        assert_eq!(app.current_folder.as_deref(), Some(next.as_path()));
     }
 
     #[cfg(windows)]

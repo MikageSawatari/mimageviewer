@@ -31,6 +31,7 @@
 
 ### 1.280 レーティング一覧を一度開くと、以後のフォルダ履歴 (←/→) が壊れる — v4.0.0 からの退行、原因特定済み (2026-09-25)
 
+- 進捗 (2026-09-27): **実装・自動 gate 完了**。§1.282 と共通の表示位置 owner、Rating entry/replay の採用 transaction、BS provenance を実装し、load/adoption 回帰と `test-full.ps1` が PASS。設計・検証台帳は [folder-history-location-plan.md](folder-history-location-plan.md) §9。独立 completion review は完了、利用者承認後の実アプリ smoke は未了。
 - 出典: 利用者メール (2026-09-25、v3.10.0 → v4.0.0 更新後から)。症状 1 は開発者本人が v4.1.0 で再現。
   症状 2 は報告者の記述のみで、こちらでは未確認。
 - 症状 (報告):
@@ -62,10 +63,9 @@
     Rating 経由のフォルダでは出ない可能性。
   - スマートフォルダ・スナップショット・コレクションへ入るときの戻り先
     (`smart_folder.rs` / `snapshot_ops.rs` / `collection_grid.rs` の `current_top_level_restore_snapshot()`)。
-- 方針候補: 症状パッチ (履歴側で Rating を特別扱いする等) ではなく、「レーティング一覧から実フォルダの表示を
-  採用した時点で surface を Folder へ移す」ことで surface の所有を正す。ただしレーティング一覧の中から開いた
-  コンテナを BS でレーティング一覧へ戻す仕組み (`rating_view_nav_stack`) は surface と別に持っているので、
-  それを壊さないことを確かめる。surface を消す位置は DriveList 等と同じ load 採用の境界が候補。
+- 採用した設計: レーティング一覧から実フォルダを可視採用した時点で surface を Folder へ移し、履歴の現在地に
+  表示済み path と Rating からの BS 親 chain を一緒に保持する。詳細な採用・失敗境界は
+  [folder-history-location-plan.md](folder-history-location-plan.md) §2 を正本とする。
 - 回帰確認 (テストを足す): 実際に load を通して Rating → hoge → ← → → が hoge に戻ること、Rating → F → G →
   ← が F になること、BS でレーティング一覧へ戻る動作、A/B クイックフォルダの両方、検索の開閉の戻り先。
   既存テスト (`folder_nav_forward_from_synthetic_view_records_synthetic_on_back_stack` 等) は stack を
@@ -74,18 +74,19 @@
 
 ### 1.281 レーティング一覧の並び順を次に開いたときも保つ — 利用者要望 (2026-09-25)
 
+- 進捗 (2026-09-27): **実装・自動 gate 完了**。全 ★段共通の `RatingViewSort` 保存、直接 entry / 履歴 replay の共通適用、`Normal(Rating*)` の保存前正規化を実装。Settings の JSON / DB roundtrip、Preferences merge の focused test、`test-full.ps1` が PASS。設計・検証台帳は [folder-history-location-plan.md](folder-history-location-plan.md) §6 / §9。実アプリ smoke は未了。
 - 出典: §1.280 と同じ利用者メール。レーティング一覧を開くたびに「★時刻↓」に戻るので、毎回並べ直している
   (本棚の代わりに使っている)。
 - 現状: `enter_rating_view` と履歴からの復帰 (`dispatch_synthetic_folder_history_target_with_rollback`) の
   2 か所で `rating_view_sort` を `RatingViewSort::default()` (★設定時刻の新しい順) に戻している。v3.10.0 も同じ。
-- 方針候補: 一覧の並べ方 (`RatingViewSort`) を設定に保存し、両方の入口がそれを読む。詳細表示の列ソートの
-  所有権を戻す処理 (§1.143 の `reset_details_sort_to_toolbar`) は変えない。保存するのは一覧専用の並べ方だけ。
-  ★の段 (★1〜★5) ごとに分けるかは決める (既定は全段共通で十分と思われる)。
+- 採用した設計: 一覧の並べ方 (`RatingViewSort`) を全 ★段共通の設定に保存し、直接 entry と履歴 replay の両方で読む。
+  詳細表示の列ソートの所有権を戻す §1.143 の `reset_details_sort_to_toolbar` は維持する。
 - 新しい設定項目の追加なので移行は不要 (未設定なら今の既定)。
 - 規模 / 優先度: Small / P2。
 
 ### 1.282 コレクションから開いた本・フォルダで ← を押すと、コレクションを飛ばしてその前の場所へ戻る — コード調査、§1.280 と同じ構造 (2026-09-25)
 
+- 進捗 (2026-09-27): **実装・自動 gate 完了**。Collection root / 子の別地点、root entry anchor、offscreen prepare 後の可視一覧と履歴の同時採用を実装し、ZIP/PDF の成功・失敗・取消を含む回帰と `test-full.ps1` が PASS。設計・検証台帳は [folder-history-location-plan.md](folder-history-location-plan.md) §9、従来契約の改訂点は [collection-implementation-plan.md](collection-implementation-plan.md) §16.3 / §20。独立 completion review は完了、実アプリ smoke は未了。
 - 出典: §1.280 と同じ利用者メール (コレクションで戻る・進むが効かない)。症状は開発者本人が観測。
   利用者へは「自然な動きではないので、あわせて見直す」と返信済み (2026-09-25)。
 - 症状: A を見る → コレクション C を開く → C から本 / フォルダ B を開く → ← で C ではなく A へ戻る。
@@ -98,10 +99,10 @@
 - §1.280 との関係: どちらも「履歴の今いる場所を、表示中の場所ではなく surface から読む」ことで起きる。
   §1.280 は残った Rating、こちらは子の表示中の Collection。**一緒に設計する** (今いる場所 = 表示中の場所、
   という不変条件を 1 か所で持つ)。
-- 方針候補: C から子を開く移動も「C (開いていた位置の anchor 付き) → 子の Path」として履歴へ積む。← は C の
-  同じ位置へ戻り、BS の戻り先と一致するので経路が二重でも食い違わない。子からさらに下へ入る移動は通常の
-  フォルダと同じく積む。collection session の保持、再生・ページ送りの親への復帰、detached context での扱いを
-  崩さないことを確かめる。
+- 採用した設計: C から子を明示的に開く移動を「C (開いていた位置の anchor 付き) → 子の物理地点」として
+  履歴へ積む。← は C の同じ位置へ戻り、BS の戻り先と一致する。子からさらに下へ入る移動も積む。
+  Collection session、再生・ページ送り、detached context の所有境界は
+  [folder-history-location-plan.md](folder-history-location-plan.md) §4–5 を正本とする。
 - 回帰確認: A → C → B → ← が C (位置復元) / → が B、B → 下位フォルダ → ← ← で B → C、BS の戻りは不変、
   A/B クイックフォルダ、削除済みコレクションの prune。
 - 規模 / 優先度: Small〜Medium / P2 (§1.280 と同時に)。
