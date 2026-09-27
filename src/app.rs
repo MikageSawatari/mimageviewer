@@ -837,7 +837,7 @@ pub(crate) type PdfEnumeratePending = (
     Option<String>,
     crate::pdf_loader::PdfEnumerateHandle,
     OpenRequestOwner,
-    Option<FolderNavHistorySnapshot>,
+    Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23059,7 +23059,7 @@ impl App {
     /// dispatcher. Same-folder reloads remain exempt in
     /// `cancel_archive_convert_for_navigation_to`.
     fn claim_open_request_owner(&mut self, path: &Path, owner: &OpenRequestOwner) -> bool {
-        match owner {
+        let claimed = match owner {
             OpenRequestOwner::Navigation
             | OpenRequestOwner::RatingPhysical(_)
             | OpenRequestOwner::QuickFolderSwitch(_)
@@ -23094,37 +23094,31 @@ impl App {
                     self.pending_auto_fs_open = false;
                     return false;
                 }
-                if self.navigation_scope.is_detached_physical() {
-                    // Archive conversion, unresolved startup opens, and bookmark
-                    // opens are App-global main requests. A detached context can
-                    // own its load without cancelling any of them.
-                    return true;
+                if !self.navigation_scope.is_detached_physical() {
+                    // Archive conversion, unresolved startup opens, and bookmark opens are
+                    // App-global main requests. A detached context owns only its own load.
+                    let detached_owner = self
+                        .archive_convert
+                        .as_ref()
+                        .and_then(|state| state.completion.detached_grid_archive_owner())
+                        .cloned();
+                    let cancel_reason = detached_owner
+                        .as_ref()
+                        .map(|_| "detached_grid_archive_owner_stale_normal_navigation")
+                        .unwrap_or("normal_navigation");
+                    if self.cancel_archive_convert_for_navigation_to(path, cancel_reason)
+                        && let Some(owner) = detached_owner
+                    {
+                        crate::logger::log(format!(
+                            "[detached-grid-archive] request stale id={} reason=normal_navigation source={} destination={}",
+                            owner.request_id,
+                            owner.source_path.display(),
+                            path.display()
+                        ));
+                    }
+                    self.cancel_unresolved_open_for_navigation();
+                    self.cancel_conflicting_bookmark_open_for_navigation(path);
                 }
-                self.replace_history_navigation_transition(None);
-                // A direct navigation owns the next visible location. If an earlier startup,
-                // activation, or bookmark path is still resolving, dispose that request before
-                // the worker can overwrite this navigation with a late completion.
-                let detached_owner = self
-                    .archive_convert
-                    .as_ref()
-                    .and_then(|state| state.completion.detached_grid_archive_owner())
-                    .cloned();
-                let cancel_reason = detached_owner
-                    .as_ref()
-                    .map(|_| "detached_grid_archive_owner_stale_normal_navigation")
-                    .unwrap_or("normal_navigation");
-                if self.cancel_archive_convert_for_navigation_to(path, cancel_reason)
-                    && let Some(owner) = detached_owner
-                {
-                    crate::logger::log(format!(
-                        "[detached-grid-archive] request stale id={} reason=normal_navigation source={} destination={}",
-                        owner.request_id,
-                        owner.source_path.display(),
-                        path.display()
-                    ));
-                }
-                self.cancel_unresolved_open_for_navigation();
-                self.cancel_conflicting_bookmark_open_for_navigation(path);
                 true
             }
             OpenRequestOwner::Bookmark(bookmark_owner) => {
@@ -23177,7 +23171,14 @@ impl App {
                 }
                 true
             }
+        };
+        // All accepted direct owners (Navigation, RatingPhysical, QuickFolderSwitch,
+        // CollectionGridPhysical, MainGridArchive, Bookmark, DetachedGridArchive) retire the
+        // staged request for this main surface at the same admission boundary.
+        if claimed && !self.navigation_scope.is_detached_physical() {
+            self.replace_history_navigation_transition(None);
         }
+        claimed
     }
 
     fn commit_rating_physical_load_owner(
@@ -23409,8 +23410,13 @@ impl App {
                 path,
             );
         }
-        let pdf_open_history_snapshot = crate::folder_tree::is_paged_document_path(&path)
-            .then(|| self.folder_nav_history_snapshot());
+        let pdf_open_restore = crate::folder_tree::is_paged_document_path(&path).then(|| {
+            crate::ui_dialogs::epub_convert::EpubOpenRestore {
+                logical: path.clone(),
+                history: Some(self.folder_nav_history_snapshot()),
+                address_before: Some(self.address.clone()),
+            }
+        });
         let independent_navigation = !detached_physical
             && matches!(
                 &owner,
@@ -23650,7 +23656,7 @@ impl App {
                 self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
                 self.load_pdf_as_folder_owned(path, owner);
                 if let Some(pending) = self.pdf_enumerate_pending.as_mut() {
-                    pending.4 = pdf_open_history_snapshot;
+                    pending.4 = pdf_open_restore;
                 }
                 if crate::perf::is_enabled() {
                     crate::perf::event(
@@ -26231,8 +26237,7 @@ impl App {
         let Ok(prepare) = self.start_collection_history_prepare(root) else {
             return false;
         };
-        self.cancel_superseded_epub_convert();
-        self.pdf_enumerate_pending = None;
+        self.retire_direct_document_open_for_history_admission();
         self.pdf_placeholder_count = None;
         self.fs_nav_after_pdf_enumerate = None;
         self.pending_auto_fs_open = false;
@@ -26331,6 +26336,20 @@ impl App {
             .set_history_navigation_transition(next);
     }
 
+    /// An accepted staged request inherits the location before any unfinished direct book open.
+    /// Retire the direct owner and consume its rollback before recording the staged source.
+    fn retire_direct_document_open_for_history_admission(&mut self) {
+        let conversion_restore =
+            self.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded);
+        let enumeration_restore = self
+            .pdf_enumerate_pending
+            .take()
+            .and_then(|pending| pending.4);
+        if let Some(restore) = conversion_restore.or(enumeration_restore) {
+            self.restore_epub_open(restore);
+        }
+    }
+
     fn start_physical_history_transition_with_dfs(
         &mut self,
         intent: PhysicalHistoryIntent,
@@ -26343,8 +26362,7 @@ impl App {
         let Ok(preflight) = self.start_physical_history_preflight(path.clone(), None) else {
             return false;
         };
-        self.cancel_superseded_epub_convert();
-        self.pdf_enumerate_pending = None;
+        self.retire_direct_document_open_for_history_admission();
         self.pdf_placeholder_count = None;
         self.fs_nav_after_pdf_enumerate = None;
         self.pending_auto_fs_open = false;
@@ -30283,6 +30301,14 @@ impl App {
         owner: OpenRequestOwner,
         password_override: Option<String>,
     ) {
+        let open_restore =
+            prepared_pages
+                .is_none()
+                .then(|| crate::ui_dialogs::epub_convert::EpubOpenRestore {
+                    logical: pdf_path.clone(),
+                    history: Some(self.folder_nav_history_snapshot()),
+                    address_before: Some(self.address.clone()),
+                });
         self.cancel_superseded_epub_convert();
         crate::logger::log(format!(
             "=== load_pdf_as_folder: {} ===",
@@ -30424,7 +30450,8 @@ impl App {
                 want_direction: want_direction && !is_epub,
             },
         );
-        self.pdf_enumerate_pending = Some((pdf_path.clone(), password, handle, owner, None));
+        self.pdf_enumerate_pending =
+            Some((pdf_path.clone(), password, handle, owner, open_restore));
         // 同じ key なら新 handle が既に waiter として登録済みなので、ここで旧 handle を
         // drop しても source request は継続する。
         drop(previous_pdf_enumerate);
@@ -30985,7 +31012,7 @@ impl App {
             }
         };
 
-        let (pdf_path, password, _handle, owner, history_snapshot) =
+        let (pdf_path, password, _handle, owner, open_restore) =
             self.pdf_enumerate_pending.take().unwrap();
 
         // cancel 経由の Interrupted は late-arriving な stale 結果なので適用しない
@@ -31015,13 +31042,15 @@ impl App {
                     match route {
                         PdfOpenFailureRoute::ConversionDialogOpened => {
                             if let Some(state) = self.epub_convert.as_mut() {
-                                state.open_restore.history = history_snapshot;
+                                if let Some(restore) = open_restore {
+                                    state.open_restore = restore;
+                                }
                                 state.deferred_fullscreen = self.fs_nav_after_pdf_enumerate.take();
                             }
                         }
                         PdfOpenFailureRoute::Handled => {
-                            if let Some(snapshot) = history_snapshot {
-                                self.restore_folder_nav_history(snapshot);
+                            if let Some(restore) = open_restore {
+                                self.restore_epub_open(restore);
                             }
                             self.fs_nav_after_pdf_enumerate = None;
                             self.finish_visible_container_fs_nav_failed();

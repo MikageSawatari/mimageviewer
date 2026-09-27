@@ -161,6 +161,8 @@ Collection root からの変換書庫 tile が directory になった場合、Fo
 
 EPUB→PDF 統合との merge は案 A を採用する。変換ダイアログの継続先は `Direct(owner)` と `StagedHistory(context, request_id)` の型付き区別とし、後者では既存の物理／Collection 子 history transition が source snapshot、replay target、採用を最後まで所有する。ダイアログはその子操作であり、履歴を記録・rollback しない。未変換の `NotConverted` は worker から型を保って返し、Ask／Convert／Ignore／取消／失敗／古い公開では旧表示、address、履歴、A/B slot を維持する。変換成功後は同じ context と request ID を照合し、論理 `.epub` を再 preflight してから可視採用する。新しい直接 open は同一 path でも承認された admission 時に旧 history 変換を退役させ、history open は承認された admission 時に直接列挙・変換を退役させる。拒否された検索／detached 履歴入力は既存 open を退役させない。
 
+直接 EPUB open が未完了のまま history request を受け付けた場合、直接列挙または変換が保持する履歴・アドレスの rollback を一度だけ復元し、その後に staged request の source を記録する。staged request の失敗・取消で戻る先は直接 EPUB を始める前の表示である。直接 open の owner は `Navigation`、`RatingPhysical`、`QuickFolderSwitch`、`CollectionGridPhysical`、`MainGridArchive`、`Bookmark`、`DetachedGridArchive` を同じ admission 境界で扱い、承認された main surface の要求は旧 staged preflight を退役させる。detached physical scope は main の要求を退役させない。
+
 history の PDF/EPUB preflight は `PdfEnumerateResult` 全体（ページ、綴じ方向、世代 stamp）を渡し、直接 open と共通の prepared-PDF 成功処理で採用する。history の採用に仮ページや一時的な `pdf_enumerate_pending` owner は作らない。worker は既知の item kind があっても実 file／directory を判定し、`.epub` 名の directory を Folder として扱う。page flip と ZIP 内部階層は外側履歴の一点のままである。
 
 ダイアログの「変換して開く」は元の論理 `.epub` target へ戻る。「PDF を保存」は sibling `.pdf` を**明示的な新しい行き先**として再 preflight し、成功時にだけ採用する。Back／Forward の head が EPUB だった場合、その entry を pop しない。Collection root の明示 open では既存の source anchor/provenance を維持できる場合に維持し、EPUB entry の外へ出る Collection child replay は独立した物理行き先となる。fullscreen lock と parked／retired context は同じ staged request の終端で片付ける。

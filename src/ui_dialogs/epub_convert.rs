@@ -41,6 +41,7 @@ pub(crate) enum EpubConvertExit {
 pub(crate) struct EpubOpenRestore {
     pub(crate) logical: PathBuf,
     pub(crate) history: Option<FolderNavHistorySnapshot>,
+    pub(crate) address_before: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +127,7 @@ impl EpubConvertState {
             open_restore: EpubOpenRestore {
                 logical,
                 history: None,
+                address_before: None,
             },
             deferred_fullscreen: None,
             phase: EpubConvertPhase::Converting(None),
@@ -152,6 +154,7 @@ impl EpubConvertState {
             open_restore: EpubOpenRestore {
                 logical,
                 history: None,
+                address_before: None,
             },
             deferred_fullscreen: None,
             phase: EpubConvertPhase::Saving(None),
@@ -393,6 +396,7 @@ impl App {
                     open_restore: EpubOpenRestore {
                         logical: logical.to_owned(),
                         history: None,
+                        address_before: None,
                     },
                     deferred_fullscreen: None,
                     phase: EpubConvertPhase::Scanning,
@@ -441,7 +445,12 @@ impl App {
         if let Some(snapshot) = restore.history {
             self.restore_folder_nav_history(snapshot);
         }
-        self.restore_address_after_epub_open_aborted(&restore.logical);
+        if let Some(address) = restore.address_before {
+            self.address = address;
+            self.update_global_search_address();
+        } else {
+            self.restore_address_after_epub_open_aborted(&restore.logical);
+        }
     }
 
     pub(crate) fn finish_epub_convert(&mut self, exit: EpubConvertExit) -> Option<EpubOpenRestore> {
@@ -456,6 +465,7 @@ impl App {
             EpubOpenRestore {
                 logical: state.src_path.clone(),
                 history: None,
+                address_before: None,
             },
         );
         drop(state);
@@ -521,6 +531,7 @@ impl App {
             EpubOpenRestore {
                 logical: state.src_path.clone(),
                 history: None,
+                address_before: None,
             },
         );
         let deferred = state.deferred_fullscreen.take();
@@ -578,7 +589,7 @@ impl App {
             && crate::folder_tree::path_eq(&pending.0, &path)
             && pending.3 == owner
         {
-            pending.4 = restore.history;
+            pending.4 = Some(restore);
             if deferred.is_some() {
                 self.fs_nav_after_pdf_enumerate = deferred;
             }
@@ -780,6 +791,7 @@ mod tests {
                 open_restore: EpubOpenRestore {
                     logical: PathBuf::from("C:/books/book.epub"),
                     history: None,
+                    address_before: None,
                 },
                 deferred_fullscreen: None,
                 phase,

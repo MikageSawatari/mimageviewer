@@ -930,7 +930,8 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
     let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
     let pending = app.pdf_enumerate_pending.as_ref().unwrap();
     assert_eq!(pending.0, other);
-    assert!(pending.4.is_none());
+    assert_eq!(pending.4.as_ref().unwrap().logical, other);
+    assert!(pending.4.as_ref().unwrap().history.is_some());
     assert!(app.fs_nav_after_pdf_enumerate.is_none());
 }
 
@@ -1236,7 +1237,11 @@ fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
         None,
         handle,
         OpenRequestOwner::Navigation,
-        Some(snapshot),
+        Some(crate::ui_dialogs::epub_convert::EpubOpenRestore {
+            logical: source.clone(),
+            history: Some(snapshot),
+            address_before: Some(previous.to_string_lossy().into_owned()),
+        }),
     ));
     app.poll_pdf_enumerate();
     let state = app.epub_convert.as_ref().unwrap();
@@ -10544,6 +10549,179 @@ mod startup_open_path_resolve_tests {
                 stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
             },
         ));
+    }
+
+    fn write_history_review_epub(path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "mimetype",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut zip, b"application/epub+zip").unwrap();
+        for (name, contents) in [
+            ("META-INF/container.xml", b"<?xml version=\"1.0\"?><container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\"><rootfiles><rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>".as_slice()),
+            ("OEBPS/content.opf", b"<?xml version=\"1.0\"?><package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"id\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:identifier id=\"id\">direct-review</dc:identifier><dc:title>Direct review</dc:title><dc:language>en</dc:language></metadata><manifest><item id=\"chapter\" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"chapter\"/></spine></package>".as_slice()),
+            ("OEBPS/chapter.xhtml", b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Review</p></body></html>".as_slice()),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, contents).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn direct_epub_conversion_or_enumeration_supersession_restores_source() {
+        for conversion_started in [true, false] {
+            for fail_preflight in [true, false] {
+                let mut app = setup_app();
+                let old = app.tmp.path().join("before-direct-epub");
+                let staged = app.tmp.path().join("history-target");
+                let epub = app.tmp.path().join("direct.epub");
+                std::fs::create_dir(&old).unwrap();
+                std::fs::write(old.join("old.jpg"), b"old row").unwrap();
+                if !fail_preflight {
+                    std::fs::create_dir(&staged).unwrap();
+                }
+                write_history_review_epub(&epub);
+                app.load_folder(old.clone());
+                app.set_quick_folder_slot_target(super::QuickFolderSlotId::A, old.clone());
+                app.set_quick_folder_slot_target(super::QuickFolderSlotId::B, staged.clone());
+                app.active_quick_folder_slot = Some(super::QuickFolderSlotId::A);
+                let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(17);
+                arm_book_bookmark(&mut app, owner_id, epub.clone(), std::time::Instant::now());
+                let owner = super::OpenRequestOwner::Bookmark(
+                    crate::bookmark_browser::BookmarkOpenRequestOwner {
+                        request_id: owner_id,
+                        target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+                            epub.clone(),
+                        ),
+                        #[cfg(windows)]
+                        detached_lease: None,
+                    },
+                );
+                let rows = app.items.clone();
+                let address = app.address.clone();
+                let before = app.folder_nav_history_snapshot();
+                let source = app.folder_nav_current_target();
+                assert!(app.load_folder_with_scan_owned(epub.clone(), None, owner));
+                if conversion_started {
+                    // The lib executable has no PDF worker child. Deliver its typed NotConverted
+                    // result through the real direct-open pending handle and poll/adoption route.
+                    let pending = app.pdf_enumerate_pending.as_mut().unwrap();
+                    pending.2 = crate::pdf_loader::completed_enumerate_result_handle(
+                        &epub,
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            crate::pdf_loader::PdfReadError::NotConverted,
+                        )),
+                    );
+                    app.poll_pdf_enumerate();
+                    assert!(
+                        app.epub_convert.is_some(),
+                        "direct EPUB did not reach NotConverted"
+                    );
+                } else {
+                    assert!(app.pdf_enumerate_pending.is_some());
+                }
+                assert_ne!(app.address, address);
+                assert!(app.start_physical_history_transition(
+                    super::PhysicalHistoryIntent::Navigation {
+                        replay: None,
+                        auto_fullscreen: false,
+                    },
+                    staged,
+                ));
+                assert!(app.epub_convert.is_none());
+                assert!(app.pdf_enumerate_pending.is_none());
+                if fail_preflight {
+                    let ctx = egui::Context::default();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while app
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some()
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "failed preflight did not settle"
+                        );
+                        app.poll_collection_history_transition(&ctx);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                } else {
+                    app.replace_history_navigation_transition(None);
+                }
+                assert_eq!(app.address, address);
+                assert_eq!(app.items, rows);
+                assert_eq!(app.folder_nav_current_target(), source);
+                assert_eq!(app.folder_nav_back_stack, before.back_stack);
+                assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
+                assert_eq!(app.recent_folders, before.recent_folders);
+                assert_eq!(
+                    app.suppress_folder_nav_record_once,
+                    before.suppress_record_once
+                );
+                assert_eq!(
+                    app.active_quick_folder_slot,
+                    before.active_quick_folder_slot
+                );
+                for slot in 0..2 {
+                    assert_eq!(
+                        app.quick_folder_workspaces[slot].target,
+                        before.quick_folder_workspaces[slot].target,
+                    );
+                    assert_eq!(
+                        app.quick_folder_workspaces[slot].history,
+                        before.quick_folder_workspaces[slot].history,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bookmark_direct_open_retires_pending_history_preflight() {
+        let mut app = setup_app();
+        let old = app.tmp.path().join("before-bookmark");
+        let staged = app.tmp.path().join("staged-folder");
+        let book = app.tmp.path().join("bookmark.pdf");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(&book, b"%PDF-1.4\n").unwrap();
+        app.load_folder(old);
+        assert!(app.start_physical_history_transition(
+            super::PhysicalHistoryIntent::Navigation {
+                replay: None,
+                auto_fullscreen: false,
+            },
+            staged,
+        ));
+        let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(18);
+        arm_book_bookmark(&mut app, owner_id, book.clone(), std::time::Instant::now());
+        assert!(app.load_folder_with_scan_owned(
+            book.clone(),
+            None,
+            super::OpenRequestOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
+                request_id: owner_id,
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(book.clone()),
+                #[cfg(windows)]
+                detached_lease: None,
+            }),
+        ));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert!(matches!(
+            app.pdf_enumerate_pending.as_ref().map(|pending| &pending.3),
+            Some(super::OpenRequestOwner::Bookmark(_))
+        ));
+        assert_eq!(app.address, book.to_string_lossy());
     }
 
     fn install_bookmark_resolver(

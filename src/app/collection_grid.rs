@@ -3484,31 +3484,74 @@ mod tests {
         pages
     }
 
-    fn real_epub_history_result(
+    fn real_cached_epub_history_fixture(
         source: &Path,
+        data_dir: &Path,
     ) -> (
         crate::pdf_loader::TestEpubPin,
-        crate::pdf_loader::PdfEnumerateResult,
+        crate::pdf_loader::RemotePdfTestBackend,
+        crate::pdf_loader::DocumentStamp,
     ) {
+        use crate::epub_cache::{EpubCache, GenerationRow, WriteDenyingSource};
+
         write_small_history_epub(source);
-        let generated = source.with_extension("generated.pdf");
+        let mut cache = EpubCache::open_at(data_dir).unwrap();
+        let reserved = cache.reserve_output(source).unwrap();
+        let generated = reserved.final_path().to_path_buf();
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
         write_two_page_history_pdf(&generated);
         let size = std::fs::metadata(&generated).unwrap().len();
-        let pin = crate::pdf_loader::pin_epub_with_direction_for_test(
-            source,
-            41,
-            size,
-            crate::pdf_loader::PdfReadingDirection::R2L,
-        );
-        let result = crate::pdf_loader::PdfEnumerateResult {
-            pages: read_real_pdf_pages_for_history(&generated),
-            direction: Some(crate::pdf_loader::PdfReadingDirection::R2L),
-            stamp: Some(crate::pdf_loader::DocumentStamp::Generation {
-                id: 41,
-                pdf_size: size,
-            }),
+        let row = GenerationRow {
+            generation_id: reserved.generation_id(),
+            src_path_key: crate::epub_cache::src_key(source),
+            src_path: source.to_path_buf(),
+            src_state: crate::epub_cache::source_state(&std::fs::metadata(source).unwrap()),
+            src_sha256: "history-fixture-full".into(),
+            src_head_hash: "history-fixture-head".into(),
+            pdf_file: generated,
+            pdf_size: size,
+            page_count: 2,
+            direction: "rtl".into(),
+            profile: "reflow-v1".into(),
+            created_at: 1,
+            output_version: crate::epub_cache::CONVERTER_OUTPUT_VERSION,
         };
-        (pin, result)
+        let source_guard = WriteDenyingSource::open(source).unwrap();
+        assert!(matches!(
+            cache.publish(&row, &source_guard),
+            Ok(crate::epub_cache::PublishOutcome::Published)
+        ));
+        let (pin, target) = crate::pdf_loader::pin_cached_epub_for_test(source, data_dir).unwrap();
+        assert_eq!(target.read_path.as_path(), row.pdf_file);
+        assert_eq!(
+            target.epub_direction,
+            Some(crate::pdf_loader::PdfReadingDirection::R2L)
+        );
+        let backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&row.pdf_file);
+        (pin, backend, target.stamp)
+    }
+
+    fn assert_cached_epub_worker_adoption(
+        app: &mut App,
+        source: &Path,
+        stamp: &crate::pdf_loader::DocumentStamp,
+    ) {
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Rtl
+        );
+        assert_eq!(app.items.len(), 2);
+        let (id, size) = stamp.generation_catalog_pair().unwrap();
+        let catalog = app.get_or_open_catalog(source.parent().unwrap()).unwrap();
+        let name = source.file_name().unwrap().to_str().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while catalog.get_pdf_meta(name, id, size).unwrap() != Some((2, false)) {
+            assert!(
+                Instant::now() < deadline,
+                "EPUB worker generation stamp was not adopted"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn history_grid_key(app: &mut App, key: egui::Key) -> Option<crate::ui_main::AddressBarNav> {
@@ -5294,13 +5337,17 @@ mod tests {
             "book.pdf"
         });
         let mut epub_pin = None;
+        let mut epub_worker = None;
+        let mut epub_stamp = None;
         let pdf_pages: Option<crate::pdf_loader::PdfEnumerateResult> = if zip {
             write_nested_history_zip(&source);
             None
         } else if epub {
-            let (pin, result) = real_epub_history_result(&source);
+            let (pin, worker, stamp) = real_cached_epub_history_fixture(&source, temp.path());
             epub_pin = Some(pin);
-            Some(result)
+            epub_worker = Some(worker);
+            epub_stamp = Some(stamp);
+            None
         } else {
             write_two_page_history_pdf(&source);
             Some(read_real_pdf_pages_for_history(&source).into())
@@ -5399,39 +5446,11 @@ mod tests {
             "staged PDF/EPUB adoption has no second owner"
         );
         if epub {
+            assert_cached_epub_worker_adoption(&mut app, &source, epub_stamp.as_ref().unwrap());
             assert_eq!(
-                app.reading_direction,
-                crate::settings::ReadingDirection::Rtl
+                epub_worker.as_ref().unwrap().direction_requests(),
+                vec![false]
             );
-            let generation_size = std::fs::metadata(source.with_extension("generated.pdf"))
-                .unwrap()
-                .len() as i64;
-            assert_eq!(
-                pdf_pages
-                    .as_ref()
-                    .unwrap()
-                    .stamp
-                    .as_ref()
-                    .unwrap()
-                    .generation_catalog_pair(),
-                Some((41, generation_size)),
-            );
-            let catalog = app.get_or_open_catalog(temp.path()).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if catalog
-                    .get_pdf_meta("book.epub", 41, generation_size)
-                    .unwrap()
-                    == Some((2, false))
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "prepared EPUB generation was not cached"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
         }
         let source_target = app
             .folder_nav_current_target()
@@ -5481,6 +5500,13 @@ mod tests {
         replay_real_history(&mut app, true, root.as_deref(), None);
         assert_eq!(app.folder_history_forward_target(), Some(&source_target));
         replay_real_history(&mut app, false, Some(&source), pdf_pages.as_ref());
+        if epub {
+            assert_eq!(
+                epub_worker.as_ref().unwrap().direction_requests(),
+                vec![false, false],
+                "both initial and replay opens must use the worker result"
+            );
+        }
         assert_eq!(app.folder_nav_current_target(), Some(source_target));
         assert_eq!(app.folder_history_back_target(), Some(&root_target));
 
@@ -5544,7 +5570,8 @@ mod tests {
         let old = temp.path().join("ordinary-before-epub");
         std::fs::create_dir(&old).unwrap();
         let source = temp.path().join("ordinary.epub");
-        let (_pin, pages) = real_epub_history_result(&source);
+        let (_pin, worker, stamp) = real_cached_epub_history_fixture(&source, temp.path());
+        assert!(stamp.generation_catalog_pair().is_some());
         let target = super::super::FolderNavHistoryTarget::Path(source.clone());
         for back in [true, false] {
             let (mut app, _) = start_ready_app(&temp.path().join(if back {
@@ -5568,7 +5595,8 @@ mod tests {
                 super::super::FolderHistoryDirection::Forward
             };
             assert!(app.start_ordinary_archive_history_replay(direction, target.clone()));
-            poll_real_history_load(&mut app, Some(&source), Some(&pages));
+            poll_real_history_load(&mut app, Some(&source), None);
+            assert_cached_epub_worker_adoption(&mut app, &source, &stamp);
             assert_eq!(app.folder_nav_current_target(), Some(target.clone()));
             assert_eq!(app.items.len(), 2);
             assert!(app.pdf_enumerate_pending.is_none());
@@ -5583,6 +5611,7 @@ mod tests {
             );
             app.shutdown_collection_runtime_for_exit();
         }
+        assert_eq!(worker.direction_requests(), vec![false, false]);
     }
 
     #[test]
@@ -5593,8 +5622,10 @@ mod tests {
         let old = temp.path().join("slot-a");
         std::fs::create_dir(&old).unwrap();
         let source = temp.path().join("slot-b.epub");
-        let (_pin, pages) = real_epub_history_result(&source);
+        let (_pin, worker, stamp) = real_cached_epub_history_fixture(&source, temp.path());
+        assert!(stamp.generation_catalog_pair().is_some());
         let (mut app, _) = start_ready_app(&temp.path().join("collection.db"));
+        app.settings.follow_document_reading_direction = true;
         app.load_folder(old.clone());
         app.set_quick_folder_slot_target(super::super::QuickFolderSlotId::A, old.clone());
         app.set_quick_folder_slot_target(super::super::QuickFolderSlotId::B, source.clone());
@@ -5617,7 +5648,9 @@ mod tests {
             app.active_quick_folder_slot,
             Some(super::super::QuickFolderSlotId::A)
         );
-        poll_real_history_load(&mut app, Some(&source), Some(&pages));
+        poll_real_history_load(&mut app, Some(&source), None);
+        assert_cached_epub_worker_adoption(&mut app, &source, &stamp);
+        assert_eq!(worker.direction_requests(), vec![false]);
         assert_eq!(
             app.active_quick_folder_slot,
             Some(super::super::QuickFolderSlotId::B)

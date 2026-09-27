@@ -529,7 +529,7 @@ x64 で `+crt-static` なので VC runtime 検査の追加設定は不要 (`chec
 
 ## 9. 段階の記録
 
-履歴 navigation との統合時の typed continuation、成功採用境界、未変換 EPUB と「PDF を保存」の履歴規則は [folder-history-location-plan.md §11](folder-history-location-plan.md#11-epub-統合時の履歴-open-所有2026-09-27設計担当決定) を正本とする。直接 open の非同期 PDF 列挙と、履歴の staged preflight は一つの要求を二重に所有しない。
+履歴 navigation との統合時の typed continuation、成功採用境界、未変換 EPUB と「PDF を保存」の履歴規則は [folder-history-location-plan.md §11](folder-history-location-plan.md#11-epub-統合時の履歴-open-所有2026-09-27設計担当決定) を正本とする。直接 open の非同期 PDF 列挙と、履歴の staged preflight は一つの要求を二重に所有しない。直接 EPUB が未完了のときに history request が受け付けられた場合は、直接 open の rollback を staged source の記録前に消費する。
 
 ### S3a 一覧・分類・D5 (2026-09-26)
 

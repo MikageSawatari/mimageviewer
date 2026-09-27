@@ -1455,6 +1455,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-27 履歴 preflight と直接 open の admission**
+
+独立 integration review の指摘に従い、`OpenRequestOwner` の各 variant が承認された後に、main の staged 履歴要求を一か所で退役させる。既存の `navigation_scope.is_detached_physical()` 境界を維持し、detached の直接 open は main の staged 要求を退役させない。detached 判定・viewport・window の状態や再試行は追加していない。これは同じ surface の要求所有権を統一する変更であり、detached 表示症状の局所回避ではない。
+
 **2026-09-27 §1.280 / §1.282 Collection 履歴と detached 外側 navigation**
 
 Collection fullscreen から外側へ移動する要求は、root session が一時的に `return_to=Collection` へ移った後も同じ viewer context が所有する。`collection_navigation_request_is_current` は live session がある場合、その collection ID と非 `Deleted` を検証し、session がない場合だけ typed `return_to=Collection` の同じ ID を認めるようにした。session が別 ID または `Deleted` の場合は fallback しない。これにより要求の context / surface / sequence / items generation / fullscreen index の既存照合を保ったまま、正規の detached Collection 外側移動を継続し、別窓や main の結果を採用しない。新しい detached flag、待機、retry、viewport 再作成は加えない。独立 reviewer は owner 境界の修正であり症状パッチではないと確認した。detached Collection の focused 回帰 1/1 と `scripts/test-full.ps1` は PASS。実窓 smoke は未実行。
