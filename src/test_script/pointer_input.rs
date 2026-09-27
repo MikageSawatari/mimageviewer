@@ -1615,6 +1615,7 @@ mod tests {
             sidecar_imported: false,
             sidecar_loaded: false,
             seek_strip: crate::test_script::TestScriptSeekStripSnapshot::closed(),
+            audio_track: crate::test_script::TestScriptAudioTrackSnapshot::absent(),
         }
     }
 

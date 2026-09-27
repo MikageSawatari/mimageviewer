@@ -25,7 +25,7 @@ MultiWindowRarNav checks Ctrl+Up/Down across direct RAR, ZIP, and CBR in one det
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -38,6 +38,9 @@ if (-not $InteractiveApproved) {
     [Console]::Error.WriteLine(
         '[ui-smoke] interactive UI run requires explicit user approval; use -InteractiveApproved only after the user agrees to the scenario and expected duration.')
     exit 2
+}
+if ($Scenario -eq 'AudioTracks' -and -not $PSBoundParameters.ContainsKey('TimeoutSeconds')) {
+    $TimeoutSeconds = 240
 }
 
 $ErrorActionPreference = 'Stop'
@@ -732,7 +735,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection')
+    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -818,6 +821,46 @@ if ($script:archiveErrors.Count -gt 0) {
     $candidateFixtureGeneratorPdfDependencyPath = $null
 
     switch ($Scenario) {
+    'AudioTracks' {
+        $scenarioRoot = Join-Path $targetRoot 'ui-smoke\audio-tracks'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\audio-tracks.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $source = Join-Path $repoRoot 'testdata\audio-tracks\multi.mkv'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\audio-tracks') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'audio-tracks-fixture'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        Assert-NoReparsePath $source $repoRoot 'audio-tracks-source'
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $candidateScriptPath -PathType Leaf)) {
+            throw '[ui-smoke] AudioTracks scenario or multi.mkv is missing'
+        }
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        $copy = Join-Path $candidateFixtureDir 'multi.mkv'
+        Copy-Item -LiteralPath $source -Destination $copy
+        Assert-NoReparseTree $candidateFixtureDir 'audio-tracks-fixture'
+        if ((Get-Item -LiteralPath $copy).Length -le 0 -or
+            (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) {
+            throw '[ui-smoke] copied AudioTracks fixture does not match multi.mkv'
+        }
+        Write-UiSmokeJson $candidateSettingsPath ([ordered]@{
+            detached_viewer_enabled = $true
+            detached_viewer_open_images_in_window = $false
+            detached_viewer_window_placement = [ordered]@{
+                x = 40.0
+                y = 40.0
+                w = 1280.0
+                h = 760.0
+                maximized = $false
+            }
+            video_in_window_mode = $true
+            video_loop_mode = 'Full'
+        })
+    }
     'RatingSortCollection' {
         $scenarioRoot = Join-Path $dataDir 'rating-sort-collection'
         $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\rating-sort-collection.rhai'

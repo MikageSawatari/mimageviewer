@@ -472,6 +472,79 @@ pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) sidecar_imported: bool,
     pub(crate) sidecar_loaded: bool,
     pub(crate) seek_strip: TestScriptSeekStripSnapshot,
+    pub(crate) audio_track: TestScriptAudioTrackSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TestScriptAudioTrackSnapshot {
+    pub(crate) audio_tracks_len: i64,
+    pub(crate) desired_stream_index: i64,
+    pub(crate) desired_generation: i64,
+    pub(crate) applied_stream_index: i64,
+    pub(crate) applied_generation: i64,
+    pub(crate) state: String,
+    pub(crate) engine_state: String,
+    pub(crate) audio_mode: bool,
+    pub(crate) processed_frequency_hz: f64,
+}
+
+impl TestScriptAudioTrackSnapshot {
+    #[cfg(feature = "test-script")]
+    pub(crate) fn from_player(player: &crate::video::VideoPlayer, audio_mode: bool) -> Self {
+        let selection = player.audio_track_selection();
+        Self {
+            audio_tracks_len: player
+                .info()
+                .map_or(0, |info| info.audio_tracks.len() as i64),
+            desired_stream_index: selection.map_or(-1, |s| s.desired.stream_index as i64),
+            desired_generation: selection.map_or(-1, |s| s.desired.generation as i64),
+            applied_stream_index: selection.map_or(-1, |s| s.applied.stream_index as i64),
+            applied_generation: selection.map_or(-1, |s| s.applied.generation as i64),
+            state: selection
+                .map(|selection| selection.display_state(player.is_at_eof()))
+                .map_or_else(|| "none".to_string(), |state| format!("{state:?}")),
+            engine_state: player.engine_state_name().to_string(),
+            audio_mode,
+            processed_frequency_hz: player.test_script_processed_frequency_hz().unwrap_or(-1.0),
+        }
+    }
+
+    pub(crate) fn absent() -> Self {
+        Self {
+            audio_tracks_len: 0,
+            desired_stream_index: -1,
+            desired_generation: -1,
+            applied_stream_index: -1,
+            applied_generation: -1,
+            state: "none".to_string(),
+            engine_state: "none".to_string(),
+            audio_mode: false,
+            processed_frequency_hz: -1.0,
+        }
+    }
+
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("audio_tracks_len".into(), self.audio_tracks_len.into());
+        map.insert(
+            "desired_stream_index".into(),
+            self.desired_stream_index.into(),
+        );
+        map.insert("desired_generation".into(), self.desired_generation.into());
+        map.insert(
+            "applied_stream_index".into(),
+            self.applied_stream_index.into(),
+        );
+        map.insert("applied_generation".into(), self.applied_generation.into());
+        map.insert("state".into(), self.state.clone().into());
+        map.insert("engine_state".into(), self.engine_state.clone().into());
+        map.insert("audio_mode".into(), self.audio_mode.into());
+        map.insert(
+            "processed_frequency_hz".into(),
+            self.processed_frequency_hz.into(),
+        );
+        map
+    }
 }
 
 impl TestScriptWindowSnapshot {
@@ -662,6 +735,10 @@ impl TestScriptWindowSnapshot {
         map.insert(
             "seek_strip".into(),
             Dynamic::from_map(self.seek_strip.to_rhai_map()),
+        );
+        map.insert(
+            "audio_track".into(),
+            Dynamic::from_map(self.audio_track.to_rhai_map()),
         );
         map
     }
@@ -898,6 +975,7 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) continuous_reading: bool,
     pub(crate) current_is_still_image: bool,
     pub(crate) music_view_active: bool,
+    pub(crate) music_audio_track_popup_open: bool,
     pub(crate) modal_open: bool,
     pub(crate) context_menu_open: bool,
     pub(crate) popup_open: bool,
@@ -919,6 +997,7 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) passthrough_unavailable: String,
     pub(crate) keymap_level_observations: Vec<KeymapLevelObservation>,
     pub(crate) windows: Vec<TestScriptWindowSnapshot>,
+    pub(crate) audio_track: TestScriptAudioTrackSnapshot,
 }
 
 impl Default for TestScriptSnapshot {
@@ -961,6 +1040,7 @@ impl Default for TestScriptSnapshot {
             continuous_reading: false,
             current_is_still_image: false,
             music_view_active: false,
+            music_audio_track_popup_open: false,
             modal_open: false,
             context_menu_open: false,
             popup_open: false,
@@ -976,6 +1056,7 @@ impl Default for TestScriptSnapshot {
             passthrough_unavailable: String::new(),
             keymap_level_observations: Vec::new(),
             windows: Vec::new(),
+            audio_track: TestScriptAudioTrackSnapshot::absent(),
         }
     }
 }
@@ -1047,6 +1128,7 @@ impl TestScriptSnapshot {
         insert!(continuous_reading);
         insert!(current_is_still_image);
         insert!(music_view_active);
+        insert!(music_audio_track_popup_open);
         insert!(modal_open);
         insert!(context_menu_open);
         insert!(popup_open);
@@ -1067,6 +1149,10 @@ impl TestScriptSnapshot {
                 .map(|window| Dynamic::from_map(window.to_rhai_map()))
                 .collect::<rhai::Array>()
                 .into(),
+        );
+        map.insert(
+            "audio_track".into(),
+            Dynamic::from_map(self.audio_track.to_rhai_map()),
         );
         map
     }
@@ -1850,6 +1936,50 @@ impl RunnerBridge {
         );
         Ok(result)
     }
+
+    #[cfg(feature = "test-script")]
+    fn click_native_audio_control(&self, name: &str, timeout: Duration) -> Result<Map, String> {
+        use crate::video::native_ui_smoke::NativeUiSmokeAudioControl;
+        if timeout.is_zero() {
+            return Err("click_native_audio_control timeout_ms must be greater than zero".into());
+        }
+        let control = if name == "native_audio_button" {
+            NativeUiSmokeAudioControl::Button
+        } else if let Some(ordinal) = name.strip_prefix("native_audio_row_") {
+            let ordinal = ordinal
+                .parse::<usize>()
+                .map_err(|_| format!("invalid native audio row name: {name}"))?;
+            if ordinal == 0 {
+                return Err("native audio row numbers start at 1".into());
+            }
+            NativeUiSmokeAudioControl::Row(ordinal - 1)
+        } else {
+            return Err(format!("unknown native audio control: {name}"));
+        };
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "click_native_audio_control timeout is too large".to_string())?;
+        let identity = self.selected_detached_identity()?;
+        if matches!(control, NativeUiSmokeAudioControl::Button) {
+            self.move_native_canvas(
+                [0.5, 0.95],
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+        }
+        let (token, client_x, client_y) =
+            crate::video::native_ui_smoke::click_native_audio_control(
+                identity.hwnd(),
+                control,
+                deadline,
+                || self.validate_selected_owner_fresh(&identity, deadline),
+            )?;
+        let mut map = Map::new();
+        map.insert("name".into(), name.into());
+        map.insert("token".into(), saturating_rhai_int(token).into());
+        map.insert("client_x".into(), i64::from(client_x).into());
+        map.insert("client_y".into(), i64::from(client_y).into());
+        Ok(map)
+    }
 }
 
 #[cfg(feature = "test-script")]
@@ -2449,6 +2579,22 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                     .click_native_top_panorama(timeout)
                     .map_err(|message| {
                         native_mouse_environment_error(&native_top_panorama_click_bridge, message)
+                    })
+            },
+        );
+
+        let native_audio_control_bridge = bridge.clone();
+        engine.register_fn(
+            "click_native_audio_control",
+            move |name: ImmutableString,
+                  timeout_ms: rhai::INT|
+                  -> Result<Map, Box<EvalAltResult>> {
+                let timeout =
+                    checked_duration(timeout_ms, "click_native_audio_control timeout_ms")?;
+                native_audio_control_bridge
+                    .click_native_audio_control(&name, timeout)
+                    .map_err(|message| {
+                        native_mouse_environment_error(&native_audio_control_bridge, message)
                     })
             },
         );
@@ -5376,6 +5522,14 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn audio_tracks_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let source = include_str!("../scripts/ui-smoke/audio-tracks.rhai");
+        build_engine(bridge).compile(source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn native_seek_strip_fixture_exceeds_the_nine_cell_fallback_at_a_bounded_width() {
         let cell_height = crate::video::seek_strip_layout::SeekStripHeightValues::default()
             .points(crate::video::seek_strip_layout::SeekStripHeight::Smallest)
@@ -6061,6 +6215,7 @@ mod tests {
             sidecar_imported: false,
             sidecar_loaded: false,
             seek_strip: TestScriptSeekStripSnapshot::closed(),
+            audio_track: TestScriptAudioTrackSnapshot::absent(),
         }
     }
 

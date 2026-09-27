@@ -59,6 +59,15 @@ pub(crate) fn music_audio_track_popup_open(
     ctx.data(|data| data.get_temp::<bool>(id).unwrap_or(false))
 }
 
+#[cfg(all(windows, feature = "test-script"))]
+pub(crate) fn test_script_music_audio_track_popup_open(ctx: &egui::Context) -> bool {
+    ctx.data(|data| {
+        data.get_temp::<egui::Id>(egui::Id::new("test_script_music_audio_track_popup_id"))
+            .and_then(|id| data.get_temp::<bool>(id))
+            .unwrap_or(false)
+    })
+}
+
 #[cfg(windows)]
 fn consume_music_popup_wheel(ctx: &egui::Context) {
     ctx.input_mut(|input| {
@@ -94,6 +103,8 @@ pub(crate) fn draw_music_audio_track_selector(
             egui::Sense::hover()
         },
     );
+    #[cfg(feature = "test-script")]
+    crate::test_script::register_clickable_widget("music_audio_track_button", &response);
     let painter = ui.painter_at(rect);
     draw_overlay_button_bg(&painter, rect, interactive && response.hovered(), open);
     let ordinal = rows
@@ -123,11 +134,17 @@ pub(crate) fn draw_music_audio_track_selector(
             &mut open,
             &mut menu_rect,
             &mut commands,
+            #[cfg(feature = "test-script")]
+            None,
         );
         // A popup above the HUD owns wheel input for the entire frame.
         consume_music_popup_wheel(ui.ctx());
     }
     ui.ctx().data_mut(|data| data.insert_temp(id, open));
+    #[cfg(feature = "test-script")]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(egui::Id::new("test_script_music_audio_track_popup_id"), id)
+    });
     commands.into_iter().find_map(|command| match command {
         NativeOverlayCommand::SelectAudioTrack { stream_index } => Some(stream_index),
         _ => None,
@@ -2343,6 +2360,8 @@ mod tests {
                     let rect =
                         egui::Rect::from_min_size(egui::pos2(235.0, 210.0), egui::vec2(62.0, 28.0));
                     super::draw_music_audio_track_selector(ui, rect, &rows, true, id);
+                    #[cfg(feature = "test-script")]
+                    assert!(super::test_script_music_audio_track_popup_open(ui.ctx()));
                 });
             });
         harness.run();

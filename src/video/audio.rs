@@ -83,10 +83,18 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
+    #[cfg(feature = "test-script")]
+    pub(crate) fn test_script_processed_frequency_hz(&self) -> Option<f64> {
+        // Snapshot sampling must not wait for the audio callback or pump on the UI thread.
+        self.buffer.try_lock().ok()?.last_processed_frequency_hz
+    }
+
     #[cfg(test)]
     pub(crate) fn connected_without_output_for_test(sample_rate: u32) -> Self {
         let buffer = Arc::new(Mutex::new(AudioBuffer {
             processed: std::collections::VecDeque::new(),
+            #[cfg(feature = "test-script")]
+            last_processed_frequency_hz: None,
             drain_offset_in_first: 0,
             raw_pending: std::collections::VecDeque::new(),
             next_pts_secs: 0.0,
@@ -217,6 +225,10 @@ impl AudioOutput {
                 ));
             }
             buf.processed.clear();
+            #[cfg(feature = "test-script")]
+            {
+                buf.last_processed_frequency_hz = None;
+            }
             buf.raw_pending.clear();
             buf.drain_offset_in_first = 0;
             buf.next_pts_secs = clock.now_secs();
@@ -410,6 +422,35 @@ pub(crate) struct ProcessedChunk {
     pub(crate) pdc_latency_secs_at_process: f64,
 }
 
+/// Estimate the actual post-processing tone from positive zero crossings of one
+/// stereo channel. Crossing interpolation avoids the large one-period rounding
+/// error on short AAC chunks. This observation never enters production builds.
+#[cfg(feature = "test-script")]
+fn estimate_processed_frequency_hz(samples: &[f32], sample_rate: u32) -> Option<f64> {
+    let mut previous = *samples.first()?;
+    let mut first_crossing = None;
+    let mut last_crossing = None;
+    let mut crossings = 0_u32;
+    let mut peak = previous.abs();
+    for (frame, pair) in samples.chunks_exact(2).enumerate().skip(1) {
+        let current = pair[0];
+        peak = peak.max(current.abs());
+        if previous < 0.0 && current >= 0.0 {
+            let fraction = -f64::from(previous) / f64::from(current - previous);
+            let position = (frame - 1) as f64 + fraction;
+            first_crossing.get_or_insert(position);
+            last_crossing = Some(position);
+            crossings += 1;
+        }
+        previous = current;
+    }
+    if peak < 1e-4 || crossings < 2 {
+        return None;
+    }
+    let span = last_crossing? - first_crossing?;
+    (span > 0.0).then_some((crossings - 1) as f64 * f64::from(sample_rate) / span)
+}
+
 #[derive(Clone)]
 pub(crate) struct AudioTapController {
     command_tx: Sender<AudioTapCommand>,
@@ -557,6 +598,9 @@ struct AudioBuffer {
     /// post-VST 処理済 chunk queue。fill_output が `drain_offset_in_first` を進めて
     /// drain。chunk が空になったら pop_front + drain_offset_in_first=0 にリセット。
     processed: std::collections::VecDeque<ProcessedChunk>,
+    /// Last chunk admitted to the output queue. Test-script only; reset at every seek/clear.
+    #[cfg(feature = "test-script")]
+    last_processed_frequency_hz: Option<f64>,
     /// `processed.front()` 内の **次に drain されるサンプルの index** (= interleaved stereo)。
     /// fill_output が advance、chunk fully drain で 0 にリセット + pop_front。
     drain_offset_in_first: usize,
@@ -976,6 +1020,8 @@ pub(crate) fn start(
 
     let buffer = Arc::new(Mutex::new(AudioBuffer {
         processed: std::collections::VecDeque::with_capacity(32),
+        #[cfg(feature = "test-script")]
+        last_processed_frequency_hz: None,
         drain_offset_in_first: 0,
         raw_pending: std::collections::VecDeque::with_capacity(64),
         next_pts_secs: 0.0,
@@ -1473,6 +1519,10 @@ fn run_pump(
                 // pump_seek_serial 切替 → processed + raw_pending 両方クリア
                 if frame_seek_serial > buf.pump_seek_serial {
                     buf.processed.clear();
+                    #[cfg(feature = "test-script")]
+                    {
+                        buf.last_processed_frequency_hz = None;
+                    }
                     buf.drain_offset_in_first = 0;
                     buf.raw_pending.clear();
                     buf.next_pts_secs = frame.pts_secs;
@@ -1541,6 +1591,10 @@ fn run_pump(
                 if buf.pump_seek_serial < cur_clock_serial {
                     let old_serial = buf.pump_seek_serial;
                     buf.processed.clear();
+                    #[cfg(feature = "test-script")]
+                    {
+                        buf.last_processed_frequency_hz = None;
+                    }
                     buf.drain_offset_in_first = 0;
                     buf.raw_pending.clear();
                     clock.zero_audio_tx_queued_secs();
@@ -1864,6 +1918,9 @@ fn run_pump(
                 seek_serial: raw.seek_serial,
                 pdc_latency_secs_at_process: current_latency_source_secs,
             };
+            #[cfg(feature = "test-script")]
+            let processed_frequency_hz =
+                estimate_processed_frequency_hz(&chunk.samples, sample_rate);
 
             refresh_audio_tap(&audio_tap_command_rx, &mut active_audio_tap);
             // tap 接続時だけ samples を clone する。cpal callback と共有する AudioBuffer
@@ -1902,6 +1959,10 @@ fn run_pump(
             }
             publish_prepared_audio_tap_chunk(&mut active_audio_tap, prepared_audio_tap);
             buf.processed.push_back(chunk);
+            #[cfg(feature = "test-script")]
+            {
+                buf.last_processed_frequency_hz = processed_frequency_hz;
+            }
         }
 
         // ── publish_buffer_secs + BufferReady emit ──
@@ -2387,6 +2448,10 @@ fn run_pump(
         // the EOF/loop quiet gate, including when raw back-pressure was active.
         let mut buf = buffer.lock().unwrap();
         buf.processed.clear();
+        #[cfg(feature = "test-script")]
+        {
+            buf.last_processed_frequency_hz = None;
+        }
         buf.raw_pending.clear();
         buf.drain_offset_in_first = 0;
         buf.pdc_latency_secs = 0.0;
@@ -2556,6 +2621,10 @@ fn fill_output(
             buf.last_fill_stale_clear_logged_serial = clock_serial;
         }
         buf.processed.clear();
+        #[cfg(feature = "test-script")]
+        {
+            buf.last_processed_frequency_hz = None;
+        }
         buf.drain_offset_in_first = 0;
         buf.raw_pending.clear();
         publish_buffer_secs(&buf, clock);
@@ -2775,6 +2844,28 @@ mod tests {
     //! 各シナリオで意図通り動くことを構造的に保証する。
 
     use super::*;
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn processed_chunk_frequency_estimator_identifies_fixture_tones() {
+        for tone in [440.0, 880.0, 1320.0] {
+            let samples = (0..2048)
+                .flat_map(|frame| {
+                    let phase = std::f64::consts::TAU * tone * frame as f64 / 48_000.0;
+                    [phase.sin() as f32, phase.sin() as f32]
+                })
+                .collect::<Vec<_>>();
+            let estimated = estimate_processed_frequency_hz(&samples, 48_000).unwrap();
+            assert!(
+                (estimated - tone).abs() < 2.0,
+                "tone={tone} estimated={estimated}"
+            );
+        }
+        assert_eq!(
+            estimate_processed_frequency_hz(&vec![0.0; 4096], 48_000),
+            None
+        );
+    }
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
@@ -2789,6 +2880,8 @@ mod tests {
     fn make_buffer(sample_rate: u32) -> Arc<Mutex<AudioBuffer>> {
         Arc::new(Mutex::new(AudioBuffer {
             processed: std::collections::VecDeque::new(),
+            #[cfg(feature = "test-script")]
+            last_processed_frequency_hz: None,
             drain_offset_in_first: 0,
             raw_pending: std::collections::VecDeque::new(),
             next_pts_secs: 0.0,

@@ -1788,7 +1788,15 @@ pub(crate) fn draw_native_audio_track_menu(
     menu_open: &mut bool,
     menu_rect_out: &mut Option<egui::Rect>,
     commands: &mut Vec<NativeOverlayCommand>,
+    #[cfg(feature = "test-script")] smoke_controls: Option<
+        &mut Vec<(
+            crate::video::native_ui_smoke::NativeUiSmokeAudioControl,
+            crate::video::native_ui_smoke::NativeUiSmokeControlObservation,
+        )>,
+    >,
 ) {
+    #[cfg(feature = "test-script")]
+    let mut smoke_controls = smoke_controls;
     *menu_rect_out = None;
     if !*menu_open || rows.len() < 2 {
         *menu_open = false;
@@ -1861,6 +1869,27 @@ pub(crate) fn draw_native_audio_track_menu(
                 let response = ui
                     .interact(item_rect, menu_id.with(index), egui::Sense::click())
                     .hover_tip_dark(&row.label);
+                #[cfg(feature = "test-script")]
+                if let Some(controls) = smoke_controls.as_deref_mut() {
+                    controls.push((
+                        crate::video::native_ui_smoke::NativeUiSmokeAudioControl::Row(index),
+                        crate::video::native_ui_smoke::NativeUiSmokeControlObservation {
+                            rect: response.rect,
+                            interact_rect: response.interact_rect,
+                            clip_rect: ui.clip_rect(),
+                            layer_id: response.layer_id,
+                            sense: response.sense,
+                            enabled: true,
+                        },
+                    ));
+                }
+                #[cfg(feature = "test-script")]
+                if smoke_controls.is_none() {
+                    crate::test_script::register_clickable_widget(
+                        &format!("music_audio_track_row_{}", row.ordinal),
+                        &response,
+                    );
+                }
                 if response.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
@@ -2720,12 +2749,14 @@ struct NativeBarVisibilitySnapshot {
 struct NativeUiSmokeChromeEligibility {
     top_hover_activation: bool,
     named_control: bool,
+    audio_control: bool,
 }
 
 #[cfg(feature = "test-script")]
 #[allow(clippy::too_many_arguments)]
 fn native_ui_smoke_chrome_eligibility(
     panel_chrome_visible: bool,
+    bottom_hud_visible: bool,
     tile_overlay_visible: bool,
     navigation_preview_visible: bool,
     hud_dimmed: bool,
@@ -2745,6 +2776,7 @@ fn native_ui_smoke_chrome_eligibility(
     NativeUiSmokeChromeEligibility {
         top_hover_activation: chrome_allowed,
         named_control: chrome_allowed && panel_chrome_visible && !audio_only,
+        audio_control: chrome_allowed && bottom_hud_visible && !audio_only,
     }
 }
 
@@ -12026,6 +12058,7 @@ impl NativeEguiOverlay {
         #[cfg(feature = "test-script")]
         let ui_smoke_eligibility = native_ui_smoke_chrome_eligibility(
             panel_chrome_visible,
+            bottom_hud_visible,
             tile_overlay_visible,
             navigation_preview_visible,
             hud_dimmed,
@@ -12048,6 +12081,8 @@ impl NativeEguiOverlay {
         let ui_smoke_named_control_allowed = ui_smoke_eligibility.named_control;
         #[cfg(feature = "test-script")]
         let mut ui_smoke_native_top_panorama = None;
+        #[cfg(feature = "test-script")]
+        let mut ui_smoke_audio_controls = Vec::new();
         #[cfg(feature = "test-script")]
         let ui_smoke_button_up_metadata =
             take_unique_ui_smoke_button_up(&mut self.ui_smoke_pending_button_up_metadata);
@@ -13276,6 +13311,18 @@ impl NativeEguiOverlay {
                                 egui::vec2(audio_track_w, btn_size),
                             );
                             let response = ui.interact(rect, egui::Id::new("native_video_audio_track_button"), egui::Sense::click());
+                            #[cfg(feature = "test-script")]
+                            ui_smoke_audio_controls.push((
+                                crate::video::native_ui_smoke::NativeUiSmokeAudioControl::Button,
+                                crate::video::native_ui_smoke::NativeUiSmokeControlObservation {
+                                    rect: response.rect,
+                                    interact_rect: response.interact_rect,
+                                    clip_rect: ui.clip_rect(),
+                                    layer_id: response.layer_id,
+                                    sense: response.sense,
+                                    enabled: true,
+                                },
+                            ));
                             draw_overlay_button_bg(painter, rect, response.hovered(), audio_track_menu_open);
                             let ordinal = video_metadata.as_ref().and_then(|metadata| metadata.audio_track_rows.iter().find(|row| row.is_current)).map_or(1, |row| row.ordinal);
                             painter.text(egui::pos2(rect.center().x, text_center_y), egui::Align2::CENTER_CENTER,
@@ -13941,6 +13988,8 @@ impl NativeEguiOverlay {
                             &mut audio_track_menu_open,
                             &mut audio_track_menu_rect,
                             &mut commands,
+                            #[cfg(feature = "test-script")]
+                            Some(&mut ui_smoke_audio_controls),
                         );
                     }
                 } else {
@@ -14167,7 +14216,8 @@ impl NativeEguiOverlay {
                 ppp,
                 self.width,
                 self.height,
-            ),
+            )
+            .with_audio_controls(ui_smoke_audio_controls, ui_smoke_eligibility.audio_control),
             #[cfg(feature = "test-script")]
             ui_smoke_command_attribution,
         })
@@ -15299,6 +15349,8 @@ mod tests {
                     &mut open,
                     &mut drawn_rect,
                     &mut commands,
+                    #[cfg(feature = "test-script")]
+                    None,
                 );
             },
         );
@@ -18399,36 +18451,37 @@ mod tests {
     #[test]
     fn ui_smoke_top_and_named_targets_follow_final_chrome_suppression() {
         let ready = native_ui_smoke_chrome_eligibility(
-            true, false, false, false, false, false, false, false, false,
+            true, true, false, false, false, false, false, false, false, false,
         );
         assert_eq!(
             ready,
             NativeUiSmokeChromeEligibility {
                 top_hover_activation: true,
                 named_control: true,
+                audio_control: true,
             }
         );
         for blocked in [
             native_ui_smoke_chrome_eligibility(
-                true, true, false, false, false, false, false, false, false,
+                true, true, true, false, false, false, false, false, false, false,
             ),
             native_ui_smoke_chrome_eligibility(
-                true, false, true, false, false, false, false, false, false,
+                true, true, false, true, false, false, false, false, false, false,
             ),
             native_ui_smoke_chrome_eligibility(
-                true, false, false, true, false, false, false, false, false,
+                true, true, false, false, true, false, false, false, false, false,
             ),
             native_ui_smoke_chrome_eligibility(
-                true, false, false, false, true, false, false, false, false,
+                true, true, false, false, false, true, false, false, false, false,
             ),
             native_ui_smoke_chrome_eligibility(
-                true, false, false, false, false, true, false, false, false,
+                true, true, false, false, false, false, true, false, false, false,
             ),
             native_ui_smoke_chrome_eligibility(
-                true, false, false, false, false, false, true, false, false,
+                true, true, false, false, false, false, false, true, false, false,
             ),
             native_ui_smoke_chrome_eligibility(
-                true, false, false, false, false, false, false, true, false,
+                true, true, false, false, false, false, false, false, true, false,
             ),
         ] {
             assert_eq!(
@@ -18436,19 +18489,27 @@ mod tests {
                 NativeUiSmokeChromeEligibility {
                     top_hover_activation: false,
                     named_control: false,
+                    audio_control: false,
                 }
             );
         }
         let audio = native_ui_smoke_chrome_eligibility(
-            true, false, false, false, false, false, false, false, true,
+            true, true, false, false, false, false, false, false, false, true,
         );
         assert!(audio.top_hover_activation);
         assert!(!audio.named_control);
+        assert!(!audio.audio_control);
         let hidden_bar = native_ui_smoke_chrome_eligibility(
-            false, false, false, false, false, false, false, false, false,
+            false, false, false, false, false, false, false, false, false, false,
         );
         assert!(hidden_bar.top_hover_activation);
         assert!(!hidden_bar.named_control);
+        assert!(!hidden_bar.audio_control);
+        let bottom_only = native_ui_smoke_chrome_eligibility(
+            false, true, false, false, false, false, false, false, false, false,
+        );
+        assert!(!bottom_only.named_control);
+        assert!(bottom_only.audio_control);
     }
 
     #[cfg(feature = "test-script")]

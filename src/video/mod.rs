@@ -9301,6 +9301,13 @@ impl VideoPlayer {
             .map(|selection| selection.snapshot())
     }
 
+    #[cfg(feature = "test-script")]
+    pub(crate) fn test_script_processed_frequency_hz(&self) -> Option<f64> {
+        self.audio
+            .as_ref()
+            .and_then(audio::AudioOutput::test_script_processed_frequency_hz)
+    }
+
     fn saved_audio_track_for_stream(&self, stream_index: usize) -> Option<SavedAudioTrackChoice> {
         self.info
             .as_ref()?

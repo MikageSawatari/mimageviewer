@@ -28001,6 +28001,18 @@ impl App {
             continuous_reading,
             current_is_still_image,
             music_view_active,
+            music_audio_track_popup_open: music_view_active
+                && crate::ui_music_panels::test_script_music_audio_track_popup_open(ctx),
+            audio_track: fs_idx
+                .and_then(|idx| {
+                    self.fs_video_player(idx).map(|player| {
+                        crate::test_script::TestScriptAudioTrackSnapshot::from_player(
+                            player,
+                            self.video_audio_mode == Some(idx),
+                        )
+                    })
+                })
+                .unwrap_or_else(crate::test_script::TestScriptAudioTrackSnapshot::absent),
             modal_open: self.any_modal_dialog_open_for_fullscreen_keys(),
             context_menu_open: self.fs_context_menu_idx.is_some(),
             popup_open: self.spread_popup_open

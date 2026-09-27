@@ -30,8 +30,8 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEINPUT, SendInput,
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOT, GetAncestor, GetClientRect, GetForegroundWindow, GetMessageExtraInfo,
@@ -228,16 +228,32 @@ pub(crate) struct NativeUiSmokeControlObservation {
     pub(crate) enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeUiSmokeAudioControl {
+    Button,
+    Row(usize),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NativeUiSmokeCommittedAudioControl {
+    name: NativeUiSmokeAudioControl,
+    observation: NativeUiSmokeControlObservation,
+    area: NativeUiSmokeTargetArea,
+    token: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct NativeUiSmokeLogicalInventory {
     owner: Weak<NativeUiSmokeOverlayOwner>,
     owner_nonce: u64,
     top_hover_activation: Option<NativeUiSmokeTargetArea>,
     native_top_panorama: Option<NativeUiSmokeControlObservation>,
+    audio_controls: Vec<(NativeUiSmokeAudioControl, NativeUiSmokeControlObservation)>,
     panorama_classification: NativeUiSmokePanoramaClassification,
     panorama_pose_present: bool,
     video_zoom_present: bool,
     named_control_allowed: bool,
+    audio_control_allowed: bool,
     pixels_per_point: f32,
     client_width: u32,
     client_height: u32,
@@ -262,14 +278,26 @@ impl NativeUiSmokeLogicalInventory {
             owner_nonce: owner.nonce,
             top_hover_activation,
             native_top_panorama,
+            audio_controls: Vec::new(),
             panorama_classification,
             panorama_pose_present,
             video_zoom_present,
             named_control_allowed,
+            audio_control_allowed: false,
             pixels_per_point,
             client_width,
             client_height,
         }
+    }
+
+    pub(crate) fn with_audio_controls(
+        mut self,
+        controls: Vec<(NativeUiSmokeAudioControl, NativeUiSmokeControlObservation)>,
+        allowed: bool,
+    ) -> Self {
+        self.audio_controls = controls;
+        self.audio_control_allowed = allowed;
+        self
     }
 
     #[cfg(test)]
@@ -296,10 +324,51 @@ pub(crate) struct NativeUiSmokeCommittedInventory {
     target_version: u64,
     top_hover_activation: Option<NativeUiSmokeTargetArea>,
     native_top_panorama: Option<NativeUiSmokeCommittedNamedControl>,
+    audio_controls: Vec<NativeUiSmokeCommittedAudioControl>,
 }
 
 impl NativeUiSmokeCommittedInventory {
     pub(crate) fn commit(previous: Option<&Self>, logical: NativeUiSmokeLogicalInventory) -> Self {
+        let audio_controls = logical
+            .audio_controls
+            .iter()
+            .map(|(name, observation)| {
+                let area = NativeUiSmokeTargetArea::new(
+                    observation
+                        .rect
+                        .intersect(observation.interact_rect)
+                        .intersect(observation.clip_rect),
+                    logical.pixels_per_point,
+                    logical.client_width,
+                    logical.client_height,
+                );
+                let eligible = logical.audio_control_allowed
+                    && observation.enabled
+                    && observation.sense.senses_click()
+                    && area.valid()
+                    && area.client_point([0.5, 0.5]).is_ok();
+                let previous_token = previous
+                    .filter(|previous| previous.owner_nonce == logical.owner_nonce)
+                    .and_then(|previous| {
+                        previous.audio_controls.iter().find(|entry| {
+                            entry.name == *name
+                                && entry.observation == *observation
+                                && entry.area == area
+                        })
+                    })
+                    .and_then(|entry| entry.token);
+                NativeUiSmokeCommittedAudioControl {
+                    name: *name,
+                    observation: *observation,
+                    area,
+                    token: eligible.then(|| {
+                        previous_token.unwrap_or_else(|| {
+                            NEXT_NAMED_TARGET_TOKEN.fetch_add(1, Ordering::Relaxed)
+                        })
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
         let named = logical.native_top_panorama.map(|observation| {
             let area_rect = observation
                 .rect
@@ -364,6 +433,7 @@ impl NativeUiSmokeCommittedInventory {
                         named.area,
                     )
                 })
+                && previous.audio_controls == audio_controls
         });
         Self {
             owner: logical.owner,
@@ -378,6 +448,7 @@ impl NativeUiSmokeCommittedInventory {
             }),
             top_hover_activation: logical.top_hover_activation,
             native_top_panorama: named,
+            audio_controls,
         }
     }
 
@@ -1675,6 +1746,155 @@ pub(crate) fn wait_for_native_top_panorama_after_move(
             "named_target_after_broker_wait",
         )?;
     }
+}
+
+/// Click a control from the committed native HUD inventory through the OS input
+/// route. The caller verifies the resulting menu/selection in the next App
+/// snapshot; a popup click intentionally retires the control inventory itself.
+pub(crate) fn click_native_audio_control(
+    owner_hwnd: u64,
+    name: NativeUiSmokeAudioControl,
+    deadline: Instant,
+    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+) -> Result<(u64, i32, i32), String> {
+    validate_disposable_runtime()?;
+    let (target, token) = loop {
+        validate_owner_for_phase(
+            &mut validate_owner_and_interrupt,
+            "audio_control_before_snapshot",
+        )?;
+        let broker = broker();
+        let state = lock_broker_state(broker)?;
+        let candidates = coherent_audio_control_targets(&state, owner_hwnd, name)?;
+        match candidates.as_slice() {
+            [(target, token)] => break (target.clone(), *token),
+            [] => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(format!(
+                        "timed out waiting for enabled native audio control {name:?}"
+                    ));
+                }
+                let wait = TARGET_WAIT_POLL.min(deadline.saturating_duration_since(now));
+                let waited = broker.changed.wait_timeout(state, wait);
+                match waited {
+                    Ok((state, _)) => drop(state),
+                    Err(_) => return Err("native audio control broker is poisoned".into()),
+                }
+            }
+            _ => return Err(format!("native audio control {name:?} is not unique")),
+        }
+    };
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "audio_control_before_os_input",
+    )?;
+    validate_os_target(&target)?;
+    {
+        let state = lock_broker_state(broker())?;
+        let current = coherent_audio_control_targets(&state, owner_hwnd, name)?;
+        if !matches!(current.as_slice(), [(fresh, fresh_token)]
+            if *fresh_token == token
+                && fresh.host.publisher == target.host.publisher
+                && fresh.render.publisher == target.render.publisher
+                && fresh.client_point.x == target.client_point.x
+                && fresh.client_point.y == target.client_point.y)
+        {
+            return Err(format!(
+                "native audio control {name:?} changed before input"
+            ));
+        }
+    }
+    require_unexpired_deadline(deadline, "clicking native audio control")?;
+    // Move, press and release are one ordered SendInput batch. The observed
+    // point comes from a committed egui Response, never a guessed coordinate.
+    let _dpi = ThreadDpiContext::enter()?;
+    let mut screen = target.client_point;
+    if !unsafe {
+        ClientToScreen(hwnd_from_value(target.render.presenter_hwnd), &mut screen).as_bool()
+    } {
+        return Err("ClientToScreen failed for native audio control".into());
+    }
+    let (dx, dy) = virtual_desktop_absolute(screen)?;
+    let mouse = |flags, x, y| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: x,
+                dy: y,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [
+        mouse(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            dx,
+            dy,
+        ),
+        mouse(MOUSEEVENTF_LEFTDOWN, 0, 0),
+        mouse(MOUSEEVENTF_LEFTUP, 0, 0),
+    ];
+    let inserted = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if inserted != inputs.len() as u32 {
+        return Err(format!(
+            "SendInput inserted {inserted} of {} audio control events",
+            inputs.len()
+        ));
+    }
+    Ok((token, target.client_point.x, target.client_point.y))
+}
+
+fn coherent_audio_control_targets(
+    state: &BrokerState,
+    owner_hwnd: u64,
+    name: NativeUiSmokeAudioControl,
+) -> Result<Vec<(PreparedTarget, u64)>, String> {
+    let mut candidates = Vec::new();
+    for host in state.hosts.values().filter(|host| {
+        host.owner_hwnd == owner_hwnd
+            && host.placement == NativeVideoPlacement::DetachedViewerChild
+            && host.windows.presenter_only()
+    }) {
+        for render in state.renders.values() {
+            let evaluation = evaluate_target_pair(host, render, owner_hwnd, [0.5, 0.5]);
+            if !evaluation.host_eligible()
+                || !evaluation.render_matches_host()
+                || !render.inventory.owner_is_live()
+                || render
+                    .requested_source_epoch
+                    .upgrade()
+                    .is_none_or(|source| {
+                        source.load(Ordering::Acquire) != render.actual_source_epoch
+                    })
+            {
+                continue;
+            }
+            for control in &render.inventory.audio_controls {
+                if control.name != name {
+                    continue;
+                }
+                let Some(token) = control.token else {
+                    continue;
+                };
+                candidates.push((
+                    PreparedTarget {
+                        host: host.clone(),
+                        render: render.clone(),
+                        kind: PreparedTargetKind::Canvas,
+                        area: control.area,
+                        client_point: control.area.client_point([0.5, 0.5])?,
+                        named_token: Some(token),
+                    },
+                    token,
+                ));
+            }
+        }
+    }
+    Ok(candidates)
 }
 
 fn named_control_after_move(
@@ -3836,6 +4056,36 @@ mod tests {
             },
             enabled,
         }
+    }
+
+    #[test]
+    fn audio_control_inventory_retains_named_targets_only_while_enabled() {
+        let owner = allocate_overlay_owner();
+        let observation = test_panorama_observation(true);
+        let logical = |audio_allowed| {
+            NativeUiSmokeLogicalInventory::new(
+                &owner,
+                None,
+                None,
+                NativeUiSmokePanoramaClassification::Unknown,
+                false,
+                false,
+                false,
+                1.0,
+                400,
+                240,
+            )
+            .with_audio_controls(
+                vec![(NativeUiSmokeAudioControl::Button, observation)],
+                audio_allowed,
+            )
+        };
+        let first = NativeUiSmokeCommittedInventory::commit(None, logical(true));
+        let token = first.audio_controls[0].token.expect("enabled button token");
+        let stable = NativeUiSmokeCommittedInventory::commit(Some(&first), logical(true));
+        assert_eq!(stable.audio_controls[0].token, Some(token));
+        let disabled = NativeUiSmokeCommittedInventory::commit(Some(&stable), logical(false));
+        assert_eq!(disabled.audio_controls[0].token, None);
     }
 
     fn test_fixture_panorama_observation(enabled: bool) -> NativeUiSmokeControlObservation {

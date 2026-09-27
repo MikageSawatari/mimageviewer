@@ -203,6 +203,18 @@ impl App {
                 sidecar_imported: false,
                 sidecar_loaded: false,
                 seek_strip: context.video_seek_strip_test_script_snapshot(),
+                audio_track: page_index
+                    .and_then(|idx| context.fs_cache().get(&idx).map(|entry| (idx, entry)))
+                    .and_then(|(idx, entry)| match entry {
+                        FsCacheEntry::Video { player, .. } => Some(
+                            crate::test_script::TestScriptAudioTrackSnapshot::from_player(
+                                player,
+                                context.video_audio_mode() == Some(idx),
+                            ),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_else(crate::test_script::TestScriptAudioTrackSnapshot::absent),
             }
         })
     }
