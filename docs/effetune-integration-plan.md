@@ -310,8 +310,11 @@ enum EffectiveState {
 - `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.11.1、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
   ディレクトリごとコピーする (変更時のみ)。
-- 実行時は `native_assets::bundled_root().join("effetune").join("EffeTune Mixwright.vst3")`。
-  無ければ `Unavailable(BundleMissing)`。
+- 実行時は **EffeTune モジュール自身の解決関数** で `<実行中 exe のディレクトリ>\effetune\EffeTune Mixwright.vst3`
+  を探す。`native_assets` は使わない (ポータブル版の DLL 解決専用に `#[cfg(feature = "portable")]` で
+  閉じられており、公開範囲を広げない。実装時に判明、2026-09-27)。通常版・ポータブル版で同じ規則。
+  `current_exe()` が失敗したら `.` に逃がさず `Unavailable(BundleMissing(理由))`。
+  bundle が無ければ `Unavailable(BundleMissing)`。
 - `is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")` が偽なら
   `Unavailable(CpuUnsupported)`。
 - release / portable / launcher への埋め込みはしない。build.rs の必須チェックにも入れない。
