@@ -3366,6 +3366,175 @@ mod tests {
         app.shutdown_collection_runtime_for_exit();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn deleted_collection_child_stays_physical_through_park_resume_and_backspace() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), b"page").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        let collection =
+            collection_with_sources(&client, &[(child.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(collection.collection_id(), None);
+        wait_for_grid(&mut app, collection.collection_id());
+        let owner = app
+            .collection_grid_physical_load_owner(0, &child)
+            .expect("Collection child owner");
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(&child, &app.settings).unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            child.clone(),
+            Some(scan),
+            super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+        ));
+        assert!(matches!(
+            app.collection_grid_parent_nav(),
+            Some(crate::ui_main::AddressBarNav::Collection(_))
+        ));
+
+        let deleted = recv(
+            client
+                .delete_collection(collection.collection_id(), collection.revision())
+                .unwrap(),
+        );
+        poll_until(&mut app, "child deletion did not settle", |app| {
+            app.top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    session.observed_catalog_revision >= deleted.catalog_revision
+                        && matches!(session.load, CollectionGridLoadState::Deleted { .. })
+                })
+        });
+        // The catalog delete notice and history-prune notice may arrive in adjacent polls.
+        // Settle both before comparing the parked display with its resumed owner.
+        let ctx = egui::Context::default();
+        app.poll_collection_ui(&ctx);
+        app.poll_collection_grid(&ctx);
+        let rows = app.items.clone();
+        let address = app.address.clone();
+        let selected = app.selected;
+        let before_back = app.folder_nav_back_stack.clone();
+        let before_forward = app.folder_nav_forward_stack.clone();
+        app.pause_mounted_background_work_keep_current_frame();
+        let parked = app.stash_mounted_and_start_fresh("deleted_collection_child_park");
+        app.with_viewer_context(parked, |resumed| {
+            let ctx = egui::Context::default();
+            resumed.poll_collection_ui(&ctx);
+            resumed.poll_collection_grid(&ctx);
+            assert!(
+                resumed
+                    .top_level_grid_view
+                    .collection_session()
+                    .is_some_and(|session| matches!(
+                        session.load,
+                        CollectionGridLoadState::Deleted { .. }
+                    ))
+            );
+            assert_eq!(resumed.current_folder.as_deref(), Some(child.as_path()));
+            assert_eq!(resumed.items, rows);
+            assert_eq!(resumed.address, address);
+            assert_eq!(resumed.selected, selected);
+            assert_eq!(resumed.folder_nav_back_stack, before_back);
+            assert_eq!(resumed.folder_nav_forward_stack, before_forward);
+            assert!(resumed.collection_grid_parent_nav().is_none());
+            assert!(matches!(
+                resumed.collection_grid_current_restore_snapshot(),
+                Some(TopLevelGridRestore::Folder(path))
+                    if crate::folder_tree::path_eq(&path, &child)
+            ));
+            let parent = temp.path().to_path_buf();
+            assert!(matches!(
+                history_grid_key(resumed, egui::Key::Backspace),
+                Some(crate::ui_main::AddressBarNav::Direct(path))
+                    if crate::folder_tree::path_eq(&path, &parent)
+            ));
+            let scan =
+                super::super::folder_scan::scan_directory_with_settings(&parent, &resumed.settings)
+                    .unwrap();
+            assert!(resumed.load_folder_with_scan_owned(
+                parent.clone(),
+                Some(scan),
+                super::super::OpenRequestOwner::Navigation,
+            ));
+            assert_eq!(resumed.current_folder.as_deref(), Some(parent.as_path()));
+            assert!(matches!(
+                resumed.top_level_grid_view.surface(),
+                TopLevelGridSurface::Folder
+            ));
+            assert!(
+                resumed
+                    .folder_nav_back_stack
+                    .iter()
+                    .all(|target| target.collection_id() != Some(collection.collection_id()))
+            );
+        })
+        .unwrap();
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn park_keeps_other_settled_collection_load_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let empty = recv(client.create_collection("Empty".into()).unwrap());
+        app.open_collection_grid(empty.collection_id(), None);
+        wait_for_grid(&mut app, empty.collection_id());
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Empty(_)
+        ));
+        app.pause_mounted_background_work_keep_current_frame();
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Empty(_)
+        ));
+
+        let session = app.top_level_grid_view.collection_session_mut().unwrap();
+        session.load = CollectionGridLoadState::Failed {
+            message: "settled failure".into(),
+            installed: None,
+        };
+        app.pause_mounted_background_work_keep_current_frame();
+        assert!(matches!(
+            &app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Failed { message, .. } if message == "settled failure"
+        ));
+
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .cancel_pending();
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::RequestNeeded { .. }
+        ));
+        app.pause_mounted_background_work_keep_current_frame();
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::RequestNeeded { .. }
+        ));
+
+        let image = temp.path().join("image.png");
+        std::fs::write(&image, b"image").unwrap();
+        let ready = collection_with_sources(&client, &[(image, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(ready.collection_id(), None);
+        wait_for_grid(&mut app, ready.collection_id());
+        let before = match &app.top_level_grid_view.collection_session().unwrap().load {
+            CollectionGridLoadState::Ready(presentation) => Arc::clone(presentation),
+            _ => panic!("nonempty collection should be ready"),
+        };
+        app.pause_mounted_background_work_keep_current_frame();
+        assert!(matches!(
+            &app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Ready(presentation) if Arc::ptr_eq(presentation, &before)
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
     #[cfg(all(windows, feature = "test-script"))]
     #[test]
     fn seeded_collection_smoke_action_opens_python_seeded_root_after_startup() {

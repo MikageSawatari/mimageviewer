@@ -1270,8 +1270,13 @@ impl ContextAsyncOwner {
             }
             Self::HistoryTransition => app.replace_history_navigation_transition(None),
             Self::CollectionGrid => {
-                if let Some(session) = app.top_level_grid_view.collection_session_mut() {
-                    session.cancel_pending();
+                // `cancel_pending` also converts Ready/Empty/Failed/Deleted into a fresh
+                // request. Parking only owns the in-flight snapshot/prepare worker; a Deleted
+                // physical child must keep its tombstone when this context is resumed.
+                if self.is_pending(ContextRef::mounted(app)) {
+                    if let Some(session) = app.top_level_grid_view.collection_session_mut() {
+                        session.cancel_pending();
+                    }
                 }
             }
             Self::CollectionNavigation => app.cancel_collection_navigation_intent(),

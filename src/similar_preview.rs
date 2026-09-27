@@ -832,10 +832,19 @@ impl SimilarPreviewState {
         )
     }
 
-    /// A parked still viewer has no input or render service. Release its cancelled receiver
-    /// at the park boundary so a late completion cannot require a parked-context poll.
+    /// A parked still viewer has no input or render service. End its gesture and release only
+    /// a live worker; a prepared cache or terminal failure still belongs to the same viewer.
     pub(crate) fn terminate_on_park(&mut self) {
-        self.invalidate();
+        self.end_gesture_with_reason("context_parked");
+        if !self.has_pending_background_work() {
+            return;
+        }
+        self.owner_generation = self.owner_generation.wrapping_add(1).max(1);
+        if let SimilarPreviewPreparation::Running(pending)
+        | SimilarPreviewPreparation::Draining { pending, .. } = &self.preparation
+        {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
         self.preparation = SimilarPreviewPreparation::Idle;
     }
 
@@ -1660,6 +1669,45 @@ mod tests {
         assert!(matches!(state.preparation, SimilarPreviewPreparation::Idle));
         assert!(state.cached.is_none());
         assert!(!state.has_active_gesture());
+    }
+
+    #[test]
+    fn park_terminates_only_preview_work_and_preserves_settled_cache_or_failure() {
+        let ctx = egui::Context::default();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let hit = hit(r"C:\a.png", 1);
+
+        let mut ready = SimilarPreviewState::default();
+        let worker = ready.queue_test_worker();
+        ready.begin_press(&ctx, &hit, &passwords, viewport(), session(0));
+        worker.send(Ok(prepared(1))).unwrap();
+        assert!(
+            ready
+                .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+                .is_some()
+        );
+        ready.end_gesture();
+        let cached = ready.cached_paint_resource_id().expect("prepared cache");
+        ready.terminate_on_park();
+        assert_eq!(ready.cached_paint_resource_id(), Some(cached));
+        assert!(!ready.has_active_gesture());
+        assert!(!ready.has_pending_background_work());
+
+        let mut failed = SimilarPreviewState::default();
+        let worker = failed.queue_test_worker();
+        failed.begin_press(&ctx, &hit, &passwords, viewport(), session(0));
+        worker.send(Err("decode failed".to_owned())).unwrap();
+        failed.poll_worker(&ctx, &passwords);
+        assert!(matches!(
+            failed.preparation,
+            SimilarPreviewPreparation::Failed { .. }
+        ));
+        failed.terminate_on_park();
+        assert!(matches!(
+            failed.preparation,
+            SimilarPreviewPreparation::Failed { .. }
+        ));
+        assert!(!failed.has_active_gesture());
     }
 
     #[test]

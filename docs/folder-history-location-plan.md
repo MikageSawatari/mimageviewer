@@ -255,6 +255,11 @@ detached folder scan、PDF/ZIP enumeration、EPUB 変換、PDF password request 
 取消を registry に集約する。staged request の取消では旧表示・履歴を維持し、未採用 direct cold open は
 所有 rollback を返す。取消済み worker の late result は request ID / generation で捨てる。
 root の `poll_parked_document_open_owners` と parked dialog の描画は廃止する。
+Collection grid の park terminal は Snapshot / Preparing の worker に限定する。
+Ready / Empty / Failed / Deleted と、未開始の RequestNeeded は変更しない。特に
+Deleted の物理子は tombstone を保持し、park / resume 後も BS と restore が物理 path を
+返す。Similar preview は進行中の preparation と保持 gesture を終了するが、完成 cache と
+terminal failure は保持する。どちらも「settled state を park で新規 request にしない」規則に従う。
 
 modal owner（EPUB 変換、PDF password）がいずれかの context に存在する間は、別 viewer
 context の activation を共通 gate で拒否する。passive click、activation watcher と

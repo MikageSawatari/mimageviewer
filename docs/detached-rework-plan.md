@@ -1466,6 +1466,10 @@ typed owner registry の `service` を呼ぶ。parked still context は frozen f
 direct open は所有 rollback を返し、分類・DFS・scan・enumeration は取消、EPUB 変換と
 password request と Similar preview preparation は terminal にする。以前の root から parked bundle を一時 mount して
 poll / dialog 描画する実装と、その coverage claim は撤回した。
+Collection grid の Snapshot / Preparing だけを park で取り消し、Ready / Empty / Failed /
+Deleted は変更しない。特に物理子表示中の Deleted tombstone を維持するので、復帰後も
+Backspace と復元 snapshot は実フォルダとして扱う。Similar preview も進行中 worker
+だけを取消し、完成 cache と terminal failure を維持する。
 
 EPUB 変換または PDF password prompt の owner がある間、passive window click、activation
 watcher、deferred activation、keyboard/gamepad の窓選択が到達する共通 activation 境界は
