@@ -2256,6 +2256,7 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   「RECORD_SEQUENCE 共有の不安定テスト」として別課題にされていたもの。
 - `app::tests::pipeline_cache_refactor_tests::colorize_display_gate_requires_final_effect_for_creative_lut`:
   非同期の LUT 読み込みを `yield_now` 1 万回だけ待つ。高負荷で待ち切れない。
+- 追記 (2026-09-27): 同日、並列の全ライブラリテストでテスト実行ファイル自体のアクセス違反 (`0xc0000005`、Windows のエラーダイアログ「wgpu Device Class ...: mimageviewer-<hash>」を**利用者が目撃**、スクリーンショットあり) が別 worktree で 2 回起きた。並列度を下げた再実行では完走。「wgpu Device Class」は GL の隠しウィンドウ名で、ui_snapshot で以前から見ている間欠クラッシュと同じ系統と推定 (未確認、ダンプなし)。エラーダイアログが出るとテストが止まったままになるので、無人実行では問題が大きい。
 - 方針: 共通 counter を注入可能にする、または観測の対象 key に限定する等、テスト側の隔離で直す。待ち回数を増やすだけの対処はしない
   (完了通知を待つ形にする)。規模 / 優先度: Small / P3 (リリース判定のたびに単独再実行の手間がかかる)。
 
