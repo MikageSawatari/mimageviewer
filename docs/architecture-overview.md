@@ -154,7 +154,7 @@ source と編集 context を `MergedSpread` にまとめ、materializer worker �
 | --- | --- |
 | `zip_loader.rs` | ZIP 内の画像列挙、エントリバイト取得、先頭画像抽出。ネスト ZIP (ZIP in ZIP) は再帰列挙し (表示は `zip_tree` でツリー化)、内側 ZIP バイト列は 256MB LRU キャッシュに保持。非 ZIP アーカイブ (RAR/7z/LZH) のエントリは `has_foreign_archives` フラグで検出して変換提案へつなぐ (v1.3.0)。読み戻しは literal フルネーム一致 → ネスト境界分割の順 (変換キャッシュのフラットエントリ対応)。画像判定は `folder_tree::is_recognized_image_ext` に委譲 (ネイティブ + WIC + Susie) |
 | `canonical_image_loader.rs` | fullscreen と remote AI が共有する静止画 canonical decoder。通常 file / verified bytes / ZIP・CBZ entry（nested ZIP を含む）を typed source で受け、image crate → WIC → Susie の順、EXIF 適用、GIF/APNG/WebP の既存 Animated 分類、通常 static の 8192 clamp を一箇所に置く。panorama 用 native tee は呼び出し側の従来位置に残し、raster PDF は `pdf_loader` の canonical renderer が担当する |
-| `pdf_loader.rs` | PDFium ワーカープロセスプール。ページ列挙・レンダリング |
+| `pdf_loader.rs` | PDFium ワーカープロセスプール。ページ列挙・レンダリング。EPUB の世代解決と使用は本ごとの読取リースを保持し、キャッシュの即時削除と順序付ける |
 | `pdf_passwords.rs` | PDF パスワードの DPAPI 暗号化永続化 |
 | `wic_decoder.rs` | HEIC/AVIF/JXL/TIFF/RAW のデコード (Windows Imaging Component) |
 | `save_with_metadata.rs` | JPEG/PNG/WebP のエンコードと EXIF/XMP/PNG text/WebP metadata の転記。Ctrl+E エクスポートから呼ばれ、出力は `create_new` で上書きしない |

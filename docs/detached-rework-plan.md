@@ -1455,6 +1455,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-28 D15 EPUB キャッシュ即時削除の読取所有権 (review #2 改訂)**
+
+分類待ちの候補から表示中の本まで、mounted / parked の各 `ViewerContextBundle` にある EPUB 所有者を列挙し、`App` が本ごとの読取リースを保持する。固定世代の解決・PDF 描画・Remote 要求・サムネイル処理も同じ本の調停を通し、削除は読取中なら使用中として拒否する。分類候補の登録は開封要求の作成時に行い、削除操作の直前にもメモリ内の所有者を同期する。表示 context を閉じたり再作成したりせず、detached の predicate、viewport ID、host、配置、focus、window lifecycle は変えない。旧保護一覧のスナップショットを削除 worker に渡す方式から、所有期間を表すリースへ移す構造変更であり、§2 の症状パッチには当たらない。
+
 **2026-09-28 §1.280 履歴 / EPUB の context-owned 非同期処理 (review #8/#9 改訂)**
 
 分類 candidate、staged 履歴 transition、Collection navigation、detached folder scan、

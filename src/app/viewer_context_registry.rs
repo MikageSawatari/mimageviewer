@@ -3445,8 +3445,8 @@ impl App {
         self.viewer_contexts.table.ids()
     }
 
-    /// Memory-only snapshot for the EPUB manager; parked contexts can still own
-    /// a visible book and must be protected before a background unlink starts.
+    /// Memory-only inventory of UI owners; the matching read leases are the
+    /// cache deletion boundary, including parked and not-yet-adopted opens.
     pub(crate) fn epub_current_sources_in_all_contexts(&self) -> Vec<PathBuf> {
         let is_epub = |path: &Path| {
             path.extension()
@@ -3468,6 +3468,13 @@ impl App {
             .into_iter()
             .collect::<Vec<_>>();
         sources.extend(fullscreen_source(&self.items, self.fullscreen_idx));
+        sources.extend(
+            self.top_level_grid_view
+                .open_path_classification()
+                .map(|candidate| &candidate.path)
+                .filter(|path| is_epub(path))
+                .cloned(),
+        );
         sources.extend(
             self.pdf_enumerate_pending
                 .as_ref()
@@ -3501,6 +3508,14 @@ impl App {
             sources.extend(fullscreen_source(&bundle.items, bundle.fullscreen_idx));
             sources.extend(
                 bundle
+                    .top_level_grid_view
+                    .open_path_classification()
+                    .map(|candidate| &candidate.path)
+                    .filter(|path| is_epub(path))
+                    .cloned(),
+            );
+            sources.extend(
+                bundle
                     .pdf_enumerate_pending
                     .as_ref()
                     .map(|pending| &pending.0)
@@ -3523,6 +3538,25 @@ impl App {
             );
         }
         sources
+    }
+
+    /// Reconcile process-local UI owners with the same per-book read leases used
+    /// by Remote/PDF workers. This does no I/O and never waits on a deletion.
+    pub(crate) fn sync_epub_ui_read_leases(&mut self) {
+        let sources = self.epub_current_sources_in_all_contexts();
+        let keys = sources
+            .iter()
+            .map(|path| crate::epub_cache::src_key(path))
+            .collect::<std::collections::HashSet<_>>();
+        for path in sources {
+            let key = crate::epub_cache::src_key(&path);
+            if !self.epub_ui_read_leases.contains_key(&key)
+                && let Some(lease) = crate::pdf_loader::try_acquire_epub_read_lease(&path)
+            {
+                self.epub_ui_read_leases.insert(key, lease);
+            }
+        }
+        self.epub_ui_read_leases.retain(|key, _| keys.contains(key));
     }
 
     pub(crate) fn invalidate_removed_epub_generations(
@@ -4506,6 +4540,8 @@ mod tests {
         }];
         let parked = app.stash_mounted_and_start_fresh("epub_delete_context_test");
         assert!(app.epub_current_sources_in_all_contexts().contains(&source));
+        app.sync_epub_ui_read_leases();
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
         app.items = vec![GridItem::PdfFile(other)];
         let parked_before = app
             .with_viewer_context_ref(parked, |context| context.items_generation())
@@ -4514,7 +4550,7 @@ mod tests {
         let removed = crate::epub_cache::GenerationRow {
             generation_id: 7,
             src_path_key: crate::epub_cache::src_key(&source),
-            src_path: source,
+            src_path: source.clone(),
             src_state: crate::epub_cache::SourceState {
                 size: 1,
                 mtime_ticks: 1,
@@ -4530,6 +4566,7 @@ mod tests {
             output_version: 1,
         };
         app.invalidate_removed_epub_generations(&[removed]);
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
         assert_eq!(app.items_generation, mounted_before);
         assert_eq!(
             app.with_viewer_context_ref(parked, |context| context.items_generation())
@@ -4547,12 +4584,46 @@ mod tests {
         assert!(app.epub_current_sources_in_all_contexts().contains(&source));
         let parked = app.stash_mounted_and_start_fresh("epub_pending_delete_test");
         assert!(app.epub_current_sources_in_all_contexts().contains(&source));
+        app.sync_epub_ui_read_leases();
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
         assert!(
             app.with_viewer_context_ref(parked, |context| context
                 .pending_context_async_owners()
                 .contains(&ContextAsyncOwner::PdfPassword))
                 .unwrap()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epub_classification_candidate_owns_read_lease_before_delete_can_start() {
+        let mut app = crate::app::setup_app_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("candidate.epub");
+        std::fs::write(&source, b"candidate").unwrap();
+        assert!(app.start_open_path_classification(
+            source.clone(),
+            super::super::ClassifiedOpenContinuation::Direct {
+                auto_fullscreen: false,
+                owner: super::super::OpenRequestOwner::Navigation,
+            },
+        ));
+        assert!(
+            app.epub_ui_read_leases
+                .contains_key(&crate::epub_cache::src_key(&source))
+        );
+        let deletion_source = source.clone();
+        let result = std::thread::spawn(move || {
+            crate::pdf_loader::acquire_epub_delete_coverage(&deletion_source)
+                .err()
+                .expect("classification owns the source")
+        })
+        .join()
+        .unwrap();
+        assert!(result.contains("使用中"));
+        app.top_level_grid_view.set_open_path_classification(None);
+        app.sync_epub_ui_read_leases();
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_ok());
     }
 
     #[cfg(windows)]

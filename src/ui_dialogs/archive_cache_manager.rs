@@ -45,7 +45,6 @@ impl App {
             self.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                 crate::cache_maintenance::EpubMaintTask::LoadRows,
                 crate::data_dir::get(),
-                Vec::new(),
             ));
         }
     }
@@ -180,10 +179,11 @@ impl App {
                         )
                         .clicked()
                     {
+                        #[cfg(windows)]
+                        self.sync_epub_ui_read_leases();
                         self.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                             crate::cache_maintenance::EpubMaintTask::DeleteAll,
                             crate::data_dir::get(),
-                            self.epub_current_sources_in_all_contexts(),
                         ));
                         self.epub_cache_confirm_delete_all = false;
                     }
@@ -416,12 +416,13 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
             )
             .clicked()
         {
+            #[cfg(windows)]
+            app.sync_epub_ui_read_leases();
             app.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                 crate::cache_maintenance::EpubMaintTask::DeleteSelected {
                     generation_ids: app.epub_cache_selection.iter().copied().collect(),
                 },
                 crate::data_dir::get(),
-                app.epub_current_sources_in_all_contexts(),
             ));
         }
         if ui
@@ -437,10 +438,11 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
             )
             .clicked()
         {
+            #[cfg(windows)]
+            app.sync_epub_ui_read_leases();
             app.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                 crate::cache_maintenance::EpubMaintTask::DeleteMissingSources,
                 crate::data_dir::get(),
-                app.epub_current_sources_in_all_contexts(),
             ));
         }
         if ui.add_enabled(!busy, egui::Button::new("再読込")).clicked() {
@@ -448,7 +450,6 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
             app.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                 crate::cache_maintenance::EpubMaintTask::LoadRows,
                 crate::data_dir::get(),
-                Vec::new(),
             ));
         }
     });

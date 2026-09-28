@@ -58,7 +58,7 @@ impl DocumentStamp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ReadTarget {
     pub read_path: ResolvedReadPath,
     pub stamp: DocumentStamp,
@@ -66,6 +66,34 @@ pub struct ReadTarget {
     pub display_source_state: Option<epub_cache::SourceState>,
     /// Direction recorded for this immutable EPUB generation; PDFs have no value here.
     pub epub_direction: Option<PdfReadingDirection>,
+    // The pinned map stores an unleased copy. Every target handed to a reader
+    // owns this lease through its final use of the physical generation.
+    read_lease: Option<Arc<EpubReadLease>>,
+}
+
+impl PartialEq for ReadTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.read_path == other.read_path
+            && self.stamp == other.stamp
+            && self.display_source_state == other.display_source_state
+            && self.epub_direction == other.epub_direction
+    }
+}
+
+impl Eq for ReadTarget {}
+
+impl ReadTarget {
+    fn with_read_lease(mut self, lease: EpubReadLease) -> Self {
+        debug_assert!(matches!(self.stamp, DocumentStamp::Generation { .. }));
+        self.read_lease = Some(Arc::new(lease));
+        self
+    }
+
+    fn unleased_copy(&self) -> Self {
+        let mut copy = self.clone();
+        copy.read_lease = None;
+        copy
+    }
 }
 
 /// A worker path whose origin has passed the logical-path resolver, except for
@@ -117,6 +145,7 @@ fn passthrough_read_target(logical: &Path) -> ReadTarget {
         },
         display_source_state: None,
         epub_direction: None,
+        read_lease: None,
     }
 }
 
@@ -195,6 +224,7 @@ static EPUB_PIN_COORD: OnceLock<(Mutex<EpubPinCoordState>, Condvar)> = OnceLock:
 #[derive(Default)]
 struct EpubPinCoordState {
     active_books: HashMap<String, usize>,
+    active_reads: HashMap<String, usize>,
     active_ranges: Vec<(u64, Vec<EpubKeyMatch>)>,
     active_deletions: HashSet<String>,
     next_range_id: u64,
@@ -265,6 +295,64 @@ fn ranges_overlap(a: &[EpubKeyMatch], b: &[EpubKeyMatch]) -> bool {
 }
 
 pub(crate) struct EpubBookLease(String);
+
+#[derive(Debug)]
+pub(crate) struct EpubReadLease(String);
+
+impl Drop for EpubReadLease {
+    fn drop(&mut self) {
+        let (mutex, changed) = epub_pin_coord();
+        let mut state = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = state
+            .active_reads
+            .get_mut(&self.0)
+            .expect("read lease exists");
+        *count -= 1;
+        if *count == 0 {
+            state.active_reads.remove(&self.0);
+        }
+        changed.notify_all();
+    }
+}
+
+fn enter_epub_read(key: &str) -> EpubReadLease {
+    let (mutex, changed) = epub_pin_coord();
+    let mut state = mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while state.active_deletions.contains(key) {
+        state = changed
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    *state.active_reads.entry(key.to_owned()).or_default() += 1;
+    EpubReadLease(key.to_owned())
+}
+
+fn try_enter_epub_read(key: &str) -> Option<EpubReadLease> {
+    let mut state = epub_pin_coord()
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.active_deletions.contains(key) {
+        return None;
+    }
+    *state.active_reads.entry(key.to_owned()).or_default() += 1;
+    Some(EpubReadLease(key.to_owned()))
+}
+
+/// UI ownership is acquired without filesystem work or waiting for a delete.
+pub(crate) fn try_acquire_epub_read_lease(logical: &Path) -> Option<EpubReadLease> {
+    try_enter_epub_read(&epub_cache::src_key(logical))
+}
+
+/// Background Remote requests may wait for an in-progress deletion before
+/// resolving the book again. The lease then lives with the resolved address.
+pub(crate) fn acquire_epub_read_lease(logical: &Path) -> EpubReadLease {
+    enter_epub_read(&epub_cache::src_key(logical))
+}
 
 impl Drop for EpubBookLease {
     fn drop(&mut self) {
@@ -370,30 +458,21 @@ pub(crate) fn acquire_epub_book_lease(logical: &Path) -> EpubBookLease {
 }
 
 /// A cache-manager deletion must not wait indefinitely for an earlier reader.
-pub(crate) fn acquire_epub_delete_coverage(
-    path: &Path,
-    deadline: std::time::Instant,
-) -> Result<EpubRangeLease, String> {
+pub(crate) fn acquire_epub_delete_coverage(path: &Path) -> Result<EpubRangeLease, String> {
     let key = epub_cache::src_key(path);
     let range = vec![EpubKeyMatch::Exact(key.clone())];
-    let (mutex, changed) = epub_pin_coord();
+    let (mutex, _) = epub_pin_coord();
     let mut state = mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    while state.active_books.contains_key(&key)
+    if state.active_reads.contains_key(&key)
+        || state.active_books.contains_key(&key)
         || state
             .active_ranges
             .iter()
             .any(|(_, active)| ranges_overlap(&range, active))
     {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err("先行する読み取りが終了せず、削除を中止しました".into());
-        }
-        let (next, _) = changed
-            .wait_timeout(state, remaining)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state = next;
+        return Err("使用中のため削除できませんでした".into());
     }
     state.next_range_id = state
         .next_range_id
@@ -507,23 +586,13 @@ pub fn pinned_epub_target(logical: &Path) -> Option<ReadTarget> {
         return None;
     }
     let key = epub_cache::src_key(logical);
-    if epub_delete_in_progress(&key) {
-        return None;
-    }
-    epub_pinned()
+    let lease = try_enter_epub_read(&key)?;
+    let target = epub_pinned()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&key)
-        .cloned()
-}
-
-fn epub_delete_in_progress(key: &str) -> bool {
-    epub_pin_coord()
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .active_deletions
-        .contains(key)
+        .cloned()?;
+    Some(target.with_read_lease(lease))
 }
 
 /// Called while the deletion range is held, before any new resolution is admitted.
@@ -647,6 +716,7 @@ pub(crate) fn generation_target_for_test(logical: &Path, id: i64, pdf_size: u64)
         stamp: DocumentStamp::Generation { id, pdf_size },
         display_source_state: None,
         epub_direction: None,
+        read_lease: None,
     }
 }
 
@@ -887,6 +957,7 @@ fn resolve_epub_at(
     pinned: &Mutex<HashMap<String, ReadTarget>>,
 ) -> Result<ReadTarget, PdfReadError> {
     let key = epub_cache::src_key(logical);
+    let read_lease = enter_epub_read(&key);
     let _book_lease = enter_epub_book(&key);
     if let Some(target) = pinned
         .lock()
@@ -894,7 +965,7 @@ fn resolve_epub_at(
         .get(&key)
         .cloned()
     {
-        return Ok(target);
+        return Ok(target.with_read_lease(read_lease));
     }
     let candidate = (|| -> Result<ReadTarget, PdfReadError> {
         let source = match std::fs::metadata(logical) {
@@ -939,6 +1010,7 @@ fn resolve_epub_at(
             },
             display_source_state: Some(source),
             epub_direction: parse_epub_direction_name(&row.direction),
+            read_lease: None,
         })
     })();
     with_epub_pin_guard(logical, || {
@@ -948,7 +1020,7 @@ fn resolve_epub_at(
             .get(&key)
             .cloned()
         {
-            return Ok(existing);
+            return Ok(existing.with_read_lease(read_lease));
         }
         let target = candidate?;
         if let Some(expected) = target.display_source_state {
@@ -966,21 +1038,8 @@ fn resolve_epub_at(
         let mut pinned = pinned
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pinned.insert(key, target.clone());
-        Ok(target)
-    })
-}
-
-/// The caller must be a background worker; PDFs are statted here at consumer demand.
-pub fn pdf_document_stamp(logical: &Path) -> Result<DocumentStamp, PdfReadError> {
-    let target = resolve_read_target(logical)?;
-    if is_epub(logical) {
-        return Ok(target.stamp);
-    }
-    let metadata = std::fs::metadata(logical)?;
-    Ok(DocumentStamp::File {
-        mtime: Some(metadata.modified()?),
-        size: Some(metadata.len()),
+        pinned.insert(key, target.unleased_copy());
+        Ok(target.with_read_lease(read_lease))
     })
 }
 
@@ -5049,8 +5108,7 @@ pub struct EnumerateOptions {
 pub struct PdfEnumerateResult {
     pub pages: Vec<PdfPageEntry>,
     pub direction: Option<PdfReadingDirection>,
-    /// EPUB generation only. PDF keeps its existing page attributes; callers needing
-    /// a standalone PDF stamp can call `pdf_document_stamp` on a worker.
+    /// EPUB generation only. PDF keeps its existing page attributes.
     pub stamp: Option<DocumentStamp>,
 }
 
@@ -6564,6 +6622,7 @@ mod tests {
                 size: 123,
             }),
             epub_direction: Some(PdfReadingDirection::R2L),
+            read_lease: None,
         };
         let mut result = PdfEnumerateResult::from(vec![PdfPageEntry {
             page_num: 0,
@@ -8065,11 +8124,9 @@ C:\isolated\miv-data"#
                 pdf_size: first.pdf_size
             }
         );
-        let boundary = acquire_epub_delete_coverage(
-            &source,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        )
-        .unwrap();
+        assert!(acquire_epub_delete_coverage(&source).is_err());
+        drop(first_read);
+        let boundary = acquire_epub_delete_coverage(&source).unwrap();
         assert!(matches!(
             db.delete_generation_now(first.generation_id).unwrap(),
             epub_cache::ImmediateDeleteOutcome::Deleted(_)
@@ -8100,7 +8157,103 @@ C:\isolated\miv-data"#
     }
 
     #[test]
-    fn epub_delete_wait_for_prior_reader_has_a_total_deadline() {
+    fn pinned_generation_acquisition_and_delete_start_share_one_boundary() {
+        let source = PathBuf::from("C:/books/pin-delete-race.epub");
+        let _pin = pin_epub_for_test(&source, 44, 100);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader_source = source.clone();
+        let reader = std::thread::spawn(move || {
+            let target = pinned_epub_target(&reader_source).unwrap();
+            ready_tx.send(target.stamp.clone()).unwrap();
+            release_rx.recv().unwrap();
+            drop(target);
+        });
+        assert_eq!(
+            ready_rx.recv().unwrap(),
+            DocumentStamp::Generation {
+                id: 44,
+                pdf_size: 100
+            }
+        );
+        assert!(acquire_epub_delete_coverage(&source).is_err());
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        let boundary = acquire_epub_delete_coverage(&source).unwrap();
+        assert!(pinned_epub_target(&source).is_none());
+        invalidate_epub_pin_under_delete(&source, 44);
+        drop(boundary);
+        assert!(pinned_epub_target(&source).is_none());
+    }
+
+    #[test]
+    fn epub_generation_resolver_entries_return_only_leased_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("leased-target.epub");
+        fs::write(&source, b"source").unwrap();
+        let mut db = EpubCache::open_at(root.path()).unwrap();
+        publish_test_generation(&mut db, root.path(), &source);
+        let cold = resolve_epub_at(&source, root.path(), epub_pinned()).unwrap();
+        assert!(cold.read_lease.is_some());
+        drop(cold);
+        let hot = pinned_epub_target(&source).unwrap();
+        assert!(hot.read_lease.is_some());
+        drop(hot);
+        let generic = resolve_read_target(&source).unwrap();
+        assert!(generic.read_lease.is_some());
+        drop(generic);
+        assert!(acquire_epub_delete_coverage(&source).is_ok());
+        with_epub_pin_guard(&source, || {
+            epub_pinned()
+                .lock()
+                .unwrap()
+                .remove(&epub_cache::src_key(&source));
+        });
+    }
+
+    #[test]
+    fn read_admitted_during_delete_resolves_after_removed_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("late-reader.epub");
+        fs::write(&source, b"source").unwrap();
+        let mut db = EpubCache::open_at(root.path()).unwrap();
+        let generation = publish_test_generation(&mut db, root.path(), &source);
+        let existing = resolve_epub_at(&source, root.path(), epub_pinned()).unwrap();
+        drop(existing);
+        let boundary = acquire_epub_delete_coverage(&source).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader_source = source.clone();
+        let reader_root = root.path().to_owned();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(resolve_epub_at(&reader_source, &reader_root, epub_pinned()))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        assert!(matches!(
+            db.delete_generation_now(generation.generation_id).unwrap(),
+            epub_cache::ImmediateDeleteOutcome::Deleted(_)
+        ));
+        invalidate_epub_pin_under_delete(&source, generation.generation_id);
+        drop(boundary);
+        assert!(matches!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            Err(PdfReadError::NotConverted)
+        ));
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn epub_delete_refuses_prior_reader_without_waiting() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("book.epub");
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -8113,22 +8266,13 @@ C:\isolated\miv-data"#
             });
         });
         entered_rx.recv().unwrap();
-        let error = acquire_epub_delete_coverage(
-            &source,
-            std::time::Instant::now() + std::time::Duration::from_millis(30),
-        )
-        .err()
-        .expect("busy prior reader must time out");
-        assert!(error.contains("先行する読み取り"));
+        let error = acquire_epub_delete_coverage(&source)
+            .err()
+            .expect("busy prior reader must be refused");
+        assert!(error.contains("使用中"));
         release_tx.send(()).unwrap();
         holder.join().unwrap();
-        assert!(
-            acquire_epub_delete_coverage(
-                &source,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-            )
-            .is_ok()
-        );
+        assert!(acquire_epub_delete_coverage(&source).is_ok());
     }
 
     #[test]

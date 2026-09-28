@@ -12935,6 +12935,11 @@ pub struct App {
     pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
+    /// App-wide owners for every mounted or parked EPUB open/display. The
+    /// cache manager consults the same read-lease coordinator as PDF workers.
+    #[cfg(windows)]
+    pub(crate) epub_ui_read_leases:
+        std::collections::HashMap<String, crate::pdf_loader::EpubReadLease>,
     pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
@@ -17045,6 +17050,8 @@ impl App {
         let mut app = Self {
             address: String::new(),
             current_folder: None,
+            #[cfg(windows)]
+            epub_ui_read_leases: std::collections::HashMap::new(),
             normal_folder_omitted_entries: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
@@ -22961,6 +22968,8 @@ impl App {
         };
         self.top_level_grid_view
             .set_open_path_classification(Some(candidate));
+        #[cfg(windows)]
+        self.sync_epub_ui_read_leases();
         true
     }
 
@@ -31896,10 +31905,14 @@ impl App {
 
         let is_epub = pdf_stamp_policy_for_path(pdf_path)
             == crate::thumb_loader::PdfStampPolicy::ResolveInWorker;
-        let (lookup_mtime, lookup_size, mtime, file_size) = if is_epub {
+        let epub_read = if is_epub {
             // The pinned table is memory-only. An unpinned book needs DB and source I/O,
             // so it waits for the normal background enumeration instead.
-            let read = crate::pdf_loader::pinned_epub_target(pdf_path)?;
+            Some(crate::pdf_loader::pinned_epub_target(pdf_path)?)
+        } else {
+            None
+        };
+        let (lookup_mtime, lookup_size, mtime, file_size) = if let Some(read) = epub_read.as_ref() {
             let (id, size) = read.stamp.generation_catalog_pair()?;
             let source = read.display_source_state?;
             const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
@@ -84923,6 +84936,8 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        self.sync_epub_ui_read_leases();
         crate::page_edit_write_epoch::PAGE_EDIT_WRITES.register_repaint_context(ctx);
         crate::rating_db::RATING_WRITES.register_repaint_context(ctx);
         crate::tags_db::TAG_WRITES.register_repaint_context(ctx);
@@ -84936,6 +84951,8 @@ impl eframe::App for App {
         // update_frame returns through a fullscreen or native-video presentation path.
         self.poll_collection_ui(ctx);
         self.poll_mounted_document_open_owners(ctx);
+        #[cfg(windows)]
+        self.sync_epub_ui_read_leases();
         // A settings-family mutation may already hold the exclusive DB permit. Defer only a
         // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
         // remains under the established close policy.
@@ -84949,6 +84966,8 @@ impl eframe::App for App {
             self.similar_panel.preview.poll_background(ctx, &passwords);
         }
         self.update_frame(ctx, frame);
+        #[cfg(windows)]
+        self.sync_epub_ui_read_leases();
         // Dedicated viewer viewports draw their mounted owner's dialog in their callback.
         // Root and embedded presentations draw here; parked contexts are not serviced.
         if self.fullscreen_idx.is_none()

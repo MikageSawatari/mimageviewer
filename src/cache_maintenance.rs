@@ -205,11 +205,7 @@ pub struct EpubMaintPending {
     pub rx: mpsc::Receiver<EpubMaintResult>,
 }
 
-pub fn spawn_epub(
-    task: EpubMaintTask,
-    data_dir: PathBuf,
-    displayed_sources: Vec<PathBuf>,
-) -> EpubMaintPending {
+pub fn spawn_epub(task: EpubMaintTask, data_dir: PathBuf) -> EpubMaintPending {
     let (tx, rx) = mpsc::channel();
     let fallback = tx.clone();
     let pending_task = task.clone();
@@ -223,7 +219,6 @@ pub fn spawn_epub(
                 Ok(run_epub_task(
                     &mut cache,
                     &task,
-                    &displayed_sources,
                     crate::pdf_loader::release_epub_document_for_delete,
                     |cache, id| cache.delete_generation_now(id),
                 ))
@@ -260,7 +255,6 @@ pub fn spawn_epub(
 fn run_epub_task(
     cache: &mut crate::epub_cache::EpubCache,
     task: &EpubMaintTask,
-    displayed_sources: &[PathBuf],
     release_document: impl Fn(
         &std::path::Path,
         std::time::Instant,
@@ -289,10 +283,6 @@ fn run_epub_task(
             return result;
         }
     };
-    let displayed = displayed_sources
-        .iter()
-        .map(|path| crate::epub_cache::src_key(path))
-        .collect::<std::collections::HashSet<_>>();
     let selected_ids = match task {
         EpubMaintTask::DeleteSelected { generation_ids } => generation_ids
             .iter()
@@ -321,22 +311,14 @@ fn run_epub_task(
         if !selected {
             continue;
         }
-        if displayed.contains(&row.src_path_key) {
-            result.failures.push((
-                row.src_path.clone(),
-                "表示中のため削除できませんでした".into(),
-            ));
-            continue;
-        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let _read_boundary =
-            match crate::pdf_loader::acquire_epub_delete_coverage(&row.src_path, deadline) {
-                Ok(lease) => lease,
-                Err(reason) => {
-                    result.failures.push((row.src_path.clone(), reason));
-                    continue;
-                }
-            };
+        let _read_boundary = match crate::pdf_loader::acquire_epub_delete_coverage(&row.src_path) {
+            Ok(lease) => lease,
+            Err(reason) => {
+                result.failures.push((row.src_path.clone(), reason));
+                continue;
+            }
+        };
         let mut worker_boundary = match release_document(&row.pdf_file, deadline) {
             Ok(guard) => guard,
             Err(reason) => {
@@ -725,12 +707,12 @@ mod tests {
         let a = publish_test_epub(&mut cache, &temp.path().join("a.epub"));
         let b = publish_test_epub(&mut cache, &temp.path().join("b.epub"));
         let c = publish_test_epub(&mut cache, &temp.path().join("c.epub"));
+        let busy = crate::pdf_loader::try_acquire_epub_read_lease(&b.src_path).unwrap();
         let selected = run_epub_task(
             &mut cache,
             &EpubMaintTask::DeleteSelected {
                 generation_ids: vec![a.generation_id, b.generation_id],
             },
-            &[b.src_path.clone()],
             crate::pdf_loader::block_epub_document_for_test,
             |cache, id| cache.delete_generation_now(id),
         );
@@ -744,16 +726,15 @@ mod tests {
         let missing = run_epub_task(
             &mut cache,
             &EpubMaintTask::DeleteMissingSources,
-            &[],
             crate::pdf_loader::block_epub_document_for_test,
             |cache, id| cache.delete_generation_now(id),
         );
         assert_eq!(missing.deleted, 1);
         assert!(!c.pdf_file.exists());
+        drop(busy);
         let all = run_epub_task(
             &mut cache,
             &EpubMaintTask::DeleteAll,
-            &[],
             crate::pdf_loader::block_epub_document_for_test,
             |cache, id| cache.delete_generation_now(id),
         );
@@ -773,7 +754,6 @@ mod tests {
         let result = run_epub_task(
             &mut cache,
             &EpubMaintTask::DeleteAll,
-            &[],
             crate::pdf_loader::block_epub_document_for_test,
             |cache, id| cache.delete_generation_with_commit_failure_for_test(id),
         );

@@ -16,6 +16,7 @@ Remote でも同じ本・ページの論理パスと世代スタンプを使う�
 読み取り経路で生成し、未変換のタイルは EPUB の目印を出す。Remote から変換は開始しない。
 `pdf_loader::resolve_read_target` は論理パスを変換世代の PDF パスへ解決する。EPUB の初回解決は背景スレッドで行い、
 PDFium の open admission・worker 文書キャッシュ・列挙合流にはその実ファイルのパスを渡す。
+EPUB の世代を返す `ReadTarget` は本ごとの読取リースを持ち、列挙・描画・サムネイルや派生データの処理が終わるまで削除を拒否する。
 表示や perf のキーは論理パスのままにする。通常 PDF の解決はパスをそのまま返し、stat を追加しない。
 IPC の要求生成には `ResolvedReadPath` を必須にし、PDF pool へは要求 bytes と解決済みパスを `PdfPoolRequest` で対にして渡す。
 変換 PDF の物理 `.part` 検証だけは例外で、キャッシュの世代予約時に発行した `ReservedOutput` token を必須にする。
