@@ -2100,6 +2100,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `toolbar_facet_name_filter_index_stash` | Option\<usize\> | None | 保存時に `NameFilter` の位置を退避するダウングレード互換用フィールド。`usize::MAX` は利用者が明示的に非表示にした状態を表す。読込時に `toolbar_facet_filter_items` へ戻して消費し、フィールド自体が無い旧設定では従来の常設入力を維持するため末尾へ追加する |
 | `facet_name_filter_width` | FacetNameFilterWidth | Medium | ファイル名欄の幅。Small=90px / Medium=140px / Large=200px。未知値は Medium へ正規化 |
 | `toolbar_cols_details_visible` | bool | true | ツールバーの列セクションに `詳細` 切替を表示 |
+| `toolbar_cols_items` | Vec\<usize\> | 1〜20 | ツールバーの列セクションに表示する列数候補。旧既定の 1〜10 全部と完全一致する保存値は、初回読み込み時だけ 11〜20 を補完する。部分集合・並び替え済みの値は維持し、補完後に候補を外しても復活させない。表示方式は判定に影響しない |
 | `toolbar_section_order` | Vec\<ToolbarSectionId\> | [] (=既定順) | ツールバーセクションの並び順 (v2.0.0、ラベルのドラッグで変更)。未登録は既定順で末尾補完、未知の variant は描画前に除外 |
 | `toolbar_section_new_row` | Vec\<ToolbarSectionId\> | [] | 「行頭に表示」(= その手前で改行) するセクションの集合 (v2.0.0) |
 | `toolbar_{cols,aspect,sort,favorites,smart_folders,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
