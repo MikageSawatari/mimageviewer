@@ -786,8 +786,21 @@ enum SmartFolderTransitionRoot {
 
 #[derive(Clone)]
 struct SmartChildSource {
-    logical_source: PathBuf,
+    logical_source: crate::pdf_loader::LeasedEpubPath,
     load_path: PathBuf,
+}
+
+impl SmartChildSource {
+    fn try_new(
+        logical_source: PathBuf,
+        load_path: PathBuf,
+    ) -> Result<Self, super::OpenAdmissionRefusal> {
+        Ok(Self {
+            logical_source: crate::pdf_loader::LeasedEpubPath::try_new(logical_source)
+                .map_err(super::OpenAdmissionRefusal::from)?,
+            load_path,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2259,9 +2272,12 @@ impl App {
         if pre_scan.is_some() && kind != SmartChildKind::Folder {
             return Err(pre_scan);
         }
-        let source = SmartChildSource {
-            logical_source: path.clone(),
-            load_path: path,
+        let source = match SmartChildSource::try_new(path.clone(), path) {
+            Ok(source) => source,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return Err(pre_scan);
+            }
         };
         let mut effects = source_index
             .filter(|&index| {
@@ -2430,13 +2446,22 @@ impl App {
             return true;
         }
         if super::App::path_needs_open_classification(&path) {
-            return self.start_open_path_classification(
+            return match self.start_open_path_classification(
                 path,
                 super::ClassifiedOpenContinuation::SmartGrid {
                     index,
                     auto_fullscreen,
                 },
-            );
+            ) {
+                super::OpenAdmission::Accepted => true,
+                super::OpenAdmission::Refused(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    true
+                }
+                super::OpenAdmission::NotApplicable => {
+                    unreachable!("the path was checked before classification")
+                }
+            };
         }
         self.begin_smart_grid_container_navigation_classified(
             index,
@@ -2520,7 +2545,7 @@ impl App {
         else {
             return;
         };
-        let path = source.logical_source.clone();
+        let path = source.logical_source.to_path_buf();
         let auto_fullscreen = *auto_fullscreen;
         let owner =
             super::OpenRequestOwner::MainGridArchive(super::MainGridArchiveTransitionIntent {
@@ -2703,10 +2728,19 @@ impl App {
             self.smart_folder_transition = Some(transition);
             return false;
         };
-        let load_source = SmartChildSource {
-            logical_source: source_path.to_path_buf(),
-            load_path: pdf_path.to_path_buf(),
-        };
+        let load_source =
+            match SmartChildSource::try_new(source_path.to_path_buf(), pdf_path.to_path_buf()) {
+                Ok(source) => source,
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    transition.phase = SmartFolderTransitionPhase::ChildPreflight {
+                        root,
+                        child: SmartPhysicalPreflight::EpubConvert,
+                    };
+                    self.smart_folder_transition = Some(transition);
+                    return false;
+                }
+            };
         match self.begin_smart_child_preflight(&load_source, SmartChildKind::Pdf) {
             Ok(child) => {
                 if let SmartFolderTransitionTarget::Child { source, .. } = &mut transition.target {
@@ -2753,10 +2787,19 @@ impl App {
             self.smart_folder_transition = Some(transition);
             return false;
         };
-        let load_source = SmartChildSource {
-            logical_source: source_path.to_path_buf(),
-            load_path: load_path.to_path_buf(),
-        };
+        let load_source =
+            match SmartChildSource::try_new(source_path.to_path_buf(), load_path.to_path_buf()) {
+                Ok(source) => source,
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    transition.phase = SmartFolderTransitionPhase::ChildPreflight {
+                        root,
+                        child: SmartPhysicalPreflight::ArchiveConvert,
+                    };
+                    self.smart_folder_transition = Some(transition);
+                    return false;
+                }
+            };
         let child = match self.begin_smart_child_preflight(&load_source, SmartChildKind::Zip) {
             Ok(child) => child,
             Err(message) => {
@@ -2949,13 +2992,16 @@ impl App {
                 current,
                 current_kind,
                 ..
-            } => Some((
-                SmartChildSource {
-                    logical_source: current.clone(),
-                    load_path: current.clone(),
-                },
-                *current_kind,
-            )),
+            } => {
+                let source = match SmartChildSource::try_new(current.clone(), current.clone()) {
+                    Ok(source) => source,
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return false;
+                    }
+                };
+                Some((source, *current_kind))
+            }
             SmartFolderPosition::Container {
                 root_entry,
                 current,
@@ -2966,13 +3012,14 @@ impl App {
                     Some(SmartFolderEntryKind::Archive) => SmartChildKind::ConvertibleArchive,
                     _ => return false,
                 };
-                Some((
-                    SmartChildSource {
-                        logical_source: root_entry.clone(),
-                        load_path: current.clone(),
-                    },
-                    kind,
-                ))
+                let source = match SmartChildSource::try_new(root_entry.clone(), current.clone()) {
+                    Ok(source) => source,
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return false;
+                    }
+                };
+                Some((source, kind))
             }
         };
         if child.is_none()
@@ -3146,7 +3193,7 @@ impl App {
                         metadata_revision: prepared.metadata_revision,
                         adopted_request_id: Some(request_id),
                         phase: SmartFolderOpenPhase::Child {
-                            logical_path: source.logical_source.clone(),
+                            logical_path: source.logical_source.to_path_buf(),
                             parked_root: SmartFolderRootPayload::Offscreen(prepared),
                         },
                     });
@@ -3172,7 +3219,7 @@ impl App {
                     super::top_level_grid_view::TopLevelGridSurface::SmartFolder(target),
                 );
                 session.phase = SmartFolderOpenPhase::Child {
-                    logical_path: source.logical_source.clone(),
+                    logical_path: source.logical_source.to_path_buf(),
                     parked_root,
                 };
                 session.adopted_request_id = Some(request_id);
@@ -3183,10 +3230,10 @@ impl App {
         self.current_smart_folder_id = Some(definition_id);
         self.items_are_smart_folder_view = false;
         if let Some(top) = self.facet_filter_suppression_stack.last_mut() {
-            top.anchor = source.logical_source.clone();
+            top.anchor = source.logical_source.to_path_buf();
         }
         if let Some((anchor, _)) = self.rating_filter_suppressed_at.as_mut() {
-            *anchor = source.logical_source.clone();
+            *anchor = source.logical_source.to_path_buf();
         }
         true
     }
@@ -3297,8 +3344,10 @@ impl App {
             && self.rating_filter_suppressed_at.is_none()
             && self.rating_filter_active()
         {
-            self.rating_filter_suppressed_at =
-                Some((source.logical_source.clone(), self.settings.rating_filter));
+            self.rating_filter_suppressed_at = Some((
+                source.logical_source.to_path_buf(),
+                self.settings.rating_filter,
+            ));
             self.show_feedback_toast("★フィルタ一時解除中 (親へ戻ると復元)".into());
         }
         if effects.suppress_facet_filter {
@@ -3392,6 +3441,7 @@ impl App {
                     super::PdfOpenPhase::CommittedVerification {
                         placeholder_count: page_count,
                     },
+                    source.logical_source.clone(),
                 ));
                 true
             }
@@ -3444,6 +3494,7 @@ impl App {
                     super::PdfOpenPhase::CommittedVerification {
                         placeholder_count: page_count,
                     },
+                    source.logical_source.clone(),
                 ));
                 true
             }
@@ -7808,6 +7859,7 @@ impl App {
             ..
         } = layout;
         let synthetic = smart_folder_synthetic_path(definition_id);
+        self.display_epub_source = None;
         self.current_folder = Some(synthetic.clone());
         self.current_folder_last_mtime = None;
         self.current_folder_signature = None;
@@ -9310,10 +9362,7 @@ mod tests {
             SmartGridArchiveOwner,
         };
         let path = PathBuf::from("C:/books/smart-book.epub");
-        let source = SmartChildSource {
-            logical_source: path.clone(),
-            load_path: path.clone(),
-        };
+        let source = SmartChildSource::try_new(path.clone(), path.clone()).unwrap();
         let lease = app.smart_folder_source_lease().unwrap();
         let request_id = app.smart_folder_transition_sequence.wrapping_add(1);
         app.smart_folder_transition_sequence = request_id;
@@ -9372,6 +9421,32 @@ mod tests {
                     }
                 )
             })
+    }
+
+    #[test]
+    fn smart_epub_child_owns_read_lease_through_preflight_and_ready() {
+        let mut app = crate::app::setup_app_for_test();
+        let (source, _) = stage_smart_epub_conversion(&mut app);
+        // The transition must protect the book independently of the conversion dialog.
+        app.epub_convert = None;
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
+        app.smart_folder_transition.as_mut().unwrap().phase =
+            SmartFolderTransitionPhase::ChildReady {
+                root: SmartFolderTransitionRoot::Resident,
+                child: SmartPhysicalReady::PdfPages {
+                    pages: vec![crate::pdf_loader::PdfPageEntry {
+                        page_num: 0,
+                        mtime: 1,
+                        file_size: 1,
+                    }],
+                    direction: None,
+                    password: None,
+                    save_password: false,
+                },
+            };
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
+        app.smart_folder_transition = None;
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_ok());
     }
 
     #[test]

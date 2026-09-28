@@ -172,6 +172,14 @@ impl App {
         };
         let remap = |idx: usize| swap.old_to_new.get(&idx).copied();
 
+        match self.try_own_fullscreen_epub_at(swap.new_fullscreen_idx) {
+            super::OpenAdmission::Accepted => {}
+            super::OpenAdmission::NotApplicable => return,
+            super::OpenAdmission::Refused(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        }
         if let Some(entry) = swap.preserved_fs_entry.take() {
             self.fs_cache.insert(swap.new_fullscreen_idx, entry);
         }
@@ -1096,6 +1104,17 @@ impl App {
                 snap.page_edit_source == crate::snapshot::SnapshotPageEditSource::PreparedExact,
             )
         };
+        let display_epub_source =
+            match crate::pdf_loader::LeasedEpubPath::try_new(snap_origin.clone()) {
+                Ok(source) => source,
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason.into());
+                    return false;
+                }
+            };
+        let display_epub_source = display_epub_source
+            .has_epub_lease()
+            .then_some(display_epub_source);
         // 既に snapshot root に居れば何もしない (= 通常 BS の対象)
         let at_origin = self
             .current_folder
@@ -1127,6 +1146,7 @@ impl App {
         self.thumbnails = list_thumbs;
         self.image_metas = list_image_metas;
         self.visible_indices = (0..n).collect();
+        self.display_epub_source = display_epub_source;
         self.current_folder = Some(snap_origin.clone());
         self.address = snap_origin.display().to_string();
         self.scroll_offset_y = 0.0;

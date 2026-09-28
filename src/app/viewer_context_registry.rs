@@ -722,6 +722,8 @@ pub(in crate::app) enum RetireContextError {
 pub(in crate::app) struct ViewerContextBundle {
     address: String,
     current_folder: Option<PathBuf>,
+    display_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
+    fullscreen_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
     favorite_view_context: FavoriteViewContextState,
     navigation_scope: ViewerNavigationScope,
     archive_source_override: Option<PathBuf>,
@@ -1667,6 +1669,8 @@ impl ViewerContextBundle {
         Self {
             address: String::new(),
             current_folder: None,
+            display_epub_source: None,
+            fullscreen_epub_source: None,
             favorite_view_context: FavoriteViewContextState::default(),
             navigation_scope: ViewerNavigationScope::Main,
             archive_source_override: None,
@@ -1991,6 +1995,14 @@ impl App {
         window_id: u64,
         idx: usize,
     ) {
+        match self.try_own_fullscreen_epub_at(idx) {
+            super::OpenAdmission::Accepted => {}
+            super::OpenAdmission::NotApplicable => return,
+            super::OpenAdmission::Refused(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        }
         self.selected = Some(idx);
         self.fullscreen_idx = Some(idx);
         // 新しく開くページは分割方向の最初の半分から。ここで残すと前のページの
@@ -2023,6 +2035,8 @@ impl App {
         let ViewerContextBundle {
             address,
             current_folder,
+            display_epub_source,
+            fullscreen_epub_source,
             favorite_view_context,
             navigation_scope,
             archive_source_override,
@@ -2289,6 +2303,8 @@ impl App {
 
         swap_field!(address);
         swap_field!(current_folder);
+        swap_field!(display_epub_source);
+        swap_field!(fullscreen_epub_source);
         swap_field!(favorite_view_context);
         swap_field!(navigation_scope);
         swap_field!(archive_source_override);
@@ -2614,6 +2630,8 @@ impl App {
         let ViewerContextBundle {
             address,
             current_folder,
+            display_epub_source,
+            fullscreen_epub_source,
             favorite_view_context,
             navigation_scope,
             archive_source_override,
@@ -2888,6 +2906,8 @@ impl App {
         duplicate_for_parked!(
             address,
             current_folder,
+            display_epub_source,
+            fullscreen_epub_source,
             favorite_view_context,
             archive_source_override,
             zip_nav,
@@ -3231,6 +3251,8 @@ impl App {
         detached.navigation_scope = ViewerNavigationScope::DetachedPhysical;
         detached.set_items_generation(items_generation);
         detached.address = physical_context.display().to_string();
+        detached.display_epub_source = self.display_epub_source.clone();
+        detached.fullscreen_epub_source = self.fullscreen_epub_source.clone();
         detached.current_folder = Some(physical_context.to_path_buf());
         detached.visible_indices = detached
             .items
@@ -3443,6 +3465,51 @@ impl App {
 
     pub(in crate::app) fn viewer_context_ids(&self) -> Vec<ViewerContextId> {
         self.viewer_contexts.table.ids()
+    }
+
+    pub(crate) fn invalidate_removed_epub_generations(
+        &mut self,
+        removed: &[crate::epub_cache::GenerationRow],
+    ) {
+        if removed.is_empty() {
+            return;
+        }
+        let keys = removed
+            .iter()
+            .map(|row| crate::epub_cache::src_key(&row.src_path))
+            .collect::<std::collections::HashSet<_>>();
+        let refers_to_removed = |item: &GridItem| {
+            let source = match item {
+                GridItem::PdfFile(path) | GridItem::PdfPage { pdf_path: path, .. } => path,
+                _ => return false,
+            };
+            keys.contains(&crate::epub_cache::src_key(source))
+        };
+        if self.items.iter().any(&refers_to_removed) {
+            self.bump_items_generation();
+        }
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            if bundle.items.iter().any(&refers_to_removed) {
+                bundle.set_items_generation(bundle.items_generation.wrapping_add(1));
+            }
+        }
+        let retained_prefixes = keys
+            .iter()
+            .map(|key| format!("{key}::page_"))
+            .collect::<Vec<_>>();
+        let retained_belongs_to_removed = |item_key: &str| {
+            retained_prefixes
+                .iter()
+                .any(|prefix| item_key.starts_with(prefix))
+        };
+        self.retained_final_ai_cache
+            .retain(|key, _| !retained_belongs_to_removed(&key.item_key));
+        self.retained_pdf_page_cache
+            .retain(|key, _| !retained_belongs_to_removed(&key.item_key));
+        self.retained_final_ai_epoch = self.retained_final_ai_epoch.wrapping_add(1);
     }
 
     /// Modal admission can be checked while a detached context is being built. Unlike `ids`,
@@ -4365,6 +4432,164 @@ mod tests {
             assert!(grid_source.contains(field));
         }
         assert!(bundle.contains("similar_panel:"));
+    }
+
+    #[test]
+    fn epub_pending_and_visible_owner_inventory_is_explicit() {
+        let owners = [
+            (
+                include_str!("../app.rs"),
+                "path_owner: Option<crate::pdf_loader::LeasedEpubPath>",
+            ),
+            (
+                include_str!("../app.rs"),
+                "target_owner: Option<crate::pdf_loader::LeasedEpubPath>",
+            ),
+            (
+                include_str!("../app.rs"),
+                "requested: crate::pdf_loader::LeasedEpubPath",
+            ),
+            (
+                include_str!("../app.rs"),
+                "path: crate::pdf_loader::LeasedEpubPath",
+            ),
+            (
+                include_str!("../app.rs"),
+                "display_epub_source: Option<crate::pdf_loader::LeasedEpubPath>",
+            ),
+            (
+                include_str!("../app.rs"),
+                "fullscreen_epub_source: Option<crate::pdf_loader::LeasedEpubPath>",
+            ),
+            (
+                include_str!("smart_folder.rs"),
+                "logical_source: crate::pdf_loader::LeasedEpubPath",
+            ),
+            (
+                include_str!("collection_navigation.rs"),
+                "owner: crate::pdf_loader::LeasedEpubPath",
+            ),
+            (
+                include_str!("collection_navigation.rs"),
+                "book_owner: Option<crate::pdf_loader::LeasedEpubPath>",
+            ),
+            (
+                include_str!("../bookmark_browser.rs"),
+                "bookmark_source: crate::pdf_loader::LeasedEpubPath",
+            ),
+            (
+                include_str!("../ui_dialogs/epub_convert.rs"),
+                "src_owner: crate::pdf_loader::LeasedEpubPath",
+            ),
+        ];
+        for (source, owner) in owners {
+            assert!(source.contains(owner), "missing EPUB read owner: {owner}");
+        }
+        let resolver = include_str!("../pdf_loader.rs");
+        assert!(
+            resolver.contains("enum ReadTargetKind {")
+                && resolver.contains("_lease: Arc<EpubReadLease>")
+        );
+        // The cache manager must rely on RAII owners rather than a post-hoc UI sweep.
+        let sync_name = concat!("sync_epub", "_ui_read_leases");
+        assert!(!include_str!("../app.rs").contains(sync_name));
+        assert!(!include_str!("../ui_dialogs/archive_cache_manager.rs").contains(sync_name));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epub_manager_protects_parked_book_and_invalidates_only_referencing_context() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = PathBuf::from("C:/books/one.epub");
+        let other = PathBuf::from("C:/books/two.epub");
+        app.current_folder = Some(source.clone());
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: source.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        app.display_epub_source =
+            Some(crate::pdf_loader::LeasedEpubPath::try_new(source.clone()).unwrap());
+        let parked = app.stash_mounted_and_start_fresh("epub_delete_context_test");
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
+        app.items = vec![GridItem::PdfFile(other)];
+        let parked_before = app
+            .with_viewer_context_ref(parked, |context| context.items_generation())
+            .unwrap();
+        let mounted_before = app.items_generation;
+        let removed = crate::epub_cache::GenerationRow {
+            generation_id: 7,
+            src_path_key: crate::epub_cache::src_key(&source),
+            src_path: source.clone(),
+            src_state: crate::epub_cache::SourceState {
+                size: 1,
+                mtime_ticks: 1,
+            },
+            src_sha256: String::new(),
+            src_head_hash: String::new(),
+            pdf_file: PathBuf::from("C:/data/book.g7.pdf"),
+            pdf_size: 1,
+            page_count: 1,
+            direction: String::new(),
+            profile: String::new(),
+            created_at: 0,
+            output_version: 1,
+        };
+        app.invalidate_removed_epub_generations(&[removed]);
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
+        assert_eq!(app.items_generation, mounted_before);
+        assert_eq!(
+            app.with_viewer_context_ref(parked, |context| context.items_generation())
+                .unwrap(),
+            parked_before.wrapping_add(1)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epub_manager_protects_a_pending_open_before_visible_adoption() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = PathBuf::from("C:/books/pending.epub");
+        app.pdf_password_request = Some(super::super::PdfPasswordRequest::legacy(source.clone()));
+        let parked = app.stash_mounted_and_start_fresh("epub_pending_delete_test");
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
+        assert!(
+            app.with_viewer_context_ref(parked, |context| context
+                .pending_context_async_owners()
+                .contains(&ContextAsyncOwner::PdfPassword))
+                .unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epub_classification_candidate_owns_read_lease_before_delete_can_start() {
+        let mut app = crate::app::setup_app_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("candidate.epub");
+        std::fs::write(&source, b"candidate").unwrap();
+        assert!(matches!(
+            app.start_open_path_classification(
+                source.clone(),
+                super::super::ClassifiedOpenContinuation::Direct {
+                    auto_fullscreen: false,
+                    owner: super::super::OpenRequestOwner::Navigation,
+                },
+            ),
+            super::super::OpenAdmission::Accepted
+        ));
+        assert!(app.top_level_grid_view.open_path_classification().is_some());
+        let deletion_source = source.clone();
+        let result = std::thread::spawn(move || {
+            crate::pdf_loader::acquire_epub_delete_coverage(&deletion_source)
+                .err()
+                .expect("classification owns the source")
+        })
+        .join()
+        .unwrap();
+        assert!(result.contains("使用中"));
+        app.top_level_grid_view.set_open_path_classification(None);
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_ok());
     }
 
     #[cfg(windows)]

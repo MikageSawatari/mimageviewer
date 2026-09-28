@@ -3956,7 +3956,7 @@ impl ContainerEngine {
             match registry.active_resolved_path(&address.path) {
                 Ok(Some(resolved)) => {
                     self.ensure_epub_allowed(&resolved)?;
-                    return Ok(resolved);
+                    return Ok(self.retain_epub_request_read(resolved));
                 }
                 Ok(None) => {}
                 Err(error) => return Err(active_archive_media_error(error)),
@@ -3964,7 +3964,16 @@ impl ContainerEngine {
         }
         let resolved = resolve_existing(&address.path).map_err(resolve_media_error)?;
         self.ensure_epub_allowed(&resolved)?;
-        Ok(resolved)
+        Ok(self.retain_epub_request_read(resolved))
+    }
+
+    fn retain_epub_request_read(&self, resolved: ResolvedPath) -> ResolvedPath {
+        if is_epub_path(&resolved.logical) {
+            let lease = crate::pdf_loader::acquire_epub_read_lease(&resolved.logical);
+            resolved.with_epub_read_lease(lease)
+        } else {
+            resolved
+        }
     }
 
     /// Every direct Remote address (container, page, thumbnail and related reads)
@@ -8084,6 +8093,63 @@ mod tests {
         assert_eq!(payload.page_groups.len(), 2, "pinned wide page must split");
         assert_eq!(resolves.take(), 1);
         assert_eq!(catalog.load_one("page_0000").unwrap().unwrap().mtime, 904);
+    }
+
+    #[test]
+    fn remote_epub_resolution_keeps_read_lease_until_response_finishes() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("remote-lease.epub");
+        std::fs::write(&epub, b"source").unwrap();
+        let pdf = minimal_remote_pdf(144, 72);
+        let generated = epub.with_extension("generated.pdf");
+        std::fs::write(&generated, &pdf).unwrap();
+        let _backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&generated);
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 927, pdf.len() as u64);
+        open_parent_catalog(&epub)
+            .unwrap()
+            .set_pdf_meta_safe("remote-lease.epub", 927, pdf.len() as i64, 1)
+            .unwrap();
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let target = epub.clone();
+        remote_dim_race_hooks().lock().unwrap().insert(
+            epub.clone(),
+            Box::new(move || {
+                checked_tx
+                    .send(crate::pdf_loader::acquire_epub_delete_coverage(&target).is_err())
+                    .unwrap();
+            }),
+        );
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        assert!(matches!(
+            engine.container(ContainerRequest {
+                spread_mode: Some(RemoteSpreadMode::SplitLtr),
+                ..remote_epub_request(&epub)
+            }),
+            ContainerResponse::Success(_)
+        ));
+        assert!(
+            checked_rx.recv().unwrap(),
+            "Remote must retain the generation lease"
+        );
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&epub).is_ok());
+    }
+
+    #[test]
+    fn remote_resolved_address_owns_book_after_page_count_target_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("remote-address-lease.epub");
+        std::fs::write(&epub, b"source").unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 928, 120);
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let resolved = engine
+            .resolve(&RemoteAddress::file(epub.to_string_lossy().into_owned()))
+            .unwrap();
+        let read = crate::pdf_loader::resolve_read_target(&resolved.logical).unwrap();
+        drop(read);
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&epub).is_err());
+        drop(resolved);
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&epub).is_ok());
     }
 
     #[test]

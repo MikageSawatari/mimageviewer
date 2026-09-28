@@ -446,6 +446,7 @@ pub fn convert_at<S: WorkerSpawner>(
             epub_cache::CacheError::InvalidState("gate for a different data directory"),
         ));
     }
+    let _book_read = crate::pdf_loader::acquire_epub_book_lease(source);
     let mut db = EpubCache::open_at(context.data_dir)?;
     if timeout_secs == 0 {
         return Err(EpubConvertError::Invalid);
@@ -606,6 +607,7 @@ pub fn save_sibling_at<S: WorkerSpawner>(
     if cancel.is_cancelled() {
         return Err(EpubConvertError::Cancelled);
     }
+    let _book_read = crate::pdf_loader::acquire_epub_book_lease(source);
     let mut cache = EpubCache::open_at(context.data_dir)?;
     let temp = TempFolder::create(&context.data_dir.join("epub_sibling_work"))?;
     let output = SiblingOutput {

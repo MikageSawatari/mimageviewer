@@ -1645,6 +1645,7 @@ fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
         super::PdfOpenPhase::ColdCandidate {
             retained_source: None,
         },
+        crate::pdf_loader::LeasedEpubPath::try_new(source.clone()).unwrap(),
     ));
     app.poll_pdf_enumerate();
     let state = app.epub_convert.as_ref().unwrap();
@@ -11081,6 +11082,7 @@ mod startup_open_path_resolve_tests {
         app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
             crate::bookmark_browser::PendingBookOpen {
                 request_id,
+                bookmark_source: crate::pdf_loader::LeasedEpubPath::try_new(path.clone()).unwrap(),
                 bookmark: crate::book_bookmarks::BookBookmark {
                     id: 1,
                     container_key: crate::adjustment_db::normalize_path(&path),
@@ -12300,7 +12302,7 @@ mod startup_open_path_resolve_tests {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
-            requested,
+            requested: crate::pdf_loader::LeasedEpubPath::try_new(requested).unwrap(),
             owner: StartupOpenPathOwner::Bookmark(
                 crate::bookmark_browser::BookmarkOpenRequestOwner {
                     request_id,
@@ -12316,6 +12318,119 @@ mod startup_open_path_resolve_tests {
             held_resolve_for_activation_admission: None,
         });
         (tx, cancel)
+    }
+
+    #[test]
+    fn startup_and_activation_epub_resolve_pending_own_read_lease() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("pending-startup.epub");
+        std::fs::write(&source, b"pending").unwrap();
+        let ctx = egui::Context::default();
+        for entry in [
+            StartupOpenPathSource::InitialStartup,
+            StartupOpenPathSource::Activation,
+        ] {
+            app.start_startup_open_path_resolve(source.clone(), entry, &ctx);
+            assert!(app.startup_open_path_resolve_pending.is_some());
+            assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
+            let pending = app.startup_open_path_resolve_pending.take().unwrap();
+            pending.cancel.store(true, Ordering::Release);
+            drop(pending);
+            assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_ok());
+        }
+    }
+
+    #[test]
+    fn bookmark_epub_resolve_pending_owns_read_lease_until_cancel() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("pending-bookmark.epub");
+        std::fs::write(&source, b"pending").unwrap();
+        let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(source.clone());
+        let _ = install_bookmark_resolver(
+            &mut app,
+            crate::bookmark_browser::BookmarkOpenRequestId(1),
+            target,
+            source.clone(),
+        );
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
+        app.startup_open_path_resolve_pending = None;
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_ok());
+    }
+
+    #[test]
+    fn invalid_fullscreen_target_keeps_displayed_epub_lease() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("visible-fullscreen.epub");
+        std::fs::write(&source, b"book").unwrap();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: source.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        assert_eq!(app.try_own_fullscreen_epub_at(0), OpenAdmission::Accepted);
+        assert_eq!(
+            app.try_own_fullscreen_epub_at(1),
+            OpenAdmission::NotApplicable
+        );
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
+        app.fullscreen_epub_source = None;
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_ok());
+    }
+
+    #[test]
+    fn deleting_epub_fullscreen_open_keeps_current_position_and_reports_refusal() {
+        let mut app = setup_app();
+        let current = app.tmp.path().join("current.jpg");
+        let epub = app.tmp.path().join("next.epub");
+        std::fs::write(&current, b"image").unwrap();
+        std::fs::write(&epub, b"book").unwrap();
+        app.items = vec![
+            GridItem::Image(current),
+            GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 0,
+                content_type: None,
+            },
+        ];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        let deleting = crate::pdf_loader::acquire_epub_delete_coverage(&epub).unwrap();
+
+        app.open_fullscreen(1, crate::app::HistoryTrigger::UserChosen);
+
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fullscreen_epub_source.is_none());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains("EPUB の削除処理"))
+        );
+        drop(deleting);
+    }
+
+    #[test]
+    fn removing_fullscreen_epub_releases_old_book_and_owns_neighbor() {
+        let mut app = setup_app();
+        let first = app.tmp.path().join("first-visible.epub");
+        let next = app.tmp.path().join("next-visible.epub");
+        for path in [&first, &next] {
+            std::fs::write(path, b"book").unwrap();
+        }
+        app.items = [&first, &next]
+            .into_iter()
+            .map(|path| GridItem::PdfPage {
+                pdf_path: path.clone(),
+                page_num: 0,
+                content_type: None,
+            })
+            .collect();
+        app.fullscreen_idx = Some(0);
+        assert_eq!(app.try_own_fullscreen_epub_at(0), OpenAdmission::Accepted);
+        app.remove_items_batch(&[0]);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&first).is_ok());
+        assert!(crate::pdf_loader::acquire_epub_delete_coverage(&next).is_err());
     }
 
     fn arm_archive_bookmark(
@@ -12537,7 +12652,10 @@ mod startup_open_path_resolve_tests {
         let (_resolve_tx, resolve_rx) = mpsc::channel::<StartupOpenPathResolveResult>();
         let cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
-            requested: app.tmp.path().join("unresolved-startup-target"),
+            requested: crate::pdf_loader::LeasedEpubPath::try_new(
+                app.tmp.path().join("unresolved-startup-target"),
+            )
+            .unwrap(),
             owner: StartupOpenPathOwner::Activation,
             cancel: Arc::clone(&cancel),
             rx: resolve_rx,
@@ -12955,7 +13073,7 @@ mod startup_open_path_resolve_tests {
         assert!(
             app.pdf_enumerate_pending
                 .as_ref()
-                .is_some_and(|(path, _, _, _, _, _)| crate::folder_tree::path_eq(path, &source))
+                .is_some_and(|(path, _, _, _, _, _, _)| crate::folder_tree::path_eq(path, &source))
         );
         assert_bookmark_is_awaiting_page(&app);
         // Mutation: replace Some(Box::new(pending)) with None in Activation adoption. The
@@ -13408,7 +13526,10 @@ mod startup_open_path_resolve_tests {
         let mut app = setup_app();
         let (_tx, rx) = mpsc::channel();
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
-            requested: PathBuf::from(r"\\server\offline\book.zip"),
+            requested: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
+                r"\\server\offline\book.zip",
+            ))
+            .unwrap(),
             owner: StartupOpenPathOwner::Activation,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
@@ -13438,7 +13559,10 @@ mod startup_open_path_resolve_tests {
         let (_tx, rx) = mpsc::channel();
         let old_cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
-            requested: PathBuf::from(r"\\server\slow\old.zip"),
+            requested: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
+                r"\\server\slow\old.zip",
+            ))
+            .unwrap(),
             owner: StartupOpenPathOwner::Activation,
             cancel: Arc::clone(&old_cancel),
             rx,
@@ -24922,6 +25046,7 @@ fn arm_detached_bookmark_book_open(
     app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
         crate::bookmark_browser::PendingBookOpen {
             request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
+            bookmark_source: crate::pdf_loader::LeasedEpubPath::try_new(container.clone()).unwrap(),
             bookmark: crate::book_bookmarks::BookBookmark {
                 id: 9,
                 container_key: crate::adjustment_db::normalize_path(&container),
@@ -25019,6 +25144,68 @@ fn ignored_epub_bookmark_row_keeps_existing_detached_window_and_bookmark_positio
 
 #[cfg(windows)]
 #[test]
+fn deleting_epub_bookmark_ui_open_reports_refusal_without_changing_main_or_detached_state() {
+    for detached in [false, true] {
+        let mut app = phase_c_support::setup_app();
+        let epub = app.tmp.path().join(format!("bookmark-{detached}.epub"));
+        std::fs::write(&epub, b"book").unwrap();
+        let bookmark = crate::book_bookmarks::BookBookmark {
+            id: 92,
+            container_key: crate::adjustment_db::normalize_path(&epub),
+            container_path: epub.clone(),
+            container_kind: crate::book_bookmarks::BookContainerKind::Pdf,
+            page_identity: crate::book_bookmarks::PageIdentity::PdfPage(1),
+            page_index_hint: 1,
+            created_at_ms: 1,
+            title: None,
+        };
+        let row = crate::bookmark_browser::BookmarkBrowserRow {
+            source: crate::bookmark_browser::BookmarkRowSource::Book(bookmark),
+            item: GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 1,
+                content_type: None,
+            },
+            relative_page_provenance: None,
+            image_meta: None,
+            marker_thumbnail: None,
+            created_at_ms: 1,
+            missing: false,
+        };
+        app.items = vec![row.item.clone()];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.bookmark_browser_rows = vec![row.clone()];
+        app.items_are_bookmark_view = true;
+        app.current_folder = Some(super::bookmark_view_synthetic_path());
+        app.address = "ブックマーク".into();
+        app.settings.detached_viewer_open_images_in_window = detached;
+        let incumbent = detached
+            .then(|| app.build_active_context_for_test(Some(9103), DetachedSource::Image, |_| {}));
+        let deleting = crate::pdf_loader::acquire_epub_delete_coverage(&epub).unwrap();
+
+        app.open_bookmark_browser_row(&egui::Context::default(), &row);
+
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains("EPUB の削除処理")),
+            "detached={detached}: a rejected UI open needs a reason"
+        );
+        assert_eq!(app.active_viewer_context_id(), incumbent);
+        assert!(app.detached_image_windows.is_empty());
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.address, "ブックマーク");
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        assert_eq!(app.bookmark_open_request_seq, 0);
+        drop(deleting);
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn ignored_epub_bookmark_after_resolve_does_not_park_existing_window() {
     let mut app = phase_c_support::setup_app();
     let epub = app.tmp.path().join("resolved-page.epub");
@@ -25040,7 +25227,7 @@ fn ignored_epub_bookmark_after_resolve_does_not_park_existing_window() {
             epub,
             crate::folder_tree::OpenablePathKind::File,
         ),
-        Some(false)
+        DetachedBuild::Built(false)
     );
     assert_eq!(app.active_viewer_context_id(), Some(existing_context));
     assert_eq!(app.active_detached_window_id(), existing_window);
@@ -25136,7 +25323,7 @@ fn ignored_epub_bookmark_loading_context_ends_without_page_wait() {
         .with_active_viewer_context(|mounted| {
             mounted.continue_active_detached_book_context_from_descriptor(
                 ViewerContextDescriptor::Pdf {
-                    path: epub,
+                    path: crate::pdf_loader::LeasedEpubPath::try_new(epub).unwrap(),
                     page_num: None,
                 },
             )
@@ -25195,6 +25382,125 @@ fn ignored_epub_grid_detached_open_keeps_existing_window() {
 
 #[cfg(windows)]
 #[test]
+fn deleting_epub_detached_open_keeps_incumbent_window_and_explains_refusal() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let epub = app.tmp.path().join("next-book.epub");
+    std::fs::write(&epub, b"book").unwrap();
+    app.settings.detached_viewer_open_images_in_window = true;
+    let incumbent = app.build_active_context_for_test(Some(9110), DetachedSource::Image, |_| {});
+    app.items = vec![GridItem::PdfFile(epub.clone())];
+    let deleting = crate::pdf_loader::acquire_epub_delete_coverage(&epub).unwrap();
+
+    assert!(app.open_grid_item_in_detached_book_context_with_auto_fullscreen(&ctx, 0, true));
+    assert_eq!(app.active_viewer_context_id(), Some(incumbent));
+    assert_eq!(app.active_detached_window_id(), Some(9110));
+    assert!(app.detached_image_windows.is_empty());
+    assert!(app.pdf_enumerate_pending.is_none());
+    assert!(app.top_level_grid_view.open_path_classification().is_none());
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("EPUB の削除処理"))
+    );
+
+    drop(deleting);
+    let descriptor = app.detached_grid_descriptor(0, true);
+    assert!(
+        matches!(&descriptor, DetachedBuild::Built(ViewerContextDescriptor::Pdf { path, .. }) if path.has_epub_lease())
+    );
+    assert!(crate::pdf_loader::acquire_epub_delete_coverage(&epub).is_err());
+    drop(descriptor);
+    assert!(crate::pdf_loader::acquire_epub_delete_coverage(&epub).is_ok());
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_epub_refusal_precedes_parking_for_file_page_and_virtual_views() {
+    use crate::app::top_level_grid_view::{CollectionGridIdentity, TopLevelGridSurface};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Surface {
+        Folder,
+        Rating,
+        Collection,
+    }
+
+    for (name, page, auto_fullscreen, surface) in [
+        ("file", false, true, Surface::Folder),
+        (
+            "file_without_auto_fullscreen",
+            false,
+            false,
+            Surface::Folder,
+        ),
+        ("page", true, true, Surface::Folder),
+        ("page_without_auto_fullscreen", true, false, Surface::Folder),
+        ("rating_page", true, true, Surface::Rating),
+        ("collection_child_page", true, true, Surface::Collection),
+    ] {
+        let mut app = phase_c_support::setup_app();
+        let epub = app.tmp.path().join(format!("{name}.epub"));
+        std::fs::write(&epub, b"book").unwrap();
+        app.settings.detached_viewer_open_images_in_window = true;
+        match surface {
+            Surface::Folder => app
+                .top_level_grid_view
+                .begin(TopLevelGridSurface::Folder, None),
+            Surface::Rating => app
+                .top_level_grid_view
+                .begin(TopLevelGridSurface::Rating { stars: 5 }, None),
+            Surface::Collection => app.top_level_grid_view.begin(
+                TopLevelGridSurface::Collection(CollectionGridIdentity {
+                    collection_id: crate::collection_store::CollectionId::new(),
+                }),
+                None,
+            ),
+        };
+        let incumbent =
+            app.build_active_context_for_test(Some(9120), DetachedSource::Image, |_| {});
+        app.items = vec![if page {
+            GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 0,
+                content_type: None,
+            }
+        } else {
+            GridItem::PdfFile(epub.clone())
+        }];
+        let deleting = crate::pdf_loader::acquire_epub_delete_coverage(&epub).unwrap();
+
+        assert!(
+            matches!(
+                app.detached_grid_item_open_plan(0, auto_fullscreen),
+                DetachedBuild::Refused(OpenAdmissionRefusal::EpubDeletionInProgress)
+            ),
+            "{name}: descriptor refusal"
+        );
+        assert!(
+            app.open_grid_item_in_detached_book_context_with_auto_fullscreen(
+                &egui::Context::default(),
+                0,
+                auto_fullscreen,
+            ),
+            "{name}: refusal consumes the open"
+        );
+        assert_eq!(app.active_viewer_context_id(), Some(incumbent), "{name}");
+        assert_eq!(app.active_detached_window_id(), Some(9120), "{name}");
+        assert!(app.detached_image_windows.is_empty(), "{name}");
+        assert!(app.pdf_enumerate_pending.is_none(), "{name}");
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains("EPUB の削除処理")),
+            "{name}"
+        );
+        drop(deleting);
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn ignored_epub_passive_window_reopen_preserves_active_and_parked_windows() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
@@ -25204,7 +25510,7 @@ fn ignored_epub_passive_window_reopen_preserves_active_and_parked_windows() {
         app.build_active_context_for_test(Some(9105), DetachedSource::Image, |_| {});
     let mut snapshot = contextless_test_window(&ctx, 9106);
     snapshot.reopen_descriptor = Some(ViewerContextDescriptor::Pdf {
-        path: epub,
+        path: crate::pdf_loader::LeasedEpubPath::try_new(epub).unwrap(),
         page_num: None,
     });
     app.detached_image_windows.push(snapshot);
@@ -25248,7 +25554,7 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
             pdf.clone(),
             crate::folder_tree::OpenablePathKind::File,
         ),
-        Some(true)
+        DetachedBuild::Built(true)
     );
 
     assert!(app.items_are_bookmark_view);
@@ -25266,7 +25572,7 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
             active
                 .pdf_enumerate_pending
                 .as_ref()
-                .is_some_and(|(path, _, _, _, _, _)| crate::path_key::eq_keep_drive(path, &pdf))
+                .is_some_and(|(path, _, _, _, _, _, _)| crate::path_key::eq_keep_drive(path, &pdf))
         );
         assert!(matches!(
             active.bookmark_view_state,
@@ -25306,7 +25612,7 @@ fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
             zip.clone(),
             crate::folder_tree::OpenablePathKind::File,
         ),
-        Some(true)
+        DetachedBuild::Built(true)
     );
     assert!(app.items_are_bookmark_view);
     app.with_active_viewer_context(|active| {
@@ -25462,7 +25768,7 @@ fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() 
             folder.clone(),
             crate::folder_tree::OpenablePathKind::Directory,
         ),
-        Some(true)
+        DetachedBuild::Built(true)
     );
     assert!(app.items_are_bookmark_view);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -25833,6 +26139,7 @@ fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
     app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
         crate::bookmark_browser::PendingBookOpen {
             request_id: crate::bookmark_browser::BookmarkOpenRequestId(1),
+            bookmark_source: crate::pdf_loader::LeasedEpubPath::try_new(book.clone()).unwrap(),
             bookmark: crate::book_bookmarks::BookBookmark {
                 id: 73,
                 container_key: crate::adjustment_db::normalize_path(&book),
@@ -28574,25 +28881,25 @@ mod favorite_adjustment_defaults_tests {
         let vid_idx = app.items.len() - 1;
 
         assert!(matches!(
-            app.detached_viewer_context_descriptor_for_idx(img_idx),
-            Some(crate::app::ViewerContextDescriptor::Image { path })
+            app.detached_grid_descriptor(img_idx, false),
+            DetachedBuild::Built(crate::app::ViewerContextDescriptor::Image { path })
                 if path == PathBuf::from(r"D:\pics\a.jpg")
         ));
 
         assert!(matches!(
             app.parked_still_reopen_descriptor_for_idx(img_idx),
-            Some(crate::app::ViewerContextDescriptor::Image { path })
+            DetachedBuild::Built(crate::app::ViewerContextDescriptor::Image { path })
                 if path == PathBuf::from(r"D:\pics\a.jpg")
         ));
         // ZipImage は従来の Zip descriptor、動画はフォールバックなし。
         assert!(matches!(
             app.parked_still_reopen_descriptor_for_idx(zip_idx),
-            Some(crate::app::ViewerContextDescriptor::Zip { .. })
+            DetachedBuild::Built(crate::app::ViewerContextDescriptor::Zip { .. })
         ));
-        assert!(
-            app.parked_still_reopen_descriptor_for_idx(vid_idx)
-                .is_none()
-        );
+        assert!(matches!(
+            app.parked_still_reopen_descriptor_for_idx(vid_idx),
+            DetachedBuild::NotApplicable
+        ));
     }
 
     /// トーストの面 routing (findings-19): 発火面付きトーストは該当面にだけ表示する。
@@ -58241,6 +58548,10 @@ mod still_window_mode_key_tests {
                         Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
                             crate::bookmark_browser::PendingBookOpen {
                                 request_id,
+                                bookmark_source: crate::pdf_loader::LeasedEpubPath::try_new(
+                                    pending_container.clone(),
+                                )
+                                .unwrap(),
                                 bookmark: crate::book_bookmarks::BookBookmark {
                                     id: window_id as i64,
                                     container_key: crate::adjustment_db::normalize_path(
@@ -58347,7 +58658,7 @@ mod still_window_mode_key_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let resolver_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
-            requested: media.clone(),
+            requested: crate::pdf_loader::LeasedEpubPath::try_new(media.clone()).unwrap(),
             owner: StartupOpenPathOwner::Bookmark(
                 crate::bookmark_browser::BookmarkOpenRequestOwner {
                     request_id,
@@ -58521,6 +58832,8 @@ mod still_window_mode_key_tests {
         let pending = crate::bookmark_browser::PendingBookmarkOpen::Book(
             crate::bookmark_browser::PendingBookOpen {
                 request_id,
+                bookmark_source: crate::pdf_loader::LeasedEpubPath::try_new(missing.clone())
+                    .unwrap(),
                 bookmark: crate::book_bookmarks::BookBookmark {
                     id: 508,
                     container_key: crate::adjustment_db::normalize_path(&missing),
@@ -58916,7 +59229,7 @@ mod still_window_mode_key_tests {
 
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
-            Some(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate { path, .. })
+            DetachedBuild::Built(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate { path, .. })
                 if path == source
         ));
         assert!(
@@ -59413,7 +59726,10 @@ mod still_window_mode_key_tests {
         install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
         app.settings.detached_viewer_open_images_in_window = false;
 
-        assert!(app.detached_grid_item_open_plan(0, false).is_none());
+        assert!(matches!(
+            app.detached_grid_item_open_plan(0, false),
+            DetachedBuild::NotApplicable
+        ));
         assert_eq!(
             app.load_folder_or_convert_archive_with_auto_fullscreen(source.clone(), false),
             FolderOpenOutcome::Classifying
@@ -59445,7 +59761,7 @@ mod still_window_mode_key_tests {
         app.items = vec![GridItem::ZipFile(zip.clone())];
         assert!(matches!(
             app.detached_grid_item_open_plan(0, true),
-            Some(DetachedGridItemOpenPlan::Descriptor {
+            DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor {
                 descriptor: ViewerContextDescriptor::Zip {
                     path,
                     entry_name: None,
@@ -59458,7 +59774,7 @@ mod still_window_mode_key_tests {
         app.items = vec![GridItem::PdfFile(pdf.clone())];
         assert!(matches!(
             app.detached_grid_item_open_plan(0, true),
-            Some(DetachedGridItemOpenPlan::Descriptor {
+            DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor {
                 descriptor: ViewerContextDescriptor::Pdf {
                     path,
                     page_num: None,
@@ -59466,6 +59782,166 @@ mod still_window_mode_key_tests {
                 ..
             }) if path == pdf
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_plan_classifies_every_grid_item_kind_before_any_window_handoff() {
+        use crate::grid_item::{CollectionPlaceholderReason, SearchContainerKind};
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Expected {
+            Descriptor,
+            Folder,
+            Convertible,
+            NotApplicable,
+        }
+        let path = PathBuf::from(r"C:\books\sample.pdf");
+        let cases = vec![
+            (
+                "folder",
+                GridItem::Folder(path.clone()),
+                true,
+                Expected::Folder,
+            ),
+            (
+                "folder_no_auto",
+                GridItem::Folder(path.clone()),
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "image",
+                GridItem::Image(path.clone()),
+                false,
+                Expected::Descriptor,
+            ),
+            (
+                "video",
+                GridItem::Video(path.clone()),
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "audio",
+                GridItem::Audio(path.clone()),
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "zip_file",
+                GridItem::ZipFile(path.clone()),
+                true,
+                Expected::Descriptor,
+            ),
+            (
+                "zip_file_no_auto",
+                GridItem::ZipFile(path.clone()),
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "pdf_file",
+                GridItem::PdfFile(path.clone()),
+                true,
+                Expected::Descriptor,
+            ),
+            (
+                "pdf_file_no_auto",
+                GridItem::PdfFile(path.clone()),
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "convertible",
+                GridItem::ConvertibleArchive {
+                    path: path.clone(),
+                    format: ArchiveFormat::SevenZ,
+                },
+                false,
+                Expected::Convertible,
+            ),
+            (
+                "zip_image",
+                GridItem::ZipImage {
+                    zip_path: path.clone(),
+                    entry_name: "p.jpg".into(),
+                },
+                false,
+                Expected::Descriptor,
+            ),
+            (
+                "zip_dir",
+                GridItem::ZipDir {
+                    zip_path: path.clone(),
+                    dir_prefix: "pages/".into(),
+                    is_archive: false,
+                    representative: None,
+                },
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "pdf_page",
+                GridItem::PdfPage {
+                    pdf_path: path.clone(),
+                    page_num: 0,
+                    content_type: None,
+                },
+                false,
+                Expected::Descriptor,
+            ),
+            (
+                "stack",
+                GridItem::Stack {
+                    key: "sample".into(),
+                    representative: path.clone(),
+                    count: 2,
+                },
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "search_container",
+                GridItem::SearchContainer {
+                    path: path.clone(),
+                    kind: SearchContainerKind::Folder,
+                    hit_count: 1,
+                    representative: None,
+                },
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "collection_placeholder",
+                GridItem::CollectionPlaceholder {
+                    path,
+                    last_known_kind: crate::collection_store::CollectionResolvedKind::Pdf,
+                    reason: CollectionPlaceholderReason::Missing,
+                },
+                false,
+                Expected::NotApplicable,
+            ),
+        ];
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = true;
+        for (name, item, auto_fullscreen, expected) in cases {
+            app.items = vec![item];
+            let actual = match app.detached_grid_item_open_plan(0, auto_fullscreen) {
+                DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor { .. }) => {
+                    Expected::Descriptor
+                }
+                DetachedBuild::Built(DetachedGridItemOpenPlan::FolderCandidate { .. }) => {
+                    Expected::Folder
+                }
+                DetachedBuild::Built(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
+                    ..
+                }) => Expected::Convertible,
+                DetachedBuild::NotApplicable => Expected::NotApplicable,
+                other => panic!("unexpected plan for {name}: {other:?}"),
+            };
+            assert_eq!(actual, expected, "{name}");
+        }
     }
 
     #[test]
@@ -59503,10 +59979,11 @@ mod still_window_mode_key_tests {
                 std::fs::write(&path, b"fixture").unwrap();
             }
             let expected = install_collection_item_for_detached_plan(&mut app, &path, kind);
-            let actual = match app
-                .detached_grid_item_open_plan(0, case != 3)
-                .expect("detached collection plan")
-            {
+            let plan = match app.detached_grid_item_open_plan(0, case != 3) {
+                DetachedBuild::Built(plan) => plan,
+                other => panic!("detached collection plan: {other:?}"),
+            };
+            let actual = match plan {
                 DetachedGridItemOpenPlan::FolderCandidate {
                     collection_owner, ..
                 } => {
@@ -66285,7 +66762,10 @@ mod still_window_mode_key_tests {
                 image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
-                    path: PathBuf::from(r"C:\books\a.pdf"),
+                    path: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
+                        r"C:\books\a.pdf",
+                    ))
+                    .unwrap(),
                     page_num: Some(5),
                 }),
                 reopen_sync_stamp: None,
@@ -66427,7 +66907,10 @@ mod still_window_mode_key_tests {
                 image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
-                    path: PathBuf::from(r"C:\books\a.pdf"),
+                    path: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
+                        r"C:\books\a.pdf",
+                    ))
+                    .unwrap(),
                     page_num: Some(5),
                 }),
                 reopen_sync_stamp: None,
@@ -80535,7 +81018,7 @@ mod smart_folder_transition_tests {
         let old_handle =
             crate::pdf_loader::completed_enumerate_handle_for_test(&old, Ok(Vec::new()));
         app.pdf_enumerate_pending = Some((
-            old,
+            old.clone(),
             None,
             old_handle,
             Box::new(OpenRequestOwner::Navigation),
@@ -80543,6 +81026,7 @@ mod smart_folder_transition_tests {
             super::PdfOpenPhase::ColdCandidate {
                 retained_source: None,
             },
+            crate::pdf_loader::LeasedEpubPath::try_new(old).unwrap(),
         ));
 
         assert!(app.begin_smart_grid_container_navigation(index, target.clone(), true));
@@ -80567,7 +81051,7 @@ mod smart_folder_transition_tests {
         assert_eq!(
             app.pdf_enumerate_pending
                 .as_ref()
-                .map(|(path, _, _, _, _, _)| path),
+                .map(|(path, _, _, _, _, _, _)| path),
             Some(&target)
         );
         assert!(app.fs_nav_after_pdf_enumerate.is_some());
@@ -80730,7 +81214,7 @@ mod smart_folder_transition_tests {
             )),
         );
         app.pdf_enumerate_pending = Some((
-            old_pdf,
+            old_pdf.clone(),
             None,
             old_handle,
             Box::new(OpenRequestOwner::Navigation),
@@ -80738,6 +81222,7 @@ mod smart_folder_transition_tests {
             super::PdfOpenPhase::ColdCandidate {
                 retained_source: None,
             },
+            crate::pdf_loader::LeasedEpubPath::try_new(old_pdf).unwrap(),
         ));
         app.poll_pdf_enumerate();
         assert!(app.fs_navigation_sequence_owned_by_smart_folder());

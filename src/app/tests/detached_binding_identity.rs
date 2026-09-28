@@ -32,7 +32,7 @@ fn start_cached_pdf(app: &mut App, root: &Path) -> (PathBuf, u64) {
     app.settings.auto_fullscreen_zip_pdf = true;
     assert!(app.start_active_detached_book_context(
         ViewerContextDescriptor::Pdf {
-            path: pdf.clone(),
+            path: crate::pdf_loader::LeasedEpubPath::try_new(pdf.clone()).unwrap(),
             page_num: None
         },
         &egui::Context::default(),
