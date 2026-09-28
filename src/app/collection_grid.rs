@@ -3063,6 +3063,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.tx = tx.clone();
         self.rx = rx;
+        self.display_epub_source = None;
         self.current_folder = None;
         self.archive_source_override = None;
         self.zip_nav = None;
@@ -3774,7 +3775,7 @@ mod tests {
             Some(crate::pdf_loader::PdfReadingDirection::R2L)
         );
         let backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&row.pdf_file);
-        (pin, backend, target.stamp)
+        (pin, backend, target.stamp.clone())
     }
 
     fn assert_cached_epub_worker_adoption(

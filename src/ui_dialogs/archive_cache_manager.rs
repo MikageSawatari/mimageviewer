@@ -179,8 +179,6 @@ impl App {
                         )
                         .clicked()
                     {
-                        #[cfg(windows)]
-                        self.sync_epub_ui_read_leases();
                         self.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                             crate::cache_maintenance::EpubMaintTask::DeleteAll,
                             crate::data_dir::get(),
@@ -416,8 +414,6 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            #[cfg(windows)]
-            app.sync_epub_ui_read_leases();
             app.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                 crate::cache_maintenance::EpubMaintTask::DeleteSelected {
                     generation_ids: app.epub_cache_selection.iter().copied().collect(),
@@ -438,8 +434,6 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            #[cfg(windows)]
-            app.sync_epub_ui_read_leases();
             app.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                 crate::cache_maintenance::EpubMaintTask::DeleteMissingSources,
                 crate::data_dir::get(),

@@ -20714,6 +20714,9 @@ impl App {
             self.reset_fs_side_panel_runtime_for_file_change();
             self.finish_stale_fs_navigation_diagnostic_for_target(target_idx);
         }
+        if !self.try_own_fullscreen_epub_at(target_idx) {
+            return;
+        }
         self.fullscreen_idx = Some(target_idx);
         self.selected = Some(target_idx);
         self.scroll_to_selected = true;
@@ -37729,6 +37732,9 @@ impl App {
         }
         self.fs_vertical_scroll =
             vertical_reading_reanchor_scroll(self.fs_vertical_scroll, old_offsets, new_pos);
+        if !self.try_own_fullscreen_epub_at(new_idx) {
+            return;
+        }
         self.fullscreen_idx = Some(new_idx);
         self.fullscreen_page_slice = new_slice;
         self.sync_main_selection_from_viewer_idx(new_idx);

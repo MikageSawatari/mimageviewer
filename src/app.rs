@@ -420,6 +420,7 @@ pub(crate) struct PhysicalHistoryTransition {
     request_id: u64,
     intent: PhysicalHistoryIntent,
     path: PathBuf,
+    path_owner: Option<crate::pdf_loader::LeasedEpubPath>,
     classified_kind: Option<OpenPathKind>,
     phase: PhysicalHistoryPhase,
     history_before: FolderNavHistorySnapshot,
@@ -465,6 +466,7 @@ pub(crate) struct CollectionHistoryTransition {
     request_id: u64,
     intent: CollectionHistoryIntent,
     target: FolderNavHistoryTarget,
+    target_owner: Option<crate::pdf_loader::LeasedEpubPath>,
     classified_kind: Option<OpenPathKind>,
     history_before: FolderNavHistorySnapshot,
     source_context: ViewerContextId,
@@ -488,7 +490,7 @@ pub(crate) enum HistoryNavigationTransition {
 pub(crate) struct OpenPathClassification {
     request_id: u64,
     context: ViewerContextId,
-    path: PathBuf,
+    path: crate::pdf_loader::LeasedEpubPath,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<std::io::Result<ClassifiedOpenPath>>,
     continuation: Option<Box<ClassifiedOpenContinuation>>,
@@ -920,6 +922,7 @@ pub(crate) type PdfEnumeratePending = (
     Box<OpenRequestOwner>,
     Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
     PdfOpenPhase,
+    crate::pdf_loader::LeasedEpubPath,
 );
 
 /// The one per-context PDF-open owner. A committed placeholder may remain the source while a
@@ -3615,7 +3618,7 @@ enum DeferredFsOpenOutcome {
 }
 
 pub(crate) struct PdfPasswordRequest {
-    path: PathBuf,
+    path: crate::pdf_loader::LeasedEpubPath,
     owner: PdfPasswordRequestOwner,
 }
 
@@ -3637,32 +3640,38 @@ struct DirectPdfPasswordContinuation {
 }
 
 impl PdfPasswordRequest {
+    fn try_new(path: PathBuf, owner: PdfPasswordRequestOwner) -> Option<Self> {
+        Some(Self {
+            path: crate::pdf_loader::LeasedEpubPath::try_new(path)?,
+            owner,
+        })
+    }
+
+    pub(crate) fn try_legacy(path: PathBuf) -> Option<Self> {
+        Self::try_new(path, PdfPasswordRequestOwner::Legacy)
+    }
+
+    #[cfg(test)]
     pub(crate) fn legacy(path: PathBuf) -> Self {
-        Self {
-            path,
-            owner: PdfPasswordRequestOwner::Legacy,
-        }
+        Self::try_legacy(path).expect("test PDF password owner is not being deleted")
     }
 
     fn direct(
         path: PathBuf,
         open_owner: OpenRequestOwner,
         restore: crate::ui_dialogs::epub_convert::EpubOpenRestore,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        Self::try_new(
             path,
-            owner: PdfPasswordRequestOwner::Direct(Box::new(DirectPdfPasswordContinuation {
+            PdfPasswordRequestOwner::Direct(Box::new(DirectPdfPasswordContinuation {
                 open_owner,
                 restore,
             })),
-        }
+        )
     }
 
-    fn staged_history(path: PathBuf, request_id: u64) -> Self {
-        Self {
-            path,
-            owner: PdfPasswordRequestOwner::StagedHistory(request_id),
-        }
+    fn staged_history(path: PathBuf, request_id: u64) -> Option<Self> {
+        Self::try_new(path, PdfPasswordRequestOwner::StagedHistory(request_id))
     }
 }
 
@@ -3834,7 +3843,7 @@ pub(crate) struct StartupOpenPathResolveResult {
 /// `Path::is_file` / `is_dir` は切断ネットワークパス等で UI を止めうるため、
 /// resolve だけ先に worker へ逃がし、完了後の実ロードだけ UI スレッドで行う。
 pub(crate) struct StartupOpenPathResolvePending {
-    requested: PathBuf,
+    requested: crate::pdf_loader::LeasedEpubPath,
     owner: StartupOpenPathOwner,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<StartupOpenPathResolveResult>,
@@ -12935,11 +12944,10 @@ pub struct App {
     pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
-    /// App-wide owners for every mounted or parked EPUB open/display. The
-    /// cache manager consults the same read-lease coordinator as PDF workers.
-    #[cfg(windows)]
-    pub(crate) epub_ui_read_leases:
-        std::collections::HashMap<String, crate::pdf_loader::EpubReadLease>,
+    /// The mounted visible EPUB owns its lease until this viewer context changes source.
+    pub(crate) display_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
+    /// A fullscreen page from a composite grid can own an EPUB independently of current_folder.
+    pub(crate) fullscreen_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
     pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
@@ -17050,8 +17058,9 @@ impl App {
         let mut app = Self {
             address: String::new(),
             current_folder: None,
+            display_epub_source: None,
+            fullscreen_epub_source: None,
             #[cfg(windows)]
-            epub_ui_read_leases: std::collections::HashMap::new(),
             normal_folder_omitted_entries: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
@@ -22738,6 +22747,7 @@ impl App {
         self.tx = tx.clone();
         self.rx = rx;
 
+        self.display_epub_source = None;
         self.current_folder = Some(drive_list_synthetic_path());
         self.current_folder_last_mtime = None;
         self.current_folder_signature = None;
@@ -22912,6 +22922,10 @@ impl App {
         if self.document_open_modal_admission_blocked() {
             return false;
         }
+        let Some(candidate_source) = crate::pdf_loader::LeasedEpubPath::try_new(path.clone())
+        else {
+            return false;
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let worker_path = path.clone();
@@ -22960,7 +22974,7 @@ impl App {
         let candidate = OpenPathClassification {
             request_id: NEXT_OPEN_PATH_CLASSIFICATION_ID.fetch_add(1, Ordering::Relaxed),
             context: self.projected_viewer_context_id(),
-            path,
+            path: candidate_source,
             cancel,
             rx,
             continuation: Some(Box::new(continuation)),
@@ -22968,8 +22982,6 @@ impl App {
         };
         self.top_level_grid_view
             .set_open_path_classification(Some(candidate));
-        #[cfg(windows)]
-        self.sync_epub_ui_read_leases();
         true
     }
 
@@ -23034,7 +23046,7 @@ impl App {
         let Some(continuation) = candidate.continuation.take() else {
             return;
         };
-        let path = candidate.path.clone();
+        let path = candidate.path.to_path_buf();
         match *continuation {
             ClassifiedOpenContinuation::DirectNavigation {
                 pre_scan,
@@ -27222,6 +27234,17 @@ impl App {
                 return false;
             }
         }
+        let target_owner = match &target {
+            FolderNavHistoryTarget::CollectionPhysical(child)
+                if classified_kind != Some(OpenPathKind::Directory) =>
+            {
+                match crate::pdf_loader::LeasedEpubPath::try_new(child.visible_path.clone()) {
+                    Some(owner) => Some(owner),
+                    None => return false,
+                }
+            }
+            _ => None,
+        };
         let Ok(prepare) = self.start_collection_history_prepare(root) else {
             return false;
         };
@@ -27250,6 +27273,7 @@ impl App {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
             target,
+            target_owner,
             classified_kind,
             history_before: self.folder_nav_history_snapshot(),
             source_context: self.projected_viewer_context_id(),
@@ -27391,6 +27415,14 @@ impl App {
             self.show_pdf_open_refusal(reason);
             return false;
         }
+        let path_owner = if classified_kind == Some(OpenPathKind::Directory) {
+            None
+        } else {
+            match crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) {
+                Some(owner) => Some(owner),
+                None => return false,
+            }
+        };
         let Ok(preflight) = self.start_physical_history_preflight(path.clone(), None) else {
             return false;
         };
@@ -27422,6 +27454,7 @@ impl App {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
             path,
+            path_owner,
             classified_kind,
             phase: PhysicalHistoryPhase::Preflighting {
                 preflight,
@@ -27889,9 +27922,13 @@ impl App {
                             let CollectionHistoryPhase::ChildPreflighting { prepared, target, .. } =
                                 std::mem::replace(&mut request.phase, CollectionHistoryPhase::Finished)
                             else { unreachable!() };
-                            self.pdf_password_request = Some(PdfPasswordRequest::staged_history(
+                            let Some(password_request) = PdfPasswordRequest::staged_history(
                                 target.visible_path.clone(), request.request_id,
-                            ));
+                            ) else {
+                                self.show_feedback_toast("EPUB の削除処理が終わってから開いてください".into());
+                                return;
+                            };
+                            self.pdf_password_request = Some(password_request);
                             self.pdf_password_error = None;
                             request.phase = CollectionHistoryPhase::ChildPdfPassword { prepared, target };
                             self.top_level_grid_view.set_history_navigation_transition(Some(
@@ -28206,10 +28243,16 @@ impl App {
                         payload,
                         collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired
                     ) {
-                        self.pdf_password_request = Some(PdfPasswordRequest::staged_history(
+                        let Some(password_request) = PdfPasswordRequest::staged_history(
                             request.path.clone(),
                             request.request_id,
-                        ));
+                        ) else {
+                            self.show_feedback_toast(
+                                "EPUB の削除処理が終わってから開いてください".into(),
+                            );
+                            return;
+                        };
+                        self.pdf_password_request = Some(password_request);
                         self.pdf_password_error = None;
                         request.phase = PhysicalHistoryPhase::PdfPassword;
                         self.top_level_grid_view
@@ -30252,6 +30295,7 @@ impl App {
         {
             self.archive_source_override = None;
         }
+        self.display_epub_source = None;
         self.current_folder = Some(zip_path.clone());
         self.current_folder_rating_cache = None;
         self.current_folder_last_mtime = None;
@@ -31377,6 +31421,7 @@ impl App {
                         auto_fullscreen: false,
                     },
                     path,
+                    path_owner: None,
                     classified_kind: Some(OpenPathKind::File),
                     phase: PhysicalHistoryPhase::Preflighting {
                         preflight,
@@ -31519,6 +31564,11 @@ impl App {
         if let Some(reason) = self.pdf_open_refusal(&pdf_path) {
             return self.report_pdf_open_refusal(&pdf_path, reason);
         }
+        let Some(candidate_source) = crate::pdf_loader::LeasedEpubPath::try_new(pdf_path.clone())
+        else {
+            self.show_feedback_toast("EPUB の削除処理が終わってから開いてください".into());
+            return FolderOpenOutcome::Ignored;
+        };
         let mut previous_pdf_enumerate = self.pdf_enumerate_pending.take();
         let mut retained_source = None;
         if let Some(previous) = previous_pdf_enumerate.as_mut() {
@@ -31570,7 +31620,9 @@ impl App {
         // ZIP 側 pending も一緒に捨てる (ZIP → PDF 遷移時の取り残し防止、Codex P2)。
         if previous_pdf_enumerate
             .as_ref()
-            .is_some_and(|(path, _, _, _, _, _)| !crate::path_key::eq_keep_drive(path, &pdf_path))
+            .is_some_and(|(path, _, _, _, _, _, _)| {
+                !crate::path_key::eq_keep_drive(path, &pdf_path)
+            })
         {
             previous_pdf_enumerate = None;
         }
@@ -31607,7 +31659,7 @@ impl App {
             password_override.or_else(|| self.pdf_open_password(&pdf_path));
         if previous_pdf_enumerate
             .as_ref()
-            .is_some_and(|(_, previous_password, _, _, _, _)| previous_password != &password)
+            .is_some_and(|(_, previous_password, _, _, _, _, _)| previous_password != &password)
         {
             // 同じ path でも password が違えば別 request。旧 source はここで cancel する。
             previous_pdf_enumerate = None;
@@ -31687,6 +31739,7 @@ impl App {
                     _,
                     _,
                     PdfOpenPhase::CommittedVerification { placeholder_count },
+                    _,
                 )) = self.pdf_enumerate_pending.as_ref()
                 {
                     self.pdf_placeholder_count = Some(*placeholder_count);
@@ -31733,6 +31786,7 @@ impl App {
             Box::new(owner),
             open_restore,
             phase,
+            candidate_source,
         ));
         // 同じ key なら新 handle が既に waiter として登録済みなので、ここで旧 handle を
         // drop しても source request は継続する。
@@ -32212,7 +32266,7 @@ impl App {
         if self.sidecar_restore_active() {
             return;
         }
-        let Some((ref pdf_path, _, ref handle, _, _, ref phase)) = self.pdf_enumerate_pending
+        let Some((ref pdf_path, _, ref handle, _, _, ref phase, _)) = self.pdf_enumerate_pending
         else {
             return;
         };
@@ -32289,7 +32343,7 @@ impl App {
             }
         };
 
-        let (pdf_path, password, _handle, owner, mut open_restore, phase) =
+        let (pdf_path, password, _handle, owner, mut open_restore, phase, _candidate_source) =
             self.pdf_enumerate_pending.take().unwrap();
 
         // cancel 経由の Interrupted は late-arriving な stale 結果なので適用しない
@@ -32407,10 +32461,16 @@ impl App {
                             crate::empty_items_reason::EmptyItemsReason::PdfPasswordRequired,
                         );
                     }
-                    self.pdf_password_request = Some(match open_restore {
+                    self.pdf_password_request = match open_restore {
                         Some(restore) => PdfPasswordRequest::direct(pdf_path, *owner, restore),
-                        None => PdfPasswordRequest::legacy(pdf_path),
-                    });
+                        None => PdfPasswordRequest::try_legacy(pdf_path),
+                    };
+                    if self.pdf_password_request.is_none() {
+                        self.show_feedback_toast(
+                            "EPUB の削除処理が終わってから開いてください".into(),
+                        );
+                        return;
+                    }
                     self.pdf_password_input.clear();
                     // password が渡されていた = 入力済みのパスワードが誤っていた
                     self.pdf_password_error = if password.is_some() {
@@ -32479,7 +32539,7 @@ impl App {
             self.with_viewer_context_ref(id, |context| {
                 context
                     .pdf_password_request()
-                    .map(|request| request.path.clone())
+                    .map(|request| request.path.to_path_buf())
             })
             .flatten()
         }) {
@@ -32487,7 +32547,7 @@ impl App {
         }
         self.pdf_password_request
             .as_ref()
-            .map(|request| request.path.clone())
+            .map(|request| request.path.to_path_buf())
             .or_else(|| self.smart_pdf_password_dialog_path())
     }
 
@@ -32587,10 +32647,11 @@ impl App {
                     return false;
                 }
                 self.pdf_current_password = Some(password.clone());
-                self.pdf_password_pending_save = save.then(|| (request.path.clone(), password));
+                self.pdf_password_pending_save =
+                    save.then(|| (request.path.to_path_buf(), password));
                 self.resume_fs_navigation_sequence_after_password();
-                let outcome =
-                    self.load_pdf_as_folder_owned(request.path.clone(), continuation.open_owner);
+                let outcome = self
+                    .load_pdf_as_folder_owned(request.path.to_path_buf(), continuation.open_owner);
                 if !matches!(outcome, FolderOpenOutcome::Loaded) {
                     self.pdf_password_pending_save = None;
                     self.restore_epub_open(continuation.restore);
@@ -32622,9 +32683,11 @@ impl App {
             return false;
         }
         self.pdf_current_password = Some(password.clone());
-        self.pdf_password_pending_save = save.then(|| (request.path.clone(), password));
+        self.pdf_password_pending_save = save.then(|| (request.path.to_path_buf(), password));
         self.resume_fs_navigation_sequence_after_password();
-        match self.load_pdf_as_folder_owned(request.path, OpenRequestOwner::Navigation) {
+        match self
+            .load_pdf_as_folder_owned(request.path.to_path_buf(), OpenRequestOwner::Navigation)
+        {
             FolderOpenOutcome::Loaded
             | FolderOpenOutcome::Classifying
             | FolderOpenOutcome::ConversionDialogOpened => true,
@@ -33198,6 +33261,26 @@ impl App {
                 Some((*logical_source).to_path_buf())
             }
         };
+        // Acquire the new visible owner's lease while the staged owner still exists.
+        // A failed acquisition means deletion won the coordinator before this install.
+        let visible_logical = smart_open_path.as_deref().unwrap_or(&source_path);
+        let display_epub_source = if items.iter().any(|item| {
+            matches!(item, GridItem::PdfPage { pdf_path, .. }
+                if crate::folder_tree::path_eq(pdf_path, visible_logical))
+        }) {
+            let Some(source) =
+                crate::pdf_loader::LeasedEpubPath::try_new(visible_logical.to_path_buf())
+            else {
+                crate::logger::log(format!(
+                    "epub open: visible install deferred by cache deletion: {}",
+                    visible_logical.display()
+                ));
+                return;
+            };
+            source.has_epub_lease().then_some(source)
+        } else {
+            None
+        };
         let preserve_smart_folder_session = match &authority {
             VisibleInstallAuthority::Ordinary | VisibleInstallAuthority::StagedArchive { .. } => {
                 !detached_physical
@@ -33293,7 +33376,7 @@ impl App {
         // enumerate pending を無効化する。放置すると遅れて届いた結果を
         // `poll_pdf_enumerate` が適用して現在表示を古い PDF 仮想フォルダに戻す。
         // pending.Drop で自動 cancel されるので take するだけでよい。
-        if let Some((pending_path, _, _, _, _, _)) = self.pdf_enumerate_pending.as_ref() {
+        if let Some((pending_path, _, _, _, _, _, _)) = self.pdf_enumerate_pending.as_ref() {
             if pending_path != &source_path {
                 self.pdf_enumerate_pending = None;
                 self.fs_nav_after_pdf_enumerate = None;
@@ -33432,6 +33515,7 @@ impl App {
         crate::perf::emit_ms("nav", "sli_nav_cancel", sli_seq, cancel_t0);
 
         let assign_t0 = std::time::Instant::now();
+        self.display_epub_source = display_epub_source;
         self.current_folder = Some(source_path.clone());
         if let Some(logical_path) = smart_open_path.as_deref()
             && !crate::folder_tree::path_eq(logical_path, &source_path)
@@ -37474,6 +37558,14 @@ impl App {
                     fullscreen_neighbor_after_removal(&self.items, slid)
                 }
             };
+            if let Some(idx) = self.fullscreen_idx {
+                if !self.try_own_fullscreen_epub_at(idx) {
+                    self.fullscreen_idx = None;
+                    self.fullscreen_epub_source = None;
+                }
+            } else {
+                self.fullscreen_epub_source = None;
+            }
         }
         // 音声モード系の idx-keyed 状態は対象アイテムが残存したときだけ追随し、消えたら畳む
         // (fullscreen_idx と同じ p で shift されるので、残存時は相互一致が保たれる)。
@@ -41972,6 +42064,12 @@ impl App {
                 );
             }
             crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => {
+                let Some(bookmark_source) =
+                    crate::pdf_loader::LeasedEpubPath::try_new(bookmark.container_path.clone())
+                else {
+                    self.show_feedback_toast("EPUB の削除処理が終わってから開いてください".into());
+                    return;
+                };
                 let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(
                     bookmark.container_path.clone(),
                 );
@@ -41989,6 +42087,7 @@ impl App {
                     crate::bookmark_browser::PendingBookOpen {
                         request_id,
                         bookmark: bookmark.clone(),
+                        bookmark_source,
                         relative_page_provenance: row.relative_page_provenance.clone(),
                         started_at: std::time::Instant::now(),
                         stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
@@ -47620,6 +47719,7 @@ impl App {
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
         self.pending_grid_scroll = None;
+        self.display_epub_source = None;
         self.current_folder = None;
         self.archive_source_override = None;
         self.address = destination_label;
@@ -53312,6 +53412,7 @@ impl App {
                 // park してしまう (2026-07-09 実機 2 件目: 動画窓に画像が表示・点滅)。
                 // live-media park (park_current_viewer_context_as_live_media_inner 末尾) と
                 // 同じ後始末で main を非 detached へ戻す。
+                self.fullscreen_epub_source = None;
                 self.fullscreen_idx = None;
                 self.viewer_presentation = self.non_detached_viewer_presentation();
                 self.detached_viewer_independent_active = false;
@@ -55528,6 +55629,7 @@ impl App {
         self.update_detached_window_runtime_flags(snapshot_id, false, reason);
         self.handoff_active_detached_viewport_to_passive(reason);
         self.transition_detached_window_state(snapshot_id, DetachedWindowState::ParkedLive, reason);
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.detached_viewer_independent_active = false;
@@ -55656,6 +55758,7 @@ impl App {
         self.update_detached_window_runtime_flags(snapshot_id, false, reason);
         self.handoff_active_detached_viewport_to_passive(reason);
         self.transition_detached_window_state(snapshot_id, DetachedWindowState::ParkedLive, reason);
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.detached_viewer_independent_active = false;
@@ -55878,6 +55981,7 @@ impl App {
             "promote_detached_video_for_main_context_change",
         );
 
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.detached_viewer_independent_active = false;
@@ -57878,6 +57982,22 @@ impl App {
         }
     }
 
+    pub(crate) fn try_own_fullscreen_epub_at(&mut self, idx: usize) -> bool {
+        let path = match self.items.get(idx) {
+            Some(GridItem::PdfPage { pdf_path, .. } | GridItem::PdfFile(pdf_path)) => pdf_path,
+            None => return false,
+            _ => {
+                self.fullscreen_epub_source = None;
+                return true;
+            }
+        };
+        let Some(source) = crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) else {
+            return false;
+        };
+        self.fullscreen_epub_source = source.has_epub_lease().then_some(source);
+        true
+    }
+
     pub(crate) fn open_fullscreen_with_materialization_and_contract(
         &mut self,
         idx: usize,
@@ -57912,6 +58032,10 @@ impl App {
         #[cfg(windows)]
         if routed_materialized_physical_still {
             finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
+            return;
+        }
+
+        if !self.try_own_fullscreen_epub_at(idx) {
             return;
         }
 
@@ -66715,6 +66839,7 @@ impl App {
                 self.similar_panel.clear_book_history();
             }
         }
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
         // A true viewer close ends ownership of the last painted page layout. Temporary context
         // parking does not enter this teardown and therefore keeps its context-local layout.
@@ -81463,6 +81588,7 @@ impl App {
             return false;
         }
         self.sync_main_selection_from_viewer_idx(next_idx);
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = Some(next_idx);
         self.video_zoom_state = None;
         self.video_audio_mode = None;
@@ -84936,8 +85062,6 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        #[cfg(windows)]
-        self.sync_epub_ui_read_leases();
         crate::page_edit_write_epoch::PAGE_EDIT_WRITES.register_repaint_context(ctx);
         crate::rating_db::RATING_WRITES.register_repaint_context(ctx);
         crate::tags_db::TAG_WRITES.register_repaint_context(ctx);
@@ -84951,8 +85075,6 @@ impl eframe::App for App {
         // update_frame returns through a fullscreen or native-video presentation path.
         self.poll_collection_ui(ctx);
         self.poll_mounted_document_open_owners(ctx);
-        #[cfg(windows)]
-        self.sync_epub_ui_read_leases();
         // A settings-family mutation may already hold the exclusive DB permit. Defer only a
         // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
         // remains under the established close policy.
@@ -84966,8 +85088,6 @@ impl eframe::App for App {
             self.similar_panel.preview.poll_background(ctx, &passwords);
         }
         self.update_frame(ctx, frame);
-        #[cfg(windows)]
-        self.sync_epub_ui_read_leases();
         // Dedicated viewer viewports draw their mounted owner's dialog in their callback.
         // Root and embedded presentations draw here; parked contexts are not serviced.
         if self.fullscreen_idx.is_none()

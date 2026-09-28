@@ -59,40 +59,53 @@ impl DocumentStamp {
 }
 
 #[derive(Debug, Clone)]
-pub struct ReadTarget {
+pub struct ReadTarget(ReadTargetKind);
+
+#[derive(Debug, Clone)]
+enum ReadTargetKind {
+    File(ReadTargetData),
+    Generation {
+        data: ReadTargetData,
+        // A published EPUB generation cannot leave the resolver without its read lease.
+        _lease: Arc<EpubReadLease>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadTargetData {
     pub read_path: ResolvedReadPath,
     pub stamp: DocumentStamp,
     /// Original EPUB attributes for display, separate from the generation stamp.
     pub display_source_state: Option<epub_cache::SourceState>,
     /// Direction recorded for this immutable EPUB generation; PDFs have no value here.
     pub epub_direction: Option<PdfReadingDirection>,
-    // The pinned map stores an unleased copy. Every target handed to a reader
-    // owns this lease through its final use of the physical generation.
-    read_lease: Option<Arc<EpubReadLease>>,
 }
 
 impl PartialEq for ReadTarget {
     fn eq(&self, other: &Self) -> bool {
-        self.read_path == other.read_path
-            && self.stamp == other.stamp
-            && self.display_source_state == other.display_source_state
-            && self.epub_direction == other.epub_direction
+        **self == **other
     }
 }
 
 impl Eq for ReadTarget {}
 
-impl ReadTarget {
-    fn with_read_lease(mut self, lease: EpubReadLease) -> Self {
-        debug_assert!(matches!(self.stamp, DocumentStamp::Generation { .. }));
-        self.read_lease = Some(Arc::new(lease));
-        self
-    }
+impl std::ops::Deref for ReadTarget {
+    type Target = ReadTargetData;
 
-    fn unleased_copy(&self) -> Self {
-        let mut copy = self.clone();
-        copy.read_lease = None;
-        copy
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            ReadTargetKind::File(data) | ReadTargetKind::Generation { data, .. } => data,
+        }
+    }
+}
+
+impl ReadTargetData {
+    fn with_read_lease(self, lease: EpubReadLease) -> ReadTarget {
+        assert!(matches!(self.stamp, DocumentStamp::Generation { .. }));
+        ReadTarget(ReadTargetKind::Generation {
+            data: self,
+            _lease: Arc::new(lease),
+        })
     }
 }
 
@@ -137,7 +150,7 @@ fn classify_read_path(logical: &Path) -> ReadPathClass {
 }
 
 fn passthrough_read_target(logical: &Path) -> ReadTarget {
-    ReadTarget {
+    ReadTarget(ReadTargetKind::File(ReadTargetData {
         read_path: ResolvedReadPath::from_resolution(logical.to_owned()),
         stamp: DocumentStamp::File {
             mtime: None,
@@ -145,8 +158,7 @@ fn passthrough_read_target(logical: &Path) -> ReadTarget {
         },
         display_source_state: None,
         epub_direction: None,
-        read_lease: None,
-    }
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -214,7 +226,7 @@ impl From<std::io::Error> for PdfReadError {
 }
 
 static EPUB_GATE: OnceLock<GateOutcome> = OnceLock::new();
-static EPUB_PINNED: OnceLock<Mutex<HashMap<String, ReadTarget>>> = OnceLock::new();
+static EPUB_PINNED: OnceLock<Mutex<HashMap<String, ReadTargetData>>> = OnceLock::new();
 // A ledger writer and the first pin of the same logical book must have one
 // linearization point. The map lock is only held while finding a book lock;
 // SQLite and source I/O never block resolution of a different book.
@@ -352,6 +364,64 @@ pub(crate) fn try_acquire_epub_read_lease(logical: &Path) -> Option<EpubReadLeas
 /// resolving the book again. The lease then lives with the resolved address.
 pub(crate) fn acquire_epub_read_lease(logical: &Path) -> EpubReadLease {
     enter_epub_read(&epub_cache::src_key(logical))
+}
+
+/// An accepted UI open owns the logical EPUB until it is adopted or cancelled.
+/// Clones share one coordinator entry, so a transition can hand the path to its
+/// successor without a gap in deletion protection. A non-EPUB path has no lease.
+#[derive(Clone, Debug)]
+pub(crate) struct LeasedEpubPath {
+    path: PathBuf,
+    _lease: Option<Arc<EpubReadLease>>,
+}
+
+impl LeasedEpubPath {
+    pub(crate) fn try_new(path: PathBuf) -> Option<Self> {
+        let lease = if is_epub(&path) {
+            Some(Arc::new(try_acquire_epub_read_lease(&path)?))
+        } else {
+            None
+        };
+        Some(Self {
+            path,
+            _lease: lease,
+        })
+    }
+
+    /// Only background workers may wait behind an in-progress exclusive deletion.
+    pub(crate) fn acquire_on_worker(path: PathBuf) -> Self {
+        let lease = is_epub(&path).then(|| Arc::new(acquire_epub_read_lease(&path)));
+        Self {
+            path,
+            _lease: lease,
+        }
+    }
+
+    pub(crate) fn has_epub_lease(&self) -> bool {
+        self._lease.is_some()
+    }
+}
+
+impl std::ops::Deref for LeasedEpubPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl PartialEq for LeasedEpubPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for LeasedEpubPath {}
+
+impl PartialEq<PathBuf> for LeasedEpubPath {
+    fn eq(&self, other: &PathBuf) -> bool {
+        &self.path == other
+    }
 }
 
 impl Drop for EpubBookLease {
@@ -562,7 +632,7 @@ fn is_epub(path: &Path) -> bool {
     classify_read_path(path) == ReadPathClass::Epub
 }
 
-fn epub_pinned() -> &'static Mutex<HashMap<String, ReadTarget>> {
+fn epub_pinned() -> &'static Mutex<HashMap<String, ReadTargetData>> {
     EPUB_PINNED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -626,7 +696,7 @@ pub(crate) fn pin_epub_for_test(logical: &Path, id: i64, pdf_size: u64) -> TestE
     with_epub_pin_guard(logical, || {
         epub_pinned().lock().unwrap().insert(
             key.clone(),
-            generation_target_for_test(logical, id, pdf_size),
+            (*generation_target_for_test(logical, id, pdf_size)).clone(),
         );
     });
     TestEpubPin(key)
@@ -711,13 +781,13 @@ pub(crate) fn pin_cached_epub_for_test(
 
 #[cfg(test)]
 pub(crate) fn generation_target_for_test(logical: &Path, id: i64, pdf_size: u64) -> ReadTarget {
-    ReadTarget {
+    ReadTargetData {
         read_path: ResolvedReadPath::from_resolution(logical.with_extension("generated.pdf")),
         stamp: DocumentStamp::Generation { id, pdf_size },
         display_source_state: None,
         epub_direction: None,
-        read_lease: None,
     }
+    .with_read_lease(acquire_epub_read_lease(logical))
 }
 
 #[cfg(test)]
@@ -954,7 +1024,7 @@ fn epub_gate_reason_message(reason: &epub_cache::GateReason) -> String {
 fn resolve_epub_at(
     logical: &Path,
     data_dir: &Path,
-    pinned: &Mutex<HashMap<String, ReadTarget>>,
+    pinned: &Mutex<HashMap<String, ReadTargetData>>,
 ) -> Result<ReadTarget, PdfReadError> {
     let key = epub_cache::src_key(logical);
     let read_lease = enter_epub_read(&key);
@@ -967,7 +1037,7 @@ fn resolve_epub_at(
     {
         return Ok(target.with_read_lease(read_lease));
     }
-    let candidate = (|| -> Result<ReadTarget, PdfReadError> {
+    let candidate = (|| -> Result<ReadTargetData, PdfReadError> {
         let source = match std::fs::metadata(logical) {
             Ok(metadata) => epub_cache::source_state(&metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1002,7 +1072,7 @@ fn resolve_epub_at(
         db.touch_current(&key, row.generation_id).map_err(|error| {
             PdfReadError::Other(Arc::new(std::io::Error::other(format!("{error:?}"))))
         })?;
-        Ok(ReadTarget {
+        Ok(ReadTargetData {
             read_path: ResolvedReadPath::from_resolution(row.pdf_file),
             stamp: DocumentStamp::Generation {
                 id: row.generation_id,
@@ -1010,7 +1080,6 @@ fn resolve_epub_at(
             },
             display_source_state: Some(source),
             epub_direction: parse_epub_direction_name(&row.direction),
-            read_lease: None,
         })
     })();
     with_epub_pin_guard(logical, || {
@@ -1038,7 +1107,7 @@ fn resolve_epub_at(
         let mut pinned = pinned
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pinned.insert(key, target.unleased_copy());
+        pinned.insert(key, target.clone());
         Ok(target.with_read_lease(read_lease))
     })
 }
@@ -6522,7 +6591,7 @@ mod tests {
     use std::fs;
 
     fn resolved_test_path(path: &Path) -> ResolvedReadPath {
-        resolve_read_target(path).unwrap().read_path
+        resolve_read_target(path).unwrap().read_path.clone()
     }
 
     struct TestSource(SourceState);
@@ -6611,7 +6680,8 @@ mod tests {
 
     #[test]
     fn epub_display_attributes_are_separate_from_generation_stamp() {
-        let target = ReadTarget {
+        let logical = Path::new("generation.epub");
+        let target = ReadTargetData {
             read_path: resolved_test_path(Path::new("generation.pdf")),
             stamp: DocumentStamp::Generation {
                 id: 31,
@@ -6622,8 +6692,8 @@ mod tests {
                 size: 123,
             }),
             epub_direction: Some(PdfReadingDirection::R2L),
-            read_lease: None,
-        };
+        }
+        .with_read_lease(acquire_epub_read_lease(logical));
         let mut result = PdfEnumerateResult::from(vec![PdfPageEntry {
             page_num: 0,
             mtime: 999,
@@ -8194,13 +8264,13 @@ C:\isolated\miv-data"#
         let mut db = EpubCache::open_at(root.path()).unwrap();
         publish_test_generation(&mut db, root.path(), &source);
         let cold = resolve_epub_at(&source, root.path(), epub_pinned()).unwrap();
-        assert!(cold.read_lease.is_some());
+        assert!(matches!(cold.0, ReadTargetKind::Generation { .. }));
         drop(cold);
         let hot = pinned_epub_target(&source).unwrap();
-        assert!(hot.read_lease.is_some());
+        assert!(matches!(hot.0, ReadTargetKind::Generation { .. }));
         drop(hot);
         let generic = resolve_read_target(&source).unwrap();
-        assert!(generic.read_lease.is_some());
+        assert!(matches!(generic.0, ReadTargetKind::Generation { .. }));
         drop(generic);
         assert!(acquire_epub_delete_coverage(&source).is_ok());
         with_epub_pin_guard(&source, || {

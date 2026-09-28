@@ -82,6 +82,26 @@ impl App {
             ));
             return;
         };
+        // The suffix is known before the filesystem resolver runs. A directory ending in
+        // `.epub` holds this provisional lease only until classification returns Directory.
+        let Some(requested_owner) = crate::pdf_loader::LeasedEpubPath::try_new(requested.clone())
+        else {
+            match source {
+                StartupOpenPathSource::Activation => {
+                    #[cfg(windows)]
+                    let _ = self.activation_open_path_tx.send(requested);
+                    #[cfg(not(windows))]
+                    let _ = requested;
+                }
+                StartupOpenPathSource::InitialStartup => self.startup_open_path = Some(requested),
+                StartupOpenPathSource::Bookmark => {
+                    self.show_feedback_toast(
+                        "EPUB を使用中のため、しばらくしてから開いてください".into(),
+                    );
+                }
+            }
+            return;
+        };
         let defer_activation_supersede =
             matches!(source, StartupOpenPathSource::Activation) && self.is_snapshot_active();
         // A forwarded activation is a new navigation request as soon as it is received. Do not
@@ -173,7 +193,7 @@ impl App {
         match spawn_result {
             Ok(_) => {
                 self.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
-                    requested,
+                    requested: requested_owner,
                     owner,
                     cancel,
                     rx,
@@ -194,6 +214,7 @@ impl App {
                     result,
                     held_resolve_for_activation_admission,
                     held_duration,
+                    Some(requested_owner),
                     ctx,
                 );
             }
@@ -218,12 +239,14 @@ impl App {
                 let owner = pending.owner.clone();
                 let held = pending.held_resolve_for_activation_admission.take();
                 let held_duration = pending.elapsed();
+                let requested_owner = pending.requested.clone();
                 drop(pending);
                 self.finish_startup_open_path_resolve_with_held(
                     owner,
                     result,
                     held,
                     held_duration,
+                    Some(requested_owner),
                     ctx,
                 );
                 ctx.request_repaint();
@@ -285,6 +308,7 @@ impl App {
             result,
             None,
             std::time::Duration::ZERO,
+            None,
             ctx,
         );
     }
@@ -295,6 +319,7 @@ impl App {
         result: StartupOpenPathResolveResult,
         held: Option<Box<StartupOpenPathResolvePending>>,
         held_duration: std::time::Duration,
+        requested_owner: Option<crate::pdf_loader::LeasedEpubPath>,
         ctx: &egui::Context,
     ) {
         if !self.startup_open_path_owner_is_current(&owner) {
@@ -322,6 +347,7 @@ impl App {
                     result,
                     held,
                     held_duration,
+                    requested_owner,
                     ctx,
                 );
             });
