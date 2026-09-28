@@ -324,11 +324,20 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   HUD touch DOWN は mouse-down と同じ typed `RequestFocusClaim` を送るが、touch 用 `SetCapture` は
   呼ばない。owned touch の promoted mouse は source query が `IMDT_TOUCH` と確定した場合だけ捨てる。
 - **Keyboard / IME**: HUD では受けない (`WS_EX_NOACTIVATE` で focus を取らない)。presenter HWND の
-  既存 wndproc で受けて `NativeEguiOverlay` に流す。HUD 上の mouse-down で `claim_foreground(presenter_hwnd)`
-  を発火することで、VST 操作後でも presenter HWND を foreground/focus に戻して keyboard/IME を維持。
+  既存 wndproc で受けて `NativeEguiOverlay` に流す。HUD mouse-down は foreground HWND をイベントに記録し、
+  pump で登録済み VST editor が前面だったと判定した場合は presenter focus 要求を出さない。
+  presenter 上の touch DOWN はこの HUD 限定抑止の対象外で、editor から動画へ戻る focus 要求を維持する。
+  他アプリから HUD に戻る操作でも従来どおり要求する。editor の HWND/PID 登録と bridge PID 集合は一つの不変
+  snapshot として公開し、更新準備中も直前の完全な snapshot で分類する。presenter が owner の
+  popup でも、未登録なら editor として扱わない。
+  登録 editor は HWND と稼働中 bridge PID の両方で
+  照合し、plugin popup は editor と区別する。presenter の通常復旧も同じ分類を使い、editor 前面では
+  raise latch を立てず、外部アプリから戻った時の復旧は維持する。
   TextEdit を含む overlay ダイアログ表示中は、mIV が foreground に戻っているのに pump observation の
   thread focus が外れている場合も、render tick が rate-limit 付き focus intent を返し、`NativeWindowHost` が
   `claim_foreground(presenter_hwnd)` を実行して Alt+Tab 復帰後の文字入力 / Ctrl+V を回復する。
+  VST ボタンを押した時だけ通常ログに HUD down/up と toggle 実行、foreground PID、editor の
+  owner/可視/topmost/iconic、presenter/HUD の topmost を最大 64 行記録する。
   presenter の egui Context にも App と同じ IME input plugin を登録し、composition state を
   viewport 単位で所有する。native event queue が次の egui pass を待つ間は、plugin snapshot に
   `pending_events` を read-only 投影して Ctrl+V/C/X と Enter/Esc の gate を決め、presenter-local な

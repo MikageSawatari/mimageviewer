@@ -92,6 +92,7 @@ struct PersistentCollectionViewKey {
     order: CollectionPrepareReuseKey,
     spread: SpreadRequest,
     spread_page_gap_px: u32,
+    include_epub: bool,
 }
 
 impl PersistentCollectionViewKey {
@@ -100,6 +101,7 @@ impl PersistentCollectionViewKey {
             order: CollectionPrepareReuseKey::new(id, revision, &settings.grid_display_order),
             spread,
             spread_page_gap_px: settings.spread_page_gap_px,
+            include_epub: !settings.epub_file_handling_ignores_epub(),
         }
     }
 }
@@ -349,7 +351,7 @@ impl PersistentCollectionEngine {
             exact.prepared.entries.as_ref(),
             retain_budget,
             &mut current,
-            wire_entry,
+            |entry| wire_entry_with_epub_policy(entry, settings),
             |prepared_index, wire| {
                 if let Some(kind) = wire_available_resolved_kind(wire) {
                     remote_eligible.push(RemoteEligibleEntry {
@@ -1597,6 +1599,29 @@ fn wire_entry(entry: &PreparedCollectionEntry) -> PersistentCollectionEntry {
     }
 }
 
+fn wire_entry_with_epub_policy(
+    entry: &PreparedCollectionEntry,
+    settings: &Settings,
+) -> PersistentCollectionEntry {
+    let mut wire = wire_entry(entry);
+    if settings.epub_file_handling_ignores_path(&entry.source_path)
+        && matches!(
+            &wire.state,
+            PersistentCollectionEntryState::Available {
+                kind: RemoteEntryKind::Pdf,
+                ..
+            }
+        )
+    {
+        // Persistent collections retain user-curated rows even when a source is
+        // unavailable. Keep its identity, but remove it from Remote navigation.
+        wire.state = PersistentCollectionEntryState::BlockedByRemotePolicy {
+            last_known_kind: Some(RemoteEntryKind::Pdf),
+        };
+    }
+    wire
+}
+
 fn wire_available_resolved_kind(
     entry: &PersistentCollectionEntry,
 ) -> Option<CollectionResolvedKind> {
@@ -2672,6 +2697,43 @@ mod tests {
             wire_entry(&entry).state,
             PersistentCollectionEntryState::Unsupported {
                 last_known_kind: Some(RemoteEntryKind::Image)
+            }
+        ));
+    }
+
+    #[test]
+    fn persistent_collection_epub_ignore_keeps_row_but_blocks_remote_navigation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("book.epub");
+        std::fs::write(&path, b"epub").unwrap();
+        let source = CollectionSourcePath::from_trusted(&path).unwrap();
+        let entry = PreparedCollectionEntry {
+            entry_id: crate::collection_store::CollectionEntryId::new(),
+            source_key: source.key().clone(),
+            source_path: path.clone(),
+            availability: CollectionSourcePreparation::Available {
+                kind: CollectionResolvedKind::Pdf,
+                mtime: 1,
+                file_size: Some(4),
+            },
+            item: crate::grid_item::GridItem::PdfFile(path),
+            display_meta: Some((1, 4)),
+        };
+        let ignored = Settings {
+            epub_file_handling: crate::settings::EpubFileHandling::Ignore,
+            ..Default::default()
+        };
+        assert!(matches!(
+            wire_entry_with_epub_policy(&entry, &ignored).state,
+            PersistentCollectionEntryState::BlockedByRemotePolicy {
+                last_known_kind: Some(RemoteEntryKind::Pdf)
+            }
+        ));
+        assert!(matches!(
+            wire_entry_with_epub_policy(&entry, &Settings::default()).state,
+            PersistentCollectionEntryState::Available {
+                kind: RemoteEntryKind::Pdf,
+                ..
             }
         ));
     }

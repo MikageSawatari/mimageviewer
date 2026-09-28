@@ -127,6 +127,22 @@ always-active guidance.
   editing. Bug fixes should preserve the intended feature set unless the user has
   approved the functional change.
 
+## Design Simplicity And Regression Consultation
+
+- Before designing machinery that handles every interleaving of asynchronous
+  work (rollback, supersession, resume), first ask whether the combinations can
+  be removed instead. Prefer making long or inconsistency-prone flows
+  (conversion, saving, password prompts) modal so other opens, navigation,
+  history and window switches cannot start meanwhile; prefer closing or
+  reloading a shown window/panel through an existing path when a setting
+  changes, rather than adding a dedicated live-rebuild path. Record in the
+  design document which simplification was considered and why it was or was
+  not used. (User direction 2026-09-28; see CLAUDE.md "設計の簡素化".)
+- If a new feature or fix would make ordinary use slower, add steps, or remove
+  released behavior, stop before implementing and ask the design owner/user
+  with the options and costs. Do not choose the behavior-removing option on
+  your own; check in code what released behavior an option would remove.
+
 ## Bug Fix Policy
 
 - Before changing code for a bug, identify the observed failure, the expected

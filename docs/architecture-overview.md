@@ -29,6 +29,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │   - サムネイルワーカー (通常/重 I/O の 2 系統)                 │
 │   - フルスクリーンロードスレッド (1 画像ごとに spawn)          │
 │   - PDF ワーカープロセス (--pdf-worker、設定 3〜10、既定 5)     │
+│   - EPUB → PDF 変換プロセス (1 冊につき 1 子プロセス)          │
 │   - 外部受け渡し実体化ワーカー (ZIP/PDF/編集焼き込み + 起動)   │
 │   - Susie 32bit ワーカープロセス (mimageviewer-susie32.exe × N)│
 │   - TRT エンジンビルダー (--tensorrt-build サブプロセス、初回1回)│
@@ -160,6 +161,8 @@ source と編集 context を `MergedSpread` にまとめ、materializer worker �
 | `susie_loader.rs` | Susie 画像プラグイン (`.spi`) のワーカープロセスプール。PI/MAG/Q0/PIC/MAKI 等レトロ画像のデコードをルーティング。32bit ワーカー exe は本体に `include_bytes!` で埋め込み、初回起動時に `%APPDATA%\mimageviewer\mimageviewer-susie32.exe` へ自動展開 |
 | `archive_converter.rs` | RAR / 7z / LZH / (非 ZIP 入れ子入り) ZIP → 無圧縮 ZIP 変換 (unrar / sevenz-rust2 / delharc / zip)。入れ子アーカイブは一時ファイル経由で再帰展開し (深さ上限 8)、`"inner.rar/p01.jpg"` 形式のフラットなエントリ名で出力する (v1.3.0)。RAR はパスワード付きにも対応するが、入力パスワード自体は保存しない。画像判定は `is_recognized_image_ext` 経由 (Susie 対応拡張子も含む) |
 | `archive_cache.rs` | 変換済み ZIP のマッピング DB (`%APPDATA%/mimageviewer/archive_cache.db`)。元ファイルパス + mtime + size で lookup、変換後 ZIP は `archive_cache/<hash[..2]>/<hash>/*.zip`。設定された容量上限がある場合は変換完了後に `last_access_at` の古い順で削除する。パスワード付き RAR 由来でもキャッシュ ZIP は暗号化されないため、管理 UI で `PW` と表示し削除可能にする。将来版/旧版由来の未知 `format` 行も `旧形式 / 不明` と raw format 値で表示し、同じ管理 UI から削除できる |
+| `epub_cache.rs` | S2a の EPUB 専用ストア。`<data_dir>/epub_cache.db` の予約 ID・不変世代・現在・削除予約の 4 表を持ち、PDF は `epub_cache/<hash[..2]>/<hash>/<stem>.g<ID>.pdf` に置く。起動時は単一インスタンス取得後に `.alive` の排他ロックで削除ゲートを試み、共有ロックをプロセス終了まで保持する。削除予約中の世代と未完了予約のファイルだけを回収し、完了予約行も整理する。削除対象の root と各親ディレクトリをハンドルで検査して再解析ポイントを拒む。現行の ZIP 変換キャッシュとは独立する |
+| `epub_convert.rs` / `crates/epub-pdf-worker` | 背景スレッド専用 EPUB → PDF 変換ランナーと WebView2 子プロセス。core は自分の exe の隣から `mimageviewer-epub-pdf.exe` を探す (`MIV_EPUB_PDF_WORKER` で上書き可能)。書き込み共有を拒むハンドルから一時コピーと内容同定ハッシュを作り、子を suspended で起動して `KILL_ON_JOB_CLOSE` の Job Object に割り当てる。取消・異常終了で子プロセス群を止め、PDF 検証後に世代ファイルを上書きなしで公開して `epub_cache` に記録する。世代ファイルは読込中に固定し、削除予約後も実行中は読み続ける |
 | `fs_animation.rs` | GIF / APNG / WebP アニメーションのフレーム展開 |
 | `video_thumb.rs` | 動画サムネイル取得 (Windows Shell API) |
 | `video/` | 動画インライン再生とリモート時計なし配信。`mod.rs` (VideoPlayer 公開 API) / `ffmpeg_loader.rs` (FFmpeg LGPL DLL が exe 同居しているか検証 — 展開は launcher が起動時に行い、ロードは Windows ローダが行う) / `decoder.rs` (avformat/avcodec/swscale デコード worker、`VideoDynamicState` で per-frame 状態を atomic 共有) / `audio.rs` (cpal/WASAPI 出力 + ring buffer + VST3 前段の time-stretch) / `clockless_transcode.rs` と `stream/session.rs` (再生時計から独立した H.264/AAC/fMP4 generation、session 共有 remote VST3) / `audio_stretch.rs` (Signalsmith Stretch による pitch 維持の倍速音声処理) / `clock.rs` (AV マスタークロック)。FsCacheEntry::Video が VideoPlayer を所有し、remote headless player は metadata / thumbnail だけを提供する。`VideoInfo.dynamic` は decoder thread / native presenter thread / UI で共有し、右パネルの「フレーム表示」「デインターレース」を動的更新する |
@@ -253,7 +256,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `ui_metadata_panel.rs` | 右情報パネル (AI メタデータ + EXIF + XMP ツイート情報 + 類似画像)。類似タブ・照会表示・サムネイル要求と完了channelは `ViewerContextBundle` が所有する。可視カードとhoverページ帯の需要だけを描画後に処理し、workerは4枠、GPU uploadは1フレーム1件、派生キャッシュは512件以内に保つ。要求IDと内容stampを照合して退避・取消後の古い完了を拒否する |
 | `ui_erase.rs` | 消しゴムモード (筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円 → MI-GAN で inpaint) |
 | `ui_conceal.rs` | 隠蔽加工モード (同じマスク編集 UI でモザイク / 塗りつぶし / ぼかしを合成) |
-| `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブキャッシュ管理 (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定・ネットワーク上のデータ保存先に関する起動案内等。アーカイブ変換は `ArchiveConvertState` が scan / password retry / convert 共通の cancel token と completion policy を所有し、state drop と競合 navigation で worker と receiver を同時に終了する。モーダル相当の表示状態は `App::common_modal_dialog_open` に集約し、`process_scroll` のポインタ直下 floating-layer guard と組み合わせてダイアログ内 wheel の背面グリッドへの伝播を防ぐ。TensorRT パック取得のような長時間ツール Window はモデルレスとし、表示中も閲覧を止めない |
+| `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブ管理と EPUB 変換キャッシュ管理の独立したダイアログ (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定・ネットワーク上のデータ保存先に関する起動案内等。アーカイブ変換は `ArchiveConvertState` が scan / password retry / convert 共通の cancel token と completion policy を所有し、state drop と競合 navigation で worker と receiver を同時に終了する。モーダル相当の表示状態は `App::common_modal_dialog_open` に集約し、`process_scroll` のポインタ直下 floating-layer guard と組み合わせてダイアログ内 wheel の背面グリッドへの伝播を防ぐ。TensorRT パック取得のような長時間ツール Window はモデルレスとし、表示中も閲覧を止めない |
 | `native_name_dialog.rs` | 名前変更 / 新規フォルダ作成で共有する Windows 標準の単一行入力画面。メモリ上のダイアログテンプレートを同期モーダル表示し、IME・書記素編集・クリップボード・Undo を OS に委譲する。非 Windows では no-op stub |
 | `ui_dialogs/preferences.rs` | 環境設定ダイアログの状態、App 連携、ツリー / ページ dispatch |
 | `ui_dialogs/preferences/pages.rs` | 環境設定の各 `page_*` 描画関数 |

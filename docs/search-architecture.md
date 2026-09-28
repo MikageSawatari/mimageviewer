@@ -143,6 +143,32 @@ separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 新しい lookup 経路を追加するときも同じ正規化を通すこと。
 `!` を separator に戻してはいけない (通常ファイル名と衝突する。INDEX_VERSION=4 で廃止)。
 
+### EPUB 行の互換性 (S3a)
+
+Ctrl+S の EPUB は既存の `search_index.db` の `PdfFile`、Ctrl+G の EPUB は既存の
+`fts_meta.db` / Tantivy の `Pdf` として追加する。既存行・列・kind 値・索引の schema は
+変えず、`fts_meta::INDEX_VERSION` は 10 のままにする。全利用者へ索引再構築を強制しない。
+前方互換では新しい EPUB 行だけが増え、移行は不要。
+「EPUB の処理」が「無視する」のとき、Ctrl+S は SQLite の `WHERE` で EPUB を除いてから
+5,000 件の上限を適用する。Ctrl+G は検索ワーカーが EPUB のパスを STORED 原文取得前に
+除き、残った結果だけを 10,000 件の上限に数える。EPUB は PDF と同じ kind で索引されるため、
+Ctrl+G の kind 条件だけでは区別できない。
+
+v4.1.0 へ戻すと、残っている Ctrl+G の `Pdf` 行は旧 `grid_item_from_fs_hit_path` で
+**画像タイル**に再分類される。クリックすると画像としての読込に失敗するが、その前に
+`open_fullscreen` が `record_book_resume` を呼ぶ。読書位置の記録が有効なら、検索元フォルダーの
+保存済み位置を `book_resume.db` で上書きし得る。これは表示だけの差ではない。
+Ctrl+S に `PdfFile` 行が残っている間は本タイルとして表示されるが、開くと旧版の `.pdf` 限定判定を
+通らず通常ディレクトリ走査のエラーになる。
+
+旧版の索引走査は通常 `.epub` を候補に含めないため、後続の差分処理で新しい EPUB 行を削除する
+(Susie プラグインが `.epub` を画像拡張子として申告する構成では画像候補として残り得る)。
+現行版へ戻した後は、`search_walker::walk_dir_recursive` が EPUB を `CandidateKind::Pdf` として集め、
+DB に行が無ければ `scan` が `to_ingest` に入れ、`IngestSession::apply` が同じ `Pdf` kind で再登録する。
+Ctrl+S も `name_bulk_indexer::classify_name_index_kind` が EPUB を `PdfFile` として次の走査で再登録する。
+`INDEX_VERSION` を上げなくても復旧する。索引の再登録は対象のお気に入りの次の走査時であり、
+利用者ごとの自動索引設定で走査が無効なら、その設定に従う。
+
 ---
 
 ## 4. インデクサパイプライン
@@ -152,6 +178,13 @@ separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 画像 / PDF / 動画 / 音声を、ファイル名・タグ・EXIF・AI プロンプト等で横断検索する
 ための索引。Ctrl+G が使う。Ctrl+F (現在地フィルタ) はこの索引を使わず、
 表示中アイテムを on-demand に判定する (§5.2)。
+
+EPUB は Ctrl+S / Ctrl+G とも元ファイル名を検索対象にし、検索結果と同定には元 EPUB の
+パスを保持する (`IndexDoc.path` 等)。パスの親ディレクトリ名は検索語にしない。
+`ingest_worker::build_doc_for_pdf` は EPUB を
+拡張子で明示的に分岐し、未変換・変換済みのどちらでも生成 PDF の Info 辞書を呼ばない。
+EPUB 内のタイトル・著者も索引しない。取込失敗として記録・ログ出力せず、通常の `Pdf` 行を
+登録する。Ctrl+F も EPUB はファイル名だけで判定し、生成 PDF の Info 辞書を読まない。
 
 ```
 App 起動
@@ -467,7 +500,7 @@ PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた�
 ```
 UI (render_favsearch_bar)
   → execute_favsearch (spawn worker thread)
-    → SearchIndexDb::search(query, favorite_roots, kind, mode)
+    → SearchIndexDb::search_with_epub(query, favorite_roots, kind, mode, include_epub)
          SQL: SELECT ... FROM entries WHERE
               include 群を mode に応じて AND / OR 結合した LIKE
               AND exclude 群の NOT LIKE
@@ -475,6 +508,8 @@ UI (render_favsearch_bar)
               AND 種別フィルタ:
                   kind=Some(k) なら kind = ?
                   kind=None    なら kind <> VideoFile
+              AND EPUB を無視する場合は PdfFile の .epub パスを除外
+         ORDER BY display_name LIMIT 5000
   → poll_favsearch が結果を受け取り GridItem::Folder/ZipFile/PdfFile に展開
 ```
 
@@ -564,13 +599,14 @@ UI (global_search_ui::render_global_search_bar)
        重複・抜け防止: commit が走っても snapshot は古い seg を見続ける)
     3. TopDocs::with_limit(PAGE_SIZE=500).and_offset(offset) をループ:
        a. Tantivy 候補 (path, addr, score) を取得
-       b. doc_text_for_target で同じ Tantivy snapshot から STORED 原文を引く
+       b. EPUB を無視する場合は .epub パスを除外 (valid 件数には数えない)
+       c. doc_text_for_target で同じ Tantivy snapshot から STORED 原文を引く
           (target で取り出すフィールドを切り替え)
-       c. search_query::matches_with_mode で post-filter (phrase / NOT / AND/OR 判定)
-       d. 1 candidate page ごとに Batch 送信 (path と累計 scanned / valid を streaming)。
+       d. search_query::matches_with_mode で post-filter (phrase / NOT / AND/OR 判定)
+       e. 1 candidate page ごとに Batch 送信 (path と累計 scanned / valid を streaming)。
           post-filter で全滅した page も空 Batch として進捗を送る
-       e. 累計 valid_hits が HARD_MAX=10_000 到達で TruncatedAtMax 終了
-       f. 候補使い切りで Complete、cancel で Cancelled
+       f. 累計 valid_hits が HARD_MAX=10_000 到達で TruncatedAtMax 終了
+       g. 候補使い切りで Complete、cancel で Cancelled
     4. Done 送信
 
   [UI] 毎フレーム:

@@ -14,6 +14,14 @@ pub const PDF_WORKER_COUNT_MIN: u32 = 3;
 pub const PDF_WORKER_COUNT_MAX: u32 = 10;
 pub const PDF_WORKER_COUNT_DEFAULT: u32 = 5;
 
+pub fn viewer_window_level(always_on_top: bool) -> egui::WindowLevel {
+    if always_on_top {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    }
+}
+
 fn default_ui_scale_factor() -> f32 {
     1.0
 }
@@ -2493,6 +2501,42 @@ impl ArchiveFileHandling {
     }
 }
 
+/// EPUB から PDF への変換を開始する際の扱い。書庫の旧設定移行とは独立する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpubFileHandling {
+    Ask,
+    Convert,
+    Ignore,
+}
+
+impl Default for EpubFileHandling {
+    fn default() -> Self {
+        Self::Ask
+    }
+}
+
+impl EpubFileHandling {
+    pub fn all() -> &'static [Self] {
+        &[Self::Ask, Self::Convert, Self::Ignore]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "確認してから変換する",
+            Self::Convert => "確認せず変換する",
+            Self::Ignore => "無視する",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Ask => "未変換の EPUB を開くときに確認画面を表示します。",
+            Self::Convert => "確認画面を省略して PDF に変換します。進捗とエラーは表示します。",
+            Self::Ignore => "EPUB を一覧やフォルダ移動の対象にせず、変換済みの本も開きません。",
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // インデクサ速度プロファイル (v0.8.0, docs/archive/search-metadata/search-expansion-design.md §7.5)
 // -----------------------------------------------------------------------
@@ -4203,6 +4247,9 @@ pub struct Settings {
     /// 復元先が最大化サイズで潰れて戻れなくなる (detached 側の §1.115 と同じ根)。
     #[serde(default)]
     pub window_maximized: bool,
+    /// Keep the main and viewer host windows above other applications when requested.
+    #[serde(default)]
+    pub always_on_top: bool,
     /// 起動時にメインウィンドウを最大化するか。既定は従来どおり通常ウィンドウ。
     #[serde(default)]
     pub startup_window_state: StartupWindowState,
@@ -4226,6 +4273,9 @@ pub struct Settings {
     /// サムネイルグリッドのソート順
     #[serde(default)]
     pub sort_order: SortOrder,
+    /// ★1〜★5 のレーティング一覧で共通に使うソート順。
+    #[serde(default)]
+    pub rating_view_sort: crate::rating_view::RatingViewSort,
     #[serde(default)]
     pub rating_sort_unrated_position: crate::rating_sort::RatingSortUnratedPosition,
     /// サブフォルダ展開ビューでフォルダ境界を優先するか。
@@ -4313,6 +4363,9 @@ pub struct Settings {
     /// RAR / 7z / LZH などの変換対象アーカイブをどう扱うか。
     #[serde(default)]
     pub archive_file_handling: ArchiveFileHandling,
+    /// EPUB を PDF に変換して開くときの扱い。書庫の設定からは引き継がない。
+    #[serde(default)]
+    pub epub_file_handling: EpubFileHandling,
     /// 旧設定互換: RAR / 7z / LZH を開くとき、確認ダイアログを省略するか。
     /// 新規 UI / 実行時判定は `archive_file_handling` を source of truth とし、
     /// この bool は古い設定の読み込み互換と旧版へ戻した場合の近似互換のために同期する。
@@ -4547,6 +4600,8 @@ pub struct Settings {
     /// 同名の ZIP/CBZ がある場合、RAR/7z/LZH 側をスキップする
     #[serde(default = "default_true")]
     pub skip_archive_if_zip_exists: bool,
+    #[serde(default = "default_true")]
+    pub skip_epub_if_pdf_exists: bool,
     /// 同名の動画と画像がある場合、画像をスキップする（動画サムネイルで代替）
     #[serde(default = "default_true")]
     pub skip_image_if_video_exists: bool,
@@ -4708,6 +4763,9 @@ pub struct Settings {
     /// デフォルトのページ構成
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
+    /// 本に保存した見開きモードがない場合、PDF / EPUB の右開き指定に従う。
+    #[serde(default)]
+    pub follow_document_reading_direction: bool,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -4926,6 +4984,10 @@ pub struct Settings {
     /// ツールバーに表示する列数の選択肢
     #[serde(default = "default_toolbar_cols_items")]
     pub toolbar_cols_items: Vec<usize>,
+    /// 旧既定の列数候補 1〜10 を一度だけ 1〜20 へ補完した marker。
+    /// 旧保存では false、現行の新規設定では true。以後候補を外しても再追加しない。
+    #[serde(default)]
+    pub(crate) toolbar_cols_20_options_migrated: bool,
     /// ツールバーの列セクションに「詳細」切替を表示するか
     #[serde(default = "default_true")]
     pub toolbar_cols_details_visible: bool,
@@ -6623,7 +6685,7 @@ fn default_video_seek_strip_waveform_span_secs() -> f64 {
 /// グリッド列数の最小値
 pub const MIN_GRID_COLS: usize = 1;
 /// グリッド列数の最大値
-pub const MAX_GRID_COLS: usize = 10;
+pub const MAX_GRID_COLS: usize = 20;
 pub const FULLSCREEN_JUMP_PERCENT_MIN: u32 = 1;
 pub const FULLSCREEN_JUMP_PERCENT_MAX: u32 = 100;
 pub const FULLSCREEN_JUMP_PERCENT_DEFAULT: u32 = 10;
@@ -7066,6 +7128,7 @@ impl Default for Settings {
             window_pos: None,
             window_size: None,
             window_maximized: false,
+            always_on_top: false,
             startup_window_state: StartupWindowState::default(),
             parallelism: Parallelism::default(),
             pdf_worker_count: default_pdf_worker_count(),
@@ -7074,6 +7137,7 @@ impl Default for Settings {
             folder_skip_limit: default_folder_skip_limit(),
             show_hidden_files: false,
             sort_order: SortOrder::default(),
+            rating_view_sort: crate::rating_view::RatingViewSort::default(),
             rating_sort_unrated_position: Default::default(),
             subfolder_expansion_order: SubfolderExpansionOrder::default(),
             subfolder_expansion_max_depth: default_subfolder_expansion_max_depth(),
@@ -7097,6 +7161,7 @@ impl Default for Settings {
             edit_preview_cache_max_bytes: default_edit_preview_cache_max_bytes(),
             archive_cache_max_bytes: 0,
             archive_file_handling: ArchiveFileHandling::Ask,
+            epub_file_handling: EpubFileHandling::Ask,
             archive_convert_without_dialog: false,
             batch_cache_zip_contents: false,
             batch_cache_pdf_contents: false,
@@ -7124,6 +7189,7 @@ impl Default for Settings {
             exif_hidden_tags: default_exif_hidden_tags(),
             skip_zip_if_folder_exists: true,
             skip_archive_if_zip_exists: true,
+            skip_epub_if_pdf_exists: true,
             skip_image_if_video_exists: true,
             skip_duplicate_images: true,
             image_ext_priority: default_image_ext_priority(),
@@ -7142,6 +7208,7 @@ impl Default for Settings {
             active_book_name: default_active_book_name(),
             pinned_books: Vec::new(),
             default_spread_mode: SpreadMode::default(),
+            follow_document_reading_direction: false,
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
@@ -7242,6 +7309,7 @@ impl Default for Settings {
             ring_shortcuts: crate::ring_shortcut::RingShortcutSettings::default(),
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
+            toolbar_cols_20_options_migrated: true,
             toolbar_cols_details_visible: true,
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_aspect_auto_visible: default_toolbar_aspect_auto_visible(),
@@ -7869,13 +7937,13 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 /// 1. `migrate_vst3_legacy`
 /// 2. `migrate_legacy_video_loop`
 /// 3. `migrate_legacy_archive_file_handling`
-/// 4. `migrate_toolbar_sort_size_options`
-/// 5. `migrate_toolbar_sort_name_numeric_desc_options`
-/// 6. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
+/// 4. ツールバーの列数・ソート候補の一度きりの補完
+/// 5. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
 pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_vst3_legacy();
     settings.migrate_legacy_video_loop();
     settings.migrate_legacy_archive_file_handling();
+    settings.migrate_toolbar_cols_20_options();
     settings.migrate_toolbar_sort_size_options();
     settings.migrate_toolbar_sort_name_numeric_desc_options();
     settings.migrate_toolbar_sort_rating_options();
@@ -8352,6 +8420,22 @@ impl Settings {
             .resolved(self.archive_convert_without_dialog)
     }
 
+    pub fn epub_convert_suppresses_confirm(&self) -> bool {
+        self.epub_file_handling == EpubFileHandling::Convert
+    }
+
+    pub fn epub_file_handling_ignores_epub(&self) -> bool {
+        self.epub_file_handling == EpubFileHandling::Ignore
+    }
+
+    pub fn epub_file_handling_ignores_path(&self, path: &std::path::Path) -> bool {
+        self.epub_file_handling_ignores_epub()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    }
+
     pub fn archive_convert_suppresses_confirm(&self) -> bool {
         self.archive_file_handling_resolved() == ArchiveFileHandling::Convert
     }
@@ -8467,6 +8551,20 @@ impl Settings {
         true
     }
 
+    /// 保存済みの旧既定 1〜10 だけを一度 1〜20 へ補完する。
+    /// 部分集合や並び替え済みの配列は利用者の選択として保持する。
+    fn migrate_toolbar_cols_20_options(&mut self) -> bool {
+        if self.toolbar_cols_20_options_migrated {
+            return false;
+        }
+        const LEGACY_DEFAULT_COLS: [usize; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        if self.toolbar_cols_items == LEGACY_DEFAULT_COLS {
+            self.toolbar_cols_items = (1..=20).collect();
+        }
+        self.toolbar_cols_20_options_migrated = true;
+        true
+    }
+
     /// 一覧サイズ順を追加する前の既定4候補を、保存世代ごとに一度だけ6候補へ補完する。
     /// markerを別に持つことで、移行後に利用者がサイズ2候補だけを非表示にした同じ4値を
     /// 次回loadで再び既定扱いしない。
@@ -8574,6 +8672,7 @@ impl Settings {
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
+        let toolbar_cols_20_options_migrated = settings.migrate_toolbar_cols_20_options();
         let toolbar_sort_size_options_migrated = settings.migrate_toolbar_sort_size_options();
         let toolbar_sort_name_numeric_desc_options_migrated =
             settings.migrate_toolbar_sort_name_numeric_desc_options();
@@ -8711,6 +8810,7 @@ impl Settings {
             || autoplay_mode_migrated
             || video_loop_migrated
             || archive_file_handling_migrated
+            || toolbar_cols_20_options_migrated
             || video_volume_sanitized
             || video_playback_speed_sanitized
             || video_seek_thumbnail_tolerance_sanitized
@@ -9542,6 +9642,7 @@ impl Settings {
         self.thumb_aspect = src.thumb_aspect;
         self.thumb_aspect_auto = src.thumb_aspect_auto;
         self.sort_order = src.sort_order;
+        self.rating_view_sort = src.rating_view_sort;
         self.subfolder_expansion_order = src.subfolder_expansion_order;
         self.subfolder_expansion_max_depth = src.subfolder_expansion_max_depth;
         self.subfolder_expansion_filter_kinds = src.subfolder_expansion_filter_kinds.clone();
@@ -9585,6 +9686,7 @@ impl Settings {
         self.toolbar_bookshelf_collapsed = src.toolbar_bookshelf_collapsed;
         self.toolbar_collections_collapsed = src.toolbar_collections_collapsed;
         self.toolbar_cols_items = std::mem::take(&mut src.toolbar_cols_items);
+        self.toolbar_cols_20_options_migrated = src.toolbar_cols_20_options_migrated;
         self.toolbar_cols_details_visible = src.toolbar_cols_details_visible;
         self.toolbar_aspect_items = std::mem::take(&mut src.toolbar_aspect_items);
         self.toolbar_aspect_auto_visible = src.toolbar_aspect_auto_visible;
@@ -9668,6 +9770,7 @@ impl Settings {
         // 最大化 flag は環境設定に出さない実行時状態。`startup_window_state` の方は
         // 利用者が編集する設定なので、ここで live 値へ巻き戻してはいけない。
         self.window_maximized = src.window_maximized;
+        self.always_on_top = src.always_on_top;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
         // お気に入り表示 overlay は runtime 状態。環境設定を開いている間に viewer context
@@ -9881,6 +9984,68 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rating_view_sort_defaults_roundtrips_and_survives_preferences_merge() {
+        use crate::rating_view::RatingViewSort;
+
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.rating_view_sort, RatingViewSort::RatedAtDesc);
+        assert_eq!(
+            Settings::default().rating_view_sort,
+            RatingViewSort::RatedAtDesc
+        );
+
+        let mut live = Settings::default();
+        live.rating_view_sort = RatingViewSort::Normal(SortOrder::DateAsc);
+        live.sort_order = SortOrder::FileName;
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+        assert_eq!(
+            restored.rating_view_sort,
+            RatingViewSort::Normal(SortOrder::DateAsc)
+        );
+        assert_eq!(restored.sort_order, SortOrder::FileName);
+
+        let mut stale_draft = Settings::default();
+        stale_draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            stale_draft.rating_view_sort,
+            RatingViewSort::Normal(SortOrder::DateAsc)
+        );
+    }
+
+    #[test]
+    fn always_on_top_defaults_off_roundtrips_and_survives_preferences_merge() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!old.always_on_top);
+        assert_eq!(viewer_window_level(false), egui::WindowLevel::Normal);
+        assert_eq!(viewer_window_level(true), egui::WindowLevel::AlwaysOnTop);
+
+        let mut live = Settings {
+            always_on_top: true,
+            ..Settings::default()
+        };
+        let saved = serde_json::to_string(&live).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&saved)
+                .unwrap()
+                .always_on_top
+        );
+        let mut draft = Settings::default();
+        draft.overwrite_non_preferences_from(&mut live);
+        assert!(draft.always_on_top);
+
+        let mut previous =
+            egui::ViewportBuilder::default().with_window_level(viewer_window_level(false));
+        let (commands, _) = previous
+            .patch(egui::ViewportBuilder::default().with_window_level(viewer_window_level(true)));
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)
+        ));
+    }
 
     #[test]
     fn page_alone_key_action_writes_opposite_effective_value() {
@@ -12568,7 +12733,19 @@ mod tests {
         persisted.stash_details_place_for_persist();
         persisted.stash_details_page_count_for_persist();
         let json = serde_json::to_string(&persisted).unwrap();
-        assert!(!json.contains("RatedAt"));
+        let persisted_fields: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for key in [
+            "details_sort_key",
+            "details_column_order",
+            "details_column_widths",
+            "details_selection_bar_column_order",
+            "details_selection_bar_column_widths",
+        ] {
+            assert!(
+                !persisted_fields[key].to_string().contains("RatedAt"),
+                "{key} must remain readable by older details settings"
+            );
+        }
 
         let mut loaded: Settings = serde_json::from_str(&json).unwrap();
         loaded.sanitize();
@@ -13100,6 +13277,7 @@ mod tests {
         );
         assert_eq!(s.archive_cache_max_bytes, 0);
         assert_eq!(s.archive_file_handling, ArchiveFileHandling::Ask);
+        assert_eq!(s.epub_file_handling, EpubFileHandling::Ask);
         assert!(!s.archive_convert_without_dialog);
         assert_eq!(s.thumb_prev_pages, 2);
         assert_eq!(s.thumb_next_pages, 4);
@@ -14400,6 +14578,19 @@ mod tests {
     }
 
     #[test]
+    fn missing_epub_handling_defaults_to_ask_without_archive_migration() {
+        let mut stored = serde_json::to_value(Settings::default()).unwrap();
+        stored.as_object_mut().unwrap().remove("epub_file_handling");
+        stored["archive_file_handling"] = serde_json::json!("Convert");
+        let loaded: Settings = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(loaded.archive_file_handling, ArchiveFileHandling::Convert);
+        assert_eq!(loaded.epub_file_handling, EpubFileHandling::Ask);
+
+        stored["epub_file_handling"] = serde_json::json!("Legacy");
+        assert!(serde_json::from_value::<Settings>(stored).is_err());
+    }
+
+    #[test]
     fn sanitize_syncs_legacy_bool_from_mode_idempotent() {
         // mode を source of truth として bool を導出。sanitize は idempotent。
         let mut s = Settings::default();
@@ -15476,6 +15667,181 @@ mod tests {
         s
     }
 
+    fn save_released_toolbar_cols_db(
+        dir: &std::path::Path,
+        cols: Vec<usize>,
+        display: ToolbarSectionDisplay,
+    ) {
+        let mut old = Settings::default();
+        old.toolbar_cols_items = cols;
+        old.toolbar_cols_20_options_migrated = false;
+        old.toolbar_cols_display = display;
+        let db = crate::settings_db::SettingsDb::create_new(dir).unwrap();
+        db.save_full(&old).unwrap();
+        drop(db);
+        // リリース済み DB にはこの新フィールド自体が無い。
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'toolbar_cols_20_options_migrated'",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_released_default_once_and_preserves_later_choice() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, (1..=10).collect(), ToolbarSectionDisplay::Dropdown);
+
+        let mut loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::LoadedExistingDb
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        let db = crate::settings_db::SettingsDb::open(&dir).unwrap();
+        let persisted = db.load_into_settings().unwrap();
+        assert_eq!(persisted.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(persisted.toolbar_cols_20_options_migrated);
+        drop(db);
+
+        // 利用者が追加候補を全部外すと旧既定と同じ配列へ戻るが、印が再移行を防ぐ。
+        loaded.settings.toolbar_cols_items = (1..=10).collect();
+        loaded.settings.save();
+        reset_backup_state_for_test();
+        let reloaded = Settings::load();
+        assert_eq!(reloaded.toolbar_cols_items, (1..=10).collect::<Vec<_>>());
+        assert!(reloaded.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_button_display_too() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, (1..=10).collect(), ToolbarSectionDisplay::Buttons);
+
+        let loaded = Settings::load();
+        assert_eq!(loaded.toolbar_cols_display, ToolbarSectionDisplay::Buttons);
+        assert_eq!(loaded.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(loaded.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(
+            persisted.toolbar_cols_display,
+            ToolbarSectionDisplay::Buttons
+        );
+        assert_eq!(persisted.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_leaves_custom_subset_untouched_and_marks_it_done() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, vec![1, 4, 10], ToolbarSectionDisplay::Dropdown);
+        let loaded = Settings::load();
+        assert_eq!(loaded.toolbar_cols_items, vec![1, 4, 10]);
+        assert!(loaded.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(persisted.toolbar_cols_items, vec![1, 4, 10]);
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_clean_install_starts_complete() {
+        let _env = setup_backup_env();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::CleanInstall
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&crate::data_dir::get())
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_released_json_in_portable_data_dir() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        let mut old = Settings::default();
+        old.toolbar_cols_items = (1..=10).collect();
+        let mut json = serde_json::to_value(old).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("toolbar_cols_20_options_migrated");
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::MigratedFromJson
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        assert_eq!(
+            crate::settings_db::SettingsDb::open(&dir)
+                .unwrap()
+                .load_into_settings()
+                .unwrap()
+                .toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_after_db_backup_recovery() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, (1..=10).collect(), ToolbarSectionDisplay::Dropdown);
+        let db = crate::settings_db::SettingsDb::open(&dir).unwrap();
+        db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        drop(db);
+        std::fs::remove_file(dir.join("settings.db")).unwrap();
+        std::fs::write(dir.join("settings.db"), b"GARBAGE-NOT-A-SQLITE-DB-CONTENT").unwrap();
+        let _ = std::fs::remove_file(dir.join("settings.db-wal"));
+        let _ = std::fs::remove_file(dir.join("settings.db-shm"));
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::RestoredFromDbBackup
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(persisted.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
     #[test]
     fn toolbar_name_numeric_desc_migration_is_persisted_once_in_settings_db() {
         let _env = setup_backup_env();
@@ -16108,6 +16474,25 @@ mod tests {
             // env は tempdir を保持しているが path 取得は data_dir::get() でできる。
             let _ = env;
             crate::data_dir::get().join("settings.db")
+        }
+
+        #[test]
+        fn rating_view_sort_db_roundtrip_is_independent_of_normal_sort() {
+            use crate::rating_view::RatingViewSort;
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.sort_order = SortOrder::DateDesc;
+            settings.rating_view_sort = RatingViewSort::RatedAtAsc;
+            settings.save();
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(loaded.sort_order, SortOrder::DateDesc);
+            assert_eq!(loaded.rating_view_sort, RatingViewSort::RatedAtAsc);
         }
         fn db_bak_path(env: &BackupTestEnv, n: usize) -> PathBuf {
             let _ = env;

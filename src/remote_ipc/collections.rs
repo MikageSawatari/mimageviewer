@@ -240,11 +240,12 @@ impl CollectionEngine {
             FavoriteSearchKind::Zip => Some(IndexKind::ZipFile),
             FavoriteSearchKind::Pdf => Some(IndexKind::PdfFile),
         };
-        let index_entries = match db.search(
+        let index_entries = match db.search_with_epub(
             &request.query,
             &favorite_paths,
             kind,
             crate::search_query::MatchMode::And,
+            !settings.epub_file_handling_ignores_epub(),
         ) {
             Ok(entries) => entries,
             Err(error) => {
@@ -392,6 +393,7 @@ impl CollectionEngine {
             request.kind,
             key_scan_limit,
             !settings.archive_file_handling_ignores_convertible(),
+            !settings.epub_file_handling_ignores_epub(),
         );
         Ok(TagItemsPayload {
             listing: self.tag_items_listing(settings, sort_order, entries, truncated),
@@ -1107,8 +1109,19 @@ fn candidate_from_tag_item_key(key: String, filter: TagItemKind) -> Option<Candi
 }
 
 fn include_collection_candidate(settings: &Settings, candidate: &CandidateEntry) -> bool {
-    candidate.kind != RemoteEntryKind::Archive
-        || !settings.archive_file_handling_ignores_convertible()
+    if candidate.kind == RemoteEntryKind::Archive {
+        return !settings.archive_file_handling_ignores_convertible();
+    }
+    if candidate.kind == RemoteEntryKind::Pdf
+        && candidate
+            .path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    {
+        return !settings.epub_file_handling_ignores_epub();
+    }
+    true
 }
 
 fn map_tag_item_keys(
@@ -1116,12 +1129,14 @@ fn map_tag_item_keys(
     filter: TagItemKind,
     key_scan_limit: usize,
     include_archives: bool,
+    include_epub: bool,
 ) -> (Vec<RemoteEntry>, bool) {
     map_tag_item_keys_with_entry_limit(
         item_keys,
         filter,
         key_scan_limit,
         include_archives,
+        include_epub,
         MAX_REMOTE_COLLECTION_ENTRIES,
     )
 }
@@ -1131,6 +1146,7 @@ fn map_tag_item_keys_with_entry_limit(
     filter: TagItemKind,
     key_scan_limit: usize,
     include_archives: bool,
+    include_epub: bool,
     entry_limit: usize,
 ) -> (Vec<RemoteEntry>, bool) {
     let key_limit_reached = item_keys.len() > key_scan_limit;
@@ -1141,6 +1157,16 @@ fn map_tag_item_keys_with_entry_limit(
             continue;
         };
         if !include_archives && candidate.kind == RemoteEntryKind::Archive {
+            continue;
+        }
+        if !include_epub
+            && candidate.kind == RemoteEntryKind::Pdf
+            && candidate
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
             continue;
         }
         candidates.push(candidate);
@@ -2543,6 +2569,7 @@ mod tests {
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
             true,
+            true,
             test_limit,
         );
 
@@ -2562,17 +2589,41 @@ mod tests {
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
             false,
+            true,
         );
         let (included, _) = map_tag_item_keys(
             vec![key],
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
             true,
+            true,
         );
 
         assert!(ignored.is_empty());
         assert_eq!(included.len(), 1);
         assert_eq!(included[0].kind, RemoteEntryKind::Archive);
+    }
+
+    #[test]
+    fn tag_item_mapping_honors_epub_ignore_independently_of_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let epub = temp.path().join("tagged.epub");
+        let archive = temp.path().join("tagged.7z");
+        std::fs::write(&epub, b"epub").unwrap();
+        std::fs::write(&archive, b"archive").unwrap();
+        let keys = vec![
+            crate::tags_db::item_key_for_path(&epub),
+            crate::tags_db::item_key_for_path(&archive),
+        ];
+        let (entries, _) = map_tag_item_keys(
+            keys,
+            TagItemKind::All,
+            crate::tag_view::TAG_VIEW_RESULT_LIMIT,
+            true,
+            false,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, RemoteEntryKind::Archive);
     }
 
     #[test]
@@ -2594,6 +2645,7 @@ mod tests {
             item_keys,
             TagItemKind::Image,
             crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT,
+            true,
             true,
             test_limit,
         );
@@ -2758,5 +2810,43 @@ mod tests {
 
         assert_eq!(entries.len(), test_limit);
         assert!(truncated);
+    }
+
+    #[test]
+    fn favorite_search_epub_ignore_filters_before_index_limit() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        std::fs::create_dir_all(&root).unwrap();
+        let pdf = root.join("zzz-book.pdf");
+        std::fs::write(&pdf, b"pdf").unwrap();
+        let mut indexed = (0..SEARCH_RESULT_LIMIT)
+            .map(|n| {
+                let path = root.join(format!("aaa-book-{n:04}.EPUB"));
+                IndexEntry {
+                    display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    path,
+                    kind: IndexKind::PdfFile,
+                    mtime: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        indexed.push(IndexEntry {
+            path: pdf.clone(),
+            display_name: "zzz-book.pdf".into(),
+            kind: IndexKind::PdfFile,
+            mtime: 0,
+        });
+        let db = SearchIndexDb::open_at(&SearchIndexDb::db_path()).unwrap();
+        db.upsert_children(&root, &root, &indexed).unwrap();
+        drop(db);
+        let settings = Settings {
+            favorites: vec![favorite_with_container_index(root, true)],
+            epub_file_handling: crate::settings::EpubFileHandling::Ignore,
+            ..Default::default()
+        };
+        let payload =
+            search_success(CollectionEngine::new(settings).favorite_search(search_request("book")));
+        assert_eq!(payload.listing.entries.len(), 1);
+        assert_eq!(payload.listing.entries[0].path, pdf.to_string_lossy());
     }
 }

@@ -271,6 +271,28 @@ fn snapshot_with_theme_at_size(
 }
 
 #[test]
+fn details_icons_light() {
+    snapshot_with_theme_at_size(
+        "details_icons_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 480.0),
+        Some(egui::pos2(28.0, 120.0)),
+        mimageviewer::draw_details_icons_snapshot_fixture,
+    );
+}
+
+#[test]
+fn details_icons_dark() {
+    snapshot_with_theme_at_size(
+        "details_icons_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(480.0, 480.0),
+        Some(egui::pos2(28.0, 120.0)),
+        mimageviewer::draw_details_icons_snapshot_fixture,
+    );
+}
+
+#[test]
 fn fullscreen_page_wait_indicator_dark() {
     snapshot_with_theme(
         "fullscreen_page_wait_indicator_dark",
@@ -734,6 +756,9 @@ fn cell_filename_mixed_glyphs_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    checked: false,
+                    stack_count: None,
+                    filter_match_count: None,
                     bookmark_time: None,
                     upscaled_video: false,
                     edit_badges: Default::default(),
@@ -794,6 +819,9 @@ fn compact_file_format_badges_light() {
                     mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                         cell,
                         inner,
+                        checked: false,
+                        stack_count: None,
+                        filter_match_count: None,
                         bookmark_time: None,
                         upscaled_video: false,
                         edit_badges: Default::default(),
@@ -904,6 +932,9 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    checked: false,
+                    stack_count: None,
+                    filter_match_count: None,
                     bookmark_time: Some("0:25"),
                     upscaled_video: false,
                     edit_badges: Default::default(),
@@ -957,6 +988,9 @@ fn bookmark_time_and_tag_badges_dark() {
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    checked: false,
+                    stack_count: None,
+                    filter_match_count: None,
                     bookmark_time: Some("12:34"),
                     upscaled_video: false,
                     edit_badges: mimageviewer::thumb_overlay_layout::EditBadgeFlags {

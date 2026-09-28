@@ -45,7 +45,7 @@ impl PhysicalKeySlot {
     }
 }
 
-/// Navigation keys supported by the initial synthetic-input timeline.
+/// Navigation keys, Backspace, and F12 supported by the synthetic-input timeline.
 ///
 /// Printable keys, JIS symbols, numpad-specific keys, clipboard shortcuts,
 /// text events, and IME events are intentionally not representable here.
@@ -60,7 +60,9 @@ pub enum SyntheticNavigationKey {
     Home,
     End,
     Enter,
+    Backspace,
     Escape,
+    F12,
 }
 
 impl SyntheticNavigationKey {
@@ -76,7 +78,9 @@ impl SyntheticNavigationKey {
             Self::Home => "Home",
             Self::End => "End",
             Self::Enter => "Enter",
+            Self::Backspace => "Backspace",
             Self::Escape => "Escape",
+            Self::F12 => "F12",
         }
     }
 
@@ -91,7 +95,9 @@ impl SyntheticNavigationKey {
             Self::Home => PhysicalKeySlot::new(0x24, true),
             Self::End => PhysicalKeySlot::new(0x23, true),
             Self::Enter => PhysicalKeySlot::new(0x0D, false),
+            Self::Backspace => PhysicalKeySlot::new(0x08, false),
             Self::Escape => PhysicalKeySlot::new(0x1B, false),
+            Self::F12 => PhysicalKeySlot::new(0x7B, false),
         }
     }
 
@@ -106,7 +112,9 @@ impl SyntheticNavigationKey {
             Self::Home => 0x47,
             Self::End => 0x4F,
             Self::Enter => 0x1C,
+            Self::Backspace => 0x0E,
             Self::Escape => 0x01,
+            Self::F12 => 0x58,
         }
     }
 
@@ -121,7 +129,9 @@ impl SyntheticNavigationKey {
             Self::Home => egui::Key::Home,
             Self::End => egui::Key::End,
             Self::Enter => egui::Key::Enter,
+            Self::Backspace => egui::Key::Backspace,
             Self::Escape => egui::Key::Escape,
+            Self::F12 => egui::Key::F12,
         }
     }
 }
@@ -3847,6 +3857,14 @@ mod tests {
                 .all(|edge| edge.0 == egui::Key::ArrowRight)
         );
         assert!(egui_edges.iter().all(|edge| !edge.2));
+    }
+
+    #[test]
+    fn synthetic_backspace_uses_the_parent_navigation_key() {
+        let key = SyntheticNavigationKey::Backspace;
+        assert_eq!(key.physical_slot(), PhysicalKeySlot::new(0x08, false));
+        assert_eq!(key.scan_code(), 0x0E);
+        assert_eq!(key.egui_key(), egui::Key::Backspace);
     }
 
     #[test]

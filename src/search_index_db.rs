@@ -365,6 +365,20 @@ impl SearchIndexDb {
         kind: Option<IndexKind>,
         mode: crate::search_query::MatchMode,
     ) -> rusqlite::Result<Vec<IndexEntry>> {
+        self.search_with_epub(query, favorite_roots, kind, mode, true)
+    }
+
+    /// Apply EPUB visibility in SQLite before the result limit. Both PC and
+    /// Remote favorite search use this query, so ignored rows cannot consume
+    /// slots that belong to later PDF results.
+    pub fn search_with_epub(
+        &self,
+        query: &str,
+        favorite_roots: &[PathBuf],
+        kind: Option<IndexKind>,
+        mode: crate::search_query::MatchMode,
+        include_epub: bool,
+    ) -> rusqlite::Result<Vec<IndexEntry>> {
         let tokens = crate::search_query::parse(query);
 
         let conn = self.conn.lock().unwrap();
@@ -410,6 +424,14 @@ impl SearchIndexDb {
         match kind_val {
             Some(_) => where_clauses.push("kind = ?".to_string()),
             None => where_clauses.push(format!("kind <> {}", IndexKind::VideoFile as i64)),
+        }
+        if !include_epub {
+            // LIKE is ASCII case-insensitive in SQLite. The filename extension
+            // is at the end of display_path, so this matches .EPUB as well.
+            where_clauses.push(format!(
+                "NOT (kind = {} AND display_path LIKE '%.epub')",
+                IndexKind::PdfFile as i64
+            ));
         }
 
         let where_sql = if where_clauses.is_empty() {

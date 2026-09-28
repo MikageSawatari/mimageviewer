@@ -22,6 +22,7 @@ use crate::settings::{
     GridClickSelectionMode, GridViewMode,
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
+use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
 
@@ -165,6 +166,11 @@ enum PinButtonClick {
 #[derive(Debug)]
 pub(crate) enum AddressBarNav {
     Direct(PathBuf),
+    GridVirtual(crate::app::GridVirtualOpenIntent),
+    RatingSource {
+        path: PathBuf,
+        owner: crate::app::RatingPhysicalLoadOwner,
+    },
     CollectionSource {
         path: PathBuf,
         owner: crate::app::top_level_grid_view::CollectionGridPhysicalLoadOwner,
@@ -1490,6 +1496,9 @@ fn omitted_entries_breakdown_label(counts: crate::app::OmittedFolderEntryCounts)
             counts.ignored_archive
         ));
     }
+    if counts.ignored_epub > 0 {
+        parts.push(format!("EPUB（設定で無視） {}", counts.ignored_epub));
+    }
     parts.push(format!("対象外 {}", counts.unsupported));
     if counts.system > 0 {
         // システムファイルは主数字に入れないので、内訳でも別立てにして誤解を防ぐ。
@@ -1519,7 +1528,11 @@ fn draw_omitted_entries_chip(
             .small()
             .weak(),
         );
-        if counts.same_name > 0 || counts.ignored_archive > 0 || counts.hidden > 0 {
+        if counts.same_name > 0
+            || counts.ignored_archive > 0
+            || counts.ignored_epub > 0
+            || counts.hidden > 0
+        {
             ui.separator();
         }
         if counts.same_name > 0 && ui.link("同名ファイル設定を開く").clicked() {
@@ -1537,6 +1550,11 @@ fn draw_omitted_entries_chip(
                     Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::ARCHIVE_HANDLING);
                 ui.close();
             }
+        }
+        if counts.ignored_epub > 0 && ui.link("「EPUB の処理」を設定する").clicked() {
+            open_preferences =
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::EPUB_HANDLING);
+            ui.close();
         }
         if counts.hidden > 0
             && ui
@@ -4405,57 +4423,6 @@ mod details_text_clip_tests {
     }
 }
 
-fn draw_details_preview_icon(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    color: egui::Color32,
-    muted: bool,
-) {
-    if rect.width() < 12.0 || rect.height() < 12.0 {
-        return;
-    }
-    let alpha = if muted { 90 } else { color.a() };
-    let stroke_color =
-        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
-    let icon = egui::Rect::from_center_size(
-        rect.center(),
-        egui::vec2(rect.width().min(17.0), rect.height().min(15.0)),
-    );
-    let stroke = egui::Stroke::new(1.25, stroke_color);
-    painter.rect_stroke(icon, 2.0, stroke, egui::StrokeKind::Inside);
-    painter.circle_filled(
-        egui::pos2(
-            icon.left() + icon.width() * 0.28,
-            icon.top() + icon.height() * 0.32,
-        ),
-        1.7,
-        stroke_color,
-    );
-    let mountain = vec![
-        egui::pos2(
-            icon.left() + icon.width() * 0.16,
-            icon.bottom() - icon.height() * 0.22,
-        ),
-        egui::pos2(
-            icon.left() + icon.width() * 0.42,
-            icon.top() + icon.height() * 0.55,
-        ),
-        egui::pos2(
-            icon.left() + icon.width() * 0.57,
-            icon.bottom() - icon.height() * 0.32,
-        ),
-        egui::pos2(
-            icon.left() + icon.width() * 0.78,
-            icon.top() + icon.height() * 0.44,
-        ),
-        egui::pos2(
-            icon.right() - icon.width() * 0.12,
-            icon.bottom() - icon.height() * 0.22,
-        ),
-    ];
-    painter.add(egui::Shape::line(mountain, stroke));
-}
-
 /// Snapshot fixture for the cut-item content/interaction paint split.
 ///
 /// The thumbnail cells use the production grid layout and painter. The details rows use
@@ -4513,6 +4480,8 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 false,
                 VideoThumbnailIndicator::PlayIcon,
+                true,
+                None,
             );
             crate::app::draw_cell(
                 ui,
@@ -4524,7 +4493,6 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 item,
                 thumbnail,
                 crate::rotation_db::Rotation::None,
-                None,
                 None,
                 false,
                 VideoThumbnailIndicator::PlayIcon,
@@ -4557,7 +4525,13 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
         content_painter.multiply_opacity(details_item_content_opacity(false, is_cut));
         let icon_rect =
             egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 4.0), egui::vec2(34.0, 34.0));
-        draw_details_preview_icon(&content_painter, icon_rect, strong_text, false);
+        draw_details_preview_icon(
+            &content_painter,
+            icon_rect,
+            DetailsIconKind::Image,
+            strong_text,
+            false,
+        );
         draw_details_text_with_painter(
             ui,
             &content_painter,
@@ -4599,6 +4573,216 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
     ui.separator();
     draw_details_sample(ui, "詳細一覧・通常", false);
     draw_details_sample(ui, "詳細一覧・切り取り中", true);
+}
+
+/// Fixed Details rows for reviewing the typed preview icons in both themes.
+#[doc(hidden)]
+pub fn draw_details_icons_snapshot_fixture(ui: &mut egui::Ui) {
+    use crate::archive_converter::ArchiveFormat;
+    use crate::grid_item::{CollectionPlaceholderReason, SearchContainerKind};
+
+    let path = PathBuf::from("C:/sample/item");
+    let rows: Vec<(&str, GridItem, bool)> = vec![
+        ("Folder", GridItem::Folder(path.clone()), false),
+        ("Image (selected, cut)", GridItem::Image(path.clone()), true),
+        ("Video", GridItem::Video(path.clone()), false),
+        ("Audio", GridItem::Audio(path.clone()), false),
+        ("ZIP", GridItem::ZipFile(path.clone()), false),
+        (
+            "RAR",
+            GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: ArchiveFormat::Rar,
+            },
+            false,
+        ),
+        (
+            "7z",
+            GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: ArchiveFormat::SevenZ,
+            },
+            false,
+        ),
+        (
+            "LZH",
+            GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: ArchiveFormat::Lzh,
+            },
+            false,
+        ),
+        ("PDF", GridItem::PdfFile(path.clone()), false),
+        (
+            "ZIP image",
+            GridItem::ZipImage {
+                zip_path: path.clone(),
+                entry_name: "page.jpg".into(),
+            },
+            false,
+        ),
+        (
+            "ZIP directory",
+            GridItem::ZipDir {
+                zip_path: path.clone(),
+                dir_prefix: "pages/".into(),
+                is_archive: false,
+                representative: None,
+            },
+            false,
+        ),
+        (
+            "Nested ZIP",
+            GridItem::ZipDir {
+                zip_path: path.clone(),
+                dir_prefix: "inside.zip/".into(),
+                is_archive: true,
+                representative: None,
+            },
+            false,
+        ),
+        (
+            "PDF page",
+            GridItem::PdfPage {
+                pdf_path: path.clone(),
+                page_num: 0,
+                content_type: None,
+            },
+            false,
+        ),
+        (
+            "Stack",
+            GridItem::Stack {
+                key: "stack".into(),
+                representative: path.clone(),
+                count: 2,
+            },
+            false,
+        ),
+        (
+            "Search folder",
+            GridItem::SearchContainer {
+                path: path.clone(),
+                kind: SearchContainerKind::Folder,
+                hit_count: 1,
+                representative: None,
+            },
+            false,
+        ),
+        (
+            "Search ZIP",
+            GridItem::SearchContainer {
+                path: path.clone(),
+                kind: SearchContainerKind::Zip,
+                hit_count: 1,
+                representative: None,
+            },
+            false,
+        ),
+        (
+            "Unavailable",
+            GridItem::CollectionPlaceholder {
+                path,
+                last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
+                reason: CollectionPlaceholderReason::Missing,
+            },
+            false,
+        ),
+    ];
+
+    ui.set_width(440.0);
+    let row_size = egui::vec2(440.0, 22.0);
+    let (header, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
+    let visuals = ui.visuals();
+    ui.painter()
+        .rect_filled(header, 0.0, visuals.widgets.inactive.bg_fill);
+    let header_icon = egui::Rect::from_min_size(header.min, egui::vec2(34.0, 22.0));
+    draw_details_preview_icon(
+        ui.painter(),
+        header_icon.shrink2(egui::vec2(6.0, 2.0)),
+        DetailsIconKind::Image,
+        visuals.text_color(),
+        false,
+    );
+    ui.painter().text(
+        header.min + egui::vec2(42.0, 11.0),
+        egui::Align2::LEFT_CENTER,
+        "Name",
+        egui::FontId::proportional(12.0),
+        visuals.text_color(),
+    );
+    ui.painter().text(
+        header.min + egui::vec2(300.0, 11.0),
+        egui::Align2::LEFT_CENTER,
+        "Kind",
+        egui::FontId::proportional(12.0),
+        visuals.text_color(),
+    );
+    ui.painter().line_segment(
+        [header.left_bottom(), header.right_bottom()],
+        egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+    );
+
+    for (row, (label, item, is_cut)) in rows.iter().enumerate() {
+        let (rect, _) = ui.allocate_exact_size(row_size, egui::Sense::hover());
+        let visuals = ui.visuals();
+        let selected = *is_cut;
+        let hovered = ui.rect_contains_pointer(rect);
+        let bg = details_row_background(
+            visuals,
+            DetailsRowStyle::SeparatorAndStripe,
+            row,
+            selected,
+            false,
+            hovered,
+        );
+        let separator_color = details_separator_color(visuals);
+        ui.painter().rect_filled(rect, 0.0, bg);
+        let text_color = details_row_text_color(visuals, selected);
+        let mut content_painter = ui.painter().clone();
+        content_painter.multiply_opacity(details_item_content_opacity(false, *is_cut));
+        let preview = egui::Rect::from_min_size(rect.min, egui::vec2(34.0, 22.0));
+        let icon_rect = preview.shrink2(egui::vec2(6.0, 2.0));
+        draw_details_preview_icon(
+            &content_painter,
+            icon_rect,
+            details_icon_kind(item),
+            text_color,
+            false,
+        );
+        draw_details_text_with_painter(
+            ui,
+            &content_painter,
+            egui::Rect::from_min_max(
+                rect.min + egui::vec2(42.0, 0.0),
+                rect.min + egui::vec2(295.0, 22.0),
+            ),
+            label,
+            egui::Align2::LEFT_CENTER,
+            text_color,
+            false,
+        );
+        draw_details_text_with_painter(
+            ui,
+            &content_painter,
+            egui::Rect::from_min_max(rect.min + egui::vec2(300.0, 0.0), rect.right_bottom()),
+            label,
+            egui::Align2::LEFT_CENTER,
+            text_color,
+            false,
+        );
+        if *is_cut {
+            crate::app::draw_cut_badge(ui.painter(), icon_rect);
+        }
+        let y = details_separator_y(rect, ui.ctx().pixels_per_point());
+        ui.painter().line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(
+                details_separator_stroke_width(ui.ctx().pixels_per_point()),
+                separator_color,
+            ),
+        );
+    }
 }
 
 fn archive_container_format_label(
@@ -4677,12 +4861,32 @@ fn details_kind_label(
         GridItem::Video(path) => details_ext_kind(path, "動画"),
         GridItem::Audio(path) => details_ext_kind(path, "音声"),
         GridItem::ZipFile(path) => details_ext_kind(path, "ZIP"),
-        GridItem::PdfFile(path) => details_ext_kind(path, "PDF"),
+        GridItem::PdfFile(path) => {
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                "EPUB".to_string()
+            } else {
+                details_ext_kind(path, "PDF")
+            }
+        }
         GridItem::ConvertibleArchive { format, .. } => format.label().to_string(),
         GridItem::ZipImage { zip_path, .. } => {
             archive_inner_image_kind_label(zip_path, archive_source_override, current_folder)
         }
-        GridItem::PdfPage { .. } => "PDF ページ".to_string(),
+        GridItem::PdfPage { pdf_path, .. } => {
+            if pdf_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                "EPUB ページ".to_string()
+            } else {
+                "PDF ページ".to_string()
+            }
+        }
         GridItem::ZipDir {
             zip_path,
             is_archive,
@@ -6403,12 +6607,18 @@ impl App {
             .keymap
             .menu_command_label(MenuCommandId::TagsManagePinned);
         let tag_view_menu_label = self.keymap.menu_command_label(MenuCommandId::TagsTagView);
+        let settings_always_on_top_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsAlwaysOnTop);
         let settings_thumbnail_cache_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SettingsThumbnailCache);
         let settings_archive_cache_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SettingsArchiveCache);
+        let settings_epub_cache_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsEpubCache);
         let settings_thumbnail_quality_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SettingsThumbnailQuality);
@@ -7043,7 +7253,8 @@ impl App {
                                     }
                                     let enabled = self.grid_item_input_allowed() && convert_target_count > 0
                                         && self.archive_convert.is_none()
-                                        && self.batch_convert.is_none();
+                                        && self.batch_convert.is_none()
+                                        && self.epub_batch_convert.is_none();
                                     let response = ui
                                         .add_enabled(
                                             enabled,
@@ -7204,6 +7415,19 @@ impl App {
                         TopMenuId::Settings => {
                             let settings_menu_commands = &resolved_top_menu.commands;
                             let response = ui.menu_button(TopMenuId::Settings.label(), |ui| {
+                                if settings_menu_commands
+                                    .contains(&MenuCommandId::SettingsAlwaysOnTop)
+                                {
+                                    let mut checked = self.settings.always_on_top;
+                                    if ui
+                                        .checkbox(&mut checked, &settings_always_on_top_menu_label)
+                                        .changed()
+                                    {
+                                        self.set_always_on_top(ctx, checked, crate::app::ActionSurface::MainWindow);
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                }
                                 ui.menu_button("サムネイル列数", |ui| {
                                     for cols in
                                         crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS
@@ -7334,7 +7558,6 @@ impl App {
                                                         crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
                                                     );
                                                 } else if self.items_are_rating_view {
-                                                    self.settings.sort_order = order;
                                                     self.set_rating_view_sort(
                                                         crate::rating_view::RatingViewSort::Normal(order),
                                                     );
@@ -7395,6 +7618,9 @@ impl App {
                                 });
                                 ui.separator();
                                 for &command in settings_menu_commands {
+                                    if command == MenuCommandId::SettingsAlwaysOnTop {
+                                        continue;
+                                    }
                                     match command {
                                         MenuCommandId::SettingsThumbnailCache => {
                                             if ui
@@ -7424,6 +7650,13 @@ impl App {
                                             if ui.button(&settings_archive_cache_menu_label).clicked()
                                             {
                                                 self.open_archive_cache_manager();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SettingsEpubCache => {
+                                            if ui.button(&settings_epub_cache_menu_label).clicked()
+                                            {
+                                                self.open_epub_cache_manager();
                                                 ui.close();
                                             }
                                         }
@@ -9069,6 +9302,31 @@ impl App {
             });
     }
 
+    /// Keep the source grid visible while a location is prepared offscreen.
+    fn render_location_navigation_wait_overlay(&self, ctx: &egui::Context) {
+        if !self.location_navigation_pending() {
+            return;
+        }
+        egui::Area::new("location_navigation_wait_overlay".into())
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(PROGRESS_BG_COLOR)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new("移動先を読み込み中…")
+                                    .color(PROGRESS_LABEL_COLOR),
+                            );
+                        });
+                    });
+            });
+        ctx.request_repaint();
+    }
+
     // ── ツールバー ───────────────────────────────────────────────────
 
     /// Single product dispatch seam for toolbar pointer intents. Drawing only creates one typed
@@ -9542,6 +9800,14 @@ egui::ComboBox::from_id_salt("toolbar_cols_combo")
                                 .selected_text(text)
                                 .show_ui(ui, |ui| {
                                     apply_toolbar_style(ui);
+                                    if toolbar_details_visible {
+                                        if ui.selectable_label(details_mode, "詳細").clicked() {
+                                            self.set_grid_view_mode(GridViewMode::Details);
+                                        }
+                                        if !tb_cols.is_empty() {
+                                            ui.separator();
+                                        }
+                                    }
                                     for &cols in &tb_cols {
                                         if ui
                                             .selectable_label(
@@ -9553,14 +9819,6 @@ egui::ComboBox::from_id_salt("toolbar_cols_combo")
                                             self.set_grid_view_mode(GridViewMode::Thumbnail);
                                             self.settings.grid_cols = cols;
                                             self.settings.save();
-                                        }
-                                    }
-                                    if toolbar_details_visible {
-                                        if !tb_cols.is_empty() {
-                                            ui.separator();
-                                        }
-                                        if ui.selectable_label(details_mode, "詳細").clicked() {
-                                            self.set_grid_view_mode(GridViewMode::Details);
                                         }
                                     }
                                 })
@@ -9768,8 +10026,6 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                             crate::bookmark_browser::BookmarkViewSort::Normal(order),
                                         );
                                     } else if self.items_are_rating_view {
-                                        self.settings.sort_order = order;
-                                        self.settings.save();
                                         self.set_rating_view_sort(
                                             crate::rating_view::RatingViewSort::Normal(order),
                                         );
@@ -9945,8 +10201,6 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                                         crate::bookmark_browser::BookmarkViewSort::Normal(order),
                                                     );
                                                 } else if self.items_are_rating_view {
-                                                    self.settings.sort_order = order;
-                                                    self.settings.save();
                                                     self.set_rating_view_sort(
                                                         crate::rating_view::RatingViewSort::Normal(order),
                                                     );
@@ -10880,9 +11134,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &mut changed,
                 );
                 ui.separator();
+                changed |= ui
+                    .checkbox(&mut self.settings.toolbar_cols_details_visible, "詳細")
+                    .changed();
+                ui.separator();
                 ui.label("出す列:");
                 ui.horizontal_wrapped(|ui| {
-                    for cols in 1..=10usize {
+                    for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS {
                         let mut checked = self.settings.toolbar_cols_items.contains(&cols);
                         if ui.checkbox(&mut checked, format!("{cols}")).changed() {
                             if checked {
@@ -10894,9 +11152,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             changed = true;
                         }
                     }
-                    changed |= ui
-                        .checkbox(&mut self.settings.toolbar_cols_details_visible, "詳細")
-                        .changed();
                 });
             }
             TS::Aspect => {
@@ -13382,12 +13637,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         if let Some(resolved) =
                                             resolve_folder_bar_nav_path(&raw_target)
                                         {
-                                            result = Some(AddressBarNav::Direct(resolved));
+                                            self.start_quick_folder_slot_switch(slot, resolved);
                                         } else {
                                             self.show_feedback_toast(format!(
                                                 "{label} の最後の場所が見つかりません。ドライブ一覧へ切り替えます: {}",
                                                 raw_target.to_string_lossy()
                                             ));
+                                            self.commit_quick_folder_slot_drive_list(slot);
                                             result = Some(AddressBarNav::DriveList(None));
                                         }
                                     }
@@ -13428,8 +13684,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             } else {
                                 match parent_nav_target.as_ref() {
                                     Some(AddressBarNav::Direct(p))
+                                    | Some(AddressBarNav::RatingSource { path: p, .. })
                                     | Some(AddressBarNav::CollectionSource { path: p, .. }) => {
                                         format!("親フォルダへ [BS]\n{}", p.to_string_lossy())
+                                    }
+                                    Some(AddressBarNav::GridVirtual(intent)) => {
+                                        format!("親フォルダへ [BS]\n{}", intent.path.to_string_lossy())
                                     }
                                     Some(AddressBarNav::DriveList(Some(origin))) => {
                                         format!("ドライブ一覧へ [BS]\n{}", origin.to_string_lossy())
@@ -14249,7 +14509,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             None => "すべての種別",
                             Some(IndexKind::Folder) => "フォルダ",
                             Some(IndexKind::ZipFile) => "ZIP",
-                            Some(IndexKind::PdfFile) => "PDF",
+                            Some(IndexKind::PdfFile) => "PDF / EPUB",
                             Some(IndexKind::VideoFile) => "動画",
                         }
                     };
@@ -15054,11 +15314,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         self.note_reading_history_open(idx);
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
                         self.maybe_suppress_facet_filter_for_opened_container(idx);
-                        self.record_rating_view_nav_open(&p);
                         if auto_fs {
                             self.pending_auto_fs_open = true;
                         }
-                        nav = Some(self.grid_physical_navigation(idx, p));
+                        nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
                     }
                 }
                 Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
@@ -15072,15 +15331,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fs) {
                         return nav;
                     }
-                    self.note_reading_history_open(idx);
-                    self.maybe_suppress_rating_filter_for_opened_container(idx);
-                    self.maybe_suppress_facet_filter_for_opened_container(idx);
-                    self.record_rating_view_nav_open(&p);
-                    // 環境設定 ON なら、ページ一覧を経由せず 1 ページ目を即フルスクリーンで開く。
-                    if auto_fs {
-                        self.pending_auto_fs_open = true;
-                    }
-                    nav = Some(self.grid_physical_navigation(idx, p));
+                    nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
                 }
                 Some(GridItem::Image(_))
                 | Some(GridItem::Audio(_))
@@ -15129,21 +15380,22 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
                     let owner = self.main_grid_archive_open_owner(idx, &pf);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
-                    let search_rollback = if self.favsearch.active
-                        || self.tag_view.active
-                        || self.rating_view_nav_context_active()
+                    let staged = self.will_stage_archive_navigation(&pf, &owner);
+                    let search_rollback = if !staged
+                        && (self.favsearch.active
+                            || self.tag_view.active
+                            || self.rating_view_nav_context_active())
                     {
                         Some(self.folder_nav_history_snapshot())
                     } else {
                         None
                     };
-                    if self.favsearch.active {
+                    if !staged && self.favsearch.active {
                         self.favsearch.nav_stack.push(pf.clone());
                     }
-                    if self.tag_view.active {
+                    if !staged && self.tag_view.active {
                         self.record_tag_view_nav_open(&pf);
                     }
-                    self.record_rating_view_nav_open(&pf);
                     let open_outcome = self
                         .load_folder_or_convert_archive_with_auto_fullscreen_owned(
                             pf, auto_fs, owner,
@@ -15152,17 +15404,23 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         (crate::app::FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                             self.attach_archive_convert_nav_history_rollback(snapshot);
                         }
-                        (crate::app::FolderOpenOutcome::Ignored, Some(snapshot)) => {
+                        (
+                            crate::app::FolderOpenOutcome::Ignored
+                            | crate::app::FolderOpenOutcome::Refused(_),
+                            Some(snapshot),
+                        ) => {
                             self.restore_folder_nav_history(snapshot);
                         }
                         _ => {}
                     }
-                    if self.favsearch.active
+                    if !staged
+                        && self.favsearch.active
                         && matches!(open_outcome, crate::app::FolderOpenOutcome::Loaded)
                     {
                         self.update_favsearch_address();
                     }
-                    if self.tag_view.active
+                    if !staged
+                        && self.tag_view.active
                         && matches!(open_outcome, crate::app::FolderOpenOutcome::Loaded)
                     {
                         self.update_tag_view_address();
@@ -16717,6 +16975,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 draw_details_preview_icon(
                     ui.painter(),
                     col_rect.shrink2(egui::vec2(6.0, 4.0)),
+                    DetailsIconKind::Image,
                     text_color,
                     false,
                 );
@@ -17026,6 +17285,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let Some(item) = self.items.get(idx) else {
             return None;
         };
+        let icon_kind = details_icon_kind(item);
         let is_cut = !display_only
             && item
                 .drag_source_path()
@@ -17106,12 +17366,20 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         ui.id().with(("details_preview_icon", idx)),
                         egui::Sense::hover(),
                     );
+                    #[cfg(feature = "test-script")]
+                    if !display_only {
+                        crate::test_script::register_details_preview_pointer(
+                            &response,
+                            ui.clip_rect(),
+                        );
+                    }
                     if response.hovered() {
                         hovered_preview_rect = Some(col_rect);
                     }
                     draw_details_preview_icon(
                         &content_painter,
                         col_rect.shrink2(egui::vec2(6.0, 5.0)),
+                        icon_kind,
                         text_color,
                         false,
                     );
@@ -17332,7 +17600,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             Self::cancel_details_best_fit_job(ctx);
         }
 
-        egui::CentralPanel::default()
+        let nav = egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<AddressBarNav> {
                 if !self.grid_item_input_allowed() {
                     ui.disable();
@@ -17949,18 +18217,26 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         row.badge_label()
                                     }
                                 });
-                                let overlay_layout = crate::app::layout_cell_overlays(
+                                let is_checked = self.checked.contains(&idx);
+                                let filter_match = if self.items_are_drive_list {
+                                    None
+                                } else {
+                                    self.folder_rating_match(idx)
+                                };
+                                let filter_match_count = filter_match.map(|(count, _)| count);
+                                let edit_flags = crate::thumb_overlay_layout::EditBadgeFlags {
+                                    page_override: badges.page_override,
+                                    local_adjust: badges.local_adjust,
+                                    mask: badges.mask,
+                                    conceal: badges.conceal,
+                                    comic: badges.comic,
+                                    crop: badges.crop,
+                                    pin: has_pin,
+                                };
+                                let mut overlay_layout = crate::app::layout_cell_overlays(
                                     ui.painter(),
                                     cell_rect,
-                                    crate::thumb_overlay_layout::EditBadgeFlags {
-                                        page_override: badges.page_override,
-                                        local_adjust: badges.local_adjust,
-                                        mask: badges.mask,
-                                        conceal: badges.conceal,
-                                        comic: badges.comic,
-                                        crop: badges.crop,
-                                        pin: has_pin,
-                                    },
+                                    edit_flags,
                                     rating,
                                     &self.items[idx],
                                     &self.thumbnails[idx],
@@ -17968,6 +18244,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     bookmark_time.as_deref(),
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
+                                    is_checked,
+                                    filter_match_count,
                                 );
 
                                 primary_click_hit_cell |=
@@ -17995,6 +18273,24 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 if idx >= self.items.len() || idx >= self.thumbnails.len() {
                                     break;
                                 }
+                                // A click may toggle the check state during interaction. Re-layout only
+                                // that changed cell so the new check and its reserved area agree in this frame.
+                                if self.checked.contains(&idx) != is_checked {
+                                    overlay_layout = crate::app::layout_cell_overlays(
+                                        ui.painter(),
+                                        cell_rect,
+                                        edit_flags,
+                                        rating,
+                                        &self.items[idx],
+                                        &self.thumbnails[idx],
+                                        &tags,
+                                        bookmark_time.as_deref(),
+                                        self.items_are_drive_list,
+                                        self.settings.video_thumbnail_indicator,
+                                        self.checked.contains(&idx),
+                                        filter_match_count,
+                                    );
+                                }
 
                                 let rot = self.get_rotation(idx);
                                 // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
@@ -18002,19 +18298,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 // ドラッグ中は両経路ともスキップして生サムネ表示に戻す
                                 // (70 枚毎フレーム再生成は ~200ms のフリーズになるため)。
                                 if !self.adjustment_dragging {
-                                    self.maybe_apply_thumb_adjustment(ctx, idx);
+                                    self.maybe_apply_thumb_adjustment(ctx, idx, "visible");
                                 }
                                 let adjusted_tex = if self.adjustment_dragging {
                                     None
                                 } else {
                                     self.thumb_adjust_tex.get(&idx)
                                 };
-                                let filter_match = if self.items_are_drive_list {
-                                    None
-                                } else {
-                                    self.folder_rating_match(idx)
-                                };
-                                let filter_match_count = filter_match.map(|(c, _)| c);
                                 // 📌 バッジ (金色) — ユーザーが Pin 操作した対象アイテムの
                                 // 目印。「現在表示中のコンテナの pin source = この item」
                                 // (= ユーザーがこのアイテムを選択して P / 📌 を押した) のとき
@@ -18040,7 +18330,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     &self.thumbnails[idx],
                                     rot,
                                     adjusted_tex,
-                                    filter_match_count,
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
                                     is_cut,
@@ -18175,7 +18464,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
                 nav
             })
-            .inner
+            .inner;
+        self.render_location_navigation_wait_overlay(ctx);
+        nav
     }
 
     // ── 選択情報オーバーレイ ─────────────────────────────────────────
@@ -18659,6 +18950,7 @@ mod facet_filter_bar_tests {
             same_name: 3,
             hidden: 2,
             ignored_archive: 4,
+            ignored_epub: 0,
             unsupported: 1,
             system: 4,
         };
@@ -18670,11 +18962,24 @@ mod facet_filter_bar_tests {
             omitted_entries_breakdown_label(counts),
             "同名など 3、隠し項目 2、RAR / 7z / LZH（設定で無視） 4、対象外 1、システム 4"
         );
+        let epub_only = crate::app::OmittedFolderEntryCounts {
+            ignored_epub: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            omitted_entries_chip_label(epub_only).as_deref(),
+            Some("非表示 2 件")
+        );
+        assert_eq!(
+            omitted_entries_breakdown_label(epub_only),
+            "同名など 0、隠し項目 0、EPUB（設定で無視） 2、対象外 0"
+        );
 
         let unsupported_only = crate::app::OmittedFolderEntryCounts {
             same_name: 0,
             hidden: 0,
             ignored_archive: 0,
+            ignored_epub: 0,
             unsupported: 5,
             system: 0,
         };
@@ -18693,6 +18998,7 @@ mod facet_filter_bar_tests {
             same_name: 0,
             hidden: 0,
             ignored_archive: 0,
+            ignored_epub: 0,
             unsupported: 0,
             system: 9,
         };
@@ -18712,6 +19018,7 @@ mod facet_filter_bar_tests {
             same_name: 3,
             hidden: 2,
             ignored_archive: 4,
+            ignored_epub: 0,
             unsupported: 1,
             system: 0,
         };
@@ -18747,6 +19054,7 @@ mod facet_filter_bar_tests {
             same_name: 0,
             hidden: 0,
             ignored_archive: 0,
+            ignored_epub: 0,
             unsupported: 1,
             system: 0,
         };
@@ -18807,6 +19115,7 @@ mod facet_filter_bar_tests {
                 same_name: 1,
                 hidden: 0,
                 ignored_archive: 0,
+                ignored_epub: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -18822,6 +19131,7 @@ mod facet_filter_bar_tests {
                 same_name: 0,
                 hidden: 0,
                 ignored_archive: 1,
+                ignored_epub: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -18833,6 +19143,7 @@ mod facet_filter_bar_tests {
                 same_name: 0,
                 hidden: 1,
                 ignored_archive: 0,
+                ignored_epub: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -19423,6 +19734,26 @@ mod selection_info_tests {
 
     #[test]
     fn shared_builder_formats_zip_and_pdf_container_fields() {
+        assert_eq!(
+            details_kind_label(
+                &GridItem::PdfFile(PathBuf::from(r"C:\books\book.epub")),
+                None,
+                None
+            ),
+            "EPUB"
+        );
+        assert_eq!(
+            details_kind_label(
+                &GridItem::PdfPage {
+                    pdf_path: PathBuf::from(r"C:\books\book.epub"),
+                    page_num: 0,
+                    content_type: None,
+                },
+                None,
+                None
+            ),
+            "EPUB ページ"
+        );
         let mut zip = app_with_item(
             GridItem::ZipFile(PathBuf::from(r"C:\books\book.zip")),
             Some((1_700_000_000, 4096)),
@@ -22577,6 +22908,18 @@ mod compute_cell_size_tests {
         let (w, _) = compute_cell_size(100.0, 10, 1.0).expect("Some");
         assert!(w >= MIN_CELL_PX);
         assert_eq!(w, MIN_CELL_PX);
+    }
+
+    #[test]
+    fn twenty_columns_keep_the_existing_minimum_cell_width_rule() {
+        let (wide_w, _) = compute_cell_size(3840.0 / 1.75, 20, 1.0).unwrap();
+        assert!(wide_w >= 100.0);
+
+        let (narrow_w, narrow_h) = compute_cell_size(100.0, 20, 1.0).unwrap();
+        assert_eq!((narrow_w, narrow_h), (MIN_CELL_PX, MIN_CELL_PX));
+        // The requested column count remains 20; the existing viewport clips the overflow.
+        assert!(narrow_w * 20.0 > 100.0);
+        assert_eq!(41usize.div_ceil(20), 3);
     }
 
     #[test]

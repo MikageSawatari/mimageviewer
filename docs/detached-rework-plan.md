@@ -1455,6 +1455,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-28 §1.251 S7 / master 統合: Remote 取得と EPUB・履歴の非同期 open の所有境界**
+
+master が追加したパス分類、EPUB 変換、履歴・コレクション・評価一覧の遷移、フォルダ pane scan、PDF password、Smart 遷移が Remote の取得後にローカル閲覧を再開しないよう、取得時に既存の context owner terminal で失効させる。detached 側の閉鎖は S7 の既存 terminal close を再利用し、detached 述語、host / park / focus、viewport 生成・終了は変更しない。Remote とローカルの所有権引き継ぎを同じ境界で完結させる構造的統合であり、時間窓・再試行・一括 reset による症状隠しではない。独立レビューの指摘を統合した。ClaudeCode の検収判断は未了。
+
 **2026-09-28 §1.251 S7: Remote の取得時にローカルの閲覧 context をすべて閉じ、所有中は閲覧の open を拒否**
 
 音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §9B) で、Remote で見た再生位置を
@@ -1470,6 +1474,33 @@ transition と未実行の effect) から判定し、完了したフレームで
 なくす構造的変更であり、guard・遅延・再試行・一括 reset で症状を隠すものではない。rect 一致・時間窓・新しい App の
 bool は加えていない (§2 の禁止事項に抵触しない。取得 barrier の既存の watchdog は取得を諦める判断にだけ使う)。
 独立レビュー (Sol) と ClaudeCode の双方がこの判断に合意した。
+
+**2026-09-28 §1.280 履歴 / EPUB の context-owned 非同期処理 (review #8/#9 改訂)**
+
+分類 candidate、staged 履歴 transition、Collection navigation、detached folder scan、
+DFS、PDF/ZIP 列挙、EPUB 変換、PDF password request は表示先の
+`ViewerContextBundle` が所有する。root と active detached の **mounted** context だけが
+typed owner registry の `service` を呼ぶ。parked still context は frozen frame のまま
+一切 poll / dialog 描画を行わない。park transaction は同じ registry の
+`terminate_on_park` を全 owner に適用し、staged 履歴は旧表示・履歴を保持、未採用
+direct open は所有 rollback を返し、分類・DFS・scan・enumeration は取消、EPUB 変換と
+password request と Similar preview preparation は terminal にする。以前の root から parked bundle を一時 mount して
+poll / dialog 描画する実装と、その coverage claim は撤回した。
+Collection grid の Snapshot / Preparing だけを park で取り消し、Ready / Empty / Failed /
+Deleted は変更しない。特に物理子表示中の Deleted tombstone を維持するので、復帰後も
+Backspace と復元 snapshot は実フォルダとして扱う。Similar preview も進行中 worker
+だけを取消し、完成 cache と terminal failure を維持する。
+
+EPUB 変換または PDF password prompt の owner がある間、passive window click、activation
+watcher、deferred activation、keyboard/gamepad の窓選択が到達する共通 activation 境界は
+別 context への切替を拒否する。よって通常入力から modal owner が park されない。
+password の表示・Retry/Cancel は context ごとの typed request から一件を決定的に選び、
+active detached viewport は自身が選択 owner の時だけ描く。global visibility flag は置かない。
+bundle 内の cache / write worker は従来の resume・永続化契約を保ち、registry の source audit
+で明示した例外とする（[folder history plan §12.5](folder-history-location-plan.md#125-detached-owner-servicing-と-warm-stamp-の-review-8-修正)）。
+tray/taskbar の root 復帰は viewer context を切り替えない。窓 host、placement、viewport
+identity は変更しない。これは非同期要求の所有 context と park terminal を揃える修正で、
+時間待ちや repaint による症状緩和は加えない。WebView2 実変換の窓操作は対話的検証に残す。
 
 **2026-09-27 §1.251 S4: 動画 HUD の音声トラック選択を ParkedLive の HUD クリック分類と music shell の許可に追加**
 
@@ -1507,10 +1538,91 @@ detached の述語、host / park / focus の lifecycle、viewport の生成・�
 guard・遅延・再試行・一括 reset で症状を隠すものではない (§2 の禁止事項に抵触しない)。独立レビュー (Sol) と
 ClaudeCode の双方がこの判断に合意した。
 
+**2026-09-27 履歴 preflight と直接 open の admission**
+
+独立 integration review の指摘に従い、`OpenRequestOwner` の各 variant が承認された後に、同じ viewer context が所有する staged 履歴要求だけを一か所で退役させる。`DetachedGridArchive` と detached lease を持つ `Bookmark` は型付き owner の window ID から registry の context ID を引き、通常 owner は投影中の context ID を使う。履歴 transition 自身の `source_context` も照合する。変換 cache 命中時の detached archive open は main App 上で admission を呼ぶが、宛先 context が detached なので main の staged 履歴・表示を変更しない。以前の `navigation_scope.is_detached_physical()` だけの判定ではこの経路を見落としていた。viewport / window の再作成や再試行は追加していない。これは要求と表示の context 所有権を揃える変更であり、detached 表示症状の局所回避ではない。
+
+**2026-09-27 §1.280 / §1.282 Collection 履歴と detached 外側 navigation**
+
+Collection fullscreen から外側へ移動する要求は、root session が一時的に `return_to=Collection` へ移った後も同じ viewer context が所有する。`collection_navigation_request_is_current` は live session がある場合、その collection ID と非 `Deleted` を検証し、session がない場合だけ typed `return_to=Collection` の同じ ID を認めるようにした。session が別 ID または `Deleted` の場合は fallback しない。これにより要求の context / surface / sequence / items generation / fullscreen index の既存照合を保ったまま、正規の detached Collection 外側移動を継続し、別窓や main の結果を採用しない。新しい detached flag、待機、retry、viewport 再作成は加えない。独立 reviewer は owner 境界の修正であり症状パッチではないと確認した。detached Collection の focused 回帰 1/1 と `scripts/test-full.ps1` は PASS。実窓 smoke は未実行。
+
+**2026-09-27 D13: EPUB しおりの開封拒否を別ウィンドウ確定前に処理**
+
+設計担当の D13 5 回目の指示に従い、しおり行の EPUB Ignore 判定を既存ウィンドウの退避・loading context 作成より前に置く。解決中に設定が変わった場合は、同じ bookmark request ID の待機を終了する。detached descriptor の PDF 開封は理由付きの `FolderOpenOutcome` を返し、拒否時は既存の build abort / Preparing session terminal へ渡す。グリッドからの別ウィンドウ開封と parked 窓の descriptor 再開でも、PDF の拒否を既存ウィンドウの退避前に処理する。新しい detached 状態や時間待ちは足さず、viewport ID・host・placement・focus の所有規則も変更しない。Codex は開封結果を捨てて成功扱いした境界を直す構造修正として §2 に適合すると判断した。独立レビューは未実施。
+
+**2026-09-27 §1.250 常に最前面**
+
+`Settings.always_on_top` を唯一の希望状態とし、active / loading / holdover / cleanup と passive / parked の閲覧用 viewport builder に `Normal` または `AlwaysOnTop` を明示する。root への切替 command と、子 host の builder diff を別の発行 owner にして二重送信を避ける。同一 ViewportId を active session が所有する間は passive snapshot を重ねて登録せず、handoff 後に passive が所有する。別の detached 状態 flag、時間待ち、Focus、個別 HWND への症状的な `SetWindowPos` は追加しない。これは他機能の level 設定が viewport builder 経路へ到達する構造変更であり、§2 の同一 host ownership を維持する。復帰時の再 assert は style 実測で欠落が確認された edge に限り、現時点では追加していない。設計は [always-on-top-plan.md](always-on-top-plan.md) を参照。
+
+Stage B probe の再確認では、parked still host が viewer context から unbind されても OS viewport は生存するため、test-script の style / capture は frozen snapshot と active session の ID を重複排除し、backend witness で生存 host を確認する。描画・活性化の predicate は変更しない。また fullscreen viewport の再生成で共有 wgpu painter の全 surface が消され root capture が `SurfaceAbsent` になったため、`set_window(id, None)` は当該 ID の surface のみ破棄する。複数 viewport の資源所有境界を正す変更であり、時間待ち・再試行・host 再作成による症状抑止は加えない。
+
+**2026-09-27 smoke screenshot の frozen parked capture 判定**
+
+計装した MultiWindowPdf run `20260926T152033476Z-227256-MultiWindowPdf-7e5d76c3` では、
+先行別窓 `detached-1-1` は `Parked` / `AtRest`、visible、非最小化で、eframe の
+Deferred viewport に Screenshot action が queue されたが、その後の native pass が
+一度もなく timeout した。test-script は command 発行時に対象 ViewportId へ egui の
+`request_repaint_of` を既に送っていた。eframe の action queue 境界で当該 window に
+`request_redraw` する案も実窓 run `20260926T153506671Z-221916-MultiWindowPdf-dea8c081`
+で反証された (redraw 要求後も Deferred pass は 0)。この無効な renderer 変更は撤去する。
+capture harness は App の `Parked` / `AtRest` と passive frozen view の組から導く typed
+presentation の場合だけ、`parked frozen view (not re-rendered by egui)` を manifest に
+`status=skipped` と記録し、Screenshot を発行しない。active / その他の描画対象は従来の
+capture と timeout 失敗を維持する。detached の状態遷移、host、viewport の生成・終了、
+  描画内容は変更しない。2026-09-27 00:55 JST の隔離 portable 実窓確認では
+  MultiWindowPdf / MultiWindowStills / MultiWindowRarNav / RatingSort /
+  RatingSortCollection の 5 scenario がすべて exit 0。証跡は
+  `target/ui-smoke-runs/20260926T155430402Z-211364-MultiWindowPdf-062bab16`
+  からの連続 5 run にある。PDF manifest の `two-detached` は先行窓を
+  `status=skipped` / `parked frozen view (not re-rendered by egui)` と記録し、
+  root と active 別窓の PNG を取得した。レビュー後、`test-script` 専用
+  capture probe の App / eframe 詳細行を capture session あたり 128 行に制限し、
+  終了時に出力・抑制行数を記録する。detached の振る舞いは変更しない。
+
+**2026-09-26 smoke screenshot 第 3 回失敗の限定診断**
+
+`20260926T144546234Z-175420-MultiWindowPdf-1d955946` でも先行別窓
+`detached-1-1` の batch 2 capture だけが timeout した。repaint と passive deferred
+callback の input 処理だけでは説明できないため、追加の挙動修正は行わず、
+`test-script` capture 中に限る `[capture-probe]` を App、eframe、egui-wgpu に追加した。
+対象 identity と residence、描画 presentation、各 frame の viewport pass、Screenshot
+command の output/queue/painter 境界、wgpu の readback 完成、event の配送先を記録する。
+プローブは batch 終了時に無効になり、通常 build では有効にならない。detached の
+状態遷移、host、viewport の生成・終了、描画内容は変更しない。実窓の再実行結果に
+基づいて欠落境界を特定する。
+
+**2026-09-26 smoke screenshot の passive deferred 配送修正**
+
+MultiWindowPdf 再実行 `20260926T135827388Z-22136-MultiWindowPdf-9e598672` で、active
+immediate 別窓の PNG は取得できたが、2 窓目を開いた後の先行別窓 (passive deferred)
+だけが timeout した。HWND の `InvalidateRect` も試したが、次の実窓 run
+`20260926T141955613Z-185920-MultiWindowPdf-c7477a1b` で同じ timeout となり、
+HWND `InvalidateRect` での解決仮説は棄却した。ログでは window 1 が `pause_active_context` で
+`AtRest` に移り、window 2 が mounted active になる。製品コードは window 1 の凍結表示を
+`show_viewport_deferred` で登録しており、egui 描画の対象である。eframe は screenshot
+応答を次に描画する native viewport の input に入れるが、test-script は root と active
+immediate の input だけを読んでいた。passive deferred の callback でも同じ応答処理を
+行い、capture 対象は eframe の native viewport 登録表と既存の identity を突き合わせる。
+表に無い窓・非表示・最小化窓は理由付き skip、表示可能な窓の timeout は失敗を維持する。
+誤った仮説に基づく `InvalidateRect` は撤去した。製品の detached 状態、host/park/focus、
+viewport 生成・終了には触れない。実窓再確認は別途必要。
+
+**2026-09-26 smoke screenshot の immediate viewport 配送修正**
+
+MultiWindowPdf 実アプリ run `20260926T131312679Z-225084-MultiWindowPdf-3b245082` で
+main の PNG だけ保存され、別窓 PDF の Screenshot event が 5 秒以内に届かなかった。
+原因は `vendor/eframe` の native backend で、root は保留された Screenshot command を
+paint へ渡す一方、immediate child は wgpu paint に空の capture list を渡し、glow でも
+paint 後の readback を行わなかったこと。両 backend の immediate paint 境界で
+その viewport の Screenshot command を消費し、同じ viewport ID を持つ event を返す。
+App の detached 判定、viewport 生成/終了、host/park/focus、context 状態は変更しない。
+描画済みの同一 surface に対応する command を処理する修正で、§2 の時間窓・再試行・
+症状隠しは追加しない。実窓再確認は別途必要。
+
 **2026-09-26 実アプリ smoke の viewport スクリーンショット証跡**
 
 `portable,test-script` のみで egui の viewport Screenshot 応答を受け、main と別窓の画像を
-run ごとの証跡へ保存する。別窓の描画 callback では届いた Screenshot event を診断 runner に
+run ごとの証跡へ保存する。egui callback は viewport ID 付き Screenshot event を診断 runner に
 渡すだけで、PNG 化・ファイル I/O は worker が行う。capture 対象は既存の window identity と
 viewport ID の read-only snapshot から選ぶ。detached の述語、host/park/focus lifecycle、
 viewport 生成・終了、App の context 状態には変更を加えない。既存の別窓症状を判定で

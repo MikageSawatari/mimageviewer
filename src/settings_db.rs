@@ -52,8 +52,8 @@ const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v
 const SINGLETON_ENDPOINT_MIGRATION_META_KEY: &str = "singleton_spread_endpoints_v1";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
     'sort_order', 'rating_sort_unrated_position', 'show_hidden_files', 'grid_display_order',
-    'archive_file_handling', 'archive_convert_without_dialog',
-    'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists',
+    'archive_file_handling', 'archive_convert_without_dialog', 'epub_file_handling',
+    'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists', 'skip_epub_if_pdf_exists',
     'skip_image_if_video_exists', 'video_thumb_use_sidecar_image',
     'skip_duplicate_images', 'image_ext_priority', 'book_root',
     'auto_fullscreen_zip_pdf', 'auto_fullscreen_image_folders',
@@ -295,9 +295,11 @@ pub(crate) struct RemoteListingSettings {
     show_hidden_files: bool,
     grid_display_order: crate::settings::GridDisplayOrder,
     archive_file_handling: crate::settings::ArchiveFileHandling,
+    epub_file_handling: crate::settings::EpubFileHandling,
     archive_convert_without_dialog: bool,
     skip_zip_if_folder_exists: bool,
     skip_archive_if_zip_exists: bool,
+    skip_epub_if_pdf_exists: bool,
     skip_image_if_video_exists: bool,
     video_thumb_use_sidecar_image: bool,
     skip_duplicate_images: bool,
@@ -321,6 +323,7 @@ pub(crate) struct RemoteListingSettings {
 pub(crate) struct RemoteReadingSettings {
     pub(crate) default_spread_mode: crate::settings::SpreadMode,
     pub(crate) default_reading_direction: crate::settings::ReadingDirection,
+    pub(crate) follow_document_reading_direction: bool,
     pub(crate) final_cover_spread_enabled: bool,
     pub(crate) singleton_spread_first_enabled: bool,
     pub(crate) singleton_spread_last_enabled: bool,
@@ -334,6 +337,7 @@ impl RemoteReadingSettings {
         Self {
             default_spread_mode: settings.default_spread_mode,
             default_reading_direction: settings.default_reading_direction,
+            follow_document_reading_direction: settings.follow_document_reading_direction,
             final_cover_spread_enabled: settings.final_cover_spread_enabled,
             singleton_spread_first_enabled: settings.singleton_spread_first_enabled,
             singleton_spread_last_enabled: settings.singleton_spread_last_enabled,
@@ -352,9 +356,11 @@ impl RemoteListingSettings {
             show_hidden_files: settings.show_hidden_files,
             grid_display_order: settings.grid_display_order.clone(),
             archive_file_handling: settings.archive_file_handling,
+            epub_file_handling: settings.epub_file_handling,
             archive_convert_without_dialog: settings.archive_convert_without_dialog,
             skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
+            skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
             skip_duplicate_images: settings.skip_duplicate_images,
@@ -374,9 +380,11 @@ impl RemoteListingSettings {
         settings.show_hidden_files = self.show_hidden_files;
         settings.grid_display_order = self.grid_display_order;
         settings.archive_file_handling = self.archive_file_handling;
+        settings.epub_file_handling = self.epub_file_handling;
         settings.archive_convert_without_dialog = self.archive_convert_without_dialog;
         settings.skip_zip_if_folder_exists = self.skip_zip_if_folder_exists;
         settings.skip_archive_if_zip_exists = self.skip_archive_if_zip_exists;
+        settings.skip_epub_if_pdf_exists = self.skip_epub_if_pdf_exists;
         settings.skip_image_if_video_exists = self.skip_image_if_video_exists;
         settings.video_thumb_use_sidecar_image = self.video_thumb_use_sidecar_image;
         settings.skip_duplicate_images = self.skip_duplicate_images;
@@ -836,6 +844,11 @@ impl SettingsDb {
                 &inner.conn,
                 "default_reading_direction",
                 || fallback.default_reading_direction,
+            )?,
+            follow_document_reading_direction: read_settings_kv_typed(
+                &inner.conn,
+                "follow_document_reading_direction",
+                || fallback.follow_document_reading_direction,
             )?,
             final_cover_spread_enabled: read_settings_kv_typed(
                 &inner.conn,
@@ -2998,9 +3011,11 @@ fn apply_remote_listing_setting(
         "show_hidden_files" => assign!(show_hidden_files),
         "grid_display_order" => assign!(grid_display_order),
         "archive_file_handling" => assign!(archive_file_handling),
+        "epub_file_handling" => assign!(epub_file_handling),
         "archive_convert_without_dialog" => assign!(archive_convert_without_dialog),
         "skip_zip_if_folder_exists" => assign!(skip_zip_if_folder_exists),
         "skip_archive_if_zip_exists" => assign!(skip_archive_if_zip_exists),
+        "skip_epub_if_pdf_exists" => assign!(skip_epub_if_pdf_exists),
         "skip_image_if_video_exists" => assign!(skip_image_if_video_exists),
         "video_thumb_use_sidecar_image" => assign!(video_thumb_use_sidecar_image),
         "skip_duplicate_images" => assign!(skip_duplicate_images),
@@ -4382,6 +4397,20 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    #[test]
+    fn twenty_grid_columns_roundtrip_without_changing_toolbar_choices() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.grid_cols = 20;
+        settings.toolbar_cols_items = vec![1, 4, 10];
+        db.save_full(&settings).unwrap();
+
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.grid_cols, 20);
+        assert_eq!(loaded.toolbar_cols_items, vec![1, 4, 10]);
+    }
+
     fn sample_settings() -> Settings {
         let mut s = Settings::default();
         s.grid_cols = 7;
@@ -5342,9 +5371,11 @@ mod tests {
             vec![GridItemDisplayKind::Folder],
         ]);
         live.archive_file_handling = ArchiveFileHandling::Ignore;
+        live.epub_file_handling = crate::settings::EpubFileHandling::Convert;
         live.archive_convert_without_dialog = true;
         live.skip_zip_if_folder_exists = false;
         live.skip_archive_if_zip_exists = false;
+        live.skip_epub_if_pdf_exists = false;
         live.skip_image_if_video_exists = false;
         live.video_thumb_use_sidecar_image = false;
         live.skip_duplicate_images = false;
@@ -6641,19 +6672,21 @@ mod tests {
             )
             .unwrap()
         };
-        let mut statement = conn.prepare("SELECT value FROM settings_kv").unwrap();
-        let persisted_json = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .join("|");
-
-        assert!(!persisted_json.contains("RatedAt"));
+        for key in [
+            "details_sort_key",
+            "details_column_order",
+            "details_column_widths",
+            "details_selection_bar_column_order",
+            "details_selection_bar_column_widths",
+        ] {
+            assert!(
+                !read(key).contains("RatedAt"),
+                "{key} must remain readable by older details settings"
+            );
+        }
         assert_eq!(read("details_sort_key"), r#""Toolbar""#);
         assert_eq!(read("details_rated_at_width"), "154.0");
         assert_eq!(read("details_selection_bar_rated_at_width"), "176.0");
-        drop(statement);
         drop(conn);
 
         let mut loaded = db.load_into_settings().unwrap();

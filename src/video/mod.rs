@@ -530,11 +530,10 @@ pub struct NativeVideoOutputConfig {
     pub anime4k_variant: Option<anime4k_policy::VideoAnime4kVariant>,
     pub anime4k_budget: anime4k_policy::VideoAnime4kBudgetPreset,
     /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
-    /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
+    /// VST editor container HWND/PID の snapshot。App が `dsp_bridge.editor_ui_snapshot()` を
     /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
     /// になるが、`SetWindowRgn` 経由の click-through は機能する。
-    pub editor_hwnds_snapshot:
-        Option<std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>>,
+    pub editor_ui_snapshot: Option<dsp::SharedEditorUiSnapshot>,
     /// CP7: `foreground_allows_hud_raise` 判定用の main HWND (mIV メインウィンドウ)。
     /// 0 だと「mIV 既知 HWND」判定で main HWND が許可されなくなる (= presenter / HUD のみ
     /// 許可)。App が `self.main_hwnd` を渡す。
@@ -1793,6 +1792,46 @@ struct NativeCommandSender {
 struct NativeCommandReceiver {
     lossless_rx: crossbeam_channel::Receiver<SequencedNativeCommand>,
     shared: Arc<NativeCommandBusShared>,
+}
+
+#[cfg(all(windows, test))]
+pub(crate) struct NativeUiProbeForTest {
+    event_tx: NativeOutputEventSender,
+    command_rx: NativeCommandReceiver,
+}
+
+#[cfg(all(windows, test))]
+#[derive(Debug, PartialEq)]
+pub(crate) enum NativeUiCommandForTest {
+    Compact(bool),
+    Panel(Option<native_presenter::NativeOverlayVst3Panel>),
+    Available(bool),
+}
+
+#[cfg(all(windows, test))]
+impl NativeUiProbeForTest {
+    pub(crate) fn send_overlay_command(&self, command: native_presenter::NativeOverlayCommand) {
+        send_native_overlay_command(&self.event_tx, 0, 0, command);
+    }
+
+    pub(crate) fn drain_ui_commands(&self) -> Vec<NativeUiCommandForTest> {
+        self.command_rx
+            .drain()
+            .into_iter()
+            .filter_map(|command| match command {
+                NativeVideoOutputCommand::SetVideoCompact { compact } => {
+                    Some(NativeUiCommandForTest::Compact(compact))
+                }
+                NativeVideoOutputCommand::SetVst3Panel { panel } => {
+                    Some(NativeUiCommandForTest::Panel(panel))
+                }
+                NativeVideoOutputCommand::SetVst3Available { available } => {
+                    Some(NativeUiCommandForTest::Available(available))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[cfg(windows)]
@@ -4695,6 +4734,7 @@ fn run_native_video_output(
                 height: initial_attach.height,
                 os_pixels_per_point: initial_attach.pixels_per_point,
                 initial_observation: initial_attach.observation,
+                editor_ui_snapshot: config.editor_ui_snapshot.clone(),
                 test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
                 egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
                 cursor_hide_delay_secs: config.cursor_hide_delay_secs,
@@ -6035,6 +6075,7 @@ fn run_native_video_output(
                                 height: attach.height,
                                 os_pixels_per_point: attach.pixels_per_point,
                                 initial_observation: attach.observation,
+                                editor_ui_snapshot: config.editor_ui_snapshot.clone(),
                                 test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY")
                                     .is_some(),
                                 egui_overlay: native_video_env_flag_enabled(
@@ -8409,6 +8450,24 @@ impl VideoPlayer {
             sar_den: 1,
         });
         player
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn install_native_ui_probe_for_test(&mut self) -> NativeUiProbeForTest {
+        let (mut output, event_tx) =
+            NativeVideoOutput::disconnected_for_test_with_event_sender(Arc::clone(&self.ui_wake));
+        let (command_tx, command_rx) = native_command_bus(16, Arc::new(AtomicBool::new(false)));
+        output.command_tx = command_tx.clone();
+        output.visibility_gate = Arc::new(NativeVideoOutputVisibilityGate::new(
+            true,
+            command_tx,
+            Arc::clone(&output.hwnd),
+        ));
+        self.native_output = Some(output);
+        NativeUiProbeForTest {
+            event_tx,
+            command_rx,
+        }
     }
 
     #[cfg(test)]

@@ -178,6 +178,78 @@ pub struct ArchiveMaintPending {
     pub rx: mpsc::Receiver<ArchiveMaintResult>,
 }
 
+#[derive(Debug, Clone)]
+pub enum EpubMaintTask {
+    LoadRows,
+    DeleteSelected { generation_ids: Vec<i64> },
+    DeleteAll,
+}
+
+pub struct EpubMaintResult {
+    pub entries: Vec<crate::epub_cache::CurrentGenerationEntry>,
+    pub retired: usize,
+    pub error: Option<String>,
+}
+
+pub struct EpubMaintPending {
+    pub rx: mpsc::Receiver<EpubMaintResult>,
+}
+
+pub fn spawn_epub(task: EpubMaintTask, data_dir: PathBuf) -> EpubMaintPending {
+    let (tx, rx) = mpsc::channel();
+    let fallback = tx.clone();
+    let spawn = std::thread::Builder::new()
+        .name("epub-cache-maint".into())
+        .spawn(move || {
+            let result = (|| -> Result<_, String> {
+                crate::pdf_loader::epub_conversion_guard().map_err(|error| format!("{error:?}"))?;
+                let mut cache = crate::epub_cache::EpubCache::open_at(&data_dir)
+                    .map_err(|error| format!("{error:?}"))?;
+                let retired = match task {
+                    EpubMaintTask::LoadRows => 0,
+                    EpubMaintTask::DeleteSelected { generation_ids } => {
+                        let mut count = 0;
+                        for id in generation_ids {
+                            if cache
+                                .retire_generation(id)
+                                .map_err(|error| format!("{error:?}"))?
+                            {
+                                count += 1;
+                            }
+                        }
+                        count
+                    }
+                    EpubMaintTask::DeleteAll => cache
+                        .retire_all_current()
+                        .map_err(|error| format!("{error:?}"))?,
+                };
+                let entries = cache.list_current().map_err(|error| format!("{error:?}"))?;
+                Ok((entries, retired))
+            })();
+            let message = match result {
+                Ok((entries, retired)) => EpubMaintResult {
+                    entries,
+                    retired,
+                    error: None,
+                },
+                Err(error) => EpubMaintResult {
+                    entries: Vec::new(),
+                    retired: 0,
+                    error: Some(error),
+                },
+            };
+            let _ = tx.send(message);
+        });
+    if let Err(error) = spawn {
+        let _ = fallback.send(EpubMaintResult {
+            entries: Vec::new(),
+            retired: 0,
+            error: Some(format!("worker を開始できません: {error}")),
+        });
+    }
+    EpubMaintPending { rx }
+}
+
 pub fn spawn_archive(
     task: ArchiveMaintTask,
     db: Arc<crate::archive_cache::ArchiveCacheDb>,

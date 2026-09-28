@@ -1235,10 +1235,12 @@ impl App {
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => {
-                // `<pdf>/p:<num>` 形式
-                let mut p = pdf_path.clone();
-                p.push(format!("p:{page_num}"));
-                Some(p)
+                // `<book>/p:<num>` 形式。Windows で PathBuf::push("p:1") を使うと
+                // `p:` がドライブ指定と見なされ、本のパスが失われる。
+                let mut pseudo_path = pdf_path.as_os_str().to_os_string();
+                pseudo_path.push("/");
+                pseudo_path.push(format!("p:{page_num}"));
+                Some(pseudo_path.into())
             }
             _ => None,
         }
@@ -1603,7 +1605,6 @@ impl App {
         self.zip_enumerate_pending = None;
         self.pdf_password_request = None;
         self.pdf_password_pending_save = None;
-        self.show_pdf_password_dialog = false;
         self.pdf_password_input.clear();
         self.pdf_password_error = None;
         self.pdf_password_save = false;
@@ -1629,7 +1630,6 @@ impl App {
             self.zip_enumerate_pending = None;
             self.pdf_password_request = None;
             self.pdf_password_pending_save = None;
-            self.show_pdf_password_dialog = false;
             self.pdf_password_input.clear();
             self.pdf_password_error = None;
             self.pdf_password_save = false;
@@ -1638,7 +1638,7 @@ impl App {
         self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::ViewerExited);
     }
 
-    fn prepare_required_fullscreen_navigation(
+    pub(super) fn prepare_required_fullscreen_navigation(
         &mut self,
         ctx: &egui::Context,
         navigation_purpose: crate::app::FsNavigationPurpose,
@@ -1659,7 +1659,7 @@ impl App {
         true
     }
 
-    fn finish_required_fullscreen_load(
+    pub(super) fn finish_required_fullscreen_load(
         &mut self,
         target: crate::snapshot::SnapshotTarget,
         history_trigger: crate::app::HistoryTrigger,
@@ -1696,6 +1696,33 @@ impl App {
         history_trigger: crate::app::HistoryTrigger,
         navigation_purpose: crate::app::FsNavigationPurpose,
     ) {
+        if self.main_folder_history_available()
+            && matches!(
+                target,
+                crate::snapshot::SnapshotTarget::ZipImage { .. }
+                    | crate::snapshot::SnapshotTarget::PdfPage { .. }
+            )
+            && crate::folder_tree::is_virtual_folder(&folder_path)
+        {
+            // A prepared ZIP/PDF has no legacy enumerate receiver yet. Carry the required
+            // page into the staged owner so exact-leaf resolution runs after visible adoption.
+            self.snapshot_internal_nav = true;
+            let started = self
+                .claim_open_request_owner(&folder_path, &crate::app::OpenRequestOwner::Navigation)
+                && self.start_physical_history_transition(
+                    crate::app::PhysicalHistoryIntent::RequiredFullscreen {
+                        target,
+                        history_trigger,
+                        navigation_purpose,
+                    },
+                    folder_path,
+                );
+            self.snapshot_internal_nav = false;
+            if !started {
+                self.show_feedback_toast("画像の場所を開けません".to_string());
+            }
+            return;
+        }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
             self.show_feedback_toast("画像の場所を開けません".to_string());
             return;
@@ -2243,6 +2270,47 @@ mod tests {
             }),
             Some(0)
         );
+    }
+
+    #[test]
+    fn required_virtual_leaf_stages_before_filesystem_preflight() {
+        use crate::snapshot::SnapshotTarget;
+
+        let temp = tempfile::tempdir().unwrap();
+        for (name, pdf) in [("missing.zip", false), ("missing.pdf", true)] {
+            let path = temp.path().join(name);
+            let target = if pdf {
+                SnapshotTarget::PdfPage {
+                    pdf_path: path.clone(),
+                    page_num: 0,
+                }
+            } else {
+                SnapshotTarget::ZipImage {
+                    zip_path: path.clone(),
+                    entry_name: "page.jpg".into(),
+                }
+            };
+            let old_page = temp.path().join("old.jpg");
+            let mut app = test_app_with_items(vec![GridItem::Image(old_page)]);
+            app.fullscreen_idx = Some(0);
+            let old_items = app.items.clone();
+
+            app.open_required_fullscreen_location(
+                &egui::Context::default(),
+                path,
+                target,
+                crate::app::HistoryTrigger::UserChosen,
+            );
+
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some(),
+                "the worker must classify the container before changing the visible viewer"
+            );
+            assert_eq!(app.items, old_items);
+            assert_eq!(app.fullscreen_idx, Some(0));
+        }
     }
 
     #[test]
@@ -2912,6 +2980,70 @@ mod tests {
             !app.fs_nav_is_locked(),
             "直接 open 後は nav lock が解除され、次の Ctrl+↑↓ が block されない"
         );
+    }
+
+    #[test]
+    fn snapshot_epub_page_list_navigates_from_current_page() {
+        let ctx = egui::Context::default();
+        let book = PathBuf::from(r"E:\test\book.epub");
+        let mut app = test_app_with_items(
+            (0..3)
+                .map(|page_num| GridItem::PdfPage {
+                    pdf_path: book.clone(),
+                    page_num,
+                    content_type: None,
+                })
+                .collect(),
+        );
+        app.current_folder = Some(book);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen,));
+        assert_eq!(
+            app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
+            Some(1)
+        );
+        assert!(app.snapshot_navigate(
+            &ctx,
+            true,
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert_eq!(app.fullscreen_idx, Some(2));
+        assert_eq!(
+            app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn snapshot_pdf_pages_inside_epub_named_folder_keep_their_owner() {
+        let ctx = egui::Context::default();
+        let book = PathBuf::from(r"E:\test\shelf.epub\book.pdf");
+        let mut app = test_app_with_items(
+            (0..3)
+                .map(|page_num| GridItem::PdfPage {
+                    pdf_path: book.clone(),
+                    page_num,
+                    content_type: None,
+                })
+                .collect(),
+        );
+        app.current_folder = Some(book);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen));
+        assert_eq!(
+            app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
+            Some(1),
+        );
+        assert!(app.snapshot_navigate(
+            &ctx,
+            true,
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert_eq!(app.fullscreen_idx, Some(2));
     }
 
     /// Codex follow-up (スライドショー経路): snapshot スライドショーの直接 leaf 送りでも

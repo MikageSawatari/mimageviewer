@@ -442,6 +442,32 @@ impl CatalogDb {
         Ok(map)
     }
 
+    /// EPUB page dimensions belonging to one immutable converted generation.
+    /// The same integer columns hold PDF file attributes in ordinary catalogs.
+    pub fn load_source_dims_matching(
+        &self,
+        mtime: i64,
+        file_size: i64,
+    ) -> rusqlite::Result<HashMap<String, Option<(u32, u32)>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT filename, source_width, source_height FROM thumbnails \
+             WHERE mtime = ?1 AND file_size = ?2",
+        )?;
+        let mut map = HashMap::new();
+        let iter = stmt.query_map(rusqlite::params![mtime, file_size], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<u32>>(1)?,
+                row.get::<_, Option<u32>>(2)?,
+            ))
+        })?;
+        for (filename, width, height) in iter.flatten() {
+            map.insert(filename, valid_dims(width, height));
+        }
+        Ok(map)
+    }
+
     /// DB 内の全エントリを HashMap<filename, CacheEntry> として返す（一括 SELECT）。
     pub fn load_all(&self) -> rusqlite::Result<HashMap<String, CacheEntry>> {
         let conn = self.conn.lock().unwrap();

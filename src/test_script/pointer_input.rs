@@ -1597,6 +1597,7 @@ mod tests {
             hwnd: Some(owner.hwnd()),
             backend_token: Some(owner.backend_token()),
             residence: "mounted".to_string(),
+            presentation: crate::test_script::TestScriptWindowPresentation::ActiveImmediate,
             media_kind: "image".to_string(),
             page_index: Some(page_index),
             items_generation: 7,

@@ -72,7 +72,14 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
   認証後の全画面では左上の小さな badge に「操作中」または
   「別の端末が操作中 (操作すると取得します)」を常時表示し、確認や入力 blocking は行わない
 - session owner が変わった時、本体は全 context の再生位置と確定済み音声トラック選択を収穫し、
-  取得前の delayed open / fullscreen restore を失効させる。既存の全窓 terminal close 経路で
+  取得前の delayed open / fullscreen restore を失効させる。起動・二重起動のパス解決結果、
+  閲覧用アーカイブ変換、本棚ショートカットの準備、サブ展開・ファイル名スタックの表示準備も
+  それぞれの終了処理で破棄する。変換結果を書くだけの sibling ZIP は閲覧を開かないため継続する。
+  明示された起動パス自体は保持し、取得失敗または返却で Local に戻った時に通常の起動先として開く。
+  通常の一覧の現在フォルダが無く、保留中の起動パスも無い場合は既定の起動先を開く。
+  二重起動のパスはパイプ受信時の所有状態と取得世代で判定し、Remote 所有中に届いたものと
+  取得前から保留されていたものはログと通知を出して拒否する。返却後に届いたものは Local で開く。
+  既存の全窓 terminal close 経路で
   main / detached / ParkedLive / メディア窓を閉じる。Remote が見た再生位置は IPC write で
   PC の settings と読書履歴に戻す。hidden / viewer 破棄の最終報告は keepalive で即時発信し、
   viewer は配信開始時の所有 session ID を attach 成功後に報告へ固定し、再接続中の旧位置を新 owner として
@@ -1023,6 +1030,12 @@ change は 180 ms debounce 後にこの判定を再実行する。
 
 `spread.db::get_direction` も本体側で同じ key / fallback から読み、`reading_direction` として応答する。
 LTR / RTL の見開きモードは本体と同じく方向をそのモードへ揃え、Single は保存済み方向を維持する。
+変換済み EPUB は PDF の本と同じ Remote 経路で開き、本とページの address は元 `.epub` とその
+`PdfPage` subresource を使う。Remote は変換を始めず、未変換時は PC の mImageViewer で一度開くよう
+案内する。一覧は本体の同名 PDF 優先設定を適用し、Web は EPUB バッジと表紙未取得時のプレースホルダーを表示する。
+本体の世代スタンプでページ数・表紙・見開き用寸法を照合する。EPUB の綴じ方向は保存済み本別値が無く、
+「文書の綴じ方向に従う」が有効なときに固定世代の方向を採用する。通常 PDF の `/Direction` は
+Remote では従来どおり既定方向への反映対象外である。
 Web で RTL から Single へ切り替えた場合も、そのセッションの RTL を request に引き継ぐ。
 RTL の横方向入力は画面上の方向を反転し、左 swipe / 左 tap zone / `ArrowLeft` を次グループ、
 右 swipe / 右 tap zone / `ArrowRight` を前グループとする。上下矢印と PageUp / PageDown は
@@ -1885,7 +1898,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-現行版は **v62**。v62 は Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control を追加した。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
+現行版は **v63**。v63 は audio-tracks ブランチの追加を統合し、Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control と、端末で見た再生位置の PC への書き戻し (`RecordVideoProgress`、所有世代と連番の照合) を含む。audio-tracks ブランチでは音声トラック追加時に v62、再生位置追加時に v63 としていた。master の v62 は EPUB 対応で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げた。統合後の v63 では EPUB と音声トラック・再生位置の追加をすべて含み、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
 `{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
 catalog / snapshot / navigation を追加した。collection の session spread request と
 address-based `page_groups` を追加した版は v49。

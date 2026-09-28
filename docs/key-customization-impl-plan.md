@@ -11,6 +11,8 @@
 > settings.db に保存し、`keymap.ini.imported*.bak` へ退避する。設定メニュー「操作カスタマイズ…」から
 > `Settings.keymap` を編集できる。`keymap.ini.default` は Action 名と既定キーの参照として引き続き生成する。
 
+> §1.250: `ToggleAlwaysOnTop` は Global / Press / 既定 `none`。main、egui fullscreen、native video の各入力経路へ配線し、native presenter 用の allowlist と chord snapshot にも含める。
+
 関連: [keymap-spec.md](keymap-spec.md) (現行キー仕様 = アクション洗い出しの元ネタ)、
 [archive/ui-input/key-customization-plan.md](archive/ui-input/key-customization-plan.md) §8 (簡易版の設計確定事項)。
 
@@ -498,7 +500,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
     ツールの並べ替えでスロットとの対応が変わるため、設定 UI では番号を明示する。
 - GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P) /
   GridCopyFiles `Ctrl+C` (P) / GridCutFiles `Ctrl+X` (P)
-- GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)
+- GridColumnCount1..10 `Alt+1`..`Alt+0`、GridColumnCount11..20 は既定キーなし、GridToggleDetailsView `Alt+-` (P)
 
 ### Grid (Ph4)
 - GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpenSelected `Enter` (P) / GridOpenExternalPlayer `Shift+Enter` (P) /

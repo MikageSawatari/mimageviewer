@@ -97,6 +97,8 @@ mod edit_source;
 pub mod editing_addon;
 pub mod editing_addon_download;
 pub mod egui_focus_policy;
+pub mod epub_cache;
+pub mod epub_convert;
 pub mod exif_reader;
 pub mod explorer_integration;
 pub mod export_batch;
@@ -279,10 +281,12 @@ pub use ui_fullscreen::{
     draw_music_panel_reach_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
     draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
+mod ui_details_icon;
 pub mod ui_helpers;
 mod ui_main;
 #[doc(hidden)]
 pub use ui_main::draw_cut_item_appearance_snapshot_fixture;
+pub use ui_main::draw_details_icons_snapshot_fixture;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{
@@ -1048,6 +1052,10 @@ pub fn run() -> eframe::Result {
     // `--log` 引数は後方互換のため受け付けるが現在は no-op。
     logger::init();
 
+    // Keep the shared liveness lock alive until run() returns. A disabled gate is
+    // retained as a typed outcome for the EPUB integration in the next stage.
+    pdf_loader::install_epub_gate(epub_cache::startup_gate(&data_dir::get()));
+
     // --perf-log: 構造化イベントログ (JSON Lines) を有効化する。
     // 無指定時は `perf::is_enabled()` が false のまま、全 perf::event 呼出しが即 return。
     // prog_start を基準にすることで startup.* イベントの `total_ms` が真の経過時間を指す。
@@ -1236,6 +1244,7 @@ pub fn run() -> eframe::Result {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
+        .with_window_level(crate::settings::viewer_window_level(saved.always_on_top))
         .with_inner_size(size)
         .with_min_inner_size(MIN_INNER_SIZE)
         .with_icon(icon);

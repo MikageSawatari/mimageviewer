@@ -839,6 +839,10 @@ fn remote_video_start_outcome_for_player(
 }
 
 impl crate::app::App {
+    pub(crate) fn remote_session_handle(&self) -> Option<&SessionHandle> {
+        self.remote_session_ui.handle.as_ref()
+    }
+
     pub(crate) fn set_remote_ipc_server_control(&mut self, control: super::RemoteIpcServerControl) {
         self.remote_session_ui.final_exit_control = Some(control);
     }
@@ -992,6 +996,12 @@ impl crate::app::App {
         let control_returned = snapshot.as_ref().is_some_and(|snapshot| {
             snapshot.control_return_sequence != self.remote_session_ui.last_control_return_sequence
         });
+        // Drain queued opens while Remote owns control. Opens received before a return but
+        // drained afterwards carry their receive-time owner in ActivationOpenPath.
+        #[cfg(windows)]
+        if blocks_local_control {
+            self.reject_activation_open_paths_for_remote(ctx);
+        }
         // The remote owner is the resource boundary. Tear down its taps and worker before the
         // existing acquire/release path pauses or reloads media; that path remains the one source
         // of truth for playback state transitions.
@@ -3924,7 +3934,18 @@ impl crate::app::App {
                 self.refresh_smart_folder_staged(id);
             }
             ReloadedView::Other => {
-                self.reload_current_folder_preserving_override();
+                if self.current_folder.is_some() {
+                    self.reload_current_folder_preserving_override();
+                } else if self.initialized
+                    && self.startup_open_path.is_none()
+                    && self.startup_open_path_resolve_pending.is_none()
+                    && matches!(
+                        self.top_level_grid_view.surface(),
+                        crate::app::top_level_grid_view::TopLevelGridSurface::Folder
+                    )
+                {
+                    self.open_default_startup_target();
+                }
             }
         }
         crate::logger::log("remote_ipc: local control restored; current view reload requested");
@@ -3983,9 +4004,10 @@ impl crate::app::App {
     }
 }
 
-/// Exhaustive admission classifier for Remote UI writes. Only `SetSortOrder` mutates
-/// settings.db through the in-memory `Settings` mirror; the remaining variants belong to other
-/// databases or read-only response paths and stay available during settings recovery.
+/// Exhaustive admission classifier for Remote UI writes. `SetSortOrder` and
+/// `RecordVideoProgress` mutate settings.db through the in-memory `Settings` mirror;
+/// the remaining variants belong to other databases or read-only response paths and stay
+/// available during settings recovery.
 fn remote_write_uses_settings_family(request: &RemoteWriteRequest) -> bool {
     match request {
         RemoteWriteRequest::SetSortOrder { .. }

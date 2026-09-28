@@ -2067,6 +2067,7 @@ pub struct NativeRenderConfig {
     pub height: u32,
     pub(crate) os_pixels_per_point: f32,
     pub(crate) initial_observation: NativeWindowObservation,
+    pub(crate) editor_ui_snapshot: Option<crate::video::dsp::SharedEditorUiSnapshot>,
     pub test_overlay: bool,
     pub egui_overlay: bool,
     pub cursor_hide_delay_secs: f32,
@@ -2456,6 +2457,11 @@ struct NativeTestOverlay {
     transparent: bool,
 }
 
+struct VstButtonTrace {
+    editors: std::collections::HashSet<u64>,
+    editor_raw: u64,
+}
+
 struct NativeEguiOverlay {
     #[cfg(feature = "test-script")]
     ui_smoke_owner: Arc<crate::video::native_ui_smoke::NativeUiSmokeOverlayOwner>,
@@ -2485,6 +2491,9 @@ struct NativeEguiOverlay {
     _dcomp_target_lease: NativeRenderTarget,
     /// Pump-owned USER32 state, copied as a value snapshot.
     window_observation: NativeWindowObservation,
+    editor_ui_snapshot: Option<crate::video::dsp::SharedEditorUiSnapshot>,
+    vst_button_rect: Option<egui::Rect>,
+    vst_button_trace: Option<VstButtonTrace>,
     /// テキスト入力ダイアログ表示中に presenter HWND へ focus を戻した時刻。
     /// HUD HWND は `WS_EX_NOACTIVATE` なので、別アプリから mIV に戻っただけでは
     /// OS focus が main/HUD 側に残り、presenter wndproc に key/IME が来ない場合がある。
@@ -4613,7 +4622,7 @@ impl NativeOverlayInputRouting {
             NativeEvent::GeometryChanged { .. }
             | NativeEvent::DpiChanged { .. }
             | NativeEvent::RequestRaiseHud
-            | NativeEvent::RequestFocusClaim
+            | NativeEvent::RequestFocusClaim { .. }
             | NativeEvent::CursorOwnership(_)
             | NativeEvent::Destroyed => false,
         }
@@ -4973,6 +4982,7 @@ impl NativeRenderCore {
                         config.height,
                         config.os_pixels_per_point,
                         config.initial_observation,
+                        config.editor_ui_snapshot.clone(),
                         config.cursor_hide_delay_secs,
                         config.ui_scale,
                         config.text_contrast,
@@ -5041,6 +5051,7 @@ impl NativeRenderCore {
                         config.height,
                         config.os_pixels_per_point,
                         config.initial_observation,
+                        config.editor_ui_snapshot.clone(),
                         config.cursor_hide_delay_secs,
                         config.ui_scale,
                         config.text_contrast,
@@ -7455,7 +7466,7 @@ impl NativeRenderCore {
     ///      届いていなければ synthetic `MouseMove` を overlay の `push_native_event` に流す
     ///      (= region 外 cursor でも hover 表示遷移を成立させる)。
     ///   4. cursor が activation zone (= 上端 0..76pt / 下端 H-220..H pt) 内、かつ
-    ///      `editor_hwnds_snapshot` から `foreground_allows_hud_raise` が true を返した場合、
+    ///      `editor_ui_snapshot` から `foreground_allows_hud_raise` が true を返した場合、
     ///      raise を要求する (= 戻り値 true)。判定不能なら false で skip。
     pub(crate) fn cursor_polling_tick(
         &mut self,
@@ -8797,6 +8808,7 @@ impl NativeEguiOverlay {
         height: u32,
         os_pixels_per_point: f32,
         window_observation: NativeWindowObservation,
+        editor_ui_snapshot: Option<crate::video::dsp::SharedEditorUiSnapshot>,
         _cursor_hide_delay_secs: f32,
         ui_scale: f32,
         text_contrast: crate::settings::TextContrast,
@@ -8885,6 +8897,9 @@ impl NativeEguiOverlay {
             egui_ctx,
             _dcomp_target_lease: dcomp_target,
             window_observation,
+            editor_ui_snapshot,
+            vst_button_rect: None,
+            vst_button_trace: None,
             last_text_input_focus_claim_at: None,
             started_at: Instant::now(),
             pending_events: Vec::new(),
@@ -9645,6 +9660,58 @@ impl NativeEguiOverlay {
                 self.dirty = true;
             }
             NativeEvent::MouseButton(button) => {
+                if button.button == NativeVideoMouseButton::Left {
+                    let hud_hwnd = match button.receipt.origin {
+                        crate::mouse_seek_debug::NativeVideoInputOrigin::Win32MouseButton {
+                            window_source: crate::video::native_window::NativeVideoWindowSource::Hud,
+                            receiver_hwnd,
+                            ..
+                        } => Some(receiver_hwnd),
+                        _ => None,
+                    };
+                    if button.down {
+                        self.vst_button_trace = None;
+                        if let Some(hud_hwnd) = hud_hwnd
+                            && self.vst_button_rect.is_some_and(|rect| {
+                                rect.contains(self.native_pos(button.x, button.y))
+                            })
+                            && let Some(snapshot) = self.editor_ui_snapshot.as_ref()
+                        {
+                            let editors = crate::video::dsp::read_editor_ui_snapshot(snapshot)
+                                .hwnds
+                                .clone();
+                            if !editors.is_empty() {
+                                let editor_raw =
+                                    crate::video::native_window::vst_button_editor_hint(&editors);
+                                crate::video::native_window::log_vst_button_probe(
+                                    "hud-down",
+                                    &editors,
+                                    Some(editor_raw),
+                                    self.window_observation.focus.target_id,
+                                    hud_hwnd,
+                                    false,
+                                );
+                                self.vst_button_trace = Some(VstButtonTrace {
+                                    editors,
+                                    editor_raw,
+                                });
+                            }
+                        }
+                    } else if let Some(trace) = self.vst_button_trace.take() {
+                        crate::video::native_window::log_vst_button_probe(
+                            if hud_hwnd.is_some() {
+                                "hud-up"
+                            } else {
+                                "up-other-source"
+                            },
+                            &trace.editors,
+                            Some(trace.editor_raw),
+                            self.window_observation.focus.target_id,
+                            hud_hwnd.unwrap_or(0),
+                            false,
+                        );
+                    }
+                }
                 #[cfg(feature = "test-script")]
                 if button.button == NativeVideoMouseButton::Left && !button.down {
                     if let Some(metadata) = button.smoke_metadata {
@@ -9712,7 +9779,7 @@ impl NativeEguiOverlay {
             NativeEvent::GeometryChanged { .. }
             | NativeEvent::DpiChanged { .. }
             | NativeEvent::RequestRaiseHud
-            | NativeEvent::RequestFocusClaim
+            | NativeEvent::RequestFocusClaim { .. }
             | NativeEvent::CursorOwnership(_)
             | NativeEvent::Destroyed => {}
         }
@@ -12113,6 +12180,7 @@ impl NativeEguiOverlay {
         // 実機修正 (2026-05-12 A): VST3 設定パネルをドラッグ可能化 (`.movable(true)`)。
         // ドラッグ後の actual rect を記録して region に追従させる。
         let mut last_drawn_vst3_panel_rect: Option<egui::Rect> = None;
+        let mut last_drawn_vst_button_rect: Option<egui::Rect> = None;
         let mut last_drawn_toast_rect: Option<egui::Rect> = None;
         let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
         let mut last_drawn_panorama_projection_popup_rect: Option<egui::Rect> = None;
@@ -12328,7 +12396,7 @@ impl NativeEguiOverlay {
                 );
             }
             if panel_chrome_visible {
-                draw_native_top_bar(
+                let top_layout = draw_native_top_bar(
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
@@ -12355,6 +12423,7 @@ impl NativeEguiOverlay {
                     #[cfg(feature = "test-script")]
                     &mut ui_smoke_command_attribution,
                 );
+                last_drawn_vst_button_rect = top_layout.vst_button_rect;
             }
             if checked {
                 draw_native_checkmark(
@@ -14099,6 +14168,7 @@ impl NativeEguiOverlay {
         self.hover_preview_anchor_x = hover_preview_anchor_x;
         self.last_drawn_preview_rect = last_drawn_preview_rect;
         self.last_drawn_vst3_panel_rect = last_drawn_vst3_panel_rect;
+        self.vst_button_rect = last_drawn_vst_button_rect;
         self.last_emitted_vst3_panel_pos = last_emitted_vst3_panel_pos;
         self.last_drawn_toast_rect = last_drawn_toast_rect;
         self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;

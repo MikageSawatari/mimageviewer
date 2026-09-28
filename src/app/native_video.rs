@@ -3,6 +3,15 @@ use crate::keymap::{
     CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction, VIDEO_ADJUST_SLOT_ACTIONS,
     VIDEO_SEEK_STRIP_ACTIONS,
 };
+
+#[cfg(windows)]
+pub(super) fn native_vst_video_compact(
+    vst_available: bool,
+    gui_visible: bool,
+    compact_pref: bool,
+) -> bool {
+    vst_available && gui_visible && compact_pref
+}
 #[cfg(windows)]
 use crate::video::seek_strip_thumbs::StripThumbnailRequestTrigger;
 
@@ -4242,22 +4251,37 @@ impl App {
             // foreground 状態を観測したら presenter 所有スレッドへ依頼する。
             let now = std::time::Instant::now();
             let foreground_hwnd = crate::video::native_window::foreground_hwnd();
-            let foreground_is_ours =
-                crate::video::native_window::foreground_belongs_to_current_process_strict();
+            let editor_snapshot = self.dsp_bridge.editor_ui_snapshot();
+            let editors = crate::video::dsp::read_editor_ui_snapshot(&editor_snapshot);
+            let foreground_group = crate::video::native_window::ui_group_for_hwnd(
+                foreground_hwnd,
+                &editors.hwnd_pids,
+                &editors.bridge_pids,
+            );
             let foreground_is_presenter =
                 foreground_hwnd == hwnd || (hud_hwnd != 0 && foreground_hwnd == hud_hwnd);
-            let internal_foreground_needs_recover = foreground_is_ours && !foreground_is_presenter;
-            if !foreground_is_ours {
-                self.native_video_front_recover_after_external_foreground = true;
-            } else if internal_foreground_needs_recover {
-                self.native_video_front_recover_after_external_foreground = true;
+            let internal_foreground_needs_recover = foreground_group
+                == crate::video::native_window::ForegroundUiGroup::OwnProcess
+                && !foreground_is_presenter;
+            match foreground_group {
+                crate::video::native_window::ForegroundUiGroup::External => {
+                    self.native_video_front_recover_after_external_foreground = true;
+                }
+                crate::video::native_window::ForegroundUiGroup::OwnProcess
+                    if internal_foreground_needs_recover =>
+                {
+                    self.native_video_front_recover_after_external_foreground = true;
+                }
+                // An editor is owned by this presentation, so it neither arms
+                // recovery nor triggers a raise while its controls have focus.
+                _ => {}
             }
             let presenter_raise_due = self
                 .native_video_front_last_raise
                 .map(|last| now.duration_since(last) >= std::time::Duration::from_millis(250))
                 .unwrap_or(true);
             if presenter_raise_due
-                && foreground_is_ours
+                && foreground_group == crate::video::native_window::ForegroundUiGroup::OwnProcess
                 && self.native_video_front_recover_after_external_foreground
             {
                 let recover_reason = if internal_foreground_needs_recover {
@@ -4356,11 +4380,9 @@ impl App {
             IsWindowVisible, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
             WS_CHILD,
         };
-        let editor_arc = self.dsp_bridge.editor_hwnds_snapshot();
-        let raw_list: Vec<u64> = match editor_arc.read() {
-            Ok(set) => set.iter().copied().collect(),
-            Err(_) => return,
-        };
+        let editor_arc = self.dsp_bridge.editor_ui_snapshot();
+        let editors = crate::video::dsp::read_editor_ui_snapshot(&editor_arc);
+        let raw_list: Vec<u64> = editors.hwnds.iter().copied().collect();
 
         // HWND 正規化 (Codex 続編 P2 反映): 順序を「先に GA_ROOT で正規化 → 正規化後の root に
         // 対して IsWindow / IsWindowVisible / WS_CHILD を検査」に修正。
@@ -6412,6 +6434,18 @@ impl App {
                     self.mark_native_video_hud_activity(ctx);
                     return;
                 }
+                let editor_snapshot = self.dsp_bridge.editor_ui_snapshot();
+                let editors = crate::video::dsp::read_editor_ui_snapshot(&editor_snapshot);
+                if !editors.hwnds.is_empty() {
+                    crate::video::native_window::log_vst_button_probe(
+                        "toggle-ran",
+                        &editors.hwnds,
+                        None,
+                        self.native_video_presenter_hwnd().unwrap_or(0),
+                        self.dsp_bridge.hud_hwnd(),
+                        true,
+                    );
+                }
                 self.toggle_native_video_vst3_gui();
                 self.mark_native_video_hud_activity(ctx);
             }
@@ -6910,7 +6944,7 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::GeometryChanged { .. } => {}
             crate::video::native_window::NativeVideoWindowEvent::DpiChanged { .. }
             | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud
-            | crate::video::native_window::NativeVideoWindowEvent::RequestFocusClaim
+            | crate::video::native_window::NativeVideoWindowEvent::RequestFocusClaim { .. }
             | crate::video::native_window::NativeVideoWindowEvent::Touch(_)
             | crate::video::native_window::NativeVideoWindowEvent::CursorOwnership(_)
             | crate::video::native_window::NativeVideoWindowEvent::Destroyed => {}
@@ -8683,7 +8717,8 @@ impl App {
     #[cfg(windows)]
     fn native_video_help_includes_row(row: &CommandDisplayRow) -> bool {
         match row.spec.action {
-            KeyAction::ToggleDetachedViewerMode
+            KeyAction::ToggleAlwaysOnTop
+            | KeyAction::ToggleDetachedViewerMode
             | KeyAction::FsToggleWindowMode
             | KeyAction::FsBackToList
             | KeyAction::FsCtrlNavPrev
@@ -9263,9 +9298,11 @@ impl App {
         // 複数ウィンドウモード / F12 detached では音声チェーンだけを維持し、UI は出さない。
         let vst3_ok = self.native_video_vst3_controls_available();
         player.set_native_vst3_available(vst3_ok);
-        player.set_native_video_compact(
-            vst3_ok && self.settings.vst3_gui_visible && self.settings.vst3_video_compact,
-        );
+        player.set_native_video_compact(native_vst_video_compact(
+            vst3_ok,
+            self.settings.vst3_gui_visible,
+            self.settings.vst3_video_compact,
+        ));
     }
 
     #[cfg(windows)]
@@ -12339,6 +12376,15 @@ impl App {
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStart)
             }
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::ToggleAlwaysOnTop, &key) =>
+            {
+                self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
+                hud_activity = false;
+                NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+            }
             // F12: detached viewer mode toggle. Keep this as a keymap action
             // so a future remap works when the native video HWND has focus.
             _ if !key.repeat
@@ -13238,7 +13284,7 @@ impl App {
             self.settings.text_contrast,
             self.settings.ui_font.clone(),
             self.settings.fullscreen_cursor_hide_delay_secs,
-            Some(self.dsp_bridge.editor_hwnds_snapshot()),
+            Some(self.dsp_bridge.editor_ui_snapshot()),
             self.main_hwnd.unwrap_or(0) as u64,
             self.creative_lut_library.video_snapshot(
                 &self.settings.creative_luts,
@@ -14103,7 +14149,7 @@ impl App {
                 self.settings.text_contrast,
                 self.settings.ui_font.clone(),
                 self.settings.fullscreen_cursor_hide_delay_secs,
-                Some(self.dsp_bridge.editor_hwnds_snapshot()),
+                Some(self.dsp_bridge.editor_ui_snapshot()),
                 self.main_hwnd.unwrap_or(0) as u64,
                 self.creative_lut_library.video_snapshot(
                     &self.settings.creative_luts,
@@ -15739,6 +15785,31 @@ mod native_video_display_mode_toggle_tests {
 #[cfg(all(test, windows))]
 mod configurable_video_seek_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn rebound_always_on_top_native_key_toggles_once_per_press() {
+        let (mut app, idx) = setup_seek_app();
+        let ctx = egui::Context::default();
+        app.keymap = crate::keymap::Keymap::from_ini_str("[Global]\nToggleAlwaysOnTop = F16\n");
+        let first = native_key(0x7f, false, false);
+        assert!(matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, first),
+            NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+        ));
+        assert!(app.settings.always_on_top);
+        let mut repeat = first;
+        repeat.repeat = true;
+        assert!(!matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, repeat),
+            NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+        ));
+        assert!(app.settings.always_on_top);
+        assert!(matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, first),
+            NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+        ));
+        assert!(!app.settings.always_on_top);
+    }
 
     fn native_key(
         virtual_key: u32,

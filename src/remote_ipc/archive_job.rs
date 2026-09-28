@@ -422,6 +422,27 @@ mod tests {
     }
 
     #[test]
+    fn epub_is_rejected_before_archive_conversion_or_input() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("book.epub");
+        std::fs::write(&source, b"not an archive job").unwrap();
+        let executor = archive_executor(crate::settings::Settings::default(), None);
+        let outcome = executor.execute(
+            &RemoteArchiveStartRequest {
+                request_id: "epub-excluded".to_owned(),
+                source: RemoteAddress::file(source.to_string_lossy().into_owned()),
+            },
+            &NoInputControl,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        assert!(matches!(
+            outcome,
+            RemoteArchiveExecutionOutcome::Failed(RemoteArchiveTerminalCode::UnsupportedFormat, _)
+        ));
+    }
+
+    #[test]
     fn ask_requires_confirmation_before_conversion() {
         let _data_dir = crate::data_dir::TestDataDirGuard::new();
         let temp = tempfile::tempdir().unwrap();

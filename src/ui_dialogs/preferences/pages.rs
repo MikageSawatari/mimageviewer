@@ -7,7 +7,7 @@ use crate::keymap::{
     BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
     Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, ModKind,
     ReservedBindingKind, TopMenuId, menu_command_can_be_hidden, menu_command_spec,
-    menu_commands_for_parent, parse_chord_for_action,
+    menu_commands_for_parent, parse_chord_for_action, pin_settings_always_on_top_command,
 };
 use crate::ring_shortcut::{
     MouseGestureDirection, RightDragContext, RightDragMode, RingActionId, RingDirection,
@@ -1111,7 +1111,7 @@ pub(super) fn association_extension_groups() -> [(&'static str, &'static [&'stat
         ("画像", crate::folder_tree::SUPPORTED_EXTENSIONS),
         ("動画", crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS),
         ("音声", crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS),
-        ("書庫 / PDF", &["zip", "cbz", "pdf"]),
+        ("書庫 / PDF / EPUB", &["zip", "cbz", "pdf", "epub"]),
     ]
 }
 
@@ -2433,6 +2433,16 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::GridColumnCount8 => RingActionId::GridColumnCount8,
         KeyAction::GridColumnCount9 => RingActionId::GridColumnCount9,
         KeyAction::GridColumnCount10 => RingActionId::GridColumnCount10,
+        KeyAction::GridColumnCount11 => RingActionId::GridColumnCount11,
+        KeyAction::GridColumnCount12 => RingActionId::GridColumnCount12,
+        KeyAction::GridColumnCount13 => RingActionId::GridColumnCount13,
+        KeyAction::GridColumnCount14 => RingActionId::GridColumnCount14,
+        KeyAction::GridColumnCount15 => RingActionId::GridColumnCount15,
+        KeyAction::GridColumnCount16 => RingActionId::GridColumnCount16,
+        KeyAction::GridColumnCount17 => RingActionId::GridColumnCount17,
+        KeyAction::GridColumnCount18 => RingActionId::GridColumnCount18,
+        KeyAction::GridColumnCount19 => RingActionId::GridColumnCount19,
+        KeyAction::GridColumnCount20 => RingActionId::GridColumnCount20,
         KeyAction::FsClose => RingActionId::CloseFullscreen,
         KeyAction::FsToggleMetadata => RingActionId::ImageToggleMetadata,
         KeyAction::FsToggleWindowMode => RingActionId::ToggleWindowMode,
@@ -4557,6 +4567,7 @@ fn key_trigger_label(trigger: KeyTrigger) -> &'static str {
 pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "menu/layout", |ui, state| {
         ui.small("メニューバーの上位メニューと固定項目の表示順を変更します。登録済みお気に入り、タグ一覧、更新確認など状態で変わる項目は固定位置に残ります。");
+        ui.small("設定の「常に最前面」は先頭固定です。表示・非表示を切り替えられます。");
         ui.add_space(8.0);
 
         let layout_snapshot = state.settings.menu_layout.clone();
@@ -4646,7 +4657,12 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                                 ui.label(label);
 
                                 if ui
-                                    .add_enabled(command_index > 0, egui::Button::new("↑").small())
+                                    .add_enabled(
+                                        command_index > 0
+                                            && command != MenuCommandId::SettingsAlwaysOnTop
+                                            && !(top == TopMenuId::Settings && command_index == 1),
+                                        egui::Button::new("↑").small(),
+                                    )
                                     .on_hover_text("上へ")
                                     .clicked()
                                 {
@@ -4655,7 +4671,8 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                                 }
                                 if ui
                                     .add_enabled(
-                                        command_index + 1 < command_order.len(),
+                                        command_index + 1 < command_order.len()
+                                            && command != MenuCommandId::SettingsAlwaysOnTop,
                                         egui::Button::new("↓").small(),
                                     )
                                     .on_hover_text("下へ")
@@ -5104,7 +5121,9 @@ fn apply_menu_layout_edit(layout: &mut MenuLayoutSettings, edit: MenuLayoutEdit)
         }
         MenuLayoutEdit::MoveCommand(parent, index, delta) => {
             let mut order = menu_layout_command_order(layout, parent);
-            if move_index(&mut order, index, delta) {
+            let target = index as i32 + delta;
+            let crosses_pinned = parent == TopMenuId::Settings && (index == 0 || target == 0);
+            if !crosses_pinned && move_index(&mut order, index, delta) {
                 write_menu_layout_command_order(layout, parent, &order);
             }
         }
@@ -5118,6 +5137,38 @@ fn apply_menu_layout_edit(layout: &mut MenuLayoutSettings, edit: MenuLayoutEdit)
             write_menu_layout_hidden(layout, &hidden);
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn always_on_top_menu_editor_keeps_fixed_slot_and_allows_visibility_change() {
+    let mut layout = MenuLayoutSettings::default();
+    let original = menu_layout_command_order(&layout, TopMenuId::Settings);
+    assert_eq!(original[0], MenuCommandId::SettingsAlwaysOnTop);
+
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::MoveCommand(TopMenuId::Settings, 0, 1),
+    );
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::MoveCommand(TopMenuId::Settings, 1, -1),
+    );
+    assert_eq!(
+        menu_layout_command_order(&layout, TopMenuId::Settings),
+        original
+    );
+
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::SetCommandVisible(MenuCommandId::SettingsAlwaysOnTop, false),
+    );
+    assert!(menu_layout_hidden_set(&layout).contains(&MenuCommandId::SettingsAlwaysOnTop));
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::SetCommandVisible(MenuCommandId::SettingsAlwaysOnTop, true),
+    );
+    assert!(!menu_layout_hidden_set(&layout).contains(&MenuCommandId::SettingsAlwaysOnTop));
 }
 
 fn move_index<T>(items: &mut [T], index: usize, delta: i32) -> bool {
@@ -5178,6 +5229,7 @@ fn menu_layout_command_order(layout: &MenuLayoutSettings, parent: TopMenuId) -> 
             out.push(spec.id);
         }
     }
+    pin_settings_always_on_top_command(parent, &mut out);
     out
 }
 
@@ -7061,6 +7113,10 @@ pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState
     });
 }
 
+pub(super) fn reset_epub_file_handling(settings: &mut crate::settings::Settings) {
+    settings.epub_file_handling = crate::settings::EpubFileHandling::default();
+}
+
 pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         "サムネイルキャッシュをいつ生成するかを指定します。\n\
@@ -7220,6 +7276,25 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .small()
         .weak(),
     );
+    });
+    ui.add_space(8.0);
+    anchored(ui, state, "cache/epub-handling", |ui, state| {
+        let s = &mut state.settings;
+        ui.label(egui::RichText::new("EPUB の処理").strong());
+        for &handling in crate::settings::EpubFileHandling::all() {
+            ui.radio_value(&mut s.epub_file_handling, handling, handling.label())
+                .on_hover_text(handling.description());
+        }
+        if ui.button("既定値に戻す").clicked() {
+            reset_epub_file_handling(s);
+        }
+        ui.label(
+            egui::RichText::new(
+                "「無視する」では、EPUB を一覧・フォルダ移動の対象にせず、変換済みの本も開きません。",
+            )
+            .small()
+            .weak(),
+        );
     });
     ui.add_space(8.0);
     anchored(ui, state, "cache/archive-limit", |ui, state| {
@@ -8625,7 +8700,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         let s = &mut state.settings;
         ui.checkbox(
             &mut s.skip_zip_if_folder_exists,
-            "同名の ZIP/PDF/RAR/7z/LZH ファイルとフォルダがある場合、アーカイブ側をスキップ",
+            "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
         );
     });
     ui.add_space(4.0);
@@ -8634,6 +8709,13 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         ui.checkbox(
             &mut s.skip_archive_if_zip_exists,
             "同名の ZIP/CBZ と RAR/7z/LZH がある場合、ZIP/CBZ だけ表示",
+        );
+    });
+    ui.add_space(4.0);
+    anchored(ui, state, "duplicate/epub-pdf", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.skip_epub_if_pdf_exists,
+            "同名の EPUB と PDF がある場合、PDF だけ表示",
         );
     });
     ui.add_space(4.0);
@@ -9267,6 +9349,13 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     ui.selectable_value(&mut s.default_spread_mode, mode, mode.label());
                 }
             });
+    });
+    anchored(ui, state, "spread/document-direction", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.follow_document_reading_direction,
+            "PDF / EPUB の右開き指定に従う",
+        );
+        ui.small("本ごとに保存した見開き設定がある場合は、その設定を優先します。");
     });
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
@@ -10249,6 +10338,8 @@ mod tests {
     #[test]
     fn operation_labels_sort_numbers_naturally() {
         let mut labels = vec![
+            "サムネイル列数を20列に",
+            "サムネイル列数を11列に",
             "サムネイル列数を10列に",
             "サムネイル列数を1列に",
             "サムネイル列数を2列に",
@@ -10262,6 +10353,8 @@ mod tests {
                 "サムネイル列数を2列に",
                 "サムネイル列数を9列に",
                 "サムネイル列数を10列に",
+                "サムネイル列数を11列に",
+                "サムネイル列数を20列に",
             ]
         );
     }

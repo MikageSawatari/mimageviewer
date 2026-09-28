@@ -152,12 +152,72 @@ impl ContentIdentityRestorePending {
             .name("content-identity-restore".into())
             .spawn(move || {
                 let started = std::time::Instant::now();
-                let report = crate::content_identity::restore_candidates_at(
+                crate::logger::log(format!(
+                    "content_identity: restore started restores={} declines={}",
+                    selected.len(),
+                    declined.len()
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "content_identity",
+                        "restore_begin",
+                        None,
+                        input_seq,
+                        &[
+                            ("restores", serde_json::Value::from(selected.len())),
+                            ("declines", serde_json::Value::from(declined.len())),
+                        ],
+                    );
+                }
+                let mut last_stage = "";
+                let mut last_reported = 0usize;
+                let report = crate::content_identity::restore_candidates_at_with_progress(
                     &data_dir,
                     &selected,
                     &declined,
                     load_sidecar_bases,
+                    |stage, processed, total| {
+                        if processed == 0 {
+                            return;
+                        }
+                        if stage != last_stage {
+                            last_reported = 0;
+                        }
+                        if processed != last_reported
+                            && (stage != last_stage
+                                || processed == total
+                                || processed >= last_reported.saturating_add(1_000))
+                        {
+                            let ms = started.elapsed().as_secs_f64() * 1000.0;
+                            crate::logger::log(format!(
+                                "content_identity: restore progress stage={stage} processed={processed} total={total} elapsed_ms={ms:.0}"
+                            ));
+                            if crate::perf::is_enabled() {
+                                crate::perf::event(
+                                    "content_identity",
+                                    "restore_progress",
+                                    None,
+                                    input_seq,
+                                    &[
+                                        ("stage", serde_json::Value::from(stage)),
+                                        ("processed", serde_json::Value::from(processed)),
+                                        ("total", serde_json::Value::from(total)),
+                                        ("ms", serde_json::Value::from(ms)),
+                                    ],
+                                );
+                            }
+                            last_stage = stage;
+                            last_reported = processed;
+                        }
+                    },
                 );
+                crate::logger::log(format!(
+                    "content_identity: restore worker completed restores={} declines={} errors={} elapsed_ms={:.0}",
+                    report.requested_restores,
+                    report.requested_declines,
+                    report.errors.len(),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                ));
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "content_identity",
@@ -513,6 +573,7 @@ mod tests {
     fn candidate(name: &str) -> crate::content_identity::RestoreCandidate {
         let target_path = PathBuf::from(format!("C:/copied/{name}.png"));
         crate::content_identity::RestoreCandidate {
+            epub_source_state: None,
             target_key: crate::path_key::normalize_keep_drive(&target_path),
             target_path,
             target_kind: crate::content_identity::ContentKind::Image,

@@ -1863,10 +1863,21 @@ impl crate::app::App {
         }
     }
 
-    /// The mounted bundle owns whether its retained aggregate may receive item input.
+    pub(crate) fn location_navigation_pending(&self) -> bool {
+        self.rating_view_pending
+            .as_ref()
+            .is_some_and(|pending| pending.navigation.is_some())
+            || self
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+    }
+
+    /// The mounted bundle and staged location owner determine whether grid items accept input.
     /// All grid input owners (key, pointer, touch, ring, gamepad, and menu) use this gate.
     pub(crate) fn grid_item_input_allowed(&self) -> bool {
-        !matches!(self.stack_return_state.as_ref(),
+        !self.location_navigation_pending()
+            && !matches!(self.stack_return_state.as_ref(),
             Some(StackReturnState::Refreshing { view })
                 if self.stack_view.as_ref().is_some_and(|current| Arc::ptr_eq(current, view)))
     }

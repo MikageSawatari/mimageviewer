@@ -7022,6 +7022,8 @@ export function createGridTile(
   cellWidth,
   commandDispatcher = dispatchCommand
 ) {
+  const isEpubBook =
+    entry.kind === "pdf" && /\.epub$/i.test(entryAddress(entry).path);
   const tile = element("button", "grid-tile");
   tile.type = "button";
   tile.title = entry.name;
@@ -7071,11 +7073,13 @@ export function createGridTile(
     if (entry.kind === "audio") {
       preview.append(createAudioThumbnailIcon());
     } else {
-      preview.append(textElement("span", "◇", "file-glyph"));
+      preview.append(textElement("span", isEpubBook ? "▤" : "◇", "file-glyph"));
       preview.append(image);
     }
     if (entry.kind !== "image") {
-      preview.append(textElement("span", entryTypeLabel(entry.kind), "type-badge"));
+      preview.append(
+        textElement("span", isEpubBook ? "epub" : entryTypeLabel(entry.kind), "type-badge")
+      );
     }
     if (entry.kind === "image") {
       tile.addEventListener("click", (event) => {

@@ -1409,6 +1409,7 @@ pub enum KeyAction {
     GlobalMetadataSearch,
     GlobalOpenFolder,
     ToggleDetachedViewerMode,
+    ToggleAlwaysOnTop,
     HelpShowContextShortcuts,
     GridFavoritePrev,
     GridFavoriteNext,
@@ -1601,6 +1602,7 @@ pub enum KeyAction {
     GridToggleMaximize,
     GridToggleFolderTreePane,
     GridToggleStackMode,
+    GridConvertEpubToPdf,
     GridTagApply,
     GridTagView,
     GridRotateCw,
@@ -1620,6 +1622,16 @@ pub enum KeyAction {
     GridColumnCount8,
     GridColumnCount9,
     GridColumnCount10,
+    GridColumnCount11,
+    GridColumnCount12,
+    GridColumnCount13,
+    GridColumnCount14,
+    GridColumnCount15,
+    GridColumnCount16,
+    GridColumnCount17,
+    GridColumnCount18,
+    GridColumnCount19,
+    GridColumnCount20,
     GridToggleDetailsView,
     GridOpenPreferences,
     GridOpenOperationCustomize,
@@ -1961,6 +1973,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalMetadataSearch,
     KeyAction::GlobalOpenFolder,
     KeyAction::ToggleDetachedViewerMode,
+    KeyAction::ToggleAlwaysOnTop,
     KeyAction::HelpShowContextShortcuts,
     KeyAction::GridFavoritePrev,
     KeyAction::GridFavoriteNext,
@@ -2153,6 +2166,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridToggleMaximize,
     KeyAction::GridToggleFolderTreePane,
     KeyAction::GridToggleStackMode,
+    KeyAction::GridConvertEpubToPdf,
     KeyAction::GridTagApply,
     KeyAction::GridTagView,
     KeyAction::GridRotateCw,
@@ -2172,6 +2186,16 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridColumnCount8,
     KeyAction::GridColumnCount9,
     KeyAction::GridColumnCount10,
+    KeyAction::GridColumnCount11,
+    KeyAction::GridColumnCount12,
+    KeyAction::GridColumnCount13,
+    KeyAction::GridColumnCount14,
+    KeyAction::GridColumnCount15,
+    KeyAction::GridColumnCount16,
+    KeyAction::GridColumnCount17,
+    KeyAction::GridColumnCount18,
+    KeyAction::GridColumnCount19,
+    KeyAction::GridColumnCount20,
     KeyAction::GridToggleDetailsView,
     KeyAction::GridOpenPreferences,
     KeyAction::GridOpenOperationCustomize,
@@ -2630,7 +2654,9 @@ pub enum MenuCommandId {
     TagsManagePinned,
     TagsTagView,
     SettingsThumbnailCache,
+    SettingsAlwaysOnTop,
     SettingsArchiveCache,
+    SettingsEpubCache,
     SettingsThumbnailQuality,
     SettingsStats,
     SettingsResetRotation,
@@ -2684,7 +2710,9 @@ impl MenuCommandId {
         Self::TagsManagePinned,
         Self::TagsTagView,
         Self::SettingsThumbnailCache,
+        Self::SettingsAlwaysOnTop,
         Self::SettingsArchiveCache,
+        Self::SettingsEpubCache,
         Self::SettingsThumbnailQuality,
         Self::SettingsStats,
         Self::SettingsResetRotation,
@@ -2738,7 +2766,9 @@ impl MenuCommandId {
             MenuCommandId::TagsManagePinned => "TagsManagePinned",
             MenuCommandId::TagsTagView => "TagsTagView",
             MenuCommandId::SettingsThumbnailCache => "SettingsThumbnailCache",
+            MenuCommandId::SettingsAlwaysOnTop => "SettingsAlwaysOnTop",
             MenuCommandId::SettingsArchiveCache => "SettingsArchiveCache",
+            MenuCommandId::SettingsEpubCache => "SettingsEpubCache",
             MenuCommandId::SettingsThumbnailQuality => "SettingsThumbnailQuality",
             MenuCommandId::SettingsStats => "SettingsStats",
             MenuCommandId::SettingsResetRotation => "SettingsResetRotation",
@@ -3001,6 +3031,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         action: Some(KeyAction::GridTagView),
     },
     MenuCommandSpec {
+        id: MenuCommandId::SettingsAlwaysOnTop,
+        parent: TopMenuId::Settings,
+        label: "常に最前面",
+        action: Some(KeyAction::ToggleAlwaysOnTop),
+    },
+    MenuCommandSpec {
         id: MenuCommandId::SettingsThumbnailCache,
         parent: TopMenuId::Settings,
         label: "サムネイルキャッシュ管理",
@@ -3009,7 +3045,13 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
     MenuCommandSpec {
         id: MenuCommandId::SettingsArchiveCache,
         parent: TopMenuId::Settings,
-        label: "変換済みアーカイブキャッシュ管理",
+        label: "変換済みアーカイブ管理",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsEpubCache,
+        parent: TopMenuId::Settings,
+        label: "EPUB 変換キャッシュ管理",
         action: None,
     },
     MenuCommandSpec {
@@ -3238,7 +3280,21 @@ fn resolve_menu_commands_for_parent(
         }
     }
 
+    pin_settings_always_on_top_command(parent, &mut out);
+
     out
+}
+
+/// The checked Settings item precedes the fixed controls, including for saved old menu orders.
+pub fn pin_settings_always_on_top_command(parent: TopMenuId, commands: &mut Vec<MenuCommandId>) {
+    if parent == TopMenuId::Settings
+        && let Some(index) = commands
+            .iter()
+            .position(|id| *id == MenuCommandId::SettingsAlwaysOnTop)
+    {
+        commands.remove(index);
+        commands.insert(0, MenuCommandId::SettingsAlwaysOnTop);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3913,6 +3969,7 @@ impl KeyAction {
             GlobalMetadataSearch => "GlobalMetadataSearch",
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
+            ToggleAlwaysOnTop => "ToggleAlwaysOnTop",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
             GridOpenCurrentDriveRoot => "GridOpenCurrentDriveRoot",
             GridFavoritePrev => "GridFavoritePrev",
@@ -4107,6 +4164,7 @@ impl KeyAction {
             GridToggleMaximize => "GridToggleMaximize",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
             GridToggleStackMode => "GridToggleStackMode",
+            GridConvertEpubToPdf => "GridConvertEpubToPdf",
             GridTagApply => "GridTagApply",
             GridTagView => "GridTagView",
             GridRotateCw => "GridRotateCw",
@@ -4126,6 +4184,16 @@ impl KeyAction {
             GridColumnCount8 => "GridColumnCount8",
             GridColumnCount9 => "GridColumnCount9",
             GridColumnCount10 => "GridColumnCount10",
+            GridColumnCount11 => "GridColumnCount11",
+            GridColumnCount12 => "GridColumnCount12",
+            GridColumnCount13 => "GridColumnCount13",
+            GridColumnCount14 => "GridColumnCount14",
+            GridColumnCount15 => "GridColumnCount15",
+            GridColumnCount16 => "GridColumnCount16",
+            GridColumnCount17 => "GridColumnCount17",
+            GridColumnCount18 => "GridColumnCount18",
+            GridColumnCount19 => "GridColumnCount19",
+            GridColumnCount20 => "GridColumnCount20",
             GridToggleDetailsView => "GridToggleDetailsView",
             GridOpenPreferences => "GridOpenPreferences",
             GridOpenOperationCustomize => "GridOpenOperationCustomize",
@@ -4622,6 +4690,7 @@ impl KeyAction {
             GlobalMetadataSearch => "全フォルダのメタデータを検索する",
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
             ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
+            ToggleAlwaysOnTop => "常に最前面を切り替える",
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
             GridFavoritePrev => "前のお気に入りへ移動する",
             GridFavoriteNext => "次のお気に入りへ移動する",
@@ -4822,6 +4891,7 @@ impl KeyAction {
             GridToggleMaximize => "メインウィンドウを最大化/復元する",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
             GridToggleStackMode => "スタック表示を切り替える",
+            GridConvertEpubToPdf => "選択中の EPUB を PDF ファイルに変換する",
             GridTagApply => "タグを付ける/外すダイアログを開く",
             GridTagView => "タグビューを開く",
             GridRotateCw => "選択中の画像を右に90度回転する",
@@ -4843,6 +4913,16 @@ impl KeyAction {
             GridColumnCount8 => "サムネイル列数を8列にする",
             GridColumnCount9 => "サムネイル列数を9列にする",
             GridColumnCount10 => "サムネイル列数を10列にする",
+            GridColumnCount11 => "サムネイル列数を11列にする",
+            GridColumnCount12 => "サムネイル列数を12列にする",
+            GridColumnCount13 => "サムネイル列数を13列にする",
+            GridColumnCount14 => "サムネイル列数を14列にする",
+            GridColumnCount15 => "サムネイル列数を15列にする",
+            GridColumnCount16 => "サムネイル列数を16列にする",
+            GridColumnCount17 => "サムネイル列数を17列にする",
+            GridColumnCount18 => "サムネイル列数を18列にする",
+            GridColumnCount19 => "サムネイル列数を19列にする",
+            GridColumnCount20 => "サムネイル列数を20列にする",
             GridToggleDetailsView => "サムネイル一覧と詳細一覧を切り替える",
             GridOpenPreferences => "環境設定を開く",
             GridOpenOperationCustomize => "操作カスタマイズを開く",
@@ -5167,6 +5247,7 @@ impl KeyAction {
             | GlobalMetadataSearch
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
+            | ToggleAlwaysOnTop
             | HelpShowContextShortcuts => KeyContext::Global,
             GridFavoritePrev
             | GridFavoriteNext
@@ -5359,6 +5440,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
             | GridRotateCw
@@ -5378,6 +5460,16 @@ impl KeyAction {
             | GridColumnCount8
             | GridColumnCount9
             | GridColumnCount10
+            | GridColumnCount11
+            | GridColumnCount12
+            | GridColumnCount13
+            | GridColumnCount14
+            | GridColumnCount15
+            | GridColumnCount16
+            | GridColumnCount17
+            | GridColumnCount18
+            | GridColumnCount19
+            | GridColumnCount20
             | GridToggleDetailsView
             | GridOpenPreferences
             | GridOpenOperationCustomize
@@ -5658,6 +5750,7 @@ impl KeyAction {
             | GlobalMetadataSearch
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
+            | ToggleAlwaysOnTop
             | HelpShowContextShortcuts
             | GridFavoritePrev
             | GridFavoriteNext
@@ -5850,6 +5943,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
             | GridRotateCw
@@ -5869,6 +5963,16 @@ impl KeyAction {
             | GridColumnCount8
             | GridColumnCount9
             | GridColumnCount10
+            | GridColumnCount11
+            | GridColumnCount12
+            | GridColumnCount13
+            | GridColumnCount14
+            | GridColumnCount15
+            | GridColumnCount16
+            | GridColumnCount17
+            | GridColumnCount18
+            | GridColumnCount19
+            | GridColumnCount20
             | GridToggleDetailsView
             | GridOpenPreferences
             | GridOpenOperationCustomize
@@ -6189,6 +6293,7 @@ impl KeyAction {
             GlobalMetadataSearch => ChordList::one(Chord::ctrl(G)),
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
+            ToggleAlwaysOnTop => ChordList::EMPTY,
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
             GridFavoritePrev
             | GridFavoriteNext
@@ -6382,6 +6487,7 @@ impl KeyAction {
             GridToggleMaximize => ChordList::one(Chord::key(F11)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
             GridToggleStackMode => ChordList::EMPTY,
+            GridConvertEpubToPdf => ChordList::EMPTY,
             GridTagApply => ChordList::one(Chord::key(T)),
             GridTagView => ChordList::one(Chord::ctrl(T)),
             GridRotateCw => ChordList::one(Chord::key(R)),
@@ -6404,6 +6510,9 @@ impl KeyAction {
             GridColumnCount8 => alt_digit_pair(Num8, Numpad8),
             GridColumnCount9 => alt_digit_pair(Num9, Numpad9),
             GridColumnCount10 => alt_digit_pair(Num0, Numpad0),
+            GridColumnCount11 | GridColumnCount12 | GridColumnCount13 | GridColumnCount14
+            | GridColumnCount15 | GridColumnCount16 | GridColumnCount17 | GridColumnCount18
+            | GridColumnCount19 | GridColumnCount20 => ChordList::EMPTY,
             GridToggleDetailsView => ChordList::one(Chord::alt(Minus)),
             GridOpenPreferences | GridOpenOperationCustomize => ChordList::EMPTY,
             GridAdjustSlot1 => ctrl_digit_pair(Num1, Numpad1),
@@ -8245,7 +8354,10 @@ impl Keymap {
             matches!(
                 action.context(),
                 KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
-            ) || *action == KeyAction::ToggleDetachedViewerMode
+            ) || matches!(
+                action,
+                KeyAction::ToggleDetachedViewerMode | KeyAction::ToggleAlwaysOnTop
+            )
         }) {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
@@ -9320,7 +9432,10 @@ pub fn native_video_fullscreen_shortcut_key(
             matches!(
                 action.context(),
                 KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
-            ) || *action == KeyAction::ToggleDetachedViewerMode
+            ) || matches!(
+                action,
+                KeyAction::ToggleDetachedViewerMode | KeyAction::ToggleAlwaysOnTop
+            )
         })
         .any(|action| fallback.matches_vk_action(action, key))
 }
@@ -10283,7 +10398,7 @@ mod tests {
         ]);
         add_numbered_names(&mut key_handled, "OpenFavorite", 1..=20);
         add_drive_names(&mut key_handled, "OpenDrive");
-        add_numbered_names(&mut key_handled, "GridColumnCount", 1..=10);
+        add_numbered_names(&mut key_handled, "GridColumnCount", 1..=20);
 
         let fixed_or_ring_only = std::collections::BTreeSet::from([
             // Favorite picker / snapshot lock / Explorer open-folder are input-layer features.
@@ -10835,6 +10950,84 @@ mod tests {
     }
 
     #[test]
+    fn always_on_top_is_pinned_for_saved_settings_orders_and_can_be_hidden() {
+        let mut settings = MenuLayoutSettings {
+            command_order: vec![MenuCommandOrderSettings {
+                parent: "Settings".into(),
+                commands: vec![
+                    "SettingsPreferences".into(),
+                    "SettingsStats".into(),
+                    "SettingsAlwaysOnTop".into(),
+                ],
+            }],
+            ..MenuLayoutSettings::default()
+        };
+        let settings_commands = |settings: &MenuLayoutSettings| {
+            resolve_menu_layout(settings)
+                .menus
+                .into_iter()
+                .find(|menu| menu.id == TopMenuId::Settings)
+                .unwrap()
+                .commands
+        };
+        let commands = settings_commands(&settings);
+        assert_eq!(commands[0], MenuCommandId::SettingsAlwaysOnTop);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|id| **id == MenuCommandId::SettingsAlwaysOnTop)
+                .count(),
+            1
+        );
+        settings.hidden_commands.push("SettingsAlwaysOnTop".into());
+        let hidden = settings_commands(&settings);
+        assert!(!hidden.contains(&MenuCommandId::SettingsAlwaysOnTop));
+        assert!(hidden.contains(&MenuCommandId::SettingsPreferences));
+        assert!(KeyAction::ToggleAlwaysOnTop.default_chords().is_empty());
+        assert_eq!(KeyAction::ToggleAlwaysOnTop.context(), KeyContext::Global);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn always_on_top_has_no_default_key_and_rebound_key_reaches_egui_and_native() {
+        let _guard = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let ctx = egui::Context::default();
+        let default = Keymap::empty();
+        begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
+        assert!(!default.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
+        let _ = ctx.end_pass();
+
+        let rebound = Keymap::from_ini_str("[Global]\nToggleAlwaysOnTop = F16\n");
+        assert!(rebound.warnings().is_empty());
+        assert_eq!(
+            rebound.effective_chords(KeyAction::ToggleAlwaysOnTop),
+            vec![Chord::key(KeyName::F16)]
+        );
+        let ctx = egui::Context::default();
+        begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
+        assert!(rebound.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
+        assert!(!rebound.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
+        let _ = ctx.end_pass();
+
+        let key = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key: 0x7f,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        assert!(rebound.matches_vk_action(KeyAction::ToggleAlwaysOnTop, &key));
+        Keymap::empty().install_global_native_video_shortcuts();
+        assert!(!native_video_fullscreen_shortcut_key(&key));
+        rebound.install_global_native_video_shortcuts();
+        assert!(native_video_fullscreen_shortcut_key(&key));
+    }
+
+    #[test]
     fn moved_remote_command_keeps_its_saved_hidden_identity() {
         let settings = MenuLayoutSettings {
             hidden_commands: vec!["SettingsRemoteConnection".to_owned()],
@@ -10995,8 +11188,9 @@ mod tests {
             ),
             (
                 MenuCommandId::SettingsArchiveCache,
-                "変換済みアーカイブキャッシュ管理",
+                "変換済みアーカイブ管理",
             ),
+            (MenuCommandId::SettingsEpubCache, "EPUB 変換キャッシュ管理"),
             (MenuCommandId::SettingsThumbnailQuality, "サムネイル画質…"),
             (MenuCommandId::SettingsStats, "統計…"),
             (MenuCommandId::SettingsResetRotation, "回転情報をリセット…"),
@@ -11277,6 +11471,9 @@ mod tests {
     #[test]
     fn grid_toggle_stack_mode_is_default_unassigned() {
         assert!(KeyAction::GridToggleStackMode.default_chords().is_empty());
+        assert!(KeyAction::GridConvertEpubToPdf.default_chords().is_empty());
+        assert_eq!(KeyAction::GridConvertEpubToPdf.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridConvertEpubToPdf.trigger(), KeyTrigger::Press);
         assert_eq!(KeyAction::GridToggleStackMode.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridToggleStackMode.trigger(), KeyTrigger::Press);
     }
@@ -14225,6 +14422,40 @@ mod tests {
             vec![Chord::ctrl_shift(KeyName::S)]
         );
         assert!(restored.effective_chords(KeyAction::FsSlideshow).is_empty());
+    }
+
+    #[test]
+    fn grid_column_actions_11_to_20_roundtrip_from_ini_through_settings() {
+        let mut ini = String::from("[Grid]\n");
+        for cols in 11..=20 {
+            ini.push_str(&format!("GridColumnCount{cols} = F{}\n", cols + 2));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(&path, ini).unwrap();
+        let parsed = Keymap::load_from_file(&path);
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        let settings = KeymapSettings::from_keymap(&parsed);
+        let restored = Keymap::from_settings(&settings);
+        for cols in 11..=20 {
+            let name = format!("GridColumnCount{cols}");
+            let action = KeyAction::from_ini_name(&name).expect("registered action");
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert_eq!(
+                parsed.effective_chords(action),
+                restored.effective_chords(action)
+            );
+            assert_eq!(
+                settings
+                    .overrides
+                    .iter()
+                    .filter(|row| row.action == name)
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

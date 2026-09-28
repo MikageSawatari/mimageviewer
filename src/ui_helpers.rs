@@ -1336,6 +1336,15 @@ pub fn draw_overlay_edit_badge(
     draw_badge_text(painter, placement, fg);
 }
 
+/// Count of additional edit markers that cannot fit in the cell's top lane.
+pub fn draw_overlay_edit_overflow_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    painter.rect_filled(placement.rect, 3.0, egui::Color32::from_rgb(80, 90, 100));
+    draw_badge_text(painter, placement, egui::Color32::WHITE);
+}
+
 pub fn draw_overlay_tag_badge(
     painter: &egui::Painter,
     placement: &crate::thumb_overlay_layout::BadgePlacement,

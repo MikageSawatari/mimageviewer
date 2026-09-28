@@ -130,6 +130,8 @@ pub struct SearchScope {
     pub target: SearchTarget,
     /// include トークン結合モード (docs §20)。既定は AND。
     pub mode: crate::search_query::MatchMode,
+    /// Hide EPUB paths before counting accepted hits toward HARD_MAX.
+    pub ignore_epub: bool,
 }
 
 /// 検索ワーカーのエントリーポイント。別スレッドで実行する想定。
@@ -147,6 +149,28 @@ pub fn run(
     cancel: &AtomicBool,
     tx: &Sender<SearchStreamEvent>,
     wake: Option<&(dyn Fn() + Send + Sync)>,
+) {
+    run_with_hit_limit(
+        query_text,
+        favorite_ids,
+        scope,
+        fts,
+        cancel,
+        tx,
+        wake,
+        HARD_MAX,
+    );
+}
+
+fn run_with_hit_limit(
+    query_text: &str,
+    favorite_ids: &[Uuid],
+    scope: &SearchScope,
+    fts: &FtsIndex,
+    cancel: &AtomicBool,
+    tx: &Sender<SearchStreamEvent>,
+    wake: Option<&(dyn Fn() + Send + Sync)>,
+    hit_limit: usize,
 ) {
     // 1. クエリパース
     let tokens = search_query::parse(query_text);
@@ -250,7 +274,7 @@ pub fn run(
         }
         scanned += page.len();
 
-        // 5b. post-filter (token matching のみ)。削除直後の短い窓では Tantivy delete_term
+        // 5b. EPUB visibility and token post-filter. 削除直後の短い窓では Tantivy delete_term
         // 投入 → 次回 commit までの間、削除済み path が結果に混じる。サムネイル読み込み
         // 失敗で気付ける前提で許容する。
         let mut batch = Vec::new();
@@ -260,6 +284,11 @@ pub fn run(
             if cancel.load(Ordering::Relaxed) {
                 inner_cancelled = true;
                 break;
+            }
+            // The index has no separate EPUB kind. Skip by indexed path here,
+            // before fetching STORED text and before the accepted-hit limit.
+            if scope.ignore_epub && is_epub_search_path(&path) {
+                continue;
             }
             let text = match fts_index::doc_text_for_target(
                 &searcher,
@@ -284,7 +313,7 @@ pub fn run(
                     file_size,
                 });
                 valid += 1;
-                if valid >= HARD_MAX {
+                if valid >= hit_limit {
                     inner_truncated = true;
                     break;
                 }
@@ -322,6 +351,15 @@ pub fn run(
             reason: final_reason,
         },
     );
+}
+
+fn is_epub_search_path(path: &str) -> bool {
+    // ZIP page keys are not top-level EPUB files.
+    !path.contains(crate::search_norm::ZIP_ENTRY_SEP)
+        && std::path::Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
 }
 
 // -----------------------------------------------------------------------
@@ -572,6 +610,84 @@ mod tests {
             fts.reload_reader()
         })
         .unwrap();
+    }
+
+    #[test]
+    fn ignored_epub_candidates_do_not_consume_global_hit_limit() {
+        let (_tmp, _meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        retry_tantivy_permission_denied(|| {
+            let mut writer = fts.writer()?;
+            for (path, text) in [
+                ("c:/books/aaa.EPUB", "target target target"),
+                ("c:/books/aab.epub", "target target target"),
+                ("c:/books/aac.epub", "target target target"),
+                ("c:/books/zzz.pdf", "target"),
+            ] {
+                upsert_doc(
+                    &writer,
+                    fts.fields(),
+                    &IndexDoc {
+                        path: path.into(),
+                        container: Container::Fs,
+                        zip_entry: String::new(),
+                        favorite_id: fav,
+                        kind: IndexKind::Pdf,
+                        mtime: 0,
+                        file_size: 0,
+                        norms: PerSourceText {
+                            name: crate::search_norm::normalize_for_match(text),
+                            ..PerSourceText::default()
+                        },
+                    },
+                )?;
+            }
+            writer.commit()?;
+            fts.reload_reader()
+        })
+        .unwrap();
+
+        let scope = SearchScope {
+            ignore_epub: true,
+            ..Default::default()
+        };
+        let (raw_tx, raw_rx) = crossbeam_channel::unbounded();
+        run_with_hit_limit(
+            "target",
+            &[fav],
+            &SearchScope::default(),
+            &fts,
+            &AtomicBool::new(false),
+            &raw_tx,
+            None,
+            1,
+        );
+        let raw_hit = raw_rx.try_iter().find_map(|event| match event {
+            SearchStreamEvent::Batch { hits, .. } => hits.into_iter().next(),
+            _ => None,
+        });
+        assert!(raw_hit.is_some_and(|hit| is_epub_search_path(&hit.path)));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        run_with_hit_limit(
+            "target",
+            &[fav],
+            &scope,
+            &fts,
+            &AtomicBool::new(false),
+            &tx,
+            None,
+            1,
+        );
+        let hits = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                SearchStreamEvent::Batch { hits, .. } => Some(hits),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "c:/books/zzz.pdf");
     }
 
     #[test]

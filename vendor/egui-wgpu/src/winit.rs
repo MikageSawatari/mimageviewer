@@ -191,8 +191,9 @@ impl Painter {
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
-            log::warn!("No window - clearing all surfaces");
-            self.surfaces.clear();
+            // Viewport recreation retires only that viewport's window. Other
+            // viewports share this painter and must retain their surfaces.
+            self.surfaces.remove(&viewport_id);
         }
         Ok(())
     }
@@ -220,8 +221,7 @@ impl Painter {
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
-            log::warn!("No window - clearing all surfaces");
-            self.surfaces.clear();
+            self.surfaces.remove(&viewport_id);
         }
         Ok(())
     }
@@ -488,6 +488,12 @@ impl Painter {
         profiling::function_scope!();
 
         let capture = !capture_data.is_empty();
+        if capture && crate::atlas_diag::capture_probe_active() {
+            crate::atlas_diag::log_line(format!(
+                "[capture-probe] wgpu_capture_begin viewport={viewport_id:?} requests={}",
+                capture_data.len()
+            ));
+        }
         let mut vsync_sec = 0.0;
 
         // mIV: apply texture deltas before the surface lookup.
@@ -666,6 +672,11 @@ impl Painter {
                 if let Some(capture_buffer) = capture_buffer
                     && let Some(screen_capture_state) = &mut self.screen_capture_state
                 {
+                    if crate::atlas_diag::capture_probe_active() {
+                        crate::atlas_diag::log_line(format!(
+                            "[capture-probe] wgpu_capture_readback_queued viewport={viewport_id:?}"
+                        ));
+                    }
                     screen_capture_state.read_screen_rgba(
                         self.context.clone(),
                         capture_buffer,
@@ -686,6 +697,12 @@ impl Painter {
                 PaintOutcome::Submitted
             }
         };
+
+        if capture && crate::atlas_diag::capture_probe_active() {
+            crate::atlas_diag::log_line(format!(
+                "[capture-probe] wgpu_capture_outcome viewport={viewport_id:?} outcome={outcome:?}"
+            ));
+        }
 
         probe_atlas_delivery("paint", textures_delta, outcome);
         finish_delivery(self.render_state.as_ref(), textures_delta, outcome);
@@ -738,7 +755,11 @@ fn probe_atlas_delivery(
                 "{}x{}{}",
                 delta.image.width(),
                 delta.image.height(),
-                if delta.pos.is_none() { "full" } else { "partial" }
+                if delta.pos.is_none() {
+                    "full"
+                } else {
+                    "partial"
+                }
             )
         })
         .collect();

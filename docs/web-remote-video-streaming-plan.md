@@ -516,7 +516,7 @@ thumbnail を含めない。
 
 - `/stream/` 配下も**認証必須**。同一オリジンなので Cookie は `<video>` / hls.js の
   どちらからも送られる
-- protocol v62 では core が `RemoteAudioTrack { stream_index, label, is_default }` を作り、端末は 2 本以上のときだけ「操作」に並べる。選択表示は Ready になった server state の `audio_track` に従う。control の generation 不一致は `stream_generation_mismatch` (409) とし、端末は選んだ `audio_track` を start に載せて再開する。選択の保存は App が、選択 generation の Ready と実際の音声 stream index の一致を確認した後にだけ行う。Norm gain は generation worker がその stream の値を読み取り専用 DB 接続で解決する。
+- 統合後の protocol v63 では core が `RemoteAudioTrack { stream_index, label, is_default }` を作り、端末は 2 本以上のときだけ「操作」に並べる。選択表示は Ready になった server state の `audio_track` に従う。control の generation 不一致は `stream_generation_mismatch` (409) とし、端末は選んだ `audio_track` を start に載せて再開する。選択の保存は App が、選択 generation の Ready と実際の音声 stream index の一致を確認した後にだけ行う。Norm gain は generation worker がその stream の値を読み取り専用 DB 接続で解決する。EPUB 対応と再生位置の書き戻しも同じ版に含む。
 - セグメントは `Cache-Control: no-store`、init segment だけ `immutable`
 - 未生成 / 存在しないセグメントは 404、ring から巻き取られたセグメントは 410 Gone、
   session / generation 不一致はどちらも 409 とするが、JSON の `error` をそれぞれ

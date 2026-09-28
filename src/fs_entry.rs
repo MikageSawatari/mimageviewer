@@ -21,7 +21,22 @@ pub fn is_internal_app_entry_name(name: &OsStr) -> bool {
     }
 
     let name = name.to_ascii_lowercase();
-    name.starts_with(&format!(".{PORTABLE_METADATA_BUNDLE_DIRNAME}.")) && name.ends_with(".tmp")
+    if name.starts_with(&format!(".{PORTABLE_METADATA_BUNDLE_DIRNAME}.")) && name.ends_with(".tmp")
+    {
+        return true;
+    }
+    // Also hide old .pdf leftovers from development builds of sibling saving.
+    for extension in [".tmp", ".pdf"] {
+        if let Some(token) = name
+            .strip_prefix(".miv-part-")
+            .and_then(|rest| rest.strip_suffix(extension))
+            && token.len() == 64
+            && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +177,19 @@ mod tests {
             ".mimageviewer.meta.miv.tmp.jpg"
         )));
         assert!(!is_internal_app_entry_name(OsStr::new("photos")));
+    }
+
+    #[test]
+    fn sibling_output_temp_names_are_internal_even_without_hidden_attribute() {
+        let token = "a".repeat(64);
+        for extension in ["tmp", "pdf"] {
+            assert!(is_internal_app_entry_name(OsStr::new(&format!(
+                ".miv-part-{token}.{extension}"
+            ))));
+        }
+        assert!(!is_internal_app_entry_name(OsStr::new(
+            ".miv-part-short.pdf"
+        )));
     }
 
     #[test]

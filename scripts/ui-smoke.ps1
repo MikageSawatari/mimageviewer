@@ -8,6 +8,7 @@ Automation must not pass this switch until that approval has been obtained.
 
 .PARAMETER Scenario
 MultiWindowRarNav checks Ctrl+Up/Down across direct RAR, ZIP, and CBR in one detached window.
+FolderHistory checks Rating and Collection folder history with real shortcut input.
 #>
 # Run an isolated, diagnostic portable UI smoke scenario.
 #
@@ -25,7 +26,7 @@ MultiWindowRarNav checks Ctrl+Up/Down across direct RAR, ZIP, and CBR in one det
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'AlwaysOnTop')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -345,8 +346,21 @@ function Register-UiSmokeScreenshots {
     foreach ($line in (Get-Content -LiteralPath $manifestPath -Encoding UTF8)) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         $record = $line | ConvertFrom-Json
+        if ([string]$record.status -eq 'skipped') {
+            if ([string]$record.path -or
+                [string]$record.label -notmatch '^[A-Za-z0-9_-]{1,48}$' -or
+                [string]$record.viewport -notmatch '^(root|fullscreen|preview|detached-[0-9]+(?:-[0-9]+)?)$' -or
+                [string]::IsNullOrWhiteSpace([string]$record.reason) -or
+                [long]$record.frame -lt 0 -or [long]$record.timestamp_ms -le 0) {
+                throw '[screenshot] invalid skipped manifest record'
+            }
+            continue
+        }
+        if ([string]$record.status) {
+            throw "[screenshot] invalid manifest status: $($record.status)"
+        }
         $relative = [string]$record.path
-        if ($relative -notmatch '^screenshots/[0-9]{2,}-[A-Za-z0-9_-]+-(root|detached-[0-9]+-[0-9]+)\.png$' -or
+        if ($relative -notmatch '^screenshots/[0-9]{2,}-[A-Za-z0-9_-]+-(root|fullscreen|preview|detached-[0-9]+(?:-[0-9]+)?)\.png$' -or
             -not $seen.Add($relative)) {
             throw "[screenshot] invalid or duplicate manifest path: $relative"
         }
@@ -588,6 +602,10 @@ function Save-UiSmokeEvidence {
         prepare_exit_code = $script:prepareExitCode
         app_pid = $script:startedPid
         app_exit_code = $script:appExitCode
+        primary_app_pid = $script:primaryAppPid
+        primary_app_exit_code = $script:primaryAppExitCode
+        restart_app_pid = $script:restartAppPid
+        restart_app_exit_code = $script:restartAppExitCode
         runner_exit_code = $script:runExitCode
         exit_code = $script:runExitCode
         timed_out = $script:timedOut
@@ -735,7 +753,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks')
+    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'AlwaysOnTop')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -860,6 +878,80 @@ if ($script:archiveErrors.Count -gt 0) {
             video_in_window_mode = $true
             video_loop_mode = 'Full'
         })
+    }
+    'FolderHistory' {
+        $scenarioRoot = Join-Path $dataDir 'folder-history'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\folder-history.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'A'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_folder_history_fixture.py'
+        $candidateFixtureGeneratorPdfDependencyPath = Join-Path $PSScriptRoot 'page-turn\generate_pdf_fixture.py'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\portable-smoke\data\folder-history') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $dataDir 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        foreach ($path in @($candidateScriptPath, $candidateFixtureGeneratorPath, $candidateFixtureGeneratorPdfDependencyPath)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "[ui-smoke] folder-history input not found: $path"
+            }
+        }
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        & python $candidateFixtureGeneratorPath $candidateFixtureDir $dataDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "[ui-smoke] folder-history fixture generator failed with exit $LASTEXITCODE"
+        }
+        Assert-NoReparseTree $candidateFixtureDir 'folder-history-fixture'
+        foreach ($relative in @('F\G\g-page.png', 'F\z-page.png', 'F\x-book.pdf', 'F\y-book.zip', 'B\D\d-page.png', 'B\z-page.png', 'B\x-book.pdf', 'B\y-book.zip')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $candidateFixtureDir $relative) -PathType Leaf)) {
+                throw "[ui-smoke] folder-history fixture file missing: $relative"
+            }
+        }
+        Write-UiSmokeJson $candidateSettingsPath ([ordered]@{
+            auto_fullscreen_image_folders = $false
+            auto_fullscreen_zip_pdf = $false
+            sort_order = 'FileName'
+        })
+    }
+    'AlwaysOnTop' {
+        $scenarioRoot = Join-Path $targetRoot 'ui-smoke\always-on-top'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\always-on-top.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_multi_window_stills_fixture.py'
+        $candidateFixtureGeneratorDependencyPath = Join-Path $PSScriptRoot 'page-turn\generate_fixture.py'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\always-on-top') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        foreach ($path in @($candidateScriptPath, $candidateFixtureGeneratorPath, $candidateFixtureGeneratorDependencyPath)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "[ui-smoke] always-on-top input not found: $path"
+            }
+        }
+        $generatedStillsDir = Join-Path $scenarioRoot 'generated-stills'
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        New-Item -ItemType Directory -Path $generatedStillsDir -Force | Out-Null
+        & python $candidateFixtureGeneratorPath $generatedStillsDir
+        if ($LASTEXITCODE -ne 0) { throw '[ui-smoke] still fixture generator failed' }
+        Copy-Item -LiteralPath (Join-Path $generatedStillsDir 'a-folder\page-000.png') -Destination (Join-Path $candidateFixtureDir '00-still.png')
+        Copy-Item -LiteralPath (Join-Path $generatedStillsDir 'a-folder\page-001.png') -Destination (Join-Path $candidateFixtureDir '01-still.png')
+        $ffmpegCommand = Get-Command -Name 'ffmpeg.exe' -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $videoPath = Join-Path $candidateFixtureDir 'zz-video.mp4'
+        & $ffmpegCommand.Source @('-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=10', '-t', '90', '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', $videoPath)
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $videoPath -PathType Leaf)) {
+            throw '[ui-smoke] video fixture generator failed'
+        }
+        Assert-NoReparseTree $candidateFixtureDir 'always-on-top-fixture'
+        $fixtureNames = @(Get-ChildItem -LiteralPath $candidateFixtureDir -File | ForEach-Object Name | Sort-Object)
+        if (($fixtureNames -join ',') -ne '00-still.png,01-still.png,zz-video.mp4') {
+            throw '[ui-smoke] always-on-top fixture must contain exactly two PNGs and one MP4'
+        }
+        $settingsJson = '{"always_on_top":false,"minimize_to_tray_on_close":true,"detached_viewer_open_images_in_window":false,"default_spread_mode":"Single","default_reading_flow":"Paged"}'
+        [System.IO.File]::WriteAllText($candidateSettingsPath, $settingsJson, (New-Object System.Text.UTF8Encoding($false)))
     }
     'RatingSortCollection' {
         $scenarioRoot = Join-Path $dataDir 'rating-sort-collection'
@@ -1679,6 +1771,61 @@ $arguments = @(
             $script:failureMessage = "application exited with code $processExitCode"
         }
         Write-UiSmokeEvent "exit: $processExitCode"
+        if ($Scenario -eq 'AlwaysOnTop' -and $processExitCode -eq 0) {
+            $script:primaryAppPid = $script:startedPid
+            $script:primaryAppExitCode = $processExitCode
+            $restartScript = Join-Path $PSScriptRoot 'ui-smoke\always-on-top-restart.rhai'
+            if (-not (Test-Path -LiteralPath $restartScript -PathType Leaf)) {
+                throw '[ui-smoke] always-on-top restart script is missing'
+            }
+            $runsRoot = Join-Path $targetRoot 'ui-smoke-runs'
+            $restartRunDir = Join-Path $runsRoot ((Split-Path -Leaf $script:runDir) + '-restart')
+            Assert-NoReparsePath $runsRoot $repoRoot 'restart-runs-root'
+            New-Item -ItemType Directory -Path $restartRunDir -ErrorAction Stop | Out-Null
+            $restartOverridePath = Join-Path $script:runDir 'inputs\restart-settings-override.json'
+            [System.IO.File]::WriteAllText($restartOverridePath, '{}', (New-Object System.Text.UTF8Encoding($false)))
+            Try-AddUiSmokeEvidenceFile $restartScript 'inputs/restart-scenario.rhai' 'restart-scenario-script'
+            Try-RegisterUiSmokeEvidenceFile $restartOverridePath 'inputs/restart-settings-override.json' 'restart-settings-override'
+            $restartArguments = @(
+                '--perf-log',
+                '--data-dir', $dataDir,
+                '--test-script', $restartScript,
+                '--test-evidence-dir', $restartRunDir,
+                '--settings-override', $restartOverridePath,
+                $fixtureDir
+            )
+            Write-UiSmokeEvent 'always-on-top: restarting with the same disposable profile and an empty override'
+            $script:process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $restartArguments) -PassThru
+            $script:startedPid = $script:process.Id
+            $script:restartAppPid = $script:startedPid
+            Write-UiSmokeEvent "restart PID: $($script:startedPid)"
+            while (-not $script:process.HasExited -and
+                -not (Test-UiSmokeDeadlineReached $scenarioClock.ElapsedMilliseconds $timeoutMilliseconds)) {
+                Start-Sleep -Milliseconds 100
+                $script:process.Refresh()
+            }
+            if (-not $script:process.HasExited) {
+                $script:timedOut = $true
+                $script:runExitCode = 124
+                $script:runPhase = 'timed-out'
+                $script:failureMessage = 'always-on-top restart exceeded the scenario deadline'
+            }
+            else {
+                $script:process.WaitForExit()
+                $script:appExitCode = [int]$script:process.ExitCode
+                $script:restartAppExitCode = $script:appExitCode
+                $script:runExitCode = $script:appExitCode
+                $script:runPhase = if ($script:appExitCode -eq 0) { 'completed' } else { 'application-failed' }
+                if ($script:appExitCode -ne 0) {
+                    $script:failureMessage = "always-on-top restart exited with code $($script:appExitCode)"
+                }
+                Write-UiSmokeEvent "restart exit: $($script:appExitCode)"
+            }
+            if ((Get-Content -LiteralPath $marker -Raw -Encoding ASCII).Trim() -ne $expectedMarker) {
+                throw '[ui-smoke] disposable marker changed during the restart'
+            }
+            Try-AddUiSmokeEvidenceDirectory $restartRunDir 'restart' 'restart-run'
+        }
         if ($Scenario -eq 'RatingSort' -and $processExitCode -eq 0) {
             & python $candidateFixtureGeneratorPath $candidateFixtureDir --verify-settings $dataDir
             if ($LASTEXITCODE -ne 0) {

@@ -133,10 +133,11 @@
 
   <section>
     <h2>端末内に保存されるデータ</h2>
-    <p>本アプリは、動作に必要な次のデータを利用者の PC に保存します。リモート閲覧を有効にした場合、再生位置などは利用者の端末から PC へ送られます。開発者や第三者のサーバーへ送信されることはありません。</p>
+    <p>本アプリは、動作に必要な次のデータを利用者の PC に保存します。リモート閲覧を有効にした場合、再生位置などは利用者の端末から PC へ送られます。開発者のサーバーへ送信されることはありません。外出先との暗号化された通信は Tailscale の中継サーバーを経由することがあります。</p>
     <ul class="pink-list">
       <li>アプリの設定・表示状態、動画・音声の再生位置とファイルごとに選んだ音声トラック</li>
       <li>サムネイルキャッシュ（動画の場面と音声波形の解析結果を含みます）</li>
+      <li>EPUB を変換した閲覧用 PDF（キャッシュ管理画面で削除を予約できます。実際の削除は同じデータフォルダを使うアプリがすべて終了した後の起動時です）</li>
       <li>タグ・レーティング・回転情報・読み込み履歴</li>
       <li>コレクションの名前・並び順・登録した元ファイルやフォルダのパス（<code>collection.db</code>）と、その世代バックアップ</li>
       <li>別バージョンを探すための索引（画像の保存場所・形式・大きさ・見た目を照合するための情報）</li>
@@ -149,6 +150,21 @@
       保存先は <code>%APPDATA%\mimageviewer</code>（インストーラ版・単体exe版）、
       またはポータブル版では実行ファイルと同じ場所の <code>data</code> フォルダです。
       アンインストール時に削除できます。
+    </div>
+    <div class="info-box">
+      EPUB の閲覧用変換では、Windows の一時フォルダ内に本アプリ専用の作業場所を作り、
+      変換に使う Windows の表示機能（WebView2）のデータもそこに一時保存します。
+      ポータブル版ではアプリのデータフォルダ内を使います。
+      元の EPUB と同じ場所に PDF を保存するときの変換作業は、アプリのデータフォルダ内で行います。
+      本アプリが作った一時フォルダは変換後に削除を試み、異常終了などで残った分は次回の通常起動時に回収を試みます。
+      Windows または Edge WebView2 に管理者や利用者がポリシーを設定して別の保存先を指定した場合は、
+      その設定に従い、別の保存先のデータを本アプリは削除しません。
+    </div>
+    <div class="info-box">
+      元の EPUB と同じ場所に PDF を作るのは、利用者が確認画面の「PDF ファイルとして保存して開く」か、一覧の右クリック「変換 &gt; PDF ファイルに変換」を選んだときだけです。
+      元の EPUB がネットワーク上のフォルダにあれば、PDF もそこに保存されます。
+      通常の閲覧用変換では元の EPUB の隣に書き出しません。
+      保存する PDF には EPUB の書名と、著者情報があれば最初の著者が記録されます。書名がない場合は EPUB のファイル名が使われます。
     </div>
     <div class="info-box">
       外部ツールへ渡す一時ファイルは、Windows の一時フォルダ内に本アプリ専用の場所を作って
@@ -176,10 +192,14 @@
         端末で選んだ音声トラックも PC に保存されます。
         待ち受けは PC の内部に対して行うので、外部から直接つながることはありません。
         外出先からつなぐには、別途インストールする Tailscale を利用者自身が設定します。
-        <strong>画像やライブラリの内容が、開発者やその他の第三者のサーバーへ送られることはありません。</strong></li>
+        外出先の端末との通信は Tailscale によって暗号化されます。接続状況によっては、
+        この<strong>暗号化された通信が Tailscale の中継サーバーを経由することがあります</strong>が、
+        中継サーバーでは画像やライブラリの内容を読み取れません。
+        <strong>画像やライブラリの内容が、開発者のサーバーへ送られることはありません。</strong></li>
     </ul>
+    <p>EPUB の変換も通信を増やしません。本の外部サイトへの要求はすべて遮断し、PC 内で PDF に変換します。Windows または Edge WebView2 に管理者や利用者がポリシーを設定している場合は、その設定に従います。</p>
     <p>
-      これらの通信先（GitHub / mikage.to 等）は、各社のプライバシーポリシーに従って
+      これらの通信先（GitHub / mikage.to、リモート閲覧を使う場合の Tailscale 等）は、各社のプライバシーポリシーに従って
       通常のアクセスログ（IP アドレス等）を記録する場合がありますが、
       <strong>開発者がそれらの情報を取得・利用することはありません。</strong>
     </p>
@@ -190,7 +210,7 @@
     <p>
       AI によるアップスケール・ノイズ除去・補完・自動判別などの処理は、
       <strong>すべて利用者の PC 内（GPU）で実行</strong>されます。
-      画像やその内容が外部のサーバーへ送信されることはありません。
+      AI 処理のために画像を外部のサーバーへアップロードすることはありません。
     </p>
   </section>
 
@@ -213,7 +233,7 @@
       リモート閲覧を外出先から使う場合に必要な Tailscale は、本アプリとは別の会社が提供する
       ソフトウェアとサービスで、利用者自身が契約・設定します。その利用は
       <a href="https://tailscale.com/privacy-policy" target="_blank" rel="noopener">Tailscale のプライバシーポリシー</a>
-      に従います。<strong>本アプリが Tailscale へ利用者の情報を渡すことはありません。</strong>
+      に従います。<strong>暗号化された通信が Tailscale の中継サーバーを経由することはありますが、中継サーバーは画像やライブラリの内容を読めません。</strong>
     </p>
   </section>
 
@@ -258,10 +278,11 @@
 
   <section>
     <h2>Data stored on your device</h2>
-    <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer or to a third-party server.</p>
+    <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer's server. Encrypted traffic may pass through a Tailscale relay server when you connect from outside your home.</p>
     <ul class="pink-list">
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
       <li>Thumbnail cache (including video frames and audio waveform analysis)</li>
+      <li>PDFs converted from EPUBs for reading (you can request deletion in the cache manager; deletion takes effect when the App next starts after all instances using the same data folder have closed)</li>
       <li>Tags, ratings, rotation info, and reading history</li>
       <li>Collections (list names, ordering, and the locations of the files and folders you add), and their rolling backups</li>
       <li>An index for finding alternate versions (image locations, formats, dimensions, and information used to compare their appearance)</li>
@@ -274,6 +295,24 @@
       Data is stored in <code>%APPDATA%\mimageviewer</code> (installer / single-exe editions),
       or in a <code>data</code> folder next to the executable (portable edition). It can be
       removed when you uninstall the App.
+    </div>
+    <div class="info-box">
+      When converting an EPUB for reading, the App creates a dedicated work folder inside the
+      Windows temporary folder. It temporarily stores data from the Windows display component
+      used for conversion (WebView2) there. The portable edition uses its data folder instead.
+      When you save a PDF beside the EPUB, conversion uses a work folder inside the App's data folder.
+      The App attempts to remove its own temporary folders after conversion and to clean up leftovers
+      from an interrupted conversion at the next normal start. If an administrator or user has configured
+      a Windows or Edge WebView2 policy that redirects data elsewhere, the App follows that policy
+      and does not delete data in the redirected location.
+    </div>
+    <div class="info-box">
+      The App creates a PDF beside the original EPUB only when you choose the save button in the
+      conversion dialog or the right-click PDF conversion command.
+      If the EPUB is in a network folder, the PDF is saved there too. Ordinary conversion for
+      reading does not write a PDF beside the original EPUB.
+      The saved PDF records the EPUB's book title and, if present, its first author; if no title is present,
+      the App uses the EPUB's filename.
     </div>
     <div class="info-box">
       <strong>If you turn on operation logging</strong> to investigate a problem, the records
@@ -296,9 +335,11 @@
         to your PC, where the position is recorded in settings and viewing history. The audio track you choose on the
         device is also saved on your PC. The App listens on the PC itself, so nothing can reach it directly from outside.
         To connect while away from home you set up Tailscale yourself, which you install
-        separately. <strong>Your images and the contents of your library are never sent to the
-        developer or to any other third party's server.</strong></li>
+        separately. Tailscale encrypts that connection; encrypted traffic may pass through a
+        Tailscale relay server, which cannot read your images or library content.
+        <strong>Your images and library content are never sent to the developer's server.</strong></li>
     </ul>
+    <p>EPUB conversion is not another network case. The App blocks every request the book makes to an external site and converts the book to PDF on your PC. If an administrator or user has configured Windows or Edge WebView2 policies, conversion follows those settings.</p>
     <p>
       These endpoints (GitHub / mikage.to, etc.) may record standard access logs (such as IP
       addresses) under their own privacy policies, but <strong>the developer does not obtain or
@@ -310,8 +351,8 @@
     <h2>AI features</h2>
     <p>
       Upscaling, denoising, inpainting, and automatic classification are performed
-      <strong>entirely on your PC (GPU)</strong>. Your images and their contents are never sent
-      to any external server.
+      <strong>entirely on your PC (GPU)</strong>. The App does not upload images to an external
+      server for AI processing.
     </p>
   </section>
 
@@ -335,7 +376,7 @@
       a service from a different company; you sign up for it and configure it yourself. Your use
       of it is governed by
       <a href="https://tailscale.com/privacy-policy" target="_blank" rel="noopener">Tailscale's privacy policy</a>.
-      <strong>The App does not pass any of your information to Tailscale.</strong>
+      <strong>Encrypted traffic may pass through a Tailscale relay server, but the relay cannot read your images or library content.</strong>
     </p>
   </section>
 

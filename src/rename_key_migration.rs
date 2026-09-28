@@ -173,6 +173,50 @@ pub(crate) enum JournalPersistStatus {
 /// SQLite の既定可変長 parameter 上限 (999) を十分下回る exact purge の batch 幅。
 const PURGE_EXACT_BATCH_SIZE: usize = 500;
 
+fn with_identity_epub_coverage<T>(
+    descriptor: &StoreDescriptor,
+    coverage: &[(PathBuf, IdentityCoverageShape)],
+    action: impl FnOnce() -> T,
+) -> T {
+    if descriptor.file == "content_identity.db"
+        && descriptor.table == "edit_origin"
+        && descriptor.column == "file_key"
+    {
+        let ranges = coverage
+            .iter()
+            .filter_map(|(path, shape)| match shape {
+                IdentityCoverageShape::Exact
+                    if !path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
+                {
+                    None
+                }
+                IdentityCoverageShape::Exact => {
+                    Some(crate::pdf_loader::EpubPinCoverage::Exact(path.clone()))
+                }
+                IdentityCoverageShape::PathAndDescendants => Some(
+                    crate::pdf_loader::EpubPinCoverage::PathAndDescendants(path.clone()),
+                ),
+                IdentityCoverageShape::VirtualDescendants => Some(
+                    crate::pdf_loader::EpubPinCoverage::VirtualDescendants(path.clone()),
+                ),
+            })
+            .collect::<Vec<_>>();
+        crate::pdf_loader::with_epub_pin_ranges(&ranges, action)
+    } else {
+        action()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IdentityCoverageShape {
+    Exact,
+    PathAndDescendants,
+    VirtualDescendants,
+}
+
 /// 移行結果。`rows` = 書き換えた行数合計 (sidecar / パスワードは 1 件 = 1)。
 pub struct RenameMigrationReport {
     pub rows: usize,
@@ -1140,16 +1184,61 @@ enum NormalizedStoreCopyMapping {
 ///
 /// `unique=false` は path 以外の PK 再採番が必要なストアを表すため v1 では対象外。
 /// DB 行は `INSERT OR IGNORE` で複製し、コピー先にある行を常に優先する。
+#[cfg(test)]
 pub(crate) fn copy_stores_at(
     data_dir: &Path,
     mappings: &[StoreCopyPathMapping],
 ) -> StoreCopyReport {
+    copy_stores_at_with_progress(data_dir, mappings, |_, _| {})
+}
+
+pub(crate) fn copy_stores_at_with_progress(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, true, on_progress)
+}
+
+/// EPUB restore promotes its ledger row under the book guard after copying.
+/// Copying edit_origin here would recursively enter the EPUB range guard.
+pub(crate) fn copy_restore_stores_without_identity_at(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+) -> StoreCopyReport {
+    copy_restore_stores_without_identity_at_with_progress(data_dir, mappings, |_, _| {})
+}
+
+pub(crate) fn copy_restore_stores_without_identity_at_with_progress(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, false, on_progress)
+}
+
+fn copy_stores_impl(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    include_identity: bool,
+    mut on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
     let mut report = StoreCopyReport::default();
+    let total = STORES
+        .iter()
+        .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
+        .count()
+        * mappings.len();
+    let mut processed = 0;
     // A prepared virtual list must not observe a mixture of copied stores.
     let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
     let _rating_write = crate::rating_db::RATING_WRITES.begin();
     let _tag_write = crate::tags_db::TAG_WRITES.begin();
-    for descriptor in STORES.iter().copied().filter(|store| store.unique) {
+    for descriptor in STORES
+        .iter()
+        .copied()
+        .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
+    {
         let normalized = mappings
             .iter()
             .filter_map(|mapping| match mapping {
@@ -1172,15 +1261,25 @@ pub(crate) fn copy_stores_at(
                 }
             })
             .collect::<Vec<_>>();
+        processed += mappings.len() - normalized.len();
+        on_progress(processed, total);
         if normalized.is_empty() {
             continue;
         }
+        let descriptor_start = processed;
         copy_store(
             &data_dir.join(descriptor.file),
             descriptor,
             &normalized,
             &mut report,
+            &mut || {
+                processed += 1;
+                on_progress(processed, total);
+            },
         );
+        // Missing databases and failed transactions still finish this descriptor's work.
+        processed = descriptor_start + normalized.len();
+        on_progress(processed, total);
     }
     report
 }
@@ -1287,6 +1386,17 @@ pub fn run(old_path: &Path, new_path: &Path) -> RenameMigrationReport {
 
 /// data_dir を差し替え可能にしたテスト用エントリポイント。
 pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrationReport {
+    run_at_with_shape(data_dir, old_path, new_path, false)
+}
+
+/// The queued operation retains its source shape, but generic store SQL
+/// migrates exact, slash descendants and virtual entries for either shape.
+pub(crate) fn run_at_with_shape(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    _tree: bool,
+) -> RenameMigrationReport {
     let mut report = RenameMigrationReport {
         rows: 0,
         errors: Vec::new(),
@@ -1381,19 +1491,98 @@ pub(crate) struct PurgeReport {
 /// [`STORES`] を走査し、exact + `<key>/` + `<key>::` を素の `DELETE` にする。
 /// `pdf_paths` は SHA-256 キーの逆引きができない PDF password 用に、worker が削除前に
 /// 列挙した実 path 群。
+#[cfg(test)]
 pub(crate) fn purge_removed_paths_at(
     data_dir: &Path,
     removed: &[PathBuf],
     pdf_paths: &[PathBuf],
 ) -> PurgeReport {
+    let scopes = removed
+        .iter()
+        .cloned()
+        .map(crate::delete_worker::DeleteSourceScope::Tree)
+        .collect::<Vec<_>>();
+    purge_removed_scopes_at(data_dir, &scopes, pdf_paths)
+}
+
+/// The retry journal has no source shape; its paths conservatively cover trees.
+pub(crate) fn purge_removed_paths_guarded_at(
+    data_dir: &Path,
+    removed: &[PathBuf],
+    pdf_paths: &[PathBuf],
+    guard: &crate::pdf_loader::EpubRangeLease,
+) -> PurgeReport {
+    let scopes = removed
+        .iter()
+        .cloned()
+        .map(crate::delete_worker::DeleteSourceScope::Tree)
+        .collect::<Vec<_>>();
+    purge_removed_scopes_guarded_at(data_dir, &scopes, pdf_paths, guard)
+}
+
+/// Acquire once before Shell, then pass this guard through every purge attempt.
+pub(crate) fn acquire_delete_epub_guard(
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+) -> crate::pdf_loader::EpubRangeLease {
+    let paths = scopes
+        .iter()
+        .map(|scope| match scope {
+            crate::delete_worker::DeleteSourceScope::Exact(path)
+            | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
+        })
+        .collect::<Vec<_>>();
+    crate::pdf_loader::acquire_epub_pin_coverage(&paths)
+}
+
+/// The SQL uses exact, slash-descendant and virtual-descendant keys for both
+/// source shapes, even if a deleted file or folder no longer exists on disk.
+#[cfg(test)]
+pub(crate) fn purge_removed_scopes_at(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+) -> PurgeReport {
+    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, None)
+}
+
+pub(crate) fn purge_removed_scopes_guarded_at(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+    guard: &crate::pdf_loader::EpubRangeLease,
+) -> PurgeReport {
+    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, Some(guard))
+}
+
+fn purge_removed_scopes_impl(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
+) -> PurgeReport {
     let mut report = PurgeReport::default();
-    if removed.is_empty() {
+    if scopes.is_empty() {
         return report;
     }
 
-    let keep_drive_keys = normalized_removed_keys(removed, StoreKeyNormalization::KeepDrive);
+    let removed = scopes
+        .iter()
+        .map(|scope| match scope {
+            crate::delete_worker::DeleteSourceScope::Exact(path)
+            | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        guard.is_none_or(|guard| guard.covers_paths_and_descendants(&removed)),
+        "delete purge must keep the Shell range guard"
+    );
+
+    let keep_drive_keys = normalized_removed_keys(&removed, StoreKeyNormalization::KeepDrive);
     let drive_stripped_keys =
-        normalized_removed_keys(removed, StoreKeyNormalization::DriveStripped);
+        normalized_removed_keys(&removed, StoreKeyNormalization::DriveStripped);
+    let keep_drive_coverage = normalized_removed_coverage(scopes, StoreKeyNormalization::KeepDrive);
+    let drive_stripped_coverage =
+        normalized_removed_coverage(scopes, StoreKeyNormalization::DriveStripped);
     let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
     let rating_write = crate::rating_db::RATING_WRITES.begin();
     let tag_write = crate::tags_db::TAG_WRITES.begin();
@@ -1402,7 +1591,11 @@ pub(crate) fn purge_removed_paths_at(
             StoreKeyNormalization::KeepDrive => &keep_drive_keys,
             StoreKeyNormalization::DriveStripped => &drive_stripped_keys,
         };
-        purge_store(data_dir, descriptor, keys, &mut report);
+        let coverage = match descriptor.normalization {
+            StoreKeyNormalization::KeepDrive => &keep_drive_coverage,
+            StoreKeyNormalization::DriveStripped => &drive_stripped_coverage,
+        };
+        purge_store(data_dir, descriptor, keys, coverage, guard, &mut report);
     }
     drop(rating_write);
     drop(tag_write);
@@ -1412,7 +1605,7 @@ pub(crate) fn purge_removed_paths_at(
         Ok(rows) => report.rows += rows,
         Err(error) => report.errors.push(format!("pdf_passwords.json: {error}")),
     }
-    purge_sidecar_backups(removed, &mut report);
+    purge_sidecar_backups(&removed, &mut report);
     report
 }
 
@@ -1478,14 +1671,43 @@ fn normalized_removed_keys(
     keys
 }
 
+fn normalized_removed_coverage(
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    normalization: StoreKeyNormalization,
+) -> Vec<(PathBuf, IdentityCoverageShape)> {
+    scopes
+        .iter()
+        .filter_map(|scope| {
+            let path = match scope {
+                crate::delete_worker::DeleteSourceScope::Exact(path)
+                | crate::delete_worker::DeleteSourceScope::Tree(path) => path,
+            };
+            let key = match normalization {
+                StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(path),
+                StoreKeyNormalization::DriveStripped => crate::path_key::normalize(path),
+            };
+            // Both source shapes use exact + `key/` + `key::` SQL deletes.
+            (!key.is_empty()).then(|| {
+                (
+                    PathBuf::from(key),
+                    IdentityCoverageShape::PathAndDescendants,
+                )
+            })
+        })
+        .collect()
+}
+
 /// BINARY collation で `prefix` から始まる文字列の排他的 upper bound を返す。
 ///
 /// UTF-8 の辞書順は Unicode code point 順を保つため、最後の scalar value を次へ進めれば
-/// `value >= prefix AND value < upper` が prefix 一致と同じ集合になる。最後が `char::MAX`
+/// `value >= prefix AND value < upper` が prefix 一致と同じ集合になる。ただし旧 SQL の
+/// `substr` との等価性は、保存済み path key と prefix に NUL が含まれないことが前提。
+/// Windows の実 path は NUL を含められず、この store の key は実 path 由来である。
+/// 最後が `char::MAX`
 /// または次が surrogate で scalar value にできない場合は `None` とし、呼び出し側で従来の
 /// `substr` 条件へ安全に fallback する。hard purge が渡す prefix は `/` / `:` 終端なので
 /// 通常は必ず index range 条件を使える。
-fn prefix_upper_bound(prefix: &str) -> Option<String> {
+pub(crate) fn prefix_upper_bound(prefix: &str) -> Option<String> {
     let (last_index, last) = prefix.char_indices().next_back()?;
     let next = char::from_u32((last as u32).checked_add(1)?)?;
     let mut upper = prefix[..last_index].to_owned();
@@ -1497,69 +1719,102 @@ fn purge_store(
     data_dir: &Path,
     descriptor: &StoreDescriptor,
     removed_keys: &[String],
+    coverage: &[(PathBuf, IdentityCoverageShape)],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
     report: &mut PurgeReport,
+) {
+    purge_store_with_before_sql(
+        data_dir,
+        descriptor,
+        removed_keys,
+        coverage,
+        guard,
+        report,
+        || {},
+    );
+}
+
+fn purge_store_with_before_sql(
+    data_dir: &Path,
+    descriptor: &StoreDescriptor,
+    removed_keys: &[String],
+    coverage: &[(PathBuf, IdentityCoverageShape)],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
+    report: &mut PurgeReport,
+    before_sql: impl FnOnce(),
 ) {
     let db_path = data_dir.join(descriptor.file);
     if removed_keys.is_empty() || !db_path.exists() {
         return;
     }
     report.db_open_count += 1;
-    let result = (|| -> Result<usize, rusqlite::Error> {
-        let mut conn = rusqlite::Connection::open(&db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let table_exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            [descriptor.table],
-            |row| row.get(0),
-        )?;
-        if !table_exists {
-            return Ok(0);
-        }
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-        let _rating_write =
-            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
-        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-        let tx = conn.transaction()?;
-        let mut changed = 0usize;
+    let action = || {
+        before_sql();
+        (|| -> Result<usize, rusqlite::Error> {
+            let mut conn = rusqlite::Connection::open(&db_path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            let table_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [descriptor.table],
+                |row| row.get(0),
+            )?;
+            if !table_exists {
+                return Ok(0);
+            }
+            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            let _rating_write =
+                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+            let _tag_write =
+                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+            let tx = conn.transaction()?;
+            let mut changed = 0usize;
 
-        // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
-        // 上限 999 より小さくし、削除数に比例した statement 数を抑える。
-        for keys in removed_keys.chunks(PURGE_EXACT_BATCH_SIZE) {
-            let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "DELETE FROM {} WHERE {} IN ({placeholders})",
+            // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
+            // 上限 999 より小さくし、削除数に比例した statement 数を抑える。
+            for keys in removed_keys.chunks(PURGE_EXACT_BATCH_SIZE) {
+                let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "DELETE FROM {} WHERE {} IN ({placeholders})",
+                    descriptor.table, descriptor.column
+                );
+                changed += tx.execute(&sql, rusqlite::params_from_iter(keys.iter()))?;
+            }
+
+            // 全 STORES のキー列は既定 BINARY collation で、PK または path index を持つ。
+            // substr(col, ...) を列へ適用せず、同じ collation 上の range scan にする。
+            let range_sql = format!(
+                "DELETE FROM {} WHERE {} >= ?1 AND {} < ?2",
+                descriptor.table, descriptor.column, descriptor.column
+            );
+            let fallback_sql = format!(
+                "DELETE FROM {} WHERE substr({}, 1, ?1) = ?2",
                 descriptor.table, descriptor.column
             );
-            changed += tx.execute(&sql, rusqlite::params_from_iter(keys.iter()))?;
-        }
-
-        // 全 STORES のキー列は既定 BINARY collation で、PK または path index を持つ。
-        // substr(col, ...) を列へ適用せず、同じ collation 上の range scan にする。
-        let range_sql = format!(
-            "DELETE FROM {} WHERE {} >= ?1 AND {} < ?2",
-            descriptor.table, descriptor.column, descriptor.column
-        );
-        let fallback_sql = format!(
-            "DELETE FROM {} WHERE substr({}, 1, ?1) = ?2",
-            descriptor.table, descriptor.column
-        );
-        {
-            let mut range_statement = tx.prepare(&range_sql)?;
-            let mut fallback_statement = tx.prepare(&fallback_sql)?;
-            for key in removed_keys {
-                for prefix in [format!("{key}/"), format!("{key}::")] {
-                    if let Some(upper) = prefix_upper_bound(&prefix) {
-                        changed += range_statement.execute(rusqlite::params![prefix, upper])?;
-                    } else {
-                        changed += fallback_statement
-                            .execute(rusqlite::params![prefix.chars().count() as i64, prefix,])?;
+            {
+                let mut range_statement = tx.prepare(&range_sql)?;
+                let mut fallback_statement = tx.prepare(&fallback_sql)?;
+                for key in removed_keys {
+                    for prefix in [format!("{key}/"), format!("{key}::")] {
+                        if let Some(upper) = prefix_upper_bound(&prefix) {
+                            changed += range_statement.execute(rusqlite::params![prefix, upper])?;
+                        } else {
+                            changed += fallback_statement.execute(rusqlite::params![
+                                prefix.chars().count() as i64,
+                                prefix,
+                            ])?;
+                        }
                     }
                 }
             }
-        }
-        tx.commit()?;
-        Ok(changed)
-    })();
+            tx.commit()?;
+            Ok(changed)
+        })()
+    };
+    let result = if guard.is_some() {
+        action()
+    } else {
+        with_identity_epub_coverage(descriptor, coverage, action)
+    };
     match result {
         Ok(rows) => {
             report.rows += rows;
@@ -1570,6 +1825,34 @@ fn purge_store(
             descriptor.file, descriptor.table, descriptor.column
         )),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn purge_exact_identity_with_before_sql_for_test(
+    data_dir: &Path,
+    removed: &Path,
+    before_sql: impl FnOnce(),
+) -> PurgeReport {
+    let descriptor = STORES
+        .iter()
+        .find(|store| store.file == "content_identity.db" && store.table == "edit_origin")
+        .unwrap();
+    let scopes = [crate::delete_worker::DeleteSourceScope::Exact(
+        removed.to_path_buf(),
+    )];
+    let keys = normalized_removed_keys(&[removed.to_path_buf()], descriptor.normalization);
+    let coverage = normalized_removed_coverage(&scopes, descriptor.normalization);
+    let mut report = PurgeReport::default();
+    purge_store_with_before_sql(
+        data_dir,
+        descriptor,
+        &keys,
+        &coverage,
+        None,
+        &mut report,
+        before_sql,
+    );
+    report
 }
 
 /// 1 ストア分の移行: exact + `<old>/` prefix + `<old>::` prefix。
@@ -1583,74 +1866,75 @@ fn migrate_store(
     if !db_path.exists() {
         return;
     }
-    let result = (|| -> Result<usize, rusqlite::Error> {
-        let mut conn = rusqlite::Connection::open(db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-        let _rating_write =
-            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
-        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-        let tx = conn.transaction()?;
-        let columns = table_columns(&tx, descriptor.table)?;
-        if columns.is_empty()
-            && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
-        {
-            return Ok(0);
-        }
-        if !columns.iter().any(|column| column == descriptor.column) {
-            return Err(rusqlite::Error::InvalidColumnName(
-                descriptor.column.to_string(),
-            ));
-        }
-        let mut changed = 0usize;
-        changed += move_exact(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            old_key,
-            new_key,
-        )?;
-        changed += move_prefix(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            &format!("{old_key}/"),
-            &format!("{new_key}/"),
-        )?;
-        changed += move_prefix(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            &format!("{old_key}::"),
-            &format!("{new_key}::"),
-        )?;
-        // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
-        // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
-        // "::" より前、無ければキー自身)。
-        if descriptor.table == "ratings" && changed > 0 {
-            tx.execute(
-                "UPDATE ratings SET source_path = CASE
-                     WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
-                     ELSE path
-                 END
-                 WHERE path = ?1
-                    OR substr(path, 1, ?2) = ?3
-                    OR substr(path, 1, ?4) = ?5",
-                rusqlite::params![
-                    new_key,
-                    format!("{new_key}/").chars().count() as i64,
-                    format!("{new_key}/"),
-                    format!("{new_key}::").chars().count() as i64,
-                    format!("{new_key}::"),
-                ],
+    // The SQL below migrates exact, slash descendants and virtual entries for
+    // both files and folders, so the guard must cover those same key families.
+    let shape = IdentityCoverageShape::PathAndDescendants;
+    let coverage = [
+        (PathBuf::from(old_key), shape),
+        (PathBuf::from(new_key), shape),
+    ];
+    let result = with_identity_epub_coverage(descriptor, &coverage, || {
+        (|| -> Result<usize, rusqlite::Error> {
+            let mut conn = rusqlite::Connection::open(db_path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            let _rating_write =
+                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+            let _tag_write =
+                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+            let tx = conn.transaction()?;
+            let columns = table_columns(&tx, descriptor.table)?;
+            if columns.is_empty()
+                && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+            {
+                return Ok(0);
+            }
+            if !columns.iter().any(|column| column == descriptor.column) {
+                return Err(rusqlite::Error::InvalidColumnName(
+                    descriptor.column.to_string(),
+                ));
+            }
+            let mut changed = 0usize;
+            changed += move_exact(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                old_key,
+                new_key,
             )?;
-        }
-        tx.commit()?;
-        Ok(changed)
-    })();
+            changed += move_prefix(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                &format!("{old_key}/"),
+                &format!("{new_key}/"),
+            )?;
+            changed += move_prefix(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                &format!("{old_key}::"),
+                &format!("{new_key}::"),
+            )?;
+            // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
+            // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
+            // "::" より前、無ければキー自身)。
+            if descriptor.table == "ratings" && changed > 0 {
+                tx.execute(
+                    &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
+                    [new_key],
+                )?;
+                update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
+                update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        })()
+    });
+
     match result {
         Ok(n) => {
             report.rows += n;
@@ -1691,9 +1975,7 @@ fn move_exact(
     Ok(changed)
 }
 
-/// prefix キーの移動。対象キーを `substr` 等値で列挙してから 1 行ずつ付け替える
-/// (LIKE を使わないのは path 中の `%` / `_` をワイルドカード扱いさせないため。
-/// substr の長さ引数は SQLite では文字数なので `chars().count()` を渡す)。
+/// prefix キーの移動。BINARY key index の範囲で列挙してから 1 行ずつ付け替える。
 fn move_prefix(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -1702,16 +1984,7 @@ fn move_prefix(
     old_prefix: &str,
     new_prefix: &str,
 ) -> Result<usize, rusqlite::Error> {
-    let keys: Vec<String> = {
-        let mut stmt = tx.prepare(&format!(
-            "SELECT DISTINCT {col} FROM {table} WHERE substr({col}, 1, ?1) = ?2"
-        ))?;
-        let rows = stmt.query_map(
-            rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
-            |r| r.get::<_, String>(0),
-        )?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
+    let keys = indexed_prefix_keys(tx, table, col, old_prefix)?;
     let mut changed = 0usize;
     for key in keys {
         let Some(suffix) = key.strip_prefix(old_prefix) else {
@@ -1728,12 +2001,43 @@ fn copy_store(
     descriptor: StoreDescriptor,
     mappings: &[NormalizedStoreCopyMapping],
     report: &mut StoreCopyReport,
+    on_mapping: &mut impl FnMut(),
 ) {
     if !db_path.exists() {
+        for _ in mappings {
+            on_mapping();
+        }
         return;
     }
     report.database_opens += 1;
-    let result = copy_store_transaction(db_path, descriptor, mappings);
+    let coverage = mappings
+        .iter()
+        .flat_map(|mapping| match mapping {
+            NormalizedStoreCopyMapping::Exact {
+                old_key, new_key, ..
+            } => [
+                (PathBuf::from(old_key), IdentityCoverageShape::Exact),
+                (PathBuf::from(new_key), IdentityCoverageShape::Exact),
+            ],
+            NormalizedStoreCopyMapping::Prefix {
+                old_prefix,
+                new_prefix,
+            } => [
+                (
+                    PathBuf::from(old_prefix.trim_end_matches("::")),
+                    IdentityCoverageShape::VirtualDescendants,
+                ),
+                (
+                    PathBuf::from(new_prefix.trim_end_matches("::")),
+                    IdentityCoverageShape::VirtualDescendants,
+                ),
+            ],
+        })
+        .collect::<Vec<_>>();
+    let result = with_identity_epub_coverage(&descriptor, &coverage, || {
+        copy_store_transaction(db_path, descriptor, mappings, on_mapping)
+    });
+
     match result {
         Ok(rows) => report.rows += rows,
         Err(error) => report.errors.push(format!(
@@ -1747,6 +2051,7 @@ fn copy_store_transaction(
     db_path: &Path,
     descriptor: StoreDescriptor,
     mappings: &[NormalizedStoreCopyMapping],
+    on_mapping: &mut impl FnMut(),
 ) -> Result<usize, String> {
     let cache_root = db_path
         .parent()
@@ -1783,6 +2088,7 @@ fn copy_store_transaction(
                 &cache_root,
                 &mut destination_files,
             )?;
+            on_mapping();
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(changed)
@@ -1927,8 +2233,7 @@ fn copy_exact(
     )
 }
 
-/// prefix キーを `substr` 等値で列挙し、suffix を保って 1 キーずつ複製する。
-/// SQLite の `substr` length は文字数なので byte length ではなく `chars().count()` を渡す。
+/// BINARY key index の範囲で prefix キーを列挙し、suffix を保って複製する。
 fn copy_prefix(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -1940,16 +2245,7 @@ fn copy_prefix(
     if old_prefix == new_prefix {
         return Ok(GenericCopyOutcome::default());
     }
-    let keys = {
-        let mut statement = tx.prepare(&format!(
-            "SELECT DISTINCT {col} FROM {table} WHERE substr({col}, 1, ?1) = ?2"
-        ))?;
-        let rows = statement.query_map(
-            rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
-            |row| row.get::<_, String>(0),
-        )?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
+    let keys = indexed_prefix_keys(tx, table, col, old_prefix)?;
     let mut outcome = GenericCopyOutcome::default();
     for key in keys {
         let Some(suffix) = key.strip_prefix(old_prefix) else {
@@ -1965,6 +2261,36 @@ fn copy_prefix(
     Ok(outcome)
 }
 
+/// All store keys use BINARY collation and have a leading-key index. Equivalence
+/// with the old SQLite `substr` predicate assumes path keys and prefixes have no NUL;
+/// Windows paths cannot contain NUL. Keep a lower bound even for Unicode prefixes
+/// without a representable exclusive upper bound.
+fn indexed_prefix_keys(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    col: &str,
+    prefix: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    if let Some(upper) = prefix_upper_bound(prefix) {
+        let mut statement = tx.prepare(&format!(
+            "SELECT DISTINCT {col} FROM {table} WHERE {col} >= ?1 AND {col} < ?2"
+        ))?;
+        statement
+            .query_map(rusqlite::params![prefix, upper], |row| row.get(0))?
+            .collect()
+    } else {
+        let mut statement = tx.prepare(&format!(
+            "SELECT DISTINCT {col} FROM {table} WHERE {col} >= ?1 AND substr({col}, 1, ?2) = ?1"
+        ))?;
+        statement
+            .query_map(
+                rusqlite::params![prefix, prefix.chars().count() as i64],
+                |row| row.get(0),
+            )?
+            .collect()
+    }
+}
+
 fn update_copied_rating_source_paths(
     tx: &rusqlite::Transaction<'_>,
     mapping: &NormalizedStoreCopyMapping,
@@ -1972,24 +2298,35 @@ fn update_copied_rating_source_paths(
     match mapping {
         NormalizedStoreCopyMapping::Exact { new_key, .. } => {
             tx.execute(
-                "UPDATE ratings SET source_path = CASE
-                     WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
-                     ELSE path
-                 END
-                 WHERE path = ?1",
+                &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
                 [new_key],
             )?;
         }
         NormalizedStoreCopyMapping::Prefix { new_prefix, .. } => {
-            tx.execute(
-                "UPDATE ratings SET source_path = CASE
-                     WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
-                     ELSE path
-                 END
-                 WHERE substr(path, 1, ?1) = ?2",
-                rusqlite::params![new_prefix.chars().count() as i64, new_prefix],
-            )?;
+            update_rating_source_paths_for_prefix(tx, new_prefix)?;
         }
+    }
+    Ok(())
+}
+
+const RATING_SOURCE_PATH_UPDATE: &str = "UPDATE ratings SET source_path = CASE
+    WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
+    ELSE path END";
+
+fn update_rating_source_paths_for_prefix(
+    tx: &rusqlite::Transaction<'_>,
+    prefix: &str,
+) -> Result<(), rusqlite::Error> {
+    if let Some(upper) = prefix_upper_bound(prefix) {
+        tx.execute(
+            &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path >= ?1 AND path < ?2"),
+            rusqlite::params![prefix, upper],
+        )?;
+    } else {
+        tx.execute(
+            &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path >= ?1 AND substr(path, 1, ?2) = ?1"),
+            rusqlite::params![prefix, prefix.chars().count() as i64],
+        )?;
     }
     Ok(())
 }
@@ -2069,6 +2406,83 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+
+    #[test]
+    fn pdf_and_image_store_copy_does_not_wait_for_nonoverlapping_epub_range() {
+        let data = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(data.path().join("content_identity.db")).unwrap();
+        db.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let range = data.path().join("unrelated-shelf");
+        let holder = std::thread::spawn(move || {
+            crate::pdf_loader::with_epub_pin_coverage(&[range], || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let data_path = data.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let mut errors = Vec::new();
+            for extension in ["pdf", "png"] {
+                let old = data_path.join(format!("old.{extension}"));
+                let new = data_path.join(format!("new.{extension}"));
+                let migrated = run_at(&data_path, &old, &new);
+                errors.extend(migrated.errors);
+                let report = copy_stores_at(&data_path, &[StoreCopyPathMapping::exact(old, new)]);
+                errors.extend(report.errors);
+            }
+            done_tx.send(errors).unwrap();
+        });
+        let completed = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "PDF store copy waited for an EPUB range operation"
+        );
+        assert!(completed.unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_purge_keeps_slash_and_virtual_descendant_deletion() {
+        let data = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(data.path().join("content_identity.db")).unwrap();
+        db.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)")
+            .unwrap();
+        let removed = data.path().join("cover.png");
+        let key = crate::adjustment_db::normalize_path(&removed);
+        let nearby = format!("{key}x/book.epub");
+        for row in [
+            key.clone(),
+            format!("{key}/book.epub"),
+            format!("{key}::page_0"),
+            nearby.clone(),
+        ] {
+            db.execute("INSERT INTO edit_origin(file_key) VALUES (?1)", [&row])
+                .unwrap();
+        }
+        drop(db);
+        let report = purge_removed_scopes_at(
+            data.path(),
+            &[crate::delete_worker::DeleteSourceScope::Exact(removed)],
+            &[],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let db = rusqlite::Connection::open(data.path().join("content_identity.db")).unwrap();
+        let rows = db
+            .prepare("SELECT file_key FROM edit_origin ORDER BY file_key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![nearby]);
+    }
 
     fn open(dir: &Path, file: &str) -> rusqlite::Connection {
         rusqlite::Connection::open(dir.join(file)).unwrap()
@@ -2390,6 +2804,416 @@ mod tests {
     }
 
     #[test]
+    fn indexed_prefix_matches_legacy_substr_for_unicode_case_and_no_upper_bound() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE entries (path TEXT PRIMARY KEY)")
+            .unwrap();
+        for key in [
+            "c:/日本/本::一.jpg",
+            "c:/日本/本::二.jpg",
+            "c:/日本/本:;outside",
+            "c:/A::upper",
+            "c:/a::lower",
+            "c:/100%_本::page",
+            "c:/100x_本::outside",
+            "c:/\u{d7ff}::page",
+            "c:/\u{e000}::outside",
+            "c:/\u{10ffff}::page",
+            "d:/unrelated",
+        ] {
+            connection
+                .execute("INSERT INTO entries VALUES (?1)", [key])
+                .unwrap();
+        }
+        let tx = connection.transaction().unwrap();
+        for prefix in [
+            "c:/日本/本::",
+            "c:/A::",
+            "c:/a::",
+            "c:/100%_本::",
+            "c:/\u{d7ff}",
+            "c:/\u{10ffff}",
+            "",
+        ] {
+            let mut legacy = tx
+                .prepare("SELECT path FROM entries WHERE substr(path, 1, ?1) = ?2 ORDER BY path")
+                .unwrap();
+            let old = legacy
+                .query_map(
+                    rusqlite::params![prefix.chars().count() as i64, prefix],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let mut new = indexed_prefix_keys(&tx, "entries", "path", prefix).unwrap();
+            new.sort();
+            assert_eq!(new, old, "prefix={prefix:?}");
+
+            let (sql, parameters): (&str, Vec<rusqlite::types::Value>) = if let Some(upper) =
+                prefix_upper_bound(prefix)
+            {
+                (
+                    "EXPLAIN QUERY PLAN SELECT DISTINCT path FROM entries WHERE path >= ?1 AND path < ?2",
+                    vec![prefix.to_owned().into(), upper.into()],
+                )
+            } else {
+                (
+                    "EXPLAIN QUERY PLAN SELECT DISTINCT path FROM entries WHERE path >= ?1 AND substr(path, 1, ?2) = ?1",
+                    vec![
+                        prefix.to_owned().into(),
+                        (prefix.chars().count() as i64).into(),
+                    ],
+                )
+            };
+            let plan: String = tx
+                .query_row(sql, rusqlite::params_from_iter(parameters), |row| {
+                    row.get(3)
+                })
+                .unwrap();
+            assert!(
+                plan.contains("SEARCH") && !plan.contains("SCAN"),
+                "{prefix:?}: {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_image_container_and_move_match_legacy_database_rows() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE old_copy (path TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE new_copy (path TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE old_move (path TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE new_move (path TEXT PRIMARY KEY, payload TEXT);",
+            )
+            .unwrap();
+        let keys = [
+            ("c:/日本/old.png", "image"),
+            ("c:/日本/book.zip", "container"),
+            ("c:/日本/book.zip::一.jpg", "page1"),
+            ("c:/日本/book.zip::二.jpg", "page2"),
+            ("c:/日本/book.zip:;outside", "outside"),
+            ("c:/日本/book.zip::三.jpg", "page3"),
+            ("d:/日本/book.zip::二.jpg", "unrelated"),
+        ];
+        for table in ["old_copy", "new_copy", "old_move", "new_move"] {
+            for (key, payload) in keys {
+                connection
+                    .execute(
+                        &format!("INSERT INTO {table} VALUES (?1, ?2)"),
+                        rusqlite::params![key, payload],
+                    )
+                    .unwrap();
+            }
+        }
+        let tx = connection.transaction().unwrap();
+        let columns = vec!["path".to_owned(), "payload".to_owned()];
+        // An image has only the exact face. A container has exact and virtual faces.
+        for (old, new) in [
+            ("c:/日本/old.png", "d:/日本/new.png"),
+            ("c:/日本/book.zip", "d:/日本/new.zip"),
+        ] {
+            for table in ["old_copy", "new_copy"] {
+                copy_exact(&tx, table, "path", &columns, old, new).unwrap();
+            }
+        }
+        let old_prefix = "c:/日本/book.zip::";
+        let new_prefix = "d:/日本/new.zip::";
+        let old_keys = tx
+            .prepare("SELECT path FROM old_copy WHERE substr(path, 1, ?1) = ?2")
+            .unwrap()
+            .query_map(
+                rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for key in old_keys {
+            copy_exact(
+                &tx,
+                "old_copy",
+                "path",
+                &columns,
+                &key,
+                &format!("{new_prefix}{}", key.strip_prefix(old_prefix).unwrap()),
+            )
+            .unwrap();
+        }
+        copy_prefix(&tx, "new_copy", "path", &columns, old_prefix, new_prefix).unwrap();
+
+        let move_old = "c:/日本/book.zip::";
+        let move_new = "d:/日本/moved.zip::";
+        let move_keys = tx
+            .prepare("SELECT path FROM old_move WHERE substr(path, 1, ?1) = ?2")
+            .unwrap()
+            .query_map(
+                rusqlite::params![move_old.chars().count() as i64, move_old],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for key in move_keys {
+            move_exact(
+                &tx,
+                "old_move",
+                "path",
+                true,
+                &key,
+                &format!("{move_new}{}", key.strip_prefix(move_old).unwrap()),
+            )
+            .unwrap();
+        }
+        move_prefix(&tx, "new_move", "path", true, move_old, move_new).unwrap();
+        for (old, new) in [("old_copy", "new_copy"), ("old_move", "new_move")] {
+            let rows = |table: &str| {
+                tx.prepare(&format!("SELECT path, payload FROM {table} ORDER BY path"))
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            assert_eq!(rows(old), rows(new), "{old} vs {new}");
+        }
+    }
+
+    #[test]
+    fn every_store_copy_and_move_rows_match_legacy_prefix_scan() {
+        for descriptor in STORES {
+            let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+            let col = descriptor.column;
+            for table in ["legacy_copy", "indexed_copy", "legacy_move", "indexed_move"] {
+                connection
+                    .execute_batch(&format!(
+                        "CREATE TABLE {table} ({col} TEXT PRIMARY KEY, payload TEXT)"
+                    ))
+                    .unwrap();
+            }
+            let image_old = descriptor.normalize_path(Path::new(r"C:\日本\old.png"));
+            let image_new = descriptor.normalize_path(Path::new(r"D:\日本\new.png"));
+            let container_old = descriptor.normalize_path(Path::new(r"C:\日本\book.zip"));
+            let container_new = descriptor.normalize_path(Path::new(r"D:\日本\new.zip"));
+            let moved = descriptor.normalize_path(Path::new(r"D:\日本\moved.zip"));
+            let keys = [
+                (image_old.as_str(), "image"),
+                (container_old.as_str(), "container"),
+                (&format!("{container_old}::一.jpg"), "page1"),
+                (&format!("{container_old}::二.jpg"), "page2"),
+                (&format!("{container_old}:;outside"), "outside"),
+            ];
+            for table in ["legacy_copy", "indexed_copy", "legacy_move", "indexed_move"] {
+                for (key, payload) in keys {
+                    connection
+                        .execute(
+                            &format!("INSERT INTO {table} ({col}, payload) VALUES (?1, ?2)"),
+                            rusqlite::params![key, payload],
+                        )
+                        .unwrap();
+                }
+            }
+            let tx = connection.transaction().unwrap();
+            let columns = vec![col.to_owned(), "payload".to_owned()];
+            if descriptor.unique {
+                for table in ["legacy_copy", "indexed_copy"] {
+                    copy_exact(&tx, table, col, &columns, &image_old, &image_new).unwrap();
+                    copy_exact(&tx, table, col, &columns, &container_old, &container_new).unwrap();
+                }
+                let old_prefix = format!("{container_old}::");
+                let new_prefix = format!("{container_new}::");
+                let old_keys = tx
+                    .prepare(&format!(
+                        "SELECT {col} FROM legacy_copy WHERE substr({col}, 1, ?1) = ?2"
+                    ))
+                    .unwrap()
+                    .query_map(
+                        rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                for key in old_keys {
+                    copy_exact(
+                        &tx,
+                        "legacy_copy",
+                        col,
+                        &columns,
+                        &key,
+                        &format!("{new_prefix}{}", key.strip_prefix(&old_prefix).unwrap()),
+                    )
+                    .unwrap();
+                }
+                copy_prefix(&tx, "indexed_copy", col, &columns, &old_prefix, &new_prefix).unwrap();
+            }
+            let old_prefix = format!("{container_old}::");
+            let new_prefix = format!("{moved}::");
+            let old_keys = tx
+                .prepare(&format!(
+                    "SELECT {col} FROM legacy_move WHERE substr({col}, 1, ?1) = ?2"
+                ))
+                .unwrap()
+                .query_map(
+                    rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for key in old_keys {
+                move_exact(
+                    &tx,
+                    "legacy_move",
+                    col,
+                    descriptor.unique,
+                    &key,
+                    &format!("{new_prefix}{}", key.strip_prefix(&old_prefix).unwrap()),
+                )
+                .unwrap();
+            }
+            move_prefix(
+                &tx,
+                "indexed_move",
+                col,
+                descriptor.unique,
+                &old_prefix,
+                &new_prefix,
+            )
+            .unwrap();
+            let rows = |table: &str| {
+                tx.prepare(&format!(
+                    "SELECT {col}, payload FROM {table} ORDER BY {col}"
+                ))
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+            };
+            assert_eq!(
+                rows("legacy_copy"),
+                rows("indexed_copy"),
+                "copy {}.{}",
+                descriptor.file,
+                descriptor.table
+            );
+            assert_eq!(
+                rows("legacy_move"),
+                rows("indexed_move"),
+                "move {}.{}",
+                descriptor.file,
+                descriptor.table
+            );
+        }
+    }
+
+    /// One representative indexed store: 100k existing rows, 1k container restores.
+    /// Measures the old/new copy query and the old/new runtime family query together.
+    #[test]
+    #[ignore]
+    fn measure_thousand_restores_against_hundred_thousand_rows() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE old_rows (path TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE new_rows (path TEXT PRIMARY KEY, payload TEXT);",
+            )
+            .unwrap();
+        let tx = connection.transaction().unwrap();
+        for index in 0..100_000 {
+            let key = format!("c:/本/{index:06}.zip::page.jpg");
+            for table in ["old_rows", "new_rows"] {
+                tx.execute(&format!("INSERT INTO {table} VALUES (?1, 'state')"), [&key])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let tx = connection.transaction().unwrap();
+        let columns = vec!["path".to_owned(), "payload".to_owned()];
+        let mut old_hits = 0usize;
+        let old_started = std::time::Instant::now();
+        for index in 0..1_000 {
+            let old_base = format!("c:/本/{index:06}.zip");
+            let new_base = format!("d:/本/{index:06}.zip");
+            let old_prefix = format!("{old_base}::");
+            let new_prefix = format!("{new_base}::");
+            let mut statement = tx
+                .prepare("SELECT path FROM old_rows WHERE substr(path, 1, ?1) = ?2")
+                .unwrap();
+            let keys = statement
+                .query_map(
+                    rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            drop(statement);
+            for key in keys {
+                old_hits += copy_exact(
+                    &tx,
+                    "old_rows",
+                    "path",
+                    &columns,
+                    &key,
+                    &format!("{new_prefix}{}", key.strip_prefix(&old_prefix).unwrap()),
+                )
+                .unwrap();
+            }
+            let mut statement = tx
+                .prepare(
+                    "SELECT COUNT(*) FROM old_rows WHERE path = ?1 OR substr(path, 1, ?2) = ?3",
+                )
+                .unwrap();
+            let _: i64 = statement
+                .query_row(
+                    rusqlite::params![new_base, new_prefix.chars().count() as i64, new_prefix],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        }
+        let old_elapsed = old_started.elapsed();
+        let mut new_hits = 0usize;
+        let new_started = std::time::Instant::now();
+        for index in 0..1_000 {
+            let old_base = format!("c:/本/{index:06}.zip");
+            let new_base = format!("d:/本/{index:06}.zip");
+            let old_prefix = format!("{old_base}::");
+            let new_prefix = format!("{new_base}::");
+            new_hits += copy_prefix(&tx, "new_rows", "path", &columns, &old_prefix, &new_prefix)
+                .unwrap()
+                .rows;
+            let _: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM new_rows WHERE path = ?1",
+                    [&new_base],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let _: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM new_rows WHERE path >= ?1 AND path < ?2",
+                    rusqlite::params![new_prefix, prefix_upper_bound(&new_prefix).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        }
+        let new_elapsed = new_started.elapsed();
+        assert_eq!((old_hits, new_hits), (1_000, 1_000));
+        eprintln!(
+            "100000 rows x 1000 restores, one store copy+family: old={old_elapsed:?} new={new_elapsed:?}"
+        );
+    }
+
+    #[test]
     fn exact_and_prefix_query_plans_use_the_binary_primary_key_index() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
@@ -2490,7 +3314,14 @@ mod tests {
             table_availability: StoreTableAvailability::Required,
         };
         let mut report = PurgeReport::default();
-        purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
+        purge_store(
+            dir.path(),
+            &descriptor,
+            &removed_keys,
+            &[],
+            None,
+            &mut report,
+        );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, legacy_changed);
         assert_eq!(
@@ -2555,7 +3386,14 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let mut report = PurgeReport::default();
-        purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
+        purge_store(
+            dir.path(),
+            &descriptor,
+            &removed_keys,
+            &[],
+            None,
+            &mut report,
+        );
         let elapsed = started.elapsed();
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);
