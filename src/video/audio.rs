@@ -328,7 +328,9 @@ pub(crate) struct ProcessedChunk {
     pub(crate) samples: Vec<f32>,
     /// **audible PTS** = この chunk の最初のサンプルが「実際にスピーカーから聞こえる」
     /// PTS (秒)。`input_pts - pdc_latency_at_process` で計算。video clock 同期に使う。
-    /// mIV Remote の AAC input PTS にもこの source timeline 値を使う。
+    /// mIV Remote の AAC input PTS にもこの source timeline 値を使う。remote では
+    /// plugin latency が chunk 間で変わった場合に重複 sample の除去または無音の挿入を行い、
+    /// 最初に残る sample の PTS に補正してから AAC に渡す。
     pub(crate) audible_pts_secs: f64,
     /// chunk の音声時間 (秒) = `samples.len() / samples_per_sec`。
     /// BufferReady 判定や processed cap 比較で再計算を避けるためキャッシュ。
@@ -341,7 +343,8 @@ pub(crate) struct ProcessedChunk {
     /// VST / safety limiter / stretcher を含む処理時点の合計 latency (source 秒)。
     /// 後続 chunk と差があれば video clock jump で吸収
     /// (旧 `pdc_latency_secs_applied` 比較ロジックを chunk 単位に分離)。
-    /// mIV Remote は tap metadata の有限性も AAC input 前に検証する。
+    /// mIV Remote は latency 変化時に sample/PTS を補正してもこの処理時点の値を保ち、
+    /// AAC input 前に metadata の有限性も検証する。
     pub(crate) pdc_latency_secs_at_process: f64,
     /// EffeTune slot generation actually applied to this chunk.
     pub(crate) effetune_generation: Option<u64>,

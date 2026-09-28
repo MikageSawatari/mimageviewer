@@ -1336,6 +1336,78 @@ struct ClocklessAudioProcessor {
     effetune: Option<ClocklessVstChain>,
     effetune_output: Vec<f32>,
     limiter: SafetyLimiter,
+    latency_reconciler: ClocklessLatencyReconciler,
+}
+
+/// Reconciles only changes in applied plugin delay. A positive pending adjustment removes
+/// duplicated audible time; a negative one fills the gap with silence. The value is carried
+/// across chunks when a delay increase consumes an entire chunk.
+struct ClocklessLatencyReconciler {
+    sample_rate: u32,
+    seek_serial: Option<u64>,
+    previous_plugin_latency_samples: Option<i64>,
+    pending_adjustment_samples: i64,
+}
+
+impl ClocklessLatencyReconciler {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            sample_rate,
+            seek_serial: None,
+            previous_plugin_latency_samples: None,
+            pending_adjustment_samples: 0,
+        }
+    }
+
+    fn reconcile(
+        &mut self,
+        mut chunk: ProcessedChunk,
+        plugin_latency_samples: i64,
+    ) -> Option<ProcessedChunk> {
+        if self.seek_serial != Some(chunk.seek_serial) {
+            self.seek_serial = Some(chunk.seek_serial);
+            self.previous_plugin_latency_samples = None;
+            self.pending_adjustment_samples = 0;
+        }
+        if let Some(previous) = self.previous_plugin_latency_samples
+            && previous != plugin_latency_samples
+        {
+            let delta = plugin_latency_samples - previous;
+            self.pending_adjustment_samples += delta;
+            let action = if self.pending_adjustment_samples > 0 {
+                "drop"
+            } else if self.pending_adjustment_samples < 0 {
+                "prepend silence"
+            } else {
+                "none (pending adjustment cancelled)"
+            };
+            crate::logger::log(format!(
+                "remote-stream plugin latency reconciliation: old_samples={previous} new_samples={plugin_latency_samples} delta_samples={delta} action={action}"
+            ));
+        }
+        self.previous_plugin_latency_samples = Some(plugin_latency_samples);
+
+        let rate = f64::from(self.sample_rate);
+        if self.pending_adjustment_samples > 0 {
+            let frames = chunk.samples.len() / 2;
+            let dropped = frames.min(self.pending_adjustment_samples as usize);
+            chunk.samples.drain(..dropped * 2);
+            chunk.audible_pts_secs += dropped as f64 / rate;
+            self.pending_adjustment_samples -= dropped as i64;
+            if chunk.samples.is_empty() {
+                return None;
+            }
+        } else if self.pending_adjustment_samples < 0 {
+            let silence_frames = (-self.pending_adjustment_samples) as usize;
+            let mut samples = vec![0.0; silence_frames * 2];
+            samples.extend_from_slice(&chunk.samples);
+            chunk.samples = samples;
+            chunk.audible_pts_secs -= silence_frames as f64 / rate;
+            self.pending_adjustment_samples = 0;
+        }
+        chunk.duration_secs = (chunk.samples.len() / 2) as f64 / rate;
+        Some(chunk)
+    }
 }
 
 impl ClocklessAudioProcessor {
@@ -1376,10 +1448,11 @@ impl ClocklessAudioProcessor {
             effetune,
             effetune_output: Vec::new(),
             limiter: SafetyLimiter::new(sample_rate, 2),
+            latency_reconciler: ClocklessLatencyReconciler::new(sample_rate),
         })
     }
 
-    fn process(&mut self, mut chunk: ProcessedChunk) -> ProcessedChunk {
+    fn process(&mut self, mut chunk: ProcessedChunk) -> Option<ProcessedChunk> {
         if (self.normalize_gain - 1.0).abs() > f32::EPSILON {
             for sample in &mut chunk.samples {
                 *sample *= self.normalize_gain;
@@ -1478,7 +1551,11 @@ impl ClocklessAudioProcessor {
         }
         chunk.audible_pts_secs -= latency_secs;
         chunk.pdc_latency_secs_at_process = latency_secs;
-        chunk
+        let plugin_latency_samples = (composition.plugin_latency_secs
+            * f64::from(self.latency_reconciler.sample_rate))
+        .round() as i64;
+        self.latency_reconciler
+            .reconcile(chunk, plugin_latency_samples)
     }
 }
 
@@ -1661,12 +1738,17 @@ impl DriverState<'_> {
     fn push_audio_chunk(&mut self, chunk: ProcessedChunk) -> Result<(), String> {
         self.wait_for_capacity()?;
         self.checkpoint()?;
+        // Source progress follows decoded input, including chunks consumed by latency
+        // reconciliation. AAC PTS follows the reconciled audible samples below.
         self.max_source_pts = self
             .max_source_pts
             .max(chunk.audible_pts_secs + chunk.duration_secs);
         let started = Instant::now();
         let chunk = self.audio_processor.process(chunk);
         self.times.audio_process_secs += started.elapsed().as_secs_f64();
+        let Some(chunk) = chunk else {
+            return self.drain_mux();
+        };
         let started = Instant::now();
         let packets = self
             .audio_encoder
@@ -2304,7 +2386,7 @@ fn selected_frame_rate(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -2393,6 +2475,196 @@ mod tests {
             seek_serial: SEEK_SERIAL,
             pdc_latency_secs_at_process: 0.0,
             effetune_generation: None,
+        }
+    }
+
+    struct ChangingLatencyVstProcessor {
+        sample_rate: u32,
+        latency_samples: AtomicU32,
+    }
+
+    impl ClocklessVstProcessor for ChangingLatencyVstProcessor {
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn prepare(&self) -> ClocklessVstPrepareResult {
+            ClocklessVstPrepareResult {
+                active_slots: 1,
+                warning: None,
+            }
+        }
+
+        fn reset(&self) {}
+
+        fn total_latency_samples(&self) -> u32 {
+            self.latency_samples.load(Ordering::Acquire)
+        }
+
+        fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
+            dst.copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    fn changing_latency_processor(
+        sample_rate: u32,
+        initial_latency: u32,
+    ) -> (ClocklessAudioProcessor, Arc<ChangingLatencyVstProcessor>) {
+        let host = Arc::new(ChangingLatencyVstProcessor {
+            sample_rate,
+            latency_samples: AtomicU32::new(initial_latency),
+        });
+        let config = ClocklessAudioProcessing::with_vst3(1.0, host.clone(), 1, None);
+        (
+            ClocklessAudioProcessor::new(config, sample_rate).unwrap(),
+            host,
+        )
+    }
+
+    fn timed_audio_chunk(
+        sample_rate: u32,
+        first_frame: usize,
+        frames: usize,
+        seek_serial: u64,
+    ) -> ProcessedChunk {
+        ProcessedChunk {
+            samples: [0.25, -0.25].repeat(frames),
+            audible_pts_secs: 10.0 + first_frame as f64 / f64::from(sample_rate),
+            duration_secs: frames as f64 / f64::from(sample_rate),
+            source_secs_per_output_sec: 1.0,
+            seek_serial,
+            pdc_latency_secs_at_process: 0.0,
+            effetune_generation: None,
+        }
+    }
+
+    #[test]
+    fn remote_latency_changes_remain_continuous_through_real_aac_encoder() {
+        const RATE: u32 = 44_100;
+        const FRAMES: usize = 512;
+        let (mut processor, host) = changing_latency_processor(RATE, 0);
+        let timeline = StreamTimeline::new(10.0).unwrap();
+        let mut encoder = open_aac_encoder(RATE, 96_000, SEEK_SERIAL, timeline).unwrap();
+        let limiter_samples = (processor.limiter.latency_secs() * f64::from(RATE)).round() as usize;
+        let mut emitted_frames = 0;
+        let mut previous_end: Option<f64> = None;
+        let mut packets = Vec::new();
+
+        for (index, latency) in [0, 128, 64, 64].into_iter().enumerate() {
+            host.latency_samples.store(latency, Ordering::Release);
+            let chunk = processor
+                .process(timed_audio_chunk(RATE, index * FRAMES, FRAMES, SEEK_SERIAL))
+                .unwrap();
+            if let Some(end) = previous_end {
+                assert!((chunk.audible_pts_secs - end).abs() < 1.0e-10);
+            }
+            let expected_frames = match index {
+                1 => FRAMES - 128,
+                2 => FRAMES + 64,
+                _ => FRAMES,
+            };
+            assert_eq!(chunk.samples.len() / 2, expected_frames);
+            if index == 2 {
+                assert!(chunk.samples[..64 * 2].iter().all(|sample| *sample == 0.0));
+            }
+            assert!(
+                (chunk.pdc_latency_secs_at_process
+                    - (f64::from(latency) / f64::from(RATE) + processor.limiter.latency_secs()))
+                .abs()
+                    < 1.0e-10
+            );
+            emitted_frames += expected_frames;
+            previous_end = Some(chunk.audible_pts_secs + chunk.duration_secs);
+            packets.extend(encoder.push_chunk(chunk).unwrap());
+        }
+        packets.extend(encoder.finish().unwrap());
+        assert!(!packets.is_empty());
+        assert_eq!(emitted_frames, 4 * FRAMES - 128 + 64);
+        assert_eq!(
+            encoder.stats().input_samples_per_channel,
+            (emitted_frames - limiter_samples) as u64
+        );
+    }
+
+    #[test]
+    fn remote_latency_increase_carries_drop_across_short_chunks() {
+        const RATE: u32 = 44_100;
+        const FRAMES: usize = 64;
+        let (mut processor, host) = changing_latency_processor(RATE, 0);
+        let first = processor
+            .process(timed_audio_chunk(RATE, 0, FRAMES, SEEK_SERIAL))
+            .unwrap();
+        host.latency_samples.store(128, Ordering::Release);
+        assert!(
+            processor
+                .process(timed_audio_chunk(RATE, FRAMES, FRAMES, SEEK_SERIAL))
+                .is_none()
+        );
+        assert_eq!(processor.latency_reconciler.pending_adjustment_samples, 64);
+        assert!(
+            processor
+                .process(timed_audio_chunk(RATE, 2 * FRAMES, FRAMES, SEEK_SERIAL))
+                .is_none()
+        );
+        assert_eq!(processor.latency_reconciler.pending_adjustment_samples, 0);
+        let resumed = processor
+            .process(timed_audio_chunk(RATE, 3 * FRAMES, FRAMES, SEEK_SERIAL))
+            .unwrap();
+        assert_eq!(resumed.samples.len(), FRAMES * 2);
+        assert!(
+            (resumed.audible_pts_secs - first.audible_pts_secs - first.duration_secs).abs()
+                < 1.0e-10
+        );
+    }
+
+    #[test]
+    fn remote_latency_reconciliation_resets_on_seek_and_generation() {
+        const RATE: u32 = 44_100;
+        let (mut processor, host) = changing_latency_processor(RATE, 0);
+        processor
+            .process(timed_audio_chunk(RATE, 0, 64, SEEK_SERIAL))
+            .unwrap();
+        host.latency_samples.store(128, Ordering::Release);
+        assert!(
+            processor
+                .process(timed_audio_chunk(RATE, 64, 64, SEEK_SERIAL))
+                .is_none()
+        );
+        let after_seek = processor
+            .process(timed_audio_chunk(RATE, 0, 64, SEEK_SERIAL + 1))
+            .unwrap();
+        assert_eq!(after_seek.samples.len(), 128);
+        assert_eq!(processor.latency_reconciler.pending_adjustment_samples, 0);
+
+        let (mut next_generation, _) = changing_latency_processor(RATE, 128);
+        let first = next_generation
+            .process(timed_audio_chunk(RATE, 0, 64, SEEK_SERIAL))
+            .unwrap();
+        assert_eq!(first.samples.len(), 128);
+        assert_eq!(
+            next_generation
+                .latency_reconciler
+                .pending_adjustment_samples,
+            0
+        );
+    }
+
+    #[test]
+    fn remote_constant_plugin_latency_keeps_samples_and_timestamps() {
+        const RATE: u32 = 44_100;
+        let (mut processor, _) = changing_latency_processor(RATE, 128);
+        for index in 0..3 {
+            let chunk = processor
+                .process(timed_audio_chunk(RATE, index * 256, 256, SEEK_SERIAL))
+                .unwrap();
+            assert_eq!(chunk.samples.len(), 512);
+            assert_eq!(chunk.duration_secs, 256.0 / f64::from(RATE));
+            assert_eq!(
+                chunk.audible_pts_secs,
+                10.0 + index as f64 * 256.0 / f64::from(RATE) - chunk.pdc_latency_secs_at_process
+            );
+            assert_eq!(processor.latency_reconciler.pending_adjustment_samples, 0);
         }
     }
 
@@ -2672,15 +2944,17 @@ mod tests {
             AUDIO_OUTPUT_RATE,
         )
         .unwrap();
-        let chunk = processor.process(ProcessedChunk {
-            samples: vec![1.0, -0.5],
-            audible_pts_secs: 10.0,
-            duration_secs: 1.0 / f64::from(AUDIO_OUTPUT_RATE),
-            source_secs_per_output_sec: 1.0,
-            seek_serial: SEEK_SERIAL,
-            pdc_latency_secs_at_process: 0.0,
-            effetune_generation: None,
-        });
+        let chunk = processor
+            .process(ProcessedChunk {
+                samples: vec![1.0, -0.5],
+                audible_pts_secs: 10.0,
+                duration_secs: 1.0 / f64::from(AUDIO_OUTPUT_RATE),
+                source_secs_per_output_sec: 1.0,
+                seek_serial: SEEK_SERIAL,
+                pdc_latency_secs_at_process: 0.0,
+                effetune_generation: None,
+            })
+            .unwrap();
 
         assert!((chunk.samples[0] - 0.579).abs() < 1.0e-6);
         assert!((chunk.samples[1] + 0.2895).abs() < 1.0e-6);
@@ -2707,7 +2981,7 @@ mod tests {
         let config = ClocklessAudioProcessing::with_vst3(0.5, processor_handle, 1, None);
         let status = config.vst3_status();
         let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
-        let chunk = processor.process(audio_chunk(vec![0.4, -0.2]));
+        let chunk = processor.process(audio_chunk(vec![0.4, -0.2])).unwrap();
 
         assert_eq!(chunk.samples, vec![0.2, -0.1]);
         let status = status.snapshot();
@@ -2729,7 +3003,7 @@ mod tests {
         let config = ClocklessAudioProcessing::with_vst3(0.5, processor_handle, 0, None);
         let status = config.vst3_status();
         let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
-        let chunk = processor.process(audio_chunk(vec![0.4, -0.2]));
+        let chunk = processor.process(audio_chunk(vec![0.4, -0.2])).unwrap();
 
         assert_eq!(chunk.samples, vec![0.2, -0.1]);
         assert_eq!(host.reset_count.load(Ordering::Acquire), 0);
@@ -2780,7 +3054,7 @@ mod tests {
         );
         let status = config.vst3_status();
         let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
-        let failed_chunk = processor.process(audio_chunk(vec![0.4, -0.2]));
+        let failed_chunk = processor.process(audio_chunk(vec![0.4, -0.2])).unwrap();
         assert_eq!(user.inputs.lock().unwrap().as_slice(), &[vec![0.2, -0.1]]);
         assert_eq!(effect.inputs.lock().unwrap().as_slice(), &[vec![0.4, -0.2]]);
         assert_eq!(
@@ -2843,7 +3117,7 @@ mod tests {
         );
         let status = config.vst3_status();
         let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
-        let chunk = processor.process(audio_chunk(vec![0.2, -0.2]));
+        let chunk = processor.process(audio_chunk(vec![0.2, -0.2])).unwrap();
         assert_eq!(user.inputs.lock().unwrap().len(), 1);
         assert!(effect.inputs.lock().unwrap().is_empty());
         assert!(chunk.pdc_latency_secs_at_process >= 1.5);
