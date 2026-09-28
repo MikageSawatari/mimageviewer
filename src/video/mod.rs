@@ -9260,13 +9260,13 @@ impl VideoPlayer {
 
     #[cfg(windows)]
     fn begin_dsp_acquisition(&self, requested_position: LocalDspPosition) -> bool {
-        let Some(audio) = self
-            .audio
-            .as_ref()
-            .filter(|audio| audio.has_applicable_dsp())
-        else {
+        let Some(audio) = self.audio.as_ref() else {
             return false;
         };
+        if !audio.has_applicable_dsp() {
+            audio.note_dsp_acquisition_not_started();
+            return false;
+        }
         if audio.has_dsp_token() {
             return false;
         }
@@ -9304,6 +9304,7 @@ impl VideoPlayer {
             return true;
         }
         let Some(handoff) = audio.request_dsp_handoff(Arc::clone(&self.ui_wake)) else {
+            audio.note_dsp_acquisition_not_started();
             self.seek_with_play_state(position_secs, false);
             self.engine
                 .lock()
@@ -9315,6 +9316,7 @@ impl VideoPlayer {
             handoff,
             requested_position,
         });
+        audio.note_dsp_acquisition_started();
         true
     }
 
@@ -9350,7 +9352,21 @@ impl VideoPlayer {
             }
         };
         if let Some(position) = requested_position {
-            self.begin_dsp_acquisition(position);
+            if !self.begin_dsp_acquisition(position) {
+                // Pausing for metadata cleared autoplay intent. A failed acquisition
+                // must restore that intent and the requested position for dry playback.
+                self.seek_with_play_state(position.resolve(self.position()), false);
+                if self
+                    .audio
+                    .as_ref()
+                    .is_none_or(|audio| audio.local_dry_resume_allowed())
+                {
+                    self.engine
+                        .lock()
+                        .unwrap()
+                        .apply_command(engine::actor::TransportCommand::Play);
+                }
+            }
         }
     }
 
@@ -10923,12 +10939,13 @@ impl VideoPlayer {
         #[cfg(windows)]
         self.poll_dsp_acquisition();
         #[cfg(windows)]
-        if self.intent_playing()
-            && self
-                .audio
-                .as_ref()
-                .is_some_and(|audio| audio.newly_applicable_dsp())
-        {
+        #[cfg(windows)]
+        let newly_applicable = self
+            .audio
+            .as_ref()
+            .is_some_and(|audio| audio.newly_applicable_dsp());
+        #[cfg(windows)]
+        if self.intent_playing() && newly_applicable {
             self.begin_dsp_acquisition(LocalDspPosition::CurrentAfterMetadata);
         }
 
@@ -12082,6 +12099,85 @@ mod tests {
             assert!((player.position() - expected).abs() < 0.001);
             assert!(player.current_seek_serial() >= 1);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn metadata_stage_failure_restores_requested_dry_autoplay() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("metadata-stage-failure.mp4"),
+        );
+        let info = player.info.take().unwrap();
+        let (info_tx, info_rx) = crossbeam_channel::bounded(1);
+        player.decode.info_rx = info_rx;
+        player.pending_resume_secs = Some(12.0);
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
+            },
+            true,
+        ));
+        player.set_playing(true);
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::AwaitingMetadata(_)
+        ));
+        assert!(
+            !player.intent_playing(),
+            "handoff pause clears autoplay intent"
+        );
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_dsp_applicable_for_test(false);
+        info_tx.send(Ok(info)).unwrap();
+        let ctx = egui::Context::default();
+        player.tick(&ctx);
+        player.tick(&ctx);
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Idle
+        ));
+        assert!(player.intent_playing(), "dry autoplay must be restored");
+        assert!((player.position() - 12.0).abs() < 0.001);
+        assert!(player.current_seek_serial() > 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn applicability_flicker_before_reservation_does_not_lose_acquisition() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("applicability-flicker.mp4"),
+        );
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
+            },
+            false,
+        ));
+        player.set_playing(true);
+        let audio = player.audio.as_ref().unwrap();
+        audio.set_dsp_applicable_for_test(true);
+        assert!(audio.newly_applicable_dsp());
+        audio.set_dsp_applicable_for_test(false);
+        assert!(!player.begin_dsp_acquisition(super::LocalDspPosition::CurrentAfterMetadata));
+        audio.set_dsp_applicable_for_test(true);
+        player.tick(&egui::Context::default());
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Waiting(_)
+        ));
     }
 
     #[cfg(windows)]

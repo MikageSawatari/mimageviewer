@@ -1,5 +1,6 @@
 //! Exclusive, block-scoped ownership of the two application DSP bridges.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -25,7 +26,8 @@ pub enum HandoffWaitError {
 #[derive(Default)]
 struct State {
     next_request: u64,
-    ownership_version: u64,
+    // A dry block is invalidated only by a transition for its own pump.
+    local_reservations: HashMap<u64, u64>,
     desired: Option<DspRequest>,
     granted: Option<DspRequest>,
     in_flight: usize,
@@ -41,6 +43,12 @@ pub struct DspProcessingCoordinator {
 }
 
 impl DspProcessingCoordinator {
+    #[cfg(test)]
+    pub(crate) fn with_state_lock_for_test(&self, f: impl FnOnce()) {
+        let _state = self.state.lock().unwrap();
+        f();
+    }
+
     /// Reservation only changes memory. The old block may finish under its existing permit.
     pub fn reserve(&self, owner: DspOwner) -> Option<DspRequest> {
         let mut state = self.state.lock().unwrap();
@@ -48,11 +56,14 @@ impl DspProcessingCoordinator {
             return None;
         }
         state.next_request = state.next_request.saturating_add(1);
-        state.ownership_version = state.ownership_version.wrapping_add(1);
         let request = DspRequest {
             owner,
             number: state.next_request,
         };
+        if let DspOwner::Local { pump_instance, .. } = owner {
+            let generation = state.local_reservations.entry(pump_instance).or_default();
+            *generation = generation.wrapping_add(1);
+        }
         state.desired = Some(request);
         state.granted = None;
         self.changed.notify_all();
@@ -63,7 +74,6 @@ impl DspProcessingCoordinator {
     pub fn revoke(&self) {
         let mut state = self.state.lock().unwrap();
         state.next_request = state.next_request.saturating_add(1);
-        state.ownership_version = state.ownership_version.wrapping_add(1);
         state.desired = None;
         state.granted = None;
         self.changed.notify_all();
@@ -71,7 +81,6 @@ impl DspProcessingCoordinator {
 
     pub fn cancel(&self, request: DspRequest) {
         let mut state = self.state.lock().unwrap();
-        let old = (state.desired, state.granted, state.remote_owner);
         if state.desired == Some(request) {
             state.desired = None;
         }
@@ -81,15 +90,11 @@ impl DspProcessingCoordinator {
         if state.remote_owner == Some(request) {
             state.remote_owner = None;
         }
-        if old != (state.desired, state.granted, state.remote_owner) {
-            state.ownership_version = state.ownership_version.wrapping_add(1);
-        }
         self.changed.notify_all();
     }
 
     pub fn revoke_local(&self, pump_instance: u64) {
         let mut state = self.state.lock().unwrap();
-        let old = (state.desired, state.granted);
         let belongs_to_pump = |request: DspRequest| matches!(request.owner, DspOwner::Local { pump_instance: id, .. } if id == pump_instance);
         if state.desired.is_some_and(belongs_to_pump) {
             state.desired = None;
@@ -97,10 +102,18 @@ impl DspProcessingCoordinator {
         if state.granted.is_some_and(belongs_to_pump) {
             state.granted = None;
         }
-        if old != (state.desired, state.granted) {
-            state.ownership_version = state.ownership_version.wrapping_add(1);
-        }
+        let generation = state.local_reservations.entry(pump_instance).or_default();
+        *generation = generation.wrapping_add(1);
         self.changed.notify_all();
+    }
+
+    /// The pump has terminated, so no dry-block ticket can still commit.
+    pub fn retire_local(&self, pump_instance: u64) {
+        self.state
+            .lock()
+            .unwrap()
+            .local_reservations
+            .remove(&pump_instance);
     }
 
     pub fn is_acquiring_local(&self, pump_instance: u64) -> bool {
@@ -159,7 +172,7 @@ impl DspProcessingCoordinator {
         }
         LocalBlockMode::Dry(DspDryBlock {
             coordinator: Arc::clone(self),
-            ownership_version: state.ownership_version,
+            own_reservation: state.local_reservations.get(&pump_instance).copied(),
             pump_instance,
         })
     }
@@ -212,7 +225,6 @@ impl DspProcessingCoordinator {
             if remaining.is_zero() {
                 if state.desired == Some(request) {
                     state.desired = None;
-                    state.ownership_version = state.ownership_version.wrapping_add(1);
                 }
                 self.changed.notify_all();
                 return Err(HandoffWaitError::TimedOut);
@@ -227,7 +239,6 @@ impl DspProcessingCoordinator {
         let mut state = self.state.lock().unwrap();
         state.exiting = true;
         state.next_request = state.next_request.saturating_add(1);
-        state.ownership_version = state.ownership_version.wrapping_add(1);
         state.desired = None;
         state.granted = None;
         self.changed.notify_all();
@@ -251,7 +262,7 @@ pub enum LocalBlockMode {
 
 pub struct DspDryBlock {
     coordinator: Arc<DspProcessingCoordinator>,
-    ownership_version: u64,
+    own_reservation: Option<u64>,
     pump_instance: u64,
 }
 
@@ -259,7 +270,9 @@ impl DspDryBlock {
     /// Serialize the queue push with grant/revoke without holding the lock during DSP work.
     pub fn commit_if_current(&self, commit: impl FnOnce() -> bool) -> bool {
         let state = self.coordinator.state.lock().unwrap();
-        if state.exiting || state.ownership_version != self.ownership_version {
+        if state.exiting
+            || state.local_reservations.get(&self.pump_instance).copied() != self.own_reservation
+        {
             return false;
         }
         if matches!(state.desired, Some(DspRequest { owner: DspOwner::Local { pump_instance, .. }, .. }) if pump_instance == self.pump_instance)
@@ -298,7 +311,6 @@ impl DspHandoff {
             return false;
         }
         state.granted = Some(self.request);
-        state.ownership_version = state.ownership_version.wrapping_add(1);
         if matches!(self.request.owner, DspOwner::Remote { .. }) {
             state.remote_owner = Some(self.request);
         }
@@ -437,6 +449,24 @@ mod tests {
         assert!(handoff.grant());
         assert!(!coordinator.is_acquiring_local(2));
         assert!(coordinator.local_permit(2).is_some());
+    }
+
+    #[test]
+    fn dry_ticket_stays_invalid_after_own_reserve_and_revoke() {
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let LocalBlockMode::Dry(dry) = coordinator.local_block_mode(1) else {
+            panic!("pump starts dry");
+        };
+        let request = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 1,
+                epoch: 1,
+            })
+            .unwrap();
+        coordinator.cancel(request);
+        coordinator.revoke_local(1);
+        assert!(!dry.commit_if_current(|| true));
+        coordinator.retire_local(1);
     }
 
     #[test]

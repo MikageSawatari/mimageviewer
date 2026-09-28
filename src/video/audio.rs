@@ -37,6 +37,8 @@ struct LocalDspControl {
     pump_instance: u64,
     epoch: AtomicU64,
     chain: AudioDspChain,
+    // The ordinary no-stage pump reads only this atomic per block.
+    dsp_armed: AtomicBool,
     applicable_seen: AtomicBool,
     #[cfg(test)]
     test_applicable: AtomicBool,
@@ -175,7 +177,8 @@ impl AudioOutput {
             pump_instance: NEXT_LOCAL_DSP_PUMP.fetch_add(1, Ordering::Relaxed),
             epoch: AtomicU64::new(0),
             chain,
-            applicable_seen: AtomicBool::new(applicable),
+            dsp_armed: AtomicBool::new(false),
+            applicable_seen: AtomicBool::new(false),
             test_applicable: AtomicBool::new(applicable),
             before_dry_commit: None,
         }));
@@ -202,9 +205,31 @@ impl AudioOutput {
     pub(crate) fn newly_applicable_dsp(&self) -> bool {
         self.dsp_control.as_ref().is_some_and(|control| {
             let applicable = control.has_applicable_stage();
-            let previous = control.applicable_seen.swap(applicable, Ordering::AcqRel);
-            applicable && !previous
+            if !applicable {
+                control.applicable_seen.store(false, Ordering::Release);
+                if control.dsp_armed.swap(false, Ordering::AcqRel) {
+                    control
+                        .chain
+                        .coordinator
+                        .revoke_local(control.pump_instance);
+                }
+            }
+            applicable && !control.applicable_seen.load(Ordering::Acquire)
         })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn note_dsp_acquisition_started(&self) {
+        if let Some(control) = self.dsp_control.as_ref() {
+            control.applicable_seen.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn note_dsp_acquisition_not_started(&self) {
+        if let Some(control) = self.dsp_control.as_ref() {
+            control.applicable_seen.store(false, Ordering::Release);
+        }
     }
 
     #[cfg(windows)]
@@ -218,12 +243,20 @@ impl AudioOutput {
     }
 
     #[cfg(windows)]
+    pub(crate) fn local_dry_resume_allowed(&self) -> bool {
+        self.dsp_control
+            .as_ref()
+            .is_none_or(|control| control.chain.coordinator.local_dry_resume_allowed())
+    }
+
+    #[cfg(windows)]
     pub(crate) fn request_dsp_handoff(
         &self,
         ui_wake: Arc<super::VideoUiWake>,
     ) -> Option<LocalDspHandoff> {
         use crate::video::dsp::coordinator::{DspOwner, HandoffWaitError};
         let control = self.dsp_control.as_ref()?.clone();
+        control.dsp_armed.store(true, Ordering::Release);
         let epoch = control.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let coordinator = Arc::clone(&control.chain.coordinator);
         let request = coordinator.reserve(DspOwner::Local {
@@ -509,10 +542,21 @@ impl Drop for AudioOutput {
         //    付け替え、Drop は即時返す。万一 pump が exit しなくても thread は単に
         //    残るだけで UI には影響しない。
         if let Some(p) = self.pump.take() {
+            #[cfg(windows)]
+            let retirement = self.dsp_control.as_ref().map(|control| {
+                (
+                    Arc::clone(&control.chain.coordinator),
+                    control.pump_instance,
+                )
+            });
             let _ = std::thread::Builder::new()
                 .name("audio-output-drop-join".to_string())
                 .spawn(move || {
                     let _ = p.join();
+                    #[cfg(windows)]
+                    if let Some((coordinator, pump_instance)) = retirement {
+                        coordinator.retire_local(pump_instance);
+                    }
                 });
         }
     }
@@ -1171,12 +1215,12 @@ pub(crate) fn start(
     let pump_diagnostics = Arc::clone(&diagnostics);
     #[cfg(windows)]
     let dsp_control = dsp_chain.as_ref().map(|chain| {
-        let applicable = chain.has_applicable_stage();
         Arc::new(LocalDspControl {
             pump_instance: NEXT_LOCAL_DSP_PUMP.fetch_add(1, Ordering::Relaxed),
             epoch: AtomicU64::new(0),
             chain: chain.clone(),
-            applicable_seen: AtomicBool::new(applicable),
+            dsp_armed: AtomicBool::new(false),
+            applicable_seen: AtomicBool::new(false),
             #[cfg(test)]
             test_applicable: AtomicBool::new(false),
             #[cfg(test)]
@@ -1580,12 +1624,15 @@ fn run_pump(
                 && (!seen_valid_audio_frame || frame_seek_serial > last_seen_seek_serial);
             if should_reset_plugins {
                 #[cfg(windows)]
-                let _reset_permit = dsp_control.as_ref().and_then(|control| {
-                    control
-                        .chain
-                        .coordinator
-                        .local_permit(control.pump_instance)
-                });
+                let _reset_permit = dsp_control
+                    .as_ref()
+                    .filter(|control| control.dsp_armed.load(Ordering::Acquire))
+                    .and_then(|control| {
+                        control
+                            .chain
+                            .coordinator
+                            .local_permit(control.pump_instance)
+                    });
                 #[cfg(windows)]
                 if let Some(b) = &dsp_bridge {
                     // T20 (Claude R3-3): cancel check を `reset_plugins_sync` 前に挟む。
@@ -1843,12 +1890,15 @@ fn run_pump(
         // 3. lock → seek_serial check → push processed → unlock
         loop {
             #[cfg(windows)]
-            let block_mode = dsp_control.as_ref().map(|control| {
-                control
-                    .chain
-                    .coordinator
-                    .local_block_mode(control.pump_instance)
-            });
+            let block_mode = dsp_control
+                .as_ref()
+                .filter(|control| control.dsp_armed.load(Ordering::Acquire))
+                .map(|control| {
+                    control
+                        .chain
+                        .coordinator
+                        .local_block_mode(control.pump_instance)
+                });
             #[cfg(windows)]
             if matches!(
                 block_mode.as_ref(),
@@ -2717,12 +2767,15 @@ fn run_pump(
     // (= 動画切替 / Drop) では即 exit したいので skip。
     #[cfg(windows)]
     if !cancel.load(Ordering::Acquire)
-        && let Some(_flush_permit) = dsp_control.as_ref().and_then(|control| {
-            control
-                .chain
-                .coordinator
-                .local_permit(control.pump_instance)
-        })
+        && let Some(_flush_permit) = dsp_control
+            .as_ref()
+            .filter(|control| control.dsp_armed.load(Ordering::Acquire))
+            .and_then(|control| {
+                control
+                    .chain
+                    .coordinator
+                    .local_permit(control.pump_instance)
+            })
     {
         if let Some(b) = &dsp_bridge {
             if b.is_enabled() && b.active_slot_count() > 0 {
@@ -3137,6 +3190,7 @@ mod tests {
             pump_instance: 81,
             epoch: AtomicU64::new(0),
             chain: chain.clone(),
+            dsp_armed: AtomicBool::new(true),
             applicable_seen: AtomicBool::new(false),
             test_applicable: AtomicBool::new(false),
             before_dry_commit: Some(Arc::new(move || {
@@ -3208,6 +3262,201 @@ mod tests {
         let _ = shutdown_tx.send(());
         pump.join().unwrap();
         assert!(buffer.lock().unwrap().processed.is_empty());
+    }
+
+    #[cfg(windows)]
+    fn test_chain(
+        coordinator: Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
+    ) -> AudioDspChain {
+        AudioDspChain {
+            user: None,
+            effetune: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+            coordinator,
+        }
+    }
+
+    #[cfg(windows)]
+    fn start_test_pump(
+        chain: AudioDspChain,
+        control: Arc<LocalDspControl>,
+    ) -> (
+        Sender<AudioFrame>,
+        Sender<()>,
+        Arc<AtomicBool>,
+        Arc<Mutex<AudioBuffer>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let buffer = make_buffer(48_000);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(2);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (event_tx, _event_rx) = bounded(8);
+        let event_tx = crate::video::EngineEventSender::new(
+            event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let pump_buffer = Arc::clone(&buffer);
+        let pump_cancel = Arc::clone(&cancel);
+        let pump = std::thread::spawn(move || {
+            run_pump(
+                audio_rx,
+                shutdown_rx,
+                pump_buffer,
+                pump_cancel,
+                make_clock(),
+                event_tx,
+                playing_state(),
+                make_diag(),
+                tap_rx,
+                Some(chain),
+                Some(control),
+            );
+        });
+        (audio_tx, shutdown_tx, cancel, buffer, pump)
+    }
+
+    #[cfg(windows)]
+    fn send_test_frame(tx: &Sender<AudioFrame>, pts_secs: f64) {
+        tx.send(AudioFrame {
+            samples: vec![0.25; 1_920],
+            pts_secs,
+            seek_serial: 0,
+            duration_secs: 0.02,
+            queued_wall_secs: 0.02,
+            audio_tx_accounting_epoch: 0,
+            seek_target_secs: Some(0.0),
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    fn processed_reaches(buffer: &Arc<Mutex<AudioBuffer>>, count: usize) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if buffer.lock().unwrap().processed.len() >= count {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        false
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn other_playing_pump_grant_preserves_dry_pump_commit() {
+        use crate::video::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let chain = test_chain(Arc::clone(&coordinator));
+        let (at_commit_tx, at_commit_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let dry_control = Arc::new(LocalDspControl {
+            pump_instance: 91,
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            dsp_armed: AtomicBool::new(true),
+            applicable_seen: AtomicBool::new(false),
+            test_applicable: AtomicBool::new(false),
+            before_dry_commit: Some(Arc::new(move || {
+                at_commit_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })),
+        });
+        let (dry_tx, dry_shutdown, dry_cancel, dry_buffer, dry_pump) =
+            start_test_pump(chain.clone(), dry_control);
+        send_test_frame(&dry_tx, 0.0);
+        at_commit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("dry pump must reach commit");
+
+        let owner_control = Arc::new(LocalDspControl {
+            pump_instance: 92,
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            dsp_armed: AtomicBool::new(true),
+            applicable_seen: AtomicBool::new(true),
+            test_applicable: AtomicBool::new(true),
+            before_dry_commit: None,
+        });
+        let (owner_tx, owner_shutdown, owner_cancel, owner_buffer, owner_pump) =
+            start_test_pump(chain, owner_control);
+        let request = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 92,
+                epoch: 1,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(
+                    request,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+                .grant()
+        );
+        send_test_frame(&owner_tx, 0.0);
+        let owner_committed = processed_reaches(&owner_buffer, 1);
+        release_tx.send(()).unwrap();
+        let dry_committed = processed_reaches(&dry_buffer, 1);
+        dry_cancel.store(true, Ordering::Release);
+        owner_cancel.store(true, Ordering::Release);
+        let _ = dry_shutdown.send(());
+        let _ = owner_shutdown.send(());
+        dry_pump.join().unwrap();
+        owner_pump.join().unwrap();
+        assert!(
+            owner_committed,
+            "new owner's playing pump must emit DSP audio"
+        );
+        assert!(
+            dry_committed,
+            "unrelated dry pump must retain its audible block"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_stage_pump_uses_only_atomic_gate_while_coordinator_lock_is_held() {
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let chain = test_chain(Arc::clone(&coordinator));
+        let control = Arc::new(LocalDspControl {
+            pump_instance: 93,
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            dsp_armed: AtomicBool::new(false),
+            applicable_seen: AtomicBool::new(false),
+            test_applicable: AtomicBool::new(false),
+            before_dry_commit: None,
+        });
+        let (audio_tx, shutdown_tx, cancel, buffer, pump) = start_test_pump(chain, control);
+        send_test_frame(&audio_tx, 0.0);
+        assert!(processed_reaches(&buffer, 1));
+
+        let (locked_tx, locked_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let holder = std::thread::spawn(move || {
+            coordinator.with_state_lock_for_test(|| {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        locked_rx.recv().unwrap();
+        send_test_frame(&audio_tx, 0.02);
+        let committed_while_locked = processed_reaches(&buffer, 2);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        pump.join().unwrap();
+        assert!(
+            committed_while_locked,
+            "no-stage pump must not take the coordinator lock"
+        );
     }
 
     fn make_clock() -> Arc<AvClock> {
