@@ -7,7 +7,7 @@ let collection_surface = "Collection(" + collection_id + ")";
 let rating_surface = "Rating { stars: 1 }";
 
 // Rating rows keep the rating store's normalized key (lowercase, '/'), so names and paths reached
-// through the Rating view are lowercase (released behavior, backlog 1.297). This
+// through the Rating view are lowercase (released behavior, backlog 1.298). This
 // smoke checks history, not casing, so every comparison ignores case.
 fn lower_names(names) { names.map(|n| n.to_lower()) }
 fn norm_path(p) { let x = p.to_lower(); x.replace("/", "\\"); x }
