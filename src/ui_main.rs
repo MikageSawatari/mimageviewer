@@ -3738,7 +3738,7 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
     use crate::settings::ToolbarSectionId as TS;
     match section {
         TS::FolderTree => "ツリー",
-        TS::EffeTune => "EffeTune",
+        TS::EffeTune => "音響調整",
         TS::Bookshelf => "本棚",
         TS::Collections => "コレクション",
         TS::Cols => "列",
@@ -9576,7 +9576,7 @@ impl App {
                         let resp = ui
                             .add_enabled(
                                 available,
-                                egui::Button::selectable(active, "EffeTune").sense(
+                                egui::Button::selectable(active, "音響調整").sense(
                                     if drag_enabled {
                                         egui::Sense::click_and_drag()
                                     } else {
@@ -10857,7 +10857,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .checkbox(&mut s.show_toolbar_folder_tree_button, "ツリー")
             .changed();
         changed |= ui
-            .checkbox(&mut s.show_toolbar_effetune, "EffeTune")
+            .checkbox(&mut s.show_toolbar_effetune, "音響調整")
             .changed();
         changed |= ui.checkbox(&mut s.show_toolbar_bookshelf, "本棚").changed();
         changed |= ui

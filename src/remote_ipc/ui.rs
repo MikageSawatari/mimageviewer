@@ -1144,7 +1144,7 @@ impl crate::app::App {
                         Ok(source) => source,
                         Err(error) => {
                             return config.with_effetune_warning(format!(
-                                "EffeTune の状態取得を準備できませんでした: {error}"
+                                "音響調整の設定を取得できませんでした: {error}"
                             ));
                         }
                     };
@@ -1156,7 +1156,7 @@ impl crate::app::App {
                     );
                 } else {
                     config = config.with_effetune_warning(
-                        "EffeTune の bundle を見つけられませんでした。".into(),
+                        "音響調整に必要なファイルが見つかりませんでした。".into(),
                     );
                 }
             }

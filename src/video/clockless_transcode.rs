@@ -184,7 +184,7 @@ impl ClocklessVstStatus {
                 warnings.push(format!("ユーザー VST: {warning}"));
             }
             if let Some(warning) = effetune.warning {
-                warnings.push(format!("EffeTune: {warning}"));
+                warnings.push(format!("音響調整: {warning}"));
             }
             return ClocklessVstStatusSnapshot {
                 requested: user.requested || effetune.requested,
@@ -388,51 +388,47 @@ impl RemoteEffeTuneProcessor {
                     warning: Some(reason),
                 };
                 if Instant::now() >= self.load_deadline {
-                    return fail("EffeTune の最新の設定を取得する時間がありませんでした。".into());
+                    return fail("最新の設定を取得する時間がありませんでした。".into());
                 }
                 let capture = match self.capture_source.request() {
                     Ok(capture) => capture,
                     Err(error) => {
-                        return fail(format!(
-                            "EffeTune の状態取得を開始できませんでした: {error}"
-                        ));
+                        return fail(format!("最新の設定を取得できませんでした: {error}"));
                     }
                 };
                 let Some(remaining) = self.load_deadline.checked_duration_since(Instant::now())
                 else {
-                    return fail("EffeTune の最新の設定を取得する時間がありませんでした。".into());
+                    return fail("最新の設定を取得する時間がありませんでした。".into());
                 };
                 let bytes = match capture.recv_timeout(remaining) {
                     Ok(Ok(bytes)) => bytes,
                     Ok(Err(error)) => {
-                        return fail(format!(
-                            "EffeTune の最新の設定を取得できませんでした: {error}"
-                        ));
+                        return fail(format!("最新の設定を取得できませんでした: {error}"));
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         return fail(format!(
-                            "EffeTune の最新の設定を取得できませんでした: {}",
+                            "最新の設定を取得できませんでした: {}",
                             crate::effetune::CaptureError::CallerDeadline
                         ));
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        return fail("EffeTune の状態取得 worker が切断されました。".into());
+                        return fail("設定の取得が中断されました。".into());
                     }
                 };
                 if let crate::effetune::EffectiveState::Unparseable(reason) =
                     crate::effetune::EffectiveState::from_bytes(&bytes)
                 {
-                    return fail(format!("EffeTune の状態を判定できませんでした: {reason}"));
+                    return fail(format!("設定を判定できませんでした: {reason}"));
                 }
                 if Instant::now() >= self.load_deadline {
-                    return fail("EffeTune の読み込み時間がありませんでした。".into());
+                    return fail("読み込む時間がありませんでした。".into());
                 }
                 if let Err(error) = self.bridge.enable() {
-                    return fail(format!("EffeTune ホストを開始できませんでした: {error}"));
+                    return fail(format!("処理を開始できませんでした: {error}"));
                 }
                 let Some(remaining) = self.load_deadline.checked_duration_since(Instant::now())
                 else {
-                    return fail("EffeTune の読み込み時間がありませんでした。".into());
+                    return fail("読み込む時間がありませんでした。".into());
                 };
                 use base64::Engine;
                 let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
@@ -447,16 +443,16 @@ impl RemoteEffeTuneProcessor {
                     None,
                     remaining,
                 ) {
-                    return fail(format!("EffeTune の状態を復元できませんでした: {error}"));
+                    return fail(format!("設定を復元できませんでした: {error}"));
                 }
                 if Instant::now() >= self.load_deadline {
-                    return fail("EffeTune の読み込み期限が切れました。".into());
+                    return fail("読み込みの期限が切れました。".into());
                 }
                 if let Err(error) = self.bridge.try_reset_plugins_before(self.load_deadline) {
-                    return fail(format!("EffeTune の reset に失敗しました: {error}"));
+                    return fail(format!("初期化に失敗しました: {error}"));
                 }
                 if Instant::now() >= self.load_deadline {
-                    return fail("EffeTune の読み込み期限が切れました。".into());
+                    return fail("読み込みの期限が切れました。".into());
                 }
                 ClocklessVstPrepareResult {
                     active_slots: 1,
@@ -2794,7 +2790,7 @@ mod tests {
         let snapshot = status.snapshot();
         assert!(snapshot.active);
         assert_eq!(snapshot.active_slots, 1);
-        assert!(snapshot.warning.unwrap().contains("EffeTune"));
+        assert!(snapshot.warning.unwrap().contains("音響調整"));
     }
 
     #[test]
@@ -2879,7 +2875,7 @@ mod tests {
         let snapshot = status.snapshot();
         assert!(snapshot.active);
         assert_eq!(snapshot.active_slots, 1);
-        assert!(snapshot.warning.unwrap().contains("EffeTune"));
+        assert!(snapshot.warning.unwrap().contains("音響調整"));
     }
 
     #[cfg(windows)]
@@ -2941,7 +2937,7 @@ mod tests {
         assert_eq!(process_calls.load(Ordering::Acquire), 1);
         assert!(capture_saw_prepared.load(Ordering::Acquire));
         assert!(status.snapshot().active);
-        assert!(status.snapshot().warning.unwrap().contains("EffeTune"));
+        assert!(status.snapshot().warning.unwrap().contains("音響調整"));
     }
 
     #[test]

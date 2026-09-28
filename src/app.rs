@@ -23519,26 +23519,26 @@ impl App {
         use crate::effetune::{EffectiveState, EffetuneRuntime, UnavailableReason};
         match &self.effetune.runtime {
             EffetuneRuntime::Unavailable(UnavailableReason::BundleMissing(reason)) => {
-                format!("EffeTune を利用できません: bundle が見つかりません\n{reason}")
+                format!("音響調整を利用できません: 必要なファイルが見つかりません\n{reason}")
             }
             EffetuneRuntime::Unavailable(UnavailableReason::CpuUnsupported) => {
-                "EffeTune を利用できません: CPU に AVX2 と FMA が必要です".into()
+                "音響調整を利用できません: CPU が AVX2 と FMA に対応している必要があります".into()
             }
-            EffetuneRuntime::Unavailable(_) => "EffeTune を利用できません".into(),
-            EffetuneRuntime::Idle => "EffeTune を起動".into(),
-            EffetuneRuntime::Loading { .. } => "EffeTune を読み込み中…".into(),
-            EffetuneRuntime::Failed(reason) => format!("EffeTune は停止しました: {reason:?}"),
+            EffetuneRuntime::Unavailable(_) => "音響調整を利用できません".into(),
+            EffetuneRuntime::Idle => "音響調整を開く".into(),
+            EffetuneRuntime::Loading { .. } => "音響調整を読み込み中…".into(),
+            EffetuneRuntime::Failed(reason) => format!("音響調整は停止しました: {reason:?}"),
             EffetuneRuntime::Running { .. } => match self.effetune.effective_state() {
                 Some(EffectiveState::Effective) => {
-                    "EffeTune は有効です。表示は最後の状態取得時点の判定です".into()
+                    "音響調整は有効です (設定の窓を閉じた時点の内容で判定しています)".into()
                 }
                 Some(EffectiveState::Inert) => {
-                    "EffeTune は空または全体バイパスです。表示は最後の状態取得時点の判定です".into()
+                    "音響調整にエフェクトが無いか、全体バイパス中です (設定の窓を閉じた時点の内容で判定しています)".into()
                 }
                 Some(EffectiveState::Unparseable(reason)) => {
-                    format!("EffeTune の状態を判定できません: {reason}")
+                    format!("音響調整の設定を判定できません: {reason}")
                 }
-                None => "EffeTune の状態を取得中です".into(),
+                None => "音響調整の設定を確認中です".into(),
             },
         }
     }
