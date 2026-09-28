@@ -8,6 +8,8 @@ enum StartupOpenApplyOutcome {
     Opened,
     NotOpenable,
     Refused(FolderOpenRefusal),
+    #[cfg(windows)]
+    DetachedRefused(DetachedOpenRefusal),
 }
 
 #[cfg(test)]
@@ -413,6 +415,14 @@ impl App {
                 }
                 return;
             }
+            #[cfg(windows)]
+            StartupOpenApplyOutcome::DetachedRefused(reason) => {
+                if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner {
+                    self.cancel_bookmark_open_request(bookmark_owner.request_id, "epub_deleting");
+                }
+                self.show_feedback_toast(reason.message().to_owned());
+                return;
+            }
             StartupOpenApplyOutcome::NotOpenable => {}
         }
         if matches!(source, StartupOpenPathSource::InitialStartup) {
@@ -811,13 +821,19 @@ impl App {
                     FolderOpenOutcome::Refused(reason) => StartupOpenApplyOutcome::Refused(reason),
                 };
             }
-            if let Some(descriptor) = self.bookmark_detached_descriptor(&openable, resolution.kind)
-            {
-                return if self.continue_active_detached_book_context_from_descriptor(descriptor) {
-                    StartupOpenApplyOutcome::Opened
-                } else {
-                    StartupOpenApplyOutcome::NotOpenable
-                };
+            match self.bookmark_detached_descriptor(&openable, resolution.kind) {
+                DetachedBuild::Built(descriptor) => {
+                    return if self.continue_active_detached_book_context_from_descriptor(descriptor)
+                    {
+                        StartupOpenApplyOutcome::Opened
+                    } else {
+                        StartupOpenApplyOutcome::NotOpenable
+                    };
+                }
+                DetachedBuild::Refused(reason) => {
+                    return StartupOpenApplyOutcome::DetachedRefused(reason);
+                }
+                DetachedBuild::NotApplicable => {}
             }
             // OtherArchive without a cache remains in this same loading context.  The ordinary
             // owned loader below starts probe/conversion and carries the bookmark's window lease
@@ -853,14 +869,19 @@ impl App {
         #[cfg(windows)]
         if matches!(source, StartupOpenPathSource::Bookmark)
             && self.settings.detached_viewer_open_images_in_window
-            && let Some(opened) =
-                self.open_bookmark_book_in_detached_context(ctx, openable.clone(), resolution.kind)
         {
-            return if opened {
-                StartupOpenApplyOutcome::Opened
-            } else {
-                StartupOpenApplyOutcome::NotOpenable
-            };
+            match self.open_bookmark_book_in_detached_context(
+                ctx,
+                openable.clone(),
+                resolution.kind,
+            ) {
+                DetachedBuild::Built(true) => return StartupOpenApplyOutcome::Opened,
+                DetachedBuild::Built(false) => return StartupOpenApplyOutcome::NotOpenable,
+                DetachedBuild::Refused(reason) => {
+                    return StartupOpenApplyOutcome::DetachedRefused(reason);
+                }
+                DetachedBuild::NotApplicable => {}
+            }
         }
         #[cfg(windows)]
         if matches!(source, StartupOpenPathSource::Bookmark)
@@ -903,31 +924,31 @@ impl App {
     }
 
     /// Route a bookmark-backed book into the same independent context seam used by normal
-    /// PDF/ZIP grid opens. `None` means the container still needs the archive-conversion flow;
-    /// `Some` means this method owns the request and main must not load the container.
+    /// PDF/ZIP grid opens. An inapplicable container still needs archive conversion;
+    /// EPUB admission refusal is terminal and must not fall through to that route.
     #[cfg(windows)]
     fn bookmark_detached_descriptor(
         &mut self,
         openable: &Path,
         kind: crate::folder_tree::OpenablePathKind,
-    ) -> Option<ViewerContextDescriptor> {
-        let pending = self
+    ) -> DetachedBuild<ViewerContextDescriptor> {
+        let Some(pending) = self
             .bookmark_open_pending
             .as_ref()
-            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)?;
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)
+        else {
+            return DetachedBuild::NotApplicable;
+        };
         match pending.bookmark.container_kind {
             crate::book_bookmarks::BookContainerKind::Pdf
                 if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
             {
-                Some(ViewerContextDescriptor::Pdf {
-                    path: crate::pdf_loader::LeasedEpubPath::try_new(openable.to_path_buf())?,
-                    page_num: None,
-                })
+                Self::detached_pdf_descriptor(openable, None)
             }
             crate::book_bookmarks::BookContainerKind::Zip
                 if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
             {
-                Some(ViewerContextDescriptor::Zip {
+                DetachedBuild::Built(ViewerContextDescriptor::Zip {
                     path: openable.to_path_buf(),
                     entry_name: None,
                     archive_source_override: None,
@@ -937,20 +958,22 @@ impl App {
             | crate::book_bookmarks::BookContainerKind::ImageFolder
                 if matches!(kind, crate::folder_tree::OpenablePathKind::Directory) =>
             {
-                Some(ViewerContextDescriptor::BookFolder {
+                DetachedBuild::Built(ViewerContextDescriptor::BookFolder {
                     path: openable.to_path_buf(),
                 })
             }
             crate::book_bookmarks::BookContainerKind::OtherArchive => {
                 let source = pending.bookmark.container_path.clone();
-                let cached = self.try_archive_cache_lookup(&source)?;
-                Some(ViewerContextDescriptor::Zip {
+                let Some(cached) = self.try_archive_cache_lookup(&source) else {
+                    return DetachedBuild::NotApplicable;
+                };
+                DetachedBuild::Built(ViewerContextDescriptor::Zip {
                     path: cached,
                     entry_name: None,
                     archive_source_override: Some(source),
                 })
             }
-            _ => None,
+            _ => DetachedBuild::NotApplicable,
         }
     }
 
@@ -960,11 +983,14 @@ impl App {
         ctx: &egui::Context,
         openable: PathBuf,
         kind: crate::folder_tree::OpenablePathKind,
-    ) -> Option<bool> {
-        let pending = self
+    ) -> DetachedBuild<bool> {
+        let Some(pending) = self
             .bookmark_open_pending
             .as_ref()
-            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)?;
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)
+        else {
+            return DetachedBuild::NotApplicable;
+        };
         let target_matches = matches!(
             self.bookmark_view_state.as_ref(),
             Some(BookmarkViewState::Opening {
@@ -973,24 +999,28 @@ impl App {
             }) if crate::path_key::eq_keep_drive(path, &pending.bookmark.container_path)
         );
         if !target_matches {
-            return None;
+            return DetachedBuild::NotApplicable;
         }
 
         let request_id = pending.request_id;
-        let descriptor = self.bookmark_detached_descriptor(&openable, kind)?;
+        let descriptor = match self.bookmark_detached_descriptor(&openable, kind) {
+            DetachedBuild::Built(descriptor) => descriptor,
+            DetachedBuild::NotApplicable => return DetachedBuild::NotApplicable,
+            DetachedBuild::Refused(reason) => return DetachedBuild::Refused(reason),
+        };
         if let ViewerContextDescriptor::Pdf { path, .. } = &descriptor
             && let Some(reason) = self.pdf_open_refusal(path)
         {
             self.show_pdf_open_refusal(reason);
             self.cancel_bookmark_open_request(request_id, "epub_ignored");
-            return Some(false);
+            return DetachedBuild::Built(false);
         }
 
         let pending = match self.bookmark_open_pending.take() {
             Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending)) => pending,
             other => {
                 self.bookmark_open_pending = other;
-                return None;
+                return DetachedBuild::NotApplicable;
             }
         };
         let base_placement = self.active_detached_viewer_current_placement();
@@ -998,11 +1028,11 @@ impl App {
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             self.bookmark_open_pending =
                 Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));
-            return Some(false);
+            return DetachedBuild::Built(false);
         }
         let placement_seed = had_active_detached
             .then(|| self.offset_detached_image_window_placement(base_placement));
-        Some(self.start_active_detached_book_context(
+        DetachedBuild::Built(self.start_active_detached_book_context(
             descriptor,
             ctx,
             placement_seed,

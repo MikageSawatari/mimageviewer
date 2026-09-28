@@ -25130,7 +25130,7 @@ fn ignored_epub_bookmark_after_resolve_does_not_park_existing_window() {
             epub,
             crate::folder_tree::OpenablePathKind::File,
         ),
-        Some(false)
+        DetachedBuild::Built(false)
     );
     assert_eq!(app.active_viewer_context_id(), Some(existing_context));
     assert_eq!(app.active_detached_window_id(), existing_window);
@@ -25308,15 +25308,98 @@ fn deleting_epub_detached_open_keeps_incumbent_window_and_explains_refusal() {
     );
 
     drop(deleting);
-    let descriptor = app
-        .detached_book_context_descriptor_for_grid_idx(0)
-        .unwrap();
+    let descriptor = app.detached_grid_descriptor(0, true);
     assert!(
-        matches!(&descriptor, ViewerContextDescriptor::Pdf { path, .. } if path.has_epub_lease())
+        matches!(&descriptor, DetachedBuild::Built(ViewerContextDescriptor::Pdf { path, .. }) if path.has_epub_lease())
     );
     assert!(crate::pdf_loader::acquire_epub_delete_coverage(&epub).is_err());
     drop(descriptor);
     assert!(crate::pdf_loader::acquire_epub_delete_coverage(&epub).is_ok());
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_epub_refusal_precedes_parking_for_file_page_and_virtual_views() {
+    use crate::app::top_level_grid_view::{CollectionGridIdentity, TopLevelGridSurface};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Surface {
+        Folder,
+        Rating,
+        Collection,
+    }
+
+    for (name, page, auto_fullscreen, surface) in [
+        ("file", false, true, Surface::Folder),
+        (
+            "file_without_auto_fullscreen",
+            false,
+            false,
+            Surface::Folder,
+        ),
+        ("page", true, true, Surface::Folder),
+        ("page_without_auto_fullscreen", true, false, Surface::Folder),
+        ("rating_page", true, true, Surface::Rating),
+        ("collection_child_page", true, true, Surface::Collection),
+    ] {
+        let mut app = phase_c_support::setup_app();
+        let epub = app.tmp.path().join(format!("{name}.epub"));
+        std::fs::write(&epub, b"book").unwrap();
+        app.settings.detached_viewer_open_images_in_window = true;
+        match surface {
+            Surface::Folder => app
+                .top_level_grid_view
+                .begin(TopLevelGridSurface::Folder, None),
+            Surface::Rating => app
+                .top_level_grid_view
+                .begin(TopLevelGridSurface::Rating { stars: 5 }, None),
+            Surface::Collection => app.top_level_grid_view.begin(
+                TopLevelGridSurface::Collection(CollectionGridIdentity {
+                    collection_id: crate::collection_store::CollectionId::new(),
+                }),
+                None,
+            ),
+        };
+        let incumbent =
+            app.build_active_context_for_test(Some(9120), DetachedSource::Image, |_| {});
+        app.items = vec![if page {
+            GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 0,
+                content_type: None,
+            }
+        } else {
+            GridItem::PdfFile(epub.clone())
+        }];
+        let deleting = crate::pdf_loader::acquire_epub_delete_coverage(&epub).unwrap();
+
+        assert!(
+            matches!(
+                app.detached_grid_item_open_plan(0, auto_fullscreen),
+                DetachedBuild::Refused(DetachedOpenRefusal::EpubDeletionInProgress)
+            ),
+            "{name}: descriptor refusal"
+        );
+        assert!(
+            app.open_grid_item_in_detached_book_context_with_auto_fullscreen(
+                &egui::Context::default(),
+                0,
+                auto_fullscreen,
+            ),
+            "{name}: refusal consumes the open"
+        );
+        assert_eq!(app.active_viewer_context_id(), Some(incumbent), "{name}");
+        assert_eq!(app.active_detached_window_id(), Some(9120), "{name}");
+        assert!(app.detached_image_windows.is_empty(), "{name}");
+        assert!(app.pdf_enumerate_pending.is_none(), "{name}");
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains("EPUB の削除処理")),
+            "{name}"
+        );
+        drop(deleting);
+    }
 }
 
 #[cfg(windows)]
@@ -25374,7 +25457,7 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
             pdf.clone(),
             crate::folder_tree::OpenablePathKind::File,
         ),
-        Some(true)
+        DetachedBuild::Built(true)
     );
 
     assert!(app.items_are_bookmark_view);
@@ -25432,7 +25515,7 @@ fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
             zip.clone(),
             crate::folder_tree::OpenablePathKind::File,
         ),
-        Some(true)
+        DetachedBuild::Built(true)
     );
     assert!(app.items_are_bookmark_view);
     app.with_active_viewer_context(|active| {
@@ -25588,7 +25671,7 @@ fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() 
             folder.clone(),
             crate::folder_tree::OpenablePathKind::Directory,
         ),
-        Some(true)
+        DetachedBuild::Built(true)
     );
     assert!(app.items_are_bookmark_view);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -28701,25 +28784,25 @@ mod favorite_adjustment_defaults_tests {
         let vid_idx = app.items.len() - 1;
 
         assert!(matches!(
-            app.detached_viewer_context_descriptor_for_idx(img_idx),
-            Some(crate::app::ViewerContextDescriptor::Image { path })
+            app.detached_grid_descriptor(img_idx, false),
+            DetachedBuild::Built(crate::app::ViewerContextDescriptor::Image { path })
                 if path == PathBuf::from(r"D:\pics\a.jpg")
         ));
 
         assert!(matches!(
             app.parked_still_reopen_descriptor_for_idx(img_idx),
-            Some(crate::app::ViewerContextDescriptor::Image { path })
+            DetachedBuild::Built(crate::app::ViewerContextDescriptor::Image { path })
                 if path == PathBuf::from(r"D:\pics\a.jpg")
         ));
         // ZipImage は従来の Zip descriptor、動画はフォールバックなし。
         assert!(matches!(
             app.parked_still_reopen_descriptor_for_idx(zip_idx),
-            Some(crate::app::ViewerContextDescriptor::Zip { .. })
+            DetachedBuild::Built(crate::app::ViewerContextDescriptor::Zip { .. })
         ));
-        assert!(
-            app.parked_still_reopen_descriptor_for_idx(vid_idx)
-                .is_none()
-        );
+        assert!(matches!(
+            app.parked_still_reopen_descriptor_for_idx(vid_idx),
+            DetachedBuild::NotApplicable
+        ));
     }
 
     /// トーストの面 routing (findings-19): 発火面付きトーストは該当面にだけ表示する。
@@ -59049,7 +59132,7 @@ mod still_window_mode_key_tests {
 
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
-            Some(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate { path, .. })
+            DetachedBuild::Built(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate { path, .. })
                 if path == source
         ));
         assert!(
@@ -59546,7 +59629,10 @@ mod still_window_mode_key_tests {
         install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
         app.settings.detached_viewer_open_images_in_window = false;
 
-        assert!(app.detached_grid_item_open_plan(0, false).is_none());
+        assert!(matches!(
+            app.detached_grid_item_open_plan(0, false),
+            DetachedBuild::NotApplicable
+        ));
         assert_eq!(
             app.load_folder_or_convert_archive_with_auto_fullscreen(source.clone(), false),
             FolderOpenOutcome::Classifying
@@ -59578,7 +59664,7 @@ mod still_window_mode_key_tests {
         app.items = vec![GridItem::ZipFile(zip.clone())];
         assert!(matches!(
             app.detached_grid_item_open_plan(0, true),
-            Some(DetachedGridItemOpenPlan::Descriptor {
+            DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor {
                 descriptor: ViewerContextDescriptor::Zip {
                     path,
                     entry_name: None,
@@ -59591,7 +59677,7 @@ mod still_window_mode_key_tests {
         app.items = vec![GridItem::PdfFile(pdf.clone())];
         assert!(matches!(
             app.detached_grid_item_open_plan(0, true),
-            Some(DetachedGridItemOpenPlan::Descriptor {
+            DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor {
                 descriptor: ViewerContextDescriptor::Pdf {
                     path,
                     page_num: None,
@@ -59599,6 +59685,166 @@ mod still_window_mode_key_tests {
                 ..
             }) if path == pdf
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_plan_classifies_every_grid_item_kind_before_any_window_handoff() {
+        use crate::grid_item::{CollectionPlaceholderReason, SearchContainerKind};
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Expected {
+            Descriptor,
+            Folder,
+            Convertible,
+            NotApplicable,
+        }
+        let path = PathBuf::from(r"C:\books\sample.pdf");
+        let cases = vec![
+            (
+                "folder",
+                GridItem::Folder(path.clone()),
+                true,
+                Expected::Folder,
+            ),
+            (
+                "folder_no_auto",
+                GridItem::Folder(path.clone()),
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "image",
+                GridItem::Image(path.clone()),
+                false,
+                Expected::Descriptor,
+            ),
+            (
+                "video",
+                GridItem::Video(path.clone()),
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "audio",
+                GridItem::Audio(path.clone()),
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "zip_file",
+                GridItem::ZipFile(path.clone()),
+                true,
+                Expected::Descriptor,
+            ),
+            (
+                "zip_file_no_auto",
+                GridItem::ZipFile(path.clone()),
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "pdf_file",
+                GridItem::PdfFile(path.clone()),
+                true,
+                Expected::Descriptor,
+            ),
+            (
+                "pdf_file_no_auto",
+                GridItem::PdfFile(path.clone()),
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "convertible",
+                GridItem::ConvertibleArchive {
+                    path: path.clone(),
+                    format: ArchiveFormat::SevenZ,
+                },
+                false,
+                Expected::Convertible,
+            ),
+            (
+                "zip_image",
+                GridItem::ZipImage {
+                    zip_path: path.clone(),
+                    entry_name: "p.jpg".into(),
+                },
+                false,
+                Expected::Descriptor,
+            ),
+            (
+                "zip_dir",
+                GridItem::ZipDir {
+                    zip_path: path.clone(),
+                    dir_prefix: "pages/".into(),
+                    is_archive: false,
+                    representative: None,
+                },
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "pdf_page",
+                GridItem::PdfPage {
+                    pdf_path: path.clone(),
+                    page_num: 0,
+                    content_type: None,
+                },
+                false,
+                Expected::Descriptor,
+            ),
+            (
+                "stack",
+                GridItem::Stack {
+                    key: "sample".into(),
+                    representative: path.clone(),
+                    count: 2,
+                },
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "search_container",
+                GridItem::SearchContainer {
+                    path: path.clone(),
+                    kind: SearchContainerKind::Folder,
+                    hit_count: 1,
+                    representative: None,
+                },
+                false,
+                Expected::NotApplicable,
+            ),
+            (
+                "collection_placeholder",
+                GridItem::CollectionPlaceholder {
+                    path,
+                    last_known_kind: crate::collection_store::CollectionResolvedKind::Pdf,
+                    reason: CollectionPlaceholderReason::Missing,
+                },
+                false,
+                Expected::NotApplicable,
+            ),
+        ];
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = true;
+        for (name, item, auto_fullscreen, expected) in cases {
+            app.items = vec![item];
+            let actual = match app.detached_grid_item_open_plan(0, auto_fullscreen) {
+                DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor { .. }) => {
+                    Expected::Descriptor
+                }
+                DetachedBuild::Built(DetachedGridItemOpenPlan::FolderCandidate { .. }) => {
+                    Expected::Folder
+                }
+                DetachedBuild::Built(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
+                    ..
+                }) => Expected::Convertible,
+                DetachedBuild::NotApplicable => Expected::NotApplicable,
+                other => panic!("unexpected plan for {name}: {other:?}"),
+            };
+            assert_eq!(actual, expected, "{name}");
+        }
     }
 
     #[test]
@@ -59636,10 +59882,11 @@ mod still_window_mode_key_tests {
                 std::fs::write(&path, b"fixture").unwrap();
             }
             let expected = install_collection_item_for_detached_plan(&mut app, &path, kind);
-            let actual = match app
-                .detached_grid_item_open_plan(0, case != 3)
-                .expect("detached collection plan")
-            {
+            let plan = match app.detached_grid_item_open_plan(0, case != 3) {
+                DetachedBuild::Built(plan) => plan,
+                other => panic!("detached collection plan: {other:?}"),
+            };
+            let actual = match plan {
                 DetachedGridItemOpenPlan::FolderCandidate {
                     collection_owner, ..
                 } => {

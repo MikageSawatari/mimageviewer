@@ -3062,6 +3062,43 @@ pub(crate) enum ViewerContextDescriptor {
     Image { path: PathBuf },
 }
 
+/// A detached descriptor may be inapplicable, but EPUB delete admission is a
+/// terminal refusal. Callers must not route a refusal through the ordinary open.
+#[cfg(windows)]
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DetachedBuild<T> {
+    Built(T),
+    NotApplicable,
+    Refused(DetachedOpenRefusal),
+}
+
+#[cfg(windows)]
+impl<T> DetachedBuild<T> {
+    fn map<U>(self, build: impl FnOnce(T) -> U) -> DetachedBuild<U> {
+        match self {
+            Self::Built(value) => DetachedBuild::Built(build(value)),
+            Self::NotApplicable => DetachedBuild::NotApplicable,
+            Self::Refused(reason) => DetachedBuild::Refused(reason),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetachedOpenRefusal {
+    EpubDeletionInProgress,
+}
+
+#[cfg(windows)]
+impl DetachedOpenRefusal {
+    fn message(self) -> &'static str {
+        match self {
+            Self::EpubDeletionInProgress => "EPUB の削除処理が終わってから開いてください",
+        }
+    }
+}
+
 /// A detached book context is created only after the source ownership is known.
 ///
 /// Grid `Folder` tiles use `ScannedFolder`: the main context owns the asynchronous
@@ -22923,13 +22960,23 @@ impl App {
         if self.document_open_modal_admission_blocked() {
             return false;
         }
-        let Some(candidate_source) = crate::pdf_loader::LeasedEpubPath::try_new(path.clone())
-        else {
+        let Some(candidate_source) = crate::pdf_loader::LeasedEpubPath::try_new(path) else {
             return false;
         };
+        self.start_open_path_classification_owned(candidate_source, continuation)
+    }
+
+    fn start_open_path_classification_owned(
+        &mut self,
+        candidate_source: crate::pdf_loader::LeasedEpubPath,
+        continuation: ClassifiedOpenContinuation,
+    ) -> bool {
+        if self.document_open_modal_admission_blocked() {
+            return false;
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
-        let worker_path = path.clone();
+        let worker_path = candidate_source.to_path_buf();
         let include_convertible = !self.settings.archive_file_handling_ignores_convertible();
         let include_epub = !self.settings.epub_file_handling_ignores_epub();
         let show_hidden = self.settings.show_hidden_files;
@@ -50513,27 +50560,59 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_viewer_context_descriptor_for_idx(
+    fn detached_pdf_descriptor(
+        path: &Path,
+        page_num: Option<u32>,
+    ) -> DetachedBuild<ViewerContextDescriptor> {
+        match crate::pdf_loader::LeasedEpubPath::try_new(path.to_path_buf()) {
+            Some(path) => DetachedBuild::Built(ViewerContextDescriptor::Pdf { path, page_num }),
+            None => DetachedBuild::Refused(DetachedOpenRefusal::EpubDeletionInProgress),
+        }
+    }
+
+    /// All GridItem kinds enter this one descriptor decision. An EPUB refusal
+    /// stays distinct from a kind that the ordinary grid open should handle.
+    #[cfg(windows)]
+    fn detached_grid_descriptor(
         &self,
         idx: usize,
-    ) -> Option<ViewerContextDescriptor> {
-        match self.items.get(idx)? {
-            GridItem::Image(path) => Some(ViewerContextDescriptor::Image { path: path.clone() }),
-            GridItem::PdfPage {
+        auto_fullscreen: bool,
+    ) -> DetachedBuild<ViewerContextDescriptor> {
+        match self.items.get(idx) {
+            Some(GridItem::Image(path)) => {
+                DetachedBuild::Built(ViewerContextDescriptor::Image { path: path.clone() })
+            }
+            Some(GridItem::PdfPage {
                 pdf_path, page_num, ..
-            } => Some(ViewerContextDescriptor::Pdf {
-                path: crate::pdf_loader::LeasedEpubPath::try_new(pdf_path.clone())?,
-                page_num: Some(*page_num),
-            }),
-            GridItem::ZipImage {
+            }) => Self::detached_pdf_descriptor(pdf_path, Some(*page_num)),
+            Some(GridItem::ZipImage {
                 zip_path,
                 entry_name,
-            } => Some(ViewerContextDescriptor::Zip {
+            }) => DetachedBuild::Built(ViewerContextDescriptor::Zip {
                 path: zip_path.clone(),
                 entry_name: Some(entry_name.clone()),
                 archive_source_override: self.archive_source_override.clone(),
             }),
-            _ => None,
+            Some(GridItem::PdfFile(path)) => {
+                let descriptor = Self::detached_pdf_descriptor(path, None);
+                if auto_fullscreen {
+                    descriptor
+                } else {
+                    match descriptor {
+                        DetachedBuild::Built(_) => DetachedBuild::NotApplicable,
+                        DetachedBuild::NotApplicable => unreachable!("PDF has a descriptor"),
+                        DetachedBuild::Refused(reason) => DetachedBuild::Refused(reason),
+                    }
+                }
+            }
+            Some(GridItem::ZipFile(path)) if auto_fullscreen => {
+                DetachedBuild::Built(ViewerContextDescriptor::Zip {
+                    path: path.clone(),
+                    entry_name: None,
+                    archive_source_override: None,
+                })
+            }
+            _ => DetachedBuild::NotApplicable,
         }
     }
 
@@ -50544,27 +50623,8 @@ impl App {
     pub(crate) fn parked_still_reopen_descriptor_for_idx(
         &self,
         idx: usize,
-    ) -> Option<ViewerContextDescriptor> {
-        self.detached_viewer_context_descriptor_for_idx(idx)
-    }
-
-    #[cfg(windows)]
-    fn detached_book_context_descriptor_for_grid_idx(
-        &self,
-        idx: usize,
-    ) -> Option<ViewerContextDescriptor> {
-        match self.items.get(idx)? {
-            GridItem::PdfFile(path) => Some(ViewerContextDescriptor::Pdf {
-                path: crate::pdf_loader::LeasedEpubPath::try_new(path.clone())?,
-                page_num: None,
-            }),
-            GridItem::ZipFile(path) => Some(ViewerContextDescriptor::Zip {
-                path: path.clone(),
-                entry_name: None,
-                archive_source_override: None,
-            }),
-            _ => None,
-        }
+    ) -> DetachedBuild<ViewerContextDescriptor> {
+        self.detached_grid_descriptor(idx, false)
     }
 
     #[cfg(windows)]
@@ -54009,27 +54069,13 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_book_context_descriptor_for_grid_item(
-        &self,
-        idx: usize,
-        auto_fullscreen: bool,
-    ) -> Option<ViewerContextDescriptor> {
-        if auto_fullscreen {
-            if let Some(descriptor) = self.detached_book_context_descriptor_for_grid_idx(idx) {
-                return Some(descriptor);
-            }
-        }
-        self.detached_viewer_context_descriptor_for_idx(idx)
-    }
-
-    #[cfg(windows)]
     fn detached_grid_item_open_plan(
         &self,
         idx: usize,
         auto_fullscreen: bool,
-    ) -> Option<DetachedGridItemOpenPlan> {
+    ) -> DetachedBuild<DetachedGridItemOpenPlan> {
         if !self.settings.detached_viewer_open_images_in_window {
-            return None;
+            return DetachedBuild::NotApplicable;
         }
         if matches!(self.items.get(idx), Some(GridItem::Image(_)))
             && self
@@ -54042,28 +54088,30 @@ impl App {
                     )
                 })
         {
-            return Some(self.detached_collection_root_image_open_plan(idx).map_or(
-                DetachedGridItemOpenPlan::CollectionRootUnavailable,
-                DetachedGridItemOpenPlan::CollectionRootImage,
-            ));
+            return DetachedBuild::Built(
+                self.detached_collection_root_image_open_plan(idx).map_or(
+                    DetachedGridItemOpenPlan::CollectionRootUnavailable,
+                    DetachedGridItemOpenPlan::CollectionRootImage,
+                ),
+            );
         }
         if auto_fullscreen && let Some(GridItem::Folder(path)) = self.items.get(idx) {
             // Ctrl+G drill folders are navigation nodes, not physical book containers.
             if self.global_search.active && self.global_search.drill.is_some() {
-                return None;
+                return DetachedBuild::NotApplicable;
             }
-            return Some(DetachedGridItemOpenPlan::FolderCandidate {
+            return DetachedBuild::Built(DetachedGridItemOpenPlan::FolderCandidate {
                 path: path.clone(),
                 collection_owner: self.collection_grid_physical_load_owner(idx, path),
             });
         }
         if let Some(GridItem::ConvertibleArchive { path, .. }) = self.items.get(idx) {
-            return Some(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
+            return DetachedBuild::Built(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
                 path: path.clone(),
                 collection_restore: self.collection_grid_restore_for_source(idx, path),
             });
         }
-        self.detached_book_context_descriptor_for_grid_item(idx, auto_fullscreen)
+        self.detached_grid_descriptor(idx, auto_fullscreen)
             .map(|descriptor| {
                 let collection_restore = self
                     .items
@@ -54242,24 +54290,20 @@ impl App {
             && Self::path_needs_open_classification(path)
         {
             let path = path.to_path_buf();
-            // The detached caller treats `false` as "try the ordinary open".
-            // A deletion-owned EPUB must instead consume the request before A is parked.
             let Some(admission) = crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) else {
-                self.show_feedback_toast("EPUB の削除処理が終わってから開いてください".into());
+                self.show_feedback_toast(
+                    DetachedOpenRefusal::EpubDeletionInProgress.message().into(),
+                );
                 return true;
             };
-            // `start_open_path_classification` installs its own RAII candidate while
-            // this admission is still held, so there is no deletion gap.
-            let started = self.start_open_path_classification(
-                path,
+            return self.start_open_path_classification_owned(
+                admission,
                 ClassifiedOpenContinuation::DetachedGrid {
                     index: idx,
                     items_generation: self.items_generation,
                     auto_fullscreen,
                 },
             );
-            drop(admission);
-            return started;
         }
         self.open_grid_item_in_detached_book_context_classified(ctx, idx, auto_fullscreen, None)
     }
@@ -54280,11 +54324,17 @@ impl App {
                     path: path.to_path_buf(),
                     collection_owner: self.collection_grid_physical_load_owner(idx, path),
                 })
+                .map_or(DetachedBuild::NotApplicable, DetachedBuild::Built)
         } else {
             self.detached_grid_item_open_plan(idx, auto_fullscreen)
         };
-        let Some(plan) = plan else {
-            return false;
+        let plan = match plan {
+            DetachedBuild::Built(plan) => plan,
+            DetachedBuild::NotApplicable => return false,
+            DetachedBuild::Refused(reason) => {
+                self.show_feedback_toast(reason.message().into());
+                return true;
+            }
         };
 
         let descriptor = match plan {
@@ -55363,6 +55413,13 @@ impl App {
             None
         };
         let Some((base_texture, rotation)) = captured_primary.or(resolved_current) else {
+            let descriptor_kind = match self.detached_grid_descriptor(idx, false) {
+                DetachedBuild::Built(descriptor) => {
+                    Self::detached_viewer_descriptor_debug_kind(&Some(descriptor))
+                }
+                DetachedBuild::NotApplicable => "none",
+                DetachedBuild::Refused(_) => "refused",
+            };
             self.log_detached_image_window_debug(format!(
                 "build_active_snapshot_failed reason=no_display_texture idx={idx} \
                  window_id={:?} current_pending={} pending={} \
@@ -55375,9 +55432,7 @@ impl App {
                     self.thumbnails.get(idx),
                     Some(crate::grid_item::ThumbnailState::Loaded { .. })
                 ),
-                Self::detached_viewer_descriptor_debug_kind(
-                    &self.detached_viewer_context_descriptor_for_idx(idx)
-                ),
+                descriptor_kind,
                 self.viewer_sync_stamp_for_idx(idx).is_some()
             ));
             return None;
@@ -55485,10 +55540,18 @@ impl App {
             paged_display_unit.as_ref(),
         );
         let reopen_collection_root = self.detached_collection_root_image_open_plan(idx);
-        let reopen_descriptor = reopen_collection_root
-            .is_none()
-            .then(|| self.parked_still_reopen_descriptor_for_idx(idx))
-            .flatten();
+        let reopen_descriptor = if reopen_collection_root.is_some() {
+            None
+        } else {
+            match self.parked_still_reopen_descriptor_for_idx(idx) {
+                DetachedBuild::Built(descriptor) => Some(descriptor),
+                DetachedBuild::NotApplicable => None,
+                DetachedBuild::Refused(reason) => {
+                    self.show_feedback_toast(reason.message().into());
+                    return None;
+                }
+            }
+        };
         let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
         self.log_detached_image_window_debug(format!(
             "build_active_snapshot_ok id={id} idx={idx} \

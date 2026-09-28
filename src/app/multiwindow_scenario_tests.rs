@@ -3087,7 +3087,7 @@ fn multiwindow_scenario_noncollection_image_controls_remain_physical() {
         app.items_are_reading_history_view = matches!(surface, TopLevelGridSurface::ReadingHistory);
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
-            Some(DetachedGridItemOpenPlan::Descriptor {
+            DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor {
                 descriptor: ViewerContextDescriptor::Image { .. },
                 collection_restore: None,
             })
@@ -3262,7 +3262,7 @@ fn multiwindow_scenario_collection_root_stale_grid_open_is_terminal() {
             .installed_items_generation = None;
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
-            Some(DetachedGridItemOpenPlan::CollectionRootUnavailable)
+            DetachedBuild::Built(DetachedGridItemOpenPlan::CollectionRootUnavailable)
         ));
         assert!(app.open_grid_container_in_detached_book_context(&driver.ctx, 0));
         assert_eq!(app.items, main_items);
@@ -3286,7 +3286,7 @@ fn multiwindow_scenario_collection_root_stale_grid_open_is_terminal() {
         };
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
-            Some(DetachedGridItemOpenPlan::Descriptor { .. })
+            DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor { .. })
         ));
     })
     .join()
