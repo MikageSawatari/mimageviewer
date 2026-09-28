@@ -438,6 +438,18 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - 配信中の起動・設定変更のリモート反映
 - 作者への連絡
 
+### 10.1 ポータブル版 (利用者決定 2026-09-28)
+
+- ポータブル版は **ユーザー VST も音響調整 (EffeTune) も無効のまま** (vst3-host.exe を同梱しない現状を維持)。
+- 理由: Mixwright は mIV の data_dir に関係なく `%APPDATA%` に書く (上流 v0.11.1 で確認:
+  プリセット = `%APPDATA%\effetune\` か `%APPDATA%\Frieve\EffeTunePlugin\`、config.json も同所、
+  WebView の保存領域 = CHOC `getUserDataFolder()` により `%APPDATA%\<ホスト exe 名>\`)。
+  ユーザー VST も APPDATA に書くものが多い。いずれもポータブル版の「APPDATA を使わない」前提と合わない。
+- 参考: 過去のポータブル版の誤検知の原因は未署名の vst3-host.exe そのもので、フォルダ走査 (core の
+  `src/video/dsp/scanner.rs`) ではなかった。
+- Mixwright のパイプライン プリセットは DAW やデスクトップ版 EffeTune と共有される (作者の設計)。
+  WebView の保存領域はホスト exe ごとに分かれる。配布版の privacy.html に APPDATA への保存を追記する。
+
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 
 - 独立コードレビュー (実装者と別の Sol、5 回) の最終判定: SHIP-FOR-USER-TEST。
@@ -449,3 +461,85 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   失敗する。失敗は EffeTune と無関係なモジュールにも広く分布)。
 - 実機でまだ誰も確認していないこと: Mixwright の GUI 表示、音声処理、ビジュアライザー、空パイプラインの
   遅延と透過性、初回の既定パイプライン、再生中の編集・開閉の負荷試験 (§8)。
+
+## 12. 第 6 版: リモート配信はローカルの bridge を共有する (2026-09-28、利用者合意)
+
+### 12.1 背景 (実機の観測とコード)
+
+- 利用者が実機で観測: リモート配信の最初の約 5 秒は EQ が効かず、途中から効いた。
+- 原因 (上流ソース `src/plugin/plugin_processor.cpp` v0.11.1 で確認): Mixwright の `setState` は
+  反映待ちの印を立てて内蔵 WebView に再読込を指示するだけで、音声処理への反映は WebView の
+  `rebuildPipeline` 要求 (~1-2 秒後) で行われる。反映完了をホストへ知らせる手段は無い
+  (遅延が変わるときの `kLatencyChanged` だけ)。リモートはセッションごとに新しい bridge で状態を
+  復元し、実時間より速く先読みするため、反映待ちの間に数秒分が EQ なしで処理される。
+- ユーザー VST も、リモートではセッションごとに `settings.vst3_plugins` (保存済み状態) から読み直して
+  いる (`src/remote_ipc/ui.rs` `remote_clockless_audio_processing`)。ローカルの GUI で変えた直後の
+  設定は保存されるまでリモートに反映されない (本ブランチ以前からの挙動)。
+- 旧設計 (`docs/vst3-integration.md` §2、「ローカル再生の plugin state と高速 feed の timeline を
+  混在させないため、streaming session 専用 DspBridge を持つ」) の懸念は、リモートとローカルが同時に
+  音を出さないこと (`docs/web-remote-plan.md` §2.2: 操作権の移動でローカルのメディアを一時停止) と、
+  受け渡し時の reset で満たせる。
+
+### 12.2 決定
+
+リモート配信は、配信用の bridge を作らず、**ローカルの bridge (ユーザー VST チェーン `App::dsp_bridge`、
+EffeTune の controller が持つ bridge) をそのまま使う**。
+
+- 読み込みと状態の復元が配信開始時に起きないので、反映待ちが無い。
+- ローカルの窓で変えた設定が配信中もそのまま反映される (EffeTune・ユーザー VST とも)。
+- EffeTune の窓のビジュアライザーに配信中の音が流れる。ただし先読みのため、端末で聞こえる音より
+  先に進む (明記する制約)。
+- 配信中の host プロセスはローカルの 2 つだけになる。
+
+### 12.3 不変条件
+
+- **I1 (処理の持ち主は 1 つ)**: 共有 bridge の `process_block` を呼ぶのは、常にローカルの音声 pump か
+  リモート配信の処理のどちらか一方。持ち主は型付きの lease (`Local` / `Remote { session, generation }`)
+  で表し、単一の所有者が切り替える。候補: 既存の remote session owner の遷移 (取得・解放・奪取) に
+  合わせて切り替える。持ち主でない側は `process_block` を呼ばない。
+- **I2 (受け渡しで reset)**: 持ち主が変わるとき (Local→Remote、Remote→Local、リモートの generation
+  切替・seek) は、新しい持ち主の最初のブロックの前に共有 bridge を reset し、成否を確認する
+  (`Result` を返す reset)。失敗はその bridge の既存の失敗経路へ (ユーザーチェーン = 既存の disable、
+  EffeTune = controller の `fail()`)。
+- **I3 (ローカルの一時停止中の扱い)**: 操作権がリモートにある間、ローカルの pump が持ち主でない状態で
+  音声を処理して、処理済みキューに「素通しの音」を貯めないこと。候補: 持ち主でない間は pump が
+  処理を進めず待つ (キャンセル・終了では待ちを解く)。ローカルへ戻った最初のブロックは I2 の reset 後。
+  **ここは既存コードの一時停止の実態 (pump が停止中もどこまで処理するか) を確認して決める。**
+- **I4 (失敗の持ち主は変えない)**: リモート側で起きた失敗も、共有 bridge の既存の持ち主が処理する。
+  ユーザーチェーンの連続失敗はローカルでも無効化される (旧設計では配信用 bridge だけが止まった)。
+  EffeTune は controller の `fail()` を通す。
+- **I5 (遅延)**: 共有しても遅延は配信中に変わり得る (窓での操作)。第 5 版の「適用した遅延の差分だけを
+  補正する」処理はそのまま使う。
+- **I6 (サンプルレート)**: 共有 bridge は起動時の出力デバイスのレートで準備されている。リモートの
+  音声処理のレートは、共有 bridge が準備されたレートに合わせる (配信時に `default_output_sample_rate()`
+  を読み直さない)。レートが食い違う場合の扱いを明記する (候補: その段を適用せず warning)。
+
+### 12.4 起動直後・未準備のとき
+
+- ユーザー VST の起動時読み込み、または EffeTune のロードが終わっていない間に配信が始まった場合は、
+  配信開始の期限の中で決着を待ち、間に合わなければその段なしで始めて warning を出す
+  (既存の「起動時ロード中はメディアのオープンを遅らせる」ゲートと同じ決着判定を使う)。
+- ユーザー VST が無効、EffeTune が Running でない場合は、その段は無い (従来どおり)。
+
+### 12.5 撤去するもの
+
+- リモート用のセッション bridge (`ClocklessAudioProcessing::with_remote_vst3` が作る `DspBridge::new()`、
+  EffeTune の配信用 bridge)。
+- 配信受け付け時の EffeTune 状態の取り直し (§6 の第 4〜5 版の仕組み) と、ロード予算の共有期限。
+- リモート側の plugin 読み込みに関する warning の一部 (ロード失敗・時間切れ)。処理中の失敗の warning は残す。
+
+### 12.6 テスト
+
+- lease: 持ち主でない側が `process_block` を呼ばない。Local→Remote→Local で各持ち主の最初のブロックの
+  前に reset。reset 失敗が既存の失敗経路に入る。
+- ローカルの一時停止中に操作権がリモートへ移っても、処理済みキューに素通しの音が貯まらない。
+- 配信の generation 切替・seek で reset。
+- 起動時ロード中に配信を始めた場合の待ちと、間に合わない場合の warning。
+- 共有 bridge のレートとリモートの処理レートの一致、食い違い時の扱い。
+- リモート側の連続失敗がユーザーチェーン・EffeTune の既存の失敗経路に入る。
+- 第 5 版の遅延補正テストは残す。
+
+### 12.7 文書
+
+- `docs/vst3-integration.md` §2 の「streaming session 専用 DspBridge」の記述を更新し、設計変更の理由を残す。
+- 本書 §6 (第 4〜5 版のリモート 2 段構成) は第 6 版で置き換えた旨を記す。
