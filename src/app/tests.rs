@@ -78421,6 +78421,11 @@ fn common_dialog_registry_covers_cache_and_setup_dialogs() {
     assert!(app.any_modal_dialog_open_for_fullscreen_keys());
     app.show_archive_cache_manager = false;
 
+    app.show_epub_cache_manager = true;
+    assert!(app.any_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+    app.show_epub_cache_manager = false;
+
     app.cc.show = true;
     assert!(app.any_dialog_open());
     assert!(app.any_modal_dialog_open_for_fullscreen_keys());

@@ -13919,6 +13919,8 @@ pub struct App {
     pub(crate) archive_cache_manager_result: Option<String>,
     /// 「すべて削除」確認ステップ
     pub(crate) archive_cache_confirm_delete_all: bool,
+    /// 「EPUB 変換キャッシュ管理」ウィンドウの表示フラグ。
+    pub(crate) show_epub_cache_manager: bool,
     pub(crate) epub_cache_rows: Option<Vec<crate::epub_cache::CurrentGenerationEntry>>,
     pub(crate) epub_cache_selection: std::collections::HashSet<i64>,
     pub(crate) epub_cache_confirm_delete_all: bool,
@@ -17408,6 +17410,7 @@ impl App {
             archive_cache_selection: std::collections::HashSet::new(),
             archive_cache_manager_result: None,
             archive_cache_confirm_delete_all: false,
+            show_epub_cache_manager: false,
             epub_cache_rows: None,
             epub_cache_selection: std::collections::HashSet::new(),
             epub_cache_confirm_delete_all: false,
@@ -19596,6 +19599,7 @@ impl App {
             self.show_toolbar_reset_confirm => "toolbar_reset_confirm",
             self.show_cache_manager => "cache_manager",
             self.show_archive_cache_manager => "archive_cache_manager",
+            self.show_epub_cache_manager => "epub_cache_manager",
             self.show_metadata_cleanup => "metadata_cleanup",
             self.metadata_cleanup_pending.is_some() => "metadata_cleanup_pending",
             self.metadata_transfer.is_some() => "metadata_transfer",
@@ -83527,6 +83531,7 @@ impl App {
         self.show_metadata_transfer_dialog(ctx);
         self.show_sidecar_restore_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);
+        self.show_epub_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
         self.show_archive_convert_dialog(ctx);
         self.show_video_upscale_dialog(ctx);
