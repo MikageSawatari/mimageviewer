@@ -4984,6 +4984,10 @@ pub struct Settings {
     /// ツールバーに表示する列数の選択肢
     #[serde(default = "default_toolbar_cols_items")]
     pub toolbar_cols_items: Vec<usize>,
+    /// 旧既定の列数候補 1〜10 を一度だけ 1〜20 へ補完した marker。
+    /// 旧保存では false、現行の新規設定では true。以後候補を外しても再追加しない。
+    #[serde(default)]
+    pub(crate) toolbar_cols_20_options_migrated: bool,
     /// ツールバーの列セクションに「詳細」切替を表示するか
     #[serde(default = "default_true")]
     pub toolbar_cols_details_visible: bool,
@@ -7301,6 +7305,7 @@ impl Default for Settings {
             ring_shortcuts: crate::ring_shortcut::RingShortcutSettings::default(),
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
+            toolbar_cols_20_options_migrated: true,
             toolbar_cols_details_visible: true,
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_aspect_auto_visible: default_toolbar_aspect_auto_visible(),
@@ -7927,13 +7932,13 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 /// 1. `migrate_vst3_legacy`
 /// 2. `migrate_legacy_video_loop`
 /// 3. `migrate_legacy_archive_file_handling`
-/// 4. `migrate_toolbar_sort_size_options`
-/// 5. `migrate_toolbar_sort_name_numeric_desc_options`
-/// 6. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
+/// 4. ツールバーの列数・ソート候補の一度きりの補完
+/// 5. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
 pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_vst3_legacy();
     settings.migrate_legacy_video_loop();
     settings.migrate_legacy_archive_file_handling();
+    settings.migrate_toolbar_cols_20_options();
     settings.migrate_toolbar_sort_size_options();
     settings.migrate_toolbar_sort_name_numeric_desc_options();
     settings.migrate_toolbar_sort_rating_options();
@@ -8541,6 +8546,20 @@ impl Settings {
         true
     }
 
+    /// 保存済みの旧既定 1〜10 だけを一度 1〜20 へ補完する。
+    /// 部分集合や並び替え済みの配列は利用者の選択として保持する。
+    fn migrate_toolbar_cols_20_options(&mut self) -> bool {
+        if self.toolbar_cols_20_options_migrated {
+            return false;
+        }
+        const LEGACY_DEFAULT_COLS: [usize; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        if self.toolbar_cols_items == LEGACY_DEFAULT_COLS {
+            self.toolbar_cols_items = (1..=20).collect();
+        }
+        self.toolbar_cols_20_options_migrated = true;
+        true
+    }
+
     /// 一覧サイズ順を追加する前の既定4候補を、保存世代ごとに一度だけ6候補へ補完する。
     /// markerを別に持つことで、移行後に利用者がサイズ2候補だけを非表示にした同じ4値を
     /// 次回loadで再び既定扱いしない。
@@ -8648,6 +8667,7 @@ impl Settings {
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
+        let toolbar_cols_20_options_migrated = settings.migrate_toolbar_cols_20_options();
         let toolbar_sort_size_options_migrated = settings.migrate_toolbar_sort_size_options();
         let toolbar_sort_name_numeric_desc_options_migrated =
             settings.migrate_toolbar_sort_name_numeric_desc_options();
@@ -8785,6 +8805,7 @@ impl Settings {
             || autoplay_mode_migrated
             || video_loop_migrated
             || archive_file_handling_migrated
+            || toolbar_cols_20_options_migrated
             || video_volume_sanitized
             || video_playback_speed_sanitized
             || video_seek_thumbnail_tolerance_sanitized
@@ -9660,6 +9681,7 @@ impl Settings {
         self.toolbar_bookshelf_collapsed = src.toolbar_bookshelf_collapsed;
         self.toolbar_collections_collapsed = src.toolbar_collections_collapsed;
         self.toolbar_cols_items = std::mem::take(&mut src.toolbar_cols_items);
+        self.toolbar_cols_20_options_migrated = src.toolbar_cols_20_options_migrated;
         self.toolbar_cols_details_visible = src.toolbar_cols_details_visible;
         self.toolbar_aspect_items = std::mem::take(&mut src.toolbar_aspect_items);
         self.toolbar_aspect_auto_visible = src.toolbar_aspect_auto_visible;
@@ -15638,6 +15660,181 @@ mod tests {
         let mut s = Settings::default();
         s.add_favorite(name.to_string(), PathBuf::from(format!(r"C:\{name}")));
         s
+    }
+
+    fn save_released_toolbar_cols_db(
+        dir: &std::path::Path,
+        cols: Vec<usize>,
+        display: ToolbarSectionDisplay,
+    ) {
+        let mut old = Settings::default();
+        old.toolbar_cols_items = cols;
+        old.toolbar_cols_20_options_migrated = false;
+        old.toolbar_cols_display = display;
+        let db = crate::settings_db::SettingsDb::create_new(dir).unwrap();
+        db.save_full(&old).unwrap();
+        drop(db);
+        // リリース済み DB にはこの新フィールド自体が無い。
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'toolbar_cols_20_options_migrated'",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_released_default_once_and_preserves_later_choice() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, (1..=10).collect(), ToolbarSectionDisplay::Dropdown);
+
+        let mut loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::LoadedExistingDb
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        let db = crate::settings_db::SettingsDb::open(&dir).unwrap();
+        let persisted = db.load_into_settings().unwrap();
+        assert_eq!(persisted.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(persisted.toolbar_cols_20_options_migrated);
+        drop(db);
+
+        // 利用者が追加候補を全部外すと旧既定と同じ配列へ戻るが、印が再移行を防ぐ。
+        loaded.settings.toolbar_cols_items = (1..=10).collect();
+        loaded.settings.save();
+        reset_backup_state_for_test();
+        let reloaded = Settings::load();
+        assert_eq!(reloaded.toolbar_cols_items, (1..=10).collect::<Vec<_>>());
+        assert!(reloaded.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_button_display_too() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, (1..=10).collect(), ToolbarSectionDisplay::Buttons);
+
+        let loaded = Settings::load();
+        assert_eq!(loaded.toolbar_cols_display, ToolbarSectionDisplay::Buttons);
+        assert_eq!(loaded.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(loaded.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(
+            persisted.toolbar_cols_display,
+            ToolbarSectionDisplay::Buttons
+        );
+        assert_eq!(persisted.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_leaves_custom_subset_untouched_and_marks_it_done() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, vec![1, 4, 10], ToolbarSectionDisplay::Dropdown);
+        let loaded = Settings::load();
+        assert_eq!(loaded.toolbar_cols_items, vec![1, 4, 10]);
+        assert!(loaded.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(persisted.toolbar_cols_items, vec![1, 4, 10]);
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_clean_install_starts_complete() {
+        let _env = setup_backup_env();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::CleanInstall
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&crate::data_dir::get())
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_released_json_in_portable_data_dir() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        let mut old = Settings::default();
+        old.toolbar_cols_items = (1..=10).collect();
+        let mut json = serde_json::to_value(old).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("toolbar_cols_20_options_migrated");
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::MigratedFromJson
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        assert_eq!(
+            crate::settings_db::SettingsDb::open(&dir)
+                .unwrap()
+                .load_into_settings()
+                .unwrap()
+                .toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_after_db_backup_recovery() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, (1..=10).collect(), ToolbarSectionDisplay::Dropdown);
+        let db = crate::settings_db::SettingsDb::open(&dir).unwrap();
+        db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        drop(db);
+        std::fs::remove_file(dir.join("settings.db")).unwrap();
+        std::fs::write(dir.join("settings.db"), b"GARBAGE-NOT-A-SQLITE-DB-CONTENT").unwrap();
+        let _ = std::fs::remove_file(dir.join("settings.db-wal"));
+        let _ = std::fs::remove_file(dir.join("settings.db-shm"));
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::RestoredFromDbBackup
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(persisted.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(persisted.toolbar_cols_20_options_migrated);
     }
 
     #[test]
