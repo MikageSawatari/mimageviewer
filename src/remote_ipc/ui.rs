@@ -508,6 +508,7 @@ struct AppRemoteVideoOpening {
     quality: crate::video::stream::quality::QualityPreset,
     player: Option<Box<crate::video::VideoPlayer>>,
     budget: VideoStreamStartBudget,
+    dsp_admission_deadline: std::time::Instant,
 }
 
 struct AppRemoteVideoStreaming {
@@ -554,10 +555,21 @@ fn resolve_remote_video_end_behavior(
     }
 }
 
-fn remote_vst_load_budget(start_budget_remaining: std::time::Duration) -> std::time::Duration {
+fn remote_dsp_readiness_budget(start_budget_remaining: std::time::Duration) -> std::time::Duration {
     start_budget_remaining
         .saturating_sub(std::time::Duration::from_secs(3))
         .min(std::time::Duration::from_secs(10))
+}
+
+#[cfg(windows)]
+fn remote_dsp_admission_waits(
+    user_requested: bool,
+    user_loading: bool,
+    effetune_loading: bool,
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+) -> bool {
+    ((user_requested && user_loading) || effetune_loading) && now < deadline
 }
 
 struct AppRemoteVideoStarting {
@@ -902,12 +914,16 @@ impl crate::app::App {
                 if let Some(lease) = self.remote_session_ui.local_ai_lease.take() {
                     self.release_local_ai_remote_barrier(lease.resume_video_upscale);
                 }
+                #[cfg(windows)]
+                self.reseek_remote_paused_local_media();
                 self.reload_after_remote_session_release();
             }
         }
         if let Some(snapshot) = snapshot.as_ref()
             && acquisition_changed
         {
+            #[cfg(windows)]
+            self.dsp_processing.revoke();
             self.remote_session_ui.last_acquisition_sequence = snapshot.acquisition_sequence;
             let (media, slideshow, animations, continuous) =
                 self.pause_local_progress_for_remote_session();
@@ -989,6 +1005,8 @@ impl crate::app::App {
             if let Some(lease) = self.remote_session_ui.local_ai_lease.take() {
                 self.release_local_ai_remote_barrier(lease.resume_video_upscale);
             }
+            #[cfg(windows)]
+            self.reseek_remote_paused_local_media();
             self.reload_after_remote_session_release();
         }
         if matches!(
@@ -1010,7 +1028,6 @@ impl crate::app::App {
         quality: crate::video::stream::quality::QualityPreset,
         start_inputs: crate::video::RemoteStreamStartInputs,
         player: Box<crate::video::VideoPlayer>,
-        start_budget_remaining: std::time::Duration,
     ) -> Result<AppRemoteVideoStreaming, String> {
         if !self.settings.remote_video_streaming_enabled {
             return Err("remote video streaming is disabled".to_owned());
@@ -1058,8 +1075,7 @@ impl crate::app::App {
         if speed_changed {
             player.set_playback_speed(1.0);
         }
-        let audio_processing = self
-            .remote_clockless_audio_processing(start_inputs.normalize_gain, start_budget_remaining);
+        let audio_processing = self.remote_clockless_audio_processing(start_inputs.normalize_gain);
         let session = match RemoteVideoStreamingSession::start(
             owner,
             &player,
@@ -1100,11 +1116,9 @@ impl crate::app::App {
     fn remote_clockless_audio_processing(
         &self,
         normalize_gain: f64,
-        start_budget_remaining: std::time::Duration,
     ) -> crate::video::clockless_transcode::ClocklessAudioProcessing {
         #[cfg(not(windows))]
         {
-            let _ = start_budget_remaining;
             return crate::video::clockless_transcode::ClocklessAudioProcessing::without_vst3(
                 normalize_gain,
             );
@@ -1114,57 +1128,43 @@ impl crate::app::App {
         {
             use crate::video::clockless_transcode::ClocklessAudioProcessing;
 
-            let user_vst_requested =
-                self.settings.vst3_enabled && !self.settings.vst3_plugins.is_empty();
-            let effetune_requested = matches!(
-                self.effetune.runtime,
-                crate::effetune::EffetuneRuntime::Running { .. }
-            );
-            if !user_vst_requested && !effetune_requested {
-                return ClocklessAudioProcessing::without_vst3(normalize_gain);
-            }
-
-            // The worker prepares both session hosts in order against this one deadline.
-            let sample_rate = crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
-            let deadline =
-                std::time::Instant::now() + remote_vst_load_budget(start_budget_remaining);
-            let mut config = if user_vst_requested {
-                ClocklessAudioProcessing::with_remote_vst3(
-                    normalize_gain,
-                    self.settings.vst3_plugins.clone(),
-                    sample_rate,
-                    deadline,
-                )
-            } else {
-                ClocklessAudioProcessing::without_vst3(normalize_gain)
-            };
-            if effetune_requested {
-                if let Some(bundle) = self.effetune.bundle_path() {
-                    let capture_source = match self.effetune.remote_capture_source() {
-                        Ok(source) => source,
-                        Err(error) => {
-                            return config.with_effetune_warning(format!(
-                                "音響調整の設定を取得できませんでした: {error}"
-                            ));
-                        }
-                    };
-                    config = config.with_remote_effetune(
-                        bundle.to_path_buf(),
-                        capture_source,
-                        sample_rate,
-                        deadline,
-                    );
-                } else {
-                    config = config.with_effetune_warning(
-                        "音響調整に必要なファイルが見つかりませんでした。".into(),
-                    );
-                }
-            }
-            config
+            let user_requested = self.settings.vst3_enabled
+                && self
+                    .settings
+                    .vst3_plugins
+                    .iter()
+                    .any(|plugin| !plugin.bypass);
+            let user = (user_requested
+                && self.vst3_startup_load.is_none()
+                && self.dsp_bridge.is_enabled()
+                && self.dsp_bridge.active_slot_count() > 0)
+                .then(|| std::sync::Arc::clone(&self.dsp_bridge));
+            let user_warning = (user_requested && user.is_none())
+                .then(|| "VST3 を利用できないため、この配信では適用していません。".to_owned());
+            let effetune_requested = self.effetune.startup_pending()
+                || matches!(
+                    self.effetune.runtime,
+                    crate::effetune::EffetuneRuntime::Running { .. }
+                        | crate::effetune::EffetuneRuntime::Failed(_)
+                );
+            let effetune = (!self.effetune.startup_pending())
+                .then(|| self.effetune.slot.snapshot())
+                .flatten()
+                .map(|(generation, _)| (std::sync::Arc::clone(&self.effetune.slot), generation));
+            let effetune_warning = (effetune_requested && effetune.is_none())
+                .then(|| "音響調整を利用できないため、この配信では適用していません。".to_owned());
+            ClocklessAudioProcessing::with_shared_bridges(
+                normalize_gain,
+                user,
+                effetune,
+                std::sync::Arc::clone(&self.dsp_processing),
+                user_warning,
+                effetune_warning,
+            )
         }
     }
 
-    fn cancel_remote_video_stream_state(
+    pub(crate) fn cancel_remote_video_stream_state(
         &mut self,
         code: VideoStreamErrorCode,
         message: &'static str,
@@ -1438,6 +1438,23 @@ impl crate::app::App {
 
         match readiness {
             Ok(Some(start_inputs)) => {
+                #[cfg(windows)]
+                if remote_dsp_admission_waits(
+                    self.settings.vst3_enabled
+                        && self
+                            .settings
+                            .vst3_plugins
+                            .iter()
+                            .any(|plugin| !plugin.bypass),
+                    self.vst3_startup_load.is_some(),
+                    self.effetune.startup_pending(),
+                    std::time::Instant::now(),
+                    opening.dsp_admission_deadline,
+                ) {
+                    self.remote_session_ui.video_stream =
+                        Some(AppRemoteVideoStreamState::Opening(opening));
+                    return;
+                }
                 if let Some(error) = opening.budget.expired_error(VideoStreamStartStage::Player) {
                     self.fail_remote_video_opening(opening, error.code, error.message);
                     return;
@@ -1452,7 +1469,6 @@ impl crate::app::App {
                     opening.quality,
                     start_inputs,
                     player,
-                    opening.budget.remaining(),
                 );
                 match result {
                     Ok(streaming) => {
@@ -1759,6 +1775,8 @@ impl crate::app::App {
                 quality,
                 player,
                 budget,
+                dsp_admission_deadline: std::time::Instant::now()
+                    + remote_dsp_readiness_budget(budget.remaining()),
             }));
     }
 
@@ -4486,6 +4504,7 @@ mod tests {
                 quality: crate::video::stream::quality::QualityPreset::default(),
                 player: None,
                 budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+                dsp_admission_deadline: std::time::Instant::now(),
             })),
             pending_bookmark_writes,
             pending_fullscreen_restore: Some(PendingFullscreenRestore {
@@ -5107,16 +5126,37 @@ mod tests {
     }
 
     #[test]
-    fn remote_vst_load_budget_preserves_the_encoder_playlist_reserve() {
+    fn remote_dsp_readiness_budget_preserves_the_encoder_playlist_reserve() {
         assert_eq!(
-            remote_vst_load_budget(std::time::Duration::from_secs(15)),
+            remote_dsp_readiness_budget(std::time::Duration::from_secs(15)),
             std::time::Duration::from_secs(10)
         );
         assert_eq!(
-            remote_vst_load_budget(std::time::Duration::from_secs(8)),
+            remote_dsp_readiness_budget(std::time::Duration::from_secs(8)),
             std::time::Duration::from_secs(5)
         );
-        assert!(remote_vst_load_budget(std::time::Duration::from_secs(2)).is_zero());
+        assert!(remote_dsp_readiness_budget(std::time::Duration::from_secs(2)).is_zero());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_dsp_admission_waits_only_for_requested_stages_until_deadline() {
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(1);
+        assert!(!remote_dsp_admission_waits(
+            false, true, false, now, deadline
+        ));
+        assert!(remote_dsp_admission_waits(true, true, false, now, deadline));
+        assert!(remote_dsp_admission_waits(
+            false, false, true, now, deadline
+        ));
+        assert!(remote_dsp_admission_waits(true, true, true, now, deadline));
+        assert!(!remote_dsp_admission_waits(
+            true, false, false, now, deadline
+        ));
+        assert!(!remote_dsp_admission_waits(
+            true, true, true, deadline, deadline
+        ));
     }
 
     #[test]

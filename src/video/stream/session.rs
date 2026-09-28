@@ -222,6 +222,7 @@ pub(crate) struct StreamingGenerationHandle {
 
 impl StreamingGenerationHandle {
     fn start(
+        session: StreamingSessionId,
         generation: StreamingGeneration,
         owner: &RemoteSessionOwner,
         source_path: PathBuf,
@@ -232,6 +233,7 @@ impl StreamingGenerationHandle {
         hw_decode: bool,
         audio_processing: ClocklessAudioProcessing,
     ) -> Result<Self, String> {
+        let audio_processing = audio_processing.for_remote_generation(session.0, generation.0);
         let config = GenerationConfig {
             generation,
             path: source_path,
@@ -498,8 +500,10 @@ impl RemoteVideoStreamingSession {
             return Err("remote streaming segment capacity must be non-zero".to_owned());
         }
         validate_remote_stream_tracks(inputs)?;
+        let id = StreamingSessionId(NEXT_STREAMING_SESSION_ID.fetch_add(1, Ordering::Relaxed));
         let generation = StreamingGeneration(1);
         let current = StreamingGenerationHandle::start(
+            id,
             generation,
             &owner,
             player.path().clone(),
@@ -511,7 +515,7 @@ impl RemoteVideoStreamingSession {
             audio_processing.clone(),
         )?;
         Ok(Self {
-            id: StreamingSessionId(NEXT_STREAMING_SESSION_ID.fetch_add(1, Ordering::Relaxed)),
+            id,
             owner,
             source_path: player.path().clone(),
             encoder,
@@ -573,6 +577,7 @@ impl RemoteVideoStreamingSession {
     ) -> Result<StreamingGeneration, String> {
         let generation = StreamingGeneration(self.next_generation);
         let replacement = StreamingGenerationHandle::start(
+            self.id,
             generation,
             &self.owner,
             self.source_path.clone(),

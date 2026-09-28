@@ -260,29 +260,6 @@ enum HostCommand {
     },
 }
 
-#[derive(Clone)]
-pub struct RemoteCaptureSource {
-    queue: Arc<CaptureQueue>,
-    bridge: Arc<DspBridge>,
-}
-
-impl RemoteCaptureSource {
-    pub fn request(&self) -> Result<mpsc::Receiver<Result<Vec<u8>, CaptureError>>, CaptureError> {
-        self.queue.request(Arc::clone(&self.bridge))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_fake_capture(
-        state_path: PathBuf,
-        capture: impl Fn(&DspBridge) -> Result<Vec<u8>, CaptureError> + Send + 'static,
-    ) -> Self {
-        Self {
-            queue: Arc::new(CaptureQueue::new_with_capture(state_path, capture)),
-            bridge: DspBridge::new(),
-        }
-    }
-}
-
 #[derive(Default)]
 struct PublicationGate {
     state: Mutex<PublicationState>,
@@ -891,14 +868,6 @@ impl EffetuneController {
         self.pending_hide = Some(rx);
     }
 
-    pub fn remote_capture_source(&self) -> Result<RemoteCaptureSource, String> {
-        let bridge = self.bridge.as_ref().ok_or("EffeTune is not running")?;
-        Ok(RemoteCaptureSource {
-            queue: Arc::clone(&self.captures),
-            bridge: Arc::clone(bridge),
-        })
-    }
-
     pub fn effective_state(&self) -> Option<EffectiveState> {
         self.captures.latest_effective_state()
     }
@@ -1397,50 +1366,6 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::TimedOut
         );
-    }
-
-    #[test]
-    fn remote_caller_deadline_does_not_end_running_local_capture() {
-        let dir = tempfile::tempdir().unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let queue = Arc::new(CaptureQueue::new_with_capture(
-            dir.path().join("mixwright-state.json"),
-            move |_| {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                Ok(fixture("[]", "[]", "A", false))
-            },
-        ));
-        let mut controller = EffetuneController::new();
-        controller.captures = queue;
-        controller.publish_running(DspBridge::new());
-        let capture = controller
-            .remote_capture_source()
-            .unwrap()
-            .request()
-            .unwrap();
-        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(
-            capture.recv_timeout(Duration::from_millis(10)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        assert!(matches!(
-            controller.runtime,
-            EffetuneRuntime::Running { .. }
-        ));
-        assert!(controller.slot.snapshot().is_some());
-        release_tx.send(()).unwrap();
-        assert!(
-            capture
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .is_ok()
-        );
-        assert!(matches!(
-            controller.runtime,
-            EffetuneRuntime::Running { .. }
-        ));
     }
 
     #[test]

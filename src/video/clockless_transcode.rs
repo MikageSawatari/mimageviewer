@@ -226,6 +226,30 @@ impl ClocklessVstStatus {
         ));
     }
 
+    fn mark_rate_mismatch(&self, stage: &str, stage_rate: u32, processing_rate: u32) {
+        let mut status = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        status.active = false;
+        status.active_slots = 0;
+        status.warning = Some(format!(
+            "{stage} のサンプルレートが配信と一致しません ({stage_rate} / {processing_rate} Hz)。"
+        ));
+    }
+
+    fn mark_handoff_timeout(&self) {
+        let mut status = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        status.active = false;
+        status.active_slots = 0;
+        status.warning = Some("音声処理の受け渡しが時間内に終わりませんでした。".to_owned());
+    }
+
+    fn mark_unavailable(&self) {
+        let mut status = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        status.active = false;
+        status.active_slots = 0;
+        status.warning =
+            Some("音声処理の準備が間に合わなかったため、この配信では適用していません。".to_owned());
+    }
+
     fn mark_prepared(&self, prepared: &ClocklessVstPrepareResult) {
         let mut status = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         status.active = prepared.active_slots > 0;
@@ -251,6 +275,15 @@ pub(crate) trait ClocklessVstProcessor: Send + Sync {
 
     fn total_latency_samples(&self) -> u32;
     fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String>;
+    fn process_if_available(&self, src: &[f32], dst: &mut [f32]) -> Result<bool, String> {
+        self.process_block(src, dst).map(|()| true)
+    }
+
+    fn available(&self) -> bool {
+        true
+    }
+    fn report_process_failure(&self, _error: String) {}
+    fn report_latency_failure(&self, _total_secs: f64) {}
 }
 
 #[cfg(windows)]
@@ -270,6 +303,10 @@ impl ClocklessVstProcessor for super::dsp::DspBridge {
         super::dsp::DspBridge::reset_plugins_sync(self);
     }
 
+    fn try_reset(&self) -> Result<(), String> {
+        super::dsp::DspBridge::try_reset_plugins_sync(self)
+    }
+
     fn total_latency_samples(&self) -> u32 {
         super::dsp::DspBridge::total_latency_samples(self)
     }
@@ -277,238 +314,111 @@ impl ClocklessVstProcessor for super::dsp::DspBridge {
     fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
         super::dsp::DspBridge::process_block(self, src, dst)
     }
-}
 
-#[cfg(windows)]
-struct RemoteVstProcessor {
-    bridge: Arc<super::dsp::DspBridge>,
-    plugins: Vec<crate::settings::Vst3PluginEntry>,
-    sample_rate: u32,
-    load_deadline: Instant,
-    prepared: std::sync::OnceLock<ClocklessVstPrepareResult>,
-}
+    fn report_process_failure(&self, error: String) {
+        self.disable_with_reason(Some(format!("remote DSP process: {error}")));
+    }
 
-#[cfg(windows)]
-impl RemoteVstProcessor {
-    fn prepare_once(&self) -> ClocklessVstPrepareResult {
-        self.prepared
-            .get_or_init(|| {
-                if Instant::now() >= self.load_deadline {
-                    return ClocklessVstPrepareResult {
-                        active_slots: 0,
-                        warning: Some(
-                            "VST3 の初期化時間を確保できなかったため、配信は VST3 なしで継続しています。"
-                                .to_owned(),
-                        ),
-                    };
-                }
-                if let Err(error) = self.bridge.enable() {
-                    crate::logger::log(format!(
-                        "remote-stream VST3 host enable failed; continuing dry: {error}"
-                    ));
-                    return ClocklessVstPrepareResult {
-                        active_slots: 0,
-                        warning: Some(
-                            "VST3 ホストを開始できなかったため、配信は VST3 なしで継続しています。"
-                                .to_owned(),
-                        ),
-                    };
-                }
-
-                let requested_active = self.plugins.iter().filter(|plugin| !plugin.bypass).count();
-                let mut load_failures = 0_usize;
-                for plugin in self.plugins.iter().filter(|plugin| !plugin.bypass) {
-                    let Some(load_timeout) = self.load_deadline.checked_duration_since(Instant::now())
-                    else {
-                        load_failures = load_failures.saturating_add(1);
-                        break;
-                    };
-                    if let Err(error) = self.bridge.add_plugin_with_load_timeout(
-                        &plugin.path,
-                        self.sample_rate,
-                        480,
-                        false,
-                        plugin.user_hidden,
-                        plugin.state.as_deref(),
-                        None,
-                        None,
-                        load_timeout,
-                    ) {
-                        load_failures = load_failures.saturating_add(1);
-                        crate::logger::log(format!(
-                            "remote-stream VST3 load failed path={:?}; continuing: {error}",
-                            plugin.path
-                        ));
-                        if !self.bridge.is_enabled() {
-                            break;
-                        }
-                    }
-                }
-
-                let active_slots = self.bridge.active_slot_count();
-                let warning = if requested_active > 0 && active_slots == 0 {
-                    Some(
-                        "VST3 プラグインを読み込めなかったため、配信は VST3 なしで継続しています。"
-                            .to_owned(),
-                    )
-                } else if load_failures > 0 || active_slots < requested_active {
-                    Some(format!(
-                        "一部の VST3 プラグインを読み込めなかったため、{active_slots}/{requested_active} 個だけ適用しています。"
-                    ))
-                } else {
-                    None
-                };
-                ClocklessVstPrepareResult {
-                    active_slots: u32::try_from(active_slots).unwrap_or(u32::MAX),
-                    warning,
-                }
-            })
-            .clone()
+    fn available(&self) -> bool {
+        self.is_enabled() && self.active_slot_count() > 0
     }
 }
 
 #[cfg(windows)]
-struct RemoteEffeTuneProcessor {
-    bridge: Arc<super::dsp::DspBridge>,
-    bundle: PathBuf,
-    capture_source: crate::effetune::RemoteCaptureSource,
-    sample_rate: u32,
-    load_deadline: Instant,
-    prepared: std::sync::OnceLock<ClocklessVstPrepareResult>,
-    first_prepared_use: AtomicBool,
+struct SharedEffeTuneProcessor {
+    slot: Arc<crate::effetune::EffetuneAudioSlot>,
+    generation: u64,
+    admitted_rate: u32,
 }
 
 #[cfg(windows)]
-impl RemoteEffeTuneProcessor {
-    fn prepare_once(&self) -> ClocklessVstPrepareResult {
-        self.prepared
-            .get_or_init(|| {
-                let fail = |reason: String| ClocklessVstPrepareResult {
-                    active_slots: 0,
-                    warning: Some(reason),
-                };
-                if Instant::now() >= self.load_deadline {
-                    return fail("最新の設定を取得する時間がありませんでした。".into());
-                }
-                let capture = match self.capture_source.request() {
-                    Ok(capture) => capture,
-                    Err(error) => {
-                        return fail(format!("最新の設定を取得できませんでした: {error}"));
-                    }
-                };
-                let Some(remaining) = self.load_deadline.checked_duration_since(Instant::now())
-                else {
-                    return fail("最新の設定を取得する時間がありませんでした。".into());
-                };
-                let bytes = match capture.recv_timeout(remaining) {
-                    Ok(Ok(bytes)) => bytes,
-                    Ok(Err(error)) => {
-                        return fail(format!("最新の設定を取得できませんでした: {error}"));
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        return fail(format!(
-                            "最新の設定を取得できませんでした: {}",
-                            crate::effetune::CaptureError::CallerDeadline
-                        ));
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        return fail("設定の取得が中断されました。".into());
-                    }
-                };
-                if let crate::effetune::EffectiveState::Unparseable(reason) =
-                    crate::effetune::EffectiveState::from_bytes(&bytes)
-                {
-                    return fail(format!("設定を判定できませんでした: {reason}"));
-                }
-                if Instant::now() >= self.load_deadline {
-                    return fail("読み込む時間がありませんでした。".into());
-                }
-                if let Err(error) = self.bridge.enable() {
-                    return fail(format!("処理を開始できませんでした: {error}"));
-                }
-                let Some(remaining) = self.load_deadline.checked_duration_since(Instant::now())
-                else {
-                    return fail("読み込む時間がありませんでした。".into());
-                };
-                use base64::Engine;
-                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-                if let Err(error) = self.bridge.add_plugin_with_load_timeout(
-                    &self.bundle.to_string_lossy(),
-                    self.sample_rate,
-                    480,
-                    false,
-                    true,
-                    Some(&encoded),
-                    None,
-                    None,
-                    remaining,
-                ) {
-                    return fail(format!("設定を復元できませんでした: {error}"));
-                }
-                if Instant::now() >= self.load_deadline {
-                    return fail("読み込みの期限が切れました。".into());
-                }
-                if let Err(error) = self.bridge.try_reset_plugins_before(self.load_deadline) {
-                    return fail(format!("初期化に失敗しました: {error}"));
-                }
-                if Instant::now() >= self.load_deadline {
-                    return fail("読み込みの期限が切れました。".into());
-                }
-                ClocklessVstPrepareResult {
-                    active_slots: 1,
-                    warning: None,
-                }
-            })
-            .clone()
+impl SharedEffeTuneProcessor {
+    fn bridge(&self) -> Option<Arc<super::dsp::DspBridge>> {
+        self.slot
+            .snapshot()
+            .and_then(|(generation, bridge)| (generation == self.generation).then_some(bridge))
     }
 }
 
 #[cfg(windows)]
-impl ClocklessVstProcessor for RemoteEffeTuneProcessor {
+impl ClocklessVstProcessor for SharedEffeTuneProcessor {
     fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.bridge()
+            .map_or(self.admitted_rate, |bridge| bridge.sample_rate())
     }
+
     fn prepare(&self) -> ClocklessVstPrepareResult {
-        self.prepare_once()
-    }
-    fn reset(&self) {
-        self.bridge.reset_plugins_sync();
-    }
-    fn try_reset(&self) -> Result<(), String> {
-        if !self.first_prepared_use.swap(true, Ordering::AcqRel) {
-            Ok(())
-        } else {
-            self.bridge.try_reset_plugins_sync()
+        ClocklessVstPrepareResult {
+            active_slots: u32::from(self.bridge().is_some()),
+            warning: None,
         }
     }
-    fn total_latency_samples(&self) -> u32 {
-        self.bridge.total_latency_samples()
+
+    fn reset(&self) {}
+
+    fn try_reset(&self) -> Result<(), String> {
+        match self.bridge() {
+            Some(bridge) => bridge.try_reset_plugins_sync(),
+            None => Ok(()),
+        }
     }
+
+    fn total_latency_samples(&self) -> u32 {
+        self.bridge()
+            .map_or(0, |bridge| bridge.total_latency_samples())
+    }
+
     fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
-        self.bridge.process_block(src, dst)
+        if let Some(bridge) = self.bridge() {
+            bridge.process_block(src, dst)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn process_if_available(&self, src: &[f32], dst: &mut [f32]) -> Result<bool, String> {
+        match self.bridge() {
+            Some(bridge) => bridge.process_block(src, dst).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
+    fn available(&self) -> bool {
+        self.bridge().is_some()
+    }
+
+    fn report_process_failure(&self, error: String) {
+        self.slot.report_failure_once(
+            self.generation,
+            crate::effetune::EffetuneFailure::ProcessFailed(error),
+        );
+    }
+
+    fn report_latency_failure(&self, total_secs: f64) {
+        self.slot.report_failure_once(
+            self.generation,
+            crate::effetune::EffetuneFailure::LatencyExceeded { total_secs },
+        );
     }
 }
 
 #[cfg(windows)]
-impl ClocklessVstProcessor for RemoteVstProcessor {
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
+#[derive(Clone)]
+struct SharedRemoteDsp {
+    coordinator: Arc<super::dsp::coordinator::DspProcessingCoordinator>,
+    owner: Option<super::dsp::coordinator::DspOwner>,
+}
 
-    fn prepare(&self) -> ClocklessVstPrepareResult {
-        self.prepare_once()
-    }
+#[cfg(windows)]
+struct SharedRemoteLease {
+    coordinator: Arc<super::dsp::coordinator::DspProcessingCoordinator>,
+    request: super::dsp::coordinator::DspRequest,
+}
 
-    fn reset(&self) {
-        self.bridge.reset_plugins_sync();
-    }
-
-    fn total_latency_samples(&self) -> u32 {
-        self.bridge.total_latency_samples()
-    }
-
-    fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
-        self.bridge.process_block(src, dst)
+#[cfg(windows)]
+impl Drop for SharedRemoteLease {
+    fn drop(&mut self) {
+        self.coordinator.cancel(self.request);
     }
 }
 
@@ -525,6 +435,8 @@ pub(crate) struct ClocklessAudioProcessing {
     vst3: Option<ClocklessVstChain>,
     effetune: Option<ClocklessVstChain>,
     vst3_status: ClocklessVstStatus,
+    #[cfg(windows)]
+    shared: Option<SharedRemoteDsp>,
 }
 
 impl ClocklessAudioProcessing {
@@ -540,9 +452,12 @@ impl ClocklessAudioProcessing {
             vst3: None,
             effetune: None,
             vst3_status,
+            #[cfg(windows)]
+            shared: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_vst3(
         normalize_gain: f64,
         processor: Arc<dyn ClocklessVstProcessor>,
@@ -564,73 +479,128 @@ impl ClocklessAudioProcessing {
             }),
             effetune: None,
             vst3_status,
+            #[cfg(windows)]
+            shared: None,
         }
     }
 
     #[cfg(windows)]
-    pub(crate) fn with_remote_vst3(
+    pub(crate) fn with_shared_bridges(
         normalize_gain: f64,
-        plugins: Vec<crate::settings::Vst3PluginEntry>,
-        sample_rate: u32,
-        load_deadline: Instant,
+        user: Option<Arc<super::dsp::DspBridge>>,
+        effetune: Option<(Arc<crate::effetune::EffetuneAudioSlot>, u64)>,
+        coordinator: Arc<super::dsp::coordinator::DspProcessingCoordinator>,
+        user_warning: Option<String>,
+        effetune_warning: Option<String>,
     ) -> Self {
-        let processor: Arc<dyn ClocklessVstProcessor> = Arc::new(RemoteVstProcessor {
-            bridge: super::dsp::DspBridge::new(),
-            plugins,
-            sample_rate: sample_rate.max(1),
-            load_deadline,
-            prepared: std::sync::OnceLock::new(),
+        let mut config = Self::without_vst3(normalize_gain);
+        let user_status = ClocklessVstStatus::new(ClocklessVstStatusSnapshot {
+            requested: user.is_some() || user_warning.is_some(),
+            active: user.is_some(),
+            active_slots: user
+                .as_ref()
+                .map_or(0, |bridge| bridge.active_slot_count() as u32),
+            warning: user_warning,
         });
-        Self::with_vst3(normalize_gain, processor, 0, None)
+        if let Some(bridge) = user {
+            config.vst3 = Some(ClocklessVstChain {
+                processor: bridge,
+                failed: Arc::new(AtomicBool::new(false)),
+                status: user_status.clone(),
+            });
+        }
+        let effetune_status = ClocklessVstStatus::new(ClocklessVstStatusSnapshot {
+            requested: effetune.is_some() || effetune_warning.is_some(),
+            active: effetune.is_some(),
+            active_slots: u32::from(effetune.is_some()),
+            warning: effetune_warning,
+        });
+        if let Some((slot, generation)) = effetune {
+            let admitted_rate = slot
+                .snapshot()
+                .map_or(0, |(_, bridge)| bridge.sample_rate());
+            config.effetune = Some(ClocklessVstChain {
+                processor: Arc::new(SharedEffeTuneProcessor {
+                    slot,
+                    generation,
+                    admitted_rate,
+                }),
+                failed: Arc::new(AtomicBool::new(false)),
+                status: effetune_status.clone(),
+            });
+        }
+        config.vst3_status = ClocklessVstStatus::combined(user_status, effetune_status);
+        config.shared = Some(SharedRemoteDsp {
+            coordinator,
+            owner: None,
+        });
+        let processing_rate = config.processing_sample_rate();
+        if let Some(chain) = config.vst3.as_ref()
+            && chain.processor.sample_rate() != processing_rate
+        {
+            chain
+                .status
+                .mark_rate_mismatch("VST3", chain.processor.sample_rate(), processing_rate);
+            config.vst3 = None;
+        }
+        if let Some(chain) = config.effetune.as_ref()
+            && chain.processor.sample_rate() != processing_rate
+        {
+            chain.status.mark_rate_mismatch(
+                "音響調整",
+                chain.processor.sample_rate(),
+                processing_rate,
+            );
+            config.effetune = None;
+        }
+        config
     }
 
     #[cfg(windows)]
-    pub(crate) fn with_remote_effetune(
-        mut self,
-        bundle: PathBuf,
-        capture_source: crate::effetune::RemoteCaptureSource,
-        sample_rate: u32,
-        load_deadline: Instant,
-    ) -> Self {
-        let processor: Arc<dyn ClocklessVstProcessor> = Arc::new(RemoteEffeTuneProcessor {
-            bridge: super::dsp::DspBridge::new_with_policies(
-                super::dsp::GuiOwnerPolicy::Auto,
-                super::dsp::LatencyPolicy::ReportOnly,
-                true,
-            ),
-            bundle,
-            capture_source,
-            sample_rate: sample_rate.max(1),
-            load_deadline,
-            prepared: std::sync::OnceLock::new(),
-            first_prepared_use: AtomicBool::new(false),
-        });
-        let status = ClocklessVstStatus::new(ClocklessVstStatusSnapshot {
-            requested: true,
-            active: false,
-            active_slots: 0,
-            warning: None,
-        });
-        let user_status = self.vst3_status;
-        self.vst3_status = ClocklessVstStatus::combined(user_status, status.clone());
-        self.effetune = Some(ClocklessVstChain {
-            processor,
-            failed: Arc::new(AtomicBool::new(false)),
-            status,
-        });
-        self
+    pub(crate) fn for_remote_generation(&self, session: u64, generation: u64) -> Self {
+        let mut config = self.clone();
+        let (user_status, effetune_status) = self
+            .vst3_status
+            .stages
+            .as_ref()
+            .map(|stages| {
+                (
+                    ClocklessVstStatus::new(stages.0.snapshot()),
+                    ClocklessVstStatus::new(stages.1.snapshot()),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    ClocklessVstStatus::new(self.vst3_status.snapshot()),
+                    ClocklessVstStatus::new(ClocklessVstStatusSnapshot {
+                        requested: false,
+                        active: false,
+                        active_slots: 0,
+                        warning: None,
+                    }),
+                )
+            });
+        if let Some(chain) = config.vst3.as_mut() {
+            chain.failed = Arc::new(AtomicBool::new(false));
+            chain.status = user_status.clone();
+        }
+        if let Some(chain) = config.effetune.as_mut() {
+            chain.failed = Arc::new(AtomicBool::new(false));
+            chain.status = effetune_status.clone();
+        }
+        config.vst3_status = ClocklessVstStatus::combined(user_status, effetune_status);
+        if let Some(shared) = config.shared.as_mut() {
+            shared.owner = Some(super::dsp::coordinator::DspOwner::Remote {
+                session,
+                generation,
+            });
+        }
+        config
     }
 
-    #[cfg(windows)]
-    pub(crate) fn with_effetune_warning(mut self, warning: String) -> Self {
-        let status = ClocklessVstStatus::new(ClocklessVstStatusSnapshot {
-            requested: true,
-            active: false,
-            active_slots: 0,
-            warning: Some(warning),
-        });
-        self.vst3_status = ClocklessVstStatus::combined(self.vst3_status, status);
-        self
+    #[cfg(not(windows))]
+    pub(crate) fn for_remote_generation(&self, _session: u64, _generation: u64) -> Self {
+        self.clone()
     }
 
     pub(crate) fn vst3_status(&self) -> ClocklessVstStatus {
@@ -640,9 +610,20 @@ impl ClocklessAudioProcessing {
     fn processing_sample_rate(&self) -> u32 {
         self.vst3
             .as_ref()
-            .or(self.effetune.as_ref())
+            .filter(|chain| {
+                chain.processor.available() && chain.processor.prepare().active_slots > 0
+            })
             .map(|chain| chain.processor.sample_rate())
-            .filter(|sample_rate| *sample_rate > 0)
+            .filter(|rate| *rate > 0)
+            .or_else(|| {
+                self.effetune
+                    .as_ref()
+                    .filter(|chain| {
+                        chain.processor.available() && chain.processor.prepare().active_slots > 0
+                    })
+                    .map(|chain| chain.processor.sample_rate())
+                    .filter(|rate| *rate > 0)
+            })
             .unwrap_or(AUDIO_OUTPUT_RATE)
     }
 }
@@ -1337,6 +1318,11 @@ struct ClocklessAudioProcessor {
     effetune_output: Vec<f32>,
     limiter: SafetyLimiter,
     latency_reconciler: ClocklessLatencyReconciler,
+    vst3_health: crate::effetune::composition::StageHealth,
+    effetune_health: crate::effetune::composition::StageHealth,
+    sample_rate: u32,
+    #[cfg(windows)]
+    shared_lease: Option<SharedRemoteLease>,
 }
 
 /// Reconciles changes in the total delay subtracted from audible PTS, including the safety
@@ -1411,7 +1397,144 @@ impl ClocklessLatencyReconciler {
 }
 
 impl ClocklessAudioProcessor {
+    #[cfg(windows)]
+    fn new_for_stream(
+        mut config: ClocklessAudioProcessing,
+        sample_rate: u32,
+        control: &ClocklessTranscodeControl,
+    ) -> Result<Self, String> {
+        use super::dsp::coordinator::HandoffWaitError;
+        let mut lease = None;
+        let shared = config.shared.take();
+        let shared_mode = shared.is_some();
+        if let Some(shared) = shared
+            && (config.vst3.is_some() || config.effetune.is_some())
+        {
+            let owner = shared
+                .owner
+                .ok_or_else(|| "remote DSP generation owner was not assigned".to_owned())?;
+            let request = shared
+                .coordinator
+                .reserve(owner)
+                .ok_or_else(|| "clockless transcode cancelled".to_owned())?;
+            let handoff = match shared.coordinator.wait_handoff(
+                request,
+                Instant::now() + std::time::Duration::from_secs(2),
+                &control.inner.cancel,
+            ) {
+                Ok(handoff) => handoff,
+                Err(HandoffWaitError::Cancelled) => {
+                    return Err("clockless transcode cancelled".to_owned());
+                }
+                Err(HandoffWaitError::TimedOut) => {
+                    crate::logger::log("remote DSP handoff timeout; continuing without DSP");
+                    if let Some(chain) = config.vst3.take() {
+                        chain.status.mark_handoff_timeout();
+                    }
+                    if let Some(chain) = config.effetune.take() {
+                        chain.status.mark_handoff_timeout();
+                    }
+                    return Self::new_inner(config, sample_rate, true, None);
+                }
+            };
+            if let Some(chain) = config.vst3.as_ref()
+                && (!chain.processor.available() || chain.processor.sample_rate() != sample_rate)
+            {
+                if chain.processor.available() {
+                    chain.status.mark_rate_mismatch(
+                        "VST3",
+                        chain.processor.sample_rate(),
+                        sample_rate,
+                    );
+                } else {
+                    chain.status.mark_unavailable();
+                }
+                config.vst3 = None;
+            }
+            if let Some(chain) = config.effetune.as_ref()
+                && (!chain.processor.available() || chain.processor.sample_rate() != sample_rate)
+            {
+                if chain.processor.available() {
+                    chain.status.mark_rate_mismatch(
+                        "音響調整",
+                        chain.processor.sample_rate(),
+                        sample_rate,
+                    );
+                } else {
+                    chain.status.mark_unavailable();
+                }
+                config.effetune = None;
+            }
+            if control.inner.cancel.load(Ordering::Acquire)
+                || !shared.coordinator.is_desired(request)
+            {
+                return Err("clockless transcode cancelled".to_owned());
+            }
+            let user_reset_failure = config
+                .vst3
+                .as_ref()
+                .and_then(|chain| chain.processor.try_reset().err());
+            if control.inner.cancel.load(Ordering::Acquire)
+                || !shared.coordinator.is_desired(request)
+            {
+                return Err("clockless transcode cancelled".to_owned());
+            }
+            let effetune_reset_failure = config
+                .effetune
+                .as_ref()
+                .and_then(|chain| chain.processor.try_reset().err());
+            if control.inner.cancel.load(Ordering::Acquire)
+                || !shared.coordinator.is_desired(request)
+            {
+                return Err("clockless transcode cancelled".to_owned());
+            }
+            if let Some(error) = user_reset_failure
+                && let Some(chain) = config.vst3.as_ref()
+            {
+                crate::logger::log(format!("remote user-chain handoff reset failed: {error}"));
+                chain
+                    .processor
+                    .report_process_failure(format!("handoff reset: {error}"));
+                chain.status.mark_processing_failed();
+                config.vst3 = None;
+            }
+            if let Some(error) = effetune_reset_failure
+                && let Some(chain) = config.effetune.as_ref()
+            {
+                crate::logger::log(format!("remote EffeTune handoff reset failed: {error}"));
+                chain
+                    .processor
+                    .report_process_failure(format!("handoff reset: {error}"));
+                chain.status.mark_effetune_processing_failed();
+                config.effetune = None;
+            }
+            if !handoff.grant() {
+                return Err("clockless transcode cancelled".to_owned());
+            }
+            lease = Some(SharedRemoteLease {
+                coordinator: shared.coordinator,
+                request,
+            });
+        }
+        Self::new_inner(config, sample_rate, shared_mode, lease)
+    }
+
     fn new(config: ClocklessAudioProcessing, sample_rate: u32) -> Result<Self, String> {
+        Self::new_inner(
+            config,
+            sample_rate,
+            false,
+            #[cfg(windows)]
+            None,
+        )
+    }
+
+    fn new_inner(
+        config: ClocklessAudioProcessing,
+        sample_rate: u32,
+        skip_prepare_reset: bool,
+        #[cfg(windows)] shared_lease: Option<SharedRemoteLease>,
+    ) -> Result<Self, String> {
         if !config.normalize_gain.is_finite() || config.normalize_gain < 0.0 {
             return Err("normalize gain must be finite and non-negative".to_owned());
         }
@@ -1421,10 +1544,17 @@ impl ClocklessAudioProcessor {
         {
             let prepared = chain.processor.prepare();
             chain.status.mark_prepared(&prepared);
-            if prepared.active_slots > 0 {
+            if prepared.active_slots > 0 && chain.processor.sample_rate() != sample_rate {
+                chain
+                    .status
+                    .mark_rate_mismatch("VST3", chain.processor.sample_rate(), sample_rate);
+                vst3 = None;
+            } else if prepared.active_slots > 0 && !skip_prepare_reset {
                 chain.processor.reset();
             } else {
-                vst3 = None;
+                if prepared.active_slots == 0 {
+                    vst3 = None;
+                }
             }
         }
         let mut effetune = config.effetune;
@@ -1435,7 +1565,14 @@ impl ClocklessAudioProcessor {
             chain.status.mark_prepared(&prepared);
             if prepared.active_slots == 0 {
                 effetune = None;
-            } else if let Err(error) = chain.processor.try_reset() {
+            } else if chain.processor.sample_rate() != sample_rate {
+                chain.status.mark_rate_mismatch(
+                    "音響調整",
+                    chain.processor.sample_rate(),
+                    sample_rate,
+                );
+                effetune = None;
+            } else if !skip_prepare_reset && let Err(error) = chain.processor.try_reset() {
                 crate::logger::log(format!("remote-stream EffeTune reset failed: {error}"));
                 chain.status.mark_effetune_processing_failed();
                 effetune = None;
@@ -1449,7 +1586,24 @@ impl ClocklessAudioProcessor {
             effetune_output: Vec::new(),
             limiter: SafetyLimiter::new(sample_rate, 2),
             latency_reconciler: ClocklessLatencyReconciler::new(sample_rate),
+            vst3_health: crate::effetune::composition::StageHealth::default(),
+            effetune_health: crate::effetune::composition::StageHealth::default(),
+            sample_rate,
+            #[cfg(windows)]
+            shared_lease,
         })
+    }
+
+    #[cfg(windows)]
+    fn shared_permit(&self) -> Result<Option<super::dsp::coordinator::DspPermit>, String> {
+        match self.shared_lease.as_ref() {
+            Some(lease) => lease
+                .coordinator
+                .permit(lease.request)
+                .map(Some)
+                .ok_or_else(|| "clockless transcode cancelled".to_owned()),
+            None => Ok(None),
+        }
     }
 
     fn process(&mut self, mut chunk: ProcessedChunk) -> Option<ProcessedChunk> {
@@ -1461,28 +1615,47 @@ impl ClocklessAudioProcessor {
 
         let mut latency_secs = 0.0;
         let mut vst3_applied = false;
+        if let Some(chain) = self.vst3.as_ref()
+            && !chain.processor.available()
+            && !chain.failed.swap(true, Ordering::AcqRel)
+        {
+            chain.status.mark_unavailable();
+        }
         if let Some(chain) = self
             .vst3
             .as_ref()
-            .filter(|chain| !chain.failed.load(Ordering::Acquire))
+            .filter(|chain| !chain.failed.load(Ordering::Acquire) && chain.processor.available())
         {
-            self.vst3_output.resize(chunk.samples.len(), 0.0);
-            match chain
-                .processor
-                .process_block(&chunk.samples, &mut self.vst3_output)
-            {
-                Ok(()) => {
-                    std::mem::swap(&mut chunk.samples, &mut self.vst3_output);
-                    latency_secs += chain.processor.total_latency_samples() as f64
-                        / f64::from(chain.processor.sample_rate().max(1));
-                    vst3_applied = true;
+            if chain.processor.sample_rate() != self.sample_rate {
+                if !chain.failed.swap(true, Ordering::AcqRel) {
+                    chain.status.mark_rate_mismatch(
+                        "VST3",
+                        chain.processor.sample_rate(),
+                        self.sample_rate,
+                    );
                 }
-                Err(error) => {
-                    if !chain.failed.swap(true, Ordering::AcqRel) {
-                        crate::logger::log(format!(
-                            "remote-stream VST3 process failed; continuing dry: {error}"
-                        ));
-                        chain.status.mark_processing_failed();
+            } else {
+                self.vst3_output.resize(chunk.samples.len(), 0.0);
+                match chain
+                    .processor
+                    .process_if_available(&chunk.samples, &mut self.vst3_output)
+                {
+                    Ok(true) => {
+                        self.vst3_health.succeeded();
+                        std::mem::swap(&mut chunk.samples, &mut self.vst3_output);
+                        latency_secs += chain.processor.total_latency_samples() as f64
+                            / f64::from(chain.processor.sample_rate().max(1));
+                        vst3_applied = true;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        if self.vst3_health.failed() && !chain.failed.swap(true, Ordering::AcqRel) {
+                            crate::logger::log(format!(
+                                "remote-stream VST3 process failed; continuing dry: {error}"
+                            ));
+                            chain.processor.report_process_failure(error);
+                            chain.status.mark_processing_failed();
+                        }
                     }
                 }
             }
@@ -1491,39 +1664,63 @@ impl ClocklessAudioProcessor {
         let user_latency_secs = latency_secs;
         let mut effetune_applied = false;
         let mut effetune_latency_secs = 0.0;
+        if let Some(chain) = self.effetune.as_ref()
+            && !chain.processor.available()
+            && !chain.failed.swap(true, Ordering::AcqRel)
+        {
+            chain.status.mark_unavailable();
+        }
         if let Some(chain) = self
             .effetune
             .as_ref()
-            .filter(|chain| !chain.failed.load(Ordering::Acquire))
+            .filter(|chain| !chain.failed.load(Ordering::Acquire) && chain.processor.available())
         {
-            let proposed_latency = chain.processor.total_latency_samples() as f64
-                / f64::from(chain.processor.sample_rate().max(1));
-            match crate::effetune::composition::admit_effetune(user_latency_secs, proposed_latency)
-            {
-                Err(total) => {
-                    if !chain.failed.swap(true, Ordering::AcqRel) {
-                        crate::logger::log(format!(
-                            "remote-stream EffeTune latency exceeded: {total:.3}s"
-                        ));
-                        chain.status.mark_latency_exceeded(total);
-                    }
+            if chain.processor.sample_rate() != self.sample_rate {
+                if !chain.failed.swap(true, Ordering::AcqRel) {
+                    chain.status.mark_rate_mismatch(
+                        "音響調整",
+                        chain.processor.sample_rate(),
+                        self.sample_rate,
+                    );
                 }
-                Ok(()) => {
-                    self.effetune_output.resize(chunk.samples.len(), 0.0);
-                    match chain
-                        .processor
-                        .process_block(&chunk.samples, &mut self.effetune_output)
-                    {
-                        Ok(()) => {
-                            effetune_applied = true;
-                            effetune_latency_secs = proposed_latency;
+            } else {
+                let proposed_latency = chain.processor.total_latency_samples() as f64
+                    / f64::from(chain.processor.sample_rate().max(1));
+                match crate::effetune::composition::admit_effetune(
+                    user_latency_secs,
+                    proposed_latency,
+                ) {
+                    Err(total) => {
+                        if !chain.failed.swap(true, Ordering::AcqRel) {
+                            crate::logger::log(format!(
+                                "remote-stream EffeTune latency exceeded: {total:.3}s"
+                            ));
+                            chain.processor.report_latency_failure(total);
+                            chain.status.mark_latency_exceeded(total);
                         }
-                        Err(error) => {
-                            if !chain.failed.swap(true, Ordering::AcqRel) {
-                                crate::logger::log(format!(
-                                    "remote-stream EffeTune process failed; keeping user-chain output: {error}"
-                                ));
-                                chain.status.mark_effetune_processing_failed();
+                    }
+                    Ok(()) => {
+                        self.effetune_output.resize(chunk.samples.len(), 0.0);
+                        match chain
+                            .processor
+                            .process_if_available(&chunk.samples, &mut self.effetune_output)
+                        {
+                            Ok(true) => {
+                                self.effetune_health.succeeded();
+                                effetune_applied = true;
+                                effetune_latency_secs = proposed_latency;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                if self.effetune_health.failed()
+                                    && !chain.failed.swap(true, Ordering::AcqRel)
+                                {
+                                    crate::logger::log(format!(
+                                        "remote-stream EffeTune process failed; keeping user-chain output: {error}"
+                                    ));
+                                    chain.processor.report_process_failure(error);
+                                    chain.status.mark_effetune_processing_failed();
+                                }
                             }
                         }
                     }
@@ -1738,6 +1935,8 @@ impl DriverState<'_> {
     fn push_audio_chunk(&mut self, chunk: ProcessedChunk) -> Result<(), String> {
         self.wait_for_capacity()?;
         self.checkpoint()?;
+        #[cfg(windows)]
+        let _dsp_permit = self.audio_processor.shared_permit()?;
         // Source progress follows decoded input, including chunks consumed by latency
         // reconciliation. AAC PTS follows the reconciled audible samples below.
         self.max_source_pts = self
@@ -1993,6 +2192,10 @@ fn run_clockless_stream_inner(
         audio_bitrate_bps: audio_encoder.effective_bitrate_bps(),
         codecs: segmenter.codecs().to_owned(),
     };
+    #[cfg(windows)]
+    let audio_processor =
+        ClocklessAudioProcessor::new_for_stream(audio_processing, processing_sample_rate, control)?;
+    #[cfg(not(windows))]
     let audio_processor = ClocklessAudioProcessor::new(audio_processing, processing_sample_rate)?;
     stream_output.install(segmenter, output_info.clone(), source_origin_secs);
     on_ready(output_info);
@@ -2426,7 +2629,7 @@ mod tests {
                 latency_samples: 0,
                 prepare_active_slots: 0,
                 prepare_warning: Some(
-                    "VST3 プラグインを読み込めなかったため、配信を継続しています。".to_owned(),
+                    "VST3 の準備が間に合わなかったため、配信を継続しています。".to_owned(),
                 ),
                 reset_count: AtomicUsize::new(0),
                 inputs: Mutex::new(Vec::new()),
@@ -2509,6 +2712,49 @@ mod tests {
             dst.copy_from_slice(src);
             Ok(())
         }
+    }
+
+    struct MutableStageProcessor {
+        sample_rate: AtomicU32,
+        available: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    impl ClocklessVstProcessor for MutableStageProcessor {
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate.load(Ordering::Acquire)
+        }
+
+        fn prepare(&self) -> ClocklessVstPrepareResult {
+            ClocklessVstPrepareResult {
+                active_slots: 1,
+                warning: None,
+            }
+        }
+
+        fn reset(&self) {}
+
+        fn total_latency_samples(&self) -> u32 {
+            0
+        }
+
+        fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            dst.copy_from_slice(src);
+            Ok(())
+        }
+
+        fn available(&self) -> bool {
+            self.available.load(Ordering::Acquire)
+        }
+    }
+
+    fn mutable_stage(rate: u32) -> Arc<MutableStageProcessor> {
+        Arc::new(MutableStageProcessor {
+            sample_rate: AtomicU32::new(rate),
+            available: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+        })
     }
 
     fn changing_latency_processor(
@@ -2989,6 +3235,15 @@ mod tests {
         let chunk = processor.process(audio_chunk(vec![0.4, -0.2])).unwrap();
 
         assert_eq!(chunk.samples, vec![0.2, -0.1]);
+        for _ in 0..2 {
+            assert_eq!(
+                processor
+                    .process(audio_chunk(vec![0.4, -0.2]))
+                    .unwrap()
+                    .samples,
+                vec![0.2, -0.1]
+            );
+        }
         let status = status.snapshot();
         assert!(status.requested);
         assert!(!status.active);
@@ -3002,7 +3257,7 @@ mod tests {
     }
 
     #[test]
-    fn vst_load_failure_keeps_remote_audio_running_dry_and_publishes_warning() {
+    fn inactive_admitted_stage_keeps_remote_audio_running_dry_and_publishes_warning() {
         let host = Arc::new(FakeVstProcessor::unavailable(AUDIO_OUTPUT_RATE));
         let processor_handle: Arc<dyn ClocklessVstProcessor> = host.clone();
         let config = ClocklessAudioProcessing::with_vst3(0.5, processor_handle, 0, None);
@@ -3021,7 +3276,7 @@ mod tests {
             status
                 .warning
                 .as_deref()
-                .is_some_and(|warning| warning.contains("読み込めなかった"))
+                .is_some_and(|warning| warning.contains("準備が間に合わなかった"))
         );
     }
 
@@ -3106,7 +3361,15 @@ mod tests {
             assert_eq!(third.samples.len() / 2, FRAMES);
             assert_eq!(third.pdc_latency_secs_at_process, 0.0);
             assert!((third.audible_pts_secs - fallback_end).abs() < 1.0e-10);
+            let third_end = third.audible_pts_secs + third.duration_secs;
             packets.extend(encoder.push_chunk(third).unwrap());
+            if !cap_exceeded {
+                let fourth = processor
+                    .process(timed_audio_chunk(RATE, 3 * FRAMES, FRAMES, SEEK_SERIAL))
+                    .unwrap();
+                assert!((fourth.audible_pts_secs - third_end).abs() < 1.0e-10);
+                packets.extend(encoder.push_chunk(fourth).unwrap());
+            }
             packets.extend(encoder.finish().unwrap());
             assert!(!packets.is_empty());
             assert_eq!(
@@ -3115,7 +3378,7 @@ mod tests {
             );
             assert_eq!(
                 encoder.stats().input_samples_per_channel,
-                (3 * FRAMES) as u64
+                ((3 + usize::from(!cap_exceeded)) * FRAMES) as u64
             );
             assert!(status.snapshot().warning.unwrap().contains("音響調整"));
         }
@@ -3145,6 +3408,13 @@ mod tests {
         );
         let snapshot = status.snapshot();
         assert!(snapshot.active);
+        assert_eq!(snapshot.active_slots, 2);
+        assert!(snapshot.warning.is_none());
+        for _ in 0..2 {
+            let _ = processor.process(audio_chunk(vec![0.4, -0.2]));
+        }
+        let snapshot = status.snapshot();
+        assert!(snapshot.active);
         assert_eq!(snapshot.active_slots, 1);
         assert!(snapshot.warning.unwrap().contains("音響調整"));
     }
@@ -3162,6 +3432,12 @@ mod tests {
         let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
         let _ = processor.process(audio_chunk(vec![0.4, -0.2]));
         assert_eq!(effect.inputs.lock().unwrap().as_slice(), &[vec![0.2, -0.1]]);
+        let snapshot = status.snapshot();
+        assert!(snapshot.active);
+        assert_eq!(snapshot.active_slots, 2);
+        for _ in 0..2 {
+            let _ = processor.process(audio_chunk(vec![0.4, -0.2]));
+        }
         let snapshot = status.snapshot();
         assert!(snapshot.active);
         assert_eq!(snapshot.active_slots, 1);
@@ -3208,96 +3484,225 @@ mod tests {
         assert!(snapshot.warning.unwrap().contains("2 秒"));
     }
 
-    #[cfg(windows)]
     #[test]
-    fn expired_effect_capture_budget_preserves_the_user_stage() {
-        let user = Arc::new(FakeVstProcessor::new(AUDIO_OUTPUT_RATE, false));
-        let user_handle: Arc<dyn ClocklessVstProcessor> = user.clone();
-        let source = crate::effetune::RemoteCaptureSource::with_fake_capture(
-            PathBuf::from("unused"),
-            |_| unreachable!("expired deadline must not start capture"),
+    fn rebuilt_user_bridge_rate_mismatch_removes_only_user_stage() {
+        let user = mutable_stage(44_100);
+        let effect = mutable_stage(44_100);
+        let config = with_fake_effetune(
+            ClocklessAudioProcessing::with_vst3(1.0, user.clone(), 1, None),
+            effect.clone(),
         );
-        let config = ClocklessAudioProcessing::with_vst3(1.0, user_handle, 1, None)
-            .with_remote_effetune(
-                PathBuf::from("unused"),
-                source,
-                AUDIO_OUTPUT_RATE,
-                Instant::now() - Duration::from_millis(1),
-            );
         let status = config.vst3_status();
-        let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
-        let _ = processor.process(audio_chunk(vec![0.2, -0.2]));
-        assert_eq!(user.inputs.lock().unwrap().len(), 1);
+        assert_eq!(config.processing_sample_rate(), 44_100);
+        let mut processor = ClocklessAudioProcessor::new(config, 44_100).unwrap();
+        processor.process(audio_chunk(vec![0.25, -0.25]));
+        user.sample_rate.store(48_000, Ordering::Release);
+        processor.process(audio_chunk(vec![0.25, -0.25]));
+        assert_eq!(user.calls.load(Ordering::Acquire), 1);
+        assert_eq!(effect.calls.load(Ordering::Acquire), 2);
         let snapshot = status.snapshot();
-        assert!(snapshot.active);
         assert_eq!(snapshot.active_slots, 1);
-        assert!(snapshot.warning.unwrap().contains("音響調整"));
+        assert!(snapshot.warning.unwrap().contains("VST3"));
+    }
+
+    #[test]
+    fn inactive_user_stage_does_not_select_rate_over_effect() {
+        let user = Arc::new(FakeVstProcessor::unavailable(48_000));
+        let effect = mutable_stage(44_100);
+        let config = with_fake_effetune(
+            ClocklessAudioProcessing::with_vst3(1.0, user, 0, None),
+            effect,
+        );
+        assert_eq!(config.processing_sample_rate(), 44_100);
+    }
+
+    #[test]
+    fn admitted_effect_slot_disappearing_does_not_join_or_process_again() {
+        let effect = mutable_stage(44_100);
+        let config =
+            with_fake_effetune(ClocklessAudioProcessing::without_vst3(1.0), effect.clone());
+        let status = config.vst3_status();
+        let mut processor = ClocklessAudioProcessor::new(config, 44_100).unwrap();
+        processor.process(audio_chunk(vec![0.25, -0.25]));
+        effect.available.store(false, Ordering::Release);
+        processor.process(audio_chunk(vec![0.25, -0.25]));
+        effect.available.store(true, Ordering::Release);
+        processor.process(audio_chunk(vec![0.25, -0.25]));
+        assert_eq!(effect.calls.load(Ordering::Acquire), 1);
+        assert_eq!(status.snapshot().active_slots, 0);
     }
 
     #[cfg(windows)]
     #[test]
-    fn remote_recapture_starts_after_user_prepare_and_timeout_keeps_user_stage() {
-        struct MarkPrepared(Arc<AtomicBool>, Arc<AtomicU64>);
-        impl ClocklessVstProcessor for MarkPrepared {
+    fn shared_remote_processor_resets_both_stages_after_old_block_finishes() {
+        use super::super::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let cancel = AtomicBool::new(false);
+        let local = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 1,
+                epoch: 1,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(local, Instant::now() + Duration::from_secs(1), &cancel)
+                .unwrap()
+                .grant()
+        );
+        let old_block = coordinator.permit(local).unwrap();
+        let user = Arc::new(FakeVstProcessor::new(44_100, false));
+        let effect = Arc::new(FakeVstProcessor::new(44_100, false));
+        let mut config = with_fake_effetune(
+            ClocklessAudioProcessing::with_vst3(1.0, user.clone(), 1, None),
+            effect.clone(),
+        );
+        config.shared = Some(SharedRemoteDsp {
+            coordinator: Arc::clone(&coordinator),
+            owner: Some(DspOwner::Remote {
+                session: 7,
+                generation: 2,
+            }),
+        });
+        let control = ClocklessTranscodeControl::manual(2).unwrap();
+        let join = thread::spawn(move || {
+            ClocklessAudioProcessor::new_for_stream(config, 44_100, &control).unwrap()
+        });
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(user.reset_count.load(Ordering::Acquire), 0);
+        assert_eq!(effect.reset_count.load(Ordering::Acquire), 0);
+        drop(old_block);
+        let processor = join.join().unwrap();
+        assert_eq!(user.reset_count.load(Ordering::Acquire), 1);
+        assert_eq!(effect.reset_count.load(Ordering::Acquire), 1);
+        assert!(processor.shared_permit().unwrap().is_some());
+        drop(processor);
+        assert!(!coordinator.local_has_token(1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_handoff_timeout_stays_dry_without_reporting_local_host_failure() {
+        use super::super::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let cancel = AtomicBool::new(false);
+        let local = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 1,
+                epoch: 1,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(local, Instant::now() + Duration::from_secs(1), &cancel)
+                .unwrap()
+                .grant()
+        );
+        let old_block = coordinator.permit(local).unwrap();
+        let user = Arc::new(FakeVstProcessor::new(44_100, false));
+        let mut config = ClocklessAudioProcessing::with_vst3(1.0, user.clone(), 1, None);
+        let status = config.vst3_status();
+        config.shared = Some(SharedRemoteDsp {
+            coordinator: Arc::clone(&coordinator),
+            owner: Some(DspOwner::Remote {
+                session: 7,
+                generation: 2,
+            }),
+        });
+        let control = ClocklessTranscodeControl::manual(2).unwrap();
+        let processor = ClocklessAudioProcessor::new_for_stream(config, 44_100, &control).unwrap();
+        assert!(processor.vst3.is_none());
+        assert_eq!(user.reset_count.load(Ordering::Acquire), 0);
+        assert!(status.snapshot().warning.unwrap().contains("受け渡し"));
+        drop(old_block);
+        let next_local = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 1,
+                epoch: 2,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(next_local, Instant::now() + Duration::from_secs(1), &cancel)
+                .unwrap()
+                .grant()
+        );
+        assert!(coordinator.local_permit(1).is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_remote_reset_does_not_start_second_stage_or_report_plugin_failure() {
+        use super::super::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        struct BlockingReset {
+            entered: Mutex<Option<mpsc::Sender<()>>>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl ClocklessVstProcessor for BlockingReset {
             fn sample_rate(&self) -> u32 {
-                AUDIO_OUTPUT_RATE
+                44_100
             }
             fn prepare(&self) -> ClocklessVstPrepareResult {
-                self.0.store(true, Ordering::Release);
                 ClocklessVstPrepareResult {
                     active_slots: 1,
                     warning: None,
                 }
             }
             fn reset(&self) {}
+            fn try_reset(&self) -> Result<(), String> {
+                if let Some(sender) = self.entered.lock().unwrap().take() {
+                    sender.send(()).unwrap();
+                }
+                self.release.lock().unwrap().recv().unwrap();
+                Err("reset failed after cancellation".to_owned())
+            }
             fn total_latency_samples(&self) -> u32 {
                 0
             }
             fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
-                self.1.fetch_add(1, Ordering::AcqRel);
                 dst.copy_from_slice(src);
                 Ok(())
             }
         }
-        let prepared = Arc::new(AtomicBool::new(false));
-        let process_calls = Arc::new(AtomicU64::new(0));
-        let capture_saw_prepared = Arc::new(AtomicBool::new(false));
-        let marker = Arc::clone(&capture_saw_prepared);
-        let prepared_for_capture = Arc::clone(&prepared);
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let source = crate::effetune::RemoteCaptureSource::with_fake_capture(
-            PathBuf::from("unused"),
-            move |_| {
-                marker.store(
-                    prepared_for_capture.load(Ordering::Acquire),
-                    Ordering::Release,
-                );
-                let _ = release_rx.recv();
-                Err(crate::effetune::CaptureError::Interrupted(
-                    "released".into(),
-                ))
-            },
-        );
-        let user: Arc<dyn ClocklessVstProcessor> =
-            Arc::new(MarkPrepared(prepared, Arc::clone(&process_calls)));
-        let config = ClocklessAudioProcessing::with_vst3(1.0, user, 1, None).with_remote_effetune(
-            PathBuf::from("unused"),
-            source,
-            AUDIO_OUTPUT_RATE,
-            Instant::now() + Duration::from_millis(300),
+        let user = Arc::new(BlockingReset {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(release_rx),
+        });
+        let effect = Arc::new(FakeVstProcessor::new(44_100, false));
+        let mut config = with_fake_effetune(
+            ClocklessAudioProcessing::with_vst3(1.0, user, 1, None),
+            effect.clone(),
         );
         let status = config.vst3_status();
-        let mut processor = ClocklessAudioProcessor::new(config, AUDIO_OUTPUT_RATE).unwrap();
+        config.shared = Some(SharedRemoteDsp {
+            coordinator: Arc::clone(&coordinator),
+            owner: Some(DspOwner::Remote {
+                session: 1,
+                generation: 1,
+            }),
+        });
+        let control = ClocklessTranscodeControl::manual(2).unwrap();
+        let worker = thread::spawn(move || {
+            ClocklessAudioProcessor::new_for_stream(config, 44_100, &control)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        coordinator.revoke();
         release_tx.send(()).unwrap();
-        let _chunk = processor.process(audio_chunk(vec![0.2, -0.2]));
-        assert_eq!(process_calls.load(Ordering::Acquire), 1);
-        assert!(capture_saw_prepared.load(Ordering::Acquire));
-        assert!(status.snapshot().active);
-        assert!(status.snapshot().warning.unwrap().contains("音響調整"));
+        assert!(matches!(worker.join().unwrap(), Err(error) if error.contains("cancelled")));
+        assert_eq!(effect.reset_count.load(Ordering::Acquire), 0);
+        assert!(status.snapshot().warning.is_none());
     }
 
     #[test]
-    fn generation_switch_reuses_one_session_vst_host() {
+    fn generation_clones_share_the_admitted_processor() {
         let host = Arc::new(FakeVstProcessor::new(AUDIO_OUTPUT_RATE, false));
         let processor_handle: Arc<dyn ClocklessVstProcessor> = host;
         let session = ClocklessAudioProcessing::with_vst3(1.0, processor_handle, 1, None);

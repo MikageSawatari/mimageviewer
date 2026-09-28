@@ -14,6 +14,7 @@
 #![cfg(windows)]
 
 pub mod bridge;
+pub mod coordinator;
 pub mod extract;
 pub mod gui;
 pub mod scanner;
@@ -161,9 +162,9 @@ pub enum GuiFailure {
 
 /// DspBridge — 1 本の VST3 チェーンホスト bridge との対話を管理する。
 ///
-/// ローカル再生用はアプリ起動から終了まで 1 個を保持する。時計なしリモート配信は
-/// ローカルの時間状態を壊さないようセッション専用の 1 個を持ち、全配信世代で共有する。
-/// 各所有者内では `Arc<DspBridge>` 化して audio-pump / worker と制御側から共有アクセス。
+/// アプリ起動時に読み込んだユーザー VST と音響調整の各 bridge をローカル再生と
+/// 時計なしリモート配信で共有する。audio-pump と配信 worker の process/reset/flush は
+/// `DspProcessingCoordinator` の世代付き許可で排他する。
 pub struct DspBridge {
     inner: Mutex<DspBridgeInner>,
     gui_owner_policy: GuiOwnerPolicy,

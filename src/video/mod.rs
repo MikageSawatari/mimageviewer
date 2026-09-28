@@ -246,6 +246,36 @@ impl VideoContinuousMode {
     }
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum LocalDspPosition {
+    CurrentAfterMetadata,
+    Exact(f64),
+}
+
+#[cfg(windows)]
+impl LocalDspPosition {
+    fn resolve(self, current_position_secs: f64) -> f64 {
+        match self {
+            Self::CurrentAfterMetadata => current_position_secs,
+            Self::Exact(position_secs) => position_secs,
+        }
+    }
+}
+
+#[cfg(windows)]
+struct PendingLocalDspHandoff {
+    handoff: audio::LocalDspHandoff,
+    requested_position: LocalDspPosition,
+}
+
+#[cfg(windows)]
+enum LocalDspAcquisition {
+    Idle,
+    AwaitingMetadata(LocalDspPosition),
+    Waiting(PendingLocalDspHandoff),
+}
+
 pub struct VideoPlayer {
     path: PathBuf,
     /// All player-owned workers and the native event funnel wake the same egui root.
@@ -308,6 +338,8 @@ pub struct VideoPlayer {
     video_output: VideoOutputState,
     /// 保持目的に加え、Remote streaming session が audio tap controller を取得する。
     audio: Option<audio::AudioOutput>,
+    #[cfg(windows)]
+    dsp_handoff: Mutex<LocalDspAcquisition>,
     info: Option<VideoInfo>,
     /// open 失敗 / DLL ロード失敗のメッセージ。Some なら UI は赤字エラー表示する。
     error: Option<String>,
@@ -8271,6 +8303,8 @@ impl VideoPlayer {
             decode: dummy_decode_handles(),
             video_output: VideoOutputState::Inactive,
             audio: None,
+            #[cfg(windows)]
+            dsp_handoff: Mutex::new(LocalDspAcquisition::Idle),
             info: None,
             error: None,
             thumb_worker: None,
@@ -8598,6 +8632,8 @@ impl VideoPlayer {
                 decode: dummy_decode_handles(),
                 video_output: VideoOutputState::Inactive,
                 audio: None,
+                #[cfg(windows)]
+                dsp_handoff: Mutex::new(LocalDspAcquisition::Idle),
                 info: None,
                 error: Some(format!("FFmpeg DLL のロードに失敗しました: {e}")),
                 thumb_worker: None,
@@ -8859,6 +8895,8 @@ impl VideoPlayer {
             },
             video_output,
             audio,
+            #[cfg(windows)]
+            dsp_handoff: Mutex::new(LocalDspAcquisition::Idle),
             info: None,
             error: headless_init_error.or(native_init_error),
             thumb_worker,
@@ -8892,6 +8930,10 @@ impl VideoPlayer {
         // (config=None ケースは呼び出し元が `fail_native_init` 経由で同等の処理を行う)
         if player.error.is_some() {
             player.shutdown_workers_for_error();
+        }
+        #[cfg(windows)]
+        if autoplay && player.error.is_none() {
+            player.begin_dsp_acquisition(LocalDspPosition::CurrentAfterMetadata);
         }
         crate::logger::log(format!(
             "[video-debug] VideoPlayer::open done path={} autoplay={} volume={:.2} normalize_gain={:.3} audio_preroll_suspended={} engine_state={} resume_secs={:?} video_rx_len={} audio_rx_len={}",
@@ -9200,6 +9242,14 @@ impl VideoPlayer {
     /// Phase 9.C: engine state machine に Play / Pause を伝える。
     /// `toggle_play` / `set_playing` から共有。`apply_command` は idempotent。
     fn dispatch_play_pause(&self, playing: bool) {
+        #[cfg(windows)]
+        if playing && self.begin_dsp_acquisition(LocalDspPosition::CurrentAfterMetadata) {
+            return;
+        }
+        #[cfg(windows)]
+        if !playing {
+            self.cancel_dsp_acquisition();
+        }
         let cmd = if playing {
             engine::actor::TransportCommand::Play
         } else {
@@ -9208,7 +9258,181 @@ impl VideoPlayer {
         self.engine.lock().unwrap().apply_command(cmd);
     }
 
+    #[cfg(windows)]
+    fn begin_dsp_acquisition(&self, requested_position: LocalDspPosition) -> bool {
+        let Some(audio) = self
+            .audio
+            .as_ref()
+            .filter(|audio| audio.has_dsp_coordinator())
+        else {
+            return false;
+        };
+        if audio.has_dsp_token() {
+            return false;
+        }
+        {
+            let mut acquisition = self.dsp_handoff.lock().unwrap();
+            match &mut *acquisition {
+                LocalDspAcquisition::Waiting(_) => return true,
+                LocalDspAcquisition::AwaitingMetadata(existing) if self.info.is_none() => {
+                    if matches!(requested_position, LocalDspPosition::Exact(_)) {
+                        *existing = requested_position;
+                    }
+                    return true;
+                }
+                LocalDspAcquisition::AwaitingMetadata(_) => {
+                    *acquisition = LocalDspAcquisition::Idle;
+                }
+                LocalDspAcquisition::Idle => {}
+            }
+        }
+        let position_secs = requested_position.resolve(self.position());
+        let requested_position = if self.info.is_some() {
+            LocalDspPosition::Exact(position_secs)
+        } else {
+            requested_position
+        };
+        // Freeze the clock and output before revoking the old owner's token.
+        self.engine
+            .lock()
+            .unwrap()
+            .apply_command(engine::actor::TransportCommand::Pause);
+        self.clock.set_paused_position(position_secs);
+        if self.info.is_none() {
+            *self.dsp_handoff.lock().unwrap() =
+                LocalDspAcquisition::AwaitingMetadata(requested_position);
+            return true;
+        }
+        let Some(handoff) = audio.request_dsp_handoff(Arc::clone(&self.ui_wake)) else {
+            self.seek_with_play_state(position_secs, false);
+            self.engine
+                .lock()
+                .unwrap()
+                .apply_command(engine::actor::TransportCommand::Play);
+            return true;
+        };
+        *self.dsp_handoff.lock().unwrap() = LocalDspAcquisition::Waiting(PendingLocalDspHandoff {
+            handoff,
+            requested_position,
+        });
+        true
+    }
+
+    #[cfg(windows)]
+    fn cancel_dsp_acquisition(&self) -> bool {
+        match std::mem::replace(
+            &mut *self.dsp_handoff.lock().unwrap(),
+            LocalDspAcquisition::Idle,
+        ) {
+            LocalDspAcquisition::Idle => false,
+            LocalDspAcquisition::AwaitingMetadata(_) => true,
+            LocalDspAcquisition::Waiting(pending) => {
+                pending.handoff.coordinator.cancel(pending.handoff.request);
+                true
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn start_dsp_acquisition_after_metadata(&self) {
+        if self.info.is_none() {
+            return;
+        }
+        let requested_position = {
+            let mut acquisition = self.dsp_handoff.lock().unwrap();
+            match &*acquisition {
+                LocalDspAcquisition::AwaitingMetadata(position) => {
+                    let position = *position;
+                    *acquisition = LocalDspAcquisition::Idle;
+                    Some(position)
+                }
+                _ => None,
+            }
+        };
+        if let Some(position) = requested_position {
+            self.begin_dsp_acquisition(position);
+        }
+    }
+
+    #[cfg(windows)]
+    fn poll_dsp_acquisition(&self) {
+        let completion = {
+            let mut pending = self.dsp_handoff.lock().unwrap();
+            let LocalDspAcquisition::Waiting(current) = &*pending else {
+                return;
+            };
+            match current.handoff.receiver.try_recv() {
+                Ok(result) => match std::mem::replace(&mut *pending, LocalDspAcquisition::Idle) {
+                    LocalDspAcquisition::Waiting(request) => Some((request, result)),
+                    _ => unreachable!(),
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    match std::mem::replace(&mut *pending, LocalDspAcquisition::Idle) {
+                        LocalDspAcquisition::Waiting(request) => {
+                            Some((request, audio::LocalDspHandoffResult::Cancelled))
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        };
+        let Some((pending, result)) = completion else {
+            return;
+        };
+        let request = pending.handoff.request;
+        let coordinator = pending.handoff.coordinator;
+        let requested_position_secs = pending.requested_position.resolve(self.position());
+        if !coordinator.is_desired(request)
+            && !(matches!(result, audio::LocalDspHandoffResult::TimedOut)
+                && coordinator.is_latest_request(request))
+        {
+            if coordinator.local_dry_resume_allowed() {
+                self.seek_with_play_state(requested_position_secs, false);
+                self.engine
+                    .lock()
+                    .unwrap()
+                    .apply_command(engine::actor::TransportCommand::Play);
+            }
+            return;
+        }
+        match result {
+            audio::LocalDspHandoffResult::Ready(handoff) => {
+                self.seek_with_play_state(requested_position_secs, false);
+                if handoff.grant() {
+                    self.engine
+                        .lock()
+                        .unwrap()
+                        .apply_command(engine::actor::TransportCommand::Play);
+                } else if coordinator.local_dry_resume_allowed() {
+                    self.engine
+                        .lock()
+                        .unwrap()
+                        .apply_command(engine::actor::TransportCommand::Play);
+                }
+            }
+            audio::LocalDspHandoffResult::TimedOut | audio::LocalDspHandoffResult::ResetFailed => {
+                if matches!(result, audio::LocalDspHandoffResult::TimedOut) {
+                    crate::logger::log("local DSP handoff timeout; resuming without DSP");
+                }
+                self.seek_with_play_state(requested_position_secs, false);
+                coordinator.cancel(request);
+                if coordinator.local_dry_resume_allowed() {
+                    self.engine
+                        .lock()
+                        .unwrap()
+                        .apply_command(engine::actor::TransportCommand::Play);
+                }
+            }
+            audio::LocalDspHandoffResult::Cancelled => {}
+        }
+    }
+
     pub fn toggle_play(&self) {
+        #[cfg(windows)]
+        if self.cancel_dsp_acquisition() {
+            return;
+        }
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
         //
@@ -9220,6 +9444,10 @@ impl VideoPlayer {
         // epoch 競合なく扱いたいので、ここでは明示的に `request_seek(0)` + `handle_seek_request(0)`
         // + `apply_command(Play)` を発行する。
         if !self.clock.is_playing() && self.clock.is_eof_reached() {
+            #[cfg(windows)]
+            if self.begin_dsp_acquisition(LocalDspPosition::Exact(0.0)) {
+                return;
+            }
             self.clear_pending_user_seek();
             self.clear_frame_step_target();
             self.clock.request_seek(0.0);
@@ -9260,6 +9488,14 @@ impl VideoPlayer {
     }
 
     pub fn set_playing(&self, p: bool) {
+        #[cfg(windows)]
+        if !p && self.cancel_dsp_acquisition() {
+            self.engine
+                .lock()
+                .unwrap()
+                .apply_command(engine::actor::TransportCommand::Pause);
+            return;
+        }
         // **intent 基準で dispatch 判定** (Codex P2 2026-05-17): 旧版は
         // `prev = self.clock.is_playing()` を見ていたが、`is_playing()` は engine state
         // が Playing のときだけ true なので、Loading/Buffering/Seeking 中 (autoplay=true)
@@ -9289,7 +9525,19 @@ impl VideoPlayer {
         // 強制 dispatch することで `handle_play` の Eof arm (= `handle_seek_request(0)` +
         // autoplay 強制) を発火させ replay する。
         let force_dispatch = p && self.clock.is_eof_reached();
-        if prev_intent != p || force_dispatch {
+        #[cfg(windows)]
+        if force_dispatch && self.begin_dsp_acquisition(LocalDspPosition::Exact(0.0)) {
+            return;
+        }
+        #[cfg(windows)]
+        let needs_dsp_acquisition = p
+            && self
+                .audio
+                .as_ref()
+                .is_some_and(|audio| audio.has_dsp_coordinator() && !audio.has_dsp_token());
+        #[cfg(not(windows))]
+        let needs_dsp_acquisition = false;
+        if prev_intent != p || force_dispatch || needs_dsp_acquisition {
             self.dispatch_play_pause(p);
         }
         crate::logger::log(format!(
@@ -9399,6 +9647,13 @@ impl VideoPlayer {
     pub fn seek(&self, target_secs: f64) {
         self.clear_frame_step_target();
         let clamped = self.clamp_seek_target(target_secs);
+        #[cfg(windows)]
+        {
+            self.cancel_dsp_acquisition();
+            if self.begin_dsp_acquisition(LocalDspPosition::Exact(clamped)) {
+                return;
+            }
+        }
         crate::logger::log(format!(
             "[video-debug] seek({target_secs:.3}) called: clamped={clamped:.3} engine_state={} prev_seek_serial={} playing={} video_rx_len={} audio_rx_len={}",
             self.engine_state_name(),
@@ -9423,6 +9678,17 @@ impl VideoPlayer {
     pub fn seek_with_play_state(&self, target_secs: f64, should_play: bool) {
         self.clear_frame_step_target();
         let clamped = self.clamp_seek_target(target_secs);
+        #[cfg(windows)]
+        if should_play {
+            self.cancel_dsp_acquisition();
+            if self.begin_dsp_acquisition(LocalDspPosition::Exact(clamped)) {
+                return;
+            }
+        }
+        #[cfg(windows)]
+        if !should_play {
+            self.cancel_dsp_acquisition();
+        }
         if should_play {
             let mut state = self.user_seek_coalesce.lock().unwrap();
             self.issue_user_seek_locked(&mut state, clamped);
@@ -9668,6 +9934,8 @@ impl VideoPlayer {
 
     /// フレーム送り用の精密シーク。到着後は必ず一時停止状態に保つ。
     pub fn seek_paused(&self, target_secs: f64) {
+        #[cfg(windows)]
+        self.cancel_dsp_acquisition();
         self.clear_pending_user_seek();
         self.clear_frame_step_target();
         self.seek_paused_internal(target_secs);
@@ -10650,6 +10918,10 @@ impl VideoPlayer {
         // dispatch する。EngineActor は state machine のみ更新し、AvClock の挙動には
         // まだ影響しない (= Phase 3d までは AvClock が引き続き source of truth)。
         self.drain_engine_events();
+        #[cfg(windows)]
+        self.start_dsp_acquisition_after_metadata();
+        #[cfg(windows)]
+        self.poll_dsp_acquisition();
 
         // info を取り込む
         if self.info.is_none() {
@@ -10715,10 +10987,28 @@ impl VideoPlayer {
                         // resume 指定があれば最初の info 到着時に 1 度だけ実行。
                         // 末尾近く (残り 5 秒以下) なら 0 から再生 (= 完走済みと見なす)。
                         // 保存側 (`save_video_resume_position`) と同じ閾値で gate する。
-                        if let Some(resume) = sanitize_resume_for_duration(
-                            self.pending_resume_secs.take(),
-                            info.duration_secs,
-                        ) {
+                        let requested_before_metadata = {
+                            #[cfg(windows)]
+                            {
+                                matches!(
+                                    &*self.dsp_handoff.lock().unwrap(),
+                                    LocalDspAcquisition::AwaitingMetadata(LocalDspPosition::Exact(
+                                        _
+                                    ))
+                                )
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                false
+                            }
+                        };
+                        let pending_resume = self.pending_resume_secs.take();
+                        let resume = if requested_before_metadata {
+                            None
+                        } else {
+                            sanitize_resume_for_duration(pending_resume, info.duration_secs)
+                        };
+                        if let Some(resume) = resume {
                             self.clock.request_seek(resume);
                             // 共有 seek_serial は clock.request_seek で 1 回 bump。
                             // 続く engine.handle_seek_request は adaptive ロジックで
@@ -10737,6 +11027,13 @@ impl VideoPlayer {
                             self.engine.lock().unwrap().handle_seek_request(resume);
                         }
                         self.info = Some(info);
+                        #[cfg(windows)]
+                        if matches!(
+                            &*self.dsp_handoff.lock().unwrap(),
+                            LocalDspAcquisition::AwaitingMetadata(_)
+                        ) {
+                            ctx.request_repaint();
+                        }
                     }
                     Err(e) => {
                         // T13 (Claude R-VENG-3): info_rx Err 経路でも他経路と同じく
@@ -11583,6 +11880,8 @@ impl VideoPlayer {
     fn shutdown_workers_for_error(&mut self) {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(windows)]
+        self.cancel_dsp_acquisition();
         self.stop_video_output();
         self.pause_audio_output();
         self.clear_audio_output_buffer();
@@ -11669,6 +11968,61 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn local_dsp_handoff_waits_for_metadata_and_reseeks_at_requested_position() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        for (requested, expected) in [
+            (super::LocalDspPosition::CurrentAfterMetadata, 12.0),
+            (super::LocalDspPosition::Exact(20.0), 20.0),
+        ] {
+            let coordinator = std::sync::Arc::new(DspProcessingCoordinator::default());
+            let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+                std::path::PathBuf::from("handoff.mp4"),
+            );
+            let info = player.info.take().unwrap();
+            let (info_tx, info_rx) = crossbeam_channel::bounded(1);
+            player.decode.info_rx = info_rx;
+            player.pending_resume_secs = Some(12.0);
+            player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+                AudioDspChain {
+                    user: None,
+                    effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                    coordinator: std::sync::Arc::clone(&coordinator),
+                },
+            ));
+
+            assert!(player.begin_dsp_acquisition(requested));
+            assert!(matches!(
+                &*player.dsp_handoff.lock().unwrap(),
+                super::LocalDspAcquisition::AwaitingMetadata(_)
+            ));
+            assert_eq!(player.current_seek_serial(), 0);
+            assert!(!player.audio.as_ref().unwrap().has_dsp_token());
+
+            info_tx.send(Ok(info)).unwrap();
+            let ctx = egui::Context::default();
+            player.tick(&ctx);
+            assert!(player.info.is_some());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !player.audio.as_ref().unwrap().has_dsp_token()
+                && std::time::Instant::now() < deadline
+            {
+                player.tick(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(player.audio.as_ref().unwrap().has_dsp_token());
+            assert!(matches!(
+                &*player.dsp_handoff.lock().unwrap(),
+                super::LocalDspAcquisition::Idle
+            ));
+            assert!((player.position() - expected).abs() < 0.001);
+            assert!(player.current_seek_serial() >= 1);
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn changed_video_placement_cannot_be_ready_before_a_frame_is_owned() {

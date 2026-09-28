@@ -179,14 +179,14 @@ for plugin relayout/paint work on every mouse step.
 
 ```
 mimageviewer-core.exe (Rust)
-├─ DspBridge (ローカル再生 singleton, src/video/dsp/mod.rs)
+├─ DspBridge (ユーザー VST 共有 singleton, src/video/dsp/mod.rs)
 │   ├─ Vec<PluginSlot>          ← チェーン (順番が音声適用順)
 │   │   ├─ Slot[0]: bridge: Arc<Bridge> ──┐
 │   │   ├─ Slot[1]: bridge: Arc<Bridge> ──┤  全 slot が同じ Arc を共有
 │   │   └─ ...                            ┘  (= 1 bridge プロセスが全プラグインを host)
 │   └─ active_slot_count (atomic): bypass=false の Loaded 個数
-├─ Remote streaming session (配信中だけ)
-│   └─ DspBridge × 1: active plugin の同順 chain。全 generation が Arc 共有
+├─ DspProcessingCoordinator (src/video/dsp/coordinator.rs)
+│   └─ ローカル pump / リモート (session, generation) の host 操作をブロック単位で調停
 ├─ src/video/audio.rs: audio-pump thread が local DspBridge::process_block を呼ぶ。
 │   bridges を Arc::ptr_eq で dedup するため、N 個のプラグインがあっても
 │   IPC roundtrip は **1 回だけ** (= bridge 内部で chain 順に処理して 1 回で返す)
@@ -224,13 +224,15 @@ include_bytes! でメイン exe に埋め込み、初回 enable 時に
 音声処理 entry は `DspBridge::process_block` だけである。per-plugin bridge 時代の
 `chain_process` と ping-pong scratch buffer は削除済み。
 
-時計なしリモート配信はローカル再生の plugin state と高速 feed の timeline を混在させないため、
-streaming session 専用 `DspBridge` を 1 個持つ。設定の active plugin を worker 内で一度だけ load し、
-seek / 画質変更による新旧 generation は同じ processor `Arc` を使う。generation resource lease が
-旧 worker の FFmpeg/VST drop 後に新 worker を進めるため、切替中も host process は
-**ローカル 1 + リモート 1 = 最大 2** から増えない。ロードは start 残予算から後段用 3 秒を
-予約した値（上限 10 秒）で打ち切り、load/process 失敗は normalize 済み dry へ fallback して
-配信を継続し、IPC/Web と本体 modal に warning を公開する。
+時計なしリモート配信は、起動時に読み込んだユーザー VST と音響調整の bridge をローカル再生と共有する。
+旧方式のセッション専用 bridge は、Mixwright の状態復元後に WebView がパイプラインを組み直す間、
+配信の冒頭数秒が EQ なしになるため廃止した。`DspProcessingCoordinator` は
+`Local { pump_instance, epoch }` と `Remote { session, generation }` の札を管理する。
+新しい所有者は実行中の音声ブロックが終わるのを worker 上で待ち、結果を返す reset を経てから札を得る。
+許可は raw 音声の取り出しから 2 段の処理、出力の確定まで保持する。札を失ったローカル pump は
+host を呼ばず素通しで処理し、再取得時は一時停止のまま再 seek して古いキューを消す。
+リモートの段は受け付け時に独立して採用し、未準備や失敗の段は warning とともに外す。
+host 数はユーザー VST と音響調整で通常最大 2、配信中も増えない。
 
 ## 3. ディレクトリ / モジュールマップ
 
@@ -273,7 +275,7 @@ decoder → audio_rx → audio-pump thread:
 ```
 
 時計なしリモート配信では time stretch と cpal 出力を持たず、
-`decode/resample → fixed normalize gain → session VST3 → safety limiter → AAC` とする。
+`decode/resample → fixed normalize gain → shared user VST → shared 音響調整 → safety limiter → AAC` とする。
 normalize/VST/limiter の前後関係と PDC/lookahead 補正はローカル再生と同じである。
 
 設計判断:

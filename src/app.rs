@@ -12011,11 +12011,29 @@ fn pause_current_media_player_for_remote_session(
     else {
         return false;
     };
-    if !player.intent_playing() {
-        return false;
-    }
+    let was_playing = player.intent_playing();
     player.set_playing(false);
-    true
+    was_playing
+}
+
+#[cfg(windows)]
+struct RemotePausedLocalMedia {
+    context: Option<ViewerContextId>,
+    path: PathBuf,
+    position_secs: f64,
+}
+
+#[cfg(windows)]
+fn current_playing_media_snapshot(
+    fullscreen_idx: Option<usize>,
+    fs_cache: &ItemsGenerationMap<FsCacheEntry>,
+) -> Option<(PathBuf, f64)> {
+    let FsCacheEntry::Video { player, .. } = fs_cache.get(&fullscreen_idx?)? else {
+        return None;
+    };
+    player
+        .intent_playing()
+        .then(|| (player.path().clone(), player.position()))
 }
 
 #[cfg(windows)]
@@ -12425,6 +12443,8 @@ pub(crate) struct FavoriteViewContextState {
 
 pub struct App {
     pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
+    #[cfg(windows)]
+    remote_paused_local_media: Vec<RemotePausedLocalMedia>,
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
     pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
@@ -15956,6 +15976,9 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) dsp_bridge: std::sync::Arc<crate::video::dsp::DspBridge>,
     #[cfg(windows)]
+    pub(crate) dsp_processing:
+        std::sync::Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
+    #[cfg(windows)]
     pub(crate) effetune: crate::effetune::EffetuneController,
     /// VST3 プラグイン管理ウィンドウ (= プレイバックパネル) の表示状態。
     pub(crate) show_vst3_manager: bool,
@@ -17763,6 +17786,10 @@ impl App {
             #[cfg(windows)]
             dsp_bridge: crate::video::dsp::DspBridge::new(),
             #[cfg(windows)]
+            dsp_processing: std::sync::Arc::new(
+                crate::video::dsp::coordinator::DspProcessingCoordinator::default(),
+            ),
+            #[cfg(windows)]
             effetune: crate::effetune::EffetuneController::new(),
             show_vst3_manager: false,
             #[cfg(windows)]
@@ -17782,6 +17809,8 @@ impl App {
             snapshot_next_generation_id: 1,
             snapshot_internal_nav: false,
             remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState::default(),
+            #[cfg(windows)]
+            remote_paused_local_media: Vec::new(),
         };
 
         let initial_ai_backend = app
@@ -47137,6 +47166,32 @@ impl App {
     }
 
     pub(crate) fn pause_local_progress_for_remote_session(&mut self) -> (bool, bool, usize, bool) {
+        #[cfg(windows)]
+        {
+            self.remote_paused_local_media.clear();
+            if let Some((path, position_secs)) =
+                current_playing_media_snapshot(self.fullscreen_idx, &self.fs_cache)
+            {
+                self.remote_paused_local_media.push(RemotePausedLocalMedia {
+                    context: None,
+                    path,
+                    position_secs,
+                });
+            }
+            for id in self.other_viewer_context_ids() {
+                if let Some(Some((path, position_secs))) =
+                    self.with_viewer_context_ref(id, |context| {
+                        current_playing_media_snapshot(context.fullscreen_idx(), context.fs_cache())
+                    })
+                {
+                    self.remote_paused_local_media.push(RemotePausedLocalMedia {
+                        context: Some(id),
+                        path,
+                        position_secs,
+                    });
+                }
+            }
+        }
         let mut media_paused_count = usize::from(pause_current_media_player_for_remote_session(
             self.fullscreen_idx,
             &self.fs_cache,
@@ -47200,6 +47255,28 @@ impl App {
             animations_paused,
             continuous_pending_cancelled,
         )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn reseek_remote_paused_local_media(&mut self) {
+        for paused in std::mem::take(&mut self.remote_paused_local_media) {
+            let reseek = |fullscreen_idx: Option<usize>,
+                          fs_cache: &ItemsGenerationMap<FsCacheEntry>| {
+                if let Some(FsCacheEntry::Video { player, .. }) =
+                    fullscreen_idx.and_then(|index| fs_cache.get(&index))
+                    && crate::folder_tree::path_eq(player.path(), &paused.path)
+                {
+                    player.seek_with_play_state(paused.position_secs, false);
+                }
+            };
+            if let Some(id) = paused.context {
+                let _ = self.with_viewer_context_ref(id, |context| {
+                    reseek(context.fullscreen_idx(), context.fs_cache())
+                });
+            } else {
+                reseek(self.fullscreen_idx, &self.fs_cache);
+            }
+        }
     }
 
     /// on_exit 時に mount 外の active detached / ParkedLive bundle から最終 resume を収穫する。
@@ -59131,13 +59208,14 @@ impl App {
                 crate::video::VideoOutputConsumer::RemoteHeadless
             ) {
                 // The paused headless player is metadata/thumbnail-only and never feeds realtime
-                // PCM. Clockless streaming owns one separate session VST3 host shared by every
-                // generation, so it must not also attach the App-global local-playback bridge here.
+                // PCM. The clockless generation uses the App bridges under the DSP coordinator;
+                // attaching them to this player's unused audio pump would create another claimant.
                 None
             } else {
                 Some(crate::video::audio::AudioDspChain {
                     user: Some(self.dsp_bridge.clone()),
                     effetune: Arc::clone(&self.effetune.slot),
+                    coordinator: Arc::clone(&self.dsp_processing),
                 })
             },
             output_consumer,
@@ -59539,6 +59617,7 @@ impl App {
             Some(crate::video::audio::AudioDspChain {
                 user: Some(self.dsp_bridge.clone()),
                 effetune: Arc::clone(&self.effetune.slot),
+                coordinator: Arc::clone(&self.dsp_processing),
             }),
             #[cfg(windows)]
             None, // native_output_config (headless = 音楽ビューは egui 描画)

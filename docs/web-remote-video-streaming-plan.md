@@ -30,7 +30,7 @@ production の配信 worker に旧経路や silent fallback は残さない。
 - **リモート操作中は本体がロックされる** ([web-remote-plan.md](web-remote-plan.md) §2.2)。
   session / generation を 1 経路に限定でき、時計なし worker の所有権と相性が良い
 - 音声も同じファイルから独立 decode できる。音量正規化 gain は metadata player から snapshot
-  し、リモートセッション専用の VST3 チェーンとともに PC と同じ順序で AAC 前段へ適用する
+  し、ローカルと共有するユーザー VST・音響調整の bridge とともに PC と同じ順序で AAC 前段へ適用する
 - 解像度・ビットレートを送信側で決められるので、帯域に合わせて画質を落とせる
 
 **したがって remux + 音声フォールバックは不要になり、本方式がそれを完全に置き換える。**
@@ -153,22 +153,20 @@ remote session が所有する headless `VideoPlayer` は pause のまま metada
 音量正規化 gain、seek thumbnail を提供する。配信 frame と transport clock は一切供給せず、
 generation worker が同じファイルを独立 open する。
 
-### 4.1 時計なし音声 — normalize → VST3 → safety limiter
+### 4.1 時計なし音声 — normalize → ユーザー VST → 音響調整 → safety limiter
 
 production の時計なし worker は decoded PCM に `VideoPlayer::normalize_gain()` の確定値を
-固定 gain として掛け、リモートセッション専用 `DspBridge` の active plugin、既存
+固定 gain として掛け、App が起動時に読み込んだユーザー VST と音響調整の共有 bridge、既存
 `SafetyLimiter` の順に通してから AAC encoder へ渡す。これは PC の
 **time stretch → normalize gain → VST3 `process_block` → safety limiter** から時計依存の
 time stretch だけを除いた順序である。VST の sample rate に PCM を resample し、VST PDC と
 limiter lookahead は AAC へ渡す `audible_pts_secs` から差し引く。
 
-paused headless player は引き続き metadata / thumbnail 専用なので `DspBridge` を渡さない。
-VST は generation ではなく streaming session が所有する別ホストで処理する。chain load は
-generation worker 内で一度だけ行い、全世代が同じ `Arc` を共有する (§10.2)。ロード全体は start
-の 15 秒予算の残りから encoder/playlist 用 3 秒を予約した値（上限 10 秒）で打ち切り、
-全失敗または process 失敗時は normalized dry で
-動画配信を継続する。ただし IPC/Web の VST 状態と本体のリモート接続 modal に警告を表示し、
-黙った pass-through にはしない。
+paused headless player は引き続き metadata / thumbnail 専用なので bridge を渡さない。
+配信の受け付けは起動時ロードが終わるのを残り予算内で非同期に待ち、各段を独立して採否決定する。
+`DspProcessingCoordinator` がローカル pump と `(session, generation)` の worker 間で bridge の
+ブロック単位の操作権を渡し、handoff reset の後に処理する。失敗または未準備の段は warning を示して
+その配信から外し、利用可能な段または normalized dry で継続する (§12 の新しい所有方針)。
 
 以下の tap 設計は移行元の記録であり、production 配信には使わない。
 
@@ -1010,15 +1008,11 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
 
 ### 10.2 時計なし経路での状態所有方針
 
-- **VST3**: mIV を全停止して再測定した実 chain (active 5、44.1 kHz、60 秒 fast-feed) は
-  `wall_secs=2.040909`、**29.399x realtime**。1080p 映像込み全体の 8.4x より十分速く、律速ではない。
-  前回の `SSL Meter Pro` 20 秒 timeout は同時に 3 host を立てた測定条件が原因だった。このため
-  ローカル再生の App-global host へ高速配信を混在させず、streaming session が **専用 host を 1 個だけ**
-  所有する。`ClocklessAudioProcessing` の processor / failure / status を全 generation が `Arc` clone
-  し、既存 generation resource lease が旧 worker と新 worker の VST 使用も直列化する。したがって
-  generation 切替中も **ローカル 1 + リモート 1 = 最大 2 host** であり、新旧世代に比例して増えない。
-  bypass plugin はリモート host へ load せず、設定順を保った active plugin だけを一度 load する。
-  load 時間は start 残予算から後段用 3 秒を予約した値（上限 10 秒）に制限する
+- **VST3 / 音響調整**: 初期の性能測定では専用チェーンを採用したが、Mixwright の WebView が復元後に
+  パイプラインを組み直す間、配信冒頭の EQ が欠けた。現在は App の起動時ロード済み bridge を共有する。
+  `ClocklessAudioProcessing` は受け付け時に採用した段と世代別状態を持ち、各 generation worker は
+  `(session, generation)` の札を取得してから処理する。FFmpeg 資源 lease と DSP 操作権は別々に直列化する。
+  配信によって host は増えず、ユーザー VST と音響調整で最大 2 プロセスとなる。
 - **音量正規化**: remote player は autoplay=false で開くため deferred scan を持たず、open 前の
   DB lookup (未測定なら 1.0) で `normalize_gain` が確定する。`RemoteStreamStartInputs` を
   generation 作成時に snapshot し、時計なし PCM の AAC 前段で固定 gain として適用する

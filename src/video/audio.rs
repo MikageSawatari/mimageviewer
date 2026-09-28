@@ -29,6 +29,31 @@ use super::engine::actor::state_code;
 
 const MAX_STALE_AUDIO_DRAIN_PER_TICK: usize = 256;
 
+#[cfg(windows)]
+static NEXT_LOCAL_DSP_PUMP: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(windows)]
+struct LocalDspControl {
+    pump_instance: u64,
+    epoch: AtomicU64,
+    chain: AudioDspChain,
+}
+
+#[cfg(windows)]
+pub(crate) enum LocalDspHandoffResult {
+    Ready(crate::video::dsp::coordinator::DspHandoff),
+    Cancelled,
+    TimedOut,
+    ResetFailed,
+}
+
+#[cfg(windows)]
+pub(crate) struct LocalDspHandoff {
+    pub request: crate::video::dsp::coordinator::DspRequest,
+    pub coordinator: Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
+    pub receiver: std::sync::mpsc::Receiver<LocalDspHandoffResult>,
+}
+
 fn duration_ns_u64(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
 }
@@ -78,6 +103,8 @@ pub struct AudioOutput {
     /// producer は常に audio-pump であり、session は [`AudioTapLease`] を所有する。
     #[allow(dead_code)] // 増分 5 で streaming session から接続する。
     audio_tap: AudioTapController,
+    #[cfg(windows)]
+    dsp_control: Option<Arc<LocalDspControl>>,
 }
 
 impl AudioOutput {
@@ -112,7 +139,130 @@ impl AudioOutput {
                 command_tx,
                 next_owner_id: Arc::new(AtomicU64::new(1)),
             },
+            #[cfg(windows)]
+            dsp_control: None,
         }
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn with_dsp_chain_for_test(mut self, chain: AudioDspChain) -> Self {
+        self.dsp_control = Some(Arc::new(LocalDspControl {
+            pump_instance: NEXT_LOCAL_DSP_PUMP.fetch_add(1, Ordering::Relaxed),
+            epoch: AtomicU64::new(0),
+            chain,
+        }));
+        self
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn has_dsp_coordinator(&self) -> bool {
+        self.dsp_control.is_some()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn has_dsp_token(&self) -> bool {
+        self.dsp_control.as_ref().is_some_and(|control| {
+            control
+                .chain
+                .coordinator
+                .local_has_token(control.pump_instance)
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn request_dsp_handoff(
+        &self,
+        ui_wake: Arc<super::VideoUiWake>,
+    ) -> Option<LocalDspHandoff> {
+        use crate::video::dsp::coordinator::{DspOwner, HandoffWaitError};
+        let control = self.dsp_control.as_ref()?.clone();
+        let epoch = control.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let coordinator = Arc::clone(&control.chain.coordinator);
+        let request = coordinator.reserve(DspOwner::Local {
+            pump_instance: control.pump_instance,
+            epoch,
+        })?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = Arc::clone(&self.cancel);
+        let coordinator_worker = Arc::clone(&coordinator);
+        let spawn = std::thread::Builder::new()
+            .name("local-dsp-handoff".into())
+            .spawn(move || {
+                let outcome = match coordinator_worker.wait_handoff(
+                    request,
+                    std::time::Instant::now() + std::time::Duration::from_secs(2),
+                    &cancel,
+                ) {
+                    Ok(handoff) => {
+                        let user_failure = control
+                            .chain
+                            .user
+                            .as_ref()
+                            .filter(|bridge| {
+                                !cancel.load(Ordering::Acquire)
+                                    && coordinator_worker.is_desired(request)
+                                    && bridge.is_enabled()
+                                    && bridge.active_slot_count() > 0
+                            })
+                            .and_then(|bridge| {
+                                bridge
+                                    .try_reset_plugins_sync()
+                                    .err()
+                                    .map(|error| (bridge, error))
+                            });
+                        let still_desired = || {
+                            !cancel.load(Ordering::Acquire)
+                                && coordinator_worker.is_desired(request)
+                        };
+                        if !still_desired() {
+                            LocalDspHandoffResult::Cancelled
+                        } else {
+                            let effetune_failure = control.chain.effetune.snapshot().and_then(
+                                |(generation, bridge)| {
+                                    bridge
+                                        .try_reset_plugins_sync()
+                                        .err()
+                                        .map(|error| (generation, error))
+                                },
+                            );
+                            if !still_desired() {
+                                LocalDspHandoffResult::Cancelled
+                            } else if user_failure.is_some() || effetune_failure.is_some() {
+                                if let Some((bridge, error)) = user_failure {
+                                    bridge.disable_with_reason(Some(format!(
+                                        "handoff reset: {error}"
+                                    )));
+                                }
+                                if let Some((generation, error)) = effetune_failure {
+                                    control.chain.effetune.report_failure_once(
+                                        generation,
+                                        crate::effetune::EffetuneFailure::ProcessFailed(format!(
+                                            "handoff reset: {error}"
+                                        )),
+                                    );
+                                }
+                                LocalDspHandoffResult::ResetFailed
+                            } else {
+                                LocalDspHandoffResult::Ready(handoff)
+                            }
+                        }
+                    }
+                    Err(HandoffWaitError::Cancelled) => LocalDspHandoffResult::Cancelled,
+                    Err(HandoffWaitError::TimedOut) => LocalDspHandoffResult::TimedOut,
+                };
+                let _ = sender.send(outcome);
+                ui_wake.wake();
+            });
+        if let Err(error) = spawn {
+            crate::logger::log(format!("local DSP handoff worker spawn failed: {error}"));
+            coordinator.cancel(request);
+            return None;
+        }
+        Some(LocalDspHandoff {
+            request,
+            coordinator,
+            receiver,
+        })
     }
 
     pub fn pause_stream(&self) {
@@ -259,6 +409,13 @@ impl Drop for AudioOutput {
     fn drop(&mut self) {
         // 1. pump 停止指示
         self.cancel.store(true, Ordering::Release);
+        #[cfg(windows)]
+        if let Some(control) = &self.dsp_control {
+            control
+                .chain
+                .coordinator
+                .revoke_local(control.pump_instance);
+        }
         let _ = self.shutdown_tx.try_send(());
         // 2. Stream を pause して直ちに新規 callback を停止 → drop で完全終了
         if let Some(stream) = self.stream.take() {
@@ -865,6 +1022,7 @@ pub fn default_output_sample_rate() -> Option<u32> {
 pub struct AudioDspChain {
     pub user: Option<Arc<crate::video::dsp::DspBridge>>,
     pub effetune: Arc<crate::effetune::EffetuneAudioSlot>,
+    pub coordinator: Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
 }
 
 /// 音声出力ストリームを開く。デフォルトデバイスを使う。
@@ -951,6 +1109,16 @@ pub(crate) fn start(
     let pump_engine_state = engine_state.clone();
     let pump_diagnostics = Arc::clone(&diagnostics);
     #[cfg(windows)]
+    let dsp_control = dsp_chain.as_ref().map(|chain| {
+        Arc::new(LocalDspControl {
+            pump_instance: NEXT_LOCAL_DSP_PUMP.fetch_add(1, Ordering::Relaxed),
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+        })
+    });
+    #[cfg(windows)]
+    let pump_dsp_control = dsp_control.clone();
+    #[cfg(windows)]
     let pump_dsp_chain = dsp_chain;
     let pump_handle = std::thread::Builder::new()
         .name("audio-pump".into())
@@ -967,6 +1135,8 @@ pub(crate) fn start(
                 audio_tap_command_rx,
                 #[cfg(windows)]
                 pump_dsp_chain,
+                #[cfg(windows)]
+                pump_dsp_control,
             );
         })
         .map_err(|e| format!("spawn audio-pump: {e}"))?;
@@ -1068,6 +1238,8 @@ pub(crate) fn start(
         stream_id,
         diagnostics,
         audio_tap,
+        #[cfg(windows)]
+        dsp_control,
     })
 }
 
@@ -1159,6 +1331,7 @@ fn run_pump(
     diagnostics: Arc<AudioDiagnostics>,
     audio_tap_command_rx: Receiver<AudioTapCommand>,
     #[cfg(windows)] dsp_chain: Option<AudioDspChain>,
+    #[cfg(windows)] dsp_control: Option<Arc<LocalDspControl>>,
 ) {
     #[cfg(windows)]
     boost_audio_pump_priority();
@@ -1340,6 +1513,13 @@ fn run_pump(
                 && (!seen_valid_audio_frame || frame_seek_serial > last_seen_seek_serial);
             if should_reset_plugins {
                 #[cfg(windows)]
+                let _reset_permit = dsp_control.as_ref().and_then(|control| {
+                    control
+                        .chain
+                        .coordinator
+                        .local_permit(control.pump_instance)
+                });
+                #[cfg(windows)]
                 if let Some(b) = &dsp_bridge {
                     // T20 (Claude R3-3): cancel check を `reset_plugins_sync` 前に挟む。
                     // `reset_plugins_sync` は bridge ごとに最大 2 秒の timeout を持ち、複数
@@ -1348,7 +1528,8 @@ fn run_pump(
                     // 切り替え済 (`audio-output-drop-join`) なので UI は freeze しないが、
                     // pump exit が遅れて次の動画で audio 再起動が遅延する。cancel check で
                     // shutdown 中は reset を skip して即 exit させる。
-                    if !cancel.load(Ordering::Acquire)
+                    if _reset_permit.is_some()
+                        && !cancel.load(Ordering::Acquire)
                         && b.is_enabled()
                         && b.active_slot_count() > 0
                     {
@@ -1356,7 +1537,8 @@ fn run_pump(
                     }
                 }
                 #[cfg(windows)]
-                if seen_valid_audio_frame
+                if _reset_permit.is_some()
+                    && seen_valid_audio_frame
                     && !cancel.load(Ordering::Acquire)
                     && let Some(slot) = effetune_slot.as_ref()
                     && let Some((generation, bridge)) = slot.snapshot()
@@ -1593,6 +1775,24 @@ fn run_pump(
         // 2. process_block (no lock)
         // 3. lock → seek_serial check → push processed → unlock
         loop {
+            #[cfg(windows)]
+            let _dsp_permit = dsp_control.as_ref().and_then(|control| {
+                control
+                    .chain
+                    .coordinator
+                    .local_permit(control.pump_instance)
+            });
+            #[cfg(windows)]
+            if dsp_control.as_ref().is_some_and(|control| {
+                control
+                    .chain
+                    .coordinator
+                    .is_acquiring_local(control.pump_instance)
+            }) {
+                break;
+            }
+            #[cfg(windows)]
+            let dsp_allowed = _dsp_permit.is_some();
             // 現在の processed 秒数 (= cap 比較用) を lock 内で取得
             let (current_processed_secs, raw_chunk_opt, target_serial) = {
                 let mut buf = buffer.lock().unwrap();
@@ -1629,7 +1829,7 @@ fn run_pump(
                 f64,
                 bool,
             ) = if let Some(b) = &dsp_bridge {
-                if b.is_enabled() && b.active_slot_count() > 0 {
+                if dsp_allowed && b.is_enabled() && b.active_slot_count() > 0 {
                     fx_out.resize(stretched.samples.len(), 0.0);
                     let process_result = b.process_block(&stretched.samples, &mut fx_out);
                     let success = process_result.is_ok();
@@ -1725,7 +1925,7 @@ fn run_pump(
             #[cfg(windows)]
             let mut effetune_generation = None;
             #[cfg(windows)]
-            if let Some(slot) = effetune_slot.as_ref() {
+            if dsp_allowed && let Some(slot) = effetune_slot.as_ref() {
                 if let Some((generation, bridge)) = slot.snapshot() {
                     if effetune_reset_failed_serial != Some(raw.seek_serial) {
                         let effetune_latency_secs =
@@ -1897,7 +2097,12 @@ fn run_pump(
 
             // ── lock 再取得して processed に push (= seek serial check) ──
             let mut buf = buffer.lock().unwrap();
-            if chunk.seek_serial != target_serial || chunk.seek_serial != buf.pump_seek_serial {
+            if !processed_chunk_matches_live_seek(
+                chunk.seek_serial,
+                target_serial,
+                buf.pump_seek_serial,
+                clock.current_seek_serial(),
+            ) {
                 // seek 世代が変わった (= chunk は stale) → drop
                 continue;
             }
@@ -2409,7 +2614,14 @@ fn run_pump(
     // 通常終了 (= 動画 EOF / 停止) では tail silence を吐き切る価値があるが、cancel 経由
     // (= 動画切替 / Drop) では即 exit したいので skip。
     #[cfg(windows)]
-    if !cancel.load(Ordering::Acquire) {
+    if !cancel.load(Ordering::Acquire)
+        && let Some(_flush_permit) = dsp_control.as_ref().and_then(|control| {
+            control
+                .chain
+                .coordinator
+                .local_permit(control.pump_instance)
+        })
+    {
         if let Some(b) = &dsp_bridge {
             if b.is_enabled() && b.active_slot_count() > 0 {
                 b.flush_silence(480, 10);
@@ -2422,6 +2634,15 @@ fn run_pump(
         }
     }
     crate::logger::log("audio-pump terminated");
+}
+
+fn processed_chunk_matches_live_seek(
+    chunk_serial: u64,
+    dequeued_serial: u64,
+    pump_serial: u64,
+    clock_serial: u64,
+) -> bool {
+    chunk_serial == dequeued_serial && chunk_serial == pump_serial && chunk_serial == clock_serial
 }
 
 /// pre-target trim 結果。
@@ -2789,6 +3010,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
+    #[test]
+    fn dry_block_dequeued_before_seek_cannot_commit_after_clock_serial_advances() {
+        assert!(super::processed_chunk_matches_live_seek(7, 7, 7, 7));
+        // The pump's buffer serial can lag the clock after a seek request.
+        assert!(!super::processed_chunk_matches_live_seek(7, 7, 7, 8));
+        assert!(!super::processed_chunk_matches_live_seek(7, 7, 8, 8));
+    }
+
     fn make_clock() -> Arc<AvClock> {
         let seek_serial = Arc::new(AtomicU64::new(0));
         let clock = Arc::new(AvClock::new(0.6, seek_serial));
@@ -2959,6 +3188,8 @@ mod tests {
                     engine_state,
                     diagnostics,
                     tap_rx,
+                    #[cfg(windows)]
+                    None,
                     #[cfg(windows)]
                     None,
                 );
