@@ -26,6 +26,16 @@ pub enum UnavailableReason {
     PlatformUnsupported,
 }
 
+impl UnavailableReason {
+    pub(crate) fn user_reason(&self) -> &'static str {
+        match self {
+            Self::BundleMissing(_) => "必要なファイルが見つかりません",
+            Self::CpuUnsupported => "この CPU では動作しません (AVX2/FMA が必要です)",
+            Self::PlatformUnsupported => "この OS では利用できません",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadOrigin {
     Startup,
@@ -40,6 +50,19 @@ pub enum EffetuneFailure {
     LatencyExceeded { total_secs: f64 },
     HostLost(String),
     GuiFailed(String),
+}
+
+impl EffetuneFailure {
+    pub(crate) fn user_reason(&self) -> &'static str {
+        match self {
+            Self::LoadFailed(_) => "読み込みに失敗しました",
+            Self::RestoreFailed(_) => "保存した設定を復元できませんでした",
+            Self::ProcessFailed(_) => "音声処理に失敗しました",
+            Self::LatencyExceeded { .. } => "音声処理の遅延が上限を超えました",
+            Self::HostLost(_) => "音声処理との接続が切れました",
+            Self::GuiFailed(_) => "設定画面の操作に失敗しました",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -621,6 +644,9 @@ fn wake_ui(context: &Mutex<Option<egui::Context>>) {
 impl EffetuneController {
     pub fn new() -> Self {
         let bundle = resolve_bundle();
+        if let Err(reason) = &bundle {
+            crate::logger::log(format!("[EffeTune] unavailable: {reason:?}"));
+        }
         let (failure_tx, failure_rx) = mpsc::channel();
         let (gui_failure_tx, gui_failure_rx) = mpsc::channel();
         let (host_tx, host_rx) = mpsc::channel::<HostCommand>();

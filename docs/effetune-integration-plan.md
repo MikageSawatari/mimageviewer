@@ -170,6 +170,8 @@ enum EffetuneFailure {
   - クリック: `Idle` → `Loading { UserButton, open_gui_when_ready: true }` /
     `Running` → GUI の表示・非表示 / `Loading` → 何もしない / `Unavailable`・`Failed` → 無効表示。
   - ツールチップに状態と理由 (Failed の理由、判定が古い可能性、Unparseable の理由) を出す。
+  - 実装事実 (2026-09-28): 利用不可・失敗・判定不能のツールチップには短い日本語の理由を出し、
+    enum 名、host の詳細エラー、bundle の絶対パスは表示しない。診断詳細は log に残す。
 - **GUI の owner はメインウィンドウに固定**。`DspBridge` に GUI owner 方針
   (`GuiOwnerPolicy::FixedMain` / 既存の `Auto`) を持たせ、EffeTune の bridge は `FixedMain`。
   attach と再表示のたびに main HWND が有効か確認し、無効なら表示しない (理由を log)。
@@ -305,11 +307,13 @@ enum EffectiveState {
 - 実機で確認した配信時の追加条件 (2026-09-28): Mixwright は読み込み時の遅延 0 から、
   復元した効果の遅延 (例: 44.1 kHz で 128 samples) を再生開始後に通知する。このとき
   clockless audio の `audible_pts_secs` が後退し、AAC encoder の連続性チェックにより配信が止まる。
-  `ClocklessAudioProcessor` は generation/seek ごとに直前の適用済み plugin latency を保持する。
+  `ClocklessAudioProcessor` は generation/seek ごとに直前の適用済み合計 latency
+  (plugin + safety limiter、`audible_pts_secs` から引いた全量) を保持する。
   遅延増加分は出力先頭からサンプル単位で除去し、チャンクより長ければ残りを次へ持ち越す。
   遅延減少分は同数の無音を先頭へ挿入する。各チャンクの PTS/長さをサンプル数に合わせて更新し、
   `pdc_latency_secs_at_process` は実際に処理した PDC のまま残す。元の source 進捗と video PTS は
-  変更せず、AAC encoder の連続性チェックも維持する。ユーザー VST の遅延変更にも同じ規則を適用する。
+  変更せず、AAC encoder の連続性チェックも維持する。ユーザー VST の遅延変更と、
+  EffeTune 単独段が失敗・上限超過で外れて limiter も停止する場合に同じ規則を適用する。
 - `remote_clockless_audio_processing` の「`!vst3_enabled || plugins.is_empty()` なら VST なし」の
   早期 return を、EffeTune を含めた条件に直す。ユーザー VST が無効でも EffeTune だけで経路を作る。
 - **既知の制約 (サンプル版)**:

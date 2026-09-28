@@ -4560,6 +4560,70 @@ fn effetune_and_vst_startup_gate_releases_deferred_media_once_in_either_order() 
 
 #[test]
 #[cfg(windows)]
+fn effetune_tooltip_uses_user_reasons_without_diagnostic_details() {
+    use crate::effetune::{EffetuneFailure, EffetuneRuntime, UnavailableReason};
+
+    let mut app = phase_c_support::setup_app();
+    let diagnostic = r"C:\private\effetune\EffeTune Mixwright.vst3: host error";
+    let unavailable = [
+        (
+            UnavailableReason::BundleMissing(diagnostic.into()),
+            "必要なファイルが見つかりません",
+        ),
+        (
+            UnavailableReason::CpuUnsupported,
+            "この CPU では動作しません",
+        ),
+        (
+            UnavailableReason::PlatformUnsupported,
+            "この OS では利用できません",
+        ),
+    ];
+    for (reason, expected) in unavailable {
+        app.effetune.runtime = EffetuneRuntime::Unavailable(reason);
+        let tooltip = app.effetune_toolbar_tooltip();
+        assert!(tooltip.starts_with("音響調整を利用できません: "));
+        assert!(tooltip.contains(expected));
+        assert!(!tooltip.contains(diagnostic));
+        assert!(!tooltip.contains("BundleMissing"));
+    }
+
+    let failures = [
+        (
+            EffetuneFailure::LoadFailed(diagnostic.into()),
+            "読み込みに失敗しました",
+        ),
+        (
+            EffetuneFailure::RestoreFailed(diagnostic.into()),
+            "保存した設定を復元できませんでした",
+        ),
+        (
+            EffetuneFailure::ProcessFailed(diagnostic.into()),
+            "音声処理に失敗しました",
+        ),
+        (
+            EffetuneFailure::LatencyExceeded { total_secs: 2.1 },
+            "音声処理の遅延が上限を超えました",
+        ),
+        (
+            EffetuneFailure::HostLost(diagnostic.into()),
+            "音声処理との接続が切れました",
+        ),
+        (
+            EffetuneFailure::GuiFailed(diagnostic.into()),
+            "設定画面の操作に失敗しました",
+        ),
+    ];
+    for (failure, expected) in failures {
+        app.effetune.runtime = EffetuneRuntime::Failed(failure);
+        let tooltip = app.effetune_toolbar_tooltip();
+        assert_eq!(tooltip, format!("音響調整は停止しました: {expected}"));
+        assert!(!tooltip.contains(diagnostic));
+    }
+}
+
+#[test]
+#[cfg(windows)]
 fn vst3_production_traversal_survives_removing_a_later_paused_window() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();

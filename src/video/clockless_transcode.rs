@@ -1339,13 +1339,13 @@ struct ClocklessAudioProcessor {
     latency_reconciler: ClocklessLatencyReconciler,
 }
 
-/// Reconciles only changes in applied plugin delay. A positive pending adjustment removes
-/// duplicated audible time; a negative one fills the gap with silence. The value is carried
-/// across chunks when a delay increase consumes an entire chunk.
+/// Reconciles changes in the total delay subtracted from audible PTS, including the safety
+/// limiter. A positive pending adjustment removes duplicated audible time; a negative one fills
+/// the gap with silence. The value is carried across chunks when an increase consumes a chunk.
 struct ClocklessLatencyReconciler {
     sample_rate: u32,
     seek_serial: Option<u64>,
-    previous_plugin_latency_samples: Option<i64>,
+    previous_total_latency_samples: Option<i64>,
     pending_adjustment_samples: i64,
 }
 
@@ -1354,7 +1354,7 @@ impl ClocklessLatencyReconciler {
         Self {
             sample_rate,
             seek_serial: None,
-            previous_plugin_latency_samples: None,
+            previous_total_latency_samples: None,
             pending_adjustment_samples: 0,
         }
     }
@@ -1362,17 +1362,17 @@ impl ClocklessLatencyReconciler {
     fn reconcile(
         &mut self,
         mut chunk: ProcessedChunk,
-        plugin_latency_samples: i64,
+        total_latency_samples: i64,
     ) -> Option<ProcessedChunk> {
         if self.seek_serial != Some(chunk.seek_serial) {
             self.seek_serial = Some(chunk.seek_serial);
-            self.previous_plugin_latency_samples = None;
+            self.previous_total_latency_samples = None;
             self.pending_adjustment_samples = 0;
         }
-        if let Some(previous) = self.previous_plugin_latency_samples
-            && previous != plugin_latency_samples
+        if let Some(previous) = self.previous_total_latency_samples
+            && previous != total_latency_samples
         {
-            let delta = plugin_latency_samples - previous;
+            let delta = total_latency_samples - previous;
             self.pending_adjustment_samples += delta;
             let action = if self.pending_adjustment_samples > 0 {
                 "drop"
@@ -1382,10 +1382,10 @@ impl ClocklessLatencyReconciler {
                 "none (pending adjustment cancelled)"
             };
             crate::logger::log(format!(
-                "remote-stream plugin latency reconciliation: old_samples={previous} new_samples={plugin_latency_samples} delta_samples={delta} action={action}"
+                "remote-stream applied latency reconciliation: old_samples={previous} new_samples={total_latency_samples} delta_samples={delta} action={action}"
             ));
         }
-        self.previous_plugin_latency_samples = Some(plugin_latency_samples);
+        self.previous_total_latency_samples = Some(total_latency_samples);
 
         let rate = f64::from(self.sample_rate);
         if self.pending_adjustment_samples > 0 {
@@ -1551,11 +1551,11 @@ impl ClocklessAudioProcessor {
         }
         chunk.audible_pts_secs -= latency_secs;
         chunk.pdc_latency_secs_at_process = latency_secs;
-        let plugin_latency_samples = (composition.plugin_latency_secs
+        let total_latency_samples = (chunk.pdc_latency_secs_at_process
             * f64::from(self.latency_reconciler.sample_rate))
         .round() as i64;
         self.latency_reconciler
-            .reconcile(chunk, plugin_latency_samples)
+            .reconcile(chunk, total_latency_samples)
     }
 }
 
@@ -2481,6 +2481,7 @@ mod tests {
     struct ChangingLatencyVstProcessor {
         sample_rate: u32,
         latency_samples: AtomicU32,
+        fail: AtomicBool,
     }
 
     impl ClocklessVstProcessor for ChangingLatencyVstProcessor {
@@ -2502,6 +2503,9 @@ mod tests {
         }
 
         fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err("fixture effect failed".to_owned());
+            }
             dst.copy_from_slice(src);
             Ok(())
         }
@@ -2514,6 +2518,7 @@ mod tests {
         let host = Arc::new(ChangingLatencyVstProcessor {
             sample_rate,
             latency_samples: AtomicU32::new(initial_latency),
+            fail: AtomicBool::new(false),
         });
         let config = ClocklessAudioProcessing::with_vst3(1.0, host.clone(), 1, None);
         (
@@ -3020,9 +3025,9 @@ mod tests {
         );
     }
 
-    fn with_fake_effetune(
+    fn with_fake_effetune<P: ClocklessVstProcessor + 'static>(
         mut config: ClocklessAudioProcessing,
-        effect: Arc<FakeVstProcessor>,
+        effect: Arc<P>,
     ) -> ClocklessAudioProcessing {
         let status = ClocklessVstStatus::new(ClocklessVstStatusSnapshot {
             requested: true,
@@ -3037,6 +3042,83 @@ mod tests {
             status,
         });
         config
+    }
+
+    #[test]
+    fn remote_effect_only_fallback_reconciles_plugin_and_limiter_through_aac() {
+        const RATE: u32 = 44_100;
+        const FRAMES: usize = 512;
+        for cap_exceeded in [false, true] {
+            let effect = Arc::new(ChangingLatencyVstProcessor {
+                sample_rate: RATE,
+                latency_samples: AtomicU32::new(128),
+                fail: AtomicBool::new(false),
+            });
+            let config = with_fake_effetune(
+                ClocklessAudioProcessing::without_vst3(1.0),
+                Arc::clone(&effect),
+            );
+            let status = config.vst3_status();
+            let mut processor = ClocklessAudioProcessor::new(config, RATE).unwrap();
+            let limiter_samples =
+                (processor.limiter.latency_secs() * f64::from(RATE)).round() as usize;
+            let mut encoder = open_aac_encoder(
+                RATE,
+                96_000,
+                SEEK_SERIAL,
+                StreamTimeline::new(10.0).unwrap(),
+            )
+            .unwrap();
+            let first = processor
+                .process(timed_audio_chunk(RATE, 0, FRAMES, SEEK_SERIAL))
+                .unwrap();
+            assert_eq!(
+                (first.pdc_latency_secs_at_process * f64::from(RATE)).round() as usize,
+                128 + limiter_samples
+            );
+            let first_end = first.audible_pts_secs + first.duration_secs;
+            let mut packets = encoder.push_chunk(first).unwrap();
+
+            if cap_exceeded {
+                effect
+                    .latency_samples
+                    .store(2 * RATE + 1, Ordering::Release);
+            } else {
+                effect.fail.store(true, Ordering::Release);
+            }
+            let fallback = processor
+                .process(timed_audio_chunk(RATE, FRAMES, FRAMES, SEEK_SERIAL))
+                .unwrap();
+            assert_eq!(fallback.pdc_latency_secs_at_process, 0.0);
+            assert_eq!(fallback.samples.len() / 2, FRAMES + 128 + limiter_samples);
+            assert!(
+                fallback.samples[..(128 + limiter_samples) * 2]
+                    .iter()
+                    .all(|sample| *sample == 0.0)
+            );
+            assert!((fallback.audible_pts_secs - first_end).abs() < 1.0e-10);
+            let fallback_end = fallback.audible_pts_secs + fallback.duration_secs;
+            packets.extend(encoder.push_chunk(fallback).unwrap());
+
+            let third = processor
+                .process(timed_audio_chunk(RATE, 2 * FRAMES, FRAMES, SEEK_SERIAL))
+                .unwrap();
+            assert_eq!(third.samples.len() / 2, FRAMES);
+            assert_eq!(third.pdc_latency_secs_at_process, 0.0);
+            assert!((third.audible_pts_secs - fallback_end).abs() < 1.0e-10);
+            packets.extend(encoder.push_chunk(third).unwrap());
+            packets.extend(encoder.finish().unwrap());
+            assert!(!packets.is_empty());
+            assert_eq!(
+                encoder.stats().pre_session_trimmed_samples_per_channel,
+                (128 + limiter_samples) as u64
+            );
+            assert_eq!(
+                encoder.stats().input_samples_per_channel,
+                (3 * FRAMES) as u64
+            );
+            assert!(status.snapshot().warning.unwrap().contains("音響調整"));
+        }
     }
 
     #[test]

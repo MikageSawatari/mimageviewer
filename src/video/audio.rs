@@ -329,7 +329,7 @@ pub(crate) struct ProcessedChunk {
     /// **audible PTS** = この chunk の最初のサンプルが「実際にスピーカーから聞こえる」
     /// PTS (秒)。`input_pts - pdc_latency_at_process` で計算。video clock 同期に使う。
     /// mIV Remote の AAC input PTS にもこの source timeline 値を使う。remote では
-    /// plugin latency が chunk 間で変わった場合に重複 sample の除去または無音の挿入を行い、
+    /// 適用した合計 latency が chunk 間で変わった場合に重複 sample の除去または無音の挿入を行い、
     /// 最初に残る sample の PTS に補正してから AAC に渡す。
     pub(crate) audible_pts_secs: f64,
     /// chunk の音声時間 (秒) = `samples.len() / samples_per_sec`。

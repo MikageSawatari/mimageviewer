@@ -23516,18 +23516,16 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn effetune_toolbar_tooltip(&self) -> String {
-        use crate::effetune::{EffectiveState, EffetuneRuntime, UnavailableReason};
+        use crate::effetune::{EffectiveState, EffetuneRuntime};
         match &self.effetune.runtime {
-            EffetuneRuntime::Unavailable(UnavailableReason::BundleMissing(reason)) => {
-                format!("音響調整を利用できません: 必要なファイルが見つかりません\n{reason}")
+            EffetuneRuntime::Unavailable(reason) => {
+                format!("音響調整を利用できません: {}", reason.user_reason())
             }
-            EffetuneRuntime::Unavailable(UnavailableReason::CpuUnsupported) => {
-                "音響調整を利用できません: CPU が AVX2 と FMA に対応している必要があります".into()
-            }
-            EffetuneRuntime::Unavailable(_) => "音響調整を利用できません".into(),
             EffetuneRuntime::Idle => "音響調整を開く".into(),
             EffetuneRuntime::Loading { .. } => "音響調整を読み込み中…".into(),
-            EffetuneRuntime::Failed(reason) => format!("音響調整は停止しました: {reason:?}"),
+            EffetuneRuntime::Failed(reason) => {
+                format!("音響調整は停止しました: {}", reason.user_reason())
+            }
             EffetuneRuntime::Running { .. } => match self.effetune.effective_state() {
                 Some(EffectiveState::Effective) => {
                     "音響調整は有効です (設定の窓を閉じた時点の内容で判定しています)".into()
@@ -23535,9 +23533,7 @@ impl App {
                 Some(EffectiveState::Inert) => {
                     "音響調整にエフェクトが無いか、全体バイパス中です (設定の窓を閉じた時点の内容で判定しています)".into()
                 }
-                Some(EffectiveState::Unparseable(reason)) => {
-                    format!("音響調整の設定を判定できません: {reason}")
-                }
+                Some(EffectiveState::Unparseable(_)) => "音響調整の設定を判定できません".into(),
                 None => "音響調整の設定を確認中です".into(),
             },
         }
