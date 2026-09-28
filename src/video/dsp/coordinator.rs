@@ -94,17 +94,30 @@ impl DspProcessingCoordinator {
     }
 
     pub fn revoke_local(&self, pump_instance: u64) {
+        self.revoke_local_inner(pump_instance, false);
+    }
+
+    /// Drop invalidates a dequeued dry block even when this pump owns no token.
+    pub fn end_local_pump(&self, pump_instance: u64) {
+        self.revoke_local_inner(pump_instance, true);
+    }
+
+    fn revoke_local_inner(&self, pump_instance: u64, ending: bool) {
         let mut state = self.state.lock().unwrap();
         let belongs_to_pump = |request: DspRequest| matches!(request.owner, DspOwner::Local { pump_instance: id, .. } if id == pump_instance);
-        if state.desired.is_some_and(belongs_to_pump) {
+        let desired = state.desired.is_some_and(belongs_to_pump);
+        let granted = state.granted.is_some_and(belongs_to_pump);
+        if desired {
             state.desired = None;
         }
-        if state.granted.is_some_and(belongs_to_pump) {
+        if granted {
             state.granted = None;
         }
-        let generation = state.local_reservations.entry(pump_instance).or_default();
-        *generation = generation.wrapping_add(1);
-        self.changed.notify_all();
+        if desired || granted || ending {
+            let generation = state.local_reservations.entry(pump_instance).or_default();
+            *generation = generation.wrapping_add(1);
+            self.changed.notify_all();
+        }
     }
 
     /// The pump has terminated, so no dry-block ticket can still commit.
@@ -466,7 +479,39 @@ mod tests {
         coordinator.cancel(request);
         coordinator.revoke_local(1);
         assert!(!dry.commit_if_current(|| true));
+        let LocalBlockMode::Dry(after_cancel) = coordinator.local_block_mode(1) else {
+            panic!("cancelled pump must be dry");
+        };
+        coordinator.end_local_pump(1);
+        assert!(!after_cancel.commit_if_current(|| true));
         coordinator.retire_local(1);
+    }
+
+    #[test]
+    fn tokenless_stage_deactivation_keeps_dry_ticket_valid() {
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let owner = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 2,
+                epoch: 1,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(
+                    owner,
+                    Instant::now() + Duration::from_secs(1),
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+                .grant()
+        );
+        let LocalBlockMode::Dry(dry) = coordinator.local_block_mode(1) else {
+            panic!("other pump must be dry");
+        };
+        coordinator.revoke_local(1);
+        assert!(dry.commit_if_current(|| true));
+        assert!(coordinator.is_granted(owner));
     }
 
     #[test]

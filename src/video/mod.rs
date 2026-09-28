@@ -9303,20 +9303,28 @@ impl VideoPlayer {
                 LocalDspAcquisition::AwaitingMetadata(requested_position);
             return true;
         }
-        let Some(handoff) = audio.request_dsp_handoff(Arc::clone(&self.ui_wake)) else {
-            audio.note_dsp_acquisition_not_started();
-            self.seek_with_play_state(position_secs, false);
-            self.engine
-                .lock()
-                .unwrap()
-                .apply_command(engine::actor::TransportCommand::Play);
-            return true;
+        let handoff = match audio.request_dsp_handoff(Arc::clone(&self.ui_wake)) {
+            Ok(handoff) => handoff,
+            Err(error) => {
+                // This activation has ended. Repeated UI ticks must not pause and
+                // seek again for a worker that cannot be started.
+                audio.note_dsp_activation_handled();
+                crate::logger::log(format!("local DSP handoff start failed: {error}"));
+                self.seek_with_play_state(position_secs, false);
+                if audio.local_dry_resume_allowed() {
+                    self.engine
+                        .lock()
+                        .unwrap()
+                        .apply_command(engine::actor::TransportCommand::Play);
+                }
+                return true;
+            }
         };
         *self.dsp_handoff.lock().unwrap() = LocalDspAcquisition::Waiting(PendingLocalDspHandoff {
             handoff,
             requested_position,
         });
-        audio.note_dsp_acquisition_started();
+        audio.note_dsp_activation_handled();
         true
     }
 
@@ -12178,6 +12186,75 @@ mod tests {
             &*player.dsp_handoff.lock().unwrap(),
             super::LocalDspAcquisition::Waiting(_)
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn handoff_worker_spawn_failure_is_terminal_for_one_activation() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("handoff-spawn-failure.mp4"),
+        );
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
+            },
+            false,
+        ));
+        player.set_playing(true);
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_handoff_spawn_failure_for_test(true);
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_dsp_applicable_for_test(true);
+        let ctx = egui::Context::default();
+        player.tick(&ctx);
+        assert_eq!(
+            player.audio.as_ref().unwrap().handoff_attempts_for_test(),
+            1
+        );
+        assert!(player.intent_playing());
+        assert!(!player.audio.as_ref().unwrap().has_dsp_token());
+        let serial_after_failure = player.current_seek_serial();
+        for _ in 0..5 {
+            player.tick(&ctx);
+        }
+        assert_eq!(
+            player.audio.as_ref().unwrap().handoff_attempts_for_test(),
+            1
+        );
+        assert_eq!(player.current_seek_serial(), serial_after_failure);
+
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_dsp_applicable_for_test(false);
+        player.tick(&ctx);
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_dsp_applicable_for_test(true);
+        player.tick(&ctx);
+        assert_eq!(
+            player.audio.as_ref().unwrap().handoff_attempts_for_test(),
+            2
+        );
+        player.set_playing(true);
+        assert_eq!(
+            player.audio.as_ref().unwrap().handoff_attempts_for_test(),
+            3
+        );
     }
 
     #[cfg(windows)]

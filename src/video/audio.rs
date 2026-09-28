@@ -43,6 +43,10 @@ struct LocalDspControl {
     #[cfg(test)]
     test_applicable: AtomicBool,
     #[cfg(test)]
+    test_handoff_spawn_failure: AtomicBool,
+    #[cfg(test)]
+    test_handoff_attempts: AtomicU64,
+    #[cfg(test)]
     before_dry_commit: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -75,6 +79,34 @@ pub(crate) struct LocalDspHandoff {
     pub request: crate::video::dsp::coordinator::DspRequest,
     pub coordinator: Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
     pub receiver: std::sync::mpsc::Receiver<LocalDspHandoffResult>,
+}
+
+#[cfg(windows)]
+pub(crate) enum LocalDspHandoffStartError {
+    CoordinatorUnavailable,
+    WorkerSpawnFailed(std::io::Error),
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for LocalDspHandoffStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CoordinatorUnavailable => write!(f, "DSP coordinator unavailable"),
+            Self::WorkerSpawnFailed(error) => write!(f, "DSP handoff worker spawn failed: {error}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn finish_handoff_spawn_failure(
+    control: &LocalDspControl,
+    coordinator: &Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
+    request: crate::video::dsp::coordinator::DspRequest,
+    error: std::io::Error,
+) -> LocalDspHandoffStartError {
+    coordinator.cancel(request);
+    control.dsp_armed.store(false, Ordering::Release);
+    LocalDspHandoffStartError::WorkerSpawnFailed(error)
 }
 
 fn duration_ns_u64(duration: std::time::Duration) -> u64 {
@@ -180,6 +212,8 @@ impl AudioOutput {
             dsp_armed: AtomicBool::new(false),
             applicable_seen: AtomicBool::new(false),
             test_applicable: AtomicBool::new(applicable),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
             before_dry_commit: None,
         }));
         self
@@ -192,6 +226,24 @@ impl AudioOutput {
             .unwrap()
             .test_applicable
             .store(applicable, Ordering::Release);
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_handoff_spawn_failure_for_test(&self, fail: bool) {
+        self.dsp_control
+            .as_ref()
+            .unwrap()
+            .test_handoff_spawn_failure
+            .store(fail, Ordering::Release);
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn handoff_attempts_for_test(&self) -> u64 {
+        self.dsp_control
+            .as_ref()
+            .unwrap()
+            .test_handoff_attempts
+            .load(Ordering::Acquire)
     }
 
     #[cfg(windows)]
@@ -219,7 +271,9 @@ impl AudioOutput {
     }
 
     #[cfg(windows)]
-    pub(crate) fn note_dsp_acquisition_started(&self) {
+    /// The activation was reserved or ended with a terminal start error.
+    /// A later inactive observation or explicit play request permits another attempt.
+    pub(crate) fn note_dsp_activation_handled(&self) {
         if let Some(control) = self.dsp_control.as_ref() {
             control.applicable_seen.store(true, Ordering::Release);
         }
@@ -253,19 +307,38 @@ impl AudioOutput {
     pub(crate) fn request_dsp_handoff(
         &self,
         ui_wake: Arc<super::VideoUiWake>,
-    ) -> Option<LocalDspHandoff> {
+    ) -> Result<LocalDspHandoff, LocalDspHandoffStartError> {
         use crate::video::dsp::coordinator::{DspOwner, HandoffWaitError};
-        let control = self.dsp_control.as_ref()?.clone();
+        let control = self
+            .dsp_control
+            .as_ref()
+            .ok_or(LocalDspHandoffStartError::CoordinatorUnavailable)?
+            .clone();
+        #[cfg(test)]
+        control.test_handoff_attempts.fetch_add(1, Ordering::AcqRel);
         control.dsp_armed.store(true, Ordering::Release);
         let epoch = control.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let coordinator = Arc::clone(&control.chain.coordinator);
-        let request = coordinator.reserve(DspOwner::Local {
+        let Some(request) = coordinator.reserve(DspOwner::Local {
             pump_instance: control.pump_instance,
             epoch,
-        })?;
+        }) else {
+            control.dsp_armed.store(false, Ordering::Release);
+            return Err(LocalDspHandoffStartError::CoordinatorUnavailable);
+        };
+        #[cfg(test)]
+        if control.test_handoff_spawn_failure.load(Ordering::Acquire) {
+            return Err(finish_handoff_spawn_failure(
+                &control,
+                &coordinator,
+                request,
+                std::io::Error::other("injected handoff worker spawn failure"),
+            ));
+        }
         let (sender, receiver) = std::sync::mpsc::channel();
         let cancel = Arc::clone(&self.cancel);
         let coordinator_worker = Arc::clone(&coordinator);
+        let worker_control = Arc::clone(&control);
         let spawn = std::thread::Builder::new()
             .name("local-dsp-handoff".into())
             .spawn(move || {
@@ -275,7 +348,7 @@ impl AudioOutput {
                     &cancel,
                 ) {
                     Ok(handoff) => {
-                        let user_failure = control
+                        let user_failure = worker_control
                             .chain
                             .user
                             .as_ref()
@@ -298,14 +371,15 @@ impl AudioOutput {
                         if !still_desired() {
                             LocalDspHandoffResult::Cancelled
                         } else {
-                            let effetune_failure = control.chain.effetune.snapshot().and_then(
-                                |(generation, bridge)| {
-                                    bridge
-                                        .try_reset_plugins_sync()
-                                        .err()
-                                        .map(|error| (generation, error))
-                                },
-                            );
+                            let effetune_failure =
+                                worker_control.chain.effetune.snapshot().and_then(
+                                    |(generation, bridge)| {
+                                        bridge
+                                            .try_reset_plugins_sync()
+                                            .err()
+                                            .map(|error| (generation, error))
+                                    },
+                                );
                             if !still_desired() {
                                 LocalDspHandoffResult::Cancelled
                             } else if user_failure.is_some() || effetune_failure.is_some() {
@@ -315,7 +389,7 @@ impl AudioOutput {
                                     )));
                                 }
                                 if let Some((generation, error)) = effetune_failure {
-                                    control.chain.effetune.report_failure_once(
+                                    worker_control.chain.effetune.report_failure_once(
                                         generation,
                                         crate::effetune::EffetuneFailure::ProcessFailed(format!(
                                             "handoff reset: {error}"
@@ -335,11 +409,14 @@ impl AudioOutput {
                 ui_wake.wake();
             });
         if let Err(error) = spawn {
-            crate::logger::log(format!("local DSP handoff worker spawn failed: {error}"));
-            coordinator.cancel(request);
-            return None;
+            return Err(finish_handoff_spawn_failure(
+                &control,
+                &coordinator,
+                request,
+                error,
+            ));
         }
-        Some(LocalDspHandoff {
+        Ok(LocalDspHandoff {
             request,
             coordinator,
             receiver,
@@ -495,7 +572,7 @@ impl Drop for AudioOutput {
             control
                 .chain
                 .coordinator
-                .revoke_local(control.pump_instance);
+                .end_local_pump(control.pump_instance);
         }
         let _ = self.shutdown_tx.try_send(());
         // 2. Stream を pause して直ちに新規 callback を停止 → drop で完全終了
@@ -1223,6 +1300,10 @@ pub(crate) fn start(
             applicable_seen: AtomicBool::new(false),
             #[cfg(test)]
             test_applicable: AtomicBool::new(false),
+            #[cfg(test)]
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            test_handoff_attempts: AtomicU64::new(0),
             #[cfg(test)]
             before_dry_commit: None,
         })
@@ -3193,6 +3274,8 @@ mod tests {
             dsp_armed: AtomicBool::new(true),
             applicable_seen: AtomicBool::new(false),
             test_applicable: AtomicBool::new(false),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
             before_dry_commit: Some(Arc::new(move || {
                 at_commit_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
@@ -3358,6 +3441,8 @@ mod tests {
             dsp_armed: AtomicBool::new(true),
             applicable_seen: AtomicBool::new(false),
             test_applicable: AtomicBool::new(false),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
             before_dry_commit: Some(Arc::new(move || {
                 at_commit_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
@@ -3377,6 +3462,8 @@ mod tests {
             dsp_armed: AtomicBool::new(true),
             applicable_seen: AtomicBool::new(true),
             test_applicable: AtomicBool::new(true),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
             before_dry_commit: None,
         });
         let (owner_tx, owner_shutdown, owner_cancel, owner_buffer, owner_pump) =
@@ -3419,6 +3506,69 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn tokenless_stage_deactivation_preserves_in_flight_dry_audio() {
+        use crate::video::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let owner = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 102,
+                epoch: 1,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(
+                    owner,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+                .grant()
+        );
+
+        let chain = test_chain(Arc::clone(&coordinator));
+        let (at_commit_tx, at_commit_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let control = Arc::new(LocalDspControl {
+            pump_instance: 101,
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            dsp_armed: AtomicBool::new(true),
+            applicable_seen: AtomicBool::new(true),
+            test_applicable: AtomicBool::new(true),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
+            before_dry_commit: Some(Arc::new(move || {
+                at_commit_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })),
+        });
+        let mut output = AudioOutput::connected_without_output_for_test(48_000);
+        output.dsp_control = Some(Arc::clone(&control));
+        let (audio_tx, shutdown_tx, cancel, buffer, pump) = start_test_pump(chain, control);
+        send_test_frame(&audio_tx, 0.0);
+        at_commit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("dry block must pause before commit");
+
+        output.set_dsp_applicable_for_test(false);
+        assert!(!output.newly_applicable_dsp());
+        release_tx.send(()).unwrap();
+        let committed = processed_reaches(&buffer, 1);
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        pump.join().unwrap();
+        drop(output);
+        assert!(
+            committed,
+            "deactivation must not discard an unrelated dry block"
+        );
+        assert!(coordinator.is_granted(owner));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn no_stage_pump_uses_only_atomic_gate_while_coordinator_lock_is_held() {
         use crate::video::dsp::coordinator::DspProcessingCoordinator;
 
@@ -3431,6 +3581,8 @@ mod tests {
             dsp_armed: AtomicBool::new(false),
             applicable_seen: AtomicBool::new(false),
             test_applicable: AtomicBool::new(false),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
             before_dry_commit: None,
         });
         let (audio_tx, shutdown_tx, cancel, buffer, pump) = start_test_pump(chain, control);
