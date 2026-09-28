@@ -9790,6 +9790,14 @@ egui::ComboBox::from_id_salt("toolbar_cols_combo")
                                 .selected_text(text)
                                 .show_ui(ui, |ui| {
                                     apply_toolbar_style(ui);
+                                    if toolbar_details_visible {
+                                        if ui.selectable_label(details_mode, "詳細").clicked() {
+                                            self.set_grid_view_mode(GridViewMode::Details);
+                                        }
+                                        if !tb_cols.is_empty() {
+                                            ui.separator();
+                                        }
+                                    }
                                     for &cols in &tb_cols {
                                         if ui
                                             .selectable_label(
@@ -9801,14 +9809,6 @@ egui::ComboBox::from_id_salt("toolbar_cols_combo")
                                             self.set_grid_view_mode(GridViewMode::Thumbnail);
                                             self.settings.grid_cols = cols;
                                             self.settings.save();
-                                        }
-                                    }
-                                    if toolbar_details_visible {
-                                        if !tb_cols.is_empty() {
-                                            ui.separator();
-                                        }
-                                        if ui.selectable_label(details_mode, "詳細").clicked() {
-                                            self.set_grid_view_mode(GridViewMode::Details);
                                         }
                                     }
                                 })
@@ -11124,6 +11124,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &mut changed,
                 );
                 ui.separator();
+                changed |= ui
+                    .checkbox(&mut self.settings.toolbar_cols_details_visible, "詳細")
+                    .changed();
+                ui.separator();
                 ui.label("出す列:");
                 ui.horizontal_wrapped(|ui| {
                     for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS {
@@ -11138,9 +11142,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             changed = true;
                         }
                     }
-                    changed |= ui
-                        .checkbox(&mut self.settings.toolbar_cols_details_visible, "詳細")
-                        .changed();
                 });
             }
             TS::Aspect => {
