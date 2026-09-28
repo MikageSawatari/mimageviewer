@@ -45,6 +45,7 @@ impl App {
             self.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                 crate::cache_maintenance::EpubMaintTask::LoadRows,
                 crate::data_dir::get(),
+                Vec::new(),
             ));
         }
     }
@@ -100,7 +101,19 @@ impl App {
             .max_size(safe_rect.size())
             .constrain_to(safe_rect)
             .show(ctx, |ui| draw_epub_body(self, ui));
-        if !open || (escape_pressed && !self.epub_cache_confirm_delete_all) {
+        if epub_manager_should_close(
+            open,
+            escape_pressed,
+            self.epub_cache_confirm_delete_all,
+            self.epub_cache_maint_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    !matches!(
+                        pending.task,
+                        crate::cache_maintenance::EpubMaintTask::LoadRows
+                    )
+                }),
+        ) {
             self.close_epub_cache_manager();
         }
         self.show_epub_cache_confirm_dialog(ctx);
@@ -127,21 +140,21 @@ impl App {
             }
         };
         self.epub_cache_maint_pending = None;
+        self.invalidate_removed_epub_generations(&result.physically_removed);
         if let Some(error) = result.error {
             crate::logger::log(format!("epub cache manager: {error}"));
-            self.epub_cache_manager_result = Some("処理できませんでした。".into());
+            self.epub_cache_manager_result =
+                Some("処理できませんでした。詳細はログを確認してください。".into());
         } else {
-            if result.retired > 0 {
-                self.epub_cache_manager_result = Some(format!(
-                    "{} 件を削除予約しました。次回起動時に削除します。",
-                    result.retired
-                ));
+            if result.deleted > 0 || !result.failures.is_empty() {
+                self.epub_cache_manager_result =
+                    Some(format_epub_delete_result(result.deleted, &result.failures));
             }
             self.epub_cache_selection.retain(|id| {
                 result
                     .entries
                     .iter()
-                    .any(|entry| entry.generation.generation_id == *id && !entry.retired)
+                    .any(|entry| entry.generation.generation_id == *id)
             });
             self.epub_cache_rows = Some(result.entries);
         }
@@ -157,7 +170,7 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("すべての EPUB の変換結果を次回起動時に削除します。");
+                ui.label("すべての EPUB の変換結果をその場で削除します。使用中の本は残ります。");
                 ui.label("元の EPUB は残ります。再度読むには変換が必要です。");
                 ui.horizontal(|ui| {
                     if ui
@@ -170,6 +183,7 @@ impl App {
                         self.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                             crate::cache_maintenance::EpubMaintTask::DeleteAll,
                             crate::data_dir::get(),
+                            self.epub_current_sources_in_all_contexts(),
                         ));
                         self.epub_cache_confirm_delete_all = false;
                     }
@@ -226,6 +240,22 @@ impl App {
             self.archive_cache_confirm_delete_all = false;
         }
     }
+}
+
+fn epub_manager_should_close(open: bool, escape: bool, confirming_all: bool, busy: bool) -> bool {
+    !busy && (!open || (escape && !confirming_all))
+}
+
+fn format_epub_delete_result(deleted: usize, failures: &[(PathBuf, String)]) -> String {
+    let mut message = format!("{deleted} 件を削除しました。");
+    for (path, reason) in failures {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("EPUB");
+        message.push_str(&format!("\n{name}: {reason}"));
+    }
+    message
 }
 
 fn close_archive_cache_manager_flags(show: &mut bool, archive: &mut bool) {
@@ -371,15 +401,13 @@ fn draw_archive_body(app: &mut App, ui: &mut egui::Ui) {
 
 fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
     ui.set_min_width(600.0_f32.min(ui.available_width()));
-    ui.label("削除は、同じデータを使うアプリをすべて終了した後の次回起動時に行います。元の EPUB は残ります。");
+    ui.label("変換結果はその場で削除します。表示中など使用中の本は削除できず、一覧に残ります。元の EPUB は残ります。");
     let busy = app.epub_cache_maint_pending.is_some();
     if busy {
         ui.ctx().request_repaint();
     }
     let rows = app.epub_cache_rows.clone();
-    let active_count = rows
-        .as_ref()
-        .map_or(0, |rows| rows.iter().filter(|row| !row.retired).count());
+    let active_count = rows.as_ref().map_or(0, Vec::len);
     ui.horizontal(|ui| {
         if ui
             .add_enabled(
@@ -393,6 +421,7 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
                     generation_ids: app.epub_cache_selection.iter().copied().collect(),
                 },
                 crate::data_dir::get(),
+                app.epub_current_sources_in_all_contexts(),
             ));
         }
         if ui
@@ -401,16 +430,37 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
         {
             app.epub_cache_confirm_delete_all = true;
         }
+        if ui
+            .add_enabled(
+                !busy && active_count > 0,
+                egui::Button::new("元ファイル消失を削除"),
+            )
+            .clicked()
+        {
+            app.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
+                crate::cache_maintenance::EpubMaintTask::DeleteMissingSources,
+                crate::data_dir::get(),
+                app.epub_current_sources_in_all_contexts(),
+            ));
+        }
         if ui.add_enabled(!busy, egui::Button::new("再読込")).clicked() {
             app.epub_cache_rows = None;
             app.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
                 crate::cache_maintenance::EpubMaintTask::LoadRows,
                 crate::data_dir::get(),
+                Vec::new(),
             ));
         }
     });
     if let Some(result) = &app.epub_cache_manager_result {
-        ui.label(result);
+        egui::ScrollArea::vertical()
+            .max_height(120.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for line in result.lines() {
+                    ui.label(line);
+                }
+            });
     }
     if let Some(rows) = rows {
         if rows.is_empty() {
@@ -436,10 +486,7 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
                             let id = row.generation.generation_id;
                             let mut selected = app.epub_cache_selection.contains(&id);
                             if ui
-                                .add_enabled(
-                                    !row.retired && !busy,
-                                    egui::Checkbox::new(&mut selected, ""),
-                                )
+                                .add_enabled(!busy, egui::Checkbox::new(&mut selected, ""))
                                 .changed()
                             {
                                 if selected {
@@ -463,7 +510,7 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
                                 false,
                             ));
                             ui.label(if row.retired {
-                                "削除予約"
+                                "旧変換結果"
                             } else {
                                 "利用可能"
                             });
@@ -602,6 +649,33 @@ fn spawn_delete_selected(app: &mut App, db: std::sync::Arc<crate::archive_cache:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epub_delete_result_reports_partial_success_and_each_failure() {
+        let message = format_epub_delete_result(
+            2,
+            &[
+                (
+                    PathBuf::from("C:/books/open.epub"),
+                    "表示中のため削除できませんでした".into(),
+                ),
+                (
+                    PathBuf::from("C:/books/busy.epub"),
+                    "使用中のため削除できませんでした".into(),
+                ),
+            ],
+        );
+        assert!(message.starts_with("2 件を削除しました。"));
+        assert!(message.contains("open.epub: 表示中のため"));
+        assert!(message.contains("busy.epub: 使用中のため"));
+    }
+
+    #[test]
+    fn epub_manager_stays_modal_until_background_delete_result_arrives() {
+        assert!(!epub_manager_should_close(false, false, false, true));
+        assert!(!epub_manager_should_close(true, true, false, true));
+        assert!(epub_manager_should_close(false, false, false, false));
+    }
 
     #[test]
     fn closing_each_manager_clears_only_its_own_confirmation() {

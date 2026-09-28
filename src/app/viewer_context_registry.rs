@@ -3445,6 +3445,131 @@ impl App {
         self.viewer_contexts.table.ids()
     }
 
+    /// Memory-only snapshot for the EPUB manager; parked contexts can still own
+    /// a visible book and must be protected before a background unlink starts.
+    pub(crate) fn epub_current_sources_in_all_contexts(&self) -> Vec<PathBuf> {
+        let is_epub = |path: &Path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        };
+        let fullscreen_source = |items: &[GridItem], idx: Option<usize>| match items.get(idx?)? {
+            GridItem::PdfPage { pdf_path, .. } | GridItem::PdfFile(pdf_path)
+                if is_epub(pdf_path) =>
+            {
+                Some(pdf_path.clone())
+            }
+            _ => None,
+        };
+        let mut sources = self
+            .current_folder
+            .as_deref()
+            .filter(|path| is_epub(path))
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect::<Vec<_>>();
+        sources.extend(fullscreen_source(&self.items, self.fullscreen_idx));
+        sources.extend(
+            self.pdf_enumerate_pending
+                .as_ref()
+                .map(|pending| &pending.0)
+                .filter(|path| is_epub(path))
+                .cloned(),
+        );
+        sources.extend(
+            self.pdf_password_request
+                .as_ref()
+                .map(|request| &request.path)
+                .filter(|path| is_epub(path))
+                .cloned(),
+        );
+        sources.extend(
+            self.epub_convert
+                .as_ref()
+                .map(|conversion| conversion.src_path.clone()),
+        );
+        for slot in self.viewer_contexts.table.slots.values() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            if let Some(path) = bundle
+                .current_folder
+                .as_deref()
+                .filter(|path| is_epub(path))
+            {
+                sources.push(path.to_owned());
+            }
+            sources.extend(fullscreen_source(&bundle.items, bundle.fullscreen_idx));
+            sources.extend(
+                bundle
+                    .pdf_enumerate_pending
+                    .as_ref()
+                    .map(|pending| &pending.0)
+                    .filter(|path| is_epub(path))
+                    .cloned(),
+            );
+            sources.extend(
+                bundle
+                    .pdf_password_request
+                    .as_ref()
+                    .map(|request| &request.path)
+                    .filter(|path| is_epub(path))
+                    .cloned(),
+            );
+            sources.extend(
+                bundle
+                    .epub_convert
+                    .as_ref()
+                    .map(|conversion| conversion.src_path.clone()),
+            );
+        }
+        sources
+    }
+
+    pub(crate) fn invalidate_removed_epub_generations(
+        &mut self,
+        removed: &[crate::epub_cache::GenerationRow],
+    ) {
+        if removed.is_empty() {
+            return;
+        }
+        let keys = removed
+            .iter()
+            .map(|row| crate::epub_cache::src_key(&row.src_path))
+            .collect::<std::collections::HashSet<_>>();
+        let refers_to_removed = |item: &GridItem| {
+            let source = match item {
+                GridItem::PdfFile(path) | GridItem::PdfPage { pdf_path: path, .. } => path,
+                _ => return false,
+            };
+            keys.contains(&crate::epub_cache::src_key(source))
+        };
+        if self.items.iter().any(&refers_to_removed) {
+            self.bump_items_generation();
+        }
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            if bundle.items.iter().any(&refers_to_removed) {
+                bundle.set_items_generation(bundle.items_generation.wrapping_add(1));
+            }
+        }
+        let retained_prefixes = keys
+            .iter()
+            .map(|key| format!("{key}::page_"))
+            .collect::<Vec<_>>();
+        let retained_belongs_to_removed = |item_key: &str| {
+            retained_prefixes
+                .iter()
+                .any(|prefix| item_key.starts_with(prefix))
+        };
+        self.retained_final_ai_cache
+            .retain(|key, _| !retained_belongs_to_removed(&key.item_key));
+        self.retained_pdf_page_cache
+            .retain(|key, _| !retained_belongs_to_removed(&key.item_key));
+        self.retained_final_ai_epoch = self.retained_final_ai_epoch.wrapping_add(1);
+    }
+
     /// Modal admission can be checked while a detached context is being built. Unlike `ids`,
     /// reading the projected payload and parked slots does not require a settled table operation.
     pub(in crate::app) fn document_modal_owners_in_any_context(&self) -> (bool, bool) {
@@ -4365,6 +4490,69 @@ mod tests {
             assert!(grid_source.contains(field));
         }
         assert!(bundle.contains("similar_panel:"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epub_manager_protects_parked_book_and_invalidates_only_referencing_context() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = PathBuf::from("C:/books/one.epub");
+        let other = PathBuf::from("C:/books/two.epub");
+        app.current_folder = Some(source.clone());
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: source.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        let parked = app.stash_mounted_and_start_fresh("epub_delete_context_test");
+        assert!(app.epub_current_sources_in_all_contexts().contains(&source));
+        app.items = vec![GridItem::PdfFile(other)];
+        let parked_before = app
+            .with_viewer_context_ref(parked, |context| context.items_generation())
+            .unwrap();
+        let mounted_before = app.items_generation;
+        let removed = crate::epub_cache::GenerationRow {
+            generation_id: 7,
+            src_path_key: crate::epub_cache::src_key(&source),
+            src_path: source,
+            src_state: crate::epub_cache::SourceState {
+                size: 1,
+                mtime_ticks: 1,
+            },
+            src_sha256: String::new(),
+            src_head_hash: String::new(),
+            pdf_file: PathBuf::from("C:/data/book.g7.pdf"),
+            pdf_size: 1,
+            page_count: 1,
+            direction: String::new(),
+            profile: String::new(),
+            created_at: 0,
+            output_version: 1,
+        };
+        app.invalidate_removed_epub_generations(&[removed]);
+        assert_eq!(app.items_generation, mounted_before);
+        assert_eq!(
+            app.with_viewer_context_ref(parked, |context| context.items_generation())
+                .unwrap(),
+            parked_before.wrapping_add(1)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epub_manager_protects_a_pending_open_before_visible_adoption() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = PathBuf::from("C:/books/pending.epub");
+        app.pdf_password_request = Some(super::super::PdfPasswordRequest::legacy(source.clone()));
+        assert!(app.epub_current_sources_in_all_contexts().contains(&source));
+        let parked = app.stash_mounted_and_start_fresh("epub_pending_delete_test");
+        assert!(app.epub_current_sources_in_all_contexts().contains(&source));
+        assert!(
+            app.with_viewer_context_ref(parked, |context| context
+                .pending_context_async_owners()
+                .contains(&ContextAsyncOwner::PdfPassword))
+                .unwrap()
+        );
     }
 
     #[cfg(windows)]

@@ -196,6 +196,7 @@ static EPUB_PIN_COORD: OnceLock<(Mutex<EpubPinCoordState>, Condvar)> = OnceLock:
 struct EpubPinCoordState {
     active_books: HashMap<String, usize>,
     active_ranges: Vec<(u64, Vec<EpubKeyMatch>)>,
+    active_deletions: HashSet<String>,
     next_range_id: u64,
 }
 
@@ -263,7 +264,7 @@ fn ranges_overlap(a: &[EpubKeyMatch], b: &[EpubKeyMatch]) -> bool {
         .any(|left| b.iter().any(|right| left.overlaps(right)))
 }
 
-struct EpubBookLease(String);
+pub(crate) struct EpubBookLease(String);
 
 impl Drop for EpubBookLease {
     fn drop(&mut self) {
@@ -306,6 +307,7 @@ fn enter_epub_book(key: &str) -> EpubBookLease {
 pub(crate) struct EpubRangeLease {
     id: Option<u64>,
     range: Vec<EpubKeyMatch>,
+    delete_key: Option<String>,
 }
 
 impl EpubRangeLease {
@@ -339,6 +341,9 @@ impl Drop for EpubRangeLease {
         state
             .active_ranges
             .retain(|(active_id, _)| *active_id != id);
+        if let Some(key) = &self.delete_key {
+            state.active_deletions.remove(key);
+        }
         changed.notify_all();
     }
 }
@@ -360,6 +365,50 @@ pub(crate) fn acquire_epub_pin_coverage(paths: &[PathBuf]) -> EpubRangeLease {
     acquire_epub_pin_ranges(&coverage)
 }
 
+pub(crate) fn acquire_epub_book_lease(logical: &Path) -> EpubBookLease {
+    enter_epub_book(&epub_cache::src_key(logical))
+}
+
+/// A cache-manager deletion must not wait indefinitely for an earlier reader.
+pub(crate) fn acquire_epub_delete_coverage(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<EpubRangeLease, String> {
+    let key = epub_cache::src_key(path);
+    let range = vec![EpubKeyMatch::Exact(key.clone())];
+    let (mutex, changed) = epub_pin_coord();
+    let mut state = mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while state.active_books.contains_key(&key)
+        || state
+            .active_ranges
+            .iter()
+            .any(|(_, active)| ranges_overlap(&range, active))
+    {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("先行する読み取りが終了せず、削除を中止しました".into());
+        }
+        let (next, _) = changed
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = next;
+    }
+    state.next_range_id = state
+        .next_range_id
+        .checked_add(1)
+        .expect("range ID exhausted");
+    let id = state.next_range_id;
+    state.active_ranges.push((id, range.clone()));
+    state.active_deletions.insert(key.clone());
+    Ok(EpubRangeLease {
+        id: Some(id),
+        range,
+        delete_key: Some(key),
+    })
+}
+
 pub(crate) fn with_epub_pin_ranges<T>(
     coverage: &[EpubPinCoverage],
     action: impl FnOnce() -> T,
@@ -374,7 +423,11 @@ fn acquire_epub_pin_ranges(coverage: &[EpubPinCoverage]) -> EpubRangeLease {
         item.append_matches(&mut range);
     }
     if range.is_empty() {
-        return EpubRangeLease { id: None, range };
+        return EpubRangeLease {
+            id: None,
+            range,
+            delete_key: None,
+        };
     }
     let (mutex, changed) = epub_pin_coord();
     let mut state = mutex
@@ -403,6 +456,7 @@ fn acquire_epub_pin_ranges(coverage: &[EpubPinCoverage]) -> EpubRangeLease {
     EpubRangeLease {
         id: Some(id),
         range,
+        delete_key: None,
     }
 }
 
@@ -452,11 +506,37 @@ pub fn pinned_epub_target(logical: &Path) -> Option<ReadTarget> {
     if !is_epub(logical) {
         return None;
     }
+    let key = epub_cache::src_key(logical);
+    if epub_delete_in_progress(&key) {
+        return None;
+    }
     epub_pinned()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&epub_cache::src_key(logical))
+        .get(&key)
         .cloned()
+}
+
+fn epub_delete_in_progress(key: &str) -> bool {
+    epub_pin_coord()
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .active_deletions
+        .contains(key)
+}
+
+/// Called while the deletion range is held, before any new resolution is admitted.
+pub(crate) fn invalidate_epub_pin_under_delete(path: &Path, generation_id: i64) {
+    let key = epub_cache::src_key(path);
+    let mut pins = epub_pinned()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if pins.get(&key).is_some_and(|target| {
+        matches!(target.stamp, DocumentStamp::Generation { id, .. } if id == generation_id)
+    }) {
+        pins.remove(&key);
+    }
 }
 
 #[cfg(test)]
@@ -726,11 +806,7 @@ fn read_target_without_io(logical: &Path) -> Option<Result<ReadTarget, PdfReadEr
             if let Err(error) = ensure_epub_gate(gate) {
                 return Some(Err(error));
             }
-            let key = epub_cache::src_key(logical);
-            let pinned = epub_pinned()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pinned.get(&key).cloned().map(Ok)
+            pinned_epub_target(logical).map(Ok)
         }
     }
 }
@@ -811,6 +887,7 @@ fn resolve_epub_at(
     pinned: &Mutex<HashMap<String, ReadTarget>>,
 ) -> Result<ReadTarget, PdfReadError> {
     let key = epub_cache::src_key(logical);
+    let _book_lease = enter_epub_book(&key);
     if let Some(target) = pinned
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1383,6 +1460,16 @@ impl<'pdfium> PdfDocumentCache<'pdfium> {
         }
     }
 
+    fn release_path(&mut self, path: &Path) {
+        if self
+            .cached
+            .as_ref()
+            .is_some_and(|entry| entry.key.path == path)
+        {
+            self.cached = None;
+        }
+    }
+
     fn with_document<T>(
         &mut self,
         path: &Path,
@@ -1511,6 +1598,7 @@ const MSG_OPEN: u8 = 7;
 /// 知る必要があり、それをサムネイルカタログに頼っていたため、**まだサムネイルを
 /// 作っていない PDF ではどちらも黙って効かなかった** (2026-08-26 に利用者報告)。
 const MSG_PAGE_SIZES: u8 = 8;
+const MSG_RELEASE_DOCUMENT: u8 = 9;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 const RENDER_METRICS_MAGIC: &[u8; 4] = &[0x50, 0x44, 0x4d, 0x31];
@@ -1811,6 +1899,12 @@ fn encode_open_request(path: &ResolvedReadPath, password: Option<&str>) -> Vec<u
     buf
 }
 
+fn encode_release_document_request(path: &ResolvedReadPath) -> Vec<u8> {
+    let mut buf = vec![MSG_RELEASE_DOCUMENT];
+    encode_path_and_password(&mut buf, path, None);
+    buf
+}
+
 fn encode_render_request(
     path: &ResolvedReadPath,
     page_num: u32,
@@ -2046,6 +2140,10 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
             let (path, password, _) = decode_path_and_password(payload)?;
             Ok(DecodedRequest::Open { path, password })
         }
+        MSG_RELEASE_DOCUMENT => {
+            let (path, _, _) = decode_path_and_password(payload)?;
+            Ok(DecodedRequest::ReleaseDocument { path })
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown message type: {msg_type}"),
@@ -2083,6 +2181,9 @@ enum DecodedRequest {
         path: PathBuf,
         password: Option<String>,
     },
+    ReleaseDocument {
+        path: PathBuf,
+    },
     Shutdown,
 }
 
@@ -2097,7 +2198,7 @@ fn pdf_document_identity(
         | DecodedRequest::Open { path, password } => (path, password),
         DecodedRequest::Render { path, password, .. }
         | DecodedRequest::AnalyzePage { path, password, .. } => (path, password),
-        DecodedRequest::Shutdown => return None,
+        DecodedRequest::ReleaseDocument { .. } | DecodedRequest::Shutdown => return None,
     };
     if path.to_string_lossy() != read_path.as_path().to_string_lossy() {
         return None;
@@ -2270,6 +2371,10 @@ pub fn run_worker_process() {
                         let _ = send_error(&mut stdout, &e.to_string());
                     }
                 }
+            }
+            DecodedRequest::ReleaseDocument { path } => {
+                document_cache.release_path(&path);
+                let _ = write_msg(&mut stdout, &[STATUS_OK]);
             }
             DecodedRequest::Shutdown => break,
         }
@@ -2948,6 +3053,8 @@ struct JobQueue {
     /// 使い切った後も HighNormal 自身の上限まで開始できる。
     high_normal: std::collections::VecDeque<Job>,
     normal: std::collections::VecDeque<Job>,
+    /// A dispatcher handles its own control slot before taking another document job.
+    release_slots: Vec<Option<ReleaseDocumentRequest>>,
     /// 現在処理中の HighNormal + Normal ジョブ数。lane ごとの開始判定に使う。
     /// Critical はこのカウントに含めない (= 予約枠を消費しない)。
     normal_in_flight: usize,
@@ -2973,6 +3080,7 @@ impl JobQueue {
             critical: std::collections::VecDeque::new(),
             high_normal: std::collections::VecDeque::new(),
             normal: std::collections::VecDeque::new(),
+            release_slots: (0..configured_pool_size).map(|_| None).collect(),
             normal_in_flight: 0,
             worker_documents: vec![None; configured_pool_size],
             open_in_flight: 0,
@@ -2988,6 +3096,7 @@ struct PdfWorkerPool {
     queue: Arc<(Mutex<JobQueue>, Condvar)>,
     /// 起動したワーカープロセス (subprocess) の数
     worker_count: usize,
+    worker_ids: Vec<usize>,
     /// ディスパッチャースレッド (Pool drop 時に join する)
     dispatcher_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// 各 worker_id の子プロセス Child の共有スロット。dispatcher が `take()` で
@@ -3022,6 +3131,162 @@ fn configured_pool_size() -> usize {
 type PdfWorkerPoolInit = Result<PdfWorkerPool, PdfWorkerPoolStartupFailure>;
 
 static POOL: OnceLock<PdfWorkerPoolInit> = OnceLock::new();
+static EPUB_DOCUMENT_DELETE_GATE: OnceLock<(Mutex<HashSet<ResolvedReadPath>>, Condvar)> =
+    OnceLock::new();
+
+fn epub_document_delete_gate() -> &'static (Mutex<HashSet<ResolvedReadPath>>, Condvar) {
+    EPUB_DOCUMENT_DELETE_GATE.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()))
+}
+
+struct ReleaseDocumentRequest {
+    path: ResolvedReadPath,
+    reply: mpsc::Sender<std::io::Result<()>>,
+}
+
+fn defer_queued_document_jobs(
+    lane: &mut std::collections::VecDeque<Job>,
+    path: &ResolvedReadPath,
+) -> Vec<Job> {
+    let mut deferred = Vec::new();
+    let mut remaining = std::collections::VecDeque::new();
+    while let Some(job) = lane.pop_front() {
+        if job.document_identity.path == *path {
+            deferred.push(job);
+        } else {
+            remaining.push_back(job);
+        }
+    }
+    *lane = remaining;
+    deferred
+}
+
+/// Blocks new IPC admission until the maintenance operation has finished or failed.
+pub(crate) struct EpubDocumentDeleteGuard {
+    path: ResolvedReadPath,
+    queue: Option<Arc<(Mutex<JobQueue>, Condvar)>>,
+    deferred: Vec<Job>,
+    file_removed: bool,
+}
+
+impl EpubDocumentDeleteGuard {
+    pub(crate) fn mark_file_removed(&mut self) {
+        self.file_removed = true;
+    }
+}
+
+impl Drop for EpubDocumentDeleteGuard {
+    fn drop(&mut self) {
+        let (gate, changed) = epub_document_delete_gate();
+        let mut blocked = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((mutex, changed)) = self.queue.as_deref() {
+            let mut queue = mutex
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.file_removed {
+                for job in self.deferred.drain(..) {
+                    let _ = job.reply.send(Err(PdfReadError::NotConverted.into_io()));
+                }
+            } else {
+                for job in self.deferred.drain(..).rev() {
+                    match job.priority {
+                        JobPriority::Critical => queue.critical.push_front(job),
+                        JobPriority::HighNormal => queue.high_normal.push_front(job),
+                        JobPriority::Normal => queue.normal.push_front(job),
+                    }
+                }
+            }
+            changed.notify_all();
+        }
+        blocked.remove(&self.path);
+        changed.notify_all();
+    }
+}
+
+pub(crate) fn release_epub_document_for_delete(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<EpubDocumentDeleteGuard, String> {
+    release_epub_document_for_delete_with_pool(path, deadline, initialized_pool())
+}
+
+#[cfg(test)]
+pub(crate) fn block_epub_document_for_test(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<EpubDocumentDeleteGuard, String> {
+    release_epub_document_for_delete_with_pool(path, deadline, None)
+}
+
+fn release_epub_document_for_delete_with_pool(
+    path: &Path,
+    deadline: std::time::Instant,
+    pool: Option<&PdfWorkerPool>,
+) -> Result<EpubDocumentDeleteGuard, String> {
+    let path = ResolvedReadPath::from_resolution(path.to_owned());
+    let mut blocked = epub_document_delete_gate()
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !blocked.insert(path.clone()) {
+        return Err("この本の削除はすでに進行中です".into());
+    }
+    // The global admission lock also orders a concurrent pool startup. If the pool
+    // does not exist yet, its first caller cannot enqueue the old path until this
+    // guard is released; workers started during deletion have no cached document.
+    let Some(pool) = pool else {
+        drop(blocked);
+        return Ok(EpubDocumentDeleteGuard {
+            path,
+            queue: None,
+            deferred: Vec::new(),
+            file_removed: false,
+        });
+    };
+    let mut replies = Vec::new();
+    let deferred = {
+        let (mutex, changed) = &*pool.queue;
+        let mut queue = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut deferred = defer_queued_document_jobs(&mut queue.critical, &path);
+        deferred.extend(defer_queued_document_jobs(&mut queue.high_normal, &path));
+        deferred.extend(defer_queued_document_jobs(&mut queue.normal, &path));
+        for &worker_id in &pool.worker_ids {
+            let (reply, rx) = mpsc::channel();
+            queue.release_slots[worker_id] = Some(ReleaseDocumentRequest {
+                path: path.clone(),
+                reply,
+            });
+            replies.push(rx);
+        }
+        changed.notify_all();
+        deferred
+    };
+    drop(blocked);
+    let guard = EpubDocumentDeleteGuard {
+        path,
+        queue: Some(Arc::clone(&pool.queue)),
+        deferred,
+        file_removed: false,
+    };
+    for rx in replies {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("PDF の読み取りが終了せず、削除を中止しました".into());
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(format!("PDF の読み取りを解放できませんでした: {error}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err("PDF の読み取りが終了せず、削除を中止しました".into());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("PDF の読み取りとの通信が切れたため、削除を中止しました".into());
+            }
+        }
+    }
+    Ok(guard)
+}
 static PDF_WORKER_NOTICE: Mutex<Option<PdfWorkerNotice>> = Mutex::new(None);
 
 /// PDF worker pool の遅延初期化失敗を UI へ 1 回だけ渡す typed notice。
@@ -3295,6 +3560,7 @@ impl PdfWorkerPool {
             .map(|(worker_id, (child, io))| (worker_id, child, io))
             .collect();
         let worker_count = pending_workers.len();
+        let worker_ids = pending_workers.iter().map(|(id, _, _)| *id).collect();
 
         if let Some(terminated) = terminate_if_underfilled(
             &mut pending_workers,
@@ -3346,6 +3612,7 @@ impl PdfWorkerPool {
         Ok(PdfWorkerPool {
             queue,
             worker_count,
+            worker_ids,
             dispatcher_threads: Mutex::new(dispatcher_threads),
             worker_children,
         })
@@ -3560,6 +3827,25 @@ impl PdfWorkerPool {
 
         // Job をキューに積んで worker を 1 つ起こす
         {
+            let (gate, changed) = epub_document_delete_gate();
+            let mut blocked = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut waited_for_delete = false;
+            while blocked.contains(&job.document_identity.path) {
+                waited_for_delete = true;
+                let (next, timeout) = changed
+                    .wait_timeout(blocked, std::time::Duration::from_secs(15))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                blocked = next;
+                if timeout.timed_out() && blocked.contains(&job.document_identity.path) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "EPUB cache deletion did not finish",
+                    ));
+                }
+            }
+            if waited_for_delete && !job.document_identity.path.as_path().is_file() {
+                return Err(PdfReadError::NotConverted.into_io());
+            }
             let (mtx, cv) = &*self.queue;
             let mut q = mtx.lock().unwrap();
             match priority {
@@ -4166,6 +4452,11 @@ fn try_pop_dispatch_job(
     None
 }
 
+enum DispatcherWork {
+    Document(DispatchJob),
+    Release(ReleaseDocumentRequest),
+}
+
 /// ディスパッチャースレッドのメインループ。
 ///
 /// キューを覗き込み、Critical > HighNormal > Normal の順に pop して IPC を実行する。
@@ -4196,27 +4487,57 @@ fn run_dispatcher(
 
     loop {
         // ── キューから 1 件取る ──
-        let job = {
+        let work = {
             let (mtx, cv) = &*queue;
             let mut q = mtx.lock().unwrap();
             loop {
                 if q.shutdown {
                     break None;
                 }
+                if let Some(release) = q.release_slots[worker_id].take() {
+                    break Some(DispatcherWork::Release(release));
+                }
                 let lane_caps = non_critical_lane_caps(worker_count, critical_reservation_active());
                 if let Some(dispatch) =
                     try_pop_dispatch_job(&mut q, worker_id, lane_caps, open_admission_caps())
                 {
-                    break Some(dispatch);
+                    break Some(DispatcherWork::Document(dispatch));
                 }
                 // 取れなかった → Condvar で寝る
                 q = cv.wait(q).unwrap();
             }
         };
 
-        let Some(dispatch) = job else {
+        let Some(work) = work else {
             // shutdown
             break;
+        };
+        let dispatch = match work {
+            DispatcherWork::Document(dispatch) => dispatch,
+            DispatcherWork::Release(release) => {
+                let response =
+                    send_recv_io(&mut io, &encode_release_document_request(&release.path));
+                let outcome = match response {
+                    Ok(response) if response.bytes.as_slice() == [STATUS_OK] => {
+                        let (mutex, changed) = &*queue;
+                        let mut q = mutex
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if q.worker_documents[worker_id]
+                            .as_ref()
+                            .is_some_and(|document| document.path == release.path)
+                        {
+                            q.worker_documents[worker_id] = None;
+                        }
+                        changed.notify_all();
+                        Ok(())
+                    }
+                    Ok(_) => Err(std::io::Error::other("PDF worker refused document release")),
+                    Err(error) => Err(error),
+                };
+                let _ = release.reply.send(outcome);
+                continue;
+            }
         };
         let DispatchJob {
             job,
@@ -7699,6 +8020,7 @@ C:\isolated\miv-data"#
         let pool = PdfWorkerPool {
             queue: Arc::clone(&queue),
             worker_count: 0,
+            worker_ids: Vec::new(),
             dispatcher_threads: Mutex::new(Vec::new()),
             worker_children: Vec::new(),
         };
@@ -7726,6 +8048,122 @@ C:\isolated\miv-data"#
         assert!(q.normal.is_empty());
         assert_eq!(q.workers_busy, 0);
         assert_eq!(q.open_in_flight, 0);
+    }
+
+    #[test]
+    fn epub_manager_delete_clears_fixed_generation_for_same_run_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("book.epub");
+        fs::write(&source, b"first").unwrap();
+        let mut db = EpubCache::open_at(root.path()).unwrap();
+        let first = publish_test_generation(&mut db, root.path(), &source);
+        let first_read = resolve_epub_at(&source, root.path(), epub_pinned()).unwrap();
+        assert_eq!(
+            first_read.stamp,
+            DocumentStamp::Generation {
+                id: first.generation_id,
+                pdf_size: first.pdf_size
+            }
+        );
+        let boundary = acquire_epub_delete_coverage(
+            &source,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            db.delete_generation_now(first.generation_id).unwrap(),
+            epub_cache::ImmediateDeleteOutcome::Deleted(_)
+        ));
+        invalidate_epub_pin_under_delete(&source, first.generation_id);
+        drop(boundary);
+        assert!(matches!(
+            resolve_epub_at(&source, root.path(), epub_pinned()),
+            Err(PdfReadError::NotConverted)
+        ));
+        let second = publish_test_generation(&mut db, root.path(), &source);
+        assert!(second.generation_id > first.generation_id);
+        assert_eq!(
+            resolve_epub_at(&source, root.path(), epub_pinned())
+                .unwrap()
+                .stamp,
+            DocumentStamp::Generation {
+                id: second.generation_id,
+                pdf_size: second.pdf_size
+            }
+        );
+        with_epub_pin_guard(&source, || {
+            epub_pinned()
+                .lock()
+                .unwrap()
+                .remove(&epub_cache::src_key(&source));
+        });
+    }
+
+    #[test]
+    fn epub_delete_wait_for_prior_reader_has_a_total_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("book.epub");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let held_source = source.clone();
+        let holder = std::thread::spawn(move || {
+            with_epub_pin_guard(&held_source, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+        let error = acquire_epub_delete_coverage(
+            &source,
+            std::time::Instant::now() + std::time::Duration::from_millis(30),
+        )
+        .err()
+        .expect("busy prior reader must time out");
+        assert!(error.contains("先行する読み取り"));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            acquire_epub_delete_coverage(
+                &source,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn unresponsive_worker_release_times_out_and_unblocks_later_operations() {
+        let queue = Arc::new((Mutex::new(JobQueue::new(1)), Condvar::new()));
+        let pool = PdfWorkerPool {
+            queue,
+            worker_count: 1,
+            worker_ids: vec![0],
+            dispatcher_threads: Mutex::new(Vec::new()),
+            worker_children: Vec::new(),
+        };
+        let path = PathBuf::from("unresponsive-worker-book.g1.pdf");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let error = release_epub_document_for_delete_with_pool(&path, deadline, Some(&pool))
+            .err()
+            .expect("unresponsive worker must fail");
+        assert!(error.contains("終了せず"));
+        // The timed-out operation must not leave the admission boundary held.
+        let later = release_epub_document_for_delete_with_pool(
+            &path,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            None,
+        );
+        assert!(later.is_ok());
+    }
+
+    #[test]
+    fn release_document_request_round_trips_its_target_path() {
+        let path = resolved_test_path(Path::new("book.g1.pdf"));
+        let encoded = encode_release_document_request(&path);
+        assert!(matches!(
+            decode_request(&encoded).unwrap(),
+            DecodedRequest::ReleaseDocument { path: decoded } if decoded == path.as_path()
+        ));
     }
 
     // ── Context epoch tests (PdfWorkerPool 内部ロジックのみ、PDFium IPC は使わない) ──

@@ -101,6 +101,19 @@ pub struct CurrentGenerationEntry {
     pub last_access_at: i64,
 }
 
+/// A failed commit is distinct from a failed unlink: callers must invalidate
+/// process references whenever the immutable PDF has already disappeared.
+#[derive(Debug)]
+pub enum ImmediateDeleteOutcome {
+    NotCurrent,
+    Deleted(GenerationRow),
+    Failed {
+        generation: GenerationRow,
+        file_removed: bool,
+        error: CacheError,
+    },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum PublishOutcome {
     Published,
@@ -690,6 +703,65 @@ impl EpubCache {
         Ok(inserted)
     }
 
+    pub fn delete_generation_now(&mut self, id: i64) -> Result<ImmediateDeleteOutcome, CacheError> {
+        self.delete_generation_now_inner(id, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_generation_with_commit_failure_for_test(
+        &mut self,
+        id: i64,
+    ) -> Result<ImmediateDeleteOutcome, CacheError> {
+        self.delete_generation_now_inner(id, true)
+    }
+
+    fn delete_generation_now_inner(
+        &mut self,
+        id: i64,
+        fail_commit_after_unlink: bool,
+    ) -> Result<ImmediateDeleteOutcome, CacheError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = tx
+            .query_row(
+                "SELECT g.* FROM current c JOIN generations g USING(generation_id) WHERE c.generation_id=?1",
+                [id],
+                decode_generation,
+            )
+            .optional()?;
+        let Some(generation) = row else {
+            return Ok(ImmediateDeleteOutcome::NotCurrent);
+        };
+        if let Err(error) =
+            delete_payload_file_user(&self.data_dir.join("epub_cache"), &generation.pdf_file)
+        {
+            return Ok(ImmediateDeleteOutcome::Failed {
+                generation,
+                file_removed: false,
+                error,
+            });
+        }
+        let result = (|| -> Result<(), CacheError> {
+            tx.execute("DELETE FROM current WHERE generation_id=?1", [id])?;
+            tx.execute("DELETE FROM generations WHERE generation_id=?1", [id])?;
+            tx.execute("DELETE FROM retired WHERE generation_id=?1", [id])?;
+            if fail_commit_after_unlink {
+                return Err(CacheError::Io(io::Error::other("injected commit failure")));
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(ImmediateDeleteOutcome::Deleted(generation)),
+            Err(error) => Ok(ImmediateDeleteOutcome::Failed {
+                generation,
+                file_removed: true,
+                error,
+            }),
+        }
+    }
+
     pub fn detach_missing(&mut self, key: &str, id: i64) -> Result<(), CacheError> {
         let tx = self
             .conn
@@ -1246,6 +1318,18 @@ fn validate_retired_file(root: &Path, path: &Path) -> Result<(), CacheError> {
 }
 
 fn delete_payload_file(root: &Path, path: &Path) -> Result<(), CacheError> {
+    delete_payload_file_with_mode(root, path, true)
+}
+
+fn delete_payload_file_user(root: &Path, path: &Path) -> Result<(), CacheError> {
+    delete_payload_file_with_mode(root, path, false)
+}
+
+fn delete_payload_file_with_mode(
+    root: &Path,
+    path: &Path,
+    allow_posix_unlink: bool,
+) -> Result<(), CacheError> {
     // Every payload has exactly two hash directories below the cache root.
     let relative = path
         .strip_prefix(root)
@@ -1261,7 +1345,7 @@ fn delete_payload_file(root: &Path, path: &Path) -> Result<(), CacheError> {
     }
     #[cfg(windows)]
     {
-        delete_payload_file_by_handle(root, path)
+        delete_payload_file_by_handle(root, path, allow_posix_unlink)
     }
     #[cfg(not(windows))]
     {
@@ -1275,7 +1359,11 @@ fn delete_payload_file(root: &Path, path: &Path) -> Result<(), CacheError> {
 }
 
 #[cfg(windows)]
-fn delete_payload_file_by_handle(root: &Path, path: &Path) -> Result<(), CacheError> {
+fn delete_payload_file_by_handle(
+    root: &Path,
+    path: &Path,
+    allow_posix_unlink: bool,
+) -> Result<(), CacheError> {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
@@ -1355,10 +1443,14 @@ fn delete_payload_file_by_handle(root: &Path, path: &Path) -> Result<(), CacheEr
         return Err(CacheError::UnsafePath(path.to_owned()));
     }
     let handle = HANDLE(target.as_raw_handle());
+    let flags = FILE_DISPOSITION_FLAG_DELETE.0
+        | if allow_posix_unlink {
+            FILE_DISPOSITION_FLAG_POSIX_SEMANTICS.0
+        } else {
+            0
+        };
     let disposition = FILE_DISPOSITION_INFO_EX {
-        Flags: FILE_DISPOSITION_INFO_EX_FLAGS(
-            FILE_DISPOSITION_FLAG_DELETE.0 | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS.0,
-        ),
+        Flags: FILE_DISPOSITION_INFO_EX_FLAGS(flags),
     };
     let result = unsafe {
         SetFileInformationByHandle(
@@ -1989,6 +2081,92 @@ mod tests {
         assert!(a.pdf_file.exists() && b.pdf_file.exists());
         assert_eq!(cache.current_generation(&a.src_path_key).unwrap(), Some(a));
         assert_eq!(cache.current_generation(&b.src_path_key).unwrap(), Some(b));
+    }
+
+    #[test]
+    fn epub_cache_manager_removes_selected_generation_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = EpubCache::open_at(tmp.path()).unwrap();
+        let source = tmp.path().join("book.epub");
+        let generation = candidate(&mut cache, tmp.path(), &source, state(1));
+        cache.publish(&generation, &FakeGuard(state(1))).unwrap();
+
+        assert!(matches!(
+            cache
+                .delete_generation_now(generation.generation_id)
+                .unwrap(),
+            ImmediateDeleteOutcome::Deleted(_)
+        ));
+        assert!(!generation.pdf_file.exists());
+        assert!(
+            cache
+                .current_generation(&generation.src_path_key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .generation(generation.generation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!retired(&cache, generation.generation_id));
+    }
+
+    #[test]
+    fn immediate_delete_reports_removed_file_when_commit_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = EpubCache::open_at(tmp.path()).unwrap();
+        let source = tmp.path().join("book.epub");
+        let generation = candidate(&mut cache, tmp.path(), &source, state(1));
+        cache.publish(&generation, &FakeGuard(state(1))).unwrap();
+
+        assert!(matches!(
+            cache
+                .delete_generation_now_inner(generation.generation_id, true)
+                .unwrap(),
+            ImmediateDeleteOutcome::Failed {
+                file_removed: true,
+                ..
+            }
+        ));
+        assert!(!generation.pdf_file.exists());
+        assert!(
+            cache
+                .current_generation(&generation.src_path_key)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn immediate_delete_keeps_generation_when_windows_rejects_open_file() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = EpubCache::open_at(tmp.path()).unwrap();
+        let source = tmp.path().join("book.epub");
+        let generation = candidate(&mut cache, tmp.path(), &source, state(1));
+        cache.publish(&generation, &FakeGuard(state(1))).unwrap();
+        let _display_handle = OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(&generation.pdf_file)
+            .unwrap();
+        assert!(matches!(
+            cache
+                .delete_generation_now(generation.generation_id)
+                .unwrap(),
+            ImmediateDeleteOutcome::Failed {
+                file_removed: false,
+                ..
+            }
+        ));
+        assert!(generation.pdf_file.exists());
+        assert_eq!(
+            cache.current_generation(&generation.src_path_key).unwrap(),
+            Some(generation)
+        );
     }
 
     #[cfg(windows)]
