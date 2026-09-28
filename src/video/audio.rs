@@ -37,6 +37,27 @@ struct LocalDspControl {
     pump_instance: u64,
     epoch: AtomicU64,
     chain: AudioDspChain,
+    applicable_seen: AtomicBool,
+    #[cfg(test)]
+    test_applicable: AtomicBool,
+    #[cfg(test)]
+    before_dry_commit: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(windows)]
+impl LocalDspControl {
+    fn has_applicable_stage(&self) -> bool {
+        self.chain.has_applicable_stage() || {
+            #[cfg(test)]
+            {
+                self.test_applicable.load(Ordering::Acquire)
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -145,18 +166,45 @@ impl AudioOutput {
     }
 
     #[cfg(all(test, windows))]
-    pub(crate) fn with_dsp_chain_for_test(mut self, chain: AudioDspChain) -> Self {
+    pub(crate) fn with_dsp_chain_for_test(
+        mut self,
+        chain: AudioDspChain,
+        applicable: bool,
+    ) -> Self {
         self.dsp_control = Some(Arc::new(LocalDspControl {
             pump_instance: NEXT_LOCAL_DSP_PUMP.fetch_add(1, Ordering::Relaxed),
             epoch: AtomicU64::new(0),
             chain,
+            applicable_seen: AtomicBool::new(applicable),
+            test_applicable: AtomicBool::new(applicable),
+            before_dry_commit: None,
         }));
         self
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_dsp_applicable_for_test(&self, applicable: bool) {
+        self.dsp_control
+            .as_ref()
+            .unwrap()
+            .test_applicable
+            .store(applicable, Ordering::Release);
+    }
+
     #[cfg(windows)]
-    pub(crate) fn has_dsp_coordinator(&self) -> bool {
-        self.dsp_control.is_some()
+    pub(crate) fn has_applicable_dsp(&self) -> bool {
+        self.dsp_control
+            .as_ref()
+            .is_some_and(|control| control.has_applicable_stage())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn newly_applicable_dsp(&self) -> bool {
+        self.dsp_control.as_ref().is_some_and(|control| {
+            let applicable = control.has_applicable_stage();
+            let previous = control.applicable_seen.swap(applicable, Ordering::AcqRel);
+            applicable && !previous
+        })
     }
 
     #[cfg(windows)]
@@ -1025,6 +1073,19 @@ pub struct AudioDspChain {
     pub coordinator: Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
 }
 
+#[cfg(windows)]
+impl AudioDspChain {
+    fn has_applicable_stage(&self) -> bool {
+        self.user
+            .as_ref()
+            .is_some_and(|bridge| bridge.is_enabled() && bridge.active_slot_count() > 0)
+            || self
+                .effetune
+                .snapshot()
+                .is_some_and(|(_, bridge)| bridge.is_enabled() && bridge.active_slot_count() > 0)
+    }
+}
+
 /// 音声出力ストリームを開く。デフォルトデバイスを使う。
 ///
 /// `audio_rx` がドロップされると pump スレッドは終了するが、cpal Stream は無音で
@@ -1110,10 +1171,16 @@ pub(crate) fn start(
     let pump_diagnostics = Arc::clone(&diagnostics);
     #[cfg(windows)]
     let dsp_control = dsp_chain.as_ref().map(|chain| {
+        let applicable = chain.has_applicable_stage();
         Arc::new(LocalDspControl {
             pump_instance: NEXT_LOCAL_DSP_PUMP.fetch_add(1, Ordering::Relaxed),
             epoch: AtomicU64::new(0),
             chain: chain.clone(),
+            applicable_seen: AtomicBool::new(applicable),
+            #[cfg(test)]
+            test_applicable: AtomicBool::new(false),
+            #[cfg(test)]
+            before_dry_commit: None,
         })
     });
     #[cfg(windows)]
@@ -1776,23 +1843,24 @@ fn run_pump(
         // 3. lock → seek_serial check → push processed → unlock
         loop {
             #[cfg(windows)]
-            let _dsp_permit = dsp_control.as_ref().and_then(|control| {
+            let block_mode = dsp_control.as_ref().map(|control| {
                 control
                     .chain
                     .coordinator
-                    .local_permit(control.pump_instance)
+                    .local_block_mode(control.pump_instance)
             });
             #[cfg(windows)]
-            if dsp_control.as_ref().is_some_and(|control| {
-                control
-                    .chain
-                    .coordinator
-                    .is_acquiring_local(control.pump_instance)
-            }) {
+            if matches!(
+                block_mode.as_ref(),
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Acquiring)
+            ) {
                 break;
             }
             #[cfg(windows)]
-            let dsp_allowed = _dsp_permit.is_some();
+            let dsp_allowed = matches!(
+                block_mode.as_ref(),
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Dsp(_))
+            );
             // 現在の processed 秒数 (= cap 比較用) を lock 内で取得
             let (current_processed_secs, raw_chunk_opt, target_serial) = {
                 let mut buf = buffer.lock().unwrap();
@@ -2095,43 +2163,77 @@ fn run_pump(
             // mutex の外なので、この allocation が PC 側の drain を待たせることはない。
             let prepared_audio_tap = prepare_audio_tap_chunk(&active_audio_tap, &chunk);
 
-            // ── lock 再取得して processed に push (= seek serial check) ──
-            let mut buf = buffer.lock().unwrap();
-            if !processed_chunk_matches_live_seek(
-                chunk.seek_serial,
-                target_serial,
-                buf.pump_seek_serial,
-                clock.current_seek_serial(),
-            ) {
-                // seek 世代が変わった (= chunk は stale) → drop
+            #[cfg(all(test, windows))]
+            if matches!(
+                block_mode.as_ref(),
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Dry(_))
+            ) && let Some(hook) = dsp_control
+                .as_ref()
+                .and_then(|control| control.before_dry_commit.as_ref())
+            {
+                hook();
+            }
+            // Dry commits hold the coordinator's ownership lock through the queue push.
+            // A grant after dequeue therefore either invalidates this block or follows it.
+            let mut cap_exceeded = None;
+            let mut latency_change = None;
+            let commit = || {
+                let mut buf = buffer.lock().unwrap();
+                if !processed_chunk_matches_live_seek(
+                    chunk.seek_serial,
+                    target_serial,
+                    buf.pump_seek_serial,
+                    clock.current_seek_serial(),
+                ) {
+                    return false;
+                }
+                // ── cap exceedance check (Codex P2-3): 単 chunk が処理済 cap を超える ──
+                // AAC/Opus 等は 23ms/frame なので通常は cap=100ms に余裕。長い frame
+                // (= 一部の独自エンコード) では cap を一時的に超える可能性があるので
+                // ログだけ出して push する (= 分割は将来課題)。
+                let cur_processed_secs: f64 =
+                    buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
+                        + remaining_first_chunk_secs(&buf);
+                if cur_processed_secs + chunk.duration_secs > TARGET_PROCESSED_SECS * 1.5 {
+                    cap_exceeded = Some((cur_processed_secs, chunk.duration_secs));
+                }
+                // PDC latency 変化のログ + 同期 (= 既存挙動、chunk metadata だが
+                // global pdc_latency_secs も維持)
+                if (buf.pdc_latency_secs - current_latency_source_secs).abs() > 1e-6 {
+                    latency_change = Some((buf.pdc_latency_secs, current_latency_source_secs));
+                    buf.pdc_latency_secs = current_latency_source_secs;
+                }
+                buf.processed.push_back(chunk);
+                true
+            };
+            #[cfg(windows)]
+            let committed = match block_mode.as_ref() {
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Dry(dry)) => {
+                    dry.commit_if_current(commit)
+                }
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Dsp(_)) | None => commit(),
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Acquiring) => unreachable!(),
+            };
+            #[cfg(not(windows))]
+            let committed = commit();
+            if !committed {
                 continue;
             }
-            // ── cap exceedance check (Codex P2-3): 単 chunk が処理済 cap を超える ──
-            // AAC/Opus 等は 23ms/frame なので通常は cap=100ms に余裕。長い frame
-            // (= 一部の独自エンコード) では cap を一時的に超える可能性があるので
-            // ログだけ出して push する (= 分割は将来課題)。
-            let cur_processed_secs: f64 =
-                buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
-                    + remaining_first_chunk_secs(&buf);
-            if cur_processed_secs + chunk.duration_secs > TARGET_PROCESSED_SECS * 1.5 {
+            publish_prepared_audio_tap_chunk(&mut active_audio_tap, prepared_audio_tap);
+            if let Some((processed_secs, chunk_secs)) = cap_exceeded {
                 crate::logger::log(format!(
-                    "[audio-pump] processed cap exceeded: {:.3}s + {:.3}s > {:.3}s target \
+                    "[audio-pump] processed cap exceeded: {processed_secs:.3}s + {chunk_secs:.3}s > {:.3}s target \
                      (chunk too large to fit; EQ latency briefly elevated)",
-                    cur_processed_secs, chunk.duration_secs, TARGET_PROCESSED_SECS,
+                    TARGET_PROCESSED_SECS,
                 ));
             }
-            // PDC latency 変化のログ + 同期 (= 既存挙動、chunk metadata だが
-            // global pdc_latency_secs も維持)
-            if (buf.pdc_latency_secs - current_latency_source_secs).abs() > 1e-6 {
+            if let Some((old_latency, new_latency)) = latency_change {
                 crate::logger::log(format!(
                     "Audio latency changed: {:.3}ms -> {:.3}ms source-time",
-                    buf.pdc_latency_secs * 1000.0,
-                    current_latency_source_secs * 1000.0
+                    old_latency * 1000.0,
+                    new_latency * 1000.0
                 ));
-                buf.pdc_latency_secs = current_latency_source_secs;
             }
-            publish_prepared_audio_tap_chunk(&mut active_audio_tap, prepared_audio_tap);
-            buf.processed.push_back(chunk);
         }
 
         // ── publish_buffer_secs + BufferReady emit ──
@@ -3016,6 +3118,96 @@ mod tests {
         // The pump's buffer serial can lag the clock after a seek request.
         assert!(!super::processed_chunk_matches_live_seek(7, 7, 7, 8));
         assert!(!super::processed_chunk_matches_live_seek(7, 7, 8, 8));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dry_pump_block_cannot_commit_after_concurrent_grant() {
+        use crate::video::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let chain = AudioDspChain {
+            user: None,
+            effetune: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+            coordinator: Arc::clone(&coordinator),
+        };
+        let (at_commit_tx, at_commit_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let control = Arc::new(LocalDspControl {
+            pump_instance: 81,
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            applicable_seen: AtomicBool::new(false),
+            test_applicable: AtomicBool::new(false),
+            before_dry_commit: Some(Arc::new(move || {
+                at_commit_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })),
+        });
+        let buffer = make_buffer(48_000);
+        let clock = make_clock();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(1);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (event_tx, _event_rx) = bounded(8);
+        let event_tx = crate::video::EngineEventSender::new(
+            event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let pump = {
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            let clock = Arc::clone(&clock);
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    playing_state(),
+                    make_diag(),
+                    tap_rx,
+                    Some(chain),
+                    Some(control),
+                );
+            })
+        };
+        audio_tx
+            .send(AudioFrame {
+                samples: vec![0.25; 1_920],
+                pts_secs: 0.0,
+                seek_serial: 0,
+                duration_secs: 0.02,
+                queued_wall_secs: 0.02,
+                audio_tx_accounting_epoch: 0,
+                seek_target_secs: Some(0.0),
+            })
+            .unwrap();
+        at_commit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("pump must reach the real dry-block commit");
+        let request = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 81,
+                epoch: 1,
+            })
+            .unwrap();
+        let handoff = coordinator
+            .wait_handoff(
+                request,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(handoff.grant());
+        release_tx.send(()).unwrap();
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        pump.join().unwrap();
+        assert!(buffer.lock().unwrap().processed.is_empty());
     }
 
     fn make_clock() -> Arc<AvClock> {

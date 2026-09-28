@@ -9263,7 +9263,7 @@ impl VideoPlayer {
         let Some(audio) = self
             .audio
             .as_ref()
-            .filter(|audio| audio.has_dsp_coordinator())
+            .filter(|audio| audio.has_applicable_dsp())
         else {
             return false;
         };
@@ -9534,7 +9534,7 @@ impl VideoPlayer {
             && self
                 .audio
                 .as_ref()
-                .is_some_and(|audio| audio.has_dsp_coordinator() && !audio.has_dsp_token());
+                .is_some_and(|audio| audio.has_applicable_dsp() && !audio.has_dsp_token());
         #[cfg(not(windows))]
         let needs_dsp_acquisition = false;
         if prev_intent != p || force_dispatch || needs_dsp_acquisition {
@@ -10922,6 +10922,15 @@ impl VideoPlayer {
         self.start_dsp_acquisition_after_metadata();
         #[cfg(windows)]
         self.poll_dsp_acquisition();
+        #[cfg(windows)]
+        if self.intent_playing()
+            && self
+                .audio
+                .as_ref()
+                .is_some_and(|audio| audio.newly_applicable_dsp())
+        {
+            self.begin_dsp_acquisition(LocalDspPosition::CurrentAfterMetadata);
+        }
 
         // info を取り込む
         if self.info.is_none() {
@@ -11970,6 +11979,57 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 mod tests {
     #[cfg(windows)]
     #[test]
+    fn inactive_dsp_does_not_handoff_on_play_but_activation_acquires_while_playing() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        let coordinator = std::sync::Arc::new(DspProcessingCoordinator::default());
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("dry-then-active.mp4"),
+        );
+        player.clock.set_paused_position(7.0);
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator,
+            },
+            false,
+        ));
+        assert!(!player.begin_dsp_acquisition(super::LocalDspPosition::CurrentAfterMetadata));
+        player.set_playing(true);
+        assert!(player.intent_playing());
+        assert_eq!(player.current_seek_serial(), 0);
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Idle
+        ));
+
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_dsp_applicable_for_test(true);
+        let ctx = egui::Context::default();
+        player.tick(&ctx);
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Waiting(_)
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !player.audio.as_ref().unwrap().has_dsp_token()
+            && std::time::Instant::now() < deadline
+        {
+            player.tick(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(player.audio.as_ref().unwrap().has_dsp_token());
+        assert!(player.current_seek_serial() > 0);
+        assert!((player.position() - 7.0).abs() < 0.001);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn local_dsp_handoff_waits_for_metadata_and_reseeks_at_requested_position() {
         use crate::video::audio::AudioDspChain;
         use crate::video::dsp::coordinator::DspProcessingCoordinator;
@@ -11992,6 +12052,7 @@ mod tests {
                     effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
                     coordinator: std::sync::Arc::clone(&coordinator),
                 },
+                true,
             ));
 
             assert!(player.begin_dsp_acquisition(requested));

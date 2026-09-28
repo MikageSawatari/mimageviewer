@@ -25,6 +25,7 @@ pub enum HandoffWaitError {
 #[derive(Default)]
 struct State {
     next_request: u64,
+    ownership_version: u64,
     desired: Option<DspRequest>,
     granted: Option<DspRequest>,
     in_flight: usize,
@@ -47,6 +48,7 @@ impl DspProcessingCoordinator {
             return None;
         }
         state.next_request = state.next_request.saturating_add(1);
+        state.ownership_version = state.ownership_version.wrapping_add(1);
         let request = DspRequest {
             owner,
             number: state.next_request,
@@ -61,6 +63,7 @@ impl DspProcessingCoordinator {
     pub fn revoke(&self) {
         let mut state = self.state.lock().unwrap();
         state.next_request = state.next_request.saturating_add(1);
+        state.ownership_version = state.ownership_version.wrapping_add(1);
         state.desired = None;
         state.granted = None;
         self.changed.notify_all();
@@ -68,6 +71,7 @@ impl DspProcessingCoordinator {
 
     pub fn cancel(&self, request: DspRequest) {
         let mut state = self.state.lock().unwrap();
+        let old = (state.desired, state.granted, state.remote_owner);
         if state.desired == Some(request) {
             state.desired = None;
         }
@@ -77,17 +81,24 @@ impl DspProcessingCoordinator {
         if state.remote_owner == Some(request) {
             state.remote_owner = None;
         }
+        if old != (state.desired, state.granted, state.remote_owner) {
+            state.ownership_version = state.ownership_version.wrapping_add(1);
+        }
         self.changed.notify_all();
     }
 
     pub fn revoke_local(&self, pump_instance: u64) {
         let mut state = self.state.lock().unwrap();
+        let old = (state.desired, state.granted);
         let belongs_to_pump = |request: DspRequest| matches!(request.owner, DspOwner::Local { pump_instance: id, .. } if id == pump_instance);
         if state.desired.is_some_and(belongs_to_pump) {
             state.desired = None;
         }
         if state.granted.is_some_and(belongs_to_pump) {
             state.granted = None;
+        }
+        if old != (state.desired, state.granted) {
+            state.ownership_version = state.ownership_version.wrapping_add(1);
         }
         self.changed.notify_all();
     }
@@ -128,19 +139,36 @@ impl DspProcessingCoordinator {
             && state.remote_owner.is_none()
     }
 
-    pub fn local_permit(self: &Arc<Self>, pump_instance: u64) -> Option<DspPermit> {
+    /// One decision covers the raw dequeue and the entire processed-block commit.
+    pub fn local_block_mode(self: &Arc<Self>, pump_instance: u64) -> LocalBlockMode {
         let mut state = self.state.lock().unwrap();
-        if state.exiting || state.granted != state.desired {
-            return None;
-        }
-        if !matches!(state.granted, Some(DspRequest { owner: DspOwner::Local { pump_instance: id, .. }, .. }) if id == pump_instance)
+        if !state.exiting
+            && matches!(state.desired, Some(DspRequest { owner: DspOwner::Local { pump_instance: id, .. }, .. }) if id == pump_instance)
+            && state.granted != state.desired
         {
-            return None;
+            return LocalBlockMode::Acquiring;
         }
-        state.in_flight += 1;
-        Some(DspPermit {
+        if !state.exiting
+            && state.granted == state.desired
+            && matches!(state.granted, Some(DspRequest { owner: DspOwner::Local { pump_instance: id, .. }, .. }) if id == pump_instance)
+        {
+            state.in_flight += 1;
+            return LocalBlockMode::Dsp(DspPermit {
+                coordinator: Arc::clone(self),
+            });
+        }
+        LocalBlockMode::Dry(DspDryBlock {
             coordinator: Arc::clone(self),
+            ownership_version: state.ownership_version,
+            pump_instance,
         })
+    }
+
+    pub fn local_permit(self: &Arc<Self>, pump_instance: u64) -> Option<DspPermit> {
+        match self.local_block_mode(pump_instance) {
+            LocalBlockMode::Dsp(permit) => Some(permit),
+            LocalBlockMode::Dry(_) | LocalBlockMode::Acquiring => None,
+        }
     }
 
     pub fn local_has_token(&self, pump_instance: u64) -> bool {
@@ -184,6 +212,7 @@ impl DspProcessingCoordinator {
             if remaining.is_zero() {
                 if state.desired == Some(request) {
                     state.desired = None;
+                    state.ownership_version = state.ownership_version.wrapping_add(1);
                 }
                 self.changed.notify_all();
                 return Err(HandoffWaitError::TimedOut);
@@ -198,6 +227,7 @@ impl DspProcessingCoordinator {
         let mut state = self.state.lock().unwrap();
         state.exiting = true;
         state.next_request = state.next_request.saturating_add(1);
+        state.ownership_version = state.ownership_version.wrapping_add(1);
         state.desired = None;
         state.granted = None;
         self.changed.notify_all();
@@ -210,6 +240,33 @@ impl DspProcessingCoordinator {
             state = next;
         }
         true
+    }
+}
+
+pub enum LocalBlockMode {
+    Dsp(DspPermit),
+    Dry(DspDryBlock),
+    Acquiring,
+}
+
+pub struct DspDryBlock {
+    coordinator: Arc<DspProcessingCoordinator>,
+    ownership_version: u64,
+    pump_instance: u64,
+}
+
+impl DspDryBlock {
+    /// Serialize the queue push with grant/revoke without holding the lock during DSP work.
+    pub fn commit_if_current(&self, commit: impl FnOnce() -> bool) -> bool {
+        let state = self.coordinator.state.lock().unwrap();
+        if state.exiting || state.ownership_version != self.ownership_version {
+            return false;
+        }
+        if matches!(state.desired, Some(DspRequest { owner: DspOwner::Local { pump_instance, .. }, .. }) if pump_instance == self.pump_instance)
+        {
+            return false;
+        }
+        commit()
     }
 }
 
@@ -241,6 +298,7 @@ impl DspHandoff {
             return false;
         }
         state.granted = Some(self.request);
+        state.ownership_version = state.ownership_version.wrapping_add(1);
         if matches!(self.request.owner, DspOwner::Remote { .. }) {
             state.remote_owner = Some(self.request);
         }

@@ -47168,11 +47168,11 @@ impl App {
     pub(crate) fn pause_local_progress_for_remote_session(&mut self) -> (bool, bool, usize, bool) {
         #[cfg(windows)]
         {
-            self.remote_paused_local_media.clear();
+            let mut newly_playing = Vec::new();
             if let Some((path, position_secs)) =
                 current_playing_media_snapshot(self.fullscreen_idx, &self.fs_cache)
             {
-                self.remote_paused_local_media.push(RemotePausedLocalMedia {
+                newly_playing.push(RemotePausedLocalMedia {
                     context: None,
                     path,
                     position_secs,
@@ -47184,11 +47184,21 @@ impl App {
                         current_playing_media_snapshot(context.fullscreen_idx(), context.fs_cache())
                     })
                 {
-                    self.remote_paused_local_media.push(RemotePausedLocalMedia {
+                    newly_playing.push(RemotePausedLocalMedia {
                         context: Some(id),
                         path,
                         position_secs,
                     });
+                }
+            }
+            // A coalesced reacquisition sees these players paused. Keep their first
+            // acquired positions until local control actually returns.
+            for paused in newly_playing {
+                if !self.remote_paused_local_media.iter().any(|saved| {
+                    saved.context == paused.context
+                        && crate::folder_tree::path_eq(&saved.path, &paused.path)
+                }) {
+                    self.remote_paused_local_media.push(paused);
                 }
             }
         }

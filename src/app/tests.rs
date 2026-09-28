@@ -55608,6 +55608,80 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn coalesced_remote_reacquisition_preserves_retained_player_reseek_position() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = PathBuf::from(r"C:\clips\retained-reacquire.mp4");
+        let player = crate::video::VideoPlayer::disconnected_for_test(path.clone(), 51.0);
+        player.set_playing(true);
+        let context_id =
+            app.build_active_context_for_test(Some(208), DetachedSource::Video, move |active| {
+                active.items.push(GridItem::Video(path));
+                active.fullscreen_idx = Some(0);
+                active.fs_cache.insert(
+                    0,
+                    FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: 0,
+                    },
+                );
+            });
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        let acquire = || mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: Some("phone".to_owned()),
+            },
+        };
+        handle.acquire(acquire());
+        app.poll_remote_session(&ctx);
+        assert_eq!(app.remote_paused_local_media.len(), 1);
+        assert_eq!(app.remote_paused_local_media[0].context, Some(context_id));
+        assert_eq!(app.remote_paused_local_media[0].position_secs, 51.0);
+        let serial_before = app
+            .with_viewer_context_ref(context_id, |context| {
+                let Some(FsCacheEntry::Video { player, .. }) = context.fs_cache().get(&0) else {
+                    unreachable!();
+                };
+                player.current_seek_serial()
+            })
+            .unwrap();
+
+        let owner = handle.owner_for_test("phone");
+        let mut registration = handle
+            .streaming_owner(&owner)
+            .unwrap()
+            .register_streaming()
+            .unwrap();
+        let worker_lease = registration.take_worker_lease();
+        handle.local_disconnect();
+        app.poll_remote_session(&ctx);
+        drop(registration);
+        drop(worker_lease);
+        handle.acquire(acquire());
+        app.poll_remote_session(&ctx);
+        assert_eq!(app.remote_paused_local_media.len(), 1);
+        assert_eq!(app.remote_paused_local_media[0].position_secs, 51.0);
+
+        handle.local_disconnect();
+        app.poll_remote_session(&ctx);
+        app.poll_remote_session(&ctx);
+        assert!(app.remote_paused_local_media.is_empty());
+        app.with_viewer_context_ref(context_id, |context| {
+            let Some(FsCacheEntry::Video { player, .. }) = context.fs_cache().get(&0) else {
+                unreachable!();
+            };
+            assert!(!player.intent_playing());
+            assert_eq!(player.position(), 51.0);
+            assert!(player.current_seek_serial() > serial_before);
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn local_ai_remote_barrier_snapshot_names_every_closed_condition() {
         let snapshot = LocalAiRemoteBarrierSnapshot {
             mounted: MountedAiRemoteBarrierSnapshot {
