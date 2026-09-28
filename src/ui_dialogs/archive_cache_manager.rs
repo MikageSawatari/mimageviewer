@@ -1,6 +1,6 @@
-//! 変換済みアーカイブキャッシュ (RAR/7z/LZH → ZIP) の管理ダイアログ。
+//! 変換済みアーカイブ (RAR/7z/LZH → ZIP) と EPUB の独立した管理ダイアログ。
 //!
-//! サムネイルキャッシュとは別のメニュー項目として提供する。
+//! サムネイルキャッシュとも互いとも別のメニュー項目として提供する。
 //! キャッシュ 1 エントリは数百 MB 〜 GB になりうるため、
 //! ユーザーが一覧から容量を把握して手動で整理できる UI を重視する。
 //!
@@ -28,11 +28,18 @@ impl App {
     /// Delete* なら poll 側で reload 再 spawn) に遷移するので、open の責務はダイアログを
     /// 見えるようにするだけでよい。
     pub(crate) fn open_archive_cache_manager(&mut self) {
+        self.close_epub_cache_manager();
         self.archive_cache_manager_result = None;
         self.show_archive_cache_manager = true;
         if self.archive_cache_maint_pending.is_none() {
             self.reload_archive_cache_rows();
         }
+    }
+
+    pub(crate) fn open_epub_cache_manager(&mut self) {
+        self.close_archive_cache_manager();
+        self.epub_cache_manager_result = None;
+        self.show_epub_cache_manager = true;
         if self.epub_cache_maint_pending.is_none() {
             self.epub_cache_rows = None;
             self.epub_cache_maint_pending = Some(crate::cache_maintenance::spawn_epub(
@@ -49,33 +56,59 @@ impl App {
 
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+        let (safe_rect, dialog_size) = manager_geometry(ctx);
 
-        egui::Window::new("変換済みアーカイブ・EPUB 管理")
+        egui::Window::new("変換済みアーカイブ管理")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
             .collapsible(false)
-            .default_pos(dialog_pos)
+            .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
+            .default_size(dialog_size)
+            .max_size(safe_rect.size())
+            .constrain_to(safe_rect)
             .show(ctx, |ui| {
-                draw_body(self, ui);
+                draw_archive_body(self, ui);
             });
 
-        if !open
-            || (escape_pressed
-                && !self.archive_cache_confirm_delete_all
-                && !self.epub_cache_confirm_delete_all)
-        {
+        if !open || (escape_pressed && !self.archive_cache_confirm_delete_all) {
             self.close_archive_cache_manager();
         }
 
         self.show_archive_cache_confirm_dialog(ctx);
-        self.show_epub_cache_confirm_dialog(ctx);
     }
 
     fn close_archive_cache_manager(&mut self) {
         close_archive_cache_manager_flags(
             &mut self.show_archive_cache_manager,
             &mut self.archive_cache_confirm_delete_all,
+        );
+    }
+
+    pub(crate) fn show_epub_cache_manager_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_epub_cache_manager {
+            return;
+        }
+        let mut open = true;
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let (safe_rect, dialog_size) = manager_geometry(ctx);
+        egui::Window::new("EPUB 変換キャッシュ管理")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
+            .default_size(dialog_size)
+            .max_size(safe_rect.size())
+            .constrain_to(safe_rect)
+            .show(ctx, |ui| draw_epub_body(self, ui));
+        if !open || (escape_pressed && !self.epub_cache_confirm_delete_all) {
+            self.close_epub_cache_manager();
+        }
+        self.show_epub_cache_confirm_dialog(ctx);
+    }
+
+    fn close_epub_cache_manager(&mut self) {
+        close_epub_cache_manager_flags(
+            &mut self.show_epub_cache_manager,
             &mut self.epub_cache_confirm_delete_all,
         );
     }
@@ -195,22 +228,28 @@ impl App {
     }
 }
 
-fn close_archive_cache_manager_flags(show: &mut bool, archive: &mut bool, epub: &mut bool) {
+fn close_archive_cache_manager_flags(show: &mut bool, archive: &mut bool) {
     *show = false;
     *archive = false;
+}
+
+fn close_epub_cache_manager_flags(show: &mut bool, epub: &mut bool) {
+    *show = false;
     *epub = false;
+}
+
+fn manager_geometry(ctx: &egui::Context) -> (egui::Rect, egui::Vec2) {
+    let safe_rect = ctx.content_rect().shrink(16.0);
+    let size = egui::vec2(740.0, 600.0).min(safe_rect.size());
+    (safe_rect, size)
 }
 
 // ──────────────────────────────────────────────────────────────────────
 // 本体描画
 // ──────────────────────────────────────────────────────────────────────
 
-fn draw_body(app: &mut App, ui: &mut egui::Ui) {
-    ui.set_min_width(600.0);
-    draw_epub_section(app, ui);
-    ui.add_space(10.0);
-    ui.separator();
-    ui.heading("RAR・7z など");
+fn draw_archive_body(app: &mut App, ui: &mut egui::Ui) {
+    ui.set_min_width(600.0_f32.min(ui.available_width()));
 
     let Some(db) = app.archive_cache_db.clone() else {
         ui.label(
@@ -311,8 +350,14 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
     ui.add_space(4.0);
 
+    if busy {
+        ui.label("処理中…");
+    } else if let Some(ref msg) = app.archive_cache_manager_result {
+        ui.label(msg.as_str());
+    }
+
     if app.archive_cache_rows.is_none() {
-        // 初回ロード中は placeholder。
+        ui.label("読み込み中…");
     } else if row_count == 0 {
         ui.label(
             egui::RichText::new("変換済みのアーカイブはありません。")
@@ -322,18 +367,11 @@ fn draw_body(app: &mut App, ui: &mut egui::Ui) {
     } else {
         draw_entry_list(app, ui);
     }
-
-    if busy {
-        ui.add_space(8.0);
-        ui.label("処理中…");
-    } else if let Some(ref msg) = app.archive_cache_manager_result {
-        ui.add_space(8.0);
-        ui.label(msg.as_str());
-    }
 }
 
-fn draw_epub_section(app: &mut App, ui: &mut egui::Ui) {
-    ui.heading("EPUB");
+fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
+    ui.set_min_width(600.0_f32.min(ui.available_width()));
+    ui.label("削除は、同じデータを使うアプリをすべて終了した後の次回起動時に行います。元の EPUB は残ります。");
     let busy = app.epub_cache_maint_pending.is_some();
     if busy {
         ui.ctx().request_repaint();
@@ -371,80 +409,78 @@ fn draw_epub_section(app: &mut App, ui: &mut egui::Ui) {
             ));
         }
     });
+    if let Some(result) = &app.epub_cache_manager_result {
+        ui.label(result);
+    }
     if let Some(rows) = rows {
         if rows.is_empty() {
             ui.label("変換済みの EPUB はありません。");
         } else {
-            egui::ScrollArea::vertical()
-                .max_height(220.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("epub_cache_grid")
-                        .num_columns(6)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            for heading in [
-                                "",
-                                "元ファイル",
-                                "ページ数",
-                                "保存サイズ",
-                                "最終利用",
-                                "状態",
-                            ] {
-                                ui.strong(heading);
-                            }
-                            ui.end_row();
-                            for row in &rows {
-                                let id = row.generation.generation_id;
-                                let mut selected = app.epub_cache_selection.contains(&id);
-                                if ui
-                                    .add_enabled(
-                                        !row.retired && !busy,
-                                        egui::Checkbox::new(&mut selected, ""),
-                                    )
-                                    .changed()
-                                {
-                                    if selected {
-                                        app.epub_cache_selection.insert(id);
-                                    } else {
-                                        app.epub_cache_selection.remove(&id);
-                                    }
-                                }
-                                let name = row
-                                    .generation
-                                    .src_path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("?");
-                                ui.label(truncate_name(name, 40))
-                                    .on_hover_text(row.generation.src_path.display().to_string());
-                                ui.label(row.generation.page_count.to_string());
-                                ui.label(format_bytes(row.generation.pdf_size));
-                                ui.label(crate::app::format_details_timestamp(
-                                    row.last_access_at,
-                                    false,
-                                ));
-                                ui.label(if row.retired {
-                                    "削除予約"
+            epub_cache_entry_scroll_area(ui.available_height()).show(ui, |ui| {
+                egui::Grid::new("epub_cache_grid")
+                    .num_columns(6)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for heading in [
+                            "",
+                            "元ファイル",
+                            "ページ数",
+                            "保存サイズ",
+                            "最終利用",
+                            "状態",
+                        ] {
+                            ui.strong(heading);
+                        }
+                        ui.end_row();
+                        for row in &rows {
+                            let id = row.generation.generation_id;
+                            let mut selected = app.epub_cache_selection.contains(&id);
+                            if ui
+                                .add_enabled(
+                                    !row.retired && !busy,
+                                    egui::Checkbox::new(&mut selected, ""),
+                                )
+                                .changed()
+                            {
+                                if selected {
+                                    app.epub_cache_selection.insert(id);
                                 } else {
-                                    "利用可能"
-                                });
-                                ui.end_row();
+                                    app.epub_cache_selection.remove(&id);
+                                }
                             }
-                        });
-                });
+                            let name = row
+                                .generation
+                                .src_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?");
+                            ui.label(truncate_name(name, 40))
+                                .on_hover_text(row.generation.src_path.display().to_string());
+                            ui.label(row.generation.page_count.to_string());
+                            ui.label(format_bytes(row.generation.pdf_size));
+                            ui.label(crate::app::format_details_timestamp(
+                                row.last_access_at,
+                                false,
+                            ));
+                            ui.label(if row.retired {
+                                "削除予約"
+                            } else {
+                                "利用可能"
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
         }
     } else {
         ui.label("読み込み中…");
-    }
-    if let Some(result) = &app.epub_cache_manager_result {
-        ui.label(result);
     }
 }
 
 fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
     let rows = app.archive_cache_rows.clone().unwrap_or_default();
 
-    archive_cache_entry_scroll_area().show(ui, |ui| {
+    archive_cache_entry_scroll_area(ui.available_height()).show(ui, |ui| {
         egui::Grid::new("archive_cache_grid")
             .num_columns(5)
             .striped(true)
@@ -492,13 +528,20 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-fn archive_cache_entry_scroll_area() -> egui::ScrollArea {
+fn archive_cache_entry_scroll_area(height: f32) -> egui::ScrollArea {
     egui::ScrollArea::vertical()
-        .max_height(360.0)
+        .max_height(height.max(1.0))
         .id_salt("archive_cache_entries")
         // 横方向を内容幅へ縮めない。ダイアログの利用可能幅を使い切ることで、縦
         // スクロールバーを表の途中ではなくダイアログ右端へ固定する。
-        .auto_shrink([false, true])
+        .auto_shrink([false, false])
+}
+
+fn epub_cache_entry_scroll_area(height: f32) -> egui::ScrollArea {
+    egui::ScrollArea::vertical()
+        .max_height(height.max(1.0))
+        .id_salt("epub_cache_entries")
+        .auto_shrink([false, false])
 }
 
 fn format_display_text(entry: &ArchiveCacheEntry) -> String {
@@ -561,17 +604,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn closing_manager_clears_both_delete_all_confirmations() {
-        let (mut show, mut archive, mut epub) = (true, true, true);
-        close_archive_cache_manager_flags(&mut show, &mut archive, &mut epub);
-        assert!(!show && !archive && !epub);
+    fn closing_each_manager_clears_only_its_own_confirmation() {
+        let (mut archive_show, mut archive_confirm) = (true, true);
+        let (mut epub_show, mut epub_confirm) = (true, true);
+        close_archive_cache_manager_flags(&mut archive_show, &mut archive_confirm);
+        assert!(!archive_show && !archive_confirm);
+        assert!(epub_show && epub_confirm);
+        close_epub_cache_manager_flags(&mut epub_show, &mut epub_confirm);
+        assert!(!epub_show && !epub_confirm);
     }
 
     #[test]
     fn window_close_branch_clears_epub_delete_all_confirmation() {
         let mut env = crate::app::tests::phase_c_support::setup_app();
         let app = &mut *env;
-        app.show_archive_cache_manager = true;
+        app.show_epub_cache_manager = true;
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts_with_settings(&ctx, &app.settings.ui_font);
         let input = || egui::RawInput {
@@ -582,10 +629,10 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..3 {
-            let _ = ctx.run(input(), |ctx| app.show_archive_cache_manager_dialog(ctx));
+            let _ = ctx.run(input(), |ctx| app.show_epub_cache_manager_dialog(ctx));
         }
         let rect = ctx
-            .memory(|memory| memory.area_rect(egui::Id::new("変換済みアーカイブ・EPUB 管理")))
+            .memory(|memory| memory.area_rect(egui::Id::new("EPUB 変換キャッシュ管理")))
             .expect("manager window must be laid out");
         let style = ctx.style();
         let frame = egui::Frame::window(&style);
@@ -607,9 +654,9 @@ mod tests {
                 pressed,
                 modifiers: egui::Modifiers::NONE,
             });
-            let _ = ctx.run(frame, |ctx| app.show_archive_cache_manager_dialog(ctx));
+            let _ = ctx.run(frame, |ctx| app.show_epub_cache_manager_dialog(ctx));
         }
-        assert!(!app.show_archive_cache_manager);
+        assert!(!app.show_epub_cache_manager);
         assert!(!app.epub_cache_confirm_delete_all);
     }
 
@@ -627,12 +674,13 @@ mod tests {
         let _ = ctx.run(raw, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.set_width(600.0);
-                let output = archive_cache_entry_scroll_area().show(ui, |ui| {
-                    ui.set_min_width(120.0);
-                    for _ in 0..40 {
-                        ui.label("row");
-                    }
-                });
+                let output =
+                    archive_cache_entry_scroll_area(ui.available_height()).show(ui, |ui| {
+                        ui.set_min_width(120.0);
+                        for _ in 0..40 {
+                            ui.label("row");
+                        }
+                    });
                 inner_width = output.inner_rect.width();
             });
         });
@@ -641,5 +689,57 @@ mod tests {
             inner_width > 550.0,
             "scroll body should span the 600px dialog body, got {inner_width}"
         );
+    }
+
+    #[test]
+    fn manager_table_fills_available_height() {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut heights = (0.0, 0.0);
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_height(500.0);
+                heights.0 = archive_cache_entry_scroll_area(ui.available_height())
+                    .show(ui, |ui| {
+                        ui.label("row");
+                    })
+                    .inner_rect
+                    .height();
+                heights.1 = ui.available_height();
+            });
+        });
+        assert!(heights.0 > 400.0, "table height: {}", heights.0);
+        assert!(heights.1 < 100.0, "unused height: {}", heights.1);
+    }
+
+    #[test]
+    fn epub_table_fills_available_height() {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut height = 0.0;
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_height(500.0);
+                height = epub_cache_entry_scroll_area(ui.available_height())
+                    .show(ui, |ui| {
+                        ui.label("row");
+                    })
+                    .inner_rect
+                    .height();
+            });
+        });
+        assert!(height > 400.0, "EPUB table height: {height}");
     }
 }

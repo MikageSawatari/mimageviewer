@@ -6616,6 +6616,9 @@ impl App {
         let settings_archive_cache_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SettingsArchiveCache);
+        let settings_epub_cache_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsEpubCache);
         let settings_thumbnail_quality_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SettingsThumbnailQuality);
@@ -7647,6 +7650,13 @@ impl App {
                                             if ui.button(&settings_archive_cache_menu_label).clicked()
                                             {
                                                 self.open_archive_cache_manager();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SettingsEpubCache => {
+                                            if ui.button(&settings_epub_cache_menu_label).clicked()
+                                            {
+                                                self.open_epub_cache_manager();
                                                 ui.close();
                                             }
                                         }
