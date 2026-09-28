@@ -9,7 +9,7 @@ enum StartupOpenApplyOutcome {
     NotOpenable,
     Refused(FolderOpenRefusal),
     #[cfg(windows)]
-    DetachedRefused(DetachedOpenRefusal),
+    DetachedRefused(OpenAdmissionRefusal),
 }
 
 #[cfg(test)]
@@ -86,23 +86,25 @@ impl App {
         };
         // The suffix is known before the filesystem resolver runs. A directory ending in
         // `.epub` holds this provisional lease only until classification returns Directory.
-        let Some(requested_owner) = crate::pdf_loader::LeasedEpubPath::try_new(requested.clone())
-        else {
-            match source {
-                StartupOpenPathSource::Activation => {
-                    #[cfg(windows)]
-                    let _ = self.activation_open_path_tx.send(requested);
-                    #[cfg(not(windows))]
-                    let _ = requested;
+        let requested_owner = match crate::pdf_loader::LeasedEpubPath::try_new(requested.clone()) {
+            Ok(owner) => owner,
+            Err(reason) => {
+                match source {
+                    StartupOpenPathSource::Activation => {
+                        #[cfg(windows)]
+                        let _ = self.activation_open_path_tx.send(requested);
+                        #[cfg(not(windows))]
+                        let _ = requested;
+                    }
+                    StartupOpenPathSource::InitialStartup => {
+                        self.startup_open_path = Some(requested)
+                    }
+                    StartupOpenPathSource::Bookmark => {
+                        self.show_open_admission_refusal(reason.into());
+                    }
                 }
-                StartupOpenPathSource::InitialStartup => self.startup_open_path = Some(requested),
-                StartupOpenPathSource::Bookmark => {
-                    self.show_feedback_toast(
-                        "EPUB を使用中のため、しばらくしてから開いてください".into(),
-                    );
-                }
+                return;
             }
-            return;
         };
         let defer_activation_supersede =
             matches!(source, StartupOpenPathSource::Activation) && self.is_snapshot_active();
@@ -420,7 +422,7 @@ impl App {
                 if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner {
                     self.cancel_bookmark_open_request(bookmark_owner.request_id, "epub_deleting");
                 }
-                self.show_feedback_toast(reason.message().to_owned());
+                self.show_open_admission_refusal(reason);
                 return;
             }
             StartupOpenApplyOutcome::NotOpenable => {}

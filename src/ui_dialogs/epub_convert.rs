@@ -411,11 +411,13 @@ impl App {
                     return PdfOpenFailureRoute::Handled;
                 };
                 let (_, rx) = mpsc::channel();
-                let Some(src_owner) =
-                    crate::pdf_loader::LeasedEpubPath::try_new(logical.to_owned())
-                else {
-                    self.show_feedback_toast("EPUB の削除処理が終わってから開いてください".into());
-                    return PdfOpenFailureRoute::Handled;
+                let src_owner = match crate::pdf_loader::LeasedEpubPath::try_new(logical.to_owned())
+                {
+                    Ok(owner) => owner,
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason.into());
+                        return PdfOpenFailureRoute::Handled;
+                    }
                 };
                 let mut state = EpubConvertState {
                     src_path: logical.to_owned(),

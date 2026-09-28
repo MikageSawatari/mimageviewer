@@ -2546,13 +2546,14 @@ impl App {
                             request.lease.pause(Instant::now(), "pdf_password_input");
                             self.pdf_current_password = None;
                             self.pdf_password_pending_save = None;
-                            let Some(password_request) =
-                                super::PdfPasswordRequest::try_legacy(target.source_path.clone())
-                            else {
-                                self.show_feedback_toast(
-                                    "EPUB の削除処理が終わってから開いてください".into(),
-                                );
-                                return;
+                            let password_request = match super::PdfPasswordRequest::try_legacy(
+                                target.source_path.clone(),
+                            ) {
+                                Ok(request) => request,
+                                Err(reason) => {
+                                    self.show_open_admission_refusal(reason);
+                                    return;
+                                }
                             };
                             self.pdf_password_request = Some(password_request);
                             let revision_wake = CollectionRevisionWake::spawn(ctx, &watch);
@@ -3192,13 +3193,18 @@ impl App {
             previous,
         );
         if let (Some(new_idx), Some(player)) = (landing_origin_idx, preserved_player) {
-            self.fs_cache.insert(new_idx, player);
             if self.fullscreen_idx == old_fs_idx {
-                if !self.try_own_fullscreen_epub_at(new_idx) {
-                    return None;
+                match self.try_own_fullscreen_epub_at(new_idx) {
+                    super::OpenAdmission::Accepted => {}
+                    super::OpenAdmission::NotApplicable => return None,
+                    super::OpenAdmission::Refused(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return None;
+                    }
                 }
                 self.fullscreen_idx = Some(new_idx);
             }
+            self.fs_cache.insert(new_idx, player);
             if self.video_audio_mode == old_fs_idx {
                 self.video_audio_mode = Some(new_idx);
             }
@@ -3338,12 +3344,14 @@ impl App {
             CollectionNavigationPreflightPayload::PdfPasswordRequired
         ) {
             request.lease.pause(Instant::now(), "pdf_password_input");
-            let Some(password_request) =
-                super::PdfPasswordRequest::try_legacy(ready.target.source_path.clone())
-            else {
-                self.show_feedback_toast("EPUB の削除処理が終わってから開いてください".into());
-                return;
-            };
+            let password_request =
+                match super::PdfPasswordRequest::try_legacy(ready.target.source_path.clone()) {
+                    Ok(request) => request,
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return;
+                    }
+                };
             self.pdf_password_request = Some(password_request);
             let revision_wake = CollectionRevisionWake::spawn(ctx, &watch);
             self.top_level_grid_view

@@ -375,14 +375,22 @@ pub(crate) struct LeasedEpubPath {
     _lease: Option<Arc<EpubReadLease>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EpubReadAdmissionRefusal {
+    DeletionInProgress,
+}
+
 impl LeasedEpubPath {
-    pub(crate) fn try_new(path: PathBuf) -> Option<Self> {
+    pub(crate) fn try_new(path: PathBuf) -> Result<Self, EpubReadAdmissionRefusal> {
         let lease = if is_epub(&path) {
-            Some(Arc::new(try_acquire_epub_read_lease(&path)?))
+            Some(Arc::new(
+                try_acquire_epub_read_lease(&path)
+                    .ok_or(EpubReadAdmissionRefusal::DeletionInProgress)?,
+            ))
         } else {
             None
         };
-        Some(Self {
+        Ok(Self {
             path,
             _lease: lease,
         })

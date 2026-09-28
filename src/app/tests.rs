@@ -12367,11 +12367,46 @@ mod startup_open_path_resolve_tests {
             page_num: 0,
             content_type: None,
         }];
-        assert!(app.try_own_fullscreen_epub_at(0));
-        assert!(!app.try_own_fullscreen_epub_at(1));
+        assert_eq!(app.try_own_fullscreen_epub_at(0), OpenAdmission::Accepted);
+        assert_eq!(
+            app.try_own_fullscreen_epub_at(1),
+            OpenAdmission::NotApplicable
+        );
         assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_err());
         app.fullscreen_epub_source = None;
         assert!(crate::pdf_loader::acquire_epub_delete_coverage(&source).is_ok());
+    }
+
+    #[test]
+    fn deleting_epub_fullscreen_open_keeps_current_position_and_reports_refusal() {
+        let mut app = setup_app();
+        let current = app.tmp.path().join("current.jpg");
+        let epub = app.tmp.path().join("next.epub");
+        std::fs::write(&current, b"image").unwrap();
+        std::fs::write(&epub, b"book").unwrap();
+        app.items = vec![
+            GridItem::Image(current),
+            GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 0,
+                content_type: None,
+            },
+        ];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        let deleting = crate::pdf_loader::acquire_epub_delete_coverage(&epub).unwrap();
+
+        app.open_fullscreen(1, crate::app::HistoryTrigger::UserChosen);
+
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fullscreen_epub_source.is_none());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains("EPUB の削除処理"))
+        );
+        drop(deleting);
     }
 
     #[test]
@@ -12391,7 +12426,7 @@ mod startup_open_path_resolve_tests {
             })
             .collect();
         app.fullscreen_idx = Some(0);
-        assert!(app.try_own_fullscreen_epub_at(0));
+        assert_eq!(app.try_own_fullscreen_epub_at(0), OpenAdmission::Accepted);
         app.remove_items_batch(&[0]);
         assert_eq!(app.fullscreen_idx, Some(0));
         assert!(crate::pdf_loader::acquire_epub_delete_coverage(&first).is_ok());
@@ -25109,6 +25144,68 @@ fn ignored_epub_bookmark_row_keeps_existing_detached_window_and_bookmark_positio
 
 #[cfg(windows)]
 #[test]
+fn deleting_epub_bookmark_ui_open_reports_refusal_without_changing_main_or_detached_state() {
+    for detached in [false, true] {
+        let mut app = phase_c_support::setup_app();
+        let epub = app.tmp.path().join(format!("bookmark-{detached}.epub"));
+        std::fs::write(&epub, b"book").unwrap();
+        let bookmark = crate::book_bookmarks::BookBookmark {
+            id: 92,
+            container_key: crate::adjustment_db::normalize_path(&epub),
+            container_path: epub.clone(),
+            container_kind: crate::book_bookmarks::BookContainerKind::Pdf,
+            page_identity: crate::book_bookmarks::PageIdentity::PdfPage(1),
+            page_index_hint: 1,
+            created_at_ms: 1,
+            title: None,
+        };
+        let row = crate::bookmark_browser::BookmarkBrowserRow {
+            source: crate::bookmark_browser::BookmarkRowSource::Book(bookmark),
+            item: GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 1,
+                content_type: None,
+            },
+            relative_page_provenance: None,
+            image_meta: None,
+            marker_thumbnail: None,
+            created_at_ms: 1,
+            missing: false,
+        };
+        app.items = vec![row.item.clone()];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.bookmark_browser_rows = vec![row.clone()];
+        app.items_are_bookmark_view = true;
+        app.current_folder = Some(super::bookmark_view_synthetic_path());
+        app.address = "ブックマーク".into();
+        app.settings.detached_viewer_open_images_in_window = detached;
+        let incumbent = detached
+            .then(|| app.build_active_context_for_test(Some(9103), DetachedSource::Image, |_| {}));
+        let deleting = crate::pdf_loader::acquire_epub_delete_coverage(&epub).unwrap();
+
+        app.open_bookmark_browser_row(&egui::Context::default(), &row);
+
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains("EPUB の削除処理")),
+            "detached={detached}: a rejected UI open needs a reason"
+        );
+        assert_eq!(app.active_viewer_context_id(), incumbent);
+        assert!(app.detached_image_windows.is_empty());
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.address, "ブックマーク");
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        assert_eq!(app.bookmark_open_request_seq, 0);
+        drop(deleting);
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn ignored_epub_bookmark_after_resolve_does_not_park_existing_window() {
     let mut app = phase_c_support::setup_app();
     let epub = app.tmp.path().join("resolved-page.epub");
@@ -25376,7 +25473,7 @@ fn detached_epub_refusal_precedes_parking_for_file_page_and_virtual_views() {
         assert!(
             matches!(
                 app.detached_grid_item_open_plan(0, auto_fullscreen),
-                DetachedBuild::Refused(DetachedOpenRefusal::EpubDeletionInProgress)
+                DetachedBuild::Refused(OpenAdmissionRefusal::EpubDeletionInProgress)
             ),
             "{name}: descriptor refusal"
         );

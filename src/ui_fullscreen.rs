@@ -20701,6 +20701,14 @@ impl App {
         target_idx: usize,
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
     ) {
+        match self.try_own_fullscreen_epub_at(target_idx) {
+            crate::app::OpenAdmission::Accepted => {}
+            crate::app::OpenAdmission::NotApplicable => return,
+            crate::app::OpenAdmission::Refused(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        }
         let current_page_changed = self.fullscreen_idx != Some(target_idx);
         if current_page_changed {
             self.supersede_required_fullscreen_folder_open();
@@ -20713,9 +20721,6 @@ impl App {
             }
             self.reset_fs_side_panel_runtime_for_file_change();
             self.finish_stale_fs_navigation_diagnostic_for_target(target_idx);
-        }
-        if !self.try_own_fullscreen_epub_at(target_idx) {
-            return;
         }
         self.fullscreen_idx = Some(target_idx);
         self.selected = Some(target_idx);
@@ -37715,6 +37720,14 @@ impl App {
         if self.items.get(new_idx).is_none() {
             return;
         }
+        match self.try_own_fullscreen_epub_at(new_idx) {
+            crate::app::OpenAdmission::Accepted => {}
+            crate::app::OpenAdmission::NotApplicable => return,
+            crate::app::OpenAdmission::Refused(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        }
         let current_page_changed = self.fullscreen_idx != Some(new_idx);
         let display_unit_changed = current_page_changed || self.fullscreen_page_slice != new_slice;
         if display_unit_changed {
@@ -37732,9 +37745,6 @@ impl App {
         }
         self.fs_vertical_scroll =
             vertical_reading_reanchor_scroll(self.fs_vertical_scroll, old_offsets, new_pos);
-        if !self.try_own_fullscreen_epub_at(new_idx) {
-            return;
-        }
         self.fullscreen_idx = Some(new_idx);
         self.fullscreen_page_slice = new_slice;
         self.sync_main_selection_from_viewer_idx(new_idx);

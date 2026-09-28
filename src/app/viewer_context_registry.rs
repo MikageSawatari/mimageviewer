@@ -1995,10 +1995,15 @@ impl App {
         window_id: u64,
         idx: usize,
     ) {
-        self.selected = Some(idx);
-        if !self.try_own_fullscreen_epub_at(idx) {
-            return;
+        match self.try_own_fullscreen_epub_at(idx) {
+            super::OpenAdmission::Accepted => {}
+            super::OpenAdmission::NotApplicable => return,
+            super::OpenAdmission::Refused(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
         }
+        self.selected = Some(idx);
         self.fullscreen_idx = Some(idx);
         // 新しく開くページは分割方向の最初の半分から。ここで残すと前のページの
         // 「右半分を見ていた」が別のページへ引き継がれる。
@@ -4563,12 +4568,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("candidate.epub");
         std::fs::write(&source, b"candidate").unwrap();
-        assert!(app.start_open_path_classification(
-            source.clone(),
-            super::super::ClassifiedOpenContinuation::Direct {
-                auto_fullscreen: false,
-                owner: super::super::OpenRequestOwner::Navigation,
-            },
+        assert!(matches!(
+            app.start_open_path_classification(
+                source.clone(),
+                super::super::ClassifiedOpenContinuation::Direct {
+                    auto_fullscreen: false,
+                    owner: super::super::OpenRequestOwner::Navigation,
+                },
+            ),
+            super::super::OpenAdmission::Accepted
         ));
         assert!(app.top_level_grid_view.open_path_classification().is_some());
         let deletion_source = source.clone();

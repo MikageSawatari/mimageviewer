@@ -791,9 +791,13 @@ struct SmartChildSource {
 }
 
 impl SmartChildSource {
-    fn try_new(logical_source: PathBuf, load_path: PathBuf) -> Option<Self> {
-        Some(Self {
-            logical_source: crate::pdf_loader::LeasedEpubPath::try_new(logical_source)?,
+    fn try_new(
+        logical_source: PathBuf,
+        load_path: PathBuf,
+    ) -> Result<Self, super::OpenAdmissionRefusal> {
+        Ok(Self {
+            logical_source: crate::pdf_loader::LeasedEpubPath::try_new(logical_source)
+                .map_err(super::OpenAdmissionRefusal::from)?,
             load_path,
         })
     }
@@ -2268,8 +2272,12 @@ impl App {
         if pre_scan.is_some() && kind != SmartChildKind::Folder {
             return Err(pre_scan);
         }
-        let Some(source) = SmartChildSource::try_new(path.clone(), path) else {
-            return Err(pre_scan);
+        let source = match SmartChildSource::try_new(path.clone(), path) {
+            Ok(source) => source,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return Err(pre_scan);
+            }
         };
         let mut effects = source_index
             .filter(|&index| {
@@ -2438,13 +2446,22 @@ impl App {
             return true;
         }
         if super::App::path_needs_open_classification(&path) {
-            return self.start_open_path_classification(
+            return match self.start_open_path_classification(
                 path,
                 super::ClassifiedOpenContinuation::SmartGrid {
                     index,
                     auto_fullscreen,
                 },
-            );
+            ) {
+                super::OpenAdmission::Accepted => true,
+                super::OpenAdmission::Refused(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    true
+                }
+                super::OpenAdmission::NotApplicable => {
+                    unreachable!("the path was checked before classification")
+                }
+            };
         }
         self.begin_smart_grid_container_navigation_classified(
             index,
@@ -2711,16 +2728,19 @@ impl App {
             self.smart_folder_transition = Some(transition);
             return false;
         };
-        let Some(load_source) =
-            SmartChildSource::try_new(source_path.to_path_buf(), pdf_path.to_path_buf())
-        else {
-            transition.phase = SmartFolderTransitionPhase::ChildPreflight {
-                root,
-                child: SmartPhysicalPreflight::EpubConvert,
+        let load_source =
+            match SmartChildSource::try_new(source_path.to_path_buf(), pdf_path.to_path_buf()) {
+                Ok(source) => source,
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    transition.phase = SmartFolderTransitionPhase::ChildPreflight {
+                        root,
+                        child: SmartPhysicalPreflight::EpubConvert,
+                    };
+                    self.smart_folder_transition = Some(transition);
+                    return false;
+                }
             };
-            self.smart_folder_transition = Some(transition);
-            return false;
-        };
         match self.begin_smart_child_preflight(&load_source, SmartChildKind::Pdf) {
             Ok(child) => {
                 if let SmartFolderTransitionTarget::Child { source, .. } = &mut transition.target {
@@ -2767,16 +2787,19 @@ impl App {
             self.smart_folder_transition = Some(transition);
             return false;
         };
-        let Some(load_source) =
-            SmartChildSource::try_new(source_path.to_path_buf(), load_path.to_path_buf())
-        else {
-            transition.phase = SmartFolderTransitionPhase::ChildPreflight {
-                root,
-                child: SmartPhysicalPreflight::ArchiveConvert,
+        let load_source =
+            match SmartChildSource::try_new(source_path.to_path_buf(), load_path.to_path_buf()) {
+                Ok(source) => source,
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    transition.phase = SmartFolderTransitionPhase::ChildPreflight {
+                        root,
+                        child: SmartPhysicalPreflight::ArchiveConvert,
+                    };
+                    self.smart_folder_transition = Some(transition);
+                    return false;
+                }
             };
-            self.smart_folder_transition = Some(transition);
-            return false;
-        };
         let child = match self.begin_smart_child_preflight(&load_source, SmartChildKind::Zip) {
             Ok(child) => child,
             Err(message) => {
@@ -2970,9 +2993,12 @@ impl App {
                 current_kind,
                 ..
             } => {
-                let Some(source) = SmartChildSource::try_new(current.clone(), current.clone())
-                else {
-                    return false;
+                let source = match SmartChildSource::try_new(current.clone(), current.clone()) {
+                    Ok(source) => source,
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return false;
+                    }
                 };
                 Some((source, *current_kind))
             }
@@ -2986,9 +3012,12 @@ impl App {
                     Some(SmartFolderEntryKind::Archive) => SmartChildKind::ConvertibleArchive,
                     _ => return false,
                 };
-                let Some(source) = SmartChildSource::try_new(root_entry.clone(), current.clone())
-                else {
-                    return false;
+                let source = match SmartChildSource::try_new(root_entry.clone(), current.clone()) {
+                    Ok(source) => source,
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return false;
+                    }
                 };
                 Some((source, kind))
             }
