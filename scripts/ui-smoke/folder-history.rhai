@@ -13,6 +13,20 @@ fn lower_names(names) { names.map(|n| n.to_lower()) }
 fn norm_path(p) { let x = p.to_lower(); x.replace("/", "\\"); x }
 fn same_path(a, b) { norm_path(a) == norm_path(b) }
 
+// run_action is acknowledged while the grid handler is still in its pass. The snapshot is
+// published at the start of that pass, so wait for a later one before sending another input.
+fn grid_move_first() {
+    run_action("GridMoveFirst");
+    let acknowledged_frame = snapshot().snapshot_frame;
+    wait_until(|s| s.snapshot_frame > acknowledged_frame && s.selected_index == 0, 30000);
+}
+
+fn grid_right_to(index) {
+    let previous_frame = snapshot().snapshot_frame;
+    tap_key("Right");
+    wait_until(|s| s.snapshot_frame > previous_frame && s.selected_index == index, 30000);
+}
+
 fn state(s) {
     "surface=" + s.grid_surface + " path=" + s.current_folder_path
         + " collection=" + s.collection_id + " names=" + s.item_names.to_debug()
@@ -63,10 +77,10 @@ if rating_path == "" || same_path(rating_path, a) {
     fail("Rating root did not adopt its synthetic path: " + state(snapshot()));
 }
 arrive(rating_surface, rating_path, ["F"], "rating-one");
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
 arrive("Folder", f, ["G", "x-book.pdf", "y-book.zip", "z-page.png"], "rating-child-f");
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
 arrive("Folder", g, ["g-page.png"], "rating-descendant-g");
 tap_key("Left", "alt");
@@ -75,13 +89,13 @@ tap_key("Left", "alt");
 arrive(rating_surface, rating_path, ["F"], "rating-back-root");
 tap_key("Right", "alt");
 arrive("Folder", f, ["G", "x-book.pdf", "y-book.zip", "z-page.png"], "rating-forward-f");
-run_action("GridMoveFirst");
-tap_key("Right");
-tap_key("Right");
+grid_move_first();
+grid_right_to(1);
+grid_right_to(2);
 run_action("GridOpenSelected");
 let rating_zip = f + "\\y-book.zip";
 arrive("Folder", rating_zip, ["chapter", "root.png"], "rating-zip-root");
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
 arrive("Folder", rating_zip, ["first.png", "second.png"], "rating-zip-chapter");
 tap_key("Backspace");
@@ -92,13 +106,13 @@ tap_key("Right", "alt");
 arrive("Folder", rating_zip, ["chapter", "root.png"], "rating-zip-forward-outer");
 tap_key("Backspace");
 arrive("Folder", f, ["G", "x-book.pdf", "y-book.zip", "z-page.png"], "rating-zip-bs-parent");
-run_action("GridMoveFirst");
-tap_key("Right");
+grid_move_first();
+grid_right_to(1);
 run_action("GridOpenSelected");
 let rating_pdf = f + "\\x-book.pdf";
 arrive("Folder", rating_pdf, ["Page 1", "Page 2"], "rating-pdf-pages");
-run_action("GridMoveFirst");
-tap_key("Right");
+grid_move_first();
+grid_right_to(1);
 arrive("Folder", rating_pdf, ["Page 1", "Page 2"], "rating-pdf-page-move");
 tap_key("Left", "alt");
 arrive("Folder", f, ["G", "x-book.pdf", "y-book.zip", "z-page.png"], "rating-pdf-back-outer");
@@ -115,12 +129,12 @@ arrive("Folder", a, ["B", "F"], "rating-bs-a");
 // physical grid input, then read the durable placeholder-adoption event instead of racing the
 // PDF worker's verification frame.
 let warm_before = snapshot().pdf_warm_adoption_sequence;
-run_action("GridMoveFirst");
-tap_key("Right");
+grid_move_first();
+grid_right_to(1);
 tap_key("Enter");
 arrive("Folder", f, ["G", "x-book.pdf", "y-book.zip", "z-page.png"], "warm-direct-folder-f");
-run_action("GridMoveFirst");
-tap_key("Right");
+grid_move_first();
+grid_right_to(1);
 tap_key("Enter");
 wait_until(|s| s.pdf_warm_adoption_sequence > warm_before
     && s.pdf_warm_adoption_phase == "CommittedPlaceholder"
@@ -137,10 +151,10 @@ arrive("Folder", a, ["B", "F"], "warm-direct-bs-a");
 
 folder_history_smoke("open_seeded_collection");
 arrive_collection_root(collection_surface, collection_id, "collection-root-c");
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
 arrive(collection_surface, b, ["D", "x-book.pdf", "y-book.zip", "z-page.png"], "collection-child-b");
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
 arrive(collection_surface, d, ["d-page.png"], "collection-descendant-d");
 tap_key("Left", "alt");
@@ -149,13 +163,13 @@ tap_key("Left", "alt");
 arrive_collection_root(collection_surface, collection_id, "collection-back-c");
 tap_key("Right", "alt");
 arrive(collection_surface, b, ["D", "x-book.pdf", "y-book.zip", "z-page.png"], "collection-forward-b");
-run_action("GridMoveFirst");
-tap_key("Right");
-tap_key("Right");
+grid_move_first();
+grid_right_to(1);
+grid_right_to(2);
 run_action("GridOpenSelected");
 let collection_zip = b + "\\y-book.zip";
 arrive(collection_surface, collection_zip, ["chapter", "root.png"], "collection-zip-root");
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
 arrive(collection_surface, collection_zip, ["first.png", "second.png"], "collection-zip-chapter");
 tap_key("Backspace");
@@ -166,16 +180,16 @@ tap_key("Right", "alt");
 arrive(collection_surface, collection_zip, ["chapter", "root.png"], "collection-zip-forward-outer");
 tap_key("Backspace");
 arrive_collection_root(collection_surface, collection_id, "collection-zip-bs-root");
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
 arrive(collection_surface, b, ["D", "x-book.pdf", "y-book.zip", "z-page.png"], "collection-reopen-b");
-run_action("GridMoveFirst");
-tap_key("Right");
+grid_move_first();
+grid_right_to(1);
 run_action("GridOpenSelected");
 let collection_pdf = b + "\\x-book.pdf";
 arrive(collection_surface, collection_pdf, ["Page 1", "Page 2"], "collection-pdf-pages");
-run_action("GridMoveFirst");
-tap_key("Right");
+grid_move_first();
+grid_right_to(1);
 arrive(collection_surface, collection_pdf, ["Page 1", "Page 2"], "collection-pdf-page-move");
 tap_key("Left", "alt");
 arrive(collection_surface, b, ["D", "x-book.pdf", "y-book.zip", "z-page.png"], "collection-pdf-back-outer");
@@ -183,7 +197,7 @@ tap_key("Right", "alt");
 arrive(collection_surface, collection_pdf, ["Page 1", "Page 2"], "collection-pdf-forward-outer");
 tap_key("Backspace");
 arrive_collection_root(collection_surface, collection_id, "collection-pdf-bs-root");
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
 arrive(collection_surface, b, ["D", "x-book.pdf", "y-book.zip", "z-page.png"], "collection-reopen-before-bs");
 tap_key("Backspace");

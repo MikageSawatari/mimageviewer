@@ -28012,6 +28012,10 @@ impl App {
             // A child callback publishes true after it is actually reached.
             target_rendered: target.is_some_and(|target| target.viewport == egui::ViewportId::ROOT),
             items_len: i64::try_from(self.items.len()).unwrap_or(i64::MAX),
+            snapshot_frame: i64::try_from(ctx.cumulative_frame_nr()).unwrap_or(i64::MAX),
+            selected_index: self
+                .selected
+                .map_or(-1, |index| i64::try_from(index).unwrap_or(i64::MAX)),
             item_names: self
                 .items
                 .iter()

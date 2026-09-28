@@ -146,6 +146,13 @@ stale action受付の拒否・LegacyへfallbackしないことはUiRuntime/consu
 
 既存`run_action`はOS foregroundの登録・focusを要求しないdirect actionであり、
 `tap_key`/`hold_key`の物理foreground由来routingとは契約が異なる。
+`run_action` の ACK は action consumer 到達を示し、grid handler の選択変更完了を示さない。
+ROOT の test-script snapshot は UI pass 冒頭で公開されるため、直後の `tap_key` は同じ
+pass の更新に先行し得る。順序が必要な scenario は `snapshot_frame`（ROOT snapshot を
+発行した egui frame）と `selected_index`（表示中 grid の raw item index、未選択は -1）を
+読み、`GridMoveFirst` の ACK 後に見た frame より新しい snapshot で目的 index を確認してから
+次の入力を送る。`tap_key("Right")` も直前 frame より新しい snapshot と目的 index を待つ。
+これは描画完了の証拠ではなく grid 入力の状態 barrier であり、固定 sleep は使わない。
 未選択の`LegacyImplicit`は、従来の最初の該当consumerへの配送・ROOT frame基準のexpiryを
 維持する。窓固定の保証は持たず、新しいforeground/host登録条件を加えない。
 明示`Targeted`はS1aのRoot/Detached exact identityを保持し、受付時にも再検証する。
