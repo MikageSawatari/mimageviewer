@@ -407,8 +407,8 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   `HostExited` として別経路で渡し、取得 worker が子プロセス終了を待って exit code を読む。
   Running 中の予期しない host 終了も専用 monitor worker が exit code を読んで controller に報告する。
   watchdog の終了コードは `0xEFFEC001` とし、stderr の受信順によらず Rust 側が識別する。
-- リモートの状態再取得は worker がユーザーチェーン準備を終えた後に投入する。reset も共有の
-  絶対期限の残りだけ待つ。pump の失敗報告は音声スロットで世代ごとに 1 回へ集約する。
+- (第 6〜9 版で置き換え: 配信受け付け時の状態再取得は撤去、§12.8) リモートの状態再取得は worker が
+  ユーザーチェーン準備を終えた後に投入する。reset も共有の絶対期限の残りだけ待つ。pump の失敗報告は音声スロットで世代ごとに 1 回へ集約する。
 - bundle 解決は `src/effetune/mod.rs::resolve_bundle_from_exe` に置いた。通常版と portable 版で
   `current_exe` の親から同じ相対パスを使い、`native_assets` には触れていない。
 - GUI タイトルバーの電源ボタンは bridge ごとの `show_editor_bypass_button` で切り替える。
@@ -466,7 +466,7 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
 - 実機でまだ誰も確認していないこと: Mixwright の GUI 表示、音声処理、ビジュアライザー、空パイプラインの
   遅延と透過性、初回の既定パイプライン、再生中の編集・開閉の負荷試験 (§8)。
 
-## 12. 第 6〜9 版: リモート配信はローカルの bridge を共有する (2026-09-28、利用者合意)
+## 12. 第 6〜9 版 (Sol 設計レビュー ACCEPT WITH CHANGES、指摘反映済み): リモート配信はローカルの bridge を共有する (2026-09-28、利用者合意)
 
 ### 12.1 背景 (実機の観測とコード)
 
@@ -632,6 +632,7 @@ EffeTune の controller が持つ bridge) をそのまま使う**。
 
 - `docs/vst3-integration.md` §2 の「streaming session 専用 DspBridge」の記述を、共有と調停者の説明に
   置き換え、設計変更の理由を残す。
-- `docs/async-architecture.md` の配信の世代の説明、`docs/architecture-overview.md` の host プロセス数を更新。
-- 本書 §6 (第 4〜5 版のリモート 2 段構成) と §8 のリモートのテスト、§10 の「配信中の設定変更の
-  リモート反映」は第 6〜9 版で置き換えた (本版で注記済み)。
+- `docs/async-architecture.md` の配信の世代の説明、`docs/architecture-overview.md` の host プロセス数、
+  `docs/web-remote-video-streaming-plan.md` のセッション共有の VST 段の説明を更新。
+- 本書 §6 (第 4〜5 版のリモート 2 段構成)、§8 のリモートのテスト、§9 の実装記録のうちリモートの状態
+  再取得、§10 の「配信中の設定変更のリモート反映」は第 6〜9 版で置き換えた (本版で注記済み)。
