@@ -940,6 +940,11 @@ pub(crate) struct TestScriptSnapshot {
     /// `pending_thumbs == 0` だけでは「全部終わった」と「まだ何も始まっていない」を
     /// 区別できない。落ち着いたことを待つ条件には `items_len > 0` を併せて使う。
     pub(crate) items_len: i64,
+    /// Root UI pass that published this snapshot. A selection barrier must observe a later
+    /// pass because the snapshot is captured before grid input is applied in that pass.
+    pub(crate) snapshot_frame: i64,
+    /// Raw index in `item_names`/the mounted grid, or -1 when nothing is selected.
+    pub(crate) selected_index: i64,
     pub(crate) item_names: Vec<String>,
     pub(crate) item_ratings: Vec<i64>,
     pub(crate) sort_order: String,
@@ -1061,6 +1066,8 @@ impl Default for TestScriptSnapshot {
             target_registered: false,
             target_rendered: false,
             items_len: 0,
+            snapshot_frame: 0,
+            selected_index: -1,
             item_names: Vec::new(),
             item_ratings: Vec::new(),
             sort_order: String::new(),
@@ -1134,6 +1141,8 @@ impl TestScriptSnapshot {
         insert!(target_registered);
         insert!(target_rendered);
         insert!(items_len);
+        insert!(snapshot_frame);
+        insert!(selected_index);
         map.insert(
             "item_names".into(),
             self.item_names
@@ -5067,13 +5076,20 @@ mod tests {
         let actions = call_lines("run_action");
         let smoke = call_lines("always_on_top_smoke");
         let captures = call_lines("capture");
+        // The Right literal lives in a helper definition; source order is no longer the
+        // runtime call order, but every literal still needs to reach the runner API.
+        assert_eq!(keys.len(), 3);
         assert_eq!(
-            keys,
-            [
-                "tap_key(\"F12\");",
-                "tap_key(\"F12\");",
-                "tap_key(\"Right\");"
-            ]
+            keys.iter()
+                .filter(|line| **line == "tap_key(\"F12\");")
+                .count(),
+            2
+        );
+        assert_eq!(
+            keys.iter()
+                .filter(|line| **line == "tap_key(\"Right\");")
+                .count(),
+            1
         );
         assert!(!actions.is_empty() && !smoke.is_empty() && !captures.is_empty());
 
@@ -6143,6 +6159,43 @@ mod tests {
             published.is_fullscreen = true;
             published.focused = true;
         }
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::Success,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn selection_barrier_requires_a_later_snapshot_even_when_index_already_matches() {
+        let mut stale = ready_snapshot();
+        stale.snapshot_frame = 12;
+        stale.selected_index = 0;
+        let (bridge, rx, _) = runner_bridge(stale.clone());
+        spawn_script_source(
+            "wait_until(|s| s.snapshot_frame > 12 && s.selected_index == 0, 50);".to_string(),
+            bridge,
+        )
+        .unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("wait_until timed out")
+        ));
+
+        stale.snapshot_frame = 13;
+        let (bridge, rx, _) = runner_bridge(stale);
+        spawn_script_source(
+            "wait_until(|s| s.snapshot_frame > 12 && s.selected_index == 0, 50);".to_string(),
+            bridge,
+        )
+        .unwrap();
         let commands = receive_through_finished(&rx);
         assert!(matches!(
             commands.last(),
