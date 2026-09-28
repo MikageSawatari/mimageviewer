@@ -16119,9 +16119,9 @@ mod phase_c_folder_nav_history_tests {
     use crate::app::{
         App, FolderHistoryDirection, FolderNavHistoryState, FolderNavHistoryTarget,
         FolderOpenOutcome, FolderPaneOpenReady, GridClickSelectionAnchor, GridScrollIntent,
-        QuickFolderSlotId, QuickFolderSwitchTarget, ScannedDir, drive_current_key_for_letter,
-        drive_current_key_for_path, drive_root_path_for_letter, location_root_for_path,
-        scan_directory,
+        QuickFolderSlotId, QuickFolderSwitchTarget, RatingPhysicalLoadIntent, ScannedDir,
+        drive_current_key_for_letter, drive_current_key_for_path, drive_root_path_for_letter,
+        location_root_for_path, scan_directory,
     };
     use crate::archive_converter::ArchiveFormat;
     use crate::grid_item::GridItem;
@@ -19348,6 +19348,7 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.start_rating_physical_restore(
             f_restore.clone(),
             Some((FolderHistoryDirection::Back, f_target.clone())),
+            RatingPhysicalLoadIntent::Restore,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(g.as_path()));
         finish_staged_physical_history_for_test(&mut app);
@@ -19361,6 +19362,7 @@ mod phase_c_folder_nav_history_tests {
                 _ => panic!("G must retain Rating provenance"),
             },
             Some((FolderHistoryDirection::Forward, g_target.clone())),
+            RatingPhysicalLoadIntent::Restore,
         ));
         finish_staged_physical_history_for_test(&mut app);
         assert_eq!(app.current_folder.as_deref(), Some(g.as_path()));
@@ -19374,6 +19376,7 @@ mod phase_c_folder_nav_history_tests {
         finish_staged_physical_history_for_test(&mut app);
         assert_eq!(app.current_folder.as_deref(), Some(f.as_path()));
         assert_eq!(app.rating_view_nav_stack, vec![f]);
+        assert_eq!(app.folder_history_back_target(), Some(&g_target));
     }
 
     #[test]

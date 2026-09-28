@@ -20371,6 +20371,9 @@ impl App {
         if fullscreen_close_origin {
             self.close_fullscreen();
         }
+        // AddressBarNav::Collection is a parent-navigation request. The root loading shell is
+        // visible adoption, so commit its child -> parent edge before replacing the child.
+        self.record_collection_nav_transition(restore.clone());
         self.open_collection_grid(restore.identity.collection_id, Some(restore));
     }
 
@@ -21554,13 +21557,18 @@ impl App {
                         self.start_rating_physical_restore(
                             restore.clone(),
                             Some((direction, target.clone())),
+                            RatingPhysicalLoadIntent::Restore,
                         )
                     }) {
                         return SyntheticFolderHistoryDispatch::Restored;
                     }
                     return SyntheticFolderHistoryDispatch::Unavailable;
                 }
-                if self.start_rating_physical_restore(restore.clone(), None) {
+                if self.start_rating_physical_restore(
+                    restore.clone(),
+                    None,
+                    RatingPhysicalLoadIntent::Restore,
+                ) {
                     return SyntheticFolderHistoryDispatch::Restored;
                 }
                 return SyntheticFolderHistoryDispatch::Unavailable;
@@ -26299,7 +26307,11 @@ impl App {
                 return;
             }
             TopLevelGridRestore::RatingPhysical(restore) => {
-                self.start_rating_physical_restore(restore, None);
+                self.start_rating_physical_restore(
+                    restore,
+                    None,
+                    RatingPhysicalLoadIntent::Restore,
+                );
                 return;
             }
             TopLevelGridRestore::CollectionPhysical(restore) => {
@@ -27558,13 +27570,14 @@ impl App {
         &mut self,
         restore: top_level_grid_view::RatingPhysicalRestore,
         replay: Option<(FolderHistoryDirection, FolderNavHistoryTarget)>,
+        intent: RatingPhysicalLoadIntent,
     ) -> bool {
         let path = restore.visible_path.clone();
         let Some(source_location) = self.folder_nav_current_target() else {
             return false;
         };
         let owner = RatingPhysicalLoadOwner {
-            intent: RatingPhysicalLoadIntent::Restore,
+            intent,
             source_context: self.projected_viewer_context_id(),
             source_surface_generation: self.top_level_grid_view.generation(),
             source_items_generation: self.items_generation,
@@ -29312,7 +29325,9 @@ impl App {
         if self.rating_view_nav_stack.len() == 1 {
             self.start_rating_navigation(
                 self.rating_view_stars.clamp(1, 5),
-                RatingNavigationIntent::Restore,
+                RatingNavigationIntent::Direct {
+                    from: self.folder_nav_current_target(),
+                },
                 self.rating_view_saved_folder.clone(),
                 self.rating_view_subfolder_restore.clone(),
             );
@@ -29332,7 +29347,7 @@ impl App {
             saved_folder: self.rating_view_saved_folder.clone(),
             subfolder_restore: self.rating_view_subfolder_restore.clone(),
         };
-        self.start_rating_physical_restore(restore, None);
+        self.start_rating_physical_restore(restore, None, RatingPhysicalLoadIntent::Explicit);
     }
 
     fn select_rating_view_row_for_opened_path(&mut self, path: &Path) {
@@ -84221,10 +84236,7 @@ impl App {
                                 None
                             }
                             crate::ui_main::AddressBarNav::Collection(restore) => {
-                                self.open_collection_grid(
-                                    restore.identity.collection_id,
-                                    Some(restore),
-                                );
+                                self.apply_collection_input_nav(restore, false);
                                 None
                             }
                             crate::ui_main::AddressBarNav::CollectionOpen(id) => {
@@ -84356,7 +84368,7 @@ impl App {
                         None
                     }
                     Some(crate::ui_main::AddressBarNav::Collection(restore)) => {
-                        self.open_collection_grid(restore.identity.collection_id, Some(restore));
+                        self.apply_collection_input_nav(restore, false);
                         None
                     }
                     Some(crate::ui_main::AddressBarNav::CollectionOpen(id)) => {

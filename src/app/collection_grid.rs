@@ -3800,7 +3800,11 @@ mod tests {
         }
     }
 
-    fn history_grid_key(app: &mut App, key: egui::Key) -> Option<crate::ui_main::AddressBarNav> {
+    fn history_grid_key_with_modifiers(
+        app: &mut App,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) -> Option<crate::ui_main::AddressBarNav> {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
             events: vec![egui::Event::Key {
@@ -3808,13 +3812,240 @@ mod tests {
                 physical_key: None,
                 pressed: true,
                 repeat: false,
-                modifiers: egui::Modifiers::NONE,
+                modifiers,
             }],
             ..Default::default()
         });
         let nav = app.handle_keyboard(&ctx);
         let _ = ctx.end_pass();
         nav
+    }
+
+    fn history_grid_key(app: &mut App, key: egui::Key) -> Option<crate::ui_main::AddressBarNav> {
+        history_grid_key_with_modifiers(app, key, egui::Modifiers::NONE)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn collection_child_backspace_back_forward_round_trip_uses_keyboard_history() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("B");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), b"page").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        let collection =
+            collection_with_sources(&client, &[(child.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(collection.collection_id(), None);
+        wait_for_grid(&mut app, collection.collection_id());
+        app.selected = Some(0);
+        let Some(crate::ui_main::AddressBarNav::CollectionSource { path, owner }) =
+            history_grid_key(&mut app, egui::Key::Enter)
+        else {
+            panic!("Enter must route the Collection root row to its physical child");
+        };
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(&path, &app.settings).unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            path,
+            Some(scan),
+            super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+        ));
+        let child_target = app.folder_nav_current_target().expect("adopted child");
+        let root_target = app
+            .folder_history_back_target()
+            .cloned()
+            .expect("root back target");
+
+        let Some(crate::ui_main::AddressBarNav::Collection(restore)) =
+            history_grid_key(&mut app, egui::Key::Backspace)
+        else {
+            panic!("Backspace must route to the Collection root");
+        };
+        app.apply_collection_input_nav(restore, false);
+        poll_real_history_load(&mut app, None, None);
+        wait_for_grid(&mut app, collection.collection_id());
+        assert_eq!(app.folder_nav_current_target(), Some(root_target.clone()));
+        assert_eq!(app.folder_history_back_target(), Some(&child_target));
+
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            history_grid_key_with_modifiers(&mut app, egui::Key::ArrowLeft, alt),
+            Some(crate::ui_main::AddressBarNav::HistoryBack)
+        ));
+        let mut rollback = None;
+        assert!(
+            app.dispatch_main_folder_history_input(
+                super::super::FolderHistoryDirection::Back,
+                &mut rollback,
+            )
+            .is_none()
+        );
+        poll_real_history_load(&mut app, Some(&child), None);
+        assert_eq!(app.folder_nav_current_target(), Some(child_target));
+        assert_eq!(app.folder_history_forward_target(), Some(&root_target));
+        assert!(matches!(
+            history_grid_key_with_modifiers(&mut app, egui::Key::ArrowRight, alt),
+            Some(crate::ui_main::AddressBarNav::HistoryForward)
+        ));
+        assert!(
+            app.dispatch_main_folder_history_input(
+                super::super::FolderHistoryDirection::Forward,
+                &mut rollback,
+            )
+            .is_none()
+        );
+        poll_real_history_load(&mut app, None, None);
+        assert_eq!(app.folder_nav_current_target(), Some(root_target));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rating_child_backspace_back_forward_round_trip_uses_keyboard_history() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("B");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), b"page").unwrap();
+        let (mut app, _) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        let key = crate::adjustment_db::normalize_path(&child);
+        app.rating_db.as_ref().unwrap().set(&key, 1).unwrap();
+        app.enter_rating_view_from_menu(1);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while app.rating_view_pending.is_some() {
+            assert!(Instant::now() < deadline, "Rating root did not settle");
+            app.poll_rating_view();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let rating_root = app.current_folder.clone();
+        assert!(app.items_are_rating_view);
+        let root_target = app.folder_nav_current_target().expect("Rating root");
+        let row = app
+            .items
+            .iter()
+            .position(|item| {
+                item.drag_source_path().is_some_and(|path| {
+                    crate::adjustment_db::normalize_path(path)
+                        == crate::adjustment_db::normalize_path(&child)
+                })
+            })
+            .expect("Rating child row");
+        let rated_child = app.items[row].drag_source_path().unwrap().to_path_buf();
+        app.selected = Some(row);
+        let Some(crate::ui_main::AddressBarNav::RatingSource { owner, .. }) =
+            history_grid_key(&mut app, egui::Key::Enter)
+        else {
+            panic!("Enter must route the Rating row to its physical child");
+        };
+        assert!(app.start_rating_physical_open(owner));
+        poll_real_history_load(&mut app, Some(&rated_child), None);
+        let child_target = app.folder_nav_current_target().expect("Rating child");
+        assert_eq!(app.folder_history_back_target(), Some(&root_target));
+
+        assert!(history_grid_key(&mut app, egui::Key::Backspace).is_none());
+        poll_real_history_load(&mut app, rating_root.as_deref(), None);
+        assert_eq!(app.folder_nav_current_target(), Some(root_target.clone()));
+        assert_eq!(app.folder_history_back_target(), Some(&child_target));
+
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            history_grid_key_with_modifiers(&mut app, egui::Key::ArrowLeft, alt),
+            Some(crate::ui_main::AddressBarNav::HistoryBack)
+        ));
+        replay_real_history(&mut app, true, Some(&rated_child), None);
+        assert_eq!(app.folder_history_forward_target(), Some(&root_target));
+        assert!(matches!(
+            history_grid_key_with_modifiers(&mut app, egui::Key::ArrowRight, alt),
+            Some(crate::ui_main::AddressBarNav::HistoryForward)
+        ));
+        replay_real_history(&mut app, false, rating_root.as_deref(), None);
+        assert_eq!(app.folder_nav_current_target(), Some(root_target));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_folder_backspace_back_forward_round_trip_uses_keyboard_history() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("A");
+        let child = parent.join("B");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), b"page").unwrap();
+        let (mut app, _) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        for path in [&parent, &child] {
+            let scan = super::super::folder_scan::scan_directory_with_settings(path, &app.settings)
+                .unwrap();
+            assert!(app.load_folder_with_scan_owned(
+                path.clone(),
+                Some(scan),
+                super::super::OpenRequestOwner::Navigation,
+            ));
+        }
+        let child_target = app.folder_nav_current_target().expect("physical child");
+        let parent_target = app.folder_history_back_target().cloned().expect("parent");
+        let Some(crate::ui_main::AddressBarNav::Direct(path)) =
+            history_grid_key(&mut app, egui::Key::Backspace)
+        else {
+            panic!("Backspace must route to the physical parent");
+        };
+        assert!(crate::folder_tree::path_eq(&path, &parent));
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(&path, &app.settings).unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            path,
+            Some(scan),
+            super::super::OpenRequestOwner::Navigation,
+        ));
+        assert_eq!(app.folder_nav_current_target(), Some(parent_target.clone()));
+        assert_eq!(app.folder_history_back_target(), Some(&child_target));
+
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        for (key, direction, expected, forward) in [
+            (
+                egui::Key::ArrowLeft,
+                super::super::FolderHistoryDirection::Back,
+                &child,
+                Some(&parent_target),
+            ),
+            (
+                egui::Key::ArrowRight,
+                super::super::FolderHistoryDirection::Forward,
+                &parent,
+                None,
+            ),
+        ] {
+            assert!(history_grid_key_with_modifiers(&mut app, key, alt).is_some());
+            let mut rollback = None;
+            let path = app
+                .dispatch_main_folder_history_input(direction, &mut rollback)
+                .expect("physical history path");
+            assert!(crate::folder_tree::path_eq(&path, expected));
+            let scan =
+                super::super::folder_scan::scan_directory_with_settings(&path, &app.settings)
+                    .unwrap();
+            assert!(app.load_folder_with_scan_owned(
+                path,
+                Some(scan),
+                super::super::OpenRequestOwner::Navigation,
+            ));
+            assert_eq!(app.folder_history_forward_target(), forward);
+        }
+        assert_eq!(app.folder_nav_current_target(), Some(parent_target));
+        app.shutdown_collection_runtime_for_exit();
     }
 
     fn seed_real_pdf_preflight_if_ready(
@@ -3959,7 +4190,11 @@ mod tests {
                 app.start_rating_history_replay(direction, *stars)
             }
             super::super::FolderNavHistoryTarget::RatingPhysical(restore) => app
-                .start_rating_physical_restore(restore.clone(), Some((direction, target.clone()))),
+                .start_rating_physical_restore(
+                    restore.clone(),
+                    Some((direction, target.clone())),
+                    super::super::RatingPhysicalLoadIntent::Restore,
+                ),
             _ => panic!("unexpected virtual book history target: {target:?}"),
         };
         assert!(started, "history replay did not start: {target:?}");
@@ -5755,7 +5990,7 @@ mod tests {
                 "both initial and replay opens must use the worker result"
             );
         }
-        assert_eq!(app.folder_nav_current_target(), Some(source_target));
+        assert_eq!(app.folder_nav_current_target(), Some(source_target.clone()));
         assert_eq!(app.folder_history_back_target(), Some(&root_target));
 
         let parent_nav = history_grid_key(&mut app, egui::Key::Backspace);
@@ -5771,6 +6006,18 @@ mod tests {
             );
         }
         poll_real_history_load(&mut app, root.as_deref(), None);
+        if collection {
+            let super::super::FolderNavHistoryTarget::Collection(restore) = &root_target else {
+                unreachable!();
+            };
+            wait_for_grid(&mut app, restore.identity.collection_id);
+        }
+        assert_eq!(app.folder_nav_current_target(), Some(root_target.clone()));
+        assert_eq!(app.folder_history_back_target(), Some(&source_target));
+        replay_real_history(&mut app, true, Some(&source), pdf_pages.as_ref());
+        assert_eq!(app.folder_nav_current_target(), Some(source_target));
+        assert_eq!(app.folder_history_forward_target(), Some(&root_target));
+        replay_real_history(&mut app, false, root.as_deref(), None);
         assert_eq!(app.folder_nav_current_target(), Some(root_target));
         app.shutdown_collection_runtime_for_exit();
         drop(epub_pin);
