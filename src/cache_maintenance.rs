@@ -381,7 +381,13 @@ fn run_epub_task(
         }
     }
     match cache.list_current() {
-        Ok(entries) => result.entries = entries,
+        Ok(mut entries) => {
+            for entry in &mut entries {
+                entry.source_missing =
+                    source_definitely_missing(&entry.generation.src_path).unwrap_or(false);
+            }
+            result.entries = entries;
+        }
         Err(error) => result.error = Some(format!("一覧を更新できませんでした: {error:?}")),
     }
     result
@@ -741,6 +747,41 @@ mod tests {
         assert_eq!(all.deleted, 1);
         assert!(!b.pdf_file.exists());
         assert!(all.entries.is_empty());
+    }
+
+    #[test]
+    fn epub_manager_load_rows_marks_missing_sources_on_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = crate::epub_cache::EpubCache::open_at(temp.path()).unwrap();
+        let present = publish_test_epub(&mut cache, &temp.path().join("present.epub"));
+        let missing = publish_test_epub(&mut cache, &temp.path().join("missing.epub"));
+        std::fs::remove_file(&missing.src_path).unwrap();
+        let result = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::LoadRows,
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_now(id),
+        );
+        assert!(result.error.is_none());
+        assert_eq!(result.entries.len(), 2);
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(
+                    |entry| entry.generation.generation_id == present.generation_id
+                        && !entry.source_missing
+                )
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(
+                    |entry| entry.generation.generation_id == missing.generation_id
+                        && entry.source_missing
+                )
+        );
     }
 
     #[test]

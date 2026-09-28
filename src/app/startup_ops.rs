@@ -920,7 +920,7 @@ impl App {
                 if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
             {
                 Some(ViewerContextDescriptor::Pdf {
-                    path: openable.to_path_buf(),
+                    path: crate::pdf_loader::LeasedEpubPath::try_new(openable.to_path_buf())?,
                     page_num: None,
                 })
             }

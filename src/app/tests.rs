@@ -25226,7 +25226,7 @@ fn ignored_epub_bookmark_loading_context_ends_without_page_wait() {
         .with_active_viewer_context(|mounted| {
             mounted.continue_active_detached_book_context_from_descriptor(
                 ViewerContextDescriptor::Pdf {
-                    path: epub,
+                    path: crate::pdf_loader::LeasedEpubPath::try_new(epub).unwrap(),
                     page_num: None,
                 },
             )
@@ -25285,6 +25285,42 @@ fn ignored_epub_grid_detached_open_keeps_existing_window() {
 
 #[cfg(windows)]
 #[test]
+fn deleting_epub_detached_open_keeps_incumbent_window_and_explains_refusal() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let epub = app.tmp.path().join("next-book.epub");
+    std::fs::write(&epub, b"book").unwrap();
+    app.settings.detached_viewer_open_images_in_window = true;
+    let incumbent = app.build_active_context_for_test(Some(9110), DetachedSource::Image, |_| {});
+    app.items = vec![GridItem::PdfFile(epub.clone())];
+    let deleting = crate::pdf_loader::acquire_epub_delete_coverage(&epub).unwrap();
+
+    assert!(app.open_grid_item_in_detached_book_context_with_auto_fullscreen(&ctx, 0, true));
+    assert_eq!(app.active_viewer_context_id(), Some(incumbent));
+    assert_eq!(app.active_detached_window_id(), Some(9110));
+    assert!(app.detached_image_windows.is_empty());
+    assert!(app.pdf_enumerate_pending.is_none());
+    assert!(app.top_level_grid_view.open_path_classification().is_none());
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("EPUB の削除処理"))
+    );
+
+    drop(deleting);
+    let descriptor = app
+        .detached_book_context_descriptor_for_grid_idx(0)
+        .unwrap();
+    assert!(
+        matches!(&descriptor, ViewerContextDescriptor::Pdf { path, .. } if path.has_epub_lease())
+    );
+    assert!(crate::pdf_loader::acquire_epub_delete_coverage(&epub).is_err());
+    drop(descriptor);
+    assert!(crate::pdf_loader::acquire_epub_delete_coverage(&epub).is_ok());
+}
+
+#[cfg(windows)]
+#[test]
 fn ignored_epub_passive_window_reopen_preserves_active_and_parked_windows() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
@@ -25294,7 +25330,7 @@ fn ignored_epub_passive_window_reopen_preserves_active_and_parked_windows() {
         app.build_active_context_for_test(Some(9105), DetachedSource::Image, |_| {});
     let mut snapshot = contextless_test_window(&ctx, 9106);
     snapshot.reopen_descriptor = Some(ViewerContextDescriptor::Pdf {
-        path: epub,
+        path: crate::pdf_loader::LeasedEpubPath::try_new(epub).unwrap(),
         page_num: None,
     });
     app.detached_image_windows.push(snapshot);
@@ -66382,7 +66418,10 @@ mod still_window_mode_key_tests {
                 image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
-                    path: PathBuf::from(r"C:\books\a.pdf"),
+                    path: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
+                        r"C:\books\a.pdf",
+                    ))
+                    .unwrap(),
                     page_num: Some(5),
                 }),
                 reopen_sync_stamp: None,
@@ -66524,7 +66563,10 @@ mod still_window_mode_key_tests {
                 image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
                 frozen_continuous_pages: Vec::new(),
                 reopen_descriptor: Some(ViewerContextDescriptor::Pdf {
-                    path: PathBuf::from(r"C:\books\a.pdf"),
+                    path: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
+                        r"C:\books\a.pdf",
+                    ))
+                    .unwrap(),
                     page_num: Some(5),
                 }),
                 reopen_sync_stamp: None,

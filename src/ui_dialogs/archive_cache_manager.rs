@@ -406,11 +406,38 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
     }
     let rows = app.epub_cache_rows.clone();
     let active_count = rows.as_ref().map_or(0, Vec::len);
+    let missing_count = rows.as_ref().map_or(0, |rows| {
+        rows.iter().filter(|row| row.source_missing).count()
+    });
+    let total_bytes = rows.as_ref().map_or(0, |rows| {
+        rows.iter().fold(0_u64, |sum, row| {
+            sum.saturating_add(row.generation.pdf_size)
+        })
+    });
+    ui.horizontal(|ui| {
+        if rows.is_none() {
+            ui.label("読み込み中…");
+        } else {
+            ui.label(format!(
+                "{} 件 / 合計 {}",
+                active_count,
+                format_bytes(total_bytes)
+            ));
+            if missing_count > 0 {
+                ui.label(
+                    egui::RichText::new(format!("(元ファイル消失: {})", missing_count))
+                        .color(ui.visuals().error_fg_color),
+                );
+            }
+        }
+    });
+    ui.add_space(6.0);
+    let selected_count = app.epub_cache_selection.len();
     ui.horizontal(|ui| {
         if ui
             .add_enabled(
-                !busy && !app.epub_cache_selection.is_empty(),
-                egui::Button::new("選択を削除"),
+                !busy && selected_count > 0,
+                egui::Button::new(format!("選択を削除 ({})", selected_count)),
             )
             .clicked()
         {
@@ -422,15 +449,9 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
             ));
         }
         if ui
-            .add_enabled(!busy && active_count > 0, egui::Button::new("すべて削除"))
-            .clicked()
-        {
-            app.epub_cache_confirm_delete_all = true;
-        }
-        if ui
             .add_enabled(
-                !busy && active_count > 0,
-                egui::Button::new("元ファイル消失を削除"),
+                !busy && missing_count > 0,
+                egui::Button::new(format!("元ファイル消失を削除 ({})", missing_count)),
             )
             .clicked()
         {
@@ -438,6 +459,12 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
                 crate::cache_maintenance::EpubMaintTask::DeleteMissingSources,
                 crate::data_dir::get(),
             ));
+        }
+        if ui
+            .add_enabled(!busy && active_count > 0, egui::Button::new("すべて削除"))
+            .clicked()
+        {
+            app.epub_cache_confirm_delete_all = true;
         }
         if ui.add_enabled(!busy, egui::Button::new("再読込")).clicked() {
             app.epub_cache_rows = None;
@@ -496,7 +523,13 @@ fn draw_epub_body(app: &mut App, ui: &mut egui::Ui) {
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("?");
-                            ui.label(truncate_name(name, 40))
+                            let label = if row.source_missing {
+                                egui::RichText::new(format!("✗ {}", truncate_name(name, 38)))
+                                    .color(ui.visuals().error_fg_color)
+                            } else {
+                                egui::RichText::new(truncate_name(name, 40))
+                            };
+                            ui.label(label)
                                 .on_hover_text(row.generation.src_path.display().to_string());
                             ui.label(row.generation.page_count.to_string());
                             ui.label(format_bytes(row.generation.pdf_size));

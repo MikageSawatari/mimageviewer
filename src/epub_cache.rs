@@ -99,6 +99,8 @@ pub struct CurrentGenerationEntry {
     pub generation: GenerationRow,
     pub retired: bool,
     pub last_access_at: i64,
+    /// Set by cache maintenance on its worker; never probe the filesystem in the dialog.
+    pub source_missing: bool,
 }
 
 /// A failed commit is distinct from a failed unlink: callers must invalidate
@@ -808,6 +810,7 @@ impl EpubCache {
                 generation: decode_generation(row)?,
                 retired: row.get(14)?,
                 last_access_at: row.get(15)?,
+                source_missing: false,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

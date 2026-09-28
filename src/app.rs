@@ -3043,7 +3043,8 @@ impl App {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ViewerContextDescriptor {
     Pdf {
-        path: PathBuf,
+        /// Owns EPUB admission before the current detached window is parked.
+        path: crate::pdf_loader::LeasedEpubPath,
         page_num: Option<u32>,
     },
     Zip {
@@ -12626,14 +12627,14 @@ fn detached_window_references_removed(
     }
     if let Some(desc) = window.reopen_descriptor.as_ref() {
         let (path, source_override) = match desc {
-            ViewerContextDescriptor::Pdf { path, .. } => (path, None),
+            ViewerContextDescriptor::Pdf { path, .. } => (path.as_path(), None),
             ViewerContextDescriptor::Zip {
                 path,
                 archive_source_override,
                 ..
-            } => (path, archive_source_override.as_deref()),
-            ViewerContextDescriptor::BookFolder { path } => (path, None),
-            ViewerContextDescriptor::Image { path } => (path, None),
+            } => (path.as_path(), archive_source_override.as_deref()),
+            ViewerContextDescriptor::BookFolder { path } => (path.as_path(), None),
+            ViewerContextDescriptor::Image { path } => (path.as_path(), None),
         };
         if matches_key(&crate::adjustment_db::normalize_path(path)) {
             return true;
@@ -50521,7 +50522,7 @@ impl App {
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => Some(ViewerContextDescriptor::Pdf {
-                path: pdf_path.clone(),
+                path: crate::pdf_loader::LeasedEpubPath::try_new(pdf_path.clone())?,
                 page_num: Some(*page_num),
             }),
             GridItem::ZipImage {
@@ -50554,7 +50555,7 @@ impl App {
     ) -> Option<ViewerContextDescriptor> {
         match self.items.get(idx)? {
             GridItem::PdfFile(path) => Some(ViewerContextDescriptor::Pdf {
-                path: path.clone(),
+                path: crate::pdf_loader::LeasedEpubPath::try_new(path.clone())?,
                 page_num: None,
             }),
             GridItem::ZipFile(path) => Some(ViewerContextDescriptor::Zip {
@@ -50575,7 +50576,7 @@ impl App {
                 path,
                 page_num: Some(page_num),
             } => Some(crate::snapshot::SnapshotTarget::PdfPage {
-                pdf_path: path.clone(),
+                pdf_path: (**path).clone(),
                 page_num: *page_num,
             }),
             ViewerContextDescriptor::Zip {
@@ -53782,7 +53783,7 @@ impl App {
                 FolderOpenOutcome::Loaded
             }
             ViewerContextDescriptor::Pdf { path, .. } => {
-                self.load_pdf_as_folder_owned(path, OpenRequestOwner::Navigation)
+                self.load_pdf_as_folder_owned((*path).clone(), OpenRequestOwner::Navigation)
             }
             ViewerContextDescriptor::BookFolder { path } => {
                 self.start_detached_folder_open(path);
@@ -54241,7 +54242,15 @@ impl App {
             && Self::path_needs_open_classification(path)
         {
             let path = path.to_path_buf();
-            return self.start_open_path_classification(
+            // The detached caller treats `false` as "try the ordinary open".
+            // A deletion-owned EPUB must instead consume the request before A is parked.
+            let Some(admission) = crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) else {
+                self.show_feedback_toast("EPUB の削除処理が終わってから開いてください".into());
+                return true;
+            };
+            // `start_open_path_classification` installs its own RAII candidate while
+            // this admission is still held, so there is no deletion gap.
+            let started = self.start_open_path_classification(
                 path,
                 ClassifiedOpenContinuation::DetachedGrid {
                     index: idx,
@@ -54249,6 +54258,8 @@ impl App {
                     auto_fullscreen,
                 },
             );
+            drop(admission);
+            return started;
         }
         self.open_grid_item_in_detached_book_context_classified(ctx, idx, auto_fullscreen, None)
     }

@@ -1455,9 +1455,9 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
-**2026-09-28 D15 EPUB キャッシュ即時削除の読取所有権 (review #2 改訂)**
+**2026-09-28 D15 EPUB キャッシュ即時削除の読取所有権 (review #3・#4 改訂)**
 
-分類待ちの候補から表示中の本まで、mounted / parked の各 `ViewerContextBundle` にある EPUB 所有者を列挙し、`App` が本ごとの読取リースを保持する。固定世代の解決・PDF 描画・Remote 要求・サムネイル処理も同じ本の調停を通し、削除は読取中なら使用中として拒否する。分類候補の登録は開封要求の作成時に行い、削除操作の直前にもメモリ内の所有者を同期する。表示 context を閉じたり再作成したりせず、detached の predicate、viewport ID、host、配置、focus、window lifecycle は変えない。旧保護一覧のスナップショットを削除 worker に渡す方式から、所有期間を表すリースへ移す構造変更であり、§2 の症状パッチには当たらない。
+分類待ち・開封待ち・表示中の各状態が、EPUB の論理パスを受け付けた時点から `LeasedEpubPath` を自分で保持し、状態の drop で解放する。mounted / parked の `ViewerContextBundle` を横断して所有者を列挙・同期する方式は、手書きの列挙から smart folder と起動系の候補が漏れたため廃止した。固定世代の解決・PDF 描画・Remote 要求・サムネイル処理も同じ本の調停を通し、削除は読取中なら使用中として拒否する。review #3 では smart folder と起動・二重起動通知・しおりの採用待ちまで対象を広げた。review #4 では別ウィンドウの PDF descriptor 自体にリースを持たせ、次の EPUB の取得に成功してから現在の窓を退避する。取得できなければ窓を退避せず案内する。表示 context を閉じたり再作成したりせず、detached の predicate、viewport ID、host、配置、focus、window lifecycle は変えない。所有期間を各状態の RAII に置く構造変更であり、§2 の症状パッチには当たらない。
 
 **2026-09-28 §1.280 履歴 / EPUB の context-owned 非同期処理 (review #8/#9 改訂)**
 
