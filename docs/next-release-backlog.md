@@ -2301,6 +2301,20 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   影ハーネスは削除候補。`docs/release-verification-records.md` の過去の記録は残す。
 - 規模 / 優先度: Medium / P3 (利用者への影響なし。コードの見通しの問題)。
 
+### 1.304 別ウィンドウで動画を再生中にコレクションを開くと、再生が止まりコレクションも開かない — v4.1.0 から (2026-09-29)
+
+- 観測 (利用者、インストール版 v4.2.0 候補と v4.1.0 ポータブル版の両方で再現): 複数ウィンドウモードで動画を別ウィンドウで再生中に
+  コレクションを開くと、動画が止まり、コレクションの一覧も表示されない。別ウィンドウで開いているときだけ起きる (利用者の報告)。
+  v4.1.0 でも再現するので今回の退行ではない。v4.2.0 は既知の不具合ページに載せて公開した。
+- ログ (`%APPDATA%\mimageviewer\logs\mimageviewer.log`、2026-09-29 22:5x のセッション):
+  動画は active detached の window_id=3 で、`bind window_id=3 context=ViewerContextId(0)` (メインと同じ context)。
+  355.653s にコレクションを開くと thumbnail workers が停止し `items_gen=46 items_len=0` になり、`fullscreen presenter stopped`。
+  以後 `app_update fullscreen=Some(14)` のまま 0 件で止まり、コレクションの読込・採用のログが無い。
+- 見立て (コード未確認): 別ウィンドウが mounted の context 0 を使っている間に、コレクション open が同じ context の一覧を
+  置き換え始め、fullscreen (idx=14) の状態を残したまま採用に進めていない。detached リワーク (§2) の所有規則で扱う。
+- 既知の不具合ページの回避策 (「別ウィンドウを閉じてから開く」) は**未確認**。
+- 規模 / 優先度: Medium / P2 (リリース済みの操作で、閲覧が止まる)。
+
 ### 1.303 別ウィンドウを開くと、フォーカスを 2 回取る (読み込み中の枠と、ページの表示) — smoke のログから (2026-09-29)
 
 - 観測 (AlwaysOnTop smoke のログ、`target/ui-smoke-runs/20260929T121319957Z-204608-AlwaysOnTop-5f0bd9d4`): グリッドから別ウィンドウを開くと、
