@@ -183,21 +183,32 @@ pub enum EpubMaintTask {
     LoadRows,
     DeleteSelected { generation_ids: Vec<i64> },
     DeleteAll,
+    DeleteMissingSources,
 }
 
 pub struct EpubMaintResult {
     pub entries: Vec<crate::epub_cache::CurrentGenerationEntry>,
-    pub retired: usize,
+    pub deleted: usize,
+    /// Includes files unlinked before a failed database commit.
+    pub physically_removed: Vec<crate::epub_cache::GenerationRow>,
+    pub failures: Vec<(PathBuf, String)>,
     pub error: Option<String>,
+    /// Keep the read/admission boundary until the UI has invalidated its memory caches.
+    pub(crate) barriers: Vec<(
+        crate::pdf_loader::EpubRangeLease,
+        crate::pdf_loader::EpubDocumentDeleteGuard,
+    )>,
 }
 
 pub struct EpubMaintPending {
+    pub task: EpubMaintTask,
     pub rx: mpsc::Receiver<EpubMaintResult>,
 }
 
 pub fn spawn_epub(task: EpubMaintTask, data_dir: PathBuf) -> EpubMaintPending {
     let (tx, rx) = mpsc::channel();
     let fallback = tx.clone();
+    let pending_task = task.clone();
     let spawn = std::thread::Builder::new()
         .name("epub-cache-maint".into())
         .spawn(move || {
@@ -205,37 +216,22 @@ pub fn spawn_epub(task: EpubMaintTask, data_dir: PathBuf) -> EpubMaintPending {
                 crate::pdf_loader::epub_conversion_guard().map_err(|error| format!("{error:?}"))?;
                 let mut cache = crate::epub_cache::EpubCache::open_at(&data_dir)
                     .map_err(|error| format!("{error:?}"))?;
-                let retired = match task {
-                    EpubMaintTask::LoadRows => 0,
-                    EpubMaintTask::DeleteSelected { generation_ids } => {
-                        let mut count = 0;
-                        for id in generation_ids {
-                            if cache
-                                .retire_generation(id)
-                                .map_err(|error| format!("{error:?}"))?
-                            {
-                                count += 1;
-                            }
-                        }
-                        count
-                    }
-                    EpubMaintTask::DeleteAll => cache
-                        .retire_all_current()
-                        .map_err(|error| format!("{error:?}"))?,
-                };
-                let entries = cache.list_current().map_err(|error| format!("{error:?}"))?;
-                Ok((entries, retired))
+                Ok(run_epub_task(
+                    &mut cache,
+                    &task,
+                    crate::pdf_loader::release_epub_document_for_delete,
+                    |cache, id| cache.delete_generation_now(id),
+                ))
             })();
             let message = match result {
-                Ok((entries, retired)) => EpubMaintResult {
-                    entries,
-                    retired,
-                    error: None,
-                },
+                Ok(result) => result,
                 Err(error) => EpubMaintResult {
                     entries: Vec::new(),
-                    retired: 0,
+                    deleted: 0,
+                    physically_removed: Vec::new(),
+                    failures: Vec::new(),
                     error: Some(error),
+                    barriers: Vec::new(),
                 },
             };
             let _ = tx.send(message);
@@ -243,11 +239,198 @@ pub fn spawn_epub(task: EpubMaintTask, data_dir: PathBuf) -> EpubMaintPending {
     if let Err(error) = spawn {
         let _ = fallback.send(EpubMaintResult {
             entries: Vec::new(),
-            retired: 0,
+            deleted: 0,
+            physically_removed: Vec::new(),
+            failures: Vec::new(),
             error: Some(format!("worker を開始できません: {error}")),
+            barriers: Vec::new(),
         });
     }
-    EpubMaintPending { rx }
+    EpubMaintPending {
+        task: pending_task,
+        rx,
+    }
+}
+
+fn run_epub_task(
+    cache: &mut crate::epub_cache::EpubCache,
+    task: &EpubMaintTask,
+    release_document: impl Fn(
+        &std::path::Path,
+        std::time::Instant,
+    ) -> Result<crate::pdf_loader::EpubDocumentDeleteGuard, String>,
+    delete_generation: impl Fn(
+        &mut crate::epub_cache::EpubCache,
+        i64,
+    ) -> Result<
+        crate::epub_cache::ImmediateDeleteOutcome,
+        crate::epub_cache::CacheError,
+    >,
+) -> EpubMaintResult {
+    use crate::epub_cache::ImmediateDeleteOutcome;
+    let mut result = EpubMaintResult {
+        entries: Vec::new(),
+        deleted: 0,
+        physically_removed: Vec::new(),
+        failures: Vec::new(),
+        error: None,
+        barriers: Vec::new(),
+    };
+    let initial_rows = match cache.list_current() {
+        Ok(rows) => rows,
+        Err(error) => {
+            result.error = Some(format!("一覧を読み込めませんでした: {error:?}"));
+            return result;
+        }
+    };
+    let selected_ids = match task {
+        EpubMaintTask::DeleteSelected { generation_ids } => generation_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(
+        ),
+        _ => std::collections::HashSet::new(),
+    };
+    for entry in &initial_rows {
+        let row = &entry.generation;
+        let selected = match task {
+            EpubMaintTask::LoadRows => false,
+            EpubMaintTask::DeleteSelected { .. } => selected_ids.contains(&row.generation_id),
+            EpubMaintTask::DeleteAll => true,
+            EpubMaintTask::DeleteMissingSources => match source_definitely_missing(&row.src_path) {
+                Ok(missing) => missing,
+                Err(error) => {
+                    result.failures.push((
+                        row.src_path.clone(),
+                        format!("元ファイルを確認できませんでした: {error}"),
+                    ));
+                    false
+                }
+            },
+        };
+        if !selected {
+            continue;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let _read_boundary = match crate::pdf_loader::acquire_epub_delete_coverage(&row.src_path) {
+            Ok(lease) => lease,
+            Err(reason) => {
+                result.failures.push((row.src_path.clone(), reason));
+                continue;
+            }
+        };
+        let mut worker_boundary = match release_document(&row.pdf_file, deadline) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                result.failures.push((row.src_path.clone(), reason));
+                continue;
+            }
+        };
+        let removed_before = result.physically_removed.len();
+        match delete_generation(cache, row.generation_id) {
+            Ok(ImmediateDeleteOutcome::NotCurrent) => {}
+            Ok(ImmediateDeleteOutcome::Deleted(deleted)) => {
+                crate::pdf_loader::invalidate_epub_pin_under_delete(
+                    &deleted.src_path,
+                    deleted.generation_id,
+                );
+                result.deleted += 1;
+                result.physically_removed.push(deleted);
+            }
+            Ok(ImmediateDeleteOutcome::Failed {
+                generation,
+                file_removed,
+                error,
+            }) => {
+                crate::logger::log(format!(
+                    "epub cache delete failed source={} generation={} file_removed={file_removed} error={error:?}",
+                    generation.src_path.display(),
+                    generation.generation_id
+                ));
+                if file_removed {
+                    crate::pdf_loader::invalidate_epub_pin_under_delete(
+                        &generation.src_path,
+                        generation.generation_id,
+                    );
+                    result.physically_removed.push(generation.clone());
+                    result.failures.push((
+                        generation.src_path,
+                        "ファイルは削除されましたが、管理情報を更新できませんでした。再度開くときに確認します".into(),
+                    ));
+                } else {
+                    result
+                        .failures
+                        .push((generation.src_path, epub_delete_error_message(&error)));
+                }
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "epub cache delete could not start source={} generation={} error={error:?}",
+                    row.src_path.display(),
+                    row.generation_id
+                ));
+                result.failures.push((
+                    row.src_path.clone(),
+                    "管理情報を読み込めず、削除できませんでした".into(),
+                ));
+            }
+        }
+        if result.physically_removed.len() > removed_before {
+            worker_boundary.mark_file_removed();
+            result.barriers.push((_read_boundary, worker_boundary));
+        }
+    }
+    match cache.list_current() {
+        Ok(mut entries) => {
+            for entry in &mut entries {
+                entry.source_missing =
+                    source_definitely_missing(&entry.generation.src_path).unwrap_or(false);
+            }
+            result.entries = entries;
+        }
+        Err(error) => result.error = Some(format!("一覧を更新できませんでした: {error:?}")),
+    }
+    result
+}
+
+/// A missing file is safe to classify only after a containing directory can
+/// be reached. A disconnected network share can otherwise look like NotFound.
+fn source_definitely_missing(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut parent = path.parent();
+            while let Some(directory) = parent {
+                match std::fs::metadata(directory) {
+                    Ok(meta) if meta.is_dir() => return Ok(true),
+                    Ok(_) => return Err(std::io::Error::other("parent is not a directory")),
+                    Err(parent_error) if parent_error.kind() == std::io::ErrorKind::NotFound => {
+                        parent = directory.parent();
+                    }
+                    Err(parent_error) => return Err(parent_error),
+                }
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn epub_delete_error_message(error: &crate::epub_cache::CacheError) -> String {
+    match error {
+        crate::epub_cache::CacheError::Io(_) => {
+            "使用中またはアクセスできないため削除できませんでした".into()
+        }
+        crate::epub_cache::CacheError::Sql(_) => {
+            "管理情報を更新できず、削除できませんでした".into()
+        }
+        crate::epub_cache::CacheError::UnsafePath(_) => {
+            "保存先を安全に確認できず、削除できませんでした".into()
+        }
+        crate::epub_cache::CacheError::InvalidState(_) => {
+            "対象の状態が変わったため削除できませんでした".into()
+        }
+    }
 }
 
 pub fn spawn_archive(
@@ -485,6 +668,196 @@ fn auto_aspect_clear_all() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestSource(crate::epub_cache::SourceState);
+
+    impl crate::epub_cache::SourceGuard for TestSource {
+        fn state(&self) -> std::io::Result<crate::epub_cache::SourceState> {
+            Ok(self.0)
+        }
+    }
+
+    fn publish_test_epub(
+        cache: &mut crate::epub_cache::EpubCache,
+        source: &std::path::Path,
+    ) -> crate::epub_cache::GenerationRow {
+        use crate::epub_cache::{CONVERTER_OUTPUT_VERSION, GenerationRow};
+        std::fs::write(source, b"test epub").unwrap();
+        let state = crate::epub_cache::source_state(&std::fs::metadata(source).unwrap());
+        let reserved = cache.reserve_output(source).unwrap();
+        std::fs::create_dir_all(reserved.final_path().parent().unwrap()).unwrap();
+        std::fs::write(reserved.final_path(), b"%PDF-1.4\n").unwrap();
+        let row = GenerationRow {
+            generation_id: reserved.generation_id(),
+            src_path_key: crate::epub_cache::src_key(source),
+            src_path: source.to_owned(),
+            src_state: state,
+            src_sha256: "full".into(),
+            src_head_hash: "head".into(),
+            pdf_file: reserved.final_path().to_owned(),
+            pdf_size: 9,
+            page_count: 1,
+            direction: "rtl".into(),
+            profile: "test".into(),
+            created_at: 1,
+            output_version: CONVERTER_OUTPUT_VERSION,
+        };
+        cache.publish(&row, &TestSource(state)).unwrap();
+        row
+    }
+
+    #[test]
+    fn epub_manager_selected_all_and_missing_delete_immediately_with_partial_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = crate::epub_cache::EpubCache::open_at(temp.path()).unwrap();
+        let a = publish_test_epub(&mut cache, &temp.path().join("a.epub"));
+        let b = publish_test_epub(&mut cache, &temp.path().join("b.epub"));
+        let c = publish_test_epub(&mut cache, &temp.path().join("c.epub"));
+        let busy = crate::pdf_loader::try_acquire_epub_read_lease(&b.src_path).unwrap();
+        let selected = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::DeleteSelected {
+                generation_ids: vec![a.generation_id, b.generation_id],
+            },
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_now(id),
+        );
+        assert_eq!(selected.deleted, 1);
+        assert_eq!(selected.failures.len(), 1);
+        assert!(!a.pdf_file.exists());
+        assert!(b.pdf_file.exists());
+        assert!(c.pdf_file.exists());
+
+        std::fs::remove_file(&c.src_path).unwrap();
+        let missing = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::DeleteMissingSources,
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_now(id),
+        );
+        assert_eq!(missing.deleted, 1);
+        assert!(!c.pdf_file.exists());
+        drop(busy);
+        let all = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::DeleteAll,
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_now(id),
+        );
+        assert_eq!(all.deleted, 1);
+        assert!(!b.pdf_file.exists());
+        assert!(all.entries.is_empty());
+    }
+
+    #[test]
+    fn epub_manager_load_rows_marks_missing_sources_on_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = crate::epub_cache::EpubCache::open_at(temp.path()).unwrap();
+        let present = publish_test_epub(&mut cache, &temp.path().join("present.epub"));
+        let missing = publish_test_epub(&mut cache, &temp.path().join("missing.epub"));
+        std::fs::remove_file(&missing.src_path).unwrap();
+        let result = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::LoadRows,
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_now(id),
+        );
+        assert!(result.error.is_none());
+        assert_eq!(result.entries.len(), 2);
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(
+                    |entry| entry.generation.generation_id == present.generation_id
+                        && !entry.source_missing
+                )
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(
+                    |entry| entry.generation.generation_id == missing.generation_id
+                        && entry.source_missing
+                )
+        );
+    }
+
+    #[test]
+    fn epub_manager_commit_failure_invalidates_fixed_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = crate::epub_cache::EpubCache::open_at(temp.path()).unwrap();
+        let row = publish_test_epub(&mut cache, &temp.path().join("book.epub"));
+        let _pin =
+            crate::pdf_loader::pin_epub_for_test(&row.src_path, row.generation_id, row.pdf_size);
+        assert!(crate::pdf_loader::pinned_epub_target(&row.src_path).is_some());
+        let result = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::DeleteAll,
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_with_commit_failure_for_test(id),
+        );
+        assert_eq!(result.deleted, 0);
+        assert_eq!(result.physically_removed.len(), 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(!row.pdf_file.exists());
+        let mut app = crate::app::setup_app_for_test();
+        let removed_key = format!("{}::page_0", crate::epub_cache::src_key(&row.src_path));
+        let unrelated_key = "c:/books/other.epub::page_0".to_owned();
+        let pixels = std::sync::Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]));
+        for item_key in [removed_key.clone(), unrelated_key.clone()] {
+            app.retained_final_ai_cache.insert(
+                crate::app::RetainedFinalAiKey {
+                    item_key: item_key.clone(),
+                    edit_size: [1, 1],
+                    color_ai_hash: 1,
+                    bg: 0,
+                },
+                crate::app::RetainedFinalAiEntry {
+                    pixels: std::sync::Arc::clone(&pixels),
+                    used_upscale: false,
+                    bytes: 4,
+                    last_used: 0,
+                },
+            );
+            app.retained_pdf_page_cache.insert(
+                crate::app::RetainedPdfPageKey { item_key },
+                crate::app::RetainedPdfPageEntry {
+                    kind: crate::app::RetainedPdfPageCacheKind::Raster {
+                        pixels: std::sync::Arc::clone(&pixels),
+                        source_dims: [1, 1],
+                        render_long_edge: 1,
+                    },
+                    bytes: 4,
+                    last_used: 0,
+                },
+            );
+        }
+        app.invalidate_removed_epub_generations(&result.physically_removed);
+        assert!(
+            !app.retained_final_ai_cache
+                .keys()
+                .any(|key| key.item_key == removed_key)
+        );
+        assert!(
+            !app.retained_pdf_page_cache
+                .keys()
+                .any(|key| key.item_key == removed_key)
+        );
+        assert!(
+            app.retained_final_ai_cache
+                .keys()
+                .any(|key| key.item_key == unrelated_key)
+        );
+        assert!(
+            app.retained_pdf_page_cache
+                .keys()
+                .any(|key| key.item_key == unrelated_key)
+        );
+        drop(result);
+        assert!(crate::pdf_loader::pinned_epub_target(&row.src_path).is_none());
+    }
 
     #[test]
     fn collection_actor_failure_preserves_folder_maintenance_and_reports_unknown_total() {

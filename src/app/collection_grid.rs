@@ -3063,6 +3063,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.tx = tx.clone();
         self.rx = rx;
+        self.display_epub_source = None;
         self.current_folder = None;
         self.archive_source_override = None;
         self.zip_nav = None;
@@ -3774,7 +3775,7 @@ mod tests {
             Some(crate::pdf_loader::PdfReadingDirection::R2L)
         );
         let backend = crate::pdf_loader::RemotePdfTestBackend::for_path(&row.pdf_file);
-        (pin, backend, target.stamp)
+        (pin, backend, target.stamp.clone())
     }
 
     fn assert_cached_epub_worker_adoption(
@@ -6098,6 +6099,8 @@ mod tests {
         assert_eq!(app.current_folder.as_deref(), Some(epub.as_path()));
         assert_eq!(app.folder_history_back_target(), source.as_ref());
         let placeholder_generation = app.items_generation;
+        let placeholder_workers = Arc::clone(&app.cancel_token);
+        assert!(!placeholder_workers.load(Ordering::Relaxed));
         app.pdf_enumerate_pending.as_mut().unwrap().2 =
             crate::pdf_loader::completed_enumerate_result_handle(
                 &epub,
@@ -6109,6 +6112,8 @@ mod tests {
             );
         app.poll_pdf_enumerate();
         assert_eq!(app.items_generation, placeholder_generation);
+        assert!(Arc::ptr_eq(&app.cancel_token, &placeholder_workers));
+        assert!(!placeholder_workers.load(Ordering::Relaxed));
         assert_eq!(
             app.reading_direction,
             crate::settings::ReadingDirection::Ltr

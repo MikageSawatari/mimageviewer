@@ -1859,10 +1859,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      (バックログ §1.196)
 
 6.5. **GitHub Actions の CI が緑であることを確認** (`gh run list --limit 5`)。
-   赤なら原因を直してからリリース作業に入る。特に `cargo check (ubuntu / non-Windows cfg)` は
-   **`cfg(windows)` 漏れの番人**で、Windows 機のローカルビルドでは原理的に出ない失敗を拾う
-   (例: `#[cfg(windows)]` フィールドを cfg なしの経路から参照している)。ローカルの
-   `cargo check` / `test-full.ps1` が全部通っていても、この job だけ落ちていることがある。
+   赤なら原因を直してからリリース作業に入る。現在の job は `cargo fmt --check` と viewer context 監査の 2 本。
+   (ubuntu での非 Windows cfg の `cargo check` job は 2026-09-29 に廃止した。mIV は Windows 専用で、
+   この job のための修正と、どこでも実行されない `cfg(not(windows))` 側のコードが増え続けていたため。
+   非 Windows でコンパイルが通るかは今後は検査しないので、復活させない。)
    失敗ログの読み方: `gh run view <run-id> --log-failed` はビルド全体の warning も含むため、
    ファイルへ落として `error[E` で絞り込む (`-->` の行に実ファイル位置が出る)。
 7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）

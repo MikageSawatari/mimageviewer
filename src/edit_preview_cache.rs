@@ -1277,16 +1277,18 @@ impl EditPreviewCacheService {
                                             "edit preview WebP encode failed".to_string()
                                         })
                                 });
+                            let epub_read = source_container_path.as_deref().and_then(|path| {
+                                path.extension()
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                                    .then(|| crate::pdf_loader::resolve_read_target(path).ok())
+                                    .flatten()
+                            });
                             let Some((source_mtime, source_size, source_container_size)) =
                                 preview_save_stamp(
                                     source_mtime,
                                     source_size,
                                     source_container_path.as_deref(),
-                                    |path| {
-                                        crate::pdf_loader::resolve_read_target(path)
-                                            .ok()
-                                            .and_then(|read| read.stamp.generation_catalog_pair())
-                                    },
+                                    |_| epub_read.as_ref()?.stamp.generation_catalog_pair(),
                                 )
                             else {
                                 crate::logger::log(

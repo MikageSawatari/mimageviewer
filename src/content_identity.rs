@@ -1863,7 +1863,10 @@ fn record_source_at(
     } else {
         None
     };
-    if let Some(EpubProvenance::Pinned(id)) = epub_provenance.as_ref() {
+    if let Some(EpubProvenance::Pinned(read)) = epub_provenance.as_ref() {
+        let crate::pdf_loader::DocumentStamp::Generation { id, .. } = &read.stamp else {
+            unreachable!("pinned EPUB provenance has a generation stamp");
+        };
         let cache = crate::epub_cache::EpubCache::open_at(epub_data_dir)
             .map_err(|error| format!("{error:?}"))?;
         let row = cache
@@ -1886,7 +1889,7 @@ fn record_source_at(
             || Ok(Some((row.src_head_hash.clone(), row.src_sha256.clone()))),
             || {
                 Ok(
-                    matches!(capture_epub_provenance(&source.path)?, EpubProvenance::Pinned(current) if current == *id),
+                    matches!(capture_epub_provenance(&source.path)?, EpubProvenance::Pinned(current) if current.stamp == read.stamp),
                 )
             },
         )?;
@@ -1965,15 +1968,20 @@ fn record_source_at(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum EpubProvenance {
-    Pinned(i64),
+    // The generation row remains in use until the record/detection operation
+    // finishes. Keeping only its ID would let cache deletion pass this reader.
+    Pinned(crate::pdf_loader::ReadTarget),
     Unpinned(crate::epub_cache::SourceState),
 }
 
 fn capture_epub_provenance(path: &Path) -> Result<EpubProvenance, String> {
     if let Some(read) = crate::pdf_loader::pinned_epub_target(path)
-        && let crate::pdf_loader::DocumentStamp::Generation { id, .. } = read.stamp
+        && matches!(
+            &read.stamp,
+            crate::pdf_loader::DocumentStamp::Generation { .. }
+        )
     {
-        return Ok(EpubProvenance::Pinned(id));
+        return Ok(EpubProvenance::Pinned(read));
     }
     let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
     Ok(EpubProvenance::Unpinned(crate::epub_cache::source_state(
@@ -4108,7 +4116,9 @@ mod tests {
             source: ContentIdentitySource::from_path(&path).unwrap(),
             trigger: ContentIdentityTrigger::Edit,
             recorded_at: 10,
-            epub_provenance: Some(EpubProvenance::Pinned(row.generation_id)),
+            epub_provenance: Some(EpubProvenance::Pinned(
+                crate::pdf_loader::pinned_epub_target(&path).unwrap(),
+            )),
         };
         let entry = record_source_at(&db, &request, &AtomicBool::new(false), tmp.path())
             .unwrap()

@@ -12,6 +12,37 @@
 
 ---
 
+## v4.2.0 (2026-09-29)
+
+- **依存**: PDFium `chromium/8066` (最新)。FFmpeg は `setup-ffmpeg.sh check` が `n7.1.5-12` を「新版」と出すが、
+  現行 `n7.1.5-16` より古い (v3.4.0 と同じ誤検知)。DLL は v4.1.0 と同一で更新なし。ONNX Runtime / Susie / VST3 bridge は
+  v4.1.0 から変更なし (`-SkipVst3Bridge`)。`check-panic-log.ps1`: 52 件 15 種すべて disposition あり。
+- **CI**: この版の公開準備中に ubuntu の非 Windows cfg job を**廃止** (利用者判断、backlog §1.302)。残る fmt / viewer context audit は
+  master / main とも success。audit は EPUB / フォルダ履歴で増えた registry API の A4 allowlist 登録漏れで一度赤 (`aaa92558f` で登録)。
+- **Rust テスト**: 配布ビルド内の全体テストで **10,688 件通過 / 失敗 0** (`be04889d4`)。
+- **ui-smoke (使い捨て portable)**: 7 本すべて PASS。AlwaysOnTop は 2 つの理由で落ちた:
+  (1) 別ウィンドウは読み込み中の枠とページ表示で 2 回フォーカスを取り、smoke が 1 回目の後に root へ戻って OS の Right キーを
+  送っていた → 待ち合わせを「ページ描画済みかつ前面」まで延ばして 4 回連続 PASS (backlog §1.303)。
+  (2) Claude デスクトップのウィンドウが同じモニターで smoke の座標に重なり、実ポインタ / キーが届かなかった → 別モニターへ移して解消。
+  **smoke 中は Claude のウィンドウを別モニターに置く。**
+- **idle health (配布ビルドの core)**: `static-foreground` / `static-background` / `tray-residency` の 3 シナリオとも **PASS**。
+  全区間で perf event 0 件 (完全 sleep)、CPU 1 コア比 0.0062 / 0.0062 / 0.0187、`tray-residency` は `8/0 visible`。
+  `video-pin-background` は未実施 (waiver): v4.1.0 からアイドル高画質化 (`idle_upgrade`) のコードに差分なし。
+- **perf smoke**: 3,563 フレーム、16ms 以上 189 件、ログは `target/release-verification/v4.2.0-perf_smoke-perf_events.jsonl`。
+  直前が `request_repaint` の描画中フレームは n=1,696 で **16ms 未満 96.6%、p95 12ms、max 133ms**。
+  `pre_grid_breakdown.total_ms` は **p50 0.062 / p95 0.131 / max 2.81ms**。100ms 超 36 件の内訳は `none` 15、
+  `request_repaint_after_idle_upgrade` 14、`request_repaint_after_ai_upscale` 1、起動直後 1、`request_repaint` 5。
+  その 5 件はフルスクリーン viewport の `setup_ms` 96〜120ms (2 件)、初回フォルダの `thumbnail_polls_ms` 94ms (1 件)、
+  コレクションを開いたフレーム (read_lease の `active_ms` 92ms は lease の存続期間で UI 停止時間ではない、1 件) など。
+  **説明のつかない 100ms 超は 0 件。**
+- **配布物の確認で見つかったリリース阻害 (修正済み)**: 利用者がポータブル版 (空の data) で、一覧で PDF のサムネイルを作ってから
+  その PDF を開くと、ページのサムネイルが永久に「読込中」。キャッシュ済み PDF の即時表示 (§12) で、ページ数の照合成功時に
+  採用処理をやり直して thumbnail worker を止めていた (`b5e3c2340`、独立レビュー 3 回で ACCEPT、`76926e007`)。
+  普段の環境はページのサムネイルがキャッシュ済みで表に出なかった。**空の data での配布物確認が捕まえた。**
+  修正後の配布ビルドで利用者が PDF と動画を確認。
+
+---
+
 ## v3.4.0 (2026-09-01)
 
 - **依存**: PDFium を `chromium/8021` → **`chromium/8035` へ更新**。FFmpeg は

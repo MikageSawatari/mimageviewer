@@ -1455,6 +1455,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-29 Smart Folder PDF 可視採用の共通後片付け**
+
+Smart Folder の PDF warm placeholder と準備済み pages は、Smart child session の採用後に通常 PDF と同じ `prepare_pdf_visible_adoption` を通す。既存の detached image window 退避判定を含む後片付けを page rows の install 前に一度だけ行い、列挙検証時は繰り返さない。detached の述語・viewport・window lifecycle の実装は変更せず、Smart 経路の可視採用を既存の所有境界へ合流させた。
+
+**2026-09-28 D15 EPUB キャッシュ即時削除の読取所有権 (review #3〜#6 改訂)**
+
+分類待ち・開封待ち・表示中の各状態が、EPUB の論理パスを受け付けた時点から `LeasedEpubPath` を自分で保持し、状態の drop で解放する。mounted / parked の `ViewerContextBundle` を横断して所有者を列挙・同期する方式は、手書きの列挙から smart folder と起動系の候補が漏れたため廃止した。固定世代の解決・PDF 描画・Remote 要求・サムネイル処理も同じ本の調停を通し、削除は読取中なら使用中として拒否する。review #3 では smart folder と起動・二重起動通知・しおりの採用待ちまで対象を広げた。review #4 では別ウィンドウの PDF descriptor 自体にリースを持たせ、次の EPUB の取得に成功してから現在の窓を退避する。review #5 では PDF ページなど実ファイルをドラッグできない項目としおりも同じ PDF descriptor 生成境界を通し、「対象外」と「削除中で拒否」を型で分けて退避前に処理する。取得できなければ窓を退避せず案内する。表示 context を閉じたり再作成したりせず、detached の predicate、viewport ID、host、配置、focus、window lifecycle は変えない。所有期間を各状態の RAII に置く構造変更であり、§2 の症状パッチには当たらない。
+
+review #6 では descriptor より手前の分類受付も `Accepted / NotApplicable / Refused(理由)` に分けた。`LeasedEpubPath::try_new` 自体が削除中の理由付き `Result` を返し、しおり・履歴・スマートフォルダ・直接開封・別ウィンドウは受付拒否を共通の案内へ渡す。しおりの採用状態や既存窓は変更しない。フルスクリーンの EPUB 所有権取得も理由付きにし、取得前の表示状態確定を避ける。PDF パスワード待ちとスマートフォルダ子のリース取得は失敗理由を保持する。追加の待機や再試行、detached viewport 状態は設けない。
+
 **2026-09-28 §1.251 S7 / master 統合: Remote 取得と EPUB・履歴の非同期 open の所有境界**
 
 master が追加したパス分類、EPUB 変換、履歴・コレクション・評価一覧の遷移、フォルダ pane scan、PDF password、Smart 遷移が Remote の取得後にローカル閲覧を再開しないよう、取得時に既存の context owner terminal で失効させる。detached 側の閉鎖は S7 の既存 terminal close を再利用し、detached 述語、host / park / focus、viewport 生成・終了は変更しない。Remote とローカルの所有権引き継ぎを同じ境界で完結させる構造的統合であり、時間窓・再試行・一括 reset による症状隠しではない。独立レビューの指摘を統合した。ClaudeCode の検収判断は未了。

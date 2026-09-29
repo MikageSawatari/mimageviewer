@@ -14,6 +14,8 @@
 
 root は scan→件数/確認→prepare→Ready、物理子は Folder scan、PDF warm/cold enumerate、ZIP enumerate、変換 alias の preflight→Ready を **旧可視表示の外側** で進める。Collection、検索、Folder、Smart root/Child の items・session・選択・scroll・AutoAspect・worker・既存 PDF/ZIP receiver・favorite・履歴は採用まで残る。no-resident 履歴復帰でも root を中間表示せず、offscreen `PreparedSmartFolder` を子 Ready まで保持する。PDF warm placeholder は既存の page-row 構築と列挙 handle を一度だけ使い、採用後もその handle が検証を続ける。ZIP key migration は従来どおり worker の Ready 送信前、pin batch lookup は可視採用直前に論理元 source で従来の一回を行う（既存 cascade 読取は別）。
 
+PDF warm placeholder と準備済み PDF pages の Smart child 可視採用は、共通の PDF 採用処理を一度だけ通す。読込先が Save PDF の sibling `.pdf` でも、採用の所有判定と favorite view 遷移には Smart child の論理地点 `.epub` を使う。入れ子 ZIP bytes、`zip_nav`、旧 thumbnail worker をここで破棄し、新しい page rows の worker を開始する。warm 検証結果の件数が一致すれば新 worker を維持し、採用処理を繰り返さない。
+
 可視採用直前に source lease、要求 ID、履歴 peek、rule/source、worker 由来の sort/display/grouping・metadata stamp を再照合する。設定の表示差は保存 snapshot から非同期再 prepare、rule/source 差は新 scan に戻す。`VisibleInstallAuthority::Smart` を共通 installer へ明示的に渡し、既存 `OpenRequestOwner` や path/pending presence から採用権限を推測しない。Folder は成功済み `ScannedDir` から直接 install し、fallible な共通 loader 前半へ再入しない。PDF/ZIP は列挙結果を一度だけ materialize する。採用時に旧 receiver と旧 fullscreen defer を同一 path でも先に退役し、その後だけ新 handle/defer を公開する。大きい旧 payload の破棄は retire worker へ渡す。通常/Remote/detached の Ordinary loader 経路は維持する。
 
 採用済み `SmartFolderSession` は Root または Child の排他 phase、Child は元 root を `Visible` move payload か `Offscreen` prepared payload として一つだけ所有する。Root へ戻る際は synthetic 側 favorite を先に確定し、stamp 同値なら選択・scroll・AutoAspect を exact 復元、真の設定差だけ anchor 付き再 prepare する。削除 tombstone も同じ root snapshot accessor を通り、offscreen root で削除した行を復活させない。

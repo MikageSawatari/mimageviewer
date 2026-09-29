@@ -183,6 +183,8 @@ pub(in crate::app) struct CollectionNavigationRequest {
     pub(in crate::app) root_thumbnail_sources: Option<Arc<CollectionGridNavigationSources>>,
     perf_started_at: Option<std::time::Instant>,
     lease: crate::collection_store::CollectionReadLease,
+    /// Chosen physical book, acquired by the preflight worker before it resolves a generation.
+    book_owner: Option<crate::pdf_loader::LeasedEpubPath>,
 }
 
 enum CollectionNavigationPreflightPayload {
@@ -270,6 +272,7 @@ fn physical_history_file_kind(extension: &str) -> Option<CollectionResolvedKind>
 
 pub(in crate::app) struct CollectionNavigationPreflightReady {
     target: CollectionPreparedNavigationTarget,
+    owner: crate::pdf_loader::LeasedEpubPath,
     payload: CollectionNavigationPreflightPayload,
     rejected: Vec<CollectionEntryId>,
 }
@@ -686,6 +689,8 @@ fn preflight_candidates(
             }
             inspected += 1;
             let path = &candidate.target.source_path;
+            let candidate_owner =
+                crate::pdf_loader::LeasedEpubPath::acquire_on_worker(path.clone());
             let payload = match candidate.target.resolved_kind {
                 CollectionResolvedKind::Image
                 | CollectionResolvedKind::Video
@@ -833,6 +838,7 @@ fn preflight_candidates(
             if accepted >= required_matches {
                 return Ok(Some(CollectionNavigationPreflightReady {
                     target: candidate.target,
+                    owner: candidate_owner,
                     payload,
                     rejected,
                 }));
@@ -1329,6 +1335,7 @@ impl App {
                 Instant::now(),
                 "admission",
             ),
+            book_owner: None,
         };
         self.top_level_grid_view
             .set_collection_navigation_pending(None);
@@ -1907,6 +1914,7 @@ impl App {
         mut request: CollectionNavigationRequest,
     ) {
         request.root_thumbnail_sources = None;
+        request.book_owner = None;
         request.origin.surface_generation = self.top_level_grid_view.generation();
         request.origin.items_generation = self.items_generation;
         request.lease.defer(Instant::now(), "restart");
@@ -2388,6 +2396,8 @@ impl App {
                                 &ready.target,
                             ) =>
                             {
+                                let mut request = request;
+                                request.book_owner = Some(ready.owner.clone());
                                 self.commit_collection_navigation(
                                     ctx, request, watch, prepared, ready,
                                 )
@@ -2513,6 +2523,11 @@ impl App {
                             self.pdf_current_password = Some(password.clone());
                             self.pdf_password_pending_save =
                                 save.then(|| (target.source_path.clone(), password));
+                            let owner = request
+                                .book_owner
+                                .as_ref()
+                                .expect("password retry owns book")
+                                .clone();
                             self.commit_collection_navigation(
                                 ctx,
                                 request,
@@ -2520,6 +2535,7 @@ impl App {
                                 prepared,
                                 CollectionNavigationPreflightReady {
                                     target,
+                                    owner,
                                     payload: CollectionNavigationPreflightPayload::PdfPages(pages),
                                     rejected: Vec::new(),
                                 },
@@ -2530,9 +2546,16 @@ impl App {
                             request.lease.pause(Instant::now(), "pdf_password_input");
                             self.pdf_current_password = None;
                             self.pdf_password_pending_save = None;
-                            self.pdf_password_request = Some(super::PdfPasswordRequest::legacy(
+                            let password_request = match super::PdfPasswordRequest::try_legacy(
                                 target.source_path.clone(),
-                            ));
+                            ) {
+                                Ok(request) => request,
+                                Err(reason) => {
+                                    self.show_open_admission_refusal(reason);
+                                    return;
+                                }
+                            };
+                            self.pdf_password_request = Some(password_request);
                             let revision_wake = CollectionRevisionWake::spawn(ctx, &watch);
                             self.top_level_grid_view
                                 .set_collection_navigation_pending(Some(
@@ -2554,6 +2577,11 @@ impl App {
                                 )
                             ) =>
                         {
+                            let owner = request
+                                .book_owner
+                                .as_ref()
+                                .expect("password retry owns book")
+                                .clone();
                             self.commit_collection_navigation(
                                 ctx,
                                 request,
@@ -2561,6 +2589,7 @@ impl App {
                                 prepared,
                                 CollectionNavigationPreflightReady {
                                     target,
+                                    owner,
                                     payload: CollectionNavigationPreflightPayload::PdfOpenFailure(
                                         crate::pdf_loader::typed_read_error(&error).unwrap().into(),
                                     ),
@@ -3164,10 +3193,18 @@ impl App {
             previous,
         );
         if let (Some(new_idx), Some(player)) = (landing_origin_idx, preserved_player) {
-            self.fs_cache.insert(new_idx, player);
             if self.fullscreen_idx == old_fs_idx {
+                match self.try_own_fullscreen_epub_at(new_idx) {
+                    super::OpenAdmission::Accepted => {}
+                    super::OpenAdmission::NotApplicable => return None,
+                    super::OpenAdmission::Refused(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return None;
+                    }
+                }
                 self.fullscreen_idx = Some(new_idx);
             }
+            self.fs_cache.insert(new_idx, player);
             if self.video_audio_mode == old_fs_idx {
                 self.video_audio_mode = Some(new_idx);
             }
@@ -3307,9 +3344,15 @@ impl App {
             CollectionNavigationPreflightPayload::PdfPasswordRequired
         ) {
             request.lease.pause(Instant::now(), "pdf_password_input");
-            self.pdf_password_request = Some(super::PdfPasswordRequest::legacy(
-                ready.target.source_path.clone(),
-            ));
+            let password_request =
+                match super::PdfPasswordRequest::try_legacy(ready.target.source_path.clone()) {
+                    Ok(request) => request,
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return;
+                    }
+                };
+            self.pdf_password_request = Some(password_request);
             let revision_wake = CollectionRevisionWake::spawn(ctx, &watch);
             self.top_level_grid_view
                 .set_collection_navigation_pending(Some(
@@ -4641,6 +4684,8 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         sender
             .send(Ok(Some(CollectionNavigationPreflightReady {
+                owner: crate::pdf_loader::LeasedEpubPath::try_new(target.source_path.clone())
+                    .unwrap(),
                 target,
                 payload: CollectionNavigationPreflightPayload::Media,
                 rejected: Vec::new(),
@@ -4773,6 +4818,7 @@ mod tests {
             ))),
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         };
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Folder);
         let owner = app
@@ -4822,6 +4868,7 @@ mod tests {
             root_thumbnail_sources: None,
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         };
         app.spawn_collection_navigation_prepare(
             &egui::Context::default(),
@@ -4936,6 +4983,7 @@ mod tests {
             root_thumbnail_sources: None,
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         }
     }
 
@@ -5021,6 +5069,7 @@ mod tests {
             root_thumbnail_sources: None,
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         };
         app.collection_ui.set_read_phase_for_test(false);
         let (barrier_reply, entered, release) = client.test_barrier().unwrap();
@@ -5165,6 +5214,7 @@ mod tests {
                 root_thumbnail_sources: None,
                 perf_started_at: None,
                 lease: navigation_test_lease(),
+                book_owner: None,
             },
             watch: None,
         };
@@ -5318,6 +5368,7 @@ mod tests {
             root_thumbnail_sources: None,
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         };
         request.root_thumbnail_sources = Some(navigation_sources(
             &app,
@@ -6061,6 +6112,7 @@ mod tests {
                     .unwrap(),
                 "preflight",
             ),
+            book_owner: None,
         };
         let lease_id = request.lease.request_id();
         request.lease.pause(Instant::now(), "pdf_password_input");
@@ -6164,6 +6216,7 @@ mod tests {
                     .unwrap(),
                 "preflight",
             ),
+            book_owner: None,
         };
         let request_id = request.lease.request_id();
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Image);
@@ -6201,6 +6254,8 @@ mod tests {
 
         sender
             .send(Ok(Some(CollectionNavigationPreflightReady {
+                owner: crate::pdf_loader::LeasedEpubPath::try_new(target.source_path.clone())
+                    .unwrap(),
                 target,
                 payload: CollectionNavigationPreflightPayload::Media,
                 rejected: Vec::new(),
@@ -6273,6 +6328,7 @@ mod tests {
             root_thumbnail_sources: None,
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         };
         let lease_id = request.lease.request_id();
         request.lease.pause(Instant::now(), "pdf_password_input");
@@ -6574,6 +6630,7 @@ mod tests {
             root_thumbnail_sources: None,
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         };
         let request_id = request.lease.request_id();
         let expected_action = request.action.clone();
@@ -6630,6 +6687,8 @@ mod tests {
             watch,
             Arc::clone(&prepared),
             CollectionNavigationPreflightReady {
+                owner: crate::pdf_loader::LeasedEpubPath::try_new(target.source_path.clone())
+                    .unwrap(),
                 target,
                 payload: CollectionNavigationPreflightPayload::Media,
                 rejected: Vec::new(),
@@ -6708,6 +6767,7 @@ mod tests {
             root_thumbnail_sources: None,
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         };
         assert!(app.collection_navigation_request_is_current(&request));
 
@@ -6772,6 +6832,7 @@ mod tests {
             root_thumbnail_sources: None,
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         };
         assert!(app.collection_navigation_request_is_current(&request));
 
@@ -6854,6 +6915,7 @@ mod tests {
             root_thumbnail_sources: None,
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         };
         let watch = client.subscribe().unwrap();
         let target_entry = &prepared.entries[1];
@@ -6937,6 +6999,7 @@ mod tests {
             root_thumbnail_sources: None,
             perf_started_at: None,
             lease: navigation_test_lease(),
+            book_owner: None,
         };
         let target_entry = &prepared.entries[1];
         let target = CollectionPreparedNavigationTarget {

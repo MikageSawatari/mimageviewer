@@ -3248,6 +3248,7 @@ impl App {
             if self.fullscreen_idx != Some(target_idx) {
                 self.reset_fs_side_panel_runtime_for_file_change();
             }
+            self.fullscreen_epub_source = None;
             self.fullscreen_idx = Some(target_idx);
             // Inc 7: 進行中の swap が既に音声モード維持 (audio_mode_after_swap=true) なら、
             // 通常ナビによる update でもその intent を維持する。keep_audio_mode(=この update の
@@ -3379,6 +3380,7 @@ impl App {
         if self.fullscreen_idx != Some(target_idx) {
             self.reset_fs_side_panel_runtime_for_file_change();
         }
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = Some(target_idx);
         // Inc 7: 音声モード維持 swap は fullscreen_idx を target へ進めた瞬間から
         // video_audio_mode も target に合わせて音楽ビューを継続表示する (Codex #5)。旧 idx の

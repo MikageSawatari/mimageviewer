@@ -1170,16 +1170,20 @@ fn send_pinned_only_cached(
         .seed_proof
         .as_ref()
         .map(|DriveListSeedProof::EpubPath(path)| path.clone());
-    let epub_stamp = if let Some(source) = epub_source.as_ref() {
+    let epub_read = if let Some(source) = epub_source.as_ref() {
         let Ok(read) = crate::pdf_loader::resolve_read_target(source) else {
             return false;
         };
-        let Some(stamp) = read.stamp.generation_catalog_pair() else {
-            return false;
-        };
-        Some(stamp)
+        Some(read)
     } else {
         None
+    };
+    let epub_stamp = match epub_read.as_ref() {
+        Some(read) => Some(match read.stamp.generation_catalog_pair() {
+            Some(stamp) => stamp,
+            None => return false,
+        }),
+        None => None,
     };
     let cached = cache_map.read().ok().and_then(|map| {
         map.iter()
@@ -1276,19 +1280,23 @@ fn send_pinned_child_folder_cached(
     ) else {
         return false;
     };
-    let generation = if let Some(target) = resolved.as_ref()
+    let epub_read = if let Some(target) = resolved.as_ref()
         && target.pdf_page.is_some()
         && is_epub_path(&target.abs_path)
     {
         let Ok(read) = crate::pdf_loader::resolve_read_target(&target.abs_path) else {
             return false;
         };
-        let Some(pair) = read.stamp.generation_catalog_pair() else {
-            return false;
-        };
-        Some(pair)
+        Some(read)
     } else {
         None
+    };
+    let generation = match epub_read.as_ref() {
+        Some(read) => Some(match read.stamp.generation_catalog_pair() {
+            Some(pair) => pair,
+            None => return false,
+        }),
+        None => None,
     };
     let key = resolved.as_ref().map_or_else(
         || base_key.clone(),

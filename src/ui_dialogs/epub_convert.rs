@@ -67,6 +67,7 @@ enum EpubConvertMsg {
 
 pub(crate) struct EpubConvertState {
     pub(crate) src_path: PathBuf,
+    pub(crate) src_owner: crate::pdf_loader::LeasedEpubPath,
     pub(crate) continuation: EpubOpenContinuation,
     // Existing viewer-context surface identity and Smart staged-request identity. Item
     // refreshes do not supersede an open, but another top-level surface or staged Smart open does.
@@ -136,6 +137,7 @@ impl EpubConvertState {
         tx.send(EpubConvertMsg::ConvertDone(Ok(outcome))).unwrap();
         let logical = src_path.clone();
         Self {
+            src_owner: crate::pdf_loader::LeasedEpubPath::try_new(src_path.clone()).unwrap(),
             src_path,
             continuation: EpubOpenContinuation::Direct(owner),
             surface_generation,
@@ -165,6 +167,7 @@ impl EpubConvertState {
         tx.send(EpubConvertMsg::SaveDone(Ok(saved))).unwrap();
         let logical = src_path.clone();
         Self {
+            src_owner: crate::pdf_loader::LeasedEpubPath::try_new(src_path.clone()).unwrap(),
             src_path,
             continuation: EpubOpenContinuation::Direct(owner),
             surface_generation,
@@ -408,8 +411,17 @@ impl App {
                     return PdfOpenFailureRoute::Handled;
                 };
                 let (_, rx) = mpsc::channel();
+                let src_owner = match crate::pdf_loader::LeasedEpubPath::try_new(logical.to_owned())
+                {
+                    Ok(owner) => owner,
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason.into());
+                        return PdfOpenFailureRoute::Handled;
+                    }
+                };
                 let mut state = EpubConvertState {
                     src_path: logical.to_owned(),
+                    src_owner,
                     continuation,
                     surface_generation: self.top_level_grid_view.generation(),
                     smart_transition_sequence: self.smart_folder_transition_sequence,
@@ -541,6 +553,7 @@ impl App {
         );
         let deferred = state.deferred_fullscreen.take();
         let source = state.src_path.clone();
+        let _source_owner = state.src_owner.clone();
         drop(state);
         if !user_data_errors.is_empty() {
             self.show_feedback_toast(format!(
@@ -822,6 +835,10 @@ mod tests {
         (
             EpubConvertState {
                 src_path: PathBuf::from("C:/books/book.epub"),
+                src_owner: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
+                    "C:/books/book.epub",
+                ))
+                .unwrap(),
                 continuation: EpubOpenContinuation::Direct(OpenRequestOwner::Navigation),
                 surface_generation: 0,
                 smart_transition_sequence: 0,

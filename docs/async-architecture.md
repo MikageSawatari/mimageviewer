@@ -83,7 +83,8 @@
 | 音楽ビュー spectrum | `std::thread` (`miv-music-spectrum`) + mpsc | 音楽ビュー 1 つにつき 1 本 (`MusicSpectrumState`) | 常駐 `SpectrumAnalyzer` (E0-C#10 の MIDI 半音バー、多解像度 FFT) を所有し、UI から `Arc<MusicPcm>` + `center_secs` を受けて再生位置周辺 **±1 秒**の窓を worker 側でスライス (`copy_window`、lock 下で ~1MB 未満コピー) → `analyze_moving_window`。cpal ring buffer は約 100ms 分しか無く ±1s 窓に足りないため、ラボと同じく展開済み PCM をスライスする (案A、[music-integration-plan.md](music-integration-plan.md) §11)。**`MusicPcm` は追記式共有バッファ (`RwLock<Vec<f32>>` + `complete: AtomicBool`)**: 解析ワーカーがデコード進行に合わせて末尾 `append` (write) し、spectrum worker は現デコード済み範囲から窓を read で取る (未デコード領域が中心なら `None`)。`RwLock` = 長い解析 read と spectrum 窓コピー read を並行させ spectrum を固まらせない。高々 1 リクエスト in-flight + 溜まった分は最新へ coalesce。UI (`update`) は playing / 位置変化時に throttle (16ms) 付きで送り、pending / 再生中は `request_repaint_after(16ms)`。窓がまだ取れない間は空バンド = 鍵盤ベースライン + 「解析中…」表示 (`source_complete` で抑制)。新ファイル / close で `clear`。詳細は [`src/ui_music_spectrum.rs`](../src/ui_music_spectrum.rs) |
 
 | キャッシュ一括生成 | `rayon` | (ユーザー設定) | ダイアログから起動するバッチ処理 |
-| EPUB 変換結果の管理 | `epub-cache-maint` + `mpsc` | 管理画面で最大 1 本 | 開く・再読込で現在の変換結果を DB から読み、選択削除・全削除は世代を削除予約へ入れる。`App::epub_cache_maint_pending` が受信まで所有し、UI は一覧 snapshot だけを描画する。実ファイルは次回起動時の削除ゲートまで残る。RAR/7z の容量集計とは別 DB・別 pending |
+| EPUB 変換結果の管理 | `epub-cache-maint` + `mpsc` | 管理画面で最大 1 本 | 開く・再読込で現在の変換結果を DB から読み、選択・全件・元ファイル消失の削除は対象ごとにその場で実行する。本ごとの読取リースがあれば待たずに使用中として残し、無ければ排他的な削除境界を取る。PDF worker の文書解放だけ総 10 秒を上限に待ち、応答なしの対象は残して理由を返す。`App::epub_cache_maint_pending` が受信まで所有し、UI は一覧 snapshot と結果だけを描画する。内部廃止世代の起動時回収は残す。RAR/7z の容量集計とは別 DB・別 pending |
+
 | EPUB のページ数メタ保存 | `epub-pdf-meta` | 列挙完了ごとに短命 1 本 | 非同期列挙が返した世代 stamp とページ数を親 catalog へ保存する。既存の warm catalog があれば共有し、cold open は worker が行う。旧世代の遅れた書込も stamp 不一致で再利用されない。通常 PDF の保存経路は従来どおり |
 | Ctrl+F メタデータフィルター | `std::thread` (`metadata-search`) + request 専用 `rayon::ThreadPool` | 外側 1 本 + Pass 2 最大 8 本 | Pass 1 の構造項目は逐次、画像 / 動画の on-demand メタ読みだけ 8 並列。前面検索なので `ActivityGate` は使わない。cancel 後は未開始 item を止め、開始済み item の結果までを部分結果として返す。XMP cache miss は正規化 path ごとの `OnceLock` で重複排除 |
 | メタ索引 supervisor (Ctrl+G 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_metadata=true`) | 初期スキャン + notify-rs 監視 + ingest を統括。共有 `Arc<Mutex<IndexWriter>>` 経由で Tantivy writer を直列化 (Tantivy は Index あたり writer 1 本制約) |
@@ -98,6 +99,8 @@
 | タスクトレイ (v0.9) | `std::thread` (常駐) | 1 (設定 ON 時のみ) | `mimv-tray` スレッド。`tray-icon` クレートで隠し HWND を作成 → `PeekMessageW` ポンプ (50ms 周期) + `TrayIconEvent` / `MenuEvent` の try_recv → `TrayEvent::Open / TogglePause / Quit` を UI に送信。`ActivityGate::set_paused` + `GlobalIoSemaphore::set_throttled` はメインスレッドで適用 |
 
 音楽解析の進行中結果と spectrum PCM は `MusicAnalysisSource` (所有 viewer context、fs index、player、load sequence、path、`applied` stream index) に属する。所有 context が mount されたときだけ受信し、player または source が変わった結果は破棄する。live fork で同じ player / path / `applied` stream が ParkedLive に移る場合は source と進行中 worker の所有 context だけを移し、解析結果と PCM を保持する。旧 context の終了は移管済みの解析を消さない。トラック選択の確定前は旧 `applied` の表示を保ち、確定時に解析・PCM・row raster・spectrum を作り直す。波形の session / holdover は viewer bundle と一緒に移動し、worker 内 raster LRU と永続 chunk も `applied` stream index で分離する。永続 chunk は `video_wave_chunks_track` に新規保存し、既定トラックだけ旧 `video_wave_chunks` を互換読みする。
+
+EPUB の開封待ちは各状態が論理パスと読取リースを一緒に所有する。分類候補、起動・二重起動通知・しおりのパス解決、staged 履歴、スマートフォルダの ChildPreflight / ChildReady、コレクションの採用待ち、PDF 列挙・パスワード・変換待ちから表示中・退避中の viewer context まで、引き継ぎは先に次の所有者へリースを共有してから旧状態を破棄する。`ReadTarget` の EPUB 世代はリースを必須とする型で、Remote の解決済み要求、PDF 列挙・描画・派生生成も使用終了まで保持する。所有者を後から走査する同期表は置かない。拡張子で EPUB と分かれば分類前に取得し、フォルダと判明した場合は解放する。UI の取得は待機や I/O を伴わず、背景読み手は削除が先行した場合にその終了後の世代を解決する。
 
 保存コレクションの同revision navigationは viewer bundle の`Ready / Empty`が持つ準備済み順序・
 sidecar / pin payloadを Collection ID、revision、display order、sidecar探索fingerprint、画像と動画の

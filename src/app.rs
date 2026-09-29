@@ -420,6 +420,7 @@ pub(crate) struct PhysicalHistoryTransition {
     request_id: u64,
     intent: PhysicalHistoryIntent,
     path: PathBuf,
+    path_owner: Option<crate::pdf_loader::LeasedEpubPath>,
     classified_kind: Option<OpenPathKind>,
     phase: PhysicalHistoryPhase,
     history_before: FolderNavHistorySnapshot,
@@ -465,6 +466,7 @@ pub(crate) struct CollectionHistoryTransition {
     request_id: u64,
     intent: CollectionHistoryIntent,
     target: FolderNavHistoryTarget,
+    target_owner: Option<crate::pdf_loader::LeasedEpubPath>,
     classified_kind: Option<OpenPathKind>,
     history_before: FolderNavHistorySnapshot,
     source_context: ViewerContextId,
@@ -488,7 +490,7 @@ pub(crate) enum HistoryNavigationTransition {
 pub(crate) struct OpenPathClassification {
     request_id: u64,
     context: ViewerContextId,
-    path: PathBuf,
+    path: crate::pdf_loader::LeasedEpubPath,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<std::io::Result<ClassifiedOpenPath>>,
     continuation: Option<Box<ClassifiedOpenContinuation>>,
@@ -707,6 +709,44 @@ pub(crate) enum FolderOpenOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FolderOpenRefusal {
     EpubIgnoredBySetting,
+    Admission(OpenAdmissionRefusal),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAdmissionRefusal {
+    EpubDeletionInProgress,
+    RemoteControl,
+    DocumentOpenBusy,
+    ClassificationWorkerUnavailable,
+}
+
+impl OpenAdmissionRefusal {
+    fn message(self) -> &'static str {
+        match self {
+            Self::EpubDeletionInProgress => "EPUB の削除処理が終わってから開いてください",
+            Self::RemoteControl => "リモート閲覧中のため、ローカルで開けません",
+            Self::DocumentOpenBusy => "処理中の本を完了してから開いてください",
+            Self::ClassificationWorkerUnavailable => "開く場所の確認を開始できませんでした",
+        }
+    }
+}
+
+impl From<crate::pdf_loader::EpubReadAdmissionRefusal> for OpenAdmissionRefusal {
+    fn from(reason: crate::pdf_loader::EpubReadAdmissionRefusal) -> Self {
+        match reason {
+            crate::pdf_loader::EpubReadAdmissionRefusal::DeletionInProgress => {
+                Self::EpubDeletionInProgress
+            }
+        }
+    }
+}
+
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAdmission {
+    Accepted,
+    NotApplicable,
+    Refused(OpenAdmissionRefusal),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -920,6 +960,7 @@ pub(crate) type PdfEnumeratePending = (
     Box<OpenRequestOwner>,
     Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
     PdfOpenPhase,
+    crate::pdf_loader::LeasedEpubPath,
 );
 
 /// The one per-context PDF-open owner. A committed placeholder may remain the source while a
@@ -3040,7 +3081,8 @@ impl App {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ViewerContextDescriptor {
     Pdf {
-        path: PathBuf,
+        /// Owns EPUB admission before the current detached window is parked.
+        path: crate::pdf_loader::LeasedEpubPath,
         page_num: Option<u32>,
     },
     Zip {
@@ -3056,6 +3098,28 @@ pub(crate) enum ViewerContextDescriptor {
     /// コンテキストとして読み込んでこの画像を開き直す。グリッドからの open
     /// ルーティング (`detached_viewer_context_descriptor_for_idx`) には使わない。
     Image { path: PathBuf },
+}
+
+/// A detached descriptor may be inapplicable, but EPUB delete admission is a
+/// terminal refusal. Callers must not route a refusal through the ordinary open.
+#[cfg(windows)]
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DetachedBuild<T> {
+    Built(T),
+    NotApplicable,
+    Refused(OpenAdmissionRefusal),
+}
+
+#[cfg(windows)]
+impl<T> DetachedBuild<T> {
+    fn map<U>(self, build: impl FnOnce(T) -> U) -> DetachedBuild<U> {
+        match self {
+            Self::Built(value) => DetachedBuild::Built(build(value)),
+            Self::NotApplicable => DetachedBuild::NotApplicable,
+            Self::Refused(reason) => DetachedBuild::Refused(reason),
+        }
+    }
 }
 
 /// A detached book context is created only after the source ownership is known.
@@ -3615,7 +3679,7 @@ enum DeferredFsOpenOutcome {
 }
 
 pub(crate) struct PdfPasswordRequest {
-    path: PathBuf,
+    path: crate::pdf_loader::LeasedEpubPath,
     owner: PdfPasswordRequestOwner,
 }
 
@@ -3637,32 +3701,42 @@ struct DirectPdfPasswordContinuation {
 }
 
 impl PdfPasswordRequest {
+    fn try_new(
+        path: PathBuf,
+        owner: PdfPasswordRequestOwner,
+    ) -> Result<Self, OpenAdmissionRefusal> {
+        Ok(Self {
+            path: crate::pdf_loader::LeasedEpubPath::try_new(path)
+                .map_err(OpenAdmissionRefusal::from)?,
+            owner,
+        })
+    }
+
+    pub(crate) fn try_legacy(path: PathBuf) -> Result<Self, OpenAdmissionRefusal> {
+        Self::try_new(path, PdfPasswordRequestOwner::Legacy)
+    }
+
+    #[cfg(test)]
     pub(crate) fn legacy(path: PathBuf) -> Self {
-        Self {
-            path,
-            owner: PdfPasswordRequestOwner::Legacy,
-        }
+        Self::try_legacy(path).expect("test PDF password owner is not being deleted")
     }
 
     fn direct(
         path: PathBuf,
         open_owner: OpenRequestOwner,
         restore: crate::ui_dialogs::epub_convert::EpubOpenRestore,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, OpenAdmissionRefusal> {
+        Self::try_new(
             path,
-            owner: PdfPasswordRequestOwner::Direct(Box::new(DirectPdfPasswordContinuation {
+            PdfPasswordRequestOwner::Direct(Box::new(DirectPdfPasswordContinuation {
                 open_owner,
                 restore,
             })),
-        }
+        )
     }
 
-    fn staged_history(path: PathBuf, request_id: u64) -> Self {
-        Self {
-            path,
-            owner: PdfPasswordRequestOwner::StagedHistory(request_id),
-        }
+    fn staged_history(path: PathBuf, request_id: u64) -> Result<Self, OpenAdmissionRefusal> {
+        Self::try_new(path, PdfPasswordRequestOwner::StagedHistory(request_id))
     }
 }
 
@@ -3834,7 +3908,7 @@ pub(crate) struct StartupOpenPathResolveResult {
 /// `Path::is_file` / `is_dir` は切断ネットワークパス等で UI を止めうるため、
 /// resolve だけ先に worker へ逃がし、完了後の実ロードだけ UI スレッドで行う。
 pub(crate) struct StartupOpenPathResolvePending {
-    requested: PathBuf,
+    requested: crate::pdf_loader::LeasedEpubPath,
     owner: StartupOpenPathOwner,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<StartupOpenPathResolveResult>,
@@ -12670,14 +12744,14 @@ fn detached_window_references_removed(
     }
     if let Some(desc) = window.reopen_descriptor.as_ref() {
         let (path, source_override) = match desc {
-            ViewerContextDescriptor::Pdf { path, .. } => (path, None),
+            ViewerContextDescriptor::Pdf { path, .. } => (path.as_path(), None),
             ViewerContextDescriptor::Zip {
                 path,
                 archive_source_override,
                 ..
-            } => (path, archive_source_override.as_deref()),
-            ViewerContextDescriptor::BookFolder { path } => (path, None),
-            ViewerContextDescriptor::Image { path } => (path, None),
+            } => (path.as_path(), archive_source_override.as_deref()),
+            ViewerContextDescriptor::BookFolder { path } => (path.as_path(), None),
+            ViewerContextDescriptor::Image { path } => (path.as_path(), None),
         };
         if matches_key(&crate::adjustment_db::normalize_path(path)) {
             return true;
@@ -12988,6 +13062,10 @@ pub struct App {
     pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
+    /// The mounted visible EPUB owns its lease until this viewer context changes source.
+    pub(crate) display_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
+    /// A fullscreen page from a composite grid can own an EPUB independently of current_folder.
+    pub(crate) fullscreen_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
     pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
@@ -17114,6 +17192,9 @@ impl App {
         let mut app = Self {
             address: String::new(),
             current_folder: None,
+            display_epub_source: None,
+            fullscreen_epub_source: None,
+            #[cfg(windows)]
             normal_folder_omitted_entries: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
@@ -22803,6 +22884,7 @@ impl App {
         self.tx = tx.clone();
         self.rx = rx;
 
+        self.display_epub_source = None;
         self.current_folder = Some(drive_list_synthetic_path());
         self.current_folder_last_mtime = None;
         self.current_folder_signature = None;
@@ -22973,16 +23055,34 @@ impl App {
         &mut self,
         path: PathBuf,
         continuation: ClassifiedOpenContinuation,
-    ) -> bool {
+    ) -> OpenAdmission {
+        if !Self::path_needs_open_classification(&path) {
+            return OpenAdmission::NotApplicable;
+        }
         if self.remote_session_blocks_local_control() {
-            return false;
+            return OpenAdmission::Refused(OpenAdmissionRefusal::RemoteControl);
         }
         if self.document_open_modal_admission_blocked() {
-            return false;
+            return OpenAdmission::Refused(OpenAdmissionRefusal::DocumentOpenBusy);
+        }
+        let candidate_source = match crate::pdf_loader::LeasedEpubPath::try_new(path) {
+            Ok(source) => source,
+            Err(reason) => return OpenAdmission::Refused(reason.into()),
+        };
+        self.start_open_path_classification_owned(candidate_source, continuation)
+    }
+
+    fn start_open_path_classification_owned(
+        &mut self,
+        candidate_source: crate::pdf_loader::LeasedEpubPath,
+        continuation: ClassifiedOpenContinuation,
+    ) -> OpenAdmission {
+        if self.document_open_modal_admission_blocked() {
+            return OpenAdmission::Refused(OpenAdmissionRefusal::DocumentOpenBusy);
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
-        let worker_path = path.clone();
+        let worker_path = candidate_source.to_path_buf();
         let include_convertible = !self.settings.archive_file_handling_ignores_convertible();
         let include_epub = !self.settings.epub_file_handling_ignores_epub();
         let show_hidden = self.settings.show_hidden_files;
@@ -23023,12 +23123,12 @@ impl App {
             })
             .is_err()
         {
-            return false;
+            return OpenAdmission::Refused(OpenAdmissionRefusal::ClassificationWorkerUnavailable);
         }
         let candidate = OpenPathClassification {
             request_id: NEXT_OPEN_PATH_CLASSIFICATION_ID.fetch_add(1, Ordering::Relaxed),
             context: self.projected_viewer_context_id(),
-            path,
+            path: candidate_source,
             cancel,
             rx,
             continuation: Some(Box::new(continuation)),
@@ -23036,7 +23136,7 @@ impl App {
         };
         self.top_level_grid_view
             .set_open_path_classification(Some(candidate));
-        true
+        OpenAdmission::Accepted
     }
 
     fn poll_open_path_classification(&mut self, ctx: &egui::Context) {
@@ -23106,7 +23206,7 @@ impl App {
         let Some(continuation) = candidate.continuation.take() else {
             return;
         };
-        let path = candidate.path.clone();
+        let path = candidate.path.to_path_buf();
         match *continuation {
             ClassifiedOpenContinuation::DirectNavigation {
                 pre_scan,
@@ -23142,25 +23242,33 @@ impl App {
                         .and_then(GridItem::drag_source_path)
                         .is_some_and(|item_path| crate::folder_tree::path_eq(item_path, &path))
                 {
-                    let _ = self.open_grid_item_in_detached_book_context_classified(
+                    // The classified candidate already owns the EPUB lease; a false result
+                    // means this grid item has no detached plan after the async handoff.
+                    if !self.open_grid_item_in_detached_book_context_classified(
                         ctx,
                         index,
                         auto_fullscreen,
                         Some(kind),
-                    );
+                    ) {
+                        crate::logger::log("classified detached grid open: no applicable plan");
+                    }
                 }
             }
             ClassifiedOpenContinuation::SmartGrid {
                 index,
                 auto_fullscreen,
             } => {
-                let _ = self.begin_smart_grid_container_navigation_classified(
+                // This continuation has no synchronous caller to resume. The Smart route
+                // reports lease refusal itself; false also covers a stale view transition.
+                if !self.begin_smart_grid_container_navigation_classified(
                     index,
                     path,
                     auto_fullscreen,
                     kind,
                     folder_scan.take(),
-                );
+                ) {
+                    crate::logger::log("classified smart grid open: request not adopted");
+                }
             }
             ClassifiedOpenContinuation::Direct {
                 auto_fullscreen,
@@ -23222,24 +23330,32 @@ impl App {
                 intent,
                 dfs_continuation,
             } => {
-                let _ = self.start_physical_history_transition_classified(
+                // A stale history head is intentionally discarded; lease refusal is reported
+                // by the classified transition before it returns false.
+                if !self.start_physical_history_transition_classified(
                     intent,
                     path,
                     dfs_continuation,
                     Some(kind),
-                );
+                ) {
+                    crate::logger::log("classified physical history: request not adopted");
+                }
             }
             ClassifiedOpenContinuation::Collection {
                 target,
                 intent,
                 return_to,
             } => {
-                let _ = self.start_collection_history_transition_classified(
+                // The history transition reports EPUB admission refusal and may also reject
+                // a superseded collection revision after asynchronous classification.
+                if !self.start_collection_history_transition_classified(
                     target,
                     intent,
                     return_to,
                     Some(kind),
-                );
+                ) {
+                    crate::logger::log("classified collection history: request not adopted");
+                }
             }
         }
     }
@@ -23335,7 +23451,12 @@ impl App {
             FolderOpenRefusal::EpubIgnoredBySetting => {
                 self.show_feedback_toast("設定により EPUB を無視しています".into());
             }
+            FolderOpenRefusal::Admission(reason) => self.show_open_admission_refusal(reason),
         }
+    }
+
+    pub(crate) fn show_open_admission_refusal(&mut self, reason: OpenAdmissionRefusal) {
+        self.show_feedback_toast(reason.message().into());
     }
 
     fn report_pdf_open_refusal(
@@ -23360,7 +23481,7 @@ impl App {
         pane_epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
     ) {
         if Self::path_needs_open_classification(&path) {
-            let _ = self.start_open_path_classification(
+            match self.start_open_path_classification(
                 path,
                 ClassifiedOpenContinuation::DirectNavigation {
                     pre_scan,
@@ -23368,7 +23489,15 @@ impl App {
                     history_nav_rollback,
                     pane_epub_restore,
                 },
-            );
+            ) {
+                OpenAdmission::Accepted => {}
+                OpenAdmission::Refused(reason) => {
+                    self.show_open_admission_refusal(reason);
+                }
+                OpenAdmission::NotApplicable => {
+                    unreachable!("the path was checked before classification")
+                }
+            }
             return;
         }
         self.open_direct_navigation_target_classified(
@@ -23559,16 +23688,21 @@ impl App {
             return FolderOpenOutcome::Ignored;
         }
         if Self::path_needs_open_classification(&path) {
-            return if self.start_open_path_classification(
+            return match self.start_open_path_classification(
                 path.clone(),
                 ClassifiedOpenContinuation::Direct {
                     auto_fullscreen,
                     owner,
                 },
             ) {
-                FolderOpenOutcome::Classifying
-            } else {
-                FolderOpenOutcome::Ignored
+                OpenAdmission::Accepted => FolderOpenOutcome::Classifying,
+                OpenAdmission::Refused(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(reason))
+                }
+                OpenAdmission::NotApplicable => {
+                    unreachable!("the path was checked before classification")
+                }
             };
         }
         self.load_folder_or_convert_archive_with_auto_fullscreen_classified(
@@ -23834,7 +23968,7 @@ impl App {
             );
         }
         if Self::path_needs_open_classification(&path) {
-            return if self.start_open_path_classification(
+            return match self.start_open_path_classification(
                 path,
                 ClassifiedOpenContinuation::DirectScan {
                     pre_scan,
@@ -23842,9 +23976,14 @@ impl App {
                     grid_effects,
                 },
             ) {
-                FolderOpenOutcome::Classifying
-            } else {
-                FolderOpenOutcome::Ignored
+                OpenAdmission::Accepted => FolderOpenOutcome::Classifying,
+                OpenAdmission::Refused(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(reason))
+                }
+                OpenAdmission::NotApplicable => {
+                    unreachable!("the path was checked before classification")
+                }
             };
         }
         self.load_folder_with_scan_owned_outcome_and_effects_classified(
@@ -27252,14 +27391,23 @@ impl App {
         if let FolderNavHistoryTarget::CollectionPhysical(child) = &target
             && Self::path_needs_open_classification(&child.visible_path)
         {
-            return self.start_open_path_classification(
+            return match self.start_open_path_classification(
                 child.visible_path.clone(),
                 ClassifiedOpenContinuation::Collection {
                     target,
                     intent,
                     return_to,
                 },
-            );
+            ) {
+                OpenAdmission::Accepted => true,
+                OpenAdmission::Refused(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    false
+                }
+                OpenAdmission::NotApplicable => {
+                    unreachable!("the path was checked before classification")
+                }
+            };
         }
         self.start_collection_history_transition_classified(target, intent, return_to, None)
     }
@@ -27298,6 +27446,20 @@ impl App {
                 return false;
             }
         }
+        let target_owner = match &target {
+            FolderNavHistoryTarget::CollectionPhysical(child)
+                if classified_kind != Some(OpenPathKind::Directory) =>
+            {
+                match crate::pdf_loader::LeasedEpubPath::try_new(child.visible_path.clone()) {
+                    Ok(owner) => Some(owner),
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason.into());
+                        return false;
+                    }
+                }
+            }
+            _ => None,
+        };
         let Ok(prepare) = self.start_collection_history_prepare(root) else {
             return false;
         };
@@ -27326,6 +27488,7 @@ impl App {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
             target,
+            target_owner,
             classified_kind,
             history_before: self.folder_nav_history_snapshot(),
             source_context: self.projected_viewer_context_id(),
@@ -27440,13 +27603,22 @@ impl App {
             return false;
         }
         if Self::path_needs_open_classification(&path) {
-            return self.start_open_path_classification(
+            return match self.start_open_path_classification(
                 path.clone(),
                 ClassifiedOpenContinuation::Physical {
                     intent,
                     dfs_continuation,
                 },
-            );
+            ) {
+                OpenAdmission::Accepted => true,
+                OpenAdmission::Refused(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    false
+                }
+                OpenAdmission::NotApplicable => {
+                    unreachable!("the path was checked before classification")
+                }
+            };
         }
         self.start_physical_history_transition_classified(intent, path, dfs_continuation, None)
     }
@@ -27467,6 +27639,17 @@ impl App {
             self.show_pdf_open_refusal(reason);
             return false;
         }
+        let path_owner = if classified_kind == Some(OpenPathKind::Directory) {
+            None
+        } else {
+            match crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) {
+                Ok(owner) => Some(owner),
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason.into());
+                    return false;
+                }
+            }
+        };
         let Ok(preflight) = self.start_physical_history_preflight(path.clone(), None) else {
             return false;
         };
@@ -27498,6 +27681,7 @@ impl App {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
             path,
+            path_owner,
             classified_kind,
             phase: PhysicalHistoryPhase::Preflighting {
                 preflight,
@@ -27965,9 +28149,16 @@ impl App {
                             let CollectionHistoryPhase::ChildPreflighting { prepared, target, .. } =
                                 std::mem::replace(&mut request.phase, CollectionHistoryPhase::Finished)
                             else { unreachable!() };
-                            self.pdf_password_request = Some(PdfPasswordRequest::staged_history(
+                            let password_request = match PdfPasswordRequest::staged_history(
                                 target.visible_path.clone(), request.request_id,
-                            ));
+                            ) {
+                                Ok(request) => request,
+                                Err(reason) => {
+                                    self.show_open_admission_refusal(reason);
+                                    return;
+                                }
+                            };
+                            self.pdf_password_request = Some(password_request);
                             self.pdf_password_error = None;
                             request.phase = CollectionHistoryPhase::ChildPdfPassword { prepared, target };
                             self.top_level_grid_view.set_history_navigation_transition(Some(
@@ -28282,10 +28473,17 @@ impl App {
                         payload,
                         collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired
                     ) {
-                        self.pdf_password_request = Some(PdfPasswordRequest::staged_history(
+                        let password_request = match PdfPasswordRequest::staged_history(
                             request.path.clone(),
                             request.request_id,
-                        ));
+                        ) {
+                            Ok(request) => request,
+                            Err(reason) => {
+                                self.show_open_admission_refusal(reason);
+                                return;
+                            }
+                        };
+                        self.pdf_password_request = Some(password_request);
                         self.pdf_password_error = None;
                         request.phase = PhysicalHistoryPhase::PdfPassword;
                         self.top_level_grid_view
@@ -30328,6 +30526,7 @@ impl App {
         {
             self.archive_source_override = None;
         }
+        self.display_epub_source = None;
         self.current_folder = Some(zip_path.clone());
         self.current_folder_rating_cache = None;
         self.current_folder_last_mtime = None;
@@ -31453,6 +31652,7 @@ impl App {
                         auto_fullscreen: false,
                     },
                     path,
+                    path_owner: None,
                     classified_kind: Some(OpenPathKind::File),
                     phase: PhysicalHistoryPhase::Preflighting {
                         preflight,
@@ -31512,9 +31712,14 @@ impl App {
         )
     }
 
-    fn prepare_pdf_visible_adoption(&mut self, pdf_path: &Path) {
-        if !self.smart_folder_session_owns_load(pdf_path) {
-            self.transition_favorite_view_for_path(Some(pdf_path));
+    /// The adoption destination is the logical book. Smart Folder's Save PDF continuation
+    /// reads the sibling PDF but remains at its EPUB child until that session is left.
+    fn prepare_pdf_visible_adoption(
+        &mut self,
+        logical_location: &crate::pdf_loader::LeasedEpubPath,
+    ) {
+        if !self.smart_folder_session_owns_load(logical_location.as_path()) {
+            self.transition_favorite_view_for_path(Some(logical_location.as_path()));
         }
         #[cfg(windows)]
         if self.should_preserve_active_detached_image_window_for_main_context_change() {
@@ -31595,6 +31800,14 @@ impl App {
         if let Some(reason) = self.pdf_open_refusal(&pdf_path) {
             return self.report_pdf_open_refusal(&pdf_path, reason);
         }
+        let candidate_source = match crate::pdf_loader::LeasedEpubPath::try_new(pdf_path.clone()) {
+            Ok(source) => source,
+            Err(reason) => {
+                let reason = OpenAdmissionRefusal::from(reason);
+                self.show_open_admission_refusal(reason);
+                return FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(reason));
+            }
+        };
         let mut previous_pdf_enumerate = self.pdf_enumerate_pending.take();
         let mut retained_source = None;
         if let Some(previous) = previous_pdf_enumerate.as_mut() {
@@ -31637,7 +31850,7 @@ impl App {
             pdf_path.display()
         ));
         if prepared_pages.is_some() {
-            self.prepare_pdf_visible_adoption(&pdf_path);
+            self.prepare_pdf_visible_adoption(&candidate_source);
         }
 
         // 同じ PDF の再 open では、旧 handle を新しい waiter の登録まで保持する。
@@ -31646,7 +31859,9 @@ impl App {
         // ZIP 側 pending も一緒に捨てる (ZIP → PDF 遷移時の取り残し防止、Codex P2)。
         if previous_pdf_enumerate
             .as_ref()
-            .is_some_and(|(path, _, _, _, _, _)| !crate::path_key::eq_keep_drive(path, &pdf_path))
+            .is_some_and(|(path, _, _, _, _, _, _)| {
+                !crate::path_key::eq_keep_drive(path, &pdf_path)
+            })
         {
             previous_pdf_enumerate = None;
         }
@@ -31683,7 +31898,7 @@ impl App {
             password_override.or_else(|| self.pdf_open_password(&pdf_path));
         if previous_pdf_enumerate
             .as_ref()
-            .is_some_and(|(_, previous_password, _, _, _, _)| previous_password != &password)
+            .is_some_and(|(_, previous_password, _, _, _, _, _)| previous_password != &password)
         {
             // 同じ path でも password が違えば別 request。旧 source はここで cancel する。
             previous_pdf_enumerate = None;
@@ -31763,6 +31978,7 @@ impl App {
                     _,
                     _,
                     PdfOpenPhase::CommittedVerification { placeholder_count },
+                    _,
                 )) = self.pdf_enumerate_pending.as_ref()
                 {
                     self.pdf_placeholder_count = Some(*placeholder_count);
@@ -31770,7 +31986,7 @@ impl App {
                 return FolderOpenOutcome::Ignored;
             }
             self.finish_direct_pdf_visible_adoption(&pdf_path, &owner);
-            self.prepare_pdf_visible_adoption(&pdf_path);
+            self.prepare_pdf_visible_adoption(&candidate_source);
             let (items, image_metas, existing_keys) =
                 Self::build_pdf_meta_placeholder_rows(&pdf_path, page_count, mtime, file_size);
             self.start_loading_items(
@@ -31809,6 +32025,7 @@ impl App {
             Box::new(owner),
             open_restore,
             phase,
+            candidate_source,
         ));
         // 同じ key なら新 handle が既に waiter として登録済みなので、ここで旧 handle を
         // drop しても source request は継続する。
@@ -31981,10 +32198,14 @@ impl App {
 
         let is_epub = pdf_stamp_policy_for_path(pdf_path)
             == crate::thumb_loader::PdfStampPolicy::ResolveInWorker;
-        let (lookup_mtime, lookup_size, mtime, file_size) = if is_epub {
+        let epub_read = if is_epub {
             // The pinned table is memory-only. An unpinned book needs DB and source I/O,
             // so it waits for the normal background enumeration instead.
-            let read = crate::pdf_loader::pinned_epub_target(pdf_path)?;
+            Some(crate::pdf_loader::pinned_epub_target(pdf_path)?)
+        } else {
+            None
+        };
+        let (lookup_mtime, lookup_size, mtime, file_size) = if let Some(read) = epub_read.as_ref() {
             let (id, size) = read.stamp.generation_catalog_pair()?;
             let source = read.display_source_state?;
             const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
@@ -32284,7 +32505,7 @@ impl App {
         if self.sidecar_restore_active() {
             return;
         }
-        let Some((ref pdf_path, _, ref handle, _, _, ref phase)) = self.pdf_enumerate_pending
+        let Some((ref pdf_path, _, ref handle, _, _, ref phase, _)) = self.pdf_enumerate_pending
         else {
             return;
         };
@@ -32361,7 +32582,7 @@ impl App {
             }
         };
 
-        let (pdf_path, password, _handle, owner, mut open_restore, phase) =
+        let (pdf_path, password, _handle, owner, mut open_restore, phase, candidate_source) =
             self.pdf_enumerate_pending.take().unwrap();
 
         // cancel 経由の Interrupted は late-arriving な stale 結果なので適用しない
@@ -32410,8 +32631,16 @@ impl App {
                     }
                     self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
                 }
-                drop(phase);
-                self.prepare_pdf_visible_adoption(&pdf_path);
+                match phase {
+                    PdfOpenPhase::ColdCandidate { retained_source } => {
+                        drop(retained_source);
+                        self.prepare_pdf_visible_adoption(&candidate_source);
+                    }
+                    PdfOpenPhase::CommittedVerification { .. } => {
+                        // The placeholder grid has already adopted this PDF and started
+                        // its thumbnail workers. Verification must not cancel them.
+                    }
+                }
                 self.finish_pdf_enumerate_success(pdf_path, password, pages);
             }
             Err(e) => {
@@ -32479,10 +32708,17 @@ impl App {
                             crate::empty_items_reason::EmptyItemsReason::PdfPasswordRequired,
                         );
                     }
-                    self.pdf_password_request = Some(match open_restore {
+                    let password_request = match open_restore {
                         Some(restore) => PdfPasswordRequest::direct(pdf_path, *owner, restore),
-                        None => PdfPasswordRequest::legacy(pdf_path),
-                    });
+                        None => PdfPasswordRequest::try_legacy(pdf_path),
+                    };
+                    self.pdf_password_request = match password_request {
+                        Ok(request) => Some(request),
+                        Err(reason) => {
+                            self.show_open_admission_refusal(reason);
+                            return;
+                        }
+                    };
                     self.pdf_password_input.clear();
                     // password が渡されていた = 入力済みのパスワードが誤っていた
                     self.pdf_password_error = if password.is_some() {
@@ -32551,7 +32787,7 @@ impl App {
             self.with_viewer_context_ref(id, |context| {
                 context
                     .pdf_password_request()
-                    .map(|request| request.path.clone())
+                    .map(|request| request.path.to_path_buf())
             })
             .flatten()
         }) {
@@ -32559,7 +32795,7 @@ impl App {
         }
         self.pdf_password_request
             .as_ref()
-            .map(|request| request.path.clone())
+            .map(|request| request.path.to_path_buf())
             .or_else(|| self.smart_pdf_password_dialog_path())
     }
 
@@ -32659,10 +32895,11 @@ impl App {
                     return false;
                 }
                 self.pdf_current_password = Some(password.clone());
-                self.pdf_password_pending_save = save.then(|| (request.path.clone(), password));
+                self.pdf_password_pending_save =
+                    save.then(|| (request.path.to_path_buf(), password));
                 self.resume_fs_navigation_sequence_after_password();
-                let outcome =
-                    self.load_pdf_as_folder_owned(request.path.clone(), continuation.open_owner);
+                let outcome = self
+                    .load_pdf_as_folder_owned(request.path.to_path_buf(), continuation.open_owner);
                 if !matches!(outcome, FolderOpenOutcome::Loaded) {
                     self.pdf_password_pending_save = None;
                     self.restore_epub_open(continuation.restore);
@@ -32694,9 +32931,11 @@ impl App {
             return false;
         }
         self.pdf_current_password = Some(password.clone());
-        self.pdf_password_pending_save = save.then(|| (request.path.clone(), password));
+        self.pdf_password_pending_save = save.then(|| (request.path.to_path_buf(), password));
         self.resume_fs_navigation_sequence_after_password();
-        match self.load_pdf_as_folder_owned(request.path, OpenRequestOwner::Navigation) {
+        match self
+            .load_pdf_as_folder_owned(request.path.to_path_buf(), OpenRequestOwner::Navigation)
+        {
             FolderOpenOutcome::Loaded
             | FolderOpenOutcome::Classifying
             | FolderOpenOutcome::ConversionDialogOpened => true,
@@ -33270,6 +33509,29 @@ impl App {
                 Some((*logical_source).to_path_buf())
             }
         };
+        // Acquire the new visible owner's lease while the staged owner still exists.
+        // A failed acquisition means deletion won the coordinator before this install.
+        let visible_logical = smart_open_path.as_deref().unwrap_or(&source_path);
+        let display_epub_source = if items.iter().any(|item| {
+            matches!(item, GridItem::PdfPage { pdf_path, .. }
+                if crate::folder_tree::path_eq(pdf_path, visible_logical))
+        }) {
+            let source =
+                match crate::pdf_loader::LeasedEpubPath::try_new(visible_logical.to_path_buf()) {
+                    Ok(source) => source,
+                    Err(reason) => {
+                        crate::logger::log(format!(
+                            "epub open: visible install deferred by cache deletion: {}",
+                            visible_logical.display()
+                        ));
+                        self.show_open_admission_refusal(reason.into());
+                        return;
+                    }
+                };
+            source.has_epub_lease().then_some(source)
+        } else {
+            None
+        };
         let preserve_smart_folder_session = match &authority {
             VisibleInstallAuthority::Ordinary | VisibleInstallAuthority::StagedArchive { .. } => {
                 !detached_physical
@@ -33365,7 +33627,7 @@ impl App {
         // enumerate pending を無効化する。放置すると遅れて届いた結果を
         // `poll_pdf_enumerate` が適用して現在表示を古い PDF 仮想フォルダに戻す。
         // pending.Drop で自動 cancel されるので take するだけでよい。
-        if let Some((pending_path, _, _, _, _, _)) = self.pdf_enumerate_pending.as_ref() {
+        if let Some((pending_path, _, _, _, _, _, _)) = self.pdf_enumerate_pending.as_ref() {
             if pending_path != &source_path {
                 self.pdf_enumerate_pending = None;
                 self.fs_nav_after_pdf_enumerate = None;
@@ -33504,6 +33766,7 @@ impl App {
         crate::perf::emit_ms("nav", "sli_nav_cancel", sli_seq, cancel_t0);
 
         let assign_t0 = std::time::Instant::now();
+        self.display_epub_source = display_epub_source;
         self.current_folder = Some(source_path.clone());
         if let Some(logical_path) = smart_open_path.as_deref()
             && !crate::folder_tree::path_eq(logical_path, &source_path)
@@ -37546,6 +37809,22 @@ impl App {
                     fullscreen_neighbor_after_removal(&self.items, slid)
                 }
             };
+            if let Some(idx) = self.fullscreen_idx {
+                match self.try_own_fullscreen_epub_at(idx) {
+                    OpenAdmission::Accepted => {}
+                    OpenAdmission::NotApplicable => {
+                        self.fullscreen_idx = None;
+                        self.fullscreen_epub_source = None;
+                    }
+                    OpenAdmission::Refused(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        self.fullscreen_idx = None;
+                        self.fullscreen_epub_source = None;
+                    }
+                }
+            } else {
+                self.fullscreen_epub_source = None;
+            }
         }
         // 音声モード系の idx-keyed 状態は対象アイテムが残存したときだけ追随し、消えたら畳む
         // (fullscreen_idx と同じ p で shift されるので、残存時は相互一致が保たれる)。
@@ -41950,6 +42229,8 @@ impl App {
                 }
             },
         )
+        // The pending bookmark already owns the EPUB lease. None here is a loading-context
+        // build/resolve result, not an EPUB admission refusal; the caller clears its return state.
         .is_some()
     }
 
@@ -41970,10 +42251,18 @@ impl App {
         if let crate::bookmark_browser::BookmarkRowSource::Book(bookmark) = &row.source
             && Self::path_needs_open_classification(&bookmark.container_path)
         {
-            let _ = self.start_open_path_classification(
+            match self.start_open_path_classification(
                 bookmark.container_path.clone(),
                 ClassifiedOpenContinuation::BookmarkRow(Box::new(row.clone())),
-            );
+            ) {
+                OpenAdmission::Accepted => {}
+                OpenAdmission::Refused(reason) => {
+                    self.show_open_admission_refusal(reason);
+                }
+                OpenAdmission::NotApplicable => {
+                    unreachable!("the path was checked before classification")
+                }
+            }
             return;
         }
         self.open_bookmark_browser_row_classified(ctx, row);
@@ -42056,6 +42345,15 @@ impl App {
                 );
             }
             crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => {
+                let bookmark_source = match crate::pdf_loader::LeasedEpubPath::try_new(
+                    bookmark.container_path.clone(),
+                ) {
+                    Ok(source) => source,
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason.into());
+                        return;
+                    }
+                };
                 let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(
                     bookmark.container_path.clone(),
                 );
@@ -42073,6 +42371,7 @@ impl App {
                     crate::bookmark_browser::PendingBookOpen {
                         request_id,
                         bookmark: bookmark.clone(),
+                        bookmark_source,
                         relative_page_provenance: row.relative_page_provenance.clone(),
                         started_at: std::time::Instant::now(),
                         stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
@@ -47704,6 +48003,7 @@ impl App {
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
         self.pending_grid_scroll = None;
+        self.display_epub_source = None;
         self.current_folder = None;
         self.archive_source_override = None;
         self.address = destination_label;
@@ -49249,6 +49549,9 @@ impl App {
                         FolderOpenOutcome::Refused(FolderOpenRefusal::EpubIgnoredBySetting) => {
                             "epub_ignored"
                         }
+                        FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(_)) => {
+                            "open_admission_refused"
+                        }
                         FolderOpenOutcome::Loaded => "done",
                     };
                     emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
@@ -49303,6 +49606,9 @@ impl App {
                             FolderOpenOutcome::Ignored => "open_ignored",
                             FolderOpenOutcome::Refused(FolderOpenRefusal::EpubIgnoredBySetting) => {
                                 "epub_ignored"
+                            }
+                            FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(_)) => {
+                                "open_admission_refused"
                             }
                             FolderOpenOutcome::Loaded => "done",
                         };
@@ -50509,27 +50815,59 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_viewer_context_descriptor_for_idx(
+    fn detached_pdf_descriptor(
+        path: &Path,
+        page_num: Option<u32>,
+    ) -> DetachedBuild<ViewerContextDescriptor> {
+        match crate::pdf_loader::LeasedEpubPath::try_new(path.to_path_buf()) {
+            Ok(path) => DetachedBuild::Built(ViewerContextDescriptor::Pdf { path, page_num }),
+            Err(reason) => DetachedBuild::Refused(reason.into()),
+        }
+    }
+
+    /// All GridItem kinds enter this one descriptor decision. An EPUB refusal
+    /// stays distinct from a kind that the ordinary grid open should handle.
+    #[cfg(windows)]
+    fn detached_grid_descriptor(
         &self,
         idx: usize,
-    ) -> Option<ViewerContextDescriptor> {
-        match self.items.get(idx)? {
-            GridItem::Image(path) => Some(ViewerContextDescriptor::Image { path: path.clone() }),
-            GridItem::PdfPage {
+        auto_fullscreen: bool,
+    ) -> DetachedBuild<ViewerContextDescriptor> {
+        match self.items.get(idx) {
+            Some(GridItem::Image(path)) => {
+                DetachedBuild::Built(ViewerContextDescriptor::Image { path: path.clone() })
+            }
+            Some(GridItem::PdfPage {
                 pdf_path, page_num, ..
-            } => Some(ViewerContextDescriptor::Pdf {
-                path: pdf_path.clone(),
-                page_num: Some(*page_num),
-            }),
-            GridItem::ZipImage {
+            }) => Self::detached_pdf_descriptor(pdf_path, Some(*page_num)),
+            Some(GridItem::ZipImage {
                 zip_path,
                 entry_name,
-            } => Some(ViewerContextDescriptor::Zip {
+            }) => DetachedBuild::Built(ViewerContextDescriptor::Zip {
                 path: zip_path.clone(),
                 entry_name: Some(entry_name.clone()),
                 archive_source_override: self.archive_source_override.clone(),
             }),
-            _ => None,
+            Some(GridItem::PdfFile(path)) => {
+                let descriptor = Self::detached_pdf_descriptor(path, None);
+                if auto_fullscreen {
+                    descriptor
+                } else {
+                    match descriptor {
+                        DetachedBuild::Built(_) => DetachedBuild::NotApplicable,
+                        DetachedBuild::NotApplicable => unreachable!("PDF has a descriptor"),
+                        DetachedBuild::Refused(reason) => DetachedBuild::Refused(reason),
+                    }
+                }
+            }
+            Some(GridItem::ZipFile(path)) if auto_fullscreen => {
+                DetachedBuild::Built(ViewerContextDescriptor::Zip {
+                    path: path.clone(),
+                    entry_name: None,
+                    archive_source_override: None,
+                })
+            }
+            _ => DetachedBuild::NotApplicable,
         }
     }
 
@@ -50540,27 +50878,8 @@ impl App {
     pub(crate) fn parked_still_reopen_descriptor_for_idx(
         &self,
         idx: usize,
-    ) -> Option<ViewerContextDescriptor> {
-        self.detached_viewer_context_descriptor_for_idx(idx)
-    }
-
-    #[cfg(windows)]
-    fn detached_book_context_descriptor_for_grid_idx(
-        &self,
-        idx: usize,
-    ) -> Option<ViewerContextDescriptor> {
-        match self.items.get(idx)? {
-            GridItem::PdfFile(path) => Some(ViewerContextDescriptor::Pdf {
-                path: path.clone(),
-                page_num: None,
-            }),
-            GridItem::ZipFile(path) => Some(ViewerContextDescriptor::Zip {
-                path: path.clone(),
-                entry_name: None,
-                archive_source_override: None,
-            }),
-            _ => None,
-        }
+    ) -> DetachedBuild<ViewerContextDescriptor> {
+        self.detached_grid_descriptor(idx, false)
     }
 
     #[cfg(windows)]
@@ -50572,7 +50891,7 @@ impl App {
                 path,
                 page_num: Some(page_num),
             } => Some(crate::snapshot::SnapshotTarget::PdfPage {
-                pdf_path: path.clone(),
+                pdf_path: (**path).clone(),
                 page_num: *page_num,
             }),
             ViewerContextDescriptor::Zip {
@@ -53549,6 +53868,7 @@ impl App {
                 // park してしまう (2026-07-09 実機 2 件目: 動画窓に画像が表示・点滅)。
                 // live-media park (park_current_viewer_context_as_live_media_inner 末尾) と
                 // 同じ後始末で main を非 detached へ戻す。
+                self.fullscreen_epub_source = None;
                 self.fullscreen_idx = None;
                 self.viewer_presentation = self.non_detached_viewer_presentation();
                 self.detached_viewer_independent_active = false;
@@ -53922,7 +54242,7 @@ impl App {
                 FolderOpenOutcome::Loaded
             }
             ViewerContextDescriptor::Pdf { path, .. } => {
-                self.load_pdf_as_folder_owned(path, OpenRequestOwner::Navigation)
+                self.load_pdf_as_folder_owned((*path).clone(), OpenRequestOwner::Navigation)
             }
             ViewerContextDescriptor::BookFolder { path } => {
                 self.start_detached_folder_open(path);
@@ -54152,27 +54472,13 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_book_context_descriptor_for_grid_item(
-        &self,
-        idx: usize,
-        auto_fullscreen: bool,
-    ) -> Option<ViewerContextDescriptor> {
-        if auto_fullscreen {
-            if let Some(descriptor) = self.detached_book_context_descriptor_for_grid_idx(idx) {
-                return Some(descriptor);
-            }
-        }
-        self.detached_viewer_context_descriptor_for_idx(idx)
-    }
-
-    #[cfg(windows)]
     fn detached_grid_item_open_plan(
         &self,
         idx: usize,
         auto_fullscreen: bool,
-    ) -> Option<DetachedGridItemOpenPlan> {
+    ) -> DetachedBuild<DetachedGridItemOpenPlan> {
         if !self.settings.detached_viewer_open_images_in_window {
-            return None;
+            return DetachedBuild::NotApplicable;
         }
         if matches!(self.items.get(idx), Some(GridItem::Image(_)))
             && self
@@ -54185,28 +54491,30 @@ impl App {
                     )
                 })
         {
-            return Some(self.detached_collection_root_image_open_plan(idx).map_or(
-                DetachedGridItemOpenPlan::CollectionRootUnavailable,
-                DetachedGridItemOpenPlan::CollectionRootImage,
-            ));
+            return DetachedBuild::Built(
+                self.detached_collection_root_image_open_plan(idx).map_or(
+                    DetachedGridItemOpenPlan::CollectionRootUnavailable,
+                    DetachedGridItemOpenPlan::CollectionRootImage,
+                ),
+            );
         }
         if auto_fullscreen && let Some(GridItem::Folder(path)) = self.items.get(idx) {
             // Ctrl+G drill folders are navigation nodes, not physical book containers.
             if self.global_search.active && self.global_search.drill.is_some() {
-                return None;
+                return DetachedBuild::NotApplicable;
             }
-            return Some(DetachedGridItemOpenPlan::FolderCandidate {
+            return DetachedBuild::Built(DetachedGridItemOpenPlan::FolderCandidate {
                 path: path.clone(),
                 collection_owner: self.collection_grid_physical_load_owner(idx, path),
             });
         }
         if let Some(GridItem::ConvertibleArchive { path, .. }) = self.items.get(idx) {
-            return Some(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
+            return DetachedBuild::Built(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
                 path: path.clone(),
                 collection_restore: self.collection_grid_restore_for_source(idx, path),
             });
         }
-        self.detached_book_context_descriptor_for_grid_item(idx, auto_fullscreen)
+        self.detached_grid_descriptor(idx, auto_fullscreen)
             .map(|descriptor| {
                 let collection_restore = self
                     .items
@@ -54389,14 +54697,30 @@ impl App {
             && Self::path_needs_open_classification(path)
         {
             let path = path.to_path_buf();
-            return self.start_open_path_classification(
-                path,
+            let admission = match crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) {
+                Ok(source) => source,
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason.into());
+                    return true;
+                }
+            };
+            return match self.start_open_path_classification_owned(
+                admission,
                 ClassifiedOpenContinuation::DetachedGrid {
                     index: idx,
                     items_generation: self.items_generation,
                     auto_fullscreen,
                 },
-            );
+            ) {
+                OpenAdmission::Accepted => true,
+                OpenAdmission::Refused(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    true
+                }
+                OpenAdmission::NotApplicable => {
+                    unreachable!("the path was checked before classification")
+                }
+            };
         }
         self.open_grid_item_in_detached_book_context_classified(ctx, idx, auto_fullscreen, None)
     }
@@ -54417,11 +54741,17 @@ impl App {
                     path: path.to_path_buf(),
                     collection_owner: self.collection_grid_physical_load_owner(idx, path),
                 })
+                .map_or(DetachedBuild::NotApplicable, DetachedBuild::Built)
         } else {
             self.detached_grid_item_open_plan(idx, auto_fullscreen)
         };
-        let Some(plan) = plan else {
-            return false;
+        let plan = match plan {
+            DetachedBuild::Built(plan) => plan,
+            DetachedBuild::NotApplicable => return false,
+            DetachedBuild::Refused(reason) => {
+                self.show_open_admission_refusal(reason);
+                return true;
+            }
         };
 
         let descriptor = match plan {
@@ -55506,6 +55836,13 @@ impl App {
             None
         };
         let Some((base_texture, rotation)) = captured_primary.or(resolved_current) else {
+            let descriptor_kind = match self.detached_grid_descriptor(idx, false) {
+                DetachedBuild::Built(descriptor) => {
+                    Self::detached_viewer_descriptor_debug_kind(&Some(descriptor))
+                }
+                DetachedBuild::NotApplicable => "none",
+                DetachedBuild::Refused(_) => "refused",
+            };
             self.log_detached_image_window_debug(format!(
                 "build_active_snapshot_failed reason=no_display_texture idx={idx} \
                  window_id={:?} current_pending={} pending={} \
@@ -55518,9 +55855,7 @@ impl App {
                     self.thumbnails.get(idx),
                     Some(crate::grid_item::ThumbnailState::Loaded { .. })
                 ),
-                Self::detached_viewer_descriptor_debug_kind(
-                    &self.detached_viewer_context_descriptor_for_idx(idx)
-                ),
+                descriptor_kind,
                 self.viewer_sync_stamp_for_idx(idx).is_some()
             ));
             return None;
@@ -55628,10 +55963,18 @@ impl App {
             paged_display_unit.as_ref(),
         );
         let reopen_collection_root = self.detached_collection_root_image_open_plan(idx);
-        let reopen_descriptor = reopen_collection_root
-            .is_none()
-            .then(|| self.parked_still_reopen_descriptor_for_idx(idx))
-            .flatten();
+        let reopen_descriptor = if reopen_collection_root.is_some() {
+            None
+        } else {
+            match self.parked_still_reopen_descriptor_for_idx(idx) {
+                DetachedBuild::Built(descriptor) => Some(descriptor),
+                DetachedBuild::NotApplicable => None,
+                DetachedBuild::Refused(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    return None;
+                }
+            }
+        };
         let reopen_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
         self.log_detached_image_window_debug(format!(
             "build_active_snapshot_ok id={id} idx={idx} \
@@ -55783,6 +56126,7 @@ impl App {
         self.update_detached_window_runtime_flags(snapshot_id, false, reason);
         self.handoff_active_detached_viewport_to_passive(reason);
         self.transition_detached_window_state(snapshot_id, DetachedWindowState::ParkedLive, reason);
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.detached_viewer_independent_active = false;
@@ -55911,6 +56255,7 @@ impl App {
         self.update_detached_window_runtime_flags(snapshot_id, false, reason);
         self.handoff_active_detached_viewport_to_passive(reason);
         self.transition_detached_window_state(snapshot_id, DetachedWindowState::ParkedLive, reason);
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.detached_viewer_independent_active = false;
@@ -56133,6 +56478,7 @@ impl App {
             "promote_detached_video_for_main_context_change",
         );
 
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.detached_viewer_independent_active = false;
@@ -58137,6 +58483,23 @@ impl App {
         }
     }
 
+    pub(crate) fn try_own_fullscreen_epub_at(&mut self, idx: usize) -> OpenAdmission {
+        let path = match self.items.get(idx) {
+            Some(GridItem::PdfPage { pdf_path, .. } | GridItem::PdfFile(pdf_path)) => pdf_path,
+            None => return OpenAdmission::NotApplicable,
+            _ => {
+                self.fullscreen_epub_source = None;
+                return OpenAdmission::Accepted;
+            }
+        };
+        let source = match crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) {
+            Ok(source) => source,
+            Err(reason) => return OpenAdmission::Refused(reason.into()),
+        };
+        self.fullscreen_epub_source = source.has_epub_lease().then_some(source);
+        OpenAdmission::Accepted
+    }
+
     pub(crate) fn open_fullscreen_with_materialization_and_contract(
         &mut self,
         idx: usize,
@@ -58176,6 +58539,15 @@ impl App {
         if routed_materialized_physical_still {
             finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
             return;
+        }
+
+        match self.try_own_fullscreen_epub_at(idx) {
+            OpenAdmission::Accepted => {}
+            OpenAdmission::NotApplicable => return,
+            OpenAdmission::Refused(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
         }
 
         // This is the first common boundary after any cross-viewer routing. Cancel an older
@@ -67067,6 +67439,7 @@ impl App {
                 self.similar_panel.clear_book_history();
             }
         }
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = None;
         // A true viewer close ends ownership of the last painted page layout. Temporary context
         // parking does not enter this teardown and therefore keeps its context-local layout.
@@ -81843,6 +82216,7 @@ impl App {
             return false;
         }
         self.sync_main_selection_from_viewer_idx(next_idx);
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = Some(next_idx);
         self.video_zoom_state = None;
         self.video_audio_mode = None;
