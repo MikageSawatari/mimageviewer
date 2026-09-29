@@ -387,7 +387,8 @@ RAR/7z の `archive_cache` には相乗りせず、**専用の保存先と DB �
 - **待機**: `PeekMessage` + 10ms sleep を `MsgWaitForMultipleObjects` のタイムアウト付き待ちへ替える。
 - **進捗**: 標準出力に 1 行 1 JSON。本体は既存の進捗バーへ流す。
 - **出力**: 本体が指定した `<世代ファイル>.part` へ書く。本体が `verify_converted_pdf` で検証してから §4.4 の手順で公開する。
-- **ユーザーデータフォルダ**: `<temp_root>/epub-<pid>` (materializer の一時領域、`materializer.rs:340-353`)。死んだ PID の掃除 (`:1496-1586`) に含める。
+- **変換レポート**: 本体は `--report` に変換ごとの `TempFolder/report.json` を必ず指定し、キャッシュの世代 PDF や利用者が保存する PDF の隣には置かない。通常変換の `epub_temp_root()/epub-<pid>-<番号>` と「PDF として保存」の `epub_sibling_work/epub-<pid>-<番号>` は終了時に削除し、異常終了後はそれぞれ既存の起動時掃除で死んだ別 PID の作業フォルダを回収する。
+- **ユーザーデータフォルダ**: 通常変換は `epub_temp_root()/epub-<pid>-<番号>/ud`、PDF 保存は `epub_sibling_work/epub-<pid>-<番号>/ud`。死んだ PID の掃除に含める。
 - **子プロセスの後始末 (S1 の合格条件)**: 本体は変換器を `CREATE_SUSPENDED` で起動 → `KILL_ON_JOB_CLOSE` の Job Object へ
   割り当て → 再開する。WebView2 の各 PID が同じ Job に属すること、キャンセル (Job 終了) と本体の強制終了で全プロセスが
   消えることを実測する受入試験を S1 の完了条件にする。成り立たなければ設計を差し戻す (黙った代替策を入れない)。

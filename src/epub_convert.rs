@@ -230,10 +230,43 @@ pub struct WorkerSpec {
     pub native_test_args: Option<Vec<OsString>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum WorkerOperation {
     Inspect,
-    Convert,
+    Convert { report: PathBuf },
+}
+
+#[cfg(any(windows, test))]
+fn worker_arguments(spec: &WorkerSpec) -> Vec<OsString> {
+    let mut args = match &spec.operation {
+        WorkerOperation::Inspect => vec![
+            spec.executable.as_os_str().to_os_string(),
+            OsString::from("inspect"),
+            spec.input.as_os_str().to_os_string(),
+        ],
+        WorkerOperation::Convert { report } => vec![
+            spec.executable.as_os_str().to_os_string(),
+            OsString::from("convert"),
+            spec.input.as_os_str().to_os_string(),
+            spec.output.as_os_str().to_os_string(),
+            OsString::from("--work-dir"),
+            spec.work_dir.as_os_str().to_os_string(),
+            OsString::from("--user-data-dir"),
+            spec.user_data_dir.as_os_str().to_os_string(),
+            OsString::from("--report"),
+            report.as_os_str().to_os_string(),
+            OsString::from("--progress-json"),
+            OsString::from("--timeout-secs"),
+            OsString::from(spec.timeout_secs.to_string()),
+        ],
+    };
+    if let WorkerOperation::Convert { .. } = &spec.operation {
+        if let Some(stem) = &spec.source_stem {
+            args.push(OsString::from("--source-stem"));
+            args.push(stem.clone());
+        }
+    }
+    args
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,7 +547,9 @@ fn run_worker_to_part<S: WorkerSpawner>(
     spawner: &S,
 ) -> Result<(usize, String, String), EpubConvertError> {
     let spec = WorkerSpec {
-        operation: WorkerOperation::Convert,
+        operation: WorkerOperation::Convert {
+            report: temp.path.join("report.json"),
+        },
         executable: worker_executable()?,
         input: source_copy,
         output: part.to_owned(),
@@ -1223,33 +1258,7 @@ mod windows_process {
             )
         }
         .map_err(|error| io::Error::other(error.to_string()))?;
-        let timeout = spec.timeout_secs.to_string();
-        let mut args: Vec<OsString> = match spec.operation {
-            WorkerOperation::Inspect => vec![
-                spec.executable.as_os_str().to_os_string(),
-                OsString::from("inspect"),
-                spec.input.as_os_str().to_os_string(),
-            ],
-            WorkerOperation::Convert => vec![
-                spec.executable.as_os_str().to_os_string(),
-                OsString::from("convert"),
-                spec.input.as_os_str().to_os_string(),
-                spec.output.as_os_str().to_os_string(),
-                OsString::from("--work-dir"),
-                spec.work_dir.as_os_str().to_os_string(),
-                OsString::from("--user-data-dir"),
-                spec.user_data_dir.as_os_str().to_os_string(),
-                OsString::from("--progress-json"),
-                OsString::from("--timeout-secs"),
-                OsString::from(timeout),
-            ],
-        };
-        if matches!(spec.operation, WorkerOperation::Convert) {
-            if let Some(stem) = &spec.source_stem {
-                args.push(OsString::from("--source-stem"));
-                args.push(stem.clone());
-            }
-        }
+        let args = worker_arguments(spec);
         #[cfg(test)]
         let args: Vec<OsString> = if let Some(test_args) = &spec.native_test_args {
             std::iter::once(args[0].clone())
@@ -1410,10 +1419,18 @@ mod tests {
     }
     impl WorkerSpawner for FakeSpawner {
         fn spawn(&self, spec: &WorkerSpec) -> Result<Box<dyn WorkerChild>, EpubConvertError> {
+            let WorkerOperation::Convert { report } = &spec.operation else {
+                panic!("fake converter expected a convert request")
+            };
             assert_eq!(spec.input.file_name().unwrap(), "source.epub");
             assert_eq!(spec.source_stem.as_deref(), self.source.file_stem());
             assert!(spec.work_dir.starts_with(spec.input.parent().unwrap()));
             assert!(spec.user_data_dir.starts_with(spec.input.parent().unwrap()));
+            assert_eq!(report, &spec.input.parent().unwrap().join("report.json"));
+            let args = worker_arguments(spec);
+            assert!(args.windows(2).any(|pair| {
+                pair[0] == OsStr::new("--report") && pair[1] == report.as_os_str()
+            }));
             assert!(spec.environment.iter().all(|(name, _)| {
                 !name
                     .to_string_lossy()
@@ -1423,6 +1440,8 @@ mod tests {
             if !matches!(self.mode, FakeMode::Failure(_) | FakeMode::NoResult) {
                 fs::write(&spec.output, b"%PDF-1.4\nfake").unwrap();
             }
+            // Match the real converter's report write. TempFolder owns this file.
+            fs::write(report, b"{}").unwrap();
             if matches!(
                 self.mode,
                 FakeMode::Cancel | FakeMode::CrashAfterOutput | FakeMode::Failure(6)
@@ -1496,7 +1515,12 @@ mod tests {
 
     impl WorkerSpawner for InspectSpawner {
         fn spawn(&self, spec: &WorkerSpec) -> Result<Box<dyn WorkerChild>, EpubConvertError> {
-            assert!(matches!(spec.operation, WorkerOperation::Inspect));
+            assert!(matches!(&spec.operation, WorkerOperation::Inspect));
+            assert!(
+                !worker_arguments(spec)
+                    .iter()
+                    .any(|arg| arg == OsStr::new("--report"))
+            );
             assert!(
                 spec.input
                     .extension()
@@ -1701,7 +1725,9 @@ mod tests {
     #[test]
     fn sibling_save_without_generation_converts_without_cache_row_and_cleans_part() {
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("book.epub");
+        let library = tmp.path().join("library");
+        fs::create_dir(&library).unwrap();
+        let source = library.join("book.epub");
         fs::write(&source, b"source EPUB bytes").unwrap();
         let fake = FakeSpawner {
             mode: FakeMode::Success,
@@ -1718,6 +1744,15 @@ mod tests {
         .unwrap();
         assert!(!saved.reused_cache);
         assert_eq!(fs::read(&saved.path).unwrap(), b"%PDF-1.4\nfake");
+        let mut neighbors = fs::read_dir(&library)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        neighbors.sort();
+        assert_eq!(
+            neighbors,
+            vec![OsString::from("book.epub"), OsString::from("book.pdf")]
+        );
         assert!(
             EpubCache::open_at(tmp.path())
                 .unwrap()
@@ -2348,6 +2383,11 @@ mod tests {
             .unwrap();
         assert!(row.pdf_file.exists());
         assert_eq!(row.page_count, 1);
+        let generation_files = fs::read_dir(row.pdf_file.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(generation_files, vec![row.pdf_file.clone()]);
         assert!(fs::read_dir(temp_root).unwrap().next().is_none());
     }
 
