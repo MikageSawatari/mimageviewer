@@ -28,7 +28,7 @@ HEIC / HEIF / AVIF / JXL / TIFF は従来どおり WIC のまま。
 
 **範囲に入れる**:
 - 対象拡張子: 現行の 15 種 `dng cr2 cr3 nef nrw arw srf sr2 raf orf rw2 pef ptx rwl iiq`
-  (`src/wic_decoder.rs:64-71`) に、**`crw` (Canon の旧形式) と `srw` (Samsung NX) を加えた 17 種**。
+  (`src/wic_decoder.rs:64-71`) に、**`crw` (Canon の旧形式)・`srw` (Samsung NX)・`3fr` (Hasselblad)・`erf` (Epson)・`kdc` / `dcr` (Kodak)・`mrw` (Minolta)・`mos` (Leaf) を加えた 23 種**。`mef` (Mamiya) は CC0 のサンプルが無く検証できないので入れない
   **DNG も LibRaw へ移す** (「RAW は全部 LibRaw」で説明を一本化)
 - 一覧サムネイル、フルスクリーン、ZIP 内 RAW、書き出し / コピー / 外部ツール、製本、類似画像、
   mIV Remote、360 度・比較・分析などの周辺機能での RAW の扱い
@@ -52,7 +52,7 @@ HEIC / HEIF / AVIF / JXL / TIFF は従来どおり WIC のまま。
 6. **Remote はフル現像を使う** (本体と同じ結果にする) (2026-09-27)
 7. **製本**: 無編集なら元の RAW ファイルをそのまま入れる。何か編集していれば焼き込む。
    PNG 等と同じ規則にする (2026-09-27)
-8. 対象拡張子に `crw` / `srw` を加える (2026-09-27)
+8. 対象拡張子に `crw` / `srw` を加える (2026-09-27)。さらに `3fr` / `erf` / `kdc` / `dcr` / `mrw` / `mos` を加える (2026-09-29。`mef` はサンプルが無いので除外)
 9. フル現像の保持はしない。再処理でよい (2026-09-27)。
    意味: **追加の保持 (LRU・ディスク) を作らない**。既存の keep set (`prefetch_back` / `prefetch_forward`、
    `src/app.rs:60569-60588`) の中で `fs_cache` に残る通常の保持はそのまま (AI の final cache と同じ扱い)
@@ -65,6 +65,13 @@ HEIC / HEIF / AVIF / JXL / TIFF は従来どおり WIC のまま。
 13. **Remote の RAW は「表示するページだけ、その場で現像」** (§10.2.2 の案B)。Remote では RAW の先読み現像を
     しない。最後に現像した 1 枚だけを Remote 用に保持する (決定 9 の例外、2026-09-29)。表示位置からの先読み
     現像は将来の拡張 (§10.2.3)
+14. **Remote のサムネイルでは half 現像をしない** (決定 11 を PC のサムネイルに限定、2026-09-29)。使えるプレビューが
+    あれば寸法にかかわらず使い、無ければ PC 側で作った catalog のサムネイル、それも無ければ既存の代替表示
+15. 既知の差として受け入れる (2026-09-29): 見開きを含め、RAW を開くたびにフル現像を待つのは WIC 経路でも同じ
+    構造だった (WIC も最初のフレームをフル解像度で同期にデコードする、`src/wic_decoder.rs:200`。所要時間は未計測)。
+    WIC が埋め込みプレビューを返していた一部の DNG (S1 の Ricoh GXR 640×480、Pixel 4 XL 672×502) は、
+    正しくフル現像するぶん遅くなる。Remote は RAW の先読みをしないので、Store 拡張を入れていた環境より
+    めくりで待つ場面があり得る
 
 用語の固定: 「先 / 前」は **表示順 (現在の一覧・読書順) での進行方向 / 逆方向**。
 既存設定の `prefetch_forward` (既定 12) / `prefetch_back` (既定 4) (`src/settings.rs:4226-4230`,
@@ -220,7 +227,7 @@ lossy DNG と deflate DNG は対象拡張子 `dng` の一部であり、どち�
 
 ### 5.1 拡張子の単一所有と WIC 境界での拒否
 
-- 新モジュール `src/raw_format.rs` が `RAW_EXTENSIONS` (17 種) と `is_raw_ext(&str)` /
+- 新モジュール `src/raw_format.rs` が `RAW_EXTENSIONS` (23 種) と `is_raw_ext(&str)` /
   `is_raw_path(&Path)` を所有する。`folder_tree::SUPPORTED_EXTENSIONS` と
   `wic_decoder::WIC_SUPPORTED_EXTENSIONS` はこの一覧を参照して組み立て、**WIC 側の一覧から RAW を外す**。
   `settings::default_image_ext_priority` (`src/settings.rs:6847-6859`) にも `crw` / `srw` を RAW と同じ
@@ -732,7 +739,7 @@ final composite** の consumer も点検する。S3 の最初に次を grep で�
 | D3 | Preview (サムネイル用途、§8 の条件) |
 | D4 / D9 | サムネイルと同じ (§8) |
 | D5 書き出し / 外部ツール | Full 現像 (High)。書き出しは `SrcFormat::Other` でメタデータ転記を拒否している (`src/save_with_metadata.rs:40-45,200`) ので、RAW からの EXIF 転記は現状どおり無し |
-| D5 製本 (決定 7) | **無編集の RAW は元ファイルをそのままコピー** (`src/books.rs:1185-1198` の既存の無加工コピー経路)。編集のある RAW は Full 現像 (High) してから既存の焼き込み経路。本のページ判定 `is_supported_book_image_path` (`src/books.rs:2299-2318`) に RAW 17 種を加え、コピーした RAW をページとして数える。本の中の RAW も通常の RAW と同じ表示 (プレビュー → フル現像) |
+| D5 製本 (決定 7) | **無編集の RAW は元ファイルをそのままコピー** (`src/books.rs:1185-1198` の既存の無加工コピー経路)。編集のある RAW は Full 現像 (High) してから既存の焼き込み経路。本のページ判定 `is_supported_book_image_path` (`src/books.rs:2299-2318`) に RAW の全拡張子を加え、コピーした RAW をページとして数える。本の中の RAW も通常の RAW と同じ表示 (プレビュー → フル現像) |
 | D6 類似索引 | プレビュー (§8 と同じ条件を満たさなければ half 現像を Background で)。**フル現像はしない** |
 | D7 360 度高解像度 | Full 現像 (High)。RAW の 360 度は稀なので、既存経路へ Full を差すだけ |
 | D8 画像コピー | Full 現像 (High)。既に worker thread 上 |
@@ -778,75 +785,125 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
 - 同じ source を何度も要求する: 補正プレビューのスライダー、端末の画質 (target_px) 違い、見開きの自動
   トリムの相方。JPEG ならやり直しても安いが、RAW は 1 回 0.3〜13 秒 (S1 実測、release)
 
-#### 10.2.2 設計 (第3案 = 利用者決定 13 の案B。第1案・第2案は設計レビューで却下、§20.1 / §20.2)
+#### 10.2.2 設計 (第3案 = 利用者決定 13 の案B。第1案・第2案は却下、§20.1 / §20.2。第3案の初回レビュー対応済み、§20.3)
 
 **方針: Remote の RAW は「表示するページだけ、その場で現像」する。Remote では RAW の先読み現像をしない。**
 表示ページの要求は既存のページ生成と同じく同期で応答する (PDF や大きな画像と同じ形)。
-第2案の「要求から切り離した現像の持ち主・需要の追跡・再要求」は作らない。
 
-**(1) 前景のページ要求 (heavy worker 上、既存の `page_inner` の source 解決の位置)**
+**(1) RAW の依存を先に列挙する (page_inner の入口)**
 
-- RAW の source で現像が要る場合、**RAW 用の single-flight** (`RemoteRawDevelop`、key は (3)) を通して
-  現像する。同じ key の現像が進行中ならそれに合流し、無ければ executor へ High で submit する。
-  heavy worker は結果を待つ (待ちは既存のページ生成と同じく同期。HTTP worker も IPC 応答を待つ)
-- 取消: page job の cancel token (release / 接続断 / drain / service stop で立つ) をその waiter の取消として
-  使う。waiter が全員いなくなった現像は ticket を cancel する (single-flight の既存の participant 規約と同じ)
-- 見開きの自動トリムの相方が RAW の場合も、相方の source 解決で同じ single-flight を使う
-  (`src/remote_ipc/container.rs:3790-3834` の scoped partner。相方も前景の一部として同期で現像される)
-- 待ちのあいだ `IpcAdmission` の heavy permit と HTTP worker 1 本を占有するのは、既存の遅いページと同じ。
-  RAW の先読み要求は (2) で即座に返るので、先読みが permit を長時間占有することは無い
+- `page_inner` は、要求ページの source と、見開きの自動トリムの相方の source (scoped partner が読むもの、
+  `src/remote_ipc/container.rs:3837-3881`, `5404-5430`) を、**どちらの読み込みも始める前に** 解決し、
+  RAW で現像が要るもの (= (3) の cache に無いもの) の集合 `raw_deps` を作る
+- 要求の実効優先度は、この時点で page job の registry から読み直す (`effective_page_priority`、
+  `src/remote_ipc/pipe.rs:1108-1119` の dispatch 時の snapshot ではなく、決定の直前の値)
+- 実効優先度が Prefetch で `raw_deps` が空でなければ、**何も読み込まずに** `MediaErrorCode::RawPrefetchSkipped`
+  を返す (scoped partner も起動しない)。空なら通常どおり生成する (cache に当たる再要求など)
+- 実効優先度が Foreground なら、`raw_deps` を (2) の RAW single-flight で現像してから通常の生成へ進む
+  (相方も同じ flight を使う)
 
-**(2) 先読みのページ要求 (`priority = Prefetch`)**
+**(2) RAW single-flight (`RemoteRawFlights`、App-global、Remote のページと Remote AI が共有)**
 
-- RAW で現像済みラスタが (3) の cache に無ければ、**現像せずに** typed な
-  `MediaErrorCode::RawPrefetchSkipped` を即座に返す (protocol version を上げる)
-- remote-web はこれを **再試行しない応答** (専用の error 名) に写す。Web UI の `PageDemandAdapter.runJob`
-  (`crates/remote-web/web/app.js:1080-1154`) は、この応答を受けた先読み job を「失敗」ではなく
-  「先読みしない」として終える (再試行しない、エラー表示しない、telemetry は skip として記録)。
-  前景の要求になったときに (1) で現像される
-- cache に当たる場合 (直前に表示したページの再要求など) は通常どおり生成して返す
+- key (`RemoteRawIdentity`): 正規化 path + **高精度 mtime (100ns 単位の FILETIME をそのまま)** + file size +
+  ZIP entry (+ 入れ子 prefix) + 明るさの値。target_px は含めない。秒精度の mtime は使わない
+  (同じ秒・同じ size の差し替えを見逃すため、`src/ui_helpers.rs:911-916`)
+- 1 key の状態は enum: `InFlight { flight_id, ticket, waiters: n }` / `Cancelling { flight_id }`。
+  完了した結果は flight から (3) の cache へ移り、flight は消える
+- **すべての状態遷移は flights の lock の中で決め、executor の `RawTicket::cancel` / `promote_to_high` は
+  lock の外で呼ぶ** (queued job の cancel は完了 callback を同期で呼び、callback が lock を取るため。
+  `src/raw/executor.rs:53-63`, `267-287`)
+- join: `InFlight` なら waiters+1 (前景なら ticket を High へ、lock 外で)。`Cancelling` なら、それが終わるのを
+  待たずに **新しい flight_id で新規 submit** し、key の状態を新しい `InFlight` に置き換える
+- waiter の離脱 (page job の cancel、AI job の cancel): waiters-1。0 になったら `Cancelling` に遷移させ、
+  lock の外で ticket を cancel する
+- 完了 callback: lock の中で「key の現在の状態が同じ flight_id か」を確かめ、同じときだけ結果を (3) へ
+  publish し、待っている waiter を起こす。違う (= 新しい flight に置き換わった) なら結果を捨てる。
+  既存 source single-flight の pointer 照合 (`src/remote_ipc/container.rs:1382-1421`) と同じ考え方
+- waiter は Condvar で待つ。定期的な確認 (poll) はしない。取消は page job の cancel token を見る既存の形に
+  合わせ、token が立ったら flight を離脱して `Cancelled` で返る
 
 **(3) 最後に現像した 1 枚の cache (利用者決定 13)**
 
-- App-global に **1 件だけ**。Remote のページ・Remote AI が共有する。PC のフルスクリーンからは使わない
-- key: 正規化 path + mtime + file size + ZIP entry (+ 入れ子 prefix) + 明るさの設定値。**target_px は含めない**
-  (画質・幅違いの要求、補正プレビューのスライダー、見開きの相方、AI が同じ現像を使う)
-- 値: `Arc` の現像済みラスタ (flip 適用済み 8bit RGB)。45MP で約 135 MB、100MP で約 300 MB
-- RAW 用 single-flight の完了時に置き換える。明るさの設定変更・ファイル変更 (key) で自然に外れる。
-  Remote service の停止で消える
+- App-global に **1 件だけ**。値は `Arc` の現像済みラスタ (flip 適用済み 8bit RGB、45MP で約 135 MB)
+- (2) の完了で置き換える。PC のフルスクリーンからは使わない。Remote service の停止で消える
 
-**(4) 明るさの設定と既存の cache (設計レビュー第2案 P1-6 の対応)**
+**(4) 明るさの設定**
 
-- 明るさ (`raw_brightness`) は Remote のページ生成が参照する live な設定 snapshot
-  (`AdjustmentRenderSettings`、`src/settings_db.rs:408-422`) に加えて publish する。`ContainerEngine` が
-  起動時に持つ `Settings` snapshot (`src/remote_ipc/container.rs:754-755`) からは読まない
-- RAW の source のときだけ、次の identity に明るさを含める: source single-flight
-  (`container.rs:1063-1073`)、ページ composite cache (`:1023-1033`)、Remote AI の結果 identity
-  (`:1594-1617`) と **AI native cache key** (`:1577-1592`)
+- 明るさは Remote のページ生成が参照する live な `AdjustmentRenderSettings` (`src/settings_db.rs:408-422`) に
+  加えて publish する。**1 回のページ生成・AI job の中では、最初に読んだ 1 つの値を decode と全 cache key に
+  使う** (途中で読み直さない)。Remote AI の decode 経路が起動時 snapshot を読んでいる箇所
+  (`src/remote_ipc/container.rs:4124-4145`, `4449-4479`) も live 値に揃える
+- RAW の source のときだけ、明るさを次の key に含める: (2) の `RemoteRawIdentity`、source single-flight
+  (`container.rs:1063-1073`)、ページ composite cache (`:1023-1033`)、**自動トリム bbox cache**
+  (`RemoteAutoTrimCacheKey`、`:1046-1052`)、Remote AI の結果 identity (`:1594-1617`)、AI native cache key
+  (`:1577-1592`)
+- ブラウザ側の page resource cache は変えない: 明るさは本体側の設定で、本体で設定を変えるには Remote の
+  操作権を本体へ戻す必要があり、再接続時のセッション取得で端末の cache は破棄される
+  ([web-remote-plan.md §12.16](web-remote-plan.md) の「本体側の変更はセッション取得で検知する」契約)
 
-**(5) Remote のサムネイル (`/api/thumb`)**
+**(5) 先読みの「スキップ」(wire / remote-web / Web UI)**
 
-- 使えるプレビューがあれば従来どおり (§8 の規則)
-- プレビューが無い RAW は、**half 現像をその場で同期に行う** (executor の Normal)。決定 11 どおり。
-  S1 の実測で half 現像は最長約 2.1 秒 (release、この PC) で、`/api/thumb` の IPC 締め切り 10 秒に収まる
-  (`crates/remote-web/src/ipc_client.rs:36-64`)。catalog への保存は既存の規則 (half 現像は常に自動補正 0.001、
-  §13) で、PC 側と同じ key を共有する
-- S2a で入れた「half 現像が要る RAW は Unsupported」を、この同期経路に置き換える
+- `MediaErrorCode::RawPrefetchSkipped` を加え、protocol version を上げる
+- remote-web はこれを **HTTP 204 (本文なし) + ヘッダ `X-mIV-Page-Skip: raw-prefetch`** に写す。503 系の
+  「一時的に混雑」とは別物で、再試行の対象にしない
+- Web UI (`crates/remote-web/web/page-coordinator.mjs` と `app.js` の `PageDemandAdapter.runJob`):
+  - job の結果に `SKIPPED` を足す (FAILED / ABORTED と別)。SKIPPED の resource key は、その表示計画の
+    間は再び先読み対象にしない (reconcile が同じ先読みをすぐ出し直さない。
+    `page-coordinator.mjs:246-285`, `389-435`)
+  - SKIPPED の job に表示の需要 (display member) が付いていた、または返答までに前景へ昇格していた場合は、
+    **ただちに同じ resource の前景要求を出す** (表示グループは pending のまま、失敗にしない)
+  - telemetry は `page_prefetch` の `skip` として記録し、`failed` にしない (`app.js:1139-1152`)
+- 前景へ昇格した後に届いた `RawPrefetchSkipped` (core が (1) で読んだ時点ではまだ Prefetch だった場合) も
+  同じ規則で前景要求になる
 
-**(6) Remote AI**
+**(6) 前景の admission**
 
-- AI job は自分の thread を持つ long job。RAW 用 single-flight と (3) の cache を使って Full を得る。
-  取消は AI job の cancel flag
+- RAW の待ちで `IpcAdmission` の heavy permit を長く占有するのは、前景のページ要求 (単ページ 1 本、見開きは
+  相方が同じ要求の中なので 1 本、別 group の見開きで 2 本) だけになる。先読みは (1) で即座に返り、
+  Remote のサムネイルは (7) で現像しないので、permit を長く占有しない
+- 既存の規則 (前景用に 1 枠を残す、`crates/remote-web/src/http.rs:311-317`) のまま、表示ページが permit を
+  取れない状況は「前景の RAW 要求が既に 4 本走っている」ときだけになる。ページ移動した古い前景は release で
+  cancel され、RAW の中断遅延 (S1 実測 5〜183ms) 後に permit を返す
+- この飽和をテストで確かめる (8)
 
-**(7) テスト**
+**(7) Remote のサムネイル (`/api/thumb`、利用者決定 14)**
 
-- 前景の RAW ページ: 現像して返す、同じ key の同時要求 (見開きの相方、画質違い、AI) が 1 回の現像を
-  共有する、waiter が全員取消で ticket が cancel される、release / 接続断 / drain で取消が届く、cache ヒットで
-  現像しない、明るさ変更で source / composite / AI / AI native の key が変わる
-- 先読みの RAW ページ: cache に無ければ現像せず `RawPrefetchSkipped` を即返す (heavy worker が塞がらない)、
-  cache にあれば返す。remote-web の写像、Web UI (node テスト) が再試行せず skip として終えること
-- サムネイル: プレビューの無い RAW を同期 half 現像で返す、プレビューのある RAW は現像しない
-- 既存の page / admission / coordinator のテストが通ること
+- **half 現像をしない**。使えるプレビューがあれば寸法にかかわらず使う (小さければ拡大)。無ければ catalog に
+  PC 側で作ったサムネイルがあればそれ (**cache-only の lookup**。cache miss で元ファイルを現像しない。
+  `src/remote_ipc/thumbnail.rs:332-363` の `CacheDecision::from_settings` 経路とは別に明示する)、それも無ければ
+  typed な「サムネイル無し」を返して既存の代替表示にする
+- これでサムネイル要求は RAW の現像を待たないので、10 秒の IPC 締め切りと executor の待ち行列の問題は生じない
+- S2a の「half 現像が要る RAW は Unsupported」を、この規則に置き換える
+
+**(8) Remote AI**
+
+- AI job は自分の thread を持つ long job で、(2) の flight に waiter として参加する (前景扱い、High)。
+  取消は AI job の cancel flag。AI runtime の資源を取るのは source の decode の後 (`container.rs:4138-4145`,
+  `4190-4193`) なので、待ちのあいだ AI の資源を持たない
+
+**(9) メモリと仕事量の上限**
+
+- RAW の現像を待つのは前景のページ要求と AI job だけで、その数は heavy permit (4) と AI job (1 本) で抑えられる。
+  したがって Remote 由来の executor の待ち行列は最大 5 件で、ZIP の source bytes を抱えた待機もこの件数に
+  限られる。cache は 1 件。executor が同時に現像するのは設定の並列数 (既定 3)
+- 同時の peak は「並列数 × 1 回の現像のメモリ (§12 の推定) + cache 1 件 + 既存の composite cache」。
+  固定値で決まり、実行時の空きメモリで変えない
+
+**(10) テスト**
+
+- (1) 先読み: 要求ページまたは見開きの相方のどちらかが cache に無い RAW なら、何も読まずに Skipped を返す
+  (scoped partner を起動しない)。両方 cache にあれば生成する。決定直前に前景へ昇格していれば現像する
+- (2) flight: 同じ key の前景・相方・画質違い・AI が 1 回の現像を共有する、最後の waiter の離脱で Cancelling、
+  Cancelling 中の新しい join が新しい flight になり古い完了が cache を上書きしない、queued cancel の同期
+  callback で deadlock しない、mtime の 1 秒未満の差し替えで別 key になる
+- (3)(4) cache の置き換え、明るさ変更で RAW identity・source・composite・自動トリム・AI・AI native の key が変わる、
+  1 回の生成の中で明るさを読み直さない
+- (5) remote-web: Skipped → 204 + skip ヘッダ、再試行しない。Web UI (node テスト): SKIPPED で同じ先読みを
+  出し直さない、表示需要があれば即前景要求、昇格後の Skipped も前景要求、group が失敗にならない、telemetry が skip
+- (6) 飽和: 前景 RAW 3 本 + サムネイル多数の最中に、新しい表示ページが permit を得られる。ページ移動で古い
+  前景が cancel され permit を返す
+- (7) プレビューのある RAW / 無い RAW で catalog あり / なしの各結果、cache-only で現像しないこと
+- 既存の page / admission / coordinator / thumbnail のテストが通ること
 
 #### 10.2.3 将来の拡張: 表示位置からの先読み現像 (未実装、S2b の範囲外)
 
@@ -989,7 +1046,7 @@ S1 の実測 (寸法・向き・中断・codec・形式) は S2 / S3 へ進む�
 
 ### 17.1 利用者の判断が要るもの
 
-1. `3fr erf kdc dcr mrw mos mef` 等の追加 (S1 の調査結果を見て相談)
+1. ~~追加拡張子~~ → 決定 8 (6 種を追加、`mef` は除外)
 3. ~~Remote 用の cache~~ → 決定 13 (案B、最後の 1 枚だけ)
 2. ~~明るさのパラメータ~~ → 決定 12 (プレビューに合わせる + 補正なしへの切替)
 
@@ -1062,3 +1119,12 @@ reply と permit の問題を構造的に除いた。LRU は必須になるの�
 古い完了が新しい現像を上書きし得る、再要求前に cache から追い出され得る、見開きの相方が RAW だと待ちが生じる、
 明るさが live 設定と AI native key に無い、失敗記録と待機の上限が無い。利用者は案B (決定 13) を選び、
 第3案 (§10.2.2) は Remote の RAW 先読み現像をやめて同期の既存形に戻した。
+
+### 20.3 Remote の詳細設計レビュー (2026-09-29、第3案の初回)
+
+P1×5 / P2×3。すべて採用し §10.2.2 を具体化した: 先読みの判定は見開きの相方を含む RAW の依存を先に列挙して
+から行う ((1))、Skipped の Web 側の状態遷移と昇格の競合 ((5))、前景の admission ((6))、Remote サムネイルの
+half 現像をやめて締め切りの問題を消す (利用者決定 14、(7))、flight の状態遷移を lock の中で決め cancel を lock の外で
+呼び古い完了を捨てる ((2))、明るさを自動トリムと AI にも含め 1 回の処理で読み直さない ((4))、mtime を高精度にする、
+Remote 由来の待ち行列の上限 ((9))、テスト ((10))。ブラウザ側 cache の無効化は、明るさが本体側の設定で
+セッション取得を必ず挟むため既存契約で足りると判断した。
