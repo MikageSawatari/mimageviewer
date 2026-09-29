@@ -33,8 +33,8 @@ masked the unsupported-decoder guard until this was corrected.
 
 ## Samples and measurements
 
-All 21 samples below are from the raw.pixls.us repository catalog with its
-exact CC0 license URL. `scripts/setup-raw-samples.ps1` checks the recorded
+The original 21 S1 samples below are from the raw.pixls.us repository catalog
+with its exact CC0 license URL. `scripts/setup-raw-samples.ps1` checks the recorded
 SHA-256 and byte size. Times are milliseconds from
 `cargo run --release -p mimageviewer --features dev-tools --bin bench_raw`
 on this machine and are comparative, not throughput guarantees. Brightness
@@ -157,6 +157,52 @@ median linear ΔL against the full preview averaged 0.0009 and peaked at
 ΔL averages were 0.0716 (auto 0.01), 0.0663 (auto 0.001), 0.1061 (no auto),
 and 0.0217 (product match preview). Full development ranged from 181.8 to
 13785.8 ms; cancel-to-exit latency ranged from 1.0 to 115.6 ms.
+
+### Additional formats (added 2026-09-29)
+
+Six further strict-CC0 raw.pixls.us samples were added after the original S1
+measurements. Each file's recorded SHA-256 and byte size was verified by
+`scripts/setup-raw-samples.ps1`. `info()` succeeded, and full development
+matched `info().developed_dims` for all six. Preview orientation and usability
+were checked by the per-sample decoder test. Leaf MOS reports flip 6, but its
+embedded preview fails the orientation consistency check; `preview()` returns
+`NoUsablePreview(OrientationMismatch)`, and MatchPreview uses its documented
+auto-bright fallback. The comparison PNGs for the other five formats contain
+the same five panels as the original S1 rows.
+
+| Case | Camera | Flip | Full dims | Info = Full | Half dims | Preview decoded | Aspect Δ % | Comparison |
+| --- | --- | ---: | ---: | :---: | ---: | ---: | ---: | --- |
+| 3fr | Hasselblad H3D | 0 | 7247×5444 | yes | 3624×2722 | 320×240 | 0.16 | [PNG](../target/raw-compare/2851.png) |
+| erf | Epson R-D1 | 0 | 3040×2024 | yes | 1520×1012 | 640×424 | 0.50 | [PNG](../target/raw-compare/2680.png) |
+| kdc | Kodak DC120 | 0 | 1301×976 | yes | 651×488 | 80×60 | 0.03 | [PNG](../target/raw-compare/2338.png) |
+| dcr | Kodak DCS760C | 0 | 3040×2016 | yes | 1520×1008 | 760×504 | 0.00 | [PNG](../target/raw-compare/1347.png) |
+| mrw | Minolta DiMAGE 5 | 0 | 2056×1544 | yes | 1028×772 | 640×480 | 0.13 | [PNG](../target/raw-compare/7795.png) |
+| mos | Leaf Aptus 22 | 6 | 5344×4008 | yes | 2672×2004 | unusable: orientation mismatch | — | — |
+
+Times below are milliseconds from release-profile `bench_raw`, filtered to
+these six IDs with `RAW_BENCH_ONLY`. `Match ms` includes the product brightness
+path, including its fallback for MOS.
+
+| Case | Info ms | Preview ms | Full ms | Half ms | Match ms | Cancel ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3fr | 1.3 | 0.7 | 2702.3 | 624.8 | 3486.1 | 123.8 |
+| erf | 1.2 | 1.8 | 445.8 | 50.1 | 509.6 | 7.8 |
+| kdc | 1.2 | 0.5 | 73.4 | 9.8 | 74.4 | 24.3 |
+| dcr | 17.2 | 27.2 | 534.9 | 76.4 | 509.1 | 9.7 |
+| mrw | 1.3 | 2.3 | 251.9 | 25.6 | 279.1 | 8.8 |
+| mos | 1.1 | 1.4 | 1985.1 | 446.7 | 2106.8 | 58.4 |
+
+The first four ΔL columns use the same sampled mean sRGB comparison as the
+original table. The median column compares linear-light medians.
+
+| Case | ΔL auto 0.01 | ΔL auto 0.001 | ΔL no auto | ΔL match mean | Median ΔL linear | Product gain | Full-preview gain | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 3fr | 0.0016 | 0.0155 | 0.0016 | 0.0177 | 0.0000 | 1.079 | 1.079 | gain |
+| erf | 0.0274 | 0.0357 | 0.0351 | 0.0040 | 0.0002 | 1.214 | 1.214 | gain |
+| kdc | 0.2050 | 0.2050 | 0.2049 | 0.0151 | 0.0005 | 0.448 | 0.448 | gain |
+| dcr | 0.0473 | 0.0631 | 0.2070 | 0.0021 | 0.0013 | 3.129 | 3.129 | gain |
+| mrw | 0.0502 | 0.0927 | 0.0501 | 0.0099 | 0.0002 | 0.820 | 0.820 | gain |
+| mos | — | — | — | — | — | — | — | NoPreview fallback |
 
 ### WIC comparison for DNG
 

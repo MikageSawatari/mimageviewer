@@ -801,26 +801,59 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
   を返す (scoped partner も起動しない)。空なら通常どおり生成する (cache に当たる再要求など)
 - 実効優先度が Foreground なら、`raw_deps` を (2) の RAW single-flight で現像してから通常の生成へ進む
   (相方も同じ flight を使う)
+- **要求内の pin**: (1) で cache に当たった RAW も、(2) で現像した RAW も、その要求の間は `Arc` で保持する
+  (`RawDepPins`)。要求ページと scoped partner の source 読み込みは、cache を引き直さずに pin を使う。
+  cache (1 件) は要求をまたぐ再利用のためだけにあり、要求の途中で他の完了に追い出されても影響しない
+  (設計レビュー第3案 2 回目 P1-1)
+- 実効優先度は、`page_inner` に page job の優先度 accessor (registry から現在値を読む関数) を渡して、上の決定の
+  直前に読む (`src/remote_ipc/pipe.rs:1108-1119` の dispatch 時の値ではなく)
 
 **(2) RAW single-flight (`RemoteRawFlights`、App-global、Remote のページと Remote AI が共有)**
 
 - key (`RemoteRawIdentity`): 正規化 path + **高精度 mtime (100ns 単位の FILETIME をそのまま)** + file size +
   ZIP entry (+ 入れ子 prefix) + 明るさの値。target_px は含めない。秒精度の mtime は使わない
   (同じ秒・同じ size の差し替えを見逃すため、`src/ui_helpers.rs:911-916`)
-- 1 key の状態は enum: `InFlight { flight_id, ticket, waiters: n }` / `Cancelling { flight_id }`。
-  完了した結果は flight から (3) の cache へ移り、flight は消える
+- 1 key の状態は enum: `Submitting { flight_id, waiters }` / `InFlight { flight_id, ticket, waiters }` /
+  `Cancelling { flight_id }` / `Done { flight_id, result: Arc<..>, waiters }`。`Done` の結果は waiter が全員
+  受け取るまで flight が保持し (per-flight の `Arc`)、最後の waiter が受け取った時点で flight を消す。
+  (3) の cache へは完了時に別途 `Arc` を置く (cache が先に置き換わっても waiter は flight から受け取れる)
+- **submit の順序**: lock の中で `Submitting` を登録 → lock の外で executor へ submit → lock の中で
+  `Submitting` を `InFlight` に置き換える。submit より先に完了 callback が来た場合 (即時完了・executor 停止中の
+  即時エラー) は、callback が `Submitting` の flight_id を見て `Done` / 失敗へ進め、後から来た ticket の登録は
+  捨てる。submit が Err を返した場合は、その flight を失敗で終わらせ waiter へ typed error を返す。
+  submit 前の完了のテストを置く (P2)
 - **すべての状態遷移は flights の lock の中で決め、executor の `RawTicket::cancel` / `promote_to_high` は
   lock の外で呼ぶ** (queued job の cancel は完了 callback を同期で呼び、callback が lock を取るため。
   `src/raw/executor.rs:53-63`, `267-287`)
-- join: `InFlight` なら waiters+1 (前景なら ticket を High へ、lock 外で)。`Cancelling` なら、それが終わるのを
-  待たずに **新しい flight_id で新規 submit** し、key の状態を新しい `InFlight` に置き換える
-- waiter の離脱 (page job の cancel、AI job の cancel): waiters-1。0 になったら `Cancelling` に遷移させ、
-  lock の外で ticket を cancel する
-- 完了 callback: lock の中で「key の現在の状態が同じ flight_id か」を確かめ、同じときだけ結果を (3) へ
-  publish し、待っている waiter を起こす。違う (= 新しい flight に置き換わった) なら結果を捨てる。
+- 状態ごとの join / leave (すべて lock の中で遷移を決め、ticket 操作は lock の外):
+
+  | 状態 | join (waiter 追加) | leave (waiter 離脱、最後の 1 人) | ticket / 完了の到着 |
+  | --- | --- | --- | --- |
+  | 無し | `Submitting{waiters:1}` を作り submit | — | — |
+  | `Submitting{waiters, cancel_requested}` | waiters+1。`cancel_requested` を戻す | `cancel_requested = true` (ticket はまだ無い) | ticket 到着: `cancel_requested` なら `Cancelling` にして lock 外で即 cancel、でなければ `InFlight`。完了が先に到着: `Done` / 失敗へ (後から来た ticket は、その job がもう終わっているので何もしない) |
+  | `InFlight{ticket, waiters}` | waiters+1 (前景なら lock 外で ticket を High へ) | `Cancelling` にして lock 外で ticket を cancel | 完了: `Done` へ |
+  | `Cancelling` | 新しい flight_id で `Submitting` を作り直して submit (古い完了は flight_id 不一致で捨てる) | — | 古い完了: 捨てる |
+  | `Done{result, waiters}` | 結果をそのまま使う (waiters は増やさない) | waiter の lease が減るたびに数え、0 で flight を消す | — |
+
+- submit が Err を返した場合は、その flight を失敗で終わらせ、waiter へ typed error を返す
+- `Done` の結果は typed: `Ok(Arc<DevelopedRaw>)` / `Err(RawError)`。waiter が 0 の `Done` は直ちに消す
+- **waiter は participant lease** で表す。lease は結果の受け取り・エラー・取消 (起床前・起床後のどちらでも) の
+  いずれで終わっても Drop で waiters を 1 減らし、`Done` なら 0 で flight を消す。完了通知の直後に取消された
+  waiter でも結果を pin し続けない (既存 source waiter の形、`src/remote_ipc/container.rs:1359-1370`)。テストする
+- **仕事の会計は key と別に flight_id で持つ** (`outstanding: map<flight_id, FlightWork>`)。key の現在の flight は
+  `Cancelling` の置き換えで新しい flight_id に移るが、古い flight の executor job は完了 callback (または submit の
+  失敗) が来るまで `outstanding` に残る。`outstanding` からの削除のたびに capacity 待ちへ `notify_all` する
+- テスト: ticket 到着前の取消、submit 中の join、即時完了・即時失敗、`Cancelling` 中の join
+- 完了 callback: lock の中で「key の現在の状態が同じ flight_id か」を確かめ、同じときだけ `Done` に進めて
+  結果を (3) へ publish し、待っている waiter を起こす (`notify_all`)。違う (= 新しい flight に置き換わった) なら結果を捨てる。
   既存 source single-flight の pointer 照合 (`src/remote_ipc/container.rs:1382-1421`) と同じ考え方
-- waiter は Condvar で待つ。定期的な確認 (poll) はしない。取消は page job の cancel token を見る既存の形に
-  合わせ、token が立ったら flight を離脱して `Cancelled` で返る
+- waiter は flights の Condvar で待つ。page job / AI job の取消 (release・接続断・drain・service stop・AI の
+  supersede) は `AtomicBool` を立てるだけで Condvar を起こさない (`src/remote_ipc/page_jobs.rs:258-280`,
+  `342-377`) ので、**既存の source single-flight と同じく上限付きの `wait_timeout` (50ms) で待ち、起きるたびに
+  token を確認する** (`src/remote_ipc/container.rs:1351-1378` と同じ形。try_lock + sleep ではない)。
+  取消を確認したら flight を離脱して `Cancelled` で返る。取消から離脱までの遅れは最大でこの間隔
+  (設計レビュー第3案 2 回目 P1-2。第3案初回版の「poll しない」は撤回)
+- 取消された flight の結果は、その時点でまだ waiter がいるときだけ publish する
 
 **(3) 最後に現像した 1 枚の cache (利用者決定 13)**
 
@@ -833,6 +866,11 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
   加えて publish する。**1 回のページ生成・AI job の中では、最初に読んだ 1 つの値を decode と全 cache key に
   使う** (途中で読み直さない)。Remote AI の decode 経路が起動時 snapshot を読んでいる箇所
   (`src/remote_ipc/container.rs:4124-4145`, `4449-4479`) も live 値に揃える
+- RAW の source のときは、source の識別に **高精度 mtime** (100ns 単位) を使う。現行の source / composite /
+  自動トリムの key は秒精度 (`src/remote_ipc/container.rs:5714-5719`, `1025-1052`, `5865-5906`) なので、RAW の
+  ときはこれらの key にも同じ高精度の値を入れる (同じ秒・同じ size の差し替えで古い composite に当たらない)。
+  Remote AI も同じ: prepared identity と native / 結果の key、**完了時の再確認** (`src/remote_ipc/container.rs:4120-4133`,
+  `4414-4440`) を同じ高精度の値で行う。差し替えのテストを AI にも置く
 - RAW の source のときだけ、明るさを次の key に含める: (2) の `RemoteRawIdentity`、source single-flight
   (`container.rs:1063-1073`)、ページ composite cache (`:1023-1033`)、**自動トリム bbox cache**
   (`RemoteAutoTrimCacheKey`、`:1046-1052`)、Remote AI の結果 identity (`:1594-1617`)、AI native cache key
@@ -845,33 +883,63 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
 
 - `MediaErrorCode::RawPrefetchSkipped` を加え、protocol version を上げる
 - remote-web はこれを **HTTP 204 (本文なし) + ヘッダ `X-mIV-Page-Skip: raw-prefetch`** に写す。503 系の
-  「一時的に混雑」とは別物で、再試行の対象にしない
+  「一時的に混雑」とは別物で、再試行の対象にしない。204 にも通常のページ応答と同じ session / remote state
+  generation のヘッダを付け、`Cache-Control: no-store` にする
+- Web の `fetchPageResource` (`crates/remote-web/web/app.js:16068-16107`) は現在 204 を成功として画像の
+  identity ヘッダを要求し空の blob を作る。**session と remote state generation の検証は従来どおり先に行い**、
+  その後で skip ヘッダを判定して、画像の identity / blob の処理だけを飛ばし typed な skip を `runJob` へ返す。
+  検証に通らない 204 は既存の session エラー / 古い generation として扱う (テストする)
 - Web UI (`crates/remote-web/web/page-coordinator.mjs` と `app.js` の `PageDemandAdapter.runJob`):
   - job の結果に `SKIPPED` を足す (FAILED / ABORTED と別)。SKIPPED の resource key は、その表示計画の
     間は再び先読み対象にしない (reconcile が同じ先読みをすぐ出し直さない。
     `page-coordinator.mjs:246-285`, `389-435`)
   - SKIPPED の job に表示の需要 (display member) が付いていた、または返答までに前景へ昇格していた場合は、
-    **ただちに同じ resource の前景要求を出す** (表示グループは pending のまま、失敗にしない)
+    **ただちに同じ resource の前景要求を出す** (表示グループは pending のまま、失敗にしない)。
+    coordinator は skipped の job を消し、表示需要があれば新しい前景 job を作る。表示計画の範囲の
+    「先読みしない」印は resource key に残す。昇格が応答の前か後かの両方をテストする
   - telemetry は `page_prefetch` の `skip` として記録し、`failed` にしない (`app.js:1139-1152`)
 - 前景へ昇格した後に届いた `RawPrefetchSkipped` (core が (1) で読んだ時点ではまだ Prefetch だった場合) も
   同じ規則で前景要求になる
 
 **(6) 前景の admission**
 
-- RAW の待ちで `IpcAdmission` の heavy permit を長く占有するのは、前景のページ要求 (単ページ 1 本、見開きは
-  相方が同じ要求の中なので 1 本、別 group の見開きで 2 本) だけになる。先読みは (1) で即座に返り、
-  Remote のサムネイルは (7) で現像しないので、permit を長く占有しない
-- 既存の規則 (前景用に 1 枠を残す、`crates/remote-web/src/http.rs:311-317`) のまま、表示ページが permit を
-  取れない状況は「前景の RAW 要求が既に 4 本走っている」ときだけになる。ページ移動した古い前景は release で
-  cancel され、RAW の中断遅延 (S1 実測 5〜183ms) 後に permit を返す
-- この飽和をテストで確かめる (8)
+- 現行の `IpcAdmission` は heavy の最後の 1 枠を先読みからしか守っていない (`crates/remote-web/src/http.rs:292-317`)。
+  サムネイルは通常の heavy permit を使う (`:3530-3557`)
+- **サムネイルに専用の admission class を設け、heavy の最後の 1 枠を使えないようにする** (先読みの class を
+  流用しない。流用すると先読みの別枠まで消費する)。ブラウザ側のサムネイルの同時取得はもともと 3 本なので
+  (`crates/remote-web/web/app.js:153-156`、`command-core.mjs:2527-2533`)、通常の Web のサムネイルの並列度は下がらない
+- **それでも枠は埋まり得る** (サムネイルが先に入った後に前景 3 本、前景 4 本など)。そこで保証する性質を
+  「前景ページが 1 回で permit を取れる」ではなく、**「まだ表示に必要なページを、枠の混雑で最終失敗にしない」**
+  にする: Web の前景ページ要求は、**混雑の 503 (`ipc_busy` / `admission_busy` / `raw_busy`)** に対しては、
+  その job に**表示の需要がある間は**再試行回数の上限 (`FOREGROUND_ADMISSION_RETRY_LIMIT`、
+  `crates/remote-web/web/app.js:1080-1116`) に数えずに再試行を続ける (間隔は既存の backoff、上限 2000ms)。
+  **それ以外の 503 (core の `MediaErrorCode::Busy` = `miv_media_error` を含む) は、従来どおり上限 3 回の再試行**
+  (`crates/remote-web/src/http.rs:3986-4003`、`app.js:1103-1116`)。非 503 のエラーも従来どおり。両方の規則をテストする
+- **「表示の需要がある」の判定は job の priority や abort signal では行わない**。coordinator は表示需要と先読み計画の
+  需要のどちらかがある間 job を保持し、昇格は降格しない (`crates/remote-web/web/page-coordinator.mjs:214-229`,
+  `346-348`, `389-435`) ので、それでは表示が離れた後も再試行が続き得る。coordinator に「この resource に保留中の
+  表示需要があるか」を返す関数を足す。**最後の表示需要が消えた時点で、coordinator は前景の wire job に対して
+  即座に cancel / release の effect を出す** (fetch の途中でも backoff の待ちの途中でも abort される)。先読み計画が
+  まだその resource を望んでいれば、別の新しい (上限付きの) 先読み job を作る。`runJob` は再試行のたびにも
+  同じ関数で需要を確かめる (競合の保険)
+- 観測: 需要付きの再試行は 1 回ごとに失敗として記録しない。混雑で待った回数と時間を 1 件の telemetry
+  (`page_congestion`) として、job の終わりに記録する
+- これは RAW に限らず全ページの挙動の変更 (改善) になる。テスト: サムネイルが先に入って前景 3 本が埋めた状態の
+  4 本目、前景 4 本の状態の新しい表示ページ、需要が消えたら再試行が止まる
 
 **(7) Remote のサムネイル (`/api/thumb`、利用者決定 14)**
 
-- **half 現像をしない**。使えるプレビューがあれば寸法にかかわらず使う (小さければ拡大)。無ければ catalog に
-  PC 側で作ったサムネイルがあればそれ (**cache-only の lookup**。cache miss で元ファイルを現像しない。
-  `src/remote_ipc/thumbnail.rs:332-363` の `CacheDecision::from_settings` 経路とは別に明示する)、それも無ければ
-  typed な「サムネイル無し」を返して既存の代替表示にする
+- **half 現像をしない**。対象は 2 経路とも: 通常ファイルの `ThumbnailEngine` (`src/remote_ipc/thumbnail.rs:200-215`)
+  と、ZIP entry / コンテナの `ContainerEngine::thumbnail` (`src/remote_ipc/container.rs:3726-3749`, `5808-5827`)。
+  フォルダ / ZIP の代表が RAW の場合も、代表を解決した後の RAW に同じ規則を当てる
+- 規則: 使えるプレビューがあれば **寸法にかかわらず使う** (PC のサムネイルの「プレビューの長辺が要求寸法以上」
+  (`src/thumb_loader.rs:676-684`) は Remote では使わない。Remote 用の判定を分ける)。無ければ catalog に
+  PC 側で作ったサムネイルがあればそれ (**cache-only の lookup**: cache miss で元ファイルを現像しない)。それも
+  無ければ typed な `ThumbnailErrorCode::NoThumbnail` を返す (`/api/thumb` の応答は `ThumbnailResponse` /
+  `ThumbnailErrorCode`、`crates/remote-ipc/src/lib.rs:3041-3055`。`MediaErrorCode` ではない)。コンテナ経路の
+  内部 loader が media error を使う箇所では、`NoThumbnail` への明示の変換を置く
+- `NoThumbnail` は新しい code (protocol version を上げる)。remote-web は既存のサムネイル失敗と同じ HTTP 応答
+  (Web は既存の代替表示) に写し、ログでは区別する。2 経路ともテストする
 - これでサムネイル要求は RAW の現像を待たないので、10 秒の IPC 締め切りと executor の待ち行列の問題は生じない
 - S2a の「half 現像が要る RAW は Unsupported」を、この規則に置き換える
 
@@ -883,11 +951,22 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
 
 **(9) メモリと仕事量の上限**
 
-- RAW の現像を待つのは前景のページ要求と AI job だけで、その数は heavy permit (4) と AI job (1 本) で抑えられる。
-  したがって Remote 由来の executor の待ち行列は最大 5 件で、ZIP の source bytes を抱えた待機もこの件数に
-  限られる。cache は 1 件。executor が同時に現像するのは設定の並列数 (既定 3)
-- 同時の peak は「並列数 × 1 回の現像のメモリ (§12 の推定) + cache 1 件 + 既存の composite cache」。
-  固定値で決まり、実行時の空きメモリで変えない
+- Remote 由来の仕事に **固定の上限** を置く: `REMOTE_RAW_FLIGHT_LIMIT = 6`。数えるのは (2) の `outstanding`
+  (flight_id 単位。`Cancelling` の置き換えで古い job がまだ動いている分も数える)。**新しい submit はすべて**
+  (新しい key、`Cancelling` の置き換え、同じ key の作り直し) この上限の確認を通る
+- 上限に達したとき:
+  - 前景のページ要求は、core が typed な **`MediaErrorCode::RawCapacity`** を返す。remote-web はこれを
+    503 + 専用の error 名 `raw_busy` + `Retry-After` に写す (既存の `MediaErrorCode::Busy` の `miv_media_error`
+    とも、admission の `ipc_busy` とも区別する)。Web は (6) の需要付き再試行の対象にする
+  - Remote AI は、**owner ごとに 1 つだけの capacity 待ち枠**で待つ。同じ owner の新しい AI job が来たら古い待ちを
+    起こして `Cancelled` で返させる (supersede と同じ向き)。待ちは (2) と同じ上限付き wait で、起きるたびと
+    capacity を取る直前に cancel flag を確かめる。**capacity を取るまでは ZIP の source bytes を読まない**
+    (待機中の AI は大きな source を抱えない)。接続断・drain・service stop は cancel flag で待ちを終わらせる
+- S2c の先読みの flight は別枠 (S2c で上限を決め、S2b の上限と合わせた全体の上限を定義する) とし、この上限を消費しない
+- cache は S2b では 1 件。flight の owner と cache は、S2c が「優先度付きの submit」と「件数 + 合計サイズの
+  capacity policy」を差し込めるよう、submit の優先度と cache の上限を引数 (policy) として持つ
+- 同時の peak は「executor の並列数 × 1 回の現像のメモリ (§12 の推定) + 最大 6 件の outstanding (ZIP の source bytes を
+  含む) + cache + flight が保持中の結果 + 既存の composite cache」。すべて固定の値で決まる
 
 **(10) テスト**
 
@@ -900,14 +979,27 @@ Remote のページは本体と同じ結果にするため、**フル現像**を
   1 回の生成の中で明るさを読み直さない
 - (5) remote-web: Skipped → 204 + skip ヘッダ、再試行しない。Web UI (node テスト): SKIPPED で同じ先読みを
   出し直さない、表示需要があれば即前景要求、昇格後の Skipped も前景要求、group が失敗にならない、telemetry が skip
-- (6) 飽和: 前景 RAW 3 本 + サムネイル多数の最中に、新しい表示ページが permit を得られる。ページ移動で古い
-  前景が cancel され permit を返す
-- (7) プレビューのある RAW / 無い RAW で catalog あり / なしの各結果、cache-only で現像しないこと
+- (6) 飽和: 前景 RAW 3 本 + サムネイル多数の最中の新しい表示ページが、表示の需要がある間に最終的に完了する。
+  需要が消えたら fetch / backoff の途中でも即座に cancel / release される。ページ移動で古い前景が cancel され permit を返す
+- (7) プレビューのある RAW / 無い RAW で catalog あり / なしの各結果、cache-only で現像しないこと。
+  通常ファイル・ZIP entry・フォルダ代表の 3 経路。小さいプレビューも Remote では使うこと、`NoThumbnail` の写像
+- 追加 (第3案 2 回目): 見開きで要求ページと相方の 2 つの RAW を現像した後に別の完了で cache が置き換わっても、
+  その要求は pin で正しく生成する / 取消の起床 (待機中・現像中・接続断・drain) / submit 前の完了 /
+  同じ秒・同じ size の差し替えで composite と自動トリムに古い値が当たらない / サムネイルが最後の heavy 枠を使えない
+  / 前景 RAW 3 本 + サムネイル多数 + 新しい表示ページ
+- 追加 (第3案 4 回目): 同じ key の取消と作り直しを上限の近くで繰り返しても outstanding が上限を超えない /
+  `RawCapacity` → `raw_busy` の写像と、それが需要付き再試行になること / 既存の `miv_media_error` の 503 は
+  従来どおり / 昇格済みの job が再試行の合間に表示を失ったら cancel + release し、先読み計画があれば先読み job を
+  作り直す / 表示の需要がある間は混雑が続いても最終失敗にならず、需要が消えたらすぐ止まる / AI の supersede を
+  連続させても capacity 待ちが owner ごとに 1 つ・source bytes を読まない / 接続断・drain・stop で AI の待ちが終わる
+- 追加 (第3案 3 回目): flight の状態表の各セル (ticket 到着前の取消、submit 中の join、Done 中の join) /
+  `REMOTE_RAW_FLIGHT_LIMIT` 到達時の Busy と AI の待ち / AI の supersede を連続させても flight が上限を超えない /
+  AI の高精度 mtime の差し替え / 認証・generation の通らない 204
 - 既存の page / admission / coordinator / thumbnail のテストが通ること
 
-#### 10.2.3 将来の拡張: 表示位置からの先読み現像 (未実装、S2b の範囲外)
+#### 10.2.3 表示位置からの先読み現像 (S2c、S2b の直後に実施)
 
-写真のスライドショーのようにゆっくりめくる用途を快適にするため、将来次を足せる (利用者の提案 2026-09-29)。
+写真のスライドショーのようにゆっくりめくる用途を快適にするため、次を足す (利用者の提案 2026-09-29。なるべく早く実装する方針)。S2b は (2) の flight と (3) の cache をこの拡張で再利用できる形で作る。
 
 - 本体が「Remote で最後に前景で表示された RAW ページ」の表示順の前後 (**先 2・前 1**、PC と同じ) を
   自分で先に現像し、cache に置く (cache の上限は件数と合計サイズの固定値)
@@ -1035,6 +1127,7 @@ canonical loader の Full (High)。
 | --- | --- | --- |
 | **S1** | `crates/libraw-sys` (shim + cc ビルド、`USE_ZLIB` / `USE_JPEG`)、`setup-libraw.sh`、`raw_decoder` (info / preview / develop / 中断 / 進捗)、**`RawDevelopExecutor` の本体 (枠・優先度・取消・進捗・`submit` API。App との接続は S2)**、明るさの決定 (§5.3.4)、`bench_raw` (executor の `submit` 経由で現像する)、サンプル manifest | §15 の `raw_decoder` テストが緑。**lossy DNG と deflate DNG のフル現像が通る**。全サンプルの寸法一致・向き・プレビューと現像の縦横比差・所要時間・中断遅延の表を本書へ記録。core が VC runtime DLL を import しないこと (`check-vcrt-pe-dependencies.ps1`)。非 Windows の `cargo check` は合格条件にしない (Windows 専用ソフト。ubuntu の CI job は 2026-09-29 に利用者判断で廃止)。`3fr erf kdc dcr mrw mos mef` の対応とサンプルの有無の報告 |
 | **S2** | `raw_format` と WIC 境界の拒否、`RawDevelopExecutor` の App への接続 (設定値・App-global 所有)、入口 D1〜D11・P1〜P4 の振り分け、サムネイル (worker を塞がない half 現像)、ZIP 内 RAW、類似索引、書き出し / コピー / 外部ツール / 製本、Remote (§10.2 の詳細設計を独立レビューしてから) | 入口ごとの回帰テスト、executor テスト。`is_raw_ext` を通らずに RAW を decode する経路が無いことを grep 手順と test で示す |
+| **S2c** | Remote の表示位置からの先読み現像 (§10.2.3、利用者の要望で S2b の直後に実施)。S2b の RAW flight と cache を再利用し、cache を「窓の件数 + 固定の合計サイズ」へ広げる | 別途、S2b 完了後に §10.2.3 を詳細化して設計レビュー |
 | **S3** | `RawPageStore`、`FsCacheEntry::RawPreview`、読み込み状態、現像窓、差し替えの layout (§7.5 の全経路)、色の gate、ページ送り / フォルダ移動、編集 gate、進捗表示と先読み行、設定 UI、§7.7 の consumer 点検 | `RawPageStore` の状態遷移テスト (§15 の全項目)、context 分離テスト、UI スナップショット (進捗表示と設定)。`build-dev.ps1` で利用者の実機確認 |
 | **S4** | ライセンス文書・バージョン情報・対応ソース・マニュアル・製品ページ・spec・readme・リリースチェックリスト・bootstrap | 文書差分のレビュー。`build-dist.ps1 -NoSign` 相当で同梱物に `LIBRAW-LICENSE.txt` が入ること |
 
@@ -1128,3 +1221,31 @@ half 現像をやめて締め切りの問題を消す (利用者決定 14、(7))
 呼び古い完了を捨てる ((2))、明るさを自動トリムと AI にも含め 1 回の処理で読み直さない ((4))、mtime を高精度にする、
 Remote 由来の待ち行列の上限 ((9))、テスト ((10))。ブラウザ側 cache の無効化は、明るさが本体側の設定で
 セッション取得を必ず挟むため既存契約で足りると判断した。
+
+### 20.4 Remote の詳細設計レビュー (2026-09-29、第3案の 2 回目)
+
+前回 8 件のうち 2 件解決 (Remote サムネイルの締め切り、明るさとブラウザ cache)。残りと新規 (P1×2 / P2×5 / P3×1) を
+すべて採用: 要求内の pin と per-flight の結果保持 ((1)(2))、取消の起床を上限付き `wait_timeout` にする ((2)、
+既存 source single-flight と同じ形)、submit と完了の順序 ((2))、204 の fetch 経路 ((5))、サムネイルも heavy の
+最後の枠を使えない ((6))、高精度 mtime を下流の key にも ((4))、待ち行列の上限の根拠 ((9))、サムネイルの 2 経路と
+`NoThumbnail` ((7))、優先度 accessor ((1))。
+
+### 20.5 Remote の詳細設計レビュー (2026-09-29、第3案の 3 回目)
+
+前回 8 件のうち 3 件解決 (pin と結果保持、取消の起床、優先度 accessor)。残りと新規 (P1×2 / P2×3 / P3×1) を採用:
+flight の全状態の join / leave 表 ((2))、前景の保証を「表示に必要なページを混雑で最終失敗にしない」に改め Web の
+前景再試行を需要がある間は上限なしにする ((6))、サムネイルの専用 admission class ((6))、`ThumbnailErrorCode::NoThumbnail`
+((7))、AI の高精度 mtime と完了時の再確認 ((4))、固定の flight 上限 `REMOTE_RAW_FLIGHT_LIMIT` ((9))、204 の検証順
+((5))、S2c のための priority と capacity policy ((9))。
+
+### 20.6 Remote の詳細設計レビュー (2026-09-29、第3案の 4 回目)
+
+前回の 11 項目のうち 8 件解決。残り (P1×3 / P2×1 / P3×1) を採用: flight_id 単位の仕事の会計とすべての submit への
+上限適用 ((2)(9))、表示需要の判定を coordinator の関数で行い需要が消えたら前景 job を cancel して先読みを作り直す
+((6))、上限到達を `RawCapacity` → `raw_busy` の専用 code にする ((6)(9))、AI の capacity 待ちを owner ごとに 1 つにし
+source bytes を読む前に capacity を取る ((9))、テストと telemetry の言い直し ((6)(10))。
+
+### 20.7 Remote の詳細設計レビュー (2026-09-29、第3案の 5 回目)
+
+残り 5 件のうち 3 件解決。P1 (既存の core `Busy` の上限付き再試行を残す)、P2×2 (表示需要が消えたら coordinator が
+即座に cancel / release、participant lease で `Done` の pin を必ず外す)、P3 (古いテストの削除) を採用した。

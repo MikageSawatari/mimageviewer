@@ -6850,16 +6850,20 @@ pub fn default_exif_hidden_tags() -> Vec<String> {
 }
 pub fn default_image_ext_priority() -> Vec<String> {
     // ロスレス系 > ロッシー系 > RAW 系
-    [
+    let mut priority = [
         "png", "bmp", "gif", "tiff", "tif", // ロスレス
         "webp", "jxl", "avif", "heic", "heif", // モダン (ロッシー/ロスレス混在)
         "jpg", "jpeg", // ロッシー
-        "dng", "cr2", "cr3", "nef", "nrw", "arw", // RAW (現像困難な場合が多い)
-        "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx", "rwl", "iiq", "crw", "srw",
     ]
     .iter()
     .map(|s| s.to_string())
-    .collect()
+    .collect::<Vec<_>>();
+    priority.extend(
+        crate::raw_format::RAW_EXTENSIONS
+            .iter()
+            .map(|extension| (*extension).to_string()),
+    );
+    priority
 }
 fn default_raw_develop_parallelism() -> u8 {
     3

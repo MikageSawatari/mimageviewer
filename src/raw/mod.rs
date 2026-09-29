@@ -242,8 +242,18 @@ mod tests {
                         );
                     }
                 }
-                Err(RawError::NoUsablePreview(_)) => {
+                Err(RawError::NoUsablePreview(reason)) => {
                     assert!(!expected_preview, "{} missing preview", path.display());
+                    if let Some(expected_reason) =
+                        sample["expected"]["preview_unavailable_reason"].as_str()
+                    {
+                        assert_eq!(
+                            format!("{reason:?}"),
+                            expected_reason,
+                            "{} preview reason",
+                            path.display()
+                        );
+                    }
                 }
                 Err(error) => panic!("{} preview: {error}", path.display()),
             }

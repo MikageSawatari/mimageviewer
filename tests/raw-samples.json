@@ -340,6 +340,103 @@
         "flip": null
       },
       "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "2851",
+      "case": "3fr",
+      "file": "2851.3fr",
+      "url": "https://raw.pixls.us/getfile.php/2851/nice/Hasselblad - H3D - 16bit (4:3).3FR",
+      "sha256": "34fdb93cb215e4f419ae0f7252c57b881fa381003124b4f9c143d27741f211b3",
+      "size": 53594112,
+      "format": "3FR",
+      "camera": "Hasselblad H3D",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": true,
+        "flip": 0
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "2680",
+      "case": "erf",
+      "file": "2680.erf",
+      "url": "https://raw.pixls.us/getfile.php/2680/nice/Epson - R-D1 - 12bit (3:2).ERF",
+      "sha256": "09d8e533d93116294a9f3e161ed868e929454c7b946e083b644bd6bb75bcb5e4",
+      "size": 9958994,
+      "format": "ERF",
+      "camera": "Epson R-D1",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": true,
+        "flip": 0
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "2338",
+      "case": "kdc",
+      "file": "2338.kdc",
+      "url": "https://raw.pixls.us/getfile.php/2338/nice/Kodak - DC120 - 8bit (4:3).kdc",
+      "sha256": "967c3af47289e6cc5ab4f9bd24135b7e5386f574fc76deb3b13e884bfda87856",
+      "size": 843328,
+      "format": "KDC",
+      "camera": "Kodak DC120",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": true,
+        "flip": 0
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "1347",
+      "case": "dcr",
+      "file": "1347.dcr",
+      "url": "https://raw.pixls.us/getfile.php/1347/nice/Kodak - DCS760C - 12bit (3:2).DCR",
+      "sha256": "d0e6bd0a3339daff884e73a08fed8e75b20fe05bba438fc185e3f0bd019d0da8",
+      "size": 7547392,
+      "format": "DCR",
+      "camera": "Kodak DCS760C",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": true,
+        "flip": 0
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "7795",
+      "case": "mrw",
+      "file": "7795.mrw",
+      "url": "https://raw.pixls.us/getfile.php/7795/nice/Minolta - DiMAGE 5 - 4:3.MRW",
+      "sha256": "d60bfd80bcb1f7b9c88b14a5e46ea27885bbf92d990ab30b3939288678fea0d9",
+      "size": 6422144,
+      "format": "MRW",
+      "camera": "Minolta DiMAGE 5",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": true,
+        "flip": 0
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
+    },
+    {
+      "id": "3196",
+      "case": "mos",
+      "file": "3196.mos",
+      "url": "https://raw.pixls.us/getfile.php/3196/nice/Leaf - Aptus 22 - 16bit (4:3).mos",
+      "sha256": "8a1a101cb3940b0648af54a721d92e6fb8612dd29a0909036ea2753196a00ec2",
+      "size": 23423633,
+      "format": "MOS",
+      "camera": "Leaf Aptus 22",
+      "expected": {
+        "develop_supported": true,
+        "has_usable_preview": false,
+        "flip": 6,
+        "preview_unavailable_reason": "OrientationMismatch"
+      },
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"
     }
   ]
 }

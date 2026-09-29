@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub const RAW_EXTENSIONS: &[&str] = &[
     "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx",
-    "rwl", "iiq", "crw", "srw",
+    "rwl", "iiq", "crw", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mos",
 ];
 
 pub fn is_raw_ext(extension: &str) -> bool {
@@ -27,7 +27,7 @@ mod tests {
     fn raw_and_wic_extension_lists_partition_folder_support() {
         use crate::{folder_tree::SUPPORTED_EXTENSIONS, wic_decoder::WIC_SUPPORTED_EXTENSIONS};
 
-        assert_eq!(RAW_EXTENSIONS.len(), 17);
+        assert_eq!(RAW_EXTENSIONS.len(), 23);
         for &extension in RAW_EXTENSIONS {
             assert!(SUPPORTED_EXTENSIONS.contains(&extension), "{extension}");
             assert!(
@@ -47,5 +47,12 @@ mod tests {
                 "{extension}"
             );
         }
+        let priority = crate::settings::default_image_ext_priority();
+        let expected = RAW_EXTENSIONS
+            .iter()
+            .map(|extension| (*extension).to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(&priority[priority.len() - expected.len()..], expected);
+        assert!(!is_raw_ext("mef"));
     }
 }
