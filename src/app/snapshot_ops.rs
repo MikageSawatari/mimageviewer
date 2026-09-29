@@ -1349,8 +1349,6 @@ impl App {
         let (Some(ctx), Some(fs_idx)) = (ctx, self.fullscreen_idx) else {
             return;
         };
-        #[cfg(windows)]
-        self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
         if reload {
             self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
         }

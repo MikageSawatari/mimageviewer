@@ -34763,8 +34763,6 @@ impl App {
         // folder-items sequence blocks unrelated targets until adoption, so admit this input
         // before consulting that block; sibling/page navigation remains blocked as before.
         if self.accumulate_staged_smart_fullscreen_ctrl_step(forward) {
-            #[cfg(windows)]
-            self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
             return;
         }
         if self.fs_navigation_sequence_blocks_new_target() {
@@ -34776,13 +34774,9 @@ impl App {
                 .top_level_grid_view
                 .accumulate_collection_outer_navigation(true, forward)
             {
-                #[cfg(windows)]
-                self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
                 return;
             }
             if let Some((current, mode)) = self.locked_fullscreen_folder_nav_request(false) {
-                #[cfg(windows)]
-                self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
                 // A follow-up accepted during the display-wait window targets the next items
                 // generation. Keep the existing holdover handle, but do not let readiness of
                 // the intermediate page release it before this DFS result is applied.
@@ -34835,7 +34829,6 @@ impl App {
             // search, snapshot, smart-folder and filter state. Their request is
             // owned by the mounted ViewerContextBundle and follows filesystem DFS.
             if let Some(cur) = self.effective_folder() {
-                self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
                 self.capture_fs_nav_holdover(fs_idx);
                 self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
             }
@@ -34905,8 +34898,6 @@ impl App {
             let Some(current) = self.favsearch.nav_stack.last().cloned() else {
                 return;
             };
-            #[cfg(windows)]
-            self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
             self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             self.start_folder_nav(
                 current,
@@ -34950,8 +34941,6 @@ impl App {
         }
 
         if self.top_level_grid_view.smart_folder().is_some() {
-            #[cfg(windows)]
-            self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
             self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             let _ = self.start_smart_folder_scope_nav(forward, true);
             return;
@@ -34961,8 +34950,6 @@ impl App {
         // effective_folder() を起点にする (グリッド側と同じ。Codex P2: さもないと
         // ZIP ツリーの端から抜けたとき archive_cache ディレクトリを探索してしまう)。
         if let Some(cur) = self.effective_folder() {
-            #[cfg(windows)]
-            self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
             self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
         }
@@ -34980,8 +34967,6 @@ impl App {
         }
         if self.fs_nav_is_locked() {
             if let Some((current, mode)) = self.locked_fullscreen_folder_nav_request(true) {
-                #[cfg(windows)]
-                self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
                 self.fs_nav_locked_gen = Some(self.items_generation);
                 self.start_folder_nav(current, forward, mode);
             }
@@ -34994,7 +34979,6 @@ impl App {
         #[cfg(windows)]
         if self.detached_physical_folder_nav_available() {
             if let Some(cur) = self.effective_folder() {
-                self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
                 self.capture_fs_nav_holdover(fs_idx);
                 self.start_folder_nav(cur, forward, crate::app::FolderNavMode::SiblingFullscreen);
             }
@@ -35056,8 +35040,6 @@ impl App {
 
         // 変換キャッシュ閲覧中の起点はユーザー視点の元アーカイブ (Codex P2、上と同様)。
         if let Some(cur) = self.effective_folder() {
-            #[cfg(windows)]
-            self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
             self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             self.start_folder_nav(cur, forward, crate::app::FolderNavMode::SiblingFullscreen);
         }
@@ -35387,10 +35369,6 @@ impl App {
             // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
                 if !self.fs_navigation_sequence_blocks_new_target() {
-                    #[cfg(windows)]
-                    if new_idx != fs_idx {
-                        self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
-                    }
                     let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                     self.land_still_page_navigation_target(
                         ctx,

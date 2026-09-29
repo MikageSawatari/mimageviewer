@@ -54085,6 +54085,22 @@ mod still_window_mode_key_tests {
         result_tx
     }
 
+    fn install_held_media_navigation_resolver(
+        app: &mut App,
+    ) -> (
+        mpsc::Receiver<MediaNavigationResolverRequest>,
+        mpsc::Sender<MediaNavigationResolverResponse>,
+    ) {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        app.media_navigation_resolver = Some(MediaNavigationResolver {
+            request_tx,
+            result_rx,
+            next_request_id: 0,
+        });
+        (request_rx, result_tx)
+    }
+
     fn install_all_native_pending_for_test(
         app: &mut App,
         from_idx: usize,
@@ -54163,7 +54179,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn normalize_scan_navigation_cancels_before_resolution_and_discards_ready_result() {
+    fn normalize_scan_navigation_cancels_at_switch_and_discards_ready_result() {
         use crate::video::normalize_types::{NormalizeResult, NormalizeUiState};
         use std::sync::atomic::Ordering;
 
@@ -54243,6 +54259,7 @@ mod still_window_mode_key_tests {
             "no-target keys keep scanning"
         );
         assert!(!cancel.load(Ordering::Acquire));
+        let (request_rx, result_tx) = install_held_media_navigation_resolver(&mut app);
         // Down is the default VideoNextFile action; the native key gate must admit it while
         // Scanning is still modal, before the normal navigation owner resolves the target.
         app.handle_native_video_key_event(
@@ -54253,22 +54270,38 @@ mod still_window_mode_key_tests {
                 ..key
             },
         );
-        assert!(cancel.load(Ordering::Acquire));
+        assert!(!cancel.load(Ordering::Acquire));
         assert!(
-            app.normalize_state.is_none(),
-            "cancel must precede target resolution"
+            app.normalize_state.is_some(),
+            "scan stays active while navigation resolves"
         );
-        app.poll_normalize_scan(&ctx);
+        // A queued result may finish while navigation resolves; the target still owns no part
+        // of the previous video's scan.
         assert!(
             app.audio_normalize_db
                 .as_ref()
                 .unwrap()
                 .lookup(&old_path, -14_000, 1, Some(1))
                 .is_none(),
-            "retired scan result must not be saved"
+            "unpolled scan result must not be saved"
         );
+        let request = request_rx
+            .try_recv()
+            .expect("navigation request not queued");
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: request.request_id,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(next_idx),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
         poll_media_navigation_until_done_for_test(&mut app, &ctx);
         assert_eq!(app.fullscreen_idx, Some(next_idx));
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(app.normalize_state.is_none());
+        app.poll_normalize_scan(&ctx);
         assert!(
             app.audio_normalize_db
                 .as_ref()
@@ -54281,11 +54314,318 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn normalize_navigation_keeps_another_viewer_context_scan() {
+    fn normalize_scan_navigation_without_openable_candidate_keeps_scan() {
         use std::sync::atomic::Ordering;
 
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        let old_path = app.tmp.path().join("scan-stays-old.mp4");
+        let missing_path = app.tmp.path().join("scan-stays-missing.mp4");
+        std::fs::write(&old_path, b"old video").unwrap();
+        let old_idx = push_video(&mut app, old_path.to_str().unwrap());
+        push_video(&mut app, missing_path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            old_idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(old_idx);
+        let mut scan = normalize_scan_state_for_test(old_idx, old_path);
+        scan.owner_context_id = app.projected_viewer_context_id();
+        let cancel = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+
+        app.start_manual_media_navigation(
+            &ctx,
+            &[old_idx, old_idx + 1],
+            old_idx,
+            1,
+            "test_missing",
+            ManualMediaNavigationLanding::NativeVideo,
+        );
+        poll_media_navigation_until_done_for_test(&mut app, &ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(old_idx));
+        assert!(app.normalize_state.is_some());
+        assert!(!cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_provisional_gain_stays_until_navigation_commits() {
+        use crate::video::normalize_types::NormalizeResult;
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_path = app.tmp.path().join("provisional-old.mp4");
+        let next_path = app.tmp.path().join("provisional-next.mp4");
+        std::fs::write(&old_path, b"old video").unwrap();
+        std::fs::write(&next_path, b"next video").unwrap();
+        let old_idx = push_video(&mut app, old_path.to_str().unwrap());
+        let next_idx = push_video(&mut app, next_path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        player.set_normalize_gain_for_stream(1, 0.5);
+        app.fs_cache.insert(
+            old_idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(old_idx);
+        let mut scan = normalize_scan_state_for_test(old_idx, old_path.clone());
+        scan.owner_context_id = app.projected_viewer_context_id();
+        scan.provisional_applied = true;
+        scan.provisional_result = Some(NormalizeResult {
+            gain_db: -6.0,
+            integrated_lufs: -20.0,
+            true_peak_db: -5.0,
+            target_lufs_milli: -14_000,
+        });
+        let cancel = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+
+        let (request_rx, result_tx) = install_held_media_navigation_resolver(&mut app);
+        app.start_manual_media_navigation(
+            &ctx,
+            &[old_idx, next_idx],
+            old_idx,
+            1,
+            "test_provisional",
+            ManualMediaNavigationLanding::NativeVideo,
+        );
+        assert_eq!(app.fullscreen_idx, Some(old_idx));
+        assert!(!cancel.load(Ordering::Acquire));
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&old_idx).unwrap() else {
+            panic!("old player missing")
+        };
+        assert_eq!(player.normalize_gain_for_stream(1), Some(0.5));
+
+        let request = request_rx
+            .try_recv()
+            .expect("navigation request not queued");
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: request.request_id,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(next_idx),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+        poll_media_navigation_until_done_for_test(&mut app, &ctx);
+        assert_eq!(app.fullscreen_idx, Some(next_idx));
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(app.normalize_state.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_modal_key_gate_uses_dispatch_action_priority() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("overlap-old.mp4");
+        std::fs::write(&path, b"old video").unwrap();
+        let idx = push_video(&mut app, path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsVideo]\nVideoNextFile = F11\n");
+        let mut scan = normalize_scan_state_for_test(idx, path);
+        scan.owner_context_id = app.projected_viewer_context_id();
+        app.normalize_state = Some(scan);
+        assert!(!app.video_presentation_transition.is_transitioning());
+
+        app.handle_native_video_key_event(
+            &ctx,
+            idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(1),
+                virtual_key: 0x7A,
+                scan_code: 0,
+                extended: false,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                repeat: false,
+            },
+        );
+
+        assert!(app.normalize_state.is_some());
+        assert!(
+            !app.video_presentation_transition.is_transitioning(),
+            "F11 resolves to the earlier window-mode action, which the modal scan blocks"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_modal_key_gate_blocks_video_audio_vst_toggle() {
+        use std::sync::atomic::Ordering;
+
+        for conflicting_navigation_binding in [false, true] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let path = app.tmp.path().join("vst-scan.mp4");
+            std::fs::write(&path, b"video").unwrap();
+            let idx = push_video(&mut app, path.to_str().unwrap());
+            let mut player =
+                crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+            player.set_opened_audio_stream_for_test(1, 0);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            app.fullscreen_idx = Some(idx);
+            app.video_audio_mode = Some(idx);
+            app.video_audio_vst = Some(VideoAudioVstState {
+                fs_idx: idx,
+                phase: VideoAudioVstPhase::Active,
+            });
+            if conflicting_navigation_binding {
+                app.keymap = crate::keymap::Keymap::from_ini_str(
+                    "[FsVideo]\nVideoNextFile = Z\nVideoToggleAudioMode = Z\n",
+                );
+            }
+            let mut scan = normalize_scan_state_for_test(idx, path);
+            scan.owner_context_id = app.projected_viewer_context_id();
+            let cancel = scan.cancel.clone();
+            app.normalize_state = Some(scan);
+
+            app.handle_native_video_key_event(&ctx, idx, super::video_audio_native_z(false));
+
+            assert!(app.video_audio_vst_active_for(idx));
+            assert!(app.normalize_state.is_some());
+            assert!(!cancel.load(Ordering::Acquire));
+            assert_eq!(app.fullscreen_idx, Some(idx));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_scan_can_finish_during_superseded_navigation_resolution() {
+        use crate::video::normalize_types::NormalizeResult;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_path = app.tmp.path().join("scan-finished-old.mp4");
+        let next_path = app.tmp.path().join("scan-finished-next.mp4");
+        std::fs::write(&old_path, b"old video").unwrap();
+        std::fs::write(&next_path, b"next video").unwrap();
+        let old_idx = push_video(&mut app, old_path.to_str().unwrap());
+        let next_idx = push_video(&mut app, next_path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            old_idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(old_idx);
+        app.settings.audio_normalize_enabled = true;
+        let (scan_tx, scan_rx) = std::sync::mpsc::channel();
+        let mut scan = normalize_scan_state_for_test(old_idx, old_path.clone());
+        scan.owner_context_id = app.projected_viewer_context_id();
+        scan.was_playing = false;
+        scan.rx = scan_rx;
+        app.normalize_state = Some(scan);
+        let result_tx = install_fake_media_navigation_resolver(&mut app);
+        app.media_navigation_pending = Some(MediaNavigationPending {
+            request_id: 2,
+            items_generation: app.items_generation,
+            input_seq: app.input_seq,
+            owner_window_id: app.current_media_navigation_owner(),
+            fullscreen_idx: Some(old_idx),
+            source: "test_superseded_manual",
+            action: MediaNavigationAction::Manual {
+                fs_idx: old_idx,
+                delta: 1,
+                landing: ManualMediaNavigationLanding::NativeVideo,
+            },
+            started_at: std::time::Instant::now(),
+        });
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: 1,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(next_idx),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+        app.poll_media_navigation_pending(&ctx);
+        assert_eq!(app.fullscreen_idx, Some(old_idx));
+        assert!(app.normalize_state.is_some());
+
+        scan_tx
+            .send(crate::app::normalize::NormalizeMessage::Done(
+                NormalizeResult {
+                    gain_db: -6.0,
+                    integrated_lufs: -20.0,
+                    true_peak_db: -5.0,
+                    target_lufs_milli: -14_000,
+                },
+            ))
+            .unwrap();
+        app.poll_normalize_scan(&ctx);
+        assert!(app.normalize_state.is_none());
+        assert!(
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .lookup(&old_path, -14_000, 1, Some(1))
+                .is_some()
+        );
+        assert_eq!(app.fullscreen_idx, Some(old_idx));
+
+        result_tx
+            .send(MediaNavigationResolverResponse {
+                request_id: 2,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(next_idx),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+        app.poll_media_navigation_pending(&ctx);
+        assert_eq!(app.fullscreen_idx, Some(next_idx));
+        assert!(
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .lookup(&next_path, -14_000, 1, Some(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_owner_cleanup_keeps_another_viewer_context_scan() {
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
         let path = app.tmp.path().join("other-window-scan.mp4");
         std::fs::write(&path, b"other window").unwrap();
         let idx = push_video(&mut app, path.to_str().unwrap());
@@ -54305,7 +54645,7 @@ mod still_window_mode_key_tests {
         let cancel = scan.cancel.clone();
         app.normalize_state = Some(scan);
 
-        app.cancel_normalize_scan_for_navigation(&ctx, idx);
+        app.cleanup_normalize_state_for_fs_idx(idx);
         assert!(!cancel.load(Ordering::Acquire));
         assert!(app.normalize_state.is_some());
     }
