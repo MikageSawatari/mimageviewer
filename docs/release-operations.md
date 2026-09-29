@@ -17,7 +17,7 @@
 
 公開準備・公開作業はClaudeCode Opusが主導する (担当範囲は2026-09-09決定を継続)。
 2026-09-23のモデル更新後は **ClaudeCode Opus 5.5 / high** が管理・設計・検収と公開を担当する。
-開発の実装・テストと独立レビューは別担当の **GPT-6 Sol / xhigh** とし、
+開発の実装・テストは **GPT-6.1 Sol / high**、独立レビューは別担当の **GPT-6.1 Sol / xhigh** とし (2026-09-30 更新)、
 難しい設計・原因調査の追加確認に限り **GPT-6 Astra / medium** を使う。
 モデル分担の正本は [AGENTS.md](../AGENTS.md#model-roles-and-coordination)。
 
