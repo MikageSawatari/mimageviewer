@@ -786,7 +786,9 @@ enum SmartFolderTransitionRoot {
 
 #[derive(Clone)]
 struct SmartChildSource {
+    // The Smart row and favorite/history owner, including a Save PDF continuation's EPUB.
     logical_source: crate::pdf_loader::LeasedEpubPath,
+    // The file read by the worker; Save PDF may redirect this to the sibling PDF.
     load_path: PathBuf,
 }
 
@@ -3363,7 +3365,7 @@ impl App {
             &child,
             SmartPhysicalReady::PdfPages { .. } | SmartPhysicalReady::PdfWarm { .. }
         ) {
-            self.prepare_pdf_visible_adoption(&path);
+            self.prepare_pdf_visible_adoption(&source.logical_source);
         }
         if auto_fullscreen {
             if matches!(&child, SmartPhysicalReady::Folder(_)) {
@@ -9492,6 +9494,110 @@ mod tests {
                         ..
                     }
                 ))
+        );
+    }
+
+    #[test]
+    fn smart_saved_epub_pdf_adoption_does_not_write_pdf_favorite_view() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.remember_favorite_view_state = true;
+        app.settings.skip_epub_if_pdf_exists = false;
+        let source = app.tmp.path().join("smart-saved-epub-favorite");
+        std::fs::create_dir_all(&source).unwrap();
+        let epub = source.join("book.epub");
+        let pdf = source.join("book.pdf");
+        std::fs::write(&epub, b"EPUB awaiting Save PDF").unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let pdf_favorite = crate::settings::FavoriteEntry::new("PDF alias".into(), pdf.clone());
+        let pdf_favorite_id = pdf_favorite.id;
+        app.settings.favorites.push(pdf_favorite);
+
+        let mut definition = crate::settings::SmartFolderDefinition::new("Smart Saved EPUB");
+        definition.rules.push(crate::settings::SmartFolderRule::new(
+            source,
+            true,
+            Default::default(),
+        ));
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.items_are_smart_folder_view || app.smart_folder_transition.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Smart root did not become idle"
+            );
+            app.poll_smart_folder(&ctx);
+            app.poll_search(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.favorite_view_states.contains_key(&pdf_favorite_id));
+        let index = app
+            .items
+            .iter()
+            .position(|item| {
+                item.drag_source_path()
+                    .is_some_and(|path| crate::folder_tree::path_eq(path, &epub))
+            })
+            .expect("EPUB root row");
+        app.selected = Some(index);
+        assert!(app.begin_smart_grid_container_navigation_classified(
+            index,
+            epub.clone(),
+            false,
+            super::OpenPathKind::File,
+            None,
+        ));
+        let transition = app.smart_folder_transition.as_mut().unwrap();
+        let request_id = transition.request_id;
+        let root =
+            match std::mem::replace(&mut transition.phase, SmartFolderTransitionPhase::Retired) {
+                SmartFolderTransitionPhase::ChildPreflight { root, .. } => root,
+                _ => panic!("Smart EPUB child must be in preflight"),
+            };
+        transition.phase = SmartFolderTransitionPhase::ChildPreflight {
+            root,
+            child: SmartPhysicalPreflight::EpubConvert,
+        };
+        let owner =
+            super::OpenRequestOwner::MainGridArchive(super::MainGridArchiveTransitionIntent {
+                source_path: epub.clone(),
+                reading_history_return_from: None,
+                suppress_rating_filter: false,
+                suppress_facet_filter: false,
+                smart_folder_owner: super::SmartGridArchiveOwner::Transition(request_id),
+                collection_grid_owner: None,
+                rating_grid_owner: None,
+                collection_navigation_continuation: None,
+            });
+        assert!(app.supply_smart_saved_epub_pdf(&epub, &pdf, &owner));
+        let transition = app.smart_folder_transition.as_mut().unwrap();
+        let root =
+            match std::mem::replace(&mut transition.phase, SmartFolderTransitionPhase::Retired) {
+                SmartFolderTransitionPhase::ChildPreflight { root, .. } => root,
+                _ => panic!("Save PDF must resume PDF preflight"),
+            };
+        transition.phase = SmartFolderTransitionPhase::ChildReady {
+            root,
+            child: SmartPhysicalReady::PdfPages {
+                pages: vec![crate::pdf_loader::PdfPageEntry {
+                    page_num: 0,
+                    mtime: 1,
+                    file_size: 1,
+                }],
+                direction: None,
+                password: None,
+                save_password: false,
+            },
+        };
+        app.poll_smart_folder(&ctx);
+        assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
+        assert!(app.smart_folder_session_owns_load(&epub));
+        assert!(
+            app.favorite_view_states.get(&pdf_favorite_id).is_none(),
+            "the physical PDF alias must not acquire the Smart EPUB's favorite view"
         );
     }
 

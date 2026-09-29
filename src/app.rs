@@ -31625,9 +31625,14 @@ impl App {
         )
     }
 
-    fn prepare_pdf_visible_adoption(&mut self, pdf_path: &Path) {
-        if !self.smart_folder_session_owns_load(pdf_path) {
-            self.transition_favorite_view_for_path(Some(pdf_path));
+    /// The adoption destination is the logical book. Smart Folder's Save PDF continuation
+    /// reads the sibling PDF but remains at its EPUB child until that session is left.
+    fn prepare_pdf_visible_adoption(
+        &mut self,
+        logical_location: &crate::pdf_loader::LeasedEpubPath,
+    ) {
+        if !self.smart_folder_session_owns_load(logical_location.as_path()) {
+            self.transition_favorite_view_for_path(Some(logical_location.as_path()));
         }
         #[cfg(windows)]
         if self.should_preserve_active_detached_image_window_for_main_context_change() {
@@ -31758,7 +31763,7 @@ impl App {
             pdf_path.display()
         ));
         if prepared_pages.is_some() {
-            self.prepare_pdf_visible_adoption(&pdf_path);
+            self.prepare_pdf_visible_adoption(&candidate_source);
         }
 
         // 同じ PDF の再 open では、旧 handle を新しい waiter の登録まで保持する。
@@ -31894,7 +31899,7 @@ impl App {
                 return FolderOpenOutcome::Ignored;
             }
             self.finish_direct_pdf_visible_adoption(&pdf_path, &owner);
-            self.prepare_pdf_visible_adoption(&pdf_path);
+            self.prepare_pdf_visible_adoption(&candidate_source);
             let (items, image_metas, existing_keys) =
                 Self::build_pdf_meta_placeholder_rows(&pdf_path, page_count, mtime, file_size);
             self.start_loading_items(
@@ -32490,7 +32495,7 @@ impl App {
             }
         };
 
-        let (pdf_path, password, _handle, owner, mut open_restore, phase, _candidate_source) =
+        let (pdf_path, password, _handle, owner, mut open_restore, phase, candidate_source) =
             self.pdf_enumerate_pending.take().unwrap();
 
         // cancel 経由の Interrupted は late-arriving な stale 結果なので適用しない
@@ -32542,7 +32547,7 @@ impl App {
                 match phase {
                     PdfOpenPhase::ColdCandidate { retained_source } => {
                         drop(retained_source);
-                        self.prepare_pdf_visible_adoption(&pdf_path);
+                        self.prepare_pdf_visible_adoption(&candidate_source);
                     }
                     PdfOpenPhase::CommittedVerification { .. } => {
                         // The placeholder grid has already adopted this PDF and started
