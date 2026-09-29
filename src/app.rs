@@ -13058,7 +13058,6 @@ pub(crate) struct FavoriteViewContextState {
 
 pub struct App {
     pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
-    #[cfg(windows)]
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
     /// The mounted visible EPUB owns its lease until this viewer context changes source.
