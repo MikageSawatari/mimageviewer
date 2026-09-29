@@ -1467,6 +1467,10 @@ Collection の明示 Open、物理子から root への復帰、offscreen 履歴
 
 再確認 P2 の追補: 戻り先の優先規則は共有したまま、通常の Search / Snapshot 退場では saved folder、canonical `return_to`、サブフォルダ展開の復帰状態を所有元から move する。Collection 移管前の読み取りだけが必要な fallback を複製し、transient から戻り先が決まれば現在 surface の復帰状態を余分に複製しない。これにより通常の検索終了時に動画サムネイル対応表や除外パス集合を同期コピーしない。移管・detached の所有境界は変えず、通常 Open・別窓動画 Open × Search・Snapshot の回帰テストを維持する。
 
+**2026-09-30 §1.301 動画ノーマライズ中の移動と native キー解決**
+
+native キーのモーダル gate は dispatch と同じ優先順位で解決した Action を使う。既存の `viewer_session_is_detached` を読んで、別窓の Enter / Escape が固定のセッション終了操作として先に処理される順序も保つ。移動要求時の scan 取消をやめ、移動先の採用・元動画の所有者終了にある共通 cleanup で取消す。別窓の scan は context ID で分離する。detached 述語自体、viewport、host、配置、focus、window lifecycle は変更しない。入力 gate と所有者の確定境界を揃える構造的修正であり、時間窓や新しい detached 状態による症状パッチではない。設計担当の方針と Codex の実装判断は一致している。
+
 **2026-09-29 Smart Folder PDF 可視採用の共通後片付け**
 
 Smart Folder の PDF warm placeholder と準備済み pages は、Smart child session の採用後に通常 PDF と同じ `prepare_pdf_visible_adoption` を通す。既存の detached image window 退避判定を含む後片付けを page rows の install 前に一度だけ行い、列挙検証時は繰り返さない。detached の述語・viewport・window lifecycle の実装は変更せず、Smart 経路の可視採用を既存の所有境界へ合流させた。

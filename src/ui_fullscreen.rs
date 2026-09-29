@@ -6304,6 +6304,7 @@ fn fs_still_seek_strip_popup_open(ctx: &egui::Context) -> bool {
 enum StillSeekStripMenuChoice {
     Visible(bool),
     Height(crate::settings::StillSeekStripHeight),
+    PreviewSize(crate::settings::StillSeekPreviewSize),
 }
 
 fn draw_still_seek_strip_popup(
@@ -6311,6 +6312,8 @@ fn draw_still_seek_strip_popup(
     visible: bool,
     current_height: crate::settings::StillSeekStripHeight,
     height_values: crate::settings::StillSeekStripHeightValues,
+    current_preview_size: crate::settings::StillSeekPreviewSize,
+    preview_size_values: crate::settings::StillSeekPreviewSizeValues,
 ) -> Option<StillSeekStripMenuChoice> {
     let mut selected = None;
     let _ = crate::os_theme::dark_menu_popup(response)
@@ -6321,38 +6324,67 @@ fn draw_still_seek_strip_popup(
         .gap(6.0)
         .show(|ui| {
             crate::os_theme::apply_dark_ui(ui);
-            ui.set_min_width(168.0);
-            for (label, selected_now, choice) in [
-                (
-                    "非表示".to_owned(),
-                    !visible,
-                    StillSeekStripMenuChoice::Visible(false),
-                ),
-                (
-                    "表示".to_owned(),
-                    visible,
-                    StillSeekStripMenuChoice::Visible(true),
-                ),
-            ] {
-                if ui.selectable_label(selected_now, label).clicked() {
-                    selected = Some(choice);
-                    ui.close();
-                }
-            }
-            ui.separator();
-            for preset in crate::settings::StillSeekStripHeight::ALL {
-                let points = height_values.points(preset);
-                if ui
-                    .selectable_label(
-                        current_height == preset,
-                        format!("高さ: {} ({points:.0} px)", preset.label()),
-                    )
-                    .clicked()
-                {
-                    selected = Some(StillSeekStripMenuChoice::Height(preset));
-                    ui.close();
-                }
-            }
+            let viewport = ui.ctx().content_rect();
+            let tiny = viewport.width() < 240.0;
+            ui.set_min_width(168.0_f32.min((viewport.width() - 16.0).max(120.0)));
+            egui::ScrollArea::vertical()
+                .max_height((viewport.height() - 32.0).max(60.0))
+                .show(ui, |ui| {
+                    for (label, selected_now, choice) in [
+                        (
+                            "非表示".to_owned(),
+                            !visible,
+                            StillSeekStripMenuChoice::Visible(false),
+                        ),
+                        (
+                            "表示".to_owned(),
+                            visible,
+                            StillSeekStripMenuChoice::Visible(true),
+                        ),
+                    ] {
+                        if ui.selectable_label(selected_now, label).clicked() {
+                            selected = Some(choice);
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    for preset in crate::settings::StillSeekStripHeight::ALL {
+                        let points = height_values.points(preset);
+                        let label = if tiny {
+                            format!("高さ: {}", preset.label())
+                        } else {
+                            format!("高さ: {} ({points:.0} px)", preset.label())
+                        };
+                        if ui
+                            .selectable_label(current_height == preset, label)
+                            .on_hover_text(format!("高さ: {} ({points:.0} px)", preset.label()))
+                            .clicked()
+                        {
+                            selected = Some(StillSeekStripMenuChoice::Height(preset));
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    for preset in crate::settings::StillSeekPreviewSize::ALL {
+                        let points = preview_size_values.points(preset);
+                        let label = if tiny {
+                            format!("プレビュー: {}", preset.label())
+                        } else {
+                            format!("プレビューの大きさ: {} ({points:.0} px)", preset.label())
+                        };
+                        if ui
+                            .selectable_label(current_preview_size == preset, label)
+                            .on_hover_text(format!(
+                                "プレビューの大きさ: {} ({points:.0} px)",
+                                preset.label()
+                            ))
+                            .clicked()
+                        {
+                            selected = Some(StillSeekStripMenuChoice::PreviewSize(preset));
+                            ui.close();
+                        }
+                    }
+                });
         });
     selected
 }
@@ -20223,6 +20255,19 @@ impl App {
         ctx.request_repaint();
     }
 
+    fn set_still_seek_preview_size(
+        &mut self,
+        ctx: &egui::Context,
+        size: crate::settings::StillSeekPreviewSize,
+    ) {
+        if self.settings.still_seek_preview_size == size {
+            return;
+        }
+        self.settings.still_seek_preview_size = size;
+        self.settings.save();
+        ctx.request_repaint();
+    }
+
     /// The fixed top bar may reserve image space only while the same chrome is drawable.
     /// Keep this predicate shared with the draw gate so edit/capture/music modes cannot
     /// leave an empty strip at the top of the fullscreen canvas.
@@ -20819,6 +20864,8 @@ impl App {
             strip_visible,
             self.settings.still_seek_strip_height,
             self.settings.still_seek_strip_height_values,
+            self.settings.still_seek_preview_size,
+            self.settings.still_seek_preview_size_values,
         ) {
             match choice {
                 StillSeekStripMenuChoice::Visible(visible) => {
@@ -20826,6 +20873,9 @@ impl App {
                 }
                 StillSeekStripMenuChoice::Height(height) => {
                     self.set_still_seek_strip_height(ctx, height);
+                }
+                StillSeekStripMenuChoice::PreviewSize(size) => {
+                    self.set_still_seek_preview_size(ctx, size);
                 }
             }
         }
@@ -28581,6 +28631,29 @@ impl App {
         // Enter/Space/文字キー/Ctrl+V が奪われて日本語変換や貼り付けが壊れるのを防ぐ
         // (動画は native presenter 側で入力するので同問題は無い)。モーダル表示中は ESC/Space 等の
         // フルスクリーンショートカット (閉じる/再生トグル) も塞いでモーダル操作へ集中させる。
+        #[cfg(windows)]
+        if fs_music_view_active
+            && self.music_normalize_modal_active(fs_idx)
+            && !ctx.wants_keyboard_input()
+            && !self.ime_input_active(ctx)
+            && !self.music_bookmark_modal_open()
+            && let Some(nav) = self.keymap.consume_first_action(
+                ctx,
+                FS_VIDEO_ACTIVE_SCOPES,
+                &[KeyAction::VideoPrevFile, KeyAction::VideoNextFile],
+            )
+        {
+            self.music_navigate_file(
+                ctx,
+                fs_idx,
+                if nav == KeyAction::VideoNextFile {
+                    1
+                } else {
+                    -1
+                },
+            );
+            return action;
+        }
         if fs_music_view_active && self.music_fullscreen_editor_or_modal_blocks_input(ctx, fs_idx) {
             #[cfg(windows)]
             if let Some(inputs) = video_audio_exit_key_diagnostic.as_ref() {
@@ -34791,7 +34864,6 @@ impl App {
         // ★固定 中は snapshot 内 entry を巡回する (= §4.6)。
         // Folder/Image/Video 混合 entry 全部対象。
         if self.is_snapshot_active() {
-            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             let _ = self.snapshot_navigate(
                 ctx,
                 forward,
@@ -34928,7 +35000,6 @@ impl App {
         // ★固定 中は snapshot 内の playable image-like entry のみを巡回 (= §4.6)。
         // Ctrl+PageUp/Down は Folder entry を skip して直接 image/video へ。
         if self.is_snapshot_active() {
-            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             let _ = self.snapshot_navigate(
                 ctx,
                 forward,
@@ -67744,6 +67815,149 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("missing overlay text: {expected}"))
+    }
+
+    fn choose_still_preview_size_from_hud(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+        full: egui::Rect,
+        size: crate::settings::StillSeekPreviewSize,
+    ) {
+        let geometry = app.still_seek_geometry_for_idx(full, 3, false);
+        let toggle = still_seek_control_rects(geometry, full)
+            .toggle
+            .unwrap()
+            .center();
+        still_seek_edge_frame(app, ctx, full, Vec::new());
+        still_seek_edge_frame(app, ctx, full, vec![egui::Event::PointerMoved(toggle)]);
+        still_seek_edge_frame(
+            app,
+            ctx,
+            full,
+            vec![still_seek_pointer_button_event(toggle, true)],
+        );
+        still_seek_edge_frame(
+            app,
+            ctx,
+            full,
+            vec![still_seek_pointer_button_event(toggle, false)],
+        );
+        assert!(fs_still_seek_strip_popup_open(ctx));
+        let mut frame = still_seek_edge_frame(app, ctx, full, Vec::new());
+        let tiny = full.width() < 240.0;
+        let label = format!(
+            "{}",
+            if tiny {
+                format!("プレビュー: {}", size.label())
+            } else {
+                format!(
+                    "プレビューの大きさ: {} ({:.0} px)",
+                    size.label(),
+                    app.settings.still_seek_preview_size_values.points(size),
+                )
+            }
+        );
+        let scroll_pos = still_seek_overlay_text(&frame, "非表示")
+            .0
+            .clip_rect
+            .center();
+        let mut target = egui::Pos2::ZERO;
+        let mut visible = false;
+        for _ in 0..20 {
+            if let Some((clipped, text)) =
+                frame
+                    .shapes
+                    .iter()
+                    .find_map(|clipped| match &clipped.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => {
+                            Some((clipped, text))
+                        }
+                        _ => None,
+                    })
+            {
+                target = text.pos + text.galley.rect.center().to_vec2();
+                if clipped.clip_rect.contains(target) && full.contains(target) {
+                    visible = true;
+                    break;
+                }
+            }
+            frame = still_seek_edge_frame(
+                app,
+                ctx,
+                full,
+                vec![
+                    egui::Event::PointerMoved(scroll_pos),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, -5.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(
+            visible,
+            "小さい画面でもプレビューの選択肢へスクロールできる"
+        );
+        still_seek_edge_frame(app, ctx, full, vec![egui::Event::PointerMoved(target)]);
+        still_seek_edge_frame(
+            app,
+            ctx,
+            full,
+            vec![still_seek_pointer_button_event(target, true)],
+        );
+        still_seek_edge_frame(
+            app,
+            ctx,
+            full,
+            vec![still_seek_pointer_button_event(target, false)],
+        );
+    }
+
+    #[test]
+    fn still_hud_preview_size_selection_keeps_strip_height_in_main_and_second_context() {
+        use crate::settings::StillSeekPreviewSize;
+
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 540.0));
+        let mut app = still_seek_edge_test_app();
+        let original_height = app.settings.still_seek_strip_height;
+        let ctx = egui::Context::default();
+        choose_still_preview_size_from_hud(&mut app, &ctx, full, StillSeekPreviewSize::Medium);
+        assert_eq!(
+            app.settings.still_seek_preview_size,
+            StillSeekPreviewSize::Medium
+        );
+        assert_eq!(app.settings.still_seek_strip_height, original_height);
+
+        let other = app.build_window_context_for_test(904, |mounted| {
+            mounted.items = (0..10)
+                .map(|idx| GridItem::Image(PathBuf::from(format!("c:/seek/second-{idx}.png"))))
+                .collect();
+            mounted.thumbnails = vec![ThumbnailState::Failed; mounted.items.len()];
+            mounted.image_metas = vec![Some((600, 900)); mounted.items.len()];
+            mounted.visible_indices = (0..mounted.items.len()).collect();
+            mounted.details_order = mounted.visible_indices.clone();
+            mounted.fullscreen_idx = Some(3);
+        });
+        app.with_window_context_for_test(other, |mounted| {
+            let second_ctx = egui::Context::default();
+            choose_still_preview_size_from_hud(
+                mounted,
+                &second_ctx,
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 240.0)),
+                StillSeekPreviewSize::Small,
+            );
+            assert_eq!(
+                mounted.settings.still_seek_preview_size,
+                StillSeekPreviewSize::Small
+            );
+            assert_eq!(mounted.settings.still_seek_strip_height, original_height);
+        });
+        assert_eq!(
+            app.settings.still_seek_preview_size,
+            StillSeekPreviewSize::Small
+        );
+        assert_eq!(app.settings.still_seek_strip_height, original_height);
     }
 
     fn assert_still_seek_overlay_text_is_fitted(

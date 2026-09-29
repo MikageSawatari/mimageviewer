@@ -822,6 +822,11 @@ pub enum NativeVideoOutputEvent {
         generation: u64,
         expected: Option<seek_strip::SeekStripEventStamp>,
     },
+    SetSeekPreviewSize {
+        size: crate::settings::VideoSeekPreviewSize,
+        generation: u64,
+        expected: Option<seek_strip::SeekStripEventStamp>,
+    },
     StepSeekStripRange {
         steps: Vec<seek_strip::SeekStripRangeStep>,
         stamp: seek_strip::SeekStripEventStamp,
@@ -4384,6 +4389,13 @@ fn send_native_overlay_command(
                 expected: expected.map(|stamp| stamp.at_generation(generation)),
             }
         }
+        Command::SetSeekPreviewSize { size, expected } => {
+            NativeVideoOutputEvent::SetSeekPreviewSize {
+                size,
+                generation,
+                expected: expected.map(|stamp| stamp.at_generation(generation)),
+            }
+        }
         Command::StepSeekStripRange { steps, stamp } => {
             NativeVideoOutputEvent::StepSeekStripRange {
                 steps,
@@ -6886,6 +6898,17 @@ fn run_native_video_output(
                                     event_epoch,
                                     NativeVideoOutputEvent::SetSeekStripHeight {
                                         height,
+                                        generation: cur_generation,
+                                        expected: expected.map(|stamp| stamp.at_generation(cur_generation)),
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekPreviewSize { size, expected } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetSeekPreviewSize {
+                                        size,
                                         generation: cur_generation,
                                         expected: expected.map(|stamp| stamp.at_generation(cur_generation)),
                                     },
@@ -14770,6 +14793,15 @@ mod tests {
             &tx,
             41,
             31,
+            crate::video::native_presenter::NativeOverlayCommand::SetSeekPreviewSize {
+                size: crate::settings::VideoSeekPreviewSize::Medium,
+                expected: Some(render_stamp),
+            },
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
             crate::video::native_presenter::NativeOverlayCommand::StepSeekStripRange {
                 steps: vec![crate::video::seek_strip::SeekStripRangeStep::Narrower],
                 stamp: render_stamp,
@@ -14785,7 +14817,7 @@ mod tests {
         );
 
         let events = rx.drain();
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
         assert!(matches!(
             events[0].event,
             super::NativeVideoOutputEvent::SetSeekStripView {
@@ -14804,13 +14836,21 @@ mod tests {
         ));
         assert!(matches!(
             events[2].event,
+            super::NativeVideoOutputEvent::SetSeekPreviewSize {
+                size: crate::settings::VideoSeekPreviewSize::Medium,
+                generation: 31,
+                expected: Some(actual),
+            } if actual == expected
+        ));
+        assert!(matches!(
+            events[3].event,
             super::NativeVideoOutputEvent::StepSeekStripRange {
                 stamp: actual,
                 ..
             } if actual == expected
         ));
         assert!(matches!(
-            events[3].event,
+            events[4].event,
             super::NativeVideoOutputEvent::ToggleSeekStripLock {
                 generation: 31,
                 expected: Some(actual),

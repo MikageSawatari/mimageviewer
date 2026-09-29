@@ -58888,6 +58888,17 @@ impl App {
         if self.fullscreen_idx.is_none() {
             self.fs_pdf_display_target = None;
         }
+        // The admitted open commits this viewer to a different item. Retire the old media
+        // owner's scan here; resolver requests, failed candidates, and superseded targets leave
+        // its scan and provisional gain untouched. The same owner cleanup is used when the old
+        // player is evicted or the fullscreen session closes.
+        #[cfg(windows)]
+        if let Some(previous_idx) = self
+            .fullscreen_idx
+            .filter(|&previous_idx| previous_idx != idx)
+        {
+            self.cleanup_normalize_state_for_fs_idx(previous_idx);
+        }
         self.fullscreen_idx = Some(idx);
         if load_contract == FsPageLoadContract::LatestSeek {
             self.apply_fs_page_load_contract(idx, load_contract);
