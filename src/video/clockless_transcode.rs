@@ -63,6 +63,7 @@ impl ClocklessQuality {
 pub struct ClocklessTranscodeOptions {
     pub path: PathBuf,
     pub include_audio: bool,
+    pub audio_stream_index: usize,
     pub hw_decode: bool,
     pub quality: ClocklessQuality,
     pub(crate) encoder: EncoderPreference,
@@ -79,10 +80,12 @@ pub struct ClocklessTranscodeOptions {
 }
 
 impl ClocklessTranscodeOptions {
-    pub fn benchmark(path: impl Into<PathBuf>) -> Self {
+    pub fn benchmark(path: impl Into<PathBuf>, audio_stream_index: usize) -> Self {
+        let path = path.into();
         Self {
-            path: path.into(),
+            path,
             include_audio: true,
+            audio_stream_index,
             hw_decode: true,
             quality: ClocklessQuality::Standard,
             encoder: EncoderPreference::Auto,
@@ -105,6 +108,7 @@ pub(crate) struct ClocklessVideoOutputInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClocklessOutputInfo {
     pub(crate) video: Option<ClocklessVideoOutputInfo>,
+    pub(crate) audio_stream_index: Option<usize>,
     pub(crate) audio_bitrate_bps: u64,
     pub(crate) codecs: String,
 }
@@ -2097,8 +2101,9 @@ fn run_clockless_stream_inner(
 
     let audio_stream = options
         .include_audio
-        .then(|| input.streams().best(MediaType::Audio))
-        .flatten();
+        .then(|| input.stream(options.audio_stream_index))
+        .flatten()
+        .filter(|stream| stream.parameters().medium() == MediaType::Audio);
     let audio_stream_index = audio_stream.as_ref().map(|stream| stream.index());
     let audio_start_secs = audio_stream.as_ref().map(stream_start_secs);
     let source_start_secs = audio_start_secs
@@ -2189,6 +2194,7 @@ fn run_clockless_stream_inner(
             output_dimensions: video.output_parameters().dimensions,
             bitrate_bps: video.effective_video_bitrate_bps(),
         }),
+        audio_stream_index,
         audio_bitrate_bps: audio_encoder.effective_bitrate_bps(),
         codecs: segmenter.codecs().to_owned(),
     };
@@ -3719,11 +3725,111 @@ mod tests {
     }
 
     #[test]
+    fn selected_stream_is_encoded_into_the_aac_output() {
+        fn decoded_frequency(stream_index: usize) -> f64 {
+            let fixture =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tracks/multi-audio.m4a");
+            let temp = tempfile::tempdir().unwrap();
+            let output_path = temp.path().join("selected.mp4");
+            let mut options = ClocklessTranscodeOptions::benchmark(fixture, stream_index);
+            options.hw_decode = false;
+            options.max_source_secs = Some(3.0);
+            options.segment_capacity = 8;
+            let control = ClocklessTranscodeControl::auto_releasing(8).unwrap();
+            let output = ClocklessStreamOutput::new(8, 0.0).unwrap();
+            run_clockless_stream(
+                &options,
+                &control,
+                output.clone(),
+                ClocklessAudioProcessing::default(),
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                output.info().unwrap().audio_stream_index,
+                Some(stream_index)
+            );
+            let mut bytes = output.init_segment().unwrap();
+            for sequence in 0..=output.metrics().latest_sequence.unwrap() {
+                match output.segment(sequence) {
+                    ClocklessSegmentBytes::Found(segment) => bytes.extend(segment),
+                    other => panic!("missing AAC segment {sequence}: {other:?}"),
+                }
+            }
+            std::fs::write(&output_path, bytes).unwrap();
+            let mut input = ffmpeg::format::input(&output_path).unwrap();
+            let stream = input.streams().best(MediaType::Audio).unwrap();
+            let audio_index = stream.index();
+            let context =
+                ffmpeg::codec::context::Context::from_parameters(stream.parameters()).unwrap();
+            let mut decoder = context.decoder().audio().unwrap();
+            let mut resampler = ffmpeg::software::resampling::Context::get2(
+                decoder.format(),
+                normalized_layout(decoder.ch_layout()),
+                decoder.rate(),
+                Sample::F32(SampleType::Packed),
+                ffmpeg::ChannelLayout::STEREO,
+                48_000,
+            )
+            .unwrap();
+            let mut crossings = 0_usize;
+            let mut samples = 0_usize;
+            let mut previous = 0.0_f32;
+            let mut collect = |frame: &mut Audio| {
+                let mut converted = Audio::empty();
+                unsafe {
+                    converted.alloc(
+                        Sample::F32(SampleType::Packed),
+                        frame.samples() + 256,
+                        ffmpeg::ChannelLayoutMask::STEREO,
+                    );
+                    converted.set_rate(48_000);
+                }
+                resampler.run(frame, &mut converted).unwrap();
+                for pair in converted.data(0).chunks_exact(8).take(converted.samples()) {
+                    let current = f32::from_ne_bytes(pair[..4].try_into().unwrap());
+                    if previous < 0.0 && current >= 0.0 {
+                        crossings += 1;
+                    }
+                    previous = current;
+                    samples += 1;
+                }
+            };
+            for item in input.packets() {
+                let (stream, packet) = item.unwrap();
+                if stream.index() != audio_index {
+                    continue;
+                }
+                decoder.send_packet(&packet).unwrap();
+                let mut frame = Audio::empty();
+                while decoder.receive_frame(&mut frame).is_ok() {
+                    collect(&mut frame);
+                }
+            }
+            decoder.send_eof().unwrap();
+            let mut frame = Audio::empty();
+            while decoder.receive_frame(&mut frame).is_ok() {
+                collect(&mut frame);
+            }
+            assert!(samples > 48_000);
+            crossings as f64 * 48_000.0 / samples as f64
+        }
+
+        let first = decoded_frequency(0);
+        let second = decoded_frequency(1);
+        assert!((first - 440.0).abs() < 30.0, "first AAC frequency: {first}");
+        assert!(
+            (second - 880.0).abs() < 30.0,
+            "second AAC frequency: {second}"
+        );
+    }
+
+    #[test]
     fn finite_audio_only_fixture_uses_the_shared_clockless_hls_pipeline() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("finite-audio.avi");
         write_finite_audio_fixture(&path, 10);
-        let mut options = ClocklessTranscodeOptions::benchmark(path);
+        let mut options = ClocklessTranscodeOptions::benchmark(path, 0);
         options.hw_decode = false;
         options.quality = ClocklessQuality::Low;
         options.max_source_secs = None;
@@ -3772,7 +3878,7 @@ mod tests {
             write_finite_av_fixture(&generated_path, 5);
             generated_path
         });
-        let mut options = ClocklessTranscodeOptions::benchmark(path);
+        let mut options = ClocklessTranscodeOptions::benchmark(path, 1);
         options.hw_decode = false;
         options.quality = ClocklessQuality::Minimum;
         options.max_source_secs = None;
@@ -3841,7 +3947,7 @@ mod tests {
         // one-segment live target this reproduces a browser that fetched the visible live edge
         // but does not ask for an unpublished terminal fragment.
         write_finite_av_fixture(&path, 9);
-        let mut options = ClocklessTranscodeOptions::benchmark(path);
+        let mut options = ClocklessTranscodeOptions::benchmark(path, 1);
         options.hw_decode = false;
         options.quality = ClocklessQuality::Minimum;
         options.max_source_secs = None;

@@ -13,13 +13,41 @@ use std::thread::JoinHandle;
 use crate::video::normalize_scanner::{NormalizeScanError, NormalizeScanProgress};
 use crate::video::normalize_types::NormalizeResult;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct NormalizeTargetKey {
+    pub fs_idx: usize,
+    pub file_path: PathBuf,
+    pub stream_index: usize,
+}
+
+impl NormalizeTargetKey {
+    pub(crate) fn new(fs_idx: usize, file_path: PathBuf, stream_index: usize) -> Self {
+        Self {
+            fs_idx,
+            file_path,
+            stream_index,
+        }
+    }
+}
+
+pub(crate) struct NormalizeLookupMessage {
+    /// The viewer that started the lookup. The key and request epoch identify
+    /// the source and the exact player table incarnation inside that viewer.
+    pub owner_context_id: crate::app::ViewerContextId,
+    pub key: NormalizeTargetKey,
+    pub request: crate::video::normalize_gain::NormalizeLookupRequest,
+    pub result: Result<Option<NormalizeResult>, String>,
+}
+
 /// スキャン worker と App を繋ぐ進行中 state。`App.normalize_state: Option<Self>` で持つ。
 ///
 /// 同時スキャンは禁止 (= 全 App で 1 つだけ)。新規スキャンを始める前に古い state を
 /// take() して `cancel.store(true)` で worker を停止させる。`_join` を drop することで
 /// JoinHandle も解放され、worker thread は cancel atomic を見て早期 return する。
 pub struct NormalizeScanState {
+    pub owner_context_id: crate::app::ViewerContextId,
     pub fs_idx: usize,
+    pub stream_index: usize,
     pub cancel: Arc<AtomicBool>,
     pub progress: Arc<NormalizeScanProgress>,
     pub rx: mpsc::Receiver<NormalizeMessage>,

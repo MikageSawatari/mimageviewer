@@ -145,6 +145,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             height: config.height,
             os_pixels_per_point: window.os_pixels_per_point(),
             initial_observation: window.observe(),
+            editor_ui_snapshot: None,
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
             egui_overlay: std::env::var_os("MIV_NATIVE_VIDEO_EGUI_OVERLAY").is_some(),
             cursor_hide_delay_secs: crate::settings::FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,

@@ -598,6 +598,7 @@ impl App {
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
+            music_ctrl_wheel_gate_reached: false,
         };
 
         if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {

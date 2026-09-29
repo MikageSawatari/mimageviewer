@@ -735,15 +735,16 @@ viewer-context 境界へ collection surface を追加する。
 
 - toolbarの明示Openとcollection間の明示切替は、folder Back/Forwardと共通のtyped history
   `FolderNavHistoryTarget`へ`CollectionGridRestore`を積む。履歴entryはPath / Rating / SmartFolder /
-  Collectionのいずれか一つを所有し、collectionをfilesystem風のsynthetic pathへ変換しない。
-  A→collection C→BはBackでC→A、ForwardでCへ戻り、C1/C2はstable CollectionIdで区別する。
+  Collection と、それぞれの親 provenance を持つ物理子地点のいずれか一つを所有し、collectionをfilesystem風のsynthetic pathへ変換しない。
+  A→collection C→独立physical BはBackでC→A、ForwardでCへ戻り、C1/C2はstable CollectionIdで区別する。
   rename後は同じIDからlatest snapshotへ収束し、Ready catalogで削除済みと確定したIDだけをnormal+A/Bの
   back/forwardからpruneする。rollback snapshotのinstall時も同じReady catalogで再pruneし、Starting / Failed /
-  一時的なcatalog不在では履歴を捨てない。Add、manager選択、watch refresh、collection-owned child/reloadは履歴を積まない。
+  一時的なcatalog不在では履歴を捨てない。Add、manager選択、watch refresh、同じ場所のreloadは履歴を積まない。
+  **2026-09-27 §1.282 改訂**: collection-owned child を明示的に開く時は C の root entry anchor を保存し、採用した子を独立した現在地として履歴へ積む。C→子 B→下位 D の ← は D→B→C、→ は C→B へ進む。BS による C への親復帰も同じ anchor を使う。ZIP/PDF の内部ページ・階層は外側の履歴では元書庫の一地点とし、採用前の読み取り履歴・フィルタ退避・自動 fullscreen 予約は確定しない。詳細は [folder-history-location-plan.md](folder-history-location-plan.md)。
 - collection rootから独立したphysical navigationへ出る時は、scan / archive adoptionがvisible結果を採用した境界で
   collection restoreを履歴へcommitする。scan失敗、scope拒否、stale completion、sidecar restoreではroot surfaceと
-  履歴を維持する。collection-owned child / descendant / same-folder reloadは従来どおりsessionを保持し、root復帰に
-  folder historyを使わない。
+  履歴を維持する。collection-owned child / descendant / same-folder reload は session を保持し、root 復帰の
+  BS chain と履歴の C 地点は同じ root anchor に収束させる。
 
 - collection rootのphysical leafは既存fullscreen openへ渡し、そのviewer contextのcollection originを
   `{collection_id, revision_at_open, entry_id, source_key}`として保持する。folder / book / ZIP / PDF /
@@ -1013,7 +1014,8 @@ focused / full / static / verification build保留証跡は
   相互排他的なtyped entryとしてnormal / A / Bのback・forward stack、rollback snapshot、dispatchで共有した。
   Collectionはsynthetic pathへ投影せずstable IDとrestore hintを保持し、明示的なCollection Openだけを履歴へ
   記録する。物理loadはvisible adoption成功時だけ元Collectionを記録し、scan失敗、stale result、scope拒否では
-  back / forwardを変更しない。Collection-owned child、reload、toolbar Add、管理window selectionは履歴を積まない。
+  back / forwardを変更しない。当時の契約では Collection-owned child、reload、toolbar Add、管理window selection は履歴を積まなかった。
+  **2026-09-27 §1.282 改訂**: Collection-owned child の明示的な可視採用は root entry anchor 付きの別地点を履歴へ積み、←/→ と BS の C 復元先を一致させる。同じ場所の reload、toolbar Add、管理window selection と自動再生の source 移動は履歴を増やさない。履歴 replay は offscreen prepare の成功時に可視一覧と cursor を一つの transaction で採用する。直接 ZIP/PDF の子も元書庫を一地点として扱い、失敗・取消では旧一覧と履歴、読み取り履歴、絞り込み、自動 fullscreen 状態を保持する。設計正本は [folder-history-location-plan.md](folder-history-location-plan.md)。
 - Back / ForwardでCollectionへ戻る時はIDからauthoritativeな最新catalogへ収束する。Ready catalogで削除済みのIDは
   normal / A / B stackとrollback installから除き、削除済みrootを表示中でもcurrent targetの再捕捉から履歴へ戻さない。
   Starting / Failed / Inert中の一時的なcatalog不在では履歴を消さず、renameはID一致で復元する。

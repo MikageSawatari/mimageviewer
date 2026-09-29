@@ -37,6 +37,10 @@ pub struct FolderTreeOptions {
     pub skip_zip: bool,
     /// 同名 ZIP/CBZ がある変換アーカイブをスキップする。
     pub skip_archive_if_zip_exists: bool,
+    /// 同名 PDF がある EPUB をスキップする。
+    pub skip_epub_if_pdf_exists: bool,
+    /// EPUB をフォルダ移動候補に含める。
+    pub include_epub: bool,
     /// RAR/7z/LZH などの変換アーカイブをフォルダ移動候補に含める。
     pub archive_policy: NavigationArchivePolicy,
     /// サブフォルダ / ZIP のツリー専用ソート順。
@@ -49,6 +53,8 @@ impl FolderTreeOptions {
         Self {
             skip_zip: settings.skip_zip_if_folder_exists,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
+            skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
+            include_epub: !settings.epub_file_handling_ignores_epub(),
             archive_policy: if settings.archive_file_handling_ignores_convertible() {
                 NavigationArchivePolicy::IgnoreConvertible
             } else {
@@ -64,6 +70,8 @@ impl Default for FolderTreeOptions {
         Self {
             skip_zip: true,
             skip_archive_if_zip_exists: true,
+            skip_epub_if_pdf_exists: true,
+            include_epub: true,
             archive_policy: NavigationArchivePolicy::AllSupported,
             sort_order: crate::settings::FolderTreeSortOrder::default(),
         }
@@ -166,14 +174,23 @@ pub fn is_pdf_extension(ext: &str) -> bool {
     ext == "pdf"
 }
 
-/// .zip / .cbz / .pdf ファイルを仮想フォルダとして扱うかの判定。
+/// 論理パスがページを持つ本か。実 PDF 専用の処理には `is_pdf_extension` を使う。
+pub fn is_paged_document_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("pdf") || extension.eq_ignore_ascii_case("epub")
+        })
+}
+
+/// .zip / .cbz / .pdf / .epub ファイルを仮想フォルダとして扱うかの判定。
 pub fn is_virtual_folder(path: &Path) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    is_zip_extension(&ext) || is_pdf_extension(&ext)
+    is_zip_extension(&ext) || is_paged_document_path(path)
 }
 
 /// Runtime container predicate for a path already opened as a page list.
@@ -346,6 +363,14 @@ fn is_folder_nav_file_candidate(
     if cancelled(cancel) {
         return false;
     }
+    if !opts.include_epub
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    {
+        return false;
+    }
     if is_virtual_folder(path) {
         return true;
     }
@@ -475,6 +500,14 @@ fn folder_qualifies(
     }
 
     if path.is_file() {
+        if !opts.include_epub
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
+            return false;
+        }
         if is_convertible_archive_path(path) {
             return resolve_with_memo(path, opts, cancel, cache, memo).is_some();
         }
@@ -487,7 +520,7 @@ fn folder_qualifies(
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
         return match ext.as_str() {
-            "pdf" => true,
+            _ if is_paged_document_path(path) => true,
             e if is_zip_extension(e) => {
                 crate::zip_loader::first_image_entry(path, cancel).is_some()
             }
@@ -1111,6 +1144,21 @@ fn sorted_subdirs_for_nav_observed(
         })
         .collect();
 
+    let pdf_stems: std::collections::HashSet<String> = container_candidates
+        .iter()
+        .filter(|(path, _)| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        })
+        .map(|(path, _)| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("")
+                .to_lowercase()
+        })
+        .collect();
+
     // コンテナフィルタ: 同名フォルダ、または優先 ZIP/CBZ があればスキップ
     for (zp, mtime) in container_candidates {
         if skip_zip {
@@ -1126,6 +1174,20 @@ fn sorted_subdirs_for_nav_observed(
         if opts.skip_archive_if_zip_exists
             && is_convertible_archive_path(&zp)
             && native_zip_stems.contains(
+                &zp.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("")
+                    .to_lowercase(),
+            )
+        {
+            continue;
+        }
+        if opts.skip_epub_if_pdf_exists
+            && zp
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            && pdf_stems.contains(
                 &zp.file_stem()
                     .and_then(|stem| stem.to_str())
                     .unwrap_or("")
@@ -1456,6 +1518,16 @@ mod tests {
         assert_eq!(detailed.path, tmp.path());
         assert_eq!(detailed.kind, OpenablePathKind::Directory);
         assert!(detailed.requested_is_file);
+    }
+
+    #[test]
+    fn epub_file_is_resolved_as_openable_without_parent_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let epub = temp.path().join("book.EPUB");
+        std::fs::write(&epub, b"epub").unwrap();
+        let resolved = resolve_openable_path_detailed(&epub).unwrap();
+        assert_eq!(resolved.path, epub);
+        assert_eq!(resolved.kind, OpenablePathKind::File);
     }
 
     #[test]
@@ -1895,6 +1967,67 @@ mod tests {
         let target = memo.resolve(&source, opts, None, None).unwrap();
         assert_eq!(target.kind, FolderNavLandingKind::DirectRar);
         assert_eq!(target.logical_source, source);
+    }
+
+    #[test]
+    fn paged_document_navigation_skips_same_name_epub_with_pdf() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for name in ["Book.EPUB", "book.PDF", "other.epub"] {
+            std::fs::write(temp.path().join(name), b"book").unwrap();
+        }
+        assert!(is_paged_document_path(&temp.path().join("Book.EPUB")));
+        assert!(is_virtual_folder(&temp.path().join("Book.EPUB")));
+        assert!(folder_should_stop(&temp.path().join("Book.EPUB"), None));
+        assert!(is_paged_document_path(&temp.path().join("book.PDF")));
+        assert!(!is_paged_document_path(&temp.path().join("comic.zip")));
+        let paths = sorted_subdirs(temp.path(), FolderTreeOptions::default());
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.file_name().unwrap() == "Book.EPUB")
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.file_name().unwrap() == "book.PDF")
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.file_name().unwrap() == "other.epub")
+        );
+        let paths = sorted_subdirs(
+            temp.path(),
+            FolderTreeOptions {
+                skip_epub_if_pdf_exists: false,
+                ..FolderTreeOptions::default()
+            },
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.file_name().unwrap() == "Book.EPUB")
+        );
+    }
+
+    #[test]
+    fn epub_ignore_removes_epub_but_keeps_pdf_and_archive_navigation_candidates() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for name in ["book.epub", "document.pdf", "archive.7z"] {
+            std::fs::write(temp.path().join(name), b"book").unwrap();
+        }
+        let mut settings = crate::settings::Settings::default();
+        settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+        let options = FolderTreeOptions::from_settings(&settings);
+        let paths = sorted_subdirs(temp.path(), options);
+        assert!(!paths.iter().any(|path| path.ends_with("book.epub")));
+        assert!(paths.iter().any(|path| path.ends_with("document.pdf")));
+        assert!(paths.iter().any(|path| path.ends_with("archive.7z")));
+        assert!(!folder_should_stop_with_options(
+            &temp.path().join("book.epub"),
+            None,
+            options
+        ));
     }
 
     #[test]

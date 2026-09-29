@@ -135,6 +135,8 @@ Assert-OrderedText $buildRelease @(
     'Stop-Process -Id $p.Id -Force -ErrorAction Stop',
     'Invoke-MivSign -Files $vendorEmbedTargets',
     '$coreExit = Invoke-ReleaseCargo -Args $coreCmd',
+    '$remoteExit = Invoke-ReleaseCargo -Args $remoteCmd',
+    '$epubWorkerExit = Invoke-ReleaseCargo -Args $epubWorkerCmd',
     'Invoke-MivSign -Files $launcherEmbedExecutables',
     '$launcherExit = Invoke-ReleaseCargo -Args $launcherCmd',
     'Invoke-MivSign -Files @($releaseExe) -Verify',
@@ -147,10 +149,23 @@ Assert-OrderedText $buildPortable @(
     'if ($KeepRunning)',
     'Stop-Process -Id $_.Id -Force -ErrorAction Stop',
     '& cargo build --release --bin mimageviewer-core',
+    '& cargo build --release -p mimageviewer-remote --bin mimageviewer-remote',
+    '& cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf',
     'Remove-Item -LiteralPath $pkgDir -Recurse -Force',
     'Invoke-MivSign -Files $portablePe -Verify',
     "Compress-Archive -Path (Join-Path `$pkgDir '*')"
 ) 'build-portable process/build/package/sign flow'
+
+foreach ($script in @($buildDist, $buildRelease, $buildPortable)) {
+    Assert-True ($script.Contains("'mimageviewer-epub-pdf'")) 'EPUB worker is absent from a process-stop list'
+}
+Assert-True ($buildDist.Contains('-p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher')) 'workspace clean omits EPUB worker'
+Assert-True ($buildDist.Contains('-p mimageviewer-remote -p epub-pdf-worker')) 'portable clean omits EPUB worker'
+Assert-True ($buildDist.Contains("'target\release\mimageviewer-epub-pdf.exe'")) 'final PE list omits EPUB worker'
+Assert-True ($buildRelease.Contains('$releaseEpubWorkerExe') -and
+    $buildRelease.Contains('Invoke-MivSign -Files $launcherEmbedExecutables')) 'EPUB worker is not signed before embedding'
+Assert-True ($buildPortable.Contains("@{ src = `$epubWorkerExe; dst = 'mimageviewer-epub-pdf.exe' }")) 'portable copy omits EPUB worker'
+Assert-True ($buildPortable.Contains("'mimageviewer-epub-pdf.exe'")) 'portable signing list omits EPUB worker'
 
 Assert-OrderedText $testFull @(
     'public static extern uint SetErrorMode(uint mode);',

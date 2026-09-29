@@ -255,6 +255,7 @@
 # GridToggleMaximize = F11 ; メインウィンドウを最大化/復元する
 # GridToggleFolderTreePane = F ; フォルダツリーペインの表示を切り替える
 # GridToggleStackMode = none ; スタック表示を切り替える
+# GridConvertEpubToPdf = none ; 選択中の EPUB を PDF ファイルに変換する
 # GridTagApply = T ; タグを付ける/外すダイアログを開く
 # GridTagView = Ctrl+T ; タグビューを開く
 # GridRotateCw = R ; 選択中の画像を右に90度回転する
@@ -284,6 +285,16 @@
 # GridColumnCount9.2 = Alt+Numpad9 ; サムネイル列数を9列にする
 # GridColumnCount10.1 = Alt+0 ; サムネイル列数を10列にする
 # GridColumnCount10.2 = Alt+Numpad0 ; サムネイル列数を10列にする
+# GridColumnCount11 = none ; サムネイル列数を11列にする
+# GridColumnCount12 = none ; サムネイル列数を12列にする
+# GridColumnCount13 = none ; サムネイル列数を13列にする
+# GridColumnCount14 = none ; サムネイル列数を14列にする
+# GridColumnCount15 = none ; サムネイル列数を15列にする
+# GridColumnCount16 = none ; サムネイル列数を16列にする
+# GridColumnCount17 = none ; サムネイル列数を17列にする
+# GridColumnCount18 = none ; サムネイル列数を18列にする
+# GridColumnCount19 = none ; サムネイル列数を19列にする
+# GridColumnCount20 = none ; サムネイル列数を20列にする
 # GridToggleDetailsView = Alt+- ; サムネイル一覧と詳細一覧を切り替える
 # GridOpenPreferences = none ; 環境設定を開く
 # GridOpenOperationCustomize = none ; 操作カスタマイズを開く
@@ -582,6 +593,7 @@
 # VideoAdjustSlot10.1 = Ctrl+0 ; 動画補正スロット10を読み込む
 # VideoAdjustSlot10.2 = Ctrl+Numpad0 ; 動画補正スロット10を読み込む
 # VideoToggleAudioMode = Z ; 映像を消して音声モード（音楽ビュー）で聴く。音声モード中は動画表示へ戻す
+# VideoNextAudioTrack = none ; 次の音声トラックへ切り替える
 
 [Erase] ; 消しゴムモード
 # EraseConfirm = E ; 消しゴム処理を実行して終了する

@@ -1447,6 +1447,7 @@ fn execute_video_stream_request(
             owner,
             address,
             quality,
+            audio_track,
         } => {
             let budget = VideoStreamStartBudget::from_enqueued_at(enqueued_at);
             if let Some(error) = budget.expired_error(VideoStreamStartStage::Queue) {
@@ -1462,6 +1463,7 @@ fn execute_video_stream_request(
                         owner,
                         path,
                         quality,
+                        audio_track,
                         budget,
                     },
                     operation,
@@ -2021,6 +2023,7 @@ fn operation_description(message: &ClientMessage) -> String {
             }
             RemoteWriteRequest::SetPageAlonePreference { .. } => "単独ページ設定を書き込み中",
             RemoteWriteRequest::RecordReadingProgress { .. } => "読書位置を記録中",
+            RemoteWriteRequest::RecordVideoProgress { .. } => "再生位置を記録中",
             RemoteWriteRequest::SetRating { .. } => "レーティングを書き込み中",
             RemoteWriteRequest::SetBookmark { .. } => "ブックマークを書き込み中",
             RemoteWriteRequest::GetItemState { .. } => "ページ情報を確認中",

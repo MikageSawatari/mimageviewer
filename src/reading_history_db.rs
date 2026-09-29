@@ -123,7 +123,7 @@ impl ReadingHistoryDb {
         Ok(Self { conn })
     }
 
-    fn open_at(path: PathBuf) -> Result<Self, rusqlite::Error> {
+    pub(crate) fn open_at(path: PathBuf) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

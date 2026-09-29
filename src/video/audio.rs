@@ -28,6 +28,8 @@ use super::decoder::AudioFrame;
 use super::engine::actor::state_code;
 
 const MAX_STALE_AUDIO_DRAIN_PER_TICK: usize = 256;
+pub(crate) const READY_THRESHOLD_SECS: f64 = 0.10;
+pub(crate) const AUDIO_TRACK_READY_MARGIN_SECS: f64 = 0.50;
 
 #[cfg(windows)]
 static NEXT_LOCAL_DSP_PUMP: AtomicU64 = AtomicU64::new(1);
@@ -163,10 +165,18 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
+    #[cfg(feature = "test-script")]
+    pub(crate) fn test_script_processed_frequency_hz(&self) -> Option<f64> {
+        // Snapshot sampling must not wait for the audio callback or pump on the UI thread.
+        self.buffer.try_lock().ok()?.last_processed_frequency_hz
+    }
+
     #[cfg(test)]
     pub(crate) fn connected_without_output_for_test(sample_rate: u32) -> Self {
         let buffer = Arc::new(Mutex::new(AudioBuffer {
             processed: std::collections::VecDeque::new(),
+            #[cfg(feature = "test-script")]
+            last_processed_frequency_hz: None,
             drain_offset_in_first: 0,
             raw_pending: std::collections::VecDeque::new(),
             next_pts_secs: 0.0,
@@ -423,6 +433,71 @@ impl AudioOutput {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn pumping_without_device_for_test(
+        sample_rate: u32,
+        rx: Receiver<AudioFrame>,
+        clock: Arc<AvClock>,
+        engine_event_tx: crate::video::EngineEventSender,
+        engine_state: Arc<AtomicU8>,
+    ) -> Self {
+        let mut output = Self::connected_without_output_for_test(sample_rate);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (tap_tx, tap_rx) = unbounded();
+        output.shutdown_tx = shutdown_tx;
+        output.audio_tap.command_tx = tap_tx;
+        let buffer = Arc::clone(&output.buffer);
+        let cancel = Arc::clone(&output.cancel);
+        let diagnostics = Arc::clone(&output.diagnostics);
+        output.pump = Some(std::thread::spawn(move || {
+            run_pump(
+                rx,
+                shutdown_rx,
+                buffer,
+                cancel,
+                clock,
+                engine_event_tx,
+                engine_state,
+                diagnostics,
+                tap_rx,
+                #[cfg(windows)]
+                None,
+                #[cfg(windows)]
+                None,
+            );
+        }));
+        output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fill_without_device_for_test(
+        &self,
+        clock: &Arc<AvClock>,
+        engine_state: &Arc<AtomicU8>,
+    ) -> (bool, Option<f64>) {
+        let before = self
+            .diagnostics
+            .audio_audible_pts_bits
+            .load(Ordering::Acquire);
+        let mut samples = [0.0_f32; 960];
+        fill_output(
+            &mut samples,
+            &self.buffer,
+            clock,
+            engine_state,
+            &self.diagnostics,
+            None,
+        );
+        let after = self
+            .diagnostics
+            .audio_audible_pts_bits
+            .load(Ordering::Acquire);
+        (
+            samples.iter().any(|sample| sample.abs() > 1e-4),
+            (after != before).then(|| f64::from_bits(after)),
+        )
+    }
+
     pub fn pause_stream(&self) {
         if let Some(stream) = self.stream.as_ref() {
             let _ = stream.pause();
@@ -460,6 +535,10 @@ impl AudioOutput {
                 ));
             }
             buf.processed.clear();
+            #[cfg(feature = "test-script")]
+            {
+                buf.last_processed_frequency_hz = None;
+            }
             buf.raw_pending.clear();
             buf.drain_offset_in_first = 0;
             buf.next_pts_secs = clock.now_secs();
@@ -676,6 +755,35 @@ pub(crate) struct ProcessedChunk {
     pub(crate) effetune_generation: Option<u64>,
 }
 
+/// Estimate the actual post-processing tone from positive zero crossings of one
+/// stereo channel. Crossing interpolation avoids the large one-period rounding
+/// error on short AAC chunks. This observation never enters production builds.
+#[cfg(feature = "test-script")]
+fn estimate_processed_frequency_hz(samples: &[f32], sample_rate: u32) -> Option<f64> {
+    let mut previous = *samples.first()?;
+    let mut first_crossing = None;
+    let mut last_crossing = None;
+    let mut crossings = 0_u32;
+    let mut peak = previous.abs();
+    for (frame, pair) in samples.chunks_exact(2).enumerate().skip(1) {
+        let current = pair[0];
+        peak = peak.max(current.abs());
+        if previous < 0.0 && current >= 0.0 {
+            let fraction = -f64::from(previous) / f64::from(current - previous);
+            let position = (frame - 1) as f64 + fraction;
+            first_crossing.get_or_insert(position);
+            last_crossing = Some(position);
+            crossings += 1;
+        }
+        previous = current;
+    }
+    if peak < 1e-4 || crossings < 2 {
+        return None;
+    }
+    let span = last_crossing? - first_crossing?;
+    (span > 0.0).then_some((crossings - 1) as f64 * f64::from(sample_rate) / span)
+}
+
 #[derive(Clone)]
 pub(crate) struct AudioTapController {
     command_tx: Sender<AudioTapCommand>,
@@ -823,6 +931,9 @@ struct AudioBuffer {
     /// post-VST 処理済 chunk queue。fill_output が `drain_offset_in_first` を進めて
     /// drain。chunk が空になったら pop_front + drain_offset_in_first=0 にリセット。
     processed: std::collections::VecDeque<ProcessedChunk>,
+    /// Last chunk admitted to the output queue. Test-script only; reset at every seek/clear.
+    #[cfg(feature = "test-script")]
+    last_processed_frequency_hz: Option<f64>,
     /// `processed.front()` 内の **次に drain されるサンプルの index** (= interleaved stereo)。
     /// fill_output が advance、chunk fully drain で 0 にリセット + pop_front。
     drain_offset_in_first: usize,
@@ -1264,6 +1375,8 @@ pub(crate) fn start(
 
     let buffer = Arc::new(Mutex::new(AudioBuffer {
         processed: std::collections::VecDeque::with_capacity(32),
+        #[cfg(feature = "test-script")]
+        last_processed_frequency_hz: None,
         drain_offset_in_first: 0,
         raw_pending: std::collections::VecDeque::with_capacity(64),
         next_pts_secs: 0.0,
@@ -1549,7 +1662,6 @@ fn run_pump(
     const TARGET_PROCESSED_SECS: f64 = 0.10;
     // ── BufferReady 閾値 ──
     // Buffering → Playing の遷移トリガ (level event)。
-    const READY_THRESHOLD_SECS: f64 = 0.10;
     // ── raw_pending back-pressure / warning ──
     // 以前は 30 秒を超えたら最新フレームで再 anchor していたが、video packet overflow
     // queue 導入後は demux が audio を大きく先読みできるため、通常の seek/open でも
@@ -1572,6 +1684,9 @@ fn run_pump(
     let mut safety_limiter = SafetyLimiter::new(sample_rate, 2);
     let mut time_stretcher = TimeStretcher::new(sample_rate);
     let mut normalize_gain_ramp = NormalizeGainRamp::new(sample_rate, 2);
+    let mut last_processed_normalize_stream: Option<usize> = None;
+    let mut pending_normalize_stream: Option<usize> = None;
+    let mut snap_next_normalize_gain = true;
     // preroll 解除エッジ検出。preroll 中 (測定前待機) は毎ブロック snap_to_target するが、
     // UI スレッドは「set_normalize_gain(確定 gain) → set_audio_preroll_suspended(false)」を
     // 連続で store するため、pump が preroll=true のまま新 gain を snap するブロックを
@@ -1583,7 +1698,6 @@ fn run_pump(
     // 読んでから gain を snap する。preroll=false 観測時は直前に Release された確定 gain も
     // 必ず可視 (clock.rs の set_normalize_gain / set_audio_preroll_suspended は共に Release)。
     let mut was_preroll_suspended = clock.audio_preroll_suspended();
-    normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
 
     let mut activated = false;
     let mut active_audio_tap = None;
@@ -1656,7 +1770,16 @@ fn run_pump(
     let mut last_seen_stale_clear_seq: u64 = 0;
     let mut last_seen_pdc_change_seq: u64 = 0;
 
+    let mut input_disconnected = false;
     while !cancel.load(Ordering::Acquire) {
+        // The receiver can still contain queued frames while raw back-pressure
+        // prevents recv() from observing a disconnected sender. The decode
+        // worker's exit publication covers that case without consuming audio
+        // ahead of the normal back-pressure limit.
+        if clock.audio_worker_exited() {
+            input_disconnected = true;
+            break;
+        }
         // ── frame 受信 (timeout 付き、Codex 助言): audio_rx 到着を待たず自律 refill ──
         let raw_backpressure_secs = if engine_state.load(Ordering::Acquire) == state_code::PLAYING {
             RAW_BACKPRESSURE_PLAYING_SECS
@@ -1679,7 +1802,10 @@ fn run_pump(
                 recv(shutdown_rx) -> _ => return,
                 recv(rx) -> msg => match msg {
                     Ok(f) => Some(f),
-                    Err(_) => break,
+                    Err(_) => {
+                        input_disconnected = true;
+                        break;
+                    }
                 },
                 default(std::time::Duration::from_millis(REFILL_TICK_MS)) => None,
             }
@@ -1811,6 +1937,10 @@ fn run_pump(
                 // pump_seek_serial 切替 → processed + raw_pending 両方クリア
                 if frame_seek_serial > buf.pump_seek_serial {
                     buf.processed.clear();
+                    #[cfg(feature = "test-script")]
+                    {
+                        buf.last_processed_frequency_hz = None;
+                    }
                     buf.drain_offset_in_first = 0;
                     buf.raw_pending.clear();
                     buf.next_pts_secs = frame.pts_secs;
@@ -1879,6 +2009,10 @@ fn run_pump(
                 if buf.pump_seek_serial < cur_clock_serial {
                     let old_serial = buf.pump_seek_serial;
                     buf.processed.clear();
+                    #[cfg(feature = "test-script")]
+                    {
+                        buf.last_processed_frequency_hz = None;
+                    }
                     buf.drain_offset_in_first = 0;
                     buf.raw_pending.clear();
                     clock.zero_audio_tx_queued_secs();
@@ -1950,7 +2084,6 @@ fn run_pump(
 
         let preroll_now = clock.audio_preroll_suspended();
         if preroll_now {
-            normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
             was_preroll_suspended = true;
             if let Ok(buf) = buffer.lock() {
                 publish_buffer_secs(&buf, &clock);
@@ -1958,9 +2091,8 @@ fn run_pump(
             continue;
         }
         if preroll_release_edge(was_preroll_suspended, preroll_now) {
-            // preroll 解除エッジ: 測定確定 gain で即再生開始する (4 秒 ramp を避ける)。
-            // ここで snap しておけば直後の apply_to_samples は target 一致で ramp を arm しない。
-            normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
+            // The next decoded stream owns the target gain. Snap when that frame is processed.
+            snap_next_normalize_gain = true;
         }
         was_preroll_suspended = preroll_now;
 
@@ -1999,6 +2131,13 @@ fn run_pump(
                     + remaining_first_chunk_secs(&buf);
                 if cur_secs >= TARGET_PROCESSED_SECS {
                     (cur_secs, None, buf.pump_seek_serial)
+                } else if buf
+                    .raw_pending
+                    .front()
+                    .is_some_and(|raw| clock.normalize_gain_for_stream(raw.stream_index).is_none())
+                {
+                    pending_normalize_stream = buf.raw_pending.front().map(|raw| raw.stream_index);
+                    (cur_secs, None, buf.pump_seek_serial)
                 } else if let Some(raw) = buf.raw_pending.pop_front() {
                     (cur_secs, Some(raw), buf.pump_seek_serial)
                 } else {
@@ -2012,6 +2151,24 @@ fn run_pump(
                 None => break,
             };
 
+            let Some(normalize_gain) = clock.normalize_gain_for_stream(raw.stream_index) else {
+                // A toggle may have reset the table between the head check and this load.
+                let mut buf = buffer.lock().unwrap();
+                if raw.seek_serial == buf.pump_seek_serial {
+                    buf.raw_pending.push_front(raw);
+                }
+                break;
+            };
+            if snap_next_normalize_gain
+                || last_processed_normalize_stream != Some(raw.stream_index)
+                || pending_normalize_stream == Some(raw.stream_index)
+            {
+                normalize_gain_ramp.snap_to_target(normalize_gain as f32);
+                snap_next_normalize_gain = false;
+            }
+            last_processed_normalize_stream = Some(raw.stream_index);
+            pending_normalize_stream = None;
+
             // ── Time stretch → normalize gain → VST process_block (mutex 解放中) ──
             let playback_speed = clock.playback_speed();
             let mut stretched =
@@ -2020,8 +2177,8 @@ fn run_pump(
             // VST3 (Pro-L2 等) が「-14 LUFS に揃った入力」を見られるよう前段に置く。
             // 目標変更は dB 空間で ramp する。測定前待機からの解除時は上の
             // `snap_to_target` により、最初の可聴 chunk から仮 gain で始まる。
-            let max_normalize_gain_in_block = normalize_gain_ramp
-                .apply_to_samples(&mut stretched.samples, clock.normalize_gain() as f32);
+            let max_normalize_gain_in_block =
+                normalize_gain_ramp.apply_to_samples(&mut stretched.samples, normalize_gain as f32);
             #[cfg(windows)]
             let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
                 Vec<f32>,
@@ -2288,6 +2445,9 @@ fn run_pump(
                 #[cfg(not(windows))]
                 effetune_generation: None,
             };
+            #[cfg(feature = "test-script")]
+            let processed_frequency_hz =
+                estimate_processed_frequency_hz(&chunk.samples, sample_rate);
 
             refresh_audio_tap(&audio_tap_command_rx, &mut active_audio_tap);
             // tap 接続時だけ samples を clone する。cpal callback と共有する AudioBuffer
@@ -2333,6 +2493,10 @@ fn run_pump(
                 if (buf.pdc_latency_secs - current_latency_source_secs).abs() > 1e-6 {
                     latency_change = Some((buf.pdc_latency_secs, current_latency_source_secs));
                     buf.pdc_latency_secs = current_latency_source_secs;
+                }
+                #[cfg(feature = "test-script")]
+                {
+                    buf.last_processed_frequency_hz = processed_frequency_hz;
                 }
                 buf.processed.push_back(chunk);
                 true
@@ -2382,7 +2546,7 @@ fn run_pump(
         //   - PDC 等で audible < target → max は target. anchor が target で固定
         //   - 失敗 / 初期 open: pump_anchor_target = None → audible 単独 (既存挙動)
         //   - BufferStarved (再 buffering): audible は再生位置 >> 旧 target → audible 採用
-        let (processed_secs, cur_audible_pts, cur_serial) = {
+        let (processed_secs, cur_audible_pts, cur_serial, pending_at_head) = {
             let buf = buffer.lock().unwrap();
             publish_buffer_secs(&buf, &clock);
             let secs: f64 = buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
@@ -2394,7 +2558,11 @@ fn run_pump(
             } else {
                 buf.next_pts_secs
             };
-            (secs, audible, buf.pump_seek_serial)
+            let pending_at_head = buf
+                .raw_pending
+                .front()
+                .is_some_and(|raw| clock.normalize_gain_for_stream(raw.stream_index).is_none());
+            (secs, audible, buf.pump_seek_serial, pending_at_head)
         };
         // 音声実長が閾値未満のファイル (0.1 秒未満の SFX 等 / 極短音声トラックの動画) は
         // processed がこの閾値に永久に届かず、BufferReady が一度も emit されないまま
@@ -2402,7 +2570,7 @@ fn run_pump(
         // (`is_eof_reached`) ならこれ以上 processed が増える見込みは無いので、残量に
         // 関わらず readiness を通知する (review-v2.3.0 P2-6)。post-seek で末尾間際に
         // 到達した場合も同様 (残り実データが閾値未満でも開始してよい)。
-        if processed_secs >= READY_THRESHOLD_SECS || clock.is_eof_reached() {
+        if !pending_at_head && (processed_secs >= READY_THRESHOLD_SECS || clock.is_eof_reached()) {
             // T15 (Codex R-VENG-001): BufferReady を **engine が待っている state でのみ** 送る。
             // 旧コードは Playing 中も pump loop ごと (audio frame rate ≈ 100-200Hz) に
             // BufferReady を try_send していた。engine 側はそれを epoch < current 早期 return
@@ -2841,6 +3009,25 @@ fn run_pump(
             }
         }
     }
+    if input_disconnected {
+        // No producer can refill these queues. Publishing zero is required for
+        // the EOF/loop quiet gate, including when raw back-pressure was active.
+        let mut buf = buffer.lock().unwrap();
+        buf.processed.clear();
+        #[cfg(feature = "test-script")]
+        {
+            buf.last_processed_frequency_hz = None;
+        }
+        buf.raw_pending.clear();
+        buf.drain_offset_in_first = 0;
+        buf.pdc_latency_secs = 0.0;
+        buf.pdc_latency_secs_applied = 0.0;
+        buf.next_pts_secs = clock.now_secs();
+        publish_buffer_secs(&buf, &clock);
+        drop(buf);
+        clock.reset_audio_bookkeeping_only();
+        clock.mark_audio_inactive();
+    }
     // ── 終了時の silence flush (= 既存) ──
     // T20 (Codex P2 2026-05-16): cancel が立っているときは flush_silence をスキップする。
     // `flush_silence(480, 10)` は 10 反復で各反復 200ms timeout = 最大 2 秒ブロック。
@@ -3024,6 +3211,10 @@ fn fill_output(
             buf.last_fill_stale_clear_logged_serial = clock_serial;
         }
         buf.processed.clear();
+        #[cfg(feature = "test-script")]
+        {
+            buf.last_processed_frequency_hz = None;
+        }
         buf.drain_offset_in_first = 0;
         buf.raw_pending.clear();
         publish_buffer_secs(&buf, clock);
@@ -3243,6 +3434,28 @@ mod tests {
     //! 各シナリオで意図通り動くことを構造的に保証する。
 
     use super::*;
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn processed_chunk_frequency_estimator_identifies_fixture_tones() {
+        for tone in [440.0, 880.0, 1320.0] {
+            let samples = (0..2048)
+                .flat_map(|frame| {
+                    let phase = std::f64::consts::TAU * tone * frame as f64 / 48_000.0;
+                    [phase.sin() as f32, phase.sin() as f32]
+                })
+                .collect::<Vec<_>>();
+            let estimated = estimate_processed_frequency_hz(&samples, 48_000).unwrap();
+            assert!(
+                (estimated - tone).abs() < 2.0,
+                "tone={tone} estimated={estimated}"
+            );
+        }
+        assert_eq!(
+            estimate_processed_frequency_hz(&vec![0.0; 4096], 48_000),
+            None
+        );
+    }
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
@@ -3316,6 +3529,7 @@ mod tests {
             .send(AudioFrame {
                 samples: vec![0.25; 1_920],
                 pts_secs: 0.0,
+                stream_index: 0,
                 seek_serial: 0,
                 duration_secs: 0.02,
                 queued_wall_secs: 0.02,
@@ -3404,6 +3618,7 @@ mod tests {
         tx.send(AudioFrame {
             samples: vec![0.25; 1_920],
             pts_secs,
+            stream_index: 0,
             seek_serial: 0,
             duration_secs: 0.02,
             queued_wall_secs: 0.02,
@@ -3622,6 +3837,8 @@ mod tests {
     fn make_buffer(sample_rate: u32) -> Arc<Mutex<AudioBuffer>> {
         Arc::new(Mutex::new(AudioBuffer {
             processed: std::collections::VecDeque::new(),
+            #[cfg(feature = "test-script")]
+            last_processed_frequency_hz: None,
             drain_offset_in_first: 0,
             raw_pending: std::collections::VecDeque::new(),
             next_pts_secs: 0.0,
@@ -3656,6 +3873,603 @@ mod tests {
             pdc_latency_secs_at_process: 0.0,
             effetune_generation: None,
         }
+    }
+
+    #[test]
+    fn track_switch_output_pts_and_clock_stay_continuous_through_pump_and_callback() {
+        use crate::video::decoder;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks/multi-timebase.mp4");
+        let input = ffmpeg_the_third::format::input(&fixture).unwrap();
+        let time_bases: Vec<_> = [1, 2, 3]
+            .map(|index| {
+                let base = input.stream(index).unwrap().time_base();
+                (base.numerator(), base.denominator())
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(time_bases, [(1, 48_000), (1, 44_100), (1, 32_000)]);
+
+        let serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, serial));
+        clock.set_playing(true);
+        let demux_cancel = Arc::new(AtomicBool::new(false));
+        let engine_state = playing_state();
+        let (raw_event_tx, event_rx) = bounded(256);
+        let engine_event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let handles = decoder::spawn(
+            fixture,
+            Arc::clone(&clock),
+            Arc::clone(&demux_cancel),
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            Arc::clone(&engine_state),
+            engine_event_tx.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(decoder::VideoDynamicState::default()),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            info.audio_tracks
+                .iter()
+                .map(|track| (track.sample_rate, track.channels))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(48_000), Some(2)),
+                (Some(44_100), Some(6)),
+                (Some(32_000), Some(1))
+            ]
+        );
+        let selection = handles
+            .audio_track_selection_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let pump_cancel = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (tap_tx, tap_rx) = unbounded();
+        let pump = {
+            let rx = handles.audio_rx.clone();
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&pump_cancel);
+            let clock = Arc::clone(&clock);
+            let state = Arc::clone(&engine_state);
+            let diagnostics = Arc::clone(&diagnostics);
+            std::thread::spawn(move || {
+                run_pump(
+                    rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    engine_event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                );
+            })
+        };
+
+        let mut previous_pts: Option<f64> = None;
+        let mut previous_clock: Option<f64> = None;
+        let mut previous_callback_at: Option<std::time::Instant> = None;
+        for stream_index in [2, 1, 3, 2] {
+            let target = if stream_index == 2 && previous_pts.is_none() {
+                None
+            } else {
+                let target = clock.now_secs();
+                assert_eq!(
+                    selection.request(stream_index),
+                    crate::video::audio_track_selection::AudioTrackRequestOutcome::Accepted
+                );
+                clock.request_seek(target);
+                Some(target)
+            };
+            let expected_serial = clock.current_seek_serial();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut consumed = 0;
+            let mut first_pts = None;
+            while consumed < 8 && std::time::Instant::now() < deadline {
+                while handles.video_rx.try_recv().is_ok() {}
+                while event_rx.try_recv().is_ok() {}
+                let before = diagnostics.audio_audible_pts_bits.load(Ordering::Acquire);
+                let buffer_serial = buffer.lock().unwrap().pump_seek_serial;
+                let mut output = [0.0_f32; 960]; // 10 ms at 48 kHz stereo
+                fill_output(
+                    &mut output,
+                    &buffer,
+                    &clock,
+                    &engine_state,
+                    &diagnostics,
+                    None,
+                );
+                let after = diagnostics.audio_audible_pts_bits.load(Ordering::Acquire);
+                if buffer_serial == expected_serial
+                    && after != before
+                    && output.iter().any(|sample| sample.abs() > 1e-4)
+                {
+                    let pts = f64::from_bits(after);
+                    let now = clock.now_secs();
+                    let callback_at = std::time::Instant::now();
+                    let elapsed = previous_callback_at
+                        .map(|at| callback_at.duration_since(at).as_secs_f64())
+                        .unwrap_or(0.0);
+                    if first_pts.is_none() {
+                        first_pts = Some(pts);
+                        if let Some(target) = target {
+                            assert!(
+                                (pts - target).abs() < 0.18,
+                                "stream={stream_index} first output PTS={pts} target={target}"
+                            );
+                            assert!(
+                                previous_pts.is_none_or(|prev| pts >= prev - 0.04),
+                                "stream={stream_index} output PTS regressed"
+                            );
+                        }
+                    }
+                    if let Some(prev) = previous_pts {
+                        assert!(pts >= prev - 0.04 && pts - prev < elapsed + 0.18);
+                    }
+                    if let Some(prev) = previous_clock {
+                        assert!(now >= prev - 0.04 && now - prev < elapsed + 0.18);
+                    }
+                    assert!((now - pts).abs() < elapsed + 0.18);
+                    previous_pts = Some(pts);
+                    previous_clock = Some(now);
+                    previous_callback_at = Some(callback_at);
+                    consumed += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(consumed, 8, "no output for stream={stream_index}");
+            assert_eq!(selection.snapshot().applied.stream_index, stream_index);
+        }
+
+        pump_cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.try_send(());
+        demux_cancel.store(true, Ordering::Release);
+        pump.join().unwrap();
+        drop(tap_tx);
+    }
+
+    fn disconnected_pump_releases_eof_gate(loop_enabled: bool) {
+        use crate::video::engine::EngineEvent;
+        use crate::video::engine::actor::{EngineActor, OpenOptions};
+        use crate::video::engine::state::{AudioEvent, DecoderEvent};
+
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(
+            OpenOptions {
+                loop_enabled,
+                ..OpenOptions::default()
+            },
+            seek_serial,
+            Arc::clone(&clock),
+        );
+        actor.begin_loading();
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 1.0,
+            has_audio: true,
+            has_video: true,
+        });
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(32);
+        let (_shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, event_rx) = bounded(64);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let pump = {
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            let clock = Arc::clone(&clock);
+            let state = actor.published_state_handle();
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                );
+            })
+        };
+        for index in 0..20 {
+            audio_tx
+                .send(AudioFrame {
+                    samples: vec![0.0; 9_600],
+                    pts_secs: index as f64 * 0.1,
+                    seek_serial: 0,
+                    stream_index: 0,
+                    duration_secs: 0.1,
+                    queued_wall_secs: 0.0,
+                    audio_tx_accounting_epoch: 0,
+                    seek_target_secs: None,
+                })
+                .unwrap();
+        }
+        let ready = event_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let EngineEvent::Audio(AudioEvent::BufferReady {
+            epoch,
+            pts,
+            wall_now,
+        }) = ready
+        else {
+            panic!("expected pump BufferReady");
+        };
+        actor.handle_audio_event(AudioEvent::BufferReady {
+            epoch,
+            pts,
+            wall_now,
+        });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while clock.audio_raw_pending_secs() <= 0.1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(clock.audio_raw_pending_secs() > 0.1);
+
+        drop(audio_tx);
+        pump.join().unwrap();
+        assert!(buffer.lock().unwrap().raw_pending.is_empty());
+        assert!(buffer.lock().unwrap().processed.is_empty());
+        assert_eq!(clock.audio_raw_pending_secs(), 0.0);
+        assert_eq!(clock.audio_processed_secs(), 0.0);
+        assert_eq!(clock.audio_tx_queued_secs(), 0.0);
+        assert!(!clock.is_audio_active());
+        actor.handle_audio_event(AudioEvent::AudioInactive);
+        clock.notify_eof_reached();
+        let quiet = clock.is_eof_reached()
+            && clock.audio_processed_secs() < 0.020
+            && clock.audio_raw_pending_secs() < 0.020
+            && clock.audio_tx_queued_secs() < 0.020;
+        assert!(quiet, "EOF/loop quiet gate must open after pump disconnect");
+        actor.handle_decoder_event(DecoderEvent::EofReached {
+            epoch: 0,
+            duration_secs: 1.0,
+        });
+        assert_eq!(
+            actor.published_state_code(),
+            if loop_enabled {
+                state_code::SEEKING
+            } else {
+                state_code::EOF
+            }
+        );
+    }
+
+    #[test]
+    fn disconnected_pump_with_raw_pending_allows_eof() {
+        disconnected_pump_releases_eof_gate(false);
+    }
+
+    #[test]
+    fn disconnected_pump_with_raw_pending_allows_loop_seek() {
+        disconnected_pump_releases_eof_gate(true);
+    }
+
+    #[test]
+    fn pending_track_gates_only_its_frames_and_blocks_eof_ready() {
+        use crate::video::engine::EngineEvent;
+        use crate::video::engine::state::AudioEvent;
+        let clock = Arc::new(AvClock::new_with_normalize(
+            1.0,
+            Arc::new(AtomicU64::new(0)),
+            true,
+            1.0,
+        ));
+        clock.normalize_gain_table().set_gain(1, 1.0);
+        let request = clock
+            .normalize_gain_table()
+            .begin_lookup(2, -14000)
+            .unwrap();
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(8);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, event_rx) = bounded(16);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let state = Arc::new(AtomicU8::new(state_code::BUFFERING));
+        let worker = {
+            let clock = Arc::clone(&clock);
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                )
+            })
+        };
+        let frame = |stream_index, pts_secs| AudioFrame {
+            samples: vec![0.1; 4_800],
+            pts_secs,
+            seek_serial: 0,
+            stream_index,
+            duration_secs: 0.05,
+            queued_wall_secs: 0.0,
+            audio_tx_accounting_epoch: 0,
+            seek_target_secs: None,
+        };
+        audio_tx.send(frame(1, 0.0)).unwrap();
+        audio_tx.send(frame(2, 0.05)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while (buffer.lock().unwrap().processed.is_empty()
+            || buffer.lock().unwrap().raw_pending.is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            !buffer.lock().unwrap().processed.is_empty(),
+            "resolved stream must process"
+        );
+        assert_eq!(
+            buffer
+                .lock()
+                .unwrap()
+                .raw_pending
+                .front()
+                .unwrap()
+                .stream_index,
+            2
+        );
+        clock.notify_eof_reached();
+        assert!(
+            event_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "EOF must not publish readiness while a Pending frame blocks raw"
+        );
+        assert!(clock.normalize_gain_table().resolve(request, 2.0));
+        let ready = event_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(matches!(
+            ready,
+            EngineEvent::Audio(AudioEvent::BufferReady { .. })
+        ));
+        // Readiness can be published as soon as the head is resolved, before
+        // the worker finishes draining that frame into processed audio.
+        let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !buffer.lock().unwrap().raw_pending.is_empty()
+            && std::time::Instant::now() < drain_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(buffer.lock().unwrap().raw_pending.is_empty());
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn selected_track_is_pending_before_seek_publication_and_pump_processing() {
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("selection-pump-seam.mkv"),
+        );
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        player.set_normalize_gain_for_stream(1, 1.0);
+        let selection = player.select_audio_track(2);
+        assert_eq!(
+            selection.outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        assert!(selection.normalize_unresolved);
+        let seek = player
+            .clock
+            .take_seek_request()
+            .expect("selection publishes seek");
+        assert_eq!(player.normalize_gain_for_stream(2), None);
+
+        let clock = Arc::clone(&player.clock);
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(8);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, _event_rx) = bounded(16);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let state = Arc::new(AtomicU8::new(state_code::BUFFERING));
+        let worker = {
+            let clock = Arc::clone(&clock);
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                )
+            })
+        };
+        audio_tx
+            .send(AudioFrame {
+                samples: vec![0.1; 4_800],
+                pts_secs: 0.0,
+                seek_serial: seek.serial,
+                stream_index: 2,
+                duration_secs: 0.05,
+                queued_wall_secs: 0.0,
+                audio_tx_accounting_epoch: 0,
+                seek_target_secs: Some(0.0),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while buffer.lock().unwrap().raw_pending.is_empty() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let pending = buffer.lock().unwrap();
+        assert!(
+            pending.processed.is_empty(),
+            "selected stream cannot process at unity"
+        );
+        assert_eq!(pending.raw_pending.front().unwrap().stream_index, 2);
+        drop(pending);
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn exited_decode_worker_clears_raw_backpressure_without_receiving_queued_frames() {
+        use crate::video::engine::actor::{EngineActor, OpenOptions};
+        use crate::video::engine::state::DecoderEvent;
+
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(OpenOptions::default(), seek_serial, Arc::clone(&clock));
+        actor.begin_loading();
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 6.0,
+            has_audio: true,
+            has_video: true,
+        });
+
+        let buffer = make_buffer(48_000);
+        let frame = AudioFrame {
+            samples: vec![0.0; 576_000],
+            pts_secs: 0.0,
+            seek_serial: 0,
+            stream_index: 0,
+            duration_secs: 6.0,
+            queued_wall_secs: 0.0,
+            audio_tx_accounting_epoch: 0,
+            seek_target_secs: None,
+        };
+        buffer.lock().unwrap().raw_pending.push_back(frame);
+        publish_buffer_secs(&buffer.lock().unwrap(), &clock);
+        assert!(clock.audio_raw_pending_secs() > 5.0);
+        let (audio_tx, audio_rx) = bounded(1);
+        audio_tx
+            .send(AudioFrame {
+                samples: vec![0.0; 9_600],
+                pts_secs: 6.0,
+                seek_serial: 0,
+                stream_index: 0,
+                duration_secs: 0.1,
+                queued_wall_secs: 0.0,
+                audio_tx_accounting_epoch: 0,
+                seek_target_secs: None,
+            })
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, _event_rx) = bounded(64);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let (done_tx, done_rx) = bounded(1);
+        clock.note_audio_worker_exit();
+        let pump = {
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            let clock = Arc::clone(&clock);
+            let state = actor.published_state_handle();
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    make_diag(),
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                );
+                done_tx.send(()).unwrap();
+            })
+        };
+        let exited = done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        if !exited {
+            cancel.store(true, Ordering::Release);
+            shutdown_tx.send(()).unwrap();
+        }
+        pump.join().unwrap();
+        assert!(
+            exited,
+            "pump stayed behind raw back-pressure after worker exit"
+        );
+        assert!(buffer.lock().unwrap().raw_pending.is_empty());
+        assert_eq!(clock.audio_raw_pending_secs(), 0.0);
+        drop(audio_tx);
     }
 
     #[test]
@@ -3797,6 +4611,7 @@ mod tests {
                     samples: vec![0.0; (SAMPLE_RATE as f64 * 2.0 * FRAME_SECS) as usize],
                     pts_secs,
                     seek_serial: 0,
+                    stream_index: 0,
                     duration_secs: FRAME_SECS,
                     queued_wall_secs: FRAME_SECS,
                     audio_tx_accounting_epoch: 0,
@@ -3922,6 +4737,7 @@ mod tests {
             samples: vec![0.0; 2],
             pts_secs: seek_serial as f64,
             seek_serial,
+            stream_index: 0,
             duration_secs: 0.01,
             queued_wall_secs: 0.01,
             audio_tx_accounting_epoch: 0,

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 61;
+pub const PROTOCOL_VERSION: u32 = 63;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -612,6 +612,14 @@ pub enum RemoteWriteRequest {
         record_resume: bool,
         record_history: bool,
     },
+    RecordVideoProgress {
+        address: RemoteAddress,
+        /// 端末が session ごとに採番する単調増加の報告番号。
+        sequence: u64,
+        position_secs: f64,
+        duration_secs: f64,
+        ended: bool,
+    },
     SetRating {
         address: RemoteAddress,
         stars: u8,
@@ -688,6 +696,7 @@ impl RemoteWriteRequest {
             | Self::SetSingletonSpreadEndpointPreference { address, .. }
             | Self::SetPageAlonePreference { address, .. }
             | Self::RecordReadingProgress { address, .. }
+            | Self::RecordVideoProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
             | Self::GetItemState { address, .. }
@@ -710,6 +719,7 @@ impl RemoteWriteRequest {
             | Self::SetSingletonSpreadEndpointPreference { address, .. }
             | Self::SetPageAlonePreference { address, .. }
             | Self::RecordReadingProgress { address, .. }
+            | Self::RecordVideoProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
             | Self::GetItemState { address, .. }
@@ -755,6 +765,7 @@ impl RemoteWriteRequest {
             | Self::SetSingletonSpreadPlacementPreference { .. }
             | Self::SetSingletonSpreadEndpointPreference { .. }
             | Self::SetPageAlonePreference { .. }
+            | Self::RecordVideoProgress { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
             | Self::GetAdjustmentState { .. }
@@ -793,6 +804,7 @@ impl RemoteWriteRequest {
             | Self::SetSingletonSpreadPlacementPreference { .. }
             | Self::SetSingletonSpreadEndpointPreference { .. }
             | Self::SetPageAlonePreference { .. }
+            | Self::RecordVideoProgress { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
             | Self::GetAdjustmentState { .. }
@@ -812,6 +824,7 @@ impl RemoteWriteRequest {
             }
             Self::SetPageAlonePreference { .. } => "set_page_alone_preference",
             Self::RecordReadingProgress { .. } => "record_reading_progress",
+            Self::RecordVideoProgress { .. } => "record_video_progress",
             Self::SetRating { .. } => "set_rating",
             Self::SetBookmark { .. } => "set_bookmark",
             Self::GetItemState { .. } => "get_item_state",
@@ -1939,6 +1952,11 @@ pub enum VideoStreamControlAction {
         quality: VideoStreamQuality,
         position_secs: f64,
     },
+    AudioTrack {
+        stream_index: usize,
+        position_secs: f64,
+        expected_generation: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1982,6 +2000,13 @@ pub struct VideoStreamAudioProcessing {
     pub vst3_warning: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAudioTrack {
+    pub stream_index: usize,
+    pub label: String,
+    pub is_default: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct VideoStreamStartPayload {
     pub session: u64,
@@ -1994,6 +2019,8 @@ pub struct VideoStreamStartPayload {
     pub video_size: VideoStreamSize,
     pub codecs: String,
     pub audio_processing: VideoStreamAudioProcessing,
+    pub audio_tracks: Vec<RemoteAudioTrack>,
+    pub audio_track: Option<usize>,
     pub end_behavior: VideoStreamEndBehavior,
 }
 
@@ -2092,6 +2119,8 @@ pub struct VideoStreamStatePayload {
     pub video_size: VideoStreamSize,
     pub codecs: String,
     pub audio_processing: VideoStreamAudioProcessing,
+    pub audio_tracks: Vec<RemoteAudioTrack>,
+    pub audio_track: Option<usize>,
     pub play_intent: bool,
     pub volume: f64,
 }
@@ -2709,6 +2738,7 @@ pub enum ClientMessage {
         owner: RemoteSessionIdentity,
         address: RemoteAddress,
         quality: VideoStreamQuality,
+        audio_track: Option<usize>,
     },
     VideoStreamControl {
         id: RequestId,
@@ -3148,6 +3178,30 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v63_audio_track_control_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 63);
+        let action = VideoStreamControlAction::AudioTrack {
+            stream_index: 3,
+            position_secs: 42.5,
+            expected_generation: 9,
+        };
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "action": "audio_track",
+                "stream_index": 3,
+                "position_secs": 42.5,
+                "expected_generation": 9,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<VideoStreamControlAction>(value).unwrap(),
+            action
+        );
+    }
+
+    #[test]
     fn video_stream_state_separates_generation_progress_from_terminal_playhead() {
         let state = VideoStreamStatePayload {
             session: 3,
@@ -3177,6 +3231,12 @@ mod tests {
                 vst3_active_slots: 5,
                 vst3_warning: None,
             },
+            audio_tracks: vec![RemoteAudioTrack {
+                stream_index: 2,
+                label: "2: 日本語 — aac 2ch".to_owned(),
+                is_default: false,
+            }],
+            audio_track: Some(2),
             play_intent: true,
             volume: 0.75,
         };
@@ -3186,6 +3246,14 @@ mod tests {
         assert_eq!(value["generated_end_secs"], 300.0);
         assert_eq!(value["buffer_target_secs"], 60.0);
         assert_eq!(value["play_intent"], true);
+        assert_eq!(value["audio_track"], 2);
+        assert_eq!(value["audio_tracks"][0]["stream_index"], 2);
+        assert_eq!(
+            serde_json::from_value::<VideoStreamStatePayload>(value.clone())
+                .unwrap()
+                .audio_track,
+            Some(2)
+        );
         assert_eq!(value["ended"], false);
         assert!(value.get("position_secs").is_none());
         assert!(value.get("playing").is_none());
@@ -3261,7 +3329,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 61);
+        assert_eq!(PROTOCOL_VERSION, 63);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3460,13 +3528,14 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 61);
+        assert_eq!(PROTOCOL_VERSION, 63);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
                 owner: test_owner("test-client"),
                 address: RemoteAddress::file("C:/Music/sample.flac"),
                 quality: VideoStreamQuality::Standard,
+                audio_track: Some(2),
             },
             ClientMessage::VideoStreamPlaylist {
                 id: 51,
@@ -3531,6 +3600,12 @@ mod tests {
                         vst3_active_slots: 0,
                         vst3_warning: Some("VST3 を適用できませんでした".to_owned()),
                     },
+                    audio_tracks: vec![RemoteAudioTrack {
+                        stream_index: 2,
+                        label: "2: 日本語 — aac 2ch".to_owned(),
+                        is_default: false,
+                    }],
+                    audio_track: Some(2),
                     end_behavior: VideoStreamEndBehavior::Next { wrap: true },
                 }),
             },
@@ -3775,6 +3850,13 @@ mod tests {
                 page_count: 12,
                 record_resume: true,
                 record_history: true,
+            },
+            RemoteWriteRequest::RecordVideoProgress {
+                address: RemoteAddress::file("C:/media/movie.mp4"),
+                sequence: 1,
+                position_secs: 19.5,
+                duration_secs: 120.0,
+                ended: false,
             },
             RemoteWriteRequest::SetRating {
                 address: page.clone(),
@@ -4484,7 +4566,7 @@ mod tests {
 
     #[test]
     fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
-        assert_eq!(PROTOCOL_VERSION, 61);
+        assert_eq!(PROTOCOL_VERSION, 63);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();

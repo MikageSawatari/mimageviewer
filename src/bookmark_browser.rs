@@ -935,6 +935,7 @@ pub enum PendingBookOpenStage {
 pub struct PendingBookOpen {
     pub request_id: BookmarkOpenRequestId,
     pub bookmark: crate::book_bookmarks::BookBookmark,
+    pub(crate) bookmark_source: crate::pdf_loader::LeasedEpubPath,
     pub relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     pub started_at: std::time::Instant,
     pub stage: PendingBookOpenStage,

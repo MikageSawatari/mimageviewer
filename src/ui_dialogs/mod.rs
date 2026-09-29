@@ -18,6 +18,8 @@ pub mod content_restore;
 pub(crate) mod context_menu;
 mod context_shortcuts;
 pub(crate) mod editing_addon;
+pub(crate) mod epub_batch_convert;
+pub(crate) mod epub_convert;
 pub(crate) mod export_batch;
 mod fav_add;
 pub(crate) mod favorites_editor;

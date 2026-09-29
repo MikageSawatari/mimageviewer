@@ -180,6 +180,7 @@ impl App {
         path: PathBuf,
     ) -> Result<(), String> {
         let include_convertible = !self.settings.archive_file_handling_ignores_convertible();
+        let include_epub = !self.settings.epub_file_handling_ignores_epub();
         let show_hidden = self.settings.show_hidden_files;
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -191,6 +192,7 @@ impl App {
                 let result = super::folder_scan::scan_directory_with_convertible_archives_cancel(
                     &worker_path,
                     include_convertible,
+                    include_epub,
                     show_hidden,
                     Some(&worker_cancel),
                 );
@@ -1070,7 +1072,7 @@ mod tests {
         assert_eq!(app.folder_nav_back_stack.len(), history);
         app.retire_saved_group_open_if_replaced();
         assert!(app.saved_group_open.is_none());
-        app.cancel_folder_pane_open();
+        app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
         assert!(app.saved_group_ready_nav().is_none());
     }
 

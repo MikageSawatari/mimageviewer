@@ -566,7 +566,10 @@ impl EngineActor {
                 // metadata は **epoch 関係なく常に保存** する (= pre-info user seek が
                 // 走った場合でも duration/has_audio/has_video は捨てない)。
                 self.duration_secs = Some(duration_secs);
-                self.has_audio = has_audio;
+                // Demux may lose its audio lane before the UI forwards this
+                // metadata event. A late InfoReceived must not restore the
+                // audio readiness requirement after AudioInactive.
+                self.has_audio = has_audio && !self.av_clock.audio_lane_lost();
                 self.has_video = has_video;
                 // 状態遷移は state=Loading のときだけ行う。
                 // pre-info で user seek が走って既に Seeking に入っている場合は、
@@ -643,6 +646,9 @@ impl EngineActor {
                 pts,
                 wall_now,
             } => {
+                if self.av_clock.audio_lane_lost() {
+                    return;
+                }
                 if epoch < self.current_seek_epoch() {
                     return;
                 }
@@ -671,6 +677,9 @@ impl EngineActor {
                 pts,
                 wall_now,
             } => {
+                if self.av_clock.audio_lane_lost() {
+                    return;
+                }
                 if epoch < self.current_seek_epoch() {
                     return;
                 }
@@ -682,6 +691,9 @@ impl EngineActor {
                 self.try_transition_from_buffering();
             }
             AudioEvent::BufferStarved { epoch } => {
+                if self.av_clock.audio_lane_lost() {
+                    return;
+                }
                 if epoch < self.current_seek_epoch() {
                     return;
                 }
@@ -695,8 +707,14 @@ impl EngineActor {
                 }
             }
             AudioEvent::AudioInactive => {
-                // audio 出力起動失敗 → wall master に変更
+                // audio 出力起動失敗 / decode lane 喪失 → wall master に変更
                 self.has_audio = false;
+                if matches!(self.state, EngineState::Playing) {
+                    let now = Instant::now();
+                    let pts = self.clock.now_secs();
+                    self.clock
+                        .set_anchor(ClockAnchor::wall(pts, now).with_speed(self.playback_speed));
+                }
                 // Buffering 中なら latch 再評価 (= has_audio=false で requirements が
                 // first_frame だけになる可能性)
                 if matches!(self.state, EngineState::Buffering) {
@@ -1609,6 +1627,49 @@ mod tests {
         assert!(!a.has_audio);
         assert_eq!(a.state, EngineState::Playing);
         assert_eq!(a.clock().anchor().source, ClockSource::Wall);
+    }
+
+    #[test]
+    fn decoder_failure_ends_audio_only_buffering_and_seeking() {
+        for seeking in [false, true] {
+            let mut actor = fresh_actor();
+            actor.begin_loading();
+            actor.handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 6.0,
+                has_audio: true,
+                has_video: false,
+            });
+            assert_eq!(actor.state, EngineState::Buffering);
+            if seeking {
+                actor.handle_seek_request(0.5);
+                assert!(matches!(actor.state, EngineState::Seeking { .. }));
+            }
+            actor.handle_decoder_event(DecoderEvent::Failed {
+                reason: "audio lane lost".to_owned(),
+            });
+            assert_eq!(actor.state, EngineState::Idle);
+            assert_eq!(actor.published_state_code(), state_code::IDLE);
+        }
+    }
+
+    #[test]
+    fn late_info_does_not_restore_a_lost_audio_lane() {
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.begin_loading();
+        av_clock.mark_audio_lane_lost();
+        actor.handle_audio_event(AudioEvent::AudioInactive);
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 6.0,
+            has_audio: true,
+            has_video: true,
+        });
+        assert!(!actor.readiness_snapshot().audio_required);
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+        actor.handle_audio_event(AudioEvent::BufferStarved { epoch: 0 });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
     }
 
     #[test]

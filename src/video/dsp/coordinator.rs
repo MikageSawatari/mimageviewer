@@ -151,7 +151,7 @@ impl DspProcessingCoordinator {
     }
 
     /// A displaced local claimant may keep playing dry when another local player won.
-    /// Remote acquisition and exit keep every local player paused instead.
+    /// Remote acquisition closes local players; exit does not resume them.
     pub fn local_dry_resume_allowed(&self) -> bool {
         let state = self.state.lock().unwrap();
         !state.exiting
@@ -390,6 +390,50 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         join.join().unwrap();
         assert!(coordinator.permit(remote).is_some());
+    }
+
+    #[test]
+    fn remote_first_host_operation_waits_for_dropped_players_outliving_pump_permit() {
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let cancel = AtomicBool::new(false);
+        let local = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 11,
+                epoch: 1,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(local, Instant::now() + Duration::from_secs(1), &cancel)
+                .unwrap()
+                .grant()
+        );
+        let outliving_block = coordinator.permit(local).unwrap();
+        coordinator.end_local_pump(11);
+        let remote = coordinator
+            .reserve(DspOwner::Remote {
+                session: 17,
+                generation: 1,
+            })
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = Arc::clone(&coordinator);
+        let join = std::thread::spawn(move || {
+            let handoff = worker
+                .wait_handoff(
+                    remote,
+                    Instant::now() + Duration::from_secs(1),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            assert!(handoff.grant());
+            let _first_host_operation = worker.permit(remote).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        drop(outliving_block);
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        join.join().unwrap();
     }
 
     #[test]

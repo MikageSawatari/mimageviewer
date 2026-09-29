@@ -216,6 +216,9 @@ impl PreferencesOpenRequest {
     pub(crate) const ARCHIVE_HANDLING: Self =
         Self::anchored(PreferencesPage::Cache, "cache/archive-handling");
 
+    pub(crate) const EPUB_HANDLING: Self =
+        Self::anchored(PreferencesPage::Cache, "cache/epub-handling");
+
     /// 隠しファイル・フォルダの表示。
     pub(crate) const HIDDEN_FILES: Self =
         Self::anchored(PreferencesPage::Folder, "folder/hidden-files");
@@ -699,6 +702,8 @@ impl Drop for ExternalToolPathCheckPending {
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
+    /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
+    video_media_memory_clear_requested: bool,
     /// この編集ダイアログを開いた時点の通常ホイール割り当て。
     ///
     /// `ring_shortcuts` の他項目は操作カスタマイズが所有するため、OK 前に live から
@@ -940,6 +945,11 @@ pub(crate) struct PreferencesState {
 }
 
 impl PreferencesState {
+    fn clear_video_media_memory(&mut self) {
+        self.video_media_memory_clear_requested = true;
+        self.settings.video_resume_positions.clear();
+        self.settings.video_audio_track_choices.clear();
+    }
     pub(super) fn select_external_tool(
         &mut self,
         selected: Option<crate::external_tool::ExternalToolId>,
@@ -1246,6 +1256,7 @@ impl PreferencesState {
 
         Self {
             settings: s.preferences_snapshot(),
+            video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
             context_menu_preview_scenario:
@@ -1919,6 +1930,27 @@ fn prepare_preferences_state_settings_for_commit(
         state.initial_video_normal_wheel_action,
         live,
     );
+    merge_video_media_memory_for_preferences(
+        &mut state.settings,
+        live,
+        state.video_media_memory_clear_requested,
+    );
+}
+
+fn merge_video_media_memory_for_preferences(
+    edited: &mut crate::settings::Settings,
+    live: &mut crate::settings::Settings,
+    clear_requested: bool,
+) {
+    if clear_requested {
+        edited.video_resume_positions.clear();
+        edited.video_audio_track_choices.clear();
+    } else {
+        // 再生位置の保存と選択の確定・削除・リネームはダイアログ表示中も live を更新する。
+        // 環境設定側の編集意図はクリアだけなので、OK 時には両方の最新 map を移す。
+        edited.video_resume_positions = std::mem::take(&mut live.video_resume_positions);
+        edited.video_audio_track_choices = std::mem::take(&mut live.video_audio_track_choices);
+    }
 }
 
 impl App {
@@ -1941,6 +1973,11 @@ impl App {
             &mut edited,
             state.initial_video_normal_wheel_action,
             &mut live,
+        );
+        merge_video_media_memory_for_preferences(
+            &mut edited,
+            &mut live,
+            state.video_media_memory_clear_requested,
         );
         !settings_equal_for_close_prompt(&edited, &self.settings)
     }
@@ -2291,11 +2328,13 @@ impl App {
                 let old_dup = (
                     self.settings.skip_zip_if_folder_exists,
                     self.settings.skip_archive_if_zip_exists,
+                    self.settings.skip_epub_if_pdf_exists,
                     self.settings.skip_image_if_video_exists,
                     self.settings.skip_duplicate_images,
                     self.settings.image_ext_priority.clone(),
                     self.settings.video_thumb_use_sidecar_image,
                     self.settings.archive_file_handling_resolved(),
+                    self.settings.epub_file_handling,
                 );
                 let old_grid_display_order = self.settings.grid_display_order.clone();
                 let old_rating_sort_unrated_position = self.settings.rating_sort_unrated_position;
@@ -2486,7 +2525,9 @@ impl App {
                         // detached viewer / native HUD はそれぞれ独立した egui Context を
                         // 持つため、表示倍率変更と同じ正規 teardown 経路で閉じる。
                         // 再度開いた時点で新しいフォント設定を使って生成される。
-                        let closed_detached = self.close_all_detached_viewers_for_mode_change(ctx);
+                        let closed_detached = self
+                            .close_all_detached_viewers_for_mode_change(ctx)
+                            .unwrap_or(true);
                         if !closed_detached && self.fullscreen_idx.is_some() {
                             self.close_fullscreen();
                         }
@@ -2512,7 +2553,9 @@ impl App {
                 if (old_detached_open_images_in_window
                     != self.settings.detached_viewer_open_images_in_window
                     || old_fullfeature_media_window != self.settings.fullfeature_media_window)
-                    && self.close_all_detached_viewers_for_mode_change(ctx)
+                    && self
+                        .close_all_detached_viewers_for_mode_change(ctx)
+                        .unwrap_or(true)
                 {
                     self.show_feedback_toast(
                         "別ウィンドウの表示モードを変更したため、開いていた別ウィンドウを閉じました"
@@ -2615,11 +2658,13 @@ impl App {
                 let new_dup = (
                     self.settings.skip_zip_if_folder_exists,
                     self.settings.skip_archive_if_zip_exists,
+                    self.settings.skip_epub_if_pdf_exists,
                     self.settings.skip_image_if_video_exists,
                     self.settings.skip_duplicate_images,
                     self.settings.image_ext_priority.clone(),
                     self.settings.video_thumb_use_sidecar_image,
                     self.settings.archive_file_handling_resolved(),
+                    self.settings.epub_file_handling,
                 );
                 let duplicate_settings_changed = old_dup != new_dup;
                 let file_visibility_changed =
@@ -3485,6 +3530,141 @@ mod tests {
         )
     }
 
+    fn saved_audio_choice_for_preferences_test(
+        index: usize,
+    ) -> crate::video::SavedAudioTrackChoice {
+        crate::video::SavedAudioTrackChoice {
+            stream_index: index,
+            codec: "aac".to_owned(),
+            language: None,
+            channels: Some(2),
+            title: None,
+        }
+    }
+
+    #[test]
+    fn preferences_ok_keeps_track_choice_confirmed_while_dialog_is_open() {
+        let mut app = crate::app::setup_app_for_test();
+        let key = crate::adjustment_db::normalize_path(std::path::Path::new("media/confirmed.mkv"));
+        let state = preferences_state_for_test(&app.settings);
+        app.settings
+            .video_audio_track_choices
+            .insert(key.clone(), saved_audio_choice_for_preferences_test(2));
+        app.pref_state = Some(state);
+        assert!(!app.preferences_dialog_has_unsaved_changes());
+        let mut state = app.pref_state.take().unwrap();
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.settings = state.settings;
+        assert_eq!(
+            app.settings.video_audio_track_choices.get(&key),
+            Some(&saved_audio_choice_for_preferences_test(2))
+        );
+    }
+
+    #[test]
+    fn preferences_ok_and_cancel_keep_resume_position_saved_while_dialog_is_open() {
+        let path = std::path::PathBuf::from("media/resume-during-preferences.mkv");
+        let key = crate::adjustment_db::normalize_path(&path);
+        for commit in [true, false] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.video_resume_positions.insert(key.clone(), 7.0);
+            let state = preferences_state_for_test(&app.settings);
+            let player = crate::video::VideoPlayer::disconnected_for_test(path.clone(), 18.0);
+            app.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            // 周期保存と close 時保存が共有する App の書き手を、ダイアログ表示中に実行。
+            app.save_all_video_resume_positions();
+            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&18.0));
+
+            if commit {
+                let mut state = state;
+                prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+                app.settings = state.settings;
+            } else {
+                app.pref_state = Some(state);
+                assert!(!app.preferences_dialog_has_unsaved_changes());
+                app.discard_preferences_dialog();
+            }
+            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&18.0));
+        }
+    }
+
+    #[test]
+    fn preferences_ok_and_cancel_follow_live_track_choice_delete_and_rename() {
+        let old_path = std::path::Path::new("media/old.mkv");
+        let new_path = std::path::Path::new("media/new.mkv");
+        let old_key = crate::adjustment_db::normalize_path(old_path);
+        let new_key = crate::adjustment_db::normalize_path(new_path);
+        for rename in [false, true] {
+            for commit in [false, true] {
+                let mut app = crate::app::setup_app_for_test();
+                app.settings
+                    .video_audio_track_choices
+                    .insert(old_key.clone(), saved_audio_choice_for_preferences_test(2));
+                let state = preferences_state_for_test(&app.settings);
+                if rename {
+                    app.migrate_video_resume_positions_for_renamed_path(old_path, new_path);
+                } else {
+                    app.purge_video_resume_positions_for_removed_paths(&[old_path.to_path_buf()]);
+                }
+                let expected = app.settings.video_audio_track_choices.clone();
+                if commit {
+                    let mut state = state;
+                    prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+                    app.settings = state.settings;
+                } else {
+                    app.pref_state = Some(state);
+                    app.discard_preferences_dialog();
+                }
+                assert_eq!(app.settings.video_audio_track_choices, expected);
+                assert_eq!(
+                    app.settings
+                        .video_audio_track_choices
+                        .contains_key(&old_key),
+                    false
+                );
+                assert_eq!(
+                    app.settings
+                        .video_audio_track_choices
+                        .contains_key(&new_key),
+                    rename
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preferences_cancel_keeps_confirmed_choice_and_clear_ok_clears_both_maps() {
+        let mut app = crate::app::setup_app_for_test();
+        let key = crate::adjustment_db::normalize_path(std::path::Path::new("media/clear.mkv"));
+        let state = preferences_state_for_test(&app.settings);
+        app.settings
+            .video_audio_track_choices
+            .insert(key.clone(), saved_audio_choice_for_preferences_test(2));
+        app.pref_state = Some(state);
+        app.discard_preferences_dialog();
+        assert!(app.settings.video_audio_track_choices.contains_key(&key));
+
+        let mut state = preferences_state_for_test(&app.settings);
+        state.clear_video_media_memory();
+        app.settings
+            .video_resume_positions
+            .insert(key.clone(), 12.0);
+        app.settings.video_audio_track_choices.insert(
+            "later.mkv".to_owned(),
+            saved_audio_choice_for_preferences_test(3),
+        );
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.settings = state.settings;
+        assert!(app.settings.video_resume_positions.is_empty());
+        assert!(app.settings.video_audio_track_choices.is_empty());
+    }
+
     #[test]
     fn preferences_projects_attached_owner_while_main_runtime_is_dormant() {
         let state = PreferencesState::from_settings(
@@ -4099,6 +4279,60 @@ mod tests {
     }
 
     #[test]
+    fn preferences_selects_epub_association_from_selected_book() {
+        let state = PreferencesState::from_settings(
+            &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::RealFile(PathBuf::from(r"E:\books\book.EPUB")),
+            None,
+            disabled_trt_worker_snapshot(),
+            false,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(state.external_tool_association_ext, "epub");
+        assert!(
+            pages::association_extension_groups()
+                .iter()
+                .any(|(_, extensions)| extensions.contains(&"epub"))
+        );
+    }
+
+    #[test]
+    fn preferences_duplicate_files_epub_option_snapshot() {
+        use egui_kittest::Harness;
+
+        let mut state = PreferencesState::from_settings(
+            &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::None,
+            None,
+            disabled_trt_worker_snapshot(),
+            false,
+            0,
+            0,
+            0,
+        );
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(780.0, 300.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(ui.available_width());
+                    page_duplicate_files(ui, &mut state);
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_duplicate_files_epub_option");
+    }
+
+    #[test]
     fn preferences_recycle_bin_delete_confirmation_snapshot() {
         use egui_kittest::Harness;
 
@@ -4685,6 +4919,260 @@ mod tests {
                 .map(|item| item.name().into_owned())
                 .collect::<Vec<_>>(),
             ["two.jpg", "one.jpg", "unrated.jpg"],
+        );
+    }
+
+    #[test]
+    fn epub_handling_preferences_cancel_ok_reload_reset_and_listing_effect() {
+        use crate::settings::{ArchiveFileHandling, EpubFileHandling, Settings};
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings
+            .set_archive_file_handling(ArchiveFileHandling::Convert);
+        let folder = app.tmp.path().join("epub-handling-preferences");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("book.epub"), b"book").unwrap();
+        std::fs::write(folder.join("archive.7z"), b"archive").unwrap();
+
+        app.open_preferences_page(PreferencesPage::Cache);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .epub_file_handling = EpubFileHandling::Ignore;
+        harness.run();
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        assert!(harness.state().show_preferences_discard_confirm);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness.state().settings.epub_file_handling,
+            EpubFileHandling::Ask
+        );
+
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .epub_file_handling = EpubFileHandling::Ignore;
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness.state().settings.epub_file_handling,
+            EpubFileHandling::Ignore
+        );
+
+        let reloaded = Settings::load();
+        assert_eq!(reloaded.epub_file_handling, EpubFileHandling::Ignore);
+        assert_eq!(reloaded.archive_file_handling, ArchiveFileHandling::Convert);
+        let scan =
+            crate::app::folder_scan::scan_directory_with_settings(&folder, &reloaded).unwrap();
+        assert!(scan.folders.iter().all(|entry| !matches!(&entry.item, crate::grid_item::GridItem::PdfFile(path) if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))));
+        assert!(scan.folders.iter().any(|entry| matches!(
+            entry.item,
+            crate::grid_item::GridItem::ConvertibleArchive { .. }
+        )));
+        assert_eq!(scan.omitted.ignored_epub, 1);
+
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        pages::reset_epub_file_handling(
+            &mut harness.state_mut().pref_state.as_mut().unwrap().settings,
+        );
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        let restored = Settings::load();
+        assert_eq!(restored.epub_file_handling, EpubFileHandling::Ask);
+        assert_eq!(restored.archive_file_handling, ArchiveFileHandling::Convert);
+        let scan =
+            crate::app::folder_scan::scan_directory_with_settings(&folder, &restored).unwrap();
+        assert!(scan.folders.iter().any(|entry| matches!(&entry.item, crate::grid_item::GridItem::PdfFile(path) if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))));
+    }
+
+    #[test]
+    fn ignoring_open_epub_on_preferences_ok_does_not_select_same_named_item_in_next_book() {
+        use crate::grid_item::GridItem;
+        use crate::settings::EpubFileHandling;
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut app = crate::app::setup_app_for_test();
+        let epub = app.tmp.path().join("open-book.epub");
+        std::fs::write(&epub, b"book").unwrap();
+        app.current_folder = Some(epub.clone());
+        app.address = epub.to_string_lossy().into_owned();
+        app.items = vec![
+            GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 0,
+                content_type: None,
+            },
+            GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 2,
+                content_type: None,
+            },
+        ];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(1);
+        app.open_preferences_page(PreferencesPage::Cache);
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .epub_file_handling = EpubFileHandling::Ignore;
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+
+        assert_eq!(
+            harness.state().settings.epub_file_handling,
+            EpubFileHandling::Ignore
+        );
+        assert_eq!(
+            harness.state().current_folder.as_deref(),
+            Some(epub.as_path())
+        );
+        assert_eq!(harness.state().selected, Some(1));
+        assert_eq!(harness.state().select_after_load, None);
+
+        let next_book = harness.state().tmp.path().join("next-book");
+        std::fs::create_dir_all(next_book.join("A")).unwrap();
+        std::fs::create_dir_all(next_book.join("Page 3")).unwrap();
+        harness.state_mut().load_folder(next_book);
+        let same_name = harness
+            .state()
+            .items
+            .iter()
+            .position(|item| item.name() == "Page 3")
+            .unwrap();
+        assert_ne!(harness.state().selected, Some(same_name));
+    }
+
+    #[test]
+    fn archive_and_epub_handling_ok_use_same_history_reload_timing() {
+        use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+        use crate::settings::{ArchiveFileHandling, EpubFileHandling};
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let apply = |change_epub: bool| {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings
+                .set_archive_file_handling(ArchiveFileHandling::Ask);
+            app.settings.epub_file_handling = EpubFileHandling::Ask;
+            app.reading_history_db = None;
+            app.folder_thumb_pin_db = None;
+            app.items_are_reading_history_view = true;
+            app.current_folder = Some(crate::app::reading_history_synthetic_path());
+            for name in ["book.epub", "book.pdf"] {
+                let path = app.tmp.path().join(name);
+                let entry = ReadingHistoryEntry::new(
+                    path.clone(),
+                    ReadingHistoryKind::Pdf,
+                    None,
+                    name.into(),
+                    None,
+                    None,
+                );
+                app.reading_history_rows.insert(entry.key.clone(), entry);
+                app.items.push(crate::grid_item::GridItem::PdfFile(path));
+            }
+            app.rebuild_visible_indices();
+            assert_eq!(app.visible_indices, vec![0, 1]);
+
+            app.open_preferences_page(PreferencesPage::Cache);
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1100.0, 850.0))
+                .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            harness.run();
+            let settings = &mut harness.state_mut().pref_state.as_mut().unwrap().settings;
+            if change_epub {
+                settings.epub_file_handling = EpubFileHandling::Ignore;
+            } else {
+                settings.set_archive_file_handling(ArchiveFileHandling::Ignore);
+            }
+            harness.run();
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            (
+                harness.state().visible_indices.clone(),
+                harness.state().items.len(),
+                harness.state().reading_history_rows.len(),
+                harness.state().items_are_reading_history_view,
+            )
+        };
+
+        let archive = apply(false);
+        let epub = apply(true);
+        assert_eq!(archive, epub);
+        assert_eq!(archive.0, vec![0, 1]);
+        assert_eq!(archive.2, 2);
+    }
+
+    #[test]
+    fn epub_handling_cache_page_radio_and_reset_edit_only_epub_setting() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let mut state = preferences_state_for_test(&crate::settings::Settings::default());
+        state.selected = PreferencesPage::Cache;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(760.0, 950.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            pages::page_cache(ui, state);
+                        });
+                    });
+                },
+                state,
+            );
+        harness.run();
+        harness.get_by_label("確認せず変換する").scroll_to_me();
+        harness.run();
+        harness.get_by_label("確認せず変換する").click();
+        harness.run();
+        assert_eq!(
+            harness.state().settings.epub_file_handling,
+            crate::settings::EpubFileHandling::Convert
+        );
+        assert_eq!(
+            harness.state().settings.archive_file_handling,
+            crate::settings::ArchiveFileHandling::Ask
+        );
+        harness.get_by_label("既定値に戻す").scroll_to_me();
+        harness.run();
+        harness.get_by_label("既定値に戻す").click();
+        harness.run();
+        assert_eq!(
+            harness.state().settings.epub_file_handling,
+            crate::settings::EpubFileHandling::Ask
         );
     }
 

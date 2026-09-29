@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use crate::grid_item::GridItem;
 use crate::rating_db::{RatingItemKind, RatingRow};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RatingViewSort {
     Normal(crate::settings::SortOrder),
     RatedAtDesc,
@@ -89,6 +89,7 @@ pub(crate) struct RatingViewPreparedItems {
 
 pub(crate) struct RatingViewPrepareOptions {
     pub(crate) sort: RatingViewSort,
+    pub(crate) include_epub: bool,
     pub(crate) intent: RatingViewBuildIntent,
     pub(crate) display_order: crate::settings::GridDisplayOrder,
     pub(crate) pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
@@ -113,6 +114,9 @@ pub struct RatingViewPending {
     pub rating_write_generation: u64,
     pub sort: RatingViewSort,
     pub(crate) membership_only: bool,
+    /// Direct/history entry keeps its outgoing grid mounted until prepared rows are adopted.
+    /// Ordinary reorder and membership refreshes leave this empty.
+    pub(crate) navigation: Option<crate::app::RatingNavigationTransition>,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<RatingViewBuildResult, String>>,
 }
@@ -157,6 +161,7 @@ pub(crate) fn spawn_rating_view_build(
         rating_write_generation,
         sort: options_sort,
         membership_only,
+        navigation: None,
         cancel,
         rx,
     }
@@ -204,6 +209,11 @@ fn prepare_rating_view(
         Ok(result) => result,
         Err(error) => return Err(error.to_string()),
     };
+    if !options.include_epub {
+        result.rows.retain(|row| {
+            !matches!(&row.item, GridItem::PdfFile(path) if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))
+        });
+    }
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
@@ -488,15 +498,14 @@ fn item_from_legacy_key(row: &RatingRow) -> Option<GridItem> {
         return item_from_plain_path(&existing_path(PathBuf::from(&row.key))?);
     };
     let container = existing_path(PathBuf::from(left))?;
-    let ext = ext_lower(&container);
-    if ext == "pdf" {
-        if let Some(page_num) = parse_page_key(right) {
-            return Some(GridItem::PdfPage {
-                pdf_path: container,
-                page_num,
-                content_type: None,
-            });
-        }
+    if crate::folder_tree::is_paged_document_path(&container)
+        && let Some(page_num) = parse_page_key(right)
+    {
+        return Some(GridItem::PdfPage {
+            pdf_path: container,
+            page_num,
+            content_type: None,
+        });
     }
     if entry_is_image(right) {
         let entry_name = resolve_legacy_zip_entry_name(&container, right)?;
@@ -525,7 +534,7 @@ fn item_from_plain_path(path: &Path) -> Option<GridItem> {
         Some(GridItem::Audio(path.to_path_buf()))
     } else if crate::folder_tree::is_zip_extension(&ext) {
         Some(GridItem::ZipFile(path.to_path_buf()))
-    } else if ext == "pdf" {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         Some(GridItem::PdfFile(path.to_path_buf()))
     } else if let Some(format) = crate::archive_converter::ArchiveFormat::from_extension(&ext) {
         Some(GridItem::ConvertibleArchive {
@@ -957,6 +966,21 @@ mod tests {
             GridItem::PdfPage { page_num, .. } => assert_eq!(page_num, 0),
             _ => panic!("expected PdfPage"),
         }
+        let epub = temp.path().join("Book.EPUB");
+        std::fs::write(&epub, b"epub").unwrap();
+        let mut rated_page = row(
+            "ignored".to_string(),
+            Some(RatingItemKind::PdfPage),
+            Some(epub.to_string_lossy().to_string()),
+        );
+        rated_page.page_num = Some(0);
+        assert!(
+            matches!(rating_row_to_view_row(&rated_page).unwrap().item, GridItem::PdfPage { pdf_path, page_num: 0, .. } if pdf_path == epub)
+        );
+        let rated_book = row(epub.to_string_lossy().to_string(), None, None);
+        assert!(
+            matches!(rating_row_to_view_row(&rated_book).unwrap().item, GridItem::PdfFile(path) if path == epub)
+        );
     }
 
     #[test]

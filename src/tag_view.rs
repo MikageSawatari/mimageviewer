@@ -485,7 +485,7 @@ fn classify_file_kind(path: &Path) -> TagViewItemKind {
         TagViewItemKind::Audio
     } else if crate::folder_tree::is_zip_extension(&ext) {
         TagViewItemKind::ZipFile
-    } else if ext == "pdf" {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         TagViewItemKind::PdfFile
     } else if let Some(format) = ArchiveFormat::from_extension(&ext) {
         TagViewItemKind::Archive(format)
@@ -811,6 +811,10 @@ mod tests {
 
     #[test]
     fn tag_view_classifies_audio_without_folder_fallback() {
+        assert_eq!(
+            classify_file_kind(Path::new("Book.EPUB")),
+            TagViewItemKind::PdfFile
+        );
         assert_eq!(
             classify_file_kind(Path::new("MixedCase.FLAC")),
             TagViewItemKind::Audio

@@ -2812,7 +2812,7 @@ fn multiwindow_scenario_collection_root_async_sibling_result_is_owner_scoped() {
         app.settings.detached_viewer_open_images_in_window = true;
         driver.root(&mut app);
         let temp = app.tmp.path().to_path_buf();
-        let [a, b, c] = collection_order_fixture(&mut app, &mut driver, &temp);
+        let [a, _b, c] = collection_order_fixture(&mut app, &mut driver, &temp);
         collection_order_open(&mut app, &mut driver, true, 0, &a);
         let first_id = app.active_detached_window_id().unwrap();
         collection_order_page_turn(&mut app, &mut driver, true, true);
@@ -2821,13 +2821,24 @@ fn multiwindow_scenario_collection_root_async_sibling_result_is_owner_scoped() {
             std::time::Duration::from_secs(5),
             || {
                 app.with_active_viewer_context(|owner| {
-                owner.poll_collection_navigation(&driver.ctx);
-                matches!(
-                    owner.top_level_grid_view.collection_navigation_pending_for_test(),
-                    Some(super::collection_navigation::CollectionNavigationPending::Snapshot { .. })
-                )
-            })
-            .unwrap_or(false)
+                    if matches!(
+                        owner.top_level_grid_view.collection_navigation_pending_for_test(),
+                        Some(super::collection_navigation::CollectionNavigationPending::Snapshot { .. })
+                    ) {
+                        return true;
+                    }
+                    if matches!(
+                        owner.top_level_grid_view.collection_navigation_pending_for_test(),
+                        Some(super::collection_navigation::CollectionNavigationPending::RequestNeeded { .. })
+                    ) {
+                        owner.poll_collection_navigation(&driver.ctx);
+                    }
+                    matches!(
+                        owner.top_level_grid_view.collection_navigation_pending_for_test(),
+                        Some(super::collection_navigation::CollectionNavigationPending::Snapshot { .. })
+                    )
+                })
+                .unwrap_or(false)
             },
         );
         collection_order_open(&mut app, &mut driver, true, 2, &c);
@@ -2842,17 +2853,13 @@ fn multiwindow_scenario_collection_root_async_sibling_result_is_owner_scoped() {
             .0;
         assert!(
             app.with_viewer_context(first_context, |owner| {
-                matches!(
-                    owner
-                        .top_level_grid_view
-                        .collection_navigation_pending_for_test(),
-                    Some(
-                        super::collection_navigation::CollectionNavigationPending::Snapshot { .. }
-                    )
-                )
+                owner
+                    .top_level_grid_view
+                    .collection_navigation_pending_for_test()
+                    .is_none()
             })
             .unwrap(),
-            "the async reply remains with its parked request owner"
+            "parking gives the first window's async request a terminal cancellation"
         );
         assert_eq!(
             collection_order_current_path(&mut app, true).as_deref(),
@@ -2861,7 +2868,7 @@ fn multiwindow_scenario_collection_root_async_sibling_result_is_owner_scoped() {
         );
         assert!(app.activate_detached_image_window_snapshot(&driver.ctx, first_id));
         assert_eq!(app.active_detached_window_id(), Some(first_id));
-        collection_order_observe(&mut app, &mut driver, true, &b);
+        collection_order_observe(&mut app, &mut driver, true, &a);
         assert!(
             app.detached_image_windows
                 .iter()
@@ -3080,7 +3087,7 @@ fn multiwindow_scenario_noncollection_image_controls_remain_physical() {
         app.items_are_reading_history_view = matches!(surface, TopLevelGridSurface::ReadingHistory);
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
-            Some(DetachedGridItemOpenPlan::Descriptor {
+            DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor {
                 descriptor: ViewerContextDescriptor::Image { .. },
                 collection_restore: None,
             })
@@ -3255,7 +3262,7 @@ fn multiwindow_scenario_collection_root_stale_grid_open_is_terminal() {
             .installed_items_generation = None;
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
-            Some(DetachedGridItemOpenPlan::CollectionRootUnavailable)
+            DetachedBuild::Built(DetachedGridItemOpenPlan::CollectionRootUnavailable)
         ));
         assert!(app.open_grid_container_in_detached_book_context(&driver.ctx, 0));
         assert_eq!(app.items, main_items);
@@ -3279,7 +3286,7 @@ fn multiwindow_scenario_collection_root_stale_grid_open_is_terminal() {
         };
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
-            Some(DetachedGridItemOpenPlan::Descriptor { .. })
+            DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor { .. })
         ));
     })
     .join()

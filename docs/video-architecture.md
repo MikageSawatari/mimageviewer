@@ -32,6 +32,8 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 `MIV_NATIVE_VIDEO_PRESENTER` フォールバック環境変数は削除済み)。例外は mIV Remote session が
 所有する headless player だけで、画面を作らず専用 consumer が通常出力 queue を drain する。
 
+mIV Remote の音声は headless player が開いた stream index で始まり、明示的な start 指定が列挙済みならそれを優先する。トラック切り替えは配信 session が新 generation を作り、実際に開いた音声 stream index を Ready 情報へ載せる。App は現行 generation の Ready と要求 index が一致した時だけ `settings.db` のファイル別選択を更新する。worker の Ready 公開と generation の退役は同じ状態 lock で直列化し、退役時に確定済みの選択を App へ返す。画質・音声トラック変更、seek、stop、新しい start、所有権移動、終了はこの境界を使う。Remote service は設定の書き手にならない。詳細は [audio-track-selection-plan.md](audio-track-selection-plan.md) §9A と [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md) §6 を参照。
+
 ```
 [起動時]
   GpuVideoDevice 作成 (mIV 専用の D3D11 device + VideoProcessor + Fence)
@@ -241,7 +243,45 @@ viewer context registry の window binding を保ったまま main から独立�
 同時に main context 側の `poll_video()` は抑止し、native presenter のイベントや source
 swap pending を detached 動画ではない `fullscreen_idx` で処理しないようにする。
 
+### 音声トラックの選択と記憶
+
+利用者が明示した音声トラックは `settings.db` の `video_audio_track_choices` に正規化 path ごとに保持する。
+保存する `SavedAudioTrackChoice` は stream index、codec、任意の language / channels / title を持ち、
+demux は列挙済みトラックとの一致を確認してから初期 `AudioSetup` を開く。一致しない場合は既定トラック、
+一致したトラックの setup が失敗した場合は既定で開き直し、App が 1 回通知する。
+この通知は demux の `VideoInfo.open_notice` から `VideoPlayer` が受け取り、音声出力
+device の起動に失敗して selection lane を受け取れない場合も App へ 1 回渡す。
+動画と Remote headless は `build_video_player_for_open`、音声ファイルと音楽ビューは
+`build_audio_player_for_open` から共通の in-memory lookup を使う。切り替え要求の世代が
+`applied` に確定したときに App が収穫し、close / evict / source swap / teardown では
+再生位置の保存単位に未収穫の選択を載せる。再生位置が EOF 等で消えても選択は残る。
+環境設定の「保存済み位置の管理」はクリア操作の有無を編集意図として保持する。クリアせず
+OK ならダイアログ表示中に更新された再生位置と、確定・削除・リネームされた選択を
+live Settings から引き継ぎ、
+クリアして OK なら再生位置と選択の両方を消す。
+
 ### HUD overlay HWND (v0.9.0+ 後期 — CP1-8 で導入)
+
+複数の再生可能な音声トラックがある動画では、下部 HUD の速度とミュートの間に
+「音声 N」ボタンを置く。`N` は player の `applied` の ordinal。popup の行ラベルは
+`src/video/audio_track_ui.rs` が音声モード HUD と共有し、`NativeOverlayMetadata` は
+ラベル・stream index・現在行・導出状態を render thread へ渡す。popup の実描画 rect は
+`compute_hud_regions` が `SetWindowRgn` に渡す領域にも追加し、開いている間は HUD を
+表示し続ける。幅が足りないときは Full / NoCapture ではボタンを残し、NoMarkers から隠す。
+
+音声モード HUD でも左右クラスタが重なる幅ではボタンを隠す。popup は viewport 内に収め、
+多数の行は popup 上のホイールでスクロールする。長い行は hover で全文を確認できる。
+native HUD はソース切り替え時に popup のスクロール位置も破棄し、再オープン時は現在行を表示する。
+音声モードでは音声・速度 popup がホイールを消費してから Ctrl+ホイールによる Row 秒数変更を処理する。
+Row 操作はキー処理が従来のホイール位置まで到達したフレームに限り、TextEdit・IME 入力中や
+ブックマーク／Norm モーダル中には行わない。
+選択イベントは source epoch 検査を通過した後、現在 player の stream index を確認して
+App の Norm owner 経由で `VideoPlayer::select_audio_track` に届く。ParkedLive では
+この HUD クリックは操作を実行せず窓の活性化要求になる。音声 VST シェル中は音源操作として許可する。
+右パネルの「音声」は `applied` のトラック情報を表示し、ビットレートはそのトラックが
+open 時に開いた stream と同じ場合に限って添える。2 本以上なら本数も表示する。
+音声 lane を作れず selection が無い場合は選択ボタンを隠し、右パネルには従来の
+codec / bitrate metadata を表示する。
 
 VST3 プラグイン GUI がフルスクリーン動画再生中も最前面に維持されるため (= 動画を見ながら EQ
 カーブを調整する用途)、以前は **VST GUI が presenter HWND の owned + TOPMOST** になっていた。
@@ -284,11 +324,20 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   HUD touch DOWN は mouse-down と同じ typed `RequestFocusClaim` を送るが、touch 用 `SetCapture` は
   呼ばない。owned touch の promoted mouse は source query が `IMDT_TOUCH` と確定した場合だけ捨てる。
 - **Keyboard / IME**: HUD では受けない (`WS_EX_NOACTIVATE` で focus を取らない)。presenter HWND の
-  既存 wndproc で受けて `NativeEguiOverlay` に流す。HUD 上の mouse-down で `claim_foreground(presenter_hwnd)`
-  を発火することで、VST 操作後でも presenter HWND を foreground/focus に戻して keyboard/IME を維持。
+  既存 wndproc で受けて `NativeEguiOverlay` に流す。HUD mouse-down は foreground HWND をイベントに記録し、
+  pump で登録済み VST editor が前面だったと判定した場合は presenter focus 要求を出さない。
+  presenter 上の touch DOWN はこの HUD 限定抑止の対象外で、editor から動画へ戻る focus 要求を維持する。
+  他アプリから HUD に戻る操作でも従来どおり要求する。editor の HWND/PID 登録と bridge PID 集合は一つの不変
+  snapshot として公開し、更新準備中も直前の完全な snapshot で分類する。presenter が owner の
+  popup でも、未登録なら editor として扱わない。
+  登録 editor は HWND と稼働中 bridge PID の両方で
+  照合し、plugin popup は editor と区別する。presenter の通常復旧も同じ分類を使い、editor 前面では
+  raise latch を立てず、外部アプリから戻った時の復旧は維持する。
   TextEdit を含む overlay ダイアログ表示中は、mIV が foreground に戻っているのに pump observation の
   thread focus が外れている場合も、render tick が rate-limit 付き focus intent を返し、`NativeWindowHost` が
   `claim_foreground(presenter_hwnd)` を実行して Alt+Tab 復帰後の文字入力 / Ctrl+V を回復する。
+  VST ボタンを押した時だけ通常ログに HUD down/up と toggle 実行、foreground PID、editor の
+  owner/可視/topmost/iconic、presenter/HUD の topmost を最大 64 行記録する。
   presenter の egui Context にも App と同じ IME input plugin を登録し、composition state を
   viewport 単位で所有する。native event queue が次の egui pass を待つ間は、plugin snapshot に
   `pending_events` を read-only 投影して Ctrl+V/C/X と Enter/Esc の gate を決め、presenter-local な
@@ -787,6 +836,9 @@ session owner、生存 timeout、放置 timeout は A/V と audio-only で同じ
 保持し、空きが無ければ `Condvar` wait、consumer release で resume する。cancel は各 FFmpeg
 段の前後で同じ flag を検査するため、長い段の途中へ別 state field を持ち込まない。本番の
 remote session と `dev-tools` の `clockless_transcode_bench` は同じ driver と終端 flush を使う。
+音声 stream index は driver の入力で明示する。診断 CLI は既定 stream を入口で決め、
+必要なら `--audio-stream-index N` で指定できる。本番 session は headless player の
+opened stream を渡し、driver 内では選び直さない。
 
 ## モジュール構成 (現行責務)
 
@@ -910,12 +962,12 @@ hidden 中は選択・worker・decoder・セルを保持し、波形の backgrou
 
 波形の粗トラック (全尺解析) はセッションより長く生きる。`SeekStripWaveWorker` は
 `SeekStripCloseCause::keeps_viewing_the_same_video` が真の境界では `cancel` せず、App の
-`video_seek_strip_wave_holdover` へ owner fs index、動画パス、source epoch、items generation と
-一緒に預ける。次のセッションは`take_or_spawn_seek_strip_wave_worker` でこの4 identityをexactに
+`video_seek_strip_wave_holdover` へ owner fs index、動画パス、`applied` の音声 stream index、source epoch、items generation と
+一緒に預ける。次のセッションは`take_or_spawn_seek_strip_wave_worker` でこの identity を exact に
 照合して拾い、**新しく spawn したものと
 見分けが付かない状態** (背景段は再開済み) で受け取る。預けている間は背景の全尺解析だけを
 止める。手放すのは動画が変わる / フルスクリーンを出るときで、`sync_native_video_seek_strip`
-が毎フレーム4 identityを照合してsource replacementの取りこぼしを拾う。保持は 1 本ぶん
+が毎フレーム同じ identity を照合して source replacement と音声トラック確定の取りこぼしを拾う。切り替え中は旧 `applied` の波形を保ち、新トラックが `applied` になった時点で worker を作り直す。保持は 1 本ぶん
 (`MAX_COARSE_WAVEFORM_BYTES` = 64 MiB が上限、通常の 1〜2 時間なら 250〜500 KB)。
 `cancel` は不可逆でスレッドが終わるため、預ける経路では絶対に呼ばない。サムネイルモードの
 `SeekStripThumbnailWorker` は索引の列挙、採用する場面の選択、SQLite/WebP 読み込み、未取得画像の
@@ -950,7 +1002,7 @@ session open、全 strip KeyAction、presenter の film button、シーク行の
 source session reset で `Unknown` へ戻すため、前ファイルの unavailable が次の動画へ漏れない。
 
 波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
-音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く
+音楽解析 LRU にあれば対象時間窓を切り出す。いずれも path と音声 stream index が一致する結果だけを使う。無ければ、動画と `applied` トラックごとに 1 回だけ開く
 `AudioRangeDecoder` で設定された可視 span (5 / 10 / 15 / 30 秒、1 / 2 / 5 / 10 / 15 /
 30 / 60 / 120 / 180 分、既定 3 分) と 0.75 秒の pre-roll
 だけを 48kHz stereo PCM にして first-paint raster を返す。表示後は同じ中心の保持 span を
@@ -959,7 +1011,7 @@ background で作る。保持 span は通常 3 倍だが 3600 秒で上限とす
 
 波形モードで可視 span が 10 分以上になると、同じ worker / decoder が 100ms、7 byte/bin の粗い全尺列を
 60 秒 chunk で構築する。列を作った直後、共有 `TileThumbCache` の `video_tile_thumbs.db` から
-file identity (`path` / mtime / size)、bin 幅・総 bin 数、format version が一致する全 chunk を
+file identity (`path` / stream index / mtime / size)、bin 幅・総 bin 数、format version が一致する全 chunk を
 1 batch で読み、長さと添字を検証できた chunk を coverage へ戻す。未取得 chunk は従来どおり
 foreground latest-wins request を loop 先頭で処理し、無いときだけ現在中心に最も近いものを 1 個埋め、
 復号・合成に成功した chunk だけを DB へ保存する。波形モード以外では背景段を止め、10 分の構築閾値、
@@ -1096,7 +1148,7 @@ keyframe が疎すぎる material unavailable も同じ UI surface と入力 gat
 **seek 調停**: `clock.take_seek_request()` を pull するのは demux thread のみ
 (= 旧構造と同じ単一 puller)。`input.seek` 成否を判定後、packet queue とは別の
 control channel で video に `Flush { serial, trim_before_secs, frame_step }`、audio に
-`Flush { serial, seek_target_secs, trim_before_secs }` を enqueue する。decode thread は
+`Flush { serial, seek_target_secs, trim_before_secs, replace_setup }` を enqueue する。decode thread は
 `select_biased!` で control を優先受信するため、packet queue が満杯でも Flush が古い
 compressed packet の後ろに埋もれない。
 audio の `seek_target_secs` はユーザー要求 target (= timeline / engine anchor 用)、
@@ -1109,6 +1161,28 @@ remote headless では presenter の代わりに output consumer が `FirstFrame
 `Buffering → Playing` となり、最初の post-seek PCM を cpal callback が実消費した時点で
 seek override が解除される。したがって headless でも video consumer、audio pump、audio device
 callback の 3 者を止めない。
+demux が packet に付ける serial は clock の live 値ではなく、処理済み seek の `demux_serial`。
+存在する decode lane すべての Flush 送信が受理された後にだけ要求 serial へ進める
+(seek 失敗時の trim なし Flush も同じ)。audio-only / video-only は存在する lane のみを数え、
+cancel 中の送信失敗と video lane の送信失敗は demux の終端となる。cancel を伴わない audio lane の切断は音声 routing を外し、映像があれば映像のみで続ける。以後の seek は video Flush だけを条件に serial を進める。音声のみなら lane 喪失を記録してから `DecoderEvent::Failed` を確実に送り終端となり、保留中のトラック選択には `WorkerGone` を付ける。event lane が満杯なら cancel を見ながら空きを待つため、選択後の seek が終端済み demux に公開されても engine は Seeking に残らない。UI は失敗理由を表示して出力を停止する。`SeekCompleted` の event lane 再送はこの更新と独立している。
+初回 `tick()` 前に `Ok(info)` と終端 `Failed` が両方届いても、終端理由を確定した tick は後続の info 処理へ進まず、停止済み出力を音声初期化失敗として上書きしない。
+audio decode worker の終了も demux と pump に通知する。映像が残る場合、demux は `AudioInactive` を engine event lane へ送り、満杯なら EOF 待機中も再送する。engine は音声 readiness を外し、遅れて届く `InfoReceived` や古い音声 event で復活させない。pump は入力切断または worker 終了時に raw / processed を破棄し、音声会計を 0 にする。これで音声喪失後の seek と EOF / ループの quiet 判定が進む。
+これにより、UI が serial を進めてから seek 要求を公開するまでに読んだ旧位置の packet は
+旧 serial のまま decode thread へ渡り、Flush 後に stale として破棄される。
+
+音声トラック選択 (backlog §1.251 S2) は player ごとの `AudioTrackSelection` が
+desired / applied / last_failure を generation 付きで所有する。UI は desired を書いて
+表示位置への seek を発行するだけで、demux が seek 要求の取り出し後に最新 desired を読む。
+選択の受付と音声 lane の閉鎖はこの owner の同じ mutex で直列化する。閉鎖前に受け付けた保留選択には `WorkerGone` を記録し、閉鎖後の選択は拒否する。
+別 stream なら demux thread が `AudioSetup` (avcodec + resampler) を構築し、seek 成功後に
+video Flush → `replace_setup` 付き audio Flush を送る。audio Flush が受理された時点でだけ
+routing と applied を確定する。構築失敗・seek 失敗では旧 routing を使って通常 seek を続け、
+失敗 generation は利用者の次の選択まで自動再試行しない。audio Flush の切断は上記の
+音声 lane 喪失として扱う。setup 構築時間は `audio/audio_setup_build` perf event に記録する。
+`AudioFrame.stream_index` は実際に decode した setup の stream index で、S3 の Norm gain 表に渡す。
+選択を次の seek まで保留するのは engine の published state が Eof、または切り替え先の既知の stream 範囲で音声を準備できない場合。`audio_track_available_at` は start 前と `position + AUDIO_TRACK_READY_MARGIN_SECS > end` を利用不可とし、UI の選択と demux の seek 取り出しで共用する。demux は音声を採用し始める位置 (通常 seek は target、frame-step seek は `FrameStep.base_secs` = audio trim 下限) で判定する。範囲外の選択は seek を出さず、demux で範囲外になった選択は旧 routing で通常 seek を続ける。`AudioTrackSelection.deferred_gen` は判定した generation と現在の desired が一致する場合だけ記録し、同じ generation の試行開始で解除する。表示は確定・失敗・保留・切り替え中の順に snapshot から導出する。`AudioTrackInfo` の範囲は stream の start_time/duration を優先し、MKV の stream `DURATION` タグは start_time が 0 または無い場合だけ end とする。
+demux が末尾を先読みして `clock.is_eof_reached()` を立てても、範囲内なら選択は即時 seek する。再生中・一時停止中とも、未表示の進行中 seek target (coalesce 中の pending を優先) があればそれを基準とし、無ければ表示済みフレームの PTS を使う。demux seek 失敗・frame-step 出力失敗・相対 seek の端判定・EOF 固着保険で中断した target は退役させる。音声出力が先に override を正常解除した target は映像表示まで保持する。frame-step pause は常に表示 PTS、映像が無ければ現在位置を使う。
+異なる audio time base の検証には `multi-timebase.mp4` の 3 AAC stream を使い、実 pump と `fill_output` で出力消費時の PTS と A/V clock を測る。
 frame-step seek だけは video 側 `trim_before_secs=None` と `frame_step=Some(...)` で流し、
 video decoder が decoded PTS を見て base の直前/直後の 1 枚だけを送出する。audio 側は
 基準 PTS まで trim し、停止中の余分な音声 decode を抑える。
@@ -2093,8 +2167,8 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
   同じ frame-selection は seek hover サムネ `thumbnail.rs` と共通
 - `tile_thumb_cache.rs`: 共有 `video_tile_thumbs.db` の永続キャッシュ。タイル / resume サムネイルは
   SQLite + WebP で、タイルは **絶対 PTS をキー**にしているため動画の長さが変わっても再ヒットする
-  (Phase 8.C の修正)。`video_wave_chunks` は粗い全尺波形の量子化 bin を chunk 単位で持ち、path、
-  動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用する。既存のファイル単位・
+  (Phase 8.C の修正)。粗い全尺波形の新規 chunk は `video_wave_chunks_track` に stream index 明示で保存し、path、
+  stream index、動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用する。旧 `video_wave_chunks` は既定トラックに限り互換読みする。既存のファイル単位・
   フォルダ単位・全件削除は両方のキャッシュを同時に消す
 - **抽出幅は `settings::VIDEO_TILE_EXTRACT_WIDTH` (640px) に固定**。列数・モニター解像度・
   どのモニターで再生するかに依らず常に同じ幅で抽出・保存するので、キャッシュは
@@ -3086,29 +3160,50 @@ cache 自身の 1 本 + decoder に渡した 1 本で `2` になる。`2` より
 | 通常 seek | ✓ | ✓ (`handle_seek_request`) | ✓ |
 | Norm toggle | ✗ | ✗ | ✗ (= 2026-05-11 削除、上の「既知の症状 (修正済)」節参照) |
 
-Norm では `set_normalize_gain` の atomic store のみ行い、`processed` / `raw_pending` /
-`audio_tx_queued` のいずれも触らない。audio-pump は目標 gain 変更を dB 空間で 4 秒 ramp
-するため、仮 gain → 確定 gain や手動 ON/OFF の段差を滑らかにする (= 既存 `processed`
-の最大 ~100ms は旧 gain で鳴り続けるが、A/V offset は連続性を保つ)。
-ただし open / source-swap 時点で `audio_normalize.db` の測定値が見つかる場合は、
-`build_video_player_for_open` で `VideoPlayer::open` に初期 Norm gain を渡し、音声ワーカー
-起動前の `AvClock` に設定する。これにより再生開始直後の最初の processed chunk から
-測定済み gain が使われ、動画切り替え時に旧 gain の音が一瞬鳴ることを避ける。
+Norm の gain は player の `NormalizeGainTable` が音声 stream ごとに保持する。pump は
+`AudioFrame.stream_index` で値を選び、`Gain` の変更を同一トラック内では dB 空間で
+4 秒 ramp する。トラック境界、`Pending` 解決後の最初の frame、preroll suspension
+解除直後は snap する。Norm の gain 変更で `processed` / `raw_pending` /
+`audio_tx_queued` を clear しない。既存 `processed` の最大 ~100ms は旧 gain で
+鳴り続けるが、A/V offset は連続性を保つ。
 
-グローバル Norm が ON で `audio_normalize.db` に測定値が無い動画は、open / source swap /
+Norm ON の open / source-swap では表の既定値を最初から `Pending` にする。
+`VideoInfo.opened_audio_stream_index` を受け取った後、App が読み取り専用 DB 接続を持つ
+worker でそのトラックの測定値を引く。pump は該当トラックの raw frame を保持し、
+解決前に unity gain で processed にしない。別トラックの frame は流れる。
+`Pending` が raw の先頭を塞ぐ間は EOF でも `BufferReady` を出さない。
+lookup の完了通知は開始元の `ViewerContextId` に振り分け、所有 context が mount
+された poll でのみ取り出す。ファイル path・stream と player の table epoch / request
+が一致する場合だけ適用する。一覧再配置で `fs_idx` が変わった場合はその identity から
+現在の index を求める。context が閉じられた通知は破棄する。
+測定値は `audio_normalize_track` に保存し、旧 `audio_normalize` の行は既定トラック
+についてのみ後方互換として読む。open 時の同期 lookup と autoplay の一時 false は廃止した。
+
+Norm 全体 OFF は main・F12・ParkedLive を含む各 viewer context の player 表を
+unity に reset し、全 request を epoch で失効させる。全体 ON では操作中の player の
+既存の同期 lookup / scan 経路を保ち、他の context と player は Pending に reset して
+所有 context から非同期 lookup を始める。再 ON と通常の poll は open 時の stream
+ではなく、現在の `applied` と、切り替えが未確定なら `desired` のうち未解決の
+トラックを lookup 対象にする。同じトラックの実行中 request は再起動しない。
+
+グローバル Norm が ON で選択トラックの測定値が無い動画は、lookup 完了後、open / source swap /
 seek / play toggle 等で `VideoPlayer::intent_playing()` が true になった時点で自動スキャンを
 開始する。判定は `maybe_start_normalize_scan_for_play_intent` に集約し、
 `OnUnmeasured` / fullscreen 中 / スキャン未実行 / auto-scan 抑止なし、の条件を満たす場合だけ
-`start_normalize_scan` へ進む。スキャン開始時の再開可否も `is_playing()` ではなく
+`start_normalize_scan` へ進む。
+トラック選択の `desired` と `applied` が一致する確定状態だけを自動スキャン対象にする。
+切り替え中の旧トラックには再起動せず、新トラックが applied になった poll で
+旧トラックのブロッキング scan が残っていれば cancel して preroll suspension を解く。
+スキャン開始時の再開可否も `is_playing()` ではなく
 `intent_playing()` を保存するため、Loading / Buffering 中の autoplay でも scan 完了後に再生を
-正しく再開できる。ユーザーキャンセルや scan 失敗後は fs_idx 単位で自動再発火を抑止し、
-手動 Norm クリックだけで再試行できる。抑止は fs_idx 単位で保持し、同 fs_idx への新規
+正しく再開できる。ユーザーキャンセルや scan 失敗後は fs_idx・path・stream 単位で自動再発火を抑止し、
+手動 Norm クリックだけで再試行できる。同 fs_idx への新規
 open / source swap、fullscreen 終了、または全体 OFF で解除する。
 
-未測定かつ open/source-swap 時点で autoplay する動画は、`VideoPlayer::open` へ渡す
-autoplay を一時的に false にしてから fs_cache に挿入し、`init_normalize_state_for_opened_video`
-後に `start_normalize_scan_for_deferred_play_intent` で scan を開始する。この経路では
-`NormalizeScanState.was_playing=true` を明示しておく。長尺動画では scanner が
+未測定かつ open/source-swap 時点で autoplay する動画は、worker lookup の結果を
+受け取った時に既存の deferred-play scan 経路へ渡す。scan の suspension を立ててから
+その stream を `Gain(1.0)` に解決する。この経路では `NormalizeScanState.was_playing=true`
+を保持する。長尺動画では scanner が
 `PROVISIONAL_SCAN_AFTER_SECS` (= 10 分) に到達した時点で `Provisional` を返し、App は
 仮 gain を DB 保存せず現在 player へ適用して再生 intent と `audio_preroll_suspended` を
 復帰する。scanner はそのまま継続し、最終 `Done` のみ `audio_normalize.db` に保存して

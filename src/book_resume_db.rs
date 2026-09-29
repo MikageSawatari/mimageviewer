@@ -31,11 +31,15 @@ pub struct BookResumeDb {
 impl BookResumeDb {
     /// DB を開く (なければ作成)
     pub fn open() -> Result<Self, rusqlite::Error> {
-        let path = Self::db_path();
+        Self::open_at(&Self::db_path())
+    }
+
+    /// 指定 DB を通常と同じスキーマ初期化経路で開く。
+    pub(crate) fn open_at(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = rusqlite::Connection::open(&path)?;
+        let conn = rusqlite::Connection::open(path)?;
         // 読み (UI スレッド) と書き ([`BookResumeWriter`] スレッド) で 2 接続が同じ
         // ファイルを触るため、稀な競合で SQLITE_BUSY を即時エラーにせず待たせる。
         conn.busy_timeout(Duration::from_secs(3))?;

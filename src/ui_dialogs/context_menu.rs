@@ -1388,6 +1388,13 @@ impl crate::app::App {
             surface: target.surface,
             is_folder_context: target.is_folder_context,
             has_checked: target.has_checked,
+            has_epub_target: if target.has_checked {
+                self.selection_target_indices(crate::app::ActionSurface::MainWindow)
+                    .into_iter()
+                    .any(|index| matches!(self.items.get(index), Some(crate::grid_item::GridItem::PdfFile(path)) if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))))
+            } else {
+                matches!(&target.item, crate::grid_item::GridItem::PdfFile(path) if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))
+            },
             checked_count: target.checked_count,
             checked_file_operation_selection: target.checked_file_operation_selection,
             can_use_folder_commands: target.folder_command_target.is_some(),
@@ -1580,6 +1587,10 @@ impl crate::app::App {
             return None;
         }
         match command {
+            MenuCommand::ConvertEpubToPdf => {
+                self.start_batch_convert_to_pdf_at(target.item_index);
+                None
+            }
             MenuCommand::NewFolder => {
                 if target.is_folder_context
                     && let Some(folder) = target.folder_command_target.clone()
@@ -2981,6 +2992,27 @@ mod delete_confirm_tests {
         let mut commands = Vec::new();
         visit(&app.context_menu_nodes(&target, false), &mut commands);
         commands
+    }
+
+    #[test]
+    fn epub_grid_context_routes_pdf_conversion_but_plain_pdf_does_not() {
+        let mut app = crate::app::setup_app_for_test();
+        assert!(
+            menu_commands(
+                &mut app,
+                GridItem::PdfFile(PathBuf::from("C:/books/book.epub")),
+                ContextMenuSurface::Grid,
+            )
+            .contains(&MenuCommand::ConvertEpubToPdf)
+        );
+        assert!(
+            !menu_commands(
+                &mut app,
+                GridItem::PdfFile(PathBuf::from("C:/books/book.pdf")),
+                ContextMenuSurface::Grid,
+            )
+            .contains(&MenuCommand::ConvertEpubToPdf)
+        );
     }
 
     fn menu_labels(nodes: &[MenuNode]) -> Vec<String> {

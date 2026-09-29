@@ -1455,6 +1455,111 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-29 Smart Folder PDF 可視採用の共通後片付け**
+
+Smart Folder の PDF warm placeholder と準備済み pages は、Smart child session の採用後に通常 PDF と同じ `prepare_pdf_visible_adoption` を通す。既存の detached image window 退避判定を含む後片付けを page rows の install 前に一度だけ行い、列挙検証時は繰り返さない。detached の述語・viewport・window lifecycle の実装は変更せず、Smart 経路の可視採用を既存の所有境界へ合流させた。
+
+**2026-09-28 D15 EPUB キャッシュ即時削除の読取所有権 (review #3〜#6 改訂)**
+
+分類待ち・開封待ち・表示中の各状態が、EPUB の論理パスを受け付けた時点から `LeasedEpubPath` を自分で保持し、状態の drop で解放する。mounted / parked の `ViewerContextBundle` を横断して所有者を列挙・同期する方式は、手書きの列挙から smart folder と起動系の候補が漏れたため廃止した。固定世代の解決・PDF 描画・Remote 要求・サムネイル処理も同じ本の調停を通し、削除は読取中なら使用中として拒否する。review #3 では smart folder と起動・二重起動通知・しおりの採用待ちまで対象を広げた。review #4 では別ウィンドウの PDF descriptor 自体にリースを持たせ、次の EPUB の取得に成功してから現在の窓を退避する。review #5 では PDF ページなど実ファイルをドラッグできない項目としおりも同じ PDF descriptor 生成境界を通し、「対象外」と「削除中で拒否」を型で分けて退避前に処理する。取得できなければ窓を退避せず案内する。表示 context を閉じたり再作成したりせず、detached の predicate、viewport ID、host、配置、focus、window lifecycle は変えない。所有期間を各状態の RAII に置く構造変更であり、§2 の症状パッチには当たらない。
+
+review #6 では descriptor より手前の分類受付も `Accepted / NotApplicable / Refused(理由)` に分けた。`LeasedEpubPath::try_new` 自体が削除中の理由付き `Result` を返し、しおり・履歴・スマートフォルダ・直接開封・別ウィンドウは受付拒否を共通の案内へ渡す。しおりの採用状態や既存窓は変更しない。フルスクリーンの EPUB 所有権取得も理由付きにし、取得前の表示状態確定を避ける。PDF パスワード待ちとスマートフォルダ子のリース取得は失敗理由を保持する。追加の待機や再試行、detached viewport 状態は設けない。
+
+**2026-09-28 §1.251 S7 / master 統合: Remote 取得と EPUB・履歴の非同期 open の所有境界**
+
+master が追加したパス分類、EPUB 変換、履歴・コレクション・評価一覧の遷移、フォルダ pane scan、PDF password、Smart 遷移が Remote の取得後にローカル閲覧を再開しないよう、取得時に既存の context owner terminal で失効させる。detached 側の閉鎖は S7 の既存 terminal close を再利用し、detached 述語、host / park / focus、viewport 生成・終了は変更しない。Remote とローカルの所有権引き継ぎを同じ境界で完結させる構造的統合であり、時間窓・再試行・一括 reset による症状隠しではない。独立レビューの指摘を統合した。ClaudeCode の検収判断は未了。
+
+**2026-09-28 §1.251 S7: Remote の取得時にローカルの閲覧 context をすべて閉じ、所有中は閲覧の open を拒否**
+
+音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §9B) で、Remote で見た再生位置を
+PC へ書き戻すため (利用者決定 2026-09-26)、Remote の取得 barrier の条件に「ローカルの閲覧を閉じ終えた」を加えた。
+取得時に、表示モード変更で使っている既存の terminal close (`close_all_detached_viewers_for_mode_change`) と
+`close_fullscreen_to_completion` で、active・passive / ParkedLive・残余の画像 context を retire し、viewport を
+hide する。両 helper が従来ログを残して続行していた失敗は型付きで返すようにした (表示モード変更の挙動は不変)。閉鎖の
+完了は実状態 (root 以外の context の有無、fullscreen viewport の非表示完了、detached の runtime / window / session、
+transition と未実行の effect) から判定し、完了したフレームでだけ `finish_acquire` する。取得前に積まれた閲覧の open
+要求 (fullscreen 復元、遅延 open、列挙完了後の再 open、ParkedLive 復帰要求など) は失効させ、共通の open 境界で Remote
+の所有中は open を拒否する。Remote の終了時には閉じたものを復元しない。
+判断: Remote の所有という境界で、ローカルの閲覧 context (所有する player・再生位置の書き手) を既存の terminal close で
+なくす構造的変更であり、guard・遅延・再試行・一括 reset で症状を隠すものではない。rect 一致・時間窓・新しい App の
+bool は加えていない (§2 の禁止事項に抵触しない。取得 barrier の既存の watchdog は取得を諦める判断にだけ使う)。
+独立レビュー (Sol) と ClaudeCode の双方がこの判断に合意した。
+
+**2026-09-28 §1.280 履歴 / EPUB の context-owned 非同期処理 (review #8/#9 改訂)**
+
+分類 candidate、staged 履歴 transition、Collection navigation、detached folder scan、
+DFS、PDF/ZIP 列挙、EPUB 変換、PDF password request は表示先の
+`ViewerContextBundle` が所有する。root と active detached の **mounted** context だけが
+typed owner registry の `service` を呼ぶ。parked still context は frozen frame のまま
+一切 poll / dialog 描画を行わない。park transaction は同じ registry の
+`terminate_on_park` を全 owner に適用し、staged 履歴は旧表示・履歴を保持、未採用
+direct open は所有 rollback を返し、分類・DFS・scan・enumeration は取消、EPUB 変換と
+password request と Similar preview preparation は terminal にする。以前の root から parked bundle を一時 mount して
+poll / dialog 描画する実装と、その coverage claim は撤回した。
+Collection grid の Snapshot / Preparing だけを park で取り消し、Ready / Empty / Failed /
+Deleted は変更しない。特に物理子表示中の Deleted tombstone を維持するので、復帰後も
+Backspace と復元 snapshot は実フォルダとして扱う。Similar preview も進行中 worker
+だけを取消し、完成 cache と terminal failure を維持する。
+
+EPUB 変換または PDF password prompt の owner がある間、passive window click、activation
+watcher、deferred activation、keyboard/gamepad の窓選択が到達する共通 activation 境界は
+別 context への切替を拒否する。よって通常入力から modal owner が park されない。
+password の表示・Retry/Cancel は context ごとの typed request から一件を決定的に選び、
+active detached viewport は自身が選択 owner の時だけ描く。global visibility flag は置かない。
+bundle 内の cache / write worker は従来の resume・永続化契約を保ち、registry の source audit
+で明示した例外とする（[folder history plan §12.5](folder-history-location-plan.md#125-detached-owner-servicing-と-warm-stamp-の-review-8-修正)）。
+tray/taskbar の root 復帰は viewer context を切り替えない。窓 host、placement、viewport
+identity は変更しない。これは非同期要求の所有 context と park terminal を揃える修正で、
+時間待ちや repaint による症状緩和は加えない。WebView2 実変換の窓操作は対話的検証に残す。
+
+**2026-09-27 §1.251 S4: 動画 HUD の音声トラック選択を ParkedLive の HUD クリック分類と music shell の許可に追加**
+
+音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §7.6・§8.1) で、動画 HUD の新しい
+操作 `NativeVideoOutputEvent::SelectAudioTrack` を追加した。`native_video_output_event_is_parked_live_hud_click_activation`
+では既存の HUD 操作と同じく HUD クリック (true) に分類し、ParkedLive の窓でのクリックは既存 filter どおり「窓の活性化」に
+なる (操作自体は実行しない)。音声モード (music shell) で許可する操作の一覧にも加えた。App の handler は source epoch の
+検査の後で処理し、`NavigateItem` 型の epoch 不一致の許容には入れない。detached の状態・述語の条件、viewport の生成・
+終了、時間窓は増やしていない。
+判断: 既存の明示的な分類表と許可リストに新しい操作を 1 つ加えるだけの構造的変更であり、症状パッチではない (§2 の
+禁止事項に抵触しない)。独立レビュー (Sol) と ClaudeCode の双方がこの判断に合意した。
+
+**2026-09-27 §1.251 S3-B: 音楽解析・波形の結果を所有 viewer context と音声トラックで照合**
+
+音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §6.2) で、音楽解析と seek strip
+波形の結果・進行中 worker・spectrum PCM の key に音声トラック (stream index) と所有 viewer context を加えた。
+viewer context の retire では、その context が所有する音楽解析の結果と進行中 worker を破棄する。viewer context の
+fork (ParkedLive への live fork) では、同じ player・path・`applied` の stream が移ったことを照合したうえで、解析の
+source と進行中 worker の owner を移動先の context へ移し、結果と PCM を保持する (作り直さない)。detached の述語、
+host / park / focus の lifecycle、viewport の生成・終了には変更を加えない。
+判断: context 固有の resource (解析結果・worker・PCM) を所有 context だけに作用させ、fork では所有権を移管する
+構造的修正であり、guard・遅延・再試行・一括 reset で症状を隠すものではない (§2 の禁止事項に抵触しない)。独立レビュー
+(Sol) と ClaudeCode の双方がこの判断に合意した。
+
+**2026-09-27 §1.251 S3-A: 音量正規化 (Norm) の測定値 lookup を所有 viewer context へ配送**
+
+音声トラック選択 ([audio-track-selection-plan.md](audio-track-selection-plan.md) §6.1) で、Norm の測定値の
+lookup を UI thread から worker へ移した。worker の完了通知は App 共通の受信箱で受けるが、結果は
+`ViewerContextId` と path・request epoch を持ち、**所有 context の poll でだけ**適用する (mount 中の
+`fs_cache` に対象が無いという理由で別 context 宛ての結果を捨てない)。context の retire で未適用の結果を
+破棄し、viewer context の fork で player が移った場合は移動先の context から lookup を再発行する。Norm 全体の
+ON / OFF は全 viewer context の player の gain 表に同じ遷移を適用し、epoch で古い request を失効させる。
+detached の述語、host / park / focus の lifecycle、viewport の生成・終了には変更を加えない。
+判断: context 固有の resource (lookup 結果・gain 表) を所有 context だけに作用させる構造的修正であり、
+guard・遅延・再試行・一括 reset で症状を隠すものではない (§2 の禁止事項に抵触しない)。独立レビュー (Sol) と
+ClaudeCode の双方がこの判断に合意した。
+
+**2026-09-27 履歴 preflight と直接 open の admission**
+
+独立 integration review の指摘に従い、`OpenRequestOwner` の各 variant が承認された後に、同じ viewer context が所有する staged 履歴要求だけを一か所で退役させる。`DetachedGridArchive` と detached lease を持つ `Bookmark` は型付き owner の window ID から registry の context ID を引き、通常 owner は投影中の context ID を使う。履歴 transition 自身の `source_context` も照合する。変換 cache 命中時の detached archive open は main App 上で admission を呼ぶが、宛先 context が detached なので main の staged 履歴・表示を変更しない。以前の `navigation_scope.is_detached_physical()` だけの判定ではこの経路を見落としていた。viewport / window の再作成や再試行は追加していない。これは要求と表示の context 所有権を揃える変更であり、detached 表示症状の局所回避ではない。
+
+**2026-09-27 §1.280 / §1.282 Collection 履歴と detached 外側 navigation**
+
+Collection fullscreen から外側へ移動する要求は、root session が一時的に `return_to=Collection` へ移った後も同じ viewer context が所有する。`collection_navigation_request_is_current` は live session がある場合、その collection ID と非 `Deleted` を検証し、session がない場合だけ typed `return_to=Collection` の同じ ID を認めるようにした。session が別 ID または `Deleted` の場合は fallback しない。これにより要求の context / surface / sequence / items generation / fullscreen index の既存照合を保ったまま、正規の detached Collection 外側移動を継続し、別窓や main の結果を採用しない。新しい detached flag、待機、retry、viewport 再作成は加えない。独立 reviewer は owner 境界の修正であり症状パッチではないと確認した。detached Collection の focused 回帰 1/1 と `scripts/test-full.ps1` は PASS。実窓 smoke は未実行。
+
+**2026-09-27 D13: EPUB しおりの開封拒否を別ウィンドウ確定前に処理**
+
+設計担当の D13 5 回目の指示に従い、しおり行の EPUB Ignore 判定を既存ウィンドウの退避・loading context 作成より前に置く。解決中に設定が変わった場合は、同じ bookmark request ID の待機を終了する。detached descriptor の PDF 開封は理由付きの `FolderOpenOutcome` を返し、拒否時は既存の build abort / Preparing session terminal へ渡す。グリッドからの別ウィンドウ開封と parked 窓の descriptor 再開でも、PDF の拒否を既存ウィンドウの退避前に処理する。新しい detached 状態や時間待ちは足さず、viewport ID・host・placement・focus の所有規則も変更しない。Codex は開封結果を捨てて成功扱いした境界を直す構造修正として §2 に適合すると判断した。独立レビューは未実施。
+
 **2026-09-27 §1.250 常に最前面**
 
 `Settings.always_on_top` を唯一の希望状態とし、active / loading / holdover / cleanup と passive / parked の閲覧用 viewport builder に `Normal` または `AlwaysOnTop` を明示する。root への切替 command と、子 host の builder diff を別の発行 owner にして二重送信を避ける。同一 ViewportId を active session が所有する間は passive snapshot を重ねて登録せず、handoff 後に passive が所有する。別の detached 状態 flag、時間待ち、Focus、個別 HWND への症状的な `SetWindowPos` は追加しない。これは他機能の level 設定が viewport builder 経路へ到達する構造変更であり、§2 の同一 host ownership を維持する。復帰時の再 assert は style 実測で欠落が確認された edge に限り、現時点では追加していない。設計は [always-on-top-plan.md](always-on-top-plan.md) を参照。
