@@ -1455,6 +1455,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-09-30 §1.304 Collection root 可視採用時の main context 所有境界**
+
+Collection の明示 Open、物理子から root への復帰、offscreen 履歴準備後の root 採用を、可視一覧の置換前に共通 loader・ドライブ一覧も使う `change_main_context_for_visible_grid` へ通す。動画・音声の別窓は既存の promote で旧 items 世代・player・fs_cache と共に別 context へ移し、静止画・PDF は既存の park / close 方針を使う。passive / parked sibling と F12 linked の方針は変えない。移管不可なら履歴・surface・items の変更前に理由付きで終端する。移動元の履歴地点、検索中の履歴抑止、`return_to` は移管前に捕捉する。有効な同一 Collection root の fullscreen binding だけは旧 session の `cancel_pending` で installed snapshot を保持し、`begin` と空 items install をしない。明示 Open の即時読み込み・失敗表示と記録済み履歴、履歴復元の成功時確定は維持する。
+
+変更範囲は `src/app.rs` の Collection 親ナビ・履歴採用・既存 media promote 判定に加え、通常 loader・ドライブ一覧・親なし復帰の移管処理を同じ関数へ集約した部分、`src/app/collection_grid.rs` の root entry / binding 判定 / 回帰テストである。既存 3 経路の promote → park → close の順序と条件を保ち、detached の viewport、host、placement 判定は変更しない。誤った所有 context の items と cache を同時に更新する BA-7 の破綻を既存の移管境界で分ける修正で、guard・delay・retry・一括 reset ではない。ClaudeCode の設計改訂と独立 Codex 設計レビュー 2 回で構造的修正として合意した。モーダル化は Collection の非同期準備中に操作できる既存仕様を狭め、所有の誤りを解消しないため採用しなかった。別窓の閉鎖・再開は再生継続を失うため採用しなかった。
+
+監査実行で見つかった既存の監査漏れも `tools/viewer_context_audit/src/lib.rs` で修正した。A4 に既存の非 Windows 公開関数 2 件を登録し、A6 が `#[cfg(test)]` 付き local binding 内の呼出しをテスト専用として扱うようにした。registry / decoder の実装は変更していない。
+
+実装レビュー P2 の追補: `src/app/collection_grid.rs` の移管前 `return_to` 捕捉が Search / Snapshot の退場 fallback を落としていた。`src/global_search_ui.rs`、`src/app.rs`、`src/app/snapshot_ops.rs` の退場処理から戻り先計算を副作用のない関数へ切り出し、Collection 入口もそれを使う。`src/app/subfolder_expansion.rs` は合成 path の復帰状態を読む条件と take 条件を共有する。移管前に従来の退場順と canonical `return_to` の消費を再現して戻り先を確定し、退場処理は一度だけ走らせる。別窓 media の所有境界と detached viewport / host / placement は変更しない。通常 Open・別窓動画 Open × Search・Snapshot の回帰テストは d3f7e9c79 で失敗することを確認し、Snapshot とタグ表示が重なる場合の最後の fallback も検証した。
+
+再確認 P2 の追補: 戻り先の優先規則は共有したまま、通常の Search / Snapshot 退場では saved folder、canonical `return_to`、サブフォルダ展開の復帰状態を所有元から move する。Collection 移管前の読み取りだけが必要な fallback を複製し、transient から戻り先が決まれば現在 surface の復帰状態を余分に複製しない。これにより通常の検索終了時に動画サムネイル対応表や除外パス集合を同期コピーしない。移管・detached の所有境界は変えず、通常 Open・別窓動画 Open × Search・Snapshot の回帰テストを維持する。
+
 **2026-09-29 Smart Folder PDF 可視採用の共通後片付け**
 
 Smart Folder の PDF warm placeholder と準備済み pages は、Smart child session の採用後に通常 PDF と同じ `prepare_pdf_visible_adoption` を通す。既存の detached image window 退避判定を含む後片付けを page rows の install 前に一度だけ行い、列挙検証時は繰り返さない。detached の述語・viewport・window lifecycle の実装は変更せず、Smart 経路の可視採用を既存の所有境界へ合流させた。

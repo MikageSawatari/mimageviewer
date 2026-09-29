@@ -2111,6 +2111,23 @@ impl App {
 
     /// Ctrl+G を終了して戻り先だけを引き渡す。スマートフォルダ等へ直行する場合に、
     /// 元の合成ビューを一度prepareして直後にcancelする競合を避ける。
+    pub(crate) fn global_search_return_context_without_restore(
+        &self,
+        canonical_return_to: Option<&crate::app::top_level_grid_view::TopLevelGridRestore>,
+    ) -> crate::app::top_level_grid_view::TopLevelGridRestore {
+        self.view_return_context_from_canonical_or_fallback(
+            canonical_return_to.map(std::borrow::Cow::Borrowed),
+            || {
+                let path = self.global_search.saved_folder.clone();
+                let subfolder_restore =
+                    self.global_search_subfolder_restore.clone().or_else(|| {
+                        self.subfolder_expansion_restore_for_synthetic_path(path.as_deref())
+                    });
+                (path, subfolder_restore)
+            },
+        )
+    }
+
     pub(crate) fn dismiss_global_search_without_restore(
         &mut self,
     ) -> crate::app::top_level_grid_view::TopLevelGridRestore {
@@ -2156,12 +2173,11 @@ impl App {
             .global_search_subfolder_restore
             .take()
             .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        self.top_level_grid_view
-            .take_return_to()
-            .unwrap_or(fallback)
+        let canonical = self.top_level_grid_view.take_return_to();
+        self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        )
     }
 
     /// debounce 経過チェック + 新クエリがあれば検索 spawn (App::update から毎フレーム呼ぶ)。

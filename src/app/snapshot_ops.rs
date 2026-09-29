@@ -35,6 +35,13 @@ struct SnapshotViewerIndexSwap {
     last_sync_stamp_existed: bool,
 }
 
+#[derive(Clone, Copy)]
+enum SnapshotSubfolderRestoreSlot {
+    FavSearch,
+    GlobalSearch,
+    Expansion,
+}
+
 impl App {
     #[cfg(windows)]
     fn remap_snapshot_native_pending_indices(&mut self, old_to_new: &HashMap<usize, usize>) {
@@ -857,6 +864,72 @@ impl App {
     /// (or its drill target), while `pre_snapshot_search_origin` is the real view to which the
     /// user should return.  Callers that transition directly to another synthetic view must take
     /// the latter as return ownership instead of recording the result-grid path in history.
+    fn snapshot_fallback_path(&self, snap: &SnapshotState) -> Option<PathBuf> {
+        let at_origin = self.current_folder.as_ref().is_some_and(|path| {
+            crate::snapshot::snapshot_key_from_path(path)
+                == crate::snapshot::snapshot_key_from_path(&snap.origin)
+        });
+        if at_origin {
+            snap.pre_snapshot_search_origin
+                .clone()
+                .or_else(|| Some(snap.origin.clone()))
+        } else {
+            self.current_folder.clone()
+        }
+    }
+
+    fn snapshot_subfolder_restore_slot(
+        &self,
+        snap: &SnapshotState,
+        path: Option<&Path>,
+    ) -> Option<SnapshotSubfolderRestoreSlot> {
+        let path = path?;
+        if !crate::folder_tree::path_eq(path, &super::subfolder_expansion_synthetic_path()) {
+            return None;
+        }
+        Some(match &snap.source_label {
+            SnapshotSourceLabel::FavSearch { .. } if self.favsearch_subfolder_restore.is_some() => {
+                SnapshotSubfolderRestoreSlot::FavSearch
+            }
+            SnapshotSourceLabel::GlobalSearch { .. }
+                if self.global_search_subfolder_restore.is_some() =>
+            {
+                SnapshotSubfolderRestoreSlot::GlobalSearch
+            }
+            _ => SnapshotSubfolderRestoreSlot::Expansion,
+        })
+    }
+
+    pub(crate) fn snapshot_return_context_without_restore(
+        &self,
+    ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
+        let snap = self.snapshot.as_ref()?;
+        Some(
+            self.view_return_context_from_canonical_or_fallback(
+                self.top_level_grid_view
+                    .return_to()
+                    .map(std::borrow::Cow::Borrowed),
+                || {
+                    let path = self.snapshot_fallback_path(snap);
+                    let subfolder_restore =
+                        match self.snapshot_subfolder_restore_slot(snap, path.as_deref()) {
+                            Some(SnapshotSubfolderRestoreSlot::FavSearch) => {
+                                self.favsearch_subfolder_restore.clone()
+                            }
+                            Some(SnapshotSubfolderRestoreSlot::GlobalSearch) => {
+                                self.global_search_subfolder_restore.clone()
+                            }
+                            Some(SnapshotSubfolderRestoreSlot::Expansion) => {
+                                self.subfolder_expansion_restore_for_synthetic_path(path.as_deref())
+                            }
+                            None => None,
+                        };
+                    (path, subfolder_restore)
+                },
+            ),
+        )
+    }
+
     pub(crate) fn dismiss_snapshot_without_restore(
         &mut self,
     ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
@@ -864,40 +937,32 @@ impl App {
         let _ = self.restore_rating_filter_suppression();
         // Canonical return_to がある間は fallback slot を consume しない。検索由来 snapshot
         // を fork した sibling が、それぞれ自分の restore payload を保持できるようにする。
-        if let Some(return_to) = self.top_level_grid_view.take_return_to() {
-            self.show_feedback_toast("★固定を解除しました".into());
-            return Some(return_to);
-        }
-        let at_origin = self.current_folder.as_ref().is_some_and(|path| {
-            crate::snapshot::snapshot_key_from_path(path)
-                == crate::snapshot::snapshot_key_from_path(&snap.origin)
-        });
-        let path = if at_origin {
-            snap.pre_snapshot_search_origin
-                .clone()
-                .or_else(|| Some(snap.origin.clone()))
+        let canonical = self.top_level_grid_view.take_return_to();
+        let (path, subfolder_restore) = if canonical.is_none() {
+            let path = self.snapshot_fallback_path(&snap);
+            let subfolder_restore =
+                match self.snapshot_subfolder_restore_slot(&snap, path.as_deref()) {
+                    Some(SnapshotSubfolderRestoreSlot::FavSearch) => {
+                        self.favsearch_subfolder_restore.take()
+                    }
+                    Some(SnapshotSubfolderRestoreSlot::GlobalSearch) => {
+                        self.global_search_subfolder_restore.take()
+                    }
+                    Some(SnapshotSubfolderRestoreSlot::Expansion) => {
+                        self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref())
+                    }
+                    None => None,
+                };
+            (path, subfolder_restore)
         } else {
-            self.current_folder.clone()
+            (None, None)
         };
-        let subfolder_restore = if path.as_deref().is_some_and(|path| {
-            crate::folder_tree::path_eq(path, &super::subfolder_expansion_synthetic_path())
-        }) {
-            match snap.source_label {
-                SnapshotSourceLabel::FavSearch { .. } => self.favsearch_subfolder_restore.take(),
-                SnapshotSourceLabel::GlobalSearch { .. } => {
-                    self.global_search_subfolder_restore.take()
-                }
-                _ => None,
-            }
-            .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()))
-        } else {
-            None
-        };
+        let return_context = self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        );
         self.show_feedback_toast("★固定を解除しました".into());
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        Some(fallback)
+        Some(return_context)
     }
 
     /// snapshot を deactivate する (= 退避していた items 等を復元)。

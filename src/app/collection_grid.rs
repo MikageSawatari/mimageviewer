@@ -18,7 +18,7 @@ use super::top_level_grid_view::{
     CollectionGridThumbnailSources, CollectionGridViewportAnchor, TopLevelGridRestore,
     TopLevelGridSurface,
 };
-use super::{App, GridItem, GridSortLockReason, ViewerContextId};
+use super::{App, CollectionMainContextChange, GridItem, GridSortLockReason, ViewerContextId};
 use crate::collection_store::{
     CollectionEntryId, CollectionId, CollectionOrderMode, CollectionPrepareError,
     CollectionPreparedSnapshot, CollectionStoreError, prepare_collection_snapshot,
@@ -1536,17 +1536,16 @@ impl App {
         })
     }
 
-    fn retire_transient_views_for_collection(&mut self) -> Option<TopLevelGridRestore> {
-        let current = self.current_top_level_restore_snapshot();
-        let mut origin = self.dismiss_snapshot_without_restore();
+    fn retire_transient_views_for_collection(&mut self) {
+        let _ = self.dismiss_snapshot_without_restore();
         if self.favsearch.active {
-            origin = Some(self.dismiss_favsearch_without_restore());
+            self.dismiss_favsearch_without_restore();
         }
         if self.global_search.active {
-            origin = Some(self.dismiss_global_search_without_restore());
+            self.dismiss_global_search_without_restore();
         }
         if self.tag_view.active {
-            origin = Some(self.dismiss_tag_view_without_restore());
+            self.dismiss_tag_view_without_restore();
         }
         if self.show_search_bar {
             self.show_search_bar = false;
@@ -1558,7 +1557,68 @@ impl App {
             self.cancel_search_pending();
         }
         self.cancel_pending_folder_nav();
-        origin.or(current)
+    }
+
+    pub(crate) fn collection_root_installed_binding_matches(
+        &self,
+        collection_id: CollectionId,
+    ) -> bool {
+        let Some(index) = self.fullscreen_idx else {
+            return false;
+        };
+        let Some(stamp) = self.collection_grid_stamp() else {
+            return false;
+        };
+        let Some(session) = self.top_level_grid_view.collection_session() else {
+            return false;
+        };
+        let Some(prepared) = session.prepared() else {
+            return false;
+        };
+        stamp.collection_id == collection_id
+            && matches!(session.position, CollectionGridPosition::Root)
+            && session.installed_items_generation == Some(self.items_generation)
+            && prepared.collection_id == stamp.collection_id
+            && prepared.collection_revision == session.accepted_revision
+            && prepared.entries.len() == self.items.len()
+            && index < self.items.len()
+    }
+
+    pub(crate) fn collection_open_return_to(
+        &self,
+        collection_id: CollectionId,
+        restoring: bool,
+    ) -> Option<TopLevelGridRestore> {
+        if restoring {
+            None
+        } else if matches!(
+            self.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(identity) if identity.collection_id == collection_id
+        ) {
+            self.top_level_grid_view.return_to().cloned()
+        } else {
+            // Simulate the retirement order without mutation. The first active transient consumes
+            // the canonical return_to, so a later one must use its own fallback.
+            let mut origin = self.snapshot_return_context_without_restore();
+            let mut canonical_return_to = self
+                .snapshot
+                .is_none()
+                .then(|| self.top_level_grid_view.return_to())
+                .flatten();
+            if self.favsearch.active {
+                origin = Some(self.favsearch_return_context_without_restore(canonical_return_to));
+                canonical_return_to = None;
+            }
+            if self.global_search.active {
+                origin =
+                    Some(self.global_search_return_context_without_restore(canonical_return_to));
+                canonical_return_to = None;
+            }
+            if self.tag_view.active {
+                origin = Some(self.tag_view_return_context_without_restore(canonical_return_to));
+            }
+            origin.or_else(|| self.current_top_level_restore_snapshot())
+        }
     }
 
     /// Opens the collection root. `restore` carries a minimum revision hint and a stable entry
@@ -1568,43 +1628,71 @@ impl App {
         collection_id: CollectionId,
         restore: Option<CollectionGridRestore>,
     ) {
+        let return_to = self.collection_open_return_to(collection_id, restore.is_some());
+        if let CollectionMainContextChange::Blocked(reason) =
+            self.prepare_collection_main_context_change(collection_id)
+        {
+            crate::logger::log(format!("collection open blocked: {reason}"));
+            return;
+        }
+        self.open_collection_grid_after_context_change(collection_id, restore, return_to);
+    }
+
+    pub(crate) fn open_collection_grid_after_context_change(
+        &mut self,
+        collection_id: CollectionId,
+        restore: Option<CollectionGridRestore>,
+        return_to: Option<TopLevelGridRestore>,
+    ) {
         let perf_start = crate::perf::is_enabled().then(Instant::now);
         let restoring = restore.is_some();
-        let return_to = if restore.is_some() {
-            None
-        } else if matches!(
-            self.top_level_grid_view.surface(),
-            TopLevelGridSurface::Collection(identity) if identity.collection_id == collection_id
-        ) {
-            self.top_level_grid_view.return_to().cloned()
-        } else {
-            self.retire_transient_views_for_collection()
-        };
+        let retaining_binding = self.collection_root_installed_binding_matches(collection_id);
+        if !retaining_binding
+            && !restoring
+            && !matches!(
+                self.top_level_grid_view.surface(),
+                TopLevelGridSurface::Collection(identity) if identity.collection_id == collection_id
+            )
+        {
+            self.retire_transient_views_for_collection();
+        }
         let identity = CollectionGridIdentity { collection_id };
-        self.top_level_grid_view
-            .begin(TopLevelGridSurface::Collection(identity), return_to);
+        if !retaining_binding {
+            self.top_level_grid_view
+                .begin(TopLevelGridSurface::Collection(identity), return_to);
+        }
         let watch = self
             .collection_store_client_for_read()
             .ok()
             .flatten()
             .and_then(|client| client.subscribe().ok());
         if let Some(session) = self.top_level_grid_view.collection_session_mut() {
-            session.wanted_revision = restore.as_ref().map_or(0, |state| state.revision_at_open);
+            if retaining_binding {
+                session.cancel_pending();
+            }
+            session.wanted_revision = restore
+                .as_ref()
+                .map_or(0, |state| state.revision_at_open)
+                .max(session.accepted_revision);
             session.restore_anchor = restore.and_then(|state| state.viewport_anchor);
             session.watch = watch;
         }
 
         // Do not leave a prior physical/search grid interactive while the actor and classifier are
         // resolving this collection. The empty install performs no filesystem/database access.
-        let collection_seed = self
-            .collection_auto_aspect_cache
-            .as_ref()
-            .and_then(|cache| cache.cached(collection_id));
-        self.install_collection_grid_items(Vec::new(), Vec::new(), None, collection_seed);
+        if !retaining_binding {
+            let collection_seed = self
+                .collection_auto_aspect_cache
+                .as_ref()
+                .and_then(|cache| cache.cached(collection_id));
+            self.install_collection_grid_items(Vec::new(), Vec::new(), None, collection_seed);
+        }
         // A header choice belongs to the prior root. A collection open, including history and
         // same-root reopen, starts from its installed collection order.
-        self.reset_details_sort_to_toolbar();
-        self.address = "コレクションを読み込み中…".into();
+        if !retaining_binding {
+            self.reset_details_sort_to_toolbar();
+            self.address = "コレクションを読み込み中…".into();
+        }
         self.schedule_collection_grid_snapshot();
         if let Some(start) = perf_start {
             crate::perf::event(
@@ -1638,14 +1726,22 @@ impl App {
         if self.document_open_modal_admission_blocked() {
             return;
         }
+        let source_location = self.collection_nav_history_source();
+        let return_to = self.collection_open_return_to(collection_id, false);
+        if let CollectionMainContextChange::Blocked(reason) =
+            self.prepare_collection_main_context_change(collection_id)
+        {
+            crate::logger::log(format!("collection navigation blocked: {reason}"));
+            return;
+        }
         let revision_at_open = self.collection_catalog_revision(collection_id).unwrap_or(0);
         let restore = CollectionGridRestore {
             identity: CollectionGridIdentity { collection_id },
             revision_at_open,
             viewport_anchor: None,
         };
-        self.record_collection_nav_transition(restore);
-        self.open_collection_grid(collection_id, None);
+        self.record_collection_nav_transition(restore, source_location);
+        self.open_collection_grid_after_context_change(collection_id, None, return_to);
     }
 
     pub(crate) fn start_collection_history_prepare(
@@ -1824,22 +1920,40 @@ impl App {
         restore: CollectionGridRestore,
         prepared: CollectionGridPreparedInstall,
         return_to: Option<TopLevelGridRestore>,
-    ) {
+    ) -> bool {
         let identity = restore.identity;
+        let retaining_binding =
+            self.collection_root_installed_binding_matches(identity.collection_id);
+        if let CollectionMainContextChange::Blocked(reason) =
+            self.prepare_collection_main_context_change(identity.collection_id)
+        {
+            crate::logger::log(format!("collection history adoption blocked: {reason}"));
+            return false;
+        }
         let watch = self
             .collection_store_client_for_read()
             .ok()
             .flatten()
             .and_then(|client| client.subscribe().ok());
-        self.top_level_grid_view
-            .begin(TopLevelGridSurface::Collection(identity), return_to);
+        if !retaining_binding {
+            self.top_level_grid_view
+                .begin(TopLevelGridSurface::Collection(identity), return_to);
+        }
         if let Some(session) = self.top_level_grid_view.collection_session_mut() {
-            session.wanted_revision = restore.revision_at_open;
+            if retaining_binding {
+                session.cancel_pending();
+            }
+            session.wanted_revision = restore.revision_at_open.max(session.accepted_revision);
             session.restore_anchor = restore.viewport_anchor;
             session.watch = watch;
         }
-        self.reset_details_sort_to_toolbar();
-        self.apply_collection_grid_prepared_install(prepared, None);
+        if retaining_binding {
+            self.schedule_collection_grid_snapshot();
+        } else {
+            self.reset_details_sort_to_toolbar();
+            self.apply_collection_grid_prepared_install(prepared, None);
+        }
+        true
     }
 
     /// Final child replay commit step. This mounts the latest Collection identity and BS anchor
@@ -2302,24 +2416,13 @@ impl App {
     /// A newer root is waiting for the fullscreen leaf to release the installed item indices.
     /// This is a display reason only: the existing poll/navigation owners decide when to install.
     pub(crate) fn collection_grid_refresh_waits_for_viewer(&self) -> bool {
-        let Some(index) = self.fullscreen_idx else {
-            return false;
-        };
         let Some(session) = self.top_level_grid_view.collection_session() else {
             return false;
         };
         let Some(stamp) = self.collection_grid_stamp() else {
             return false;
         };
-        let Some(prepared) = session.prepared() else {
-            return false;
-        };
-        matches!(session.position, CollectionGridPosition::Root)
-            && session.installed_items_generation == Some(self.items_generation)
-            && prepared.collection_id == stamp.collection_id
-            && prepared.collection_revision == session.accepted_revision
-            && prepared.entries.len() == self.items.len()
-            && index < self.items.len()
+        self.collection_root_installed_binding_matches(stamp.collection_id)
             && (session.wanted_revision > session.accepted_revision
                 || matches!(session.load, CollectionGridLoadState::RequestNeeded { .. }))
     }
@@ -4248,6 +4351,179 @@ mod tests {
         .snapshot
     }
 
+    fn seed_search_or_snapshot_without_return_to(
+        app: &mut App,
+        source: PathBuf,
+        saved_folder: PathBuf,
+        snapshot: bool,
+    ) {
+        app.current_folder = Some(source.parent().unwrap().join("search-results"));
+        app.items = vec![GridItem::Video(source)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(saved_folder);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Search(
+                super::super::top_level_grid_view::TopLevelSearchView::Global,
+            ),
+            None,
+        );
+        if snapshot {
+            app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+                query: "collection return".into(),
+            });
+            assert!(app.snapshot.is_some());
+            // Exercise the pre-canonical fallback retained for older Snapshot states.
+            app.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Snapshot);
+        }
+        assert!(app.top_level_grid_view.return_to().is_none());
+        assert!(app.current_top_level_restore_snapshot().is_none());
+    }
+
+    fn assert_collection_return_folder(app: &App, saved_folder: &Path) {
+        assert!(
+            matches!(
+                app.top_level_grid_view.return_to(),
+                Some(TopLevelGridRestore::Folder(path))
+                    if crate::folder_tree::path_eq(path, saved_folder)
+            ),
+            "collection return_to={:?}, expected folder={saved_folder:?}",
+            app.top_level_grid_view.return_to()
+        );
+    }
+
+    #[test]
+    fn dismiss_global_search_moves_subfolder_restore_without_cloning_large_state() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, _) = start_ready_app(&temp.path().join("collection.db"));
+        let removed_path = "removed-video-path".repeat(32);
+        let removed_path_ptr = removed_path.as_ptr();
+        app.global_search_subfolder_restore = Some(
+            super::super::subfolder_expansion::SubfolderExpansionRestoreState {
+                root: None,
+                roots: Vec::new(),
+                saved_folder: None,
+                snapshot: None,
+                removed_paths: std::iter::once(removed_path).collect(),
+            },
+        );
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(super::super::subfolder_expansion_synthetic_path());
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Search(
+                super::super::top_level_grid_view::TopLevelSearchView::Global,
+            ),
+            None,
+        );
+
+        let returned = app.dismiss_global_search_without_restore();
+        let TopLevelGridRestore::SubfolderExpansion(state) = returned else {
+            panic!("subfolder expansion restore was not returned");
+        };
+        assert_eq!(
+            state.removed_paths.iter().next().unwrap().as_ptr(),
+            removed_path_ptr
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_open_from_transient_search_or_snapshot_keeps_fallback_return_folder() {
+        for snapshot in [true, false] {
+            let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("movie.mp4");
+            let saved_folder = temp.path().join("before-search");
+            std::fs::write(&source, b"media").unwrap();
+            std::fs::create_dir(&saved_folder).unwrap();
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            let target = recv(client.create_collection("Target".into()).unwrap());
+            seed_search_or_snapshot_without_return_to(
+                &mut app,
+                source,
+                saved_folder.clone(),
+                snapshot,
+            );
+
+            app.open_collection_grid_from_navigation(target.collection_id());
+            assert_collection_return_folder(&app, &saved_folder);
+            wait_for_grid(&mut app, target.collection_id());
+            assert_collection_return_folder(&app, &saved_folder);
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
+    #[test]
+    fn collection_open_uses_last_transient_fallback_after_snapshot_consumes_return_to() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("movie.mp4");
+        let search_folder = temp.path().join("before-search");
+        let tag_folder = temp.path().join("before-tag");
+        std::fs::write(&source, b"media").unwrap();
+        std::fs::create_dir(&search_folder).unwrap();
+        std::fs::create_dir(&tag_folder).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let target = recv(client.create_collection("Target".into()).unwrap());
+        seed_search_or_snapshot_without_return_to(&mut app, source, search_folder.clone(), true);
+        app.top_level_grid_view
+            .install_return_to(TopLevelGridRestore::Folder(search_folder));
+        app.tag_view.active = true;
+        app.tag_view.saved_folder = Some(tag_folder.clone());
+
+        app.open_collection_grid_from_navigation(target.collection_id());
+        assert_collection_return_folder(&app, &tag_folder);
+        assert!(app.snapshot.is_none());
+        assert!(!app.tag_view.active);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_open_from_detached_transient_video_keeps_fallback_return_folder() {
+        for snapshot in [true, false] {
+            let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("movie.mp4");
+            let saved_folder = temp.path().join("before-search");
+            std::fs::write(&source, b"media").unwrap();
+            std::fs::create_dir(&saved_folder).unwrap();
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            let target = recv(client.create_collection("Target".into()).unwrap());
+            seed_search_or_snapshot_without_return_to(
+                &mut app,
+                source.clone(),
+                saved_folder.clone(),
+                snapshot,
+            );
+            let generation = mount_detached_collection_media(&mut app, source, 1_314, false);
+
+            app.open_collection_grid_from_navigation(target.collection_id());
+            assert_collection_return_folder(&app, &saved_folder);
+            app.with_window_viewer_context(1_314, |window| {
+                assert_eq!(window.fullscreen_idx, Some(0));
+                assert_eq!(window.items_generation, generation);
+                assert!(matches!(window.items.as_slice(), [GridItem::Video(_)]));
+                assert!(matches!(
+                    window.fs_cache.get(&0),
+                    Some(super::super::FsCacheEntry::Video { .. })
+                ));
+                assert!(matches!(
+                    window.top_level_grid_view.surface(),
+                    TopLevelGridSurface::Snapshot | TopLevelGridSurface::Search(_)
+                ));
+            })
+            .unwrap();
+            wait_for_grid(&mut app, target.collection_id());
+            assert_collection_return_folder(&app, &saved_folder);
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
     #[test]
     fn phase_a_collection_mask_is_projected_for_accepted_revision() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
@@ -5609,6 +5885,521 @@ mod tests {
             Some(0),
             "ordinary collection navigation must not inherit direct-page close semantics"
         );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    fn mount_detached_collection_media(
+        app: &mut App,
+        source: PathBuf,
+        window_id: u64,
+        audio: bool,
+    ) -> u64 {
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = super::super::ViewerPresentation::DetachedWindow;
+        app.set_detached_window_binding_for_test(Some(window_id));
+        app.begin_mounted_detached_session_for_test(
+            window_id,
+            if audio {
+                super::super::DetachedSource::Audio
+            } else {
+                super::super::DetachedSource::Video
+            },
+        );
+        app.fs_cache.insert(
+            0,
+            super::super::FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    source, 12.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        app.items_generation
+    }
+
+    #[cfg(windows)]
+    fn assert_detached_collection_media_binding(
+        app: &mut App,
+        window_id: u64,
+        collection_id: CollectionId,
+        items_generation: u64,
+    ) {
+        app.with_window_viewer_context(window_id, |window| {
+            assert_eq!(window.fullscreen_idx, Some(0));
+            assert_eq!(window.items_generation, items_generation);
+            assert_eq!(window.items.len(), 1);
+            assert!(matches!(
+                window.top_level_grid_view.surface(),
+                TopLevelGridSurface::Collection(identity) if identity.collection_id == collection_id
+            ));
+            assert_eq!(
+                window
+                    .top_level_grid_view
+                    .collection_session()
+                    .unwrap()
+                    .installed_items_generation,
+                Some(items_generation)
+            );
+            assert!(matches!(
+                window.fs_cache.get(&0),
+                Some(super::super::FsCacheEntry::Video { .. })
+            ));
+        })
+        .expect("detached media window must retain its old viewer context");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_open_transfers_video_and_audio_with_their_old_binding() {
+        for audio in [false, true] {
+            let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp
+                .path()
+                .join(if audio { "song.flac" } else { "movie.mp4" });
+            std::fs::write(&source, b"media").unwrap();
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            app.active_quick_folder_slot = None;
+            let old = collection_with_sources(
+                &client,
+                &[(
+                    source.clone(),
+                    if audio {
+                        CollectionResolvedKind::Audio
+                    } else {
+                        CollectionResolvedKind::Video
+                    },
+                )],
+            );
+            let next = recv(client.create_collection("Next".into()).unwrap());
+            app.open_collection_grid(old.collection_id(), None);
+            wait_for_grid(&mut app, old.collection_id());
+            let generation = mount_detached_collection_media(&mut app, source, 1_304, audio);
+            let sibling_path = temp.path().join("sibling.mp4");
+            let sibling = app.build_window_context_for_test(1_310, move |window| {
+                window.items.push(GridItem::Video(sibling_path.clone()));
+                window.fullscreen_idx = Some(0);
+                window.fs_cache.insert(
+                    0,
+                    super::super::FsCacheEntry::Video {
+                        player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                            sibling_path,
+                            7.0,
+                        )),
+                        load_seq: 0,
+                    },
+                );
+            });
+            let sibling_generation = app
+                .with_viewer_context(sibling, |window| window.items_generation)
+                .unwrap();
+
+            app.open_collection_grid_from_navigation(next.collection_id());
+            assert!(app.fullscreen_idx.is_none());
+            assert_eq!(app.address, "コレクションを読み込み中…");
+            assert!(
+                matches!(app.folder_history_back_target(), Some(super::super::FolderNavHistoryTarget::Collection(restore)) if restore.identity.collection_id == old.collection_id())
+            );
+            assert_detached_collection_media_binding(
+                &mut app,
+                1_304,
+                old.collection_id(),
+                generation,
+            );
+            wait_for_grid(&mut app, next.collection_id());
+            assert_detached_collection_media_binding(
+                &mut app,
+                1_304,
+                old.collection_id(),
+                generation,
+            );
+            app.with_viewer_context(sibling, |window| {
+                assert_eq!(window.items_generation, sibling_generation);
+                assert_eq!(window.fullscreen_idx, Some(0));
+                assert!(matches!(
+                    window.fs_cache.get(&0),
+                    Some(super::super::FsCacheEntry::Video { .. })
+                ));
+            })
+            .unwrap();
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_parent_return_transfers_detached_video_before_loading_root() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("movie.mp4");
+        std::fs::write(&source, b"media").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        let root =
+            collection_with_sources(&client, &[(source.clone(), CollectionResolvedKind::Video)]);
+        app.open_collection_grid(root.collection_id(), None);
+        wait_for_grid(&mut app, root.collection_id());
+        let TopLevelGridRestore::Collection(restore) =
+            app.collection_grid_restore_snapshot().unwrap()
+        else {
+            panic!("root restore")
+        };
+        let anchor = restore.viewport_anchor.clone().unwrap_or_else(|| {
+            let entry = &app
+                .top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .prepared()
+                .unwrap()
+                .entries[0];
+            CollectionGridViewportAnchor {
+                entry_id: entry.entry_id,
+                source_key: entry.source_key.clone(),
+            }
+        });
+        app.commit_collection_grid_source_open(anchor, temp.path().to_path_buf());
+        app.current_folder = Some(temp.path().to_path_buf());
+        let generation = mount_detached_collection_media(&mut app, source, 1_307, false);
+
+        app.apply_collection_input_nav(restore, false);
+        assert!(app.fullscreen_idx.is_none());
+        assert!(matches!(
+            app.folder_history_back_target(),
+            Some(super::super::FolderNavHistoryTarget::CollectionPhysical(_))
+        ));
+        assert_detached_collection_media_binding(&mut app, 1_307, root.collection_id(), generation);
+        wait_for_grid(&mut app, root.collection_id());
+        assert_detached_collection_media_binding(&mut app, 1_307, root.collection_id(), generation);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_history_root_adoption_transfers_detached_video_only_after_prepare() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("movie.mp4");
+        std::fs::write(&source, b"media").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let old =
+            collection_with_sources(&client, &[(source.clone(), CollectionResolvedKind::Video)]);
+        let next = recv(client.create_collection("History target".into()).unwrap());
+        app.open_collection_grid(old.collection_id(), None);
+        wait_for_grid(&mut app, old.collection_id());
+        let generation = mount_detached_collection_media(&mut app, source, 1_308, false);
+        let restore = CollectionGridRestore {
+            identity: CollectionGridIdentity {
+                collection_id: next.collection_id(),
+            },
+            revision_at_open: next.revision(),
+            viewport_anchor: None,
+        };
+        let mut pending = app
+            .start_collection_history_prepare(restore.clone())
+            .unwrap();
+        let prepared = loop {
+            match app.poll_collection_history_prepare(&mut pending) {
+                CollectionHistoryPreparePoll::Pending => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                CollectionHistoryPreparePoll::Ready(prepared) => break prepared,
+                CollectionHistoryPreparePoll::Failed(error) => panic!("{error}"),
+            }
+        };
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(matches!(
+            app.fs_cache.get(&0),
+            Some(super::super::FsCacheEntry::Video { .. })
+        ));
+        assert!(app.adopt_collection_history_root(restore, prepared, None));
+        assert!(app.fullscreen_idx.is_none());
+        assert_detached_collection_media_binding(&mut app, 1_308, old.collection_id(), generation);
+        assert!(
+            matches!(app.top_level_grid_view.surface(), TopLevelGridSurface::Collection(identity) if identity.collection_id == next.collection_id())
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn failed_or_cancelled_history_prepare_does_not_transfer_detached_media() {
+        for fail in [false, true] {
+            let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("movie.mp4");
+            std::fs::write(&source, b"media").unwrap();
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            app.active_quick_folder_slot = None;
+            let old = collection_with_sources(
+                &client,
+                &[(source.clone(), CollectionResolvedKind::Video)],
+            );
+            let target = recv(client.create_collection("History target".into()).unwrap());
+            poll_until(&mut app, "target was not cataloged", |app| {
+                app.collection_catalog_contains(target.collection_id())
+            });
+            app.open_collection_grid(old.collection_id(), None);
+            wait_for_grid(&mut app, old.collection_id());
+            let generation = mount_detached_collection_media(&mut app, source, 1_311, false);
+            let restore = CollectionGridRestore {
+                identity: CollectionGridIdentity {
+                    collection_id: target.collection_id(),
+                },
+                revision_at_open: target.revision(),
+                viewport_anchor: None,
+            };
+            let history_target = super::super::FolderNavHistoryTarget::Collection(restore);
+            app.folder_nav_back_stack.push(history_target.clone());
+            let history = app.folder_nav_history_snapshot();
+            let surface_generation = app.top_level_grid_view.generation();
+            assert!(app.start_collection_history_transition(
+                history_target.clone(),
+                super::super::CollectionHistoryIntent::Replay {
+                    direction: super::super::FolderHistoryDirection::Back,
+                    target: history_target,
+                },
+                None,
+            ));
+            if fail {
+                let mut transition = app
+                    .top_level_grid_view
+                    .take_history_navigation_transition()
+                    .unwrap();
+                let super::super::HistoryNavigationTransition::Collection(request) =
+                    &mut transition
+                else {
+                    panic!("collection request")
+                };
+                let super::super::CollectionHistoryPhase::Preparing(prepare) = &mut request.phase
+                else {
+                    panic!("prepare phase")
+                };
+                prepare.phase = CollectionHistoryPreparePhase::Finished;
+                app.top_level_grid_view
+                    .set_history_navigation_transition(Some(transition));
+                app.poll_collection_history_transition(&egui::Context::default());
+            } else {
+                app.replace_history_navigation_transition(None);
+            }
+            assert_eq!(app.top_level_grid_view.generation(), surface_generation);
+            assert_eq!(app.items_generation, generation);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(matches!(
+                app.fs_cache.get(&0),
+                Some(super::super::FsCacheEntry::Video { .. })
+            ));
+            assert_eq!(
+                app.folder_nav_history_snapshot().back_stack,
+                history.back_stack
+            );
+            assert_eq!(
+                app.folder_nav_history_snapshot().forward_stack,
+                history.forward_stack
+            );
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_open_from_global_search_does_not_record_back_after_media_transfer() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("movie.mp4");
+        std::fs::write(&source, b"media").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        let old =
+            collection_with_sources(&client, &[(source.clone(), CollectionResolvedKind::Video)]);
+        let next = recv(client.create_collection("Next".into()).unwrap());
+        app.open_collection_grid(old.collection_id(), None);
+        wait_for_grid(&mut app, old.collection_id());
+        let generation = mount_detached_collection_media(&mut app, source, 1_309, false);
+        app.global_search.active = true;
+        let history = app.folder_nav_history_snapshot();
+
+        app.open_collection_grid_from_navigation(next.collection_id());
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            history.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            history.forward_stack
+        );
+        assert_detached_collection_media_binding(&mut app, 1_309, old.collection_id(), generation);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_open_uses_existing_still_pdf_park_and_linked_close_policy() {
+        for (pdf, independent) in [(false, true), (true, true), (false, false)] {
+            let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join(if pdf { "book.pdf" } else { "page.png" });
+            std::fs::write(&source, b"source").unwrap();
+            std::fs::write(temp.path().join("page.png"), b"image").unwrap();
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            let old = collection_with_sources(
+                &client,
+                &[(temp.path().join("page.png"), CollectionResolvedKind::Image)],
+            );
+            let next = recv(client.create_collection("Next".into()).unwrap());
+            app.open_collection_grid(old.collection_id(), None);
+            wait_for_grid(&mut app, old.collection_id());
+            if pdf {
+                app.items[0] = GridItem::PdfPage {
+                    pdf_path: source.clone(),
+                    page_num: 0,
+                    content_type: None,
+                };
+            }
+            let ctx = egui::Context::default();
+            let pixels = egui::ColorImage::new([2, 1], vec![egui::Color32::WHITE; 2]);
+            let tex = ctx.load_texture(
+                "collection_still_park",
+                pixels.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                0,
+                super::super::FsCacheEntry::Static {
+                    tex,
+                    pixels: Arc::new(pixels),
+                    source_dims: Some([2, 1]),
+                    load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            app.settings.detached_viewer_open_images_in_window = independent;
+            app.fullscreen_idx = Some(0);
+            app.viewer_presentation = super::super::ViewerPresentation::DetachedWindow;
+            app.set_detached_window_binding_for_test(Some(1_312));
+            app.begin_mounted_detached_session_for_test(
+                1_312,
+                if pdf {
+                    super::super::DetachedSource::Book
+                } else {
+                    super::super::DetachedSource::Image
+                },
+            );
+
+            app.open_collection_grid_from_navigation(next.collection_id());
+            assert!(app.fullscreen_idx.is_none());
+            assert_eq!(app.detached_image_windows.len(), usize::from(independent));
+            if independent {
+                assert_eq!(app.detached_image_windows[0].id, 1_312);
+                assert_eq!(
+                    app.detached_window_state(1_312),
+                    Some(super::super::DetachedWindowState::Parked)
+                );
+            }
+            wait_for_grid(&mut app, next.collection_id());
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn failed_explicit_collection_open_keeps_detached_media_and_committed_history() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("movie.mp4");
+        std::fs::write(&source, b"media").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        let old =
+            collection_with_sources(&client, &[(source.clone(), CollectionResolvedKind::Video)]);
+        app.open_collection_grid(old.collection_id(), None);
+        wait_for_grid(&mut app, old.collection_id());
+        let generation = mount_detached_collection_media(&mut app, source, 1_305, false);
+
+        // An unavailable actor is a terminal Failed presentation; an unknown UUID is Deleted.
+        app.shutdown_collection_runtime_for_exit();
+        app.open_collection_grid_from_navigation(CollectionId::new());
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::Failed {
+                installed: None,
+                ..
+            }
+        ));
+        assert!(app.collection_grid_empty_message().is_some());
+        assert!(
+            matches!(app.folder_history_back_target(), Some(super::super::FolderNavHistoryTarget::Collection(restore)) if restore.identity.collection_id == old.collection_id())
+        );
+        assert_detached_collection_media_binding(&mut app, 1_305, old.collection_id(), generation);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn blocked_collection_open_leaves_history_and_old_context_unchanged() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("movie.mp4");
+        std::fs::write(&source, b"media").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        let old =
+            collection_with_sources(&client, &[(source.clone(), CollectionResolvedKind::Video)]);
+        let next = recv(client.create_collection("Next".into()).unwrap());
+        app.open_collection_grid(old.collection_id(), None);
+        wait_for_grid(&mut app, old.collection_id());
+        let generation = mount_detached_collection_media(&mut app, source, 1_306, false);
+        app.fs_nav_locked_gen = Some(generation);
+        let history = app.folder_nav_history_snapshot();
+        let surface_generation = app.top_level_grid_view.generation();
+        let old_items = app.items.clone();
+
+        app.open_collection_grid_from_navigation(next.collection_id());
+        assert_eq!(app.top_level_grid_view.generation(), surface_generation);
+        assert_eq!(app.items, old_items);
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            history.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            history.forward_stack
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(matches!(
+            app.fs_cache.get(&0),
+            Some(super::super::FsCacheEntry::Video { .. })
+        ));
+        app.fs_nav_locked_gen = None;
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn same_root_open_retains_installed_items_while_fullscreen_owns_their_indices() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("page.png");
+        std::fs::write(&source, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(&client, &[(source, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let generation = app.items_generation;
+        let surface_generation = app.top_level_grid_view.generation();
+        let rows = app.items.clone();
+        app.fullscreen_idx = Some(0);
+
+        app.open_collection_grid(snapshot.collection_id(), None);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.top_level_grid_view.generation(), surface_generation);
+        assert_eq!(app.items, rows);
+        assert!(matches!(
+            app.top_level_grid_view.collection_session().unwrap().load,
+            CollectionGridLoadState::RequestNeeded {
+                installed: Some(_),
+                ..
+            }
+        ));
+        assert!(app.collection_grid_refresh_waits_for_viewer());
         app.shutdown_collection_runtime_for_exit();
     }
 

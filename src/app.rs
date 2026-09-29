@@ -706,6 +706,14 @@ pub(crate) enum FolderOpenOutcome {
     Refused(FolderOpenRefusal),
 }
 
+/// Outcome of the main-grid ownership boundary; Collection callers use Blocked before adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollectionMainContextChange {
+    NotNeeded,
+    Transferred,
+    Blocked(&'static str),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FolderOpenRefusal {
     EpubIgnoredBySetting,
@@ -20515,17 +20523,7 @@ impl App {
             return Some(nav);
         }
         // 親が取れない (ドライブ root 等): 予約は消化済みなので通常 close にフォールバック。
-        #[cfg(windows)]
-        let detached_video_preserved = self.promote_active_detached_video_for_main_context_change();
-        #[cfg(not(windows))]
-        let detached_video_preserved = false;
-        #[cfg(windows)]
-        if !detached_video_preserved {
-            self.preserve_active_detached_image_window_for_main_context_change();
-        }
-        if !detached_video_preserved {
-            self.close_fullscreen();
-        }
+        self.change_main_context_for_visible_grid(false);
         None
     }
 
@@ -20534,13 +20532,21 @@ impl App {
         restore: top_level_grid_view::CollectionGridRestore,
         fullscreen_close_origin: bool,
     ) {
-        if fullscreen_close_origin {
+        let collection_id = restore.identity.collection_id;
+        let source_location = self.collection_nav_history_source();
+        let return_to = self.collection_open_return_to(collection_id, true);
+        let change = self.prepare_collection_main_context_change(collection_id);
+        if let CollectionMainContextChange::Blocked(reason) = change {
+            crate::logger::log(format!("collection parent navigation blocked: {reason}"));
+            return;
+        }
+        if fullscreen_close_origin && matches!(change, CollectionMainContextChange::NotNeeded) {
             self.close_fullscreen();
         }
         // AddressBarNav::Collection is a parent-navigation request. The root loading shell is
         // visible adoption, so commit its child -> parent edge before replacing the child.
-        self.record_collection_nav_transition(restore.clone());
-        self.open_collection_grid(restore.identity.collection_id, Some(restore));
+        self.record_collection_nav_transition(restore.clone(), source_location);
+        self.open_collection_grid_after_context_change(collection_id, Some(restore), return_to);
     }
 
     /// Early-return 経路で `pending_return_to_parent` 由来のナビを消化する。
@@ -21089,13 +21095,28 @@ impl App {
         Some(target)
     }
 
+    /// Search is a transparent history overlay. Capture that decision while the source bundle
+    /// is still mounted: promoting detached media swaps `global_search` out of the new main.
+    pub(crate) fn collection_nav_history_source(&self) -> Option<FolderNavHistoryTarget> {
+        if !self.main_folder_history_available()
+            || self.global_search.active
+            || self.favsearch.active
+            || self.tag_view.active
+            || self.suppress_nav_record_for_search_restore
+        {
+            None
+        } else {
+            self.folder_nav_current_target()
+        }
+    }
+
     pub(crate) fn record_collection_nav_transition(
         &mut self,
         restore: top_level_grid_view::CollectionGridRestore,
+        source_location: Option<FolderNavHistoryTarget>,
     ) {
         let target = FolderNavHistoryTarget::Collection(restore);
-        let current = self.folder_nav_current_target();
-        self.record_folder_nav_transition_from_current(target, current);
+        self.record_folder_nav_transition_from_current(target, source_location);
     }
 
     /// The collection session is still at `from` when its physical load reaches the visible
@@ -21211,6 +21232,25 @@ impl App {
             rating_view_stars,
             self.top_level_grid_view.smart_folder().cloned(),
         )
+    }
+
+    /// Resolve a transient view's canonical return before consulting its legacy fallback.
+    /// Borrowed inputs are used by Collection's pre-transfer read; dismissal supplies moved
+    /// ownership, so normal close never clones a subfolder expansion restore payload.
+    pub(crate) fn view_return_context_from_canonical_or_fallback<'a>(
+        &self,
+        canonical: Option<std::borrow::Cow<'a, top_level_grid_view::TopLevelGridRestore>>,
+        fallback: impl FnOnce() -> (
+            Option<PathBuf>,
+            Option<subfolder_expansion::SubfolderExpansionRestoreState>,
+        ),
+    ) -> top_level_grid_view::TopLevelGridRestore {
+        if let Some(return_to) = canonical {
+            return return_to.into_owned();
+        }
+        let (path, subfolder_restore) = fallback();
+        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
+        self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars)
     }
 
     pub(crate) fn current_top_level_restore_snapshot(
@@ -22849,17 +22889,7 @@ impl App {
             }
         }
 
-        #[cfg(windows)]
-        let detached_video_preserved = self.promote_active_detached_video_for_main_context_change();
-        #[cfg(not(windows))]
-        let detached_video_preserved = false;
-        #[cfg(windows)]
-        if !detached_video_preserved {
-            self.preserve_active_detached_image_window_for_main_context_change();
-        }
-        if !detached_video_preserved {
-            self.close_fullscreen();
-        }
+        self.change_main_context_for_visible_grid(false);
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -26611,6 +26641,21 @@ impl App {
 
     /// Ctrl+S の状態だけを終了し、元ビューの再構築は行わず戻り先の所有権を返す。
     /// 別の最上位ビューへ直行するとき、復元 worker を起動直後にキャンセルする競合を防ぐ。
+    pub(crate) fn favsearch_return_context_without_restore(
+        &self,
+        canonical_return_to: Option<&top_level_grid_view::TopLevelGridRestore>,
+    ) -> top_level_grid_view::TopLevelGridRestore {
+        self.view_return_context_from_canonical_or_fallback(
+            canonical_return_to.map(std::borrow::Cow::Borrowed),
+            || {
+                (
+                    self.favsearch.saved_folder.clone(),
+                    self.favsearch_subfolder_restore.clone(),
+                )
+            },
+        )
+    }
+
     pub(crate) fn dismiss_favsearch_without_restore(
         &mut self,
     ) -> top_level_grid_view::TopLevelGridRestore {
@@ -26625,13 +26670,12 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         let path = self.favsearch.saved_folder.take();
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
         let subfolder_restore = self.favsearch_subfolder_restore.take();
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        self.top_level_grid_view
-            .take_return_to()
-            .unwrap_or(fallback)
+        let canonical = self.top_level_grid_view.take_return_to();
+        self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        )
     }
 
     pub(crate) fn restore_view_return_context(
@@ -26729,6 +26773,21 @@ impl App {
         self.restore_view_return_context(return_context);
     }
 
+    pub(crate) fn tag_view_return_context_without_restore(
+        &self,
+        canonical_return_to: Option<&top_level_grid_view::TopLevelGridRestore>,
+    ) -> top_level_grid_view::TopLevelGridRestore {
+        self.view_return_context_from_canonical_or_fallback(
+            canonical_return_to.map(std::borrow::Cow::Borrowed),
+            || {
+                (
+                    self.tag_view.saved_folder.clone(),
+                    self.tag_view_subfolder_restore.clone(),
+                )
+            },
+        )
+    }
+
     pub(crate) fn dismiss_tag_view_without_restore(
         &mut self,
     ) -> top_level_grid_view::TopLevelGridRestore {
@@ -26748,13 +26807,12 @@ impl App {
         self.tag_view.reject_message = None;
         self.items_are_tag_view = false;
         let path = self.tag_view.saved_folder.take();
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
         let subfolder_restore = self.tag_view_subfolder_restore.take();
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        self.top_level_grid_view
-            .take_return_to()
-            .unwrap_or(fallback)
+        let canonical = self.top_level_grid_view.take_return_to();
+        self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        )
     }
 
     pub(crate) fn record_tag_view_nav_open(&mut self, path: &Path) {
@@ -28160,11 +28218,13 @@ impl App {
                         }
                         match request.target.clone() {
                             FolderNavHistoryTarget::Collection(restore) => {
-                                self.adopt_collection_history_root(
+                                if !self.adopt_collection_history_root(
                                     restore,
                                     prepared,
                                     request.return_to.take(),
-                                );
+                                ) {
+                                    return;
+                                }
                                 if let CollectionHistoryIntent::Replay { direction, target } =
                                     &request.intent
                                 {
@@ -33864,17 +33924,7 @@ impl App {
                     .insert(cur, (self.scroll_offset_y, self.selected));
             }
         }
-        #[cfg(windows)]
-        let detached_video_preserved = self.promote_active_detached_video_for_main_context_change();
-        #[cfg(not(windows))]
-        let detached_video_preserved = false;
-        #[cfg(windows)]
-        if !detached_video_preserved {
-            self.preserve_active_detached_image_window_for_main_context_change();
-        }
-        if !detached_video_preserved {
-            self.close_fullscreen();
-        }
+        self.change_main_context_for_visible_grid(false);
 
         // close_fullscreen_end から sli_prewarm_rating までの区間を 3 つに分割して
         // 計測する (nav cancel / items 割当 / キャッシュ clear)。UI が止まる潜在箇所を
@@ -56558,7 +56608,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn should_promote_active_detached_video_for_main_context_change(&self) -> bool {
+    fn active_detached_media_requires_main_context_transfer(&self) -> bool {
         let Some(idx) = self.fullscreen_idx else {
             return false;
         };
@@ -56574,11 +56624,58 @@ impl App {
             // replacing `items`, otherwise `start_loading_items` falls through to
             // `close_fullscreen` and drops the session that tray hide deliberately retained.
             && self.viewer_session_is_detached_or_switching()
-            && !self.fs_nav_is_locked()
             // 音声もメディア窓を使う (stage-audio / §1.7)。Video 限定だと main の
             // フォルダ移動で detached 音声が promote されず close_fullscreen で
             // 再生ごと止まる (Codex audit P2、複数ウィンドウモードにも存在した既存ギャップ)。
             && self.viewer_item_is_media(idx)
+    }
+
+    #[cfg(windows)]
+    fn should_promote_active_detached_video_for_main_context_change(&self) -> bool {
+        !self.fs_nav_is_locked() && self.active_detached_media_requires_main_context_transfer()
+    }
+
+    /// Every visible main-grid replacement uses this promote / park / close boundary. Collection
+    /// adoption requires an unlocked detached media owner; existing folder-nav reopen callers
+    /// retain their established locked-session close behavior.
+    fn change_main_context_for_visible_grid(
+        &mut self,
+        block_locked_media: bool,
+    ) -> CollectionMainContextChange {
+        #[cfg(windows)]
+        {
+            if block_locked_media
+                && self.fs_nav_is_locked()
+                && self.active_detached_media_requires_main_context_transfer()
+            {
+                return CollectionMainContextChange::Blocked("detached media navigation is active");
+            }
+            let preserved_media = self.promote_active_detached_video_for_main_context_change();
+            if !preserved_media {
+                self.preserve_active_detached_image_window_for_main_context_change();
+                self.close_fullscreen();
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = block_locked_media;
+            self.close_fullscreen();
+        }
+        CollectionMainContextChange::Transferred
+    }
+
+    /// Decide before Collection history or transient-state mutation. A locked detached media
+    /// navigation cannot give its context to a new Collection until its own transition ends.
+    pub(crate) fn prepare_collection_main_context_change(
+        &mut self,
+        collection_id: crate::collection_store::CollectionId,
+    ) -> CollectionMainContextChange {
+        if self.collection_root_installed_binding_matches(collection_id)
+            || self.fullscreen_idx.is_none()
+        {
+            return CollectionMainContextChange::NotNeeded;
+        }
+        self.change_main_context_for_visible_grid(true)
     }
 
     #[cfg(windows)]
