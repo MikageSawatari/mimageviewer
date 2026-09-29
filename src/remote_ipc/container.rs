@@ -23,6 +23,7 @@ use mimageviewer_ipc::{
 use super::path_guard::{
     ResolveError, ResolvedPath, page_identity_from_resolved, resolve_existing,
 };
+use super::raw_flights::{RemoteRawFlightError, RemoteRawFlights, RemoteRawIdentity};
 use super::thumbnail::WorkerContext;
 
 const CONTAINER_ENTRY_LIMIT: usize = 100_000;
@@ -495,6 +496,8 @@ fn decode_remote_source(
     let load_request_started = Instant::now();
     // Remote raw requests never set the folder-pin or page-adjustment fields asserted by
     // RemoteSourceDecodeIdentity, so those DB handles cannot affect this Source raster.
+    let (raw_unavailable_tx, _raw_unavailable_rx) = mpsc::channel();
+    let raw_handoff = crate::thumb_loader::RawThumbHandoff::RemotePreviewOnly(raw_unavailable_tx);
     crate::thumb_loader::process_load_request(
         &mut request,
         &cache_map,
@@ -513,7 +516,7 @@ fn decode_remote_source(
         None,
         None,
         None,
-        None,
+        Some(&raw_handoff),
     );
     let load_request_ms = load_request_started.elapsed().as_secs_f64() * 1000.0;
     drop(tx);
@@ -741,6 +744,7 @@ fn remote_auto_trim_cache_key(
     resolved: &ResolvedPath,
     mtime: i64,
     file_size: i64,
+    raw_brightness: Option<crate::raw::RawBrightness>,
     target_px: u32,
 ) -> Result<RemoteAutoTrimCacheKey, MediaError> {
     Ok(RemoteAutoTrimCacheKey {
@@ -748,6 +752,7 @@ fn remote_auto_trim_cache_key(
             .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "表示トリム対象が不正です"))?,
         mtime,
         file_size,
+        raw_brightness,
         target_px,
     })
 }
@@ -755,6 +760,7 @@ fn remote_auto_trim_cache_key(
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
     raw_develop_executor: Arc<crate::raw::RawDevelopExecutor>,
+    raw_flights: Arc<RemoteRawFlights>,
     listing_settings: RemoteListingSettingsSource,
     reading_settings: RemoteReadingSettingsSource,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
@@ -1027,6 +1033,7 @@ struct RemoteCompositeCacheKey {
     page_key: String,
     mtime: i64,
     file_size: i64,
+    raw_brightness: Option<crate::raw::RawBrightness>,
     target_px: u32,
     rotation: crate::rotation_db::Rotation,
     params: crate::adjustment::AdjustParams,
@@ -1048,6 +1055,7 @@ struct RemoteAutoTrimCacheKey {
     page_key: String,
     mtime: i64,
     file_size: i64,
+    raw_brightness: Option<crate::raw::RawBrightness>,
     target_px: u32,
 }
 
@@ -1066,12 +1074,14 @@ struct RemoteSourceDecodeIdentity {
     path: PathBuf,
     mtime: i64,
     file_size: i64,
+    raw_brightness: Option<crate::raw::RawBrightness>,
     pdf_page: Option<u32>,
     zip_entry: Option<String>,
     zip_dir_prefix: Option<String>,
     cache_key_override: Option<String>,
     target_px: u32,
     full_page: bool,
+    source_only: bool,
 }
 
 impl RemoteSourceDecodeIdentity {
@@ -1079,24 +1089,34 @@ impl RemoteSourceDecodeIdentity {
         request: &crate::thumb_loader::LoadRequest,
         target_px: u32,
         full_page: bool,
+        raw_brightness: Option<crate::raw::RawBrightness>,
     ) -> Self {
-        debug_assert_eq!(request.source_policy.bypasses_cache(), full_page);
         debug_assert!(request.relative_page_provenance.is_none());
         debug_assert!(request.edit_preview_key.is_none());
         debug_assert!(!request.edit_preview_validate_container);
         debug_assert!(request.pinned_page_adjustment_key.is_none());
         debug_assert_eq!(request.folder_thumb_depth, 0);
-        debug_assert!(request.resolve_override.is_none());
+        debug_assert!(matches!(
+            request.resolve_override,
+            None | Some(crate::thumb_loader::ResolveStrategy::ZipDirRepresentative)
+        ));
+        debug_assert_eq!(
+            request.resolve_override.is_some(),
+            request.zip_dir_prefix.is_some()
+        );
+        if request.zip_dir_prefix.is_some() {
+            debug_assert_eq!(
+                request.folder_thumb_sort,
+                Some(crate::app::BOOK_READING_PAGE_ORDER)
+            );
+        }
         debug_assert!(request.pinned_only.is_none());
         debug_assert!(!request.force_cache);
         debug_assert_eq!(request.input_seq, 0);
         debug_assert_eq!(request.items_gen, 0);
         debug_assert_eq!(request.context_epoch, 0);
-        // `resolve_override` being None is not on its own what keeps the folder-representative
-        // branch out of reach: `process_load_request` also enters it when `cache_key_override`
-        // starts with `CACHE_KEY_FOLDER`. That branch is the only reader of `folder_thumb_sort`
-        // (omitted from this identity) and of the pin DB (passed as None by `decode_remote_source`),
-        // so a future remote folder thumbnail would silently break both. Fail loudly instead.
+        // The folder-representative branch also enters on CACHE_KEY_FOLDER. It consults the pin
+        // DB, which is not part of this source identity, so reject that request shape here.
         debug_assert!(
             !request
                 .cache_key_override
@@ -1109,8 +1129,8 @@ impl RemoteSourceDecodeIdentity {
         // - idx routes ThumbMsg; input_seq only correlates perf events; items_gen only lets the
         //   UI reject stale ThumbMsg values. None changes pixels.
         // - priority changes scheduling, never pixels.
-        // - source_policy is SourceOnly exactly for `full_page`, which is included (and also separates Thumbnail's
-        //   cache_decision from full-page requests).
+        // - source_policy is represented below by source_only (Remote RAW preview thumbnails
+        //   also bypass cache).
         // - pdf_password comes from this ContainerEngine's immutable password-store snapshot, so
         //   it cannot vary for the same path within this coordinator and is not retained as a
         //   plaintext cache key.
@@ -1120,23 +1140,23 @@ impl RemoteSourceDecodeIdentity {
         //   Source deliberately loads the raw raster; edits are composed after Source.
         // - pinned_page_adjustment_key is None for the same reason, and therefore adjustment_db
         //   cannot affect this raster.
-        // - folder_thumb_depth is zero, resolve_override and pinned_only are None, and force_cache
-        //   is false in this remote path, as asserted above.
+        // - folder_thumb_depth is zero, pinned_only is None, and force_cache is false here.
+        //   resolve_override is ZipDirRepresentative exactly when zip_dir_prefix is present.
         // - context_epoch is the documented zero sentinel for this background path.
-        // - folder_thumb_sort is populated for ZipDirectory but is only read by the
-        //   folder-representative branch, which this path never enters: it needs either a
-        //   ResolveStrategy override or a CACHE_KEY_FOLDER cache key, and remote Source produces
-        //   neither (its keys are zipthumb:/pdfthumb:/zipdir:). Both are asserted above.
+        // - folder_thumb_sort is fixed to BOOK_READING_PAGE_ORDER for ZipDirectory, asserted
+        //   above. Other remote source shapes never read it.
         Self {
             path: request.path.clone(),
             mtime: request.mtime,
             file_size: request.file_size,
+            raw_brightness,
             pdf_page: request.pdf_page,
             zip_entry: request.zip_entry.clone(),
             zip_dir_prefix: request.zip_dir_prefix.clone(),
             cache_key_override: request.cache_key_override.clone(),
             target_px,
             full_page,
+            source_only: request.source_policy.bypasses_cache(),
         }
     }
 }
@@ -1145,6 +1165,41 @@ impl RemoteSourceDecodeIdentity {
 struct RemoteSourceRaster {
     pixels: Arc<egui::ColorImage>,
     decoded_source_dims: Option<(u32, u32)>,
+}
+
+#[derive(Clone)]
+struct RawDepSpec {
+    identity: RemoteRawIdentity,
+    readable_path: PathBuf,
+    zip_entry: Option<String>,
+}
+
+impl RawDepSpec {
+    fn source(
+        &self,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<crate::raw::RawOwnedSource, crate::raw::RawError> {
+        match &self.zip_entry {
+            Some(entry) => {
+                crate::zip_loader::read_entry_bytes_cancellable(&self.readable_path, entry, cancel)
+                    .map(|bytes| crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)))
+                    .map_err(|error| crate::raw::RawError::Io(error.to_string()))
+            }
+            None => Ok(crate::raw::RawOwnedSource::Path(self.readable_path.clone())),
+        }
+    }
+}
+
+struct RawDepPins {
+    brightness: crate::raw::RawBrightness,
+    settings: crate::settings_db::AdjustmentRenderSettings,
+    developed: HashMap<RemoteRawIdentity, Arc<crate::raw::RawDevelopOutput>>,
+}
+
+impl RawDepPins {
+    fn get(&self, key: &RemoteRawIdentity) -> Option<&Arc<crate::raw::RawDevelopOutput>> {
+        self.developed.get(key)
+    }
 }
 
 #[derive(Debug)]
@@ -1581,6 +1636,7 @@ struct RemoteAiNativeCacheKey {
     page_key: String,
     mtime: i64,
     file_size: i64,
+    raw_brightness: Option<crate::raw::RawBrightness>,
     source_size: [usize; 2],
     pre_ai_params: crate::adjustment::AdjustParams,
     pre_ai_edit_fingerprint: [u8; 32],
@@ -2285,6 +2341,10 @@ impl ContainerEngine {
         )
     }
 
+    pub(super) fn raw_flights(&self) -> Arc<RemoteRawFlights> {
+        Arc::clone(&self.raw_flights)
+    }
+
     #[cfg(test)]
     fn new_with_resume_error(
         settings: crate::settings::Settings,
@@ -2338,15 +2398,20 @@ impl ContainerEngine {
                     None
                 }
             };
-        Self {
-            raw_develop_executor: raw_develop_executor.unwrap_or_else(|| {
-                Arc::new(
-                    crate::raw::RawDevelopExecutor::new(
-                        settings.raw_develop_parallelism.clamp(1, 10) as usize,
-                    )
-                    .expect("RAW develop worker startup"),
+        let raw_develop_executor = raw_develop_executor.unwrap_or_else(|| {
+            Arc::new(
+                crate::raw::RawDevelopExecutor::new(
+                    settings.raw_develop_parallelism.clamp(1, 10) as usize
                 )
-            }),
+                .expect("RAW develop worker startup"),
+            )
+        });
+        Self {
+            raw_flights: RemoteRawFlights::new(
+                Arc::clone(&raw_develop_executor),
+                super::raw_flights::RemoteRawFlightPolicy::s2b(),
+            ),
+            raw_develop_executor,
             settings: Arc::new(settings),
             listing_settings,
             reading_settings,
@@ -2577,31 +2642,6 @@ impl ContainerEngine {
         })
     }
 
-    fn prepare_remote_composite(
-        &self,
-        address: &RemoteAddress,
-        logical_path: &Path,
-        mtime: i64,
-        file_size: i64,
-        target_px: u32,
-        rotation: crate::rotation_db::Rotation,
-        preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
-        context: &WorkerContext,
-    ) -> Result<Option<RemotePreparedComposite>, RemoteCompositePrepareError> {
-        self.prepare_remote_composite_timed(
-            address,
-            logical_path,
-            mtime,
-            file_size,
-            target_px,
-            rotation,
-            preview,
-            context,
-            None,
-            None,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn prepare_remote_composite_timed(
         &self,
@@ -2615,6 +2655,8 @@ impl ContainerEngine {
         context: &WorkerContext,
         primary: Option<&mut RemotePageStageGuard>,
         fallback: Option<&mut RemotePageStageGuard>,
+        settings_override: Option<&crate::settings_db::AdjustmentRenderSettings>,
+        raw_brightness: Option<crate::raw::RawBrightness>,
     ) -> Result<Option<RemotePreparedComposite>, RemoteCompositePrepareError> {
         let Some(mut identity) = remote_adjustment_identity(address, logical_path) else {
             return Ok(None);
@@ -2624,7 +2666,9 @@ impl ContainerEngine {
                 crate::books::is_direct_book_folder(&self.settings.books_root_path(), parent)
             });
         let measure_lock_wait = primary.is_some() || fallback.is_some();
-        let (settings, settings_lock_wait_ms) = if measure_lock_wait {
+        let (settings, settings_lock_wait_ms) = if let Some(settings) = settings_override {
+            (settings.clone(), 0.0)
+        } else if measure_lock_wait {
             self.adjustment_render_settings_timed()?
         } else {
             (self.adjustment_render_settings()?, 0.0)
@@ -2696,6 +2740,7 @@ impl ContainerEngine {
             page_key: identity.page_key,
             mtime,
             file_size,
+            raw_brightness,
             target_px,
             rotation,
             params: params.clone(),
@@ -3736,6 +3781,19 @@ impl ContainerEngine {
         };
         let rotation =
             context.rotation_for_remote_page(&resolved.logical, &request.address.subresource);
+        let raw_thumbnail = std::fs::metadata(&resolved.canonical)
+            .ok()
+            .and_then(|metadata| {
+                remote_raw_dep_spec(
+                    &request.address,
+                    &resolved,
+                    &metadata,
+                    crate::raw::RawBrightness::default(),
+                )
+                .ok()
+                .flatten()
+            })
+            .is_some();
         let response = match self.load_image(
             &request.address,
             &resolved,
@@ -3762,6 +3820,20 @@ impl ContainerEngine {
                         "WebP エンコードに失敗しました",
                     )
                 }),
+            Err(error)
+                if raw_thumbnail
+                    && matches!(
+                        error.code,
+                        MediaErrorCode::NotFound
+                            | MediaErrorCode::RenderFailed
+                            | MediaErrorCode::Unsupported
+                    ) =>
+            {
+                thumbnail_error(
+                    ThumbnailErrorCode::NoThumbnail,
+                    "RAW サムネイルがありません",
+                )
+            }
             Err(error) => thumbnail_error_from_media(error),
         };
         let (outcome, output_bytes) = match &response {
@@ -3781,7 +3853,18 @@ impl ContainerEngine {
         context: &WorkerContext,
         job_cancel: Arc<AtomicBool>,
     ) -> PageResponse {
-        self.page_inner(request, context, job_cancel)
+        let priority = request.priority;
+        self.page_inner(request, context, job_cancel, &|| priority)
+    }
+
+    pub(super) fn page_with_job_cancel_and_priority(
+        &self,
+        request: PageRequest,
+        context: &WorkerContext,
+        job_cancel: Arc<AtomicBool>,
+        priority: &dyn Fn() -> PagePriority,
+    ) -> PageResponse {
+        self.page_inner(request, context, job_cancel, priority)
     }
 
     fn page_inner(
@@ -3789,10 +3872,11 @@ impl ContainerEngine {
         request: PageRequest,
         context: &WorkerContext,
         cancel: Arc<AtomicBool>,
+        effective_priority: &dyn Fn() -> PagePriority,
     ) -> PageResponse {
         let started = Instant::now();
         let source_kind = media_source_kind(&request.address);
-        let priority = request.priority;
+        let priority;
         let page_perf = RemotePagePerf::new(&request, source_kind);
         let mut total_stage = page_perf.enter(RemotePageStage::Total);
         let mut resolve_stage = page_perf.enter(RemotePageStage::Resolve);
@@ -3834,14 +3918,104 @@ impl ContainerEngine {
         } else {
             RemoteImageLoadKind::CompositedPage
         };
+        let raw_settings = if remote_address_may_contain_raw(&request.address, &resolved)
+            || view_trim_plan.spread_partner().is_some()
+        {
+            match self.adjustment_render_settings() {
+                Ok(settings) => Some(settings),
+                Err(error) => return PageResponse::Error(error.into_media_error()),
+            }
+        } else {
+            None
+        };
         let partner_start = match self.prepare_remote_auto_trim_partner_timed(
             &view_trim_plan,
             request.target_px,
             &cancel,
             resolve_stage.as_mut(),
+            raw_settings
+                .as_ref()
+                .map(|settings| settings.raw_brightness),
         ) {
             Ok(start) => start,
             Err(error) => return PageResponse::Error(error),
+        };
+        let raw_needed = remote_address_may_contain_raw(&request.address, &resolved)
+            || matches!(&partner_start, RemotePartnerStart::Resolve(partner)
+                if remote_address_may_contain_raw(&partner.address, &partner.resolved));
+        let raw_pins = if raw_needed {
+            let settings = raw_settings.expect("RAW source requires a settings snapshot");
+            let mut pins = RawDepPins {
+                brightness: settings.raw_brightness,
+                settings,
+                developed: HashMap::new(),
+            };
+            let mut specs = Vec::new();
+            for (address, resolved) in
+                std::iter::once((&request.address, &resolved)).chain(match &partner_start {
+                    RemotePartnerStart::Resolve(partner) => {
+                        Some((&partner.address, &partner.resolved))
+                    }
+                    _ => None,
+                })
+            {
+                let metadata = match std::fs::metadata(&resolved.canonical) {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        return PageResponse::Error(media_error(
+                            MediaErrorCode::NotFound,
+                            "コンテナが見つかりません",
+                        ));
+                    }
+                };
+                match remote_raw_dep_spec(address, resolved, &metadata, pins.brightness) {
+                    Ok(Some(spec))
+                        if !specs
+                            .iter()
+                            .any(|existing: &RawDepSpec| existing.identity == spec.identity) =>
+                    {
+                        specs.push(spec)
+                    }
+                    Ok(_) => {}
+                    Err(error) => return PageResponse::Error(error),
+                }
+            }
+            for spec in &specs {
+                if let Some(hit) = self.raw_flights.lookup(&spec.identity) {
+                    pins.developed.insert(spec.identity.clone(), hit);
+                }
+            }
+            // Demand may have promoted a queued page since heavy-worker dispatch.
+            priority = effective_priority();
+            if priority == PagePriority::Prefetch
+                && specs
+                    .iter()
+                    .any(|spec| !pins.developed.contains_key(&spec.identity))
+            {
+                return PageResponse::Error(media_error(
+                    MediaErrorCode::RawPrefetchSkipped,
+                    "RAW の先読み現像を省略しました",
+                ));
+            }
+            for spec in specs {
+                if pins.developed.contains_key(&spec.identity) {
+                    continue;
+                }
+                let source_spec = spec.clone();
+                let developed = match self.raw_flights.develop_page(
+                    spec.identity.clone(),
+                    move |flight_cancel| source_spec.source(flight_cancel),
+                    &cancel,
+                ) {
+                    Ok(developed) => developed,
+                    Err(error) => return PageResponse::Error(remote_raw_flight_media_error(error)),
+                };
+                pins.developed.insert(spec.identity, developed);
+            }
+            Some(pins)
+        } else {
+            priority = effective_priority();
+            None
         };
         let load_timing = resolve_stage.take().map(|resolve| RemotePageLoadTiming {
             perf: page_perf.clone(),
@@ -3863,6 +4037,7 @@ impl ContainerEngine {
                     &partner_context,
                     &partner_cancel,
                     None,
+                    raw_pins.as_ref(),
                 )
             },
             || {
@@ -3878,6 +4053,7 @@ impl ContainerEngine {
                     request.adjustment_preview.as_ref(),
                     load_timing,
                     None,
+                    raw_pins.as_ref(),
                 )?;
                 if cancel.load(Ordering::Acquire) {
                     return Err(media_error(
@@ -3985,11 +4161,12 @@ impl ContainerEngine {
 
     pub(super) fn execute_remote_ai(
         &self,
+        owner: &str,
         request: &RemoteAiStartRequest,
         progress: &dyn super::ai_job::RemoteAiProgressSink,
         cancel: &Arc<AtomicBool>,
     ) -> super::ai_job::RemoteAiExecutionOutcome {
-        match self.execute_remote_ai_inner(request, progress, cancel) {
+        match self.execute_remote_ai_inner(owner, request, progress, cancel) {
             Ok(results) => super::ai_job::RemoteAiExecutionOutcome::Completed(results),
             Err(RemoteAiRunError::NotApplicable {
                 code,
@@ -4024,16 +4201,27 @@ impl ContainerEngine {
 
     fn execute_remote_ai_inner(
         &self,
+        owner: &str,
         request: &RemoteAiStartRequest,
         progress: &dyn super::ai_job::RemoteAiProgressSink,
         cancel: &Arc<AtomicBool>,
     ) -> Result<Vec<super::ai_job::RemoteAiPageExecutionOutcome>, RemoteAiRunError> {
         self.execute_remote_ai_inner_with(
+            owner,
             request,
             progress,
             cancel,
-            &|engine, address, logical_path, mtime, file_size, target_px, rotation, context| {
-                engine.prepare_remote_composite(
+            &|engine,
+              address,
+              logical_path,
+              mtime,
+              file_size,
+              target_px,
+              rotation,
+              context,
+              settings,
+              raw_brightness| {
+                engine.prepare_remote_composite_timed(
                     address,
                     logical_path,
                     mtime,
@@ -4042,10 +4230,16 @@ impl ContainerEngine {
                     rotation,
                     None,
                     context,
+                    None,
+                    None,
+                    Some(settings),
+                    raw_brightness,
                 )
             },
-            &|engine, address, resolved, metadata, page_index, cancel| {
-                engine.decode_remote_ai_source(address, resolved, metadata, page_index, cancel)
+            &|engine, address, resolved, metadata, page_index, cancel, brightness| {
+                engine.decode_remote_ai_source(
+                    address, resolved, metadata, page_index, cancel, brightness,
+                )
             },
             &|engine, cancel| {
                 engine
@@ -4058,6 +4252,7 @@ impl ContainerEngine {
 
     fn execute_remote_ai_inner_with(
         &self,
+        owner: &str,
         request: &RemoteAiStartRequest,
         progress: &dyn super::ai_job::RemoteAiProgressSink,
         cancel: &Arc<AtomicBool>,
@@ -4070,6 +4265,8 @@ impl ContainerEngine {
             u32,
             crate::rotation_db::Rotation,
             &WorkerContext,
+            &crate::settings_db::AdjustmentRenderSettings,
+            Option<crate::raw::RawBrightness>,
         ) -> Result<
             Option<RemotePreparedComposite>,
             RemoteCompositePrepareError,
@@ -4081,6 +4278,7 @@ impl ContainerEngine {
             &std::fs::Metadata,
             usize,
             &Arc<AtomicBool>,
+            crate::raw::RawBrightness,
         )
             -> Result<(Arc<egui::ColorImage>, [usize; 2]), RemoteAiRunError>,
         resources_for_remote: &dyn Fn(
@@ -4088,6 +4286,9 @@ impl ContainerEngine {
             &AtomicBool,
         ) -> Option<super::session::RemoteAiResources>,
     ) -> Result<Vec<super::ai_job::RemoteAiPageExecutionOutcome>, RemoteAiRunError> {
+        let operation_settings = self
+            .adjustment_render_settings()
+            .map_err(RemoteCompositePrepareError::into_ai_error)?;
         let context = WorkerContext::open();
         let page_count = request.pages.len();
         let mut results = Vec::with_capacity(page_count);
@@ -4117,7 +4318,14 @@ impl ContainerEngine {
                     "AI source is not a file".to_owned(),
                 ));
             }
-            let mtime = crate::ui_helpers::mtime_secs(&metadata);
+            let raw_spec = remote_raw_dep_spec(
+                &page.address,
+                &resolved,
+                &metadata,
+                operation_settings.raw_brightness,
+            )
+            .map_err(remote_ai_media_error)?;
+            let mtime = remote_source_mtime(&metadata, raw_spec.is_some());
             let file_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
             let rotation = context
                 .rotation_for_remote_page(&resolved.logical, &page.address.subresource);
@@ -4130,19 +4338,44 @@ impl ContainerEngine {
                 page.target_px,
                 rotation,
                 &context,
+                &operation_settings,
+                raw_spec
+                    .as_ref()
+                    .map(|_| operation_settings.raw_brightness),
             )
             .map_err(RemoteCompositePrepareError::into_ai_error)?
             .ok_or_else(|| {
                 RemoteAiRunError::Failed("address does not identify an image page".to_owned())
             })?;
-            let (source, decoded_source_dims) = decode_source(
-                self,
-                &page.address,
-                &resolved,
-                &metadata,
-                page_index,
-                cancel,
-            )?;
+            let mut raw_pins = RawDepPins {
+                brightness: operation_settings.raw_brightness,
+                settings: operation_settings.clone(),
+                developed: HashMap::new(),
+            };
+            let (source, decoded_source_dims) = if let Some(spec) = raw_spec {
+                let source_spec = spec.clone();
+                let developed = self.raw_flights.develop_ai(
+                    spec.identity.clone(),
+                    owner,
+                    move |flight_cancel| source_spec.source(flight_cancel),
+                    cancel,
+                )
+                .map_err(|error| RemoteAiRunError::Failed(format!("RAW source: {error:?}")))?;
+                let dims = [developed.image.width() as usize, developed.image.height() as usize];
+                let source = Arc::new(crate::canonical_image_loader::dynamic_image_to_color_image(&developed.image));
+                raw_pins.developed.insert(spec.identity, developed);
+                (source, dims)
+            } else {
+                decode_source(
+                    self,
+                    &page.address,
+                    &resolved,
+                    &metadata,
+                    page_index,
+                    cancel,
+                    operation_settings.raw_brightness,
+                )?
+            };
             let requires_stored_edit_space = !prepared.edits.comic.is_empty()
                 || prepared.edits.export_crop.is_some();
             let pdf_canonical_raster_dims = matches!(
@@ -4196,6 +4429,7 @@ impl ContainerEngine {
                 page_key: prepared.key.page_key.clone(),
                 mtime,
                 file_size,
+                raw_brightness: prepared.key.raw_brightness,
                 source_size: materialized.pixels.size,
                 pre_ai_params: remote_ai_pre_params(&prepared.params),
                 pre_ai_edit_fingerprint,
@@ -4336,29 +4570,67 @@ impl ContainerEngine {
                     rotation,
                 )
                 .map_err(remote_ai_media_error)?;
+            if let Some(partner) = view_trim_plan.spread_partner() {
+                let partner_resolved = self.resolve(partner).map_err(remote_ai_media_error)?;
+                let partner_metadata = std::fs::metadata(&partner_resolved.canonical)
+                    .map_err(|error| RemoteAiRunError::Failed(format!("partner metadata: {error}")))?;
+                if let Some(spec) = remote_raw_dep_spec(
+                    partner,
+                    &partner_resolved,
+                    &partner_metadata,
+                    operation_settings.raw_brightness,
+                )
+                .map_err(remote_ai_media_error)?
+                && !raw_pins.developed.contains_key(&spec.identity)
+                && self.remote_auto_trim_bbox_cache_lookup_timed(
+                    partner,
+                    &partner_resolved,
+                    page.target_px,
+                    cancel,
+                    None,
+                    Some(operation_settings.raw_brightness),
+                )
+                .map_err(remote_ai_media_error)?
+                .is_none()
+                {
+                    let source_spec = spec.clone();
+                    let developed = self.raw_flights.develop_ai(
+                        spec.identity.clone(),
+                        owner,
+                        move |flight_cancel| source_spec.source(flight_cancel),
+                        cancel,
+                    )
+                    .map_err(|error| RemoteAiRunError::Failed(format!("RAW partner: {error:?}")))?;
+                    raw_pins.developed.insert(spec.identity, developed);
+                }
+            }
             // Auto は AI 出力ではなく本体と同じ元ページ raster から検出する。bbox cache を
             // 参照することで、AI result へ切り替えても表示 bbox を変えない。
             let auto_trim_bbox = if view_trim_plan.requires_auto_detection() {
-                self.remote_auto_trim_bbox(
+                self.remote_auto_trim_bbox_timed(
                     &page.address,
                     &resolved,
                     page.target_px,
                     true,
                     &context,
                     cancel,
+                    None,
+                    Some(&raw_pins),
                 )
                 .map_err(remote_ai_media_error)?
             } else {
                 None
             };
             let view_trim_bbox = self
-                .complete_remote_view_trim_bbox(
+                .complete_remote_view_trim_bbox_timed(
                     &view_trim_plan,
                     auto_trim_bbox,
                     page.target_px,
                     true,
                     &context,
                     cancel,
+                    None,
+                    Some(&raw_pins),
                 )
                 .map_err(remote_ai_media_error)?;
             let (bytes, width, height) =
@@ -4406,6 +4678,9 @@ impl ContainerEngine {
             .and_then(|session| session.remote_ai_resources(cancel))
             .map(|resources| resources.background_mode)
             .ok_or_else(|| RemoteAiRunError::Superseded("AI runtime was detached".to_owned()))?;
+        let current_settings = self
+            .adjustment_render_settings()
+            .map_err(RemoteCompositePrepareError::into_ai_error)?;
         for (address, target_px, expected) in identities {
             check_remote_ai_cancel(cancel)?;
             let resolved = self.resolve(&address).map_err(|_| {
@@ -4413,18 +4688,31 @@ impl ContainerEngine {
             })?;
             let metadata = std::fs::metadata(&resolved.canonical)
                 .map_err(|_| RemoteAiRunError::Superseded("source metadata changed".to_owned()))?;
+            let current_raw = remote_raw_dep_spec(
+                &address,
+                &resolved,
+                &metadata,
+                current_settings.raw_brightness,
+            )
+            .map_err(|_| RemoteAiRunError::Superseded("RAW source changed".to_owned()))?;
             let rotation = validation_context
                 .rotation_for_remote_page(&resolved.logical, &address.subresource);
             let current = self
-                .prepare_remote_composite(
+                .prepare_remote_composite_timed(
                     &address,
                     &resolved.logical,
-                    crate::ui_helpers::mtime_secs(&metadata),
+                    remote_source_mtime(&metadata, current_raw.is_some()),
                     i64::try_from(metadata.len()).unwrap_or(i64::MAX),
                     target_px,
                     rotation,
                     None,
                     &validation_context,
+                    None,
+                    None,
+                    Some(&current_settings),
+                    current_raw
+                        .as_ref()
+                        .map(|_| current_settings.raw_brightness),
                 )
                 .map_err(|error| match error {
                     RemoteCompositePrepareError::SettingsRecoveryInProgress => {
@@ -4453,6 +4741,7 @@ impl ContainerEngine {
         metadata: &std::fs::Metadata,
         page_index: usize,
         cancel: &Arc<AtomicBool>,
+        raw_brightness: crate::raw::RawBrightness,
     ) -> Result<(Arc<egui::ColorImage>, [usize; 2]), RemoteAiRunError> {
         match &address.subresource {
             RemoteSubresource::File if is_image_path(&resolved.logical) => {
@@ -4464,7 +4753,7 @@ impl ContainerEngine {
                     page_index,
                     cancel,
                     &self.raw_develop_executor,
-                    self.settings.raw_brightness,
+                    raw_brightness,
                 )
             }
             RemoteSubresource::ZipEntry { entry_name } if is_archive_container(resolved) => {
@@ -4476,7 +4765,7 @@ impl ContainerEngine {
                     page_index,
                     cancel,
                     &self.raw_develop_executor,
-                    self.settings.raw_brightness,
+                    raw_brightness,
                 )
             }
             RemoteSubresource::PdfPage { page_number } if is_pdf_path(&resolved.logical) => {
@@ -5279,6 +5568,7 @@ impl ContainerEngine {
         target_px: u32,
         cancel: &AtomicBool,
         wait_stage: Option<&mut RemotePageStageGuard>,
+        raw_brightness: Option<crate::raw::RawBrightness>,
     ) -> Result<RemotePartnerStart<Option<egui::Rect>, RemotePartnerAutoTrimRequest>, MediaError>
     {
         let Some(partner) = plan.spread_partner() else {
@@ -5286,7 +5576,12 @@ impl ContainerEngine {
         };
         let resolved = self.resolve(partner)?;
         if let Some(bbox) = self.remote_auto_trim_bbox_cache_lookup_timed(
-            partner, &resolved, target_px, cancel, wait_stage,
+            partner,
+            &resolved,
+            target_px,
+            cancel,
+            wait_stage,
+            raw_brightness,
         )? {
             return Ok(RemotePartnerStart::Cached(bbox));
         }
@@ -5314,6 +5609,7 @@ impl ContainerEngine {
             context,
             cancel,
             None,
+            None,
         )
     }
 
@@ -5327,6 +5623,7 @@ impl ContainerEngine {
         context: &WorkerContext,
         cancel: &Arc<AtomicBool>,
         mut wait_stage: Option<&mut RemotePageStageGuard>,
+        raw_pins: Option<&RawDepPins>,
     ) -> Result<Option<egui::Rect>, MediaError> {
         let partner = match plan {
             RemoteViewTrimPlan::AutoSpread { partner, .. } => {
@@ -5341,6 +5638,7 @@ impl ContainerEngine {
                     context,
                     cancel,
                     wait_stage.as_deref_mut(),
+                    raw_pins,
                 )?;
                 RemotePartnerResult::Resolved(partner_auto_trim_bbox)
             }
@@ -5365,7 +5663,7 @@ impl ContainerEngine {
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<egui::Rect>, MediaError> {
         self.remote_auto_trim_bbox_timed(
-            address, resolved, target_px, foreground, context, cancel, None,
+            address, resolved, target_px, foreground, context, cancel, None, None,
         )
     }
 
@@ -5376,6 +5674,7 @@ impl ContainerEngine {
         target_px: u32,
         cancel: &AtomicBool,
         wait_stage: Option<&mut RemotePageStageGuard>,
+        raw_brightness: Option<crate::raw::RawBrightness>,
     ) -> Result<Option<Option<egui::Rect>>, MediaError> {
         if cancel.load(Ordering::Relaxed) {
             return Err(media_error(
@@ -5391,11 +5690,18 @@ impl ContainerEngine {
                 "対象はコンテナファイルではありません",
             ));
         }
+        let raw_spec = raw_brightness
+            .map(|brightness| remote_raw_dep_spec(address, resolved, &metadata, brightness))
+            .transpose()?
+            .flatten();
         let key = remote_auto_trim_cache_key(
             address,
             resolved,
-            crate::ui_helpers::mtime_secs(&metadata),
+            remote_source_mtime(&metadata, raw_spec.is_some()),
             i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+            raw_spec
+                .as_ref()
+                .map(|_| raw_brightness.expect("RAW lookup has brightness")),
             target_px,
         )?;
         Ok(lock_with_remote_page_wait(&self.auto_trim_bbox_cache, wait_stage, None).get(&key))
@@ -5411,6 +5717,7 @@ impl ContainerEngine {
         context: &WorkerContext,
         cancel: &Arc<AtomicBool>,
         mut wait_stage: Option<&mut RemotePageStageGuard>,
+        raw_pins: Option<&RawDepPins>,
     ) -> Result<Option<egui::Rect>, MediaError> {
         if let Some(bbox) = self.remote_auto_trim_bbox_cache_lookup_timed(
             address,
@@ -5418,6 +5725,7 @@ impl ContainerEngine {
             target_px,
             cancel,
             wait_stage.as_deref_mut(),
+            raw_pins.map(|pins| pins.brightness),
         )? {
             return Ok(bbox);
         }
@@ -5433,6 +5741,7 @@ impl ContainerEngine {
             None,
             None,
             wait_stage,
+            raw_pins,
         )
         .map(|loaded| loaded.auto_trim_bbox)
     }
@@ -5675,6 +5984,7 @@ impl ContainerEngine {
             adjustment_preview,
             None,
             None,
+            None,
         )
     }
 
@@ -5692,6 +6002,7 @@ impl ContainerEngine {
         adjustment_preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
         mut page_timing: Option<RemotePageLoadTiming>,
         mut ambient_wait_stage: Option<&mut RemotePageStageGuard>,
+        raw_pins: Option<&RawDepPins>,
     ) -> Result<LoadedImage, MediaError> {
         let full_page = load_kind.full_page();
         let compose_full_page = load_kind.composes_page();
@@ -5711,7 +6022,19 @@ impl ContainerEngine {
                 "対象はコンテナファイルではありません",
             ));
         }
-        let mtime = crate::ui_helpers::mtime_secs(&metadata);
+        let raw_spec = if full_page {
+            match raw_pins {
+                Some(pins) => remote_raw_dep_spec(address, resolved, &metadata, pins.brightness)?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let mtime = if raw_spec.is_some() {
+            super::raw_flights::remote_raw_mtime_100ns(&metadata)
+        } else {
+            crate::ui_helpers::mtime_secs(&metadata)
+        };
         let file_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
         let mut request = crate::thumb_loader::LoadRequest {
             path: resolved.readable_logical().to_path_buf(),
@@ -5762,6 +6085,8 @@ impl ContainerEngine {
             }
             RemoteSubresource::ZipDirectory { prefix } if is_archive_container(resolved) => {
                 request.zip_dir_prefix = Some(prefix.clone());
+                request.resolve_override =
+                    Some(crate::thumb_loader::ResolveStrategy::ZipDirRepresentative);
                 request.cache_key_override = Some(crate::grid_item::zipdir_cache_key(prefix));
                 request.folder_thumb_sort = Some(crate::app::BOOK_READING_PAGE_ORDER);
                 &resolved.logical
@@ -5796,33 +6121,30 @@ impl ContainerEngine {
                 ));
             }
         };
-        // S2b owns Remote page development. Reject the resolved RAW source before
-        // source/composite cache lookup, so an older embedded-preview cache cannot
-        // turn a page request into a silent preview response.
-        if full_page && remote_page_source_is_raw(&request, resolved, address) {
-            return Err(media_error(
-                MediaErrorCode::Unsupported,
-                "RAW pages are not supported yet (S2b)",
-            ));
-        }
+        let pinned_raw = if let Some(spec) = raw_spec.as_ref() {
+            Some(
+                raw_pins
+                    .and_then(|pins| pins.get(&spec.identity))
+                    .cloned()
+                    .ok_or_else(|| {
+                        media_error(
+                            MediaErrorCode::Internal,
+                            "RAW dependency was not pinned before source load",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         if !full_page {
-            match crate::thumb_loader::remote_raw_thumbnail_requirement(&request, target_px, None) {
-                Ok(crate::thumb_loader::RemoteRawThumbRequirement::NeedsHalfDevelopment) => {
-                    return Err(media_error(
-                        MediaErrorCode::Unsupported,
-                        "RAW thumbnail requires half development; Remote does not support it yet",
-                    ));
+            match crate::thumb_loader::remote_raw_thumbnail_requirement(&request, None) {
+                crate::thumb_loader::RemoteRawThumbRequirement::NotRaw => {}
+                crate::thumb_loader::RemoteRawThumbRequirement::PreviewAvailable => {
+                    request.source_policy = crate::thumb_loader::LoadSourcePolicy::SourceOnly;
                 }
-                Err(error) => {
-                    return Err(media_error(
-                        MediaErrorCode::Unsupported,
-                        format!("RAW thumbnail information unavailable: {error}"),
-                    ));
+                crate::thumb_loader::RemoteRawThumbRequirement::CatalogOnly => {
+                    request.source_policy = crate::thumb_loader::LoadSourcePolicy::CacheOnly;
                 }
-                Ok(
-                    crate::thumb_loader::RemoteRawThumbRequirement::NotRaw
-                    | crate::thumb_loader::RemoteRawThumbRequirement::PreviewSufficient,
-                ) => {}
             }
         }
         // identity は HTTP 要求値の echo ではなく、この描画要求が実際に使う
@@ -5842,6 +6164,10 @@ impl ContainerEngine {
                 context,
                 page_timing.as_mut().map(|timing| &mut timing.resolve),
                 ambient_wait_stage.as_deref_mut(),
+                raw_pins.map(|pins| &pins.settings),
+                raw_spec
+                    .as_ref()
+                    .map(|_| raw_pins.expect("raw source has pins").brightness),
             )
             .map_err(RemoteCompositePrepareError::into_media_error)?
         } else {
@@ -5849,7 +6175,14 @@ impl ContainerEngine {
         };
         let auto_trim_key = if detect_auto_trim {
             Some(remote_auto_trim_cache_key(
-                address, resolved, mtime, file_size, target_px,
+                address,
+                resolved,
+                mtime,
+                file_size,
+                raw_spec
+                    .as_ref()
+                    .map(|_| raw_pins.expect("raw source has pins").brightness),
+                target_px,
             )?)
         } else {
             None
@@ -5941,10 +6274,21 @@ impl ContainerEngine {
         let cancel = external_cancel
             .cloned()
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let source_identity =
-            RemoteSourceDecodeIdentity::from_load_request(&request, target_px, full_page);
+        let source_identity = RemoteSourceDecodeIdentity::from_load_request(
+            &request,
+            target_px,
+            full_page,
+            raw_spec
+                .as_ref()
+                .map(|_| raw_pins.expect("raw source has pins").brightness),
+        );
         let pdf_password = request.pdf_password.clone();
-        let cache_decision = remote_page_cache_decision(full_page, &self.settings);
+        let cache_decision = if !full_page && request.source_policy.bypasses_cache() {
+            // A Remote embedded preview must not replace a PC half-developed catalog row.
+            crate::thumb_loader::CacheDecision::without_thumbnail()
+        } else {
+            remote_page_cache_decision(full_page, &self.settings)
+        };
         let zip_directory = matches!(address.subresource, RemoteSubresource::ZipDirectory { .. });
         let stats = Arc::clone(&self.stats);
         let thumb_px = self.settings.thumb_px;
@@ -5953,6 +6297,25 @@ impl ContainerEngine {
             source_identity,
             Arc::clone(&cancel),
             move |shared_cancel| {
+                if let Some(developed) = pinned_raw {
+                    let started = Instant::now();
+                    let image = crate::thumb_loader::resize_to_display_color_image(
+                        &developed.image,
+                        target_px,
+                        Some((developed.image.width(), developed.image.height())),
+                    );
+                    return Ok(RemoteDecodedSource {
+                        raster: RemoteSourceRaster {
+                            pixels: Arc::new(image),
+                            decoded_source_dims: Some((
+                                developed.image.width(),
+                                developed.image.height(),
+                            )),
+                        },
+                        load_request_ms: started.elapsed().as_secs_f64() * 1000.0,
+                        drain_ms: 0.0,
+                    });
+                }
                 decode_remote_source(
                     request,
                     cache_map,
@@ -7177,34 +7540,112 @@ fn is_archive_container(resolved: &ResolvedPath) -> bool {
     resolved.has_archive_backing() || is_zip_path(&resolved.logical)
 }
 
-fn remote_page_source_is_raw(
-    request: &crate::thumb_loader::LoadRequest,
-    resolved: &ResolvedPath,
+fn remote_address_may_contain_raw(address: &RemoteAddress, resolved: &ResolvedPath) -> bool {
+    match &address.subresource {
+        RemoteSubresource::File => {
+            crate::raw_format::is_raw_path(&resolved.logical) || is_archive_container(resolved)
+        }
+        RemoteSubresource::ZipEntry { entry_name } => {
+            crate::raw_format::is_raw_path(Path::new(entry_name))
+        }
+        RemoteSubresource::ZipDirectory { .. } => is_archive_container(resolved),
+        RemoteSubresource::PdfPage { .. } => false,
+    }
+}
+
+fn remote_source_mtime(metadata: &std::fs::Metadata, is_raw: bool) -> i64 {
+    if is_raw {
+        super::raw_flights::remote_raw_mtime_100ns(metadata)
+    } else {
+        crate::ui_helpers::mtime_secs(metadata)
+    }
+}
+
+fn remote_raw_flight_media_error(error: RemoteRawFlightError) -> MediaError {
+    match error {
+        RemoteRawFlightError::Capacity => {
+            media_error(MediaErrorCode::RawCapacity, "RAW 現像の待機枠が満杯です")
+        }
+        RemoteRawFlightError::Cancelled => {
+            media_error(MediaErrorCode::Cancelled, "RAW 現像を取り消しました")
+        }
+        RemoteRawFlightError::Raw(crate::raw::RawError::Unsupported(_)) => {
+            media_error(MediaErrorCode::Unsupported, "この RAW を現像できません")
+        }
+        RemoteRawFlightError::Raw(error) => media_error(
+            MediaErrorCode::RenderFailed,
+            format!("RAW 現像に失敗しました: {error}"),
+        ),
+    }
+}
+
+/// Resolve a RAW source from archive directory metadata only. In particular, this must not
+/// extract the selected RAW bytes before the page's prefetch decision or AI capacity admission.
+fn remote_raw_dep_spec(
     address: &RemoteAddress,
-) -> bool {
-    if let Some(entry) = request.zip_entry.as_deref() {
-        return crate::raw_format::is_raw_path(Path::new(entry));
-    }
-    if let Some(prefix) = request.zip_dir_prefix.as_deref() {
-        return crate::zip_loader::enumerate_image_entries(&request.path)
-            .ok()
-            .and_then(|entries| {
-                crate::zip_tree::ZipTree::build(request.path.clone(), entries)
-                    .representative_for_prefix_str(
-                        prefix,
-                        request
-                            .folder_thumb_sort
-                            .unwrap_or(crate::settings::SortOrder::Numeric),
+    resolved: &ResolvedPath,
+    metadata: &std::fs::Metadata,
+    brightness: crate::raw::RawBrightness,
+) -> Result<Option<RawDepSpec>, MediaError> {
+    let (entry, prefix) = match &address.subresource {
+        RemoteSubresource::File if crate::raw_format::is_raw_path(&resolved.logical) => {
+            (None, None)
+        }
+        RemoteSubresource::File if is_archive_container(resolved) => {
+            let entries = crate::zip_loader::enumerate_image_entries(resolved.readable_canonical())
+                .map_err(|error| {
+                    media_error(
+                        MediaErrorCode::RenderFailed,
+                        format!("ZIP inventory: {error}"),
                     )
-                    .map(|entry| crate::raw_format::is_raw_path(Path::new(&entry.entry_name)))
-            })
-            .unwrap_or(false);
+                })?;
+            (entries.first().map(|entry| entry.entry_name.clone()), None)
+        }
+        RemoteSubresource::ZipEntry { entry_name } if is_archive_container(resolved) => {
+            (Some(entry_name.clone()), None)
+        }
+        RemoteSubresource::ZipDirectory { prefix } if is_archive_container(resolved) => {
+            let entries = crate::zip_loader::enumerate_image_entries(resolved.readable_canonical())
+                .map_err(|error| {
+                    media_error(
+                        MediaErrorCode::RenderFailed,
+                        format!("ZIP inventory: {error}"),
+                    )
+                })?;
+            let tree = crate::zip_tree::ZipTree::build(
+                resolved.readable_canonical().to_path_buf(),
+                entries,
+            );
+            let entry = tree
+                .representative_for_prefix_str(prefix, crate::app::BOOK_READING_PAGE_ORDER)
+                .map(|entry| entry.entry_name.clone());
+            (entry, Some(prefix.as_str()))
+        }
+        _ => return Ok(None),
+    };
+    let is_raw = entry.as_deref().map_or_else(
+        || crate::raw_format::is_raw_path(&resolved.logical),
+        |entry| crate::raw_format::is_raw_path(Path::new(entry)),
+    );
+    if !is_raw {
+        return Ok(None);
     }
-    if matches!(address.subresource, RemoteSubresource::File) && is_archive_container(resolved) {
-        return crate::zip_loader::read_first_image_bytes(&request.path)
-            .is_some_and(|(entry, _)| crate::raw_format::is_raw_path(Path::new(&entry)));
-    }
-    crate::raw_format::is_raw_path(&request.path)
+    let readable_path = if entry.is_some() {
+        resolved.readable_canonical().to_path_buf()
+    } else {
+        resolved.canonical.clone()
+    };
+    Ok(Some(RawDepSpec {
+        identity: RemoteRawIdentity::new(
+            &resolved.logical,
+            metadata,
+            entry.as_deref(),
+            prefix,
+            brightness,
+        ),
+        readable_path,
+        zip_entry: entry,
+    }))
 }
 
 fn is_pdf_path(path: &Path) -> bool {
@@ -7292,6 +7733,8 @@ fn remote_write_error_from_media(error: MediaError) -> RemoteWriteError {
         MediaErrorCode::PasswordRequired
         | MediaErrorCode::PageOutOfRange
         | MediaErrorCode::Cancelled
+        | MediaErrorCode::RawPrefetchSkipped
+        | MediaErrorCode::RawCapacity
         | MediaErrorCode::RenderFailed
         | MediaErrorCode::Internal => RemoteWriteErrorCode::Internal,
     };
@@ -7335,6 +7778,8 @@ fn thumbnail_error_from_media(error: MediaError) -> ThumbnailResponse {
         MediaErrorCode::PageOutOfRange => ThumbnailErrorCode::PageOutOfRange,
         MediaErrorCode::Cancelled => ThumbnailErrorCode::Busy,
         MediaErrorCode::Busy => ThumbnailErrorCode::Busy,
+        MediaErrorCode::RawCapacity => ThumbnailErrorCode::Busy,
+        MediaErrorCode::RawPrefetchSkipped => ThumbnailErrorCode::Internal,
         MediaErrorCode::RenderFailed => ThumbnailErrorCode::GenerationFailed,
         MediaErrorCode::Internal => ThumbnailErrorCode::Internal,
     };
@@ -7351,7 +7796,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn raw_zip_representative_needing_half_is_typed_unsupported_thumbnail() {
+    fn raw_zip_representative_uses_small_preview_and_missing_preview_is_no_thumbnail() {
         use std::io::Write;
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let folder = data_dir.path().join("raw-zip-thumbnail");
@@ -7366,7 +7811,7 @@ mod tests {
         writer.write_all(&std::fs::read(source).unwrap()).unwrap();
         writer.finish().unwrap();
         let mut settings = crate::settings::Settings {
-            favorites: vec![FavoriteEntry::new("RAW".to_owned(), folder)],
+            favorites: vec![FavoriteEntry::new("RAW".to_owned(), folder.clone())],
             ..Default::default()
         };
         settings.thumb_px = 2048;
@@ -7381,10 +7826,44 @@ mod tests {
                 prefix: "chapter/".to_owned(),
             },
         ] {
+            let address = RemoteAddress {
+                path: archive.to_string_lossy().into_owned(),
+                subresource,
+            };
+            let response = engine.thumbnail(
+                &mimageviewer_ipc::ThumbnailRequest {
+                    address,
+                    source_address: None,
+                    target_px: 2048,
+                },
+                &context,
+            );
+            assert!(
+                matches!(response, ThumbnailResponse::Success { .. }),
+                "{response:?}"
+            );
+        }
+
+        let missing_archive = folder.join("missing.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&missing_archive).unwrap());
+        writer
+            .start_file("chapter/page.cr2", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"invalid raw without preview").unwrap();
+        writer.finish().unwrap();
+        for subresource in [
+            RemoteSubresource::File,
+            RemoteSubresource::ZipEntry {
+                entry_name: "chapter/page.cr2".to_owned(),
+            },
+            RemoteSubresource::ZipDirectory {
+                prefix: "chapter/".to_owned(),
+            },
+        ] {
             let response = engine.thumbnail(
                 &mimageviewer_ipc::ThumbnailRequest {
                     address: RemoteAddress {
-                        path: archive.to_string_lossy().into_owned(),
+                        path: missing_archive.to_string_lossy().into_owned(),
                         subresource,
                     },
                     source_address: None,
@@ -7392,15 +7871,80 @@ mod tests {
                 },
                 &context,
             );
-            assert!(matches!(response, ThumbnailResponse::Error(ThumbnailError {
-                code: ThumbnailErrorCode::Unsupported, message,
-            }) if message.contains("requires half development")));
+            assert!(
+                matches!(
+                    response,
+                    ThumbnailResponse::Error(ThumbnailError {
+                        code: ThumbnailErrorCode::NoThumbnail,
+                        ..
+                    })
+                ),
+                "{response:?}"
+            );
+        }
+        let archive_metadata = std::fs::metadata(&missing_archive).unwrap();
+        let cached = image::DynamicImage::new_rgb8(8, 8);
+        let webp = crate::catalog::encode_thumb_webp(&cached, 8, 80.0)
+            .unwrap()
+            .0;
+        for (subresource, catalog_folder, key) in [
+            (
+                RemoteSubresource::File,
+                folder.as_path(),
+                container_thumb_key(crate::thumb_loader::CACHE_KEY_ZIP, &missing_archive).unwrap(),
+            ),
+            (
+                RemoteSubresource::ZipEntry {
+                    entry_name: "chapter/page.cr2".to_owned(),
+                },
+                missing_archive.as_path(),
+                "chapter/page.cr2".to_owned(),
+            ),
+            (
+                RemoteSubresource::ZipDirectory {
+                    prefix: "chapter/".to_owned(),
+                },
+                missing_archive.as_path(),
+                crate::grid_item::zipdir_cache_key("chapter/"),
+            ),
+        ] {
+            let catalog = crate::catalog::CatalogDb::open(
+                &crate::catalog::default_cache_dir(),
+                catalog_folder,
+            )
+            .unwrap();
+            catalog
+                .save(
+                    &key,
+                    crate::ui_helpers::mtime_secs(&archive_metadata),
+                    archive_metadata.len() as i64,
+                    8,
+                    8,
+                    Some((8, 8)),
+                    &webp,
+                )
+                .unwrap();
+            let response = engine.thumbnail(
+                &mimageviewer_ipc::ThumbnailRequest {
+                    address: RemoteAddress {
+                        path: missing_archive.to_string_lossy().into_owned(),
+                        subresource,
+                    },
+                    source_address: None,
+                    target_px: 2048,
+                },
+                &context,
+            );
+            assert!(
+                matches!(response, ThumbnailResponse::Success { .. }),
+                "{response:?}"
+            );
         }
     }
 
     #[cfg(windows)]
     #[test]
-    fn raw_remote_page_is_explicitly_unsupported_before_decode() {
+    fn raw_remote_page_skips_prefetch_then_develops_for_promoted_display() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let folder = data_dir.path().join("raw-remote-page");
         std::fs::create_dir_all(&folder).unwrap();
@@ -7408,28 +7952,201 @@ mod tests {
         assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
         let path = folder.join("page.dng");
         std::fs::copy(source, &path).unwrap();
+        drop(crate::adjustment_db::AdjustmentDb::open().unwrap());
+        drop(crate::mask_db::MaskDb::open().unwrap());
+        drop(crate::local_adjust_db::LocalAdjustDb::open().unwrap());
+        drop(crate::conceal_db::ConcealDb::open().unwrap());
+        drop(crate::comic_db::ComicDb::open().unwrap());
+        drop(crate::export_crop::CropDb::open().unwrap());
         let engine = ContainerEngine::new(crate::settings::Settings {
             favorites: vec![FavoriteEntry::new("RAW".to_owned(), folder)],
             ..Default::default()
         });
         let context = WorkerContext::open();
-        let response = engine.page_with_job_cancel(
+        let request = PageRequest {
+            job_id: "raw-page".to_owned(),
+            display_request_id: None,
+            address: RemoteAddress::file(path.to_string_lossy().into_owned()),
+            target_px: 512,
+            priority: PagePriority::Prefetch,
+            render_context: None,
+            adjustment_preview: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let skipped = engine.page_with_job_cancel_and_priority(
+            request.clone(),
+            &context,
+            Arc::clone(&cancel),
+            &|| PagePriority::Prefetch,
+        );
+        assert!(
+            matches!(
+                skipped,
+                PageResponse::Error(MediaError {
+                    code: MediaErrorCode::RawPrefetchSkipped,
+                    ..
+                })
+            ),
+            "{skipped:?}"
+        );
+        assert!(
+            engine
+                .raw_flights
+                .lookup(
+                    &remote_raw_dep_spec(
+                        &request.address,
+                        &engine.resolve(&request.address).unwrap(),
+                        &std::fs::metadata(&path).unwrap(),
+                        engine.settings.raw_brightness,
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .identity
+                )
+                .is_none()
+        );
+        let response = engine.page_with_job_cancel_and_priority(
+            request.clone(),
+            &context,
+            Arc::clone(&cancel),
+            &|| PagePriority::Foreground,
+        );
+        assert!(matches!(response, PageResponse::Success(_)), "{response:?}");
+        let cached_prefetch =
+            engine.page_with_job_cancel_and_priority(request, &context, cancel, &|| {
+                PagePriority::Prefetch
+            });
+        assert!(
+            matches!(cached_prefetch, PageResponse::Success(_)),
+            "{cached_prefetch:?}"
+        );
+    }
+
+    #[test]
+    fn raw_spread_partner_dependency_skips_prefetch_before_scoped_load() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let book = data_dir.path().join("raw-partner-book");
+        std::fs::create_dir_all(&book).unwrap();
+        let left_path = book.join("left.png");
+        let right_path = book.join("right.cr2");
+        std::fs::write(&left_path, remote_ai_test_png(8, 8)).unwrap();
+        std::fs::write(&right_path, b"invalid RAW that must never be read").unwrap();
+        let view_trim =
+            crate::view_trim_db::ViewTrimDb::open_at(&data_dir.path().join("view_trim.db"))
+                .unwrap();
+        view_trim
+            .set_book_state(
+                &book,
+                crate::view_trim::ViewTrimBookState {
+                    apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        drop(view_trim);
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("RAW".to_owned(), book.clone())],
+            ..Default::default()
+        });
+        let left = RemoteAddress::file(left_path.to_string_lossy().into_owned());
+        let right = RemoteAddress::file(right_path.to_string_lossy().into_owned());
+        let response = engine.page_with_job_cancel_and_priority(
             PageRequest {
-                job_id: "raw-page".to_owned(),
+                job_id: "raw-partner-prefetch".to_owned(),
                 display_request_id: None,
-                address: RemoteAddress::file(path.to_string_lossy().into_owned()),
-                target_px: 2048,
-                priority: PagePriority::Foreground,
-                render_context: None,
+                address: left,
+                target_px: 512,
+                priority: PagePriority::Prefetch,
+                render_context: Some(RemotePageRenderContext {
+                    context_address: RemoteAddress::file(book.to_string_lossy().into_owned()),
+                    display_slot: RemotePageDisplaySlot::SpreadLeft,
+                    spread_partner: Some(right),
+                }),
                 adjustment_preview: None,
             },
-            &context,
+            &WorkerContext::open(),
             Arc::new(AtomicBool::new(false)),
+            &|| PagePriority::Prefetch,
         );
-        assert!(matches!(response, PageResponse::Error(MediaError {
-            code: MediaErrorCode::Unsupported,
-            message,
-        }) if message.contains("RAW pages are not supported yet")));
+        assert!(
+            matches!(
+                response,
+                PageResponse::Error(MediaError {
+                    code: MediaErrorCode::RawPrefetchSkipped,
+                    ..
+                })
+            ),
+            "{response:?}"
+        );
+    }
+
+    #[test]
+    fn raw_request_pins_feed_page_and_partner_after_cache_eviction() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("raw-pins");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in ["left.cr2", "right.cr2"] {
+            std::fs::write(
+                folder.join(name),
+                b"invalid RAW; only the pinned raster is usable",
+            )
+            .unwrap();
+        }
+        drop(crate::adjustment_db::AdjustmentDb::open().unwrap());
+        drop(crate::mask_db::MaskDb::open().unwrap());
+        drop(crate::local_adjust_db::LocalAdjustDb::open().unwrap());
+        drop(crate::conceal_db::ConcealDb::open().unwrap());
+        drop(crate::comic_db::ComicDb::open().unwrap());
+        drop(crate::export_crop::CropDb::open().unwrap());
+        let settings = crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("RAW".to_owned(), folder.clone())],
+            ..Default::default()
+        };
+        let mut pins = RawDepPins {
+            brightness: settings.raw_brightness,
+            settings: crate::settings_db::AdjustmentRenderSettings::from_settings(&settings),
+            developed: HashMap::new(),
+        };
+        let engine = ContainerEngine::new(settings);
+        let pages = ["left.cr2", "right.cr2"]
+            .map(|name| RemoteAddress::file(folder.join(name).to_string_lossy().into_owned()));
+        for address in &pages {
+            let resolved = engine.resolve(address).unwrap();
+            let metadata = std::fs::metadata(&resolved.canonical).unwrap();
+            let spec = remote_raw_dep_spec(address, &resolved, &metadata, pins.brightness)
+                .unwrap()
+                .unwrap();
+            pins.developed.insert(
+                spec.identity,
+                Arc::new(crate::raw::RawDevelopOutput {
+                    image: image::DynamicImage::new_rgb8(4, 3),
+                    brightness: crate::raw::AppliedBrightness::None,
+                }),
+            );
+        }
+        let context = WorkerContext::open();
+        for (index, address) in pages.iter().enumerate() {
+            let resolved = engine.resolve(address).unwrap();
+            let loaded = engine.load_image_timed(
+                address,
+                &resolved,
+                16,
+                if index == 0 {
+                    RemoteImageLoadKind::CompositedPage
+                } else {
+                    RemoteImageLoadKind::AutoTrimReference
+                },
+                crate::rotation_db::Rotation::None,
+                true,
+                &context,
+                None,
+                None,
+                None,
+                None,
+                Some(&pins),
+            );
+            assert!(loaded.is_ok(), "pinned RAW {index}: {:?}", loaded.err());
+        }
     }
 
     #[cfg(windows)]
@@ -7621,12 +8338,14 @@ mod tests {
             path: PathBuf::from(name),
             mtime: 10,
             file_size: 20,
+            raw_brightness: None,
             pdf_page: None,
             zip_entry: None,
             zip_dir_prefix: None,
             cache_key_override: None,
             target_px,
             full_page,
+            source_only: full_page,
         }
     }
 
@@ -8102,12 +8821,14 @@ mod tests {
             &request,
             4096,
             RemoteImageLoadKind::AutoTrimReference.full_page(),
+            None,
         );
         request.priority = true;
         let page_identity = RemoteSourceDecodeIdentity::from_load_request(
             &request,
             4096,
             RemoteImageLoadKind::CompositedPageWithAutoTrim.full_page(),
+            None,
         );
         assert_eq!(identity, page_identity);
 
@@ -9357,7 +10078,7 @@ mod tests {
         assert!(
             matches!(
                 engine
-                    .prepare_remote_auto_trim_partner_timed(&plan, 1024, &cancel, None)
+                    .prepare_remote_auto_trim_partner_timed(&plan, 1024, &cancel, None, None)
                     .unwrap(),
                 RemotePartnerStart::Resolve(_)
             ),
@@ -9373,7 +10094,7 @@ mod tests {
             .unwrap();
 
         match engine
-            .prepare_remote_auto_trim_partner_timed(&plan, 1024, &cancel, None)
+            .prepare_remote_auto_trim_partner_timed(&plan, 1024, &cancel, None, None)
             .unwrap()
         {
             RemotePartnerStart::Cached(bbox) => assert_eq!(bbox, expected),
@@ -9383,7 +10104,7 @@ mod tests {
         assert!(
             matches!(
                 engine
-                    .prepare_remote_auto_trim_partner_timed(&plan, 2048, &cancel, None)
+                    .prepare_remote_auto_trim_partner_timed(&plan, 2048, &cancel, None, None)
                     .unwrap(),
                 RemotePartnerStart::Resolve(_)
             ),
@@ -9397,6 +10118,7 @@ mod tests {
             page_key: "book/page.png".to_owned(),
             mtime: 10,
             file_size: 20,
+            raw_brightness: None,
             target_px: 4096,
         };
         let mut cache = RemoteAutoTrimCache::default();
@@ -9414,6 +10136,11 @@ mod tests {
         let mut changed_decode = key;
         changed_decode.target_px = 2048;
         assert_eq!(cache.get(&changed_decode), None);
+
+        let mut changed_brightness = changed_source;
+        changed_brightness.mtime = 10;
+        changed_brightness.raw_brightness = Some(crate::raw::RawBrightness::MatchPreview);
+        assert_eq!(cache.get(&changed_brightness), None);
     }
 
     #[test]
@@ -9762,6 +10489,7 @@ mod tests {
             page_key: page_key.to_owned(),
             mtime: 1,
             file_size: 2,
+            raw_brightness: None,
             source_size: [2, 2],
             pre_ai_params: crate::adjustment::AdjustParams::default(),
             pre_ai_edit_fingerprint: [0; 32],
@@ -9812,6 +10540,7 @@ mod tests {
         let permit = crate::settings_db::quiesce_settings_family().unwrap();
 
         let outcome = engine.execute_remote_ai(
+            "test",
             &request,
             &NoRemoteAiProgress,
             &Arc::new(AtomicBool::new(false)),
@@ -9927,7 +10656,9 @@ mod tests {
                        file_size: i64,
                        target_px: u32,
                        rotation: crate::rotation_db::Rotation,
-                       _context: &WorkerContext| {
+                       _context: &WorkerContext,
+                       _settings: &crate::settings_db::AdjustmentRenderSettings,
+                       raw_brightness: Option<crate::raw::RawBrightness>| {
             let params = render_settings.global_preset.clone();
             let page_key =
                 crate::edit_source::page_key_for_remote(logical_path, &address.subresource)
@@ -9937,6 +10668,7 @@ mod tests {
                     page_key,
                     mtime,
                     file_size,
+                    raw_brightness,
                     target_px,
                     rotation,
                     params: params.clone(),
@@ -9964,7 +10696,8 @@ mod tests {
                       _resolved: &ResolvedPath,
                       _metadata: &std::fs::Metadata,
                       page_index: usize,
-                      _cancel: &Arc<AtomicBool>| {
+                      _cancel: &Arc<AtomicBool>,
+                      _brightness: crate::raw::RawBrightness| {
             if matches!(address.subresource, RemoteSubresource::PdfPage { .. }) {
                 Err(RemoteAiRunError::NotApplicable {
                     code: RemoteAiTerminalCode::VectorPdf,
@@ -9997,6 +10730,7 @@ mod tests {
         });
         let outcomes = engine
             .execute_remote_ai_inner_with(
+                "test",
                 &mixed,
                 &NoRemoteAiProgress,
                 &cancel,
@@ -10045,9 +10779,14 @@ mod tests {
         let metadata = std::fs::metadata(&resolved.canonical).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let Ok((actual, actual_dims)) =
-            engine.decode_remote_ai_source(&address, &resolved, &metadata, 0, &cancel)
-        else {
+        let Ok((actual, actual_dims)) = engine.decode_remote_ai_source(
+            &address,
+            &resolved,
+            &metadata,
+            0,
+            &cancel,
+            engine.settings.raw_brightness,
+        ) else {
             panic!("nested ZIP remote source must decode");
         };
         let Ok((expected, expected_dims)) = decode_remote_ai_canonical(
@@ -10102,6 +10841,7 @@ mod tests {
             page_key: "page".to_owned(),
             mtime: 1,
             file_size: 2,
+            raw_brightness: None,
             target_px: 1024,
             rotation: crate::rotation_db::Rotation::None,
             params: crate::adjustment::AdjustParams::default(),
@@ -10115,6 +10855,94 @@ mod tests {
         let mut edited_key = base_key;
         edited_key.edit_fingerprint[0] = 1;
         assert!(cache.get(&edited_key).is_none());
+
+        let mut changed_stamp = key.clone();
+        changed_stamp.params.brightness = 0.0;
+        changed_stamp.mtime += 1;
+        assert!(cache.get(&changed_stamp).is_none());
+        let mut changed_raw = key;
+        changed_raw.params.brightness = 0.0;
+        changed_raw.raw_brightness = Some(crate::raw::RawBrightness::MatchPreview);
+        assert!(cache.get(&changed_raw).is_none());
+    }
+
+    #[test]
+    fn raw_source_and_ai_keys_separate_brightness_and_subsecond_stamp() {
+        let mut source = source_test_identity("camera.cr2", 1024, true);
+        source.raw_brightness = Some(crate::raw::RawBrightness::None);
+        let mut changed_source = source.clone();
+        changed_source.mtime += 1;
+        assert_ne!(source, changed_source);
+        changed_source = source.clone();
+        changed_source.raw_brightness = Some(crate::raw::RawBrightness::MatchPreview);
+        assert_ne!(source, changed_source);
+
+        let mut native = remote_ai_cache_key("camera.cr2");
+        native.raw_brightness = Some(crate::raw::RawBrightness::None);
+        let mut changed_native = native.clone();
+        changed_native.mtime += 1;
+        assert!(native != changed_native);
+        changed_native = native.clone();
+        changed_native.raw_brightness = Some(crate::raw::RawBrightness::MatchPreview);
+        assert!(native != changed_native);
+
+        let composite = RemoteCompositeCacheKey {
+            page_key: "camera.cr2".to_owned(),
+            mtime: 1,
+            file_size: 2,
+            raw_brightness: Some(crate::raw::RawBrightness::None),
+            target_px: 1024,
+            rotation: crate::rotation_db::Rotation::None,
+            params: crate::adjustment::AdjustParams::default(),
+            lut_entry: None,
+            edit_fingerprint: [0; 32],
+        };
+        let result = RemoteAiResultIdentity {
+            composite,
+            ai_feature_mode: crate::settings::AiFeatureMode::Light,
+            ai_upscale_limit: crate::ai::upscale::AiProcessSizeLimit::square(4096),
+            ai_denoise_limit: crate::ai::upscale::AiProcessSizeLimit::square(4096),
+            ai_backend: None,
+            retained_max_entries: 1,
+            retained_max_mib: 128,
+            background_mode: 0,
+        };
+        let mut changed_result = result.clone();
+        changed_result.composite.mtime += 1;
+        assert!(result != changed_result);
+        changed_result = result.clone();
+        changed_result.composite.raw_brightness = Some(crate::raw::RawBrightness::MatchPreview);
+        assert!(result != changed_result);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_metadata_stamp_detects_same_second_same_size_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("camera.cr2");
+        std::fs::write(&path, b"A").unwrap();
+        let base = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000)
+            + std::time::Duration::from_nanos(100);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(base))
+            .unwrap();
+        let first = std::fs::metadata(&path).unwrap();
+        std::fs::write(&path, b"B").unwrap();
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(base + std::time::Duration::from_nanos(100)),
+        )
+        .unwrap();
+        let second = std::fs::metadata(&path).unwrap();
+        assert_eq!(first.len(), second.len());
+        assert_eq!(
+            crate::ui_helpers::mtime_secs(&first),
+            crate::ui_helpers::mtime_secs(&second)
+        );
+        assert_ne!(
+            remote_source_mtime(&first, true),
+            remote_source_mtime(&second, true)
+        );
     }
 
     #[test]

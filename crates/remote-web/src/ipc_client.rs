@@ -193,6 +193,7 @@ impl ClientError {
                 ThumbnailErrorCode::Unsupported => "miv_unsupported",
                 ThumbnailErrorCode::NotReady => "miv_not_ready",
                 ThumbnailErrorCode::GenerationFailed => "miv_generation_failed",
+                ThumbnailErrorCode::NoThumbnail => "miv_no_thumbnail",
                 ThumbnailErrorCode::Busy => "miv_busy",
                 ThumbnailErrorCode::PasswordRequired => "miv_password_required",
                 ThumbnailErrorCode::PageOutOfRange => "miv_page_out_of_range",
@@ -209,6 +210,8 @@ impl ClientError {
                 MediaErrorCode::PageOutOfRange => "miv_media_page_out_of_range",
                 MediaErrorCode::Cancelled => "miv_media_cancelled",
                 MediaErrorCode::Busy => "miv_media_busy",
+                MediaErrorCode::RawPrefetchSkipped => "miv_raw_prefetch_skipped",
+                MediaErrorCode::RawCapacity => "miv_raw_capacity",
                 MediaErrorCode::RenderFailed => "miv_media_render_failed",
                 MediaErrorCode::Internal => "miv_media_internal",
             }

@@ -45,7 +45,9 @@ pub enum RawDevelopScale {
     Half,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 pub enum RawBrightness {
     #[default]
     MatchPreview,

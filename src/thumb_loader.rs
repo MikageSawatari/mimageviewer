@@ -599,19 +599,18 @@ pub(crate) fn cancel_raw_thumb_tickets_outside_keep(
     }
 }
 
-/// Remote must decide this before consulting any thumbnail cache. The resolver
-/// follows the same folder and archive representative choices as the loader.
+/// Remote decides this before consulting the catalog. It accepts any usable
+/// embedded preview, regardless of the PC thumbnail size threshold.
 pub(crate) enum RemoteRawThumbRequirement {
     NotRaw,
-    PreviewSufficient,
-    NeedsHalfDevelopment,
+    PreviewAvailable,
+    CatalogOnly,
 }
 
 pub(crate) fn remote_raw_thumbnail_requirement(
     req: &LoadRequest,
-    display_px: u32,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
-) -> Result<RemoteRawThumbRequirement, String> {
+) -> RemoteRawThumbRequirement {
     let mut path = req.path.clone();
     let mut cached_pin_source = false;
     if let Some(sort) = req.folder_thumb_sort
@@ -623,7 +622,7 @@ pub(crate) fn remote_raw_thumbnail_requirement(
                 path = cached.source_path;
                 cached_pin_source = true;
             }
-            None => return Ok(RemoteRawThumbRequirement::NotRaw),
+            None => return RemoteRawThumbRequirement::NotRaw,
         }
     }
 
@@ -631,7 +630,7 @@ pub(crate) fn remote_raw_thumbnail_requirement(
         Some(entry.to_owned())
     } else if let Some(prefix) = req.zip_dir_prefix.as_deref() {
         let Ok(entries) = crate::zip_loader::enumerate_image_entries(&path) else {
-            return Ok(RemoteRawThumbRequirement::NotRaw);
+            return RemoteRawThumbRequirement::NotRaw;
         };
         crate::zip_tree::ZipTree::build(path.clone(), entries)
             .representative_for_prefix_str(
@@ -658,29 +657,25 @@ pub(crate) fn remote_raw_thumbnail_requirement(
     };
     let bytes = if let Some(entry) = selected_entry {
         if !crate::raw_format::is_raw_path(Path::new(&entry)) {
-            return Ok(RemoteRawThumbRequirement::NotRaw);
+            return RemoteRawThumbRequirement::NotRaw;
         }
-        Some(
-            crate::zip_loader::read_entry_bytes(&path, &entry)
-                .map_err(|error| error.to_string())?,
-        )
+        match crate::zip_loader::read_entry_bytes(&path, &entry) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => return RemoteRawThumbRequirement::CatalogOnly,
+        }
     } else if crate::raw_format::is_raw_path(&path) {
         None
     } else {
-        return Ok(RemoteRawThumbRequirement::NotRaw);
+        return RemoteRawThumbRequirement::NotRaw;
     };
     let source = bytes.as_deref().map_or(
         crate::raw::RawSource::Path(&path),
         crate::raw::RawSource::Bytes,
     );
-    let info = crate::raw::raw_decoder::info(source).map_err(|error| error.to_string())?;
-    let required = display_px.min(info.developed_dims[0].max(info.developed_dims[1]));
-    if crate::raw::raw_decoder::preview(source)
-        .is_ok_and(|preview| preview.image.width().max(preview.image.height()) >= required)
-    {
-        Ok(RemoteRawThumbRequirement::PreviewSufficient)
+    if crate::raw::raw_decoder::preview(source).is_ok() {
+        RemoteRawThumbRequirement::PreviewAvailable
     } else {
-        Ok(RemoteRawThumbRequirement::NeedsHalfDevelopment)
+        RemoteRawThumbRequirement::CatalogOnly
     }
 }
 
@@ -3578,7 +3573,10 @@ pub fn load_one_cached(
             let preview = crate::raw::raw_decoder::preview(source.as_source());
             let threshold = display_px.min(developed_dims[0].max(developed_dims[1]));
             match preview {
-                Ok(preview) if preview.image.width().max(preview.image.height()) >= threshold => {
+                Ok(preview)
+                    if matches!(raw_handoff, Some(RawThumbHandoff::RemotePreviewOnly(_)))
+                        || preview.image.width().max(preview.image.height()) >= threshold =>
+                {
                     Ok(preview.image)
                 }
                 Ok(_) | Err(crate::raw::RawError::NoUsablePreview(_)) => {
@@ -4488,6 +4486,77 @@ mod tests {
         assert_eq!(stats.count_raw, 1);
         assert_eq!(stats.count_wic, 0);
         assert_eq!(stats.count_susie, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_cr2_preview_is_available_from_zip_bytes() {
+        use std::io::Write;
+
+        let path = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let bytes = std::fs::read(path).unwrap();
+        let path_preview = crate::raw::raw_decoder::preview(crate::raw::RawSource::Path(path))
+            .expect("path preview");
+        let bytes_preview = crate::raw::raw_decoder::preview(crate::raw::RawSource::Bytes(&bytes))
+            .expect("ZIP bytes preview");
+        assert_eq!(
+            (path_preview.image.width(), path_preview.image.height()),
+            (bytes_preview.image.width(), bytes_preview.image.height())
+        );
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("book.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file("chapter/page.cr2", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let first = crate::zip_loader::read_first_image_bytes(&archive).unwrap();
+        assert_eq!(first.0, "chapter/page.cr2");
+        assert_eq!(first.1, bytes);
+        let metadata = std::fs::metadata(&archive).unwrap();
+        let mut request = LoadRequest {
+            path: archive,
+            mtime: crate::ui_helpers::mtime_secs(&metadata),
+            file_size: metadata.len() as i64,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            cache_key_override: Some("zipthumb:book.zip".to_owned()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            remote_raw_thumbnail_requirement(&request, None),
+            RemoteRawThumbRequirement::PreviewAvailable
+        ));
+        let cache_map = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let (tx, rx) = mpsc::channel();
+        let (raw_unavailable_tx, raw_unavailable_rx) = mpsc::channel();
+        let raw_handoff = RawThumbHandoff::RemotePreviewOnly(raw_unavailable_tx);
+        let done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        process_load_request(
+            &mut request,
+            &cache_map,
+            &tx,
+            None,
+            2048,
+            80,
+            2048,
+            CacheDecision::without_thumbnail(),
+            &done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(usize::MAX)),
+            None,
+            None,
+            None,
+            None,
+            Some(&raw_handoff),
+        );
+        assert!(raw_unavailable_rx.try_recv().is_err());
+        drop(tx);
+        assert!(rx.into_iter().any(|message| message.image.is_some()));
     }
 
     #[cfg(windows)]

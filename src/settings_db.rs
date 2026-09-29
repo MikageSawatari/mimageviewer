@@ -419,6 +419,7 @@ pub(crate) struct AdjustmentRenderSettings {
     pub(crate) erase_inpaint_mono_tolerance: u8,
     pub(crate) retained_final_ai_cache_max_entries: usize,
     pub(crate) retained_final_ai_cache_max_mib: u64,
+    pub(crate) raw_brightness: crate::raw::RawBrightness,
 }
 
 impl AdjustmentRenderSettings {
@@ -436,6 +437,7 @@ impl AdjustmentRenderSettings {
             erase_inpaint_mono_tolerance: settings.erase_inpaint_mono_tolerance,
             retained_final_ai_cache_max_entries: settings.retained_final_ai_cache_max_entries,
             retained_final_ai_cache_max_mib: settings.retained_final_ai_cache_max_mib,
+            raw_brightness: settings.raw_brightness,
         }
     }
 }
@@ -793,6 +795,9 @@ impl SettingsDb {
                     "retained_final_ai_cache_max_mib",
                     || defaults.retained_final_ai_cache_max_mib,
                 )?,
+                raw_brightness: read_settings_kv_typed(&inner.conn, "raw_brightness", || {
+                    defaults.raw_brightness
+                })?,
             },
             lock_wait_ms,
         ))
@@ -5467,6 +5472,7 @@ mod tests {
         settings.conceal_type = crate::conceal::ConcealType::BlackFill;
         settings.conceal_fill_opacity_percent = 73;
         settings.erase_inpaint_mono_tolerance = 9;
+        settings.raw_brightness = crate::raw::RawBrightness::MatchPreview;
         db.save_full(&settings).unwrap();
 
         let first = db.load_adjustment_render_settings().unwrap();
@@ -5475,6 +5481,10 @@ mod tests {
         assert_eq!(first.favorites[0].path, favorite.path);
         assert_eq!(first.global_preset.brightness, 11.0);
         assert_eq!(first.erase_inpaint_mono_tolerance, 9);
+        assert_eq!(
+            first.raw_brightness,
+            crate::raw::RawBrightness::MatchPreview
+        );
         assert_eq!(first.creative_luts, settings.creative_luts);
         assert_eq!(
             first.conceal_preset,
@@ -5487,12 +5497,14 @@ mod tests {
         settings.conceal_type = crate::conceal::ConcealType::Blur;
         settings.conceal_blur_radius_px = 41.0;
         settings.erase_inpaint_mono_tolerance = 27;
+        settings.raw_brightness = crate::raw::RawBrightness::None;
         db.save_full(&settings).unwrap();
 
         let second = db.load_adjustment_render_settings().unwrap();
         assert!(second.favorites.is_empty());
         assert_eq!(second.global_preset.brightness, 37.0);
         assert_eq!(second.erase_inpaint_mono_tolerance, 27);
+        assert_eq!(second.raw_brightness, crate::raw::RawBrightness::None);
         assert!(second.creative_luts.is_empty());
         assert_eq!(
             second.conceal_preset,

@@ -598,6 +598,7 @@ pub(super) struct ServerGuard {
     stream_work_tx: mpsc::SyncSender<Work>,
     session_runtime: SessionRuntime,
     settings_reader_control: super::live_favorites::RemoteSettingsReaderControl,
+    raw_flights: Arc<super::raw_flights::RemoteRawFlights>,
     _ai_jobs: Arc<super::ai_job::RemoteAiJobRegistry>,
     _archive_jobs: Arc<super::archive_job::RemoteArchiveJobRegistry>,
 }
@@ -625,6 +626,7 @@ impl ServerControl {
 struct ServerStartupWorkers {
     armed: bool,
     stop: Arc<AtomicBool>,
+    raw_flights: Arc<super::raw_flights::RemoteRawFlights>,
     listeners: Vec<std::thread::JoinHandle<()>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     stream_workers: Vec<std::thread::JoinHandle<()>>,
@@ -638,6 +640,7 @@ struct ServerStartupWorkers {
 
 struct StartedWorkers {
     stop: Arc<AtomicBool>,
+    raw_flights: Arc<super::raw_flights::RemoteRawFlights>,
     listeners: Vec<std::thread::JoinHandle<()>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     stream_workers: Vec<std::thread::JoinHandle<()>>,
@@ -654,6 +657,7 @@ impl ServerStartupWorkers {
         self.armed = false;
         StartedWorkers {
             stop: Arc::clone(&self.stop),
+            raw_flights: Arc::clone(&self.raw_flights),
             listeners: std::mem::take(&mut self.listeners),
             workers: std::mem::take(&mut self.workers),
             stream_workers: std::mem::take(&mut self.stream_workers),
@@ -672,6 +676,7 @@ impl ServerStartupWorkers {
         }
         self.armed = false;
         respond_stopped_works(self.heavy_queue.stop(), reason);
+        self.raw_flights.stop();
         self.stop.store(true, Ordering::Release);
         for _ in 0..self.listeners.len() {
             poke_listener();
@@ -747,6 +752,7 @@ impl ServerGuard {
             session_handle.clone(),
             raw_develop_executor,
         ));
+        let raw_flights = container_engine.raw_flights();
         let ai_executor = Arc::new(super::ai_job::ContainerRemoteAiExecutor::new(Arc::clone(
             &container_engine,
         )));
@@ -794,6 +800,7 @@ impl ServerGuard {
         let mut startup = ServerStartupWorkers {
             armed: true,
             stop: Arc::clone(&stop),
+            raw_flights,
             listeners: Vec::with_capacity(ACCEPTOR_COUNT),
             workers: Vec::with_capacity(worker_count),
             stream_workers: Vec::with_capacity(STREAM_WORKER_COUNT),
@@ -907,6 +914,7 @@ impl ServerGuard {
         let started = startup.finish();
         Ok(Self {
             stop: started.stop,
+            raw_flights: started.raw_flights,
             listeners: started.listeners,
             workers: started.workers,
             stream_workers: started.stream_workers,
@@ -944,6 +952,7 @@ impl ServerGuard {
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         respond_stopped_works(self.heavy_queue.stop(), "service_stopping");
+        self.raw_flights.stop();
         self.stop.store(true, Ordering::Release);
         for _ in 0..self.listeners.len() {
             poke_listener();
@@ -1112,10 +1121,11 @@ fn worker_loop(
                         request.priority = effective_page_priority(page_job);
                         ServerMessage::Page {
                             id,
-                            response: container_engine.page_with_job_cancel(
+                            response: container_engine.page_with_job_cancel_and_priority(
                                 request,
                                 &context,
                                 Arc::clone(&page_job.cancel),
+                                &|| effective_page_priority(page_job),
                             ),
                         }
                     }
@@ -4249,6 +4259,10 @@ mod tests {
         let startup = ServerStartupWorkers {
             armed: true,
             stop: Arc::new(AtomicBool::new(false)),
+            raw_flights: super::super::raw_flights::RemoteRawFlights::new(
+                Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
+                super::super::raw_flights::RemoteRawFlightPolicy::s2b(),
+            ),
             listeners: Vec::new(),
             workers: Vec::new(),
             stream_workers: Vec::new(),

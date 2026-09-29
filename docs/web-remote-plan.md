@@ -2710,6 +2710,23 @@ Rust 1.94.1 の標準ライブラリ実装も確認した。`stdout().lock()` �
 集約コレクションが使う旧 `/api/image` / `/api/image-info` の URL にも generation を含める。
 session 再取得時の session cache epoch による HTTP cache 分離も従来どおり併用する。
 
+### 14.23 RAW ページとサムネイル (protocol v62, 2026-09-29)
+
+Remote の RAW ページは表示要求時に本体の LibRaw フル現像を待つ。RAW 現像を要する先読みは
+protocol v62 の `RawPrefetchSkipped` を HTTP 204、`X-mIV-Page-Skip: raw-prefetch`、session / generation
+ヘッダ、`no-store` で返す。Web は session / generation を先に検証し、同じ計画中の先読みを抑止する。
+表示需要が付けば即座に前景要求を始める。現像枠不足の `RawCapacity` は 503 `raw_busy` と
+`Retry-After` で返し、`ipc_busy` / `admission_busy` と共に表示需要が続く間だけ回数上限なしで
+再試行する。それ以外の 503 は従来の 3 回上限を守る。表示需要が消えた前景 job は直ちに
+cancel / release し、計画に残る場合は新しい有界の先読み job に戻す。混雑は job ごとに
+`page_congestion` 1 件へ集約して記録する。
+
+Remote RAW サムネイルは half 現像を起こさず、埋め込みプレビューまたは既存 catalog の
+サムネイルを使う。どちらも無ければ protocol v62 の `NoThumbnail` を従来のサムネイル失敗
+応答へ写す。サムネイル専用 IPC admission は heavy の最後の 1 枠を使わない。
+旧 `/api/image` / `/api/image-info` では RAW を非対応とし、集約コレクション・検索・タグの
+画像 entry に address を付けて `/api/page` へ送る。
+
 ## 15. 横長ページの左右分割 (§1.119) をリモートへ (2026-08-25)
 
 本体側の設計は [page-split-plan.md](page-split-plan.md)。本節は**端末側で何が変わるか**だけを決める。

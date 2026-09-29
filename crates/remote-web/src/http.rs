@@ -231,6 +231,7 @@ enum IpcClass {
     Browse,
     Home,
     Heavy,
+    Thumbnail,
     Prefetch,
     Stream,
 }
@@ -296,7 +297,7 @@ impl IpcAdmission {
         };
         // 先読みは all/heavy の最終 1 枠を使用しない。表示要求が queue 待ちではなく
         // admission を即取得できる余地を remote-web 側でも固定する。
-        let all_limit = if matches!(class, IpcClass::Prefetch) {
+        let all_limit = if matches!(class, IpcClass::Prefetch | IpcClass::Thumbnail) {
             self.all.limit - 1
         } else {
             self.all.limit
@@ -308,8 +309,11 @@ impl IpcAdmission {
                 return Err(self.busy());
             }
         };
-        let heavy = if matches!(class, IpcClass::Heavy | IpcClass::Prefetch) {
-            let heavy_limit = if matches!(class, IpcClass::Prefetch) {
+        let heavy = if matches!(
+            class,
+            IpcClass::Heavy | IpcClass::Prefetch | IpcClass::Thumbnail
+        ) {
+            let heavy_limit = if matches!(class, IpcClass::Prefetch | IpcClass::Thumbnail) {
                 self.heavy.limit - 1
             } else {
                 self.heavy.limit
@@ -2686,7 +2690,8 @@ fn api_collection(
     match result {
         Ok(result) => {
             let entry_count = result.value.entries.len();
-            HttpResponse::json(&result.value)
+            collection_payload_for_web(&result.value)
+                .and_then(|payload| HttpResponse::json(&payload))
                 .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
                 .with_header("Cache-Control", "no-store")
                 .with_log_details(json!({
@@ -3039,7 +3044,8 @@ fn api_favorite_search(
                 FavoriteSearchIndexState::Disabled => "disabled",
                 FavoriteSearchIndexState::Unavailable => "unavailable",
             };
-            HttpResponse::json(&result.value)
+            listing_payload_for_web(&result.value, &result.value.listing.entries)
+                .and_then(|payload| HttpResponse::json(&payload))
                 .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
                 .with_header("Cache-Control", "no-store")
                 .with_log_details(json!({
@@ -3142,7 +3148,8 @@ fn api_tag_items(
         Ok(result) => {
             let entry_count = result.value.listing.entries.len();
             let index_state = tag_index_state_name(result.value.state);
-            HttpResponse::json(&result.value)
+            listing_payload_for_web(&result.value, &result.value.listing.entries)
+                .and_then(|payload| HttpResponse::json(&payload))
                 .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
                 .with_header("Cache-Control", "no-store")
                 .with_log_details(json!({
@@ -3554,7 +3561,7 @@ fn api_thumb(
     };
     let source_kind = remote_source_kind(&address);
     let started = Instant::now();
-    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+    let result = match state.ipc_admission.run(IpcClass::Thumbnail, || {
         state.thumbnail_client.thumbnail_address(
             owner,
             address.clone(),
@@ -3750,10 +3757,78 @@ fn api_page(
                     }
                 }))
         }
-        Err(failure) => {
-            media_ipc_error_response(failure, started.elapsed(), "page", Some(target_px))
+        Err(failure) => page_ipc_error_response(
+            failure,
+            started.elapsed(),
+            &remote_state_generation,
+            owner,
+            target_px,
+        ),
+    }
+}
+
+fn collection_payload_for_web(
+    payload: &mimageviewer_ipc::CollectionPayload,
+) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(payload)?;
+    add_collection_entry_addresses(&mut value, &payload.entries);
+    Ok(value)
+}
+
+fn listing_payload_for_web<T: serde::Serialize>(
+    payload: &T,
+    entries: &[mimageviewer_ipc::RemoteEntry],
+) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(payload)?;
+    if let Some(listing) = value.get_mut("listing") {
+        add_collection_entry_addresses(listing, entries);
+    }
+    Ok(value)
+}
+
+fn add_collection_entry_addresses(
+    value: &mut Value,
+    source_entries: &[mimageviewer_ipc::RemoteEntry],
+) {
+    if let Some(entries) = value.get_mut("entries").and_then(Value::as_array_mut) {
+        for (entry, source) in entries.iter_mut().zip(source_entries) {
+            if source.kind == RemoteEntryKind::Image
+                && let Some(object) = entry.as_object_mut()
+            {
+                object.insert(
+                    "address".to_owned(),
+                    json!(RemoteAddress::file(source.path.clone())),
+                );
+            }
         }
     }
+}
+
+fn page_ipc_error_response(
+    failure: crate::ipc_client::ClientFailure,
+    elapsed: Duration,
+    generation: &str,
+    owner: &RemoteSessionIdentity,
+    target_px: u32,
+) -> HttpResponse {
+    if !matches!(&failure.error, IpcClientError::MediaRemote(error) if error.code == MediaErrorCode::RawPrefetchSkipped)
+    {
+        return media_ipc_error_response(failure, elapsed, "page", Some(target_px));
+    }
+    HttpResponse::bytes(204, "text/plain; charset=utf-8", Vec::new())
+        .with_header("X-mIV-Page-Skip", "raw-prefetch")
+        .with_header("X-mIV-Remote-State-Generation", generation)
+        .with_header("X-mIV-Remote-Session", owner.session_id.clone())
+        .with_header("Vary", "X-mIV-Remote-Session")
+        .with_header("Cache-Control", "no-store")
+        .with_log_details(json!({
+            "page": {
+                "ipc_status": "raw_prefetch_skipped",
+                "ipc_ms": crate::diagnostics::duration_ms(elapsed),
+                "ipc_retry_count": failure.retry_count,
+                "ipc_retry_statuses": failure.retry_statuses,
+            }
+        }))
 }
 
 fn api_page_demand(
@@ -3993,6 +4068,11 @@ fn media_ipc_error_response(
                 MediaErrorCode::PasswordRequired => 423,
                 MediaErrorCode::PageOutOfRange => 416,
                 MediaErrorCode::Cancelled => 409,
+                MediaErrorCode::RawPrefetchSkipped => 500,
+                MediaErrorCode::RawCapacity => {
+                    retryable = true;
+                    503
+                }
                 MediaErrorCode::Busy => {
                     retryable = true;
                     503
@@ -4000,7 +4080,15 @@ fn media_ipc_error_response(
                 MediaErrorCode::RenderFailed => 422,
                 MediaErrorCode::Internal => 500,
             };
-            (status, "miv_media_error", error.message)
+            (
+                status,
+                if error.code == MediaErrorCode::RawCapacity {
+                    "raw_busy"
+                } else {
+                    "miv_media_error"
+                },
+                error.message,
+            )
         }
         IpcClientError::Remote(error) => (500, "miv_media_error", error.message),
         IpcClientError::CollectionRemote(error) => (500, "miv_media_error", error.message),
@@ -4136,6 +4224,7 @@ fn ipc_error_response(
                 ThumbnailErrorCode::NotReady => 503,
                 ThumbnailErrorCode::Busy => 503,
                 ThumbnailErrorCode::GenerationFailed => 422,
+                ThumbnailErrorCode::NoThumbnail => 422,
                 ThumbnailErrorCode::PasswordRequired => 423,
                 ThumbnailErrorCode::PageOutOfRange => 416,
                 ThumbnailErrorCode::Internal => 500,
@@ -6706,6 +6795,129 @@ mod tests {
     }
 
     #[test]
+    fn raw_prefetch_skip_has_empty_attested_non_cacheable_response() {
+        let owner = RemoteSessionIdentity {
+            client_id: "client".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        let failure = crate::ipc_client::ClientFailure {
+            error: IpcClientError::MediaRemote(mimageviewer_ipc::MediaError::new(
+                MediaErrorCode::RawPrefetchSkipped,
+                "skipped",
+            )),
+            retry_count: 0,
+            retry_statuses: Vec::new(),
+        };
+        let response = page_ipc_error_response(
+            failure,
+            Duration::from_millis(5),
+            "generation-1",
+            &owner,
+            2048,
+        );
+        assert_eq!(response.status, 204);
+        assert!(response.body.is_empty());
+        for (name, value) in [
+            ("X-mIV-Page-Skip", "raw-prefetch"),
+            ("X-mIV-Remote-State-Generation", "generation-1"),
+            ("X-mIV-Remote-Session", "0123456789abcdef0123456789abcdef"),
+            ("Cache-Control", "no-store"),
+        ] {
+            assert!(
+                response
+                    .headers
+                    .iter()
+                    .any(|(header, found)| *header == name && found == value)
+            );
+        }
+        assert!(
+            !response
+                .headers
+                .iter()
+                .any(|(name, _)| *name == "Retry-After")
+        );
+    }
+
+    #[test]
+    fn raw_capacity_is_retryable_raw_busy_but_existing_busy_keeps_its_name() {
+        for (media_code, expected_code) in [
+            (MediaErrorCode::RawCapacity, "raw_busy"),
+            (MediaErrorCode::Busy, "miv_media_error"),
+        ] {
+            let response = media_ipc_error_response(
+                crate::ipc_client::ClientFailure {
+                    error: IpcClientError::MediaRemote(mimageviewer_ipc::MediaError::new(
+                        media_code, "busy",
+                    )),
+                    retry_count: 0,
+                    retry_statuses: Vec::new(),
+                },
+                Duration::from_millis(5),
+                "page",
+                Some(2048),
+            );
+            assert_eq!(response.status, 503);
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["error"], expected_code);
+            assert!(
+                response
+                    .headers
+                    .iter()
+                    .any(|(name, value)| *name == "Retry-After" && value == "1")
+            );
+        }
+    }
+
+    #[test]
+    fn no_raw_thumbnail_uses_existing_failure_response_with_distinct_log_status() {
+        let response = ipc_error_response(
+            IpcClientError::Remote(mimageviewer_ipc::ThumbnailError::new(
+                mimageviewer_ipc::ThumbnailErrorCode::NoThumbnail,
+                "no thumbnail",
+            )),
+            0,
+            Vec::new(),
+            Duration::from_millis(5),
+            256,
+            "file",
+        );
+        assert_eq!(response.status, 422);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "miv_thumbnail_error");
+        assert_eq!(
+            response.log_details.unwrap()["thumb"]["ipc_status"],
+            "miv_no_thumbnail"
+        );
+    }
+
+    #[test]
+    fn collection_image_entries_publish_addresses_for_raw_page_routing() {
+        let source = mimageviewer_ipc::RemoteEntry {
+            path: "C:/Photos/camera.cr3".to_owned(),
+            thumbnail_address: None,
+            name: "camera.cr3".to_owned(),
+            kind: RemoteEntryKind::Image,
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            rating: None,
+        };
+        let mut value = json!({ "entries": [source] });
+        add_collection_entry_addresses(&mut value, std::slice::from_ref(&source));
+        assert_eq!(
+            value["entries"][0]["address"],
+            json!(RemoteAddress::file("C:/Photos/camera.cr3")),
+        );
+        let nested =
+            listing_payload_for_web(&json!({ "listing": { "entries": [source] } }), &[source])
+                .unwrap();
+        assert_eq!(
+            nested["listing"]["entries"][0]["address"],
+            value["entries"][0]["address"]
+        );
+    }
+
+    #[test]
     fn thumbnail_diagnostics_distinguish_container_source_without_logging_a_path() {
         let zip = RemoteAddress::file("C:/Books/volume.ZIP");
         let pdf = RemoteAddress::file("C:/Books/volume.pdf");
@@ -6814,6 +7026,35 @@ mod tests {
         drop(foreground);
         drop(prefetches);
         drop(existing);
+    }
+
+    #[test]
+    fn thumbnails_keep_the_last_heavy_slot_and_do_not_consume_prefetch_quota() {
+        let admission = IpcAdmission::new();
+        let thumbnails = (0..MAX_CONCURRENT_HEAVY_IPC - 1)
+            .map(|_| admission.try_enter(IpcClass::Thumbnail).unwrap())
+            .collect::<Vec<_>>();
+        assert!(admission.try_enter(IpcClass::Thumbnail).is_err());
+        assert_eq!(admission.prefetch.in_flight(), 0);
+        let foreground = admission.try_enter(IpcClass::Heavy).unwrap();
+        assert!(admission.try_enter(IpcClass::Heavy).is_err());
+        drop(foreground);
+        drop(thumbnails);
+
+        let prefetches = (0..MAX_CONCURRENT_PAGE_PREFETCH - 1)
+            .map(|_| admission.try_enter(IpcClass::Prefetch).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            admission.prefetch.in_flight(),
+            MAX_CONCURRENT_PAGE_PREFETCH - 1
+        );
+        let thumbnail = admission.try_enter(IpcClass::Thumbnail).unwrap();
+        assert_eq!(
+            admission.prefetch.in_flight(),
+            MAX_CONCURRENT_PAGE_PREFETCH - 1
+        );
+        let foreground = admission.try_enter(IpcClass::Heavy).unwrap();
+        drop((prefetches, thumbnail, foreground));
     }
 
     #[test]

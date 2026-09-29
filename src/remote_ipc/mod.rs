@@ -8,6 +8,7 @@ mod long_job;
 mod page_jobs;
 mod path_guard;
 mod persistent_collections;
+mod raw_flights;
 mod service;
 mod thumbnail;
 mod video_jump;

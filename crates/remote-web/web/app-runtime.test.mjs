@@ -131,6 +131,7 @@ const {
   LatestPageLoadQueue,
   PageDemandAdapter,
   PageResourceCache,
+  fetchPageResource,
   PersistentEofTerminalOwner,
   PersistentCollectionNavigationQueue,
   RemoteArchiveOpenController,
@@ -1873,6 +1874,54 @@ function adapterPageRequest(cacheKey) {
   };
 }
 
+test("RAW skip requires session and generation attestation before returning typed skip", async () => {
+  const savedFetch = globalThis.fetch;
+  const headers = {
+    "X-mIV-Page-Skip": "raw-prefetch",
+    "X-mIV-Remote-Session": TEST_SESSION_ID,
+    "X-mIV-Remote-State-Generation": "test-1",
+  };
+  const request = adapterPageRequest("raw-skip");
+  try {
+    globalThis.fetch = async () => new Response(null, { status: 204, headers });
+    assert.deepEqual(await fetchPageResource(request, new AbortController().signal, true), {
+      kind: "skipped",
+    });
+    globalThis.fetch = async () => new Response(null, { status: 204, headers: {
+      ...headers, "X-mIV-Remote-Session": "other",
+    } });
+    await assert.rejects(fetchPageResource(request, new AbortController().signal, true),
+      (error) => error.code === "remote_session_unattested");
+    globalThis.fetch = async () => new Response(null, { status: 204, headers: {
+      "X-mIV-Page-Skip": "raw-prefetch",
+      "X-mIV-Remote-Session": TEST_SESSION_ID,
+    } });
+    await assert.rejects(fetchPageResource(request, new AbortController().signal, true),
+      (error) => error.code === "remote_state_generation_unattested");
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("display congestion retries do not emit per-attempt fetch errors", async () => {
+  const savedFetch = globalThis.fetch;
+  const errors = [];
+  setRuntimeTestErrorObserver((event) => errors.push(event));
+  const request = adapterPageRequest("raw-busy");
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      error: "raw_busy", message: "busy",
+    }), { status: 503, headers: { "Content-Type": "application/json" } });
+    await assert.rejects(fetchPageResource(request, new AbortController().signal, false, () => true));
+    assert.deepEqual(errors, []);
+    await assert.rejects(fetchPageResource(request, new AbortController().signal, false, () => false));
+    assert.equal(errors.filter((event) => event.category === "fetch_non_2xx").length, 1);
+  } finally {
+    globalThis.fetch = savedFetch;
+    setRuntimeTestErrorObserver(null);
+  }
+});
+
 function pendingPageFetch(started) {
   return (request, signal, prefetch) => {
     started.push({ request, signal, prefetch });
@@ -1975,6 +2024,61 @@ test("a planned prefetch promotes once and batches the display identity", async 
 
   adapter.releaseDisplay("reader-1");
   adapter.releaseDisplay("reader-2");
+  adapter.setPlan([]);
+});
+
+test("a skipped prefetch is not retried until display demand starts foreground", async () => {
+  const calls = [];
+  const events = [];
+  const adapter = new PageDemandAdapter({
+    cache: new PageResourceCache(8),
+    wirePrefix: "skip",
+    fetchResource: async (request, _signal, prefetch) => {
+      calls.push({ request, prefetch });
+      return prefetch ? { kind: "skipped" } : {
+        blob: new Blob(["image"]), requestId: "foreground", fetchMs: 1, info: null,
+      };
+    },
+    recordTelemetry: (event) => events.push(event),
+    postDemand: async () => ({}),
+  });
+  const request = adapterPageRequest("raw");
+  adapter.setPlan([request]);
+  await waitForAdapterIdle(adapter);
+  adapter.setPlan([request]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(events.filter((event) => event.type === "page_prefetch"), [
+    { type: "page_prefetch", status: "skip" },
+  ]);
+  adapter.openDisplay({ requestId: "reader", groupKey: "raw", requests: [request] });
+  await adapter.waitForDisplay("reader");
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].prefetch, false);
+  adapter.releaseDisplay("reader");
+  adapter.setPlan([]);
+});
+
+test("a promoted job skipped by core starts a new foreground job", async () => {
+  const first = deferred();
+  const calls = [];
+  const adapter = new PageDemandAdapter({
+    cache: new PageResourceCache(8),
+    wirePrefix: "promoted-skip",
+    fetchResource: (request, _signal, prefetch) => {
+      calls.push({ request, prefetch });
+      return prefetch ? first.promise : Promise.resolve({
+        blob: new Blob(["image"]), requestId: "foreground", fetchMs: 1, info: null,
+      });
+    },
+    postDemand: async () => ({}),
+  });
+  const request = adapterPageRequest("raw-promoted");
+  adapter.setPlan([request]);
+  adapter.openDisplay({ requestId: "reader", groupKey: "raw", requests: [request] });
+  first.resolve({ kind: "skipped" });
+  await adapter.waitForDisplay("reader");
+  assert.deepEqual(calls.map((call) => call.prefetch), [true, false]);
+  adapter.releaseDisplay("reader");
   adapter.setPlan([]);
 });
 
@@ -2287,6 +2391,90 @@ test("a foreground admission retry stops when its own load is aborted", async ()
   await waitForAdapterIdle(adapter);
   assert.equal(attempts, 1);
   cache.clear();
+});
+
+test("display demand retries named congestion beyond three attempts and records one event", async () => {
+  let attempts = 0;
+  const events = [];
+  const adapter = new PageDemandAdapter({
+    cache: new PageResourceCache(4),
+    wirePrefix: "congestion",
+    fetchResource: async () => {
+      attempts += 1;
+      if (attempts <= 5) {
+        const error = new Error("busy");
+        error.status = 503;
+        error.code = attempts % 2 ? "ipc_busy" : "raw_busy";
+        error.retryAfterMs = 1;
+        throw error;
+      }
+      return { blob: new Blob(["image"]), requestId: "ok", fetchMs: 1, info: null };
+    },
+    recordTelemetry: (event) => events.push(event),
+    postDemand: async () => ({}),
+  });
+  adapter.openDisplay({ requestId: "reader", groupKey: "raw", requests: [adapterPageRequest("busy")] });
+  await adapter.waitForDisplay("reader");
+  assert.equal(attempts, 6);
+  assert.equal(events.filter((event) => event.type === "page_congestion").length, 1);
+  assert.equal(events.find((event) => event.type === "page_congestion").retry_count, 5);
+  adapter.releaseDisplay("reader");
+});
+
+test("other HTTP 503 remains bounded at three retries", async () => {
+  for (const code of ["miv_media_error", "ipc_timeout"]) {
+    let attempts = 0;
+    const adapter = new PageDemandAdapter({
+      cache: new PageResourceCache(4),
+      wirePrefix: "bounded",
+      fetchResource: async () => {
+        attempts += 1;
+        const error = new Error("busy");
+        error.status = 503;
+        error.code = code;
+        error.retryAfterMs = 1;
+        throw error;
+      },
+      postDemand: async () => ({}),
+    });
+    adapter.openDisplay({ requestId: code, groupKey: code, requests: [adapterPageRequest(code)] });
+    await assert.rejects(adapter.waitForDisplay(code));
+    assert.equal(attempts, FOREGROUND_ADMISSION_RETRY_LIMIT + 1);
+    adapter.releaseDisplay(code);
+  }
+});
+
+test("last display demand cancels promoted backoff and restarts bounded prefetch", async () => {
+  const firstAttempt = deferred();
+  const started = [];
+  const demandBodies = [];
+  const adapter = new PageDemandAdapter({
+    cache: new PageResourceCache(4),
+    wirePrefix: "restart",
+    fetchResource: (request, signal, prefetch) => {
+      started.push({ request, signal, prefetch });
+      if (started.length === 1) {
+        firstAttempt.resolve();
+        const error = new Error("busy");
+        error.status = 503;
+        error.code = "raw_busy";
+        error.retryAfterMs = 10_000;
+        return Promise.reject(error);
+      }
+      return pendingPageFetch([])(request, signal, prefetch);
+    },
+    postDemand: async (body) => { demandBodies.push(body); },
+  });
+  const request = adapterPageRequest("planned-raw");
+  adapter.setPlan([request]);
+  adapter.openDisplay({ requestId: "reader", groupKey: "raw", requests: [request] });
+  await firstAttempt.promise;
+  adapter.releaseDisplay("reader");
+  await Promise.resolve();
+  assert.equal(started[0].signal.aborted, true);
+  assert.equal(started[1].prefetch, true);
+  assert.deepEqual(demandBodies.at(-1)?.release, [{ job: "restart-j1", cause: "no_demand" }]);
+  adapter.setPlan([]);
 });
 
 test("page demand adapter reports HUD states and refreshes on start settle cancel and evict", async () => {

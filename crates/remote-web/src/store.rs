@@ -640,7 +640,22 @@ fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
 
 fn require_image_file(path: &Path) -> Result<std::fs::Metadata, StoreError> {
     let metadata = std::fs::metadata(path)?;
-    if metadata.is_file() && classify_path(path) == EntryKind::Image {
+    let extension = path.extension().and_then(|value| value.to_str());
+    if metadata.is_file()
+        && extension.is_some_and(|extension| {
+            REMOTE_RAW_EXTENSIONS
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+    {
+        return Err(StoreError::Decode);
+    }
+    let legacy_extension = extension.is_some_and(|extension| {
+        image_support::SUPPORTED_IMAGE_EXTENSIONS
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    });
+    if metadata.is_file() && legacy_extension {
         Ok(metadata)
     } else {
         Err(StoreError::NotFound)
@@ -679,7 +694,9 @@ pub fn classify_entry(name: &str, is_dir: bool, is_file: bool) -> EntryKind {
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
 
-    if image_support::SUPPORTED_IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+    if image_support::SUPPORTED_IMAGE_EXTENSIONS.contains(&extension.as_str())
+        || REMOTE_RAW_EXTENSIONS.contains(&extension.as_str())
+    {
         EntryKind::Image
     } else if image_support::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()) {
         EntryKind::Video
@@ -693,6 +710,13 @@ pub fn classify_entry(name: &str, is_dir: bool, is_file: bool) -> EntryKind {
         EntryKind::Other
     }
 }
+
+// Remote-web cannot depend on the core crate's raw_format module. This list is used only to
+// classify and validate addressed entries; legacy decoding uses SUPPORTED_IMAGE_EXTENSIONS.
+pub(crate) const REMOTE_RAW_EXTENSIONS: &[&str] = &[
+    "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx",
+    "rwl", "iiq", "crw", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mos",
+];
 
 #[cfg(test)]
 mod tests {
@@ -718,6 +742,32 @@ mod tests {
         assert_eq!(classify_entry("a.pdf", false, true), EntryKind::Pdf);
         assert_eq!(classify_entry("notes.txt", false, true), EntryKind::Other);
         assert_eq!(classify_entry("a.jpg", false, false), EntryKind::Other);
+    }
+
+    #[test]
+    fn raw_files_are_addressed_images_but_not_legacy_decode_inputs() {
+        assert_eq!(REMOTE_RAW_EXTENSIONS.len(), 23);
+        for extension in REMOTE_RAW_EXTENSIONS {
+            assert!(!image_support::SUPPORTED_IMAGE_EXTENSIONS.contains(extension));
+            assert_eq!(
+                classify_entry(&format!("camera.{extension}"), false, true),
+                EntryKind::Image
+            );
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let library = Library::empty_for_test(temp.path().join("cache"));
+        let raw = temp.path().join("camera.cr3");
+        std::fs::write(&raw, b"raw fixture").unwrap();
+        let path = raw.to_string_lossy().into_owned();
+        let address = RemoteAddress::file(path.clone());
+        assert!(library.validate_remote_file_image(&address).is_ok());
+        assert!(
+            library
+                .validate_remote_file_kind(&address, RemoteEntryKind::Image)
+                .is_ok()
+        );
+        assert!(matches!(library.image_info(&path), Err(StoreError::Decode)));
+        assert!(matches!(library.image(&path, 256), Err(StoreError::Decode)));
     }
 
     #[test]
