@@ -3049,6 +3049,10 @@ impl App {
                 .copied()
                 .find(|&i| is_fullscreen_target(self.items.get(i)));
             if let Some(idx) = image_idx {
+                #[cfg(windows)]
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
+                }
                 self.open_fullscreen_from_fs_navigation(
                     ctx,
                     idx,

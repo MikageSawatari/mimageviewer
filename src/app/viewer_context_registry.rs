@@ -4150,6 +4150,16 @@ impl App {
         })
         .expect("test window viewer context build must commit")
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_window_context_for_test<R>(
+        &mut self,
+        id: ViewerContextId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_viewer_context(id, f)
+            .expect("test window viewer context must mount")
+    }
     pub(in crate::app) fn push_window_context_for_test(
         &mut self,
         ctx: &egui::Context,

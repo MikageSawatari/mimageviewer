@@ -1544,6 +1544,8 @@ impl App {
             if continuation_is_current
                 && pending.accumulate_manual(delta, landing, still_only, display_unit_step)
             {
+                #[cfg(windows)]
+                self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
                 let sequence = self
                     .top_level_grid_view
                     .advance_collection_navigation_sequence();
@@ -1558,6 +1560,8 @@ impl App {
         let Some(mut origin) = self.collection_root_navigation_origin(fs_idx, true) else {
             return false;
         };
+        #[cfg(windows)]
+        self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
         let delta = if display_unit_step
             && origin
                 .anchor
@@ -1710,6 +1714,8 @@ impl App {
             .top_level_grid_view
             .accumulate_collection_outer_navigation(true, forward)
         {
+            #[cfg(windows)]
+            self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
             let sequence = self
                 .top_level_grid_view
                 .advance_collection_navigation_sequence();
@@ -1727,6 +1733,8 @@ impl App {
         let Some(mut origin) = self.collection_outer_navigation_origin(Some(fs_idx)) else {
             return false;
         };
+        #[cfg(windows)]
+        self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
         origin.intent_sequence = self
             .top_level_grid_view
             .advance_collection_navigation_sequence();

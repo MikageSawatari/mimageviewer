@@ -53058,6 +53058,94 @@ mod native_video_rating_key_tests {
     }
 
     #[test]
+    fn native_seek_preview_menu_event_updates_size_independently_in_each_viewer_context() {
+        use crate::settings::VideoSeekPreviewSize;
+        use crate::video::NativeVideoOutputEvent;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let original_height = app.settings.video_seek_strip_height;
+        let path = PathBuf::from(r"C:\clips\preview-main.mp4");
+        let idx = push_video(&mut app, path.clone());
+        let player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        let source_epoch = player.native_source_epoch().unwrap();
+        let generation = player.native_committed_generation().unwrap_or(0).max(1);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch,
+            NativeVideoOutputEvent::SetSeekPreviewSize {
+                size: VideoSeekPreviewSize::Medium,
+                generation,
+                expected: None,
+            },
+        );
+        assert_eq!(
+            app.settings.video_seek_preview_size,
+            VideoSeekPreviewSize::Medium
+        );
+        assert_eq!(
+            app.native_bar_lock_state().seek_preview_size,
+            VideoSeekPreviewSize::Medium
+        );
+        assert_eq!(app.settings.video_seek_strip_height, original_height);
+
+        let other = app.build_window_context_for_test(903, |mounted| {
+            let path = PathBuf::from(r"C:\clips\preview-second.mp4");
+            let idx = push_video(mounted, path.clone());
+            let player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+            mounted.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            mounted.fullscreen_idx = Some(idx);
+        });
+        app.with_viewer_context(other, |mounted| {
+            let idx = mounted.fullscreen_idx.unwrap();
+            let (source_epoch, generation) = match mounted.fs_cache.get(&idx).unwrap() {
+                FsCacheEntry::Video { player, .. } => (
+                    player.native_source_epoch().unwrap(),
+                    player.native_committed_generation().unwrap_or(0).max(1),
+                ),
+                _ => unreachable!(),
+            };
+            mounted.handle_native_video_output_event(
+                &ctx,
+                idx,
+                source_epoch,
+                NativeVideoOutputEvent::SetSeekPreviewSize {
+                    size: VideoSeekPreviewSize::Small,
+                    generation,
+                    expected: None,
+                },
+            );
+            assert_eq!(
+                mounted.settings.video_seek_preview_size,
+                VideoSeekPreviewSize::Small
+            );
+            assert_eq!(mounted.settings.video_seek_strip_height, original_height);
+        })
+        .unwrap();
+        assert_eq!(
+            app.settings.video_seek_preview_size,
+            VideoSeekPreviewSize::Small
+        );
+        assert_eq!(app.settings.video_seek_strip_height, original_height);
+    }
+
+    #[test]
     fn hidden_native_video_does_not_toggle_mode_owned_by_egui_music_view() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -54071,6 +54159,155 @@ mod still_window_mode_key_tests {
         path: &str,
     ) -> crate::app::normalize::NormalizeTargetKey {
         crate::app::normalize::NormalizeTargetKey::new(fs_idx, PathBuf::from(path), 1)
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_scan_navigation_cancels_before_resolution_and_discards_ready_result() {
+        use crate::video::normalize_types::{NormalizeResult, NormalizeUiState};
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_path = app.tmp.path().join("scan-nav-old.mp4");
+        let next_path = app.tmp.path().join("scan-nav-next.mp4");
+        std::fs::write(&old_path, b"old video").unwrap();
+        std::fs::write(&next_path, b"next video").unwrap();
+        let old_idx = push_video(&mut app, old_path.to_str().unwrap());
+        let next_idx = push_video(&mut app, next_path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            old_idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(old_idx);
+        app.selected = Some(old_idx);
+        app.settings.audio_normalize_enabled = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut scan = normalize_scan_state_for_test(old_idx, old_path.clone());
+        scan.owner_context_id = app.projected_viewer_context_id();
+        scan.was_playing = false;
+        scan.rx = rx;
+        let cancel = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+        app.normalize_ui_states.insert(
+            crate::app::normalize::NormalizeTargetKey::new(old_idx, old_path.clone(), 1),
+            NormalizeUiState::Scanning,
+        );
+        // Model a worker whose Done was queued before navigation but not yet polled.
+        tx.send(crate::app::normalize::NormalizeMessage::Done(
+            NormalizeResult {
+                gain_db: -6.0,
+                integrated_lufs: -20.0,
+                true_peak_db: -5.0,
+                target_lufs_milli: -14_000,
+            },
+        ))
+        .unwrap();
+
+        let key = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key: 0x26,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        app.handle_native_video_key_event(&ctx, old_idx, key); // Up at the first item
+        app.handle_native_video_key_event(
+            &ctx,
+            old_idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                virtual_key: 0x24, // Home at the first item
+                ..key
+            },
+        );
+        app.handle_native_video_key_event(
+            &ctx,
+            old_idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                ctrl: true,
+                repeat: true, // repeated folder key is not accepted
+                ..key
+            },
+        );
+        assert!(
+            app.normalize_state.is_some(),
+            "no-target keys keep scanning"
+        );
+        assert!(!cancel.load(Ordering::Acquire));
+        // Down is the default VideoNextFile action; the native key gate must admit it while
+        // Scanning is still modal, before the normal navigation owner resolves the target.
+        app.handle_native_video_key_event(
+            &ctx,
+            old_idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                virtual_key: 0x28,
+                ..key
+            },
+        );
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(
+            app.normalize_state.is_none(),
+            "cancel must precede target resolution"
+        );
+        app.poll_normalize_scan(&ctx);
+        assert!(
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .lookup(&old_path, -14_000, 1, Some(1))
+                .is_none(),
+            "retired scan result must not be saved"
+        );
+        poll_media_navigation_until_done_for_test(&mut app, &ctx);
+        assert_eq!(app.fullscreen_idx, Some(next_idx));
+        assert!(
+            app.audio_normalize_db
+                .as_ref()
+                .unwrap()
+                .lookup(&next_path, -14_000, 1, Some(1))
+                .is_none(),
+            "old result must not be applied to the destination"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_navigation_keeps_another_viewer_context_scan() {
+        use std::sync::atomic::Ordering;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("other-window-scan.mp4");
+        std::fs::write(&path, b"other window").unwrap();
+        let idx = push_video(&mut app, path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        let mut scan = normalize_scan_state_for_test(idx, path);
+        scan.owner_context_id = ViewerContextId::for_test(999);
+        let cancel = scan.cancel.clone();
+        app.normalize_state = Some(scan);
+
+        app.cancel_normalize_scan_for_navigation(&ctx, idx);
+        assert!(!cancel.load(Ordering::Acquire));
+        assert!(app.normalize_state.is_some());
     }
 
     #[test]

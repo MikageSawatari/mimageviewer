@@ -410,6 +410,10 @@ overlay / layout まで同期し、「バー非固定 + ストリップ固定」
 points を運ぶ。高さと5段階値の正本は overlay が持ち (`NativeBarLockState` で届く)、帯の矩形・
 セル寸法・波形ラスタの要求・左右パネルの hover band も同じ `VideoSeekGeometry` / `SeekStripLayout`
 から解決する ([video-seek-strip-plan.md](video-seek-strip-plan.md) の「全体表示と高さ」)。
+下部 HUD のストリップボタンのメニューは表示・高さに加えて、シーク位置プレビューの大きさを
+独立した 5 段階から選べる。高さとプレビューの各段階は保存済みの px 値を表示し、プレビュー選択は
+`SetSeekPreviewSize` を `SetSeekStripHeight` と同じ source 世代・strip session 照合経路で App へ返す。
+App は設定を保存し、`NativeBarLockState` で現在の presenter へ新しいプレビュー値を送る。
 要求高さが viewport に収まらない場合は下部 controls、固定上部、strip、残余の固定 gap の順に
 実効量を解き、hover で同時表示される上部 54pt と下部バーの間に strip を収める。正の領域では
 notice と範囲文字も実寸に合わせて連続的に縮小・省略し、strip 本体の clip 内へ収める。0 領域では
@@ -3211,6 +3215,14 @@ open / source swap、fullscreen 終了、または全体 OFF で解除する。
 この段階は確定値待ちのバックグラウンド scan として扱い、キー入力 / seek / deferred-play
 経路でモーダル blocker や `audio_preroll_suspended` を再度立てない。確定 gain への差分は
 audio-pump の 4 秒 ramp で追従する。
+仮 gain 適用前のモーダル段階でも、前後の動画・項目・フォルダへの移動は受け付ける。
+native keymap の上下・Home/End・フォルダ移動、ゲームパッド、HUD の前後ボタン、通常ホイール、
+音声表示の前後ボタンは既存の移動経路へ合流する。移動要求は対象の非同期解決より先に、
+所有 viewer context と player の path / fs_idx / stream が一致する scan を cancel し、
+receiver を破棄する。したがって先に worker が送った Done も DB 保存・移動先への適用はしない。
+別窓が所有する scan は変更しない。移動先で測定値が必要なら通常の open 経路から新しい scan を始める。
+scan 中の全操作をモーダルに留める案は移動を待たせるため採らず、移動以外の再生・シーク・編集は
+従来のモーダル条件を維持する。専用の再開・巻き戻し状態は設けない。
 10 分未満の動画や、10 分時点で loudness がまだ有効でない動画は従来通り確定結果まで待つ。
 キャッシュ hit の動画を grid から再開する場合や、停止中の未測定動画をクリック / Enter で
 再生する場合も同じ deferred-play scan 経路を使う。

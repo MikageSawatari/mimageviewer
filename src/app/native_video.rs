@@ -5416,6 +5416,7 @@ impl App {
             | Ev::CommitSeekStrip { .. }
             | Ev::SetSeekStripView { .. }
             | Ev::SetSeekStripHeight { .. }
+            | Ev::SetSeekPreviewSize { .. }
             | Ev::StepSeekStripRange { .. }
             | Ev::ToggleTileMode
             | Ev::TogglePerfOverlay
@@ -6071,6 +6072,9 @@ impl App {
                     delta,
                 )) => self.navigate_native_video_fullscreen(ctx, fs_idx, delta),
                 Some(crate::ring_shortcut::VideoNormalWheelResolvedAction::VolumeStep(step)) => {
+                    if self.normalize_scan_is_modal_for_current_player(fs_idx) {
+                        return;
+                    }
                     let new_volume = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
                         FsCacheEntry::Video { player, .. } => {
                             let volume = crate::settings::step_video_volume_by_fader_key_step(
@@ -6217,6 +6221,18 @@ impl App {
                 if self.set_video_seek_strip_height(fs_idx, height) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::SetSeekPreviewSize {
+                size,
+                generation,
+                expected,
+            } => {
+                if !self.seek_strip_expected_session_is_current(fs_idx, generation, expected) {
+                    return;
+                }
+                if self.set_video_seek_preview_size(fs_idx, size) {
+                    self.mark_native_video_hud_activity(ctx);
                 }
             }
             crate::video::NativeVideoOutputEvent::StepSeekStripRange { steps, stamp } => {
@@ -6904,6 +6920,13 @@ impl App {
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel) => {
                 self.mark_native_video_hud_activity(ctx);
+                if self.normalize_scan_is_modal_for_current_player(fs_idx) {
+                    if !wheel.ctrl {
+                        let delta = if wheel.delta < 0 { 1 } else { -1 };
+                        self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
+                    }
+                    return;
+                }
                 if self.apply_native_video_panorama_wheel(ctx, fs_idx, i32::from(wheel.delta)) {
                     return;
                 }
@@ -7484,6 +7507,24 @@ impl App {
     /// take() で state を捨てて新規スキャン即開始可能にする。
     #[cfg(windows)]
     pub(crate) fn handle_cancel_normalize_scan(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        self.cancel_normalize_scan(ctx, fs_idx, "user_cancelled");
+    }
+
+    /// A navigation request retires the scan before asynchronous target resolution. Dropping the
+    /// receiver is essential: a completed worker result must not reach the DB write in poll.
+    #[cfg(windows)]
+    pub(crate) fn cancel_normalize_scan_for_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        if self.normalize_scan_matches_current_player(fs_idx) {
+            self.cancel_normalize_scan(ctx, fs_idx, "navigation");
+        }
+    }
+
+    #[cfg(windows)]
+    fn cancel_normalize_scan(&mut self, ctx: &egui::Context, fs_idx: usize, reason: &'static str) {
         let should_drop = self
             .normalize_state
             .as_ref()
@@ -7498,7 +7539,7 @@ impl App {
                 state.fs_idx,
                 &state.file_path,
                 "normalize_scan_terminal",
-                "user_cancelled",
+                reason,
                 state.provisional_result.map(|result| result.gain_db),
             );
             self.normalize_auto_scan_suppressed.insert(
@@ -10354,6 +10395,24 @@ impl App {
         true
     }
 
+    #[cfg(windows)]
+    pub(crate) fn set_video_seek_preview_size(
+        &mut self,
+        fs_idx: usize,
+        size: crate::settings::VideoSeekPreviewSize,
+    ) -> bool {
+        if self.settings.video_seek_preview_size == size {
+            return false;
+        }
+        self.settings.video_seek_preview_size = size;
+        self.settings.save();
+        let bar_lock = self.native_bar_lock_state();
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_bar_lock_state(bar_lock);
+        }
+        true
+    }
+
     /// 全体表示のあいだ、軸と中心を帯の実寸へ追随させる。
     #[cfg(windows)]
     fn sync_video_seek_strip_whole_span(&mut self) -> bool {
@@ -12214,11 +12273,27 @@ impl App {
                 );
             }
         }
-        // 仮 gain 適用前のノーマライズスキャンはモーダル動作のため、ESC (cancel)
-        // 以外のキー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を
-        // 全て遮断する。ProvisionalApplied 後のバックグラウンド scan 中は通常操作を許す。
+        // The scan blocks playback/seek/edit commands until provisional gain arrives. A file or
+        // folder navigation is admitted through the modal gate. The accepted navigation path
+        // retires the scan before resolving its target. Gamepad directions use this handler.
+        let navigation_key = [KeyAction::VideoPrevFile, KeyAction::VideoNextFile]
+            .into_iter()
+            .any(|action| self.keymap.matches_vk_action(action, &key))
+            || (!key.repeat
+                && [
+                    KeyAction::FsJumpFirst,
+                    KeyAction::FsJumpLast,
+                    KeyAction::FsCtrlNavPrev,
+                    KeyAction::FsCtrlNavNext,
+                    KeyAction::FsSiblingPrev,
+                    KeyAction::FsSiblingNext,
+                ]
+                .into_iter()
+                .any(|action| self.keymap.matches_vk_action(action, &key)));
+        // Other keys remain modal; Escape still cancels the scan without navigating.
         if self.normalize_scan_is_modal_for_current_player(fs_idx)
             && !(key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt)
+            && !navigation_key
         {
             return NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::NormalizeModal);
         }
@@ -14616,6 +14691,7 @@ impl App {
             ) {
                 return;
             }
+            self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
             self.native_video_deferred_nav_delta = Some(base_delta);
             return;
         }
@@ -15202,6 +15278,11 @@ impl App {
         ignore_resume: bool,
         history_trigger: crate::app::HistoryTrigger,
     ) {
+        if let Some(current_idx) = self.fullscreen_idx
+            && current_idx != idx
+        {
+            self.cancel_normalize_scan_for_navigation(ctx, current_idx);
+        }
         self.sync_main_selection_from_viewer_idx(idx);
 
         // 7e: VST ホスト表示中に native ナビ (native HUD の前後ファイル / NavigateItem / wheel) で別

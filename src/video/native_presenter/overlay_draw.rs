@@ -3971,6 +3971,7 @@ pub(super) fn draw_native_normalize_progress(
     overlay_width_points: f32,
     overlay_height_points: f32,
     progress: &crate::video::normalize_types::NormalizeProgressSnapshot,
+    file_nav_rects: Option<[egui::Rect; 2]>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     egui::Area::new(egui::Id::new("native_video_normalize_progress"))
@@ -3998,7 +3999,11 @@ pub(super) fn draw_native_normalize_progress(
             );
             // 中央パネル
             let panel_w = 420.0_f32;
-            let panel_h = 110.0_f32;
+            let panel_h = if file_nav_rects.is_some() {
+                110.0
+            } else {
+                150.0
+            };
             let panel_rect =
                 egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
             painter.rect_filled(
@@ -4079,6 +4084,48 @@ pub(super) fn draw_native_normalize_progress(
             let cancel_resp = cancel_resp.hover_tip_dark("キャンセル [ESC]");
             if cancel_resp.clicked() || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
                 commands.push(NativeOverlayCommand::CancelNormalizeScan);
+            }
+            // The modal owns pointer input. Recreate only the two file-navigation controls above
+            // its blocker, at the HUD positions when available and inside the panel otherwise.
+            // Both positions emit the ordinary NavigateItem command.
+            let nav_rects = file_nav_rects.unwrap_or_else(|| {
+                let size = egui::vec2(104.0, 28.0);
+                let y = panel_rect.max.y - size.y - 9.0;
+                [
+                    egui::Rect::from_min_size(
+                        egui::pos2(panel_rect.center().x - size.x - 6.0, y),
+                        size,
+                    ),
+                    egui::Rect::from_min_size(egui::pos2(panel_rect.center().x + 6.0, y), size),
+                ]
+            });
+            for (direction, rect, label) in [
+                (-1, nav_rects[0], "前の項目"),
+                (1, nav_rects[1], "次の項目"),
+            ] {
+                let response = ui.interact(
+                    rect,
+                    egui::Id::new(("native_video_normalize_file_nav", direction)),
+                    egui::Sense::click(),
+                );
+                draw_overlay_button_bg(&painter, rect, response.hovered(), false);
+                if file_nav_rects.is_some() {
+                    draw_overlay_arrow_icon(&painter, rect, direction);
+                } else {
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::WHITE,
+                    );
+                }
+                if response.hover_tip_dark(label).clicked() {
+                    commands.push(NativeOverlayCommand::NavigateItem {
+                        delta: direction,
+                        via_wheel: false,
+                    });
+                }
             }
         });
 }

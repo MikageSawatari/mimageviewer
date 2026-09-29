@@ -31541,6 +31541,10 @@ impl App {
         if !landed {
             return false;
         }
+        #[cfg(windows)]
+        if let Some(ctx) = sequence_ctx {
+            self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
+        }
         self.zip_nav = Some(probe);
         // 移動確定 → holdover を取ってから items を差し替える。
         if let Some(ctx) = sequence_ctx {
@@ -81565,6 +81569,10 @@ impl App {
             fs_idx,
             delta,
         );
+        #[cfg(windows)]
+        if !candidates.is_empty() {
+            self.cancel_normalize_scan_for_navigation(ctx, fs_idx);
+        }
         self.start_media_navigation_candidate_resolution(
             ctx,
             candidates,
