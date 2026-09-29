@@ -35,6 +35,13 @@ struct SnapshotViewerIndexSwap {
     last_sync_stamp_existed: bool,
 }
 
+#[derive(Clone, Copy)]
+enum SnapshotSubfolderRestoreSlot {
+    FavSearch,
+    GlobalSearch,
+    Expansion,
+}
+
 impl App {
     #[cfg(windows)]
     fn remap_snapshot_native_pending_indices(&mut self, old_to_new: &HashMap<usize, usize>) {
@@ -871,57 +878,89 @@ impl App {
         }
     }
 
+    fn snapshot_subfolder_restore_slot(
+        &self,
+        snap: &SnapshotState,
+        path: Option<&Path>,
+    ) -> Option<SnapshotSubfolderRestoreSlot> {
+        let path = path?;
+        if !crate::folder_tree::path_eq(path, &super::subfolder_expansion_synthetic_path()) {
+            return None;
+        }
+        Some(match &snap.source_label {
+            SnapshotSourceLabel::FavSearch { .. } if self.favsearch_subfolder_restore.is_some() => {
+                SnapshotSubfolderRestoreSlot::FavSearch
+            }
+            SnapshotSourceLabel::GlobalSearch { .. }
+                if self.global_search_subfolder_restore.is_some() =>
+            {
+                SnapshotSubfolderRestoreSlot::GlobalSearch
+            }
+            _ => SnapshotSubfolderRestoreSlot::Expansion,
+        })
+    }
+
     pub(crate) fn snapshot_return_context_without_restore(
         &self,
     ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
         let snap = self.snapshot.as_ref()?;
-        if let Some(return_to) = self.top_level_grid_view.return_to() {
-            return Some(return_to.clone());
-        }
-        let path = self.snapshot_fallback_path(snap);
-        let subfolder_restore = if path.as_deref().is_some_and(|path| {
-            crate::folder_tree::path_eq(path, &super::subfolder_expansion_synthetic_path())
-        }) {
-            match &snap.source_label {
-                SnapshotSourceLabel::FavSearch { .. } => self.favsearch_subfolder_restore.clone(),
-                SnapshotSourceLabel::GlobalSearch { .. } => {
-                    self.global_search_subfolder_restore.clone()
-                }
-                _ => None,
-            }
-            .or_else(|| self.subfolder_expansion_restore_for_synthetic_path(path.as_deref()))
-        } else {
-            None
-        };
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        Some(self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars))
+        Some(
+            self.view_return_context_from_canonical_or_fallback(
+                self.top_level_grid_view
+                    .return_to()
+                    .map(std::borrow::Cow::Borrowed),
+                || {
+                    let path = self.snapshot_fallback_path(snap);
+                    let subfolder_restore =
+                        match self.snapshot_subfolder_restore_slot(snap, path.as_deref()) {
+                            Some(SnapshotSubfolderRestoreSlot::FavSearch) => {
+                                self.favsearch_subfolder_restore.clone()
+                            }
+                            Some(SnapshotSubfolderRestoreSlot::GlobalSearch) => {
+                                self.global_search_subfolder_restore.clone()
+                            }
+                            Some(SnapshotSubfolderRestoreSlot::Expansion) => {
+                                self.subfolder_expansion_restore_for_synthetic_path(path.as_deref())
+                            }
+                            None => None,
+                        };
+                    (path, subfolder_restore)
+                },
+            ),
+        )
     }
 
     pub(crate) fn dismiss_snapshot_without_restore(
         &mut self,
     ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
-        let return_context = self.snapshot_return_context_without_restore()?;
         let snap = self.snapshot.take()?;
         let _ = self.restore_rating_filter_suppression();
         // Canonical return_to がある間は fallback slot を consume しない。検索由来 snapshot
         // を fork した sibling が、それぞれ自分の restore payload を保持できるようにする。
-        if self.top_level_grid_view.take_return_to().is_some() {
-            self.show_feedback_toast("★固定を解除しました".into());
-            return Some(return_context);
-        }
-        let path = self.snapshot_fallback_path(&snap);
-        if path.as_deref().is_some_and(|path| {
-            crate::folder_tree::path_eq(path, &super::subfolder_expansion_synthetic_path())
-        }) {
-            match snap.source_label {
-                SnapshotSourceLabel::FavSearch { .. } => self.favsearch_subfolder_restore.take(),
-                SnapshotSourceLabel::GlobalSearch { .. } => {
-                    self.global_search_subfolder_restore.take()
-                }
-                _ => None,
-            }
-            .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
-        }
+        let canonical = self.top_level_grid_view.take_return_to();
+        let (path, subfolder_restore) = if canonical.is_none() {
+            let path = self.snapshot_fallback_path(&snap);
+            let subfolder_restore =
+                match self.snapshot_subfolder_restore_slot(&snap, path.as_deref()) {
+                    Some(SnapshotSubfolderRestoreSlot::FavSearch) => {
+                        self.favsearch_subfolder_restore.take()
+                    }
+                    Some(SnapshotSubfolderRestoreSlot::GlobalSearch) => {
+                        self.global_search_subfolder_restore.take()
+                    }
+                    Some(SnapshotSubfolderRestoreSlot::Expansion) => {
+                        self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref())
+                    }
+                    None => None,
+                };
+            (path, subfolder_restore)
+        } else {
+            (None, None)
+        };
+        let return_context = self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        );
         self.show_feedback_toast("★固定を解除しました".into());
         Some(return_context)
     }

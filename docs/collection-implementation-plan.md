@@ -1631,6 +1631,8 @@ retained thumbnail payloadの最終dropは既存のpayload退役workerへ移す�
 
 `return_to` の捕捉は、Search / Snapshot の `return_to` が無い場合も従来の `saved_folder`・検索前フォルダ・サブフォルダ展開状態からの fallback を含める。Snapshot → お気に入り検索 → 全体検索 → タグの退場順で最後の有効な戻り先を優先し、先行する退場が canonical `return_to` を消費した後は後続の fallback を使う。各退場処理と Collection の入口は同じ副作用のない計算関数を使う。退場は移管後に一度だけ行い、Collection には移管前に確定した値を渡す。
 
+通常の Search / Snapshot 退場は復帰状態の所有値を move する。Collection の移管前捕捉だけが戻り先の判定に必要な fallback を読み取り、必要な場合に複製する。canonical 優先規則は共有するため、通常退場でサブフォルダ展開の動画サムネイル対応表・除外パス集合を余計にコピーしない。
+
 同一 Collection root を fullscreen で閲覧中の更新だけは、現行 surface / Root 位置、installed items 世代、prepared の Collection ID・採用済み revision・行数、fullscreen index を一つの binding 判定で確認する。成立すれば `begin` と空 items install を避け、既存 session の `cancel_pending` が保持する installed snapshot と旧 items 世代を viewer が閉じるまで使う。別 Collection または物理子から root への移動にはこの例外を適用しない。
 
 明示 Open は従来どおり、可視採用直後に読み込み中を示して履歴を記録し、actor / prepare 失敗時は main に失敗表示を残す。履歴 replay は offscreen 準備の成功後にだけ移管・採用・履歴確定し、失敗・取消では旧表示と履歴を維持する。追加の rollback / supersession 状態は設けない。長い処理をモーダルにする案は、準備中も操作できる Collection の既存動作を狭め、context 所有を直さないため採用しなかった。別窓を閉じて開き直す案は再生継続を失うため採用しなかった。

@@ -1465,6 +1465,8 @@ Collection の明示 Open、物理子から root への復帰、offscreen 履歴
 
 実装レビュー P2 の追補: `src/app/collection_grid.rs` の移管前 `return_to` 捕捉が Search / Snapshot の退場 fallback を落としていた。`src/global_search_ui.rs`、`src/app.rs`、`src/app/snapshot_ops.rs` の退場処理から戻り先計算を副作用のない関数へ切り出し、Collection 入口もそれを使う。`src/app/subfolder_expansion.rs` は合成 path の復帰状態を読む条件と take 条件を共有する。移管前に従来の退場順と canonical `return_to` の消費を再現して戻り先を確定し、退場処理は一度だけ走らせる。別窓 media の所有境界と detached viewport / host / placement は変更しない。通常 Open・別窓動画 Open × Search・Snapshot の回帰テストは d3f7e9c79 で失敗することを確認し、Snapshot とタグ表示が重なる場合の最後の fallback も検証した。
 
+再確認 P2 の追補: 戻り先の優先規則は共有したまま、通常の Search / Snapshot 退場では saved folder、canonical `return_to`、サブフォルダ展開の復帰状態を所有元から move する。Collection 移管前の読み取りだけが必要な fallback を複製し、transient から戻り先が決まれば現在 surface の復帰状態を余分に複製しない。これにより通常の検索終了時に動画サムネイル対応表や除外パス集合を同期コピーしない。移管・detached の所有境界は変えず、通常 Open・別窓動画 Open × Search・Snapshot の回帰テストを維持する。
+
 **2026-09-29 Smart Folder PDF 可視採用の共通後片付け**
 
 Smart Folder の PDF warm placeholder と準備済み pages は、Smart child session の採用後に通常 PDF と同じ `prepare_pdf_visible_adoption` を通す。既存の detached image window 退避判定を含む後片付けを page rows の install 前に一度だけ行い、列挙検証時は繰り返さない。detached の述語・viewport・window lifecycle の実装は変更せず、Smart 経路の可視採用を既存の所有境界へ合流させた。

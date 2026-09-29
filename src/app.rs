@@ -21234,6 +21234,25 @@ impl App {
         )
     }
 
+    /// Resolve a transient view's canonical return before consulting its legacy fallback.
+    /// Borrowed inputs are used by Collection's pre-transfer read; dismissal supplies moved
+    /// ownership, so normal close never clones a subfolder expansion restore payload.
+    pub(crate) fn view_return_context_from_canonical_or_fallback<'a>(
+        &self,
+        canonical: Option<std::borrow::Cow<'a, top_level_grid_view::TopLevelGridRestore>>,
+        fallback: impl FnOnce() -> (
+            Option<PathBuf>,
+            Option<subfolder_expansion::SubfolderExpansionRestoreState>,
+        ),
+    ) -> top_level_grid_view::TopLevelGridRestore {
+        if let Some(return_to) = canonical {
+            return return_to.into_owned();
+        }
+        let (path, subfolder_restore) = fallback();
+        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
+        self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars)
+    }
+
     pub(crate) fn current_top_level_restore_snapshot(
         &self,
     ) -> Option<top_level_grid_view::TopLevelGridRestore> {
@@ -26626,23 +26645,20 @@ impl App {
         &self,
         canonical_return_to: Option<&top_level_grid_view::TopLevelGridRestore>,
     ) -> top_level_grid_view::TopLevelGridRestore {
-        if let Some(return_to) = canonical_return_to {
-            return return_to.clone();
-        }
-        let path = self.favsearch.saved_folder.clone();
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        self.view_return_context_from_parts(
-            path,
-            self.favsearch_subfolder_restore.clone(),
-            rating_view_stars,
+        self.view_return_context_from_canonical_or_fallback(
+            canonical_return_to.map(std::borrow::Cow::Borrowed),
+            || {
+                (
+                    self.favsearch.saved_folder.clone(),
+                    self.favsearch_subfolder_restore.clone(),
+                )
+            },
         )
     }
 
     pub(crate) fn dismiss_favsearch_without_restore(
         &mut self,
     ) -> top_level_grid_view::TopLevelGridRestore {
-        let return_context =
-            self.favsearch_return_context_without_restore(self.top_level_grid_view.return_to());
         self.cancel_pending_folder_nav();
         self.favsearch.active = false;
         self.favsearch.has_focus = false;
@@ -26653,10 +26669,13 @@ impl App {
         if let Some(pending) = self.favsearch_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        self.favsearch.saved_folder.take();
-        self.favsearch_subfolder_restore.take();
-        self.top_level_grid_view.take_return_to();
-        return_context
+        let path = self.favsearch.saved_folder.take();
+        let subfolder_restore = self.favsearch_subfolder_restore.take();
+        let canonical = self.top_level_grid_view.take_return_to();
+        self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        )
     }
 
     pub(crate) fn restore_view_return_context(
@@ -26758,23 +26777,20 @@ impl App {
         &self,
         canonical_return_to: Option<&top_level_grid_view::TopLevelGridRestore>,
     ) -> top_level_grid_view::TopLevelGridRestore {
-        if let Some(return_to) = canonical_return_to {
-            return return_to.clone();
-        }
-        let path = self.tag_view.saved_folder.clone();
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        self.view_return_context_from_parts(
-            path,
-            self.tag_view_subfolder_restore.clone(),
-            rating_view_stars,
+        self.view_return_context_from_canonical_or_fallback(
+            canonical_return_to.map(std::borrow::Cow::Borrowed),
+            || {
+                (
+                    self.tag_view.saved_folder.clone(),
+                    self.tag_view_subfolder_restore.clone(),
+                )
+            },
         )
     }
 
     pub(crate) fn dismiss_tag_view_without_restore(
         &mut self,
     ) -> top_level_grid_view::TopLevelGridRestore {
-        let return_context =
-            self.tag_view_return_context_without_restore(self.top_level_grid_view.return_to());
         self.cancel_pending_folder_nav();
         if let Some(pending) = self.tag_view_pending.take() {
             pending.cancel();
@@ -26790,10 +26806,13 @@ impl App {
         self.tag_view.truncated = false;
         self.tag_view.reject_message = None;
         self.items_are_tag_view = false;
-        self.tag_view.saved_folder.take();
-        self.tag_view_subfolder_restore.take();
-        self.top_level_grid_view.take_return_to();
-        return_context
+        let path = self.tag_view.saved_folder.take();
+        let subfolder_restore = self.tag_view_subfolder_restore.take();
+        let canonical = self.top_level_grid_view.take_return_to();
+        self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        )
     }
 
     pub(crate) fn record_tag_view_nav_open(&mut self, path: &Path) {

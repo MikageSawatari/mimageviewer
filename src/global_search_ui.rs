@@ -2115,23 +2115,22 @@ impl App {
         &self,
         canonical_return_to: Option<&crate::app::top_level_grid_view::TopLevelGridRestore>,
     ) -> crate::app::top_level_grid_view::TopLevelGridRestore {
-        if let Some(return_to) = canonical_return_to {
-            return return_to.clone();
-        }
-        let path = self.global_search.saved_folder.clone();
-        let subfolder_restore = self
-            .global_search_subfolder_restore
-            .clone()
-            .or_else(|| self.subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars)
+        self.view_return_context_from_canonical_or_fallback(
+            canonical_return_to.map(std::borrow::Cow::Borrowed),
+            || {
+                let path = self.global_search.saved_folder.clone();
+                let subfolder_restore =
+                    self.global_search_subfolder_restore.clone().or_else(|| {
+                        self.subfolder_expansion_restore_for_synthetic_path(path.as_deref())
+                    });
+                (path, subfolder_restore)
+            },
+        )
     }
 
     pub(crate) fn dismiss_global_search_without_restore(
         &mut self,
     ) -> crate::app::top_level_grid_view::TopLevelGridRestore {
-        let return_context =
-            self.global_search_return_context_without_restore(self.top_level_grid_view.return_to());
         self.cancel_pending_folder_nav();
         // pending があれば SearchHandle の Drop impl で cancel される
         self.global_search.pending = None;
@@ -2170,11 +2169,15 @@ impl App {
         // 旧データを誤って返さないように、saved_folder への load_folder より先に消す。
         self.search_drilled_folder_counts.clear();
         let path = self.global_search.saved_folder.take();
-        if self.global_search_subfolder_restore.take().is_none() {
-            let _ = self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref());
-        }
-        self.top_level_grid_view.take_return_to();
-        return_context
+        let subfolder_restore = self
+            .global_search_subfolder_restore
+            .take()
+            .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
+        let canonical = self.top_level_grid_view.take_return_to();
+        self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        )
     }
 
     /// debounce 経過チェック + 新クエリがあれば検索 spawn (App::update から毎フレーム呼ぶ)。

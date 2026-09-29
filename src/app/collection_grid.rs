@@ -1599,7 +1599,6 @@ impl App {
         } else {
             // Simulate the retirement order without mutation. The first active transient consumes
             // the canonical return_to, so a later one must use its own fallback.
-            let current = self.current_top_level_restore_snapshot();
             let mut origin = self.snapshot_return_context_without_restore();
             let mut canonical_return_to = self
                 .snapshot
@@ -1618,7 +1617,7 @@ impl App {
             if self.tag_view.active {
                 origin = Some(self.tag_view_return_context_without_restore(canonical_return_to));
             }
-            origin.or(current)
+            origin.or_else(|| self.current_top_level_restore_snapshot())
         }
     }
 
@@ -4394,6 +4393,42 @@ mod tests {
             "collection return_to={:?}, expected folder={saved_folder:?}",
             app.top_level_grid_view.return_to()
         );
+    }
+
+    #[test]
+    fn dismiss_global_search_moves_subfolder_restore_without_cloning_large_state() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, _) = start_ready_app(&temp.path().join("collection.db"));
+        let removed_path = "removed-video-path".repeat(32);
+        let removed_path_ptr = removed_path.as_ptr();
+        app.global_search_subfolder_restore = Some(
+            super::super::subfolder_expansion::SubfolderExpansionRestoreState {
+                root: None,
+                roots: Vec::new(),
+                saved_folder: None,
+                snapshot: None,
+                removed_paths: std::iter::once(removed_path).collect(),
+            },
+        );
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(super::super::subfolder_expansion_synthetic_path());
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Search(
+                super::super::top_level_grid_view::TopLevelSearchView::Global,
+            ),
+            None,
+        );
+
+        let returned = app.dismiss_global_search_without_restore();
+        let TopLevelGridRestore::SubfolderExpansion(state) = returned else {
+            panic!("subfolder expansion restore was not returned");
+        };
+        assert_eq!(
+            state.removed_paths.iter().next().unwrap().as_ptr(),
+            removed_path_ptr
+        );
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]
