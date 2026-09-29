@@ -166,8 +166,11 @@ CREATE TABLE restore_declined (
 > busy timeout は既に有効で、read→write の競合を解決できない。空の DB で
 > `journal_mode=WAL` を同時に設定する場合も timeout を待たずに `SQLITE_BUSY`
 > となる。共通の台帳 open 関数で、busy timeout 設定、WAL 設定、schema 確認を
-> プロセス共通の短い mutex 区間に置く。schema 関数は `IMMEDIATE` transaction
-> を開始してから `user_version` を読む。recorder、検出 index loader、検出、
+> プロセス共通の短い mutex 区間に置く。schema 関数はまず書き込み枠を取らずに
+> `user_version` と現行 schema を確認し、現行版ならそのまま返す。旧版または空 DB
+> の場合だけ `IMMEDIATE` transaction を開始し、その中で版を読み直してから
+> 作成・更新する。これにより、別接続の長い書き込み中でも現行版の open は
+> writer の完了を待たない。recorder、検出 index loader、検出、
 > backfill、restore、リネーム移行・コピー・purge、孤児メタデータ整理の台帳接続は
 > この open 関数を通る。区間を抜けた後の index 全件ロードや通常の読み書きは
 > 直列化しない。移行・コピー・purge 本体の read→write transaction も

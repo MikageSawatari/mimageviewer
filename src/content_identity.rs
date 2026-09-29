@@ -683,22 +683,20 @@ fn with_epub_ledger_key_guard<T>(file_key: &str, action: impl FnOnce() -> T) -> 
 /// 新規作成と過去 schema からの upgrade を担う唯一の入口。
 /// version 0 は A1 の unversioned schema、version 1 は現在 schema を表す。
 fn ensure_content_identity_schema(conn: &mut rusqlite::Connection) -> Result<(), String> {
+    // A current-schema open needs no writer slot. In particular, it must not
+    // wait for an unrelated long-running ledger write just to read the schema.
+    if content_identity_schema_version(conn)? == CONTENT_IDENTITY_SCHEMA_VERSION {
+        return validate_content_identity_schema(conn);
+    }
+
     // A DEFERRED transaction can read version 0 on two connections, then one
     // read-to-write upgrade fails immediately with SQLITE_BUSY in WAL mode.
-    // Acquire the writer slot first so the existing busy timeout serializes
-    // schema creation and upgrades across every ledger connection.
+    // Acquire the writer slot before re-reading the version so another process
+    // cannot make us create the same schema twice.
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("begin schema transaction: {error}"))?;
-    let version = transaction
-        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-        .map_err(|error| format!("read PRAGMA user_version: {error}"))?;
-    if !(0..=CONTENT_IDENTITY_SCHEMA_VERSION).contains(&version) {
-        return Err(format!(
-            "unsupported content identity schema version {version} (current {})",
-            CONTENT_IDENTITY_SCHEMA_VERSION
-        ));
-    }
+    let version = content_identity_schema_version(&transaction)?;
 
     if version == 0 {
         if !schema_object_exists(&transaction, "table", "edit_origin")? {
@@ -741,6 +739,19 @@ fn ensure_content_identity_schema(conn: &mut rusqlite::Connection) -> Result<(),
 
     validate_content_identity_schema(&transaction)?;
     transaction.commit().map_err(|error| error.to_string())
+}
+
+fn content_identity_schema_version(conn: &rusqlite::Connection) -> Result<i64, String> {
+    let version = conn
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("read PRAGMA user_version: {error}"))?;
+    if !(0..=CONTENT_IDENTITY_SCHEMA_VERSION).contains(&version) {
+        return Err(format!(
+            "unsupported content identity schema version {version} (current {})",
+            CONTENT_IDENTITY_SCHEMA_VERSION
+        ));
+    }
+    Ok(version)
 }
 
 fn schema_object_exists(
@@ -2648,6 +2659,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn current_schema_open_succeeds_while_another_connection_is_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        drop(ContentIdentityDb::open_at(&db_path).unwrap());
+
+        let mut writer = rusqlite::Connection::open(&db_path).unwrap();
+        let transaction = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO restore_declined (full_hash, target_key) VALUES ('held', 'writer')",
+                [],
+            )
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let open = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let result = ContentIdentityDb::open_at(&db_path).map(drop);
+            sender.send((start.elapsed(), result)).unwrap();
+        });
+        let outcome = receiver.recv_timeout(Duration::from_secs(7));
+        drop(transaction);
+        open.join().unwrap();
+        let (elapsed, result) = outcome.expect("open should complete within its busy timeout");
+        assert!(
+            result.is_ok(),
+            "current schema open failed while another connection held a write transaction: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "current schema open waited for a writer: {elapsed:?}"
+        );
     }
 
     #[test]
