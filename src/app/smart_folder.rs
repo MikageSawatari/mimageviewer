@@ -3356,6 +3356,15 @@ impl App {
         if let Some(anchor) = effects.select_after_load {
             self.select_after_load = Some(anchor);
         }
+        // Smart PDF pages and warm placeholders both become visible at this boundary.
+        // Use the same one-time cleanup as ordinary PDF adoption before installing
+        // their rows; the later enumerate result only verifies the adopted view.
+        if matches!(
+            &child,
+            SmartPhysicalReady::PdfPages { .. } | SmartPhysicalReady::PdfWarm { .. }
+        ) {
+            self.prepare_pdf_visible_adoption(&path);
+        }
         if auto_fullscreen {
             if matches!(&child, SmartPhysicalReady::Folder(_)) {
                 self.pending_auto_fs_open = true;

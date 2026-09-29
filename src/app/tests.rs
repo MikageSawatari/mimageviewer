@@ -79827,6 +79827,113 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn smart_warm_pdf_adoption_clears_nested_zip_bytes_without_stopping_new_workers() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("smart-warm-pdf-nested-cache");
+        std::fs::create_dir_all(&source).unwrap();
+        let pdf = source.join("book.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let outer_zip = source.join("outer.zip");
+        let write_outer_zip = |page: &[u8]| {
+            let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            inner
+                .start_file("page.jpg", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut inner, page).unwrap();
+            let inner_bytes = inner.finish().unwrap().into_inner();
+            let mut outer = zip::ZipWriter::new(std::fs::File::create(&outer_zip).unwrap());
+            outer
+                .start_file("chapter.zip", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut outer, &inner_bytes).unwrap();
+            outer.finish().unwrap();
+        };
+        write_outer_zip(b"OLD");
+
+        let stamp = std::fs::metadata(&pdf).unwrap();
+        app.get_or_open_catalog(&source)
+            .unwrap()
+            .set_pdf_meta(
+                "book.pdf",
+                crate::ui_helpers::mtime_secs(&stamp),
+                stamp.len() as i64,
+                2,
+                false,
+            )
+            .unwrap();
+        let definition = definition("Smart Warm PDF Cache", source.clone());
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(app.peek_pdf_meta_cache(&pdf, false).is_some());
+        assert!(
+            app.get_or_open_catalog(&source)
+                .unwrap()
+                .load_one(&crate::grid_item::pdf_page_cache_key(0))
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            crate::zip_loader::read_entry_bytes(&outer_zip, "chapter.zip/page.jpg").unwrap(),
+            b"OLD"
+        );
+        write_outer_zip(b"NEW CONTENT");
+        let index = select_real_path(&mut app, &pdf);
+        assert!(app.begin_smart_grid_container_navigation(index, pdf.clone(), false));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.current_folder.as_deref() != Some(pdf.as_path()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "warm PDF adoption timed out"
+            );
+            app.poll_smart_folder(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(
+            app.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
+            Some(super::PdfOpenPhase::CommittedVerification {
+                placeholder_count: 2
+            })
+        ));
+        assert_eq!(
+            crate::zip_loader::read_entry_bytes(&outer_zip, "chapter.zip/page.jpg").unwrap(),
+            b"NEW CONTENT",
+            "Smart PDF adoption must discard the prior ZIP's nested bytes"
+        );
+
+        let placeholder_generation = app.items_generation;
+        let placeholder_workers = std::sync::Arc::clone(&app.cancel_token);
+        assert!(!placeholder_workers.load(std::sync::atomic::Ordering::Relaxed));
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Ok(crate::pdf_loader::PdfEnumerateResult {
+                    pages: (0..2)
+                        .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                            page_num,
+                            mtime: crate::ui_helpers::mtime_secs(&stamp),
+                            file_size: stamp.len(),
+                        })
+                        .collect(),
+                    direction: None,
+                    stamp: None,
+                }),
+            );
+        app.poll_pdf_enumerate();
+        assert!(app.pdf_enumerate_pending.is_none());
+        assert_eq!(app.items_generation, placeholder_generation);
+        assert!(std::sync::Arc::ptr_eq(
+            &app.cancel_token,
+            &placeholder_workers
+        ));
+        assert!(!placeholder_workers.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
     fn smart_root_pdf_fullscreen_ctrl_next_opens_next_root_book() {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
