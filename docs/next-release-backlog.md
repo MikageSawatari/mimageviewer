@@ -428,6 +428,11 @@
   - 「Defender 有効 かつ VC++ ランタイム無し」の環境は未確認 (Sandbox では Defender を有効にできない。クリーンな VM が要る)。
   - 正本 §5 の「Store 申請前にクリーンな Windows (Sandbox) で起動を確認する」が、CLAUDE.md リリース手順 Phase 5 step 19 に未反映。
   - **Store 再申請は修正版の正式リリース後。**
+- **2026-09-29 v4.1.0 の更新申請も同じ文面で却下** (`10.1.2.10` / "loads indefinitely at launch"、Dell Inspiron 12-5280、
+  OS build 26200.8246)。`dd96be073` は v4.1.0 に入っているので、同じ原因とは限らない。原因は未特定・こちらで未再現。
+  利用者が Developer Support へスクリーンショット (「起動中…」の下の段階表示)・機種・ログを依頼済み。
+  起動画面は startup-init の `IndexerManager::new` 完了まで出続ける (コードの参照、`poll_startup_init`)。
+  次: 返信待ち、v4.2.0 の署名済み setup.exe で Sandbox の初回・2 回目起動、その結果を見てから再申請。
 - 規模 / 優先度: 確認と手順追記 / **P0** (Store の再申請を止めている)。
 
 ### 1.234 `settings.db-shm` を削除できず、設定の復元と完全リセットが両方失敗する — 根本原因は修正済み、残り 3 件 (2026-09-13)
