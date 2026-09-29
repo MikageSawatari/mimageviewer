@@ -2195,20 +2195,39 @@ impl App {
         }
     }
 
+    fn has_subfolder_expansion_restore_for_synthetic_path(&self, path: Option<&Path>) -> bool {
+        let Some(path) = path else {
+            return false;
+        };
+        if !crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path()) {
+            return false;
+        }
+        self.subfolder_expansion_snapshot.is_some()
+            || self.subfolder_expansion_root.is_some()
+            || self.subfolder_expansion_saved_folder.is_some()
+    }
+
+    pub(crate) fn subfolder_expansion_restore_for_synthetic_path(
+        &self,
+        path: Option<&Path>,
+    ) -> Option<SubfolderExpansionRestoreState> {
+        if !self.has_subfolder_expansion_restore_for_synthetic_path(path) {
+            return None;
+        }
+        Some(SubfolderExpansionRestoreState {
+            root: self.subfolder_expansion_root.clone(),
+            roots: self.subfolder_expansion_roots.clone(),
+            saved_folder: self.subfolder_expansion_saved_folder.clone(),
+            snapshot: self.subfolder_expansion_snapshot.clone(),
+            removed_paths: self.subfolder_expansion_removed_paths.clone(),
+        })
+    }
+
     pub(crate) fn take_subfolder_expansion_restore_for_synthetic_path(
         &mut self,
         path: Option<&Path>,
     ) -> Option<SubfolderExpansionRestoreState> {
-        let Some(path) = path else {
-            return None;
-        };
-        if !crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path()) {
-            return None;
-        }
-        if self.subfolder_expansion_snapshot.is_none()
-            && self.subfolder_expansion_root.is_none()
-            && self.subfolder_expansion_saved_folder.is_none()
-        {
+        if !self.has_subfolder_expansion_restore_for_synthetic_path(path) {
             return None;
         }
         Some(SubfolderExpansionRestoreState {

@@ -26622,9 +26622,27 @@ impl App {
 
     /// Ctrl+S の状態だけを終了し、元ビューの再構築は行わず戻り先の所有権を返す。
     /// 別の最上位ビューへ直行するとき、復元 worker を起動直後にキャンセルする競合を防ぐ。
+    pub(crate) fn favsearch_return_context_without_restore(
+        &self,
+        canonical_return_to: Option<&top_level_grid_view::TopLevelGridRestore>,
+    ) -> top_level_grid_view::TopLevelGridRestore {
+        if let Some(return_to) = canonical_return_to {
+            return return_to.clone();
+        }
+        let path = self.favsearch.saved_folder.clone();
+        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
+        self.view_return_context_from_parts(
+            path,
+            self.favsearch_subfolder_restore.clone(),
+            rating_view_stars,
+        )
+    }
+
     pub(crate) fn dismiss_favsearch_without_restore(
         &mut self,
     ) -> top_level_grid_view::TopLevelGridRestore {
+        let return_context =
+            self.favsearch_return_context_without_restore(self.top_level_grid_view.return_to());
         self.cancel_pending_folder_nav();
         self.favsearch.active = false;
         self.favsearch.has_focus = false;
@@ -26635,14 +26653,10 @@ impl App {
         if let Some(pending) = self.favsearch_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        let path = self.favsearch.saved_folder.take();
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        let subfolder_restore = self.favsearch_subfolder_restore.take();
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        self.top_level_grid_view
-            .take_return_to()
-            .unwrap_or(fallback)
+        self.favsearch.saved_folder.take();
+        self.favsearch_subfolder_restore.take();
+        self.top_level_grid_view.take_return_to();
+        return_context
     }
 
     pub(crate) fn restore_view_return_context(
@@ -26740,9 +26754,27 @@ impl App {
         self.restore_view_return_context(return_context);
     }
 
+    pub(crate) fn tag_view_return_context_without_restore(
+        &self,
+        canonical_return_to: Option<&top_level_grid_view::TopLevelGridRestore>,
+    ) -> top_level_grid_view::TopLevelGridRestore {
+        if let Some(return_to) = canonical_return_to {
+            return return_to.clone();
+        }
+        let path = self.tag_view.saved_folder.clone();
+        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
+        self.view_return_context_from_parts(
+            path,
+            self.tag_view_subfolder_restore.clone(),
+            rating_view_stars,
+        )
+    }
+
     pub(crate) fn dismiss_tag_view_without_restore(
         &mut self,
     ) -> top_level_grid_view::TopLevelGridRestore {
+        let return_context =
+            self.tag_view_return_context_without_restore(self.top_level_grid_view.return_to());
         self.cancel_pending_folder_nav();
         if let Some(pending) = self.tag_view_pending.take() {
             pending.cancel();
@@ -26758,14 +26790,10 @@ impl App {
         self.tag_view.truncated = false;
         self.tag_view.reject_message = None;
         self.items_are_tag_view = false;
-        let path = self.tag_view.saved_folder.take();
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        let subfolder_restore = self.tag_view_subfolder_restore.take();
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        self.top_level_grid_view
-            .take_return_to()
-            .unwrap_or(fallback)
+        self.tag_view.saved_folder.take();
+        self.tag_view_subfolder_restore.take();
+        self.top_level_grid_view.take_return_to();
+        return_context
     }
 
     pub(crate) fn record_tag_view_nav_open(&mut self, path: &Path) {

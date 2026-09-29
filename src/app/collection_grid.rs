@@ -1536,17 +1536,16 @@ impl App {
         })
     }
 
-    fn retire_transient_views_for_collection(&mut self) -> Option<TopLevelGridRestore> {
-        let current = self.current_top_level_restore_snapshot();
-        let mut origin = self.dismiss_snapshot_without_restore();
+    fn retire_transient_views_for_collection(&mut self) {
+        let _ = self.dismiss_snapshot_without_restore();
         if self.favsearch.active {
-            origin = Some(self.dismiss_favsearch_without_restore());
+            self.dismiss_favsearch_without_restore();
         }
         if self.global_search.active {
-            origin = Some(self.dismiss_global_search_without_restore());
+            self.dismiss_global_search_without_restore();
         }
         if self.tag_view.active {
-            origin = Some(self.dismiss_tag_view_without_restore());
+            self.dismiss_tag_view_without_restore();
         }
         if self.show_search_bar {
             self.show_search_bar = false;
@@ -1558,7 +1557,6 @@ impl App {
             self.cancel_search_pending();
         }
         self.cancel_pending_folder_nav();
-        origin.or(current)
     }
 
     pub(crate) fn collection_root_installed_binding_matches(
@@ -1599,8 +1597,28 @@ impl App {
         ) {
             self.top_level_grid_view.return_to().cloned()
         } else {
-            // Capture this before a detached media promotion swaps the mounted main context.
-            self.current_top_level_restore_snapshot()
+            // Simulate the retirement order without mutation. The first active transient consumes
+            // the canonical return_to, so a later one must use its own fallback.
+            let current = self.current_top_level_restore_snapshot();
+            let mut origin = self.snapshot_return_context_without_restore();
+            let mut canonical_return_to = self
+                .snapshot
+                .is_none()
+                .then(|| self.top_level_grid_view.return_to())
+                .flatten();
+            if self.favsearch.active {
+                origin = Some(self.favsearch_return_context_without_restore(canonical_return_to));
+                canonical_return_to = None;
+            }
+            if self.global_search.active {
+                origin =
+                    Some(self.global_search_return_context_without_restore(canonical_return_to));
+                canonical_return_to = None;
+            }
+            if self.tag_view.active {
+                origin = Some(self.tag_view_return_context_without_restore(canonical_return_to));
+            }
+            origin.or(current)
         }
     }
 
@@ -4332,6 +4350,143 @@ mod tests {
                 .expect("add request"),
         )
         .snapshot
+    }
+
+    fn seed_search_or_snapshot_without_return_to(
+        app: &mut App,
+        source: PathBuf,
+        saved_folder: PathBuf,
+        snapshot: bool,
+    ) {
+        app.current_folder = Some(source.parent().unwrap().join("search-results"));
+        app.items = vec![GridItem::Video(source)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(saved_folder);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Search(
+                super::super::top_level_grid_view::TopLevelSearchView::Global,
+            ),
+            None,
+        );
+        if snapshot {
+            app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+                query: "collection return".into(),
+            });
+            assert!(app.snapshot.is_some());
+            // Exercise the pre-canonical fallback retained for older Snapshot states.
+            app.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Snapshot);
+        }
+        assert!(app.top_level_grid_view.return_to().is_none());
+        assert!(app.current_top_level_restore_snapshot().is_none());
+    }
+
+    fn assert_collection_return_folder(app: &App, saved_folder: &Path) {
+        assert!(
+            matches!(
+                app.top_level_grid_view.return_to(),
+                Some(TopLevelGridRestore::Folder(path))
+                    if crate::folder_tree::path_eq(path, saved_folder)
+            ),
+            "collection return_to={:?}, expected folder={saved_folder:?}",
+            app.top_level_grid_view.return_to()
+        );
+    }
+
+    #[test]
+    fn collection_open_from_transient_search_or_snapshot_keeps_fallback_return_folder() {
+        for snapshot in [true, false] {
+            let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("movie.mp4");
+            let saved_folder = temp.path().join("before-search");
+            std::fs::write(&source, b"media").unwrap();
+            std::fs::create_dir(&saved_folder).unwrap();
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            let target = recv(client.create_collection("Target".into()).unwrap());
+            seed_search_or_snapshot_without_return_to(
+                &mut app,
+                source,
+                saved_folder.clone(),
+                snapshot,
+            );
+
+            app.open_collection_grid_from_navigation(target.collection_id());
+            assert_collection_return_folder(&app, &saved_folder);
+            wait_for_grid(&mut app, target.collection_id());
+            assert_collection_return_folder(&app, &saved_folder);
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
+    #[test]
+    fn collection_open_uses_last_transient_fallback_after_snapshot_consumes_return_to() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("movie.mp4");
+        let search_folder = temp.path().join("before-search");
+        let tag_folder = temp.path().join("before-tag");
+        std::fs::write(&source, b"media").unwrap();
+        std::fs::create_dir(&search_folder).unwrap();
+        std::fs::create_dir(&tag_folder).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let target = recv(client.create_collection("Target".into()).unwrap());
+        seed_search_or_snapshot_without_return_to(&mut app, source, search_folder.clone(), true);
+        app.top_level_grid_view
+            .install_return_to(TopLevelGridRestore::Folder(search_folder));
+        app.tag_view.active = true;
+        app.tag_view.saved_folder = Some(tag_folder.clone());
+
+        app.open_collection_grid_from_navigation(target.collection_id());
+        assert_collection_return_folder(&app, &tag_folder);
+        assert!(app.snapshot.is_none());
+        assert!(!app.tag_view.active);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn collection_open_from_detached_transient_video_keeps_fallback_return_folder() {
+        for snapshot in [true, false] {
+            let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("movie.mp4");
+            let saved_folder = temp.path().join("before-search");
+            std::fs::write(&source, b"media").unwrap();
+            std::fs::create_dir(&saved_folder).unwrap();
+            let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+            let target = recv(client.create_collection("Target".into()).unwrap());
+            seed_search_or_snapshot_without_return_to(
+                &mut app,
+                source.clone(),
+                saved_folder.clone(),
+                snapshot,
+            );
+            let generation = mount_detached_collection_media(&mut app, source, 1_314, false);
+
+            app.open_collection_grid_from_navigation(target.collection_id());
+            assert_collection_return_folder(&app, &saved_folder);
+            app.with_window_viewer_context(1_314, |window| {
+                assert_eq!(window.fullscreen_idx, Some(0));
+                assert_eq!(window.items_generation, generation);
+                assert!(matches!(window.items.as_slice(), [GridItem::Video(_)]));
+                assert!(matches!(
+                    window.fs_cache.get(&0),
+                    Some(super::super::FsCacheEntry::Video { .. })
+                ));
+                assert!(matches!(
+                    window.top_level_grid_view.surface(),
+                    TopLevelGridSurface::Snapshot | TopLevelGridSurface::Search(_)
+                ));
+            })
+            .unwrap();
+            wait_for_grid(&mut app, target.collection_id());
+            assert_collection_return_folder(&app, &saved_folder);
+            app.shutdown_collection_runtime_for_exit();
+        }
     }
 
     #[test]

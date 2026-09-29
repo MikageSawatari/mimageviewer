@@ -1629,6 +1629,8 @@ retained thumbnail payloadの最終dropは既存のpayload退役workerへ移す�
 
 明示 Open、Collection 物理子の親復帰、Collection root の履歴採用は、フォルダの共通 loader やドライブ一覧と同じ `change_main_context_for_visible_grid` を通ってから root の一覧を置き換える。別窓に動画・音声があれば既存の promote が旧 `ViewerContextBundle`（items 世代、player、`fs_cache`）をその窓に移し、静止画・PDF は既存の park / close 契約を使う。移動元の typed history location、検索中の履歴抑止、`return_to` は移管前に捕捉する。移管がロック中のため不可なら履歴、transient view、surface、items を変更せず終端する。passive / parked sibling は対象にしない。
 
+`return_to` の捕捉は、Search / Snapshot の `return_to` が無い場合も従来の `saved_folder`・検索前フォルダ・サブフォルダ展開状態からの fallback を含める。Snapshot → お気に入り検索 → 全体検索 → タグの退場順で最後の有効な戻り先を優先し、先行する退場が canonical `return_to` を消費した後は後続の fallback を使う。各退場処理と Collection の入口は同じ副作用のない計算関数を使う。退場は移管後に一度だけ行い、Collection には移管前に確定した値を渡す。
+
 同一 Collection root を fullscreen で閲覧中の更新だけは、現行 surface / Root 位置、installed items 世代、prepared の Collection ID・採用済み revision・行数、fullscreen index を一つの binding 判定で確認する。成立すれば `begin` と空 items install を避け、既存 session の `cancel_pending` が保持する installed snapshot と旧 items 世代を viewer が閉じるまで使う。別 Collection または物理子から root への移動にはこの例外を適用しない。
 
 明示 Open は従来どおり、可視採用直後に読み込み中を示して履歴を記録し、actor / prepare 失敗時は main に失敗表示を残す。履歴 replay は offscreen 準備の成功後にだけ移管・採用・履歴確定し、失敗・取消では旧表示と履歴を維持する。追加の rollback / supersession 状態は設けない。長い処理をモーダルにする案は、準備中も操作できる Collection の既存動作を狭め、context 所有を直さないため採用しなかった。別窓を閉じて開き直す案は再生継続を失うため採用しなかった。

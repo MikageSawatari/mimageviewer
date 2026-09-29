@@ -857,29 +857,60 @@ impl App {
     /// (or its drill target), while `pre_snapshot_search_origin` is the real view to which the
     /// user should return.  Callers that transition directly to another synthetic view must take
     /// the latter as return ownership instead of recording the result-grid path in history.
-    pub(crate) fn dismiss_snapshot_without_restore(
-        &mut self,
-    ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
-        let snap = self.snapshot.take()?;
-        let _ = self.restore_rating_filter_suppression();
-        // Canonical return_to がある間は fallback slot を consume しない。検索由来 snapshot
-        // を fork した sibling が、それぞれ自分の restore payload を保持できるようにする。
-        if let Some(return_to) = self.top_level_grid_view.take_return_to() {
-            self.show_feedback_toast("★固定を解除しました".into());
-            return Some(return_to);
-        }
+    fn snapshot_fallback_path(&self, snap: &SnapshotState) -> Option<PathBuf> {
         let at_origin = self.current_folder.as_ref().is_some_and(|path| {
             crate::snapshot::snapshot_key_from_path(path)
                 == crate::snapshot::snapshot_key_from_path(&snap.origin)
         });
-        let path = if at_origin {
+        if at_origin {
             snap.pre_snapshot_search_origin
                 .clone()
                 .or_else(|| Some(snap.origin.clone()))
         } else {
             self.current_folder.clone()
-        };
+        }
+    }
+
+    pub(crate) fn snapshot_return_context_without_restore(
+        &self,
+    ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
+        let snap = self.snapshot.as_ref()?;
+        if let Some(return_to) = self.top_level_grid_view.return_to() {
+            return Some(return_to.clone());
+        }
+        let path = self.snapshot_fallback_path(snap);
         let subfolder_restore = if path.as_deref().is_some_and(|path| {
+            crate::folder_tree::path_eq(path, &super::subfolder_expansion_synthetic_path())
+        }) {
+            match &snap.source_label {
+                SnapshotSourceLabel::FavSearch { .. } => self.favsearch_subfolder_restore.clone(),
+                SnapshotSourceLabel::GlobalSearch { .. } => {
+                    self.global_search_subfolder_restore.clone()
+                }
+                _ => None,
+            }
+            .or_else(|| self.subfolder_expansion_restore_for_synthetic_path(path.as_deref()))
+        } else {
+            None
+        };
+        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
+        Some(self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars))
+    }
+
+    pub(crate) fn dismiss_snapshot_without_restore(
+        &mut self,
+    ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
+        let return_context = self.snapshot_return_context_without_restore()?;
+        let snap = self.snapshot.take()?;
+        let _ = self.restore_rating_filter_suppression();
+        // Canonical return_to がある間は fallback slot を consume しない。検索由来 snapshot
+        // を fork した sibling が、それぞれ自分の restore payload を保持できるようにする。
+        if self.top_level_grid_view.take_return_to().is_some() {
+            self.show_feedback_toast("★固定を解除しました".into());
+            return Some(return_context);
+        }
+        let path = self.snapshot_fallback_path(&snap);
+        if path.as_deref().is_some_and(|path| {
             crate::folder_tree::path_eq(path, &super::subfolder_expansion_synthetic_path())
         }) {
             match snap.source_label {
@@ -889,15 +920,10 @@ impl App {
                 }
                 _ => None,
             }
-            .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()))
-        } else {
-            None
-        };
+            .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
+        }
         self.show_feedback_toast("★固定を解除しました".into());
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        Some(fallback)
+        Some(return_context)
     }
 
     /// snapshot を deactivate する (= 退避していた items 等を復元)。
