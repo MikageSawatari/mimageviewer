@@ -12364,17 +12364,15 @@ impl App {
             rating_key.is_some(),
             video_audio_vst_active,
         );
-        let modal_escape_fixed = key.virtual_key == 0x1B
-            && !key.repeat
-            && !key.shift
-            && !key.ctrl
-            && !key.alt
-            && resolved_action.is_none()
-            && (video_audio_vst_active
-                || self.viewer_session_is_detached()
-                || rating_key.is_none());
+        let modal_escape_fixed =
+            key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt;
+        // The VST host's audio-mode toggle exited to the music view before the scan gate.
+        // Its priority is resolved above, so a conflicting navigation binding still exits VST.
+        let modal_vst_exit =
+            video_audio_vst_active && resolved_action == Some(KeyAction::VideoToggleAudioMode);
         if self.normalize_scan_is_modal_for_current_player(fs_idx)
             && !modal_escape_fixed
+            && !modal_vst_exit
             && !matches!(
                 resolved_action,
                 Some(
@@ -12392,7 +12390,7 @@ impl App {
             return NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::NormalizeModal);
         }
         // The VST host handles Escape and its audio-mode toggle before ordinary video keys.
-        // Keep both in the same Action resolution used by the modal gate above.
+        // Both retain their pre-modal behavior through the gate above.
         if video_audio_vst_active {
             if modal_escape_fixed {
                 self.exit_video_audio_vst(ctx, fs_idx);

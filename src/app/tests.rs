@@ -54476,7 +54476,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn normalize_modal_key_gate_blocks_video_audio_vst_toggle() {
+    fn normalize_modal_key_gate_preserves_video_audio_vst_exit() {
         use std::sync::atomic::Ordering;
 
         for conflicting_navigation_binding in [false, true] {
@@ -54513,17 +54513,62 @@ mod still_window_mode_key_tests {
 
             app.handle_native_video_key_event(&ctx, idx, super::video_audio_native_z(false));
 
-            assert!(app.video_audio_vst_active_for(idx));
+            assert!(!app.video_audio_vst_active_for(idx));
+            assert_eq!(app.video_audio_mode, Some(idx));
             assert!(app.normalize_state.is_some());
             assert!(!cancel.load(Ordering::Acquire));
             assert_eq!(app.fullscreen_idx, Some(idx));
+            assert!(app.media_navigation_pending.is_none());
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normalize_modal_key_gate_preserves_fixed_escape_with_keymap_overlap() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("escape-scan.mp4");
+        std::fs::write(&path, b"video").unwrap();
+        let idx = push_video(&mut app, path.to_str().unwrap());
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsVideo]\nVideoCloseFullscreen = Esc\n");
+        let mut scan = normalize_scan_state_for_test(idx, path);
+        scan.owner_context_id = app.projected_viewer_context_id();
+        app.normalize_state = Some(scan);
+
+        app.handle_native_video_key_event(
+            &ctx,
+            idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(2),
+                virtual_key: 0x1B,
+                scan_code: 0,
+                extended: false,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                repeat: false,
+            },
+        );
+
+        assert_eq!(app.fullscreen_idx, None);
     }
 
     #[test]
     #[cfg(windows)]
     fn normalize_scan_can_finish_during_superseded_navigation_resolution() {
         use crate::video::normalize_types::NormalizeResult;
+        use std::sync::atomic::Ordering;
 
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -54550,25 +54595,36 @@ mod still_window_mode_key_tests {
         scan.owner_context_id = app.projected_viewer_context_id();
         scan.was_playing = false;
         scan.rx = scan_rx;
+        let cancel = scan.cancel.clone();
         app.normalize_state = Some(scan);
-        let result_tx = install_fake_media_navigation_resolver(&mut app);
-        app.media_navigation_pending = Some(MediaNavigationPending {
-            request_id: 2,
-            items_generation: app.items_generation,
-            input_seq: app.input_seq,
-            owner_window_id: app.current_media_navigation_owner(),
-            fullscreen_idx: Some(old_idx),
-            source: "test_superseded_manual",
-            action: MediaNavigationAction::Manual {
-                fs_idx: old_idx,
-                delta: 1,
-                landing: ManualMediaNavigationLanding::NativeVideo,
-            },
-            started_at: std::time::Instant::now(),
-        });
+        let (request_rx, result_tx) = install_held_media_navigation_resolver(&mut app);
+        let display_order = [old_idx, next_idx];
+        for source in ["test_first_manual", "test_superseding_manual"] {
+            app.start_manual_media_navigation(
+                &ctx,
+                &display_order,
+                old_idx,
+                1,
+                source,
+                ManualMediaNavigationLanding::NativeVideo,
+            );
+            assert_eq!(app.fullscreen_idx, Some(old_idx));
+            assert!(app.normalize_state.is_some());
+            assert!(
+                !cancel.load(Ordering::Acquire),
+                "superseded navigation requests must leave the old scan running"
+            );
+        }
+        let first_request = request_rx.try_recv().expect("first request not queued");
+        let latest_request = request_rx.try_recv().expect("second request not queued");
+        assert!(latest_request.request_id > first_request.request_id);
+        assert_eq!(
+            app.media_navigation_pending.as_ref().unwrap().request_id,
+            latest_request.request_id
+        );
         result_tx
             .send(MediaNavigationResolverResponse {
-                request_id: 1,
+                request_id: first_request.request_id,
                 result: MediaNavigationResolveResult {
                     target_idx: Some(next_idx),
                     missing: Vec::new(),
@@ -54578,6 +54634,11 @@ mod still_window_mode_key_tests {
         app.poll_media_navigation_pending(&ctx);
         assert_eq!(app.fullscreen_idx, Some(old_idx));
         assert!(app.normalize_state.is_some());
+        assert!(!cancel.load(Ordering::Acquire));
+        assert_eq!(
+            app.media_navigation_pending.as_ref().unwrap().request_id,
+            latest_request.request_id
+        );
 
         scan_tx
             .send(crate::app::normalize::NormalizeMessage::Done(
@@ -54602,7 +54663,7 @@ mod still_window_mode_key_tests {
 
         result_tx
             .send(MediaNavigationResolverResponse {
-                request_id: 2,
+                request_id: latest_request.request_id,
                 result: MediaNavigationResolveResult {
                     target_idx: Some(next_idx),
                     missing: Vec::new(),
