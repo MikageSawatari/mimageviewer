@@ -163,14 +163,19 @@ CREATE TABLE restore_declined (
 > loader が別接続で同時に `open_at` を呼んでいた。空の DB では両方の `DEFERRED`
 > transaction が `user_version=0` / `edit_origin` 不在を読めるため、後から
 > `CREATE TABLE` へ昇格する片方が `SQLITE_BUSY` で即時失敗する。各接続の 5 秒
-> busy timeout は既に有効で、read→write の競合を解決できない。初回 schema
-> 作成・旧版からの移行は recorder の接続が所有し、その完了結果を index loader
-> に渡してから後者が open / 全件ロードを始める。設定 OFF でも recorder は
-> 初期化し、後から検出を ON にした場合も同じ完了結果を使う。以降の reload は
-> 同じ schema を検証するだけ。DB 形式は変更しない。失敗時はディレクトリ作成、
-> SQLite open、WAL 設定、schema 初期化、index 読込の段階をログへ残す。
-> 非同期の競合ごとに retry を足す案は採らず、初回 schema 書込みの所有者を
-> 一つにして競合の組み合わせ自体をなくした。
+> busy timeout は既に有効で、read→write の競合を解決できない。空の DB で
+> `journal_mode=WAL` を同時に設定する場合も timeout を待たずに `SQLITE_BUSY`
+> となる。共通の台帳 open 関数で、busy timeout 設定、WAL 設定、schema 確認を
+> プロセス共通の短い mutex 区間に置く。schema 関数は `IMMEDIATE` transaction
+> を開始してから `user_version` を読む。recorder、検出 index loader、検出、
+> backfill、restore、リネーム移行・コピー・purge、孤児メタデータ整理の台帳接続は
+> この open 関数を通る。区間を抜けた後の index 全件ロードや通常の読み書きは
+> 直列化しない。移行・コピー・purge 本体の read→write transaction も
+> `IMMEDIATE` にし、同型の昇格競合を除く。
+> recorder の完了を loader が待つ仕組みは使わないので、recorder が panic
+> しても loader は永久待ちにならない。DB 形式は変更しない。失敗時は
+> ディレクトリ作成、SQLite open、WAL 設定、schema 初期化、index 読込の
+> 段階をログへ残す。retry の追加や初回 schema 書込みの固定所有者は不要。
 
 ### 3.3 記録のタイミング
 

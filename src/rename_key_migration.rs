@@ -1340,9 +1340,14 @@ fn store_keys_with_rows(
     descriptor: StoreDescriptor,
     file_keys: &[String],
 ) -> Result<Vec<String>, String> {
-    let mut conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|error| error.to_string())?;
+    let mut conn = if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
+        crate::content_identity::open_ledger_connection_at(db_path)?
+    } else {
+        let conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        conn
+    };
     let conn = conn.transaction().map_err(|error| error.to_string())?;
     let columns = table_columns(&conn, descriptor.table).map_err(|error| error.to_string())?;
     if columns.is_empty()
@@ -1376,6 +1381,23 @@ fn store_keys_with_rows(
         }
     }
     Ok(found)
+}
+
+/// Rename, copy, and purge can run while the recorder is opening a fresh
+/// ledger. Route their ledger connections through the same schema validation;
+/// other stores keep their existing open policy.
+fn open_store_for_write(
+    db_path: &Path,
+    descriptor: &StoreDescriptor,
+) -> Result<rusqlite::Connection, String> {
+    if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
+        crate::content_identity::open_ledger_connection_at(db_path)
+    } else {
+        let conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        Ok(conn)
+    }
 }
 
 /// リネーム移行の本体 (worker スレッドで呼ぶ)。`old_path` は改名前 (もう存在しない)、
@@ -1750,9 +1772,9 @@ fn purge_store_with_before_sql(
     report.db_open_count += 1;
     let action = || {
         before_sql();
-        (|| -> Result<usize, rusqlite::Error> {
-            let mut conn = rusqlite::Connection::open(&db_path)?;
-            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        (|| -> Result<usize, Box<dyn std::error::Error>> {
+            let mut conn =
+                open_store_for_write(&db_path, descriptor).map_err(std::io::Error::other)?;
             let table_exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
                 [descriptor.table],
@@ -1766,7 +1788,7 @@ fn purge_store_with_before_sql(
                 (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
             let _tag_write =
                 (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let mut changed = 0usize;
 
             // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
@@ -1874,15 +1896,15 @@ fn migrate_store(
         (PathBuf::from(new_key), shape),
     ];
     let result = with_identity_epub_coverage(descriptor, &coverage, || {
-        (|| -> Result<usize, rusqlite::Error> {
-            let mut conn = rusqlite::Connection::open(db_path)?;
-            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        (|| -> Result<usize, Box<dyn std::error::Error>> {
+            let mut conn =
+                open_store_for_write(db_path, descriptor).map_err(std::io::Error::other)?;
             let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
             let _rating_write =
                 (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
             let _tag_write =
                 (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let columns = table_columns(&tx, descriptor.table)?;
             if columns.is_empty()
                 && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
@@ -1890,9 +1912,9 @@ fn migrate_store(
                 return Ok(0);
             }
             if !columns.iter().any(|column| column == descriptor.column) {
-                return Err(rusqlite::Error::InvalidColumnName(
-                    descriptor.column.to_string(),
-                ));
+                return Err(
+                    rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).into(),
+                );
             }
             let mut changed = 0usize;
             changed += move_exact(
@@ -2059,14 +2081,14 @@ fn copy_store_transaction(
         .join("edit_preview_cache");
     let mut destination_files = Vec::new();
     let result = (|| -> Result<usize, String> {
-        let mut conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| error.to_string())?;
+        let mut conn = open_store_for_write(db_path, &descriptor)?;
         let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         let _rating_write =
             (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
         let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let columns = table_columns(&tx, descriptor.table).map_err(|error| error.to_string())?;
         if columns.is_empty()
             && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
@@ -2410,8 +2432,11 @@ mod tests {
     #[test]
     fn pdf_and_image_store_copy_does_not_wait_for_nonoverlapping_epub_range() {
         let data = tempfile::tempdir().unwrap();
-        let db = rusqlite::Connection::open(data.path().join("content_identity.db")).unwrap();
-        db.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY, payload TEXT)")
+        let db = crate::content_identity::open_ledger_connection_at(
+            &data.path().join("content_identity.db"),
+        )
+        .unwrap();
+        db.execute_batch("ALTER TABLE edit_origin ADD COLUMN payload TEXT")
             .unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -2451,9 +2476,10 @@ mod tests {
     #[test]
     fn exact_purge_keeps_slash_and_virtual_descendant_deletion() {
         let data = tempfile::tempdir().unwrap();
-        let db = rusqlite::Connection::open(data.path().join("content_identity.db")).unwrap();
-        db.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)")
-            .unwrap();
+        let db = crate::content_identity::open_ledger_connection_at(
+            &data.path().join("content_identity.db"),
+        )
+        .unwrap();
         let removed = data.path().join("cover.png");
         let key = crate::adjustment_db::normalize_path(&removed);
         let nearby = format!("{key}x/book.epub");
@@ -2463,8 +2489,13 @@ mod tests {
             format!("{key}::page_0"),
             nearby.clone(),
         ] {
-            db.execute("INSERT INTO edit_origin(file_key) VALUES (?1)", [&row])
-                .unwrap();
+            db.execute(
+                "INSERT INTO edit_origin
+                    (file_key, size, head_hash, hashed_mtime, kind, last_edit_at)
+                 VALUES (?1, 0, '', 0, 'image', 0)",
+                [&row],
+            )
+            .unwrap();
         }
         drop(db);
         let report = purge_removed_scopes_at(
@@ -2526,6 +2557,29 @@ mod tests {
 
     fn setup_copy_store_rows(dir: &Path, old: &Path) {
         for descriptor in STORES {
+            if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
+                let connection =
+                    crate::content_identity::open_ledger_connection_at(&dir.join(descriptor.file))
+                        .unwrap();
+                connection
+                    .execute_batch("ALTER TABLE edit_origin ADD COLUMN payload TEXT")
+                    .unwrap();
+                let old_key = descriptor.normalize_path(old);
+                for (key, payload) in [
+                    (old_key.clone(), "exact"),
+                    (format!("{old_key}::ページ/001.jpg"), "prefix"),
+                ] {
+                    connection
+                        .execute(
+                            "INSERT INTO edit_origin
+                                (file_key, size, head_hash, hashed_mtime, kind, last_edit_at, payload)
+                             VALUES (?1, 0, '', 0, 'image', 0, ?2)",
+                            rusqlite::params![key, payload],
+                        )
+                        .unwrap();
+                }
+                continue;
+            }
             let connection = open(dir, descriptor.file);
             if descriptor.unique {
                 if descriptor.table == "edit_previews" {
@@ -3418,12 +3472,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let removed = PathBuf::from(r"C:\Root\Gone");
         for descriptor in STORES {
-            let conn = open(dir.path(), descriptor.file);
-            conn.execute_batch(&format!(
-                "CREATE TABLE IF NOT EXISTS {} ({} TEXT)",
-                descriptor.table, descriptor.column
-            ))
-            .unwrap();
+            let identity = descriptor.file == crate::content_identity::LEDGER_DB_FILE;
+            let conn = if identity {
+                crate::content_identity::open_ledger_connection_at(
+                    &dir.path().join(descriptor.file),
+                )
+                .unwrap()
+            } else {
+                let conn = open(dir.path(), descriptor.file);
+                conn.execute_batch(&format!(
+                    "CREATE TABLE IF NOT EXISTS {} ({} TEXT)",
+                    descriptor.table, descriptor.column
+                ))
+                .unwrap();
+                conn
+            };
             let base = match descriptor.normalization {
                 StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(&removed),
                 StoreKeyNormalization::DriveStripped => crate::path_key::normalize(&removed),
@@ -3434,14 +3497,24 @@ mod tests {
                 format!("{base}::page_1"),
                 format!("{base}2/keep.jpg"),
             ] {
-                conn.execute(
-                    &format!(
-                        "INSERT INTO {} ({}) VALUES (?1)",
-                        descriptor.table, descriptor.column
-                    ),
-                    [key],
-                )
-                .unwrap();
+                if identity {
+                    conn.execute(
+                        "INSERT INTO edit_origin
+                            (file_key, size, head_hash, hashed_mtime, kind, last_edit_at)
+                         VALUES (?1, 0, '', 0, 'image', 0)",
+                        [key],
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute(
+                        &format!(
+                            "INSERT INTO {} ({}) VALUES (?1)",
+                            descriptor.table, descriptor.column
+                        ),
+                        [key],
+                    )
+                    .unwrap();
+                }
             }
         }
 

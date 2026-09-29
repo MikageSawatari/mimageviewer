@@ -16967,12 +16967,9 @@ impl App {
         // この設定を参照せず、OFF 中も編集確定時の記録を継続する。
         let (content_identity_index_load_pending, content_identity_ledger_state) =
             if settings.edit_restore_prompt_enabled {
-                match crate::content_identity::ContentIdentityIndexLoadPending::spawn(
-                    Arc::clone(&content_identity_fallback_io_sem),
-                    content_identity_recorder
-                        .as_ref()
-                        .map(crate::content_identity::ContentIdentityRecorder::initialization),
-                ) {
+                match crate::content_identity::ContentIdentityIndexLoadPending::spawn(Arc::clone(
+                    &content_identity_fallback_io_sem,
+                )) {
                     Ok(pending) => (
                         Some(pending),
                         crate::content_identity::ContentIdentityLedgerState::Loading,

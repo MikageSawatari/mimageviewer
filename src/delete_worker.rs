@@ -1106,10 +1106,10 @@ mod worker_tests {
     #[test]
     fn delete_worker_guards_exact_descendants_without_waiting_for_unrelated_keys() {
         let temp = tempfile::tempdir().unwrap();
-        let conn = rusqlite::Connection::open(temp.path().join("content_identity.db")).unwrap();
-        conn.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)")
-            .unwrap();
-        drop(conn);
+        crate::content_identity::initialize_identity_db_for_delete_test(
+            &temp.path().join("content_identity.db"),
+        )
+        .unwrap();
 
         let run = |scope: DeleteSourceScope| {
             let data_dir = temp.path().to_path_buf();
