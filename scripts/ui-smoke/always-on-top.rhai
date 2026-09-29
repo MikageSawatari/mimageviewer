@@ -23,6 +23,18 @@ fn style(s, role) {
     fail("missing host style for " + role);
 }
 
+fn detached_content_painted(s) {
+    for window in s.windows {
+        if window.role != "detached" || !window.host_ready || !window.page_ready { continue; }
+        for paint in window.paints {
+            if paint.item_identity == window.item_identity
+                && paint.page_index == window.page_index
+                && paint.final_composite_complete { return true; }
+        }
+    }
+    false
+}
+
 fn role_is_foreground(s, role) {
     for host in s.host_styles {
         if host.role == role && host.foreground_hwnd == host.hwnd { return true; }
@@ -201,7 +213,10 @@ always_on_top_smoke("enable_independent_windows");
 select_root();
 grid_move_first();
 run_action("GridOpenSelected");
-wait_until(|s| count_role(s, "detached") >= 1, 30000);
+// A new detached window takes focus twice: when its loading shell is first shown and again
+// when its page mounts. Wait until the page is painted and the window is foreground, so the
+// OS Right key below is sent after both activations and reaches the root.
+wait_until(|s| detached_content_painted(s) && role_is_foreground(s, "detached"), 30000);
 select_root();
 grid_move_first();
 wait_until(|s| s.target_registered && s.focused, 10000);
