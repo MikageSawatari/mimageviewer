@@ -388,7 +388,10 @@ pub(crate) enum ClassifiedTagViewPath {
 
 pub(crate) fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
     match std::fs::metadata(&path) {
-        Ok(meta) => existing_tag_view_entry(restore_real_casing(path), meta),
+        Ok(meta) => existing_tag_view_entry(
+            crate::path_key::restore_existing_path_casing(&path).unwrap_or(path),
+            meta,
+        ),
         Err(_) => {
             // 大文字小文字を区別するディレクトリ (DevDrive / WSL の case-sensitive
             // フラグ) では、小文字正規化された item_key の metadata が**実在ファイル
@@ -423,34 +426,6 @@ fn existing_tag_view_entry(path: PathBuf, meta: std::fs::Metadata) -> Classified
         },
         is_directory,
     })
-}
-
-/// 表示用に実ディスク上の casing を復元する。
-///
-/// tags.db の item_key は小文字正規化されているため、キーから直接 GridItem を作ると
-/// セル名・ツールチップ・クリップボードまで全小文字になる (Ctrl+G/S は実 casing)。
-/// `canonicalize` は Windows で実 casing を返すので、`\\?\` プレフィックスを剥がした
-/// 上で**大小・区切り以外が変わらない場合のみ**採用する (シンボリックリンク解決で
-/// 別パスになった場合は item_key とずれてタグ操作が空振りするため、元のキーを保つ)。
-fn restore_real_casing(path: PathBuf) -> PathBuf {
-    let Ok(canon) = std::fs::canonicalize(&path) else {
-        return path;
-    };
-    let s = canon.to_string_lossy();
-    let stripped: PathBuf = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        canon
-    };
-    if crate::adjustment_db::normalize_path(&stripped)
-        == crate::adjustment_db::normalize_path(&path)
-    {
-        stripped
-    } else {
-        path
-    }
 }
 
 /// 親ディレクトリを走査して、ファイル名が大小無視で一致するエントリを探す。

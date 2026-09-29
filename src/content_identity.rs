@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
@@ -436,18 +436,21 @@ impl ContentIdentityDb {
 
     fn open_at(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create ledger directory: {error}"))?;
         }
-        let mut conn = rusqlite::Connection::open(path).map_err(|error| error.to_string())?;
+        let mut conn = rusqlite::Connection::open(path)
+            .map_err(|error| format!("open ledger database: {error}"))?;
         conn.busy_timeout(Duration::from_secs(5))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("configure ledger busy timeout: {error}"))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              ",
         )
-        .map_err(|error| error.to_string())?;
-        ensure_content_identity_schema(&mut conn)?;
+        .map_err(|error| format!("configure ledger WAL: {error}"))?;
+        ensure_content_identity_schema(&mut conn)
+            .map_err(|error| format!("initialize ledger schema: {error}"))?;
         Ok(Self { conn })
     }
 
@@ -819,13 +822,27 @@ impl ContentIdentityIndexLoadPending {
     /// A2 の索引ロード。設定 OFF では呼び出し側がこの worker 自体を作らない。
     pub(crate) fn spawn(
         io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+        recorder_initialization: Option<Arc<OnceLock<Result<(), String>>>>,
     ) -> Result<Self, String> {
-        Self::spawn_at(crate::data_dir::get().join("content_identity.db"), io_sem)
+        Self::spawn_at_after(
+            crate::data_dir::get().join("content_identity.db"),
+            io_sem,
+            recorder_initialization,
+        )
     }
 
+    #[cfg(test)]
     fn spawn_at(
         db_path: PathBuf,
         io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    ) -> Result<Self, String> {
+        Self::spawn_at_after(db_path, io_sem, None)
+    }
+
+    fn spawn_at_after(
+        db_path: PathBuf,
+        io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+        recorder_initialization: Option<Arc<OnceLock<Result<(), String>>>>,
     ) -> Result<Self, String> {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -833,12 +850,29 @@ impl ContentIdentityIndexLoadPending {
         std::thread::Builder::new()
             .name("content-identity-index-load".into())
             .spawn(move || {
-                let result = io_sem
-                    .acquire_cancellable(crate::io_semaphore::IoPriority::Low, &worker_cancel)
-                    .ok_or_else(|| "cancelled".to_string())
-                    .and_then(|_permit| ContentIdentityDb::open_at(&db_path))
-                    .and_then(|db| db.load_index(&worker_cancel))
-                    .and_then(|index| index.ok_or_else(|| "cancelled".to_string()));
+                // The recorder owns first-open schema creation. A DEFERRED schema
+                // transaction on two new connections can both read version 0,
+                // then fail the read-to-write upgrade with SQLITE_BUSY immediately.
+                let initialized = recorder_initialization
+                    .as_ref()
+                    .map(|ready| ready.wait().clone())
+                    .unwrap_or(Ok(()));
+                let result = initialized
+                    .map_err(|error| format!("recorder ledger initialization failed: {error}"))
+                    .and_then(|()| {
+                        io_sem
+                            .acquire_cancellable(
+                                crate::io_semaphore::IoPriority::Low,
+                                &worker_cancel,
+                            )
+                            .ok_or_else(|| "cancelled".to_string())
+                            .and_then(|_permit| ContentIdentityDb::open_at(&db_path))
+                            .and_then(|db| {
+                                db.load_index(&worker_cancel)
+                                    .map_err(|error| format!("load detection index: {error}"))
+                            })
+                            .and_then(|index| index.ok_or_else(|| "cancelled".to_string()))
+                    });
                 if !worker_cancel.load(Ordering::Acquire) {
                     let _ = tx.send(result);
                 }
@@ -878,25 +912,40 @@ pub(crate) struct ContentIdentityRecorder {
     update_rx: mpsc::Receiver<LedgerEntry>,
     handle: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    initialization: Arc<OnceLock<Result<(), String>>>,
 }
 
 impl ContentIdentityRecorder {
     pub(crate) fn spawn() -> Option<Self> {
+        Self::spawn_at(crate::data_dir::get().join("content_identity.db"))
+    }
+
+    fn spawn_at(db_path: PathBuf) -> Option<Self> {
         let (tx, rx) = mpsc::channel::<RecordRequest>();
         let (update_tx, update_rx) = mpsc::channel::<LedgerEntry>();
         let worker_update_tx = update_tx.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
+        let initialization = Arc::new(OnceLock::new());
+        let worker_initialization = Arc::clone(&initialization);
         match std::thread::Builder::new()
             .name("content-identity-recorder".into())
-            .spawn(move || run_worker(rx, worker_update_tx, worker_shutdown))
-        {
+            .spawn(move || {
+                run_worker(
+                    &db_path,
+                    rx,
+                    worker_update_tx,
+                    worker_shutdown,
+                    worker_initialization,
+                )
+            }) {
             Ok(handle) => Some(Self {
                 tx: Some(tx),
                 update_tx,
                 update_rx,
                 handle: Some(handle),
                 shutdown,
+                initialization,
             }),
             Err(error) => {
                 crate::logger::log(format!(
@@ -931,6 +980,10 @@ impl ContentIdentityRecorder {
 
     pub(crate) fn update_sender(&self) -> mpsc::Sender<LedgerEntry> {
         self.update_tx.clone()
+    }
+
+    pub(crate) fn initialization(&self) -> Arc<OnceLock<Result<(), String>>> {
+        Arc::clone(&self.initialization)
     }
 }
 
@@ -1761,11 +1814,15 @@ pub(crate) fn sort_restore_sources(sources: &mut [RestoreSourceCandidate]) {
 }
 
 fn run_worker(
+    db_path: &Path,
     rx: mpsc::Receiver<RecordRequest>,
     update_tx: mpsc::Sender<LedgerEntry>,
     shutdown: Arc<AtomicBool>,
+    initialization: Arc<OnceLock<Result<(), String>>>,
 ) {
-    let db = match ContentIdentityDb::open() {
+    let opened = ContentIdentityDb::open_at(db_path);
+    let _ = initialization.set(opened.as_ref().map(|_| ()).map_err(Clone::clone));
+    let db = match opened {
         Ok(db) => db,
         Err(error) => {
             crate::logger::log(format!("content_identity: DB open failed: {error}"));
@@ -2544,6 +2601,74 @@ mod tests {
             1,
             "canceled Low wait must not leak a permit"
         );
+    }
+
+    #[test]
+    fn old_two_connection_deferred_schema_open_can_fail_despite_busy_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        drop(conn);
+
+        let both_read_schema = Arc::new(std::sync::Barrier::new(2));
+        let attempts: Vec<_> = (0..2)
+            .map(|_| {
+                let db_path = db_path.clone();
+                let both_read_schema = Arc::clone(&both_read_schema);
+                std::thread::spawn(move || {
+                    let mut conn = rusqlite::Connection::open(db_path).unwrap();
+                    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+                    let tx = conn.transaction().unwrap();
+                    assert!(!schema_object_exists(&tx, "table", "edit_origin").unwrap());
+                    both_read_schema.wait();
+                    let result =
+                        tx.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)");
+                    tx.rollback().unwrap();
+                    result.map_err(|error| error.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<_> = attempts
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect();
+        assert!(
+            results
+                .iter()
+                .any(|result| result.as_ref().is_err_and(|error| error.contains("locked"))),
+            "the old read-then-create sequence should hit SQLITE_BUSY: {results:?}"
+        );
+    }
+
+    #[test]
+    fn empty_ledger_recorder_and_detection_index_start_without_competing_schema_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        let recorder = ContentIdentityRecorder::spawn_at(db_path.clone()).unwrap();
+        let io_sem = Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1));
+        let pending = ContentIdentityIndexLoadPending::spawn_at_after(
+            db_path,
+            io_sem,
+            Some(recorder.initialization()),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let index = loop {
+            match pending.try_recv() {
+                Ok(result) => break result.expect("fresh ledger and index must be usable"),
+                Err(mpsc::TryRecvError::Empty) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "index load did not finish"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => panic!("index loader disconnected"),
+            }
+        };
+        assert_eq!(index.len(), 0);
+        assert!(recorder.initialization().get().unwrap().is_ok());
     }
 
     #[test]
@@ -4021,6 +4146,7 @@ mod tests {
             update_rx,
             handle: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            initialization: Arc::new(OnceLock::new()),
         };
         recorder.record(
             ContentIdentitySource::new("C:/missing/image.png", ContentKind::Image),

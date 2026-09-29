@@ -560,10 +560,12 @@ fn key_source_path(key: &str) -> Option<PathBuf> {
 }
 
 fn existing_path(path: PathBuf) -> Option<PathBuf> {
-    if matches!(path.try_exists(), Ok(true)) {
-        return Some(path);
-    }
-    find_case_insensitive_sibling(&path)
+    let existing = if matches!(path.try_exists(), Ok(true)) {
+        path
+    } else {
+        find_case_insensitive_sibling(&path)?
+    };
+    Some(crate::path_key::restore_existing_path_casing(&existing).unwrap_or(existing))
 }
 
 fn find_case_insensitive_sibling(path: &Path) -> Option<PathBuf> {
@@ -980,6 +982,37 @@ mod tests {
         let rated_book = row(epub.to_string_lossy().to_string(), None, None);
         assert!(
             matches!(rating_row_to_view_row(&rated_book).unwrap().item, GridItem::PdfFile(path) if path == epub)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rated_folder_uses_physical_name_and_path_instead_of_normalized_store_key() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("MiXeDParent").join("AlbumF");
+        std::fs::create_dir_all(&folder).unwrap();
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        let key = crate::path_key::normalize_keep_drive(&folder);
+        let meta = crate::rating_db::RatingMeta::new(RatingItemKind::Folder)
+            .with_source_path(Path::new(&key));
+        db.set_user_rating(&key, 1, Some(&meta)).unwrap();
+
+        let result = build_rating_view_rows(db_path, 1, &AtomicBool::new(false)).unwrap();
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].key, key, "rating.db key stays normalized");
+        assert_eq!(result.rows[0].item.name(), "AlbumF");
+        assert!(
+            matches!(&result.rows[0].item, GridItem::Folder(path) if path.to_string_lossy() == folder.to_string_lossy())
+        );
+
+        let legacy = row(key, None, None);
+        let restored = rating_row_to_view_row(&legacy).unwrap();
+        assert_eq!(restored.item.name(), "AlbumF");
+        assert!(
+            matches!(&restored.item, GridItem::Folder(path) if path.to_string_lossy() == folder.to_string_lossy())
         );
     }
 

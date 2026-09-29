@@ -159,6 +159,19 @@ CREATE TABLE restore_declined (
 > 積み、全件 snapshot へ merge してから Ready に戻す。段 0 は引き続きメモリだけを参照し、
 > SQLite を開かない。
 
+> **v4.3.0 初回 schema 競合修正 (§1.286)**: 起動時は recorder worker と検出 index
+> loader が別接続で同時に `open_at` を呼んでいた。空の DB では両方の `DEFERRED`
+> transaction が `user_version=0` / `edit_origin` 不在を読めるため、後から
+> `CREATE TABLE` へ昇格する片方が `SQLITE_BUSY` で即時失敗する。各接続の 5 秒
+> busy timeout は既に有効で、read→write の競合を解決できない。初回 schema
+> 作成・旧版からの移行は recorder の接続が所有し、その完了結果を index loader
+> に渡してから後者が open / 全件ロードを始める。設定 OFF でも recorder は
+> 初期化し、後から検出を ON にした場合も同じ完了結果を使う。以降の reload は
+> 同じ schema を検証するだけ。DB 形式は変更しない。失敗時はディレクトリ作成、
+> SQLite open、WAL 設定、schema 初期化、index 読込の段階をログへ残す。
+> 非同期の競合ごとに retry を足す案は採らず、初回 schema 書込みの所有者を
+> 一つにして競合の組み合わせ自体をなくした。
+
 ### 3.3 記録のタイミング
 
 - **編集の確定点** (`save_mask_with_sidecar` / `save_conceal_with_sidecar` / `set_page_params` 等)

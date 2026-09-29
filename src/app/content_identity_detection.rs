@@ -39,7 +39,12 @@ impl App {
             .as_ref()
             .map(crate::indexer_manager::IndexerManager::io_sem)
             .unwrap_or_else(|| Arc::clone(&self.content_identity_fallback_io_sem));
-        match ContentIdentityIndexLoadPending::spawn(io_sem) {
+        match ContentIdentityIndexLoadPending::spawn(
+            io_sem,
+            self.content_identity_recorder
+                .as_ref()
+                .map(crate::content_identity::ContentIdentityRecorder::initialization),
+        ) {
             Ok(pending) => self.content_identity_index_load_pending = Some(pending),
             Err(error) => self.mark_content_identity_ledger_unusable(format!(
                 "index loader thread spawn failed: {error}"
