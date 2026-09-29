@@ -11868,6 +11868,86 @@ mod startup_open_path_resolve_tests {
     }
 
     #[test]
+    fn warm_pdf_verification_keeps_placeholder_thumbnail_workers_or_rebuilds_them() {
+        for actual_count in [2, 3] {
+            let mut app = setup_app();
+            let folder = app.tmp.path().join(format!("warm-worker-{actual_count}"));
+            std::fs::create_dir(&folder).unwrap();
+            let pdf = folder.join("book.pdf");
+            std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+            let stamp = std::fs::metadata(&pdf).unwrap();
+            let catalog = app.get_or_open_catalog(&folder).unwrap();
+            catalog
+                .set_pdf_meta(
+                    "book.pdf",
+                    crate::ui_helpers::mtime_secs(&stamp),
+                    stamp.len() as i64,
+                    2,
+                    false,
+                )
+                .unwrap();
+            assert!(
+                catalog
+                    .load_one(&crate::grid_item::pdf_page_cache_key(0))
+                    .unwrap()
+                    .is_none()
+            );
+            app.load_folder(folder);
+            assert_eq!(
+                app.load_pdf_as_folder_owned(pdf.clone(), OpenRequestOwner::Navigation),
+                FolderOpenOutcome::Loaded
+            );
+            assert!(matches!(
+                app.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
+                Some(super::PdfOpenPhase::CommittedVerification {
+                    placeholder_count: 2
+                })
+            ));
+            assert_eq!(app.items.len(), 2);
+            assert!(
+                app.thumbnails
+                    .iter()
+                    .any(|state| matches!(state, crate::grid_item::ThumbnailState::Pending))
+            );
+            let visible_generation = app.items_generation;
+            let placeholder_workers = Arc::clone(&app.cancel_token);
+            assert!(!placeholder_workers.load(Ordering::Relaxed));
+
+            app.pdf_enumerate_pending.as_mut().unwrap().2 =
+                crate::pdf_loader::completed_enumerate_result_handle(
+                    &pdf,
+                    Ok(crate::pdf_loader::PdfEnumerateResult {
+                        pages: (0..actual_count)
+                            .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                                page_num,
+                                mtime: crate::ui_helpers::mtime_secs(&stamp),
+                                file_size: stamp.len(),
+                            })
+                            .collect(),
+                        direction: None,
+                        stamp: None,
+                    }),
+                );
+            app.poll_pdf_enumerate();
+            assert!(app.pdf_enumerate_pending.is_none());
+            if actual_count == 2 {
+                assert_eq!(app.items_generation, visible_generation);
+                assert!(Arc::ptr_eq(&app.cancel_token, &placeholder_workers));
+                assert!(
+                    !placeholder_workers.load(Ordering::Relaxed),
+                    "a matching verification must keep the adopted thumbnail workers alive"
+                );
+            } else {
+                assert!(app.items_generation > visible_generation);
+                assert_eq!(app.items.len(), 3);
+                assert!(placeholder_workers.load(Ordering::Relaxed));
+                assert!(!Arc::ptr_eq(&app.cancel_token, &placeholder_workers));
+                assert!(!app.cancel_token.load(Ordering::Relaxed));
+            }
+        }
+    }
+
+    #[test]
     fn warm_pdf_verifier_survives_failed_or_cancelled_cold_direct_candidate() {
         for cancel in [false, true] {
             let mut app = setup_app();

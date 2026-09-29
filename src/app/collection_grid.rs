@@ -6099,6 +6099,8 @@ mod tests {
         assert_eq!(app.current_folder.as_deref(), Some(epub.as_path()));
         assert_eq!(app.folder_history_back_target(), source.as_ref());
         let placeholder_generation = app.items_generation;
+        let placeholder_workers = Arc::clone(&app.cancel_token);
+        assert!(!placeholder_workers.load(Ordering::Relaxed));
         app.pdf_enumerate_pending.as_mut().unwrap().2 =
             crate::pdf_loader::completed_enumerate_result_handle(
                 &epub,
@@ -6110,6 +6112,8 @@ mod tests {
             );
         app.poll_pdf_enumerate();
         assert_eq!(app.items_generation, placeholder_generation);
+        assert!(Arc::ptr_eq(&app.cancel_token, &placeholder_workers));
+        assert!(!placeholder_workers.load(Ordering::Relaxed));
         assert_eq!(
             app.reading_direction,
             crate::settings::ReadingDirection::Ltr

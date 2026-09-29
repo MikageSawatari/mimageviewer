@@ -32539,8 +32539,16 @@ impl App {
                     }
                     self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
                 }
-                drop(phase);
-                self.prepare_pdf_visible_adoption(&pdf_path);
+                match phase {
+                    PdfOpenPhase::ColdCandidate { retained_source } => {
+                        drop(retained_source);
+                        self.prepare_pdf_visible_adoption(&pdf_path);
+                    }
+                    PdfOpenPhase::CommittedVerification { .. } => {
+                        // The placeholder grid has already adopted this PDF and started
+                        // its thumbnail workers. Verification must not cancel them.
+                    }
+                }
                 self.finish_pdf_enumerate_success(pdf_path, password, pages);
             }
             Err(e) => {
