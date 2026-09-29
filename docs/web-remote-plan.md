@@ -2721,6 +2721,13 @@ protocol v62 の `RawPrefetchSkipped` を HTTP 204、`X-mIV-Page-Skip: raw-prefe
 cancel / release し、計画に残る場合は新しい有界の先読み job に戻す。混雑は job ごとに
 `page_congestion` 1 件へ集約して記録する。
 
+ZIP の先読み判定は外側のディレクトリだけを見る。対象範囲に RAW entry または中身が未確定の
+入れ子 ZIP があれば RAW 代表になり得るため、外側から特定できる現像済み代表が無い限り
+`RawPrefetchSkipped` とし、判定のために入れ子 ZIP を展開しない。entry を明示した
+非 RAW ページ (入れ子 ZIP 内の JPEG を含む) は従来どおり先読みする。前景ページは最初の
+読み取り可能な代表を一度だけ選んで RAW preflight と読み込みで共有し、入れ子展開中も
+cancel を確認する。AI の代表選択は現像枠の確保後に行う。
+
 Remote RAW サムネイルは half 現像を起こさず、埋め込みプレビューまたは既存 catalog の
 サムネイルを使う。どちらも無ければ protocol v62 の `NoThumbnail` を従来のサムネイル失敗
 応答へ写す。サムネイル専用 IPC admission は heavy の最後の 1 枠を使わない。

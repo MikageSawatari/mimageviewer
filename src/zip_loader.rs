@@ -1026,6 +1026,14 @@ pub fn enumerate_image_entries_detailed_with_cancel(
     zip_path: &Path,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_with_cancels(zip_path, cancel, None)
+}
+
+pub fn enumerate_image_entries_detailed_with_cancels(
+    zip_path: &Path,
+    cancel: Option<&AtomicBool>,
+    stop: Option<&AtomicBool>,
+) -> std::io::Result<ZipEnumeration> {
     if crate::rar_loader::is_rar_path(zip_path) {
         return crate::rar_loader::enumerate_image_entries_detailed_with_cancel(zip_path, cancel);
     }
@@ -1049,12 +1057,126 @@ pub fn enumerate_image_entries_detailed_with_cancel(
         &mut has_foreign,
         &mut legacy_renames,
         cancel,
+        stop,
     )?;
     Ok(ZipEnumeration {
         entries: out,
         has_foreign_archives: has_foreign,
         legacy_renames,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn nested_cache_contains(zip_path: &Path, nested_name: &str) -> bool {
+    NESTED_CACHE.get(zip_path, nested_name).is_some()
+}
+
+/// Conservative Remote prefetch check using only the outer ZIP directory.
+/// A nested archive is opaque until extracted, so it may contain a RAW page.
+/// An unreadable earlier image can also make a later RAW the first readable one.
+pub fn prefetch_may_select_raw_without_extraction(
+    zip_path: &Path,
+    directory_prefix: Option<&str>,
+) -> std::io::Result<bool> {
+    if crate::rar_loader::is_rar_path(zip_path) {
+        let entries = crate::rar_loader::enumerate_image_entries_detailed(zip_path)?.entries;
+        return Ok(entries.iter().any(|entry| {
+            crate::raw_format::is_raw_path(Path::new(&entry.entry_name))
+                && directory_prefix.is_none_or(|prefix| entry.entry_name.starts_with(prefix))
+        }));
+    }
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, None)?;
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index(index) else {
+            continue;
+        };
+        if !entry.is_file() {
+            continue;
+        }
+        let name = normalized_zip_entry_name(&entry);
+        if should_ignore(&name) {
+            continue;
+        }
+        let Some(ext) = lowercase_ext(&name) else {
+            continue;
+        };
+        if crate::folder_tree::is_zip_extension(&ext) {
+            let nested_prefix = format!("{name}/");
+            if directory_prefix
+                .is_none_or(|prefix| name.starts_with(prefix) || prefix.starts_with(&nested_prefix))
+            {
+                return Ok(true);
+            }
+        } else if crate::raw_format::is_raw_path(Path::new(&name))
+            && directory_prefix.is_none_or(|prefix| name.starts_with(prefix))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Return a RAW representative that can be identified from the outer directory
+/// alone. A hit in the developed-RAW cache makes this selection usable without
+/// source extraction. Unknown nested candidates stay conservative misses.
+pub fn prefetch_cached_raw_candidate_without_extraction(
+    zip_path: &Path,
+    directory_prefix: Option<&str>,
+) -> std::io::Result<Option<String>> {
+    if crate::rar_loader::is_rar_path(zip_path) {
+        let entries = crate::rar_loader::enumerate_image_entries_detailed(zip_path)?.entries;
+        let selected = if let Some(prefix) = directory_prefix {
+            crate::zip_tree::ZipTree::build(zip_path.to_path_buf(), entries)
+                .representative_for_prefix_str(prefix, crate::app::BOOK_READING_PAGE_ORDER)
+                .map(|entry| entry.entry_name.clone())
+        } else {
+            entries.first().map(|entry| entry.entry_name.clone())
+        };
+        return Ok(selected.filter(|name| crate::raw_format::is_raw_path(Path::new(name))));
+    }
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, None)?;
+    let mut direct = Vec::new();
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index(index) else {
+            continue;
+        };
+        if !entry.is_file() {
+            continue;
+        }
+        let name = normalized_zip_entry_name(&entry);
+        if should_ignore(&name) {
+            continue;
+        }
+        let Some(ext) = lowercase_ext(&name) else {
+            continue;
+        };
+        if crate::folder_tree::is_zip_extension(&ext) {
+            let nested_prefix = format!("{name}/");
+            if directory_prefix
+                .is_none_or(|prefix| name.starts_with(prefix) || prefix.starts_with(&nested_prefix))
+            {
+                return Ok(None);
+            }
+        } else if is_image_ext(&ext)
+            && directory_prefix.is_none_or(|prefix| name.starts_with(prefix))
+        {
+            if directory_prefix.is_none() {
+                return Ok(crate::raw_format::is_raw_path(Path::new(&name)).then_some(name));
+            }
+            direct.push(ZipImageEntry {
+                entry_name: name,
+                uncompressed_size: entry.size(),
+                mtime: 0,
+            });
+        }
+    }
+    let Some(prefix) = directory_prefix else {
+        return Ok(None);
+    };
+    let selected = crate::zip_tree::ZipTree::build(zip_path.to_path_buf(), direct)
+        .representative_for_prefix_str(prefix, crate::app::BOOK_READING_PAGE_ORDER)
+        .map(|entry| entry.entry_name.clone());
+    Ok(selected.filter(|name| crate::raw_format::is_raw_path(Path::new(name))))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1068,10 +1190,11 @@ fn enumerate_recursive<R: Read + Seek>(
     has_foreign: &mut bool,
     legacy_renames: &mut Vec<(String, String)>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    stop: Option<&AtomicBool>,
 ) -> std::io::Result<()> {
     let len = archive.len();
     for i in 0..len {
-        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+        if cancelled_by(cancel, stop) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "ZIP enumeration cancelled",
@@ -1122,8 +1245,8 @@ fn enumerate_recursive<R: Read + Seek>(
                 }
                 None => {
                     let mut buf = Vec::with_capacity(size as usize);
-                    if read_to_end_with_cancel(&mut entry, &mut buf, cancel).is_err() {
-                        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    if read_to_end_with_cancel(&mut entry, &mut buf, cancel, stop).is_err() {
+                        if cancelled_by(cancel, stop) {
                             return Err(interrupted_error());
                         }
                         continue;
@@ -1154,20 +1277,27 @@ fn enumerate_recursive<R: Read + Seek>(
                 has_foreign,
                 legacy_renames,
                 cancel,
+                stop,
             )?;
         }
     }
     Ok(())
 }
 
+fn cancelled_by(cancel: Option<&AtomicBool>, stop: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|token| token.load(Ordering::Relaxed))
+        || stop.is_some_and(|token| token.load(Ordering::Relaxed))
+}
+
 fn read_to_end_with_cancel(
     reader: &mut impl Read,
     output: &mut Vec<u8>,
     cancel: Option<&AtomicBool>,
+    stop: Option<&AtomicBool>,
 ) -> std::io::Result<()> {
     let mut chunk = [0_u8; 64 * 1024];
     loop {
-        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        if cancelled_by(cancel, stop) {
             return Err(interrupted_error());
         }
         match reader.read(&mut chunk) {
@@ -1270,38 +1400,80 @@ fn first_image_recursive<R: Read + Seek>(
 ///
 /// 戻り値: `Some((entry_name, bytes))` or `None` (画像エントリが無い場合)
 pub fn read_first_image_bytes(zip_path: &Path) -> Option<(String, Vec<u8>)> {
+    read_first_image_bytes_impl(zip_path, None, None)
+        .ok()
+        .flatten()
+}
+
+/// Remote page representative selection. The selected entry is the same one
+/// the legacy first-image loader would return, but nested extraction and image
+/// reads stop at the same cancellation boundaries as entry reads.
+pub fn read_first_image_bytes_cancellable(
+    zip_path: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> std::io::Result<Option<(String, Vec<u8>)>> {
+    read_first_image_bytes_cancellable_with_stop(zip_path, cancel, None)
+}
+
+pub fn read_first_image_bytes_cancellable_with_stop(
+    zip_path: &Path,
+    cancel: &Arc<AtomicBool>,
+    stop: Option<&AtomicBool>,
+) -> std::io::Result<Option<(String, Vec<u8>)>> {
+    read_first_image_bytes_impl(zip_path, Some(cancel), stop)
+}
+
+fn read_first_image_bytes_impl(
+    zip_path: &Path,
+    cancel: Option<&Arc<AtomicBool>>,
+    stop: Option<&AtomicBool>,
+) -> std::io::Result<Option<(String, Vec<u8>)>> {
+    if cancelled_by(cancel.map(Arc::as_ref), stop) {
+        return Err(interrupted_error());
+    }
     if crate::rar_loader::is_rar_path(zip_path) {
-        return crate::rar_loader::read_first_image_bytes(zip_path);
+        let result = crate::rar_loader::read_first_image_bytes(zip_path);
+        return if cancelled_by(cancel.map(Arc::as_ref), stop) {
+            Err(interrupted_error())
+        } else {
+            Ok(result)
+        };
     }
     let file_size = std::fs::metadata(zip_path)
         .ok()
         .map(|m| m.len())
         .unwrap_or(0);
     let t0 = std::time::Instant::now();
-    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, None).ok()?;
-    let result = read_first_image_recursive(&mut archive, zip_path, "");
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, cancel)?;
+    let result =
+        read_first_image_recursive(&mut archive, zip_path, "", cancel.map(Arc::as_ref), stop)?;
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    if total_ms > 50.0 {
-        if let Some((ref name, ref bytes)) = result {
-            crate::logger::log(format!(
-                "      [zip detail] zip_size={:.1}MB total={total_ms:.0}ms bytes={} {}  {}",
-                file_size as f64 / (1024.0 * 1024.0),
-                bytes.len(),
-                name,
-                zip_path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-            ));
-        }
+    if total_ms > 50.0
+        && let Some((ref name, ref bytes)) = result
+    {
+        crate::logger::log(format!(
+            "      [zip detail] zip_size={:.1}MB total={total_ms:.0}ms bytes={} {}  {}",
+            file_size as f64 / (1024.0 * 1024.0),
+            bytes.len(),
+            name,
+            zip_path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+        ));
     }
-    result
+    Ok(result)
 }
 
 fn read_first_image_recursive<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     outer_zip_path: &Path,
     prefix: &str,
-) -> Option<(String, Vec<u8>)> {
+    cancel: Option<&AtomicBool>,
+    stop: Option<&AtomicBool>,
+) -> std::io::Result<Option<(String, Vec<u8>)>> {
     let len = archive.len();
     for i in 0..len {
+        if cancelled_by(cancel, stop) {
+            return Err(interrupted_error());
+        }
         let Ok(mut entry) = archive.by_index(i) else {
             continue;
         };
@@ -1318,10 +1490,13 @@ fn read_first_image_recursive<R: Read + Seek>(
         let full_name = format!("{prefix}{name}");
         if is_image_ext(&ext) {
             let mut bytes = Vec::with_capacity(entry.size() as usize);
-            if entry.read_to_end(&mut bytes).is_err() {
+            if read_to_end_with_cancel(&mut entry, &mut bytes, cancel, stop).is_err() {
+                if cancelled_by(cancel, stop) {
+                    return Err(interrupted_error());
+                }
                 continue;
             }
-            return Some((full_name, bytes));
+            return Ok(Some((full_name, bytes)));
         }
         if crate::folder_tree::is_zip_extension(&ext) {
             let size = entry.size();
@@ -1333,7 +1508,10 @@ fn read_first_image_recursive<R: Read + Seek>(
                 }
                 None => {
                     let mut buf = Vec::with_capacity(size as usize);
-                    if entry.read_to_end(&mut buf).is_err() {
+                    if read_to_end_with_cancel(&mut entry, &mut buf, cancel, stop).is_err() {
+                        if cancelled_by(cancel, stop) {
+                            return Err(interrupted_error());
+                        }
                         continue;
                     }
                     drop(entry);
@@ -1351,13 +1529,14 @@ fn read_first_image_recursive<R: Read + Seek>(
                 continue;
             };
             let new_prefix = format!("{full_name}/");
-            if let Some(found) = read_first_image_recursive(&mut inner, outer_zip_path, &new_prefix)
+            if let Some(found) =
+                read_first_image_recursive(&mut inner, outer_zip_path, &new_prefix, cancel, stop)?
             {
-                return Some(found);
+                return Ok(Some(found));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// ZIP 内の特定エントリの生バイト列を取り出す。
@@ -1681,6 +1860,97 @@ pub fn entry_basename(entry_name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CancelAfterRead<R> {
+        inner: R,
+        cancel: Arc<AtomicBool>,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl<R: Read> Read for CancelAfterRead<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            if read > 0 && self.armed.load(Ordering::Relaxed) {
+                self.cancel.store(true, Ordering::Release);
+            }
+            Ok(read)
+        }
+    }
+
+    impl<R: Seek> Seek for CancelAfterRead<R> {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    #[test]
+    fn cancelled_nested_selection_and_enumeration_stop_before_cache_publication() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cancel-nested.zip");
+        let inner_bytes = {
+            let cursor = Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(cursor);
+            writer
+                .start_file("leaf.jpg", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&vec![7; 256 * 1024]).unwrap();
+            writer.finish().unwrap().into_inner()
+        };
+        let outer_bytes = {
+            let cursor = Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(cursor);
+            writer
+                .start_file(
+                    "inner.zip",
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+            writer.write_all(&inner_bytes).unwrap();
+            writer.finish().unwrap().into_inner()
+        };
+        std::fs::write(&path, &outer_bytes).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let armed = Arc::new(AtomicBool::new(false));
+        let reader = CancelAfterRead {
+            inner: Cursor::new(outer_bytes.clone()),
+            cancel: Arc::clone(&cancel),
+            armed: Arc::clone(&armed),
+        };
+        let mut archive = zip::ZipArchive::new(reader).unwrap();
+        armed.store(true, Ordering::Release);
+        let result = read_first_image_recursive(&mut archive, &path, "", Some(&cancel), None);
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(!nested_cache_contains(&path, "inner.zip"));
+
+        cancel.store(false, Ordering::Release);
+        let reader = CancelAfterRead {
+            inner: Cursor::new(outer_bytes),
+            cancel: Arc::clone(&cancel),
+            armed,
+        };
+        let mut archive = zip::ZipArchive::new(reader).unwrap();
+        let mut entries = Vec::new();
+        let mut has_foreign = false;
+        let mut legacy_renames = Vec::new();
+        let result = enumerate_recursive(
+            &mut archive,
+            &path,
+            "",
+            "",
+            0,
+            &mut entries,
+            &mut has_foreign,
+            &mut legacy_renames,
+            Some(&cancel),
+            None,
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(!nested_cache_contains(&path, "inner.zip"));
+    }
 
     /// **先頭だけ読む経路も、全体を読む経路と同じ名前解決を通る。**
     ///
