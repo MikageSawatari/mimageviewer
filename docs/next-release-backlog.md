@@ -2313,7 +2313,7 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   テスト素材は未作成。
 - 規模 / 優先度: Medium-Large / P3。
 
-### 1.294 並列実行時だけ落ちるライブラリテスト 2 件 (2026-09-27)
+### 1.294 並列実行時だけ落ちるライブラリテスト 2 件 (2026-09-27) — content identity の隔離は修正済み (2026-10-01)
 
 - 観測: 2026-09-27 の全ライブラリテスト (他 worktree のビルドと並行、高負荷) で各 1 回失敗。どちらも単独実行では 3 回とも成功。
 - `content_identity::tests::an_origin_whose_edits_were_all_removed_stops_being_a_restore_source`
@@ -2321,11 +2321,12 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   プロセス共通の `record_sequence()` で判定する。並列の別テストが編集を記録すると掃除が見送られ、flag が下がらず失敗する。
   製品の挙動としては意図どおり (次のフォルダ訪問でやり直す)。テストの隔離の問題。EPUB 作業の S2c-2 検収で
   「RECORD_SEQUENCE 共有の不安定テスト」として別課題にされていたもの。
+- 追記 (2026-10-01、§1.313 fix3): 上記と同じ content identity test が pin reload fix2 の通常並列 full lib で2回連続して失敗した。モジュール内だけの既存 `lock_record_sequence` を、App fixture も保持する共通 `data_dir::test_override_lock` に揃え、standalone の sequence reader／writer 11テストをその lock で直列化した。直接 probe／失敗した recorder submit と、App の pin／rating／tag／undo／ページ編集等の間接 record が別テストの cleanup と重ならない。既に App fixture を持つテストと共通 detection helper では再取得しない。製品の sequence／掃除仕様と assertion は変更しない。通常並列の full lib 2回がともに 9915 pass／0 fail／51 ignored（528.65秒／545.20秒）。結果は [pin-reload-audit.md](pin-reload-audit.md) fix3 に記録。LUT 待機と下記 GL／wgpu crash は今回の修正対象ではなく、未解決のまま。
 - `app::tests::pipeline_cache_refactor_tests::colorize_display_gate_requires_final_effect_for_creative_lut`:
   非同期の LUT 読み込みを `yield_now` 1 万回だけ待つ。高負荷で待ち切れない。
 - 追記 (2026-09-27): 同日、並列の全ライブラリテストでテスト実行ファイル自体のアクセス違反 (`0xc0000005`、Windows のエラーダイアログ「wgpu Device Class ...: mimageviewer-<hash>」を**利用者が目撃**、スクリーンショットあり) が別 worktree で 2 回起きた。並列度を下げた再実行では完走。「wgpu Device Class」は GL の隠しウィンドウ名で、ui_snapshot で以前から見ている間欠クラッシュと同じ系統と推定 (未確認、ダンプなし)。エラーダイアログが出るとテストが止まったままになるので、無人実行では問題が大きい。
-- 方針: 共通 counter を注入可能にする、または観測の対象 key に限定する等、テスト側の隔離で直す。待ち回数を増やすだけの対処はしない
-  (完了通知を待つ形にする)。規模 / 優先度: Small / P3 (リリース判定のたびに単独再実行の手間がかかる)。
+- 方針: content identity は既存の共通 test lock による隔離を適用。残る LUT 待機は待ち回数を増やすだけの対処をせず、
+  完了通知を待つ形で直す。規模 / 優先度: Small / P3 (リリース判定のたびに単独再実行の手間がかかる)。
 
 ### 1.292 ソートを絞り込みバー右側にも表示できるようにする — >>470、>>473 (2026-09-27)
 

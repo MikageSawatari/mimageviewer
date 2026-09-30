@@ -138,3 +138,29 @@ worker は表示中の共有 cache を直接変更せず、worker 上の private
 | SHA-256／`git diff --check` | source 6ファイル一致／exit 0 | `pin-reload-fix2-source-hash.txt`、`pin-reload-fix2-handoff-checks.txt` |
 
 監査6件の内容は同じ A4 2件／A6 4件。該当2ファイルと audit tool は起点から未変更 (`git diff --quiet` exit 0) で、allowlist は変更していない。fix2 の実装側補助レビューは最終の import succession と unpin coverage を含め残存指摘を検出しなかったが、利用者指定の独立レビューとは別であり、その再レビューを代替しない。確認用 build は全 lib 成功後に実行し、開始時に native compiler／MSBuild がないことを確認して既存 wait override を使用した。`portable` を有効にせず、normal profile の core／remote／EPUB converter と必要 DLL を `target/dev-runtime/` に配置した。検証後から build 完了まで source 6ファイルの SHA-256 が一致する。製品の起動・UI smoke・通常プロファイルの操作は行っていない。
+
+
+## fix3: RECORD_SEQUENCE のテスト隔離 (起点 `6869ca75e`)
+
+fix2 の通常並列 full lib の失敗は、backlog §1.294 に既に記載された `an_origin_whose_edits_were_all_removed_stops_being_a_restore_source` と同じ隔離不備だった。利用者の指示に従い、直列 full lib の成功だけで完了とはせず、通常並列で安定するようテスト側の ownership を修正する。
+
+`RECORD_SEQUENCE` の直接 writer は probe 回帰の `fetch_add` と `ContentIdentityRecorder::record`。後者は App fixture の pin set／remove、rating／undo／tag、ページ補正／回転／mask／conceal／crop／comic／trim、spread／book resume 等から間接に呼ばれる。独立した test module 内の旧 mutex はそれらを保護しなかった。既存の test-only `lock_record_sequence` を `data_dir::test_override_lock()` へ委譲する。App fixture は既にこの lock を App 構築前から drop／recorder join 後まで保持しているため、新しい lock や product guard は不要である。生の App constructor を使う既存 navigation-identity 回帰も確認したが、編集／resume／`record()` を呼ばず sequence writer ではない。recorder の生成と背景 ledger 更新自体は sequence を増やさないため、そのテストを変更する範囲拡大は不要である。
+
+既存3 probe／cleanup 回帰に加え、standalone の direct detection 6件、book byte-copy detection 1件、failed recorder submit 1件に入口ガードを追加し、直接 reader／writer 合計11件を同じ scope に置く。App fixture を使うテストは既存 guard を再利用し、共通 detection helper 内では再取得しない。既存 poison recovery も共通 helper の契約を使う。製品 API に sequence 注入はないため、既存 fixture と共通 lock を統一する方が小さく、製品の挙動もそのまま検査できる。
+
+source 差分は `src/content_identity.rs` の `#[cfg(test)] mod tests` 内だけ。製品コード、`RECORD_SEQUENCE` の increment／cleanup 判定、assertion、待機回数／retry／thread 数は変更しない。`target/pin-reload-fix3-isolation-boundary.txt` に製品 prefix が起点から不変であることと直接ガード数を記録した。§1.294 の LUT 待機・GL／wgpu crash は修正したとは扱わない。
+
+### fix3 検証
+
+Windows、default features、`MSBUILDDISABLENODEREUSE=1`。source は `target/pin-reload-fix3-source-hash.txt` の SHA-256 で固定し、focus と通常並列 full lib を順に実行する。`RUST_TEST_THREADS` を指定せず、`--test-threads=1`／filter／skip を full lib に付けない。
+
+| コマンド／検査 | 結果 | ログ (`target/` 内) |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | exit 0 | `pin-reload-fix3-fmt.log` |
+| `cargo test -p mimageviewer --lib content_identity::tests::` | exit 0、46 pass／0 fail | `pin-reload-fix3-focused.log` |
+| `cargo test -p mimageviewer --lib` (通常並列、1回目) | exit 0、9915 pass／0 fail／51 ignored (528.65秒) | `pin-reload-fix3-lib-parallel-1.log` |
+| `cargo test -p mimageviewer --lib` (通常並列、2回目) | exit 0、9915 pass／0 fail／51 ignored (545.20秒) | `pin-reload-fix3-lib-parallel-2.log` |
+
+両実行で問題の origin-cleanup test と既存の同時編集／CAS probe 回帰が通過した。source の SHA-256 は focused 検証から両 full lib 完了まで一致し、`git diff --check` は exit 0（`pin-reload-fix3-handoff-checks.txt`）。通常並列を直列 full lib の結果で代替せず、filter／skip／assertion の緩和も行っていない。
+
+テスト／文書だけの変更なので確認用 binary の再ビルドと UI 起動は行わない。fix2 の fmt以外の core／snapshot／audit／確認用 build は製品 source が不変のため有効範囲を再利用する。workspace gate は引き続き release 3入力不在で未実行とし、その入力を作る release build は行わない。
