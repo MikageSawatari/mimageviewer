@@ -6029,10 +6029,43 @@ pub(crate) struct DetailsLazyMeta {
     pub(crate) page_count_pdf_password_revision: Option<u64>,
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) image_dims_failed: bool,
-    pub(crate) video_duration_secs: Option<f64>,
-    pub(crate) video_dims: Option<(u32, u32)>,
-    pub(crate) video_codec: Option<String>,
-    pub(crate) video_meta_failed: bool,
+    pub(crate) media: DetailsMediaMeta,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum DetailsMediaMeta {
+    #[default]
+    NotFetched,
+    Read(DetailsVideoProbe),
+    Unreadable,
+    /// Retry on a new item installation, without repeatedly probing this list.
+    RetryLater {
+        generation: u64,
+    },
+}
+
+impl DetailsMediaMeta {
+    fn read(&self) -> Option<&DetailsVideoProbe> {
+        match self {
+            Self::Read(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    fn satisfies(&self, generation: u64) -> bool {
+        match self {
+            Self::NotFetched => false,
+            Self::RetryLater {
+                generation: attempted,
+            } => *attempted == generation,
+            Self::Read(_) | Self::Unreadable => true,
+        }
+    }
+
+    fn failed_for_generation(&self, generation: u64) -> bool {
+        matches!(self, Self::Unreadable)
+            || matches!(self, Self::RetryLater { generation: attempted } if *attempted == generation)
+    }
 }
 
 impl DetailsLazyMeta {
@@ -6068,10 +6101,7 @@ impl DetailsLazyMeta {
             self.image_dims_failed = patch.image_dims_failed;
         }
         if loaded.video_meta {
-            self.video_duration_secs = patch.video_duration_secs;
-            self.video_dims = patch.video_dims;
-            self.video_codec = patch.video_codec;
-            self.video_meta_failed = patch.video_meta_failed;
+            self.media = patch.media;
         }
         source_changed
     }
@@ -6267,8 +6297,7 @@ struct DetailsMetaTarget {
     key: String,
     item: GridItem,
     relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
-    source_mtime: i64,
-    source_size: i64,
+    source_identity: Option<(i64, i64)>,
     catalog_folder: Option<PathBuf>,
     catalog_key: Option<String>,
     warm_image_dims: Option<(u32, u32)>,
@@ -6283,6 +6312,14 @@ struct DetailsMetaTarget {
 }
 
 impl DetailsMetaTarget {
+    fn source_mtime(&self) -> i64 {
+        self.source_identity.map_or(0, |identity| identity.0)
+    }
+
+    fn source_size(&self) -> i64 {
+        self.source_identity.map_or(0, |identity| identity.1)
+    }
+
     fn requested_fields(&self) -> DetailsLazyFieldFlags {
         DetailsLazyFieldFlags {
             page_count: self.load_page_count,
@@ -6309,10 +6346,11 @@ struct DetailsPageCountConfig {
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
 }
 
-struct DetailsVideoProbe {
-    duration_secs: Option<f64>,
-    dims: Option<(u32, u32)>,
-    codec: Option<String>,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DetailsVideoProbe {
+    pub(crate) duration_secs: Option<f64>,
+    pub(crate) dims: Option<(u32, u32)>,
+    pub(crate) codec: Option<String>,
 }
 
 /// 非同期お気に入り検索 (Ctrl+S) の状態。
@@ -60132,7 +60170,7 @@ impl App {
             return None;
         }
         self.details_lazy_meta_for_idx(idx)
-            .and_then(|meta| meta.video_duration_secs)
+            .and_then(|meta| meta.media.read()?.duration_secs)
             .and_then(crate::thumb_overlay_layout::format_media_duration)
     }
 
@@ -60145,10 +60183,10 @@ impl App {
             return "-".to_string();
         }
         if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
-            if let Some(secs) = meta.video_duration_secs {
+            if let Some(secs) = meta.media.read().and_then(|values| values.duration_secs) {
                 return format_details_duration(secs);
             }
-            if meta.video_meta_failed {
+            if meta.media.failed_for_generation(self.items_generation) {
                 return "-".to_string();
             }
         }
@@ -60167,10 +60205,10 @@ impl App {
             return "-".to_string();
         }
         if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
-            if let Some((w, h)) = meta.video_dims {
+            if let Some((w, h)) = meta.media.read().and_then(|values| values.dims) {
                 return format!("{w}x{h}");
             }
-            if meta.video_meta_failed {
+            if meta.media.failed_for_generation(self.items_generation) {
                 return "-".to_string();
             }
         }
@@ -60193,10 +60231,10 @@ impl App {
             return "-".to_string();
         }
         if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
-            if let Some(codec) = meta.video_codec.as_ref() {
+            if let Some(codec) = meta.media.read().and_then(|values| values.codec.as_ref()) {
                 return codec.clone();
             }
-            if meta.video_meta_failed {
+            if meta.media.failed_for_generation(self.items_generation) {
                 return "-".to_string();
             }
         }
@@ -60215,7 +60253,7 @@ impl App {
             return None;
         }
         self.details_lazy_meta_for_idx(idx)
-            .and_then(|meta| meta.video_duration_secs)
+            .and_then(|meta| meta.media.read()?.duration_secs)
             .filter(|secs| secs.is_finite() && *secs > 0.0)
             .map(|secs| (secs * 1000.0).round() as u64)
     }
@@ -60225,7 +60263,7 @@ impl App {
             return None;
         }
         self.details_lazy_meta_for_idx(idx)
-            .and_then(|meta| meta.video_dims)
+            .and_then(|meta| meta.media.read()?.dims)
             .map(|(w, h)| (w as u64) * (h as u64))
     }
 
@@ -60234,7 +60272,7 @@ impl App {
             return None;
         }
         self.details_lazy_meta_for_idx(idx)
-            .and_then(|meta| meta.video_codec.clone())
+            .and_then(|meta| meta.media.read()?.codec.clone())
     }
 
     fn start_details_meta_load(&mut self, ctx: &egui::Context) {
@@ -60423,7 +60461,7 @@ impl App {
                 plan.cached_failed += usize::from(
                     meta.page_count_failed
                         || meta.image_dims_failed
-                        || meta.video_meta_failed
+                        || meta.media.failed_for_generation(self.items_generation)
                         || meta.created_at_failed,
                 );
                 continue;
@@ -60732,12 +60770,7 @@ impl App {
         {
             return false;
         }
-        if self.lazy_load_video_meta_for_idx(idx)
-            && meta.video_duration_secs.is_none()
-            && meta.video_dims.is_none()
-            && meta.video_codec.is_none()
-            && !meta.video_meta_failed
-        {
+        if self.lazy_load_video_meta_for_idx(idx) && !meta.media.satisfies(self.items_generation) {
             return false;
         }
         true
@@ -60811,12 +60844,7 @@ impl App {
     ) -> Option<DetailsMetaTarget> {
         let item = self.items.get(idx)?.clone();
         let key = self.details_lazy_cache_key(idx)?;
-        let (source_mtime, source_size) = self
-            .image_metas
-            .get(idx)
-            .copied()
-            .flatten()
-            .unwrap_or((0, 0));
+        let source_identity = self.image_metas.get(idx).copied().flatten();
         let (catalog_folder, catalog_key) = self.details_catalog_lookup_for_item(&item);
         let priority = if visible_near.contains(&idx) {
             crate::io_semaphore::IoPriority::Normal
@@ -60831,12 +60859,7 @@ impl App {
             && (self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail
                 || visible_near.contains(&idx)
                 || self.selection_info_lazy_target_idx() == Some(idx))
-            && existing_meta.is_none_or(|meta| {
-                meta.video_duration_secs.is_none()
-                    && meta.video_dims.is_none()
-                    && meta.video_codec.is_none()
-                    && !meta.video_meta_failed
-            });
+            && existing_meta.is_none_or(|meta| !meta.media.satisfies(self.items_generation));
         let load_page_count = allow_page_count
             && self.lazy_load_page_count_for_idx(idx)
             && existing_meta
@@ -60883,8 +60906,7 @@ impl App {
             key,
             item,
             relative_page_provenance: self.relative_page_provenance_for_idx(idx),
-            source_mtime,
-            source_size,
+            source_identity,
             catalog_folder,
             catalog_key,
             warm_image_dims: self.details_warm_image_dims(idx),
@@ -62169,16 +62191,14 @@ impl App {
 
     fn apply_grid_view_mode_runtime(&mut self, mode: crate::settings::GridViewMode) {
         self.details_thumb_suppression_applied = false;
+        // A bounded thumbnail request cannot complete the full details request.
+        self.invalidate_details_meta_requirements();
         match mode {
             crate::settings::GridViewMode::Details => {
                 self.rebuild_details_order();
-                if self.details_any_lazy_columns_enabled() {
-                    self.details_image_dims_state = LazyColumnState::NotRequested;
-                }
             }
             crate::settings::GridViewMode::Thumbnail => {
                 self.clear_details_hover_keep();
-                self.cancel_details_meta_loading();
                 self.details_order.clear();
                 self.details_order_revision = self.details_order_revision.wrapping_add(1);
                 self.details_tag_prewarm_indices.clear();

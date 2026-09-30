@@ -19659,9 +19659,11 @@ mod selection_info_tests {
             DetailsLazyMeta {
                 source_mtime: 1_700_000_000,
                 source_size: 4096,
-                video_duration_secs: Some(125.0),
-                video_dims: Some((1920, 1080)),
-                video_codec: Some("h264".to_string()),
+                media: crate::app::DetailsMediaMeta::Read(crate::app::DetailsVideoProbe {
+                    duration_secs: Some(125.0),
+                    dims: Some((1920, 1080)),
+                    codec: Some("h264".to_string()),
+                }),
                 ..Default::default()
             },
         );
@@ -21749,7 +21751,11 @@ mod compute_cell_size_tests {
             crate::app::DetailsLazyMeta {
                 source_mtime: 1_700_000_000,
                 source_size: 4096,
-                video_codec: Some(codec.clone()),
+                media: crate::app::DetailsMediaMeta::Read(crate::app::DetailsVideoProbe {
+                    duration_secs: None,
+                    dims: None,
+                    codec: Some(codec.clone()),
+                }),
                 ..Default::default()
             },
         );

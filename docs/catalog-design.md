@@ -143,9 +143,17 @@ CREATE TABLE video_meta (
 
 長さ・解像度・コーデックを 1 回の probe からまとめて保存する。音声の幅・高さは NULL。
 `readable=0` は確定した読取失敗の negative cache で、値列は NULL。mtime / file_size の完全一致時
-だけ成功・失敗の両方を再利用する。取得できない source stamp は DB 再利用・書込の対象外。
-取消と 10 秒 timeout は `Interrupted` であり保存しない。現セッション内では従来の失敗表示で
-終端にし、同じファイルを連続再試行しない。次回フォルダを開くと DB miss として再取得できる。
+だけ成功・失敗の両方を再利用する。source identity は `Option<(mtime, size)>` として保持し、
+未知と既知のサイズ 0 を区別する。空のファイルも確定失敗の保存対象で、未知は DB 再利用・書込の対象外。
+FFmpeg の内容不正・利用可能な stream 不在・非対応 codec / container だけを確定失敗とする。
+アクセス拒否・共有違反・ファイル不在・一般 I/O エラー、取消、10 秒 timeout は `Interrupted` で
+保存しない。メモリ内の `RetryLater` は試行時の `items_generation` だけで終端として扱い、
+同じ一覧で連続再試行しない。次回フォルダを開くと世代が変わり、DB miss として再取得できる。
+
+書込は `BEGIN IMMEDIATE` で SQLite の書込を直列化してから、実ファイルの mtime / size を
+再確認し、要求時と完全一致するときだけ UPSERT する。mtime の大小で新旧を推測しない。
+別接続の新しい結果が先に保存されても、変更前の遅い worker は上書きできない。cache hit / probe
+の結果も worker が公開前に source identity を確認し、古い結果を `Interrupted` として捨てる。
 
 既存 details-meta worker が有界 catalog LRU と I/O semaphore を使って lookup → miss 時だけ probe →
 確定結果の書込を行う。UI は `DetailsLazyMeta` だけを読む。詳細列・ツールチップ・選択情報も
@@ -155,7 +163,7 @@ CREATE TABLE video_meta (
 `--perf-log` の `details_meta/media_cache_hit` / `media_probe` で再利用と再取得を区別できる。
 
 状態の簡素化として、新 worker・要求フラグ・retry owner は追加せず、既存の staged session、
-取消、メモリキャッシュを再利用する。取得中の modal 化は通常のスクロールを妨げるため採用しない。
+取消、一覧世代、メモリキャッシュを再利用する。取得中の modal 化は通常のスクロールを妨げるため採用しない。
 サムネイルの範囲変更は既存 scroll idle gate 後に現在 viewer の範囲 snapshot を差し替え、旧 stage を
 取り消す。画面外の選択情報は別機構にせず同じ stage に加え、選択変更は待たずに反映する。
 

@@ -11,6 +11,22 @@ const PDF_LAYOUT_DIMS_META_KEY: &str = "pdf_layout_dims_version";
 const PDF_LAYOUT_DIMS_VERSION: &str = "2";
 pub const THUMB_LONG_SIDE: u32 = 512;
 
+/// A known media identity includes empty files and epoch-zero timestamps.
+/// Failure to obtain either stamp component is an unknown identity.
+pub(crate) fn media_source_identity_from_metadata(
+    metadata: &std::fs::Metadata,
+) -> Option<(i64, i64)> {
+    metadata.modified().ok()?;
+    Some((
+        crate::ui_helpers::mtime_secs(metadata),
+        i64::try_from(metadata.len()).ok()?,
+    ))
+}
+
+pub(crate) fn media_source_identity(path: &Path) -> Option<(i64, i64)> {
+    media_source_identity_from_metadata(&std::fs::metadata(path).ok()?)
+}
+
 // -----------------------------------------------------------------------
 // DB path helpers
 // -----------------------------------------------------------------------
@@ -1111,13 +1127,17 @@ impl CatalogDb {
         .optional()
     }
 
+    /// Publish only while this result still describes the source file. The writer
+    /// transaction is acquired before checking the source, so a delayed worker
+    /// cannot replace a newer identity saved through another connection.
     pub fn set_video_meta(
         &self,
+        source_path: &Path,
         filename: &str,
         mtime: i64,
         file_size: i64,
         meta: &VideoMeta,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<bool> {
         let (readable, duration_secs, dims, codec) = match meta {
             VideoMeta::Read {
                 duration_secs,
@@ -1126,8 +1146,12 @@ impl CatalogDb {
             } => (true, *duration_secs, *dims, codec.as_deref()),
             VideoMeta::Unreadable => (false, None, None, None),
         };
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if media_source_identity(source_path) != Some((mtime, file_size)) {
+            return Ok(false);
+        }
+        tx.execute(
             "INSERT INTO video_meta \
              (filename, mtime, file_size, readable, duration_secs, width, height, codec) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
@@ -1146,7 +1170,8 @@ impl CatalogDb {
                 codec
             ],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn set_container_page_meta(
@@ -2443,23 +2468,126 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    fn write_video_meta_source(path: &Path, mtime: i64, size: i64) {
+        std::fs::write(path, vec![0; size as usize]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime as u64),
+                ),
+            )
+            .unwrap();
+        assert_eq!(media_source_identity(path), Some((mtime, size)));
+    }
+
+    #[test]
+    fn video_meta_independent_connections_preserve_current_identity_in_both_completion_orders() {
+        // A file identity is not ordered by mtime: replacements can be backdated
+        // or keep the same timestamp while changing size.
+        for new_identity in [(200, 4096), (50, 4096), (100, 4096)] {
+            for old_finishes_first in [false, true] {
+                let temp = tempfile::TempDir::new().unwrap();
+                let source = temp.path().join("movie.mp4");
+                let cache = temp.path().join("cache");
+                let old_worker = CatalogDb::open(&cache, temp.path()).unwrap();
+                let new_worker = CatalogDb::open(&cache, temp.path()).unwrap();
+                write_video_meta_source(&source, 100, 2048);
+                // Both workers captured their identities before completing;
+                // either completion order must reject the obsolete result.
+                write_video_meta_source(&source, new_identity.0, new_identity.1);
+                if old_finishes_first {
+                    assert!(
+                        !old_worker
+                            .set_video_meta(&source, "movie.mp4", 100, 2048, &VideoMeta::Unreadable)
+                            .unwrap()
+                    );
+                }
+                let current = VideoMeta::Read {
+                    duration_secs: Some(42.0),
+                    dims: Some((1280, 720)),
+                    codec: Some("h264".into()),
+                };
+                assert!(
+                    new_worker
+                        .set_video_meta(
+                            &source,
+                            "movie.mp4",
+                            new_identity.0,
+                            new_identity.1,
+                            &current
+                        )
+                        .unwrap()
+                );
+                if !old_finishes_first {
+                    assert!(
+                        !old_worker
+                            .set_video_meta(&source, "movie.mp4", 100, 2048, &VideoMeta::Unreadable)
+                            .unwrap()
+                    );
+                }
+                assert_eq!(
+                    old_worker
+                        .get_video_meta("movie.mp4", new_identity.0, new_identity.1)
+                        .unwrap(),
+                    Some(current)
+                );
+                assert_eq!(
+                    new_worker.get_video_meta("movie.mp4", 100, 2048).unwrap(),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn video_meta_publication_rejects_missing_source_and_accepts_known_zero_size() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("empty.mp4");
+        let db = open_in_memory();
+        assert!(
+            !db.set_video_meta(&source, "empty.mp4", 0, 0, &VideoMeta::Unreadable)
+                .unwrap()
+        );
+        write_video_meta_source(&source, 0, 0);
+        assert!(
+            db.set_video_meta(&source, "empty.mp4", 0, 0, &VideoMeta::Unreadable)
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_video_meta("empty.mp4", 0, 0).unwrap(),
+            Some(VideoMeta::Unreadable)
+        );
+    }
+
     #[test]
     fn video_meta_roundtrip_identity_and_negative_cache() {
         let db = open_in_memory();
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("movie.mp4");
+        write_video_meta_source(&source, 100, 2048);
         let value = VideoMeta::Read {
             duration_secs: Some(123.456789),
             dims: Some((1920, 1080)),
             codec: Some("h264".into()),
         };
-        db.set_video_meta("movie.mp4", 100, 2048, &value).unwrap();
+        assert!(
+            db.set_video_meta(&source, "movie.mp4", 100, 2048, &value)
+                .unwrap()
+        );
         assert_eq!(
             db.get_video_meta("movie.mp4", 100, 2048).unwrap(),
             Some(value)
         );
         assert_eq!(db.get_video_meta("movie.mp4", 101, 2048).unwrap(), None);
         assert_eq!(db.get_video_meta("movie.mp4", 100, 4096).unwrap(), None);
-        db.set_video_meta("movie.mp4", 101, 4096, &VideoMeta::Unreadable)
-            .unwrap();
+        write_video_meta_source(&source, 101, 4096);
+        assert!(
+            db.set_video_meta(&source, "movie.mp4", 101, 4096, &VideoMeta::Unreadable)
+                .unwrap()
+        );
         assert_eq!(
             db.get_video_meta("movie.mp4", 101, 4096).unwrap(),
             Some(VideoMeta::Unreadable)
@@ -2477,13 +2605,16 @@ mod tests {
     #[test]
     fn video_meta_audio_preserves_null_dimensions_and_unknown_duration() {
         let db = open_in_memory();
+        let temp = tempfile::TempDir::new().unwrap();
         for (name, duration_secs) in [("music.flac", Some(65.25)), ("stream.mp3", None)] {
             let value = VideoMeta::Read {
                 duration_secs,
                 dims: None,
                 codec: Some("flac".into()),
             };
-            db.set_video_meta(name, 100, 1024, &value).unwrap();
+            let source = temp.path().join(name);
+            write_video_meta_source(&source, 100, 1024);
+            assert!(db.set_video_meta(&source, name, 100, 1024, &value).unwrap());
             assert_eq!(db.get_video_meta(name, 100, 1024).unwrap(), Some(value));
             let dims: (Option<u32>, Option<u32>) = db
                 .conn

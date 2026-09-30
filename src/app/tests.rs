@@ -90340,7 +90340,11 @@ fn details_cell_content_revisions_follow_only_changed_cache_columns() {
         DetailsLazyMeta {
             source_mtime: 1,
             source_size: 2,
-            video_codec: Some("AV1".to_string()),
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: None,
+                dims: None,
+                codec: Some("AV1".to_string()),
+            }),
             ..Default::default()
         },
         DetailsLazyFieldFlags {
@@ -94030,9 +94034,11 @@ fn media_duration_badge_reads_memory_without_changing_details_format() {
         DetailsLazyMeta {
             source_mtime: 100,
             source_size: 2048,
-            video_duration_secs: Some(3723.0),
-            video_dims: Some((1920, 1080)),
-            video_codec: Some("h264".into()),
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(3723.0),
+                dims: Some((1920, 1080)),
+                codec: Some("h264".into()),
+            }),
             ..Default::default()
         },
     );
@@ -94174,8 +94180,11 @@ fn media_duration_video_only_stage_preserves_ready_ai_choices_and_count_cache() 
         DetailsLazyMeta {
             source_mtime: 100,
             source_size: 2048,
-            video_duration_secs: Some(65.0),
-            video_codec: Some("h264".into()),
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(65.0),
+                dims: None,
+                codec: Some("h264".into()),
+            }),
             ..Default::default()
         },
         DetailsLazyFieldFlags {
@@ -94207,7 +94216,11 @@ fn media_duration_video_only_stage_preserves_ready_ai_choices_and_count_cache() 
         DetailsLazyMeta {
             source_mtime: 101,
             source_size: 2048,
-            video_duration_secs: Some(70.0),
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(70.0),
+                dims: None,
+                codec: None,
+            }),
             ..Default::default()
         },
         DetailsLazyFieldFlags {
@@ -94230,4 +94243,201 @@ fn media_duration_running_stage_yields_to_first_all_item_ai_request() {
     assert!(app.details_meta_pending.is_none());
     assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
     assert!(!app.ai_model_facet_ready());
+}
+
+#[test]
+fn media_duration_mode_switch_discards_queued_thumbnail_completion_and_plans_all_rows() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let items = (0..DETAILS_META_TARGET_SCAN_BUDGET_PER_FRAME + 2)
+        .map(|idx| GridItem::Video(PathBuf::from(format!(r"C:\clips\{idx}.mp4"))))
+        .collect::<Vec<_>>();
+    let len = items.len();
+    app.install_new_items(items, vec![Some((100, 2048)); len]);
+    app.rebuild_visible_indices();
+    assert_eq!(app.visible_indices.len(), len);
+    app.selected = None;
+    app.keep_set = HashSet::from([0]);
+    app.details_tag_prewarm_indices = vec![0];
+    app.settings.details_show_video_duration = true;
+    app.settings.details_show_video_dimensions = true;
+    app.settings.details_show_video_codec = true;
+    let cancel = install_fake_media_duration_pending(&mut app);
+    let (old_tx, old_rx) = mpsc::channel();
+    if let Some(pending) = app.details_meta_pending.as_mut() {
+        pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+        let DetailsMetaPendingPhase::Loading { rx, .. } = &mut pending.phase else {
+            panic!("expected worker receiver");
+        };
+        *rx = old_rx;
+    }
+    old_tx
+        .send(DetailsMetaEvent::Finished {
+            generation: app.items_generation,
+            failed: 0,
+        })
+        .unwrap();
+    let revision = app.details_lazy_visible_revision;
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Details);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_ne!(revision, app.details_lazy_visible_revision);
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+    assert!(
+        old_tx
+            .send(DetailsMetaEvent::Finished {
+                generation: app.items_generation,
+                failed: 0,
+            })
+            .is_err()
+    );
+
+    // Poll the real replacement planner, stopping before it launches a worker.
+    app.poll_details_meta_load(&egui::Context::default());
+    let pending = app
+        .details_meta_pending
+        .as_ref()
+        .expect("full fetch pending");
+    assert_eq!(pending.scan_scope, DetailsMetaScanScope::AllRequirements);
+    let DetailsMetaPendingPhase::Planning(plan) = &pending.phase else {
+        panic!("full fetch must still have offscreen rows to scan");
+    };
+    assert!(
+        matches!(plan.order, DetailsMetaScanOrder::CurrentGrid { len: actual, .. } if actual == len)
+    );
+    assert!(
+        plan.background_targets
+            .iter()
+            .any(|target| target.idx == 4 && target.load_video_meta)
+    );
+    assert!(!app.details_lazy_sort_ready());
+    assert_eq!(app.details_video_duration_text(len - 1), "...");
+
+    let details_cancel = Arc::clone(&pending.cancel);
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Thumbnail);
+    assert!(details_cancel.load(Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+}
+
+#[test]
+fn media_duration_timeout_retries_after_other_folder_and_reopen() {
+    let mut app = setup_media_duration_thumbnail_app();
+    let source = GridItem::Video(PathBuf::from(r"C:\clips\short.mp4"));
+    app.install_new_items(vec![source.clone()], vec![Some((100, 2048))]);
+    app.selected = None;
+    app.keep_set = HashSet::from([0]);
+    app.details_tag_prewarm_indices = vec![0];
+    let generation = app.items_generation;
+    let key = app.details_lazy_cache_key(0).unwrap();
+    let _cancel = install_fake_media_duration_pending(&mut app);
+    let (tx, rx) = mpsc::channel();
+    let pending = app.details_meta_pending.as_mut().unwrap();
+    pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+    pending.normal_target_keys = HashSet::from([key.clone()]);
+    let DetailsMetaPendingPhase::Loading { rx: receiver, .. } = &mut pending.phase else {
+        panic!("expected worker receiver");
+    };
+    *receiver = rx;
+    tx.send(DetailsMetaEvent::Item {
+        generation,
+        key: key.clone(),
+        meta: DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            media: DetailsMediaMeta::RetryLater { generation },
+            ..Default::default()
+        },
+        loaded: DetailsLazyFieldFlags {
+            video_meta: true,
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    tx.send(DetailsMetaEvent::Finished {
+        generation,
+        failed: 1,
+    })
+    .unwrap();
+    let ctx = egui::Context::default();
+    app.poll_details_meta_load(&ctx);
+    app.reconcile_details_lazy_session_after_grid(&ctx);
+    assert_eq!(
+        app.details_image_dims_state,
+        LazyColumnState::Ready { failed: 1 }
+    );
+    assert_eq!(app.details_video_duration_text(0), "-");
+    assert!(
+        app.details_meta_target_for_idx(0, &HashSet::from([0]), true)
+            .is_none()
+    );
+
+    app.install_new_items(
+        vec![GridItem::Image(PathBuf::from(r"D:\other\still.jpg"))],
+        vec![Some((200, 4000))],
+    );
+    assert!(
+        app.details_lazy_meta.contains_key(&key),
+        "cache is retained across folders"
+    );
+    app.install_new_items(vec![source], vec![Some((100, 2048))]);
+    app.selected = None;
+    assert_ne!(generation, app.items_generation);
+    assert_eq!(
+        app.details_lazy_meta_for_idx(0).unwrap().media,
+        DetailsMediaMeta::RetryLater { generation }
+    );
+    let target = app
+        .details_meta_target_for_idx(0, &HashSet::from([0]), true)
+        .expect("reopening retries interrupted media");
+    assert!(target.load_video_meta);
+    assert!(!app.details_lazy_meta_satisfies_idx(0, app.details_lazy_meta_for_idx(0).unwrap()));
+    assert_eq!(app.details_video_duration_text(0), "...");
+
+    app.apply_details_lazy_meta_patch(
+        key,
+        DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                duration_secs: Some(5.0),
+                dims: Some((640, 360)),
+                codec: Some("h264".into()),
+            }),
+            ..Default::default()
+        },
+        DetailsLazyFieldFlags {
+            video_meta: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        app.thumbnail_media_duration_text(0).as_deref(),
+        Some("0:05")
+    );
+    assert!(
+        app.details_meta_target_for_idx(0, &HashSet::from([0]), true)
+            .is_none()
+    );
+}
+
+#[test]
+fn media_duration_target_preserves_known_zero_identity_and_unknown_identity() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.image_metas[0] = Some((0, 0));
+    app.image_metas[1] = None;
+    let near = HashSet::from([0, 1]);
+    assert_eq!(
+        app.details_meta_target_for_idx(0, &near, true)
+            .unwrap()
+            .source_identity,
+        Some((0, 0))
+    );
+    assert_eq!(
+        app.details_meta_target_for_idx(1, &near, true)
+            .unwrap()
+            .source_identity,
+        None
+    );
 }
