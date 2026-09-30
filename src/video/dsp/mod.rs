@@ -206,6 +206,7 @@ pub(crate) fn publish_editor_ui_snapshot(shared: &SharedEditorUiSnapshot, next: 
 pub struct DspBridge {
     inner: Mutex<DspBridgeInner>,
     gui_owner_policy: GuiOwnerPolicy,
+    gui_gate: std::sync::OnceLock<Arc<crate::effetune::gui_gate::GuiGate>>,
     latency_policy: LatencyPolicy,
     strict_state: bool,
     show_editor_bypass_button: bool,
@@ -420,6 +421,7 @@ impl DspBridge {
                 last_z_order_snapshot: Vec::new(),
             }),
             gui_owner_policy,
+            gui_gate: std::sync::OnceLock::new(),
             latency_policy,
             strict_state,
             show_editor_bypass_button,
@@ -465,6 +467,10 @@ impl DspBridge {
     #[inline]
     pub fn is_chain_rebuild_stale(&self, my_gen: u64) -> bool {
         self.current_chain_rebuild_gen() != my_gen
+    }
+
+    pub(crate) fn set_gui_gate(&self, gate: Arc<crate::effetune::gui_gate::GuiGate>) {
+        let _ = self.gui_gate.set(gate);
     }
 
     pub fn set_main_hwnd(&self, hwnd: u64) {
@@ -1564,25 +1570,29 @@ impl DspBridge {
 
     /// Worker-only checked presentation after hidden attach. A failed pipe write
     /// must not publish requested-visible state to the toolbar.
-    pub fn show_slot_gui_checked(&self, idx: usize) -> Result<(), String> {
+    pub fn show_slot_gui_checked(
+        &self,
+        idx: usize,
+        minimized_sequence: u64,
+        remote_token: u64,
+    ) -> Result<(), String> {
         let (bridge, slot_id, hwnd) = {
             let inner = self.inner.lock().unwrap();
             let slot = inner.slots.get(idx).ok_or("GUI slot is missing")?;
             (Arc::clone(&slot.bridge), slot.slot_id, slot.gui_hwnd)
         };
-        if hwnd == 0 {
-            return Err("GUI is not attached".into());
+        if hwnd == 0 || self.gui_gate.get().is_none() {
+            return Err("GUI or presentation gate is not attached".into());
+        }
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+                bridge.process_id(),
+            );
         }
         bridge
-            .send_value(&serde_json::json!({
-                "cmd": "set_gui_visible", "slot_id": slot_id, "visible": 1,
-            }))
-            .map_err(|error| format!("show GUI command: {error}"))?;
-        if let Some(slot) = self.inner.lock().unwrap().slots.get_mut(idx) {
-            slot.gui_visible = true;
-            slot.user_hidden = false;
-        }
-        self.refresh_editor_hwnds_snapshot();
+            .set_gui_visibility_checked(slot_id, true, minimized_sequence, remote_token)
+            .map_err(|error| error.to_string())?;
+        // Only the ordered host signal stream publishes slot visibility.
         Ok(())
     }
 
@@ -1610,7 +1620,7 @@ impl DspBridge {
         Ok(())
     }
 
-    /// Nonblocking main WM_SIZE relay; host reads IsIconic at execution time.
+    /// Worker-side main visibility relay; host reads IsIconic at execution time.
     pub fn sync_main_window_visibility(&self) {
         if self.gui_owner_policy != GuiOwnerPolicy::Unowned {
             return;
@@ -1904,6 +1914,9 @@ impl DspBridge {
                     return Err("プラグイン未ロード".to_string());
                 }
                 if slot.gui_hwnd != 0 {
+                    if self.gui_owner_policy == GuiOwnerPolicy::Unowned {
+                        return Ok(());
+                    }
                     drop(inner);
                     if visible {
                         self.sync_existing_gui_owner_to_current_viewport();
@@ -2012,6 +2025,7 @@ impl DspBridge {
                 "slot_id": slot_id,
                 "owner_hwnd": owner_hwnd,
                 "unowned": if self.gui_owner_policy == GuiOwnerPolicy::Unowned { 1 } else { 0 },
+                "gui_gate_name": self.gui_gate.get().map(|gate| gate.name()),
                 "main_hwnd": if self.gui_owner_policy == GuiOwnerPolicy::Unowned { self.main_hwnd.load(Ordering::Acquire) } else { 0 },
                 "visible": if visible { 1 } else { 0 },
                 "width": pref_w,
@@ -2129,18 +2143,9 @@ impl DspBridge {
         };
         if hwnd != 0 {
             bridge
-                .send_value(&serde_json::json!({
-                    "cmd": "set_gui_visible",
-                    "slot_id": slot_id,
-                    "visible": 0,
-                }))
-                .map_err(|error| format!("hide GUI command: {error}"))?;
+                .set_gui_visibility_checked(slot_id, false, 0, 0)
+                .map_err(|error| error.to_string())?;
         }
-        if let Some(slot) = self.inner.lock().unwrap().slots.get_mut(idx) {
-            slot.gui_visible = false;
-        }
-        self.refresh_editor_hwnds_snapshot();
-        self.fire_hud_raise_hook();
         Ok(())
     }
 
@@ -2490,6 +2495,7 @@ impl DspBridge {
     /// bridge slots と `settings.vst3_plugins` で index がズレる (= ロード失敗で詰まる)
     /// ため (Codex P2 2026-05-01)。
     pub fn pump_gui_signals(&self) -> GuiSignalChanges {
+        let mut visibility_changed = false;
         let (bridge_user_hidden_slot_ids, bridge_bypass_toggle_slot_ids): (Vec<u64>, Vec<u64>) = {
             let bridges: Vec<Arc<Bridge>> = {
                 let inner = self.inner.lock().unwrap();
@@ -2507,11 +2513,40 @@ impl DspBridge {
             let mut user_hidden_slot_ids = Vec::new();
             let mut bypass_toggle_slot_ids = Vec::new();
             for bridge in bridges {
-                user_hidden_slot_ids.extend(bridge.drain_gui_user_hidden_slots());
+                for signal in bridge.drain_gui_visibility() {
+                    use bridge::GuiVisibilitySignal;
+                    if self.gui_owner_policy == GuiOwnerPolicy::Unowned {
+                        let Some((slot_id, visible, user_hidden)) = signal.projection() else {
+                            continue;
+                        };
+                        if let Some(slot) = self
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .slots
+                            .iter_mut()
+                            .find(|slot| slot.slot_id == slot_id)
+                        {
+                            slot.gui_visible = visible;
+                            slot.user_hidden = user_hidden;
+                            visibility_changed = true;
+                        }
+                        if user_hidden {
+                            user_hidden_slot_ids.push(slot_id);
+                        } else {
+                            user_hidden_slot_ids.retain(|id| *id != slot_id);
+                        }
+                    } else if let GuiVisibilitySignal::Closed(slot_id) = signal {
+                        user_hidden_slot_ids.push(slot_id);
+                    }
+                }
                 bypass_toggle_slot_ids.extend(bridge.drain_gui_bypass_toggle_slots());
             }
             (user_hidden_slot_ids, bypass_toggle_slot_ids)
         };
+        if visibility_changed {
+            self.refresh_editor_hwnds_snapshot();
+        }
         // close 通知の検出 (Mutex 内で全 slot を調べる)
         let mut close_targets: Vec<usize> = Vec::new();
         let mut resize_targets: Vec<(usize, u32, u32)> = Vec::new();

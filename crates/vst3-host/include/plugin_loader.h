@@ -53,6 +53,7 @@ struct GuiWindowOptions {
     void* owner_hwnd = nullptr;
     bool unowned = false;
     void* main_hwnd = nullptr; // DPI/minimize reference, never an owner
+    std::string gui_gate_name;
     uint32_t width = 0;
     uint32_t height = 0;
     bool resizable = true;
@@ -151,6 +152,8 @@ public:
     /// Already-attached GUI surface visibility toggle. Keeps the VST3 view
     /// attached and only hides/shows the bridge-owned top-level surface.
     void set_gui_visible(bool visible);
+    void set_gui_visibility_checked(bool visible, GuiGateSnapshot permit,
+                                    std::function<void(const char*)> reply);
     void sync_gui_main_visibility();
     void set_gui_remote_session(bool active);
     void activate_gui();
@@ -264,6 +267,7 @@ private:
     std::atomic<bool> editor_bypassed_{false};
     std::atomic<bool> editor_show_bypass_button_{true};
     GuiVisibility gui_visibility_;
+    std::unique_ptr<GuiGateReader> gui_gate_;
     bool gui_app_active_ = true;
     uint32_t last_gui_width_ = 0;
     uint32_t last_gui_height_ = 0;

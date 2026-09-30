@@ -1462,6 +1462,14 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
         blog("show_gui: already attached, hiding first");
         hide_gui();
     }
+    if (options.unowned) {
+        auto gate = std::make_unique<GuiGateReader>();
+        if (!gate->open(utf8_to_wide(options.gui_gate_name))) {
+            error_out = "invalid or missing EffeTune presentation gate";
+            return false;
+        }
+        gui_gate_ = std::move(gate);
+    }
     if (!view_) {
         blog("show_gui: createView(kEditor)");
         view_ = Steinberg::owned(controller_->createView(Steinberg::Vst::ViewType::kEditor));
@@ -1687,6 +1695,7 @@ bool PluginLoader::gui_surface_should_show() {
     // Missing main is suppressed during teardown rather than resurrected.
     const bool minimized = main && (!IsWindow(main) || IsIconic(main));
     gui_visibility_.suppress(GuiSuppression::Minimized, minimized);
+    if (gui_gate_) gui_visibility_.suppress(GuiSuppression::RemoteSession, (gui_gate_->snapshot().remote & 1) != 0);
     return gui_visibility_.should_show(main != nullptr, gui_app_active_);
 }
 
@@ -1788,6 +1797,55 @@ void PluginLoader::activate_gui() {
     }
 }
 
+void PluginLoader::set_gui_visibility_checked(bool visible, GuiGateSnapshot permit,
+                                              std::function<void(const char*)> reply) {
+    if (!is_gui_thread()) {
+        if (editor_quarantined_.load(std::memory_order_acquire) || !gui_thread_) { reply("error"); return; }
+        gui_thread().post_async([this, visible, permit, reply = std::move(reply)]() mutable {
+            set_gui_visibility_checked(visible, permit, std::move(reply));
+        });
+        return;
+    }
+    HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
+    HWND main = reinterpret_cast<HWND>(view_main_hwnd_);
+    if (!gui_gate_ || !main || !IsWindow(main) || !container || !IsWindow(container)) { reply("error"); return; }
+    if (!visible) {
+        gui_visibility_.request(false);
+        ShowWindow(container, SW_HIDE);
+        reply("hidden");
+        return;
+    }
+    const bool previously_requested = gui_visibility_.requested();
+    if (!gui_visibility_.accept_show(permit, gui_gate_->snapshot(), IsIconic(main) != FALSE)) {
+        sync_gui_main_visibility();
+        reply("cancelled");
+        return;
+    }
+    ShowWindow(container, SW_SHOWNA);
+    // ShowWindow can call plugin/window code reentrantly. Recheck before
+    // accepting the first show and before activation, without a queued raise.
+    if (!permit.permits(gui_gate_->snapshot(), IsIconic(main) != FALSE)) {
+        if (gui_visibility_.requested()) gui_visibility_.request(previously_requested);
+        sync_gui_main_visibility();
+        reply("cancelled");
+        return;
+    }
+    if (!IsWindowVisible(container) || !gui_visibility_.requested()) {
+        if (gui_visibility_.requested()) gui_visibility_.request(previously_requested);
+        reply("cancelled");
+        return;
+    }
+    refresh_gui_surface(container);
+    if (!permit.permits(gui_gate_->snapshot(), IsIconic(main) != FALSE)) {
+        if (gui_visibility_.requested()) gui_visibility_.request(previously_requested);
+        sync_gui_main_visibility();
+        reply("cancelled");
+        return;
+    }
+    activate_gui();
+    reply(gui_visibility_.requested() && IsWindowVisible(container) ? "shown" : "cancelled");
+}
+
 void PluginLoader::set_gui_visible(bool visible) {
     if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
         return;
@@ -1802,6 +1860,7 @@ void PluginLoader::set_gui_visible(bool visible) {
         return;
     }
 
+    if (view_main_hwnd_ && visible) return; // EffeTune requires checked visibility.
     gui_visibility_.request(visible);
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
@@ -2243,6 +2302,7 @@ void PluginLoader::hide_gui() {
             abandon_gui_thread("hide_gui quarantined");
             view_host_hwnd_ = nullptr;
             view_main_hwnd_ = nullptr;
+    gui_gate_.reset();
             view_container_hwnd_ = nullptr;
             view_plugin_host_hwnd_ = nullptr;
             view_container_hwnd_snapshot_.store(nullptr, std::memory_order_release);
@@ -2275,6 +2335,7 @@ void PluginLoader::hide_gui() {
     view_attached_ = false;
     view_host_hwnd_ = nullptr;
     view_main_hwnd_ = nullptr;
+    gui_gate_.reset();
     view_container_hwnd_ = nullptr;
     view_plugin_host_hwnd_ = nullptr;
     view_container_hwnd_snapshot_.store(nullptr, std::memory_order_release);

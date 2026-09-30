@@ -189,7 +189,9 @@ enum EffetuneFailure {
 - **mIV による一時非表示は host の `GuiVisibility` が単独で所有**する。表示希望と非表示理由の集合
   (`Minimized` / `RemoteSession`) を持ち、理由がすべて解除され、表示希望が残るときだけ非アクティブで戻す。
   最小化や Remote による hide で `user_hidden`、設定保存、state capture、音声の実行状態を変えない。
-  最小化はメインの `WM_SIZE` から worker へ通知し、実際の表示直前にも現在の `IsIconic(main)` を確認する。
+  最小化はメインの `WM_SIZE` で共有 atomic の連番を更新し、worker に通知する。
+  WndProc は bridge を参照せず、`DspBridge.inner` のロック・列挙・IPC は worker 側だけで行う。
+  実際の表示直前にも現在の `IsIconic(main)` を確認する。
   アプリの非アクティブ化では窓を隠したり手前へ戻したりしない。mIV 終了時は既存の bridge teardown で消す。
 - **Remote が操作権を持つ間は窓を隠す** (利用者決定 2026-10-01)。音の look-ahead による反映遅延と
   端末より先行するビジュアライザーで PC 上の編集が紛らわしいため。
@@ -204,6 +206,17 @@ enum EffetuneFailure {
   open 要求時 (Loading 中の要求を含む) に採取し、attach 前後で照合する。
   attach 中に最小化／Remote の開始と終了が両方済んだ場合も取消し、
   まだ表示していなかった窓を「復帰」として開かない。時間窓や独自 Remote revision は使わない。
+  **配送後の取消しも host の GUI thread で確定する** (2026-10-01 review fix1)。
+  32 byte の専用共有 mapping は native 最小化連番と Remote の取得連番・phase の read-only projection
+  だけを運ぶ。Remote は `SessionStateMachine` の遷移・参照の登録／切り離しと同じロック内で公開し、
+  worker に復帰判定を通知する。worker は source を weak に参照し、通知 sender の循環で残留しない。
+  `set_gui_visibility_checked` は request ID と発行時の連番を運び、GUI thread が共有値と最小化を
+  表示・アクティブ化の直前に照合する。取消しは未表示の窓の表示希望を作らず、既に表示希望のある
+  窓の希望は保存する。判定後に始まる最小化／Remote は通常の一時非表示として扱う。
+  `Shown` / `Hidden` / `Cancelled` / `Error` を返し、Rust は pipe 書き込みだけで表示を公開しない。
+  ACK と native close は 1 本の FIFO signal を通り、`pump_gui_signals` が Rust の表示情報を更新する。
+  5 秒の ACK 待ち・mapping 作成／検証失敗は GUI failure として扱い、未検査の表示へ代替しない。
+  背面からの明示的な前面化も同じ検査と GUI task を通る。自動復帰は従来どおり非アクティブ。
   単純化として GUI 操作を既存 worker に直列化し、初回 hidden attach と理由集合を使う。
   モーダル化や editor の破棄・再生成は、再生・ビジュアライザー・設定画面の通常操作を妨げるため採らない。
 - 既存のフルスクリーン関連の VST GUI 操作 (owner 付け替え、全 GUI 表示／非表示、TOPMOST、HUD の
@@ -409,6 +422,10 @@ enum EffectiveState {
   解除して最後だけ復帰する、非表示だった窓は開かない、同じ理由の重複通知は集合として扱う、
   owned の従来動作を固定する。Rust 側では Remote 取得〜drain 完了まで表示要求を拒否し、
   UI 通知前の正本の取得と、Loading / attach 中に完了した最小化・Remote 区間でも open が取消されることを確認する。
+- 配送後: Rust の最終検査後〜GUI task 実行前の最小化／Remote と、その区間が既に終了した場合を
+  host の permit 判定で検査する。取消し後の復帰で未表示の窓が開かない、取消した raise で前の
+  表示希望を消さない、ACK／native close の FIFO 順序、request ID の照合と EOF／shutdown、
+  native size の通知経路が bridge のロックを取得しないことを回帰テストで固定する。
 - 共有メモリ: 同時に 2 本 `open_audio_pipe` しても名前が衝突しない。既存オブジェクトを開いた場合
   (`ERROR_ALREADY_EXISTS`) は失敗として扱う。
 

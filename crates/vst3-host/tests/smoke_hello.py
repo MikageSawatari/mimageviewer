@@ -65,14 +65,14 @@ def main() -> int:
         stderr=subprocess.PIPE,
     )
     try:
-        # hello → ready (protocol v4: unowned editor visibility)
-        write_msg(proc, '{"cmd":"hello","version":4}')
+        # hello → ready (protocol v5: checked editor visibility)
+        write_msg(proc, '{"cmd":"hello","version":5}')
         reply = read_msg(proc)
         print(f"<- {reply}")
         if '"event":"ready"' not in reply:
             print(f"unexpected reply: {reply}", file=sys.stderr)
             return 2
-        if '"version":4' not in reply:
+        if '"version":5' not in reply:
             print(f"version mismatch: {reply}", file=sys.stderr)
             return 3
 

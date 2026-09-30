@@ -53,3 +53,26 @@ static_assert(hidden_stays_hidden(true));
 static_assert(repeated_reason_is_a_set_not_a_counter());
 static_assert(hidden_attach_under_remote_does_not_open_on_release());
 static_assert(owned_policy_keeps_existing_activation_behavior());
+
+// Simulate the gap after Rust's final permit check: the GUI task has not run.
+constexpr bool suppression_after_dispatch_cancels_first_show(bool minimized, bool remote, bool completed) {
+    miv::GuiVisibility state;
+    const miv::GuiGateSnapshot issued {4, 2}; // no Remote acquisition yet
+    auto execution = issued;
+    if (minimized) ++execution.minimized_sequence;
+    if (remote) execution.remote = completed ? 6 : 7; // acquisition 1, current phase
+    const bool shown = state.accept_show(issued, execution, minimized && !completed);
+    state.suppress(miv::GuiSuppression::Minimized, false);
+    state.suppress(miv::GuiSuppression::RemoteSession, false);
+    return !shown && !state.requested() && !state.should_show(true, true);
+}
+constexpr bool cancelled_raise_keeps_prior_visible_request() {
+    miv::GuiVisibility state;
+    state.request(true);
+    return !state.accept_show({4, 2}, {5, 2}, false) && state.requested();
+}
+static_assert(suppression_after_dispatch_cancels_first_show(true, false, false));
+static_assert(suppression_after_dispatch_cancels_first_show(true, false, true));
+static_assert(suppression_after_dispatch_cancels_first_show(false, true, false));
+static_assert(suppression_after_dispatch_cancels_first_show(false, true, true));
+static_assert(cancelled_raise_keeps_prior_visible_request());

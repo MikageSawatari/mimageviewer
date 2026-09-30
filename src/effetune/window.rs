@@ -1,8 +1,7 @@
 //! Main-window events used only by the unowned EffeTune editor.
 //! No IPC or plugin work runs in the native window procedure.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, mpsc};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_FLAG_PRIMARY, POINTER_INFO};
@@ -19,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_XBUTTONDOWN,
 };
 
-use crate::video::dsp::DspBridge;
+use super::{HostCommand, gui_gate::GuiGate};
 
 const SUBCLASS_ID: usize = 0x4546_4645;
 
@@ -52,14 +51,28 @@ impl ClickForeground {
     }
 }
 
-#[derive(Default)]
 pub(super) struct MainWindowObserver {
-    bridge: Mutex<Weak<DspBridge>>,
+    notify: mpsc::Sender<HostCommand>,
     click: Mutex<ClickForeground>,
-    minimize_sequence: AtomicU64,
+    gate: Result<Arc<GuiGate>, String>,
 }
 
 impl MainWindowObserver {
+    pub fn new(notify: mpsc::Sender<HostCommand>) -> Self {
+        Self {
+            gate: GuiGate::create(Some(notify.clone())),
+            notify,
+            click: Mutex::new(ClickForeground::default()),
+        }
+    }
+
+    pub fn gate(&self) -> Result<Arc<GuiGate>, String> {
+        self.gate.clone()
+    }
+
+    fn notify_visibility(&self) {
+        let _ = self.notify.send(HostCommand::ReconcileVisibility);
+    }
     pub fn install(self: &Arc<Self>, hwnd: u64) {
         // The subclass owns one strong reference until WM_NCDESTROY.
         let state = Arc::into_raw(Arc::clone(self));
@@ -79,11 +92,9 @@ impl MainWindowObserver {
     }
 
     pub fn minimize_sequence(&self) -> u64 {
-        self.minimize_sequence.load(Ordering::Acquire)
-    }
-
-    pub fn set_bridge(&self, bridge: &Arc<DspBridge>) {
-        *self.bridge.lock().unwrap() = Arc::downgrade(bridge);
+        self.gate
+            .as_ref()
+            .map_or(0, |gate| gate.minimized_sequence())
     }
 
     pub fn click_foreground(&self, pointer_click: bool) -> u64 {
@@ -175,14 +186,13 @@ unsafe extern "system" fn subclass(
         }
         WM_MOUSEACTIVATE => *observer.click.lock().unwrap() = ClickForeground::None,
         WM_SIZE => {
-            let bridge = observer.bridge.lock().unwrap().upgrade();
             if wparam.0 == windows::Win32::UI::WindowsAndMessaging::SIZE_MINIMIZED as usize {
-                observer.minimize_sequence.fetch_add(1, Ordering::AcqRel);
+                if let Ok(gate) = &observer.gate {
+                    gate.note_minimized();
+                }
             }
             let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
-            if let Some(bridge) = bridge {
-                bridge.sync_main_window_visibility();
-            }
+            observer.notify_visibility();
             return result;
         }
         WM_NCDESTROY => unsafe {
@@ -197,6 +207,31 @@ unsafe extern "system" fn subclass(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_notification_only_queues_work_without_a_bridge_reference() {
+        let (tx, rx) = mpsc::channel();
+        let observer = MainWindowObserver::new(tx);
+        let before = observer.minimize_sequence();
+        observer.gate().unwrap().note_minimized();
+        observer.notify_visibility();
+        assert_eq!(observer.minimize_sequence(), before + 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostCommand::ReconcileVisibility)
+        ));
+        // The native notification type carries neither a bridge nor an IPC command.
+        let native = include_str!("window.rs")
+            .split("WM_SIZE => {")
+            .nth(1)
+            .unwrap()
+            .split("WM_NCDESTROY")
+            .next()
+            .unwrap();
+        assert!(!native.contains("bridge"));
+        assert!(!native.contains("lock("));
+        assert!(!native.contains("send_value"));
+    }
 
     #[test]
     fn activation_click_keeps_foreground_before_main_is_raised() {

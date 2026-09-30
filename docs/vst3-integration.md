@@ -318,6 +318,11 @@ host protocol v4 は `show_gui` の明示的 `unowned` と `main_hwnd`、
 owner=0 は明示的な Unowned だけで許可し、旧 host が新しい表示規則を無視することを
 hello/ready の版照合で防ぐ。C++ 変更後は host を再ビルドする必要がある。
 
+v5 は EffeTune の専用 suppression-source mapping と `set_gui_visibility_checked` /
+`gui_visibility_result` を追加した。表示・前面化は GUI thread で発行時の permit を照合して確定し、
+pipe 書き込みでは Rust の表示情報を更新しない。表示／非表示の結果と native close は同じ FIFO
+signal で処理する。mapping は最小化・Remote の正本を運ぶだけで、表示希望の持ち主は host のまま。
+
 要件:
 - アプリ起動中ずっとプラグイン GUI を表示しておける
 - 動画再生中のホバーバーから VST3 プレイバックパネルを開き、チェーン全体の

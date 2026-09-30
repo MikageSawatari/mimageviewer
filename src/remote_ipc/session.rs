@@ -249,6 +249,8 @@ struct SessionStateMachine {
     next_operation: u64,
     next_streaming_registration: u64,
     acquisition_sequence: u64,
+    #[cfg(windows)]
+    gui_gate: Option<Weak<crate::effetune::gui_gate::GuiGate>>,
     control_return_sequence: u64,
     drain_reason: Option<ReleaseReason>,
     drain_started_at: Option<Duration>,
@@ -270,6 +272,8 @@ impl Default for SessionStateMachine {
             next_operation: 1,
             next_streaming_registration: 1,
             acquisition_sequence: 0,
+            #[cfg(windows)]
+            gui_gate: None,
             control_return_sequence: 0,
             drain_reason: None,
             drain_started_at: None,
@@ -281,6 +285,24 @@ impl Default for SessionStateMachine {
 }
 
 impl SessionStateMachine {
+    fn transition_lifecycle(
+        &mut self,
+        transition: RemoteControlTransition,
+    ) -> Result<(), RemoteControlTransitionError> {
+        self.lifecycle.transition(transition)?;
+        if transition == RemoteControlTransition::BeginAcquire {
+            self.acquisition_sequence = self.acquisition_sequence.wrapping_add(1);
+        }
+        #[cfg(windows)]
+        if let Some(gate) = self.gui_gate.as_ref().and_then(Weak::upgrade) {
+            gate.publish_remote(
+                Some(self.acquisition_sequence),
+                self.lifecycle.phase.blocks_local_control(),
+            );
+        }
+        Ok(())
+    }
+
     fn acquire(
         &mut self,
         now: Duration,
@@ -308,14 +330,12 @@ impl SessionStateMachine {
             return session_closing_response();
         }
         if self
-            .lifecycle
-            .transition(RemoteControlTransition::BeginAcquire)
+            .transition_lifecycle(RemoteControlTransition::BeginAcquire)
             .is_err()
         {
             return session_closing_response();
         }
         self.generation = self.generation.wrapping_add(1);
-        self.acquisition_sequence = self.acquisition_sequence.wrapping_add(1);
         self.last_owner = Some(request.client_id.clone());
         self.last_release_reason = None;
         self.drain_reason = None;
@@ -352,8 +372,7 @@ impl SessionStateMachine {
         generation == self.generation
             && self.active.is_some()
             && self
-                .lifecycle
-                .transition(RemoteControlTransition::FinishAcquire)
+                .transition_lifecycle(RemoteControlTransition::FinishAcquire)
                 .is_ok()
     }
 
@@ -700,8 +719,7 @@ impl SessionStateMachine {
 
     fn begin_drain(&mut self, reason: ReleaseReason, now: Duration) -> bool {
         if self
-            .lifecycle
-            .transition(RemoteControlTransition::BeginDrain)
+            .transition_lifecycle(RemoteControlTransition::BeginDrain)
             .is_err()
         {
             return false;
@@ -791,8 +809,7 @@ impl SessionStateMachine {
     fn release(&mut self, reason: ReleaseReason) -> Result<(), RemoteControlTransitionError> {
         // Final release is owned by the typed phase transition. `active` is session payload,
         // not a sentinel for whether control may return to the PC.
-        self.lifecycle
-            .transition(RemoteControlTransition::FinishDrain)?;
+        self.transition_lifecycle(RemoteControlTransition::FinishDrain)?;
 
         if let Some(mut active) = self.active.take() {
             active.cancel_streaming();
@@ -1341,6 +1358,21 @@ impl ClaimedVideoStreamUiRequest {
 }
 
 impl SessionHandle {
+    #[cfg(windows)]
+    pub(crate) fn set_gui_gate(&self, gate: Option<Arc<crate::effetune::gui_gate::GuiGate>>) {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(previous) = state.gui_gate.take().and_then(|gate| gate.upgrade()) {
+            previous.publish_remote(None, false);
+        }
+        if let Some(gate) = &gate {
+            gate.publish_remote(
+                Some(state.acquisition_sequence),
+                state.lifecycle.phase.blocks_local_control(),
+            );
+        }
+        state.gui_gate = gate.map(|gate| Arc::downgrade(&gate));
+    }
+
     pub(crate) fn new() -> Self {
         let (ui_request_tx, ui_request_rx) = mpsc::sync_channel(UI_REQUEST_QUEUE_CAPACITY);
         Self {

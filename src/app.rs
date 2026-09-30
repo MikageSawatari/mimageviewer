@@ -25764,7 +25764,7 @@ impl App {
                         self.save_effetune_gui_rect();
                         self.effetune.request_hide_gui();
                     }
-                    GuiButtonAction::Activate => bridge.activate_slot_gui(0),
+                    GuiButtonAction::Activate => self.effetune.request_show_gui(),
                     GuiButtonAction::Show => {
                         if let Some(hwnd) = self.main_hwnd {
                             bridge.set_main_hwnd(hwnd as u64);
