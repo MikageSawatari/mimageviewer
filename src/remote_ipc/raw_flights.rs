@@ -18,6 +18,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 pub(super) const REMOTE_RAW_FLIGHT_LIMIT: usize = 6;
+pub(super) const REMOTE_RAW_PREFETCH_LIMIT: usize = 3;
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 pub(super) type DevelopedRaw = RawDevelopOutput;
@@ -84,6 +85,15 @@ pub(super) struct RemoteRawFlightPolicy {
 }
 
 impl RemoteRawFlightPolicy {
+    pub(super) fn s2c() -> Self {
+        Self {
+            submit_priority: RawPriority::High,
+            max_outstanding: REMOTE_RAW_FLIGHT_LIMIT + REMOTE_RAW_PREFETCH_LIMIT,
+            max_cached_entries: 4,
+            max_cached_bytes: 1024 * 1024 * 1024,
+        }
+    }
+
     pub(super) fn s2b() -> Self {
         Self {
             submit_priority: RawPriority::High,
@@ -147,11 +157,28 @@ impl FlightSubmitter for RawDevelopExecutor {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionClass {
+    Foreground,
+    Prefetch,
+}
+
+impl AdmissionClass {
+    fn for_priority(priority: RawPriority) -> Self {
+        if priority == RawPriority::High {
+            Self::Foreground
+        } else {
+            Self::Prefetch
+        }
+    }
+}
+
 enum FlightState {
     Submitting {
         id: u64,
         waiters: usize,
         cancel_requested: bool,
+        requested_priority: RawPriority,
     },
     InFlight {
         id: u64,
@@ -186,6 +213,7 @@ struct CacheEntry {
 }
 
 struct FlightWork {
+    class: AdmissionClass,
     _identity: Option<RemoteRawIdentity>,
     source_cancel: Arc<AtomicBool>,
 }
@@ -255,7 +283,7 @@ impl State {
         }
     }
 
-    fn reserve(&mut self, identity: &RemoteRawIdentity) -> u64 {
+    fn reserve(&mut self, identity: &RemoteRawIdentity, priority: RawPriority) -> u64 {
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -267,11 +295,13 @@ impl State {
                 id,
                 waiters: 1,
                 cancel_requested: false,
+                requested_priority: priority,
             },
         );
         self.outstanding.insert(
             id,
             FlightWork {
+                class: AdmissionClass::for_priority(priority),
                 _identity: Some(identity.clone()),
                 source_cancel: Arc::new(AtomicBool::new(false)),
             },
@@ -290,6 +320,7 @@ impl State {
         self.outstanding.insert(
             id,
             FlightWork {
+                class: AdmissionClass::Foreground,
                 _identity: None,
                 source_cancel: Arc::clone(&source_cancel),
             },
@@ -315,6 +346,70 @@ struct ParticipantLease {
     flights: Arc<RemoteRawFlights>,
     identity: RemoteRawIdentity,
     id: u64,
+}
+
+/// Admission occurs on the window worker before spawning a detached waiter.
+/// Dropping a reservation (including spawn failure) releases only this lease.
+enum PrefetchAdmissionState {
+    Ready(DevelopResult),
+    Reserved(ParticipantLease),
+    Started(ParticipantLease),
+    Released,
+}
+
+pub(super) struct PrefetchAdmission {
+    state: PrefetchAdmissionState,
+}
+
+impl PrefetchAdmission {
+    pub(super) fn start<F>(&mut self, source_factory: F)
+    where
+        F: FnOnce(&Arc<AtomicBool>) -> Result<RawOwnedSource, RawError> + Send + 'static,
+    {
+        let state = std::mem::replace(&mut self.state, PrefetchAdmissionState::Released);
+        self.state = match state {
+            PrefetchAdmissionState::Reserved(lease) => {
+                lease.flights.start_source_worker(
+                    lease.identity.clone(),
+                    lease.id,
+                    source_factory,
+                    RawPriority::Normal,
+                );
+                PrefetchAdmissionState::Started(lease)
+            }
+            state => state,
+        };
+    }
+
+    pub(super) fn wait(mut self, cancel: &AtomicBool) -> DevelopResult {
+        match std::mem::replace(&mut self.state, PrefetchAdmissionState::Released) {
+            PrefetchAdmissionState::Ready(result) => result,
+            PrefetchAdmissionState::Started(lease) => {
+                lease
+                    .flights
+                    .wait_for_result(&lease.identity, lease.id, cancel)
+            }
+            PrefetchAdmissionState::Reserved(_) | PrefetchAdmissionState::Released => {
+                unreachable!("prefetch must start before waiting")
+            }
+        }
+    }
+}
+
+impl Drop for PrefetchAdmission {
+    fn drop(&mut self) {
+        if let PrefetchAdmissionState::Reserved(lease) =
+            std::mem::replace(&mut self.state, PrefetchAdmissionState::Released)
+        {
+            // No source worker exists yet. This is reservation rollback only;
+            // production starts the source before observing window cancellation.
+            let flights = Arc::clone(&lease.flights);
+            let identity = lease.identity.clone();
+            let id = lease.id;
+            drop(lease);
+            flights.complete(&identity, id, Err(RawError::Cancelled));
+        }
+    }
 }
 
 impl Drop for ParticipantLease {
@@ -369,6 +464,72 @@ impl Drop for AiCapacityLease {
 }
 
 impl RemoteRawFlights {
+    pub(super) fn try_prefetch(
+        self: &Arc<Self>,
+        identity: RemoteRawIdentity,
+    ) -> Result<PrefetchAdmission, RemoteRawFlightError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle == OwnerLifecycle::Stopped {
+            return Err(RemoteRawFlightError::Cancelled);
+        }
+        let ready =
+            state
+                .cache_lookup(&identity)
+                .map(Ok)
+                .or_else(|| match state.entries.get(&identity) {
+                    Some(FlightState::Done { result, .. }) => Some(result.clone()),
+                    _ => None,
+                });
+        if let Some(result) = ready {
+            return Ok(PrefetchAdmission {
+                state: PrefetchAdmissionState::Ready(result),
+            });
+        }
+        let existing = match state.entries.get_mut(&identity) {
+            Some(FlightState::Submitting {
+                id,
+                waiters,
+                cancel_requested,
+                ..
+            }) => {
+                *waiters += 1;
+                *cancel_requested = false;
+                Some(*id)
+            }
+            Some(FlightState::InFlight { id, waiters, .. }) => {
+                *waiters += 1;
+                Some(*id)
+            }
+            _ => None,
+        };
+        let (id, submit) = if let Some(id) = existing {
+            (id, false)
+        } else {
+            if state.outstanding.len() >= self.policy.max_outstanding
+                || state
+                    .outstanding
+                    .values()
+                    .filter(|work| work.class == AdmissionClass::Prefetch)
+                    .count()
+                    >= REMOTE_RAW_PREFETCH_LIMIT
+            {
+                return Err(RemoteRawFlightError::Capacity);
+            }
+            (state.reserve(&identity, RawPriority::Normal), true)
+        };
+        let lease = ParticipantLease {
+            flights: Arc::clone(self),
+            identity,
+            id,
+        };
+        Ok(PrefetchAdmission {
+            state: if submit {
+                PrefetchAdmissionState::Reserved(lease)
+            } else {
+                PrefetchAdmissionState::Started(lease)
+            },
+        })
+    }
     pub(super) fn new(
         executor: Arc<RawDevelopExecutor>,
         policy: RemoteRawFlightPolicy,
@@ -609,7 +770,11 @@ impl RemoteRawFlights {
                     id,
                     waiters,
                     cancel_requested,
+                    requested_priority,
                 }) => {
+                    if priority == RawPriority::High {
+                        *requested_priority = RawPriority::High;
+                    }
                     *waiters += 1;
                     *cancel_requested = false;
                     Some(Join::Participant {
@@ -643,7 +808,18 @@ impl RemoteRawFlights {
             }
             // The key can be Cancelling while its old flight still occupies a
             // slot. Capacity is checked for every replacement as well.
-            if state.outstanding.len() < self.policy.max_outstanding {
+            if state.outstanding.len() < self.policy.max_outstanding
+                && state
+                    .outstanding
+                    .values()
+                    .filter(|work| work.class == AdmissionClass::for_priority(priority))
+                    .count()
+                    < if priority == RawPriority::High {
+                        REMOTE_RAW_FLIGHT_LIMIT
+                    } else {
+                        REMOTE_RAW_PREFETCH_LIMIT
+                    }
+            {
                 if cancel.load(Ordering::Acquire) {
                     return Err(RemoteRawFlightError::Cancelled);
                 }
@@ -657,7 +833,7 @@ impl RemoteRawFlights {
                 {
                     return Err(RemoteRawFlightError::Cancelled);
                 }
-                let id = state.reserve(&identity);
+                let id = state.reserve(&identity, priority);
                 break Join::Participant { id, submit: true };
             }
             let Some((owner, _)) = ai_owner else {
@@ -781,6 +957,7 @@ impl RemoteRawFlights {
                         id: current,
                         waiters,
                         cancel_requested: false,
+                        ..
                     }) if *current == id && *waiters > 0
                 )
         };
@@ -788,6 +965,17 @@ impl RemoteRawFlights {
             self.complete(&identity, id, Err(RawError::Cancelled));
             return;
         }
+        let priority = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            match state.entries.get(&identity) {
+                Some(FlightState::Submitting {
+                    id: current,
+                    requested_priority,
+                    ..
+                }) if *current == id => *requested_priority,
+                _ => priority,
+            }
+        };
         let flights = Arc::clone(self);
         let completed_identity = identity.clone();
         let submitted = self.submitter.submit(
@@ -797,12 +985,19 @@ impl RemoteRawFlights {
             Box::new(move |result| flights.complete(&completed_identity, id, result)),
         );
         match submitted {
-            Ok(ticket) => self.attach_ticket(&identity, id, ticket),
+            Ok(ticket) => self.attach_ticket(&identity, id, ticket, priority),
             Err(error) => self.complete(&identity, id, Err(error)),
         }
     }
 
-    fn attach_ticket(&self, identity: &RemoteRawIdentity, id: u64, ticket: Arc<dyn FlightTicket>) {
+    fn attach_ticket(
+        &self,
+        identity: &RemoteRawIdentity,
+        id: u64,
+        ticket: Arc<dyn FlightTicket>,
+        submitted_priority: RawPriority,
+    ) {
+        let mut promote = false;
         let cancel_ticket = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match state.entries.remove(identity) {
@@ -810,6 +1005,7 @@ impl RemoteRawFlights {
                     id: current,
                     waiters,
                     cancel_requested,
+                    requested_priority,
                 }) if current == id => {
                     if cancel_requested || waiters == 0 {
                         state
@@ -817,6 +1013,8 @@ impl RemoteRawFlights {
                             .insert(identity.clone(), FlightState::Cancelling { id });
                         true
                     } else {
+                        promote = requested_priority == RawPriority::High
+                            && submitted_priority != RawPriority::High;
                         state.entries.insert(
                             identity.clone(),
                             FlightState::InFlight {
@@ -839,6 +1037,8 @@ impl RemoteRawFlights {
         };
         if cancel_ticket {
             ticket.cancel();
+        } else if promote {
+            ticket.promote_to_high();
         }
     }
 
@@ -946,6 +1146,7 @@ impl RemoteRawFlights {
                     id,
                     waiters,
                     cancel_requested,
+                    requested_priority,
                 } => {
                     debug_assert!(waiters > 0);
                     let waiters = waiters - 1;
@@ -955,6 +1156,7 @@ impl RemoteRawFlights {
                             id,
                             waiters,
                             cancel_requested: cancel_requested || waiters == 0,
+                            requested_priority,
                         },
                     );
                     None
@@ -1017,7 +1219,7 @@ impl RemoteRawFlights {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::raw::AppliedBrightness;
     use image::{DynamicImage, GenericImageView};
@@ -1026,7 +1228,7 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    fn identity(name: &str) -> RemoteRawIdentity {
+    pub(crate) fn identity(name: &str) -> RemoteRawIdentity {
         RemoteRawIdentity {
             normalized_path: name.to_owned(),
             mtime_100ns: 1,
@@ -1038,14 +1240,14 @@ mod tests {
         }
     }
 
-    fn output() -> RawDevelopOutput {
+    pub(crate) fn output() -> RawDevelopOutput {
         RawDevelopOutput {
             image: DynamicImage::new_rgb8(2, 3),
             brightness: AppliedBrightness::None,
         }
     }
 
-    fn source(_: &Arc<AtomicBool>) -> Result<RawOwnedSource, RawError> {
+    pub(crate) fn source(_: &Arc<AtomicBool>) -> Result<RawOwnedSource, RawError> {
         Ok(RawOwnedSource::Bytes(Arc::from(&b"test"[..])))
     }
 
@@ -1063,7 +1265,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeSubmitter {
+    pub(crate) struct FakeSubmitter {
         state: Mutex<FakeState>,
         changed: Condvar,
     }
@@ -1134,12 +1336,36 @@ mod tests {
     }
 
     impl FakeSubmitter {
-        fn finish(&self, id: u64, result: Result<RawDevelopOutput, RawError>) {
+        pub(crate) fn s2c(self: &Arc<Self>) -> Arc<RemoteRawFlights> {
+            RemoteRawFlights::new_with_submitter(
+                Arc::new(Arc::clone(self)),
+                RemoteRawFlightPolicy::s2c(),
+            )
+        }
+
+        pub(crate) fn submits(&self) -> usize {
+            self.state.lock().unwrap().submitted.len()
+        }
+
+        pub(crate) fn cancellations(&self) -> Vec<u64> {
+            self.state.lock().unwrap().cancelled.clone()
+        }
+
+        pub(crate) fn wait_for_cancels(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut state = self.state.lock().unwrap();
+            while state.cancelled.len() < count {
+                assert!(Instant::now() < deadline, "cancel did not arrive");
+                state = self.changed.wait_timeout(state, CANCEL_POLL).unwrap().0;
+            }
+        }
+
+        pub(crate) fn finish(&self, id: u64, result: Result<RawDevelopOutput, RawError>) {
             let callback = self.state.lock().unwrap().completions.remove(&id).unwrap();
             callback(result);
         }
 
-        fn wait_for_submits(&self, count: usize) {
+        pub(crate) fn wait_for_submits(&self, count: usize) {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut state = self.state.lock().unwrap();
             while state.submitted.len() < count {
@@ -1157,7 +1383,219 @@ mod tests {
         )
     }
 
-    fn wait_for_waiters(flights: &RemoteRawFlights, key: &RemoteRawIdentity, wanted: usize) {
+    #[test]
+    fn s2c_high_join_during_source_read_submits_high() {
+        let fake = Arc::new(FakeSubmitter::default());
+        let flights = fake.s2c();
+        let key = identity("source-read");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let low = {
+            let flights = Arc::clone(&flights);
+            let key = key.clone();
+            thread::spawn(move || {
+                flights.develop_with_priority(
+                    key,
+                    move |cancel| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        source(cancel)
+                    },
+                    &AtomicBool::new(false),
+                    RawPriority::Normal,
+                )
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let high = {
+            let flights = Arc::clone(&flights);
+            let key = key.clone();
+            thread::spawn(move || {
+                flights.develop_page(key, |_| panic!("join read"), &AtomicBool::new(false))
+            })
+        };
+        wait_for_waiters(&flights, &key, 2);
+        release_tx.send(()).unwrap();
+        fake.wait_for_submits(1);
+        assert_eq!(fake.state.lock().unwrap().priorities, [RawPriority::High]);
+        assert_eq!(
+            flights
+                .state
+                .lock()
+                .unwrap()
+                .outstanding
+                .values()
+                .next()
+                .unwrap()
+                .class,
+            AdmissionClass::Prefetch
+        );
+        fake.finish(1, Ok(output()));
+        assert!(low.join().unwrap().is_ok());
+        assert!(high.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn s2c_high_join_between_submit_and_attach_promotes_outside_lock() {
+        struct DelayedTicket {
+            fake: Arc<FakeSubmitter>,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl FlightSubmitter for DelayedTicket {
+            fn submit(
+                &self,
+                source: RawOwnedSource,
+                brightness: RawBrightness,
+                priority: RawPriority,
+                complete: Completion,
+            ) -> Result<Arc<dyn FlightTicket>, RawError> {
+                let ticket = self.fake.submit(source, brightness, priority, complete)?;
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(ticket)
+            }
+        }
+        let fake = Arc::new(FakeSubmitter::default());
+        let (entered, arrived) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let flights = RemoteRawFlights::new_with_submitter(
+            Arc::new(DelayedTicket {
+                fake: Arc::clone(&fake),
+                entered,
+                release: Mutex::new(wait),
+            }),
+            RemoteRawFlightPolicy::s2c(),
+        );
+        let key = identity("ticket-race");
+        let low = {
+            let flights = Arc::clone(&flights);
+            let key = key.clone();
+            thread::spawn(move || {
+                flights.develop_with_priority(
+                    key,
+                    source,
+                    &AtomicBool::new(false),
+                    RawPriority::Normal,
+                )
+            })
+        };
+        arrived.recv_timeout(Duration::from_secs(5)).unwrap();
+        let high = {
+            let flights = Arc::clone(&flights);
+            let key = key.clone();
+            thread::spawn(move || {
+                flights.develop_page(key, |_| panic!("joined"), &AtomicBool::new(false))
+            })
+        };
+        wait_for_waiters(&flights, &key, 2);
+        release.send(()).unwrap();
+        wait_for_inflight(&flights, &key);
+        {
+            let mut state = fake.state.lock().unwrap();
+            while state.promoted.is_empty() {
+                state = fake.changed.wait_timeout(state, CANCEL_POLL).unwrap().0;
+            }
+        }
+        assert_eq!(fake.state.lock().unwrap().priorities, [RawPriority::Normal]);
+        fake.finish(1, Ok(output()));
+        assert!(low.join().unwrap().is_ok());
+        assert!(high.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn s2c_admission_classes_6_3_9_joins_free_and_cancelling_counted() {
+        let fake = Arc::new(FakeSubmitter::default());
+        let flights = fake.s2c();
+        {
+            let mut state = flights.state.lock().unwrap();
+            for index in 0..6 {
+                state.reserve(&identity(&format!("foreground-{index}")), RawPriority::High);
+            }
+        }
+        let mut leases = Vec::new();
+        for index in 0..3 {
+            leases.push(
+                flights
+                    .try_prefetch(identity(&format!("prefetch-{index}")))
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            flights.try_prefetch(identity("overflow")),
+            Err(RemoteRawFlightError::Capacity)
+        ));
+        assert!(matches!(
+            flights.develop_page(
+                identity("foreground-overflow"),
+                source,
+                &AtomicBool::new(false)
+            ),
+            Err(RemoteRawFlightError::Capacity)
+        ));
+        let joined = flights.try_prefetch(identity("foreground-0")).unwrap();
+        assert_eq!(flights.state.lock().unwrap().outstanding.len(), 9);
+        drop(joined);
+        let key = identity("prefetch-0");
+        let high = {
+            let flights = Arc::clone(&flights);
+            let key = key.clone();
+            thread::spawn(move || flights.develop_page(key, source, &AtomicBool::new(false)))
+        };
+        wait_for_waiters(&flights, &key, 2);
+        let (id, class) = {
+            let state = flights.state.lock().unwrap();
+            let id = state.entries.get(&key).unwrap().id();
+            (id, state.outstanding.get(&id).unwrap().class)
+        };
+        assert_eq!(class, AdmissionClass::Prefetch);
+        flights.complete(&key, id, Ok(output()));
+        assert!(high.join().unwrap().is_ok());
+        drop(leases);
+        let mut state = flights.state.lock().unwrap();
+        let key = identity("foreground-0");
+        let id = state.entries.get(&key).unwrap().id();
+        state.entries.insert(key, FlightState::Cancelling { id });
+        assert_eq!(
+            state
+                .outstanding
+                .values()
+                .filter(|work| work.class == AdmissionClass::Foreground)
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn s2c_cache_policy_enforces_both_entry_and_byte_bounds() {
+        let fake = Arc::new(FakeSubmitter::default());
+        let flights = fake.s2c();
+        assert_eq!(flights.policy.max_cached_entries, 4);
+        assert_eq!(flights.policy.max_cached_bytes, 1024 * 1024 * 1024);
+        let mut state = flights.state.lock().unwrap();
+        for index in 0..5 {
+            state.cache_insert(
+                identity(&format!("cache-{index}")),
+                Arc::new(output()),
+                flights.policy,
+            );
+        }
+        assert_eq!(state.cache.len(), 4);
+        assert!(state.cache_lookup(&identity("cache-0")).is_none());
+        let policy = RemoteRawFlightPolicy {
+            max_cached_bytes: 36,
+            ..flights.policy
+        };
+        state.cache_insert(identity("last"), Arc::new(output()), policy);
+        assert_eq!(state.cached_bytes, 36);
+        assert_eq!(state.cache.len(), 2);
+    }
+
+    pub(crate) fn wait_for_waiters(
+        flights: &RemoteRawFlights,
+        key: &RemoteRawIdentity,
+        wanted: usize,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut state = flights.state.lock().unwrap();
         loop {
@@ -1318,7 +1756,11 @@ mod tests {
         let fake = Arc::new(FakeSubmitter::default());
         let flights = flights(&fake);
         let key = identity("submitting.raw");
-        let id = flights.state.lock().unwrap().reserve(&key);
+        let id = flights
+            .state
+            .lock()
+            .unwrap()
+            .reserve(&key, RawPriority::High);
         let lease = ParticipantLease {
             flights: Arc::clone(&flights),
             identity: key.clone(),
@@ -1345,7 +1787,7 @@ mod tests {
             owner: Arc::clone(&fake),
             id: 42,
         });
-        flights.attach_ticket(&key, id, ticket);
+        flights.attach_ticket(&key, id, ticket, RawPriority::High);
         assert!(matches!(
             flights.state.lock().unwrap().entries.get(&key),
             Some(FlightState::InFlight { waiters: 1, .. })
@@ -1749,7 +2191,11 @@ mod tests {
                 },
             );
             let occupied = identity("occupied.raw");
-            let id = flights.state.lock().unwrap().reserve(&occupied);
+            let id = flights
+                .state
+                .lock()
+                .unwrap()
+                .reserve(&occupied, RawPriority::High);
             let cancel = Arc::new(AtomicBool::new(false));
             let reads = Arc::new(AtomicUsize::new(0));
             let ai = {

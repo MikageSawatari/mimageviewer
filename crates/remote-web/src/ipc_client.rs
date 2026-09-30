@@ -975,6 +975,36 @@ impl ThumbnailClient {
         })
     }
 
+    pub fn raw_prefetch_window(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: mimageviewer_ipc::RawPrefetchWindowRequest,
+    ) -> Result<IpcSuccess<mimageviewer_ipc::RawPrefetchWindowAck>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::RawPrefetchWindow {
+            id,
+            owner: owner.clone(),
+            request: request.clone(),
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::RawPrefetchWindow { response, .. } => Ok(IpcSuccess {
+                value: response,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "RAW window received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
     pub fn page_demand(
         &self,
         owner: &RemoteSessionIdentity,

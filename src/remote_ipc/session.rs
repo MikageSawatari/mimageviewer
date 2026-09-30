@@ -241,6 +241,7 @@ impl RemoteStreamingControlError {
 
 #[derive(Debug)]
 struct SessionStateMachine {
+    raw_prefetch: Weak<super::raw_prefetch::RemoteRawPrefetchRegistry>,
     lifecycle: RemoteControlLifecycle,
     active: Option<ActiveSession>,
     last_owner: Option<String>,
@@ -262,6 +263,7 @@ struct SessionStateMachine {
 impl Default for SessionStateMachine {
     fn default() -> Self {
         Self {
+            raw_prefetch: Weak::new(),
             lifecycle: RemoteControlLifecycle::default(),
             active: None,
             last_owner: None,
@@ -339,6 +341,15 @@ impl SessionStateMachine {
             failed_count: 0,
             operations: BTreeMap::new(),
         });
+        if let Some(registry) = self.raw_prefetch.upgrade() {
+            registry.acquire(
+                &self
+                    .active
+                    .as_ref()
+                    .expect("acquired session exists")
+                    .session_id,
+            );
+        }
         SessionResponse::active(
             self.active
                 .as_ref()
@@ -705,6 +716,9 @@ impl SessionStateMachine {
             .is_err()
         {
             return false;
+        }
+        if let Some(registry) = self.raw_prefetch.upgrade() {
+            registry.terminate();
         }
         self.drain_reason = Some(reason);
         self.drain_started_at = Some(now);
@@ -1359,6 +1373,26 @@ impl SessionHandle {
             page_jobs: Arc::new(Mutex::new(Weak::new())),
             archive_cache_db: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(super) fn install_raw_prefetch(
+        &self,
+        registry: &Arc<super::raw_prefetch::RemoteRawPrefetchRegistry>,
+    ) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .raw_prefetch = Arc::downgrade(registry);
+    }
+
+    pub(super) fn raw_prefetch_registry(
+        &self,
+    ) -> Option<Arc<super::raw_prefetch::RemoteRawPrefetchRegistry>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .raw_prefetch
+            .upgrade()
     }
 
     pub(crate) fn install_ai_jobs(&self, jobs: &Arc<super::ai_job::RemoteAiJobRegistry>) {
@@ -2769,6 +2803,123 @@ mod tests {
             connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
             device_name: Some("phone".to_owned()),
         }
+    }
+
+    #[test]
+    fn raw_window_terminal_at_shared_drain_logout_supersede_liveness_idle_and_retire() {
+        use super::super::raw_flights::tests::FakeSubmitter;
+        use mimageviewer_ipc::{RawPrefetchWindowRequest, RawPrefetchWindowStatus};
+        for reason in [
+            ReleaseReason::Logout,
+            ReleaseReason::Superseded,
+            ReleaseReason::LivenessTimeout,
+            ReleaseReason::IdleTimeout,
+            ReleaseReason::Local,
+            ReleaseReason::AcquireBarrierTimeout,
+        ] {
+            let registry = super::super::raw_prefetch::RemoteRawPrefetchRegistry::new(
+                Arc::new(FakeSubmitter::default()).s2c(),
+            );
+            let mut state = SessionStateMachine {
+                raw_prefetch: Arc::downgrade(&registry),
+                ..Default::default()
+            };
+            acquire(&mut state, Duration::ZERO);
+            let owner = state_owner(&state, "client");
+            let request = |generation| RawPrefetchWindowRequest {
+                window_generation: generation,
+                entries: vec![],
+            };
+            assert_eq!(
+                registry.declare(&owner.session_id, request(1)).status,
+                RawPrefetchWindowStatus::Accepted
+            );
+            match reason {
+                ReleaseReason::Logout => {
+                    state.logout(Duration::from_secs(1), &owner);
+                }
+                ReleaseReason::Superseded => {
+                    state.acquire(
+                        Duration::from_secs(1),
+                        0,
+                        SessionAcquireRequest {
+                            client_id: "new-client".to_owned(),
+                            peer: peer(),
+                        },
+                    );
+                }
+                ReleaseReason::LivenessTimeout => {
+                    assert_eq!(state.expire(LIVENESS_TIMEOUT), Some(reason));
+                }
+                ReleaseReason::IdleTimeout => {
+                    state.active.as_mut().unwrap().last_ping = IDLE_TIMEOUT;
+                    assert_eq!(state.expire(IDLE_TIMEOUT), Some(reason));
+                }
+                ReleaseReason::Local => {
+                    state.retire_app(Duration::from_secs(1));
+                }
+                ReleaseReason::AcquireBarrierTimeout => {
+                    state.begin_drain(reason, Duration::from_secs(1));
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                registry.declare(&owner.session_id, request(2)).status,
+                RawPrefetchWindowStatus::Terminal,
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_window_connection_loss_preserves_session_generation_and_mailbox() {
+        use super::super::raw_flights::tests::FakeSubmitter;
+        use mimageviewer_ipc::{RawPrefetchWindowRequest, RawPrefetchWindowStatus};
+        let registry = super::super::raw_prefetch::RemoteRawPrefetchRegistry::new(
+            Arc::new(FakeSubmitter::default()).s2c(),
+        );
+        let handle = SessionHandle::new();
+        handle.install_raw_prefetch(&registry);
+        let response = handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let session = response.session_id.unwrap();
+        handle.remote_web_connected(1);
+        handle.remote_web_connected(2);
+        registry.declare(
+            &session,
+            RawPrefetchWindowRequest {
+                window_generation: 11,
+                entries: vec![],
+            },
+        );
+        handle.remote_web_disconnected(1);
+        handle.remote_web_disconnected(2);
+        assert_eq!(
+            registry
+                .declare(
+                    &session,
+                    RawPrefetchWindowRequest {
+                        window_generation: 11,
+                        entries: vec![]
+                    }
+                )
+                .status,
+            RawPrefetchWindowStatus::Duplicate
+        );
+        assert_eq!(
+            registry
+                .declare(
+                    &session,
+                    RawPrefetchWindowRequest {
+                        window_generation: 12,
+                        entries: vec![]
+                    }
+                )
+                .status,
+            RawPrefetchWindowStatus::Accepted
+        );
     }
 
     fn state_owner(state: &SessionStateMachine, client_id: &str) -> RemoteSessionIdentity {

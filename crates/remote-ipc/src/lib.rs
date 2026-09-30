@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 64;
+pub const PROTOCOL_VERSION: u32 = 65;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1227,6 +1227,31 @@ pub struct PageDemandRelease {
 pub struct PageDemandRequest {
     pub promote: Vec<PageDemandPromotion>,
     pub release: Vec<PageDemandRelease>,
+}
+
+/// A display-position declaration, independent of page byte requests.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RawPrefetchWindowRequest {
+    pub window_generation: u64,
+    pub entries: Vec<RemoteAddress>,
+}
+
+pub const MAX_RAW_PREFETCH_WINDOW_ENTRIES: usize = 8;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawPrefetchWindowStatus {
+    Accepted,
+    Stale,
+    Duplicate,
+    Terminal,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RawPrefetchWindowAck {
+    pub window_generation: u64,
+    pub status: RawPrefetchWindowStatus,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -2669,6 +2694,11 @@ pub enum ClientMessage {
         owner: RemoteSessionIdentity,
         request: PageDemandRequest,
     },
+    RawPrefetchWindow {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: RawPrefetchWindowRequest,
+    },
     RemoteAiStart {
         id: RequestId,
         owner: RemoteSessionIdentity,
@@ -2819,6 +2849,7 @@ impl ClientMessage {
             | Self::Container { id, .. }
             | Self::Page { id, .. }
             | Self::PageDemand { id, .. }
+            | Self::RawPrefetchWindow { id, .. }
             | Self::RemoteAiStart { id, .. }
             | Self::RemoteAiState { id, .. }
             | Self::RemoteAiRecoverable { id, .. }
@@ -2909,6 +2940,10 @@ pub enum ServerMessage {
     PageDemand {
         id: RequestId,
         response: PageDemandResponse,
+    },
+    RawPrefetchWindow {
+        id: RequestId,
+        response: RawPrefetchWindowAck,
     },
     RemoteAiStart {
         id: RequestId,
@@ -3022,6 +3057,7 @@ impl ServerMessage {
             | Self::FolderList { id, .. }
             | Self::Page { id, .. }
             | Self::PageDemand { id, .. }
+            | Self::RawPrefetchWindow { id, .. }
             | Self::RemoteAiStart { id, .. }
             | Self::RemoteAiState { id, .. }
             | Self::RemoteAiRecoverable { id, .. }
@@ -3182,7 +3218,7 @@ mod tests {
 
     #[test]
     fn protocol_v63_audio_track_control_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 64);
+        assert_eq!(PROTOCOL_VERSION, 65);
         let action = VideoStreamControlAction::AudioTrack {
             stream_index: 3,
             position_secs: 42.5,
@@ -3332,7 +3368,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 64);
+        assert_eq!(PROTOCOL_VERSION, 65);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3375,7 +3411,7 @@ mod tests {
 
     #[test]
     fn protocol_v62_raw_error_codes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 64);
+        assert_eq!(PROTOCOL_VERSION, 65);
         for (code, wire) in [
             (MediaErrorCode::RawPrefetchSkipped, "raw_prefetch_skipped"),
             (MediaErrorCode::RawCapacity, "raw_capacity"),
@@ -3393,6 +3429,50 @@ mod tests {
             serde_json::from_str::<ThumbnailErrorCode>(&encoded).unwrap(),
             ThumbnailErrorCode::NoThumbnail
         );
+    }
+
+    #[test]
+    fn protocol_v65_raw_window_request_and_all_ack_outcomes_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 65);
+        let expected = ClientMessage::RawPrefetchWindow {
+            id: 65,
+            owner: test_owner("window-client"),
+            request: RawPrefetchWindowRequest {
+                window_generation: 11,
+                entries: vec![RemoteAddress::file("C:/Pictures/page.dng")],
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expected).unwrap();
+        assert_eq!(
+            read_frame::<_, ClientMessage>(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap(),
+            expected
+        );
+        assert_eq!(expected.id(), 65);
+        for status in [
+            RawPrefetchWindowStatus::Accepted,
+            RawPrefetchWindowStatus::Stale,
+            RawPrefetchWindowStatus::Duplicate,
+            RawPrefetchWindowStatus::Terminal,
+            RawPrefetchWindowStatus::Rejected,
+        ] {
+            let expected = ServerMessage::RawPrefetchWindow {
+                id: 65,
+                response: RawPrefetchWindowAck {
+                    window_generation: 11,
+                    status,
+                },
+            };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &expected).unwrap();
+            assert_eq!(
+                read_frame::<_, ServerMessage>(&mut bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(expected.id(), 65);
+        }
+        assert_eq!(MAX_RAW_PREFETCH_WINDOW_ENTRIES, 8);
     }
 
     #[test]
@@ -3553,7 +3633,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 64);
+        assert_eq!(PROTOCOL_VERSION, 65);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -4591,7 +4671,7 @@ mod tests {
 
     #[test]
     fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
-        assert_eq!(PROTOCOL_VERSION, 64);
+        assert_eq!(PROTOCOL_VERSION, 65);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();

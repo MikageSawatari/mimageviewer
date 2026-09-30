@@ -1,3 +1,4 @@
+import { RawPrefetchWindowPublisher, rawPrefetchWindow } from "./raw-prefetch-window.mjs";
 import {
   CommandName,
   FitMode,
@@ -1652,6 +1653,28 @@ export function persistentCollectionRouteOwnerTransition(
 }
 
 let recentPointerSource = { source: "mouse", at: 0 };
+const rawPrefetchPublisher = new RawPrefetchWindowPublisher({
+  current: currentRawPrefetchPresentation,
+  delay: abortableDelay,
+  send: async (body, session, signal) => {
+    const headers = remoteHeaders({ "Content-Type": "application/json" });
+    headers.set("X-mIV-Remote-Session", session);
+    const response = await fetch("/api/raw-prefetch-window", { method: "POST", headers, body: JSON.stringify(body), signal });
+    if (state.remoteSessionId !== session || signal.aborted) return response;
+    if (response.ok && response.headers.get("X-mIV-Remote-Session") !== session) {
+      const error = new Error("RAW 先読み窓のセッションが一致しません。");
+      error.retryable = false;
+      throw error;
+    }
+    if (response.status === 409 || response.status === 428) {
+      const detail = await response.clone().json().catch(() => ({}));
+      const status = remoteSessionFailureStatus({ sessionStatus: detail.status, httpStatus: response.status, errorCode: detail.error });
+      if (status) setRemoteSessionStatus(status, detail.message || "操作権がありません。再接続してください。", { observer: "api_request", observedStatus: detail.status, httpStatus: response.status });
+    }
+    return response;
+  },
+});
+
 if (!RUNTIME_TEST_MODE) {
   installDocumentDoubleTapOwner(document, {
     onDecision: recordBrowserDoubleTapDecision,
@@ -1890,6 +1913,20 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
   return state.remoteSessionAcquirePromise;
 }
 
+function currentRawPrefetchPresentation(snapshot = viewerPositionOwner.current().displayed) {
+  if (!state.viewer || !snapshot || snapshot.viewer !== state.viewer || snapshot.pageGroups !== state.pageGroups) return null;
+  const visibleIndexes = pageGroupNavigationEntries(snapshot.group)
+    .map((entry) => state.images.findIndex((image) => entryIdentity(image) === entryIdentity(entry)))
+    .filter((index) => index >= 0);
+  return {
+    unit: [snapshot.contextIdentity, snapshot.groupIdentity],
+    direction: state.pageDirection,
+    entries: rawPrefetchWindow({ images: state.images, visibleIndexes, direction: state.pageDirection, addressOf: entryAddress }),
+  };
+}
+
+
+
 function newRemoteSessionCacheEpoch() {
   return (
     globalThis.crypto?.randomUUID?.().replaceAll("-", "") ??
@@ -1912,6 +1949,7 @@ export function applyRemoteSessionId(
   // Identity is the admission boundary. Publish its revocation before invoking an optional
   // image-viewer hook; video owns no pending page fetch and intentionally has no such method.
   state.remoteSessionId = next;
+  rawPrefetchPublisher.setSession(next);
   activateVideoProgressWriter(next, state.viewer?.progressRemoteSessionId);
   state.remoteSessionCorrelation = "";
   if (next) {
@@ -3824,6 +3862,7 @@ function cleanupScreen(preserveRequestController = null) {
   state.remoteAiController = null;
   state.archiveOpenController?.destroy();
   state.archiveOpenController = null;
+  rawPrefetchPublisher.leave();
   state.viewer?.destroy();
   state.viewer = null;
   state.screenContext = "loading";
@@ -5644,6 +5683,10 @@ function openViewerPagePosition(viewer, groupIndex) {
   })) return snapshot;
   reanchorViewerPageGroups();
   return null;
+}
+
+export function viewerPagePresentationForTest() {
+  return RUNTIME_TEST_MODE ? viewerPagePresentation() : null;
 }
 
 export function openViewerPagePositionForTest(viewer, groupIndex) {
@@ -14587,6 +14630,7 @@ export class ImageViewer {
     if (livePositionSnapshot) {
       viewerPositionOwner.display(livePositionSnapshot);
     }
+    if (livePositionSnapshot && state.viewer === this) rawPrefetchPublisher.commit(currentRawPrefetchPresentation(livePositionSnapshot));
     this.displayedSeekState = { ...seekState };
     if (!this.requestedPagePresentation) {
       this.initializePagePresentation({

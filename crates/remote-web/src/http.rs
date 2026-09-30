@@ -861,6 +861,11 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             &query,
             remote_owner.expect("route guard checked session"),
         ),
+        (Method::Post, "/api/raw-prefetch-window") => api_raw_prefetch_window(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
         (Method::Post, "/api/page/demand") => api_page_demand(
             request,
             state,
@@ -890,6 +895,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (
             _,
             "/api/telemetry"
+            | "/api/raw-prefetch-window"
             | "/api/session/acquire"
             | "/api/session/ping"
             | "/api/write"
@@ -3844,6 +3850,58 @@ fn page_ipc_error_response(
         }))
 }
 
+fn api_raw_prefetch_window(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_PAGE_DEMAND_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
+        Err(BodyReadError::Read) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let window: mimageviewer_ipc::RawPrefetchWindowRequest = match serde_json::from_slice(&body) {
+        Ok(window) => window,
+        Err(_) => return HttpResponse::text(400, "Bad Request"),
+    };
+    if window.entries.len() > mimageviewer_ipc::MAX_RAW_PREFETCH_WINDOW_ENTRIES {
+        return HttpResponse::text(400, "Bad Request");
+    }
+    for address in &window.entries {
+        if let Err(error) = validate_page_address(&state.library, address) {
+            return store_error_response(error);
+        }
+    }
+    let started = Instant::now();
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.raw_prefetch_window(owner, window)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return media_admission_busy_response(busy, "raw_prefetch_window"),
+    };
+    match result {
+        Ok(success) => raw_prefetch_ack_response(&success.value, owner),
+        Err(failure) => {
+            media_ipc_error_response(failure, started.elapsed(), "raw_prefetch_window", None)
+        }
+    }
+}
+
+fn raw_prefetch_ack_response(
+    ack: &mimageviewer_ipc::RawPrefetchWindowAck,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let mut response = HttpResponse::json(ack)
+        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"));
+    if ack.status == mimageviewer_ipc::RawPrefetchWindowStatus::Rejected {
+        response.status = 400;
+    }
+    response
+        .with_header("Cache-Control", "no-store")
+        .with_header("X-mIV-Remote-Session", owner.session_id.clone())
+        .with_header("Vary", "X-mIV-Remote-Session")
+}
+
 fn api_page_demand(
     request: &mut Request,
     state: &AppState,
@@ -5413,6 +5471,83 @@ mod tests {
                 .into();
             assert_eq!(api_page_demand(&mut request, &state, &owner).status, 400);
         }
+    }
+
+    #[test]
+    fn raw_window_success_acks_attest_session_and_terminal_is_not_an_error() {
+        use mimageviewer_ipc::{RawPrefetchWindowAck, RawPrefetchWindowStatus};
+        let owner = RemoteSessionIdentity {
+            client_id: "client".to_owned(),
+            session_id: "owner-session".to_owned(),
+        };
+        for status in [
+            RawPrefetchWindowStatus::Accepted,
+            RawPrefetchWindowStatus::Duplicate,
+            RawPrefetchWindowStatus::Stale,
+            RawPrefetchWindowStatus::Terminal,
+            RawPrefetchWindowStatus::Rejected,
+        ] {
+            let response = raw_prefetch_ack_response(
+                &RawPrefetchWindowAck {
+                    window_generation: 11,
+                    status,
+                },
+                &owner,
+            );
+            assert_eq!(
+                response.status,
+                if status == RawPrefetchWindowStatus::Rejected {
+                    400
+                } else {
+                    200
+                }
+            );
+            assert_eq!(
+                response_header_values(&response, "X-mIV-Remote-Session"),
+                ["owner-session"]
+            );
+            assert_eq!(
+                response_header_values(&response, "Cache-Control"),
+                ["no-store"]
+            );
+            assert_eq!(
+                serde_json::from_slice::<RawPrefetchWindowAck>(&response.body)
+                    .unwrap()
+                    .status,
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn raw_window_body_entry_and_address_limits_reject_before_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let owner = RemoteSessionIdentity {
+            client_id: "client".to_owned(),
+            session_id: "owner".to_owned(),
+        };
+        let too_many = serde_json::to_string(&mimageviewer_ipc::RawPrefetchWindowRequest {
+            window_generation: 1,
+            entries: vec![RemoteAddress::file("C:/page.dng"); 9],
+        })
+        .unwrap();
+        for body in ["{}".to_owned(), too_many, r#"{"window_generation":1,"entries":[{"path":"../page.dng","subresource":{"kind":"file"}}]}"#.to_owned()] {
+            let mut request: Request = TestRequest::new().with_method(Method::Post).with_path("/api/raw-prefetch-window").with_body(Box::leak(body.into_boxed_str())).into();
+            assert_eq!(api_raw_prefetch_window(&mut request, &state, &owner).status, 400);
+        }
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/raw-prefetch-window")
+            .with_body(Box::leak(
+                "x".repeat(MAX_PAGE_DEMAND_BODY_BYTES + 1).into_boxed_str(),
+            ))
+            .into();
+        assert_eq!(
+            api_raw_prefetch_window(&mut request, &state, &owner).status,
+            413
+        );
+        assert!(route_requires_remote_session("/api/raw-prefetch-window"));
     }
 
     #[test]

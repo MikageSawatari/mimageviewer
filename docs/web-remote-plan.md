@@ -1898,7 +1898,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-現行版は **v64**。v64 は RAW ブランチの v62 と master の v63 を統合し、RAW ページの `RawPrefetchSkipped` / `RawCapacity`、サムネイルの `NoThumbnail` と、EPUB・音声トラック選択・再生位置書き戻しをすべて含む。本体と service を同時に更新する。v63 は audio-tracks ブランチの追加を統合し、Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control と、端末で見た再生位置の PC への書き戻し (`RecordVideoProgress`、所有世代と連番の照合) を含む。audio-tracks ブランチでは音声トラック追加時に v62、再生位置追加時に v63 としていた。master の v62 は EPUB 対応で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げた。統合後の v63 では EPUB と音声トラック・再生位置の追加をすべて含み、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
+現行版は **v65**。v65 は表示位置の RAW 先読み窓の宣言と ack を追加した (§14.24)。v64 は RAW ブランチの v62 と master の v63 を統合し、RAW ページの `RawPrefetchSkipped` / `RawCapacity`、サムネイルの `NoThumbnail` と、EPUB・音声トラック選択・再生位置書き戻しをすべて含む。本体と service を同時に更新する。v63 は audio-tracks ブランチの追加を統合し、Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control と、端末で見た再生位置の PC への書き戻し (`RecordVideoProgress`、所有世代と連番の照合) を含む。audio-tracks ブランチでは音声トラック追加時に v62、再生位置追加時に v63 としていた。master の v62 は EPUB 対応で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げた。統合後の v63 では EPUB と音声トラック・再生位置の追加をすべて含み、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
 `{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
 catalog / snapshot / navigation を追加した。collection の session spread request と
 address-based `page_groups` を追加した版は v49。
@@ -2763,6 +2763,33 @@ Remote RAW サムネイルは half 現像を起こさず、埋め込みプレビ
 応答へ写す。サムネイル専用 IPC admission は heavy の最後の 1 枠を使わない。
 旧 `/api/image` / `/api/image-info` では RAW を非対応とし、集約コレクション・検索・タグの
 画像 entry に address を付けて `/api/page` へ送る。
+
+### 14.24 表示位置の RAW 先読み窓 (S2c、protocol v65)
+
+POST /api/raw-prefetch-window は認証・session 必須の短い Home control 経路。
+本文は 32 KiB、entries は最大 8 件、address は page と同じ検証。成功 ack は session を attestation し
+no-store とする。古い世代・重複・終端の宣言も成功 ack、構文不正は 400 とする。
+
+Web は共通の presentation commit から、表示単位・進行方向・窓の address 順の印が変わったときだけ宣言する。
+画像の位置で先 2 枚・前 1 枚を数え、cache / SKIPPED の有無では除外しない。相方や補助表紙を group ごとに
+追加しない。viewer を閉じても session の generation counter は継続し、離れると空の窓を送る。
+送信は最新値だけを保持し、一時的な通信失敗・503 を既存の backoff で再試行する。session 失効で fetch /
+backoff を abort、取得し直した session では counter を振り直し現在の表示から再計算する。古い本文の replay は行わない。
+
+core reader は owner lock 内で最大 generation より新しい宣言だけを最新値の受け箱へ置き、I/O 前に ack する。
+service に 1 本の worker が通常 RAW ファイル・直接 ZIP RAW entry の source だけを特定する。入れ子の器は展開せず、
+ZIP は中央ディレクトリの展開後サイズ 256 MiB 以下に限り、実際の読み込みにも同じ上限を課す。
+特定後に世代と終端を再確認して desired set を反映。重なる waiter は保ち、既存の foreground / AI flight にも
+窓自身の lease で join する。窓外はその lease だけを取り消す。Pending / Running / Retiring と waiter ID で所有し、
+spawn 前に slot を予約、Retiring も終了まで service 全体で数えて最大 6 thread とする。
+Pending がある間は最大 50ms の Condvar wait ごとに実際の admission を再試行し、capacity epoch は使わない。
+
+共通の session drain (logout・取得交代・liveness / idle 期限切れを含む) は窓を終端する。
+service stop / startup rollback も終端し全 waiter を取り消す。pipe の接続断は窓を変更しない。
+flight は作成時の admission class を保持し、foreground 最大 6・prefetch 最大 3・合計 9、Cancelling も完了まで数える。
+join は枠を消費せず、Submitting 中の最高要求優先度を記録し ticket 付与後にも必要なら lock 外で High に昇格する。
+窓の現像は Normal、PC と executor を共有。Remote 専用 cache は 4 件 / 1 GiB。PC の保持・page の S2b 経路は変更しない。
+実アプリでの動作・性能は未確認。自動検証の結果は S2c の実装引き継ぎを参照。
 
 ## 15. 横長ページの左右分割 (§1.119) をリモートへ (2026-08-25)
 

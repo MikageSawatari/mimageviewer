@@ -1640,6 +1640,91 @@ pub fn resolve_remote_image_candidate(
     resolve_remote_nested_candidate(&mut archive, zip_path, &parts, "", &mut indices, cancel)
 }
 
+/// S2c identification never resolves a nested path or reads image payloads.
+/// Literal entries containing `.zip/` are still direct physical entries.
+pub(crate) fn resolve_direct_raw_prefetch_candidate(
+    zip_path: &Path,
+    entry_name: &str,
+    cancel: &Arc<AtomicBool>,
+) -> std::io::Result<Option<(RemoteImageCandidate, u64)>> {
+    if crate::rar_loader::is_rar_path(zip_path) {
+        return Ok(None);
+    }
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
+    let index = match resolve_entry_index(
+        &mut archive,
+        entry_name,
+        decoded_name_cache_key(zip_path),
+        Some(cancel),
+    ) {
+        Ok(index) => index,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let entry = archive
+        .by_index_raw(index)
+        .map_err(|error| zip_error_to_io(error, Some(cancel)))?;
+    let name = normalized_zip_entry_name(&entry);
+    if !entry.is_file()
+        || !remote_readable_zip_metadata(&entry)
+        || !crate::raw_format::is_raw_path(Path::new(&name))
+        || entry.size() > 256 * 1024 * 1024
+    {
+        return Ok(None);
+    }
+    Ok(Some((
+        RemoteImageCandidate {
+            entry_name: name,
+            cursor: RemoteArchiveCandidateCursor::Zip(vec![index]),
+        },
+        entry.size(),
+    )))
+}
+
+pub(crate) fn read_direct_raw_prefetch_candidate(
+    zip_path: &Path,
+    candidate: &RemoteImageCandidate,
+    size_limit: u64,
+    cancel: &Arc<AtomicBool>,
+) -> std::io::Result<Vec<u8>> {
+    let RemoteArchiveCandidateCursor::Zip(indices) = &candidate.cursor else {
+        return Err(std::io::Error::other("prefetch requires ZIP"));
+    };
+    if indices.len() != 1 || size_limit > 256 * 1024 * 1024 {
+        return Err(std::io::Error::other(
+            "prefetch requires a bounded direct entry",
+        ));
+    }
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
+    let mut entry = archive
+        .by_index(indices[0])
+        .map_err(|error| zip_error_to_io(error, Some(cancel)))?;
+    if normalized_zip_entry_name(&entry) != candidate.entry_name || entry.size() != size_limit {
+        return Err(std::io::Error::other("prefetch entry changed"));
+    }
+    read_raw_prefetch_bounded(&mut entry, size_limit, cancel)
+}
+
+fn read_raw_prefetch_bounded(
+    reader: &mut impl Read,
+    size_limit: u64,
+    cancel: &AtomicBool,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    read_to_end_with_cancel(
+        &mut reader.take(size_limit + 1),
+        &mut bytes,
+        Some(cancel),
+        None,
+    )?;
+    if bytes.len() as u64 > size_limit {
+        return Err(std::io::Error::other(
+            "prefetch entry exceeds central-directory size",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn resolve_remote_nested_candidate<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     outer_zip_path: &Path,
@@ -2810,6 +2895,121 @@ mod tests {
             zw.write_all(data).unwrap();
         }
         zw.finish().unwrap();
+    }
+
+    #[test]
+    fn raw_prefetch_identifies_only_direct_entries_without_payload_or_nested_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let inner = temp.path().join("inner.zip");
+        write_test_zip(&inner, &[("nested.dng", b"RAW")]);
+        let outer = temp.path().join("outer.zip");
+        write_test_zip(
+            &outer,
+            &[
+                ("direct.dng", b"RAW"),
+                ("plain.jpg", b"JPEG"),
+                ("inner.zip", &std::fs::read(&inner).unwrap()),
+            ],
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (candidate, size) =
+            resolve_direct_raw_prefetch_candidate(&outer, "direct.dng", &cancel)
+                .unwrap()
+                .unwrap();
+        assert_eq!(candidate.cursor, RemoteArchiveCandidateCursor::Zip(vec![0]));
+        assert_eq!(size, 3);
+        assert!(
+            resolve_direct_raw_prefetch_candidate(&outer, "plain.jpg", &cancel)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_direct_raw_prefetch_candidate(&outer, "inner.zip/nested.dng", &cancel)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(raw_payload_read_count(&outer, "direct.dng"), 0);
+        assert!(!nested_cache_contains(&outer, "inner.zip"));
+        assert_eq!(
+            read_direct_raw_prefetch_candidate(&outer, &candidate, size, &cancel).unwrap(),
+            b"RAW"
+        );
+    }
+
+    #[test]
+    fn raw_prefetch_rejects_central_directory_size_above_256_mib() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized.zip");
+        write_test_zip(&path, &[("large.dng", b"RAW")]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let central = bytes
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        bytes[central + 24..central + 28]
+            .copy_from_slice(&(256_u32 * 1024 * 1024 + 1).to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            resolve_direct_raw_prefetch_candidate(
+                &path,
+                "large.dng",
+                &Arc::new(AtomicBool::new(false))
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn raw_prefetch_actual_read_stops_when_payload_exceeds_declared_size() {
+        struct Counting {
+            bytes: std::io::Cursor<Vec<u8>>,
+            count: usize,
+        }
+        impl Read for Counting {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.bytes.read(out)?;
+                self.count += read;
+                Ok(read)
+            }
+        }
+        let mut reader = Counting {
+            bytes: Cursor::new(vec![1; 1024]),
+            count: 0,
+        };
+        let error = read_raw_prefetch_bounded(&mut reader, 4, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(reader.count, 5);
+        assert!(
+            read_raw_prefetch_bounded(&mut Cursor::new(b"RAW"), 3, &AtomicBool::new(false)).is_ok()
+        );
+        assert_eq!(
+            read_raw_prefetch_bounded(&mut Cursor::new(b"RAW"), 3, &AtomicBool::new(true))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("understated.zip");
+        write_test_zip(&path, &[("page.dng", b"REAL-PAYLOAD")]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let central = bytes
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&4_u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (candidate, size) = resolve_direct_raw_prefetch_candidate(&path, "page.dng", &cancel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(size, 4);
+        let error =
+            read_direct_raw_prefetch_candidate(&path, &candidate, size, &cancel).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds central-directory size"),
+            "{error}"
+        );
     }
 
     fn measure_zip_directory_reads(

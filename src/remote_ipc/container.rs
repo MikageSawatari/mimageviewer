@@ -1226,6 +1226,69 @@ struct RawDepSpec {
     candidate: Option<crate::zip_loader::RemoteImageCandidate>,
 }
 
+impl super::raw_prefetch::PrefetchIdentifier for ContainerEngine {
+    fn identify(
+        &self,
+        address: &RemoteAddress,
+        cancel: &Arc<AtomicBool>,
+    ) -> Option<super::raw_prefetch::PrefetchSource> {
+        if cancel.load(Ordering::Acquire) {
+            return None;
+        }
+        // Ignore container representatives and partner dependencies. Only this
+        // address's own plain RAW or direct ZIP RAW entry can be prefetched.
+        if !matches!(
+            &address.subresource,
+            RemoteSubresource::File | RemoteSubresource::ZipEntry { .. }
+        ) {
+            return None;
+        }
+        let resolved = self.resolve(address).ok()?;
+        let metadata = std::fs::metadata(&resolved.canonical).ok()?;
+        let brightness = self.adjustment_render_settings().ok()?.raw_brightness;
+        let (candidate, size_limit) = match &address.subresource {
+            RemoteSubresource::File if crate::raw_format::is_raw_path(&resolved.logical) => {
+                (None, 0)
+            }
+            RemoteSubresource::ZipEntry { entry_name } if is_archive_container(&resolved) => {
+                let (candidate, size) = crate::zip_loader::resolve_direct_raw_prefetch_candidate(
+                    resolved.readable_canonical(),
+                    entry_name,
+                    cancel,
+                )
+                .ok()??;
+                (Some(candidate), size)
+            }
+            _ => return None,
+        };
+        let spec = remote_raw_dep_spec_with_selection(
+            address,
+            &resolved,
+            &metadata,
+            brightness,
+            candidate.as_ref(),
+        )
+        .ok()??;
+        Some(super::raw_prefetch::PrefetchSource {
+            identity: spec.identity.clone(),
+            read: Arc::new(move |cancel| {
+                if let Some(candidate) = &spec.candidate {
+                    crate::zip_loader::read_direct_raw_prefetch_candidate(
+                        &spec.readable_path,
+                        candidate,
+                        size_limit,
+                        cancel,
+                    )
+                    .map(|bytes| crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)))
+                    .map_err(|error| crate::raw::RawError::Io(error.to_string()))
+                } else {
+                    spec.source(cancel)
+                }
+            }),
+        })
+    }
+}
+
 impl RawDepSpec {
     fn source(
         &self,
@@ -2490,7 +2553,7 @@ impl ContainerEngine {
         Self {
             raw_flights: RemoteRawFlights::new(
                 Arc::clone(&raw_develop_executor),
-                super::raw_flights::RemoteRawFlightPolicy::s2b(),
+                super::raw_flights::RemoteRawFlightPolicy::s2c(),
             ),
             raw_develop_executor,
             settings: Arc::new(settings),
@@ -9320,10 +9383,16 @@ mod tests {
             )
             .unwrap();
         drop(view_trim);
-        let engine = ContainerEngine::new(crate::settings::Settings {
+        let mut engine = ContainerEngine::new(crate::settings::Settings {
             favorites: vec![FavoriteEntry::new("RAW".to_owned(), folder.clone())],
             ..Default::default()
         });
+        // Keep the S2b eviction witness's deliberately narrow policy. S2c's
+        // production 4-entry / 1-GiB bounds are covered by flight policy tests.
+        engine.raw_flights = RemoteRawFlights::new(
+            Arc::clone(&engine.raw_develop_executor),
+            super::super::raw_flights::RemoteRawFlightPolicy::s2b(),
+        );
         let left = RemoteAddress::file(left_path.to_string_lossy().into_owned());
         let right = RemoteAddress::file(right_path.to_string_lossy().into_owned());
         let third = RemoteAddress::file(third_path.to_string_lossy().into_owned());
@@ -14967,6 +15036,42 @@ mod tests {
             )
             .0,
             RemoteSpreadMode::LtrCover
+        );
+    }
+}
+#[cfg(test)]
+mod raw_window_tests {
+    use super::*;
+    #[test]
+    fn raw_window_identification_owns_only_the_address_source_not_auto_trim_partner() {
+        use super::super::raw_prefetch::PrefetchIdentifier;
+        let temp = tempfile::tempdir().unwrap();
+        let own = temp.path().join("own.dng");
+        let partner = temp.path().join("partner.dng");
+        std::fs::write(&own, b"not decoded during identification").unwrap();
+        std::fs::write(&partner, b"partner").unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let source = engine
+            .identify(
+                &RemoteAddress::file(own.to_string_lossy().into_owned()),
+                &cancel,
+            )
+            .unwrap();
+        assert!(source.identity.normalized_path.ends_with("own.dng"));
+        assert_eq!(engine.raw_flights.work_counts_for_test(), (0, 0, 0, 0));
+        assert!(
+            engine
+                .identify(
+                    &RemoteAddress {
+                        path: own.to_string_lossy().into_owned(),
+                        subresource: RemoteSubresource::ZipDirectory {
+                            prefix: "".to_owned()
+                        }
+                    },
+                    &cancel
+                )
+                .is_none()
         );
     }
 }

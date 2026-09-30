@@ -185,6 +185,7 @@ const {
   normalizeRemoteViewTrimState,
   normalizePagePresentationSlots,
   openViewerPagePositionForTest,
+  viewerPagePresentationForTest,
   pageGroupNavigationEntries,
   pageGroupPresentationIdentity,
   pageGroupPresentationSlots,
@@ -5063,6 +5064,7 @@ test("video progress writer serializes ordinary snapshots with session-bound seq
   const calls = [];
   let releaseFirst;
   globalThis.fetch = (url, options) => {
+    if (url === "/api/raw-prefetch-window") return Promise.resolve(new Response("{}", { status: 200 }));
     calls.push({ url, options });
     if (calls.length === 1) {
       return new Promise((resolve) => {
@@ -5097,6 +5099,7 @@ test("hidden final progress starts keepalive while an earlier report is stalled"
   const calls = [];
   let releaseFirst;
   globalThis.fetch = (url, options) => {
+    if (url === "/api/raw-prefetch-window") return Promise.resolve(new Response("{}", { status: 200 }));
     calls.push({ url, options });
     if (calls.length === 1) {
       return new Promise((resolve) => {
@@ -5130,6 +5133,7 @@ test("reconnected session sends immediately while retained viewer still reports 
   const calls = [];
   let releaseOld;
   globalThis.fetch = (url, options) => {
+    if (url === "/api/raw-prefetch-window") return Promise.resolve(new Response("{}", { status: 200 }));
     calls.push({ url, options });
     if (calls.length === 1) {
       return new Promise((resolve) => {
@@ -5218,5 +5222,50 @@ test("viewer cleanup starts final keepalive before destroy even when prior repor
   } finally {
     applyRemoteSessionId(TEST_SESSION_ID, () => {});
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("RAW window emits at actual presentation commit once for cached spread and sends empty on exit", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalHistory = globalThis.history;
+  globalThis.history = { state: {}, replaceState() {}, pushState() {} };
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    if (url === "/api/raw-prefetch-window") calls.push(JSON.parse(options.body));
+    return new Response("{}", { status: 200 });
+  };
+  try {
+    retainVideoViewerForTest(null);
+    applyRemoteSessionId("raw-window-owner", () => {});
+    const entries = Array.from({ length: 8 }, (_, index) => ({
+      name: `page${index}.dng`, kind: "image", address: { path: `C:/raw/page${index}.dng`, subresource: { kind: "file" } },
+    }));
+    const address = { path: "C:/raw", subresource: { kind: "file" } };
+    applyContainerData(address, {
+      kind: "folder", title: "RAW", effective_address: address, entries, image_count: entries.length,
+      page_groups: entries.filter((_, index) => index !== 4).map((entry) => ({ anchor: entry.address, pages: entry === entries[3] ? [entries[3].address, entries[4].address] : [entry.address], slice: "full" })),
+    }, false);
+    const viewer = { destroy() {}, syncPagePositionFeedback() {}, requestedPagePresentation: {} };
+    openViewerPagePositionForTest(viewer, 3);
+    const presentation = viewerPagePresentationForTest();
+    assert.equal(calls.length, 0); // Opening the position is not a display commit.
+    ImageViewer.prototype.commitPagePresentation.call(viewer, presentation);
+    ImageViewer.prototype.commitPagePresentation.call(viewer, presentation);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].entries, [entries[5].address, entries[6].address, entries[2].address]);
+    cleanupVideoViewerForTest(viewer);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(calls[1].entries, []);
+    assert.equal(calls[1].window_generation, 2);
+    openViewerPagePositionForTest(viewer, 3);
+    ImageViewer.prototype.commitPagePresentation.call(viewer, viewerPagePresentationForTest());
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls[2].window_generation, 3);
+  } finally {
+    retainVideoViewerForTest(null);
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    globalThis.fetch = originalFetch;
+    globalThis.history = originalHistory;
   }
 });

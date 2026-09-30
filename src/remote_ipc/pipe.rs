@@ -599,6 +599,7 @@ pub(super) struct ServerGuard {
     session_runtime: SessionRuntime,
     settings_reader_control: super::live_favorites::RemoteSettingsReaderControl,
     raw_flights: Arc<super::raw_flights::RemoteRawFlights>,
+    raw_prefetch: Option<super::raw_prefetch::RawPrefetchService>,
     _ai_jobs: Arc<super::ai_job::RemoteAiJobRegistry>,
     _archive_jobs: Arc<super::archive_job::RemoteArchiveJobRegistry>,
 }
@@ -627,6 +628,7 @@ struct ServerStartupWorkers {
     armed: bool,
     stop: Arc<AtomicBool>,
     raw_flights: Arc<super::raw_flights::RemoteRawFlights>,
+    raw_prefetch: Option<super::raw_prefetch::RawPrefetchService>,
     listeners: Vec<std::thread::JoinHandle<()>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     stream_workers: Vec<std::thread::JoinHandle<()>>,
@@ -641,6 +643,7 @@ struct ServerStartupWorkers {
 struct StartedWorkers {
     stop: Arc<AtomicBool>,
     raw_flights: Arc<super::raw_flights::RemoteRawFlights>,
+    raw_prefetch: Option<super::raw_prefetch::RawPrefetchService>,
     listeners: Vec<std::thread::JoinHandle<()>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     stream_workers: Vec<std::thread::JoinHandle<()>>,
@@ -658,6 +661,7 @@ impl ServerStartupWorkers {
         StartedWorkers {
             stop: Arc::clone(&self.stop),
             raw_flights: Arc::clone(&self.raw_flights),
+            raw_prefetch: self.raw_prefetch.take(),
             listeners: std::mem::take(&mut self.listeners),
             workers: std::mem::take(&mut self.workers),
             stream_workers: std::mem::take(&mut self.stream_workers),
@@ -676,6 +680,7 @@ impl ServerStartupWorkers {
         }
         self.armed = false;
         respond_stopped_works(self.heavy_queue.stop(), reason);
+        drop(self.raw_prefetch.take());
         self.raw_flights.stop();
         self.stop.store(true, Ordering::Release);
         for _ in 0..self.listeners.len() {
@@ -801,6 +806,7 @@ impl ServerGuard {
             armed: true,
             stop: Arc::clone(&stop),
             raw_flights,
+            raw_prefetch: None,
             listeners: Vec::with_capacity(ACCEPTOR_COUNT),
             workers: Vec::with_capacity(worker_count),
             stream_workers: Vec::with_capacity(STREAM_WORKER_COUNT),
@@ -811,6 +817,13 @@ impl ServerGuard {
             write_work_tx: write_work_tx.clone(),
             stream_work_tx: stream_work_tx.clone(),
         };
+        let raw_prefetch = super::raw_prefetch::RawPrefetchService::start(
+            container_engine.raw_flights(),
+            Arc::clone(&container_engine) as Arc<dyn super::raw_prefetch::PrefetchIdentifier>,
+        )?;
+        session_handle.install_raw_prefetch(&raw_prefetch.registry);
+        startup.raw_prefetch = Some(raw_prefetch);
+
         let write_container_engine = Arc::clone(&container_engine);
         let write_session = session_handle.clone();
         let write_worker_metrics = Arc::clone(&write_metrics);
@@ -915,6 +928,7 @@ impl ServerGuard {
         Ok(Self {
             stop: started.stop,
             raw_flights: started.raw_flights,
+            raw_prefetch: started.raw_prefetch,
             listeners: started.listeners,
             workers: started.workers,
             stream_workers: started.stream_workers,
@@ -952,6 +966,7 @@ impl ServerGuard {
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         respond_stopped_works(self.heavy_queue.stop(), "service_stopping");
+        drop(self.raw_prefetch.take());
         self.raw_flights.stop();
         self.stop.store(true, Ordering::Release);
         for _ in 0..self.listeners.len() {
@@ -1187,6 +1202,7 @@ fn worker_loop(
                     },
                     other @ (ClientMessage::VideoStreamStart { .. }
                     | ClientMessage::PageDemand { .. }
+                    | ClientMessage::RawPrefetchWindow { .. }
                     | ClientMessage::VideoStreamControl { .. }
                     | ClientMessage::VideoStreamSeek { .. }
                     | ClientMessage::VideoStreamThumbnail { .. }
@@ -1874,6 +1890,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
             PagePriority::Prefetch => "page_prefetch",
         },
         ClientMessage::PageDemand { .. } => "page_demand",
+        ClientMessage::RawPrefetchWindow { .. } => "raw_prefetch_window",
         ClientMessage::RemoteAiStart { .. } => "remote_ai_start",
         ClientMessage::RemoteAiState { .. } => "remote_ai_state",
         ClientMessage::RemoteAiRecoverable { .. } => "remote_ai_recoverable",
@@ -1945,6 +1962,7 @@ fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
         | ClientMessage::FolderList { owner, .. }
         | ClientMessage::Page { owner, .. }
         | ClientMessage::PageDemand { owner, .. }
+        | ClientMessage::RawPrefetchWindow { owner, .. }
         | ClientMessage::RemoteAiStart { owner, .. }
         | ClientMessage::RemoteAiState { owner, .. }
         | ClientMessage::RemoteAiRecoverable { owner, .. }
@@ -2010,6 +2028,7 @@ fn operation_description(message: &ClientMessage) -> String {
             _ => "ページをレンダリング中".to_owned(),
         },
         ClientMessage::PageDemand { .. } => "ページ表示の需要を更新中".to_owned(),
+        ClientMessage::RawPrefetchWindow { .. } => "RAW prefetch window".to_owned(),
         ClientMessage::RemoteAiStart { .. } => "remote AI job を開始中".to_owned(),
         ClientMessage::RemoteAiState { .. } => "remote AI job の状態を確認中".to_owned(),
         ClientMessage::RemoteAiRecoverable { .. } => "復帰可能な remote AI job を確認中".to_owned(),
@@ -2213,6 +2232,7 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             ..
         }
         | ServerMessage::PageDemand { .. }
+        | ServerMessage::RawPrefetchWindow { .. }
         | ServerMessage::RemoteAiStart {
             response: mimageviewer_ipc::RemoteAiStartResponse::Accepted(_),
             ..
@@ -2687,6 +2707,46 @@ fn handle_connection(
                     Err(response) => response,
                 };
                 let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
+                continue;
+            }
+            ClientMessage::RawPrefetchWindow { id, owner, request } => {
+                let response = if request.entries.len()
+                    > mimageviewer_ipc::MAX_RAW_PREFETCH_WINDOW_ENTRIES
+                    || request
+                        .entries
+                        .iter()
+                        .any(|address| address.validate_syntax().is_err())
+                {
+                    ServerMessage::RawPrefetchWindow {
+                        id: *id,
+                        response: mimageviewer_ipc::RawPrefetchWindowAck {
+                            window_generation: request.window_generation,
+                            status: mimageviewer_ipc::RawPrefetchWindowStatus::Rejected,
+                        },
+                    }
+                } else {
+                    match session.begin_operation(owner, "RAW prefetch window".to_owned()) {
+                        Ok(operation) => match operation.wait_until_active() {
+                            Ok(()) => {
+                                operation.started();
+                                let response = session
+                                    .raw_prefetch_registry()
+                                    .map(|registry| {
+                                        registry.declare(&owner.session_id, request.clone())
+                                    })
+                                    .unwrap_or(mimageviewer_ipc::RawPrefetchWindowAck {
+                                        window_generation: request.window_generation,
+                                        status: mimageviewer_ipc::RawPrefetchWindowStatus::Terminal,
+                                    });
+                                operation.finish(true);
+                                ServerMessage::RawPrefetchWindow { id: *id, response }
+                            }
+                            Err(response) => ServerMessage::Session { id: *id, response },
+                        },
+                        Err(response) => ServerMessage::Session { id: *id, response },
+                    }
+                };
+                let _ = reply_tx.send(response);
                 continue;
             }
             ClientMessage::PageDemand { id, owner, request } => {
@@ -3396,7 +3456,8 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
         | ClientMessage::SessionPing { id, .. }
         | ClientMessage::SessionRelease { id, .. }
         | ClientMessage::SessionActivity { id, .. }
-        | ClientMessage::PageDemand { id, .. } => ServerMessage::Session {
+        | ClientMessage::PageDemand { id, .. }
+        | ClientMessage::RawPrefetchWindow { id, .. } => ServerMessage::Session {
             id: *id,
             response: session_response(
                 SessionStatus::NotAcquired,
@@ -3726,7 +3787,8 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
         | ClientMessage::SessionPing { id, .. }
         | ClientMessage::SessionRelease { id, .. }
         | ClientMessage::SessionActivity { id, .. }
-        | ClientMessage::PageDemand { id, .. } => ServerMessage::Session {
+        | ClientMessage::PageDemand { id, .. }
+        | ClientMessage::RawPrefetchWindow { id, .. } => ServerMessage::Session {
             id: *id,
             response: session_response(
                 SessionStatus::NotAcquired,
@@ -4262,6 +4324,7 @@ mod tests {
         let startup = ServerStartupWorkers {
             armed: true,
             stop: Arc::new(AtomicBool::new(false)),
+            raw_prefetch: None,
             raw_flights: super::super::raw_flights::RemoteRawFlights::new(
                 Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
                 super::super::raw_flights::RemoteRawFlightPolicy::s2b(),

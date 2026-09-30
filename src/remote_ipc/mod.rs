@@ -9,6 +9,7 @@ mod page_jobs;
 mod path_guard;
 mod persistent_collections;
 mod raw_flights;
+mod raw_prefetch;
 mod service;
 mod thumbnail;
 mod video_jump;
