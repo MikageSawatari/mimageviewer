@@ -7,10 +7,13 @@ always-active guidance.
 
 ## Model Roles And Coordination
 
-- Default development roles (2026-09-23 decision): ClaudeCode Opus 5.5 / `high`
-  leads overall management, design, task assignment, and acceptance;
-  Codex `gpt-6-sol` / `xhigh` implements and tests; a separate
-  `gpt-6-sol` / `xhigh` reviewer independently checks design and implementation.
+- Default development roles (2026-09-23 decision, Codex models updated 2026-09-30):
+  ClaudeCode Opus 5.5 / `high` leads overall management, design, task assignment,
+  and acceptance; Codex `gpt-6.1-sol` / `high` implements and tests; a separate
+  `gpt-6.1-sol` / `xhigh` reviewer independently checks design and implementation.
+  (Before 2026-09-30 both used `gpt-6-sol` / `xhigh`. GPT-6.1 Sol at `high` beats
+  GPT-6 Sol's best DeepSWE v1.1 score; review stays one step higher because a
+  missed finding costs more than the extra reasoning.)
   Opus verifies findings and acceptance evidence; its own review does not replace
   the independent reviewer. Later explicit user instructions override these defaults.
 - Use `gpt-6-astra` / `medium` only for bounded second opinions on difficult

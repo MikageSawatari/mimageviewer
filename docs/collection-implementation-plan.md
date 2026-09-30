@@ -1374,7 +1374,7 @@ bin check / fmt / UI glyph / viewer context audit / diff checkも通過。独立
 
 2026-09-20、後半 B-4 / D-2 は同じ actor collection ID・revision・GridDisplayOrder を
 `CollectionPrepareReuseKey` として PC / Remote の再利用判定に共用する。PC は viewer context の
-`Ready / Empty` が持つ実サムネイル情報と、sidecar 判定設定・動画 pin DB instance / 成功書込世代まで
+`Ready / Empty` が持つ実サムネイル情報と、sidecar 判定設定・動画 / コンテナ pin DB instance / 成功書込世代・代表選定 sort / depth まで
 一致するときだけ navigation の全件 prepare を省く。可視 root の同一 binding は cursor だけを進め、
 child から root へ戻る場合は保持した sidecar と pin payload から再設置する。pin WebP は動画 worker と
 `Arc` で共有して複製しない。長期保持する pin BLOB の合計は installed presentation 単位で判定し、64 MiB を超える場合だけ保持せず、
@@ -1586,7 +1586,7 @@ root prepare worker は placeholder と Audio を除く Auto 比率の eligible 
 UI は公開中の Collection ID、revision、items generation、件数が snapshot と完全一致する場合だけこの scalar を
 O(1) で初期 seed に使い、一致しなければ 0 とする。物理 child と通常フォルダは従来どおり `items.len()` を使う。
 
-cold prepare worker は video sidecar / pin の live map と、再利用用の retained `Arc` または容量超過を表す
+cold prepare worker は video sidecar / pin、コンテナ代表 pin map と動画 leaf seed の live map と、再利用用の retained `Arc` または容量超過を表す
 `Oversized` marker を同時に構築し、UI は完成品を move して install する。warm navigation preflight も retained
 資産から live map を worker 上で構築する。Collection ID、revision、表示順、sidecar fingerprint、画像・動画設定、
 pin stamp のどれかが異なる場合と `Oversized` の場合は再利用せず full prepare へ戻す。
@@ -1606,16 +1606,16 @@ mutation admissionを維持し、手動順再読込が失敗しても利用者�
 書き出しはclipboardを変更しない。DBと索引の通常ソート名はmodelの共通snake_case helperを使用し、Rustの
 `Debug`表記やSettings全体のserde表現へ依存しない。
 
-### 23.16 メタ情報取り込み後のCollection動画サムネイル更新（2026-09-21）
+### 23.16 メタ情報取り込み後のCollectionピンサムネイル更新（2026-09-21）
 
-メタ情報取り込みはAppが保持する動画ピンDBとは別のATTACH transactionで書くため、通常のmutation stampでは
-Collectionの保持済み動画サムネイルが更新を検出できない。取り込みwriterは、各item SAVEPOINTで成功した
-動画ピン変更をbatch内だけに保持し、外側transactionのCOMMIT成功後にだけ`ImportSummary`の確定件数へ加える。
+メタ情報取り込みはAppが保持する動画 / コンテナピンDBとは別のATTACH transactionで書くため、通常のmutation stampでは
+Collectionの保持済みピンサムネイルが更新を検出できない。取り込みwriterは、各item SAVEPOINTで成功した
+動画 / コンテナピン変更をbatch内だけに保持し、外側transactionのCOMMIT成功後にだけ`ImportSummary`の確定件数へ加える。
 項目rollback、batch COMMIT失敗、適用0件は変更として通知せず、後続batchが失敗した場合も先にCOMMIT済みの
 件数は保持する。
 
 UIは`WorkerMessage::Import`を最初に受理した境界で、確定件数が1件以上の場合だけApp-globalな
-thumbnail-source epochを1回進める。終端refreshの再試行では進めず、App側の動画ピンDB handleが無い場合も
+thumbnail-source epochを1回進める。終端refreshの再試行では進めず、App側のピンDB handleが無い場合も
 同じ通知を使う。epochはCollection prepareのreuse keyに含めるため、旧worker結果とnavigation用保持資産は
 再利用されない。全viewer contextは項目を走査せず、Ready / Emptyのpresentationだけをinstalled snapshot付き
 再準備へ移し、旧epochを捕捉済みのPreparingだけを取消す。RequestNeeded / Snapshotのread leaseとreceiver、
@@ -1636,3 +1636,61 @@ retained thumbnail payloadの最終dropは既存のpayload退役workerへ移す�
 同一 Collection root を fullscreen で閲覧中の更新だけは、現行 surface / Root 位置、installed items 世代、prepared の Collection ID・採用済み revision・行数、fullscreen index を一つの binding 判定で確認する。成立すれば `begin` と空 items install を避け、既存 session の `cancel_pending` が保持する installed snapshot と旧 items 世代を viewer が閉じるまで使う。別 Collection または物理子から root への移動にはこの例外を適用しない。
 
 明示 Open は従来どおり、可視採用直後に読み込み中を示して履歴を記録し、actor / prepare 失敗時は main に失敗表示を残す。履歴 replay は offscreen 準備の成功後にだけ移管・採用・履歴確定し、失敗・取消では旧表示と履歴を維持する。追加の rollback / supersession 状態は設けない。長い処理をモーダルにする案は、準備中も操作できる Collection の既存動作を狭め、context 所有を直さないため採用しなかった。別窓を閉じて開き直す案は再生継続を失うため採用しなかった。
+
+### 23.18 コンテナ代表サムネ固定（§1.307、2026-09-30）
+
+Collection root は検索・スマートフォルダと同じ `lookup_many(GridItem::container_path)` を prepare worker の
+読み取り専用コンテナ pin DB 接続で行い、完成した `folder_pin_map` を install する。Folder / ZIP / PDF / 変換書庫 /
+EPUB の元 source path を使う。root に ZipDir の単独登録はないため literal/effective alias は不要。
+入れ子 Folder→Folder→Video はスマートフォルダの `prepare_video_folder_pin_seeds` を共有する。動画 WebP の一括取得後は
+正規化キーで対応付け、表記違いで同じ動画に到達した全コンテナへ seed を渡す。seed key は検索と同じ full-path
+`Seeded#pin:{source_id}`。Collection の catalog 無しの worker へは完成済み in-memory CacheEntry map を渡す。
+invalid WebP は worker で missing seed へ正規化し、prepare / install に UI での DB open / 書込 / decode / BLOB 全量コピーは足さない。
+`make_load_request` は他の集約一覧と同じ共通 resolver を使う。その既存の metadata / 入れ子 pin DB / 動画 WebP の
+UI 同期参照は、この低リスク修正でも許容する（設計担当判断 2026-09-30）。共通 resolver の worker 化は別の P3 §1.309 とし、
+この修正では実装しない。新しい UI I/O 経路は追加しない。
+変換書庫は既存 `initialize_converted_archive_cache_paths` の typed Pending と lazy worker を使い、pin 解除後も通常代表へ戻す。
+
+retained 資産はコンテナ pin map と seed を持ち、identity は pin 種別・相対参照・ページ、seed key / 動画 path / mtime /
+size / WebP または missing 状態を含む。64 MiB の保持予算へ seed WebP も加え、超過時も live install の内容は省略しない。
+warm navigation の preflight worker は retained 資産から live cache map を作り直し、child→root の再設置へ渡す。
+reuse key は動画と同じ成功書込 mutation stamp をコンテナ pin DB にも持ち、代表選定 sort / depth も含む。
+prepare 開始・受信・navigation 着地で既存 owner/key 検証を使う。mounted root の Ready / Empty は poll の admission 境界で
+stamp 不一致を既存 presentation-only retry に変換する。child / fullscreen は既存 root materialize gate が保護し、復帰時に
+新資産へ収束する。別 context の map / items / worker は直接変更しない。取消・切替・削除・エラーは既存 lease を維持する。
+
+メタ情報 import の別接続 SQL はコンテナ pin revision を item SAVEPOINT 内で比較し、外側 COMMIT 成功後だけ確定件数へ
+加える。動画と共通の既存 thumbnail-source epoch 通知を使い、削除 / 入れ子変更 / 部分commitを含めて旧資産を失効させる。
+同一内容ファイルからの編集復元も、pin store の transaction COMMIT 成功後だけコピー件数を報告し、同じ epoch 通知を使う。
+後続 store / EPUB promotion が失敗しても先行 pin COMMIT は通知し、INSERT OR IGNORE の no-op / rollback は通知しない。
+新しい pending owner、modal、navigation 制限は不要なので、既存 prepare/retry と所有境界を使う簡素化を選んだ。
+
+Remote は別 thumbnail 経路で、現状 Folder の Image / Folder leaf だけに固定を適用し、ZIP / PDF / 動画 leaf と他コンテナの
+固定は対応していない。本修正は PC Collection の欠落を直し、Remote IPC / protocol / 既存制限を変更しない。
+実アプリ・UI smoke は依頼どおり起動しない。自動検証と確認buildの結果は本節に記録する。
+
+検証記録（`v430-collection-pins`、基点 `b98dce051` 上の本件未コミット差分、2026-09-30）:
+
+| 検証 | 結果 |
+|---|---|
+| `cargo fmt` / `cargo fmt --check` / `git diff --check` | 成功 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0（既存 warning 131 件） |
+| `cargo test -p mimageviewer --lib collection_` | 280 passed / 1 ignored |
+| pin import / mutation stamp 焦点テスト | 1 passed / 2 passed |
+| store copy / 復元 worker / 復元通知の焦点テスト 4 filters | 各 1 passed（成功 / no-op / rollback / 後続失敗を含む） |
+| `cargo test -p mimageviewer --lib`（復元 producer 対応後の最終差分） | 9,894 passed / 51 ignored / 0 failed |
+| `cargo test -p mimageviewer --test ui_snapshot` | 55 passed / 0 failed |
+| `cargo run -p viewer_context_audit` | exit 1、6 violations（依頼で指定された master の既存分のみ） |
+| `python scripts/check_ui_glyphs.py` | 0 dangerous glyphs |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | exit 0、normal features の core / remote / EPUB worker を配置。VCRT PE 検査 runtime=4 / pe=3 成功。起動なし |
+
+Cargo 全コマンドは `MSBUILDDISABLENODEREUSE=1`。FFmpeg loader error はなく、deps への DLL 追加コピーは不要だった。
+audit 既存分は `src/app/viewer_context_registry.rs:4083` / `4087` の non-Windows public API fingerprint と、
+`src/video/decoder.rs:2561` / `3249` / `3352` / `3462` の test-only call。これらのファイルは本修正では変更しない。
+独立 `gpt-6.1-sol` / `xhigh` 静的レビューは完了し、許容された共通 resolver 境界の下で修正必須の残指摘なし。
+
+追加の `.\scripts\test-full.ps1 -SuppressCrashDialogs` は exit 101。launcher の必須入力である
+`target/release/mimageviewer-core.exe` / `mimageviewer-remote.exe` / `mimageviewer-epub-pdf.exe` がこの worktree に無いため、
+workspace テストの build 前提で停止した（テスト成功とは扱わない）。この追加ゲートは未完了として残す。
+ログは `target/collection-pins-final-check.log` / `collection-pins-final-lib.log` / `collection-pins-snapshot.log` /
+`collection-pins-final-audit.log` / `collection-pins-test-full.log` / `collection-pins-build-dev.log`。

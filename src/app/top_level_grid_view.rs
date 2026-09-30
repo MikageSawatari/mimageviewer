@@ -577,6 +577,14 @@ pub(crate) struct CollectionGridPreparedInstall {
 pub(crate) struct CollectionGridThumbnailSources {
     pub(crate) video_sidecars: std::collections::HashMap<String, PathBuf>,
     pub(crate) video_pin_blobs: std::sync::Arc<std::collections::HashMap<PathBuf, Vec<u8>>>,
+    pub(crate) folder_pin_map:
+        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pub(crate) video_folder_pin_seeds: std::sync::Arc<
+        Vec<(
+            super::smart_folder::PreparedVideoFolderPinSeed,
+            Option<Vec<u8>>,
+        )>,
+    >,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -588,10 +596,25 @@ pub(crate) struct CollectionGridPreparedThumbnailSources {
     pub(crate) payload: CollectionGridThumbnailSources,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct CollectionGridPreparedThumbnailDelivery {
     pub(crate) presentation: CollectionGridPresentationSources,
-    pub(crate) live: CollectionGridThumbnailSources,
+    pub(crate) live: CollectionGridLiveThumbnailSources,
+}
+
+#[derive(Default)]
+pub(crate) struct CollectionGridLiveThumbnailSources {
+    pub(crate) sources: CollectionGridThumbnailSources,
+    pub(crate) folder_pin_cache: std::collections::HashMap<String, crate::catalog::CacheEntry>,
+}
+
+impl std::fmt::Debug for CollectionGridLiveThumbnailSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectionGridLiveThumbnailSources")
+            .field("sources", &self.sources)
+            .field("folder_pin_cache_entries", &self.folder_pin_cache.len())
+            .finish()
+    }
 }
 
 pub(crate) const MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -612,6 +635,9 @@ pub(crate) struct CollectionGridPrepareReuseKey {
     pub(crate) skip_image_if_video_exists: bool,
     pub(crate) video_thumb_use_sidecar_image: bool,
     pub(crate) pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+    pub(crate) folder_pin_stamp: Option<crate::folder_thumb_pins::FolderPinMutationStamp>,
+    pub(crate) folder_thumb_sort: crate::settings::SortOrder,
+    pub(crate) folder_thumb_depth: u32,
     pub(crate) thumbnail_source_epoch: u64,
 }
 
@@ -621,6 +647,7 @@ impl CollectionGridPrepareReuseKey {
         revision: u64,
         settings: &crate::settings::Settings,
         pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+        folder_pin_stamp: Option<crate::folder_thumb_pins::FolderPinMutationStamp>,
         thumbnail_source_epoch: u64,
     ) -> Self {
         Self {
@@ -635,6 +662,9 @@ impl CollectionGridPrepareReuseKey {
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
             pin_stamp,
+            folder_pin_stamp,
+            folder_thumb_sort: settings.folder_thumb_sort,
+            folder_thumb_depth: settings.folder_thumb_depth,
             thumbnail_source_epoch,
         }
     }
@@ -651,7 +681,7 @@ pub(crate) struct CollectionGridNavigationSources {
     pub(crate) reuse_key: CollectionGridPrepareReuseKey,
     pub(crate) page_edit_revision: u64,
     pub(crate) presentation: CollectionGridPresentationSources,
-    live: std::sync::Arc<std::sync::Mutex<Option<CollectionGridThumbnailSources>>>,
+    live: std::sync::Arc<std::sync::Mutex<Option<CollectionGridLiveThumbnailSources>>>,
     pub(crate) retained_edit_snapshot:
         Option<std::sync::Arc<super::page_edit_snapshot::PageEditSnapshot>>,
     page_edits: std::sync::Arc<
@@ -678,7 +708,7 @@ impl CollectionGridNavigationSources {
         reuse_key: CollectionGridPrepareReuseKey,
         page_edit_revision: u64,
         presentation: CollectionGridPresentationSources,
-        live: Option<CollectionGridThumbnailSources>,
+        live: Option<CollectionGridLiveThumbnailSources>,
     ) -> Self {
         Self {
             reuse_key,
@@ -725,7 +755,7 @@ impl CollectionGridNavigationSources {
         self.live.lock().is_ok_and(|live| live.is_none())
     }
 
-    pub(crate) fn publish_live(&self, sources: CollectionGridThumbnailSources) {
+    pub(crate) fn publish_live(&self, sources: CollectionGridLiveThumbnailSources) {
         if let Ok(mut live) = self.live.lock()
             && live.is_none()
         {
@@ -794,7 +824,7 @@ impl Default for CollectionGridPreparedThumbnailDelivery {
         let retained = std::sync::Arc::new(CollectionGridPreparedThumbnailSources::default());
         Self {
             presentation: CollectionGridPresentationSources::Retained(retained),
-            live: CollectionGridThumbnailSources::default(),
+            live: CollectionGridLiveThumbnailSources::default(),
         }
     }
 }
@@ -848,6 +878,7 @@ impl CollectionGridInstalledPresentation {
                 prepared.collection_id,
                 prepared.collection_revision,
                 &settings,
+                None,
                 None,
                 0,
             ),
