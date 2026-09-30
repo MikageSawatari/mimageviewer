@@ -324,6 +324,70 @@ fn still_seek_popup_owns_keyboard_before_fullscreen_shortcuts() {
 }
 
 #[test]
+fn still_seek_popup_tiny_identical_labels_select_only_the_clicked_column_setting() {
+    use crate::settings::{StillSeekPreviewSize, StillSeekStripHeight};
+
+    let mut app = still_seek_edge_test_app();
+    let ctx = egui::Context::default();
+    crate::os_theme::apply_resolved(&ctx, crate::os_theme::ResolvedTheme::Dark);
+    crate::ui_fonts::configure_fonts(&ctx);
+    let size = egui::vec2(200.0, 240.0);
+    let full = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+
+    for (index, (height, preview)) in StillSeekStripHeight::ALL
+        .into_iter()
+        .zip(StillSeekPreviewSize::ALL)
+        .enumerate()
+    {
+        assert_eq!(height.label(), preview.label());
+        for column in 0..2 {
+            // Both start on a different preset so a missed click cannot pass as a no-op.
+            app.settings.still_seek_strip_height =
+                StillSeekStripHeight::ALL[(index + 1) % StillSeekStripHeight::ALL.len()];
+            app.settings.still_seek_preview_size =
+                StillSeekPreviewSize::ALL[(index + 1) % StillSeekPreviewSize::ALL.len()];
+            let frame = open_menu(&mut app, &ctx, size);
+            let mut rows: Vec<_> = frame
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.text() == height.label() => {
+                        let ink = clipped.shape.visual_bounding_rect();
+                        assert!(full.contains_rect(ink));
+                        assert!(clipped.clip_rect.contains_rect(ink));
+                        Some(ink.center())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                rows.len(),
+                2,
+                "tiny mode must show the same label in both columns"
+            );
+            rows.sort_by(|left, right| left.x.total_cmp(&right.x));
+            assert!(rows[0].x < rows[1].x);
+            assert_eq!(rows[0].y, rows[1].y);
+
+            let mut expected = app.settings.clone();
+            if column == 0 {
+                expected.still_seek_strip_height = height;
+            } else {
+                expected.still_seek_preview_size = preview;
+            }
+            let _ = menu_frame(&mut app, &ctx, size, click_events(rows[column]));
+            assert!(!fs_still_seek_strip_popup_open(&ctx));
+            assert_eq!(
+                serde_json::to_value(&app.settings).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "tiny preset {} in column {column} must change only its own setting",
+                height.label(),
+            );
+        }
+    }
+}
+
+#[test]
 fn still_seek_popup_pairs_height_and_preview_rows_at_normal_and_compact_sizes() {
     for size in [
         egui::vec2(1280.0, 720.0),
