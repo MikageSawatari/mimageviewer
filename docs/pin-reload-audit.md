@@ -53,7 +53,7 @@ Collection root → physical child を実 owner／scan で採用した fixture �
 | `python scripts/check_ui_glyphs.py` | exit 0、危険字形 0 | `pin-reload-glyphs.log` |
 | `cargo run --locked -p viewer_context_audit --quiet` | exit 1、既知 6 violation／追加 0 | `pin-reload-audit.log` |
 
-監査の6件は A4 (`viewer_context_ids`／`viewer_context_residence` の非 Windows API) 2件と A6 (`video/decoder.rs` の test-only 呼出し) 4件。指摘対象2ファイルと audit tool が起点 `b98dce051` から未変更であることを `git diff --quiet` (exit 0) でも確認した。allowlist を追加して隠していない。実装したピン更新差分の独立 Sol / xhigh completion review では残存指摘なし。追加のソート経路の確認では上表の RatingPhysical 不具合を両者が確認し、変更禁止境界で停止した。
+監査の6件は A4 (`viewer_context_ids`／`viewer_context_residence` の非 Windows API) 2件と A6 (`video/decoder.rs` の test-only 呼出し) 4件。指摘対象2ファイルと audit tool が起点 `b98dce051` から未変更であることを `git diff --quiet` (exit 0) でも確認した。allowlist を追加して隠していない。実装担当の補助 Sol / xhigh completion review では当時残存指摘を検出しなかった（利用者指定の独立レビューとは別）。追加のソート経路の確認では上表の RatingPhysical 不具合を両者が確認し、変更禁止境界で停止した。
 
 回帰テストには通常・Collection の変換キャッシュ ZIP の実 preflight、Rating の parent chain、同一書庫の兄弟本依存と別書庫の保持、合成 request の統合・古い generation の拒否・retired request の取消、main search producer を兄弟 context の terminal 適用が取消しない検査を含む。
 
@@ -71,7 +71,7 @@ owner の直置きは App を110,664 bytesに増やし、既存 footprint テス
 
 3件の状態遷移回帰を追加した。評価 root から実 owner で親フォルダ→子フォルダを開いた fixture で、Immediate／実 scan worker 完了をそれぞれ通し、変更後の行順、RatingPhysical location、二段の親 chain、保存地点、BS の評価親ルート、back／forward stack と履歴 target を確認する。両経路で parked sibling の行・generation・token・選択・スクロールも保持される。同じ path／order のまま source generation を更新した旧 worker 完了は、行・履歴・選択・selection hint を変更しない。`select_after_load` は既存の App-global 操作 hint なので、兄弟固有の hint があるという fixture は作らない。
 
-独立 Codex (Sol / xhigh) の実装前・完了レビューで、detached の機械的転送が症状パッチではないことを確認し、完了差分に残存指摘なし。検証の実行は実装担当が所有し、レビュアーによる重複 build／test／起動は行っていない。
+実装担当の補助 Codex (Sol / xhigh) は実装前・完了レビューで detached の機械的転送が構造修正であることを確認した。この補助レビューは利用者指定の独立レビューではない。検証の実行は実装担当が所有し、レビュアーによる重複 build／test／起動は行っていない。
 
 検証中に既存の parked synthetic pin 回帰が間欠失敗した。worker の結果をそのまま consumer へ渡す前に errors を検査する診断を追加し、単独再実行の3回目で `フォルダピンDBを再読込できませんでした: database is locked` を確認した (`target/pin-reload-fix1-pin-repeat-3.log`、0.15秒)。2つの context worker の schema open が DEFERRED transaction 内の schema 読取後に `INSERT OR IGNORE` へ upgrade して競合する。pin map／reset indices が作られず、owner や generation の誤りではない。`FolderThumbPinDb::init_schema` を既存の単一 schema transaction の開始時に writer を取得する `BEGIN IMMEDIATE` へ変更した。2秒の既存 timeout、原子的な revision row／triggers、pin rows は保持する。新しい retry／delay／guard は加えず、detached 固有コードには及ばない。独立レビューもこの所有境界の修正に合意した。
 
@@ -79,7 +79,7 @@ DB 回帰は新規・初期化済み store を各8 workerで同時に open し�
 
 ### fix1 最終検証
 
-Windows、default features、`MSBUILDDISABLENODEREUSE=1`、起点 `86e051181` の未コミット差分。検証後から確認用 build 完了まで source 3ファイルが不変であることを `target/pin-reload-fix1-source-hash.txt` の SHA-256 と照合した。独立 Sol / xhigh の最終レビューも Box 転送・DB schema writer 修正を含め残存指摘なし。
+Windows、default features、`MSBUILDDISABLENODEREUSE=1`、起点 `86e051181` の未コミット差分。検証後から確認用 build 完了まで source 3ファイルが不変であることを `target/pin-reload-fix1-source-hash.txt` の SHA-256 と照合した。当時の実装担当の補助 Sol / xhigh レビューは Box 転送・DB schema writer 修正を含め指摘を検出しなかった。その後の独立レビューの P2 と fix2 は以下に記録する。
 
 | コマンド／検査 | 結果 | ログ (`target/` 内) |
 | --- | --- | --- |
@@ -97,3 +97,44 @@ Windows、default features、`MSBUILDDISABLENODEREUSE=1`、起点 `86e051181` �
 | `git diff --check` | exit 0 | 最終差分で確認 |
 
 監査6件の内容は初回と同じ A4 2件／A6 4件。該当2ファイルと audit tool は `86e051181` から未変更 (`git diff --quiet` exit 0)。allowlist は変更していない。ビルド開始時に他の native compiler／MSBuild がないことを確認して既存 wait override を使用した。`portable` は有効にせず、normal profile の core／remote／EPUB converter と DLL を `target/dev-runtime/` へ配置した。製品の起動・UI smoke・通常プロファイルの操作は行っていない。利用者による実機確認は未実施。
+
+## fix2: pin materialization の worker 境界 (起点 `0d11e5325`)
+
+2026-10-01 の独立 Codex レビュー（gpt-6.1-sol / xhigh、session `01a0f38f-1566-75e0-bfa7-4f1fdf06d28b`）は、合成ビュー pin 完了が UI thread で FS metadata、cascade pin DB lookup、catalog DELETE、動画 pin 読取と seed 書込を行う P2 を指摘し、changes needed と判定した。他の owner／history／context routing の追加指摘はなく、pin DB の IMMEDIATE schema transaction と detached typed owner 転送は構造修正として合意された。ClaudeCode と独立レビューの detached 合意日時・session は §11 に正確に記録した。
+
+同型 consumer は合成 pin の `poll_current_view_pin_refresh` と明示 metadata import の終端適用（main／active／parked／非 Windows）で、すべて共通 `apply_current_metadata_import_terminal_result` に入る。両 producer が既存 `metadata_import_refresh::run` に container row、metadata、依存 root、sort／depth／cache-key policy、cache／catalog ownership のメモリ snapshot を渡す。worker が sparse dirty 範囲を絞り、FS／cascade／video DB の参照と catalog materialization の更新を完了してから結果を送る。ZIP alias の論理 root は要求時の既存 resolver で保持する。
+
+worker は表示中の共有 cache を直接変更せず、worker 上の private map に削除／seed を適用する。影響 folder がない結果は map を交換しない。先行要求は後続 worker を起動する前に cancel し、catalog の writer lock 内でも cancel を検査する。さらに、一覧世代が変わる共通 `App::set_items_generation` で、その projected context の旧 pin 要求を退役させる。合成 worker が frame A を読んだ後に実フォルダへ移動して動画を frame B に再固定し、新 view が同じ key に B を seed してから旧 A が永続化される順序を、後続 view の catalog seed より前の generation ownership 境界で断つ。mount／deposit／restore は bundle の raw swap であり、この取消を通らない。 metadata import も同じ世代の旧 worker と同一 key を競合できる（実フォルダ由来の Snapshot など）。`take_metadata_import_refresh_requests(changed)` が pin 変更のある対象要求を確定した時点で、その context の旧 pin owner を退役させてから後続 worker を起動する。取消した unpin が既に mounted pin map から消えていても、可視 container keys を既存 `old_folder_pin_keys` に引き継ぎ Full snapshot の無効化範囲を保持する。export／開始前の import 取消／rating のみ／対象外 context は旧要求を保持する。削除と seed を単一 transaction にまとめ、cancel／error は未 commit の batch を rollback する。seed 書込失敗時は、同じ key の旧動画 bytes を再表示させない既存仕様に従って、失敗した replacement seed の stale 行を worker で削除する。この cleanup も catalog writer 境界で cancel を検査し、取消済み旧 owner が後続 seed を消せないようにする。UI 側の `Prepared` は reset index、準備済み cache map、scalar identity だけを持ち、DB handle／FS path／I/O callback を含まない。UI は items generation と resource／policy identity を検証し、map と pin map を採用して thumbnail のメモリ状態・既存 worker lifecycle を更新する。旧 thumbnail producer が保持する map は新たな採用 map と分離する。modal／新 pending phase／待機を追加せず既存 worker と typed terminal を再利用する。
+
+回帰は実際の pin worker terminal を UI 適用前に取得し、cascade による動画 seed と stale catalog DELETE が既に完了し、元の live map と thumbnail は不変であることを確認する。準備後に source を削除し UI DB reader を外しても準備済み bytes と位置／history が採用される。terminal DTO は全 field を型付きで exhaustively destructure し、DB handle の追加を検出する。同世代でも cache owner が変わった完了は拒否する。無関係な folder dirty は map／pool token を保持する。実際の ordinary visible adoption と prepared aggregate adoption を通し、旧 context の pin token が取消される一方、parked sibling／単なる mount／restore ではその要求と token が保持されることも検査する。既存の metadata import／兄弟 context fixture も同じ worker 準備済み結果を使う。catalog batch は seed 失敗時の削除 rollback と cancel 済み旧 owner の書込拒否を検査する。実 synthetic worker で、動画 frame bytes だけを変えて key が不変であることを確認し、INSERT のみ失敗する SQLite trigger を使って旧 seed の worker-side purge と UI 採用後の旧 bytes 非再表示を検査する。
+
+`target/release/` は存在しない。launcher build script が必要とする `mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` の3入力がすべてないため、利用者の条件に従い `scripts/test-full.ps1` は未実行。これらを作るための release build は行わない。下記 full lib 等は別途実行する。
+
+### fix2 最終検証
+
+最終 source 6ファイルを `target/pin-reload-fix2-source-hash.txt` の SHA-256 で固定して検証する。途中 checkpoint の full lib は 9912／9913件通過したが、seed 失敗時 cleanup と世代切替時 cancel を追加したため、最終結果としては再検証分だけを採用する。
+
+最終世代取消差分の最初の full lib で、今回未変更の `content_identity::tests::an_origin_whose_edits_were_all_removed_stops_being_a_restore_source` が台帳 flag の検査 (`src/content_identity.rs:3707`) で1件失敗した（9913 pass／1 fail／51 ignored、603.03秒、`target/pin-reload-fix2-lib-content-identity-failure.log`）。同 test の `--exact` 単独再実行は exit 0（`pin-reload-fix2-content-identity-rerun.log`）。`content_identity.rs` は起点から未変更 (`git diff --quiet` exit 0)。source を変えない2回目の通常並列 full lib でも同じ検査が失敗した（9913 pass／1 fail／51 ignored、546.66秒、`pin-reload-fix2-lib-parallel-second-failure.log`）。
+
+切り分けでは、既存の process-global `RECORD_SEQUENCE` が原因のテスト間干渉を確認した。`drop_sources_with_nothing_to_restore_with_probe` は探索中に別の記録があれば source flag を下ろさないが、復元内容のない candidate は取り除く。失敗 test はこの global sequence を直列化せず、別 test の明示 increment／recorder submit と重なると上記の結果になる。今回追加した navigation fixture は physical scan marker を持たず、identity backfill を開始しない。製品コードと assertion は変更せず、全 lib を `-- --test-threads=1` で検証して harness 間の干渉を除く。各回帰内で明示的に作られる worker／並列 producer の検査は維持する。個々の失敗実行の競合 producer を trace で特定したという主張はしない。
+
+同型 producer の最終確認で metadata import の同世代 succession を追加修正するため、その途中の直列 full lib は自分の lib test harness だけを停止した（`pin-reload-fix2-lib-before-import-succession-interrupted.log`）。これは成功結果には数えない。対象要求の owner 引継ぎ・unpin coverage・rating のみ／abort／兄弟保持と実 worker の reset index の回帰を追加し、最終 source で gates を再実行する。最終検証は Windows、default features、`MSBUILDDISABLENODEREUSE=1`、起点 `0d11e5325` の未コミット差分。source は確認用 build まで固定し、以下に最終差分の結果だけを記録する。
+
+| コマンド／検査 | 結果 | ログ (`target/` 内) |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | exit 0 | `pin-reload-fix2-fmt.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 | `pin-reload-fix2-core-check.log` |
+| `cargo test -p mimageviewer --lib mutation_refresh_` | exit 0、27 pass／0 fail | `pin-reload-fix2-focused.log` |
+| `cargo test -p mimageviewer --lib pin_materialization` | exit 0、3 pass／0 fail | `pin-reload-fix2-materialization.log` |
+| `cargo test -p mimageviewer --lib metadata_import_refresh` | exit 0、6 pass／0 fail | `pin-reload-fix2-metadata-refresh.log` |
+| `cargo test -p mimageviewer --lib metadata_folder_pin_refresh` | exit 0、1 pass／0 fail | `pin-reload-fix2-metadata-pin.log` |
+| `cargo test -p mimageviewer --lib folder_thumb_pins::tests::` | exit 0、55 pass／0 fail | `pin-reload-fix2-pin-db.log` |
+| `cargo test -p mimageviewer --lib -- --test-threads=1` | exit 0、9915 pass／0 fail／51 ignored (728.73秒) | `pin-reload-fix2-lib.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | exit 0、55 pass／0 fail | `pin-reload-fix2-ui-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険字形0 | `pin-reload-fix2-glyphs.log` |
+| `cargo run --locked -p viewer_context_audit --quiet` | exit 1、既知6 violation／追加0 | `pin-reload-fix2-audit.log` |
+| `scripts/test-full.ps1` | 必要な release 3入力不在で未実行 | `pin-reload-fix2-test-full-prerequisites.txt` |
+| `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、Cargo jobs=4 | `pin-reload-fix2-build-dev.log` |
+| SHA-256／`git diff --check` | source 6ファイル一致／exit 0 | `pin-reload-fix2-source-hash.txt`、`pin-reload-fix2-handoff-checks.txt` |
+
+監査6件の内容は同じ A4 2件／A6 4件。該当2ファイルと audit tool は起点から未変更 (`git diff --quiet` exit 0) で、allowlist は変更していない。fix2 の実装側補助レビューは最終の import succession と unpin coverage を含め残存指摘を検出しなかったが、利用者指定の独立レビューとは別であり、その再レビューを代替しない。確認用 build は全 lib 成功後に実行し、開始時に native compiler／MSBuild がないことを確認して既存 wait override を使用した。`portable` を有効にせず、normal profile の core／remote／EPUB converter と必要 DLL を `target/dev-runtime/` に配置した。検証後から build 完了まで source 6ファイルの SHA-256 が一致する。製品の起動・UI smoke・通常プロファイルの操作は行っていない。

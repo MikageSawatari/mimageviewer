@@ -44,6 +44,413 @@ fn mutation_refresh_loaded_thumb(ctx: &egui::Context) -> ThumbnailState {
     }
 }
 
+// Manual terminal fixtures use the same worker preparation as production, with a captured owner.
+fn prepared_pin_materializations_for_test(
+    app: &App,
+    reset_indices: Vec<usize>,
+) -> pin_materialization::Prepared {
+    let mut request = app.pin_materialization_request(CurrentViewRefresh::Full);
+    for (index, item) in app.items.iter().enumerate() {
+        if let Some(target) = app.folder_pin_lookup_target_for_item(item) {
+            request
+                .rows
+                .push(app.pin_materialization_row(index, item, target.path));
+        }
+    }
+    if request.rows.is_empty() {
+        return pin_materialization::Prepared {
+            reset_indices,
+            replacement: None,
+            identity: request.identity,
+        };
+    }
+    let pin_db = app.folder_thumb_pin_db.clone();
+    let video_db_path = crate::video_pins::VideoPinDb::db_path();
+    std::thread::spawn(move || {
+        let video_db = crate::video_pins::VideoPinDb::open_readonly(&video_db_path).ok();
+        request
+            .prepare(
+                reset_indices,
+                &Default::default(),
+                pin_db.as_deref(),
+                video_db.as_ref(),
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+    })
+    .join()
+    .unwrap()
+}
+
+#[test]
+fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_apply() {
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("worker-pin-boundary");
+    let child = folder.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let video = child.join("clip.mp4");
+    std::fs::write(&video, b"video").unwrap();
+    let mut webp = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        4,
+        4,
+        image::Rgba([48, 96, 160, 255]),
+    ))
+    .write_to(
+        &mut std::io::Cursor::new(&mut webp),
+        image::ImageFormat::WebP,
+    )
+    .unwrap();
+    app.video_pin_db
+        .as_ref()
+        .unwrap()
+        .set_pin(&video, 1.25, &webp)
+        .unwrap();
+    assert!(app.set_folder_thumb_pin(
+        &child,
+        FolderPinSource::File {
+            rel: "clip.mp4".into(),
+            kind: FileKind::Video
+        }
+    ));
+    assert!(app.set_folder_thumb_pin(
+        &folder,
+        FolderPinSource::File {
+            rel: "child".into(),
+            kind: FileKind::Folder
+        }
+    ));
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_tag_view = true;
+    app.top_level_grid_view
+        .replace_surface(top_level_grid_view::TopLevelGridSurface::Search(
+            top_level_grid_view::TopLevelSearchView::Tag,
+        ));
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![mutation_refresh_loaded_thumb(&egui::Context::default())];
+    app.selected = Some(0);
+    app.scroll_offset_y = 42.0;
+    let base = folder_thumb_existing_keys_for(
+        &app.items[0],
+        None,
+        &Default::default(),
+        None,
+        Some(app.settings.folder_thumb_sort),
+        app.settings.folder_thumb_depth,
+        app.use_full_path_cache_keys(),
+    )[0]
+    .clone();
+    let stale = format!(
+        "{base}{}obsolete",
+        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX
+    );
+    let catalog = Arc::new(
+        crate::catalog::CatalogDb::open(&app.tmp.path().join("boundary-cache"), &folder).unwrap(),
+    );
+    catalog.save(&stale, 1, 1, 4, 4, None, &webp).unwrap();
+    let old_map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
+    app.current_color_catalog = Some(catalog.clone());
+    app.current_color_cache_map = Some(old_map.clone());
+    let generation = app.items_generation;
+    let history = app.folder_nav_history_snapshot();
+    app.consume_folder_thumb_pin_dirty();
+    let context_id = app.projected_viewer_context_id();
+    // Receive the real worker terminal WITHOUT running a UI completion consumer.
+    let terminal = app.current_view_pin_refreshes[&context_id]
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert!(terminal.errors.is_empty(), "{:?}", terminal.errors);
+    let mut result = terminal.contexts.into_iter().next().unwrap();
+    // Exhaustive destructuring pins the terminal DTO to memory-only types. Adding any
+    // database/resource field requires explicitly revisiting this thread-boundary test.
+    let pin_materialization::Prepared {
+        reset_indices,
+        replacement,
+        identity,
+    } = result.folder_pin_materializations.take().unwrap();
+    let _: &Vec<usize> = &reset_indices;
+    let _: &Option<pin_materialization::CacheMap> = &replacement;
+    let _: pin_materialization::Identity = identity;
+    assert_eq!(reset_indices, vec![0]);
+    let prepared_map = replacement.as_ref().unwrap().clone();
+    let seed = prepared_map
+        .read()
+        .unwrap()
+        .iter()
+        .find(|(key, entry)| {
+            key.contains(crate::thumb_loader::CACHE_KEY_PIN_SUFFIX) && entry.jpeg_data == webp
+        })
+        .map(|(key, _)| key.clone())
+        .unwrap();
+    assert!(!prepared_map.read().unwrap().contains_key(&stale));
+    assert!(
+        old_map.read().unwrap().contains_key(&stale),
+        "worker must not mutate the live map"
+    );
+    assert!(
+        catalog.load_one(&stale).unwrap().is_none(),
+        "DELETE happened before UI consumption"
+    );
+    assert_eq!(
+        catalog.load_one(&seed).unwrap().unwrap().jpeg_data,
+        webp,
+        "video DB read / catalog seed happened before UI consumption"
+    );
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+    result.folder_pin_materializations = Some(pin_materialization::Prepared {
+        reset_indices,
+        replacement,
+        identity,
+    });
+    // All cascaded filesystem sources disappear and UI DB readers are unavailable.
+    // Prepared bytes must still be adopted, without re-stat, cascade lookup or video read.
+    std::fs::remove_file(&video).unwrap();
+    std::fs::remove_dir(&child).unwrap();
+    std::fs::remove_dir(&folder).unwrap();
+    app.folder_thumb_pin_db = None;
+    app.video_pin_db = None;
+    assert!(app.apply_current_metadata_import_terminal_result(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        }
+    ));
+    app.current_view_pin_refreshes.remove(&context_id);
+    assert!(Arc::ptr_eq(
+        app.current_color_cache_map.as_ref().unwrap(),
+        &prepared_map
+    ));
+    assert_eq!(
+        app.current_color_cache_map
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()[&seed]
+            .jpeg_data,
+        webp
+    );
+    assert!(old_map.read().unwrap().contains_key(&stale));
+    assert!(!matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.selected, Some(0));
+    assert_eq!(app.scroll_offset_y, 42.0);
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        history.back_stack
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().forward_stack,
+        history.forward_stack
+    );
+}
+
+#[test]
+fn mutation_refresh_synthetic_unrelated_pin_keeps_cache_and_producer_owner() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("visible");
+    std::fs::create_dir(&folder).unwrap();
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_tag_view = true;
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![mutation_refresh_loaded_thumb(&egui::Context::default())];
+    let map = Arc::new(std::sync::RwLock::new(Default::default()));
+    app.current_color_cache_map = Some(map.clone());
+    app.current_color_catalog = Some(Arc::new(
+        crate::catalog::CatalogDb::open(&app.tmp.path().join("unrelated-cache"), &folder).unwrap(),
+    ));
+    app.reload_queue = Some(Arc::new((
+        std::sync::Mutex::new(Vec::new()),
+        std::sync::Condvar::new(),
+    )));
+    let token = app.cancel_token.clone();
+    let unrelated = app.tmp.path().join("unrelated");
+    app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Pins {
+        folders: std::collections::HashSet::from([unrelated]),
+        videos: Default::default(),
+    });
+    let context = app.projected_viewer_context_id();
+    let result = app.current_view_pin_refreshes[&context]
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    tx.send(result).unwrap();
+    app.current_view_pin_refreshes.get_mut(&context).unwrap().rx = rx;
+    app.poll_current_view_pin_refresh();
+    assert!(Arc::ptr_eq(
+        app.current_color_cache_map.as_ref().unwrap(),
+        &map
+    ));
+    assert!(Arc::ptr_eq(&app.cancel_token, &token));
+    assert!(!token.load(Ordering::Relaxed));
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+}
+
+#[test]
+fn mutation_refresh_synthetic_worker_seed_failure_purges_same_key_old_frame() {
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("seed-failure");
+    std::fs::create_dir(&folder).unwrap();
+    let video = folder.join("clip.mp4");
+    std::fs::write(&video, b"video").unwrap();
+    let webp = |red| {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([red, 96, 160, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        bytes
+    };
+    let old_bytes = webp(10);
+    let new_bytes = webp(240);
+    app.video_pin_db
+        .as_ref()
+        .unwrap()
+        .set_pin(&video, 1.0, &old_bytes)
+        .unwrap();
+    assert!(app.set_folder_thumb_pin(
+        &folder,
+        FolderPinSource::File {
+            rel: "clip.mp4".into(),
+            kind: FileKind::Video
+        }
+    ));
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_tag_view = true;
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![mutation_refresh_loaded_thumb(&egui::Context::default())];
+    let keys = || {
+        folder_thumb_existing_keys_for(
+            &app.items[0],
+            None,
+            &app.folder_pin_map,
+            app.folder_thumb_pin_db.as_deref(),
+            Some(app.settings.folder_thumb_sort),
+            app.settings.folder_thumb_depth,
+            app.use_full_path_cache_keys(),
+        )
+    };
+    let key = keys()[1].clone();
+    app.video_pin_db
+        .as_ref()
+        .unwrap()
+        .set_pin(&video, 2.0, &new_bytes)
+        .unwrap();
+    assert_eq!(
+        keys()[1],
+        key,
+        "changing pinned frame bytes does not change the folder key"
+    );
+    let cache_dir = app.tmp.path().join("seed-failure-cache");
+    let catalog = Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &folder).unwrap());
+    let resolved = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+        &folder,
+        &app.folder_pin_map[&crate::path_key::normalize_keep_drive(&folder)],
+        |path| {
+            app.folder_thumb_pin_db
+                .as_ref()
+                .and_then(|db| db.lookup(path))
+        },
+        app.settings.folder_thumb_depth as usize,
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .save_seeded_folder_bytes(&key, resolved.mtime, resolved.file_size, None, &old_bytes)
+            .unwrap()
+    );
+    let old_map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
+    app.current_color_catalog = Some(catalog.clone());
+    app.current_color_cache_map = Some(old_map.clone());
+    let fault =
+        rusqlite::Connection::open(crate::catalog::db_path_for(&cache_dir, &folder)).unwrap();
+    fault.execute_batch("CREATE TRIGGER reject_video_seed BEFORE INSERT ON thumbnails BEGIN SELECT RAISE(ABORT, 'seed insert rejected'); END;").unwrap();
+    app.consume_folder_thumb_pin_dirty();
+    let id = app.projected_viewer_context_id();
+    let terminal = app.current_view_pin_refreshes[&id]
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert!(terminal.errors.is_empty(), "{:?}", terminal.errors);
+    let result = terminal.contexts.into_iter().next().unwrap();
+    assert!(
+        catalog.load_one(&key).unwrap().is_none(),
+        "worker cleanup removes stale same-key seed after failed INSERT"
+    );
+    assert!(
+        old_map.read().unwrap().contains_key(&key),
+        "worker leaves live map unchanged"
+    );
+    assert!(app.apply_current_metadata_import_terminal_result(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        }
+    ));
+    app.current_view_pin_refreshes.remove(&id);
+    assert!(
+        !app.current_color_cache_map
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .contains_key(&key),
+        "UI cannot reload the old pinned frame"
+    );
+    assert!(!matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+}
+
+#[test]
+fn mutation_refresh_synthetic_materialization_rejects_changed_cache_owner() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Folder(app.tmp.path().to_path_buf())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![mutation_refresh_loaded_thumb(&egui::Context::default())];
+    let result = metadata_import_refresh::ContextResult {
+        context_id: app.projected_viewer_context_id(),
+        items_generation: app.items_generation,
+        rating_cache: None,
+        tags_cache: None,
+        current_rating: None,
+        page_state: None,
+        folder_pin_map: Some(Default::default()),
+        folder_pin_materializations: Some(prepared_pin_materializations_for_test(&app, vec![0])),
+        video_pin_blobs: None,
+        video_items: None,
+        container_state: None,
+    };
+    let new_map = Arc::new(std::sync::RwLock::new(Default::default()));
+    app.current_color_cache_map = Some(new_map.clone());
+    assert!(!app.apply_current_metadata_import_terminal_result(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        }
+    ));
+    assert!(Arc::ptr_eq(
+        app.current_color_cache_map.as_ref().unwrap(),
+        &new_map
+    ));
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+}
+
 #[test]
 fn mutation_refresh_synthetic_pin_keeps_rows_location_selection_and_history() {
     use super::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
@@ -275,7 +682,8 @@ fn mutation_refresh_sibling_terminal_result_keeps_main_search_producer() {
         let old_sibling_token = mounted.cancel_token.clone();
         let mut result = metadata_context_result(sibling, mounted.items_generation, 0);
         result.rating_cache = None;
-        result.folder_pin_reset_indices = Some(vec![0]);
+        result.folder_pin_materializations =
+            Some(prepared_pin_materializations_for_test(mounted, vec![0]));
         result.folder_pin_map = Some(Default::default());
         assert!(mounted.apply_current_metadata_import_terminal_result(
             result,
@@ -340,6 +748,187 @@ fn mutation_refresh_synthetic_zipdir_invalidation_follows_same_archive_dependenc
     }
     assert!(!matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
     assert!(matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }));
+}
+
+#[cfg(windows)]
+#[test]
+fn mutation_refresh_navigation_retires_pin_materialization_owner_and_keeps_sibling() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("pin-nav-owner");
+    std::fs::create_dir(&folder).unwrap();
+    let page = folder.join("page.png");
+    std::fs::write(&page, b"page").unwrap();
+    app.current_folder = Some(search_results_synthetic_path());
+    app.items_are_tag_view = true;
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+    let main_id = app.projected_viewer_context_id();
+    let main_cancel = app.current_view_pin_refreshes[&main_id].cancel.clone();
+    let sibling = app.build_window_context_for_test(9_908, |mounted| {
+        mounted.current_folder = Some(search_results_synthetic_path());
+        mounted.items_are_tag_view = true;
+        mounted.items = vec![GridItem::Folder(folder.clone())];
+        mounted.image_metas = vec![None];
+        mounted.thumbnails = vec![ThumbnailState::Pending];
+    });
+    let (sibling_cancel, sibling_generation) = app
+        .with_viewer_context(sibling, |mounted| {
+            mounted.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+            (
+                mounted.current_view_pin_refreshes[&sibling].cancel.clone(),
+                mounted.items_generation,
+            )
+        })
+        .unwrap();
+    assert!(
+        !main_cancel.load(Ordering::Relaxed),
+        "building and mounting a sibling is not navigation in main"
+    );
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+    // The ordinary visible adoption path changes generation before loading/seeding its catalog.
+    app.start_loading_items(
+        folder.clone(),
+        vec![GridItem::Image(page.clone())],
+        vec![None],
+        Default::default(),
+        Vec::new(),
+        None,
+    );
+    assert!(main_cancel.load(Ordering::Relaxed));
+    assert!(!app.current_view_pin_refreshes.contains_key(&main_id));
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+    assert!(app.current_view_pin_refreshes.contains_key(&sibling));
+    app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+    let successor_cancel = app.current_view_pin_refreshes[&main_id].cancel.clone();
+    app.with_viewer_context(sibling, |mounted| {
+        assert_eq!(mounted.items_generation, sibling_generation);
+        assert!(
+            !sibling_cancel.load(Ordering::Relaxed),
+            "mount alone preserves the parked owner"
+        );
+        // Prepared aggregate adoption (search / smart / collection) owns the same invalidation.
+        mounted.install_prepared_aggregate_items(vec![GridItem::Image(page)], vec![None]);
+        assert!(sibling_cancel.load(Ordering::Relaxed));
+        assert!(!mounted.current_view_pin_refreshes.contains_key(&sibling));
+        assert!(!successor_cancel.load(Ordering::Relaxed));
+    })
+    .unwrap();
+    assert!(
+        !successor_cancel.load(Ordering::Relaxed),
+        "restoring main is not a new items generation"
+    );
+    assert!(app.current_view_pin_refreshes.contains_key(&main_id));
+}
+
+#[cfg(windows)]
+#[test]
+fn mutation_refresh_import_pin_snapshot_retires_only_superseded_materialization_owners() {
+    let mut app = setup_app_for_test();
+    let root = app.tmp.path().join("pin-import-owner");
+    let folder = root.join("book");
+    let other_root = app.tmp.path().join("unaffected-pin-owner");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::create_dir(&other_root).unwrap();
+    app.current_folder = Some(root.clone());
+    app.items = vec![GridItem::Folder(folder.clone())];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+    let main_id = app.projected_viewer_context_id();
+    let generation = app.items_generation;
+    let main_cancel = app.current_view_pin_refreshes[&main_id].cancel.clone();
+    let sibling = app.build_window_context_for_test(9_909, |mounted| {
+        mounted.current_folder = Some(other_root.clone());
+        mounted.items = vec![GridItem::Folder(other_root.clone())];
+        mounted.image_metas = vec![None];
+        mounted.thumbnails = vec![ThumbnailState::Pending];
+    });
+    let sibling_cancel = app
+        .with_viewer_context(sibling, |mounted| {
+            mounted.refresh_current_view_pin_thumbnails(CurrentViewRefresh::Full);
+            mounted.current_view_pin_refreshes[&sibling].cancel.clone()
+        })
+        .unwrap();
+
+    app.quiesce_metadata_transfer_context_writers(false)
+        .unwrap();
+    app.begin_metadata_import_terminal_refresh();
+    app.abort_metadata_import_terminal_refresh();
+    assert!(!main_cancel.load(Ordering::Relaxed));
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+
+    app.begin_metadata_import_terminal_refresh();
+    assert!(app.advance_metadata_import_terminal_refresh(&root, true));
+    let ratings_only = app.take_metadata_import_refresh_requests(
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(ratings_only.len(), 1);
+    assert_eq!(ratings_only[0].context_id, main_id);
+    assert!(!main_cancel.load(Ordering::Relaxed));
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+
+    app.begin_metadata_import_terminal_refresh();
+    assert!(app.advance_metadata_import_terminal_refresh(&root, true));
+    let pin_requests = app.take_metadata_import_refresh_requests(
+        crate::metadata_transfer::ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(pin_requests.len(), 1);
+    assert_eq!(pin_requests[0].context_id, main_id);
+    assert!(matches!(
+        pin_requests[0].pin_materialization.scope,
+        CurrentViewRefresh::Full
+    ));
+    assert_eq!(pin_requests[0].pin_materialization.rows.len(), 1);
+    assert!(
+        app.folder_pin_map.is_empty(),
+        "unpin has already removed the mounted source"
+    );
+    assert!(
+        pin_requests[0]
+            .old_folder_pin_keys
+            .contains(&crate::path_key::normalize_keep_drive(&folder)),
+        "the successor must invalidate visible unpinned rows even though neither pin map contains them"
+    );
+    let data_dir = crate::data_dir::get();
+    let prepared = std::thread::spawn(move || {
+        metadata_import_refresh::run(
+            data_dir,
+            pin_requests,
+            crate::metadata_transfer::ImportChangedSections {
+                thumbnail_pins: true,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+    })
+    .join()
+    .unwrap();
+    assert!(prepared.errors.is_empty(), "{:?}", prepared.errors);
+    assert_eq!(
+        prepared.contexts[0]
+            .folder_pin_materializations
+            .as_ref()
+            .unwrap()
+            .reset_indices,
+        [0]
+    );
+    assert_eq!(app.items_generation, generation);
+    assert!(
+        main_cancel.load(Ordering::Relaxed),
+        "old persistence owner is retired before the import worker starts"
+    );
+    assert!(!app.current_view_pin_refreshes.contains_key(&main_id));
+    assert!(!sibling_cancel.load(Ordering::Relaxed));
+    assert!(app.current_view_pin_refreshes.contains_key(&sibling));
 }
 
 #[test]
@@ -2805,7 +3394,7 @@ fn metadata_import_keeps_unaffected_thumb_adjustment() {
             thumbnail_reset_indices: vec![0],
         }),
         folder_pin_map: None,
-        folder_pin_reset_indices: None,
+        folder_pin_materializations: None,
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
@@ -2859,7 +3448,7 @@ fn phase_a2_metadata_import_updates_virtual_keyed_owner() {
             thumbnail_reset_indices: Vec::new(),
         }),
         folder_pin_map: None,
-        folder_pin_reset_indices: None,
+        folder_pin_materializations: None,
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
@@ -5822,7 +6411,7 @@ fn metadata_context_result(
         current_rating: Some(rating),
         page_state: None,
         folder_pin_map: None,
-        folder_pin_reset_indices: None,
+        folder_pin_materializations: None,
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
@@ -5933,17 +6522,27 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
     main.rating_cache = None;
     main.current_rating = None;
     main.folder_pin_map = Some(Default::default());
-    main.folder_pin_reset_indices = Some(vec![0]);
+    main.folder_pin_materializations = Some(prepared_pin_materializations_for_test(&app, vec![0]));
     let mut active = metadata_context_result(active_id, active_generation, 0);
     active.rating_cache = None;
     active.current_rating = None;
     active.folder_pin_map = Some(Default::default());
-    active.folder_pin_reset_indices = Some(vec![1]);
+    active.folder_pin_materializations = Some(
+        app.with_viewer_context(active_id, |mounted| {
+            prepared_pin_materializations_for_test(mounted, vec![1])
+        })
+        .unwrap(),
+    );
     let mut paused = metadata_context_result(parked_id, parked_generation, 0);
     paused.rating_cache = None;
     paused.current_rating = None;
     paused.folder_pin_map = Some(Default::default());
-    paused.folder_pin_reset_indices = Some(vec![0]);
+    paused.folder_pin_materializations = Some(
+        app.with_viewer_context(parked_id, |mounted| {
+            prepared_pin_materializations_for_test(mounted, vec![0])
+        })
+        .unwrap(),
+    );
 
     let (errors, stale) = app.apply_metadata_import_terminal_refresh(
         crate::app::metadata_import_refresh::RefreshResult {
@@ -5963,7 +6562,18 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
     assert!(previous_cancel.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!app.cancel_token.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!std::sync::Arc::ptr_eq(&previous_cancel, &app.cancel_token));
-    assert!(!cache_map.read().unwrap().contains_key(&stale_pin_key));
+    assert!(
+        cache_map.read().unwrap().contains_key(&stale_pin_key),
+        "worker never mutates the old live map"
+    );
+    assert!(
+        !app.current_color_cache_map
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .contains_key(&stale_pin_key)
+    );
     assert!(catalog.load_one(&stale_pin_key).unwrap().is_none());
     app.with_active_viewer_context(|active| {
         assert_eq!(active.items_generation, active_generation);
@@ -6217,7 +6827,7 @@ fn metadata_refresh_context_identity_survives_closing_an_earlier_window() {
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let request = app
-        .take_metadata_import_refresh_requests()
+        .take_metadata_import_refresh_requests(Default::default())
         .into_iter()
         .find(|request| request.context_id == target_context_id)
         .expect("the target window must have a refresh request before the earlier close");
@@ -6283,7 +6893,7 @@ fn metadata_refresh_context_identity_survives_main_promotion() {
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let request = app
-        .take_metadata_import_refresh_requests()
+        .take_metadata_import_refresh_requests(Default::default())
         .into_iter()
         .find(|request| request.context_id == requested_context_id)
         .expect("the context bound as main at request time must have a refresh request");
@@ -6350,7 +6960,7 @@ fn metadata_request_bakes_context_identity_across_bundleless_window() {
 
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
-    let requests = app.take_metadata_import_refresh_requests();
+    let requests = app.take_metadata_import_refresh_requests(Default::default());
 
     assert!(
         requests
@@ -7425,7 +8035,7 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
     assert!((1..=2_048).contains(&first_frame_items));
 
     while !app.advance_metadata_import_terminal_refresh(&root, false) {}
-    let requests = app.take_metadata_import_refresh_requests();
+    let requests = app.take_metadata_import_refresh_requests(Default::default());
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].items.len(), 5_000);
     assert_eq!(requests[0].folder_pin_paths, vec![root]);
@@ -7532,7 +8142,7 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         current_rating: Some(5),
         page_state: None,
         folder_pin_map: None,
-        folder_pin_reset_indices: None,
+        folder_pin_materializations: None,
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
@@ -7682,7 +8292,7 @@ fn parked_pdf_metadata_request_includes_container_rating_key() {
 
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&root, false) {}
-    let requests = app.take_metadata_import_refresh_requests();
+    let requests = app.take_metadata_import_refresh_requests(Default::default());
     let request = requests
         .iter()
         .find(|request| request.context_id == parked_id)
@@ -8392,7 +9002,7 @@ fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
             current_rating: Some(5),
             page_state: None,
             folder_pin_map: None,
-            folder_pin_reset_indices: None,
+            folder_pin_materializations: None,
             video_pin_blobs: None,
             video_items: None,
             container_state: None,
@@ -8525,7 +9135,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_rating_re
         current_rating: None,
         page_state: None,
         folder_pin_map: None,
-        folder_pin_reset_indices: None,
+        folder_pin_materializations: None,
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
@@ -39343,7 +39953,7 @@ mod favorite_adjustment_defaults_tests {
 
         app.begin_metadata_import_terminal_refresh();
         while !app.advance_metadata_import_terminal_refresh(Path::new(r"C:\test"), false) {}
-        let requests = app.take_metadata_import_refresh_requests();
+        let requests = app.take_metadata_import_refresh_requests(Default::default());
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         let effective = crate::path_key::normalize_keep_drive(&zip_path.join("bookB").join("only"));

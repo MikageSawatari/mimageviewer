@@ -37,6 +37,7 @@
 - 検証・同型経路の列挙: [pin-reload-audit.md](pin-reload-audit.md)。実アプリの起動・操作は行わず、利用者による修正後の実機確認は未実施。
 - 監査で別途判明した RatingPhysical 子のソート再表示も修正済み。Immediate／WorkerScan を F5 と同じ単一の `OpenRequestOwner` に揃え、親 chain と back／forward を保持する。古い owner の完了は選択 hint の変更前に共通採用境界で拒否する。detached consumer 内の変更は owner の機械的転送だけで、ClaudeCode と独立 Codex が構造修正に合意した。[detached-rework-plan.md §11](detached-rework-plan.md#11-リワーク外からの変更記録) に記録。
 - fix1 の自動検証で判明した、兄弟 context の pin worker が同時に DB を開く際のスキーマ初期化競合も修正。開始時に単一の schema writer を取得し、読取→書込 upgrade の deadlock をなくす。既存 timeout と revision／trigger の原子的導入を保持し、再試行・待機追加は行わない。
+- fix2: 独立 Codex レビューが検出した、合成ビュー pin 完了時の UI thread I/O（FS metadata、cascade DB、catalog DELETE、video pin read／seed write）を既存 pin／metadata worker へ移した。準備済み private cache と scalar identity だけを UI に渡し、世代／owner 検証後にメモリ適用する。共通 consumer を使う metadata import も同じ境界へ揃え、元の live map の不変・実 worker の保存完了・UI reader 不在での採用・変更済み cache owner の拒否を回帰で検査する。世代切替で旧 pin 永続化 owner を取消し、兄弟 context の要求は維持する。cancel と seed 失敗時の同一 key の旧 frame cleanup も catalog worker 境界で検査する。§11 は ClaudeCode と利用者指定独立レビューの合意日時／session を明記し、内部補助レビューと区別した。
 
 ### 1.288 多数のファイルをエクスプローラへドラッグしてコピーすると、コピーが終わるまで mIV が操作できない — コード調査 + 通常ログ (2026-09-27)
 

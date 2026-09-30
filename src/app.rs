@@ -157,6 +157,7 @@ pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
 mod grid_paint;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
+mod pin_materialization;
 pub(crate) use metadata_ops::{probe_image_dims_from_bytes, tag_item_path};
 
 #[cfg(test)]
@@ -3415,6 +3416,7 @@ pub(crate) struct RatingSessionWrite {
 
 #[derive(Default)]
 struct MetadataImportRefreshIndex {
+    pin_materialization: pin_materialization::Request,
     items_generation: u64,
     next_item: usize,
     complete: bool,
@@ -22450,35 +22452,21 @@ impl App {
         {
             refresh.merge(&previous.refresh);
         }
+        // Retire the old persistence owner before its successor can start writing.
+        self.current_view_pin_refreshes
+            .remove(&self.projected_viewer_context_id());
         let pending_refresh = refresh.clone();
         let context_id = self.projected_viewer_context_id();
         let mut paths = self.folder_pin_context_lookup_paths();
         let mut aliases = Vec::new();
-        let mut reset_containers = std::collections::HashSet::new();
+        let mut materialization = self.pin_materialization_request(refresh);
         let items = self
             .items
             .iter()
             .enumerate()
             .map(|(index, item)| {
                 let container_path = self.folder_pin_lookup_target_for_item(item).map(|target| {
-                    let affected = match &refresh {
-                        CurrentViewRefresh::Full => true,
-                        CurrentViewRefresh::Pins { folders, .. } => folders.iter().any(|path| {
-                            // ZipDir pins may reference a sibling book within the same archive.
-                            let root = match item {
-                                GridItem::ZipDir { zip_path, .. } => zip_pin_root_path(
-                                    zip_path,
-                                    self.archive_source_override.as_deref(),
-                                    self.current_folder.as_deref(),
-                                ),
-                                _ => &target.path,
-                            };
-                            crate::books::path_is_under_or_equal(path, root)
-                        }),
-                    };
-                    if affected {
-                        reset_containers.insert(index);
-                    }
+                    materialization.rows.push(self.pin_materialization_row(index, item, target.path.clone()));
                     paths.push(target.path.clone());
                     if let Some(alias) = target.alias {
                         aliases.push(alias);
@@ -22487,8 +22475,8 @@ impl App {
                 });
                 let video_path = match item {
                     GridItem::Video(path)
-                        if matches!(refresh, CurrentViewRefresh::Full)
-                            || matches!(&refresh, CurrentViewRefresh::Pins { videos, .. }
+                        if matches!(materialization.scope, CurrentViewRefresh::Full)
+                            || matches!(&materialization.scope, CurrentViewRefresh::Pins { videos, .. }
                                 if videos.iter().any(|dirty| crate::path_key::eq_keep_drive(dirty, path)))
                             || !matches!(self.thumbnails.get(index), Some(ThumbnailState::Loaded { .. })) =>
                     {
@@ -22516,6 +22504,7 @@ impl App {
             })
             .collect();
         let request = metadata_import_refresh::ContextRequest {
+            pin_materialization: materialization,
             context_id,
             items_generation: self.items_generation,
             items,
@@ -22532,20 +22521,13 @@ impl App {
             folder_pin_paths: paths,
             folder_pin_aliases: aliases,
         };
-        let container_targets: Vec<_> = request
-            .items
-            .iter()
-            .filter_map(|item| item.container_path.clone().map(|path| (item.index, path)))
-            .collect();
-        let cascade_depth = self.settings.folder_thumb_depth as usize;
         let data_dir = crate::data_dir::get();
-        let data_dir_for_cascade = data_dir.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let repaint_ctx = self.edit_preview_repaint_ctx.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut result = metadata_import_refresh::run(
+            let result = metadata_import_refresh::run(
                 data_dir,
                 vec![request],
                 crate::metadata_transfer::ImportChangedSections {
@@ -22554,48 +22536,9 @@ impl App {
                 },
                 &worker_cancel,
             );
-            if let Some(result) = result.as_mut() {
-                if let CurrentViewRefresh::Pins {
-                    videos: changed, ..
-                } = &refresh
-                    && !changed.is_empty()
-                {
-                    if let Ok(db) = crate::folder_thumb_pins::FolderThumbPinDb::open_at(
-                        &data_dir_for_cascade.join("folder_thumb_pins.db"),
-                    ) {
-                        for (index, path) in container_targets {
-                            if worker_cancel.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            let key = crate::path_key::normalize_keep_drive(&path);
-                            let pin = result
-                                .contexts
-                                .first()
-                                .and_then(|context| context.folder_pin_map.as_ref())
-                                .and_then(|pins| pins.get(&key));
-                            if let Some(pin) = pin {
-                                let resolved =
-                                    crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
-                                        &path,
-                                        pin,
-                                        |path| db.lookup(path),
-                                        cascade_depth,
-                                    );
-                                if resolved.is_some_and(|target| {
-                                    changed.iter().any(|path| {
-                                        crate::path_key::eq_keep_drive(path, &target.abs_path)
-                                    })
-                                }) {
-                                    reset_containers.insert(index);
-                                }
-                            }
-                        }
-                    }
-                }
-                for context in &mut result.contexts {
-                    if let Some(indices) = &mut context.folder_pin_reset_indices {
-                        indices.retain(|index| reset_containers.contains(index));
-                    }
+            if let Some(result) = &result {
+                for error in &result.errors {
+                    crate::logger::log(error);
                 }
             }
             if tx.send(result).is_ok()
@@ -22637,9 +22580,6 @@ impl App {
         };
         self.current_view_pin_refreshes.remove(&context_id);
         if let Some(result) = result {
-            for error in result.errors {
-                crate::logger::log(error);
-            }
             for context in result.contexts {
                 if context.context_id != context_id {
                     continue;
@@ -35128,6 +35068,10 @@ impl App {
     }
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            // Pin materializations persist on their worker, so retire the old items owner
+            // before the successor view can load/seed the same catalog keys.
+            self.current_view_pin_refreshes
+                .remove(&self.projected_viewer_context_id());
             // Exact seek indices belong to the items identity, not the current page.
             self.clear_still_seek_thumbnail_requests();
             // The page layout describes the last frame painted from this exact items identity.
@@ -38924,6 +38868,7 @@ impl App {
                 .then(|| self.folder_pin_context_lookup_paths())
                 .unwrap_or_default();
             self.metadata_import_refresh_index = Some(MetadataImportRefreshIndex {
+                pin_materialization: self.pin_materialization_request(CurrentViewRefresh::Full),
                 items_generation: self.items_generation,
                 current_rating_key,
                 affected,
@@ -38965,6 +38910,12 @@ impl App {
             let tag_key = tag_item_path(item).map(crate::tags_db::item_key_for_path);
             let folder_pin_target = self.folder_pin_lookup_target_for_item(item);
             let container_path = folder_pin_target.as_ref().map(|target| target.path.clone());
+            if let Some(container) = &container_path {
+                index
+                    .pin_materialization
+                    .rows
+                    .push(self.pin_materialization_row(item_index, item, container.clone()));
+            }
             if let Some(target) = folder_pin_target {
                 if let Some(alias) = target.alias {
                     index.folder_pin_aliases.push(alias);
@@ -39030,6 +38981,7 @@ impl App {
 
     pub(crate) fn take_metadata_import_refresh_requests(
         &mut self,
+        changed: crate::metadata_transfer::ImportChangedSections,
     ) -> Vec<metadata_import_refresh::ContextRequest> {
         fn take_current(
             index: &mut Option<MetadataImportRefreshIndex>,
@@ -39044,6 +38996,7 @@ impl App {
             (index.complete && index.affected).then_some(metadata_import_refresh::ContextRequest {
                 context_id,
                 items_generation: index.items_generation,
+                pin_materialization: index.pin_materialization,
                 items: index.items,
                 current_rating_key: index.current_rating_key,
                 spread_container_path,
@@ -39091,6 +39044,29 @@ impl App {
                 old_folder_pin_keys,
             ) {
                 requests.push(request);
+            }
+        }
+        if changed.thumbnail_pins {
+            // The import's full pin snapshot now owns these contexts' materializations.
+            // Retire prior writers before spawning it, including same-generation requests.
+            // Unaffected contexts and transfers without pin changes retain their requests.
+            for request in &mut requests {
+                if self
+                    .current_view_pin_refreshes
+                    .remove(&request.context_id)
+                    .is_some()
+                {
+                    // An unpin may already be absent from the mounted map; the retiring
+                    // synthetic request included visible rows to invalidate that removal.
+                    // Carry that coverage into its full-snapshot successor as well.
+                    request
+                        .old_folder_pin_keys
+                        .extend(request.items.iter().filter_map(|item| {
+                            item.container_path
+                                .as_deref()
+                                .map(crate::path_key::normalize_keep_drive)
+                        }));
+                }
             }
         }
         requests
@@ -39348,68 +39324,59 @@ impl App {
         (result.errors, stale_context)
     }
 
-    fn refresh_folder_pin_thumbnail_materializations(&mut self, indices: &[usize]) {
-        let use_full_path_keys = self.use_full_path_cache_keys();
-        let mut pin_prefixes = std::collections::HashSet::new();
-        let mut retained_pin_keys = std::collections::HashSet::new();
-        for &index in indices {
-            let Some(item) = self.items.get(index) else {
-                continue;
-            };
-            let item_meta = self.image_metas.get(index).copied().flatten();
-            let keys = folder_thumb_existing_keys_for(
-                item,
-                item_meta,
-                &self.folder_pin_map,
-                self.folder_thumb_pin_db.as_deref(),
-                Some(self.settings.folder_thumb_sort),
-                self.settings.folder_thumb_depth,
-                use_full_path_keys,
-            );
-            if let Some(base_key) = keys.first() {
-                pin_prefixes.insert(
-                    [base_key.as_str(), crate::thumb_loader::CACHE_KEY_PIN_SUFFIX].concat(),
-                );
-            }
-            retained_pin_keys.extend(keys.into_iter().skip(1));
+    fn pin_materialization_identity(&self) -> pin_materialization::Identity {
+        pin_materialization::Identity {
+            cache: self
+                .current_color_cache_map
+                .as_ref()
+                .map(|map| Arc::as_ptr(map) as usize),
+            catalog: self
+                .current_color_catalog
+                .as_ref()
+                .map(|catalog| Arc::as_ptr(catalog) as usize),
+            sort: self.settings.folder_thumb_sort,
+            depth: self.settings.folder_thumb_depth,
+            full_path: self.use_full_path_cache_keys(),
         }
+    }
 
-        for &index in indices {
-            self.evict_thumbnail_for_reload(index);
+    fn pin_materialization_row(
+        &self,
+        index: usize,
+        item: &GridItem,
+        container: PathBuf,
+    ) -> pin_materialization::Row {
+        let dependency_root = match item {
+            GridItem::ZipDir { zip_path, .. } => zip_pin_root_path(
+                zip_path,
+                self.archive_source_override.as_deref(),
+                self.current_folder.as_deref(),
+            )
+            .to_path_buf(),
+            _ => container.clone(),
+        };
+        pin_materialization::Row {
+            index,
+            item: item.clone(),
+            metadata: self.image_metas.get(index).copied().flatten(),
+            container,
+            dependency_root,
         }
+    }
 
-        let Some(cache_map) = self.current_color_cache_map.clone() else {
-            return;
-        };
-        let Some(catalog) = self.current_color_catalog.clone() else {
-            return;
-        };
-        let stale_pin_keys = cache_map
-            .read()
-            .ok()
-            .map(|map| {
-                map.keys()
-                    .filter(|key| {
-                        pin_prefixes.iter().any(|prefix| key.starts_with(prefix))
-                            && !retained_pin_keys.contains(*key)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for key in stale_pin_keys {
-            match catalog.delete_one(&key) {
-                Ok(()) => {
-                    if let Ok(mut map) = cache_map.write() {
-                        map.remove(&key);
-                    }
-                }
-                Err(error) => crate::logger::log(format!(
-                    "metadata pin refresh: stale catalog delete failed: {error} ({key})"
-                )),
-            }
+    fn pin_materialization_request(
+        &self,
+        scope: CurrentViewRefresh,
+    ) -> pin_materialization::Request {
+        pin_materialization::Request {
+            rows: Vec::new(),
+            identity: self.pin_materialization_identity(),
+            scope,
+            cache: self
+                .current_color_cache_map
+                .clone()
+                .zip(self.current_color_catalog.clone()),
         }
-        self.seed_folder_video_pin_thumbs(&cache_map, Some(&catalog), Some(indices));
     }
 
     fn restart_thumbnail_workers_after_metadata_pin_refresh(&mut self) {
@@ -39461,7 +39428,12 @@ impl App {
         mut result: metadata_import_refresh::ContextResult,
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> bool {
-        if result.items_generation != self.items_generation {
+        if result.items_generation != self.items_generation
+            || result
+                .folder_pin_materializations
+                .as_ref()
+                .is_some_and(|prepared| !prepared.matches(self.pin_materialization_identity()))
+        {
             return false;
         }
         let rating_cache_replaced = result.rating_cache.is_some();
@@ -39559,13 +39531,23 @@ impl App {
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         }
-        let folder_pin_reset_indices = result.folder_pin_reset_indices.take().unwrap_or_default();
+        let folder_pin_reset_indices =
+            if let Some(prepared) = result.folder_pin_materializations.take() {
+                if let Some(map) = prepared.replacement {
+                    self.current_color_cache_map = Some(map);
+                }
+                prepared.reset_indices
+            } else {
+                Vec::new()
+            };
         if let Some(folder_pins) = result.folder_pin_map.take() {
             self.invalidate_converted_archive_pin_root_states();
             self.folder_pin_map = folder_pins;
         }
         if !folder_pin_reset_indices.is_empty() {
-            self.refresh_folder_pin_thumbnail_materializations(&folder_pin_reset_indices);
+            for &index in &folder_pin_reset_indices {
+                self.evict_thumbnail_for_reload(index);
+            }
         }
         let video_refresh = match (result.video_items.take(), result.video_pin_blobs.take()) {
             (Some(video_items), Some(pin_blobs)) if !video_items.is_empty() => {
@@ -44350,11 +44332,6 @@ impl App {
         let visible_end_shared = Arc::clone(&self.visible_end_shared);
         let edit_preview_db = self.edit_preview_cache.as_ref().map(|service| service.db());
 
-        crate::logger::log(format!(
-            "  spawning {} regular + {} I/O workers",
-            regular_threads, io_threads,
-        ));
-
         // ── 共通のワーカーループ本体 ──
         // queue を受け取り、priority 順に取り出して process_load_request を呼ぶ。
         let spawn_worker = |worker_idx: usize, prefix: &str, queue: Arc<NotifyQueue>| {
@@ -44382,6 +44359,12 @@ impl App {
                 // 固定代表が指すページの個別色調補正は UI thread で同期 DB 参照せず、
                 // worker ごとの接続から解決する。
                 let adjustment_db_w = crate::adjustment_db::AdjustmentDb::open().ok();
+                if tag == "w0" {
+                    crate::logger::log(format!(
+                        "  spawning {} regular + {} I/O workers",
+                        regular_threads, io_threads
+                    ));
+                }
                 crate::logger::log(format!("  {tag} started"));
                 loop {
                     // priority (可視範囲) を最優先、次に scroll_hint に近い順。

@@ -1461,7 +1461,7 @@ RatingPhysical 子の Immediate ソートが Navigation owner に落ち、Worker
 
 detached 固有コードで触れた箇所は `App::poll_detached_physical_folder_open` の `CurrentViewOrderRefresh` arm だけ。payload の `collection_owner` を `reload_owner` へ置換して既存 `apply_current_view_order_refresh` に転送する機械的変更で、Applied／Failed の扱いは既存のまま。detached の述語、viewport、geometry、配置、focus、window lifecycle は変更しない。guard／遅延／再試行による症状パッチではなく、生成時に確定した typed owner を採用まで保持する構造修正である。共通検証は既存 owner 契約の適用であり、detached 専用の条件分岐・flag は加えない。簡素化として F5 の owner 選択と既存 scan／採用経路を再利用し、新しい待機状態やモーダルは設けない。
 
-ClaudeCode は利用者からの 2026-10-01 fix1 引き継ぎで、この機械的 owner 転送が症状パッチではないと合意済み。独立 Codex (Sol / xhigh) も実装前・完了レビューで同じ構造判断に合意し、完了差分に残存指摘なし。検証結果は [pin-reload-audit.md](pin-reload-audit.md) に記録した。
+ClaudeCode（設計担当）は 2026-10-01、この機械的 owner 転送が症状パッチではなく構造修正であることに合意した。独立 Codex レビュー（gpt-6.1-sol / xhigh、session `01a0f38f-1566-75e0-bfa7-4f1fdf06d28b`）も 2026-10-01、同じ構造判断に合意し、§11 の変更範囲と理由が差分に一致することを確認した。実装担当の補助レビューをこの独立レビューとして扱わない。同レビューの全体判定は、合成ビュー pin 完了の UI thread I/O に対する P2 により changes needed だった。この P2 は共通 pin／metadata worker 境界で fix2 として修正し、detached 固有コードへの変更は追加しない。検証結果は [pin-reload-audit.md](pin-reload-audit.md) に記録する。
 
 **2026-09-29 Smart Folder PDF 可視採用の共通後片付け**
 
