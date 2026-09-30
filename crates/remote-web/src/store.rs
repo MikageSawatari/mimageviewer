@@ -704,7 +704,7 @@ pub fn classify_entry(name: &str, is_dir: bool, is_file: bool) -> EntryKind {
         EntryKind::Audio
     } else if matches!(extension.as_str(), "zip" | "cbz") {
         EntryKind::Zip
-    } else if extension == "pdf" {
+    } else if matches!(extension.as_str(), "pdf" | "epub") {
         EntryKind::Pdf
     } else {
         EntryKind::Other
@@ -740,6 +740,7 @@ mod tests {
             assert_eq!(classify_entry(name, false, true), EntryKind::Zip);
         }
         assert_eq!(classify_entry("a.pdf", false, true), EntryKind::Pdf);
+        assert_eq!(classify_entry("Book.EPUB", false, true), EntryKind::Pdf);
         assert_eq!(classify_entry("notes.txt", false, true), EntryKind::Other);
         assert_eq!(classify_entry("a.jpg", false, false), EntryKind::Other);
     }
@@ -792,6 +793,25 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         assert!(matches!(
             library.validate_remote_file_kind(&address, RemoteEntryKind::Video),
+            Err(StoreError::BadRequest)
+        ));
+    }
+
+    #[test]
+    fn epub_file_revalidates_as_pdf_book() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Book.EPUB");
+        std::fs::write(&path, b"epub source").unwrap();
+        let library = Library::empty_for_test(temp.path().join("cache"));
+        let address = RemoteAddress::file(path.to_string_lossy().into_owned());
+
+        assert!(
+            library
+                .validate_remote_file_kind(&address, RemoteEntryKind::Pdf)
+                .is_ok()
+        );
+        assert!(matches!(
+            library.validate_remote_file_kind(&address, RemoteEntryKind::Archive),
             Err(StoreError::BadRequest)
         ));
     }

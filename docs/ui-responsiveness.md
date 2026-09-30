@@ -101,6 +101,12 @@ Rust に GC は無く、`Vec` の確保はそのまま `HeapAlloc` へ行く。
 
 perf ログ有効時のみ動作し、無効時は時計を読まない:
 
+- EPUB の本を開く時間は `epub_open.begin` から同じ論理キーの `epub_open.first_display` まで。
+  後者の `placeholder=true/false` で固定済み世代のページ数 cache 先出しと列挙待ちを分ける。
+  stamp 解決・管理画面の DB 一覧と削除予約は worker に置き、UI の `image_metas` は表示専用。
+  列挙完了後の EPUB `pdf_meta` 保存も `epub-pdf-meta` worker が行い、UI は cold catalog を開かない。
+  EPUB のフォルダ代表ピンも UI で stat せず、要求には worker 解決印だけを付ける。
+
 - `frame.begin` の `prev_update_ms` / `prev_update_cycles_per_ms` — フレーム全体の実行率
 - `frame.begin` の `prev_outside_ms` — eframe の描画と present (= 自分のコードの外)
 - `ui.update_breakdown` (23 段) / `ui.fs_render_breakdown` (56 段) — 各段の `_ms` と `_cycles`
@@ -110,6 +116,11 @@ perf ログ有効時のみ動作し、無効時は時計を読まない:
 ---
 
 ## 2. 非同期 I/O の実装テンプレ
+
+EPUB の事前確認と変換もこの境界を使う。`EpubConvertState` が取消 token と結果 receiver を持ち、
+UI は `try_recv` で確認・進捗・完了を受け取る。`inspect` と `convert` の起動、元 EPUB の読み込み、
+WebView2、PDFium 検証、キャッシュ公開はすべて背景スレッドで行う。ダイアログの閉鎖、別のオープン要求、
+アプリ終了では token を取り消し、Job に属する変換器を停止する。制限時間は 600 秒。
 
 ```rust
 // (1) App に pending 状態を追加

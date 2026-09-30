@@ -285,6 +285,10 @@ impl PresentationTransitionOwner {
         !matches!(self.state, PresentationTransitionState::Stable { .. })
     }
 
+    pub(crate) fn has_pending_effects(&self) -> bool {
+        !self.effects.is_empty()
+    }
+
     pub(crate) fn z_order_recovery_permitted(&self) -> bool {
         matches!(self.state, PresentationTransitionState::Stable { .. })
     }

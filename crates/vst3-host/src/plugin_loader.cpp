@@ -189,34 +189,37 @@ void draw_editor_chrome(HWND hwnd, miv::PluginLoader* loader) {
     FillRect(hdc, &client, bg);
     DeleteObject(bg);
 
+    const bool show_power = !loader || loader->editor_chrome_show_bypass_button();
     RECT power_rect = editor_power_button_rect(hwnd);
     const bool bypassed = loader && loader->editor_chrome_bypassed();
-    HBRUSH power_bg = CreateSolidBrush(bypassed ? RGB(42, 42, 42) : RGB(36, 72, 44));
-    FillRect(hdc, &power_rect, power_bg);
-    DeleteObject(power_bg);
-    HPEN power_pen = CreatePen(PS_SOLID, 2, bypassed ? RGB(165, 165, 165) : RGB(118, 230, 130));
-    HGDIOBJ old_power_pen = SelectObject(hdc, power_pen);
-    HGDIOBJ old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    const int cx = (power_rect.left + power_rect.right) / 2;
-    const int cy = (power_rect.top + power_rect.bottom) / 2 + 1;
-    const int r = std::max<int>(5, (power_rect.bottom - power_rect.top) / 2 - 7);
-    POINT ring_points[25]{};
-    constexpr double kPi = 3.14159265358979323846;
-    constexpr double kStartDeg = 225.0;
-    constexpr double kSweepDeg = 270.0;
-    for (int i = 0; i < 25; ++i) {
-        const double t = static_cast<double>(i) / 24.0;
-        const double deg = kStartDeg - (kSweepDeg * t);
-        const double rad = deg * kPi / 180.0;
-        ring_points[i].x = cx + static_cast<LONG>(std::lround(std::cos(rad) * r));
-        ring_points[i].y = cy + static_cast<LONG>(std::lround(std::sin(rad) * r));
+    if (show_power) {
+        HBRUSH power_bg = CreateSolidBrush(bypassed ? RGB(42, 42, 42) : RGB(36, 72, 44));
+        FillRect(hdc, &power_rect, power_bg);
+        DeleteObject(power_bg);
+        HPEN power_pen = CreatePen(PS_SOLID, 2, bypassed ? RGB(165, 165, 165) : RGB(118, 230, 130));
+        HGDIOBJ old_power_pen = SelectObject(hdc, power_pen);
+        HGDIOBJ old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        const int cx = (power_rect.left + power_rect.right) / 2;
+        const int cy = (power_rect.top + power_rect.bottom) / 2 + 1;
+        const int r = std::max<int>(5, (power_rect.bottom - power_rect.top) / 2 - 7);
+        POINT ring_points[25]{};
+        constexpr double kPi = 3.14159265358979323846;
+        constexpr double kStartDeg = 225.0;
+        constexpr double kSweepDeg = 270.0;
+        for (int i = 0; i < 25; ++i) {
+            const double t = static_cast<double>(i) / 24.0;
+            const double deg = kStartDeg - (kSweepDeg * t);
+            const double rad = deg * kPi / 180.0;
+            ring_points[i].x = cx + static_cast<LONG>(std::lround(std::cos(rad) * r));
+            ring_points[i].y = cy + static_cast<LONG>(std::lround(std::sin(rad) * r));
+        }
+        Polyline(hdc, ring_points, 25);
+        MoveToEx(hdc, cx, cy - r - 5, nullptr);
+        LineTo(hdc, cx, cy - r / 3);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_power_pen);
+        DeleteObject(power_pen);
     }
-    Polyline(hdc, ring_points, 25);
-    MoveToEx(hdc, cx, cy - r - 5, nullptr);
-    LineTo(hdc, cx, cy - r / 3);
-    SelectObject(hdc, old_brush);
-    SelectObject(hdc, old_power_pen);
-    DeleteObject(power_pen);
 
     RECT close_rect = editor_close_button_rect(hwnd);
     HBRUSH close_bg = CreateSolidBrush(RGB(38, 38, 38));
@@ -233,10 +236,10 @@ void draw_editor_chrome(HWND hwnd, miv::PluginLoader* loader) {
 
     SetBkMode(hdc, TRANSPARENT);
     std::wstring latency_text = editor_latency_text(loader);
-    const LONG title_left = power_rect.right + 10;
+    const LONG title_left = show_power ? power_rect.right + 10 : 10;
     // Keep a fixed right-side readout wide enough for "123 ms" / "1.23 s",
     // but collapse it toward the power button on very narrow plugin frames.
-    RECT latency_rect{std::max<LONG>(power_rect.right + 24, close_rect.left - 96),
+    RECT latency_rect{std::max<LONG>(title_left + 14, close_rect.left - 96),
                       0,
                       close_rect.left - 10,
                       title_rect.bottom};
@@ -325,7 +328,8 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
             if (top) return HTTOP;
             if (bottom) return HTBOTTOM;
         }
-        if (point_in_rect(editor_power_button_rect(hwnd), pt) ||
+        if ((loader && loader->editor_chrome_show_bypass_button() &&
+             point_in_rect(editor_power_button_rect(hwnd), pt)) ||
             point_in_rect(editor_close_button_rect(hwnd), pt)) {
             return HTCLIENT;
         }
@@ -336,7 +340,8 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
     }
     if (msg == WM_LBUTTONDOWN) {
         POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-        if (point_in_rect(editor_power_button_rect(hwnd), pt) ||
+        if ((loader && loader->editor_chrome_show_bypass_button() &&
+             point_in_rect(editor_power_button_rect(hwnd), pt)) ||
             point_in_rect(editor_close_button_rect(hwnd), pt)) {
             SetCapture(hwnd);
             return 0;
@@ -347,10 +352,9 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         if (GetCapture() == hwnd) {
             ReleaseCapture();
         }
-        if (point_in_rect(editor_power_button_rect(hwnd), pt)) {
-            if (loader) {
-                miv::send_event_gui_bypass_toggle(loader->editor_chrome_slot_id());
-            }
+        if (loader && loader->editor_chrome_show_bypass_button() &&
+            point_in_rect(editor_power_button_rect(hwnd), pt)) {
+            miv::send_event_gui_bypass_toggle(loader->editor_chrome_slot_id());
             return 0;
         }
         if (point_in_rect(editor_close_button_rect(hwnd), pt)) {
@@ -1442,6 +1446,7 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
         return result->ok;
     }
 
+    set_editor_chrome_show_bypass_button(options.show_bypass_button);
     blog("show_gui start gui_tid=%lu owner=0x%llx visible=%d",
          GetCurrentThreadId(),
          (unsigned long long)options.owner_hwnd,
@@ -2291,6 +2296,22 @@ bool PluginLoader::query_state(std::vector<uint8_t>& out_bytes) {
     }
     out_bytes.resize(static_cast<size_t>(num_read));
     return true;
+}
+
+void PluginLoader::query_state_concurrent(
+    std::function<bool()> begin,
+    std::function<void(bool, std::vector<uint8_t>)> complete) {
+    gui_thread().post_async([this, begin = std::move(begin), complete = std::move(complete)]() mutable {
+        if (!begin()) return;
+        std::vector<uint8_t> bytes;
+        bool ok = false;
+        try {
+            ok = query_state(bytes);
+        } catch (...) {
+            bytes.clear();
+        }
+        complete(ok, std::move(bytes));
+    });
 }
 
 bool PluginLoader::restore_state(const std::vector<uint8_t>& bytes) {

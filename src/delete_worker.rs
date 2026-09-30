@@ -96,10 +96,17 @@ pub fn spawn(
 
     let cancel_worker = Arc::clone(&cancel);
     let tx_worker = tx.clone();
+    let worker_scopes = source_scopes.clone();
     let spawn_result = std::thread::Builder::new()
         .name("delete-worker".into())
         .spawn(move || {
-            run_worker(paths, hwnd.unwrap_or_default(), cancel_worker, tx_worker);
+            run_worker(
+                paths,
+                worker_scopes,
+                hwnd.unwrap_or_default(),
+                cancel_worker,
+                tx_worker,
+            );
         });
     if let Err(e) = spawn_result {
         let message = format!("削除 worker を開始できません: {e}");
@@ -134,6 +141,7 @@ pub fn spawn(
 
 fn run_worker(
     paths: Vec<PathBuf>,
+    source_scopes: Vec<DeleteSourceScope>,
     hwnd: isize,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DeleteMsg>,
@@ -141,19 +149,21 @@ fn run_worker(
     let data_dir = crate::data_dir::get();
     let purge_data_dir = data_dir.clone();
     let has_pdf_passwords = crate::pdf_passwords::PdfPasswordStore::has_entries_at(&data_dir);
-    run_worker_with_recycler(
+    run_worker_with_recycler_scoped(
         paths,
+        source_scopes,
         hwnd,
         cancel,
         tx,
         has_pdf_passwords,
         recycle_chunk,
         collect_pdf_paths_for_delete,
-        |succeeded, pdf_paths| {
-            crate::rename_key_migration::purge_removed_paths_at(
+        |succeeded, pdf_paths, guard| {
+            crate::rename_key_migration::purge_removed_scopes_guarded_at(
                 &purge_data_dir,
                 succeeded,
                 pdf_paths,
+                guard,
             )
         },
         |succeeded, pdf_paths| {
@@ -162,8 +172,9 @@ fn run_worker(
     );
 }
 
-fn run_worker_with_recycler<F, C, P, J>(
+fn run_worker_with_recycler_scoped<F, C, P, J>(
     paths: Vec<PathBuf>,
+    source_scopes: Vec<DeleteSourceScope>,
     hwnd: isize,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DeleteMsg>,
@@ -175,13 +186,21 @@ fn run_worker_with_recycler<F, C, P, J>(
 ) where
     F: FnMut(isize, &[PathBuf]) -> DeleteChunkOutcome,
     C: FnMut(&[PathBuf], &AtomicBool) -> Vec<PathBuf>,
-    P: FnMut(&[PathBuf], &[PathBuf]) -> crate::rename_key_migration::PurgeReport,
+    P: FnMut(
+        &[DeleteSourceScope],
+        &[PathBuf],
+        &crate::pdf_loader::EpubRangeLease,
+    ) -> crate::rename_key_migration::PurgeReport,
     J: FnMut(&[PathBuf], &[PathBuf]) -> bool,
 {
     let mut succeeded_for_purge = Vec::new();
     let mut pdf_paths_for_purge = Vec::new();
     let mut canceled = false;
     let mut receiver_open = true;
+
+    // One owner spans every Shell chunk, including its confirmation/progress,
+    // and the final purge (also after cancel or a partial Shell failure).
+    let range_guard = crate::rename_key_migration::acquire_delete_epub_guard(&source_scopes);
 
     for chunk in paths.chunks(FILE_OPERATION_CHUNK_SIZE) {
         if cancel.load(Ordering::Relaxed) {
@@ -264,7 +283,19 @@ fn run_worker_with_recycler<F, C, P, J>(
     if !succeeded_for_purge.is_empty() {
         let purge_started = std::time::Instant::now();
         let mut attempts = 1usize;
-        let mut report = purge(&succeeded_for_purge, &pdf_paths_for_purge);
+        let succeeded_scopes = source_scopes
+            .iter()
+            .filter(|scope| {
+                let scoped_path = match scope {
+                    DeleteSourceScope::Exact(path) | DeleteSourceScope::Tree(path) => path,
+                };
+                succeeded_for_purge
+                    .iter()
+                    .any(|path| crate::folder_tree::path_eq(path, scoped_path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut report = purge(&succeeded_scopes, &pdf_paths_for_purge, &range_guard);
         store_mutations.merge(report.store_mutations);
         let mut rows = report.rows;
         let mut db_open_count = report.db_open_count;
@@ -273,7 +304,7 @@ fn run_worker_with_recycler<F, C, P, J>(
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50 * retry));
-            report = purge(&succeeded_for_purge, &pdf_paths_for_purge);
+            report = purge(&succeeded_scopes, &pdf_paths_for_purge, &range_guard);
             store_mutations.merge(report.store_mutations);
             attempts += 1;
             rows += report.rows;
@@ -338,6 +369,54 @@ fn run_worker_with_recycler<F, C, P, J>(
             store_mutations,
         });
     }
+}
+
+#[cfg(test)]
+fn run_worker_with_recycler<F, C, P, J>(
+    paths: Vec<PathBuf>,
+    hwnd: isize,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<DeleteMsg>,
+    collect_pdf_paths: bool,
+    recycle: F,
+    collect_pdfs: C,
+    mut purge: P,
+    journal_failure: J,
+) where
+    F: FnMut(isize, &[PathBuf]) -> DeleteChunkOutcome,
+    C: FnMut(&[PathBuf], &AtomicBool) -> Vec<PathBuf>,
+    P: FnMut(
+        &[PathBuf],
+        &[PathBuf],
+        &crate::pdf_loader::EpubRangeLease,
+    ) -> crate::rename_key_migration::PurgeReport,
+    J: FnMut(&[PathBuf], &[PathBuf]) -> bool,
+{
+    let scopes = paths
+        .iter()
+        .cloned()
+        .map(DeleteSourceScope::Exact)
+        .collect();
+    run_worker_with_recycler_scoped(
+        paths,
+        scopes,
+        hwnd,
+        cancel,
+        tx,
+        collect_pdf_paths,
+        recycle,
+        collect_pdfs,
+        |scopes, pdf_paths, guard| {
+            let paths = scopes
+                .iter()
+                .map(|scope| match scope {
+                    DeleteSourceScope::Exact(path) | DeleteSourceScope::Tree(path) => path.clone(),
+                })
+                .collect::<Vec<_>>();
+            purge(&paths, pdf_paths, guard)
+        },
+        journal_failure,
+    );
 }
 
 fn path_matches_removed(path: &std::path::Path, removed: &[PathBuf]) -> bool {
@@ -781,7 +860,7 @@ mod worker_tests {
                 failed_outcome(chunk, false)
             },
             |_paths, _cancel| Vec::new(),
-            |_succeeded, _pdf_paths| crate::rename_key_migration::PurgeReport::default(),
+            |_succeeded, _pdf_paths, _guard| crate::rename_key_migration::PurgeReport::default(),
             |_succeeded, _pdf_paths| false,
         );
 
@@ -813,7 +892,7 @@ mod worker_tests {
                 failed_outcome(chunk, false)
             },
             |_paths, _cancel| Vec::new(),
-            |_succeeded, _pdf_paths| crate::rename_key_migration::PurgeReport::default(),
+            |_succeeded, _pdf_paths, _guard| crate::rename_key_migration::PurgeReport::default(),
             |_succeeded, _pdf_paths| false,
         );
 
@@ -849,7 +928,7 @@ mod worker_tests {
                 }
             },
             |_paths, _cancel| Vec::new(),
-            |removed, _pdf_paths| {
+            |removed, _pdf_paths, _guard| {
                 purge_calls += 1;
                 purged.extend_from_slice(removed);
                 crate::rename_key_migration::PurgeReport::default()
@@ -893,7 +972,7 @@ mod worker_tests {
                 }
             },
             |_paths, _cancel| Vec::new(),
-            |removed, _pdf_paths| {
+            |removed, _pdf_paths, _guard| {
                 purge_calls += 1;
                 purged.extend_from_slice(removed);
                 crate::rename_key_migration::PurgeReport::default()
@@ -939,7 +1018,7 @@ mod worker_tests {
                 collect_calls += 1;
                 collect_pdf_paths_for_delete(paths, cancel)
             },
-            |_removed, pdf_paths| {
+            |_removed, pdf_paths, _guard| {
                 purge_pdf_paths.extend_from_slice(pdf_paths);
                 crate::rename_key_migration::PurgeReport::default()
             },
@@ -1007,8 +1086,13 @@ mod worker_tests {
                 retryable: false,
             },
             |_paths, _cancel| Vec::new(),
-            |removed, pdf_paths| {
-                crate::rename_key_migration::purge_removed_paths_at(temp.path(), removed, pdf_paths)
+            |removed, pdf_paths, guard| {
+                crate::rename_key_migration::purge_removed_paths_guarded_at(
+                    temp.path(),
+                    removed,
+                    pdf_paths,
+                    guard,
+                )
             },
             |_succeeded, _pdf_paths| false,
         );
@@ -1017,6 +1101,210 @@ mod worker_tests {
         assert_eq!(batch_counts(&messages[0]), (1, 1));
         assert_eq!(db.get(&succeeded_key), 0);
         assert_eq!(db.get(&failed_key), 4);
+    }
+
+    #[test]
+    fn delete_worker_guards_exact_descendants_without_waiting_for_unrelated_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(temp.path().join("content_identity.db")).unwrap();
+        conn.execute_batch("CREATE TABLE edit_origin (file_key TEXT PRIMARY KEY)")
+            .unwrap();
+        drop(conn);
+
+        let run = |scope: DeleteSourceScope| {
+            let data_dir = temp.path().to_path_buf();
+            let removed = match &scope {
+                DeleteSourceScope::Exact(path) | DeleteSourceScope::Tree(path) => path.clone(),
+            };
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let (tx, _rx) = mpsc::channel();
+                run_worker_with_recycler_scoped(
+                    vec![removed],
+                    vec![scope],
+                    0,
+                    Arc::new(AtomicBool::new(false)),
+                    tx,
+                    false,
+                    |_hwnd, paths| DeleteChunkOutcome {
+                        succeeded: paths.to_vec(),
+                        failed: Vec::new(),
+                        shell_aborted: false,
+                        retryable: false,
+                    },
+                    |_paths, _cancel| Vec::new(),
+                    |scopes, pdf_paths, guard| {
+                        let report = crate::rename_key_migration::purge_removed_scopes_guarded_at(
+                            &data_dir, scopes, pdf_paths, guard,
+                        );
+                        assert!(report.errors.is_empty(), "{:?}", report.errors);
+                        report
+                    },
+                    |_paths, _pdf_paths| false,
+                );
+                done_tx.send(()).unwrap();
+            });
+            (worker, done_rx)
+        };
+        let hold = |book: PathBuf| {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                crate::pdf_loader::with_epub_pin_guard(&book, || {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+            });
+            ready_rx.recv().unwrap();
+            (holder, release_tx)
+        };
+
+        let file = temp.path().join("cover.png");
+        let (holder, release) = hold(file.join("child.epub"));
+        let (worker, done) = run(DeleteSourceScope::Exact(temp.path().join("other.png")));
+        let unrelated_finished = done.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            unrelated_finished,
+            "a non-overlapping Exact delete must not wait"
+        );
+
+        let (holder, release) = hold(file.join("child.epub"));
+        let (worker, done) = run(DeleteSourceScope::Exact(file));
+        let exact_finished_early = done
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        release.send(()).unwrap();
+        if !exact_finished_early {
+            done.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            !exact_finished_early,
+            "an Exact delete must cover its slash descendants"
+        );
+
+        let folder = temp.path().join("deleted.books.v2");
+        let (holder, release) = hold(folder.join("child.epub"));
+        let (worker, done) = run(DeleteSourceScope::Tree(folder));
+        let tree_finished_early = done
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        release.send(()).unwrap();
+        if !tree_finished_early {
+            done.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            !tree_finished_early,
+            "a deleted folder must cover EPUB descendants"
+        );
+    }
+
+    #[test]
+    fn shell_delete_keeps_epub_backfill_out_until_purge_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let files = temp.path().join("files");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&files).unwrap();
+        let removed = files.join("cover.png");
+        std::fs::write(&removed, b"old image").unwrap();
+        let db_path = data_dir.join("content_identity.db");
+        crate::content_identity::initialize_identity_db_for_delete_test(&db_path).unwrap();
+
+        let (shell_done_tx, shell_done_rx) = mpsc::channel();
+        let (release_shell_tx, release_shell_rx) = mpsc::channel();
+        let (purge_entered_tx, purge_entered_rx) = mpsc::channel();
+        let worker_removed = removed.clone();
+        let worker_data = data_dir.clone();
+        let worker = std::thread::spawn(move || {
+            let (tx, _rx) = mpsc::channel();
+            run_worker_with_recycler_scoped(
+                vec![worker_removed.clone()],
+                vec![DeleteSourceScope::Exact(worker_removed.clone())],
+                0,
+                Arc::new(AtomicBool::new(false)),
+                tx,
+                false,
+                |_hwnd, paths| {
+                    std::fs::remove_file(&worker_removed).unwrap();
+                    shell_done_tx.send(()).unwrap();
+                    release_shell_rx.recv().unwrap();
+                    DeleteChunkOutcome {
+                        succeeded: paths.to_vec(),
+                        failed: Vec::new(),
+                        shell_aborted: false,
+                        retryable: false,
+                    }
+                },
+                |_paths, _cancel| Vec::new(),
+                |scopes, pdf_paths, guard| {
+                    purge_entered_tx.send(()).unwrap();
+                    let report = crate::rename_key_migration::purge_removed_scopes_guarded_at(
+                        &worker_data,
+                        scopes,
+                        pdf_paths,
+                        guard,
+                    );
+                    assert!(report.errors.is_empty(), "{:?}", report.errors);
+                    report
+                },
+                |_paths, _pdf_paths| false,
+            );
+        });
+
+        shell_done_rx.recv().unwrap();
+        std::fs::create_dir(&removed).unwrap();
+        let book = removed.join("book.epub");
+        std::fs::write(&book, b"new EPUB source").unwrap();
+        let (write_started_tx, write_started_rx) = mpsc::channel();
+        let (write_done_tx, write_done_rx) = mpsc::channel();
+        let writer_db = db_path.clone();
+        let writer_book = book.clone();
+        let writer = std::thread::spawn(move || {
+            write_started_tx.send(()).unwrap();
+            let result = crate::content_identity::backfill_epub_after_delete_for_test(
+                &writer_book,
+                &writer_db,
+            );
+            write_done_tx.send(result).unwrap();
+        });
+        write_started_rx.recv().unwrap();
+        let early_write = write_done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .ok();
+        let wrote_before_purge = early_write.is_some();
+        release_shell_tx.send(()).unwrap();
+        purge_entered_rx.recv().unwrap();
+        worker.join().unwrap();
+        let result = early_write.unwrap_or_else(|| {
+            write_done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        });
+        writer.join().unwrap();
+        result.unwrap();
+        assert!(
+            !wrote_before_purge,
+            "backfill must wait from Shell delete through purge"
+        );
+        let db = rusqlite::Connection::open(db_path).unwrap();
+        let key = crate::path_key::normalize_keep_drive(&book);
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM edit_origin WHERE file_key = ?1)",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "the post-purge EPUB ledger row must survive");
     }
 
     #[test]
@@ -1044,7 +1332,7 @@ mod worker_tests {
                 retryable: false,
             },
             |_paths, _cancel| Vec::new(),
-            |_removed, _pdf_paths| {
+            |_removed, _pdf_paths, _guard| {
                 purge_calls += 1;
                 crate::rename_key_migration::PurgeReport {
                     rows: 0,

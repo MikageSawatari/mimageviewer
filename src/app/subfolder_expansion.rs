@@ -224,6 +224,7 @@ pub(crate) struct SubfolderExpansionOptions {
     video_thumb_use_sidecar_image: bool,
     image_folder_books: bool,
     include_convertible_archives: bool,
+    include_epub: bool,
     show_hidden_files: bool,
     image_ext_priority: Vec<String>,
     scan_filter: SubfolderExpansionScanFilter,
@@ -238,6 +239,7 @@ impl From<&crate::settings::Settings> for SubfolderExpansionOptions {
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
             image_folder_books: settings.auto_fullscreen_image_folders_enabled(),
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
+            include_epub: !settings.epub_file_handling_ignores_epub(),
             show_hidden_files: settings.show_hidden_files,
             image_ext_priority: settings.image_ext_priority.clone(),
             scan_filter: SubfolderExpansionScanFilter::from_settings(settings),
@@ -744,7 +746,9 @@ fn scan_one_directory(
 
         let entry_kind = if crate::folder_tree::is_zip_extension(&ext_lower) {
             Some(SubfolderExpansionEntryKind::Zip)
-        } else if ext_lower == "pdf" {
+        } else if crate::folder_tree::is_paged_document_path(&path)
+            && (options.include_epub || ext_lower != "epub")
+        {
             Some(SubfolderExpansionEntryKind::Pdf)
         } else {
             None
@@ -2796,6 +2800,7 @@ mod tests {
             video_thumb_use_sidecar_image: true,
             image_folder_books,
             include_convertible_archives: false,
+            include_epub: true,
             show_hidden_files: true,
             image_ext_priority: Vec::new(),
             scan_filter: SubfolderExpansionScanFilter::default(),
@@ -3183,6 +3188,7 @@ mod tests {
                 video_thumb_use_sidecar_image: true,
                 image_folder_books: false,
                 include_convertible_archives: false,
+                include_epub: true,
                 show_hidden_files: true,
                 image_ext_priority: Vec::new(),
                 scan_filter: SubfolderExpansionScanFilter::default(),
@@ -3253,6 +3259,7 @@ mod tests {
         std::fs::write(root.join("book.zip"), b"not opened by scan").unwrap();
         std::fs::write(root.join("comic.cbz"), b"not opened by scan").unwrap();
         std::fs::write(root.join("document.pdf"), b"not opened by scan").unwrap();
+        std::fs::write(root.join("book.epub"), b"not opened by scan").unwrap();
 
         let result = scan_test_root(&root, test_scan_options(true));
         let kinds = result
@@ -3261,7 +3268,7 @@ mod tests {
             .map(|entry| entry.kind)
             .collect::<Vec<_>>();
 
-        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.entries.len(), 4);
         assert_eq!(
             kinds
                 .iter()
@@ -3273,6 +3280,17 @@ mod tests {
             kinds
                 .iter()
                 .filter(|kind| **kind == SubfolderExpansionEntryKind::Pdf)
+                .count(),
+            2
+        );
+        let mut ignored = test_scan_options(true);
+        ignored.include_epub = false;
+        let result = scan_test_root(&root, ignored);
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == SubfolderExpansionEntryKind::Pdf)
                 .count(),
             1
         );
@@ -3443,6 +3461,7 @@ mod tests {
             video_thumb_use_sidecar_image: true,
             image_folder_books: false,
             include_convertible_archives: false,
+            include_epub: true,
             show_hidden_files: true,
             image_ext_priority: vec!["jpg".into(), "png".into()],
             scan_filter: SubfolderExpansionScanFilter::default(),

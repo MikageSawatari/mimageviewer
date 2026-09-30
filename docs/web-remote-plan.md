@@ -1,4 +1,4 @@
-﻿# リモート閲覧 (Web) 機能 計画書
+# リモート閲覧 (Web) 機能 計画書
 
 v3.0.0 の目玉として、外出先のスマートフォン / タブレット / PC のブラウザから
 自宅 PC の mIV ライブラリを閲覧できるようにする。本書がこの機能の正本。
@@ -35,7 +35,7 @@ v3.0.0 の目玉として、外出先のスマートフォン / タブレット 
 | 読み取り (画像・動画バイト) | remote-web が **直接** read-only で読む | HTTP の range / 画像配信を本体 UI から分離する |
 | 通常フォルダ一覧 | **IPC → 本体** | 表示対象・順序・sidecar 吸収・重複除去を本体の production materializer 1 箇所に固定する (§12.15) |
 | サムネイル参照・生成 | **IPC → 本体** | catalog の実態が当初想定と異なったため。本体の既存生成経路とキャッシュ方針を一元利用する (§9) |
-| 書き込み (読書履歴・ブックマーク・見開き・トリム・タグ・レーティング) | **必ず IPC → 本体** | 全永続ストアの writer を本体 1 つに固定する |
+| 書き込み (読書履歴・動画/音声の再生位置・ブックマーク・見開き・トリム・タグ・レーティング) | **必ず IPC → 本体** | 全永続ストアの writer を本体 1 つに固定する |
 | 重い生成 (PDF レンダ・AI アップスケール・カラー化・補正合成) | **IPC → 本体** | PDFium プール・ONNX セッション・GPU をステートフルに保持しているのは本体 |
 
 SQLite は DB ごとに journal 設定が異なる。特に `spread.db` は WAL / `busy_timeout` を設定せず、
@@ -50,7 +50,10 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 本体に単一の remote session owner を置く。ブラウザは認証後に
 `POST /api/session/acquire` で確認なしに操作権を取得し、本体は「リモート接続中」ダイアログを
-出して main / fullscreen / detached / native presenter の通常入力をロックする。操作者は常に
+出す。取得 barrier は全ローカル viewer context、fullscreen、detached / メディア窓、player の
+閉鎖と AI の静止を確認してから RemoteActive に進む。閉鎖失敗または 30 秒の watchdog 超過時は
+取得を失敗として Local に戻す。AcquiringRemote 中は閉鎖の途中であり得るが、RemoteActive / DrainingRemote
+にはローカルの閲覧窓と player は残らない。操作者は常に
 1 人であり、2 台目やローカルとの競合は**後から操作した側が勝つ**。表示フォルダ等の状態同期はしない。
 
 - ダイアログには `tailscale status --json` の `Peer.TailscaleIPs` と接続元 IP の照合結果から
@@ -68,9 +71,21 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
   fail-closed guard で 401 とし、owner 解決へ進めない。
   認証後の全画面では左上の小さな badge に「操作中」または
   「別の端末が操作中 (操作すると取得します)」を常時表示し、確認や入力 blocking は行わない
-- session owner が変わった時、本体は既存の media pause、slideshow stop、owner-scoped native
-  pending cancel を通して動画・音声・音楽ビュー・スライドショー・GIF/APNG・連続送りを停止する。
-  player、停止位置、main/fullscreen/detached の window 構成は保持し、操作権返却時も自動再開しない
+- session owner が変わった時、本体は全 context の再生位置と確定済み音声トラック選択を収穫し、
+  取得前の delayed open / fullscreen restore を失効させる。起動・二重起動のパス解決結果、
+  閲覧用アーカイブ変換、本棚ショートカットの準備、サブ展開・ファイル名スタックの表示準備も
+  それぞれの終了処理で破棄する。変換結果を書くだけの sibling ZIP は閲覧を開かないため継続する。
+  明示された起動パス自体は保持し、取得失敗または返却で Local に戻った時に通常の起動先として開く。
+  通常の一覧の現在フォルダが無く、保留中の起動パスも無い場合は既定の起動先を開く。
+  二重起動のパスはパイプ受信時の所有状態と取得世代で判定し、Remote 所有中に届いたものと
+  取得前から保留されていたものはログと通知を出して拒否する。返却後に届いたものは Local で開く。
+  既存の全窓 terminal close 経路で
+  main / detached / ParkedLive / メディア窓を閉じる。Remote が見た再生位置は IPC write で
+  PC の settings と読書履歴に戻す。hidden / viewer 破棄の最終報告は keepalive で即時発信し、
+  viewer は配信開始時の所有 session ID を attach 成功後に報告へ固定し、再接続中の旧位置を新 owner として
+  送らない。通常報告の列は session ごとに独立し、core は session・path 単位の連番で逆順到着を捨てる。
+  端末の再生中は 5 秒ごとに報告するため、突然の所有終了では
+  最終報告以後の最大 5 秒分が残らないことがある
 - ブラウザは 30 秒ごとに `POST /api/session/ping` を送り、直近の利用者入力と video/audio 再生中を
   通知する。通常の IPC 要求と remote-web が直接処理する一覧/画像 API も活動として数える
 - 生存タイムアウトは ping/API が 60 秒無い場合、放置タイムアウトは「利用者操作なし、かつ
@@ -78,9 +93,8 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - active 中は watchdog thread が `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` を保持し、解放時に
   `ES_CONTINUOUS` へ戻す
 - ローカルへ操作権が戻った瞬間、読書履歴・レーティング・ブックマーク・スマートフォルダ・
-  通常フォルダの既存「再読み込み」入口を 1 回呼ぶ。fullscreen 中は item identity を保持し、
-  一覧再構築後に同じ item を既存 `open_fullscreen` 経路で開き直す。再 open する media / animated
-  image には paused 状態を引き継ぎ、利用者が再生操作を行うまで動かさない
+  通常フォルダの既存「再読み込み」入口を 1 回呼ぶ。閉じた閲覧窓は復元せず一覧を表示する。
+  次に PC で開くと Remote が書いた位置と音声トラックで始まる
 - **その鏡像**として、リモートが操作権を取得した瞬間、端末は cache を破棄し、home 画面の
   データ (お気に入り / 場所 / スマートフォルダ定義) を取り直す。**この排他があるからこそ、
   セッション取得が「本体側で何か変わったかもしれない」の完全な信号になる** — 本体は
@@ -1016,6 +1030,12 @@ change は 180 ms debounce 後にこの判定を再実行する。
 
 `spread.db::get_direction` も本体側で同じ key / fallback から読み、`reading_direction` として応答する。
 LTR / RTL の見開きモードは本体と同じく方向をそのモードへ揃え、Single は保存済み方向を維持する。
+変換済み EPUB は PDF の本と同じ Remote 経路で開き、本とページの address は元 `.epub` とその
+`PdfPage` subresource を使う。Remote は変換を始めず、未変換時は PC の mImageViewer で一度開くよう
+案内する。一覧は本体の同名 PDF 優先設定を適用し、Web は EPUB バッジと表紙未取得時のプレースホルダーを表示する。
+本体の世代スタンプでページ数・表紙・見開き用寸法を照合する。EPUB の綴じ方向は保存済み本別値が無く、
+「文書の綴じ方向に従う」が有効なときに固定世代の方向を採用する。通常 PDF の `/Direction` は
+Remote では従来どおり既定方向への反映対象外である。
 Web で RTL から Single へ切り替えた場合も、そのセッションの RTL を request に引き継ぐ。
 RTL の横方向入力は画面上の方向を反転し、左 swipe / 左 tap zone / `ArrowLeft` を次グループ、
 右 swipe / 右 tap zone / `ArrowRight` を前グループとする。上下矢印と PageUp / PageDown は
@@ -1878,7 +1898,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-現行版は **v61**。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
+現行版は **v64**。v64 は RAW ブランチの v62 と master の v63 を統合し、RAW ページの `RawPrefetchSkipped` / `RawCapacity`、サムネイルの `NoThumbnail` と、EPUB・音声トラック選択・再生位置書き戻しをすべて含む。本体と service を同時に更新する。v63 は audio-tracks ブランチの追加を統合し、Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control と、端末で見た再生位置の PC への書き戻し (`RecordVideoProgress`、所有世代と連番の照合) を含む。audio-tracks ブランチでは音声トラック追加時に v62、再生位置追加時に v63 としていた。master の v62 は EPUB 対応で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げた。統合後の v63 では EPUB と音声トラック・再生位置の追加をすべて含み、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
 `{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
 catalog / snapshot / navigation を追加した。collection の session spread request と
 address-based `page_groups` を追加した版は v49。

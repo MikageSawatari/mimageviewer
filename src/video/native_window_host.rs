@@ -6,7 +6,7 @@
 
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::thread::ThreadId;
 
 use windows::Win32::Foundation::{HWND, POINT, RECT};
@@ -256,11 +256,13 @@ enum NativeOwnedWindows {
 pub(crate) struct NativeWindowHost {
     windows: NativeOwnedWindows,
     affinity: WindowThreadAffinity,
-    editor_hwnds_snapshot: Option<Arc<RwLock<std::collections::HashSet<u64>>>>,
+    editor_ui_snapshot: Option<super::dsp::SharedEditorUiSnapshot>,
     main_hwnd_for_raise: u64,
     last_logged_region_hash: Option<u64>,
     last_region_hash: Option<u64>,
     last_regions_empty: bool,
+    #[cfg(test)]
+    focus_claim_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -311,11 +313,13 @@ impl NativeWindowHost {
         let this = Self {
             windows,
             affinity,
-            editor_hwnds_snapshot: None,
+            editor_ui_snapshot: None,
             main_hwnd_for_raise: 0,
             last_logged_region_hash: None,
             last_region_hash: None,
             last_regions_empty: true,
+            #[cfg(test)]
+            focus_claim_probe: None,
             _not_send_or_sync: PhantomData,
         };
         debug_assert_eq!(this.render_targets().presenter().generation(), generation);
@@ -441,11 +445,13 @@ impl NativeWindowHost {
         let Self {
             windows,
             affinity,
-            editor_hwnds_snapshot,
+            editor_ui_snapshot,
             main_hwnd_for_raise,
             last_logged_region_hash,
             last_region_hash,
             last_regions_empty,
+            #[cfg(test)]
+            focus_claim_probe,
             _not_send_or_sync,
         } = self;
         let windows = match (windows, topology) {
@@ -462,11 +468,13 @@ impl NativeWindowHost {
         Self {
             windows,
             affinity,
-            editor_hwnds_snapshot,
+            editor_ui_snapshot,
             main_hwnd_for_raise,
             last_logged_region_hash,
             last_region_hash,
             last_regions_empty,
+            #[cfg(test)]
+            focus_claim_probe,
             _not_send_or_sync,
         }
     }
@@ -558,6 +566,11 @@ impl NativeWindowHost {
         for intent in intents {
             match *intent {
                 NativeWindowIntent::ClaimTextInputFocus => {
+                    #[cfg(test)]
+                    if let Some(probe) = &self.focus_claim_probe {
+                        probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
                     let focus_state = self.observe().focus;
                     let foreground_hwnd = super::native_window::foreground_hwnd();
                     let report =
@@ -708,12 +721,12 @@ impl NativeWindowHost {
         }
     }
 
-    pub(crate) fn set_editor_hwnds_snapshot(
+    pub(crate) fn set_editor_ui_snapshot(
         &mut self,
-        snapshot: Option<Arc<RwLock<std::collections::HashSet<u64>>>>,
+        snapshot: Option<super::dsp::SharedEditorUiSnapshot>,
     ) {
         self.assert_owner_thread();
-        self.editor_hwnds_snapshot = snapshot;
+        self.editor_ui_snapshot = snapshot;
     }
 
     pub(crate) fn set_main_hwnd_for_raise_check(&mut self, main_hwnd: u64) {
@@ -726,20 +739,44 @@ impl NativeWindowHost {
         if !self.has_hud() {
             return false;
         }
-        let editor_hwnds = match self.editor_hwnds_snapshot.as_ref() {
-            Some(snapshot) => match snapshot.try_read() {
-                Ok(guard) => guard.clone(),
-                Err(_) => return false,
-            },
+        let editor_snapshot = match self.editor_ui_snapshot.as_ref() {
+            Some(snapshot) => super::dsp::read_editor_ui_snapshot(snapshot),
             None if require_editor_snapshot => return false,
-            None => std::collections::HashSet::new(),
+            None => Arc::new(super::dsp::EditorUiSnapshot::default()),
         };
         crate::video::dsp::foreground_allows_hud_raise(
             self.hwnd().0 as usize as u64,
             self.hud_hwnd(),
             self.main_hwnd_for_raise,
-            &editor_hwnds,
+            &editor_snapshot.hwnds,
         )
+    }
+
+    /// Classify the foreground captured by the HUD wndproc at button-down,
+    /// before a queued focus request can change it. The snapshot is copied
+    /// without holding a lock across USER32 calls.
+    pub(crate) fn should_skip_hud_focus_claim(&self, hwnd_at_down: u64) -> bool {
+        self.assert_owner_thread();
+        let Some(snapshot) = self.editor_ui_snapshot.as_ref() else {
+            return false;
+        };
+        let editor_snapshot = super::dsp::read_editor_ui_snapshot(snapshot);
+        !crate::video::native_window::hud_down_should_claim_presenter_focus(
+            crate::video::native_window::ui_group_for_hwnd(
+                hwnd_at_down,
+                &editor_snapshot.hwnd_pids,
+                &std::collections::HashSet::new(),
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_focus_claim_probe_for_test(
+        &mut self,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let probe = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.focus_claim_probe = Some(Arc::clone(&probe));
+        probe
     }
 
     pub(crate) fn try_raise_hud_to_top(&self) -> bool {

@@ -4111,6 +4111,7 @@ const NATIVE_TOP_BAR_RIGHT_PAD: f32 = 12.0;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct NativeTopBarLayout {
     pub(super) controls_rect: Option<egui::Rect>,
+    pub(super) vst_button_rect: Option<egui::Rect>,
     pub(super) text_rect: egui::Rect,
     pub(super) title_rect: Option<egui::Rect>,
     pub(super) subtitle_rect: Option<egui::Rect>,
@@ -4190,6 +4191,7 @@ pub(super) fn draw_top_bar_text_lines(
 
     NativeTopBarLayout {
         controls_rect,
+        vst_button_rect: None,
         text_rect,
         title_rect: title.as_ref().map(|(rect, _)| *rect),
         subtitle_rect: subtitle.as_ref().map(|(rect, _)| *rect),
@@ -4352,6 +4354,7 @@ pub(super) fn draw_native_top_bar(
         *panorama_projection_popup_open = false;
     }
     let mut panorama_projection_button_rect = None;
+    let mut vst_button_rect = None;
     let layout = egui::Area::new(egui::Id::new("native_video_top_bar"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
@@ -4735,6 +4738,7 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::ToggleVst3Gui,
                     commands,
                 );
+                vst_button_rect = Some(vst3_rect);
                 include_native_top_bar_control(&mut controls_rect, vst3_rect);
             }
             let layout = draw_top_bar_text_lines(
@@ -4768,7 +4772,9 @@ pub(super) fn draw_native_top_bar(
     } else {
         *panorama_projection_popup_open = false;
     }
-    layout.inner
+    let mut layout = layout.inner;
+    layout.vst_button_rect = vst_button_rect;
+    layout
 }
 
 pub(super) fn draw_native_top_bar_tile(
@@ -5942,17 +5948,33 @@ pub(super) fn draw_native_metadata_panel(
                 metadata.deinterlace_status,
                 metadata.interlace_detected,
             );
-            let audio_label = match metadata.audio_codec.as_deref() {
-                Some(codec) if metadata.audio_bit_rate_bps > 0 => {
-                    format!(
-                        "{} ({})",
-                        codec,
-                        format_bitrate(metadata.audio_bit_rate_bps)
-                    )
-                }
-                Some(codec) => codec.to_string(),
-                None => "なし".to_string(),
-            };
+            let audio_label = metadata
+                .audio_track_rows
+                .iter()
+                .find(|row| row.is_current)
+                .map_or_else(
+                    || match metadata.audio_codec.as_deref() {
+                        Some(codec) if metadata.audio_bit_rate_bps > 0 => format!(
+                            "{} ({})",
+                            codec,
+                            format_bitrate(metadata.audio_bit_rate_bps)
+                        ),
+                        Some(codec) => codec.to_owned(),
+                        None => "なし".to_owned(),
+                    },
+                    |row| {
+                        let mut label = row.label.clone();
+                        if metadata.opened_audio_stream_index == Some(row.stream_index)
+                            && metadata.audio_bit_rate_bps > 0
+                        {
+                            label.push_str(&format!(
+                                " ({})",
+                                format_bitrate(metadata.audio_bit_rate_bps)
+                            ));
+                        }
+                        label
+                    },
+                );
             let mut rows = vec![
                 ("ファイル", metadata.file_name.clone()),
                 ("タイトル", title.to_string()),
@@ -5984,6 +6006,14 @@ pub(super) fn draw_native_metadata_panel(
                     "音声",
                     if metadata.probe_info_available {
                         audio_label
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "音声トラック",
+                    if metadata.audio_track_count >= 2 {
+                        format!("{} 本", metadata.audio_track_count)
                     } else {
                         String::new()
                     },
@@ -7584,8 +7614,84 @@ pub(super) fn layout_truncated_to_width(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn vst_button_pointer_down_up_emits_one_toggle_command() {
+        let commands = vst_button_pointer_commands_for_test();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], NativeOverlayCommand::ToggleVst3Gui));
+    }
+
+    pub(crate) fn vst_button_pointer_commands_for_test() -> Vec<NativeOverlayCommand> {
+        use std::sync::{Arc, Mutex};
+
+        {
+            let captured = Arc::new(Mutex::new((None::<egui::Rect>, Vec::new())));
+            let captured_for_ui = Arc::clone(&captured);
+            let mut fonts_ready = false;
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1_200.0, 80.0))
+                .build(move |ctx| {
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let mut commands = Vec::new();
+                    let mut popup_open = false;
+                    let mut popup_rect = None;
+                    let layout = draw_native_top_bar(
+                        ctx,
+                        1_200.0,
+                        80.0,
+                        0.0,
+                        100.0,
+                        None,
+                        None,
+                        None,
+                        &mut popup_open,
+                        &mut popup_rect,
+                        "test-video.mp4",
+                        false,
+                        true,
+                        true,
+                        false,
+                        crate::settings::FsSidePanelMode::Hover,
+                        false,
+                        false,
+                        &mut commands,
+                        #[cfg(feature = "test-script")]
+                        &mut None,
+                        #[cfg(feature = "test-script")]
+                        None,
+                        #[cfg(feature = "test-script")]
+                        &mut None,
+                    );
+                    *captured_for_ui.lock().unwrap() = (layout.vst_button_rect, commands);
+                });
+            harness.step();
+            let center = captured
+                .lock()
+                .unwrap()
+                .0
+                .expect("VST response rect")
+                .center();
+            harness.hover_at(center);
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness.step();
+            captured.lock().unwrap().1.clone()
+        }
+    }
 
     fn test_normal_top_bar_layout(
         width_points: f32,
@@ -7674,6 +7780,9 @@ mod tests {
             video_decoder: "test".to_owned(),
             audio_codec: Some("aac".to_owned()),
             audio_bit_rate_bps: 192_000,
+            audio_track_rows: Vec::new(),
+            audio_track_count: 0,
+            opened_audio_stream_index: None,
             avg_fps: 23.976,
             bit_rate_bps: 4_000_000,
             chapter_count: 0,

@@ -1111,7 +1111,7 @@ pub(super) fn association_extension_groups() -> [(&'static str, &'static [&'stat
         ("画像", crate::folder_tree::SUPPORTED_EXTENSIONS),
         ("動画", crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS),
         ("音声", crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS),
-        ("書庫 / PDF", &["zip", "cbz", "pdf"]),
+        ("書庫 / PDF / EPUB", &["zip", "cbz", "pdf", "epub"]),
     ]
 }
 
@@ -2433,6 +2433,16 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::GridColumnCount8 => RingActionId::GridColumnCount8,
         KeyAction::GridColumnCount9 => RingActionId::GridColumnCount9,
         KeyAction::GridColumnCount10 => RingActionId::GridColumnCount10,
+        KeyAction::GridColumnCount11 => RingActionId::GridColumnCount11,
+        KeyAction::GridColumnCount12 => RingActionId::GridColumnCount12,
+        KeyAction::GridColumnCount13 => RingActionId::GridColumnCount13,
+        KeyAction::GridColumnCount14 => RingActionId::GridColumnCount14,
+        KeyAction::GridColumnCount15 => RingActionId::GridColumnCount15,
+        KeyAction::GridColumnCount16 => RingActionId::GridColumnCount16,
+        KeyAction::GridColumnCount17 => RingActionId::GridColumnCount17,
+        KeyAction::GridColumnCount18 => RingActionId::GridColumnCount18,
+        KeyAction::GridColumnCount19 => RingActionId::GridColumnCount19,
+        KeyAction::GridColumnCount20 => RingActionId::GridColumnCount20,
         KeyAction::FsClose => RingActionId::CloseFullscreen,
         KeyAction::FsToggleMetadata => RingActionId::ImageToggleMetadata,
         KeyAction::FsToggleWindowMode => RingActionId::ToggleWindowMode,
@@ -7103,6 +7113,10 @@ pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState
     });
 }
 
+pub(super) fn reset_epub_file_handling(settings: &mut crate::settings::Settings) {
+    settings.epub_file_handling = crate::settings::EpubFileHandling::default();
+}
+
 pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         "サムネイルキャッシュをいつ生成するかを指定します。\n\
@@ -7262,6 +7276,25 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .small()
         .weak(),
     );
+    });
+    ui.add_space(8.0);
+    anchored(ui, state, "cache/epub-handling", |ui, state| {
+        let s = &mut state.settings;
+        ui.label(egui::RichText::new("EPUB の処理").strong());
+        for &handling in crate::settings::EpubFileHandling::all() {
+            ui.radio_value(&mut s.epub_file_handling, handling, handling.label())
+                .on_hover_text(handling.description());
+        }
+        if ui.button("既定値に戻す").clicked() {
+            reset_epub_file_handling(s);
+        }
+        ui.label(
+            egui::RichText::new(
+                "「無視する」では、EPUB を一覧・フォルダ移動の対象にせず、変換済みの本も開きません。",
+            )
+            .small()
+            .weak(),
+        );
     });
     ui.add_space(8.0);
     anchored(ui, state, "cache/archive-limit", |ui, state| {
@@ -8667,7 +8700,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         let s = &mut state.settings;
         ui.checkbox(
             &mut s.skip_zip_if_folder_exists,
-            "同名の ZIP/PDF/RAR/7z/LZH ファイルとフォルダがある場合、アーカイブ側をスキップ",
+            "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
         );
     });
     ui.add_space(4.0);
@@ -8676,6 +8709,13 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         ui.checkbox(
             &mut s.skip_archive_if_zip_exists,
             "同名の ZIP/CBZ と RAR/7z/LZH がある場合、ZIP/CBZ だけ表示",
+        );
+    });
+    ui.add_space(4.0);
+    anchored(ui, state, "duplicate/epub-pdf", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.skip_epub_if_pdf_exists,
+            "同名の EPUB と PDF がある場合、PDF だけ表示",
         );
     });
     ui.add_space(4.0);
@@ -9310,6 +9350,13 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 }
             });
     });
+    anchored(ui, state, "spread/document-direction", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.follow_document_reading_direction,
+            "PDF / EPUB の右開き指定に従う",
+        );
+        ui.small("本ごとに保存した見開き設定がある場合は、その設定を優先します。");
+    });
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
     });
@@ -9936,15 +9983,19 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
     ui.label(egui::RichText::new("保存済み位置の管理").strong());
     ui.add_space(4.0);
 
-    // 動画・音声 (再生位置は settings 内の同じ HashMap を path キーで共有。クリアは OK 適用時に反映)。
+    // 動画・音声の再生位置と音声トラック選択。クリアは OK 適用時に反映。
     anchored(ui, state, "resume/video-audio", |ui, state| {
         let video_count = state.settings.video_resume_positions.len();
+        let track_count = state.settings.video_audio_track_choices.len();
         ui.label(format!(
-        "動画・音声の再生位置: {video_count} 件を記憶 (3 秒以上再生・末尾 5 秒以内に未到達のときのみ保存)。"
-    ));
-        if video_count > 0 && ui.button("動画・音声の再生位置をすべてクリア").clicked()
+            "動画・音声の再生位置: {video_count} 件、音声トラックの選択: {track_count} 件を記憶。"
+        ));
+        if (video_count > 0 || track_count > 0)
+            && ui
+                .button("再生位置と音声トラックの選択をすべてクリア")
+                .clicked()
         {
-            state.settings.video_resume_positions.clear();
+            state.clear_video_media_memory();
         }
     });
 
@@ -10287,6 +10338,8 @@ mod tests {
     #[test]
     fn operation_labels_sort_numbers_naturally() {
         let mut labels = vec![
+            "サムネイル列数を20列に",
+            "サムネイル列数を11列に",
             "サムネイル列数を10列に",
             "サムネイル列数を1列に",
             "サムネイル列数を2列に",
@@ -10300,6 +10353,8 @@ mod tests {
                 "サムネイル列数を2列に",
                 "サムネイル列数を9列に",
                 "サムネイル列数を10列に",
+                "サムネイル列数を11列に",
+                "サムネイル列数を20列に",
             ]
         );
     }

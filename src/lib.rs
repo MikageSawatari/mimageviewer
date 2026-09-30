@@ -101,7 +101,11 @@ pub mod edit_preview_cache;
 mod edit_source;
 pub mod editing_addon;
 pub mod editing_addon_download;
+#[cfg(windows)]
+pub mod effetune;
 pub mod egui_focus_policy;
+pub mod epub_cache;
+pub mod epub_convert;
 pub mod exif_reader;
 pub mod explorer_integration;
 pub mod export_batch;
@@ -1054,6 +1058,10 @@ pub fn run() -> eframe::Result {
     // 前に有効化していないと痕跡が残らない」問題があったため常時 ON に変更。
     // `--log` 引数は後方互換のため受け付けるが現在は no-op。
     logger::init();
+
+    // Keep the shared liveness lock alive until run() returns. A disabled gate is
+    // retained as a typed outcome for the EPUB integration in the next stage.
+    pdf_loader::install_epub_gate(epub_cache::startup_gate(&data_dir::get()));
 
     // --perf-log: 構造化イベントログ (JSON Lines) を有効化する。
     // 無指定時は `perf::is_enabled()` が false のまま、全 perf::event 呼出しが即 return。

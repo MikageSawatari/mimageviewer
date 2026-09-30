@@ -684,12 +684,13 @@ fn file_stem_lower(path: &Path) -> Option<String> {
 }
 
 fn is_container_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            let extension = extension.to_ascii_lowercase();
-            extension == "pdf" || crate::folder_tree::is_zip_extension(&extension)
-        })
+    crate::folder_tree::is_paged_document_path(path)
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                crate::folder_tree::is_zip_extension(&extension.to_ascii_lowercase())
+            })
 }
 
 fn resolve_error_response(error: ResolveError) -> ThumbnailResponse {

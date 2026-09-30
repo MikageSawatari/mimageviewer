@@ -16,6 +16,7 @@ from unittest import mock
 
 from analyze_perf import (
     analyze_collection,
+    analyze_thumb_adjustment_frames,
     analyze_page_turn,
     analyze_remote_page,
     analyze_test_script_input,
@@ -27,6 +28,7 @@ from analyze_perf import (
     cmd_page_turn,
     cmd_pre_grid,
     cmd_remote_page,
+    cmd_thumbs,
     load_events,
     main,
     percentile,
@@ -1441,6 +1443,32 @@ class IdleHealthTests(unittest.TestCase):
                     None,
                 )
             self.assertEqual(exit_code, 1)
+
+
+class ThumbAdjustmentFrameTests(unittest.TestCase):
+    def test_visible_totals_exclude_prefetch_and_keep_sessions_separate(self) -> None:
+        events = [
+            session(10),
+            {"cat": "thumb", "kind": "adjustment_build", "origin": "visible", "n": 7,
+             "width": 256, "height": 256, "apply_ms": 2.0, "texture_ms": 1.0, "total_ms": 3.0},
+            {"cat": "thumb", "kind": "adjustment_build", "origin": "visible", "n": 7,
+             "width": 256, "height": 256, "apply_ms": 4.0, "texture_ms": 1.0, "total_ms": 5.0},
+            {"cat": "thumb", "kind": "adjustment_build", "origin": "prefetch", "n": 7,
+             "width": 256, "height": 256, "total_ms": 100.0},
+            session(11),
+            {"cat": "thumb", "kind": "adjustment_build", "origin": "visible", "n": 7,
+             "width": 256, "height": 256, "total_ms": 2.0},
+        ]
+        report = analyze_thumb_adjustment_frames(events)
+        self.assertEqual(set(report["frames"]), {(1, 7), (2, 7)})
+        self.assertEqual(sum(row["total_ms"] for row in report["frames"][(1, 7)]), 8.0)
+        self.assertEqual(len(report["prefetch"]), 1)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_thumbs(events)
+        self.assertIn("session=1 n=7 cells=2", out.getvalue())
+        self.assertIn("total=8.0ms", out.getvalue())
+        self.assertIn("prefetch=1 件", out.getvalue())
 
 
 class ColorizeReportTests(unittest.TestCase):

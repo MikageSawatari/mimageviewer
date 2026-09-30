@@ -131,7 +131,7 @@ fn similar_preview_source_notification_rejects_late_completion_in_mounted_contex
     assert!(!app.similar_panel.preview.has_active_gesture());
     complete_late(completion).expect("draining mounted receiver remains owned");
 
-    app.poll_similar_preview_workers_in_all_contexts(&ctx);
+    app.poll_mounted_document_open_owners(&ctx);
     assert_preview_drained(&app);
 }
 
@@ -148,7 +148,7 @@ fn similar_preview_actual_file_change_rejects_and_drains_late_completion() {
     assert!(!app.similar_panel.preview.has_active_gesture());
     complete_late(completion).expect("draining file-change receiver remains owned");
 
-    app.poll_similar_preview_workers_in_all_contexts(&ctx);
+    app.poll_mounted_document_open_owners(&ctx);
     assert_preview_drained(&app);
 }
 
@@ -165,12 +165,12 @@ fn similar_preview_true_close_rejects_and_drains_late_completion_in_mounted_cont
     assert!(app.similar_panel.preview.has_pending_worker_for_test());
     complete_late(completion).expect("draining close receiver remains owned");
 
-    app.poll_similar_preview_workers_in_all_contexts(&ctx);
+    app.poll_mounted_document_open_owners(&ctx);
     assert_preview_drained(&app);
 }
 
 #[test]
-fn similar_preview_actual_park_drains_late_completion_while_context_stays_at_rest() {
+fn similar_preview_actual_park_cancels_owner_without_servicing_at_rest() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     app.settings.detached_viewer_open_images_in_window = true;
@@ -204,15 +204,15 @@ fn similar_preview_actual_park_drains_late_completion_while_context_stays_at_res
         app.viewer_context_residence(context_id),
         ContextResidence::AtRest
     );
-    complete_late(completion.expect("park completion handle"))
-        .expect("parked draining receiver remains owned");
+    let parked_completion = completion.expect("park completion handle");
+    assert!(complete_late(parked_completion).is_err());
     complete_late(root_completion).expect("unrelated mounted receiver remains owned");
 
-    app.poll_similar_preview_workers_in_all_contexts(&ctx);
+    app.poll_mounted_document_open_owners(&ctx);
     assert_eq!(
         app.viewer_context_residence(context_id),
         ContextResidence::AtRest,
-        "background preview polling must not mount the parked viewer"
+        "mounted preview polling must not mount the parked viewer"
     );
     assert!(
         app.similar_panel
@@ -226,7 +226,7 @@ fn similar_preview_actual_park_drains_late_completion_while_context_stays_at_res
     app.with_viewer_context(context_id, |parked| {
         assert_preview_drained(parked);
     })
-    .expect("inspect parked viewer after background poll");
+    .expect("inspect parked viewer after mounted poll");
 }
 
 fn viewport_target() -> crate::pdf_loader::PdfDisplayTarget {

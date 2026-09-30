@@ -30,7 +30,7 @@ production の配信 worker に旧経路や silent fallback は残さない。
 - **リモート操作中は本体がロックされる** ([web-remote-plan.md](web-remote-plan.md) §2.2)。
   session / generation を 1 経路に限定でき、時計なし worker の所有権と相性が良い
 - 音声も同じファイルから独立 decode できる。音量正規化 gain は metadata player から snapshot
-  し、リモートセッション専用の VST3 チェーンとともに PC と同じ順序で AAC 前段へ適用する
+  し、ローカルと共有するユーザー VST・音響調整の bridge とともに PC と同じ順序で AAC 前段へ適用する
 - 解像度・ビットレートを送信側で決められるので、帯域に合わせて画質を落とせる
 
 **したがって remux + 音声フォールバックは不要になり、本方式がそれを完全に置き換える。**
@@ -153,22 +153,21 @@ remote session が所有する headless `VideoPlayer` は pause のまま metada
 音量正規化 gain、seek thumbnail を提供する。配信 frame と transport clock は一切供給せず、
 generation worker が同じファイルを独立 open する。
 
-### 4.1 時計なし音声 — normalize → VST3 → safety limiter
+### 4.1 時計なし音声 — normalize → ユーザー VST → 音響調整 → safety limiter
 
-production の時計なし worker は decoded PCM に `VideoPlayer::normalize_gain()` の確定値を
-固定 gain として掛け、リモートセッション専用 `DspBridge` の active plugin、既存
+production の時計なし worker は、選択された音声 stream index で読み取り専用 Norm DB を引き、
+開始時の Norm 設定 snapshot から世代ごとの固定 gain を決める。decoded PCM に掛けた後、
+App が起動時に読み込んだユーザー VST と音響調整の共有 bridge、既存
 `SafetyLimiter` の順に通してから AAC encoder へ渡す。これは PC の
 **time stretch → normalize gain → VST3 `process_block` → safety limiter** から時計依存の
 time stretch だけを除いた順序である。VST の sample rate に PCM を resample し、VST PDC と
 limiter lookahead は AAC へ渡す `audible_pts_secs` から差し引く。
 
-paused headless player は引き続き metadata / thumbnail 専用なので `DspBridge` を渡さない。
-VST は generation ではなく streaming session が所有する別ホストで処理する。chain load は
-generation worker 内で一度だけ行い、全世代が同じ `Arc` を共有する (§10.2)。ロード全体は start
-の 15 秒予算の残りから encoder/playlist 用 3 秒を予約した値（上限 10 秒）で打ち切り、
-全失敗または process 失敗時は normalized dry で
-動画配信を継続する。ただし IPC/Web の VST 状態と本体のリモート接続 modal に警告を表示し、
-黙った pass-through にはしない。
+paused headless player は引き続き metadata / thumbnail 専用なので bridge を渡さない。
+配信の受け付けは起動時ロードが終わるのを残り予算内で非同期に待ち、各段を独立して採否決定する。
+`DspProcessingCoordinator` がローカル pump と `(session, generation)` の worker 間で bridge の
+ブロック単位の操作権を渡し、handoff reset の後に処理する。失敗または未準備の段は warning を示して
+その配信から外し、利用可能な段または normalized dry で継続する (§12 の新しい所有方針)。
 
 以下の tap 設計は移行元の記録であり、production 配信には使わない。
 
@@ -500,11 +499,11 @@ thumbnail を含めない。
 
 | エンドポイント | 内容 |
 |---|---|
-| `POST /api/video/start` | `{fav, path, quality}` → `{session, generation, playlist, duration_secs, source_origin_secs, buffer_target_secs, codec, encoder, end_behavior}` |
-| `POST /api/video/control` | `{session, action: play\|pause\|volume\|quality}`。quality は端末の `position_secs` も送る |
+| `POST /api/video/start` | path query と `{quality, audio_track?}` → `{session, generation, playlist, duration_secs, source_origin_secs, buffer_target_secs, codec, encoder, end_behavior, audio_tracks, audio_track}`。指定トラックは列挙内にある場合だけ保存済み選択より優先 |
+| `POST /api/video/control` | `{session, action: play\|pause\|volume\|quality\|audio_track}`。quality は端末の `position_secs`、audio_track は `stream_index`, `position_secs`, `expected_generation` を送る |
 | `POST /api/video/seek` | `{session, position_secs}` → 新 `generation` と `playlist` |
 | `POST /api/video/thumbnail` | `{session, position_secs, bar_width_px}`。`bar_width_px` は端末の物理 px 幅。実 frame PTS 付き WebP、生成中は 202、`position_secs: null` は要求解除 |
-| `GET /api/video/state` | generation、source origin、生成済み/ring 範囲、尺、先読み目標、実効ビットレート、終端、再生 intent。実 playhead は返さない |
+| `GET /api/video/state` | generation、source origin、生成済み/ring 範囲、尺、先読み目標、実効ビットレート、終端、再生 intent、`audio_tracks`、`audio_track`。実 playhead は返さない |
 | `POST /api/video/stop` | セッション終了。本体はストリーミングを止める |
 | `GET /stream/<session>/<gen>/index.m3u8` | CODECS を宣言する Master Playlist |
 | `GET /stream/<session>/<gen>/media.m3u8` | MEDIA-SEQUENCE を持つ live Media Playlist |
@@ -513,6 +512,7 @@ thumbnail を含めない。
 
 - `/stream/` 配下も**認証必須**。同一オリジンなので Cookie は `<video>` / hls.js の
   どちらからも送られる
+- 統合後の protocol v63 では core が `RemoteAudioTrack { stream_index, label, is_default }` を作り、端末は 2 本以上のときだけ「操作」に並べる。選択表示は Ready になった server state の `audio_track` に従う。control の generation 不一致は `stream_generation_mismatch` (409) とし、端末は選んだ `audio_track` を start に載せて再開する。選択の保存は App が、選択 generation の Ready と実際の音声 stream index の一致を確認した後にだけ行う。Norm gain は generation worker がその stream の値を読み取り専用 DB 接続で解決する。EPUB 対応と再生位置の書き戻しも同じ版に含む。
 - セグメントは `Cache-Control: no-store`、init segment だけ `immutable`
 - 未生成 / 存在しないセグメントは 404、ring から巻き取られたセグメントは 410 Gone、
   session / generation 不一致はどちらも 409 とするが、JSON の `error` をそれぞれ
@@ -529,7 +529,7 @@ thumbnail を含めない。
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
-### 6.2 IPC (動画 API v15、timeout v17、thumbnail v18、時計なし v19、終端 v20、VST 状態 v21、audio-only v39、seek preview 幅 v51)
+### 6.2 IPC (動画 API v15、timeout v17、thumbnail v18、時計なし v19、終端 v20、VST 状態 v21、audio-only v39、seek preview 幅 v51、音声トラック v62)
 
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
@@ -538,13 +538,13 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 
 | request | response |
 |---|---|
-| `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, has_video, encoder, video_size, audio_processing, end_behavior }` |
+| `VideoStreamStart { address, quality, audio_track? }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, has_video, encoder, video_size, audio_processing, audio_tracks, audio_track, end_behavior }` |
 | `VideoStreamControl { session, action }` | `SessionStatus` |
 | `VideoStreamSeek { session, position_secs }` | `{ generation }` |
 | `VideoStreamThumbnail { session, position_secs, bar_width_px }` | `Pending` / 実 frame PTS + WebP / `Cleared`。要求時は端末の物理 bar 幅を渡す |
 | `VideoStreamPlaylist { session, generation, kind }` | master / media m3u8 本文 |
 | `VideoStreamSegment { session, generation, index }` | セグメントのバイト列 / `NotFound` / `Gone` |
-| `VideoStreamState { session }` | generation/source origin、生成済み/ring 範囲、先読み目標、終端、再生 intent、バッファ/ビットレート実績、最新の `audio_processing` |
+| `VideoStreamState { session }` | generation/source origin、生成済み/ring 範囲、先読み目標、終端、再生 intent、バッファ/ビットレート実績、最新の `audio_processing` と `audio_tracks` / `audio_track` |
 | `VideoStreamStop { session }` | — |
 
 セグメント IPC は既存の **heavy queue ではなく専用 lane** に置く。エンコード済みバイトを
@@ -554,18 +554,18 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 ([web-remote-plan.md](web-remote-plan.md) §12.1)。
 
 `VideoStreamStart` の `address` は照合用ではなく、再生対象を指定する正本である。本体 UI
-thread は headless `VideoPlayer` を開き、metadata、duration、pending resume、normalize gain が
+thread は headless `VideoPlayer` を開き、metadata、duration、pending resume、opened audio stream が
 確定するまで typed `Opening` state を poll する。player は pause のまま transport には使わず、
 typed `Starting` が同じファイルを独立 open する時計なし worker の encoder と最初の playlist
 readiness を確認してから generation を publish する。
 
 `Opening` の門は `RemoteStreamStartInputs` (duration、video/audio track、source origin、
-normalize gain) の確定である。`pending_resume_secs` は metadata から duration を得た後に
+opened audio stream index) の確定である。`pending_resume_secs` は metadata から duration を得た後に
 末尾 guard を含む正規化を行ってから消費され、採用した seek target は `request_seek` が
 `position_secs()` へ同期的に公開する。このため `pending_resume_secs == None` になった時点で
 source origin は確定している。pause のままでは frame/audio を再生消費しないため
 `clock.is_seeking()` が残り得るが、これは metadata player の transport 状態であって generation
-入力ではなく、門には含めない。normalize gain は player open 前の DB lookup で決まり、
+入力ではなく、門には含めない。Norm gain は generation worker の DB lookup で決まり、
 remote player は autoplay=false のため deferred normalize scan を開始しない。門を通る際に
 これらを同じ typed snapshot へ固定し、generation は player の後続 transport 状態を再読しない。
 音声 track は必須、timed video track は任意とする。後者の有無だけで video decode / H.264 encode を
@@ -1010,18 +1010,18 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
 
 ### 10.2 時計なし経路での状態所有方針
 
-- **VST3**: mIV を全停止して再測定した実 chain (active 5、44.1 kHz、60 秒 fast-feed) は
-  `wall_secs=2.040909`、**29.399x realtime**。1080p 映像込み全体の 8.4x より十分速く、律速ではない。
-  前回の `SSL Meter Pro` 20 秒 timeout は同時に 3 host を立てた測定条件が原因だった。このため
-  ローカル再生の App-global host へ高速配信を混在させず、streaming session が **専用 host を 1 個だけ**
-  所有する。`ClocklessAudioProcessing` の processor / failure / status を全 generation が `Arc` clone
-  し、既存 generation resource lease が旧 worker と新 worker の VST 使用も直列化する。したがって
-  generation 切替中も **ローカル 1 + リモート 1 = 最大 2 host** であり、新旧世代に比例して増えない。
-  bypass plugin はリモート host へ load せず、設定順を保った active plugin だけを一度 load する。
-  load 時間は start 残予算から後段用 3 秒を予約した値（上限 10 秒）に制限する
-- **音量正規化**: remote player は autoplay=false で開くため deferred scan を持たず、open 前の
-  DB lookup (未測定なら 1.0) で `normalize_gain` が確定する。`RemoteStreamStartInputs` を
-  generation 作成時に snapshot し、時計なし PCM の AAC 前段で固定 gain として適用する
+- **VST3 / 音響調整**: 初期の性能測定では専用チェーンを採用したが、Mixwright の WebView が復元後に
+  パイプラインを組み直す間、配信冒頭の EQ が欠けた。現在は App の起動時ロード済み bridge を共有する。
+  `ClocklessAudioProcessing` は受け付け時に採用した段と世代別状態を持ち、各 generation worker は
+  `(session, generation)` の札を取得してから処理する。FFmpeg 資源 lease と DSP 操作権は別々に直列化する。
+  配信によって host は増えず、ユーザー VST と音響調整で最大 2 プロセスとなる。
+- **音量正規化**: generation worker は開始時の Norm 設定 snapshot と独立の読み取り専用 DB 接続を
+  使い、選択した音声 stream index の測定値から固定 gain を決める。未測定または Norm OFF なら
+  1.0 とし、時計なし PCM の AAC 前段で適用する
+- **音声トラック選択**: 開始時は headless player が実際に開いた音声 stream を使う。Remote の
+  切り替えは新 generation を作り、旧 generation の Ready と選択確定を退役境界で収穫する。
+  新 generation は選択 index を transcode と Norm lookup に共通で渡す。共有 DSP bridge の
+  `(session, generation)` token は旧 worker の permit 終了後に handoff reset を経て得る
 - **位置**: server は generation、source origin、生成済み範囲、ring の earliest/latest、duration、
   再生 intent を所有する。実 playhead は端末の media element が source of truth であり、
   `/api/video/state` の本体位置を端末位置として返さない。resume/history が必要なときだけ端末が
@@ -1146,7 +1146,7 @@ Android 実機を保有していないため、**検証できる範囲と委ね�
   active な別 ID は停止しないこと
 - Web: generation mismatch 409 後に state の current generation へ URL を更新して回復し、
   mismatch が続く場合は有限回で利用者向け失敗表示になること。session mismatch と区別すること
-- metadata player: streaming 中も pause のまま duration / resume origin / normalize gain /
+- metadata player: streaming 中も pause のまま duration / resume origin / opened audio stream /
   seek thumbnail を提供し、frame/audio transport は clockless worker だけが所有すること。
   resume origin 確定後も paused player の `clock.is_seeking()` が true のままのケースで
   `poll_remote_video_opening` が `Starting` へ進むこと

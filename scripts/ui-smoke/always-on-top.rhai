@@ -23,6 +23,18 @@ fn style(s, role) {
     fail("missing host style for " + role);
 }
 
+fn detached_content_painted(s) {
+    for window in s.windows {
+        if window.role != "detached" || !window.host_ready || !window.page_ready { continue; }
+        for paint in window.paints {
+            if paint.item_identity == window.item_identity
+                && paint.page_index == window.page_index
+                && paint.final_composite_complete { return true; }
+        }
+    }
+    false
+}
+
 fn role_is_foreground(s, role) {
     for host in s.host_styles {
         if host.role == role && host.foreground_hwnd == host.hwnd { return true; }
@@ -47,6 +59,18 @@ fn styles(label) {
     let s = snapshot();
     log("always-on-top " + label + " desired=" + s.always_on_top
         + " visible=" + s.window_visible + " hosts=" + s.host_styles.to_debug());
+}
+
+fn grid_move_first() {
+    run_action("GridMoveFirst");
+    let acknowledged_frame = snapshot().snapshot_frame;
+    wait_until(|s| s.snapshot_frame > acknowledged_frame && s.selected_index == 0, 30000);
+}
+
+fn grid_right_to(index) {
+    let previous_frame = snapshot().snapshot_frame;
+    tap_key("Right");
+    wait_until(|s| s.snapshot_frame > previous_frame && s.selected_index == index, 30000);
 }
 
 log("always-on-top: root OFF/ON");
@@ -98,7 +122,7 @@ log("always-on-top: still fullscreen activation with root OFF");
 always_on_top_smoke("off");
 expect_role("root", 1, false);
 select_root();
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
 wait_until(|s| s.is_fullscreen && count_role(s, "fullscreen") == 1, 30000);
 expect_role("fullscreen", 1, false);
@@ -117,7 +141,7 @@ expect_role("root", 1, true);
 
 log("always-on-top: separate still fullscreen host");
 select_root();
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
 wait_until(|s| s.is_fullscreen && count_role(s, "fullscreen") == 1, 30000);
 styles("still-fullscreen-before-focus");
@@ -187,13 +211,16 @@ wait_until(|s| !s.is_fullscreen, 30000);
 log("always-on-top: independent detached windows");
 always_on_top_smoke("enable_independent_windows");
 select_root();
-run_action("GridMoveFirst");
+grid_move_first();
 run_action("GridOpenSelected");
-wait_until(|s| count_role(s, "detached") >= 1, 30000);
+// A new detached window takes focus twice: when its loading shell is first shown and again
+// when its page mounts. Wait until the page is painted and the window is foreground, so the
+// OS Right key below is sent after both activations and reaches the root.
+wait_until(|s| detached_content_painted(s) && role_is_foreground(s, "detached"), 30000);
 select_root();
-run_action("GridMoveFirst");
+grid_move_first();
 wait_until(|s| s.target_registered && s.focused, 10000);
-tap_key("Right");
+grid_right_to(1);
 run_action("GridOpenSelected");
 wait_until(|s| count_role(s, "detached") >= 2
     && count_presentation(s, "detached", "passive_deferred_frozen") >= 1

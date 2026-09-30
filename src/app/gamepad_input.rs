@@ -161,6 +161,16 @@ fn grid_ring_action_allowed_during_refresh(action: &RingActionId) -> bool {
                 | RingActionId::GridColumnCount8
                 | RingActionId::GridColumnCount9
                 | RingActionId::GridColumnCount10
+                | RingActionId::GridColumnCount11
+                | RingActionId::GridColumnCount12
+                | RingActionId::GridColumnCount13
+                | RingActionId::GridColumnCount14
+                | RingActionId::GridColumnCount15
+                | RingActionId::GridColumnCount16
+                | RingActionId::GridColumnCount17
+                | RingActionId::GridColumnCount18
+                | RingActionId::GridColumnCount19
+                | RingActionId::GridColumnCount20
                 | RingActionId::GridHistoryBack
                 | RingActionId::GridHistoryForward
                 | RingActionId::GridParentFolder
@@ -6014,6 +6024,46 @@ impl App {
                 self.apply_ring_grid_column_count(10);
                 None
             }
+            RingActionId::GridColumnCount11 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(11);
+                None
+            }
+            RingActionId::GridColumnCount12 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(12);
+                None
+            }
+            RingActionId::GridColumnCount13 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(13);
+                None
+            }
+            RingActionId::GridColumnCount14 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(14);
+                None
+            }
+            RingActionId::GridColumnCount15 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(15);
+                None
+            }
+            RingActionId::GridColumnCount16 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(16);
+                None
+            }
+            RingActionId::GridColumnCount17 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(17);
+                None
+            }
+            RingActionId::GridColumnCount18 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(18);
+                None
+            }
+            RingActionId::GridColumnCount19 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(19);
+                None
+            }
+            RingActionId::GridColumnCount20 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(20);
+                None
+            }
             RingActionId::GridHistoryBack => self.apply_folder_history_nav(false, source),
             RingActionId::GridHistoryForward => self.apply_folder_history_nav(true, source),
             RingActionId::GridParentFolder if context == RingShortcutContext::Grid => {
@@ -7227,13 +7277,17 @@ impl App {
                 if self.begin_smart_grid_container_navigation(idx, p.clone(), auto_fullscreen) {
                     return None;
                 }
-                self.note_reading_history_open(idx);
-                if auto_fullscreen {
-                    self.pending_auto_fs_open = true;
+                if crate::folder_tree::is_virtual_folder(&p) {
+                    Some(self.grid_physical_navigation(idx, p, auto_fullscreen))
+                } else {
+                    self.note_reading_history_open(idx);
+                    if auto_fullscreen {
+                        self.pending_auto_fs_open = true;
+                    }
+                    self.maybe_suppress_rating_filter_for_opened_container(idx);
+                    self.maybe_suppress_facet_filter_for_opened_container(idx);
+                    Some(AddressBarNav::Direct(p))
                 }
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
-                Some(AddressBarNav::Direct(p))
             }
             Some(GridItem::Image(_))
             | Some(GridItem::ZipImage { .. })
@@ -7252,7 +7306,7 @@ impl App {
                 None
             }
             Some(GridItem::CollectionPlaceholder { .. }) => None,
-            Some(GridItem::ConvertibleArchive { path, format }) => {
+            Some(GridItem::ConvertibleArchive { path, .. }) => {
                 let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                 if self.settings.archive_file_handling_ignores_convertible() {
                     self.show_feedback_toast(
@@ -7262,11 +7316,9 @@ impl App {
                     // The Smart request owns conversion and adopts its logical source once.
                 } else {
                     let owner = self.main_grid_archive_open_owner(idx, &path);
-                    if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                        self.open_archive_via_cache_owned(path, cached, auto_fs, owner);
-                    } else {
-                        self.request_archive_convert_owned(path, format, auto_fs, owner);
-                    }
+                    let _outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                        path, auto_fs, owner,
+                    );
                 }
                 None
             }
@@ -8327,6 +8379,63 @@ mod tests {
                 &item_action
             ));
         }
+    }
+
+    #[test]
+    fn epub_modal_blocks_ring_and_keyboard_history_dispatch() {
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("ring-modal-source");
+        std::fs::create_dir(&folder).unwrap();
+        app.load_folder(folder.clone());
+        app.active_quick_folder_slot = None;
+        let back = app.tmp.path().join("ring-modal-back");
+        std::fs::create_dir(&back).unwrap();
+        app.folder_nav_back_stack
+            .push(super::super::FolderNavHistoryTarget::Path(back));
+        let before = app.folder_nav_back_stack.clone();
+        let epub = app.tmp.path().join("ring-modal.epub");
+        assert_eq!(
+            app.route_pdf_open_failure(
+                super::super::OpenRequestOwner::Navigation,
+                &epub,
+                super::super::PdfOpenFailure::NotConverted,
+            ),
+            super::super::PdfOpenFailureRoute::ConversionDialogOpened
+        );
+        let ctx = egui::Context::default();
+        let ring = app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::GridHistoryBack,
+            "modal-ring-test",
+        );
+        if matches!(ring, Some(crate::ui_main::AddressBarNav::HistoryBack)) {
+            let mut rollback = None;
+            assert!(
+                app.dispatch_main_folder_history_input(
+                    super::super::FolderHistoryDirection::Back,
+                    &mut rollback,
+                )
+                .is_none()
+            );
+        }
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            }],
+            ..Default::default()
+        });
+        let keyboard = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+        assert!(keyboard.is_none());
+        assert_eq!(app.folder_nav_back_stack, before);
+        assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+        assert!(app.epub_convert.is_some());
     }
 
     /// 「ゲームパッドの操作を受け付ける」を切ったら、本当に届かない。

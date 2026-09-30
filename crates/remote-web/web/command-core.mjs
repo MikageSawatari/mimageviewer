@@ -64,6 +64,7 @@ export const CommandName = Object.freeze({
   MEDIA_SEEK_RELATIVE: "media_seek_relative",
   MEDIA_VOLUME: "media_volume",
   MEDIA_QUALITY: "media_quality",
+  MEDIA_AUDIO_TRACK: "media_audio_track",
 });
 
 export const FitMode = Object.freeze({

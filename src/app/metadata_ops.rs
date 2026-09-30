@@ -450,6 +450,17 @@ impl From<()> for DetailsPageCountError {
     }
 }
 
+fn details_pdf_catalog_stamp(
+    read: Option<&crate::pdf_loader::ReadTarget>,
+    source_mtime: i64,
+    source_size: i64,
+) -> Result<(i64, i64), DetailsPageCountError> {
+    match read {
+        Some(read) => read.stamp.generation_catalog_pair().ok_or(().into()),
+        None => Ok((source_mtime, source_size)),
+    }
+}
+
 fn record_details_meta_worker_exit(generation: u64, exit: DetailsMetaWorkerExit) {
     match exit {
         DetailsMetaWorkerExit::Completed => {}
@@ -1216,6 +1227,51 @@ fn load_details_page_count(
     cancel: &Arc<AtomicBool>,
     config: &DetailsPageCountConfig,
 ) -> Result<Option<u32>, DetailsPageCountError> {
+    load_details_page_count_with_pdf_enumerator(
+        target,
+        cache_dir,
+        catalogs,
+        io_sem,
+        cancel,
+        config,
+        |path, read, password, cancel| {
+            let pages = if let Some(read) = read {
+                crate::pdf_loader::enumerate_pages_with_read_target(
+                    path,
+                    read,
+                    password,
+                    Some(Arc::clone(cancel)),
+                    crate::pdf_loader::EnumerateOptions::default(),
+                )
+                .map(|result| result.pages)
+            } else {
+                crate::pdf_loader::enumerate_pages_with_cancel(
+                    path,
+                    password,
+                    Some(Arc::clone(cancel)),
+                )
+            }
+            .map_err(|_| ())?;
+            u32::try_from(pages.len()).map_err(|_| ())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_details_page_count_with_pdf_enumerator(
+    target: &DetailsMetaTarget,
+    cache_dir: &Path,
+    catalogs: &mut ContainerCatalogCache,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    cancel: &Arc<AtomicBool>,
+    config: &DetailsPageCountConfig,
+    enumerate_pdf: impl FnOnce(
+        &Path,
+        Option<&crate::pdf_loader::ReadTarget>,
+        Option<&str>,
+        &Arc<AtomicBool>,
+    ) -> Result<u32, ()>,
+) -> Result<Option<u32>, DetailsPageCountError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(DetailsPageCountError::Cancelled(
             DetailsMetaCancelReason::BeforeTarget,
@@ -1410,6 +1466,20 @@ fn load_details_page_count(
             // DPAPI 復号は metadata worker 上で行う。UI thread は暗号化ストアと
             // credential revision の snapshot だけを渡す。
             let pdf_password = config.pdf_passwords.get(path);
+            let epub_read = if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                Some(crate::pdf_loader::resolve_read_target(path).map_err(|_| ())?)
+            } else {
+                None
+            };
+            let (stamp_mtime, stamp_size) = details_pdf_catalog_stamp(
+                epub_read.as_ref(),
+                target.source_mtime,
+                target.source_size,
+            )?;
             if let Some(catalog) = catalog {
                 let cached = {
                     let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
@@ -1417,7 +1487,7 @@ fn load_details_page_count(
                             DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfCatalogRead),
                         ));
                     };
-                    catalog.get_pdf_meta(key, target.source_mtime, target.source_size)
+                    catalog.get_pdf_meta(key, stamp_mtime, stamp_size)
                 };
                 if let Ok(Some((count, password_required))) = cached {
                     if password_required && pdf_password.is_none() {
@@ -1428,25 +1498,19 @@ fn load_details_page_count(
                     }
                 }
             }
-            let pages = {
+            let count = {
                 let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
                     return Err(DetailsPageCountError::Cancelled(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfEnumerate),
                     ));
                 };
-                crate::pdf_loader::enumerate_pages_with_cancel(
-                    path,
-                    pdf_password.as_deref(),
-                    Some(Arc::clone(cancel)),
-                )
-                .map_err(|_| ())?
+                enumerate_pdf(path, epub_read.as_ref(), pdf_password.as_deref(), cancel)?
             };
             if cancel.load(Ordering::Relaxed) {
                 return Err(DetailsPageCountError::Cancelled(
                     DetailsMetaCancelReason::AfterIo(DetailsMetaIoStage::PdfEnumerate),
                 ));
             }
-            let count = u32::try_from(pages.len()).map_err(|_| ())?;
             if count == 0 {
                 return Ok(None);
             }
@@ -1458,8 +1522,8 @@ fn load_details_page_count(
                 };
                 let _ = catalog.set_pdf_meta(
                     key,
-                    target.source_mtime,
-                    target.source_size,
+                    stamp_mtime,
+                    stamp_size,
                     count,
                     pdf_password.is_some(),
                 );
@@ -1909,38 +1973,54 @@ pub(super) fn run_metadata_search(
                 true
             }
             GridItem::PdfFile(path) => {
-                // PDF: ファイル名 + PDF document info を 1 つの hay にまとめて判定する
-                // (§4.1.1)。filename と title をまたぐクエリや exclude トークンを
-                // 正しく扱うため、Image/Video と同じ combined-hay 方式にする
-                // (2 つの hay を別々に matches すると "scan invoice" や
-                // "scan -draft" を取りこぼす — Codex P2)。まずファイル名だけで
-                // 部分判定し、結論が出れば document info の IPC を省く。
-                let name = item.name();
-                let name_hay: &str = if use_name { &name } else { "" };
-                if use_pdf_meta {
-                    match crate::search_query::decide_partial_with_mode(tokens, name_hay, mode) {
-                        crate::search_query::PartialResult::Decided(true) => {
-                            matches.insert(idx);
-                        }
-                        crate::search_query::PartialResult::Decided(false) => {}
-                        crate::search_query::PartialResult::NeedsMore => {
-                            // 保護 PDF でパスワード未保存なら get_document_info は
-                            // 失敗 → doc_text 空 = ファイル名のみで判定 (= 非マッチ)。
-                            let password = pdf_passwords.get(path);
-                            let doc_text =
-                                crate::pdf_loader::get_document_info(path, password.as_deref())
-                                    .map(|info| info.as_search_text())
-                                    .unwrap_or_default();
-                            let hay = hay_of(&doc_text, name_hay, None);
-                            if crate::search_query::matches_with_mode(tokens, &hay, mode) {
+                // EPUB は変換済みでも内部タイトル・著者を検索しない。
+                // 元ファイル名だけを対象にし、PDF Info の worker 要求も出さない。
+                if path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+                {
+                    if use_name
+                        && crate::search_query::matches_with_mode(tokens, &item.name(), mode)
+                    {
+                        matches.insert(idx);
+                    }
+                } else {
+                    // PDF: ファイル名 + PDF document info を 1 つの hay にまとめて判定する
+                    // (§4.1.1)。filename と title をまたぐクエリや exclude トークンを
+                    // 正しく扱うため、Image/Video と同じ combined-hay 方式にする
+                    // (2 つの hay を別々に matches すると "scan invoice" や
+                    // "scan -draft" を取りこぼす — Codex P2)。まずファイル名だけで
+                    // 部分判定し、結論が出れば document info の IPC を省く。
+                    let name = item.name();
+                    let name_hay: &str = if use_name { &name } else { "" };
+                    if use_pdf_meta {
+                        match crate::search_query::decide_partial_with_mode(tokens, name_hay, mode)
+                        {
+                            crate::search_query::PartialResult::Decided(true) => {
                                 matches.insert(idx);
                             }
+                            crate::search_query::PartialResult::Decided(false) => {}
+                            crate::search_query::PartialResult::NeedsMore => {
+                                // 保護 PDF でパスワード未保存なら get_document_info は
+                                // 失敗 → doc_text 空 = ファイル名のみで判定 (= 非マッチ)。
+                                let password = pdf_passwords.get(path);
+                                let doc_text =
+                                    crate::pdf_loader::get_document_info(path, password.as_deref())
+                                        .map(|info| info.as_search_text())
+                                        .unwrap_or_default();
+                                let hay = hay_of(&doc_text, name_hay, None);
+                                if crate::search_query::matches_with_mode(tokens, &hay, mode) {
+                                    matches.insert(idx);
+                                }
+                            }
                         }
+                    } else if use_name
+                        && crate::search_query::matches_with_mode(tokens, name_hay, mode)
+                    {
+                        // PDF メタが検索対象外 → ファイル名のみで照合。
+                        matches.insert(idx);
                     }
-                } else if use_name && crate::search_query::matches_with_mode(tokens, name_hay, mode)
-                {
-                    // PDF メタが検索対象外 → ファイル名のみで照合。
-                    matches.insert(idx);
                 }
                 true
             }
@@ -2177,6 +2257,128 @@ pub(super) fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_folder_filter_searches_epub_name_but_not_generated_pdf_info() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logical = tmp.path().join("sunflower_book.epub");
+        std::fs::write(&logical, b"epub source").unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&logical, 1, 42);
+        let _info = crate::pdf_loader::pin_document_info_for_test(
+            &logical,
+            crate::pdf_loader::PdfDocumentInfo {
+                title: Some("SecretMetadataTitle".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::pdf_loader::get_document_info(&logical, None)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("SecretMetadataTitle"),
+        );
+        let items = [GridItem::PdfFile(logical)];
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let run = |query: &str| {
+            let result = run_metadata_search(
+                &crate::search_query::parse(query),
+                &items,
+                None,
+                &std::collections::HashMap::new(),
+                None,
+                &passwords,
+                &crate::fts_index::SearchTarget::All,
+                crate::search_query::MatchMode::And,
+                &AtomicBool::new(false),
+                None,
+            );
+            let SearchThreadResult::Done { matches, .. } = result;
+            matches
+        };
+        assert!(run("sunflower_book").contains(&0));
+        assert!(run("SecretMetadataTitle").is_empty());
+    }
+
+    #[test]
+    fn epub_details_page_count_uses_generation_and_pdf_keeps_source_stamp() {
+        let read = crate::pdf_loader::generation_target_for_test(Path::new("book.epub"), 17, 4096);
+        assert_eq!(
+            details_pdf_catalog_stamp(Some(&read), 123, 456).unwrap(),
+            (17, 4096)
+        );
+        assert_eq!(
+            details_pdf_catalog_stamp(None, 123, 456).unwrap(),
+            (123, 456)
+        );
+    }
+
+    #[test]
+    fn reconverted_epub_details_worker_reads_current_generation_page_count() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("catalog");
+        let folder = fixture.source.parent().unwrap();
+        let key = fixture.source.file_name().unwrap().to_str().unwrap();
+        let catalog = crate::catalog::CatalogDb::open(&cache_dir, folder).unwrap();
+        catalog
+            .set_pdf_meta(
+                key,
+                fixture.old.generation_id,
+                fixture.old.pdf_size as i64,
+                fixture.old.page_count,
+                false,
+            )
+            .unwrap();
+        catalog
+            .set_pdf_meta(
+                key,
+                fixture.current.generation_id,
+                fixture.current.pdf_size as i64,
+                fixture.current.page_count,
+                false,
+            )
+            .unwrap();
+        let source_meta = std::fs::metadata(&fixture.source).unwrap();
+        let target = DetailsMetaTarget {
+            idx: 0,
+            key: crate::adjustment_db::normalize_path(&fixture.source),
+            item: GridItem::PdfFile(fixture.source.clone()),
+            relative_page_provenance: None,
+            source_mtime: crate::ui_helpers::mtime_secs(&source_meta),
+            source_size: source_meta.len() as i64,
+            catalog_folder: Some(folder.to_path_buf()),
+            catalog_key: Some(key.into()),
+            warm_image_dims: None,
+            warm_page_count: None,
+            pdf_password_revision: None,
+            load_page_count: true,
+            load_created_at: false,
+            load_ai_metadata: false,
+            load_image_dims: false,
+            load_video_meta: false,
+            priority: crate::io_semaphore::IoPriority::Normal,
+        };
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut catalogs = ContainerCatalogCache::new(8);
+        let config = DetailsPageCountConfig {
+            fingerprint: 0,
+            image_folder_options: None,
+            pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+        };
+        let count = load_details_page_count_with_pdf_enumerator(
+            &target,
+            &cache_dir,
+            &mut catalogs,
+            &io_sem,
+            &cancel,
+            &config,
+            |_, _, _, _| panic!("current generation must hit pdf_meta before PDFium"),
+        )
+        .unwrap();
+        assert_eq!(count, Some(fixture.current.page_count));
+    }
 
     /// pass 2 は 1 項目のうちに複数の file を読む。取消を見ずに読みを続けると、
     /// 取り消した検索の worker が残り、次の検索の pool と並んで走ってしまう。

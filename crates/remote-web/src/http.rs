@@ -1494,6 +1494,8 @@ struct SessionPingBody {
 #[derive(Deserialize)]
 struct VideoStartBody {
     quality: VideoStreamQuality,
+    #[serde(default)]
+    audio_track: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1529,6 +1531,14 @@ enum StreamRouteResource {
     Segment(VideoStreamSegmentIndex),
 }
 
+fn video_start_success_response(owner: &RemoteSessionIdentity, mut payload: Value) -> HttpResponse {
+    payload["remote_session_id"] = json!(owner.session_id);
+    HttpResponse::json(&payload)
+        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+        .with_header("Cache-Control", "no-store")
+        .with_sensitive_value(owner.session_id.clone())
+}
+
 fn api_video_start(
     request: &mut Request,
     state: &AppState,
@@ -1551,7 +1561,7 @@ fn api_video_start(
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
         state
             .thumbnail_client
-            .video_stream_start(owner, address, body.quality)
+            .video_stream_start(owner, address, body.quality, body.audio_track)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -1559,22 +1569,25 @@ fn api_video_start(
     match result {
         Ok(success) => {
             let payload = success.value;
-            HttpResponse::json(&json!({
-                "session": payload.session,
-                "generation": payload.generation,
-                "playlist": video_playlist_url(payload.session, payload.generation),
-                "duration_secs": payload.duration_secs,
-                "source_origin_secs": payload.source_origin_secs,
-                "buffer_target_secs": payload.buffer_target_secs,
-                "has_video": payload.has_video,
-                "codec": payload.codecs,
-                "encoder": payload.encoder,
-                "video_size": payload.video_size,
-                "audio_processing": payload.audio_processing,
-                "end_behavior": payload.end_behavior,
-            }))
-            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
-            .with_header("Cache-Control", "no-store")
+            video_start_success_response(
+                owner,
+                json!({
+                    "session": payload.session,
+                    "generation": payload.generation,
+                    "playlist": video_playlist_url(payload.session, payload.generation),
+                    "duration_secs": payload.duration_secs,
+                    "source_origin_secs": payload.source_origin_secs,
+                    "buffer_target_secs": payload.buffer_target_secs,
+                    "has_video": payload.has_video,
+                    "codec": payload.codecs,
+                    "encoder": payload.encoder,
+                    "video_size": payload.video_size,
+                    "audio_processing": payload.audio_processing,
+                    "audio_tracks": payload.audio_tracks,
+                    "audio_track": payload.audio_track,
+                    "end_behavior": payload.end_behavior,
+                }),
+            )
         }
         Err(failure) => video_ipc_error_response(failure),
     }
@@ -4621,7 +4634,12 @@ fn remote_source_kind(address: &RemoteAddress) -> &'static str {
             .and_then(|value| value.to_str())
         {
             Some(extension) if extension.eq_ignore_ascii_case("zip") => "zip",
-            Some(extension) if extension.eq_ignore_ascii_case("pdf") => "pdf",
+            Some(extension)
+                if extension.eq_ignore_ascii_case("pdf")
+                    || extension.eq_ignore_ascii_case("epub") =>
+            {
+                "pdf"
+            }
             _ => "file",
         },
     }
@@ -4939,6 +4957,50 @@ mod tests {
     use tiny_http::TestRequest;
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn video_start_response_attests_the_owner_that_created_the_stream() {
+        let owner = RemoteSessionIdentity {
+            client_id: "browser-client".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        let response = video_start_success_response(&owner, json!({ "session": 12 }));
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["session"], 12);
+        assert_eq!(body["remote_session_id"], owner.session_id);
+        assert!(response.sensitive_values.contains(&owner.session_id));
+    }
+
+    #[test]
+    fn video_control_body_flattens_audio_track_action() {
+        let body: VideoControlBody = serde_json::from_value(serde_json::json!({
+            "session": 17,
+            "action": "audio_track",
+            "stream_index": 3,
+            "position_secs": 12.5,
+            "expected_generation": 9
+        }))
+        .unwrap();
+        assert_eq!(body.session, 17);
+        assert!(matches!(
+            body.action,
+            VideoStreamControlAction::AudioTrack {
+                stream_index: 3,
+                position_secs: 12.5,
+                expected_generation: 9,
+            }
+        ));
+        assert!(
+            serde_json::from_value::<VideoControlBody>(serde_json::json!({
+                "session": 17,
+                "action": "audio_track",
+                "stream_index": 3,
+                "position_secs": 12.5
+            }))
+            .is_err()
+        );
+    }
 
     fn test_state(temp: &tempfile::TempDir) -> AppState {
         let protected = temp.path().join("data");
@@ -6921,8 +6983,10 @@ mod tests {
     fn thumbnail_diagnostics_distinguish_container_source_without_logging_a_path() {
         let zip = RemoteAddress::file("C:/Books/volume.ZIP");
         let pdf = RemoteAddress::file("C:/Books/volume.pdf");
+        let epub = RemoteAddress::file("C:/Books/volume.EPUB");
         assert_eq!(remote_source_kind(&zip), "zip");
         assert_eq!(remote_source_kind(&pdf), "pdf");
+        assert_eq!(remote_source_kind(&epub), "pdf");
         assert_eq!(remote_address_kind(&zip), "file");
     }
 

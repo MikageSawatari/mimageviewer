@@ -30,6 +30,48 @@ const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) const MAX_ITEM_ROWS_IN_SNAPSHOT: usize = 16;
 const EXIT_NOT_SET: i32 = -1;
+
+/// Durable diagnostic event: a fast PDF adoption may be verified by its worker before the
+/// script's next snapshot. The sequence records that placeholders were visibly committed,
+/// independently of how long enumeration took.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) enum PdfWarmAdoptionPhase {
+    #[default]
+    None,
+    CommittedPlaceholder,
+}
+
+impl PdfWarmAdoptionPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::CommittedPlaceholder => "CommittedPlaceholder",
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PdfWarmAdoptionCheckpoint {
+    pub(crate) sequence: i64,
+    pub(crate) path: String,
+    pub(crate) phase: PdfWarmAdoptionPhase,
+}
+
+fn pdf_warm_adoption_checkpoint_slot() -> &'static Mutex<PdfWarmAdoptionCheckpoint> {
+    static SLOT: OnceLock<Mutex<PdfWarmAdoptionCheckpoint>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(PdfWarmAdoptionCheckpoint::default()))
+}
+
+pub(crate) fn record_pdf_warm_adoption(path: &Path) {
+    let mut checkpoint = pdf_warm_adoption_checkpoint_slot().lock().unwrap();
+    checkpoint.sequence = checkpoint.sequence.saturating_add(1);
+    checkpoint.path = path.to_string_lossy().into_owned();
+    checkpoint.phase = PdfWarmAdoptionPhase::CommittedPlaceholder;
+}
+
+pub(crate) fn pdf_warm_adoption_checkpoint() -> PdfWarmAdoptionCheckpoint {
+    pdf_warm_adoption_checkpoint_slot().lock().unwrap().clone()
+}
 const EXIT_SCRIPT_FAILURE: i32 = 1;
 const EXIT_ENVIRONMENT_FAILURE: i32 = 2;
 // App-owned workers get two seconds to join during normal shutdown. Six
@@ -494,6 +536,79 @@ pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) sidecar_imported: bool,
     pub(crate) sidecar_loaded: bool,
     pub(crate) seek_strip: TestScriptSeekStripSnapshot,
+    pub(crate) audio_track: TestScriptAudioTrackSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TestScriptAudioTrackSnapshot {
+    pub(crate) audio_tracks_len: i64,
+    pub(crate) desired_stream_index: i64,
+    pub(crate) desired_generation: i64,
+    pub(crate) applied_stream_index: i64,
+    pub(crate) applied_generation: i64,
+    pub(crate) state: String,
+    pub(crate) engine_state: String,
+    pub(crate) audio_mode: bool,
+    pub(crate) processed_frequency_hz: f64,
+}
+
+impl TestScriptAudioTrackSnapshot {
+    #[cfg(feature = "test-script")]
+    pub(crate) fn from_player(player: &crate::video::VideoPlayer, audio_mode: bool) -> Self {
+        let selection = player.audio_track_selection();
+        Self {
+            audio_tracks_len: player
+                .info()
+                .map_or(0, |info| info.audio_tracks.len() as i64),
+            desired_stream_index: selection.map_or(-1, |s| s.desired.stream_index as i64),
+            desired_generation: selection.map_or(-1, |s| s.desired.generation as i64),
+            applied_stream_index: selection.map_or(-1, |s| s.applied.stream_index as i64),
+            applied_generation: selection.map_or(-1, |s| s.applied.generation as i64),
+            state: selection
+                .map(|selection| selection.display_state(player.is_at_eof()))
+                .map_or_else(|| "none".to_string(), |state| format!("{state:?}")),
+            engine_state: player.engine_state_name().to_string(),
+            audio_mode,
+            processed_frequency_hz: player.test_script_processed_frequency_hz().unwrap_or(-1.0),
+        }
+    }
+
+    pub(crate) fn absent() -> Self {
+        Self {
+            audio_tracks_len: 0,
+            desired_stream_index: -1,
+            desired_generation: -1,
+            applied_stream_index: -1,
+            applied_generation: -1,
+            state: "none".to_string(),
+            engine_state: "none".to_string(),
+            audio_mode: false,
+            processed_frequency_hz: -1.0,
+        }
+    }
+
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("audio_tracks_len".into(), self.audio_tracks_len.into());
+        map.insert(
+            "desired_stream_index".into(),
+            self.desired_stream_index.into(),
+        );
+        map.insert("desired_generation".into(), self.desired_generation.into());
+        map.insert(
+            "applied_stream_index".into(),
+            self.applied_stream_index.into(),
+        );
+        map.insert("applied_generation".into(), self.applied_generation.into());
+        map.insert("state".into(), self.state.clone().into());
+        map.insert("engine_state".into(), self.engine_state.clone().into());
+        map.insert("audio_mode".into(), self.audio_mode.into());
+        map.insert(
+            "processed_frequency_hz".into(),
+            self.processed_frequency_hz.into(),
+        );
+        map
+    }
 }
 
 impl TestScriptWindowSnapshot {
@@ -685,6 +800,10 @@ impl TestScriptWindowSnapshot {
         map.insert(
             "seek_strip".into(),
             Dynamic::from_map(self.seek_strip.to_rhai_map()),
+        );
+        map.insert(
+            "audio_track".into(),
+            Dynamic::from_map(self.audio_track.to_rhai_map()),
         );
         map
     }
@@ -886,6 +1005,9 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) fs_idx: i64,
     pub(crate) items_generation: i64,
     pub(crate) folder_load_requests: i64,
+    pub(crate) pdf_warm_adoption_sequence: i64,
+    pub(crate) pdf_warm_adoption_path: String,
+    pub(crate) pdf_warm_adoption_phase: String,
     pub(crate) focused: bool,
     pub(crate) target_viewport: String,
     pub(crate) target_registered: bool,
@@ -895,6 +1017,11 @@ pub(crate) struct TestScriptSnapshot {
     /// `pending_thumbs == 0` だけでは「全部終わった」と「まだ何も始まっていない」を
     /// 区別できない。落ち着いたことを待つ条件には `items_len > 0` を併せて使う。
     pub(crate) items_len: i64,
+    /// Root UI pass that published this snapshot. A selection barrier must observe a later
+    /// pass because the snapshot is captured before grid input is applied in that pass.
+    pub(crate) snapshot_frame: i64,
+    /// Raw index in `item_names`/the mounted grid, or -1 when nothing is selected.
+    pub(crate) selected_index: i64,
     pub(crate) item_names: Vec<String>,
     pub(crate) item_ratings: Vec<i64>,
     pub(crate) sort_order: String,
@@ -923,6 +1050,7 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) continuous_reading: bool,
     pub(crate) current_is_still_image: bool,
     pub(crate) music_view_active: bool,
+    pub(crate) music_audio_track_popup_open: bool,
     pub(crate) modal_open: bool,
     pub(crate) context_menu_open: bool,
     pub(crate) popup_open: bool,
@@ -944,6 +1072,7 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) passthrough_unavailable: String,
     pub(crate) keymap_level_observations: Vec<KeymapLevelObservation>,
     pub(crate) windows: Vec<TestScriptWindowSnapshot>,
+    pub(crate) audio_track: TestScriptAudioTrackSnapshot,
     pub(crate) host_styles: Vec<TestScriptHostStyle>,
 }
 
@@ -1008,11 +1137,16 @@ impl Default for TestScriptSnapshot {
             fs_idx: -1,
             items_generation: 0,
             folder_load_requests: 0,
+            pdf_warm_adoption_sequence: 0,
+            pdf_warm_adoption_path: String::new(),
+            pdf_warm_adoption_phase: "None".into(),
             focused: false,
             target_viewport: "unregistered".to_string(),
             target_registered: false,
             target_rendered: false,
             items_len: 0,
+            snapshot_frame: 0,
+            selected_index: -1,
             item_names: Vec::new(),
             item_ratings: Vec::new(),
             sort_order: String::new(),
@@ -1041,6 +1175,7 @@ impl Default for TestScriptSnapshot {
             continuous_reading: false,
             current_is_still_image: false,
             music_view_active: false,
+            music_audio_track_popup_open: false,
             modal_open: false,
             context_menu_open: false,
             popup_open: false,
@@ -1056,6 +1191,7 @@ impl Default for TestScriptSnapshot {
             passthrough_unavailable: String::new(),
             keymap_level_observations: Vec::new(),
             windows: Vec::new(),
+            audio_track: TestScriptAudioTrackSnapshot::absent(),
             host_styles: Vec::new(),
         }
     }
@@ -1078,11 +1214,16 @@ impl TestScriptSnapshot {
         insert!(fs_idx);
         insert!(items_generation);
         insert!(folder_load_requests);
+        insert!(pdf_warm_adoption_sequence);
+        insert!(pdf_warm_adoption_path);
+        insert!(pdf_warm_adoption_phase);
         insert!(focused);
         insert!(target_viewport);
         insert!(target_registered);
         insert!(target_rendered);
         insert!(items_len);
+        insert!(snapshot_frame);
+        insert!(selected_index);
         map.insert(
             "item_names".into(),
             self.item_names
@@ -1130,6 +1271,7 @@ impl TestScriptSnapshot {
         insert!(continuous_reading);
         insert!(current_is_still_image);
         insert!(music_view_active);
+        insert!(music_audio_track_popup_open);
         insert!(modal_open);
         insert!(context_menu_open);
         insert!(popup_open);
@@ -1158,6 +1300,10 @@ impl TestScriptSnapshot {
                 .map(|window| Dynamic::from_map(window.to_rhai_map()))
                 .collect::<rhai::Array>()
                 .into(),
+        );
+        map.insert(
+            "audio_track".into(),
+            Dynamic::from_map(self.audio_track.to_rhai_map()),
         );
         map
     }
@@ -1284,6 +1430,7 @@ pub(crate) enum UiSmokeAction {
     OpenThumbnailPreferences,
     OpenFirstSmartFolder,
     OpenSeededCollection,
+    OpenRatingOne,
     AlwaysOnTopOn,
     AlwaysOnTopOff,
     MinimizeRoot,
@@ -2117,6 +2264,50 @@ impl RunnerBridge {
         );
         Ok(result)
     }
+
+    #[cfg(feature = "test-script")]
+    fn click_native_audio_control(&self, name: &str, timeout: Duration) -> Result<Map, String> {
+        use crate::video::native_ui_smoke::NativeUiSmokeAudioControl;
+        if timeout.is_zero() {
+            return Err("click_native_audio_control timeout_ms must be greater than zero".into());
+        }
+        let control = if name == "native_audio_button" {
+            NativeUiSmokeAudioControl::Button
+        } else if let Some(ordinal) = name.strip_prefix("native_audio_row_") {
+            let ordinal = ordinal
+                .parse::<usize>()
+                .map_err(|_| format!("invalid native audio row name: {name}"))?;
+            if ordinal == 0 {
+                return Err("native audio row numbers start at 1".into());
+            }
+            NativeUiSmokeAudioControl::Row(ordinal - 1)
+        } else {
+            return Err(format!("unknown native audio control: {name}"));
+        };
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "click_native_audio_control timeout is too large".to_string())?;
+        let identity = self.selected_detached_identity()?;
+        if matches!(control, NativeUiSmokeAudioControl::Button) {
+            self.move_native_canvas(
+                [0.5, 0.95],
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+        }
+        let (token, client_x, client_y) =
+            crate::video::native_ui_smoke::click_native_audio_control(
+                identity.hwnd(),
+                control,
+                deadline,
+                || self.validate_selected_owner_fresh(&identity, deadline),
+            )?;
+        let mut map = Map::new();
+        map.insert("name".into(), name.into());
+        map.insert("token".into(), saturating_rhai_int(token).into());
+        map.insert("client_x".into(), i64::from(client_x).into());
+        map.insert("client_y".into(), i64::from(client_y).into());
+        Ok(map)
+    }
 }
 
 #[cfg(feature = "test-script")]
@@ -2419,6 +2610,7 @@ fn parse_navigation_key(name: &str) -> Result<SyntheticNavigationKey, Box<EvalAl
         "home" => SyntheticNavigationKey::Home,
         "end" => SyntheticNavigationKey::End,
         "enter" => SyntheticNavigationKey::Enter,
+        "backspace" => SyntheticNavigationKey::Backspace,
         "escape" | "esc" => SyntheticNavigationKey::Escape,
         "f12" => SyntheticNavigationKey::F12,
         _ => {
@@ -2577,6 +2769,23 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                     .map_err(rhai_error),
                 _ => Err(rhai_error(format!(
                     "unknown Collection sort smoke action: {name}"
+                ))),
+            }
+        },
+    );
+    let folder_history_bridge = bridge.clone();
+    engine.register_fn(
+        "folder_history_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            match name.as_str() {
+                "open_rating_one" => folder_history_bridge
+                    .send(UiCommand::SmokeAction(UiSmokeAction::OpenRatingOne))
+                    .map_err(rhai_error),
+                "open_seeded_collection" => folder_history_bridge
+                    .send(UiCommand::SmokeAction(UiSmokeAction::OpenSeededCollection))
+                    .map_err(rhai_error),
+                _ => Err(rhai_error(format!(
+                    "unknown folder-history smoke action: {name}"
                 ))),
             }
         },
@@ -2759,6 +2968,22 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                     .click_native_top_panorama(timeout)
                     .map_err(|message| {
                         native_mouse_environment_error(&native_top_panorama_click_bridge, message)
+                    })
+            },
+        );
+
+        let native_audio_control_bridge = bridge.clone();
+        engine.register_fn(
+            "click_native_audio_control",
+            move |name: ImmutableString,
+                  timeout_ms: rhai::INT|
+                  -> Result<Map, Box<EvalAltResult>> {
+                let timeout =
+                    checked_duration(timeout_ms, "click_native_audio_control timeout_ms")?;
+                native_audio_control_bridge
+                    .click_native_audio_control(&name, timeout)
+                    .map_err(|message| {
+                        native_mouse_environment_error(&native_audio_control_bridge, message)
                     })
             },
         );
@@ -4961,6 +5186,14 @@ mod tests {
     }
 
     #[test]
+    fn folder_history_smoke_script_parses_without_launching_the_app() {
+        let script = include_str!("../scripts/ui-smoke/folder-history.rhai");
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine.compile(script).unwrap();
+    }
+
+    #[test]
     fn always_on_top_smoke_script_parses_without_launching_the_app() {
         let mut engine = rhai::Engine::new();
         engine.set_max_expr_depths(64, 64);
@@ -4989,13 +5222,20 @@ mod tests {
         let actions = call_lines("run_action");
         let smoke = call_lines("always_on_top_smoke");
         let captures = call_lines("capture");
+        // The Right literal lives in a helper definition; source order is no longer the
+        // runtime call order, but every literal still needs to reach the runner API.
+        assert_eq!(keys.len(), 3);
         assert_eq!(
-            keys,
-            [
-                "tap_key(\"F12\");",
-                "tap_key(\"F12\");",
-                "tap_key(\"Right\");"
-            ]
+            keys.iter()
+                .filter(|line| **line == "tap_key(\"F12\");")
+                .count(),
+            2
+        );
+        assert_eq!(
+            keys.iter()
+                .filter(|line| **line == "tap_key(\"Right\");")
+                .count(),
+            1
         );
         assert!(!actions.is_empty() && !smoke.is_empty() && !captures.is_empty());
 
@@ -6023,6 +6263,14 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn audio_tracks_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let source = include_str!("../scripts/ui-smoke/audio-tracks.rhai");
+        build_engine(bridge).compile(source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn native_seek_strip_fixture_exceeds_the_nine_cell_fallback_at_a_bounded_width() {
         let cell_height = crate::video::seek_strip_layout::SeekStripHeightValues::default()
             .points(crate::video::seek_strip_layout::SeekStripHeight::Smallest)
@@ -6065,6 +6313,43 @@ mod tests {
             published.is_fullscreen = true;
             published.focused = true;
         }
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::Success,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn selection_barrier_requires_a_later_snapshot_even_when_index_already_matches() {
+        let mut stale = ready_snapshot();
+        stale.snapshot_frame = 12;
+        stale.selected_index = 0;
+        let (bridge, rx, _) = runner_bridge(stale.clone());
+        spawn_script_source(
+            "wait_until(|s| s.snapshot_frame > 12 && s.selected_index == 0, 50);".to_string(),
+            bridge,
+        )
+        .unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("wait_until timed out")
+        ));
+
+        stale.snapshot_frame = 13;
+        let (bridge, rx, _) = runner_bridge(stale);
+        spawn_script_source(
+            "wait_until(|s| s.snapshot_frame > 12 && s.selected_index == 0, 50);".to_string(),
+            bridge,
+        )
+        .unwrap();
         let commands = receive_through_finished(&rx);
         assert!(matches!(
             commands.last(),
@@ -6911,6 +7196,7 @@ mod tests {
             sidecar_imported: false,
             sidecar_loaded: false,
             seek_strip: TestScriptSeekStripSnapshot::closed(),
+            audio_track: TestScriptAudioTrackSnapshot::absent(),
         }
     }
 

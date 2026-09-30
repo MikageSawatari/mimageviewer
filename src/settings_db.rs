@@ -52,8 +52,8 @@ const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v
 const SINGLETON_ENDPOINT_MIGRATION_META_KEY: &str = "singleton_spread_endpoints_v1";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
     'sort_order', 'rating_sort_unrated_position', 'show_hidden_files', 'grid_display_order',
-    'archive_file_handling', 'archive_convert_without_dialog',
-    'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists',
+    'archive_file_handling', 'archive_convert_without_dialog', 'epub_file_handling',
+    'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists', 'skip_epub_if_pdf_exists',
     'skip_image_if_video_exists', 'video_thumb_use_sidecar_image',
     'skip_duplicate_images', 'image_ext_priority', 'book_root',
     'auto_fullscreen_zip_pdf', 'auto_fullscreen_image_folders',
@@ -82,6 +82,7 @@ const COMPLEX_FIELDS: &[&str] = &[
     "favorites",
     "tags",
     "video_resume_positions",
+    "video_audio_track_choices",
     "vst3_plugins",
     "vst3_chain_slots",
     "recent_open_with_apps",
@@ -294,9 +295,11 @@ pub(crate) struct RemoteListingSettings {
     show_hidden_files: bool,
     grid_display_order: crate::settings::GridDisplayOrder,
     archive_file_handling: crate::settings::ArchiveFileHandling,
+    epub_file_handling: crate::settings::EpubFileHandling,
     archive_convert_without_dialog: bool,
     skip_zip_if_folder_exists: bool,
     skip_archive_if_zip_exists: bool,
+    skip_epub_if_pdf_exists: bool,
     skip_image_if_video_exists: bool,
     video_thumb_use_sidecar_image: bool,
     skip_duplicate_images: bool,
@@ -320,6 +323,7 @@ pub(crate) struct RemoteListingSettings {
 pub(crate) struct RemoteReadingSettings {
     pub(crate) default_spread_mode: crate::settings::SpreadMode,
     pub(crate) default_reading_direction: crate::settings::ReadingDirection,
+    pub(crate) follow_document_reading_direction: bool,
     pub(crate) final_cover_spread_enabled: bool,
     pub(crate) singleton_spread_first_enabled: bool,
     pub(crate) singleton_spread_last_enabled: bool,
@@ -333,6 +337,7 @@ impl RemoteReadingSettings {
         Self {
             default_spread_mode: settings.default_spread_mode,
             default_reading_direction: settings.default_reading_direction,
+            follow_document_reading_direction: settings.follow_document_reading_direction,
             final_cover_spread_enabled: settings.final_cover_spread_enabled,
             singleton_spread_first_enabled: settings.singleton_spread_first_enabled,
             singleton_spread_last_enabled: settings.singleton_spread_last_enabled,
@@ -351,9 +356,11 @@ impl RemoteListingSettings {
             show_hidden_files: settings.show_hidden_files,
             grid_display_order: settings.grid_display_order.clone(),
             archive_file_handling: settings.archive_file_handling,
+            epub_file_handling: settings.epub_file_handling,
             archive_convert_without_dialog: settings.archive_convert_without_dialog,
             skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
+            skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
             skip_duplicate_images: settings.skip_duplicate_images,
@@ -373,9 +380,11 @@ impl RemoteListingSettings {
         settings.show_hidden_files = self.show_hidden_files;
         settings.grid_display_order = self.grid_display_order;
         settings.archive_file_handling = self.archive_file_handling;
+        settings.epub_file_handling = self.epub_file_handling;
         settings.archive_convert_without_dialog = self.archive_convert_without_dialog;
         settings.skip_zip_if_folder_exists = self.skip_zip_if_folder_exists;
         settings.skip_archive_if_zip_exists = self.skip_archive_if_zip_exists;
+        settings.skip_epub_if_pdf_exists = self.skip_epub_if_pdf_exists;
         settings.skip_image_if_video_exists = self.skip_image_if_video_exists;
         settings.video_thumb_use_sidecar_image = self.video_thumb_use_sidecar_image;
         settings.skip_duplicate_images = self.skip_duplicate_images;
@@ -841,6 +850,11 @@ impl SettingsDb {
                 "default_reading_direction",
                 || fallback.default_reading_direction,
             )?,
+            follow_document_reading_direction: read_settings_kv_typed(
+                &inner.conn,
+                "follow_document_reading_direction",
+                || fallback.follow_document_reading_direction,
+            )?,
             final_cover_spread_enabled: read_settings_kv_typed(
                 &inner.conn,
                 "final_cover_spread_enabled",
@@ -946,6 +960,7 @@ impl SettingsDb {
         write_favorites(&tx, &settings.favorites)?;
         write_tags(&tx, &settings.tags)?;
         write_video_resume_positions(&tx, &settings.video_resume_positions)?;
+        write_video_audio_track_choices(&tx, &settings.video_audio_track_choices)?;
         // `custom_open_with_apps` は移行元の照合用にテーブルと既存行を残すが、
         // 外部ツール UI への載せ替え後は更新しない。
         write_external_tools(&tx, &settings.external_tools)?;
@@ -1618,6 +1633,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             path_normalized TEXT PRIMARY KEY,
             position_secs   REAL NOT NULL,
             updated_at      INTEGER NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS video_audio_track_choices (
+            path_normalized TEXT PRIMARY KEY,
+            stream_index INTEGER NOT NULL,
+            codec TEXT NOT NULL,
+            language TEXT,
+            channels INTEGER,
+            title TEXT,
+            updated_at INTEGER NOT NULL
          );
 
          CREATE TABLE IF NOT EXISTS vst3_plugins (
@@ -2299,6 +2324,65 @@ fn read_video_resume_positions(
     Ok(out)
 }
 
+fn write_video_audio_track_choices(
+    tx: &rusqlite::Transaction<'_>,
+    map: &std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>,
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM video_audio_track_choices", [])?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut stmt = tx.prepare(
+        "INSERT INTO video_audio_track_choices
+         (path_normalized, stream_index, codec, language, channels, title, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for (path, choice) in map {
+        stmt.execute(params![
+            path,
+            choice.stream_index as i64,
+            choice.codec,
+            choice.language,
+            choice.channels.map(i64::from),
+            choice.title,
+            now,
+        ])?;
+    }
+    Ok(())
+}
+
+fn read_video_audio_track_choices(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>, SettingsDbError>
+{
+    let mut stmt = conn.prepare(
+        "SELECT path_normalized, stream_index, codec, language, channels, title
+         FROM video_audio_track_choices",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let index: i64 = row.get(1)?;
+        let channels: Option<i64> = row.get(4)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            crate::video::SavedAudioTrackChoice {
+                stream_index: usize::try_from(index)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, index))?,
+                codec: row.get(2)?,
+                language: row.get(3)?,
+                channels: channels
+                    .map(|value| {
+                        u32::try_from(value)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, value))
+                    })
+                    .transpose()?,
+                title: row.get(5)?,
+            },
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
 // ---------------------------------------------------------------------------
 // vst3_plugins
 // ---------------------------------------------------------------------------
@@ -2860,6 +2944,7 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     let favorites = read_favorites(conn)?;
     let tags = read_tags(conn)?;
     let video_resume_positions = read_video_resume_positions(conn)?;
+    let video_audio_track_choices = read_video_audio_track_choices(conn)?;
     let vst3_plugins = read_vst3_plugins(conn)?;
     let vst3_chain_slots = read_vst3_chain_slots(conn)?;
     let custom_apps = read_legacy_open_with_apps(conn)?;
@@ -2870,6 +2955,10 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     map.insert(
         "video_resume_positions".into(),
         serde_json::to_value(video_resume_positions)?,
+    );
+    map.insert(
+        "video_audio_track_choices".into(),
+        serde_json::to_value(video_audio_track_choices)?,
     );
     map.insert("vst3_plugins".into(), serde_json::to_value(vst3_plugins)?);
     map.insert(
@@ -2927,9 +3016,11 @@ fn apply_remote_listing_setting(
         "show_hidden_files" => assign!(show_hidden_files),
         "grid_display_order" => assign!(grid_display_order),
         "archive_file_handling" => assign!(archive_file_handling),
+        "epub_file_handling" => assign!(epub_file_handling),
         "archive_convert_without_dialog" => assign!(archive_convert_without_dialog),
         "skip_zip_if_folder_exists" => assign!(skip_zip_if_folder_exists),
         "skip_archive_if_zip_exists" => assign!(skip_archive_if_zip_exists),
+        "skip_epub_if_pdf_exists" => assign!(skip_epub_if_pdf_exists),
         "skip_image_if_video_exists" => assign!(skip_image_if_video_exists),
         "video_thumb_use_sidecar_image" => assign!(video_thumb_use_sidecar_image),
         "skip_duplicate_images" => assign!(skip_duplicate_images),
@@ -4311,6 +4402,35 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    #[test]
+    fn effetune_editor_rect_round_trips_with_the_normal_full_save() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.grid_cols = 7;
+        settings.effetune_gui_pos = Some((10, 20));
+        settings.effetune_gui_size = Some((800, 600));
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.grid_cols, 7);
+        assert_eq!(loaded.effetune_gui_pos, Some((10, 20)));
+        assert_eq!(loaded.effetune_gui_size, Some((800, 600)));
+    }
+
+    #[test]
+    fn twenty_grid_columns_roundtrip_without_changing_toolbar_choices() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.grid_cols = 20;
+        settings.toolbar_cols_items = vec![1, 4, 10];
+        db.save_full(&settings).unwrap();
+
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.grid_cols, 20);
+        assert_eq!(loaded.toolbar_cols_items, vec![1, 4, 10]);
+    }
+
     fn sample_settings() -> Settings {
         let mut s = Settings::default();
         s.grid_cols = 7;
@@ -4719,6 +4839,50 @@ mod tests {
         db.save_full(&original).unwrap();
         let loaded = db.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
+    }
+
+    #[test]
+    fn saved_audio_track_choices_roundtrip_clear_and_upgrade_old_db() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        // A released database predates this additional table.
+        let conn = Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute("DROP TABLE video_audio_track_choices", [])
+            .unwrap();
+        drop(conn);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .video_audio_track_choices
+                .is_empty()
+        );
+        let choice = crate::video::SavedAudioTrackChoice {
+            stream_index: 3,
+            codec: "flac".into(),
+            language: Some("jpn".into()),
+            channels: Some(2),
+            title: Some("日本語の解説".into()),
+        };
+        let mut settings = Settings::default();
+        settings
+            .video_audio_track_choices
+            .insert("test-path".into(), choice.clone());
+        db.save_full(&settings).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().video_audio_track_choices["test-path"],
+            choice
+        );
+        settings.video_audio_track_choices.clear();
+        db.save_full(&settings).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .video_audio_track_choices
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5227,9 +5391,11 @@ mod tests {
             vec![GridItemDisplayKind::Folder],
         ]);
         live.archive_file_handling = ArchiveFileHandling::Ignore;
+        live.epub_file_handling = crate::settings::EpubFileHandling::Convert;
         live.archive_convert_without_dialog = true;
         live.skip_zip_if_folder_exists = false;
         live.skip_archive_if_zip_exists = false;
+        live.skip_epub_if_pdf_exists = false;
         live.skip_image_if_video_exists = false;
         live.video_thumb_use_sidecar_image = false;
         live.skip_duplicate_images = false;
@@ -6533,19 +6699,21 @@ mod tests {
             )
             .unwrap()
         };
-        let mut statement = conn.prepare("SELECT value FROM settings_kv").unwrap();
-        let persisted_json = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .join("|");
-
-        assert!(!persisted_json.contains("RatedAt"));
+        for key in [
+            "details_sort_key",
+            "details_column_order",
+            "details_column_widths",
+            "details_selection_bar_column_order",
+            "details_selection_bar_column_widths",
+        ] {
+            assert!(
+                !read(key).contains("RatedAt"),
+                "{key} must remain readable by older details settings"
+            );
+        }
         assert_eq!(read("details_sort_key"), r#""Toolbar""#);
         assert_eq!(read("details_rated_at_width"), "154.0");
         assert_eq!(read("details_selection_bar_rated_at_width"), "176.0");
-        drop(statement);
         drop(conn);
 
         let mut loaded = db.load_into_settings().unwrap();

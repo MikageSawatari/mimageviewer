@@ -30,12 +30,13 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │   - RAW 現像 executor (App 共有、優先度付き 1〜10 threads)     │
 │   - フルスクリーンロードスレッド (1 画像ごとに spawn)          │
 │   - PDF ワーカープロセス (--pdf-worker、設定 3〜10、既定 5)     │
+│   - EPUB → PDF 変換プロセス (1 冊につき 1 子プロセス)          │
 │   - 外部受け渡し実体化ワーカー (ZIP/PDF/編集焼き込み + 起動)   │
 │   - Susie 32bit ワーカープロセス (mimageviewer-susie32.exe × N)│
 │   - TRT エンジンビルダー (--tensorrt-build サブプロセス、初回1回)│
 │   - TRT 推論ワーカー (--tensorrt-infer-worker サブプロセス × 1)│
 │   - AI 推論スレッド (ort + DirectML、TRT は別プロセス経由)     │
-│   - VST3 host bridge (通常 ×1、remote VST 配信中は最大 ×2)    │
+│   - VST3 host bridge (ユーザー VST と音響調整で最大 ×2)    │
 │     [docs/vst3-integration.md](vst3-integration.md)            │
 │   - 動画サムネイルスレッド, フォルダナビゲーション, etc.       │
 └───────────────┬──────────────────────────────────────────────┘
@@ -158,16 +159,18 @@ source と編集 context を `MergedSpread` にまとめ、materializer worker �
 | --- | --- |
 | `zip_loader.rs` | ZIP 内の画像列挙、エントリバイト取得、先頭画像抽出。ネスト ZIP (ZIP in ZIP) は再帰列挙し (表示は `zip_tree` でツリー化)、内側 ZIP バイト列は 256MB LRU キャッシュに保持。非 ZIP アーカイブ (RAR/7z/LZH) のエントリは `has_foreign_archives` フラグで検出して変換提案へつなぐ (v1.3.0)。読み戻しは literal フルネーム一致 → ネスト境界分割の順 (変換キャッシュのフラットエントリ対応)。画像判定は `folder_tree::is_recognized_image_ext` に委譲 (ネイティブ + WIC + Susie) |
 | `canonical_image_loader.rs` | fullscreen と remote AI が共有する静止画 canonical decoder。通常 file / verified bytes / ZIP・CBZ entry（nested ZIP を含む）を typed source で受け、RAW は拡張子で先に LibRaw へ分岐し、その他は image crate → WIC → Susie の順に試す。ソース解決とデコードを分け、fullscreen の RAW Full 待機前には fs scheduler permit を返す。EXIF 適用、GIF/APNG/WebP の既存 Animated 分類、通常 static の 8192 clamp を一箇所に置く。panorama 用 native tee は呼び出し側の従来位置に残し、raster PDF は `pdf_loader` の canonical renderer が担当する |
-| `pdf_loader.rs` | PDFium ワーカープロセスプール。ページ列挙・レンダリング |
+| `pdf_loader.rs` | PDFium ワーカープロセスプール。ページ列挙・レンダリング。EPUB の世代解決と使用は本ごとの読取リースを保持し、キャッシュの即時削除と順序付ける |
 | `pdf_passwords.rs` | PDF パスワードの DPAPI 暗号化永続化 |
 | `wic_decoder.rs` | HEIC/AVIF/JXL/TIFF のデコード (Windows Imaging Component)。RAW 拡張子は path / bytes の入口で拒否する |
 | `save_with_metadata.rs` | JPEG/PNG/WebP のエンコードと EXIF/XMP/PNG text/WebP metadata の転記。Ctrl+E エクスポートから呼ばれ、出力は `create_new` で上書きしない |
 | `susie_loader.rs` | Susie 画像プラグイン (`.spi`) のワーカープロセスプール。PI/MAG/Q0/PIC/MAKI 等レトロ画像のデコードをルーティング。32bit ワーカー exe は本体に `include_bytes!` で埋め込み、初回起動時に `%APPDATA%\mimageviewer\mimageviewer-susie32.exe` へ自動展開 |
 | `archive_converter.rs` | RAR / 7z / LZH / (非 ZIP 入れ子入り) ZIP → 無圧縮 ZIP 変換 (unrar / sevenz-rust2 / delharc / zip)。入れ子アーカイブは一時ファイル経由で再帰展開し (深さ上限 8)、`"inner.rar/p01.jpg"` 形式のフラットなエントリ名で出力する (v1.3.0)。RAR はパスワード付きにも対応するが、入力パスワード自体は保存しない。画像判定は `is_recognized_image_ext` 経由 (Susie 対応拡張子も含む) |
 | `archive_cache.rs` | 変換済み ZIP のマッピング DB (`%APPDATA%/mimageviewer/archive_cache.db`)。元ファイルパス + mtime + size で lookup、変換後 ZIP は `archive_cache/<hash[..2]>/<hash>/*.zip`。設定された容量上限がある場合は変換完了後に `last_access_at` の古い順で削除する。パスワード付き RAR 由来でもキャッシュ ZIP は暗号化されないため、管理 UI で `PW` と表示し削除可能にする。将来版/旧版由来の未知 `format` 行も `旧形式 / 不明` と raw format 値で表示し、同じ管理 UI から削除できる |
+| `epub_cache.rs` | EPUB 専用ストア。`<data_dir>/epub_cache.db` の予約 ID・不変世代・現在・内部廃止世代の 4 表を持ち、PDF は `epub_cache/<hash[..2]>/<hash>/<stem>.g<ID>.pdf` に置く。管理画面の削除は背景 worker が PDF 文書を解放してその場で実行し、使用中の対象は残す。内部廃止世代と未完了予約の回収には起動時の `.alive` 削除ゲートを維持する。削除対象の root と各親ディレクトリをハンドルで検査して再解析ポイントを拒む。ZIP 変換キャッシュとは独立する |
+| `epub_convert.rs` / `crates/epub-pdf-worker` | 背景スレッド専用 EPUB → PDF 変換ランナーと WebView2 子プロセス。core は自分の exe の隣から `mimageviewer-epub-pdf.exe` を探す (`MIV_EPUB_PDF_WORKER` で上書き可能)。書き込み共有を拒むハンドルから一時コピーと内容同定ハッシュを作り、子を suspended で起動して `KILL_ON_JOB_CLOSE` の Job Object に割り当てる。取消・異常終了で子プロセス群を止め、PDF 検証後に世代ファイルを上書きなしで公開して `epub_cache` に記録する。内部廃止世代は読込中に固定され、管理画面で物理削除に成功した世代は固定表から外す |
 | `fs_animation.rs` | GIF / APNG / WebP アニメーションのフレーム展開 |
 | `video_thumb.rs` | 動画サムネイル取得 (Windows Shell API) |
-| `video/` | 動画インライン再生とリモート時計なし配信。`mod.rs` (VideoPlayer 公開 API) / `ffmpeg_loader.rs` (FFmpeg LGPL DLL が exe 同居しているか検証 — 展開は launcher が起動時に行い、ロードは Windows ローダが行う) / `decoder.rs` (avformat/avcodec/swscale デコード worker、`VideoDynamicState` で per-frame 状態を atomic 共有) / `audio.rs` (cpal/WASAPI 出力 + ring buffer + VST3 前段の time-stretch) / `clockless_transcode.rs` と `stream/session.rs` (再生時計から独立した H.264/AAC/fMP4 generation、session 共有 remote VST3) / `audio_stretch.rs` (Signalsmith Stretch による pitch 維持の倍速音声処理) / `clock.rs` (AV マスタークロック)。FsCacheEntry::Video が VideoPlayer を所有し、remote headless player は metadata / thumbnail だけを提供する。`VideoInfo.dynamic` は decoder thread / native presenter thread / UI で共有し、右パネルの「フレーム表示」「デインターレース」を動的更新する |
+| `video/` | 動画インライン再生とリモート時計なし配信。`mod.rs` (VideoPlayer 公開 API) / `ffmpeg_loader.rs` (FFmpeg LGPL DLL が exe 同居しているか検証 — 展開は launcher が起動時に行い、ロードは Windows ローダが行う) / `decoder.rs` (avformat/avcodec/swscale デコード worker、`VideoDynamicState` で per-frame 状態を atomic 共有) / `audio.rs` (cpal/WASAPI 出力 + ring buffer + VST3 前段の time-stretch) / `clockless_transcode.rs` と `stream/session.rs` (再生時計から独立した H.264/AAC/fMP4 generation、App の共有 bridge と世代別 DSP 調停) / `audio_stretch.rs` (Signalsmith Stretch による pitch 維持の倍速音声処理) / `clock.rs` (AV マスタークロック)。FsCacheEntry::Video が VideoPlayer を所有し、remote headless player は metadata / thumbnail だけを提供する。`VideoInfo.dynamic` は decoder thread / native presenter thread / UI で共有し、右パネルの「フレーム表示」「デインターレース」を動的更新する |
 | `video/native_touch.rs` | presenter / HUD HWND が共有する薄い `WM_POINTER` アダプタ。HWND ごとの bounded stream ownership、client-pixel→points 共通変換、source typed event、共有 `TouchRecognizer` への入力、先頭接点の pointer emulation、chrome command 写像を担当する。HUD source は OS hit-test を正本として geometry 再分類を行わず widget passthrough に固定する |
 | `folder_tree.rs` | 深さ優先前順トラバーサル (Ctrl+↑↓ 用) |
 | `panorama.rs` / `panorama_wgpu.rs` | 360 度パノラマビュー (Phase 1 + 1.5 + 2a)。`panorama.rs` は state / GPano XMP 検出 / 解像度ゲート / settle policy / CPU bilinear sampler / `render_settle_overlay`、`panorama_wgpu.rs` は equirect WGSL シェーダ + 8K base アップロード + settle overlay の alpha blend pipeline。詳細は [`docs/panorama-360-view-plan.md`](panorama-360-view-plan.md) |
@@ -258,7 +261,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `ui_metadata_panel.rs` | 右情報パネル (AI メタデータ + EXIF + XMP ツイート情報 + 類似画像)。類似タブ・照会表示・サムネイル要求と完了channelは `ViewerContextBundle` が所有する。可視カードとhoverページ帯の需要だけを描画後に処理し、workerは4枠、GPU uploadは1フレーム1件、派生キャッシュは512件以内に保つ。要求IDと内容stampを照合して退避・取消後の古い完了を拒否する |
 | `ui_erase.rs` | 消しゴムモード (筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円 → MI-GAN で inpaint) |
 | `ui_conceal.rs` | 隠蔽加工モード (同じマスク編集 UI でモザイク / 塗りつぶし / ぼかしを合成) |
-| `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブキャッシュ管理 (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定・ネットワーク上のデータ保存先に関する起動案内等。アーカイブ変換は `ArchiveConvertState` が scan / password retry / convert 共通の cancel token と completion policy を所有し、state drop と競合 navigation で worker と receiver を同時に終了する。モーダル相当の表示状態は `App::common_modal_dialog_open` に集約し、`process_scroll` のポインタ直下 floating-layer guard と組み合わせてダイアログ内 wheel の背面グリッドへの伝播を防ぐ。TensorRT パック取得のような長時間ツール Window はモデルレスとし、表示中も閲覧を止めない |
+| `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブ管理と EPUB 変換キャッシュ管理の独立したダイアログ (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定・ネットワーク上のデータ保存先に関する起動案内等。アーカイブ変換は `ArchiveConvertState` が scan / password retry / convert 共通の cancel token と completion policy を所有し、state drop と競合 navigation で worker と receiver を同時に終了する。モーダル相当の表示状態は `App::common_modal_dialog_open` に集約し、`process_scroll` のポインタ直下 floating-layer guard と組み合わせてダイアログ内 wheel の背面グリッドへの伝播を防ぐ。TensorRT パック取得のような長時間ツール Window はモデルレスとし、表示中も閲覧を止めない |
 | `native_name_dialog.rs` | 名前変更 / 新規フォルダ作成で共有する Windows 標準の単一行入力画面。メモリ上のダイアログテンプレートを同期モーダル表示し、IME・書記素編集・クリップボード・Undo を OS に委譲する。非 Windows では no-op stub |
 | `ui_dialogs/preferences.rs` | 環境設定ダイアログの状態、App 連携、ツリー / ページ dispatch |
 | `ui_dialogs/preferences/pages.rs` | 環境設定の各 `page_*` 描画関数 |
@@ -348,6 +351,9 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 
 すべて `%APPDATA%/mimageviewer/` 配下。バックアップ対象。
 
+`settings.db` の追加表 `video_audio_track_choices` は動画・音声ファイルごとの明示的な音声トラック選択を保持する。
+再生位置の表とは独立し、`Settings::save()` 時に既知列だけを書き込む。
+
 | ファイル | 内容 | 書き込むモジュール |
 | --- | --- | --- |
 | `settings.db` (SQLite, 2026-05 移行) | アプリ全体設定・グローバルプリセット・保存スロット・お気に入り (`FavoriteEntry { id: Uuid, name, path, auto_index_{structure,metadata,thumbs,similar} }`)・タグ定義 (`Vec<TagDef>`)・VST3 chain 設定 (大型 BLOB)。**SQLite トランザクション + `VACUUM INTO` で `settings.db.bak1..bak10` に世代スナップショット**。`schema_meta.app_version` は open 時でなく正常な `save_full` の commit 時に更新し、各 snapshot の保存元版を保持する。物理的な Corrupted 検出時だけ `.corrupted-<ts>-<seq>` 3 セット (main + WAL + SHM) で quarantine、bak1→bak10 を新→古で試行し復旧する。保存元版が現バイナリより新しい、または未知の設定 enum / field がある場合は `IncompatibleSettings` とし、main と backup chain を変更せず save 抑止する。復元 UI は bak1..bak10 と `settings.db.preupgrade-v<old>` の保存元版・互換性を一覧表示する。**Transient I/O / Incompatible / 全復旧失敗時は `MAIN_UNREADABLE_THIS_SESSION` + `settings_db::SAVE_SUPPRESSED` で `Settings::save()` 完全 no-op 化**し、初回設定等を抑止して設定復元または終了の保護モーダルを表示する (= 残骸保護)。旧版の継続利用は他の永続DBまで読み取り専用にできないため許可しない。旧 `settings.json` は初回起動時に migration して `*.migrated-<ts>` にリネーム済み | `settings.rs` + `settings_db.rs` |
@@ -355,7 +361,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `Pictures\mimageviewer\books\...` (既定、設定可) | 製本した本の実体。DB ではなく通常フォルダ + `0001_元名.ext` 画像ファイルのみ。`Settings.book_root` で変更でき、Ctrl+S/Ctrl+G の自動索引対象外 | `books.rs` + `ui_main.rs` + `ui_fullscreen.rs` |
 | `Settings.keymap` / `keymap.ini.default` | キーボード割り当て設定。GUI 編集の正本は `settings.db` 内の `Settings.keymap`。旧 `keymap.ini` が残っている環境では初回起動時に読み込み、同じ内容を `Settings.keymap` へ移してから `keymap.ini.imported*.bak` へリネームする。以後 `keymap.ini` は通常読み込み対象外。`keymap.ini.default` は現在バージョンの Action 名と既定キーを確認する参照ファイルとして更新される。競合は拒否せず warning として扱う | `keymap.rs` + `settings.rs` |
 | `catalog.db` | フォルダ単位のサムネイル WebP キャッシュ (BLOB) + PDF メタデータ + ZIP / 画像のみフォルダのページ数 cache。ページ数取得は詳細遅延 worker が `GlobalIoSemaphore` 配下で行い、cache 障害時は表示自体を失敗させず元コンテナから再取得する | `catalog.rs` + `app/metadata_ops.rs` |
-| `video_tile_thumbs.db` | 動画タイル / resume サムネイルの WebP と、粗い全尺波形の量子化 chunk。波形 chunk は path、動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用し、窓解析と raster は保存しない。サムネイルキャッシュ管理のファイル単位・フォルダ単位・全件削除を共有する | `video/tile_thumb_cache.rs` + `video/seek_strip_wave.rs` |
+| `video_tile_thumbs.db` | 動画タイル / resume サムネイルの WebP と、粗い全尺波形の量子化 chunk。新しい波形 chunk は stream index を含む追加テーブルへ保存し、既定トラックだけ旧テーブルを互換読みする。path、stream index、動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用し、窓解析と raster は保存しない。サムネイルキャッシュ管理のファイル単位・フォルダ単位・全件削除を共有する | `video/tile_thumb_cache.rs` + `video/seek_strip_wave.rs` |
 | `content_identity.db` | 物理ファイルの size / 先頭 64 KiB hash / 全体 hash と、復元元か検出 cache だけかを表す `has_restorable_content`、復元辞退組を保持する。schema は `PRAGMA user_version` の単一入口で作成 / upgrade し、unversioned A1 行へ列を足す migration の default は復元元を表す `1`。期待 schema を用意できない session は typed `Unusable` とし、空台帳として処理を続けない | `content_identity.rs` + `app/content_identity_detection.rs` |
 | `auto_aspect_cache.db` | Auto サムネイル比率のフォルダ別前回確定値と、UUID table に置く Collection root 別前回確定値。後続の実統計は既存ゲート (streak/cooldown 等) に従って補正する。Collection の DB I/O は単一 actor に限定し、prepare worker が最大 100 ms 待つ optional Get、UI はメモリ値だけを扱う。サムネイルキャッシュ管理の全件・期限整理は両 table を対象にする | `auto_aspect_cache.rs` + `app.rs` |
 | `rotation.db` | 非破壊回転角 (0/90/180/270) | `rotation_db.rs` |

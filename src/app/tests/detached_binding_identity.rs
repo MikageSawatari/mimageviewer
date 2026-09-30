@@ -32,7 +32,7 @@ fn start_cached_pdf(app: &mut App, root: &Path) -> (PathBuf, u64) {
     app.settings.auto_fullscreen_zip_pdf = true;
     assert!(app.start_active_detached_book_context(
         ViewerContextDescriptor::Pdf {
-            path: pdf.clone(),
+            path: crate::pdf_loader::LeasedEpubPath::try_new(pdf.clone()).unwrap(),
             page_num: None
         },
         &egui::Context::default(),
@@ -49,7 +49,9 @@ fn detached_binding_identity_book_start_resolves_published_window() {
     let root = app.tmp.path().to_path_buf();
     let (_, window) = start_cached_pdf(&mut app, &root);
     app.with_active_viewer_context(|mounted| {
+        // A warm direct open commits the cached placeholder before verification completes.
         assert_eq!(mounted.pdf_placeholder_count, Some(2));
+        assert!(mounted.pdf_enumerate_pending.is_some());
         assert_eq!(
             mounted.viewer_context_window(mounted.projected_viewer_context_id()),
             Some(window)
@@ -78,7 +80,7 @@ fn detached_binding_identity_pdf_load_poll_open_uses_published_window() {
             .collect()))
             .unwrap();
         // Replace only the external worker response. Keep load_pdf_as_folder's request,
-        // placeholder, deferred open, registry build/commit/mount and the real poll handler.
+        // deferred open, registry build/commit/mount and the real poll handler.
         mounted.pdf_enumerate_pending.as_mut().unwrap().2.rx = rx;
         mounted.poll_pdf_enumerate();
         assert_eq!(mounted.fullscreen_idx, Some(0));
@@ -260,7 +262,10 @@ fn detached_binding_identity_mode_close_releases_all_contexts() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     let window = install_detached_item(&mut app, &ctx, false);
-    assert!(app.close_all_detached_viewers_for_mode_change(&ctx));
+    assert!(
+        app.close_all_detached_viewers_for_mode_change(&ctx)
+            .unwrap()
+    );
     assert!(app.locate_window_context(window).is_none());
     assert_projection_matches_binding(&mut app);
 }

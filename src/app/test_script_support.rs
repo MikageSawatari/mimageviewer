@@ -377,6 +377,18 @@ impl App {
                 sidecar_imported: false,
                 sidecar_loaded: false,
                 seek_strip: context.video_seek_strip_test_script_snapshot(),
+                audio_track: page_index
+                    .and_then(|idx| context.fs_cache().get(&idx).map(|entry| (idx, entry)))
+                    .and_then(|(idx, entry)| match entry {
+                        FsCacheEntry::Video { player, .. } => Some(
+                            crate::test_script::TestScriptAudioTrackSnapshot::from_player(
+                                player,
+                                context.video_audio_mode() == Some(idx),
+                            ),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_else(crate::test_script::TestScriptAudioTrackSnapshot::absent),
             }
         })
     }
@@ -812,8 +824,12 @@ mod tests {
         let root_path = PathBuf::from(r"C:\videos\root.mp4");
         app.items = vec![GridItem::Video(root_path.clone())];
         app.fullscreen_idx = Some(0);
-        let root_worker =
-            crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(root_path.clone(), None);
+        let root_worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            root_path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         app.seed_video_seek_strip_context_for_test(root_path, root_worker, 101, 17, 102);
         let root_context = app.viewer_context_main();
 
@@ -823,6 +839,8 @@ mod tests {
             app.fullscreen_idx = Some(0);
             let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
                 detached_path.clone(),
+                Some(0),
+                Some(0),
                 None,
             );
             app.seed_video_seek_strip_context_for_test(detached_path, worker, 201, 23, 202);

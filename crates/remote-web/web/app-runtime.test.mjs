@@ -120,6 +120,7 @@ const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]
     "X-mIV-Page-Identity": pageIdentityHeader(TEST_PAGE_ADDRESS),
   },
 });
+
 globalThis.fetch = imageFetch;
 
 const {
@@ -149,6 +150,11 @@ const {
   commandTelemetryEvent,
   collectionImageHash,
   containerRuntimeStateForTest,
+  cleanupVideoViewerForTest,
+  retainVideoViewerForTest,
+  reportRetainedVideoProgressForTest,
+  enqueueVideoProgress,
+  reportVideoProgressBeforePageHide,
   containerInitialImageIndex,
   createRemoteHomeDataRefreshCoordinator,
   createFavoriteSearchForm,
@@ -2828,6 +2834,56 @@ test("tapping an audio grid tile opens the shared media viewer route", () => {
   assert.equal(resolveMediaOpenRoute("audio", { kind: "audio", address }, -1), "audio");
 });
 
+test("EPUB source on the PDF wire route has an EPUB placeholder and opens as a book", () => {
+  const address = {
+    path: testPath("books/Book.EPUB"),
+    subresource: { kind: "file" },
+  };
+  const dispatched = [];
+  const tile = createGridTile(
+    { kind: "pdf", name: "Book", address },
+    5,
+    new Map(),
+    null,
+    180,
+    (requested, meta) => dispatched.push({ requested, meta })
+  );
+  const preview = tile.children[0];
+
+  assert.equal(
+    preview.children.find((child) => child.className === "file-glyph")?.textContent,
+    "▤"
+  );
+  assert.equal(
+    preview.children.find((child) => child.className === "type-badge")?.textContent,
+    "epub"
+  );
+  assert.equal(preview.children.some((child) => child.tagName === "IMG"), true);
+  assert.ok(tile._thumbnailBinding);
+
+  tile.dispatchEvent({ type: "click", detail: 1, pointerType: "touch" });
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].requested.payload, {
+    kind: "container",
+    address,
+    entryIndex: 5,
+  });
+
+  const pdfTile = createGridTile(
+    { kind: "pdf", name: "Book", path: testPath("books/Book.pdf") },
+    6,
+    new Map(),
+    null,
+    180,
+    () => {}
+  );
+  assert.equal(
+    pdfTile.children[0].children.find((child) => child.className === "type-badge")?.textContent,
+    "pdf"
+  );
+  assert.ok(pdfTile._thumbnailBinding);
+});
+
 test("session acquisition refreshes favorites and home once without taking the viewer", async () => {
   const previousHome = {
     places: [{ kind: "folder", label: "以前の場所" }],
@@ -4999,5 +5055,168 @@ test("missing presentation wire falls back while explicit invalid presentation i
     assert.deepEqual(historyCalls, []);
   } finally {
     globalThis.history = previousHistory;
+  }
+});
+
+test("video progress writer serializes ordinary snapshots with session-bound sequence", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let releaseFirst;
+  globalThis.fetch = (url, options) => {
+    calls.push({ url, options });
+    if (calls.length === 1) {
+      return new Promise((resolve) => {
+        releaseFirst = () => resolve(new Response("{}", { status: 200 }));
+      });
+    }
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  };
+  try {
+    applyRemoteSessionId("progress-owner-a", () => {});
+    const address = { path: testPath("movie.mp4"), subresource: { kind: "file" } };
+    const first = enqueueVideoProgress({ address, remoteSessionId: "progress-owner-a", positionSecs: 12, durationSecs: 90, ended: false });
+    const second = enqueueVideoProgress({ address, remoteSessionId: "progress-owner-a", positionSecs: 18, durationSecs: 90, ended: false });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(calls.length, 1);
+    applyRemoteSessionId("progress-owner-b", () => {});
+    releaseFirst();
+    await Promise.all([first, second]);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls.map(({ options }) => JSON.parse(options.body).position_secs), [12, 18]);
+    assert.deepEqual(calls.map(({ options }) => options.headers.get("X-mIV-Remote-Session")),
+      ["progress-owner-a", "progress-owner-a"]);
+    assert.deepEqual(calls.map(({ options }) => JSON.parse(options.body).sequence), [1, 2]);
+  } finally {
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("hidden final progress starts keepalive while an earlier report is stalled", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let releaseFirst;
+  globalThis.fetch = (url, options) => {
+    calls.push({ url, options });
+    if (calls.length === 1) {
+      return new Promise((resolve) => {
+        releaseFirst = () => resolve(new Response("{}", { status: 200 }));
+      });
+    }
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  };
+  try {
+    applyRemoteSessionId("progress-hidden-owner", () => {});
+    const address = { path: testPath("movie.mp4"), subresource: { kind: "file" } };
+    const earlier = enqueueVideoProgress({ address, remoteSessionId: "progress-hidden-owner", positionSecs: 12, durationSecs: 90, ended: false });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const final = reportVideoProgressBeforePageHide({
+      snapshotProgress: () => ({ address, remoteSessionId: "progress-hidden-owner", positionSecs: 19, durationSecs: 90, ended: false }),
+    });
+    assert.equal(calls.length, 2, "hidden report must start before the stalled fetch settles");
+    assert.equal(calls[1].options.keepalive, true);
+    assert.deepEqual(calls.map(({ options }) => JSON.parse(options.body).sequence), [1, 2]);
+    await final;
+    releaseFirst();
+    await earlier;
+  } finally {
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reconnected session sends immediately while retained viewer still reports under old owner", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let releaseOld;
+  globalThis.fetch = (url, options) => {
+    calls.push({ url, options });
+    if (calls.length === 1) {
+      return new Promise((resolve) => {
+        releaseOld = () => resolve(new Response("{}", { status: 200 }));
+      });
+    }
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  };
+  const address = { path: testPath("movie.mp4"), subresource: { kind: "file" } };
+  const oldViewer = {
+    progressRemoteSessionId: "progress-old-owner",
+    snapshotProgress: () => ({
+      address, remoteSessionId: "progress-old-owner",
+      positionSecs: 22, durationSecs: 90, ended: false,
+    }),
+    destroy() { assert.equal(calls.length, 4); },
+  };
+  try {
+    applyRemoteSessionId("progress-old-owner", () => {});
+    retainVideoViewerForTest(oldViewer);
+    const stalled = enqueueVideoProgress({
+      address, remoteSessionId: "progress-old-owner",
+      positionSecs: 12, durationSecs: 90, ended: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    applyRemoteSessionId("progress-new-owner", () => {});
+    const oldFinal = reportRetainedVideoProgressForTest();
+    const newReport = enqueueVideoProgress({
+      address, remoteSessionId: "progress-new-owner",
+      positionSecs: 35, durationSecs: 90, ended: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(calls.length, 3, "new owner must not wait for the old owner's stalled fetch");
+    assert.deepEqual(calls.map(({ options }) => options.headers.get("X-mIV-Remote-Session")),
+      ["progress-old-owner", "progress-old-owner", "progress-new-owner"]);
+    assert.deepEqual(calls.map(({ options }) => JSON.parse(options.body).sequence), [1, 2, 1]);
+    assert.equal(calls[1].options.keepalive, true);
+    cleanupVideoViewerForTest(oldViewer);
+    assert.equal(calls[3].options.headers.get("X-mIV-Remote-Session"), "progress-old-owner");
+    assert.equal(JSON.parse(calls[3].options.body).sequence, 3);
+    await Promise.all([oldFinal, newReport]);
+    releaseOld();
+    await stalled;
+  } finally {
+    releaseOld?.();
+    retainVideoViewerForTest(null);
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("viewer cleanup starts final keepalive before destroy even when prior report is stalled", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let releaseFirst;
+  globalThis.fetch = (url, options) => {
+    calls.push({ url, options });
+    if (calls.length === 1) {
+      return new Promise((resolve) => {
+        releaseFirst = () => resolve(new Response("{}", { status: 200 }));
+      });
+    }
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  };
+  const events = [];
+  const address = { path: testPath("movie.mp4"), subresource: { kind: "file" } };
+  try {
+    applyRemoteSessionId("progress-cleanup-owner", () => {});
+    const earlier = enqueueVideoProgress({ address, remoteSessionId: "progress-cleanup-owner", positionSecs: 12, durationSecs: 90, ended: false });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    cleanupVideoViewerForTest({
+      isVideoStreamViewer: true,
+      snapshotProgress() {
+        events.push("snapshot");
+        return { address, remoteSessionId: "progress-cleanup-owner", positionSecs: 20, durationSecs: 90, ended: false };
+      },
+      destroy() {
+        assert.equal(calls.length, 2);
+        assert.equal(calls[1].options.keepalive, true);
+        events.push("destroy");
+      },
+    });
+    assert.deepEqual(events, ["snapshot", "destroy"]);
+    releaseFirst();
+    await earlier;
+  } finally {
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    globalThis.fetch = originalFetch;
   }
 });

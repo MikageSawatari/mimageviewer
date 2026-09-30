@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -52,6 +53,7 @@ struct GuiWindowOptions {
     uint32_t width = 0;
     uint32_t height = 0;
     bool resizable = true;
+    bool show_bypass_button = true;
     bool has_initial_pos = false;
     int32_t x = 0;
     int32_t y = 0;
@@ -164,6 +166,9 @@ public:
     bool editor_chrome_bypassed() const {
         return editor_bypassed_.load(std::memory_order_acquire);
     }
+    bool editor_chrome_show_bypass_button() const {
+        return editor_show_bypass_button_.load(std::memory_order_acquire);
+    }
     void invalidate_editor_chrome() const {
         if (auto* hwnd = static_cast<HWND>(view_container_hwnd_snapshot_.load(std::memory_order_acquire))) {
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -171,6 +176,10 @@ public:
     }
     void set_editor_chrome_bypassed(bool bypassed) {
         editor_bypassed_.store(bypassed, std::memory_order_release);
+        invalidate_editor_chrome();
+    }
+    void set_editor_chrome_show_bypass_button(bool show) {
+        editor_show_bypass_button_.store(show, std::memory_order_release);
         invalidate_editor_chrome();
     }
     uint32_t editor_chrome_latency_samples() const {
@@ -211,6 +220,10 @@ public:
     /// 戻り値: true=成功 (= `out_bytes` に空でもないバイト列が入る)、false=失敗。
     bool query_state(std::vector<uint8_t>& out_bytes);
 
+    void query_state_concurrent(
+        std::function<bool()> begin,
+        std::function<void(bool, std::vector<uint8_t>)> complete);
+
     /// プラグイン内部状態をバイト列から復元する (`IComponent::setState`)。
     /// `IEditController::setComponentState` も同期で呼んで UI 表示を合わせる。
     /// 安全のため一時的に `setProcessing(false)` してから復元、終わったら再有効化する。
@@ -241,6 +254,7 @@ private:
     uint64_t editor_slot_id_ = 0;
     std::atomic<void*> view_container_hwnd_snapshot_{nullptr};
     std::atomic<bool> editor_bypassed_{false};
+    std::atomic<bool> editor_show_bypass_button_{true};
     bool gui_surface_visible_ = false;
     bool gui_app_active_ = true;
     uint32_t last_gui_width_ = 0;

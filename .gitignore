@@ -22,12 +22,14 @@ bench_thumbs.tsv
 /vendor/vst3sdk
 /vendor/vst3-host
 /vendor/twemoji
+/vendor/effetune-mixwright
 /vendor/bench_baseline.json
 /crates/vst3-host/build
 /dev/
-# Keep local test data ignored while tracking the small rating-order smoke fixture.
+# Keep local test data ignored while tracking the small smoke fixtures.
 /testdata/*
 !/testdata/rating-sort/
+!/testdata/audio-tracks/
 # Local tooling / scratch (Claude Code, Codex レビューメモ)
 /.claude/
 /codex-review*.md

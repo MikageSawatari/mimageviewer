@@ -1602,6 +1602,7 @@ pub enum KeyAction {
     GridToggleMaximize,
     GridToggleFolderTreePane,
     GridToggleStackMode,
+    GridConvertEpubToPdf,
     GridTagApply,
     GridTagView,
     GridRotateCw,
@@ -1621,6 +1622,16 @@ pub enum KeyAction {
     GridColumnCount8,
     GridColumnCount9,
     GridColumnCount10,
+    GridColumnCount11,
+    GridColumnCount12,
+    GridColumnCount13,
+    GridColumnCount14,
+    GridColumnCount15,
+    GridColumnCount16,
+    GridColumnCount17,
+    GridColumnCount18,
+    GridColumnCount19,
+    GridColumnCount20,
     GridToggleDetailsView,
     GridOpenPreferences,
     GridOpenOperationCustomize,
@@ -1858,6 +1869,7 @@ pub enum KeyAction {
     /// 動画→音声モード (映像を消して音楽ビューで聴く、Inc 7) のトグル。動画では enter、
     /// 音声モード中は exit。音声ファイル単体では対象外 (映像が無いので no-op)。
     VideoToggleAudioMode,
+    VideoNextAudioTrack,
     EraseConfirm,
     EraseConfirmPolygon,
     EraseRedo,
@@ -2154,6 +2166,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridToggleMaximize,
     KeyAction::GridToggleFolderTreePane,
     KeyAction::GridToggleStackMode,
+    KeyAction::GridConvertEpubToPdf,
     KeyAction::GridTagApply,
     KeyAction::GridTagView,
     KeyAction::GridRotateCw,
@@ -2173,6 +2186,16 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridColumnCount8,
     KeyAction::GridColumnCount9,
     KeyAction::GridColumnCount10,
+    KeyAction::GridColumnCount11,
+    KeyAction::GridColumnCount12,
+    KeyAction::GridColumnCount13,
+    KeyAction::GridColumnCount14,
+    KeyAction::GridColumnCount15,
+    KeyAction::GridColumnCount16,
+    KeyAction::GridColumnCount17,
+    KeyAction::GridColumnCount18,
+    KeyAction::GridColumnCount19,
+    KeyAction::GridColumnCount20,
     KeyAction::GridToggleDetailsView,
     KeyAction::GridOpenPreferences,
     KeyAction::GridOpenOperationCustomize,
@@ -2408,6 +2431,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoAdjustSlot9,
     KeyAction::VideoAdjustSlot10,
     KeyAction::VideoToggleAudioMode,
+    KeyAction::VideoNextAudioTrack,
     KeyAction::EraseConfirm,
     KeyAction::EraseConfirmPolygon,
     KeyAction::EraseRedo,
@@ -2632,6 +2656,7 @@ pub enum MenuCommandId {
     SettingsThumbnailCache,
     SettingsAlwaysOnTop,
     SettingsArchiveCache,
+    SettingsEpubCache,
     SettingsThumbnailQuality,
     SettingsStats,
     SettingsResetRotation,
@@ -2687,6 +2712,7 @@ impl MenuCommandId {
         Self::SettingsThumbnailCache,
         Self::SettingsAlwaysOnTop,
         Self::SettingsArchiveCache,
+        Self::SettingsEpubCache,
         Self::SettingsThumbnailQuality,
         Self::SettingsStats,
         Self::SettingsResetRotation,
@@ -2742,6 +2768,7 @@ impl MenuCommandId {
             MenuCommandId::SettingsThumbnailCache => "SettingsThumbnailCache",
             MenuCommandId::SettingsAlwaysOnTop => "SettingsAlwaysOnTop",
             MenuCommandId::SettingsArchiveCache => "SettingsArchiveCache",
+            MenuCommandId::SettingsEpubCache => "SettingsEpubCache",
             MenuCommandId::SettingsThumbnailQuality => "SettingsThumbnailQuality",
             MenuCommandId::SettingsStats => "SettingsStats",
             MenuCommandId::SettingsResetRotation => "SettingsResetRotation",
@@ -3018,7 +3045,13 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
     MenuCommandSpec {
         id: MenuCommandId::SettingsArchiveCache,
         parent: TopMenuId::Settings,
-        label: "変換済みアーカイブキャッシュ管理",
+        label: "変換済みアーカイブ管理",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsEpubCache,
+        parent: TopMenuId::Settings,
+        label: "EPUB 変換キャッシュ管理",
         action: None,
     },
     MenuCommandSpec {
@@ -4131,6 +4164,7 @@ impl KeyAction {
             GridToggleMaximize => "GridToggleMaximize",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
             GridToggleStackMode => "GridToggleStackMode",
+            GridConvertEpubToPdf => "GridConvertEpubToPdf",
             GridTagApply => "GridTagApply",
             GridTagView => "GridTagView",
             GridRotateCw => "GridRotateCw",
@@ -4150,6 +4184,16 @@ impl KeyAction {
             GridColumnCount8 => "GridColumnCount8",
             GridColumnCount9 => "GridColumnCount9",
             GridColumnCount10 => "GridColumnCount10",
+            GridColumnCount11 => "GridColumnCount11",
+            GridColumnCount12 => "GridColumnCount12",
+            GridColumnCount13 => "GridColumnCount13",
+            GridColumnCount14 => "GridColumnCount14",
+            GridColumnCount15 => "GridColumnCount15",
+            GridColumnCount16 => "GridColumnCount16",
+            GridColumnCount17 => "GridColumnCount17",
+            GridColumnCount18 => "GridColumnCount18",
+            GridColumnCount19 => "GridColumnCount19",
+            GridColumnCount20 => "GridColumnCount20",
             GridToggleDetailsView => "GridToggleDetailsView",
             GridOpenPreferences => "GridOpenPreferences",
             GridOpenOperationCustomize => "GridOpenOperationCustomize",
@@ -4385,6 +4429,7 @@ impl KeyAction {
             VideoAdjustSlot9 => "VideoAdjustSlot9",
             VideoAdjustSlot10 => "VideoAdjustSlot10",
             VideoToggleAudioMode => "VideoToggleAudioMode",
+            VideoNextAudioTrack => "VideoNextAudioTrack",
             EraseConfirm => "EraseConfirm",
             EraseConfirmPolygon => "EraseConfirmPolygon",
             EraseRedo => "EraseRedo",
@@ -4846,6 +4891,7 @@ impl KeyAction {
             GridToggleMaximize => "メインウィンドウを最大化/復元する",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
             GridToggleStackMode => "スタック表示を切り替える",
+            GridConvertEpubToPdf => "選択中の EPUB を PDF ファイルに変換する",
             GridTagApply => "タグを付ける/外すダイアログを開く",
             GridTagView => "タグビューを開く",
             GridRotateCw => "選択中の画像を右に90度回転する",
@@ -4867,6 +4913,16 @@ impl KeyAction {
             GridColumnCount8 => "サムネイル列数を8列にする",
             GridColumnCount9 => "サムネイル列数を9列にする",
             GridColumnCount10 => "サムネイル列数を10列にする",
+            GridColumnCount11 => "サムネイル列数を11列にする",
+            GridColumnCount12 => "サムネイル列数を12列にする",
+            GridColumnCount13 => "サムネイル列数を13列にする",
+            GridColumnCount14 => "サムネイル列数を14列にする",
+            GridColumnCount15 => "サムネイル列数を15列にする",
+            GridColumnCount16 => "サムネイル列数を16列にする",
+            GridColumnCount17 => "サムネイル列数を17列にする",
+            GridColumnCount18 => "サムネイル列数を18列にする",
+            GridColumnCount19 => "サムネイル列数を19列にする",
+            GridColumnCount20 => "サムネイル列数を20列にする",
             GridToggleDetailsView => "サムネイル一覧と詳細一覧を切り替える",
             GridOpenPreferences => "環境設定を開く",
             GridOpenOperationCustomize => "操作カスタマイズを開く",
@@ -5110,6 +5166,7 @@ impl KeyAction {
             VideoToggleAudioMode => {
                 "映像を消して音声モード（音楽ビュー）で聴く。音声モード中は動画表示へ戻す"
             }
+            VideoNextAudioTrack => "次の音声トラックへ切り替える",
             EraseConfirm => "消しゴム処理を実行して終了する",
             EraseConfirmPolygon => "消しゴム多角形を確定する",
             EraseRedo => "消しゴム編集をやり直す",
@@ -5383,6 +5440,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
             | GridRotateCw
@@ -5402,6 +5460,16 @@ impl KeyAction {
             | GridColumnCount8
             | GridColumnCount9
             | GridColumnCount10
+            | GridColumnCount11
+            | GridColumnCount12
+            | GridColumnCount13
+            | GridColumnCount14
+            | GridColumnCount15
+            | GridColumnCount16
+            | GridColumnCount17
+            | GridColumnCount18
+            | GridColumnCount19
+            | GridColumnCount20
             | GridToggleDetailsView
             | GridOpenPreferences
             | GridOpenOperationCustomize
@@ -5629,6 +5697,7 @@ impl KeyAction {
             | VideoAdjustSlot9
             | VideoAdjustSlot10
             | VideoToggleAudioMode => KeyContext::FsVideo,
+            VideoNextAudioTrack => KeyContext::FsVideo,
             EraseConfirm | EraseConfirmPolygon | EraseRedo | EraseUndo | EraseDeleteShape
             | EraseToolSelect | EraseToolBrush | EraseToolBucket | EraseToolLasso
             | EraseToolPolygon | EraseToolVLine | EraseToolHLine | EraseToolLine
@@ -5874,6 +5943,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
             | GridRotateCw
@@ -5893,6 +5963,16 @@ impl KeyAction {
             | GridColumnCount8
             | GridColumnCount9
             | GridColumnCount10
+            | GridColumnCount11
+            | GridColumnCount12
+            | GridColumnCount13
+            | GridColumnCount14
+            | GridColumnCount15
+            | GridColumnCount16
+            | GridColumnCount17
+            | GridColumnCount18
+            | GridColumnCount19
+            | GridColumnCount20
             | GridToggleDetailsView
             | GridOpenPreferences
             | GridOpenOperationCustomize
@@ -6124,6 +6204,7 @@ impl KeyAction {
             | VideoAdjustSlot9
             | VideoAdjustSlot10
             | VideoToggleAudioMode
+            | VideoNextAudioTrack
             | EraseConfirm
             | EraseConfirmPolygon
             | EraseRedo
@@ -6406,6 +6487,7 @@ impl KeyAction {
             GridToggleMaximize => ChordList::one(Chord::key(F11)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
             GridToggleStackMode => ChordList::EMPTY,
+            GridConvertEpubToPdf => ChordList::EMPTY,
             GridTagApply => ChordList::one(Chord::key(T)),
             GridTagView => ChordList::one(Chord::ctrl(T)),
             GridRotateCw => ChordList::one(Chord::key(R)),
@@ -6428,6 +6510,9 @@ impl KeyAction {
             GridColumnCount8 => alt_digit_pair(Num8, Numpad8),
             GridColumnCount9 => alt_digit_pair(Num9, Numpad9),
             GridColumnCount10 => alt_digit_pair(Num0, Numpad0),
+            GridColumnCount11 | GridColumnCount12 | GridColumnCount13 | GridColumnCount14
+            | GridColumnCount15 | GridColumnCount16 | GridColumnCount17 | GridColumnCount18
+            | GridColumnCount19 | GridColumnCount20 => ChordList::EMPTY,
             GridToggleDetailsView => ChordList::one(Chord::alt(Minus)),
             GridOpenPreferences | GridOpenOperationCustomize => ChordList::EMPTY,
             GridAdjustSlot1 => ctrl_digit_pair(Num1, Numpad1),
@@ -6662,6 +6747,7 @@ impl KeyAction {
             VideoAdjustSlot10 => ctrl_digit_pair(Num0, Numpad0),
             // Z: 動画→音声モードのトグル。画像の Z (FsZoomMode) とは別コンテキスト (FsVideo) なので競合しない。
             VideoToggleAudioMode => ChordList::one(Chord::key(Z)),
+            VideoNextAudioTrack => ChordList::EMPTY,
             EraseConfirm => ChordList::one(Chord::key(E)),
             EraseConfirmPolygon => ChordList::one(Chord::key(Enter)),
             EraseRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
@@ -10312,7 +10398,7 @@ mod tests {
         ]);
         add_numbered_names(&mut key_handled, "OpenFavorite", 1..=20);
         add_drive_names(&mut key_handled, "OpenDrive");
-        add_numbered_names(&mut key_handled, "GridColumnCount", 1..=10);
+        add_numbered_names(&mut key_handled, "GridColumnCount", 1..=20);
 
         let fixed_or_ring_only = std::collections::BTreeSet::from([
             // Favorite picker / snapshot lock / Explorer open-folder are input-layer features.
@@ -11102,8 +11188,9 @@ mod tests {
             ),
             (
                 MenuCommandId::SettingsArchiveCache,
-                "変換済みアーカイブキャッシュ管理",
+                "変換済みアーカイブ管理",
             ),
+            (MenuCommandId::SettingsEpubCache, "EPUB 変換キャッシュ管理"),
             (MenuCommandId::SettingsThumbnailQuality, "サムネイル画質…"),
             (MenuCommandId::SettingsStats, "統計…"),
             (MenuCommandId::SettingsResetRotation, "回転情報をリセット…"),
@@ -11384,6 +11471,9 @@ mod tests {
     #[test]
     fn grid_toggle_stack_mode_is_default_unassigned() {
         assert!(KeyAction::GridToggleStackMode.default_chords().is_empty());
+        assert!(KeyAction::GridConvertEpubToPdf.default_chords().is_empty());
+        assert_eq!(KeyAction::GridConvertEpubToPdf.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridConvertEpubToPdf.trigger(), KeyTrigger::Press);
         assert_eq!(KeyAction::GridToggleStackMode.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridToggleStackMode.trigger(), KeyTrigger::Press);
     }
@@ -14332,6 +14422,40 @@ mod tests {
             vec![Chord::ctrl_shift(KeyName::S)]
         );
         assert!(restored.effective_chords(KeyAction::FsSlideshow).is_empty());
+    }
+
+    #[test]
+    fn grid_column_actions_11_to_20_roundtrip_from_ini_through_settings() {
+        let mut ini = String::from("[Grid]\n");
+        for cols in 11..=20 {
+            ini.push_str(&format!("GridColumnCount{cols} = F{}\n", cols + 2));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(&path, ini).unwrap();
+        let parsed = Keymap::load_from_file(&path);
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        let settings = KeymapSettings::from_keymap(&parsed);
+        let restored = Keymap::from_settings(&settings);
+        for cols in 11..=20 {
+            let name = format!("GridColumnCount{cols}");
+            let action = KeyAction::from_ini_name(&name).expect("registered action");
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert_eq!(
+                parsed.effective_chords(action),
+                restored.effective_chords(action)
+            );
+            assert_eq!(
+                settings
+                    .overrides
+                    .iter()
+                    .filter(|row| row.action == name)
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

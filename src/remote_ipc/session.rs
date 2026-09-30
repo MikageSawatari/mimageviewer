@@ -991,6 +991,7 @@ pub(crate) struct VideoStreamPlaybackSnapshot {
 pub(crate) struct PublishedVideoStream {
     pub(crate) session: StreamingSessionId,
     pub(crate) generation: StreamingGenerationAccess,
+    pub(crate) audio_tracks: Arc<Vec<mimageviewer_ipc::RemoteAudioTrack>>,
     pub(crate) playback: Arc<VideoStreamPlaybackState>,
     pub(crate) buffer_target_secs: f64,
     pub(crate) end_behavior: mimageviewer_ipc::VideoStreamEndBehavior,
@@ -1009,6 +1010,7 @@ pub(crate) enum VideoStreamUiRequest {
         owner: RemoteSessionIdentity,
         path: PathBuf,
         quality: VideoStreamQuality,
+        audio_track: Option<usize>,
         budget: VideoStreamStartBudget,
     },
     Control {
@@ -1040,6 +1042,7 @@ impl VideoStreamUiRequest {
             owner,
             path,
             quality,
+            audio_track: None,
             budget: VideoStreamStartBudget::from_enqueued_at(Instant::now()),
         }
     }
@@ -1245,6 +1248,10 @@ impl UiRequestDispatch {
 impl ClaimedRemoteWrite {
     pub(crate) fn request(&self) -> &RemoteWriteRequest {
         &self.request
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.operation.generation()
     }
 
     pub(crate) fn ownership_response(&self) -> SessionResponse {
@@ -2677,6 +2684,13 @@ mod tests {
                 page_count: 10,
                 record_resume: true,
                 record_history: true,
+            },
+            RemoteWriteRequest::RecordVideoProgress {
+                address: mimageviewer_ipc::RemoteAddress::file("C:/media/movie.mp4"),
+                sequence: 1,
+                position_secs: 19.5,
+                duration_secs: 120.0,
+                ended: false,
             },
             RemoteWriteRequest::SetRating {
                 address: page.clone(),

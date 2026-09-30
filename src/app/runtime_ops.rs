@@ -388,12 +388,28 @@ impl App {
         #[cfg(windows)]
         {
             self.sync_native_video_main_cloak(false);
-            // T22: 終了経路は早く抜けたい (ユーザーが close ボタンを押した文脈) ので 2 秒
-            // で打ち切る。timeout した slot は前回保存の state を保持する
-            let states = self.snapshot_vst3_states_into_settings(std::time::Duration::from_secs(2));
-            let positions = self.snapshot_vst3_window_positions_into_settings();
-            if states > 0 || positions > 0 {
-                self.settings.save();
+            self.save_effetune_gui_rect();
+            self.cancel_remote_video_stream_state(
+                mimageviewer_ipc::VideoStreamErrorCode::Failed,
+                "アプリを終了しています",
+            );
+            let quiesced = self
+                .dsp_processing
+                .quiesce_for_exit(std::time::Instant::now() + std::time::Duration::from_secs(2));
+            if quiesced {
+                let effetune_exit = self.effetune.begin_exit_capture();
+                // T22: state snapshot has its own bounded host deadline.
+                let states =
+                    self.snapshot_vst3_states_into_settings(std::time::Duration::from_secs(2));
+                let positions = self.snapshot_vst3_window_positions_into_settings();
+                if states > 0 || positions > 0 {
+                    self.settings.save();
+                }
+                self.effetune.finish_for_exit(effetune_exit);
+            } else {
+                crate::logger::log(
+                    "DSP exit quiescence timed out; retaining previously saved plugin states",
+                );
             }
         }
         self.stop_video_upscale_queue_for_exit();

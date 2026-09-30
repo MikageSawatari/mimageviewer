@@ -12,8 +12,10 @@
 モデル分担と調整の正本は [AGENTS.md の Model Roles And Coordination](AGENTS.md#model-roles-and-coordination)。
 新規の開発タスク、途中の担当変更、独立レビューではこの節を読む。
 旧ClaudeCode/Codex担当名は同節の役割へ読み替え、過去の合意・検証記録は保持する。
-**2026-09-23決定: 管理・設計・作業指示・検収は ClaudeCode Opus 5.5 / high、
-実装・テストは Codex GPT-6 Sol / xhigh、独立レビューは実装者とは別の GPT-6 Sol / xhigh。**
+**2026-09-23決定 (Codex のモデルは 2026-09-30 更新): 管理・設計・作業指示・検収は ClaudeCode Opus 5.5 / high、
+実装・テストは Codex GPT-6.1 Sol / high、独立レビューは実装者とは別の GPT-6.1 Sol / xhigh。**
+(2026-09-30 より前は実装・レビューとも GPT-6 Sol / xhigh。GPT-6.1 Sol は high で GPT-6 Sol の最高設定を上回るため実装は high、
+レビューは見落としの手戻りが高くつくので 1 段上の xhigh。利用者決定。)
 Opusは指摘と検証結果を確認して検収する。Opus自身の確認だけで独立レビューを代替しない。
 重要な所有境界・非同期・複数ウィンドウの設計は、実装前にもSolの独立レビューを受ける。
 実装者は指示の主要な前提をコードで確認し、矛盾があれば設計担当へ返す。
@@ -106,6 +108,40 @@ detached viewer (F12 別ウィンドウ / 複数ウィンドウ) は構造リワ
 揃える。IME 確定、OS clipboard、D&D、右クリック、マウス、ゲームパッドなど固定扱いにする
 入力は、固定である理由を `docs/keymap-spec.md` に残す。
 
+## 設計の簡素化: 状態の組み合わせを減らす (2026-09-28 利用者指示)
+
+設計を決めるとき、非同期の割り込みや状態の組み合わせを**全部扱う前に、組み合わせそのものを
+減らせないか**を必ず検討する。扱う組み合わせを減らすほうが、正しく扱い切るより設計も実装も
+単純で、見落としも起きにくい。検討した結果 (採用した / しなかった理由) を設計書に書く。
+
+- **長い処理はモーダルにして割り込みを消せないか**。変換・保存・パスワード入力のように、
+  途中で他の操作が入ると状態が食い違いやすい処理は、処理中はモーダルにして他の操作
+  (開く・移動・履歴・別ウィンドウへの切り替えなど) を受け付けない形を先に検討する。
+  「処理中に何が起きても元に戻せる」仕組みを作るのは、モーダルにできない理由があるときだけ。
+- **設定変更や状態の切り替えで、表示中のウィンドウ・パネルを閉じて作り直せないか**。
+  表示中のものを変更に追従させる処理を足す前に、閉じる・一覧を読み直すなど既存の単純な
+  経路に乗せられないかを見る。専用の作り直し処理は、既存経路で済まない理由があるときだけ。
+- ほかにも、同じ効果で状態を減らせる手 (1 つの所有者にまとめる、確定の時点を 1 つにする、
+  既存機能と同じ経路・同じタイミングに揃える) がないかを考える。
+- 経緯: 2026-09-27〜28、フォルダ履歴と EPUB 変換の組み合わせで、「変換中に別の本を開く」
+  「直接開く途中に履歴で移動する」などの割り込みを元に戻す仕組みで扱おうとし、独立レビューの
+  たびに別の組み合わせで P1 が出続けた。利用者の指摘で「変換中はモーダル」にしたところ、
+  扱う組み合わせが大きく減った。また設定変更時に表示中の一覧を EPUB 専用に作り直す処理が
+  直すたびに別の問題を出し、既存の RAR 設定と同じ経路に揃えて解消した。
+
+## 通常の使い方が不便になる変更は、着手前に利用者へ相談する
+
+新機能の実装や不具合修正のために、**今の通常の使い方が遅くなる・手間が増える・できなくなる**
+変更 (リリース済みの挙動の退行) が必要になりそうなときは、**実装に着手する前に**利用者へ
+設計を相談する。何が不便になるか、避ける案とその費用を並べて示し、判断をもらってから進める。
+
+- 実装担当・レビュー担当への指示 (brief) でも、既存の挙動を削る選択肢を設計担当が勝手に
+  優先しない。指示を出す前に、その選択で失われる既存の挙動がないかをコードで確かめる。
+- 実装中・レビュー中に退行が見つかったら、黙って進めず止めて相談する。
+- 経緯: 2026-09-27、不具合修正の指示で「開き終わるまで表示を変えない」案を優先させた結果、
+  キャッシュ済み PDF をすぐ表示するリリース済みの挙動を削ってしまった。指示の時点で、
+  その近道があることを確かめていなかった。
+
 ## 観測の出どころを落とさない (対外文書・バックログ・報告)
 
 **エージェントは製品バイナリを起動しない** (「実機検証用バイナリの準備」節)。
@@ -147,6 +183,7 @@ dual-window approach.
 - **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec / avformat / avutil / avfilter / swscale / swresample` の 6 DLL を launcher (`crates/launcher/`) が core / remote service とともに `include_bytes!` で内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開して本体 (`mimageviewer-core.exe`) を spawn する。本体側は exe と同じディレクトリの DLL を Windows ローダが解決するだけで個別ロード処理は持たない。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
 - **ZIP support**: `zip` crate
 - **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (設定 3〜10、既定 5、1 つを Critical 予約)
+- **EPUB conversion**: `crates/epub-pdf-worker` が WebView2 で DRM のない EPUB を PDF 化する。配布ビルドでは `mimageviewer-epub-pdf.exe` を署名後に launcher へ内包し、core と同じ versioned runtime へ展開する。portable 版は core exe の隣に loose 同梱する
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
 - **AI upscaling**: `ort` crate (ONNX Runtime v2、`load-dynamic` モード、`directml` + `cuda` + `tensorrt` features)。Real-ESRGAN / Real-CUGAN / NMKD-Siax ONNX モデルでタイル分割 4x アップスケール。バックエンドは Settings の `ai_backend` で DirectML / TensorRT を切替 (TRT は NVIDIA 専用)
 - **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、AI runtime 初期化 worker が `%APPDATA%/mimageviewer/` に展開して `ort::init_from()` で動的ロードする。Microsoft 公式 app-local VC runtime 4 本も全配布 exe の隣へ同梱するため、利用者による VC++ 再頒布可能パッケージの追加インストールは不要
@@ -935,13 +972,14 @@ HEVC / AV1 を再生する) のために、FFmpeg の **LGPL shared build** を 
 直接の本体には適用できない (ローダの解決タイミングに間に合わない)。`/DELAYLOAD` も
 rustc 経由の link.exe で機能しない (Delay Import Directory が空のまま、原因未解明)。
 
-そこで **launcher が core・remote service・FFmpeg DLL を内包する構成**で「単体 exe 配布」を実現している:
+そこで **launcher が core・remote service・EPUB converter・FFmpeg DLL を内包する構成**で「単体 exe 配布」を実現している:
 
 ```
 配布する mimageviewer.exe (= ランチャー、crates/launcher/ が生成)
 ├── include_bytes! で内包:
 │   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
+│   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
 │   ├── avutil-59.dll
@@ -949,8 +987,8 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── swscale-8.dll
 │   └── swresample-5.dll
 └── 起動時の動作:
-    1. %APPDATA%\mimageviewer\runtime\<version>\ に上記 8 ファイルを展開
-       (サイズ一致チェックでスキップ、不一致なら .tmp → atomic rename)
+    1. %APPDATA%\mimageviewer\runtime\<version>\ に上記 exe / DLL と app-local VC runtime を展開
+       (版別 SHA-256 sidecar で照合し、不一致なら atomic replace)
     2. std::process::Command で mimageviewer-core.exe を spawn (引数 forward)
     3. ランチャー即終了 (GUI なので exit code を待たない)
 ```
@@ -960,28 +998,29 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される。
 
 **バージョン別 runtime ディレクトリ**: `runtime\<version>\` のように分けることで、
-古い core / remote が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
+古い core / remote / EPUB worker が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
 (Codex レビュー助言)。古いバージョンの runtime ディレクトリはユーザーが手動で
 削除可能 (将来的にランチャー側で「最新 N 世代だけ残す」掃除処理を追加するかも)。
 
 **ビルド順序**: cargo は同一ワークスペース内 bin の依存順序を表現できないので
-`scripts/build-release.{sh,ps1}` が 3 段階に分けて呼ぶ:
+`scripts/build-release.{sh,ps1}` が 4 段階に分けて呼ぶ:
 1. `cargo build --release --bin mimageviewer-core` → 本体生成 (package `mimageviewer` 内の bin なので `-p` 不要)
 2. `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets`
    → Web UI 資産を内包した remote service 生成
-3. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
+3. `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf` → EPUB converter 生成
+4. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote + EPUB worker を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
 
-ラッパーは 3 つの cargo 呼び出しすべてで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
+ラッパーは 4 つの cargo 呼び出しすべてで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
 release profile はローカル rebuild 高速化のため `incremental = true` だが、ThinLTO +
 rust-lld で stale incremental object が残ると `fast_image_resize` などの SIMD symbol が
 release link 時に未解決になることがあるため、配布ビルドは安定優先で incremental を切る。
 
-`cargo build --release` を直接打つ場合は ① → ② → ③ の順で 3 回打つこと。
-ランチャー側 build.rs が `target/release` の core / remote 両方の存在をチェックし、
+`cargo build --release` を直接打つ場合は ① → ② → ③ → ④ の順で 4 回打つこと。
+ランチャー側 build.rs が `target/release` の core / remote / EPUB worker の存在をチェックし、
 無ければ復旧手順付きで止まる。
 
 **配布物**:
-- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + DLL を含む)
+- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + EPUB worker + DLL を含む)
 - インストーラ版: `mImageViewer_setup.exe` (Inno Setup が同じランチャーを配置)
 - どちらも初回起動時に APPDATA に展開、2 回目以降は展開済みなのでスキップして高速
 
@@ -1308,15 +1347,16 @@ cargo test -p mimageviewer --test <integration-test-name>
 [docs/development-build-and-test.md](docs/development-build-and-test.md) を参照。
 
 ⚠️ **`test-full.ps1` は `target\release\mimageviewer-core.exe` と
-`target\release\mimageviewer-remote.exe` が既に在ることを前提にする**。`--workspace` が
-launcher package を含み、その build.rs が内包対象 exe の存在を検査するため、どちらかが
+`target\release\mimageviewer-remote.exe`、`target\release\mimageviewer-epub-pdf.exe` が既に在ることを前提にする**。`--workspace` が
+launcher package を含み、その build.rs が内包対象 exe の存在を検査するため、いずれかが
 無いと**テストが 1 件も走らないままビルドエラーで落ちる**。新しい clone や
-`cargo clean` 直後は、先に 2 本を作ってから走らせる (どちらでもよい):
+`cargo clean` 直後は、先に 3 本を作ってから走らせる (どちらでもよい):
 
 ```powershell
-.\scripts\build-release.ps1     # core -> remote -> launcher を正しい順で作る
+.\scripts\build-release.ps1     # core -> remote -> EPUB worker -> launcher を正しい順で作る
 cargo build --release --bin mimageviewer-core
 cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
+cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
 ```
 
 `build-dist.ps1` は test-full を `cargo clean` の**前**に回すので、直前のビルド成果物が
@@ -1538,7 +1578,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 | 配布形態 | ファイル名 | 中身 / 性質 | data 保存先 | 管理者権限 |
 | --- | --- | --- | --- | --- |
-| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + FFmpeg DLL を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
+| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + FFmpeg DLL を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
 | **インストーラ版** | `mImageViewer_setup.exe` | Inno Setup 出力 | `%APPDATA%\mimageviewer` | **要 (UAC)** |
 | **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。native 依存を埋め込まず exe 隣に同梱、展開ゼロ | `<exe_dir>\data` (APPDATA 不使用) | 不要 |
 
@@ -1550,7 +1590,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 - **Vector**: インストーラ (.exe) + `installer/readme.txt` (利用者向け説明書) を zip にまとめて申請。
   readme 同梱を Vector が要件化しているため、単体 exe やインストーラ単独での申請は不可。
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
-- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → launcher → ISCC → portable を 1 コマンド、
+- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → EPUB worker → launcher → ISCC → portable を 1 コマンド、
   stale 配布物を構造的に防ぐ)。開発中の素早い反復だけ `.\scripts\build-release.ps1` 単体を使う
   (clean/ガードなしなので配布物には使わない)。
 - **出力**: `installer/Output/mImageViewer_setup.exe`
@@ -1562,11 +1602,12 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 - **ポータブル版ビルド**: 配布時は build-dist.ps1 が内部で `.\scripts\build-portable.ps1` を呼ぶ。
   `cargo build --release --bin mimageviewer-core --features portable --target-dir target-portable` と
   `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir target-portable`
+  と `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf --target-dir target-portable`
   (非portable core を上書きしないよう専用 target dir に分離) → loose 同梱フォルダ +
   `dist\mImageViewer_portable_v<VER>.zip` を生成する。`portable` feature で native 依存
   (pdfium / onnxruntime / susie / vst3-host / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
   `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームし、
-  remote service をその隣へ同梱。
+  remote service と EPUB converter をその隣へ同梱。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
 - **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
@@ -1820,10 +1861,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      (バックログ §1.196)
 
 6.5. **GitHub Actions の CI が緑であることを確認** (`gh run list --limit 5`)。
-   赤なら原因を直してからリリース作業に入る。特に `cargo check (ubuntu / non-Windows cfg)` は
-   **`cfg(windows)` 漏れの番人**で、Windows 機のローカルビルドでは原理的に出ない失敗を拾う
-   (例: `#[cfg(windows)]` フィールドを cfg なしの経路から参照している)。ローカルの
-   `cargo check` / `test-full.ps1` が全部通っていても、この job だけ落ちていることがある。
+   赤なら原因を直してからリリース作業に入る。現在の job は `cargo fmt --check` と viewer context 監査の 2 本。
+   (ubuntu での非 Windows cfg の `cargo check` job は 2026-09-29 に廃止した。mIV は Windows 専用で、
+   この job のための修正と、どこでも実行されない `cfg(not(windows))` 側のコードが増え続けていたため。
+   非 Windows でコンパイルが通るかは今後は検査しないので、復活させない。)
    失敗ログの読み方: `gh run view <run-id> --log-failed` はビルド全体の warning も含むため、
    ファイルへ落として `error[E` で絞り込む (`-->` の行に実ファイル位置が出る)。
 7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
@@ -1927,19 +1968,19 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 ### Phase 3: ビルド・配布成果物
 
-10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → launcher → ISCC → portable)。
+10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → EPUB worker → launcher → ISCC → portable)。
     - build-dist.ps1 は Rust 全体テストを通してから
-      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher`
-      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote`) してから実コンパイルするので、
+      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher`
+      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote -p epub-pdf-worker`) してから実コンパイルするので、
       cargo の偽 up-to-date 由来の **stale 配布物を構造的に防ぐ**
       ([docs/release-operations.md](docs/release-operations.md) §2.1 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
       LNK1104 を回避) と build-portable.ps1 を子 PowerShell で呼び、各 `$LASTEXITCODE` を検査する。
     - VST3 bridge の C++ を変えていなければ `.\scripts\build-dist.ps1 -SkipVst3Bridge` (cmake 再ビルドを省く)。
     - **コード署名は build-dist.ps1 が既定で ON** (Certum Open Source Code Signing 証明書、SimplySign Desktop
       のクラウド鍵)。配布する全 PE に Authenticode 署名 + RFC3161 タイムスタンプを付ける: 単体exe (launcher) /
-      core / remote / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / `mImageViewer_setup.exe` / portable の各 loose PE。
+      core / remote / EPUB worker / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / `mImageViewer_setup.exe` / portable の各 loose PE。
       **`include_bytes!` で埋め込む物は「埋め込み前」に署名する**
-      (内側 vendor PE → core + remote → launcher → setup.exe の順)。
+      (内側 vendor PE → core + remote + EPUB worker → launcher → setup.exe の順)。
       でないと APPDATA へ展開されたコピーが未署名になり、AV 誤検知
       ([docs/release-operations.md](docs/release-operations.md) §7) が
       再発する。`onnxruntime*.dll` は Microsoft 署名済みなので**再署名しない**、`*.onnx` は PE でないので対象外。
@@ -1948,7 +1989,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       (証明書選択は既定 subject `/n "Open Source Developer Taku Sano"`。証明書更新で拇印を固定したいときは
       `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。ポータブルの vst3-host は署名対応後も当面**非同梱据え置き**。
     - **通常の開発反復は `.\scripts\build-dev.ps1`**。通常feature set（portableなし）を
-      `dev-runtime` profileで `target\dev-runtime` へ core + remote をビルドし、launcherなしで必要な
+      `dev-runtime` profileで `target\dev-runtime` へ core + remote + EPUB worker をビルドし、launcherなしで必要な
       FFmpeg DLLだけを変更時に配置する。引数なしの起動は通常版と同じ
       `%APPDATA%\mimageviewer` を使う。launcher／release最適化／埋め込みasset／変更したVST3
       bridgeまで含む実機確認は `.\scripts\build-release.ps1` (incremental・cleanなし、署名は
@@ -1974,7 +2015,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       インストール版をトレイ常駐させたまま起動しても両方独立に動く (mutex 分離) ことを確認。
       検証チェックリスト全項目は [docs/portable-build-plan.md](docs/portable-build-plan.md) §8。
 12. **全 PE / app-local VC runtime gate** — `build-dist.ps1` が installer / portable 完成後に
-    `scripts/check-vcrt-pe-dependencies.ps1` を必須実行する。launcher / core / remote / installer、
+    `scripts/check-vcrt-pe-dependencies.ps1` を必須実行する。launcher / core / remote / EPUB worker / installer、
     portable 配下、埋め込み元 PDFium / DirectML ORT / FFmpeg / Susie / VST host を filesystem から
     列挙し、artifact 別 machine、direct import closure、全 input SHA-256 を report に残す。
     4 CRT は Microsoft 署名、manifest exact hash、全4本同一版かつ最低 14.44 を必須とし、
@@ -2064,7 +2105,7 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
 担当・実施粒度は [AGENTS.md](AGENTS.md#model-roles-and-coordination) に従う。
 独立レビュー担当を使える場合はその担当を再利用し、同じ差分のCLIレビューを重ねない。
 ClaudeCode主導の開発またはCLIレビューが必要な場合は以下を使い、新規reviewは「モデル指定について」の
-GPT-6 Sol / xhighを明示する。重要指摘の修正・再確認は維持し、小さな中間変更ごとの承認は求めない。
+GPT-6.1 Sol / xhighを明示する。重要指摘の修正・再確認は維持し、小さな中間変更ごとの承認は求めない。
 以下の自発的レビュー規則は開発変更が対象。ClaudeCode Opusによる定型の公開準備・公開作業
 (版番号・更新履歴・公開メタデータの更新を含む) には適用しない。
 利用者が明示的にレビューを依頼した場合、または製品コード等の開発変更が生じた場合は実施する。
@@ -2079,7 +2120,7 @@ GPT-6 Sol / xhighを明示する。重要指摘の修正・再確認は維持し
 辿り着くため。
 
 重要な所有境界・非同期・複数ウィンドウの設計は、以下の完成時レビューに加えて
-**実装前に**独立したGPT-6 Sol / xhighへ確認を依頼する。前提のコード上の根拠、不変条件、
+**実装前に**独立したGPT-6.1 Sol / xhighへ確認を依頼する。前提のコード上の根拠、不変条件、
 影響する同型経路、受入条件を渡し、設計の誤り・見落としも指摘対象にする。
 以下の第二意見はまずSolへ依頼し、それでも解けない論点や難しい構造設計は
 AGENTS.mdの条件に従いAstra / mediumへ絞って依頼する。
@@ -2307,14 +2348,16 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
 この節の簡略化したCLI例にも、実行時には同じmodel/effortを付ける。
 
 ```bash
-codex exec --model gpt-6-sol -c 'model_reasoning_effort="xhigh"' --sandbox read-only -o <FILE> "<review prompt>"
+codex exec --model gpt-6.1-sol -c 'model_reasoning_effort="xhigh"' --sandbox read-only -o <FILE> "<review prompt>"
 ```
 
-実装・テスト担当も `gpt-6-sol` / `xhigh` を明示し、上のread-onlyレビューとは別の担当・会話にする。
+実装・テスト担当は `gpt-6.1-sol` / `high` を明示し、上のread-onlyレビューとは別の担当・会話にする
+(`codex exec --model gpt-6.1-sol -c 'model_reasoning_effort="high"' --sandbox workspace-write ...`)。
+`gpt-6.1-sol` には Codex CLI 0.159.0 以上が要る。
 Astraの追加確認が必要な場合だけ、上のmodelを `gpt-6-astra`、effortを `medium` に変え、
 read-onlyのまま未解決の論点を渡す。個人configの既定値には依存させない。
 
-同じレビューの継続は既存のresume手順を使い、旧Astra担当・GPT-5.6 Sol担当等からの移行時はmodel/effortが
+同じレビューの継続は既存のresume手順を使い、旧Astra担当・GPT-5.6 Sol担当・GPT-6 Sol担当等からの移行時はmodel/effortが
 実際に切り替わったことを確認する。切り替えられなければ、既知指摘・判断根拠・対象差分と
 検証記録を指定モデルの新しい担当へ渡す。解決済み事項の全件再レビューは不要。
 利用可否やoverrideの失敗はCLIの実出力で確認し、未確認の設定を適用済みと報告しない。
@@ -2358,15 +2401,15 @@ HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI な�
   `%APPDATA%\mimageviewer` を使う。`dev-runtime` はアプリのデータprofile名ではない。
 - **release構成依存の実行**: launcher、release-only cfg／最適化、exact release performance、
   埋め込みasset展開、変更したVST3 bridge、署名、packagingに依存する場合は
-  `.\scripts\build-release.ps1`。内部で core → remote → launcher の3段cargo buildを回し、常駐mIVを
+  `.\scripts\build-release.ps1`。内部で core → remote → EPUB worker → launcher の4段cargo buildを回し、常駐mIVを
   自動停止してLNK1104を回避する。出力は `target\release\mimageviewer.exe` (launcher) と
-  `target\release\mimageviewer-core.exe` (本体)、`target\release\mimageviewer-remote.exe`。
+  `target\release\mimageviewer-core.exe` (本体)、`target\release\mimageviewer-remote.exe`、`target\release\mimageviewer-epub-pdf.exe`。
 - **配布ではないので `build-dist.ps1` は使わない**。配布物を作るときだけclean-firstの
   `build-dist.ps1`。
 - **⚠️ エージェントのツールから呼ぶときは `*>&1` を付けない**。PowerShell の `-ErrorAction Stop`
   下で cargo の stderr が terminating error 化して即失敗する
   ([docs/release-operations.md](docs/release-operations.md) §2.2)。PowerShell ツールは stderr を自前で拾うので、素の
-  `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → remote → launcher の 3 段 cargo build を
+  `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → remote → EPUB worker → launcher の 4 段 cargo build を
   直接叩く。
 - **依頼のしかた**: core検証なら
   `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`、release構成検証なら

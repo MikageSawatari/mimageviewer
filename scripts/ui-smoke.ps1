@@ -8,6 +8,7 @@ Automation must not pass this switch until that approval has been obtained.
 
 .PARAMETER Scenario
 MultiWindowRarNav checks Ctrl+Up/Down across direct RAR, ZIP, and CBR in one detached window.
+FolderHistory checks Rating and Collection folder history with real shortcut input.
 #>
 # Run an isolated, diagnostic portable UI smoke scenario.
 #
@@ -25,7 +26,7 @@ MultiWindowRarNav checks Ctrl+Up/Down across direct RAR, ZIP, and CBR in one det
 
 [CmdletBinding()]
 param(
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AlwaysOnTop')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'AlwaysOnTop')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -38,6 +39,9 @@ if (-not $InteractiveApproved) {
     [Console]::Error.WriteLine(
         '[ui-smoke] interactive UI run requires explicit user approval; use -InteractiveApproved only after the user agrees to the scenario and expected duration.')
     exit 2
+}
+if ($Scenario -eq 'AudioTracks' -and -not $PSBoundParameters.ContainsKey('TimeoutSeconds')) {
+    $TimeoutSeconds = 240
 }
 
 $ErrorActionPreference = 'Stop'
@@ -749,7 +753,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AlwaysOnTop')
+    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'AlwaysOnTop')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -835,6 +839,81 @@ if ($script:archiveErrors.Count -gt 0) {
     $candidateFixtureGeneratorPdfDependencyPath = $null
 
     switch ($Scenario) {
+    'AudioTracks' {
+        $scenarioRoot = Join-Path $targetRoot 'ui-smoke\audio-tracks'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\audio-tracks.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'fixture'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $source = Join-Path $repoRoot 'testdata\audio-tracks\multi.mkv'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\ui-smoke\audio-tracks') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $repoRoot 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'audio-tracks-fixture'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        Assert-NoReparsePath $source $repoRoot 'audio-tracks-source'
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $candidateScriptPath -PathType Leaf)) {
+            throw '[ui-smoke] AudioTracks scenario or multi.mkv is missing'
+        }
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        $copy = Join-Path $candidateFixtureDir 'multi.mkv'
+        Copy-Item -LiteralPath $source -Destination $copy
+        Assert-NoReparseTree $candidateFixtureDir 'audio-tracks-fixture'
+        if ((Get-Item -LiteralPath $copy).Length -le 0 -or
+            (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) {
+            throw '[ui-smoke] copied AudioTracks fixture does not match multi.mkv'
+        }
+        Write-UiSmokeJson $candidateSettingsPath ([ordered]@{
+            detached_viewer_enabled = $true
+            detached_viewer_open_images_in_window = $false
+            detached_viewer_window_placement = [ordered]@{
+                x = 40.0
+                y = 40.0
+                w = 1280.0
+                h = 760.0
+                maximized = $false
+            }
+            video_in_window_mode = $true
+            video_loop_mode = 'Full'
+        })
+    }
+    'FolderHistory' {
+        $scenarioRoot = Join-Path $dataDir 'folder-history'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\folder-history.rhai'
+        $candidateFixtureDir = Join-Path $scenarioRoot 'A'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_folder_history_fixture.py'
+        $candidateFixtureGeneratorPdfDependencyPath = Join-Path $PSScriptRoot 'page-turn\generate_pdf_fixture.py'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\portable-smoke\data\folder-history') 'ui-smoke-scenario'
+        Assert-NoReparsePath $scenarioRoot $dataDir 'ui-smoke-scenario'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'ui-smoke-scenario'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        foreach ($path in @($candidateScriptPath, $candidateFixtureGeneratorPath, $candidateFixtureGeneratorPdfDependencyPath)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "[ui-smoke] folder-history input not found: $path"
+            }
+        }
+        New-Item -ItemType Directory -Path $candidateFixtureDir -Force | Out-Null
+        & python $candidateFixtureGeneratorPath $candidateFixtureDir $dataDir
+        if ($LASTEXITCODE -ne 0) {
+            throw "[ui-smoke] folder-history fixture generator failed with exit $LASTEXITCODE"
+        }
+        Assert-NoReparseTree $candidateFixtureDir 'folder-history-fixture'
+        foreach ($relative in @('F\G\g-page.png', 'F\z-page.png', 'F\x-book.pdf', 'F\y-book.zip', 'B\D\d-page.png', 'B\z-page.png', 'B\x-book.pdf', 'B\y-book.zip')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $candidateFixtureDir $relative) -PathType Leaf)) {
+                throw "[ui-smoke] folder-history fixture file missing: $relative"
+            }
+        }
+        Write-UiSmokeJson $candidateSettingsPath ([ordered]@{
+            auto_fullscreen_image_folders = $false
+            auto_fullscreen_zip_pdf = $false
+            sort_order = 'FileName'
+        })
+    }
     'AlwaysOnTop' {
         $scenarioRoot = Join-Path $targetRoot 'ui-smoke\always-on-top'
         $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\always-on-top.rhai'

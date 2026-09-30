@@ -324,7 +324,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 
 ### 2.3 ツールバー
 
-- 左フォルダツリーペインの表示切替、本棚の追加先切替/追加/開く、名前付きコレクションの開く/追加、列数（1〜10 + 詳細）、
+- 左フォルダツリーペインの表示切替、本棚の追加先切替/追加/開く、名前付きコレクションの開く/追加、列数（1〜20 + 詳細）、
   縦横比（7種）、一覧ソート順（名前 / 番号 / 更新日 / ファイルサイズの6種）、レーティングフィルタ、スマートフィルタ、お気に入りフォルダ、
   登録済みスマートフォルダのボタン、
   タグの付与/解除ボタンとピン留めタグのボタンを配置
@@ -338,7 +338,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   - **空き領域を右クリック** = 表示するセクションの ON/OFF チェックリスト。全セクションを隠した
     場合の入口として、`設定` メニュー → `ツールバー` からも同じメニューを開ける。
   - **セクションのラベルを右クリック** = そのセクションの設定 (表示形式 = 展開/折りたたみ/プルダウン、
-    出す項目 = 列1〜10/比率/ソート、行頭に表示、このセクションを隠す、本/お気に入り/タグの管理)。
+    出す項目 = 列1〜20/比率/ソート、行頭に表示、このセクションを隠す、本/お気に入り/タグの管理)。
     フォルダバーでは `フォルダ:` ラベルまたは `場所▼` を右クリックして、場所▼の表示項目も設定できる。
     スマートフィルタバーでは `絞り込み:` ラベルを右クリックして、表示するフィルタ項目
     （ファイル名欄を含む）とファイル名欄の幅を設定できる。
@@ -512,7 +512,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   即時に揃え、それ以上なら描画端数だけを 130ms の ease-out で補間し、正本オフセットは完了時に
   1 回だけ更新する。補間中に触れ直した場合はその位置から操作を引き継ぐ。慣性スクロールは行わない
 - サムネイル表示の 2 本指ピンチは、広げると列数を減らしてセルを大きくし、縮めると列数を
-  増やす。連続倍率は 1.25 / 0.8 の比に達するごとに 1 列だけ変更し、1〜10 列でクランプする。
+  増やす。連続倍率は 1.25 / 0.8 の比に達するごとに 1 列だけ変更し、1〜20 列でクランプする。
   ピンチ中の移動はスクロールへ渡さず、列数設定は操作終了時に 1 回だけ保存する
 - タッチ由来のドラッグは一覧スクロールが所有し、native ファイル D&D を開始しない。
   マウスの左ドラッグ D&D、ホイール、スクロールバー、クリック / ダブルクリックは従来どおり
@@ -551,6 +551,8 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 - ツールバーの列セクションで `詳細` を選ぶか、<kbd>Alt</kbd>+<kbd>-</kbd> で
   `サムネ` / `詳細` を切り替える。<kbd>Alt</kbd>+<kbd>1</kbd>〜<kbd>0</kbd> は
   サムネ表示に戻して列数を切り替える
+- 列セクションがプルダウン表示のときは `詳細` を列数候補より上に置き、区切り線を入れる。
+  ボタン表示では列数候補の後ろに置く。列セクションの右クリック設定でも `詳細` を列数候補より上に置く
 - 詳細モードは固定行高の一覧で、既定では左端にプレビューアイコン列を置き、続けて
   `名前` / `★` / `タグ` / `種類` / `サイズ` / `更新日時` / `状態` を表示する。
   状態列にはページ個別補正 (`補`) / 補正レイヤー (`レ`) / 消しゴム (`消`) /
@@ -738,6 +740,30 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   <kbd>6</kbd> は連結方式 (ページ単位 → 縦連結 → 横連結)、<kbd>7</kbd> は横方向
   (左→右 / 右→左)、<kbd>0</kbd> はズーム/フィット
   (ページ全体 / 横幅 / 縦幅 / 100%原寸) を切り替える。
+  環境設定の見開きページに「PDF / EPUB の右開き指定に従う」を設ける (既定 OFF)。ON のときは、
+  本に保存したページ構成・読み方向がどちらも無い場合だけ PDF / EPUB の指定を既定のページ構成と読み方向へ適用する。
+  1 ページ表示はそのままで、シークバーの方向は本の指定に従う。ページ構成だけ保存されている場合はその向きを
+  読み方向へ写し、読み方向だけ保存されている場合は既定の見開きモードをその向きへ写す。
+  お気に入りの既定値は変更しない。
+  EPUB の変換結果は実行中に世代を固定する。サムネイルとページ数の再利用は固定世代の ID と
+  PDF サイズで判定し、元 EPUB の更新日時・サイズは詳細表示に残す。内容同定は EPUB を別種として扱い、
+  固定済みは変換時に記録した元のハッシュ、未固定は元 EPUB のハッシュを使う。
+  「EPUB 変換キャッシュ管理」には元ファイル名、ページ数、保存サイズ、
+  最終利用日時を表示する。選択・全件・元ファイル消失の削除はその場で実行する。
+  表示中など使用中の本は削除せず理由を示し、成功した本の固定世代と派生参照を外す。
+  次の開封は未変換として EPUB の処理設定に従う。元 EPUB と編集・評価・しおりは残る。
+  RAR/7z の容量上限と合計には EPUB を含めない。
+  RAR / 7z / LZH などの変換結果は別メニュー「変換済みアーカイブ管理」で管理し、削除は即時に行う。
+  EPUB は通常フォルダ・スマートフォルダ・サブ展開・検索・コレクション・★一覧で PDF と同じ本の行に表示する。
+  未変換なら書類アイコンと EPUB バッジ、変換済みなら先頭ページをサムネイルにする。
+  一覧から開いた未変換 EPUB はファイル処理設定に応じて変換確認へ進む。
+  確認画面の「PDF ファイルとして保存して開く」は元 EPUB と同じフォルダに同名 PDF を作り、その PDF を開く。同名 PDF は上書きしない。現在の変換結果を再利用できる場合は複写し、なければ変換してから PDF のページ数を検証して保存する。書き込めない場合は通常の「変換して開く」を案内する。「確認せずに変換」は従来どおり一時保存先を使う。
+  一覧の EPUB を右クリックして「変換 > PDF ファイルに変換」も選べる。複数選択は 1 件ずつ処理し、同名 PDF のスキップと失敗理由を表示する。キャンセルは処理中の 1 件を終えてから停止する。保存後は一覧を更新し、同名 PDF を優先する設定が有効なら EPUB を隠す。
+  保存した PDF には EPUB の書名と最初の著者を記録する。EPUB に書名がない場合は、拡張子を除いた EPUB のファイル名を書名にする。レーティングやページの補正など、通常のファイルコピーで引き継ぐ設定を PDF に複写し、元 EPUB にも残す。しおりとコレクション登録は元 EPUB に残り、PDF へは複写しない。PDF は EPUB と異なる内容として扱う。
+  同じフォルダに同名 PDF がある場合は既定で EPUB を一覧から隠す (設定で解除可能)。
+  EPUB は元ファイル名で検索し、結果は元 EPUB のパスを保持する (親フォルダ名は検索語にしない)。
+  EPUB 内のタイトル・著者は検索対象に含めず、
+  変換済み PDF に記録されたタイトル・著者も検索へ流用しない。
   見開きでは画面に表示される向きが横長 (幅 > 高さ) のページを単独表示し、次のページから
   ペアを組み直す。画面に表示される向きには保存済みの 90° 単位回転を含み、90° / 270° では
   元寸法の幅と高さを入れ替えて判定する。本体と mIV Remote は同じ判定を使い、寸法未確定の
@@ -1047,9 +1073,29 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   safety limiter のゲインリダクション量が 1dB 以上に達した場合は音量表示右側に
   赤いインジケータを約 500ms 表示する (ceiling に触れただけ・タイムストレッチ由来の
   微小オーバーでは点かない)。
+- 複数の音声トラックがある動画では、下部 HUD の「音声 N」から一覧を開いて選ぶ。
+  行には番号と、分かる場合は言語・タイトル・形式・チャンネル数を示し、既定の行に
+  「(既定)」を付ける。右メタ情報パネルには現在の音声情報とトラックの本数を示す。
+  再生中の選択は現在位置から再生を続け、一時停止中は停止したまま切り替わる。
+  最後まで再生して停止中、または選択先に現在位置の音声がないと分かる場合は、
+  「(次の再生位置で切り替え)」と表示し、次の位置移動や再生開始で切り替える。
+  長さの情報がないトラックや途中で長く途切れるトラックは、音声のない位置への切り替えで
+  読み込み中のままになることがあり、そのトラックに音声がある位置へ移動するか元のトラックへ戻すと再開する。
+  動画から音声モードへ移った場合も下部 HUD から同じトラックを選べる。
+  「次の音声トラックへ切り替える」は操作カスタマイズで割り当てられ、既定キーはない。
+  音量ノーマライズの測定結果はファイル内のトラックごとに分ける。
+- 選んだ音声トラックは動画ファイルごとに記憶し、再生位置の復元設定とは独立して次回も使う。
+  「環境設定 → ライブラリ → 履歴と復元」の「再生位置と音声トラックの選択をすべてクリア」は
+  両方の記憶を消す。
+- リモート閲覧の動画は PC で選んだ音声トラックから始まる。端末の「動画の操作」では、
+  複数ある場合にトラックを選び直せる。端末で確定した選択は PC に記憶される。
+  端末で見た動画のファイル識別情報・再生位置・長さは PC へ渡され、PC の再生位置設定と閲覧履歴に反映される。
+  再生開始時の位置は PC の位置復元設定に従う。PC 側で接続を切った場合は、最後の数秒の進みが残らないことがある。
+  リモート接続を受け付けると PC の閲覧ウィンドウをすべて閉じて「リモート接続中」だけを表示する。
+  切断後は一覧に戻り、閉じた閲覧ウィンドウは復元しない。
 - 保存済み再生位置 (動画) と読書位置 (ZIP/PDF/対応アーカイブ) の記憶件数の確認・全件クリアは
-  **環境設定 → ライブラリ → 履歴と復元** ページに集約 (動画は `settings.video_resume_positions`、本は
-  `book_resume_db` を対象)。動画クリアは settings 経路のため OK 適用時、本クリアは
+  **環境設定 → ライブラリ → 履歴と復元** ページに集約 (動画・音声の再生位置と動画の音声トラック選択、
+  本の読書位置を対象)。再生位置とトラック選択のクリアは OK 適用時、本クリアは
   `book_resume_clear_requested` one-shot 経由で App が即時 `book_resume_db.clear_all()`。
 - 閲覧履歴は、ユーザー操作で開いた画像フォルダ / ZIP / PDF / 対応アーカイブと、
   動画・音声ファイルを %APPDATA%\mimageviewer\reading_history.db に MRU として保存する。
@@ -1471,7 +1517,7 @@ F12 相当の別ウィンドウ ON/OFF、現在操作中の mIV ウィンドウ�
 現在の割り当てを混ぜて表示する。空の入力種別は省略し、全入力未割り当ての操作は `なし` と表示する。
 コマンド一覧と、キーボード図から開く「キーから割り当て」の候補一覧は、同じ操作 / キー検索欄と
 絞り込み状態を共有する。
-`GridColumnCount1..10` のようにキー操作とリング用アクションが対応するものは、同じ編集ダイアログから
+`GridColumnCount1..20` のようにキー操作とリング用アクションが対応するものは、同じ編集ダイアログから
 キー / リング / マウス戻る・進む / X+方向 / マウスジェスチャを編集できる。
 通常のキー割り当ては入力欄と「押して入力」で編集し、ルーペ表示などの修飾キー長押し操作は
 Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
@@ -1534,6 +1580,7 @@ Ctrl / Shift / Alt / 割り当て解除のボタンで選ぶ。
 | Ctrl + マウスホイール | 列数を増減 |
 | Alt + 1〜9 | 列数を 1〜9 に切り替え |
 | Alt + 0 | 列数を 10 に切り替え |
+| 操作カスタマイズで割り当て | 列数を 11〜20 に切り替え（既定キーなし） |
 | Alt + - | サムネイル表示 / 詳細表示を切り替え |
 | F11 | メインウィンドウを最大化 / 復元する（Action: `GridToggleMaximize`） |
 | リング系の「メインウィンドウを閉じる」 / 「アプリを終了する」 | 「メインウィンドウを閉じる」はグリッドだけで割り当て可能。[×] と同じ close request のため、タスクトレイ常駐設定が有効ならトレイへ格納する。「アプリを終了する」はグリッド / 画像フルスクリーン / 動画フルスクリーンで割り当て可能。明示終了として常駐設定にかかわらず通常の保存・終了処理を通り、次回起動時はフルスクリーンを復元せず一覧を表示する。画像 / 動画の「フルスクリーンを閉じる」とは別操作 |
@@ -1829,9 +1876,9 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 
 | 設定名 | 型 | デフォルト | 説明 |
 |--------|-----|---------|------|
-| `grid_cols` | usize | 4 | サムネイルグリッド列数（1〜10） |
+| `grid_cols` | usize | 4 | サムネイルグリッド列数（1〜20） |
 | `grid_view_mode` | GridViewMode | Thumbnail | グリッドの表示モード。`Thumbnail` は従来のサムネイルグリッド、`Details` は行ベースの詳細一覧 |
-| `remember_favorite_view_state` | bool | false | お気に入りごとの表示状態の自動記憶・復元。対象は `grid_view_mode` / `thumb_px` / `thumb_aspect` / `thumb_aspect_auto` / `grid_display_order` / `sort_order` / `default_spread_mode` / `default_reading_flow`。専用値は `adjustment.db.favorite_view_states` に UUID キーで保存し、共通値は `Settings` の非永続 overlay が分離する |
+| `remember_favorite_view_state` | bool | false | お気に入りごとの表示状態の自動記憶・復元。対象は `grid_view_mode` / `grid_cols` / `thumb_aspect` / `thumb_aspect_auto` / `grid_display_order` / `sort_order` / `default_spread_mode` / `default_reading_flow`。専用値は `adjustment.db.favorite_view_states` に UUID キーで保存し、共通値は `Settings` の非永続 overlay が分離する |
 | `details_sort_key` | DetailsSortKey | Toolbar | 詳細表示モードの列ヘッダソートキー。`Toolbar` はツールバーのロード時ソート順、ほかに Name / Rating / Tags / Kind / PageCount / Place / Size / Modified / Created / State / ImageDimensions / VideoDuration / VideoDimensions / VideoCodec |
 | `details_sort_ascending` | bool | true | 詳細表示モードの列ソート方向。`true` は昇順、`false` は降順 |
 | `details_size_display_mode` | DetailsSizeDisplayMode | Optimal | 詳細表示モードのサイズ列表示。`Optimal` は B / KB / MB / GB から自動選択、固定モードは Bytes / KB / MB |
@@ -1982,6 +2029,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `edit_preview_cache_max_bytes` | u64 | 1,000,000,000 | 編集プレビューキャッシュの容量上限。環境設定では MB 単位で指定し、超過時は最終アクセスが古いものから削除する |
 | `archive_cache_max_bytes` | u64 | 0 | RAR / 7z / LZH / (非 ZIP 入れ子入り) ZIP から作成した変換済み ZIP キャッシュの容量上限。`0` は無制限。環境設定では MB 単位で指定する。上限を超えた場合は、次回の変換完了後に最終アクセスが古いキャッシュから削除する。直近で作成したキャッシュは、単体で上限を超えても削除しない |
 | `archive_file_handling` | ArchiveFileHandling | Ask | RAR / 7z / LZH (および非 ZIP アーカイブを入れ子に含む ZIP) の扱い。非ソリッド・入れ子なし・暗号化なし RAR は直接閲覧し、それ以外を `Ask` / `Convert` で変換する。`Ignore` は直接閲覧対象を含め一覧・フォルダ移動で扱わない |
+| `epub_file_handling` | EpubFileHandling | Ask | EPUB を PDF に変換して開くときの確認方法。`Ask` は確認画面を表示、`Convert` は確認なしで変換、`Ignore` は一覧・フォルダ移動から除き、変換済みの本も開かない。RAR / 7z / LZH の設定とは独立 |
 | `archive_convert_without_dialog` | bool | false | 旧設定互換フィールド。新規 UI / 実行時判定は `archive_file_handling` を使い、保存時は `archive_file_handling == Convert` に同期する |
 | `batch_cache_zip_contents` | bool | false | 一括キャッシュ作成で ZIP 内の全画像をキャッシュ |
 | `batch_cache_pdf_contents` | bool | false | 一括キャッシュ作成で PDF 内の全ページをキャッシュ |
@@ -2036,11 +2084,12 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `video_anime4k_measurement` | Option<VideoAnime4kMeasurementCache> | None | S/L/UL×540p/1080pのGPU timestamp結果。adapter・driver情報が一致するときだけ再利用する |
 | `video_grid_open_starts_from_beginning` | bool | false | 位置復元マトリクス「動画 × 一覧から開く」の保存先 (v0.9.0 リリース済み bool を流用)。ON = 先頭から / OFF = 続きから。UI からは `video_open_resume` / `set_video_open_resume` 経由で ResumeMode として読み書き |
 | `video_nav_resume` | ResumeMode | Resume | 位置復元マトリクス「動画 × Ctrl+↑↓ 移動 (ホイール/キー含む)」。Resume=続きから / FromStart=先頭から |
+| `video_audio_track_choices` | `HashMap<String, SavedAudioTrackChoice>` | 空 | 切り替えた音声トラックをファイルごとに記憶。再生位置とは独立し、Remote で確定した選択も記録。「再生位置と音声トラックの選択をすべてクリア」で再生位置とともに消す |
 | `book_open_resume` | ResumeMode | Resume | 位置復元マトリクス「ZIP/PDF/対応アーカイブ/画像のみ通常フォルダ × 一覧から開く」。Resume=続き (保存済み読書位置) / FromStart=先頭ページ |
 | `book_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「ZIP/PDF/対応アーカイブ × Ctrl+↑↓ フォルダナビ移動」。既定 FromStart=従来のフォルダ先頭着地 / Resume=続き |
 | `music_open_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 一覧から開く」。既定 FromStart=最初から / Resume=続き。位置は動画と同じ `video_resume_positions` に path キーで保存 |
 | `music_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「音声 × 移動 (↓↑/ホイールの前後ファイル移動 + Ctrl+↑↓/キー)」。既定 FromStart=最初から (誤って別曲へ行って戻っても頭から) |
-| `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用。測定済み動画は再生開始前から初期 gain を入れる。未測定動画は再生前に自動スキャンし、長尺では約 10 分ぶん測れた時点で仮 gain により再生を開始、確定値が出たら DB 保存して数秒かけて gain を追従する。キャンセル / 失敗後は同 fs_idx の自動再試行を抑止する。全体 OFF は実行中のスキャンもキャンセルする。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
+| `audio_normalize_enabled` | bool | false | 動画音量ノーマライズの全体 ON/OFF。ON のとき、選択中の音声トラックの測定値を使い -14 LUFS 相当の音量にする。測定結果はトラックごとに保存し、再生開始前から適用する。未測定のトラックは再生前に自動測定し、長い動画では途中の測定値で再生を始めて、測定完了後に音量を徐々に合わせる。測定を中止したトラックは、同じ動画を表示している間は自動で測り直さず、Norm ボタンから再開できる。測定値は環境設定 → 動画・音声 → 動画から件数確認と全件クリアができる |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
 | `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。通常 fullscreen / in-window / F12 別窓 / ParkedLive の viewport と native presenter は同じ identity のまま hidden にし、動画、動画→音声モード、単体音楽の running / paused / EOF transport state を変更しない。hidden presenter は decode queue を drain して最新 frame を保持し、復帰で viewport と presenter を visible に戻すため再生中ならそのまま映像が再開する。detached / switching session と typed placement request は維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。mounted context の非 media texture とアイドル GPU 動画プールは解放するが、detached active viewer cache、稼働中 decoder / presenter / GPU frame、VST3 プラグインチェーンは保持するため、常駐中も動画 decode の CPU/GPU/電力コストを負う |
@@ -2077,6 +2126,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `toolbar_facet_name_filter_index_stash` | Option\<usize\> | None | 保存時に `NameFilter` の位置を退避するダウングレード互換用フィールド。`usize::MAX` は利用者が明示的に非表示にした状態を表す。読込時に `toolbar_facet_filter_items` へ戻して消費し、フィールド自体が無い旧設定では従来の常設入力を維持するため末尾へ追加する |
 | `facet_name_filter_width` | FacetNameFilterWidth | Medium | ファイル名欄の幅。Small=90px / Medium=140px / Large=200px。未知値は Medium へ正規化 |
 | `toolbar_cols_details_visible` | bool | true | ツールバーの列セクションに `詳細` 切替を表示 |
+| `toolbar_cols_items` | Vec\<usize\> | 1〜20 | ツールバーの列セクションに表示する列数候補。旧既定の 1〜10 全部と完全一致する保存値は、初回読み込み時だけ 11〜20 を補完する。部分集合・並び替え済みの値は維持し、補完後に候補を外しても復活させない。表示方式は判定に影響しない |
 | `toolbar_section_order` | Vec\<ToolbarSectionId\> | [] (=既定順) | ツールバーセクションの並び順 (v2.0.0、ラベルのドラッグで変更)。未登録は既定順で末尾補完、未知の variant は描画前に除外 |
 | `toolbar_section_new_row` | Vec\<ToolbarSectionId\> | [] | 「行頭に表示」(= その手前で改行) するセクションの集合 (v2.0.0) |
 | `toolbar_{cols,aspect,sort,favorites,smart_folders,tags,bookshelf}_display` | ToolbarSectionDisplay | Buttons | 各セクションの表示形式 (展開 Buttons / 折りたたみ Collapsible / プルダウン Dropdown)。セクションのラベル右クリックで変更 |
@@ -2103,8 +2153,9 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `slideshow_continuous_scroll_secs` | f32 | 0.2 | 縦/横連結読み中スライドショーの1回のスクロール時間（秒）。0 の場合は即時スクロール |
 | `slideshow_continuous_scroll_percent` | u32 | 50 | 縦/横連結読み中スライドショーの1回のスクロール量。現在の表示領域の幅または高さに対する % で指定する |
 | `slideshow_end_action` | SlideshowEndAction | LoopFolder | スライドショーがフォルダ末尾に達したときの動作。`LoopFolder`=フォルダ内で先頭へループ / `NextFolder`=次の静止画フォルダへ進む（無ければ停止） / `Stop`=末尾で停止 |
-| `skip_zip_if_folder_exists` | bool | true | 同名フォルダがある ZIP/PDF/RAR/7z/LZH をグリッドから非表示にする（フォルダツリー走査からも除外） |
+| `skip_zip_if_folder_exists` | bool | true | 同名フォルダがある ZIP/PDF/EPUB/RAR/7z/LZH をグリッドから非表示にする（フォルダツリー走査からも除外） |
 | `skip_archive_if_zip_exists` | bool | true | 同じフォルダに同名の ZIP/CBZ がある RAR/7z/LZH をグリッドと Ctrl+↑↓ の候補から非表示にする |
+| `skip_epub_if_pdf_exists` | bool | true | 同じフォルダに同名の PDF がある EPUB をグリッド・スマートフォルダ・Ctrl+↑↓ の候補から非表示にする。名前の大小文字は区別しない |
 | `skip_image_if_video_exists` | bool | true | 同名動画がある画像をスキップ（画像は動画サムネイルとして使用） |
 | `skip_duplicate_images` | bool | true | 同名で複数拡張子がある画像を優先度でフィルタ |
 | `image_ext_priority` | Vec\<String\> | [png, bmp, gif, ...] | 画像拡張子の優先度リスト（先頭が最優先） |

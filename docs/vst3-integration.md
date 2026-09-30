@@ -102,8 +102,8 @@ allowlist チェックする (= command / event / polling のすべての raise 
 **foreground HWND** を以下で判定:
 
 - **許可**: `presenter HWND` / `HUD HWND` / `main HWND` の既知 mIV HWND 3 つ、または
-  `editor_hwnds: Arc<RwLock<HashSet<u64>>>` snapshot (= 現在 visible な editor container
-  HWND) に含まれる HWND (`GA_ROOT` で正規化、`IsWindow` + `IsWindowVisible` で stale 排除)
+  `EditorUiSnapshot.hwnds` (= 現在 visible な editor container HWND) に含まれる HWND
+  (`GA_ROOT` で正規化、`IsWindow` + `IsWindowVisible` で stale 排除)
 - **skip**:
   - file dialog 等 plugin 外の top-level: foreground 自身も `GA_ROOT` も editor allowlist に
     無いので不一致で skip。
@@ -118,9 +118,10 @@ allowlist チェックする (= command / event / polling のすべての raise 
 **`GA_ROOTOWNER` は使わない** — editor を owner にする modal popup を辿ると editor 本体に
 戻るため誤許可リスクがある。`GA_ROOT` までで止める。
 
-既存の `foreground_belongs_to_miv_or_bridge` (PID ベース、`set_all_guis_app_active` で
-「bridge が foreground」判定として使用中) は変更せず、HUD raise 用に別 helper
-`foreground_allows_hud_raise` を新規追加してセマンティクスを分離 (Codex P1 反映)。
+`foreground_belongs_to_miv_or_bridge` は editor の HWND→PID 登録と bridge PID 集合を
+同じ snapshot から読み、共通の `foreground_ui_group` 分類を使う。登録 editor と bridge の
+別 popup は区別する。HUD raise の `foreground_allows_hud_raise` は editor HWND allowlist を
+使い、foreground 分類と raise 許可の判定目的を分ける。
 
 **`current_gui_owner_hwnd` の fullscreen 強制**:
 
@@ -131,18 +132,21 @@ HUD HWND を `WindowFromPoint` が拾って VST が HUD owned になり、目的
 HUD HWND は `set_hud_hwnd` で別系統に登録し、**`current_gui_owner_hwnd` の候補からは
 絶対に出ない**。
 
-**`editor_hwnds` snapshot の更新タイミング**:
+**editor UI snapshot の更新タイミングと公開順序**:
 
-allowlist 判定で参照される `editor_hwnds: Arc<RwLock<HashSet<u64>>>` は、editor 表示状態が
-変わる全経路で `refresh_editor_hwnds_snapshot()` 経由で再構築する (= slot add / show / hide /
-user_hidden / remove / bridge disconnect / 一括 visibility 変更)。「現在 `gui_visible == true`
-かつ `IsWindow` で生存している HWND だけ」を含める (= `gui_hwnd` は hidden 後も残るので
-slot に HWND があるだけでは入れない)。`disable_with_reason` でも明示的に `editor_hwnds.clear()`
-する (= HWND 再利用時の誤許可リスク排除、Codex P2 反映)。
+`EditorUiSnapshot` は可視 editor HWND の集合、HWND→bridge PID 対応、稼働中 bridge PID の
+集合を一つの不変値に持つ。共有先は `Arc<RwLock<Arc<EditorUiSnapshot>>>`。slot add / show /
+hide / user_hidden / remove / bridge disconnect / 一括 visibility 変更で
+`refresh_editor_hwnds_snapshot()` が再構築する。editor 集合には `gui_visible == true` かつ
+`IsWindow` で生存する HWND だけを含める (`gui_hwnd` は hidden 後も残る)。
 
-Lock 取得順序として `DspBridgeInner` の lock を握ったまま Windows API (`IsWindow`) や
-`hud_raise_hook` を呼ばない (inner lock → ローカル `Vec` にコピー → inner 解放 → API 呼び出し →
-`editor_hwnds.write()` の順序、deadlock 防止)。
+refresh は `DspBridgeInner` の lock 下で revision と候補を取得し、lock 外で `IsWindow` を
+検査して次の不変値を作る。再度 inner lock 下で revision・editor 候補・bridge PID 候補を
+検証し、一回の短い write lock で Arc を差し替える。古い refresh は公開しない。
+`disable_with_reason` は同じ inner lock 下で revision を進め、空 snapshot を公開する。
+reader は短い read lock で Arc を clone し、lock を離してから Windows API や別 lock を使う。
+公開中の reader は swap の完了を待って完全な snapshot で分類し、`try_read` の失敗分岐はない。
+inner lock を保持して `IsWindow` や `hud_raise_hook` は呼ばない。
 
 **フォールバック**: 環境変数 `MIV_HUD_OVERLAY=0` で HUD 経路を無効化できる。HUD HWND 作らず、
 従来通り egui overlay を presenter HWND の DComp tree に attach する経路 (= CP8 以前と等価)。
@@ -179,14 +183,14 @@ for plugin relayout/paint work on every mouse step.
 
 ```
 mimageviewer-core.exe (Rust)
-├─ DspBridge (ローカル再生 singleton, src/video/dsp/mod.rs)
+├─ DspBridge (ユーザー VST 共有 singleton, src/video/dsp/mod.rs)
 │   ├─ Vec<PluginSlot>          ← チェーン (順番が音声適用順)
 │   │   ├─ Slot[0]: bridge: Arc<Bridge> ──┐
 │   │   ├─ Slot[1]: bridge: Arc<Bridge> ──┤  全 slot が同じ Arc を共有
 │   │   └─ ...                            ┘  (= 1 bridge プロセスが全プラグインを host)
 │   └─ active_slot_count (atomic): bypass=false の Loaded 個数
-├─ Remote streaming session (配信中だけ)
-│   └─ DspBridge × 1: active plugin の同順 chain。全 generation が Arc 共有
+├─ DspProcessingCoordinator (src/video/dsp/coordinator.rs)
+│   └─ ローカル pump / リモート (session, generation) の host 操作をブロック単位で調停
 ├─ src/video/audio.rs: audio-pump thread が local DspBridge::process_block を呼ぶ。
 │   bridges を Arc::ptr_eq で dedup するため、N 個のプラグインがあっても
 │   IPC roundtrip は **1 回だけ** (= bridge 内部で chain 順に処理して 1 回で返す)
@@ -224,13 +228,15 @@ include_bytes! でメイン exe に埋め込み、初回 enable 時に
 音声処理 entry は `DspBridge::process_block` だけである。per-plugin bridge 時代の
 `chain_process` と ping-pong scratch buffer は削除済み。
 
-時計なしリモート配信はローカル再生の plugin state と高速 feed の timeline を混在させないため、
-streaming session 専用 `DspBridge` を 1 個持つ。設定の active plugin を worker 内で一度だけ load し、
-seek / 画質変更による新旧 generation は同じ processor `Arc` を使う。generation resource lease が
-旧 worker の FFmpeg/VST drop 後に新 worker を進めるため、切替中も host process は
-**ローカル 1 + リモート 1 = 最大 2** から増えない。ロードは start 残予算から後段用 3 秒を
-予約した値（上限 10 秒）で打ち切り、load/process 失敗は normalize 済み dry へ fallback して
-配信を継続し、IPC/Web と本体 modal に warning を公開する。
+時計なしリモート配信は、起動時に読み込んだユーザー VST と音響調整の bridge をローカル再生と共有する。
+旧方式のセッション専用 bridge は、Mixwright の状態復元後に WebView がパイプラインを組み直す間、
+配信の冒頭数秒が EQ なしになるため廃止した。`DspProcessingCoordinator` は
+`Local { pump_instance, epoch }` と `Remote { session, generation }` の札を管理する。
+新しい所有者は実行中の音声ブロックが終わるのを worker 上で待ち、結果を返す reset を経てから札を得る。
+許可は raw 音声の取り出しから 2 段の処理、出力の確定まで保持する。札を失ったローカル pump は
+host を呼ばず素通しで処理し、再取得時は一時停止のまま再 seek して古いキューを消す。
+リモートの段は受け付け時に独立して採用し、未準備や失敗の段は warning とともに外す。
+host 数はユーザー VST と音響調整で通常最大 2、配信中も増えない。
 
 ## 3. ディレクトリ / モジュールマップ
 
@@ -273,7 +279,7 @@ decoder → audio_rx → audio-pump thread:
 ```
 
 時計なしリモート配信では time stretch と cpal 出力を持たず、
-`decode/resample → fixed normalize gain → session VST3 → safety limiter → AAC` とする。
+`decode/resample → fixed normalize gain → shared user VST → shared 音響調整 → safety limiter → AAC` とする。
 normalize/VST/limiter の前後関係と PDC/lookahead 補正はローカル再生と同じである。
 
 設計判断:

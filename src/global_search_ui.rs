@@ -64,7 +64,7 @@ pub fn kind_label(k: IndexKind) -> &'static str {
         IndexKind::Folder => "フォルダ",
         IndexKind::Image => "画像",
         IndexKind::Zip => "ZIP ファイル",
-        IndexKind::Pdf => "PDF ファイル",
+        IndexKind::Pdf => "PDF / EPUB ファイル",
         IndexKind::Video => "動画ファイル",
         IndexKind::Audio => "音声ファイル",
     }
@@ -675,7 +675,7 @@ fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentati
         .map(str::to_ascii_lowercase)?;
     // PDF は 1 ページ目をサムネに。ScanSnap 等 PDF だらけのフォルダでも
     // コンテナに画像アイコンだけでなく中身プレビューが出るようになる。
-    if ext == "pdf" {
+    if crate::folder_tree::is_paged_document_path(Path::new(file_part)) {
         return Some(ContainerRepresentative {
             path: PathBuf::from(file_part),
             zip_entry: None,
@@ -1278,7 +1278,9 @@ fn grid_item_from_fs_hit_path(path: &Path) -> Option<GridItem> {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "pdf" => Some(GridItem::PdfFile(path.to_path_buf())),
+        _ if crate::folder_tree::is_paged_document_path(path) => {
+            Some(GridItem::PdfFile(path.to_path_buf()))
+        }
         "zip" => Some(GridItem::ZipFile(path.to_path_buf())),
         _ if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) => {
             Some(GridItem::Video(path.to_path_buf()))
@@ -2250,6 +2252,7 @@ impl App {
             kinds: self.global_search.filters.kind.map(|k| vec![k]),
             target: self.global_search.filters.target.clone(),
             mode: self.global_search.filters.or_mode.into(),
+            ignore_epub: self.settings.epub_file_handling_ignores_epub(),
         };
 
         let repaint_ctx = ctx.clone();
@@ -4364,9 +4367,13 @@ mod tests {
     /// 全サムネ「画像フォーマット判定不可」で失敗していた。その回帰ガード。
     #[test]
     fn build_drilled_items_classifies_pdf_zip_and_image_by_extension() {
+        let representative = image_representative_from_hit("C:/mix/a.epub").unwrap();
+        assert_eq!(representative.pdf_page, Some(0));
+        assert_eq!(representative.path, PathBuf::from("C:/mix/a.epub"));
         let mut state = GlobalSearchState::default();
         for p in [
             "C:/mix/a.pdf",
+            "C:/mix/a2.epub",
             "C:/mix/b.zip",
             "C:/mix/c.png",
             "C:/mix/d.jpg",
@@ -4397,7 +4404,10 @@ mod tests {
                 _ => "Other",
             })
             .collect();
-        assert_eq!(kinds, vec!["PdfFile", "ZipFile", "Image", "Image"]);
+        assert_eq!(
+            kinds,
+            vec!["PdfFile", "PdfFile", "ZipFile", "Image", "Image"]
+        );
     }
 
     /// build_flat_items: 全ヒットを sort_order で一律ソートし、拡張子で
@@ -4405,7 +4415,13 @@ mod tests {
     #[test]
     fn build_flat_items_sorts_classifies_and_skips_zip() {
         let mut state = GlobalSearchState::default();
-        for p in ["c:/a/2.jpg", "c:/b/1.png", "c:/c/doc.pdf", "c:/d/clip.mp4"] {
+        for p in [
+            "c:/a/2.jpg",
+            "c:/b/1.png",
+            "c:/c/doc.pdf",
+            "c:/d/clip.mp4",
+            "c:/g/book.epub",
+        ] {
             state.accumulate_hit(&GlobalHit {
                 path: p.into(),
                 score: 1.0,
@@ -4431,7 +4447,7 @@ mod tests {
         });
         let (items, metas) =
             build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
-        assert_eq!(items.len(), 4, "ZIP 系 2 件は除外される");
+        assert_eq!(items.len(), 5, "ZIP 系 2 件は除外される");
         assert_eq!(items.len(), metas.len());
         // ファイル名順: 1.png → 2.jpg → clip.mp4 → doc.pdf
         let kinds: Vec<&str> = items
@@ -4443,7 +4459,7 @@ mod tests {
                 _ => "Other",
             })
             .collect();
-        assert_eq!(kinds, vec!["Image", "Image", "Video", "PdfFile"]);
+        assert_eq!(kinds, vec!["Image", "Image", "PdfFile", "Video", "PdfFile"]);
     }
 
     #[test]

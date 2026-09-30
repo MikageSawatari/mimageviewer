@@ -217,7 +217,9 @@ impl ContextMenuItemId {
             MenuCommand::RemoveFromCollection => Self::RemoveFromCollection,
             MenuCommand::Deselect => Self::Deselect,
             MenuCommand::RemoveReadingHistory => Self::RemoveReadingHistory,
-            MenuCommand::ExternalTool(_) | MenuCommand::OpenWithAssociation { .. } => return None,
+            MenuCommand::ConvertEpubToPdf
+            | MenuCommand::ExternalTool(_)
+            | MenuCommand::OpenWithAssociation { .. } => return None,
         })
     }
 }
@@ -469,6 +471,7 @@ impl ContextMenuPreviewScenario {
             surface,
             is_folder_context,
             has_checked,
+            has_epub_target: false,
             checked_count: usize::from(has_checked) * 2,
             checked_file_operation_selection: if has_checked {
                 CheckedFileOperationSelection::RealOnly
@@ -692,6 +695,7 @@ pub enum MenuNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuCommand {
+    ConvertEpubToPdf,
     NewFolder,
     Paste,
     Rename,
@@ -865,6 +869,7 @@ pub struct ContextMenuInput {
     pub surface: ContextMenuSurface,
     pub is_folder_context: bool,
     pub has_checked: bool,
+    pub has_epub_target: bool,
     pub checked_count: usize,
     pub checked_file_operation_selection: CheckedFileOperationSelection,
     pub can_use_folder_commands: bool,
@@ -1013,6 +1018,7 @@ fn open_with_submenu(input: &ContextMenuInput) -> Option<MenuNode> {
 enum ContextMenuFixedSlotId {
     ExternalTools,
     OpenWithSubmenu,
+    ConvertSubmenu,
     OpenWithAssociations,
 }
 
@@ -1043,6 +1049,19 @@ fn menu_node_layout_id(node: &MenuNode) -> LayoutUnitId {
         MenuNode::Item { command, .. } => LayoutUnitId::Configurable(
             ContextMenuItemId::from_command(command).expect("static context-menu command"),
         ),
+        MenuNode::Submenu { children, .. }
+            if children.iter().any(|child| {
+                matches!(
+                    child,
+                    MenuNode::Item {
+                        command: MenuCommand::ConvertEpubToPdf,
+                        ..
+                    }
+                )
+            }) =>
+        {
+            LayoutUnitId::Fixed(ContextMenuFixedSlotId::ConvertSubmenu)
+        }
         MenuNode::Submenu { .. } => LayoutUnitId::Fixed(ContextMenuFixedSlotId::OpenWithSubmenu),
         MenuNode::Separator => unreachable!("separators are handled before unit classification"),
     }
@@ -1139,6 +1158,13 @@ fn apply_context_menu_layout(
 }
 
 /// Build the complete mIV context-menu tree from an immutable snapshot.
+fn epub_convert_submenu() -> MenuNode {
+    MenuNode::Submenu {
+        label: "変換".into(),
+        children: vec![item(MenuCommand::ConvertEpubToPdf, "PDF ファイルに変換")],
+    }
+}
+
 pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
     let mut nodes = Vec::new();
 
@@ -1198,6 +1224,9 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             );
         }
         if input.surface == ContextMenuSurface::Grid {
+            if input.has_epub_target {
+                push_group(&mut nodes, [epub_convert_submenu()]);
+            }
             // 対象外 (動画 / 音声 / フォルダ) が混じっていても出す。回転と同じで、
             // 選択の中身ではなく操作の有無で決める。実際に何件へ効くかは確認
             // ダイアログが「対象 N 件 / 対象外 M 件」として出す。
@@ -1348,6 +1377,9 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
                 item(MenuCommand::OpenContainerAsList, "一覧を開く"),
             ],
         );
+    }
+    if input.surface == ContextMenuSurface::Grid && input.has_epub_target {
+        push_group(&mut nodes, [epub_convert_submenu()]);
     }
 
     let collection_root_grid = input.surface == ContextMenuSurface::Grid
@@ -1554,6 +1586,7 @@ mod tests {
             surface,
             is_folder_context: false,
             has_checked: false,
+            has_epub_target: false,
             checked_count: 0,
             checked_file_operation_selection: CheckedFileOperationSelection::Empty,
             can_use_folder_commands: false,
@@ -1575,6 +1608,20 @@ mod tests {
             },
             layout: ContextMenuLayoutSettings::default(),
         }
+    }
+
+    #[test]
+    fn epub_grid_context_menu_has_pdf_conversion_submenu() {
+        let mut epub = input(ContextMenuItemKind::PdfFile, ContextMenuSurface::Grid);
+        epub.has_epub_target = true;
+        let nodes = build_context_menu(&epub);
+        assert!(nodes.iter().any(|node| matches!(node, MenuNode::Submenu { label, children } if label == "変換" && children.iter().any(|child| matches!(child, MenuNode::Item { command: MenuCommand::ConvertEpubToPdf, .. })))));
+        epub.has_epub_target = false;
+        assert!(
+            !build_context_menu(&epub)
+                .iter()
+                .any(|node| matches!(node, MenuNode::Submenu { label, .. } if label == "変換"))
+        );
     }
 
     fn labels(nodes: &[MenuNode]) -> Vec<String> {

@@ -15,6 +15,7 @@ use crate::video::clockless_transcode::{
     ClocklessTranscodeControl, ClocklessTranscodeOptions, ClocklessVstStatus,
     ClocklessVstStatusSnapshot, run_clockless_stream,
 };
+use mimageviewer_ipc::RemoteAudioTrack;
 
 const RESOURCE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -37,6 +38,7 @@ pub(crate) struct StreamReadyVideoInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StreamReadyInfo {
     pub(crate) video: Option<StreamReadyVideoInfo>,
+    pub(crate) audio_stream_index: Option<usize>,
     pub(crate) audio_bitrate_bps: u64,
     pub(crate) codecs: String,
 }
@@ -109,7 +111,24 @@ impl fmt::Display for StreamResourceError {
     }
 }
 
-type SharedGenerationStatus = Arc<(Mutex<StreamGenerationStatus>, Condvar)>;
+struct GenerationStatusState {
+    status: StreamGenerationStatus,
+    /// A successful Ready publication remains observable if ownership cancellation later
+    /// changes the public status to Stopped before the UI retires the generation.
+    last_ready: Option<StreamReadyInfo>,
+}
+
+type SharedGenerationStatus = Arc<(Mutex<GenerationStatusState>, Condvar)>;
+
+fn new_generation_status() -> SharedGenerationStatus {
+    Arc::new((
+        Mutex::new(GenerationStatusState {
+            status: StreamGenerationStatus::Opening,
+            last_ready: None,
+        }),
+        Condvar::new(),
+    ))
+}
 
 struct GenerationConfig {
     generation: StreamingGeneration,
@@ -119,7 +138,17 @@ struct GenerationConfig {
     source_origin_secs: f64,
     segment_capacity: usize,
     hw_decode: bool,
+    audio_stream_index: usize,
+    default_audio_stream_index: Option<usize>,
+    normalize_snapshot: RemoteNormalizeSnapshot,
     audio_processing: ClocklessAudioProcessing,
+}
+
+#[derive(Clone)]
+pub(crate) struct RemoteNormalizeSnapshot {
+    pub(crate) enabled: bool,
+    pub(crate) target_lufs_milli: i32,
+    pub(crate) db_path: PathBuf,
 }
 
 struct GenerationWorkerCompletion {
@@ -177,6 +206,7 @@ fn stream_ready_info(info: ClocklessOutputInfo) -> StreamReadyInfo {
             output_dimensions: video.output_dimensions,
             bitrate_bps: video.bitrate_bps,
         }),
+        audio_stream_index: info.audio_stream_index,
         audio_bitrate_bps: info.audio_bitrate_bps,
         codecs: info.codecs,
     }
@@ -222,6 +252,7 @@ pub(crate) struct StreamingGenerationHandle {
 
 impl StreamingGenerationHandle {
     fn start(
+        session: StreamingSessionId,
         generation: StreamingGeneration,
         owner: &RemoteSessionOwner,
         source_path: PathBuf,
@@ -230,8 +261,12 @@ impl StreamingGenerationHandle {
         quality: QualityPreset,
         segment_capacity: usize,
         hw_decode: bool,
+        audio_stream_index: usize,
+        default_audio_stream_index: Option<usize>,
+        normalize_snapshot: RemoteNormalizeSnapshot,
         audio_processing: ClocklessAudioProcessing,
     ) -> Result<Self, String> {
+        let audio_processing = audio_processing.for_remote_generation(session.0, generation.0);
         let config = GenerationConfig {
             generation,
             path: source_path,
@@ -240,6 +275,9 @@ impl StreamingGenerationHandle {
             source_origin_secs,
             segment_capacity,
             hw_decode,
+            audio_stream_index,
+            default_audio_stream_index,
+            normalize_snapshot,
             audio_processing,
         };
         let audio_status = config.audio_processing.vst3_status();
@@ -252,7 +290,7 @@ impl StreamingGenerationHandle {
         let cancel = registration.cancel_flag();
         let worker_lease = registration.take_worker_lease();
         control.bind_cancel_flag(Arc::clone(&cancel));
-        let status = Arc::new((Mutex::new(StreamGenerationStatus::Opening), Condvar::new()));
+        let status = new_generation_status();
         let worker_status = Arc::clone(&status);
         let worker_cancel = Arc::clone(&cancel);
         let worker_output = output.clone();
@@ -318,9 +356,17 @@ impl StreamingGenerationHandle {
         }
     }
 
-    pub(crate) fn stop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
+    /// Read the last successful Ready publication and close admission under the same status
+    /// lock. A worker publishing Ready immediately before this transition is included; one
+    /// arriving afterward cannot turn the retired generation Ready again.
+    fn retire(&mut self) -> Option<StreamReadyInfo> {
+        let ready = retire_generation_status(&self.status, &self.cancel);
         self.control.cancel();
+        ready
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.retire();
     }
 }
 
@@ -341,7 +387,7 @@ impl StreamingGenerationAccess {
         let deadline = Instant::now() + timeout;
         let (status, ready) = &*self.status;
         let mut status = status.lock().unwrap_or_else(|error| error.into_inner());
-        while matches!(*status, StreamGenerationStatus::Opening) {
+        while matches!(status.status, StreamGenerationStatus::Opening) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -354,7 +400,7 @@ impl StreamingGenerationAccess {
                 break;
             }
         }
-        status.clone()
+        status.status.clone()
     }
 
     pub(crate) fn resource(
@@ -429,12 +475,52 @@ fn generation_status(status: &SharedGenerationStatus) -> StreamGenerationStatus 
         .0
         .lock()
         .unwrap_or_else(|error| error.into_inner())
+        .status
         .clone()
 }
 
 fn set_generation_status(status: &SharedGenerationStatus, next: StreamGenerationStatus) {
-    *status.0.lock().unwrap_or_else(|error| error.into_inner()) = next;
+    let mut state = status.0.lock().unwrap_or_else(|error| error.into_inner());
+    if publish_generation_status(&mut state, next) {
+        status.1.notify_all();
+    }
+}
+
+fn publish_generation_status(
+    state: &mut GenerationStatusState,
+    next: StreamGenerationStatus,
+) -> bool {
+    if matches!(state.status, StreamGenerationStatus::Stopped) {
+        return false;
+    }
+    match &next {
+        StreamGenerationStatus::Ready(info) | StreamGenerationStatus::Ended(info) => {
+            state.last_ready = Some(info.clone());
+        }
+        StreamGenerationStatus::Failed(_) => state.last_ready = None,
+        StreamGenerationStatus::Opening | StreamGenerationStatus::Stopped => {}
+    }
+    state.status = next;
+    true
+}
+
+fn generation_confirmation_snapshot(
+    status: &SharedGenerationStatus,
+) -> (StreamGenerationStatus, Option<StreamReadyInfo>) {
+    let state = status.0.lock().unwrap_or_else(|error| error.into_inner());
+    (state.status.clone(), state.last_ready.clone())
+}
+
+fn retire_generation_status(
+    status: &SharedGenerationStatus,
+    cancel: &AtomicBool,
+) -> Option<StreamReadyInfo> {
+    let mut state = status.0.lock().unwrap_or_else(|error| error.into_inner());
+    let ready = state.last_ready.take();
+    cancel.store(true, Ordering::Release);
+    state.status = StreamGenerationStatus::Stopped;
     status.1.notify_all();
+    ready
 }
 
 fn validate_resource_generation(
@@ -472,9 +558,19 @@ pub(crate) struct RemoteVideoStreamingSession {
     quality: QualityPreset,
     segment_capacity: usize,
     hw_decode: bool,
+    audio_selection: RemoteAudioSelection,
+    audio_tracks: Vec<RemoteAudioTrack>,
+    default_audio_stream_index: Option<usize>,
+    normalize_snapshot: RemoteNormalizeSnapshot,
     audio_processing: ClocklessAudioProcessing,
     next_generation: u64,
     current: StreamingGenerationHandle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GenerationChange {
+    pub(crate) generation: StreamingGeneration,
+    pub(crate) confirmed_audio_choice: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -483,23 +579,102 @@ pub(crate) enum StreamReconcile {
     Stop(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteAudioSelection {
+    Settled(usize),
+    Requested {
+        generation: StreamingGeneration,
+        stream_index: usize,
+    },
+}
+
+impl RemoteAudioSelection {
+    fn stream_index(self) -> usize {
+        match self {
+            Self::Settled(index)
+            | Self::Requested {
+                stream_index: index,
+                ..
+            } => index,
+        }
+    }
+}
+
+fn confirmed_audio_choice(
+    selection: RemoteAudioSelection,
+    current: StreamingGeneration,
+    ready: Option<&StreamReadyInfo>,
+) -> Option<usize> {
+    let RemoteAudioSelection::Requested {
+        generation,
+        stream_index,
+    } = selection
+    else {
+        return None;
+    };
+    if generation != current {
+        return None;
+    }
+    ready
+        .filter(|ready| ready.audio_stream_index == Some(stream_index))
+        .map(|_| stream_index)
+}
+
+fn resolve_remote_audio_start(
+    tracks: &[RemoteAudioTrack],
+    opened_stream_index: usize,
+    requested: Option<usize>,
+) -> (usize, bool) {
+    let valid_request =
+        requested.filter(|index| tracks.iter().any(|track| track.stream_index == *index));
+    (
+        valid_request.unwrap_or(opened_stream_index),
+        valid_request.is_some(),
+    )
+}
+
 impl RemoteVideoStreamingSession {
     pub(crate) fn start(
         owner: RemoteSessionOwner,
         player: &crate::video::VideoPlayer,
         inputs: crate::video::RemoteStreamStartInputs,
+        requested_audio_track: Option<usize>,
         encoder: EncoderPreference,
         quality: QualityPreset,
         segment_capacity: usize,
         hw_decode: bool,
+        normalize_snapshot: RemoteNormalizeSnapshot,
         audio_processing: ClocklessAudioProcessing,
     ) -> Result<Self, String> {
         if segment_capacity == 0 {
             return Err("remote streaming segment capacity must be non-zero".to_owned());
         }
         validate_remote_stream_tracks(inputs)?;
+        let id = StreamingSessionId(NEXT_STREAMING_SESSION_ID.fetch_add(1, Ordering::Relaxed));
+        let info = player
+            .info()
+            .ok_or("remote streaming player has no media information")?;
+        let audio_tracks: Vec<_> = info
+            .audio_tracks
+            .iter()
+            .map(|track| RemoteAudioTrack {
+                stream_index: track.stream_index,
+                label: crate::video::audio_track_ui::audio_track_label(
+                    track,
+                    info.default_audio_stream_index,
+                    crate::video::audio_track_selection::AudioTrackSelectionDisplayState::Applied,
+                ),
+                is_default: info.default_audio_stream_index == Some(track.stream_index),
+            })
+            .collect();
+        let (audio_stream_index, explicit_choice) = resolve_remote_audio_start(
+            &audio_tracks,
+            inputs.audio_stream_index,
+            requested_audio_track,
+        );
         let generation = StreamingGeneration(1);
         let current = StreamingGenerationHandle::start(
+            id,
             generation,
             &owner,
             player.path().clone(),
@@ -508,16 +683,30 @@ impl RemoteVideoStreamingSession {
             quality,
             segment_capacity,
             hw_decode,
+            audio_stream_index,
+            inputs.default_audio_stream_index,
+            normalize_snapshot.clone(),
             audio_processing.clone(),
         )?;
         Ok(Self {
-            id: StreamingSessionId(NEXT_STREAMING_SESSION_ID.fetch_add(1, Ordering::Relaxed)),
+            id,
             owner,
             source_path: player.path().clone(),
             encoder,
             quality,
             segment_capacity,
             hw_decode,
+            audio_selection: if explicit_choice {
+                RemoteAudioSelection::Requested {
+                    generation,
+                    stream_index: audio_stream_index,
+                }
+            } else {
+                RemoteAudioSelection::Settled(audio_stream_index)
+            },
+            audio_tracks,
+            default_audio_stream_index: inputs.default_audio_stream_index,
+            normalize_snapshot,
             audio_processing,
             next_generation: 2,
             current,
@@ -530,6 +719,44 @@ impl RemoteVideoStreamingSession {
 
     pub(crate) fn status(&self) -> StreamGenerationStatus {
         self.current.status()
+    }
+
+    pub(crate) fn generation(&self) -> StreamingGeneration {
+        self.current.generation
+    }
+
+    pub(crate) fn audio_tracks(&self) -> &[RemoteAudioTrack] {
+        &self.audio_tracks
+    }
+
+    /// Only the current, successfully opened generation can confirm a user selection.
+    pub(crate) fn take_confirmed_audio_choice(&mut self) -> Option<usize> {
+        let (status, ready) = generation_confirmation_snapshot(&self.current.status);
+        let confirmed =
+            confirmed_audio_choice(self.audio_selection, self.generation(), ready.as_ref());
+        if let RemoteAudioSelection::Requested {
+            generation,
+            stream_index,
+        } = self.audio_selection
+            && (generation != self.generation()
+                || !matches!(status, StreamGenerationStatus::Opening))
+        {
+            self.audio_selection = RemoteAudioSelection::Settled(stream_index);
+        }
+        confirmed
+    }
+
+    /// Retire the current generation and return a choice confirmed at that exact boundary.
+    /// The App remains the only writer of the file-scoped settings table.
+    pub(crate) fn retire(&mut self) -> Option<usize> {
+        let ready = self.current.retire();
+        let confirmed = confirmed_audio_choice(
+            self.audio_selection,
+            self.current.generation,
+            ready.as_ref(),
+        );
+        self.audio_selection = RemoteAudioSelection::Settled(self.audio_selection.stream_index());
+        confirmed
     }
 
     pub(crate) fn access(&self) -> StreamingGenerationAccess {
@@ -548,7 +775,7 @@ impl RemoteVideoStreamingSession {
         &mut self,
         quality: QualityPreset,
         position_secs: f64,
-    ) -> Result<StreamingGeneration, String> {
+    ) -> Result<GenerationChange, String> {
         let previous = self.quality;
         self.quality = quality;
         match self.start_new_generation(position_secs) {
@@ -560,7 +787,30 @@ impl RemoteVideoStreamingSession {
         }
     }
 
-    pub(crate) fn seek(&mut self, position_secs: f64) -> Result<StreamingGeneration, String> {
+    pub(crate) fn change_audio_track(
+        &mut self,
+        stream_index: usize,
+        position_secs: f64,
+    ) -> Result<GenerationChange, String> {
+        if !self
+            .audio_tracks
+            .iter()
+            .any(|track| track.stream_index == stream_index)
+        {
+            return Err("audio stream index is not available".to_owned());
+        }
+        if !position_secs.is_finite() || position_secs < 0.0 {
+            return Err("audio track position must be finite and non-negative".to_owned());
+        }
+        let change = self.start_new_generation_with_audio(position_secs, stream_index)?;
+        self.audio_selection = RemoteAudioSelection::Requested {
+            generation: change.generation,
+            stream_index,
+        };
+        Ok(change)
+    }
+
+    pub(crate) fn seek(&mut self, position_secs: f64) -> Result<GenerationChange, String> {
         if !position_secs.is_finite() || position_secs < 0.0 {
             return Err("stream seek position must be finite and non-negative".to_owned());
         }
@@ -570,9 +820,21 @@ impl RemoteVideoStreamingSession {
     fn start_new_generation(
         &mut self,
         source_origin_secs: f64,
-    ) -> Result<StreamingGeneration, String> {
+    ) -> Result<GenerationChange, String> {
+        self.start_new_generation_with_audio(
+            source_origin_secs,
+            self.audio_selection.stream_index(),
+        )
+    }
+
+    fn start_new_generation_with_audio(
+        &mut self,
+        source_origin_secs: f64,
+        audio_stream_index: usize,
+    ) -> Result<GenerationChange, String> {
         let generation = StreamingGeneration(self.next_generation);
         let replacement = StreamingGenerationHandle::start(
+            self.id,
             generation,
             &self.owner,
             self.source_path.clone(),
@@ -581,12 +843,21 @@ impl RemoteVideoStreamingSession {
             self.quality,
             self.segment_capacity,
             self.hw_decode,
+            audio_stream_index,
+            self.default_audio_stream_index,
+            self.normalize_snapshot.clone(),
             self.audio_processing.clone(),
         )?;
         self.next_generation = self.next_generation.saturating_add(1);
         let mut previous = std::mem::replace(&mut self.current, replacement);
-        previous.stop();
-        Ok(generation)
+        let ready = previous.retire();
+        let confirmed_audio_choice =
+            confirmed_audio_choice(self.audio_selection, previous.generation, ready.as_ref());
+        self.audio_selection = RemoteAudioSelection::Settled(audio_stream_index);
+        Ok(GenerationChange {
+            generation,
+            confirmed_audio_choice,
+        })
     }
 
     /// UI polling only reconciles ownership and worker status. The headless metadata player is
@@ -624,15 +895,24 @@ fn run_generation_worker(
     output: ClocklessStreamOutput,
     on_ready: impl FnOnce(ClocklessOutputInfo),
 ) -> Result<(), String> {
+    let normalize_gain = remote_generation_normalize_gain(&config);
+    let mut audio_processing = config.audio_processing.clone();
+    audio_processing.normalize_gain = normalize_gain;
+    let options = generation_transcode_options(&config);
+    run_clockless_stream(&options, control, output, audio_processing, on_ready).map(|_| ())
+}
+
+fn generation_transcode_options(config: &GenerationConfig) -> ClocklessTranscodeOptions {
     let quality = match config.quality {
         QualityPreset::Minimum => crate::video::clockless_transcode::ClocklessQuality::Minimum,
         QualityPreset::Low => crate::video::clockless_transcode::ClocklessQuality::Low,
         QualityPreset::Standard => crate::video::clockless_transcode::ClocklessQuality::Standard,
         QualityPreset::High => crate::video::clockless_transcode::ClocklessQuality::High,
     };
-    let options = ClocklessTranscodeOptions {
-        path: config.path,
+    ClocklessTranscodeOptions {
+        path: config.path.clone(),
         include_audio: true,
+        audio_stream_index: config.audio_stream_index,
         hw_decode: config.hw_decode,
         quality,
         encoder: config.encoder,
@@ -641,8 +921,62 @@ fn run_generation_worker(
         profile_swscale: false,
         source_origin_secs: config.source_origin_secs,
         diagnostic_generation: Some(config.generation.0),
+    }
+}
+
+fn remote_generation_normalize_gain(config: &GenerationConfig) -> f64 {
+    if !config.normalize_snapshot.enabled {
+        return 1.0;
+    }
+    let result = crate::audio_normalize_db::AudioNormalizeDb::open_read_only_at(
+        &config.normalize_snapshot.db_path,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|db| {
+        db.lookup_checked(
+            &config.path,
+            config.normalize_snapshot.target_lufs_milli,
+            config.audio_stream_index,
+            config.default_audio_stream_index,
+        )
+    });
+    match result {
+        Ok(Some(result)) => 10.0_f64.powf(result.gain_db as f64 / 20.0),
+        Ok(None) => 1.0,
+        Err(error) => {
+            crate::logger::log(format!("remote-stream Norm lookup failed: {error}"));
+            1.0
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn stream_and_gain_for_start_inputs_for_test(
+    path: std::path::PathBuf,
+    inputs: crate::video::RemoteStreamStartInputs,
+    db_path: std::path::PathBuf,
+) -> (usize, f64) {
+    let config = GenerationConfig {
+        generation: StreamingGeneration(1),
+        path,
+        encoder: EncoderPreference::Auto,
+        quality: QualityPreset::Standard,
+        source_origin_secs: inputs.source_origin_secs,
+        segment_capacity: 4,
+        hw_decode: false,
+        audio_stream_index: inputs.audio_stream_index,
+        default_audio_stream_index: inputs.default_audio_stream_index,
+        normalize_snapshot: RemoteNormalizeSnapshot {
+            enabled: true,
+            target_lufs_milli: -14000,
+            db_path,
+        },
+        audio_processing: ClocklessAudioProcessing::without_vst3(1.0),
     };
-    run_clockless_stream(&options, control, output, config.audio_processing, on_ready).map(|_| ())
+    (
+        generation_transcode_options(&config).audio_stream_index,
+        remote_generation_normalize_gain(&config),
+    )
 }
 
 #[cfg(test)]
@@ -650,6 +984,9 @@ mod tests {
     use super::*;
     use crate::video::stream::audio_encoder::open_aac_encoder;
     use crate::video::stream::timeline::StreamTimeline;
+    use mimageviewer_ipc::{
+        SessionAcquireRequest, SessionConnectionKind, SessionPeerInfo, SessionStatus,
+    };
 
     struct MarkDroppedOnDrop(Arc<AtomicBool>);
 
@@ -659,8 +996,291 @@ mod tests {
             has_video,
             has_audio,
             source_origin_secs: 0.0,
-            normalize_gain: 1.0,
+            audio_stream_index: 1,
+            default_audio_stream_index: Some(1),
         }
+    }
+
+    #[test]
+    fn remote_generation_stream_and_norm_use_the_same_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("normalize.db");
+        let db = crate::audio_normalize_db::AudioNormalizeDb::open_at(&db_path).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks/multi.mkv");
+        let result = |gain_db| crate::video::normalize_types::NormalizeResult {
+            gain_db,
+            integrated_lufs: -20.0,
+            true_peak_db: -5.0,
+            target_lufs_milli: -14000,
+        };
+        db.upsert(&path, 2, &result(6.0)).unwrap();
+        db.upsert(&path, 3, &result(-6.0)).unwrap();
+        let mut config = GenerationConfig {
+            generation: StreamingGeneration(1),
+            path,
+            encoder: EncoderPreference::Auto,
+            quality: QualityPreset::Standard,
+            source_origin_secs: 0.0,
+            segment_capacity: 4,
+            hw_decode: false,
+            audio_stream_index: 2,
+            default_audio_stream_index: Some(2),
+            normalize_snapshot: RemoteNormalizeSnapshot {
+                enabled: true,
+                target_lufs_milli: -14000,
+                db_path,
+            },
+            audio_processing: ClocklessAudioProcessing::without_vst3(1.0),
+        };
+        assert_eq!(generation_transcode_options(&config).audio_stream_index, 2);
+        assert!(
+            (remote_generation_normalize_gain(&config) - 10.0_f64.powf(6.0 / 20.0)).abs() < 1e-6
+        );
+        config.generation = StreamingGeneration(2);
+        config.audio_stream_index = 3;
+        assert_eq!(generation_transcode_options(&config).audio_stream_index, 3);
+        assert!(
+            (remote_generation_normalize_gain(&config) - 10.0_f64.powf(-6.0 / 20.0)).abs() < 1e-6
+        );
+        config.normalize_snapshot.enabled = false;
+        assert_eq!(remote_generation_normalize_gain(&config), 1.0);
+    }
+
+    #[test]
+    fn remote_audio_selection_is_confirmed_only_by_matching_ready_generation_and_stream() {
+        let pending = RemoteAudioSelection::Requested {
+            generation: StreamingGeneration(2),
+            stream_index: 3,
+        };
+        let ready = |audio_stream_index| StreamReadyInfo {
+            video: None,
+            audio_stream_index,
+            audio_bitrate_bps: 96_000,
+            codecs: "mp4a.40.2".to_owned(),
+        };
+        assert_eq!(
+            confirmed_audio_choice(pending, StreamingGeneration(2), None),
+            None
+        );
+        assert_eq!(
+            confirmed_audio_choice(pending, StreamingGeneration(3), Some(&ready(Some(3)))),
+            None
+        );
+        assert_eq!(
+            confirmed_audio_choice(pending, StreamingGeneration(2), Some(&ready(Some(2)))),
+            None
+        );
+        assert_eq!(
+            confirmed_audio_choice(pending, StreamingGeneration(2), Some(&ready(Some(3)))),
+            Some(3)
+        );
+        assert_eq!(
+            confirmed_audio_choice(
+                RemoteAudioSelection::Settled(3),
+                StreamingGeneration(2),
+                Some(&ready(Some(3)))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn retirement_includes_ready_published_while_it_waits_for_the_status_lock() {
+        let status = new_generation_status();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let info = StreamReadyInfo {
+            video: None,
+            audio_stream_index: Some(3),
+            audio_bitrate_bps: 96_000,
+            codecs: "mp4a.40.2".to_owned(),
+        };
+        assert_eq!(generation_confirmation_snapshot(&status).1, None);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (publish_tx, publish_rx) = std::sync::mpsc::channel();
+        let worker_status = Arc::clone(&status);
+        let worker_info = info.clone();
+        let worker = std::thread::spawn(move || {
+            let mut state = worker_status
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            locked_tx.send(()).unwrap();
+            publish_rx.recv().unwrap();
+            assert!(publish_generation_status(
+                &mut state,
+                StreamGenerationStatus::Ready(worker_info)
+            ));
+            worker_status.1.notify_all();
+        });
+        locked_rx.recv().unwrap();
+        let retire_status = Arc::clone(&status);
+        let retire_cancel = Arc::clone(&cancel);
+        let retirement =
+            std::thread::spawn(move || retire_generation_status(&retire_status, &retire_cancel));
+        publish_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let confirmed_ready = retirement.join().unwrap();
+        assert_eq!(confirmed_ready, Some(info.clone()));
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(generation_status(&status), StreamGenerationStatus::Stopped);
+        assert_eq!(
+            confirmed_audio_choice(
+                RemoteAudioSelection::Requested {
+                    generation: StreamingGeneration(2),
+                    stream_index: 3,
+                },
+                StreamingGeneration(2),
+                confirmed_ready.as_ref(),
+            ),
+            Some(3)
+        );
+
+        // A Ready callback queued after retirement cannot confirm the replacement.
+        set_generation_status(&status, StreamGenerationStatus::Ready(info.clone()));
+        assert_eq!(generation_confirmation_snapshot(&status).1, None);
+        let owner_cancelled = new_generation_status();
+        set_generation_status(
+            &owner_cancelled,
+            StreamGenerationStatus::Ready(info.clone()),
+        );
+        set_generation_status(&owner_cancelled, StreamGenerationStatus::Stopped);
+        assert_eq!(
+            retire_generation_status(&owner_cancelled, &AtomicBool::new(true)),
+            Some(info)
+        );
+        let failed = new_generation_status();
+        set_generation_status(
+            &failed,
+            StreamGenerationStatus::Ready(StreamReadyInfo {
+                video: None,
+                audio_stream_index: Some(3),
+                audio_bitrate_bps: 96_000,
+                codecs: "mp4a.40.2".to_owned(),
+            }),
+        );
+        set_generation_status(
+            &failed,
+            StreamGenerationStatus::Failed("encoder failed".to_owned()),
+        );
+        assert_eq!(
+            retire_generation_status(&failed, &AtomicBool::new(false)),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_start_uses_headless_opened_track_unless_valid_request_overrides_it() {
+        let tracks = [
+            RemoteAudioTrack {
+                stream_index: 2,
+                label: "日本語".to_owned(),
+                is_default: false,
+            },
+            RemoteAudioTrack {
+                stream_index: 3,
+                label: "English".to_owned(),
+                is_default: true,
+            },
+        ];
+        // The opened index comes from demux even when there is no PC audio output lane.
+        assert_eq!(resolve_remote_audio_start(&tracks, 2, None), (2, false));
+        assert_eq!(resolve_remote_audio_start(&tracks, 2, Some(3)), (3, true));
+        assert_eq!(resolve_remote_audio_start(&tracks, 2, Some(99)), (2, false));
+    }
+
+    #[test]
+    fn audio_track_change_starts_new_generation_and_restores_index_if_start_fails() {
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        let response = handle.acquire(SessionAcquireRequest {
+            client_id: "audio-track-test".to_owned(),
+            peer: SessionPeerInfo {
+                connection_kind: SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert_eq!(response.status, SessionStatus::Active);
+        assert!(handle.finish_acquire(handle.snapshot().generation));
+        let identity = handle.owner_for_test("audio-track-test");
+        let owner = handle.streaming_owner(&identity).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks/multi-audio.m4a");
+        let normalize_snapshot = RemoteNormalizeSnapshot {
+            enabled: false,
+            target_lufs_milli: -14000,
+            db_path: path.with_extension("unused-db"),
+        };
+        let audio_processing = ClocklessAudioProcessing::without_vst3(1.0);
+        let current = StreamingGenerationHandle::start(
+            StreamingSessionId(1),
+            StreamingGeneration(1),
+            &owner,
+            path.clone(),
+            0.0,
+            EncoderPreference::Auto,
+            QualityPreset::Standard,
+            4,
+            false,
+            0,
+            Some(1),
+            normalize_snapshot.clone(),
+            audio_processing.clone(),
+        )
+        .unwrap();
+        let mut session = RemoteVideoStreamingSession {
+            id: StreamingSessionId(1),
+            owner,
+            source_path: path,
+            encoder: EncoderPreference::Auto,
+            quality: QualityPreset::Standard,
+            segment_capacity: 4,
+            hw_decode: false,
+            audio_selection: RemoteAudioSelection::Settled(0),
+            audio_tracks: vec![
+                RemoteAudioTrack {
+                    stream_index: 0,
+                    label: "1".to_owned(),
+                    is_default: false,
+                },
+                RemoteAudioTrack {
+                    stream_index: 1,
+                    label: "2".to_owned(),
+                    is_default: true,
+                },
+            ],
+            default_audio_stream_index: Some(1),
+            normalize_snapshot,
+            audio_processing,
+            next_generation: 2,
+            current,
+        };
+        assert_eq!(
+            session.change_audio_track(1, 0.0).unwrap(),
+            GenerationChange {
+                generation: StreamingGeneration(2),
+                confirmed_audio_choice: None,
+            }
+        );
+        assert_eq!(session.generation(), StreamingGeneration(2));
+        assert_eq!(session.audio_selection.stream_index(), 1);
+        assert_eq!(
+            session.audio_selection,
+            RemoteAudioSelection::Requested {
+                generation: StreamingGeneration(2),
+                stream_index: 1,
+            }
+        );
+        session.segment_capacity = 0; // output allocation rejects before replacement
+        assert!(session.change_audio_track(0, 0.0).is_err());
+        assert_eq!(session.generation(), StreamingGeneration(2));
+        assert_eq!(session.audio_selection.stream_index(), 1);
+        assert_eq!(
+            session.audio_selection,
+            RemoteAudioSelection::Requested {
+                generation: StreamingGeneration(2),
+                stream_index: 1,
+            }
+        );
     }
 
     #[test]
@@ -760,6 +1380,7 @@ mod tests {
                 source_secs_per_output_sec: 1.0,
                 seek_serial: 1,
                 pdc_latency_secs_at_process: 0.070_227,
+                effetune_generation: None,
             })
             .map(|_| ())
             .map_err(|error| error.to_string());
@@ -781,7 +1402,7 @@ mod tests {
     #[test]
     fn worker_completion_does_not_end_the_generation_ownership_lifetime() {
         let cancel = Arc::new(AtomicBool::new(false));
-        let status = Arc::new((Mutex::new(StreamGenerationStatus::Opening), Condvar::new()));
+        let status = new_generation_status();
         let output = ClocklessStreamOutput::new(30, 0.0).unwrap();
 
         publish_generation_worker_completion(

@@ -2,7 +2,7 @@
 ; Build: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\mimageviewer.iss
 
 #define MyAppName "mImageViewer"
-#define MyAppVersion "4.1.0"
+#define MyAppVersion "4.2.0"
 #define MyAppPublisher "Mikage Sawatari"
 #define MyAppURL "https://mikage.to/mimageviewer/"
 #define MyAppExeName "mimageviewer.exe"
@@ -44,7 +44,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; 配布する exe はランチャー (`mimageviewer.exe`) のみ。ランチャーは本体
-; `mimageviewer-core.exe`、`mimageviewer-remote.exe` と FFmpeg LGPL DLL を include_bytes! で
+; `mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` と FFmpeg LGPL DLL を include_bytes! で
 ; 内包しており、初回起動時に %APPDATA%\mimageviewer\runtime\<version>\ へ
 ; 自動展開する。詳細は CLAUDE.md「FFmpeg LGPL DLL 管理」節。
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion

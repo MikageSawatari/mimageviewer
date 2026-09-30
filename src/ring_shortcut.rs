@@ -626,6 +626,16 @@ pub enum RingActionId {
     GridColumnCount8,
     GridColumnCount9,
     GridColumnCount10,
+    GridColumnCount11,
+    GridColumnCount12,
+    GridColumnCount13,
+    GridColumnCount14,
+    GridColumnCount15,
+    GridColumnCount16,
+    GridColumnCount17,
+    GridColumnCount18,
+    GridColumnCount19,
+    GridColumnCount20,
     GridHistoryBack,
     GridHistoryForward,
     GridParentFolder,
@@ -1027,6 +1037,16 @@ impl RingActionId {
             Self::GridColumnCount8 => "grid_column_count_8",
             Self::GridColumnCount9 => "grid_column_count_9",
             Self::GridColumnCount10 => "grid_column_count_10",
+            Self::GridColumnCount11 => "grid_column_count_11",
+            Self::GridColumnCount12 => "grid_column_count_12",
+            Self::GridColumnCount13 => "grid_column_count_13",
+            Self::GridColumnCount14 => "grid_column_count_14",
+            Self::GridColumnCount15 => "grid_column_count_15",
+            Self::GridColumnCount16 => "grid_column_count_16",
+            Self::GridColumnCount17 => "grid_column_count_17",
+            Self::GridColumnCount18 => "grid_column_count_18",
+            Self::GridColumnCount19 => "grid_column_count_19",
+            Self::GridColumnCount20 => "grid_column_count_20",
             Self::GridHistoryBack => "grid_history_back",
             Self::GridHistoryForward => "grid_history_forward",
             Self::GridParentFolder => "grid_parent_folder",
@@ -1133,6 +1153,16 @@ impl RingActionId {
             "grid_column_count_8" => Self::GridColumnCount8,
             "grid_column_count_9" => Self::GridColumnCount9,
             "grid_column_count_10" => Self::GridColumnCount10,
+            "grid_column_count_11" => Self::GridColumnCount11,
+            "grid_column_count_12" => Self::GridColumnCount12,
+            "grid_column_count_13" => Self::GridColumnCount13,
+            "grid_column_count_14" => Self::GridColumnCount14,
+            "grid_column_count_15" => Self::GridColumnCount15,
+            "grid_column_count_16" => Self::GridColumnCount16,
+            "grid_column_count_17" => Self::GridColumnCount17,
+            "grid_column_count_18" => Self::GridColumnCount18,
+            "grid_column_count_19" => Self::GridColumnCount19,
+            "grid_column_count_20" => Self::GridColumnCount20,
             "grid_history_back" => Self::GridHistoryBack,
             "grid_history_forward" => Self::GridHistoryForward,
             "grid_parent_folder" => Self::GridParentFolder,
@@ -1296,6 +1326,16 @@ impl RingActionId {
             Self::GridColumnCount8 => "サムネイル 8列",
             Self::GridColumnCount9 => "サムネイル 9列",
             Self::GridColumnCount10 => "サムネイル 10列",
+            Self::GridColumnCount11 => "サムネイル 11列",
+            Self::GridColumnCount12 => "サムネイル 12列",
+            Self::GridColumnCount13 => "サムネイル 13列",
+            Self::GridColumnCount14 => "サムネイル 14列",
+            Self::GridColumnCount15 => "サムネイル 15列",
+            Self::GridColumnCount16 => "サムネイル 16列",
+            Self::GridColumnCount17 => "サムネイル 17列",
+            Self::GridColumnCount18 => "サムネイル 18列",
+            Self::GridColumnCount19 => "サムネイル 19列",
+            Self::GridColumnCount20 => "サムネイル 20列",
             Self::GridHistoryBack => "フォルダ履歴 戻る",
             Self::GridHistoryForward => "フォルダ履歴 進む",
             Self::GridParentFolder => "親フォルダへ",
@@ -1380,6 +1420,16 @@ impl RingActionId {
                     | Self::GridColumnCount8
                     | Self::GridColumnCount9
                     | Self::GridColumnCount10
+                    | Self::GridColumnCount11
+                    | Self::GridColumnCount12
+                    | Self::GridColumnCount13
+                    | Self::GridColumnCount14
+                    | Self::GridColumnCount15
+                    | Self::GridColumnCount16
+                    | Self::GridColumnCount17
+                    | Self::GridColumnCount18
+                    | Self::GridColumnCount19
+                    | Self::GridColumnCount20
                     | Self::GridHistoryBack
                     | Self::GridHistoryForward
                     | Self::GridParentFolder
@@ -1518,6 +1568,16 @@ impl RingActionId {
                 Self::GridColumnCount8,
                 Self::GridColumnCount9,
                 Self::GridColumnCount10,
+                Self::GridColumnCount11,
+                Self::GridColumnCount12,
+                Self::GridColumnCount13,
+                Self::GridColumnCount14,
+                Self::GridColumnCount15,
+                Self::GridColumnCount16,
+                Self::GridColumnCount17,
+                Self::GridColumnCount18,
+                Self::GridColumnCount19,
+                Self::GridColumnCount20,
                 Self::GridHistoryBack,
                 Self::GridHistoryForward,
                 Self::GridParentFolder,
@@ -2843,6 +2903,18 @@ impl RightDragRecognition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_column_actions_11_to_20_are_selectable_and_roundtrip() {
+        let available = RingActionId::available_for_context(RingShortcutContext::Grid);
+        for cols in 11..=20 {
+            let id = format!("grid_column_count_{cols}");
+            let action = RingActionId::from_str(&id).expect("registered grid column action");
+            assert_eq!(action.as_str(), id);
+            assert!(action.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(available.contains(&action));
+        }
+    }
 
     #[test]
     fn default_profiles_match_design_slots() {

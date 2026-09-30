@@ -14,12 +14,13 @@
 #![cfg(windows)]
 
 pub mod bridge;
+pub mod coordinator;
 pub mod extract;
 pub mod gui;
 pub mod scanner;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub use bridge::{Bridge, Cmd, Event};
@@ -49,6 +50,50 @@ pub fn vst3_supported() -> bool {
             true
         }
     })
+}
+
+#[cfg(test)]
+mod effetune_policy_tests {
+    use super::*;
+
+    #[test]
+    fn editor_bypass_chrome_defaults_on_and_effetune_can_hide_it() {
+        let user = DspBridge::new();
+        assert_eq!(user.gui_owner_policy, GuiOwnerPolicy::Auto);
+        assert_eq!(user.latency_policy, LatencyPolicy::AutoBypass);
+        assert!(!user.strict_state);
+        assert!(user.show_editor_bypass_button);
+
+        let effect = DspBridge::new_with_gui_chrome(
+            GuiOwnerPolicy::FixedMain,
+            LatencyPolicy::ReportOnly,
+            true,
+            false,
+        );
+        assert_eq!(effect.gui_owner_policy, GuiOwnerPolicy::FixedMain);
+        assert_eq!(effect.latency_policy, LatencyPolicy::ReportOnly);
+        assert!(effect.strict_state);
+        assert!(!effect.show_editor_bypass_button);
+    }
+
+    #[test]
+    fn gui_attach_handler_reports_typed_error_to_registered_owner() {
+        let bridge = DspBridge::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let wake_count_for_callback = Arc::clone(&wake_count);
+        bridge.set_gui_result_wake(Arc::new(move || {
+            wake_count_for_callback.fetch_add(1, Ordering::SeqCst);
+        }));
+        bridge.set_gui_failure_sink(tx);
+        assert!(bridge.show_slot_gui(0).is_err());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiFailure::Attach(detail) if detail.contains("スロット範囲外")
+        ));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        assert_eq!(bridge.state(), DspState::Disabled);
+    }
 }
 
 /// PDC (Plugin Delay Compensation) で許容する最大遅延 (秒)。
@@ -110,13 +155,44 @@ pub struct GuiSignalChanges {
     pub bypass_updates: Vec<(String, bool)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuiFailure {
+    Attach(String),
+}
+
+/// Visible editor registration published as one immutable value. Readers clone
+/// the Arc under a short lock and release it before querying any HWND.
+#[derive(Debug, Default)]
+pub(crate) struct EditorUiSnapshot {
+    pub(crate) hwnds: std::collections::HashSet<u64>,
+    pub(crate) hwnd_pids: std::collections::HashMap<u64, u32>,
+    pub(crate) bridge_pids: std::collections::HashSet<u32>,
+}
+
+pub(crate) type SharedEditorUiSnapshot = Arc<RwLock<Arc<EditorUiSnapshot>>>;
+
+pub(crate) fn read_editor_ui_snapshot(shared: &SharedEditorUiSnapshot) -> Arc<EditorUiSnapshot> {
+    shared.read().unwrap_or_else(|err| err.into_inner()).clone()
+}
+
+pub(crate) fn publish_editor_ui_snapshot(shared: &SharedEditorUiSnapshot, next: EditorUiSnapshot) {
+    *shared.write().unwrap_or_else(|err| err.into_inner()) = Arc::new(next);
+}
+
 /// DspBridge — 1 本の VST3 チェーンホスト bridge との対話を管理する。
 ///
-/// ローカル再生用はアプリ起動から終了まで 1 個を保持する。時計なしリモート配信は
-/// ローカルの時間状態を壊さないようセッション専用の 1 個を持ち、全配信世代で共有する。
-/// 各所有者内では `Arc<DspBridge>` 化して audio-pump / worker と制御側から共有アクセス。
+/// アプリ起動時に読み込んだユーザー VST と音響調整の各 bridge をローカル再生と
+/// 時計なしリモート配信で共有する。audio-pump と配信 worker の process/reset/flush は
+/// `DspProcessingCoordinator` の世代付き許可で排他する。
 pub struct DspBridge {
     inner: Mutex<DspBridgeInner>,
+    gui_owner_policy: GuiOwnerPolicy,
+    latency_policy: LatencyPolicy,
+    strict_state: bool,
+    show_editor_bypass_button: bool,
+    gui_failure_sink: Mutex<Option<std::sync::mpsc::Sender<GuiFailure>>>,
+    gui_result_wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    gui_command_dispatch: Mutex<Option<Arc<dyn Fn(Arc<Bridge>, serde_json::Value) + Send + Sync>>>,
     /// audio-pump thread が高速判定するためのフラグ。Mutex を取らずに読める。
     enabled: AtomicBool,
     /// 「処理対象スロット (= Loaded 且つ bypass=false) の個数」を atomic で公開。
@@ -165,7 +241,9 @@ pub struct DspBridge {
     /// user_hidden / remove / bridge disconnect / 一括 visibility の全経路で
     /// 「visible かつ `IsWindow` で生存している HWND だけ」で再構築する。
     /// `gui_hwnd` は hidden 後も残るので「slot に HWND がある」だけでは入れない。
-    editor_hwnds: Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
+    editor_ui_snapshot: SharedEditorUiSnapshot,
+    /// Newer refreshes and disable invalidate any older in-flight snapshot.
+    editor_snapshot_revision: AtomicU64,
     /// HUD overlay を最前面に上げ直す要求を流すフック。App が `set_hud_raise_hook`
     /// で登録し、各 z-order op (`set_all_guis_topmost` / `set_all_guis_visible_blocking`
     /// / `set_all_guis_app_active` / `send_chain_z_order` 等) の末尾で発火する。
@@ -183,6 +261,18 @@ pub struct DspBridge {
     /// 済みなら新 worker が disable で wipe するため副作用なし、(b) 既に add 済みの
     /// プラグインも新 worker の disable→add ループで上書きされる。
     chain_rebuild_gen: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuiOwnerPolicy {
+    Auto,
+    FixedMain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LatencyPolicy {
+    AutoBypass,
+    ReportOnly,
 }
 
 struct DspBridgeInner {
@@ -260,6 +350,23 @@ pub(crate) struct PluginSlot {
 
 impl DspBridge {
     pub fn new() -> Arc<Self> {
+        Self::new_with_policies(GuiOwnerPolicy::Auto, LatencyPolicy::AutoBypass, false)
+    }
+
+    pub fn new_with_policies(
+        gui_owner_policy: GuiOwnerPolicy,
+        latency_policy: LatencyPolicy,
+        strict_state: bool,
+    ) -> Arc<Self> {
+        Self::new_with_gui_chrome(gui_owner_policy, latency_policy, strict_state, true)
+    }
+
+    pub fn new_with_gui_chrome(
+        gui_owner_policy: GuiOwnerPolicy,
+        latency_policy: LatencyPolicy,
+        strict_state: bool,
+        show_editor_bypass_button: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(DspBridgeInner {
                 state: DspState::Disabled,
@@ -267,6 +374,13 @@ impl DspBridge {
                 next_slot_id: 0,
                 last_z_order_snapshot: Vec::new(),
             }),
+            gui_owner_policy,
+            latency_policy,
+            strict_state,
+            show_editor_bypass_button,
+            gui_failure_sink: Mutex::new(None),
+            gui_result_wake: Mutex::new(None),
+            gui_command_dispatch: Mutex::new(None),
             enabled: AtomicBool::new(false),
             active_slot_count: AtomicUsize::new(0),
             session_disabled_reason: Mutex::new(None),
@@ -279,7 +393,8 @@ impl DspBridge {
             main_hwnd: AtomicU64::new(0),
             fullscreen_owner_hwnd: AtomicU64::new(0),
             hud_hwnd: AtomicU64::new(0),
-            editor_hwnds: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            editor_ui_snapshot: Arc::new(RwLock::new(Arc::new(EditorUiSnapshot::default()))),
+            editor_snapshot_revision: AtomicU64::new(0),
             hud_raise_hook: Mutex::new(None),
             chain_rebuild_gen: AtomicU64::new(0),
         })
@@ -311,6 +426,42 @@ impl DspBridge {
         self.main_hwnd.store(hwnd, Ordering::Release);
     }
 
+    pub fn set_gui_failure_sink(&self, sink: std::sync::mpsc::Sender<GuiFailure>) {
+        *self.gui_failure_sink.lock().unwrap() = Some(sink);
+    }
+
+    pub fn set_gui_result_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        *self.gui_result_wake.lock().unwrap() = Some(wake);
+    }
+
+    pub fn set_gui_command_dispatch(
+        &self,
+        dispatch: Arc<dyn Fn(Arc<Bridge>, serde_json::Value) + Send + Sync>,
+    ) {
+        *self.gui_command_dispatch.lock().unwrap() = Some(dispatch);
+    }
+
+    fn dispatch_gui_value(&self, bridge: Arc<Bridge>, value: serde_json::Value) {
+        if let Some(dispatch) = self.gui_command_dispatch.lock().unwrap().as_ref() {
+            dispatch(bridge, value);
+        } else {
+            let _ = bridge.send_value(&value);
+        }
+    }
+
+    fn gui_failure_owned_by_controller(&self) -> bool {
+        self.gui_failure_sink.lock().unwrap().is_some()
+    }
+
+    fn report_gui_failure(&self, detail: String) {
+        if let Some(sink) = self.gui_failure_sink.lock().unwrap().as_ref() {
+            let _ = sink.send(GuiFailure::Attach(detail));
+        }
+        if let Some(wake) = self.gui_result_wake.lock().unwrap().as_ref() {
+            wake();
+        }
+    }
+
     /// フルスクリーン動画再生開始時に presenter HWND を登録。
     /// `current_gui_owner_hwnd` がこの値を最優先で返すようになる (= VST owner が
     /// 必ず presenter HWND になり、HUD HWND が owner 候補に出ない)。
@@ -330,12 +481,12 @@ impl DspBridge {
         self.hud_hwnd.store(hwnd, Ordering::Release);
     }
 
-    /// HUD raise allowlist 用に editor_hwnds snapshot の `Arc<RwLock<...>>` を
-    /// clone して返す。presenter thread が polling で `read()` して
-    /// `foreground_allows_hud_raise` に渡す。
-    #[allow(dead_code)]
-    pub fn editor_hwnds_snapshot(&self) -> Arc<std::sync::RwLock<std::collections::HashSet<u64>>> {
-        Arc::clone(&self.editor_hwnds)
+    pub fn hud_hwnd(&self) -> u64 {
+        self.hud_hwnd.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn editor_ui_snapshot(&self) -> SharedEditorUiSnapshot {
+        Arc::clone(&self.editor_ui_snapshot)
     }
 
     /// HUD raise hook を登録する。引数のクロージャは `set_all_guis_topmost` 等の
@@ -371,42 +522,83 @@ impl DspBridge {
     /// Lock 順序 (Codex 7 P2 #5):
     /// 1. inner lock で「HWND + visible 状態」をローカル `Vec` にコピー (短時間)。
     /// 2. inner lock 解放後に Windows API (`IsWindow`) を呼んで filter。
-    /// 3. `editor_hwnds.write()` で snapshot 入れ替え。
+    /// 3. inner を取り直して候補がまだ同じなら snapshot を入れ替える。
+    ///    GUI worker と UI thread の refresh が前後しても古い capture は publish しない。
     fn refresh_editor_hwnds_snapshot(&self) {
-        // Step 1: inner lock を短時間取って HWND リストをコピー。
-        let candidates: Vec<u64> = {
+        // Step 1: revision と HWND capture を同じ inner lock で順序づける。
+        let (revision, candidates, bridge_pids): (
+            u64,
+            Vec<(u64, u32)>,
+            std::collections::HashSet<u32>,
+        ) = {
             let inner = match self.inner.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
-            inner
-                .slots
-                .iter()
-                .filter(|s| s.gui_hwnd != 0 && s.gui_visible)
-                .map(|s| s.gui_hwnd)
-                .collect()
+            (
+                self.editor_snapshot_revision.fetch_add(1, Ordering::AcqRel) + 1,
+                Self::editor_snapshot_candidates(&inner),
+                Self::bridge_snapshot_candidates(&inner),
+            )
         };
 
         // Step 2: inner lock 外で IsWindow チェックして filter。
         #[cfg(windows)]
-        let filtered: std::collections::HashSet<u64> = {
+        let filtered: Vec<(u64, u32)> = {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::IsWindow;
             candidates
-                .into_iter()
-                .filter(|raw| {
+                .iter()
+                .copied()
+                .filter(|(raw, _)| {
                     let hwnd = HWND(*raw as *mut _);
                     unsafe { IsWindow(Some(hwnd)) }.as_bool()
                 })
                 .collect()
         };
         #[cfg(not(windows))]
-        let filtered: std::collections::HashSet<u64> = candidates.into_iter().collect();
+        let filtered: Vec<(u64, u32)> = candidates.clone();
 
-        // Step 3: editor_hwnds.write() で snapshot 入れ替え。
-        if let Ok(mut guard) = self.editor_hwnds.write() {
-            *guard = filtered;
+        let next = EditorUiSnapshot {
+            hwnds: filtered.iter().map(|(hwnd, _)| *hwnd).collect(),
+            hwnd_pids: filtered.iter().copied().collect(),
+            bridge_pids: bridge_pids.clone(),
+        };
+
+        // Step 3: inner を握ったまま候補と revision を確認し、両 view を一度に公開。
+        // 全 writer の revision 更新も inner の下なので、check と swap の間に
+        // 新しい refresh/disable が割り込むことはない。
+        let inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if !editor_snapshot_publish_is_current(
+            revision,
+            self.editor_snapshot_revision.load(Ordering::Acquire),
+            &candidates,
+            &Self::editor_snapshot_candidates(&inner),
+        ) || bridge_pids != Self::bridge_snapshot_candidates(&inner)
+        {
+            return;
         }
+        publish_editor_ui_snapshot(&self.editor_ui_snapshot, next);
+    }
+
+    fn editor_snapshot_candidates(inner: &DspBridgeInner) -> Vec<(u64, u32)> {
+        inner
+            .slots
+            .iter()
+            .filter(|s| s.gui_hwnd != 0 && s.gui_visible)
+            .map(|s| (s.gui_hwnd, s.bridge.process_id()))
+            .collect()
+    }
+
+    fn bridge_snapshot_candidates(inner: &DspBridgeInner) -> std::collections::HashSet<u32> {
+        inner
+            .slots
+            .iter()
+            .map(|slot| slot.bridge.process_id())
+            .collect()
     }
 
     /// VST editor の owner にする mIV 側 HWND を返す。
@@ -427,8 +619,20 @@ impl DspBridge {
         use windows::Win32::System::Threading::GetCurrentProcessId;
         use windows::Win32::UI::WindowsAndMessaging::{
             GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
-            WindowFromPoint,
+            IsWindow, WindowFromPoint,
         };
+
+        if self.gui_owner_policy == GuiOwnerPolicy::FixedMain {
+            let main = self.main_hwnd.load(Ordering::Acquire);
+            if main != 0
+                && unsafe { IsWindow(Some(windows::Win32::Foundation::HWND(main as *mut _))) }
+                    .as_bool()
+            {
+                return main;
+            }
+            crate::logger::log("[VST3 GUI] fixed main owner is unavailable".to_string());
+            return 0;
+        }
 
         // 1. フルスクリーン中は presenter HWND を強制 (= cursor 依存判定をバイパス)。
         let fullscreen = self.fullscreen_owner_hwnd.load(Ordering::Acquire);
@@ -526,31 +730,18 @@ impl DspBridge {
 
     #[cfg(windows)]
     fn foreground_belongs_to_miv_or_bridge(&self) -> bool {
-        use windows::Win32::System::Threading::GetCurrentProcessId;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowThreadProcessId,
-        };
-
-        let mut foreground_pid = 0_u32;
-        unsafe {
-            let hwnd = GetForegroundWindow();
-            if hwnd.0.is_null() {
-                return true;
-            }
-            let _ = GetWindowThreadProcessId(hwnd, Some(&mut foreground_pid));
-            if foreground_pid == 0 {
-                return true;
-            }
-            if foreground_pid == GetCurrentProcessId() {
-                return true;
-            }
+        let editors = read_editor_ui_snapshot(&self.editor_ui_snapshot);
+        match crate::video::native_window::foreground_ui_group(
+            &editors.hwnd_pids,
+            &editors.bridge_pids,
+        ) {
+            crate::video::native_window::ForegroundUiGroup::OwnProcess
+            | crate::video::native_window::ForegroundUiGroup::RegisteredEditor
+            | crate::video::native_window::ForegroundUiGroup::OtherBridgeWindow
+            | crate::video::native_window::ForegroundUiGroup::Unknown => return true,
+            crate::video::native_window::ForegroundUiGroup::External => {}
         }
-
-        let bridge_pids: Vec<u32> = {
-            let inner = self.inner.lock().unwrap();
-            inner.slots.iter().map(|s| s.bridge.process_id()).collect()
-        };
-        bridge_pids.contains(&foreground_pid)
+        false
     }
 
     #[cfg(not(windows))]
@@ -630,7 +821,10 @@ impl DspBridge {
                 ));
                 s.latency_samples = latest;
                 // 個別 plugin 単独で上限超過 → 即 bypass
-                if latest > max_samples && !s.bypass {
+                if self.latency_policy == LatencyPolicy::AutoBypass
+                    && latest > max_samples
+                    && !s.bypass
+                {
                     crate::logger::log(format!(
                         "[VST3 PDC] AUTO-BYPASS (individual): '{}' latency {} samples ({:.1}ms) \
                          exceeds {:.1}s cap.",
@@ -649,46 +843,48 @@ impl DspBridge {
         // ── Step 2: active 合計超過チェック + 最大 latency slot の auto-bypass loop ──
         // 個別では cap 内でも、合計が超えるケース (例: 1973ms + 50ms = 2023ms) に対応。
         // 合計が cap 以下になるまで、active で最大 latency の slot を bypass し続ける。
-        loop {
-            let total: u32 = inner
-                .slots
-                .iter()
-                .filter(|s| !s.bypass && matches!(s.state, SlotState::Loaded))
-                .map(|s| s.latency_samples)
-                .fold(0u32, |a, b| a.saturating_add(b));
-            if total <= max_samples {
-                break;
-            }
-            // active で最大 latency の slot を 1 つ bypass
-            let target_idx = inner
-                .slots
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| !s.bypass && matches!(s.state, SlotState::Loaded))
-                .max_by_key(|(_, s)| s.latency_samples)
-                .map(|(i, _)| i);
-            let Some(idx) = target_idx else {
-                break; // active slot が無いのに total > max は通常起きない、防御
-            };
-            let slot = &mut inner.slots[idx];
-            // 既に auto-bypass 済の slot にはログ再発火しない (= ログ連打防止)
-            let already_logged = slot.auto_bypassed_for_latency;
-            slot.bypass = true;
-            slot.auto_bypassed_for_latency = true;
-            active_changed = true;
-            if !already_logged {
-                let total_ms = total as f64 / sr.max(1) as f64 * 1000.0;
-                let this_ms = slot.latency_samples as f64 / sr.max(1) as f64 * 1000.0;
-                crate::logger::log(format!(
-                    "[VST3 PDC] AUTO-BYPASS (total): chain total {:.1}ms exceeds {:.1}s cap, \
+        if self.latency_policy == LatencyPolicy::AutoBypass {
+            loop {
+                let total: u32 = inner
+                    .slots
+                    .iter()
+                    .filter(|s| !s.bypass && matches!(s.state, SlotState::Loaded))
+                    .map(|s| s.latency_samples)
+                    .fold(0u32, |a, b| a.saturating_add(b));
+                if total <= max_samples {
+                    break;
+                }
+                // active で最大 latency の slot を 1 つ bypass
+                let target_idx = inner
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| !s.bypass && matches!(s.state, SlotState::Loaded))
+                    .max_by_key(|(_, s)| s.latency_samples)
+                    .map(|(i, _)| i);
+                let Some(idx) = target_idx else {
+                    break; // active slot が無いのに total > max は通常起きない、防御
+                };
+                let slot = &mut inner.slots[idx];
+                // 既に auto-bypass 済の slot にはログ再発火しない (= ログ連打防止)
+                let already_logged = slot.auto_bypassed_for_latency;
+                slot.bypass = true;
+                slot.auto_bypassed_for_latency = true;
+                active_changed = true;
+                if !already_logged {
+                    let total_ms = total as f64 / sr.max(1) as f64 * 1000.0;
+                    let this_ms = slot.latency_samples as f64 / sr.max(1) as f64 * 1000.0;
+                    crate::logger::log(format!(
+                        "[VST3 PDC] AUTO-BYPASS (total): chain total {:.1}ms exceeds {:.1}s cap, \
                      disabling largest active plugin '{}' ({:.1}ms).",
-                    total_ms,
-                    MAX_PDC_LATENCY_SECS,
-                    slot.plugin_name.as_deref().unwrap_or("?"),
-                    this_ms,
-                ));
+                        total_ms,
+                        MAX_PDC_LATENCY_SECS,
+                        slot.plugin_name.as_deref().unwrap_or("?"),
+                        this_ms,
+                    ));
+                }
+                // loop 継続: bypass 後の total を再計算
             }
-            // loop 継続: bypass 後の total を再計算
         }
 
         // active_slot_count atomic を更新
@@ -762,6 +958,17 @@ impl DspBridge {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn mark_enabled_without_bridge_for_test(&self) {
+        self.inner.lock().unwrap().state = DspState::Enabled;
+        self.enabled.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gui_all_visible_desired_for_test(&self) -> bool {
+        self.gui_all_visible_desired.load(Ordering::Acquire)
+    }
+
     /// VST3 機能を無効化する。全スロットを破棄して各 bridge 子プロセスを終了する。
     pub fn disable(&self) {
         self.disable_with_reason(None);
@@ -780,13 +987,11 @@ impl DspBridge {
         }
         inner.next_slot_id = 0;
         inner.state = DspState::Disabled;
+        self.editor_snapshot_revision.fetch_add(1, Ordering::AcqRel);
+        // Publish the empty identity under the same inner lock as revision
+        // invalidation, so an older refresh cannot restore a stale editor.
+        publish_editor_ui_snapshot(&self.editor_ui_snapshot, EditorUiSnapshot::default());
         drop(inner);
-        // editor_hwnds allowlist を確実に空にする (Codex CP1 P2 反映)。
-        // `refresh_editor_hwnds_snapshot` は IsWindow filter で空 set に
-        // なるはずだが、HWND 再利用時の誤許可リスクを残さないよう明示クリアする。
-        if let Ok(mut guard) = self.editor_hwnds.write() {
-            guard.clear();
-        }
         // bridge disconnect / quarantine 経路。HUD は VST がいなくなったあと
         // 最前面を維持しておきたいので念のため raise hook を発火する。
         self.fire_hud_raise_hook();
@@ -851,9 +1056,12 @@ impl DspBridge {
                 drop(inner);
                 let exe = extract::ensure_bridge_extracted()
                     .map_err(|e| format!("bridge exe 展開失敗: {e}"))?;
-                let mut bridge = Bridge::spawn(exe, |line| {
-                    crate::logger::log(format!("[vst3-bridge] {line}"));
-                })
+                let gui_signal_wake = self.gui_result_wake.lock().unwrap().clone();
+                let mut bridge = Bridge::spawn_with_gui_signal_wake(
+                    exe,
+                    |line| crate::logger::log(format!("[vst3-bridge] {line}")),
+                    gui_signal_wake,
+                )
                 .map_err(|e| format!("bridge spawn 失敗: {e}"))?;
                 if let Err(e) = bridge.send(&Cmd::Hello {
                     version: crate::video::dsp::bridge::PROTOCOL_VERSION,
@@ -896,7 +1104,13 @@ impl DspBridge {
                     }
                 }
                 bridge
-                    .open_audio_pipe(plugin_path, sample_rate, block_size, initial_state)
+                    .open_audio_pipe(
+                        plugin_path,
+                        sample_rate,
+                        block_size,
+                        initial_state,
+                        self.strict_state,
+                    )
                     .map_err(|e| format!("open_audio_pipe: {e}"))?;
                 (Arc::new(bridge), 0)
             }
@@ -910,7 +1124,13 @@ impl DspBridge {
 
         if slot_id != 0 {
             bridge_arc
-                .add_plugin_to_chain(slot_id, plugin_path, initial_state, bypass)
+                .add_plugin_to_chain(
+                    slot_id,
+                    plugin_path,
+                    initial_state,
+                    bypass,
+                    self.strict_state,
+                )
                 .map_err(|e| format!("add_plugin_to_chain: {e}"))?;
         }
 
@@ -1023,6 +1243,7 @@ impl DspBridge {
         });
         self.recalc_active_count(&inner);
         drop(inner);
+        self.refresh_editor_hwnds_snapshot();
         self.prewarm_slot_gui(idx);
         Ok(idx)
     }
@@ -1105,6 +1326,50 @@ impl DspBridge {
         out
     }
 
+    /// Request the first loaded plugin's state without occupying the normal
+    /// bridge event channel. The receiver may be waited on by a worker.
+    pub fn query_first_state_concurrent(
+        &self,
+    ) -> Result<
+        crossbeam_channel::Receiver<Result<String, bridge::ConcurrentStateError>>,
+        bridge::ConcurrentStateError,
+    > {
+        let (bridge, slot_id) = {
+            let inner = self.inner.lock().unwrap();
+            let slot = inner.slots.first().ok_or_else(|| {
+                bridge::ConcurrentStateError::HostResponse("no EffeTune plugin loaded".to_string())
+            })?;
+            (Arc::clone(&slot.bridge), slot.slot_id)
+        };
+        bridge.query_state_concurrent(slot_id)
+    }
+
+    pub fn host_exit_code_after(&self, timeout: Duration) -> Option<u32> {
+        let host = self
+            .inner
+            .lock()
+            .unwrap()
+            .slots
+            .first()
+            .map(|slot| Arc::clone(&slot.bridge))?;
+        host.wait_host_exit_code(timeout)
+    }
+
+    /// Used only when the dedicated EffeTune host exceeds the exit fence.
+    pub fn terminate_host_now(&self) {
+        let bridges: Vec<Arc<Bridge>> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .slots
+                .iter()
+                .map(|slot| Arc::clone(&slot.bridge))
+                .collect()
+        };
+        for bridge in bridges {
+            bridge.terminate_now();
+        }
+    }
+
     /// 全 Loaded スロットのプラグイン GUI ウィンドウ位置 + 外枠サイズを取得する。
     /// 戻り値: `(plugin_path, x, y, w, h)` のリスト。HWND が無い slot
     /// (= 一度も GUI を開かなかった) や `GetWindowRect` 失敗の slot は含めない。
@@ -1161,6 +1426,21 @@ impl DspBridge {
         if !self.is_enabled() {
             return;
         }
+        if let Err(error) = self.try_reset_plugins_sync() {
+            crate::logger::log(format!(
+                "[VST3] CRITICAL: reset_plugins_sync failed: {error}; pre-seek audio may leak briefly"
+            ));
+        }
+    }
+
+    pub fn try_reset_plugins_sync(&self) -> Result<(), String> {
+        self.try_reset_plugins_before(Instant::now() + std::time::Duration::from_secs(2))
+    }
+
+    pub fn try_reset_plugins_before(&self, deadline: Instant) -> Result<(), String> {
+        if !self.is_enabled() {
+            return Err("VST3 bridge disabled".to_string());
+        }
         let mut bridges: Vec<Arc<Bridge>> = {
             let inner = self.inner.lock().unwrap();
             inner
@@ -1172,21 +1452,17 @@ impl DspBridge {
         };
         bridges.dedup_by(|a, b| Arc::ptr_eq(a, b));
         if bridges.is_empty() {
-            return;
+            return Ok(());
         }
         // 各 bridge ごとに `reset_sync` (= ID 付き send + ack 照合 wait) を呼ぶ。
         // 順次実行で十分 (= active bridge 数 max 10、各 reset は数 ms-数百 ms)。
-        let timeout = std::time::Duration::from_secs(2);
         for b in &bridges {
-            if !b.reset_sync(timeout) {
-                crate::logger::log(
-                    "[VST3] CRITICAL: reset_plugins_sync ResetDone ack timeout (2s), \
-                     pre-seek audio may leak briefly. Plugin may be unresponsive or \
-                     processing too slowly."
-                        .to_string(),
-                );
+            if Instant::now() >= deadline {
+                return Err("reset deadline expired".to_string());
             }
+            b.reset_sync_result_until(deadline)?;
         }
+        Ok(())
     }
 
     /// 全 active プラグインに **無音ブロックを N 個流す**。
@@ -1283,11 +1559,14 @@ impl DspBridge {
             inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
         };
         if let Some((bridge, slot_id)) = slot {
-            let _ = bridge.send_value(&serde_json::json!({
-                "cmd": "set_gui_app_active",
-                "slot_id": slot_id,
-                "active": if active { 1 } else { 0 },
-            }));
+            self.dispatch_gui_value(
+                bridge,
+                serde_json::json!({
+                    "cmd": "set_gui_app_active",
+                    "slot_id": slot_id,
+                    "active": if active { 1 } else { 0 },
+                }),
+            );
         }
     }
 
@@ -1318,11 +1597,14 @@ impl DspBridge {
                 .map(u64::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            let _ = bridge.send_value(&serde_json::json!({
-                "cmd": "set_chain_z_order",
-                "topmost": if topmost { 1 } else { 0 },
-                "ordered_slots": ordered_slots,
-            }));
+            self.dispatch_gui_value(
+                bridge,
+                serde_json::json!({
+                    "cmd": "set_chain_z_order",
+                    "topmost": if topmost { 1 } else { 0 },
+                    "ordered_slots": ordered_slots,
+                }),
+            );
         }
     }
 
@@ -1407,6 +1689,9 @@ impl DspBridge {
                 bridge
                     .gui_show_all_in_progress
                     .store(false, Ordering::Release);
+                if let Some(wake) = bridge.gui_result_wake.lock().unwrap().as_ref() {
+                    wake();
+                }
                 crate::logger::log(format!("[VST3 GUI] async show-slot end idx={idx}"));
             })
         {
@@ -1415,6 +1700,7 @@ impl DspBridge {
             crate::logger::log(format!(
                 "[VST3 GUI] failed to spawn async show-slot idx={idx}: {err}"
             ));
+            self.report_gui_failure(format!("GUI attach worker spawn: {err}"));
         }
     }
 
@@ -1428,6 +1714,27 @@ impl DspBridge {
         visible: bool,
         clear_user_hidden: bool,
     ) -> Result<(), String> {
+        let result = self.ensure_slot_gui_attached_inner(idx, visible, clear_user_hidden);
+        if let Err(error) = &result {
+            if error != "main HWND not ready" {
+                self.report_gui_failure(error.clone());
+            }
+        }
+        result
+    }
+
+    fn ensure_slot_gui_attached_inner(
+        &self,
+        idx: usize,
+        visible: bool,
+        clear_user_hidden: bool,
+    ) -> Result<(), String> {
+        if visible
+            && self.gui_owner_policy == GuiOwnerPolicy::FixedMain
+            && self.current_gui_owner_hwnd() == 0
+        {
+            return Err("main HWND not ready".to_string());
+        }
         // 既存ウィンドウが作成済みなら可視化のみで早期 return (= 高速パス)
         // **z-order は触らない**: ユーザーが手で並べた前後関係を保持する (Codex P1)。
         // ただし `gui_topmost_desired` の現在値は最後に適用する (= fullscreen 中に
@@ -1503,9 +1810,11 @@ impl DspBridge {
                 Err(e) => {
                     crate::logger::log(format!("vst3 query_gui_size: {e}, fallback 1200x800"));
                     drop(gui_sync_guard.take());
-                    self.disable_with_reason(Some(format!(
-                        "GUI size query timed out for {plugin_name}: {e}"
-                    )));
+                    if !self.gui_failure_owned_by_controller() {
+                        self.disable_with_reason(Some(format!(
+                            "GUI size query timed out for {plugin_name}: {e}"
+                        )));
+                    }
                     return Err(format!("query_gui_size recv: {e}"));
                 }
             };
@@ -1548,6 +1857,7 @@ impl DspBridge {
                 "width": pref_w,
                 "height": pref_h,
                 "resizable": if resizable { 1 } else { 0 },
+                "hide_bypass_button": if self.show_editor_bypass_button { 0 } else { 1 },
                 "has_initial_pos": if initial_pos.is_some() { 1 } else { 0 },
                 "x": initial_pos.map(|p| p.0).unwrap_or(0),
                 "y": initial_pos.map(|p| p.1).unwrap_or(0),
@@ -1571,7 +1881,8 @@ impl DspBridge {
                 }
             }
             Ok(Event::Error { detail }) => {
-                if Self::is_bridge_poison_detail(&detail) {
+                if Self::is_bridge_poison_detail(&detail) && !self.gui_failure_owned_by_controller()
+                {
                     drop(gui_sync_guard.take());
                     self.disable_with_reason(Some(format!(
                         "GUI attach failed for {plugin_name}: {detail}"
@@ -1584,9 +1895,11 @@ impl DspBridge {
             }
             Err(e) => {
                 drop(gui_sync_guard.take());
-                self.disable_with_reason(Some(format!(
-                    "GUI attach timed out for {plugin_name}: {e}"
-                )));
+                if !self.gui_failure_owned_by_controller() {
+                    self.disable_with_reason(Some(format!(
+                        "GUI attach timed out for {plugin_name}: {e}"
+                    )));
+                }
                 return Err(format!("attach recv: {e}"));
             }
         }
@@ -1642,6 +1955,40 @@ impl DspBridge {
         }
         // HUD raise allowlist から外す + raise hook 発火 (VST が消えたら HUD は他の
         // editor の前にいるはずだが、念のため再アサート)。
+        self.refresh_editor_hwnds_snapshot();
+        self.fire_hud_raise_hook();
+    }
+
+    /// EffeTune uses this from its controller worker. Keep the slot visible
+    /// until the pipe write succeeds so the UI observes the completed command.
+    pub fn hide_slot_gui_checked(&self, idx: usize) -> Result<(), String> {
+        let (bridge, slot_id, hwnd) = {
+            let inner = self.inner.lock().unwrap();
+            let slot = inner.slots.get(idx).ok_or("GUI slot is missing")?;
+            (Arc::clone(&slot.bridge), slot.slot_id, slot.gui_hwnd)
+        };
+        if hwnd != 0 {
+            bridge
+                .send_value(&serde_json::json!({
+                    "cmd": "set_gui_visible",
+                    "slot_id": slot_id,
+                    "visible": 0,
+                }))
+                .map_err(|error| format!("hide GUI command: {error}"))?;
+        }
+        if let Some(slot) = self.inner.lock().unwrap().slots.get_mut(idx) {
+            slot.gui_visible = false;
+        }
+        self.refresh_editor_hwnds_snapshot();
+        self.fire_hud_raise_hook();
+        Ok(())
+    }
+
+    fn record_user_hidden_from_host(&self, idx: usize) {
+        if let Some(slot) = self.inner.lock().unwrap().slots.get_mut(idx) {
+            slot.gui_visible = false;
+            slot.user_hidden = true;
+        }
         self.refresh_editor_hwnds_snapshot();
         self.fire_hud_raise_hook();
     }
@@ -2122,7 +2469,13 @@ impl DspBridge {
             }
         }
         for &idx in &close_targets {
-            self.user_hide_slot_gui(idx);
+            if self.gui_failure_owned_by_controller() {
+                // The dedicated host already hid the surface before sending
+                // GuiUserHidden; no UI-thread pipe write is needed here.
+                self.record_user_hidden_from_host(idx);
+            } else {
+                self.user_hide_slot_gui(idx);
+            }
         }
         // session 切替は bridge に最初に伝える (= 後続の resize より先に状態確定)
         for (idx, active) in session_targets {
@@ -2131,11 +2484,14 @@ impl DspBridge {
                 inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
             };
             if let Some((b, slot_id)) = slot {
-                let _ = b.send_value(&serde_json::json!({
-                    "cmd": "set_user_resizing",
-                    "slot_id": slot_id,
-                    "active": if active { 1 } else { 0 },
-                }));
+                self.dispatch_gui_value(
+                    b,
+                    serde_json::json!({
+                        "cmd": "set_user_resizing",
+                        "slot_id": slot_id,
+                        "active": if active { 1 } else { 0 },
+                    }),
+                );
             }
         }
         // resize は bridge に send (Mutex 外で bridge clone してから)
@@ -2173,17 +2529,22 @@ impl DspBridge {
                 inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
             };
             if let Some((b, slot_id)) = slot {
-                let _ = b.send_value(&serde_json::json!({
-                    "cmd": "notify_host_resize",
-                    "slot_id": slot_id,
-                    "width": w,
-                    "height": h,
-                }));
+                self.dispatch_gui_value(
+                    b,
+                    serde_json::json!({
+                        "cmd": "notify_host_resize",
+                        "slot_id": slot_id,
+                        "width": w,
+                        "height": h,
+                    }),
+                );
             }
         }
         let mut bypass_updates = Vec::with_capacity(bypass_toggle_targets.len());
         for (idx, path, requested_bypass) in bypass_toggle_targets {
-            self.set_bypass(idx, requested_bypass);
+            if !self.gui_failure_owned_by_controller() {
+                self.set_bypass(idx, requested_bypass);
+            }
             let actual_bypass = {
                 let inner = self.inner.lock().unwrap();
                 inner
@@ -2391,6 +2752,27 @@ impl DspBridge {
             .count();
         self.active_slot_count.store(count, Ordering::Release);
     }
+}
+
+fn editor_snapshot_publish_is_current(
+    captured_revision: u64,
+    current_revision: u64,
+    captured: &[(u64, u32)],
+    current: &[(u64, u32)],
+) -> bool {
+    captured_revision == current_revision && captured == current
+}
+
+#[cfg(test)]
+#[test]
+fn stale_editor_refresh_cannot_overwrite_newer_identity_snapshot() {
+    let old = [(0x301, 42)];
+    let replaced = [(0x301, 43)];
+    assert!(!editor_snapshot_publish_is_current(1, 2, &old, &old));
+    assert!(!editor_snapshot_publish_is_current(2, 2, &old, &replaced));
+    assert!(editor_snapshot_publish_is_current(
+        2, 2, &replaced, &replaced
+    ));
 }
 
 impl Drop for DspBridge {
