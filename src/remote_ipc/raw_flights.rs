@@ -14,6 +14,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 pub(super) const REMOTE_RAW_FLIGHT_LIMIT: usize = 6;
 const CANCEL_POLL: Duration = Duration::from_millis(50);
@@ -273,7 +275,8 @@ impl State {
         id
     }
 
-    fn reserve_probe(&mut self) -> (u64, Arc<AtomicBool>) {
+    #[cfg(test)]
+    fn reserve_probe(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -287,7 +290,7 @@ impl State {
                 source_cancel: Arc::clone(&source_cancel),
             },
         );
-        (id, source_cancel)
+        id
     }
 }
 
@@ -328,17 +331,13 @@ struct AiRequestLease {
     id: u64,
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum RawProbeDemand<'a> {
-    Page,
-    Ai { owner: &'a str },
-}
-
-struct CapacityProbeLease {
+#[cfg(test)]
+pub(super) struct CapacityProbeLease {
     flights: Arc<RemoteRawFlights>,
     id: u64,
 }
 
+#[cfg(test)]
 impl Drop for CapacityProbeLease {
     fn drop(&mut self) {
         let mut state = self.flights.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -513,111 +512,32 @@ impl RemoteRawFlights {
         )
     }
 
-    /// A bounded source-selection operation that must inspect archive bytes
-    /// before its final RAW identity is known. It occupies one outstanding id
-    /// for the entire operation, so AI never extracts a nested ZIP while
-    /// waiting for capacity. The resulting entry name is kept, not its bytes.
-    pub(super) fn with_capacity_probe<T>(
-        self: &Arc<Self>,
-        demand: RawProbeDemand<'_>,
-        cancel: &AtomicBool,
-        action: impl FnOnce(&Arc<AtomicBool>) -> T,
-    ) -> Result<T, RemoteRawFlightError> {
-        if cancel.load(Ordering::Acquire) {
-            return Err(RemoteRawFlightError::Cancelled);
+    #[cfg(test)]
+    pub(super) fn hold_capacity_slot_for_test(self: &Arc<Self>) -> CapacityProbeLease {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(state.outstanding.len() < self.policy.max_outstanding);
+        let id = state.reserve_probe();
+        CapacityProbeLease {
+            flights: Arc::clone(self),
+            id,
         }
-        let ai_request = if let RawProbeDemand::Ai { owner } = demand {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.lifecycle == OwnerLifecycle::Stopped || cancel.load(Ordering::Acquire) {
-                return Err(RemoteRawFlightError::Cancelled);
-            }
-            let id = state.next_ai_wait_id;
-            state.next_ai_wait_id = state
-                .next_ai_wait_id
-                .checked_add(1)
-                .expect("AI request id exhausted");
-            state.ai_latest_request.insert(owner.to_owned(), id);
-            if state.ai_capacity_waiters.remove(owner).is_some() {
-                self.changed.notify_all();
-            }
-            Some(AiRequestLease {
-                flights: Arc::clone(self),
-                owner: owner.to_owned(),
-                id,
-            })
-        } else {
-            None
-        };
-        let mut ai_wait: Option<AiCapacityLease> = None;
-        let (lease, source_cancel) = loop {
-            if cancel.load(Ordering::Acquire) {
-                return Err(RemoteRawFlightError::Cancelled);
-            }
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.lifecycle == OwnerLifecycle::Stopped
-                || ai_request.as_ref().is_some_and(|request| {
-                    state.ai_latest_request.get(&request.owner) != Some(&request.id)
-                })
-                || ai_wait.as_ref().is_some_and(|wait| {
-                    state.ai_capacity_waiters.get(&wait.owner) != Some(&wait.id)
-                })
-            {
-                return Err(RemoteRawFlightError::Cancelled);
-            }
-            if state.outstanding.len() < self.policy.max_outstanding {
-                if cancel.load(Ordering::Acquire) {
-                    return Err(RemoteRawFlightError::Cancelled);
-                }
-                let (id, token) = state.reserve_probe();
-                break (
-                    CapacityProbeLease {
-                        flights: Arc::clone(self),
-                        id,
-                    },
-                    token,
-                );
-            }
-            let RawProbeDemand::Ai { owner } = demand else {
-                return Err(RemoteRawFlightError::Capacity);
-            };
-            if ai_wait.is_none() {
-                let id = state.next_ai_wait_id;
-                state.next_ai_wait_id = state
-                    .next_ai_wait_id
-                    .checked_add(1)
-                    .expect("AI capacity wait id exhausted");
-                state.ai_capacity_waiters.insert(owner.to_owned(), id);
-                ai_wait = Some(AiCapacityLease {
-                    flights: Arc::clone(self),
-                    owner: owner.to_owned(),
-                    id,
-                });
-                self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_for_ai_capacity_for_test(&self, owner: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while !state.ai_capacity_waiters.contains_key(owner) {
+            if Instant::now() >= deadline {
+                return false;
             }
             let (next, _) = self
                 .changed
                 .wait_timeout(state, CANCEL_POLL)
                 .unwrap_or_else(|e| e.into_inner());
-            drop(next);
-        };
-        drop(ai_wait);
-        let result = action(&source_cancel);
-        drop(lease);
-        if cancel.load(Ordering::Acquire)
-            || self.is_stopped()
-            || ai_request.as_ref().is_some_and(|request| {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .ai_latest_request
-                    .get(&request.owner)
-                    != Some(&request.id)
-            })
-        {
-            Err(RemoteRawFlightError::Cancelled)
-        } else {
-            Ok(result)
+            state = next;
         }
+        true
     }
 
     /// The same flight owner accepts a later, lower-priority S2c prefetch
@@ -1235,103 +1155,6 @@ mod tests {
             let (next, _) = flights.changed.wait_timeout(state, CANCEL_POLL).unwrap();
             state = next;
         }
-    }
-
-    #[test]
-    fn ai_capacity_probe_does_not_start_archive_selection_while_full() {
-        use std::io::Write;
-
-        let temp = tempfile::tempdir().unwrap();
-        let archive = temp.path().join("ai-capacity-nested.zip");
-        let nested = {
-            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            writer
-                .start_file("page.dng", zip::write::SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(b"RAW source bytes").unwrap();
-            writer.finish().unwrap().into_inner()
-        };
-        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
-        writer
-            .start_file("inner.zip", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        writer.write_all(&nested).unwrap();
-        writer.finish().unwrap();
-
-        let fake = Arc::new(FakeSubmitter::default());
-        let flights = flights(&fake);
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let release_rx = Arc::new(Mutex::new(release_rx));
-        let mut holders = Vec::new();
-        for _ in 0..REMOTE_RAW_FLIGHT_LIMIT {
-            let flights = Arc::clone(&flights);
-            let entered = entered_tx.clone();
-            let release = Arc::clone(&release_rx);
-            holders.push(thread::spawn(move || {
-                flights
-                    .with_capacity_probe(RawProbeDemand::Page, &AtomicBool::new(false), |_| {
-                        entered.send(()).unwrap();
-                        release.lock().unwrap().recv().unwrap();
-                    })
-                    .unwrap();
-            }));
-        }
-        for _ in 0..REMOTE_RAW_FLIGHT_LIMIT {
-            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        }
-        let cancel = Arc::new(AtomicBool::new(false));
-        let selections = Arc::new(AtomicUsize::new(0));
-        let ai = {
-            let flights = Arc::clone(&flights);
-            let cancel = Arc::clone(&cancel);
-            let selections = Arc::clone(&selections);
-            let archive = archive.clone();
-            thread::spawn(move || {
-                flights.with_capacity_probe(
-                    RawProbeDemand::Ai { owner: "phone" },
-                    &cancel,
-                    |stop| {
-                        selections.fetch_add(1, Ordering::SeqCst);
-                        crate::zip_loader::read_first_image_bytes_cancellable_with_stop(
-                            &archive,
-                            &cancel,
-                            Some(stop),
-                        )
-                    },
-                )
-            })
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut state = flights.state.lock().unwrap();
-        while !state.ai_capacity_waiters.contains_key("phone") {
-            assert!(Instant::now() < deadline, "AI did not wait for capacity");
-            let (next, _) = flights.changed.wait_timeout(state, CANCEL_POLL).unwrap();
-            state = next;
-        }
-        drop(state);
-        assert_eq!(selections.load(Ordering::SeqCst), 0);
-        assert!(!crate::zip_loader::nested_cache_contains(
-            &archive,
-            "inner.zip"
-        ));
-        cancel.store(true, Ordering::Release);
-        assert!(matches!(
-            ai.join().unwrap(),
-            Err(RemoteRawFlightError::Cancelled)
-        ));
-        assert_eq!(selections.load(Ordering::SeqCst), 0);
-        assert!(!crate::zip_loader::nested_cache_contains(
-            &archive,
-            "inner.zip"
-        ));
-        for _ in 0..REMOTE_RAW_FLIGHT_LIMIT {
-            release_tx.send(()).unwrap();
-        }
-        for holder in holders {
-            holder.join().unwrap();
-        }
-        assert!(flights.state.lock().unwrap().outstanding.is_empty());
     }
 
     #[test]

@@ -1071,9 +1071,9 @@ pub(crate) fn nested_cache_contains(zip_path: &Path, nested_name: &str) -> bool 
     NESTED_CACHE.get(zip_path, nested_name).is_some()
 }
 
-/// Conservative Remote prefetch check using only the outer ZIP directory.
-/// A nested archive is opaque until extracted, so it may contain a RAW page.
-/// An unreadable earlier image can also make a later RAW the first readable one.
+/// Conservative RAW possibility check for early cache lookups that precede
+/// representative selection. Actual Remote prefetch resolves its representative.
+/// A nested archive is opaque here, and an unreadable image may expose later RAW.
 pub fn prefetch_may_select_raw_without_extraction(
     zip_path: &Path,
     directory_prefix: Option<&str>,
@@ -1116,27 +1116,26 @@ pub fn prefetch_may_select_raw_without_extraction(
     Ok(false)
 }
 
-/// Return a RAW representative that can be identified from the outer directory
-/// alone. A hit in the developed-RAW cache makes this selection usable without
-/// source extraction. Unknown nested candidates stay conservative misses.
-pub fn prefetch_cached_raw_candidate_without_extraction(
+/// A ZipDirectory with images directly in its requested directory selects
+/// among those images before visiting child directories, including nested ZIPs.
+/// Return that representative from the outer central directory alone. If the
+/// representative may be in a child directory, the caller must enumerate.
+pub fn direct_zip_directory_representative_without_nested_extraction(
     zip_path: &Path,
-    directory_prefix: Option<&str>,
+    directory_prefix: &str,
+    cancel: &Arc<AtomicBool>,
+    stop: Option<&AtomicBool>,
 ) -> std::io::Result<Option<String>> {
-    if crate::rar_loader::is_rar_path(zip_path) {
-        let entries = crate::rar_loader::enumerate_image_entries_detailed(zip_path)?.entries;
-        let selected = if let Some(prefix) = directory_prefix {
-            crate::zip_tree::ZipTree::build(zip_path.to_path_buf(), entries)
-                .representative_for_prefix_str(prefix, crate::app::BOOK_READING_PAGE_ORDER)
-                .map(|entry| entry.entry_name.clone())
-        } else {
-            entries.first().map(|entry| entry.entry_name.clone())
-        };
-        return Ok(selected.filter(|name| crate::raw_format::is_raw_path(Path::new(name))));
+    if cancelled_by(Some(cancel), stop) {
+        return Err(interrupted_error());
     }
-    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, None)?;
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
     let mut direct = Vec::new();
+    let directory = directory_prefix.trim_end_matches('/');
     for index in 0..archive.len() {
+        if cancelled_by(Some(cancel), stop) {
+            return Err(interrupted_error());
+        }
         let Ok(entry) = archive.by_index(index) else {
             continue;
         };
@@ -1150,19 +1149,8 @@ pub fn prefetch_cached_raw_candidate_without_extraction(
         let Some(ext) = lowercase_ext(&name) else {
             continue;
         };
-        if crate::folder_tree::is_zip_extension(&ext) {
-            let nested_prefix = format!("{name}/");
-            if directory_prefix
-                .is_none_or(|prefix| name.starts_with(prefix) || prefix.starts_with(&nested_prefix))
-            {
-                return Ok(None);
-            }
-        } else if is_image_ext(&ext)
-            && directory_prefix.is_none_or(|prefix| name.starts_with(prefix))
+        if is_image_ext(&ext) && name.rsplit_once('/').map_or("", |(parent, _)| parent) == directory
         {
-            if directory_prefix.is_none() {
-                return Ok(crate::raw_format::is_raw_path(Path::new(&name)).then_some(name));
-            }
             direct.push(ZipImageEntry {
                 entry_name: name,
                 uncompressed_size: entry.size(),
@@ -1170,13 +1158,10 @@ pub fn prefetch_cached_raw_candidate_without_extraction(
             });
         }
     }
-    let Some(prefix) = directory_prefix else {
-        return Ok(None);
-    };
     let selected = crate::zip_tree::ZipTree::build(zip_path.to_path_buf(), direct)
-        .representative_for_prefix_str(prefix, crate::app::BOOK_READING_PAGE_ORDER)
+        .representative_for_prefix_str(directory_prefix, crate::app::BOOK_READING_PAGE_ORDER)
         .map(|entry| entry.entry_name.clone());
-    Ok(selected.filter(|name| crate::raw_format::is_raw_path(Path::new(name))))
+    Ok(selected)
 }
 
 #[allow(clippy::too_many_arguments)]
