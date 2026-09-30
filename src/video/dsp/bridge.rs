@@ -36,7 +36,8 @@ use windows::core::{HSTRING, PCWSTR};
 /// **bump 1 → 2** (T09 round 4): 旧 bridge は version 比較を no-op で握り潰していたので
 /// 1 のままだと stale bridge を検出できなかった。2 へ上げることで v0.8.x 以前の
 /// `mimageviewer-vst3-host.exe` (version=1 を返すだけ) を新 Rust 側で reject できる。
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4: explicit unowned editors, main-minimize reconciliation, and activation.
+pub const PROTOCOL_VERSION: u32 = 4;
 pub(crate) const STATE_WATCHDOG_EXIT_CODE: u32 = 0xEFFE_C001;
 
 static NEXT_AUDIO_PIPE_ID: AtomicU64 = AtomicU64::new(0);

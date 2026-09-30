@@ -305,6 +305,19 @@ bridge IPC のレイテンシ実測 (Phase 0b):
 
 ## 5. プラグイン GUI ホスティング
 
+EffeTune 専用 bridge は `GuiOwnerPolicy::Unowned` (2026-09-30 利用者決定)。owner=0 の
+tool window なのでメインをクリックするとメインを手前にでき、タスクバーボタンは増えない。
+`main_hwnd` は DPI / 最小化参照であり owner ではない。ユーザー VST の `Auto`、fullscreen の
+owner / TOPMOST / focus handoff は従来どおり。EffeTune は owner 変更 IPC と app-active relay の対象外。
+表示希望と一時非表示理由 (`Minimized` / `RemoteSession`) は host の `GuiVisibility` に集約し、
+最後の理由が解除されたときだけ元の表示希望を復元する。詳細とボタンの foreground 判定は
+[EffeTune 計画 §4](effetune-integration-plan.md#4-ウィンドウ) を参照。
+
+host protocol v4 は `show_gui` の明示的 `unowned` と `main_hwnd`、
+`sync_gui_main_visibility`、`set_gui_remote_session`、`activate_gui` を追加した。
+owner=0 は明示的な Unowned だけで許可し、旧 host が新しい表示規則を無視することを
+hello/ready の版照合で防ぐ。C++ 変更後は host を再ビルドする必要がある。
+
 要件:
 - アプリ起動中ずっとプラグイン GUI を表示しておける
 - 動画再生中のホバーバーから VST3 プレイバックパネルを開き、チェーン全体の

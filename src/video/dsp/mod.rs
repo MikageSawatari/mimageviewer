@@ -57,6 +57,23 @@ mod effetune_policy_tests {
     use super::*;
 
     #[test]
+    fn foreground_predicate_matches_only_editor_and_its_nested_popups() {
+        assert!(editor_in_owner_chain(10, 10, |_| 0));
+        assert!(editor_in_owner_chain(10, 30, |window| match window {
+            30 => 20,
+            20 => 10,
+            _ => 0,
+        }));
+        assert!(!editor_in_owner_chain(10, 40, |_| 0));
+        assert!(!editor_in_owner_chain(0, 0, |_| 0));
+        assert!(!editor_in_owner_chain(10, 30, |window| if window == 30 {
+            20
+        } else {
+            30
+        }));
+    }
+
+    #[test]
     fn editor_bypass_chrome_defaults_on_and_effetune_can_hide_it() {
         let user = DspBridge::new();
         assert_eq!(user.gui_owner_policy, GuiOwnerPolicy::Auto);
@@ -64,13 +81,15 @@ mod effetune_policy_tests {
         assert!(!user.strict_state);
         assert!(user.show_editor_bypass_button);
 
-        let effect = DspBridge::new_with_gui_chrome(
-            GuiOwnerPolicy::FixedMain,
-            LatencyPolicy::ReportOnly,
-            true,
-            false,
-        );
-        assert_eq!(effect.gui_owner_policy, GuiOwnerPolicy::FixedMain);
+        let effect = crate::effetune::new_bridge();
+        assert_eq!(effect.gui_owner_policy, GuiOwnerPolicy::Unowned);
+        effect.set_main_hwnd(123);
+        effect.register_fullscreen_owner(456);
+        assert_eq!(effect.current_gui_owner_hwnd(), 0);
+        assert!(GuiOwnerPolicy::Unowned.accepts_owner(0));
+        assert!(!GuiOwnerPolicy::Unowned.accepts_owner(123));
+        assert!(!GuiOwnerPolicy::Auto.accepts_owner(0));
+        assert!(GuiOwnerPolicy::Auto.accepts_owner(123));
         assert_eq!(effect.latency_policy, LatencyPolicy::ReportOnly);
         assert!(effect.strict_state);
         assert!(!effect.show_editor_bypass_button);
@@ -267,6 +286,32 @@ pub struct DspBridge {
 pub enum GuiOwnerPolicy {
     Auto,
     FixedMain,
+    /// A tool window with no Win32 owner; main HWND is only a presentation reference.
+    Unowned,
+}
+
+impl GuiOwnerPolicy {
+    fn accepts_owner(self, hwnd: u64) -> bool {
+        match self {
+            Self::Unowned => hwnd == 0,
+            Self::Auto | Self::FixedMain => hwnd != 0,
+        }
+    }
+}
+
+fn editor_in_owner_chain(editor: u64, root: u64, mut owner: impl FnMut(u64) -> u64) -> bool {
+    if editor == 0 {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut window = root;
+    while window != 0 && seen.insert(window) {
+        if window == editor {
+            return true;
+        }
+        window = owner(window);
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -622,6 +667,9 @@ impl DspBridge {
             IsWindow, WindowFromPoint,
         };
 
+        if self.gui_owner_policy == GuiOwnerPolicy::Unowned {
+            return 0;
+        }
         if self.gui_owner_policy == GuiOwnerPolicy::FixedMain {
             let main = self.main_hwnd.load(Ordering::Acquire);
             if main != 0
@@ -688,7 +736,7 @@ impl DspBridge {
     }
 
     fn sync_existing_gui_owner(&self, owner_hwnd: u64) {
-        if owner_hwnd == 0 {
+        if self.gui_owner_policy == GuiOwnerPolicy::Unowned || owner_hwnd == 0 {
             return;
         }
         let bridges: Vec<Arc<Bridge>> = {
@@ -1507,17 +1555,129 @@ impl DspBridge {
         }
     }
 
-    /// 指定 idx のプラグイン GUI を表示する。
-    ///
-    /// **永続 GuiHost 設計**: 一度作成された window は slot 削除まで保持される。
-    /// 2 回目以降の呼び出しは ShowWindow(SW_SHOWNA) でウィンドウを可視化するだけ
-    /// (= プラグインの createView/removed をスキップ → DAW 並みの高速トグル)。
-    ///
-    /// 新規ウィンドウ作成時の初期位置は `slot.desired_window_pos` を使う
-    /// (= settings から復元した値 / 終了時に保存した値、`add_plugin` で初期化、
-    /// 2026-05 ユーザー要望「ウィンドウ位置を復元してほしい」)。
-    ///
-    /// メインスレッドから呼ぶ前提。初回のみ bridge 応答待ちで ~数百 ms かかる。
+    /// Native main state used by the worker before publishing a new show intent.
+    pub fn main_window_is_minimized(&self) -> bool {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+        unsafe { IsIconic(HWND(self.main_hwnd.load(Ordering::Acquire) as *mut _)) }.as_bool()
+    }
+
+    /// Worker-only checked presentation after hidden attach. A failed pipe write
+    /// must not publish requested-visible state to the toolbar.
+    pub fn show_slot_gui_checked(&self, idx: usize) -> Result<(), String> {
+        let (bridge, slot_id, hwnd) = {
+            let inner = self.inner.lock().unwrap();
+            let slot = inner.slots.get(idx).ok_or("GUI slot is missing")?;
+            (Arc::clone(&slot.bridge), slot.slot_id, slot.gui_hwnd)
+        };
+        if hwnd == 0 {
+            return Err("GUI is not attached".into());
+        }
+        bridge
+            .send_value(&serde_json::json!({
+                "cmd": "set_gui_visible", "slot_id": slot_id, "visible": 1,
+            }))
+            .map_err(|error| format!("show GUI command: {error}"))?;
+        if let Some(slot) = self.inner.lock().unwrap().slots.get_mut(idx) {
+            slot.gui_visible = true;
+            slot.user_hidden = false;
+        }
+        self.refresh_editor_hwnds_snapshot();
+        Ok(())
+    }
+
+    pub fn attach_slot_gui_hidden(&self, idx: usize) -> Result<(), String> {
+        self.ensure_slot_gui_attached(idx, false, true)
+    }
+
+    pub fn set_slot_gui_remote_session_checked(
+        &self,
+        idx: usize,
+        active: bool,
+    ) -> Result<(), String> {
+        let slot = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .slots
+                .get(idx)
+                .map(|s| (Arc::clone(&s.bridge), s.slot_id))
+        };
+        if let Some((bridge, slot_id)) = slot {
+            bridge.send_value(&serde_json::json!({
+                "cmd": "set_gui_remote_session", "slot_id": slot_id, "active": u32::from(active),
+            })).map_err(|error| format!("GUI suppression: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// Nonblocking main WM_SIZE relay; host reads IsIconic at execution time.
+    pub fn sync_main_window_visibility(&self) {
+        if self.gui_owner_policy != GuiOwnerPolicy::Unowned {
+            return;
+        }
+        let slots: Vec<_> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .slots
+                .iter()
+                .map(|slot| (Arc::clone(&slot.bridge), slot.slot_id))
+                .collect()
+        };
+        for (bridge, slot_id) in slots {
+            self.dispatch_gui_value(
+                bridge,
+                serde_json::json!({
+                    "cmd": "sync_gui_main_visibility", "slot_id": slot_id,
+                }),
+            );
+        }
+    }
+
+    /// Foreground editor or a popup whose owner chain reaches this exact editor.
+    pub fn slot_gui_is_foreground(&self, idx: usize, foreground: u64) -> bool {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GW_OWNER, GetAncestor, GetWindow};
+        let editor = self
+            .inner
+            .lock()
+            .unwrap()
+            .slots
+            .get(idx)
+            .map(|s| s.gui_hwnd)
+            .unwrap_or(0);
+        if editor == 0 || foreground == 0 {
+            return false;
+        }
+        let root = unsafe { GetAncestor(HWND(foreground as *mut _), GA_ROOT) }.0 as u64;
+        editor_in_owner_chain(editor, root, |window| {
+            unsafe { GetWindow(HWND(window as *mut _), GW_OWNER) }
+                .unwrap_or_default()
+                .0 as u64
+        })
+    }
+
+    pub fn activate_slot_gui(&self, idx: usize) {
+        use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+        let slot = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .slots
+                .get(idx)
+                .map(|slot| (Arc::clone(&slot.bridge), slot.slot_id))
+        };
+        if let Some((bridge, slot_id)) = slot {
+            unsafe {
+                let _ = AllowSetForegroundWindow(bridge.process_id());
+            }
+            self.dispatch_gui_value(
+                bridge,
+                serde_json::json!({
+                    "cmd": "activate_gui", "slot_id": slot_id,
+                }),
+            );
+        }
+    }
+
     fn send_slot_gui_visible(&self, idx: usize, visible: bool) {
         let slot = {
             let inner = self.inner.lock().unwrap();
@@ -1829,7 +1989,7 @@ impl DspBridge {
                 .unwrap_or((None, None))
         };
         let owner_hwnd = self.current_gui_owner_hwnd();
-        if owner_hwnd == 0 {
+        if !self.gui_owner_policy.accepts_owner(owner_hwnd) {
             return Err("main HWND not ready".to_string());
         }
         crate::logger::log(format!(
@@ -1851,6 +2011,8 @@ impl DspBridge {
                 "cmd": "show_gui",
                 "slot_id": slot_id,
                 "owner_hwnd": owner_hwnd,
+                "unowned": if self.gui_owner_policy == GuiOwnerPolicy::Unowned { 1 } else { 0 },
+                "main_hwnd": if self.gui_owner_policy == GuiOwnerPolicy::Unowned { self.main_hwnd.load(Ordering::Acquire) } else { 0 },
                 "visible": if visible { 1 } else { 0 },
                 "width": pref_w,
                 "height": pref_h,
@@ -2518,7 +2680,9 @@ impl DspBridge {
         } else {
             app_active_latest.unwrap_or(foreground_active)
         };
-        if self.gui_app_active_effective.swap(active, Ordering::AcqRel) != active {
+        if self.gui_owner_policy != GuiOwnerPolicy::Unowned
+            && self.gui_app_active_effective.swap(active, Ordering::AcqRel) != active
+        {
             self.set_all_guis_app_active(active);
         }
         for (idx, w, h) in resize_targets {

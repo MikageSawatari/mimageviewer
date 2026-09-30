@@ -905,7 +905,15 @@ private:
             GuiWindowOptions options;
             options.slot_id = slot_id;
             options.owner_hwnd = reinterpret_cast<void*>(extract_number_field(msg, "owner_hwnd"));
-            if (!options.owner_hwnd) {
+            options.unowned = extract_number_field(msg, "unowned") != 0;
+            options.main_hwnd = reinterpret_cast<void*>(extract_number_field(msg, "main_hwnd"));
+            if (options.unowned) {
+                if (options.owner_hwnd || !options.main_hwnd ||
+                    !IsWindow(reinterpret_cast<HWND>(options.main_hwnd))) {
+                    send_event_error("show_gui: unowned editor requires a valid main reference and no owner");
+                    return true;
+                }
+            } else if (!options.owner_hwnd) {
                 send_event_error("show_gui: owner_hwnd missing");
                 return true;
             }
@@ -947,6 +955,19 @@ private:
         if (cmd == "hide_gui") {
             if (PluginLoader* loader = loader_for_message(msg)) loader->hide_gui();
             write_message("{\"event\":\"gui_detached\"}");
+            return true;
+        }
+        if (cmd == "set_gui_remote_session") {
+            if (PluginLoader* loader = loader_for_message(msg))
+                loader->set_gui_remote_session(extract_number_field(msg, "active") != 0);
+            return true;
+        }
+        if (cmd == "sync_gui_main_visibility") {
+            if (PluginLoader* loader = loader_for_message(msg)) loader->sync_gui_main_visibility();
+            return true;
+        }
+        if (cmd == "activate_gui") {
+            if (PluginLoader* loader = loader_for_message(msg)) loader->activate_gui();
             return true;
         }
         if (cmd == "set_gui_visible") {

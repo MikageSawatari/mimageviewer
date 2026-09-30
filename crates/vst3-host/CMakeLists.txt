@@ -46,6 +46,10 @@ include_directories(
 )
 
 # bridge ソース
+# Headless visibility/lifecycle regressions are checked at compile time.
+add_library(vst3-gui-visibility-tests OBJECT tests/gui_visibility.cpp)
+target_include_directories(vst3-gui-visibility-tests PRIVATE include)
+
 add_executable(mimageviewer-vst3-host
     src/main.cpp
     src/host_app.cpp
