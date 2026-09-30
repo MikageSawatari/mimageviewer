@@ -9,6 +9,9 @@
   実測と判断の記録は [raw-libraw-s1-results.md](raw-libraw-s1-results.md)
 - **S2a 完了 (2026-09-28、`a982704b9`)**: 全入口の RAW 振り分け・WIC 拒否・executor 接続・サムネイル受け渡し。
   独立レビュー (別セッション) が 3 回で受け入れ判定、`test-full.ps1` PASS。S2b (Remote) は §10.2 の方針決定待ち
+- **S2b 完了 (2026-10-01、`14f96aea3`)**: Remote の RAW (表示ページだけ同期現像、先読みは skip、最後の 1 枚、
+  サムネイルは half 現像なし)、protocol v62。独立レビュー (別セッション) が 6 回で受け入れ判定、`test-full.ps1` PASS。
+  次は master の取り込み (利用者指示)、その後 S2c
 - 作業場所: worktree `C:\home\mimageviewer-raw` / branch `raw-libraw` (master `edbac5f37` から分岐)
 - 引き継ぎ元: [raw-libraw-handoff.md](raw-libraw-handoff.md)。本書が完成したら handoff の内容は本書へ吸収済みとして削除してよい
 - 実装: Codex GPT-6 Sol / xhigh に段ごとに委任。独立レビュー: 実装者とは別の GPT-6 Sol / xhigh
@@ -1277,3 +1280,8 @@ JPEG だけの入れ子書庫の先読みと AI の待ちは解決。代表を�
 
 payload を読む前の判定は解決。新しい P2×3 を採用: 同名候補の再読込ループ → 安定した cursor、書庫 root の代表順序を
 既存 loader と同じ中央ディレクトリ順に戻す (第1版 (1b) の「名前順」は設計の誤り)、AI はページの有効性を source 準備より前に確かめる。
+
+### 20.10 S2b 実装の独立レビュー (2026-10-01、5〜6 回目)
+
+候補の順序・cursor・AI の事前検証、読めない literal entry からの入れ子へのフォールバックを解決し、受け入れ判定。
+非 RAW の全アドレス種別で pre-S2b loader との差異なし、RAW 理由の先読み skip / capacity 待ちが非 RAW に及ばないことを確認。
