@@ -6602,6 +6602,257 @@ mod tests {
         app.shutdown_collection_runtime_for_exit();
     }
 
+    fn assert_collection_mutation_refresh(refresh: impl FnOnce(&mut App, &Path)) {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("pin-refresh-child");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("page.png"), b"page").unwrap();
+        let video = folder.join("movie.mp4");
+        std::fs::write(&video, b"movie").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.active_quick_folder_slot = None;
+        let snapshot =
+            collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let owner = app.collection_grid_physical_load_owner(0, &folder).unwrap();
+        let scan = super::super::folder_scan::scan_directory_with_settings(&folder, &app.settings)
+            .unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            folder.clone(),
+            Some(scan),
+            super::super::OpenRequestOwner::CollectionGridPhysical(owner)
+        ));
+        app.selected = app
+            .items
+            .iter()
+            .position(|it| matches!(it, GridItem::Image(_)));
+        app.scroll_offset_y = 125.0;
+        let selected_item = app.items[app.selected.unwrap()].clone();
+        let location = app.folder_nav_current_target();
+        let before = app.folder_nav_history_snapshot();
+        // A parked viewer has its own rows, pending work and parent target.
+        let sibling = app.build_window_context_for_test(9_902, |sibling| {
+            sibling.current_folder = Some(temp.path().join("sibling"));
+            sibling.selected = Some(0);
+            sibling.scroll_offset_y = 77.0;
+            sibling.items = vec![GridItem::Image(temp.path().join("sibling.png"))];
+        });
+        let sibling_state = app
+            .with_viewer_context(sibling, |sibling| {
+                (
+                    sibling.items.clone(),
+                    sibling.items_generation,
+                    sibling.cancel_token.clone(),
+                    sibling.folder_nav_current_target(),
+                    sibling.selected,
+                    sibling.scroll_offset_y,
+                )
+            })
+            .unwrap();
+        refresh(&mut app, &folder);
+        assert_eq!(app.folder_nav_current_target(), location);
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .position,
+            CollectionGridPosition::PhysicalSource { .. }
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            before.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            before.forward_stack
+        );
+        assert_eq!(app.items[app.selected.unwrap()], selected_item);
+        assert_eq!(app.scroll_offset_y, 125.0);
+        let Some(crate::ui_main::AddressBarNav::Collection(parent)) =
+            app.resolve_return_to_parent_nav()
+        else {
+            panic!("BS must return to the collection root");
+        };
+        assert_eq!(parent.identity.collection_id, snapshot.collection_id());
+        app.with_viewer_context(sibling, |sibling| {
+            assert_eq!(sibling.items, sibling_state.0);
+            assert_eq!(sibling.items_generation, sibling_state.1);
+            assert!(Arc::ptr_eq(&sibling.cancel_token, &sibling_state.2));
+            assert!(!sibling.cancel_token.load(Ordering::Relaxed));
+            assert_eq!(sibling.folder_nav_current_target(), sibling_state.3);
+            assert_eq!(sibling.selected, sibling_state.4);
+            assert_eq!(sibling.scroll_offset_y, sibling_state.5);
+        })
+        .unwrap();
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn mutation_refresh_collection_pin_preserves_location_history_and_sibling() {
+        assert_collection_mutation_refresh(|app, _| {
+            app.toggle_folder_pin_for_idx(app.selected.unwrap());
+            assert!(!app.folder_thumb_pin_dirty.is_empty());
+            app.consume_folder_thumb_pin_dirty();
+            assert!(app.folder_thumb_pin_dirty.is_empty());
+        });
+    }
+
+    #[test]
+    fn mutation_refresh_collection_unpin_preserves_location_history_and_sibling() {
+        assert_collection_mutation_refresh(|app, folder| {
+            app.toggle_folder_pin_for_idx(app.selected.unwrap());
+            app.consume_folder_thumb_pin_dirty();
+            assert!(app.remove_folder_thumb_pin(folder));
+            app.consume_folder_thumb_pin_dirty();
+            assert!(app.folder_thumb_pin_for(folder).is_none());
+        });
+    }
+
+    #[test]
+    fn mutation_refresh_collection_video_pin_preserves_location_history_and_sibling() {
+        assert_collection_mutation_refresh(|app, folder| {
+            app.video_thumb_overrides_dirty_paths
+                .insert(folder.join("movie.mp4"));
+            app.consume_video_thumb_overrides_dirty();
+            assert!(app.video_thumb_overrides_dirty_paths.is_empty());
+        });
+    }
+
+    #[test]
+    fn mutation_refresh_collection_deferred_export_preserves_location_history_and_sibling() {
+        assert_collection_mutation_refresh(|app, folder| {
+            app.note_exported_file_for_folder_refresh(&folder.join("export.png"));
+            assert!(app.folder_refresh_pending.is_some());
+            app.consume_folder_refresh_pending();
+            assert!(app.folder_refresh_pending.is_none());
+        });
+    }
+
+    #[test]
+    fn mutation_refresh_collection_external_rescan_preserves_location_history_and_sibling() {
+        assert_collection_mutation_refresh(|app, folder| {
+            std::fs::write(folder.join("new.png"), b"new").unwrap();
+            let scan =
+                super::super::folder_scan::scan_directory_with_settings(folder, &app.settings)
+                    .unwrap();
+            app.apply_external_rescan(folder.to_path_buf(), std::time::SystemTime::now(), scan);
+            assert!(
+                app.items
+                    .iter()
+                    .any(|it| matches!(it, GridItem::Image(p) if p.ends_with("new.png")))
+            );
+        });
+    }
+
+    #[test]
+    fn mutation_refresh_collection_stack_toggle_preserves_location_history_and_sibling() {
+        assert_collection_mutation_refresh(|app, _| {
+            app.settings.stack_script_enabled = false;
+            app.toggle_stack_mode();
+            assert!(app.stack_mode_requested);
+            app.toggle_stack_mode();
+            assert!(!app.stack_mode_requested);
+        });
+    }
+
+    #[test]
+    fn mutation_refresh_collection_f5_preserves_location_history_and_sibling() {
+        assert_collection_mutation_refresh(|app, _| {
+            app.reload_current_folder_preserving_override()
+        });
+    }
+
+    #[test]
+    fn mutation_refresh_ordinary_cached_archive_f5_keeps_logical_history() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.7z");
+        let cache = temp.path().join("cache.zip");
+        write_single_page_zip(&cache);
+        let (mut app, _) = start_ready_app(&temp.path().join("collection.db"));
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(source.clone());
+        app.folder_nav_back_stack
+            .push(super::super::FolderNavHistoryTarget::Path(
+                temp.path().join("previous"),
+            ));
+        app.folder_nav_forward_stack
+            .push(super::super::FolderNavHistoryTarget::Path(
+                temp.path().join("next"),
+            ));
+        let before = app.folder_nav_history_snapshot();
+        let location = app.folder_nav_current_target();
+        app.reload_current_folder_preserving_override();
+        app.settle_open_path_classification_for_test();
+        poll_real_history_load(&mut app, Some(&cache), None);
+        assert_eq!(app.folder_nav_current_target(), location);
+        assert_eq!(app.archive_source_override.as_ref(), Some(&source));
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            before.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            before.forward_stack
+        );
+        assert!(app.zip_nav.is_some());
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn mutation_refresh_collection_cached_archive_f5_does_not_record_cache_location() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.7z");
+        let cache = temp.path().join("cache.zip");
+        std::fs::write(&source, b"source").unwrap();
+        write_single_page_zip(&cache);
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.active_quick_folder_slot = None;
+        let snapshot = collection_with_sources(
+            &client,
+            &[(source.clone(), CollectionResolvedKind::ConvertibleArchive)],
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        // Model the already accepted conversion: logical source and physical cache are distinct.
+        let anchor = app.collection_grid_source_anchor(0, &source).unwrap();
+        app.commit_collection_grid_source_open(anchor, source.clone());
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(source.clone());
+        let before = app.folder_nav_history_snapshot();
+        let location = app.folder_nav_current_target();
+        app.reload_current_folder_preserving_override();
+        app.settle_open_path_classification_for_test();
+        poll_real_history_load(&mut app, Some(&cache), None);
+        assert_eq!(app.current_folder.as_ref(), Some(&cache));
+        assert_eq!(app.archive_source_override.as_ref(), Some(&source));
+        assert_eq!(app.folder_nav_current_target(), location);
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            before.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            before.forward_stack
+        );
+        assert!(
+            app.zip_nav.is_some(),
+            "F5 must really re-enumerate the backing archive"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
     #[test]
     fn collection_parent_resolution_is_owned_by_the_mounted_viewer_context() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();

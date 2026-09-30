@@ -29,6 +29,14 @@
 
 ## 1. 優先候補
 
+### 1.313 コレクションの実フォルダ子で代表サムネを固定すると親復帰先と履歴が変わる — 修正済み (2026-10-01)
+
+- 観測者: 利用者。2026-10-01、v430-integration のコレクションで登録実フォルダを開き、右クリック「📌 代表サムネに固定」を実行すると、BS が実フォルダの親へ移動し、戻る履歴に画像一覧が二重に現れる。固定しなければ collection root へ戻る。設計担当のコード調査では v4.2.0 にも同じ経路がある。
+- 原因: `consume_folder_thumb_pin_dirty` がスクロール復元用 `folder_history` を消して `load_folder(cur)` を通常 Navigation owner で実行し、CollectionPhysical の provenance を失う。可視場所の identity が変わるため navigation history にも別地点が追加される。
+- 修正: pin／unpin、video pin、遅延 export は現在ビューの共通 reload へ集約。外部再走査とスタック切替も同じ物理 reload owner を使う。Collection／Rating の物理子 owner に Refresh intent を持たせ、通常書庫の cache alias も論理 source identity で履歴を比較する。ZIP pin は階層と位置を保持する再 materialize、合成ビューは既存 metadata-pin worker／適用経路で資産だけを更新する。detached 固有述語・viewport 経路は変更しない。
+- 検証・同型経路の列挙: [pin-reload-audit.md](pin-reload-audit.md)。実アプリの起動・操作は行わず、利用者による修正後の実機確認は未実施。
+- 監査で別途判明した RatingPhysical 子のソート再表示は未修正。worker owner の型変更が detached 専用 consumer の機械的転送にも及ぶため、利用者指定の変更禁止境界で停止し scope 確認中。コレクション子の pin／unpin 修正と検証済み差分には含めていない。
+
 ### 1.288 多数のファイルをエクスプローラへドラッグしてコピーすると、コピーが終わるまで mIV が操作できない — コード調査 + 通常ログ (2026-09-27)
 
 - 出典: 利用者 (開発者本人) の報告。mIV で多数のファイルを選んでエクスプローラへドラッグ＆ドロップでコピーすると、

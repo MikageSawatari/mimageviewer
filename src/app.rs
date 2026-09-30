@@ -336,6 +336,7 @@ pub(crate) struct RatingPhysicalLoadOwner {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RatingPhysicalLoadIntent {
+    Refresh,
     Explicit,
     Restore,
 }
@@ -13056,6 +13057,47 @@ pub(crate) struct FavoriteViewContextState {
     pub(crate) location_favorite_id: Option<uuid::Uuid>,
 }
 
+#[derive(Clone)]
+enum CurrentViewRefresh {
+    Full,
+    Pins {
+        folders: std::collections::HashSet<PathBuf>,
+        videos: std::collections::HashSet<PathBuf>,
+    },
+}
+
+impl CurrentViewRefresh {
+    fn merge(&mut self, previous: &Self) {
+        match (self, previous) {
+            (current, Self::Full) => *current = Self::Full,
+            (
+                Self::Pins { folders, videos },
+                Self::Pins {
+                    folders: old_folders,
+                    videos: old_videos,
+                },
+            ) => {
+                folders.extend(old_folders.iter().cloned());
+                videos.extend(old_videos.iter().cloned());
+            }
+            (Self::Full, _) => {}
+        }
+    }
+}
+
+struct CurrentViewPinRefresh {
+    items_generation: u64,
+    refresh: CurrentViewRefresh,
+    rx: mpsc::Receiver<Option<metadata_import_refresh::RefreshResult>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for CurrentViewPinRefresh {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 pub struct App {
     pub(crate) remote_session_ui: crate::remote_ipc::ui::RemoteSessionUiState,
     pub(crate) address: String,
@@ -14451,7 +14493,8 @@ pub struct App {
     pub(crate) converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
     /// 親コンテナのピン書き換えがあったので、次の機会にフォルダを再ロードして
     /// グリッドサムネに反映する必要があるフラグ (`video_thumb_overrides_dirty_paths` と同じ作法)。
-    pub(crate) folder_thumb_pin_dirty: bool,
+    pub(crate) folder_thumb_pin_dirty: std::collections::HashSet<PathBuf>,
+    current_view_pin_refreshes: std::collections::HashMap<ViewerContextId, CurrentViewPinRefresh>,
 
     // ── 動画タイルモード (Phase 5.5) ─────────────────────────────
     /// S キーでトグルされる動画タイルモード状態。再生中に間隔別にサムネを並べて
@@ -17695,7 +17738,8 @@ impl App {
             converted_archive_cache_paths: std::collections::HashMap::new(),
             converted_archive_pin_root_states: std::collections::HashMap::new(),
             converted_archive_cache_paths_pending: None,
-            folder_thumb_pin_dirty: false,
+            folder_thumb_pin_dirty: std::collections::HashSet::new(),
+            current_view_pin_refreshes: std::collections::HashMap::new(),
             #[cfg(windows)]
             video_tile_mode_active: false,
             #[cfg(windows)]
@@ -22280,7 +22324,8 @@ impl App {
             self.context_menu_idx = None;
         }
         // 既に走らせた scan を pre_scan として渡し、UI スレッドで再 read_dir しない。
-        self.load_folder_with_scan(folder, Some(scan));
+        let owner = self.current_folder_reload_owner(&folder);
+        self.load_folder_with_scan_owned(folder, Some(scan), owner);
         // 再ロード後に選択パスを探し、見つかればそこにカーソルを戻してスクロール依頼。
         // 見つからない (消えた) / そもそも未選択ならスクロール位置は触らない。
         if let Some(path) = selected_path {
@@ -22315,7 +22360,58 @@ impl App {
             .map(|item| item.name().into_owned());
     }
 
+    /// The adopted location owns a refresh, including the parent provenance of physical children.
+    fn current_folder_reload_owner(&self, folder: &Path) -> OpenRequestOwner {
+        if let Some(mut owner) = self.collection_grid_physical_reload_owner(folder) {
+            owner.intent = top_level_grid_view::CollectionGridPhysicalLoadIntent::Refresh;
+            return OpenRequestOwner::CollectionGridPhysical(owner);
+        }
+        if let Some(mut owner) = self.rating_view_physical_load_owner(folder)
+            && matches!(
+                owner.source_location,
+                FolderNavHistoryTarget::RatingPhysical(_)
+            )
+        {
+            owner.intent = RatingPhysicalLoadIntent::Refresh;
+            return OpenRequestOwner::RatingPhysical(owner);
+        }
+        OpenRequestOwner::Navigation
+    }
+
     pub(crate) fn reload_current_folder_preserving_override(&mut self) {
+        self.reload_current_view_in_place(CurrentViewRefresh::Full);
+    }
+
+    fn reload_current_view_in_place(&mut self, refresh: CurrentViewRefresh) {
+        if self.zip_nav.is_some() && matches!(refresh, CurrentViewRefresh::Pins { .. }) {
+            self.refresh_current_zip_level_preserving_position();
+            return;
+        }
+        if self.items_are_global_search_view
+            || self.favsearch.on_results_grid()
+            || self.items_are_tag_view
+            || self.items_are_rating_view
+            || self.items_are_reading_history_view
+            || self.items_are_bookmark_view
+            || matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Snapshot
+            )
+        {
+            if matches!(refresh, CurrentViewRefresh::Full)
+                && !matches!(
+                    self.top_level_grid_view.surface(),
+                    top_level_grid_view::TopLevelGridSurface::Folder
+                )
+                && let Some(ctx) = self.edit_preview_repaint_ctx.clone()
+            {
+                self.reload_top_level_grid(&ctx);
+                return;
+            }
+            // These rows have a synthetic owner; their backing folder is not a navigation target.
+            self.refresh_current_view_pin_thumbnails(refresh);
+            return;
+        }
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
@@ -22328,10 +22424,7 @@ impl App {
         let previous_hint = self.select_after_load.clone();
         self.preserve_cursor_hint_for_reload();
         let saved_override = self.archive_source_override.clone();
-        let owner = self
-            .collection_grid_physical_reload_owner(&folder)
-            .map(OpenRequestOwner::CollectionGridPhysical)
-            .unwrap_or(OpenRequestOwner::Navigation);
+        let owner = self.current_folder_reload_owner(&folder);
         let outcome =
             self.load_folder_or_convert_archive_with_auto_fullscreen_owned(folder, false, owner);
         if matches!(
@@ -22345,6 +22438,242 @@ impl App {
         if let Some(src) = saved_override {
             self.address = src.to_string_lossy().to_string();
             self.archive_source_override = Some(src);
+        }
+    }
+
+    /// Refresh synthetic assets with the existing context/generation-owned metadata worker.
+    fn refresh_current_view_pin_thumbnails(&mut self, mut refresh: CurrentViewRefresh) {
+        if let Some(previous) = self
+            .current_view_pin_refreshes
+            .get(&self.projected_viewer_context_id())
+            && previous.items_generation == self.items_generation
+        {
+            refresh.merge(&previous.refresh);
+        }
+        let pending_refresh = refresh.clone();
+        let context_id = self.projected_viewer_context_id();
+        let mut paths = self.folder_pin_context_lookup_paths();
+        let mut aliases = Vec::new();
+        let mut reset_containers = std::collections::HashSet::new();
+        let items = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let container_path = self.folder_pin_lookup_target_for_item(item).map(|target| {
+                    let affected = match &refresh {
+                        CurrentViewRefresh::Full => true,
+                        CurrentViewRefresh::Pins { folders, .. } => folders.iter().any(|path| {
+                            // ZipDir pins may reference a sibling book within the same archive.
+                            let root = match item {
+                                GridItem::ZipDir { zip_path, .. } => zip_pin_root_path(
+                                    zip_path,
+                                    self.archive_source_override.as_deref(),
+                                    self.current_folder.as_deref(),
+                                ),
+                                _ => &target.path,
+                            };
+                            crate::books::path_is_under_or_equal(path, root)
+                        }),
+                    };
+                    if affected {
+                        reset_containers.insert(index);
+                    }
+                    paths.push(target.path.clone());
+                    if let Some(alias) = target.alias {
+                        aliases.push(alias);
+                    }
+                    target.path
+                });
+                let video_path = match item {
+                    GridItem::Video(path)
+                        if matches!(refresh, CurrentViewRefresh::Full)
+                            || matches!(&refresh, CurrentViewRefresh::Pins { videos, .. }
+                                if videos.iter().any(|dirty| crate::path_key::eq_keep_drive(dirty, path)))
+                            || !matches!(self.thumbnails.get(index), Some(ThumbnailState::Loaded { .. })) =>
+                    {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                };
+                metadata_import_refresh::ItemKey {
+                    index,
+                    key: String::new(),
+                    rating: false,
+                    tags: false,
+                    page: false,
+                    had_page_state: false,
+                    alternate_page_key: None,
+                    container_path,
+                    video_path,
+                    video_size: self
+                        .image_metas
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .map_or(0, |(_, size)| size.max(0) as u64),
+                }
+            })
+            .collect();
+        let request = metadata_import_refresh::ContextRequest {
+            context_id,
+            items_generation: self.items_generation,
+            items,
+            current_rating_key: None,
+            spread_container_path: None,
+            spread_container_fallback: None,
+            // The producer has already removed an unpinned key from the mounted map. Include
+            // the visible container keys so removal also invalidates its previous materialization.
+            old_folder_pin_keys: paths
+                .iter()
+                .map(|path| crate::path_key::normalize_keep_drive(path))
+                .chain(self.folder_pin_map.keys().cloned())
+                .collect(),
+            folder_pin_paths: paths,
+            folder_pin_aliases: aliases,
+        };
+        let container_targets: Vec<_> = request
+            .items
+            .iter()
+            .filter_map(|item| item.container_path.clone().map(|path| (item.index, path)))
+            .collect();
+        let cascade_depth = self.settings.folder_thumb_depth as usize;
+        let data_dir = crate::data_dir::get();
+        let data_dir_for_cascade = data_dir.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let repaint_ctx = self.edit_preview_repaint_ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut result = metadata_import_refresh::run(
+                data_dir,
+                vec![request],
+                crate::metadata_transfer::ImportChangedSections {
+                    thumbnail_pins: true,
+                    ..Default::default()
+                },
+                &worker_cancel,
+            );
+            if let Some(result) = result.as_mut() {
+                if let CurrentViewRefresh::Pins {
+                    videos: changed, ..
+                } = &refresh
+                    && !changed.is_empty()
+                {
+                    if let Ok(db) = crate::folder_thumb_pins::FolderThumbPinDb::open_at(
+                        &data_dir_for_cascade.join("folder_thumb_pins.db"),
+                    ) {
+                        for (index, path) in container_targets {
+                            if worker_cancel.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            let key = crate::path_key::normalize_keep_drive(&path);
+                            let pin = result
+                                .contexts
+                                .first()
+                                .and_then(|context| context.folder_pin_map.as_ref())
+                                .and_then(|pins| pins.get(&key));
+                            if let Some(pin) = pin {
+                                let resolved =
+                                    crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                                        &path,
+                                        pin,
+                                        |path| db.lookup(path),
+                                        cascade_depth,
+                                    );
+                                if resolved.is_some_and(|target| {
+                                    changed.iter().any(|path| {
+                                        crate::path_key::eq_keep_drive(path, &target.abs_path)
+                                    })
+                                }) {
+                                    reset_containers.insert(index);
+                                }
+                            }
+                        }
+                    }
+                }
+                for context in &mut result.contexts {
+                    if let Some(indices) = &mut context.folder_pin_reset_indices {
+                        indices.retain(|index| reset_containers.contains(index));
+                    }
+                }
+            }
+            if tx.send(result).is_ok()
+                && let Some(ctx) = repaint_ctx
+            {
+                ctx.request_repaint();
+            }
+        });
+        self.current_view_pin_refreshes.insert(
+            context_id,
+            CurrentViewPinRefresh {
+                rx,
+                cancel,
+                items_generation: self.items_generation,
+                refresh: pending_refresh,
+            },
+        );
+    }
+
+    fn prune_current_view_pin_refreshes(&mut self) {
+        if self.current_view_pin_refreshes.is_empty() {
+            return;
+        }
+        let live_contexts = self.viewer_context_ids();
+        self.current_view_pin_refreshes
+            .retain(|id, _| live_contexts.contains(id));
+    }
+
+    fn poll_current_view_pin_refresh(&mut self) {
+        self.prune_current_view_pin_refreshes();
+        let context_id = self.projected_viewer_context_id();
+        let Some(pending) = self.current_view_pin_refreshes.get(&context_id) else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.current_view_pin_refreshes.remove(&context_id);
+        if let Some(result) = result {
+            for error in result.errors {
+                crate::logger::log(error);
+            }
+            for context in result.contexts {
+                if context.context_id != context_id {
+                    continue;
+                }
+                self.apply_current_metadata_import_terminal_result(
+                    context,
+                    crate::metadata_transfer::ImportChangedSections {
+                        thumbnail_pins: true,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+
+    /// Pin changes assets at the current ZIP level; explicit F5 still re-enumerates it.
+    fn refresh_current_zip_level_preserving_position(&mut self) {
+        let selected = self.selected;
+        let scroll = self.scroll_offset_y;
+        let checked = self.checked.clone();
+        let show_search_bar = self.show_search_bar;
+        let query = self.search_query.clone();
+        let filter = self.search_filter.clone();
+        let search_was_pending = self.search_pending.is_some();
+        self.zip_nav_show_current_level();
+        self.selected = selected.filter(|index| *index < self.items.len());
+        self.scroll_offset_y = scroll;
+        self.checked = checked;
+        self.show_search_bar = show_search_bar;
+        self.search_query = query;
+        self.search_filter = filter;
+        self.rebuild_visible_indices();
+        if search_was_pending && let Some(ctx) = self.edit_preview_repaint_ctx.clone() {
+            self.execute_search(&ctx);
         }
     }
 
@@ -24283,9 +24612,10 @@ impl App {
             return false;
         }
         let mut nav_chain = rating.nav_chain.clone();
-        if !nav_chain
-            .last()
-            .is_some_and(|last| crate::folder_tree::path_eq(last, path))
+        if rating.intent != RatingPhysicalLoadIntent::Refresh
+            && !nav_chain
+                .last()
+                .is_some_and(|last| crate::folder_tree::path_eq(last, path))
         {
             nav_chain.push(path.to_path_buf());
             if nav_chain.len() > MAX_FOLDER_NAV_STACK {
@@ -24438,10 +24768,16 @@ impl App {
                 if !self.smart_folder_session_owns_load(path) {
                     let logical_path = match owner {
                         OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
-                        _ => path,
+                        // A reload of the current cache is still the same logical archive.
+                        _ => zip_pin_root_path(
+                            path,
+                            self.archive_source_override.as_deref(),
+                            self.current_folder.as_deref(),
+                        ),
                     };
+                    let logical_path = logical_path.to_path_buf();
                     self.record_folder_nav_transition_from_current(
-                        FolderNavHistoryTarget::Path(logical_path.to_path_buf()),
+                        FolderNavHistoryTarget::Path(logical_path),
                         history_origin.cloned(),
                     );
                 }
@@ -34574,7 +34910,7 @@ impl App {
         // 取り直す経路を踏まない)。`catalog_existing_keys` には既に pinned 形式が
         // 含まれているので、直後の delete_missing がこの seed 行を消すことはない。
         if !aggregate_catalog_was_prepared {
-            self.seed_folder_video_pin_thumbs(&cache_map, catalog_arc.as_ref());
+            self.seed_folder_video_pin_thumbs(&cache_map, catalog_arc.as_ref(), None);
         }
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -35601,6 +35937,7 @@ impl App {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
         catalog: Option<&Arc<crate::catalog::CatalogDb>>,
+        indices: Option<&[usize]>,
     ) {
         if self.folder_pin_map.is_empty() {
             return;
@@ -35623,7 +35960,11 @@ impl App {
         let use_full_path_keys = self.use_full_path_cache_keys();
         let mut seeded = 0u32;
         let mut purged = 0u32;
-        for item in &self.items {
+        let candidates: Box<dyn Iterator<Item = &GridItem> + '_> = match indices {
+            Some(indices) => Box::new(indices.iter().filter_map(|index| self.items.get(*index))),
+            None => Box::new(self.items.iter()),
+        };
+        for item in candidates {
             let GridItem::Folder(container_path) = item else {
                 continue;
             };
@@ -36170,7 +36511,7 @@ impl App {
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.insert(key, source);
                 self.invalidate_smart_folder_resort_metadata();
-                self.folder_thumb_pin_dirty = true;
+                self.folder_thumb_pin_dirty.insert(container.to_path_buf());
                 crate::logger::log(format!("folder_thumb_pin set: {}", container.display()));
                 if self.zip_nav.is_some() {
                     self.record_current_container_content_identity(
@@ -36202,7 +36543,7 @@ impl App {
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.remove(&key);
                 self.invalidate_smart_folder_resort_metadata();
-                self.folder_thumb_pin_dirty = true;
+                self.folder_thumb_pin_dirty.insert(container.to_path_buf());
                 crate::logger::log(format!("folder_thumb_pin removed: {}", container.display()));
                 if self.zip_nav.is_some() {
                     self.record_current_container_content_identity(
@@ -36425,7 +36766,7 @@ impl App {
             // 再 materialize (= scroll/selected リセット) は不要。dirty を消して
             // 読書位置を保つ。親へ戻ると zip_nav_back の refresh_folder_pin_map が
             // ピンを拾ってセルに反映する。
-            self.folder_thumb_pin_dirty = false;
+            self.folder_thumb_pin_dirty.remove(&book_key);
             return;
         }
         let Some(container) = self.current_folder.clone() else {
@@ -36561,16 +36902,13 @@ impl App {
         if self.sidecar_restore_active() {
             return;
         }
-        if std::mem::take(&mut self.folder_thumb_pin_dirty) {
-            // ネスト ZIP ツリー閲覧中は現在の階層を保ったまま再 materialize する。
-            // load_folder(zip_path) で開き直すと ZIP のルートに飛んでしまう
-            // (ユーザー報告: 内側ファイルを P でピンするとトップ階層にジャンプ)。
-            if self.zip_nav.is_some() {
-                self.zip_nav_show_current_level();
-            } else if let Some(cur) = self.current_folder.clone() {
-                self.folder_history.remove(&cur);
-                self.load_folder(cur);
-            }
+        self.poll_current_view_pin_refresh();
+        let dirty = std::mem::take(&mut self.folder_thumb_pin_dirty);
+        if !dirty.is_empty() {
+            self.reload_current_view_in_place(CurrentViewRefresh::Pins {
+                folders: dirty,
+                videos: Default::default(),
+            });
         }
     }
 
@@ -36616,35 +36954,15 @@ impl App {
             return;
         }
         self.video_thumb_reload_last_at = Some(std::time::Instant::now());
-        if self.items_are_subfolder_expansion_view {
-            // 同じ snapshot を再適用して動画ピンの WebP を再取得する。
-            if !self.reinstall_subfolder_expansion_snapshot()
-                && let Some(root) = self.subfolder_expansion_root.clone()
-            {
-                let roots = if self.subfolder_expansion_roots.is_empty() {
-                    vec![root.clone()]
-                } else {
-                    self.subfolder_expansion_roots.clone()
-                };
-                self.start_subfolder_expansion_scan_roots(root, roots);
-            }
-        } else if self.items_are_smart_folder_view {
+        if self.items_are_smart_folder_view {
             // A resident smart-folder result is frozen for the session. The explicit toolbar /
             // menu / gamepad reopen is the refresh gesture for path-keyed metadata and pins.
-        } else if let Some(cur) = self.current_folder.clone()
-            && !is_synthetic_view_path(&cur)
-        {
-            // 現フォルダ + 履歴を温存したまま再ロード。folder pin 側にある zip_nav
-            // 分岐 (ルートへ飛ぶ罠の回避) は不要 — ZIP ビューには実ファイル Video
-            // セルも動画へ解決される Folder タイルも出ないため、可視性チェックで
-            // 必ず手前で return する。
-            self.folder_history.remove(&cur);
-            self.load_folder(cur);
+        } else {
+            self.reload_current_view_in_place(CurrentViewRefresh::Pins {
+                folders: Default::default(),
+                videos: dirty,
+            });
         }
-        // 既知の制限 (bool フラグ時代から同じ): 検索 / タグ等の合成ビューに dirty 動画の
-        // Video セルが見えている場合、可視性は true になるがどの再ロード分岐にも入らず
-        // サムネは古いまま (従来も close_fullscreen で consume して何もしなかった)。
-        // ビューを閉じてフォルダへ戻る load_folder で反映される。
     }
 
     /// `consume_video_thumb_overrides_dirty` の可視性判定 (App 状態込み)。
@@ -36745,8 +37063,7 @@ impl App {
                 "folder-refresh: reloading current folder after deferred change ({})",
                 cur.display()
             ));
-            self.folder_history.remove(&cur);
-            self.load_folder(cur);
+            self.reload_current_folder_preserving_override();
         }
     }
 
@@ -36763,7 +37080,7 @@ impl App {
         // 本の中では対象セルが親階層にあり現ビューに無いので、再 materialize (scroll
         // リセット) は不要。dirty を消して読書位置を保つ。
         if in_zip {
-            self.folder_thumb_pin_dirty = false;
+            self.folder_thumb_pin_dirty.remove(&container);
         }
     }
 
@@ -39095,17 +39412,18 @@ impl App {
                 )),
             }
         }
-        self.seed_folder_video_pin_thumbs(&cache_map, Some(&catalog));
+        self.seed_folder_video_pin_thumbs(&cache_map, Some(&catalog), Some(indices));
     }
 
     fn restart_thumbnail_workers_after_metadata_pin_refresh(&mut self) {
-        if self.reload_queue.is_none() && self.heavy_io_queue.is_none() {
-            return;
-        }
-        let Some(cache_map) = self.current_color_cache_map.clone() else {
-            return;
-        };
+        let had_workers = self.reload_queue.is_some() || self.heavy_io_queue.is_some();
+        let cache_map = self.current_color_cache_map.clone();
 
+        if self.projected_viewer_context_id() == self.viewer_context_main()
+            && let Some(cancel) = self.search_video_thread_cancel.take()
+        {
+            cancel.store(true, Ordering::Relaxed);
+        }
         self.cancel_token.store(true, Ordering::Relaxed);
         self.wake_all_workers();
 
@@ -39117,14 +39435,19 @@ impl App {
         self.tx = tx.clone();
         self.rx = rx;
         self.cancel_token = Arc::clone(&cancel);
-        self.reload_queue = Some(Arc::clone(&reload_queue));
-        self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+        self.reload_queue = had_workers.then(|| Arc::clone(&reload_queue));
+        self.heavy_io_queue = had_workers.then(|| Arc::clone(&heavy_io_queue));
         self.requested.clear();
         self.pending_finalize.clear();
         self.texture_backlog.clear();
         self.cache_gen_total = 0;
         self.cache_gen_done = Arc::new(AtomicUsize::new(0));
 
+        // Lightweight search requests also own their result channel. Replace it even without
+        // persistent workers, so cancelled old video/image results cannot overwrite fresh pins.
+        let Some(cache_map) = cache_map.filter(|_| had_workers) else {
+            return;
+        };
         self.spawn_thumbnail_workers(
             &tx,
             cancel,
@@ -39260,13 +39583,41 @@ impl App {
             self.restart_thumbnail_workers_after_metadata_pin_refresh();
         }
         if let Some((video_items, pin_blobs)) = video_refresh {
-            self.spawn_video_thread(
-                self.tx.clone(),
-                Arc::clone(&self.cancel_token),
-                video_items,
-                self.video_thumb_overrides.clone(),
-                Arc::new(pin_blobs),
-            );
+            if self.items_are_global_search_view {
+                // Keep Ctrl+G's streaming policy and exclude the previous folder's sidecars.
+                let pin_paths = pin_blobs.keys().cloned().collect();
+                let candidates = Self::compute_search_video_candidates(
+                    &self.items,
+                    &self.thumbnails,
+                    &pin_paths,
+                    !self.global_search.done,
+                );
+                if !candidates.is_empty() {
+                    let cancel = if self.projected_viewer_context_id() == self.viewer_context_main()
+                    {
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        self.search_video_thread_cancel = Some(Arc::clone(&cancel));
+                        cancel
+                    } else {
+                        Arc::clone(&self.cancel_token)
+                    };
+                    self.spawn_video_thread(
+                        self.tx.clone(),
+                        cancel,
+                        candidates,
+                        std::collections::HashMap::new(),
+                        Arc::new(pin_blobs),
+                    );
+                }
+            } else {
+                self.spawn_video_thread(
+                    self.tx.clone(),
+                    Arc::clone(&self.cancel_token),
+                    video_items,
+                    self.video_thumb_overrides.clone(),
+                    Arc::new(pin_blobs),
+                );
+            }
         }
         if changed.book_bookmarks {
             self.current_book_bookmarks.clear();
@@ -85872,6 +86223,8 @@ impl eframe::App for App {
         // Process-global clipboard events must be visible before fullscreen/native early
         // returns so every viewer observes the same cut snapshot in the first repaint.
         self.cut_clipboard.poll();
+        // Retired asset requests must cancel even when presentation returns early.
+        self.prune_current_view_pin_refreshes();
         // Collection startup/revision/worker responses must likewise progress even when
         // update_frame returns through a fullscreen or native-video presentation path.
         self.poll_collection_ui(ctx);
