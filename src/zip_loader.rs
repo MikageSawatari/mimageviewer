@@ -1154,6 +1154,41 @@ fn note_raw_payload_read(zip_path: &Path, entry_name: &str) {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TestZipUnreadableMetadata {
+    Encrypted,
+    UnsupportedCompression,
+}
+
+/// Mark a synthetic ZIP entry unreadable without damaging its central directory.
+#[cfg(test)]
+pub(crate) fn mark_zip_entry_unreadable_for_test(
+    bytes: &mut [u8],
+    entry_name: &str,
+    failure: TestZipUnreadableMetadata,
+) {
+    let offset = bytes
+        .windows(4)
+        .enumerate()
+        .find_map(|(offset, magic)| {
+            if magic != b"PK\x01\x02" || offset + 46 > bytes.len() {
+                return None;
+            }
+            let name_len = u16::from_le_bytes([bytes[offset + 28], bytes[offset + 29]]) as usize;
+            (bytes.get(offset + 46..offset + 46 + name_len) == Some(entry_name.as_bytes()))
+                .then_some(offset)
+        })
+        .expect("fixture has the named central-directory entry");
+    match failure {
+        TestZipUnreadableMetadata::Encrypted => bytes[offset + 8] |= 1,
+        // Bzip2 is valid ZIP metadata but unsupported by this build.
+        TestZipUnreadableMetadata::UnsupportedCompression => {
+            bytes[offset + 10..offset + 12].copy_from_slice(&12_u16.to_le_bytes());
+        }
+    }
+}
+
 /// Physical location of one archive entry. ZIP indices include each nested
 /// container followed by the leaf index, so duplicate decoded names stay distinct.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1568,6 +1603,7 @@ pub fn resolve_remote_image_candidate(
             .ok_or_else(|| entry_not_found(entry_name));
     }
     let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
+    let parts = split_nested_zip_path(entry_name);
     match resolve_entry_index(
         &mut archive,
         entry_name,
@@ -1578,21 +1614,25 @@ pub fn resolve_remote_image_candidate(
             let entry = archive
                 .by_index_raw(index)
                 .map_err(|error| zip_error_to_io(error, Some(cancel)))?;
-            if !entry.is_file() || !remote_readable_zip_metadata(&entry) {
+            if entry.is_file() && remote_readable_zip_metadata(&entry) {
+                return Ok(RemoteImageCandidate {
+                    entry_name: normalized_zip_entry_name(&entry),
+                    cursor: RemoteArchiveCandidateCursor::Zip(vec![index]),
+                });
+            }
+            if parts.len() < 2 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "ZIP entry is not readable",
                 ));
             }
-            return Ok(RemoteImageCandidate {
-                entry_name: normalized_zip_entry_name(&entry),
-                cursor: RemoteArchiveCandidateCursor::Zip(vec![index]),
-            });
+            // The named loader falls through after a literal read failure.
+            // Metadata already proves this literal cannot be read; resolve
+            // the nested path without reading either image payload here.
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let parts = split_nested_zip_path(entry_name);
     if parts.len() < 2 {
         return Err(entry_not_found(entry_name));
     }
@@ -3758,6 +3798,56 @@ mod tests {
                 .unwrap(),
             b"NESTED"
         );
+    }
+
+    #[test]
+    fn remote_explicit_candidate_falls_through_metadata_unreadable_literal_without_leaf_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for failure in [
+            TestZipUnreadableMetadata::Encrypted,
+            TestZipUnreadableMetadata::UnsupportedCompression,
+        ] {
+            for leaf in ["page.jpg", "page.cr2"] {
+                let inner = dir.path().join("inner.zip");
+                write_test_zip(&inner, &[(leaf, b"NESTED")]);
+                let inner_bytes = std::fs::read(&inner).unwrap();
+                let outer = dir.path().join(format!("{failure:?}-{leaf}.zip"));
+                let entry_name = format!("inner.zip/{leaf}");
+                write_test_zip(
+                    &outer,
+                    &[(&entry_name, b"LITERAL"), ("inner.zip", &inner_bytes)],
+                );
+                let mut bytes = std::fs::read(&outer).unwrap();
+                mark_zip_entry_unreadable_for_test(&mut bytes, &entry_name, failure);
+                std::fs::write(&outer, bytes).unwrap();
+                assert_eq!(read_entry_bytes(&outer, &entry_name).unwrap(), b"NESTED");
+                let raw_reads_before = raw_payload_read_count(&outer, &entry_name);
+                let selected =
+                    resolve_remote_image_candidate(&outer, &entry_name, &cancel).unwrap();
+                assert_eq!(
+                    raw_payload_read_count(&outer, &entry_name),
+                    raw_reads_before
+                );
+                assert_eq!(
+                    selected.cursor,
+                    RemoteArchiveCandidateCursor::Zip(vec![1, 0])
+                );
+                assert_eq!(candidate_payload_read_count(&outer, &selected.cursor), 0);
+                assert_eq!(
+                    candidate_payload_read_count(
+                        &outer,
+                        &RemoteArchiveCandidateCursor::Zip(vec![0])
+                    ),
+                    0
+                );
+                assert_eq!(
+                    read_remote_image_candidate_bytes_cancellable(&outer, &selected, &cancel)
+                        .unwrap(),
+                    b"NESTED"
+                );
+            }
+        }
     }
 
     #[test]

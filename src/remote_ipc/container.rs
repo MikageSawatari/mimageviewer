@@ -11442,6 +11442,99 @@ mod tests {
         }
     }
 
+    fn remote_unreadable_literal_nested_fixture(
+        folder: &Path,
+        failure: crate::zip_loader::TestZipUnreadableMetadata,
+    ) -> RemoteAddress {
+        std::fs::create_dir_all(folder).unwrap();
+        let archive = folder.join(format!("{failure:?}.zip"));
+        let nested = remote_ai_test_zip_bytes(&[("page.jpg", &remote_ai_test_jpeg(8, 6))]);
+        let mut bytes = remote_ai_test_zip_bytes(&[
+            ("inner.zip/page.jpg", &remote_ai_test_jpeg(6, 8)),
+            ("inner.zip", &nested),
+        ]);
+        crate::zip_loader::mark_zip_entry_unreadable_for_test(
+            &mut bytes,
+            "inner.zip/page.jpg",
+            failure,
+        );
+        std::fs::write(&archive, bytes).unwrap();
+        RemoteAddress {
+            path: archive.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "inner.zip/page.jpg".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn explicit_nested_zip_page_falls_through_metadata_unreadable_literal() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        initialize_remote_page_edit_databases();
+        let folder = data_dir.path().join("unreadable-literal-page");
+        std::fs::create_dir_all(&folder).unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("ZIP".to_owned(), folder.clone())],
+            ..Default::default()
+        });
+        for failure in [
+            crate::zip_loader::TestZipUnreadableMetadata::Encrypted,
+            crate::zip_loader::TestZipUnreadableMetadata::UnsupportedCompression,
+        ] {
+            let address = remote_unreadable_literal_nested_fixture(&folder, failure);
+            for priority in [PagePriority::Foreground, PagePriority::Prefetch] {
+                let response = engine.page_with_job_cancel_and_priority(
+                    PageRequest {
+                        job_id: format!("literal-{failure:?}-{priority:?}"),
+                        display_request_id: None,
+                        address: address.clone(),
+                        target_px: 256,
+                        priority,
+                        render_context: None,
+                        adjustment_preview: None,
+                    },
+                    &WorkerContext::open(),
+                    Arc::new(AtomicBool::new(false)),
+                    &|| priority,
+                );
+                let PageResponse::Success(payload) = response else {
+                    panic!("{response:?}")
+                };
+                assert_eq!((payload.width, payload.height), (8, 6));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_nested_zip_ai_falls_through_metadata_unreadable_literal() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        initialize_remote_page_edit_databases();
+        let folder = data_dir.path().join("unreadable-literal-ai");
+        std::fs::create_dir_all(&folder).unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("ZIP".to_owned(), folder.clone())],
+            ..Default::default()
+        });
+        for failure in [
+            crate::zip_loader::TestZipUnreadableMetadata::Encrypted,
+            crate::zip_loader::TestZipUnreadableMetadata::UnsupportedCompression,
+        ] {
+            let address = remote_unreadable_literal_nested_fixture(&folder, failure);
+            let outcome = engine.execute_remote_ai(
+                "nested-literal-owner",
+                &remote_ai_test_request(address),
+                &NoRemoteAiProgress,
+                &Arc::new(AtomicBool::new(false)),
+            );
+            assert!(
+                matches!(outcome, super::super::ai_job::RemoteAiExecutionOutcome::Completed(ref pages)
+                if matches!(pages.as_slice(), [super::super::ai_job::RemoteAiPageExecutionOutcome::NotApplicable {
+                    code: RemoteAiTerminalCode::SizeGate, ..
+                }]))
+            );
+        }
+    }
+
     fn remote_ai_cache_key(page_key: &str) -> RemoteAiNativeCacheKey {
         RemoteAiNativeCacheKey {
             page_key: page_key.to_owned(),

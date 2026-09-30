@@ -2731,6 +2731,8 @@ RAW entry の payload は先読みの skip 判定前も AI の現像枠確保前
 または AI 枠確保後の payload 読み込みが破損等で失敗した場合は、同じ要求で次候補へ進み、
 RAW 候補には同じ規則を繰り返す。候補は入れ子 ZIP の chain を含む entry index の安定 cursor
 で一方向へ進め、正規化名で再検索しない。選んだ代表と要求内の raster / payload pin は共有する。
+明示的な入れ子 `ZipEntry` は、同名の literal entry が暗号化・非対応圧縮なら既存 loader と同じく
+入れ子の解決へ進む。この判定でも画像 payload は読まない。
 AI は `ZipDirectory` 等の非 page を source 準備前に拒否する。その後 metadata で代表を先に特定し、
 RAW のときだけ最新要求優先の owner 別 capacity slot で待つ。
 同一 owner の旧 AI job は新規 job で supersede / cancel されるため、枠確保前の入れ子 ZIP の
