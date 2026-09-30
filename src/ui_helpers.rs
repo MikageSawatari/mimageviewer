@@ -1370,6 +1370,15 @@ pub fn draw_overlay_upscaled_video_badge(
     draw_badge_text(painter, placement, egui::Color32::WHITE);
 }
 
+/// Media length stays legible over bright and dark thumbnail content in either theme.
+pub fn draw_overlay_media_duration_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    painter.rect_filled(placement.rect, 3.0, egui::Color32::from_black_alpha(190));
+    draw_badge_text(painter, placement, egui::Color32::WHITE);
+}
+
 pub fn draw_overlay_bookmark_time_badge(
     painter: &egui::Painter,
     placement: &crate::thumb_overlay_layout::BadgePlacement,

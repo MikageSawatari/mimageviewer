@@ -4411,6 +4411,9 @@ pub struct Settings {
     /// `On` : スクロール停止 + 他の要求が全て完了した後、visible 範囲から順次再デコード
     #[serde(default = "default_true")]
     pub thumb_idle_upgrade: bool,
+    /// サムネイル右下に動画・音声の長さを表示する。
+    #[serde(default = "default_true")]
+    pub thumb_show_media_duration: bool,
     /// 一覧の選択情報を表示する場所。
     #[serde(default)]
     pub selection_info_display_mode: SelectionInfoDisplayMode,
@@ -7182,6 +7185,7 @@ impl Default for Settings {
             gpu_memory_percent: default_gpu_memory_percent(),
             thumb_idle_upgrade: true,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
+            thumb_show_media_duration: true,
             thumb_tooltip_show_filename: true,
             thumb_tooltip_show_image_dimensions: true,
             thumb_tooltip_show_video_duration: true,
@@ -9999,6 +10003,46 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thumb_show_media_duration_defaults_on_and_preserves_disabled_setting() {
+        assert!(Settings::default().thumb_show_media_duration);
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.thumb_show_media_duration);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"thumb_show_media_duration":false}"#).unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.thumb_show_media_duration);
+    }
+
+    #[test]
+    fn thumb_show_media_duration_missing_db_key_defaults_on_and_false_roundtrips() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_media_duration'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        assert!(loaded.thumb_show_media_duration);
+        loaded.thumb_show_media_duration = false;
+        db.save_full(&loaded).unwrap();
+        drop(db);
+        let reopened = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(
+            !reopened
+                .load_into_settings()
+                .unwrap()
+                .thumb_show_media_duration
+        );
+    }
+
     use super::*;
 
     #[test]

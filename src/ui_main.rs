@@ -4484,6 +4484,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 VideoThumbnailIndicator::PlayIcon,
                 true,
                 None,
+                None,
             );
             crate::app::draw_cell(
                 ui,
@@ -12237,7 +12238,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 prepare_ai_facet_menu_popup(ui);
                 self.request_ai_model_facet_load();
                 ui.ctx().request_repaint();
-                if !self.details_lazy_sort_ready() {
+                if !self.ai_model_facet_ready() {
                     self.draw_ai_facet_loading_menu(ui);
                     return;
                 }
@@ -12286,7 +12287,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 prepare_ai_facet_menu_popup(ui);
                 self.request_ai_model_facet_load();
                 ui.ctx().request_repaint();
-                if !self.details_lazy_sort_ready() {
+                if !self.ai_model_facet_ready() {
                     self.draw_ai_facet_loading_menu(ui);
                     return;
                 }
@@ -18267,6 +18268,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         row.badge_label()
                                     }
                                 });
+                                let media_duration = self.thumbnail_media_duration_text(idx);
                                 let is_checked = self.checked.contains(&idx);
                                 let filter_match = if self.items_are_drive_list {
                                     None
@@ -18296,6 +18298,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     self.settings.video_thumbnail_indicator,
                                     is_checked,
                                     filter_match_count,
+                                    media_duration.as_deref(),
                                 );
 
                                 primary_click_hit_cell |=
@@ -18339,6 +18342,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.settings.video_thumbnail_indicator,
                                         self.checked.contains(&idx),
                                         filter_match_count,
+                                        media_duration.as_deref(),
                                     );
                                 }
 

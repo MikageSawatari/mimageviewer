@@ -123,6 +123,42 @@ v1 は PDF の `source_*` へ page-box 単位を書いていた。どちらも W
 `pdf_layout_dims_version=2` への移行時に PDF catalog の全 page 行と通常 catalog の `pdfthumb:` 行を
 一度だけ削除・再生成し、無関係な画像 / ZIP 行は保持する。
 
+### 動画・音声メタデータ (`video_meta`)
+
+フォルダ単位の既存 catalog に次のテーブルを追加する。`pdf_meta` / `container_page_meta` と同じ
+追加方式であり、既存テーブル・行・schema version は変更せず、既存行の移行は不要。
+
+```sql
+CREATE TABLE video_meta (
+    filename TEXT NOT NULL PRIMARY KEY,
+    mtime INTEGER NOT NULL,
+    file_size INTEGER NOT NULL,
+    readable INTEGER NOT NULL,
+    duration_secs REAL,
+    width INTEGER,
+    height INTEGER,
+    codec TEXT
+);
+```
+
+長さ・解像度・コーデックを 1 回の probe からまとめて保存する。音声の幅・高さは NULL。
+`readable=0` は確定した読取失敗の negative cache で、値列は NULL。mtime / file_size の完全一致時
+だけ成功・失敗の両方を再利用する。取得できない source stamp は DB 再利用・書込の対象外。
+取消と 10 秒 timeout は `Interrupted` であり保存しない。現セッション内では従来の失敗表示で
+終端にし、同じファイルを連続再試行しない。次回フォルダを開くと DB miss として再取得できる。
+
+既存 details-meta worker が有界 catalog LRU と I/O semaphore を使って lookup → miss 時だけ probe →
+確定結果の書込を行う。UI は `DetailsLazyMeta` だけを読む。詳細列・ツールチップ・選択情報も
+同じ DB 値を使い、従来の値と整形は保つ。検索結果・コレクション・レーティング一覧・スマート
+フォルダでも、ページ数と同じ実ファイルの親 + basename で元 catalog を参照する。
+親 / キー / stamp を得られない項目や DB 障害では従来どおり probe し、表示を失敗させない。
+`--perf-log` の `details_meta/media_cache_hit` / `media_probe` で再利用と再取得を区別できる。
+
+状態の簡素化として、新 worker・要求フラグ・retry owner は追加せず、既存の staged session、
+取消、メモリキャッシュを再利用する。取得中の modal 化は通常のスクロールを妨げるため採用しない。
+サムネイルの範囲変更は既存 scroll idle gate 後に現在 viewer の範囲 snapshot を差し替え、旧 stage を
+取り消す。画面外の選択情報は別機構にせず同じ stage に加え、選択変更は待たずに反映する。
+
 ### 無効化ロジック（キャッシュ整合性）
 
 ```

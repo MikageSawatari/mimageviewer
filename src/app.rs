@@ -6141,7 +6141,14 @@ impl DetailsCellContentRevisions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailsMetaScanScope {
+    AllRequirements,
+    VisibleStage,
+}
+
 struct DetailsMetaPending {
+    scan_scope: DetailsMetaScanScope,
     visible_revision: u64,
     selection_target_key: Option<String>,
     normal_target_keys: HashSet<String>,
@@ -59310,6 +59317,10 @@ impl App {
                 entry.get_mut().apply_patch(meta, loaded)
             }
         };
+        if loaded.ai_metadata || replaced_existing_source {
+            self.facet_ai_model_counts_cache = None;
+            self.facet_ai_tool_counts_cache = None;
+        }
         if replaced_existing_source {
             self.details_cell_content_revisions.bump_all_lazy_fields();
         } else {
@@ -59317,13 +59328,27 @@ impl App {
         }
     }
 
-    fn details_page_count_uses_visible_stages(&self) -> bool {
-        self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-            && self.settings.details_show_page_count
-            && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
+    fn thumbnail_media_duration_enabled(&self) -> bool {
+        self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail
+            && self.settings.thumb_show_media_duration
     }
 
-    fn details_visible_page_count_needs_load(&self) -> bool {
+    fn details_lazy_uses_visible_stages(&self) -> bool {
+        self.thumbnail_media_duration_enabled()
+            || self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+                && self.settings.details_show_page_count
+                && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
+    }
+
+    fn details_visible_stage_needs_load(&self) -> bool {
+        if self.thumbnail_media_duration_enabled() {
+            return self.details_tag_prewarm_indices.iter().copied().any(|idx| {
+                self.details_item_requires_lazy_meta(idx)
+                    && self
+                        .details_lazy_meta_for_idx(idx)
+                        .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(idx, meta))
+            });
+        }
         self.details_tag_prewarm_indices.iter().copied().any(|idx| {
             self.lazy_load_page_count_for_idx(idx)
                 && self
@@ -59359,27 +59384,87 @@ impl App {
     /// 完了できるか判定する。未取得ページ数があれば同じセッションの次ジョブを開始し、
     /// 無ければここだけが staged page-count セッションを Ready にする。
     pub(crate) fn reconcile_details_lazy_session_after_grid(&mut self, ctx: &egui::Context) {
-        if !self.details_page_count_uses_visible_stages() {
+        if !self.details_lazy_uses_visible_stages() {
             return;
         }
 
         let failed = match self.details_image_dims_state {
             LazyColumnState::Reconciling { failed, .. } => Some(failed),
-            LazyColumnState::Ready { .. } if self.details_visible_page_count_needs_load() => None,
+            LazyColumnState::Ready { .. } if self.details_visible_stage_needs_load() => None,
             _ => return,
         };
 
-        if self.details_visible_page_count_needs_load() {
+        if self.details_visible_stage_needs_load() {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
             self.details_image_dims_state = LazyColumnState::NotRequested;
-            self.start_details_meta_load(ctx);
+            self.start_details_meta_load_for_scope(ctx, DetailsMetaScanScope::VisibleStage);
         } else if let Some(failed) = failed {
             self.finish_details_lazy_session(failed);
             ctx.request_repaint();
         }
     }
 
+    // Reuse the current viewer's range snapshot and cancellation owner. Scrolling adopts a
+    // new thumbnail stage only after the existing idle gate; selection changes stay prompt.
+    fn refresh_thumbnail_details_stage(&mut self, ctx: &egui::Context) {
+        if self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail {
+            return;
+        }
+        if !self.thumbnail_media_duration_enabled() && self.ai_model_facet_should_load() {
+            return;
+        }
+        let selected = self.selection_info_lazy_target_idx();
+        let selection_key = self.selection_info_lazy_target_key();
+        let selection_changed = self.details_meta_pending.as_ref().map_or_else(
+            || self.selection_info_needs_lazy_meta_request(),
+            |pending| pending.selection_target_key != selection_key,
+        );
+        let mut near = if self.thumbnail_media_duration_enabled() {
+            self.keep_set_sorted()
+        } else {
+            Vec::new()
+        };
+        near.extend(selected);
+        near.sort_unstable();
+        near.dedup();
+        if near == self.details_tag_prewarm_indices && !selection_changed {
+            return;
+        }
+        if !selection_changed && let Some(last_scroll) = self.last_prefetch_scroll_at {
+            let remaining = PREFETCH_IDLE_THRESHOLD.saturating_sub(last_scroll.elapsed());
+            if !remaining.is_zero() {
+                ctx.request_repaint_after(remaining);
+                return;
+            }
+        }
+        let scan_scope = self.details_meta_pending.as_ref().map_or_else(
+            || {
+                if self.details_image_dims_state.is_ready()
+                    || matches!(
+                        self.details_image_dims_state,
+                        LazyColumnState::Reconciling { .. }
+                    )
+                {
+                    DetailsMetaScanScope::VisibleStage
+                } else {
+                    DetailsMetaScanScope::AllRequirements
+                }
+            },
+            |pending| pending.scan_scope,
+        );
+        self.details_tag_prewarm_indices = near;
+        // AI facets retain their all-grid scan. The existing priority queue handles new visible
+        // media in that scan; badge-only stages can discard their old bounded range outright.
+        if !self.ai_model_facet_should_load() || selection_changed {
+            self.invalidate_details_meta_requirements();
+            if self.thumbnail_media_duration_enabled() && self.ai_model_facet_should_load() {
+                self.start_details_meta_load_for_scope(ctx, scan_scope);
+            }
+        }
+    }
+
     pub(crate) fn poll_details_meta_load(&mut self, ctx: &egui::Context) {
+        self.refresh_thumbnail_details_stage(ctx);
         if !self.details_lazy_columns_visible() {
             if let Some(pending) = self.details_meta_pending.take() {
                 pending.cancel.store(true, Ordering::Relaxed);
@@ -59409,17 +59494,18 @@ impl App {
 
         // ページ数ソート以外は画面外の全コンテナを開かず、可視範囲 + 先読み範囲だけを
         // 段階取得する。前の範囲が Ready でもスクロール先に未取得行があれば次ジョブを開始。
-        if self.details_page_count_uses_visible_stages()
+        if self.details_lazy_uses_visible_stages()
             && matches!(self.details_image_dims_state, LazyColumnState::Ready { .. })
-            && self.details_visible_page_count_needs_load()
+            && self.details_visible_stage_needs_load()
         {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
-            self.details_image_dims_state = LazyColumnState::NotRequested;
+            self.start_details_meta_load_for_scope(ctx, DetailsMetaScanScope::VisibleStage);
         }
 
         // 大きく scroll して可視近傍が移ったら、全件 plan / worker を作り直さず、現在の
         // 可視 target だけを priority queue へ差し込む。idle gate は従来どおり共有する。
-        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+        if (self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            || self.thumbnail_media_duration_enabled())
             && self.details_meta_pending.is_some()
         {
             let current_visible_order: Vec<usize> = self
@@ -59572,8 +59658,6 @@ impl App {
                     loaded,
                 } if generation == self.items_generation => {
                     self.apply_details_lazy_meta_patch(key, meta, loaded);
-                    self.facet_ai_model_counts_cache = None;
-                    self.facet_ai_tool_counts_cache = None;
                     ctx.request_repaint();
                 }
                 DetailsMetaEvent::Finished { generation, failed }
@@ -59585,7 +59669,7 @@ impl App {
                         .is_some_and(|p| p.visible_revision == self.details_lazy_visible_revision);
                     self.details_meta_pending = None;
                     if revision_matches {
-                        if self.details_page_count_uses_visible_stages() {
+                        if self.details_lazy_uses_visible_stages() {
                             let total = match self.details_image_dims_state {
                                 LazyColumnState::Loading { total, .. } => total,
                                 _ => 0,
@@ -59665,7 +59749,9 @@ impl App {
                     || self.selection_info_lazy_target_idx().is_some()
             }
             crate::settings::GridViewMode::Thumbnail => {
-                self.ai_model_facet_should_load() || self.selection_info_lazy_target_idx().is_some()
+                self.settings.thumb_show_media_duration
+                    || self.ai_model_facet_should_load()
+                    || self.selection_info_lazy_target_idx().is_some()
             }
         }
     }
@@ -59711,7 +59797,9 @@ impl App {
     fn selection_info_only_lazy_load(&self) -> bool {
         !self.ai_model_facet_should_load()
             && match self.settings.grid_view_mode {
-                crate::settings::GridViewMode::Thumbnail => true,
+                crate::settings::GridViewMode::Thumbnail => {
+                    !self.settings.thumb_show_media_duration
+                }
                 crate::settings::GridViewMode::Details => !self.details_any_lazy_columns_enabled(),
             }
     }
@@ -59788,12 +59876,14 @@ impl App {
                         && self.settings.thumb_tooltip_show_created)
             }
             crate::settings::GridViewMode::Thumbnail => {
-                self.settings.thumb_tooltip_show_created
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::Created,
-                        self.items_are_rating_view,
-                    )
+                (self.ai_model_facet_should_load()
+                    || self.selection_info_lazy_target_idx() == Some(idx))
+                    && (self.settings.thumb_tooltip_show_created
+                        || crate::ui_main::selection_info_bottom_bar_shows_column(
+                            &self.settings,
+                            crate::ui_main::DetailsColumn::Created,
+                            self.items_are_rating_view,
+                        ))
             }
         };
         requested && self.details_item_supports_created_at(idx)
@@ -59808,12 +59898,14 @@ impl App {
                         && self.settings.thumb_tooltip_show_page_count)
             }
             crate::settings::GridViewMode::Thumbnail => {
-                self.settings.thumb_tooltip_show_page_count
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::PageCount,
-                        self.items_are_rating_view,
-                    )
+                (self.ai_model_facet_should_load()
+                    || self.selection_info_lazy_target_idx() == Some(idx))
+                    && (self.settings.thumb_tooltip_show_page_count
+                        || crate::ui_main::selection_info_bottom_bar_shows_column(
+                            &self.settings,
+                            crate::ui_main::DetailsColumn::PageCount,
+                            self.items_are_rating_view,
+                        ))
             }
         };
         requested && self.details_item_supports_page_count(idx)
@@ -59828,12 +59920,14 @@ impl App {
                         && self.settings.thumb_tooltip_show_image_dimensions)
             }
             crate::settings::GridViewMode::Thumbnail => {
-                self.settings.thumb_tooltip_show_image_dimensions
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::ImageDimensions,
-                        self.items_are_rating_view,
-                    )
+                (self.ai_model_facet_should_load()
+                    || self.selection_info_lazy_target_idx() == Some(idx))
+                    && (self.settings.thumb_tooltip_show_image_dimensions
+                        || crate::ui_main::selection_info_bottom_bar_shows_column(
+                            &self.settings,
+                            crate::ui_main::DetailsColumn::ImageDimensions,
+                            self.items_are_rating_view,
+                        ))
             }
         };
         requested && self.details_item_supports_image_dims(idx)
@@ -59854,24 +59948,31 @@ impl App {
                 )
             }
             crate::settings::GridViewMode::Thumbnail => (
-                self.settings.thumb_tooltip_show_video_duration
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::VideoDuration,
-                        self.items_are_rating_view,
-                    ),
-                self.settings.thumb_tooltip_show_video_dimensions
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::VideoDimensions,
-                        self.items_are_rating_view,
-                    ),
-                self.settings.thumb_tooltip_show_video_codec
-                    || crate::ui_main::selection_info_bottom_bar_shows_column(
-                        &self.settings,
-                        crate::ui_main::DetailsColumn::VideoCodec,
-                        self.items_are_rating_view,
-                    ),
+                self.settings.thumb_show_media_duration
+                    || ((self.ai_model_facet_should_load()
+                        || self.selection_info_lazy_target_idx() == Some(idx))
+                        && (self.settings.thumb_tooltip_show_video_duration
+                            || crate::ui_main::selection_info_bottom_bar_shows_column(
+                                &self.settings,
+                                crate::ui_main::DetailsColumn::VideoDuration,
+                                self.items_are_rating_view,
+                            ))),
+                (self.ai_model_facet_should_load()
+                    || self.selection_info_lazy_target_idx() == Some(idx))
+                    && (self.settings.thumb_tooltip_show_video_dimensions
+                        || crate::ui_main::selection_info_bottom_bar_shows_column(
+                            &self.settings,
+                            crate::ui_main::DetailsColumn::VideoDimensions,
+                            self.items_are_rating_view,
+                        )),
+                (self.ai_model_facet_should_load()
+                    || self.selection_info_lazy_target_idx() == Some(idx))
+                    && (self.settings.thumb_tooltip_show_video_codec
+                        || crate::ui_main::selection_info_bottom_bar_shows_column(
+                            &self.settings,
+                            crate::ui_main::DetailsColumn::VideoCodec,
+                            self.items_are_rating_view,
+                        )),
             ),
         };
         match self.items.get(idx) {
@@ -59890,9 +59991,8 @@ impl App {
     pub(crate) fn request_ai_model_facet_load(&mut self) {
         if !self.ai_model_facet_requested {
             self.ai_model_facet_requested = true;
-            if self.details_meta_pending.is_none() && !self.details_image_dims_state.is_loading() {
-                self.details_image_dims_state = LazyColumnState::NotRequested;
-            }
+            // A media-only stage cannot stand in for the initial all-item AI scan.
+            self.invalidate_details_meta_requirements();
         }
     }
 
@@ -59911,6 +60011,17 @@ impl App {
 
     pub(crate) fn details_lazy_sort_ready(&self) -> bool {
         self.details_image_dims_state.is_ready()
+    }
+
+    pub(crate) fn ai_model_facet_ready(&self) -> bool {
+        self.details_image_dims_state.is_ready()
+            || (self.thumbnail_media_duration_enabled()
+                && (matches!(
+                    self.details_image_dims_state,
+                    LazyColumnState::Reconciling { .. }
+                ) || self.details_meta_pending.as_ref().is_some_and(|pending| {
+                    pending.scan_scope == DetailsMetaScanScope::VisibleStage
+                })))
     }
 
     pub(crate) fn details_created_text(&self, idx: usize) -> String {
@@ -60009,6 +60120,20 @@ impl App {
         self.details_lazy_meta_for_idx(idx)
             .and_then(|meta| meta.image_dims)
             .map(|(w, h)| (w as u64) * (h as u64))
+    }
+
+    pub(crate) fn thumbnail_media_duration_text(&self, idx: usize) -> Option<String> {
+        if !self.settings.thumb_show_media_duration
+            || !matches!(
+                self.items.get(idx),
+                Some(GridItem::Video(_) | GridItem::Audio(_))
+            )
+        {
+            return None;
+        }
+        self.details_lazy_meta_for_idx(idx)
+            .and_then(|meta| meta.video_duration_secs)
+            .and_then(crate::thumb_overlay_layout::format_media_duration)
     }
 
     pub(crate) fn details_video_duration_text(&self, idx: usize) -> String {
@@ -60113,6 +60238,14 @@ impl App {
     }
 
     fn start_details_meta_load(&mut self, ctx: &egui::Context) {
+        self.start_details_meta_load_for_scope(ctx, DetailsMetaScanScope::AllRequirements);
+    }
+
+    fn start_details_meta_load_for_scope(
+        &mut self,
+        ctx: &egui::Context,
+        scan_scope: DetailsMetaScanScope,
+    ) {
         if self.details_meta_pending.is_some() {
             return;
         }
@@ -60153,9 +60286,18 @@ impl App {
                 },
                 visible_near,
             )
-        } else if visible_page_count_stage_only {
+        } else if visible_page_count_stage_only
+            || (self.thumbnail_media_duration_enabled()
+                && (!ai_facet_load || scan_scope == DetailsMetaScanScope::VisibleStage))
+        {
             let mut order = self.details_tag_prewarm_indices.to_vec();
             order.sort_unstable();
+            if let Some(selected) = self.selection_info_lazy_target_idx()
+                && self.thumbnail_media_duration_enabled()
+            {
+                order.retain(|&idx| idx != selected);
+                order.insert(0, selected);
+            }
             let visible_near: HashSet<usize> = order.iter().copied().collect();
             (
                 DetailsMetaScanOrder::Explicit {
@@ -60176,8 +60318,9 @@ impl App {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         self.details_meta_pending = Some(DetailsMetaPending {
+            scan_scope,
             visible_revision: self.details_lazy_visible_revision,
-            selection_target_key: selection_info_only
+            selection_target_key: (selection_info_only || self.thumbnail_media_duration_enabled())
                 .then(|| self.selection_info_lazy_target_key())
                 .flatten(),
             normal_target_keys: visible_near
@@ -60215,6 +60358,7 @@ impl App {
             return;
         }
         let DetailsMetaPending {
+            scan_scope,
             visible_revision,
             selection_target_key,
             normal_target_keys,
@@ -60326,6 +60470,7 @@ impl App {
                 total: plan.total,
             };
             self.details_meta_pending = Some(DetailsMetaPending {
+                scan_scope,
                 visible_revision,
                 selection_target_key,
                 normal_target_keys,
@@ -60336,12 +60481,20 @@ impl App {
             return;
         }
 
-        self.launch_details_meta_worker(ctx, visible_revision, selection_target_key, cancel, plan);
+        self.launch_details_meta_worker(
+            ctx,
+            scan_scope,
+            visible_revision,
+            selection_target_key,
+            cancel,
+            plan,
+        );
     }
 
     fn launch_details_meta_worker(
         &mut self,
         ctx: &egui::Context,
+        scan_scope: DetailsMetaScanScope,
         visible_revision: u64,
         selection_target_key: Option<String>,
         cancel: Arc<AtomicBool>,
@@ -60355,7 +60508,7 @@ impl App {
 
         // target plan 中に scroll した場合も、起動時点の可視範囲を worker の先頭へ差し込む。
         // 元の background target は idx bitmap で重複排除され、全件走査 cursor は巻き戻さない。
-        let current_visible_order: Vec<usize> = self
+        let mut current_visible_order: Vec<usize> = self
             .details_tag_prewarm_indices
             .iter()
             .copied()
@@ -60366,6 +60519,15 @@ impl App {
                         .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(idx, meta))
             })
             .collect();
+        if self.thumbnail_media_duration_enabled()
+            && let Some(selected) = self.selection_info_lazy_target_idx()
+            && let Some(position) = current_visible_order
+                .iter()
+                .position(|&idx| idx == selected)
+        {
+            current_visible_order.remove(position);
+            current_visible_order.insert(0, selected);
+        }
         let current_visible_indices: HashSet<usize> =
             current_visible_order.iter().copied().collect();
         let initial_priority_targets: Vec<DetailsMetaTarget> = current_visible_order
@@ -60501,6 +60663,7 @@ impl App {
             .ok();
 
         self.details_meta_pending = Some(DetailsMetaPending {
+            scan_scope,
             visible_revision,
             selection_target_key,
             normal_target_keys,
@@ -60665,6 +60828,9 @@ impl App {
             && existing_meta
                 .is_none_or(|meta| meta.image_dims.is_none() && !meta.image_dims_failed);
         let load_video_meta = self.lazy_load_video_meta_for_idx(idx)
+            && (self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail
+                || visible_near.contains(&idx)
+                || self.selection_info_lazy_target_idx() == Some(idx))
             && existing_meta.is_none_or(|meta| {
                 meta.video_duration_secs.is_none()
                     && meta.video_dims.is_none()
@@ -60764,6 +60930,8 @@ impl App {
                 Some(crate::grid_item::pdf_page_cache_key(*page_num)),
             ),
             GridItem::Folder(path)
+            | GridItem::Video(path)
+            | GridItem::Audio(path)
             | GridItem::ZipFile(path)
             | GridItem::PdfFile(path)
             | GridItem::ConvertibleArchive { path, .. } => (
@@ -61744,7 +61912,7 @@ impl App {
 
         let ai_filter_active = !self.settings.facet_filter.ai_models.is_empty()
             || !self.settings.facet_filter.ai_tools.is_empty();
-        if ai_filter_active && !self.details_lazy_sort_ready() {
+        if ai_filter_active && !self.ai_model_facet_ready() {
             return true;
         }
         if ignore != Some(FacetField::AiModel)

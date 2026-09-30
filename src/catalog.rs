@@ -180,6 +180,17 @@ pub struct ContainerPageMeta {
     pub page_count: Option<u32>,
 }
 
+/// A definitive media probe result. Interrupted probes are never persisted.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VideoMeta {
+    Read {
+        duration_secs: Option<f64>,
+        dims: Option<(u32, u32)>,
+        codec: Option<String>,
+    },
+    Unreadable,
+}
+
 /// 保存済みサムネのバイト列からヘッダのみで `(w, h)` を取り出す。
 /// フォーマットは auto-detect (`with_guessed_format`)。これは旧バージョンが JPEG で
 /// 保存していたエントリ ([`decode_thumb_to_color_image`] が "WebP or old JPEG" の
@@ -1074,6 +1085,70 @@ impl CatalogDb {
         .optional()
     }
 
+    pub fn get_video_meta(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+    ) -> rusqlite::Result<Option<VideoMeta>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT readable, duration_secs, width, height, codec FROM video_meta \
+             WHERE filename = ?1 AND mtime = ?2 AND file_size = ?3",
+            params![filename, mtime, file_size],
+            |row| {
+                let readable: bool = row.get(0)?;
+                if !readable {
+                    return Ok(VideoMeta::Unreadable);
+                }
+                Ok(VideoMeta::Read {
+                    duration_secs: row.get(1)?,
+                    dims: valid_dims(row.get(2)?, row.get(3)?),
+                    codec: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    pub fn set_video_meta(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        meta: &VideoMeta,
+    ) -> rusqlite::Result<()> {
+        let (readable, duration_secs, dims, codec) = match meta {
+            VideoMeta::Read {
+                duration_secs,
+                dims,
+                codec,
+            } => (true, *duration_secs, *dims, codec.as_deref()),
+            VideoMeta::Unreadable => (false, None, None, None),
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO video_meta \
+             (filename, mtime, file_size, readable, duration_secs, width, height, codec) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(filename) DO UPDATE SET \
+               mtime = excluded.mtime, file_size = excluded.file_size, \
+               readable = excluded.readable, duration_secs = excluded.duration_secs, \
+               width = excluded.width, height = excluded.height, codec = excluded.codec",
+            params![
+                filename,
+                mtime,
+                file_size,
+                readable,
+                duration_secs,
+                dims.map(|(w, _)| w),
+                dims.map(|(_, h)| h),
+                codec
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_container_page_meta(
         &self,
         filename: &str,
@@ -1139,6 +1214,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              fingerprint    INTEGER NOT NULL,
              page_count     INTEGER,
              PRIMARY KEY(filename, kind)
+         );
+         CREATE TABLE IF NOT EXISTS video_meta (
+             filename       TEXT    NOT NULL PRIMARY KEY,
+             mtime          INTEGER NOT NULL,
+             file_size      INTEGER NOT NULL,
+             readable       INTEGER NOT NULL,
+             duration_secs  REAL,
+             width          INTEGER,
+             height         INTEGER,
+             codec          TEXT
          );",
     )?;
     // Trigger ownership is at the catalog layer. Install before any migration or
@@ -2356,6 +2441,87 @@ mod tests {
             .query_row("SELECT count(*) FROM thumbnails", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn video_meta_roundtrip_identity_and_negative_cache() {
+        let db = open_in_memory();
+        let value = VideoMeta::Read {
+            duration_secs: Some(123.456789),
+            dims: Some((1920, 1080)),
+            codec: Some("h264".into()),
+        };
+        db.set_video_meta("movie.mp4", 100, 2048, &value).unwrap();
+        assert_eq!(
+            db.get_video_meta("movie.mp4", 100, 2048).unwrap(),
+            Some(value)
+        );
+        assert_eq!(db.get_video_meta("movie.mp4", 101, 2048).unwrap(), None);
+        assert_eq!(db.get_video_meta("movie.mp4", 100, 4096).unwrap(), None);
+        db.set_video_meta("movie.mp4", 101, 4096, &VideoMeta::Unreadable)
+            .unwrap();
+        assert_eq!(
+            db.get_video_meta("movie.mp4", 101, 4096).unwrap(),
+            Some(VideoMeta::Unreadable)
+        );
+        assert_eq!(db.get_video_meta("movie.mp4", 102, 4096).unwrap(), None);
+        assert_eq!(db.get_video_meta("movie.mp4", 101, 4097).unwrap(), None);
+        let conn = db.conn.lock().unwrap();
+        let values: (Option<f64>, Option<u32>, Option<u32>, Option<String>) = conn.query_row(
+            "SELECT duration_secs, width, height, codec FROM video_meta WHERE filename='movie.mp4'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(values, (None, None, None, None));
+    }
+
+    #[test]
+    fn video_meta_audio_preserves_null_dimensions_and_unknown_duration() {
+        let db = open_in_memory();
+        for (name, duration_secs) in [("music.flac", Some(65.25)), ("stream.mp3", None)] {
+            let value = VideoMeta::Read {
+                duration_secs,
+                dims: None,
+                codec: Some("flac".into()),
+            };
+            db.set_video_meta(name, 100, 1024, &value).unwrap();
+            assert_eq!(db.get_video_meta(name, 100, 1024).unwrap(), Some(value));
+            let dims: (Option<u32>, Option<u32>) = db
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT width, height FROM video_meta WHERE filename=?1",
+                    [name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(dims, (None, None));
+        }
+    }
+
+    #[test]
+    fn video_meta_schema_addition_preserves_existing_metadata() {
+        let db = open_in_memory();
+        db.set_pdf_meta("book.pdf", 100, 1024, 42, true).unwrap();
+        db.set_container_page_meta("book.zip", ContainerPageKind::Zip, 100, 2048, 0, Some(30))
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DROP TABLE video_meta", []).unwrap();
+            init_schema(&conn).unwrap();
+        }
+        assert_eq!(
+            db.get_pdf_meta("book.pdf", 100, 1024).unwrap(),
+            Some((42, true))
+        );
+        assert_eq!(
+            db.get_container_page_meta("book.zip", ContainerPageKind::Zip, 100, 2048, 0)
+                .unwrap(),
+            Some(ContainerPageMeta {
+                page_count: Some(30)
+            })
+        );
+        assert_eq!(db.get_video_meta("new.mp4", 100, 1024).unwrap(), None);
     }
 
     #[test]

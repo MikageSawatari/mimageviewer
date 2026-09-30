@@ -400,6 +400,8 @@ enum DetailsMetaIoStage {
     ImageDimensionsArchive,
     VideoProbe,
     AudioProbe,
+    MediaCatalogRead,
+    MediaCatalogWrite,
     ContainerCatalogOpen,
     ZipCatalogRead,
     ZipEnumerate,
@@ -629,7 +631,7 @@ fn run_details_meta_load_inner(
         } else {
             None
         };
-        let mut video_probe: Option<DetailsVideoProbe> = None;
+        let mut video_probe = DetailsMediaProbeOutcome::Unreadable;
         if target.load_page_count {
             match load_details_page_count(
                 &target,
@@ -904,26 +906,22 @@ fn run_details_meta_load_inner(
         }
 
         if target.load_video_meta {
-            if let GridItem::Video(path) = &target.item {
-                video_probe = {
-                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
-                        return DetailsMetaWorkerExit::Cancelled(
-                            DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::VideoProbe),
-                        );
-                    };
-                    probe_video_details(path, &cancel)
-                };
-            } else if let GridItem::Audio(path) = &target.item {
-                // 音声は長さ / コーデックだけを cancel・deadline 対応の probe で取る
-                // (解像度は無い)。DetailsVideoProbe の dims=None で流用する。
-                video_probe = {
-                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
-                        return DetailsMetaWorkerExit::Cancelled(
-                            DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::AudioProbe),
-                        );
-                    };
-                    probe_audio_details(path, &cancel)
-                };
+            match load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut container_catalogs,
+                &io_sem,
+                &cancel,
+                |path, audio, cancel| {
+                    if audio {
+                        probe_audio_details(path, cancel)
+                    } else {
+                        probe_video_details(path, cancel)
+                    }
+                },
+            ) {
+                Ok(outcome) => video_probe = outcome,
+                Err(reason) => return DetailsMetaWorkerExit::Cancelled(reason),
             }
         }
 
@@ -937,7 +935,7 @@ fn run_details_meta_load_inner(
             && dims.is_none();
         let video_meta_failed = target.load_video_meta
             && matches!(target.item, GridItem::Video(_) | GridItem::Audio(_))
-            && video_probe.is_none();
+            && !matches!(video_probe, DetailsMediaProbeOutcome::Read(_));
         let created_at_failed = target.load_created_at && created_at.is_none();
         let item_failed =
             page_count_failed || image_dims_failed || video_meta_failed || created_at_failed;
@@ -945,9 +943,12 @@ fn run_details_meta_load_inner(
             failed += 1;
             failed_indices[target.idx] = true;
         }
-        let (video_duration_secs, video_dims, video_codec) = video_probe
-            .map(|probe| (probe.duration_secs, probe.dims, probe.codec))
-            .unwrap_or((None, None, None));
+        let (video_duration_secs, video_dims, video_codec) = match video_probe {
+            DetailsMediaProbeOutcome::Read(probe) => (probe.duration_secs, probe.dims, probe.codec),
+            DetailsMediaProbeOutcome::Unreadable | DetailsMediaProbeOutcome::Interrupted => {
+                (None, None, None)
+            }
+        };
         let mut meta = DetailsLazyMeta {
             source_mtime: target.source_mtime,
             source_size: target.source_size,
@@ -1628,71 +1629,232 @@ pub(super) fn details_created_time_path(item: &GridItem) -> Option<&Path> {
     }
 }
 
-pub(super) fn probe_video_details(path: &Path, cancel: &AtomicBool) -> Option<DetailsVideoProbe> {
-    use ffmpeg::media::Type as MediaType;
-    use ffmpeg_the_third as ffmpeg;
-
-    ffmpeg::init().ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let input = ffmpeg::format::input_with_interrupt(path, move || {
-        cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline
-    })
-    .ok()?;
-    if cancel.load(Ordering::Relaxed) {
-        return None;
-    }
-    let duration_secs = details_duration_to_secs(input.duration());
-    let video_stream = input.streams().best(MediaType::Video)?;
-    let params = video_stream.parameters();
-    let codec = params.id().name().to_string();
-    let ctx = ffmpeg::codec::context::Context::from_parameters(params).ok()?;
-    if cancel.load(Ordering::Relaxed) {
-        return None;
-    }
-    let decoder = ctx.decoder().video().ok()?;
-    let dims = match (decoder.width(), decoder.height()) {
-        (w, h) if w > 0 && h > 0 => Some((w, h)),
-        _ => None,
-    };
-    Some(DetailsVideoProbe {
-        duration_secs,
-        dims,
-        codec: (!codec.is_empty()).then_some(codec),
-    })
+pub(super) enum DetailsMediaProbeOutcome {
+    Read(DetailsVideoProbe),
+    Unreadable,
+    /// Cancellation and deadline expiry cannot establish a persistent failure.
+    Interrupted,
 }
 
-/// 詳細ビューの遅延メタ用に音声ファイルの長さ / コーデックだけを probe する
-/// (`probe_video_details` の音声版)。`probe_audio_file` と違い cancel トークン +
-/// 10 秒 deadline を持つ (`input_with_interrupt`) ので、詳細ワーカーがフォルダ移動で
-/// cancel された際に stale なワーカー + I/O セマフォ permit を掴んだままにならない
-/// (Codex P2)。解像度は音声に無いので `dims = None`。長さもコーデックも取れなければ
-/// 表示できる値が無いので `None` を返し、呼び出し側で `video_meta_failed` が立って
-/// "-" に落ちる (Codex P3、"..." で固着しない)。
-pub(super) fn probe_audio_details(path: &Path, cancel: &AtomicBool) -> Option<DetailsVideoProbe> {
+fn load_details_video_meta_with_probe(
+    target: &DetailsMetaTarget,
+    cache_dir: &Path,
+    catalogs: &mut ContainerCatalogCache,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    cancel: &AtomicBool,
+    probe: impl FnOnce(&Path, bool, &AtomicBool) -> DetailsMediaProbeOutcome,
+) -> Result<DetailsMediaProbeOutcome, DetailsMetaCancelReason> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DetailsMetaCancelReason::BeforeTarget);
+    }
+    let (path, audio, stage) = match &target.item {
+        GridItem::Video(path) => (path, false, DetailsMetaIoStage::VideoProbe),
+        GridItem::Audio(path) => (path, true, DetailsMetaIoStage::AudioProbe),
+        _ => return Ok(DetailsMediaProbeOutcome::Unreadable),
+    };
+    // Unavailable enumeration stamps must not become reusable zero identities.
+    // Missing keys or an unavailable DB leave the original probe path intact.
+    let catalog_identity = target
+        .catalog_folder
+        .as_ref()
+        .zip(target.catalog_key.as_deref())
+        .filter(|_| target.source_mtime > 0 && target.source_size > 0);
+    let catalog = if let Some((folder, _)) = catalog_identity {
+        catalogs.get_or_open(cache_dir, folder, io_sem, target.priority, cancel)?
+    } else {
+        None
+    };
+    if let (Some(catalog), Some((_, key))) = (catalog, catalog_identity) {
+        let cached = {
+            let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                return Err(DetailsMetaCancelReason::PermitWait(
+                    DetailsMetaIoStage::MediaCatalogRead,
+                ));
+            };
+            catalog.get_video_meta(key, target.source_mtime, target.source_size)
+        };
+        if cancel.load(Ordering::Relaxed) {
+            return Err(DetailsMetaCancelReason::AfterIo(
+                DetailsMetaIoStage::MediaCatalogRead,
+            ));
+        }
+        if let Ok(Some(cached)) = cached {
+            let outcome = match cached {
+                crate::catalog::VideoMeta::Read {
+                    duration_secs,
+                    dims,
+                    codec,
+                } => DetailsMediaProbeOutcome::Read(DetailsVideoProbe {
+                    duration_secs,
+                    dims,
+                    codec,
+                }),
+                crate::catalog::VideoMeta::Unreadable => DetailsMediaProbeOutcome::Unreadable,
+            };
+            media_metadata_perf(target, "media_cache_hit", &outcome, None);
+            return Ok(outcome);
+        }
+    }
+    let started = crate::perf::is_enabled().then(std::time::Instant::now);
+    let outcome = {
+        let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+            return Err(DetailsMetaCancelReason::PermitWait(stage));
+        };
+        probe(path, audio, cancel)
+    };
+    media_metadata_perf(target, "media_probe", &outcome, started);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DetailsMetaCancelReason::AfterIo(stage));
+    }
+    if let (Some(catalog), Some((_, key))) = (catalog, catalog_identity) {
+        let persisted = match &outcome {
+            DetailsMediaProbeOutcome::Read(probe) => Some(crate::catalog::VideoMeta::Read {
+                duration_secs: probe.duration_secs,
+                dims: probe.dims,
+                codec: probe.codec.clone(),
+            }),
+            DetailsMediaProbeOutcome::Unreadable => Some(crate::catalog::VideoMeta::Unreadable),
+            DetailsMediaProbeOutcome::Interrupted => None,
+        };
+        if let Some(persisted) = persisted {
+            let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                return Err(DetailsMetaCancelReason::PermitWait(
+                    DetailsMetaIoStage::MediaCatalogWrite,
+                ));
+            };
+            let _ =
+                catalog.set_video_meta(key, target.source_mtime, target.source_size, &persisted);
+        }
+    }
+    Ok(outcome)
+}
+
+fn media_metadata_perf(
+    target: &DetailsMetaTarget,
+    event: &str,
+    outcome: &DetailsMediaProbeOutcome,
+    started: Option<std::time::Instant>,
+) {
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "details_meta",
+            event,
+            Some(&target.key),
+            0,
+            &[
+                (
+                    "outcome",
+                    serde_json::Value::from(match outcome {
+                        DetailsMediaProbeOutcome::Read(_) => "read",
+                        DetailsMediaProbeOutcome::Unreadable => "unreadable",
+                        DetailsMediaProbeOutcome::Interrupted => "interrupted",
+                    }),
+                ),
+                (
+                    "ms",
+                    serde_json::Value::from(
+                        started.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ),
+                (
+                    "audio",
+                    serde_json::Value::from(matches!(target.item, GridItem::Audio(_))),
+                ),
+            ],
+        );
+    }
+}
+
+/// Owns interruption classification across the FFmpeg callback and final result.
+/// The latch preserves a callback interruption even if FFmpeg later returns success.
+struct DetailsProbeInterrupt<'a> {
+    cancel: &'a AtomicBool,
+    deadline: std::time::Instant,
+    interrupted: std::cell::Cell<bool>,
+}
+
+impl DetailsProbeInterrupt<'_> {
+    fn should_interrupt(&self) -> bool {
+        if self.cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= self.deadline {
+            self.interrupted.set(true);
+        }
+        self.interrupted.get()
+    }
+
+    fn finish(&self, result: Option<DetailsVideoProbe>) -> DetailsMediaProbeOutcome {
+        if self.should_interrupt() {
+            DetailsMediaProbeOutcome::Interrupted
+        } else if let Some(result) = result {
+            DetailsMediaProbeOutcome::Read(result)
+        } else {
+            DetailsMediaProbeOutcome::Unreadable
+        }
+    }
+}
+
+pub(super) fn probe_video_details(path: &Path, cancel: &AtomicBool) -> DetailsMediaProbeOutcome {
+    probe_media_details(path, cancel, false)
+}
+
+/// Audio retains the same duration/codec semantics and stores NULL dimensions.
+pub(super) fn probe_audio_details(path: &Path, cancel: &AtomicBool) -> DetailsMediaProbeOutcome {
+    probe_media_details(path, cancel, true)
+}
+
+fn probe_media_details(path: &Path, cancel: &AtomicBool, audio: bool) -> DetailsMediaProbeOutcome {
     use ffmpeg::media::Type as MediaType;
     use ffmpeg_the_third as ffmpeg;
 
-    ffmpeg::init().ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let input = ffmpeg::format::input_with_interrupt(path, move || {
-        cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline
-    })
-    .ok()?;
-    if cancel.load(Ordering::Relaxed) {
-        return None;
+    let interrupt = DetailsProbeInterrupt {
+        cancel,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        interrupted: std::cell::Cell::new(false),
+    };
+    if interrupt.should_interrupt() {
+        return DetailsMediaProbeOutcome::Interrupted;
     }
-    let duration_secs = details_duration_to_secs(input.duration());
-    let audio_stream = input.streams().best(MediaType::Audio)?;
-    let codec = audio_stream.parameters().id().name().to_string();
-    let codec = (!codec.is_empty()).then_some(codec);
-    if duration_secs.is_none() && codec.is_none() {
-        return None;
+    // Initialization failure says nothing definitive about this file.
+    if ffmpeg::init().is_err() {
+        return DetailsMediaProbeOutcome::Interrupted;
     }
-    Some(DetailsVideoProbe {
-        duration_secs,
-        dims: None,
-        codec,
-    })
+    let result = (|| {
+        let input =
+            ffmpeg::format::input_with_interrupt(path, || interrupt.should_interrupt()).ok()?;
+        if interrupt.should_interrupt() {
+            return None;
+        }
+        let duration_secs = details_duration_to_secs(input.duration());
+        let stream = input.streams().best(if audio {
+            MediaType::Audio
+        } else {
+            MediaType::Video
+        })?;
+        let params = stream.parameters();
+        let codec = params.id().name().to_string();
+        let codec = (!codec.is_empty()).then_some(codec);
+        let dims = if audio {
+            if duration_secs.is_none() && codec.is_none() {
+                return None;
+            }
+            None
+        } else {
+            let ctx = ffmpeg::codec::context::Context::from_parameters(params).ok()?;
+            if interrupt.should_interrupt() {
+                return None;
+            }
+            let decoder = ctx.decoder().video().ok()?;
+            match (decoder.width(), decoder.height()) {
+                (w, h) if w > 0 && h > 0 => Some((w, h)),
+                _ => None,
+            }
+        };
+        Some(DetailsVideoProbe {
+            duration_secs,
+            dims,
+            codec,
+        })
+    })();
+    interrupt.finish(result)
 }
 
 pub(super) fn ctrl_f_progress_total(items: &[GridItem], eligible: Option<&[bool]>) -> usize {
@@ -2825,6 +2987,312 @@ mod tests {
         meta.apply_patch(patch, loaded);
         assert_eq!(meta.page_count, Some(42));
         assert!(meta.page_count_checked);
+    }
+
+    #[test]
+    fn media_metadata_cache_reuses_all_values_after_reopen_and_invalidates_stamps() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        for audio in [false, true] {
+            let mut target = media_test_target(temp.path(), audio);
+            let mut cache = ContainerCatalogCache::new(8);
+            let first = load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut cache,
+                &io_sem,
+                &cancel,
+                |_, actual_audio, _| {
+                    assert_eq!(actual_audio, audio);
+                    media_test_read(audio)
+                },
+            )
+            .unwrap();
+            assert_media_test_read(first, audio);
+            // A new job/revisit has no connection or in-memory metadata to reuse.
+            drop(cache);
+            let mut cache = ContainerCatalogCache::new(8);
+            let cached = load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut cache,
+                &io_sem,
+                &cancel,
+                |_, _, _| panic!("warm persistent metadata must skip probe"),
+            )
+            .unwrap();
+            assert_media_test_read(cached, audio);
+            for changed_size in [false, true] {
+                if changed_size {
+                    target.source_size += 1;
+                } else {
+                    target.source_mtime += 1;
+                }
+                let calls = std::cell::Cell::new(0);
+                load_details_video_meta_with_probe(
+                    &target,
+                    &cache_dir,
+                    &mut cache,
+                    &io_sem,
+                    &cancel,
+                    |_, _, _| {
+                        calls.set(calls.get() + 1);
+                        media_test_read(audio)
+                    },
+                )
+                .unwrap();
+                assert_eq!(calls.get(), 1, "changed identity must probe again");
+            }
+        }
+    }
+
+    #[test]
+    fn media_metadata_only_definitive_failure_is_persisted() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let target = media_test_target(temp.path(), false);
+        let mut cache = ContainerCatalogCache::new(8);
+        let interrupted = load_details_video_meta_with_probe(
+            &target,
+            &cache_dir,
+            &mut cache,
+            &io_sem,
+            &cancel,
+            |_, _, _| DetailsMediaProbeOutcome::Interrupted,
+        )
+        .unwrap();
+        assert!(matches!(interrupted, DetailsMediaProbeOutcome::Interrupted));
+        let db = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+        assert_eq!(db.get_video_meta("movie.mp4", 123, 1024).unwrap(), None);
+        let failed = load_details_video_meta_with_probe(
+            &target,
+            &cache_dir,
+            &mut cache,
+            &io_sem,
+            &cancel,
+            |_, _, _| DetailsMediaProbeOutcome::Unreadable,
+        )
+        .unwrap();
+        assert!(matches!(failed, DetailsMediaProbeOutcome::Unreadable));
+        drop(cache);
+        let cached = load_details_video_meta_with_probe(
+            &target,
+            &cache_dir,
+            &mut ContainerCatalogCache::new(8),
+            &io_sem,
+            &cancel,
+            |_, _, _| panic!("definitive failure must be cached"),
+        )
+        .unwrap();
+        assert!(matches!(cached, DetailsMediaProbeOutcome::Unreadable));
+        assert_eq!(
+            db.get_video_meta("movie.mp4", 123, 1024).unwrap(),
+            Some(crate::catalog::VideoMeta::Unreadable)
+        );
+    }
+
+    #[test]
+    fn media_metadata_cache_unavailable_or_identity_unknown_preserves_probe() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let mut target = media_test_target(temp.path(), false);
+        let mut cache = ContainerCatalogCache::new(8);
+        for mode in 0..4 {
+            target.source_mtime = if mode == 0 { 0 } else { 123 };
+            target.source_size = if mode == 1 { 0 } else { 1024 };
+            target.catalog_key = if mode == 2 {
+                None
+            } else {
+                Some("movie.mp4".into())
+            };
+            target.catalog_folder = if mode == 3 {
+                None
+            } else {
+                Some(temp.path().to_path_buf())
+            };
+            assert_media_test_read(
+                load_details_video_meta_with_probe(
+                    &target,
+                    &cache_dir,
+                    &mut cache,
+                    &io_sem,
+                    &cancel,
+                    |_, _, _| media_test_read(false),
+                )
+                .unwrap(),
+                false,
+            );
+            assert!(
+                cache.entries.is_empty(),
+                "invalid identity must skip DB open"
+            );
+        }
+        // A file at the cache directory prevents opening any catalog DB.
+        std::fs::write(&cache_dir, b"not a directory").unwrap();
+        target = media_test_target(temp.path(), false);
+        assert_media_test_read(
+            load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut cache,
+                &io_sem,
+                &cancel,
+                |_, _, _| media_test_read(false),
+            )
+            .unwrap(),
+            false,
+        );
+    }
+
+    #[test]
+    fn media_metadata_catalog_read_and_write_errors_preserve_probe_result() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let target = media_test_target(temp.path(), false);
+        let mut cache = ContainerCatalogCache::new(8);
+        cache
+            .get_or_open(&cache_dir, temp.path(), &io_sem, target.priority, &cancel)
+            .unwrap();
+        let connection =
+            rusqlite::Connection::open(crate::catalog::db_path_for(&cache_dir, temp.path()))
+                .unwrap();
+        connection.execute("DROP TABLE video_meta", []).unwrap();
+        for _ in 0..2 {
+            let calls = std::cell::Cell::new(0);
+            assert_media_test_read(
+                load_details_video_meta_with_probe(
+                    &target,
+                    &cache_dir,
+                    &mut cache,
+                    &io_sem,
+                    &cancel,
+                    |_, _, _| {
+                        calls.set(calls.get() + 1);
+                        media_test_read(false)
+                    },
+                )
+                .unwrap(),
+                false,
+            );
+            assert_eq!(calls.get(), 1, "unavailable cache must continue probing");
+        }
+    }
+
+    #[test]
+    fn media_metadata_cancel_during_probe_never_writes_or_publishes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let target = media_test_target(temp.path(), false);
+        let result = load_details_video_meta_with_probe(
+            &target,
+            &cache_dir,
+            &mut ContainerCatalogCache::new(8),
+            &io_sem,
+            &cancel,
+            |_, _, cancel| {
+                cancel.store(true, Ordering::Relaxed);
+                media_test_read(false)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(DetailsMetaCancelReason::AfterIo(
+                DetailsMetaIoStage::VideoProbe
+            ))
+        ));
+        let db = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+        assert_eq!(db.get_video_meta("movie.mp4", 123, 1024).unwrap(), None);
+    }
+
+    #[test]
+    fn media_probe_interruption_latches_and_classifies_deadline() {
+        let cancel = AtomicBool::new(false);
+        let expired = DetailsProbeInterrupt {
+            cancel: &cancel,
+            deadline: std::time::Instant::now(),
+            interrupted: std::cell::Cell::new(false),
+        };
+        assert!(matches!(
+            expired.finish(None),
+            DetailsMediaProbeOutcome::Interrupted
+        ));
+        let active = DetailsProbeInterrupt {
+            cancel: &cancel,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+            interrupted: std::cell::Cell::new(false),
+        };
+        assert!(matches!(
+            active.finish(None),
+            DetailsMediaProbeOutcome::Unreadable
+        ));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(active.should_interrupt());
+        cancel.store(false, Ordering::Relaxed);
+        let DetailsMediaProbeOutcome::Read(read) = media_test_read(false) else {
+            unreachable!()
+        };
+        assert!(matches!(
+            active.finish(Some(read)),
+            DetailsMediaProbeOutcome::Interrupted
+        ));
+    }
+
+    fn media_test_target(folder: &Path, audio: bool) -> DetailsMetaTarget {
+        let name = if audio { "music.flac" } else { "movie.mp4" };
+        let path = folder.join(name);
+        DetailsMetaTarget {
+            idx: 0,
+            key: crate::adjustment_db::normalize_path(&path),
+            item: if audio {
+                GridItem::Audio(path)
+            } else {
+                GridItem::Video(path)
+            },
+            relative_page_provenance: None,
+            source_mtime: 123,
+            source_size: 1024,
+            catalog_folder: Some(folder.to_path_buf()),
+            catalog_key: Some(name.into()),
+            warm_image_dims: None,
+            warm_page_count: None,
+            pdf_password_revision: None,
+            load_page_count: false,
+            load_created_at: false,
+            load_ai_metadata: false,
+            load_image_dims: false,
+            load_video_meta: true,
+            priority: crate::io_semaphore::IoPriority::Normal,
+        }
+    }
+
+    fn media_test_read(audio: bool) -> DetailsMediaProbeOutcome {
+        DetailsMediaProbeOutcome::Read(DetailsVideoProbe {
+            duration_secs: Some(123.456789),
+            dims: (!audio).then_some((1920, 1080)),
+            codec: Some(if audio { "flac" } else { "h264" }.into()),
+        })
+    }
+
+    fn assert_media_test_read(outcome: DetailsMediaProbeOutcome, audio: bool) {
+        let DetailsMediaProbeOutcome::Read(read) = outcome else {
+            panic!("expected readable media")
+        };
+        assert_eq!(read.duration_secs, Some(123.456789));
+        assert_eq!(read.dims, (!audio).then_some((1920, 1080)));
+        assert_eq!(
+            read.codec.as_deref(),
+            Some(if audio { "flac" } else { "h264" })
+        );
     }
 
     #[test]
