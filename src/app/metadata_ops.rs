@@ -1762,16 +1762,20 @@ fn load_details_video_meta_with_probe(
                     DetailsMetaIoStage::MediaCatalogWrite,
                 ));
             };
-            if matches!(
-                catalog.set_video_meta(
-                    path,
-                    key,
-                    target.source_mtime(),
-                    target.source_size(),
-                    &persisted
-                ),
-                Ok(false)
-            ) {
+            let saved = catalog.set_video_meta(
+                path,
+                key,
+                target.source_mtime(),
+                target.source_size(),
+                &persisted,
+                cancel,
+            );
+            if cancel.load(Ordering::Relaxed) {
+                return Err(DetailsMetaCancelReason::AfterIo(
+                    DetailsMetaIoStage::MediaCatalogWrite,
+                ));
+            }
+            if matches!(saved, Ok(false)) {
                 return Ok(DetailsMediaProbeOutcome::Interrupted);
             }
         }
@@ -3449,7 +3453,8 @@ mod tests {
                             "movie.mp4",
                             122,
                             2048,
-                            &crate::catalog::VideoMeta::Unreadable
+                            &crate::catalog::VideoMeta::Unreadable,
+                            &cancel,
                         )
                         .unwrap()
                 );
@@ -3479,7 +3484,8 @@ mod tests {
                 "movie.mp4",
                 123,
                 1024,
-                &crate::catalog::VideoMeta::Unreadable
+                &crate::catalog::VideoMeta::Unreadable,
+                &AtomicBool::new(false),
             )
             .unwrap()
         );

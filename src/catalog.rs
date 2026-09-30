@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -1127,9 +1128,8 @@ impl CatalogDb {
         .optional()
     }
 
-    /// Publish only while this result still describes the source file. The writer
-    /// transaction is acquired before checking the source, so a delayed worker
-    /// cannot replace a newer identity saved through another connection.
+    /// Recheck the source without holding a catalog mutex or SQLite write lock.
+    /// Cancellation is checked around the OS stat, which cannot be interrupted.
     pub fn set_video_meta(
         &self,
         source_path: &Path,
@@ -1137,7 +1137,29 @@ impl CatalogDb {
         mtime: i64,
         file_size: i64,
         meta: &VideoMeta,
+        cancel: &AtomicBool,
     ) -> rusqlite::Result<bool> {
+        self.set_video_meta_with_source_check(filename, mtime, file_size, meta, cancel, || {
+            media_source_identity(source_path)
+        })
+    }
+
+    fn set_video_meta_with_source_check(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        meta: &VideoMeta,
+        cancel: &AtomicBool,
+        source_check: impl FnOnce() -> Option<(i64, i64)>,
+    ) -> rusqlite::Result<bool> {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let identity = source_check();
+        if cancel.load(Ordering::Relaxed) || identity != Some((mtime, file_size)) {
+            return Ok(false);
+        }
         let (readable, duration_secs, dims, codec) = match meta {
             VideoMeta::Read {
                 duration_secs,
@@ -1147,8 +1169,15 @@ impl CatalogDb {
             VideoMeta::Unreadable => (false, None, None, None),
         };
         let mut conn = self.conn.lock().unwrap();
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        // The IMMEDIATE transaction contains only SQL writes. A source change
+        // after the stat may let this result replace a newer worker's row, but
+        // lookups require exact mtime/size equality: that stale row is a miss,
+        // costing one later probe rather than publishing incorrect metadata.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if media_source_identity(source_path) != Some((mtime, file_size)) {
+        if cancel.load(Ordering::Relaxed) {
             return Ok(false);
         }
         tx.execute(
@@ -2484,7 +2513,177 @@ mod tests {
     }
 
     #[test]
-    fn video_meta_independent_connections_preserve_current_identity_in_both_completion_orders() {
+    fn video_meta_stalled_source_stat_does_not_block_catalog_or_ui_pin_writes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("movie.mp4");
+        let cache = temp.path().join("cache");
+        let writer = CatalogDb::open(&cache, temp.path()).unwrap();
+        let ui = CatalogDb::open(&cache, temp.path()).unwrap();
+        let pin_key = "folderthumb:auto-v3:numeric:d3:child#pin:video";
+        ui.save(pin_key, 1, 2, 1, 1, None, b"pin").unwrap();
+        ui.conn
+            .lock()
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        write_video_meta_source(&source, 100, 2048);
+        let cancel = AtomicBool::new(false);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (mutex_available, pin_write, saved) = std::thread::scope(|scope| {
+            let writer_ref = &writer;
+            let source_ref = &source;
+            let cancel_ref = &cancel;
+            let worker = scope.spawn(move || {
+                writer_ref.set_video_meta_with_source_check(
+                    "movie.mp4",
+                    100,
+                    2048,
+                    &VideoMeta::Unreadable,
+                    cancel_ref,
+                    || {
+                        entered_tx.send(()).unwrap();
+                        resume_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                        media_source_identity(source_ref)
+                    },
+                )
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let mutex_available = writer.conn.try_lock().is_ok();
+            // This is the same write used by UI metadata pin refresh. A zero
+            // busy timeout makes holding an IMMEDIATE lock fail deterministically.
+            let pin_write = ui.delete_one(pin_key);
+            resume_tx.send(()).unwrap();
+            (mutex_available, pin_write, worker.join().unwrap())
+        });
+        assert!(mutex_available, "source stat held the catalog mutex");
+        pin_write.expect("source stat held a SQLite write lock against the UI");
+        assert!(saved.unwrap());
+        assert_eq!(
+            ui.get_video_meta("movie.mp4", 100, 2048).unwrap(),
+            Some(VideoMeta::Unreadable)
+        );
+    }
+
+    #[test]
+    fn video_meta_cancel_before_or_during_source_stat_prevents_writes() {
+        let db = open_in_memory();
+        let cancel = AtomicBool::new(true);
+        let mut stat_called = false;
+        assert!(
+            !db.set_video_meta_with_source_check(
+                "movie.mp4",
+                100,
+                2048,
+                &VideoMeta::Unreadable,
+                &cancel,
+                || {
+                    stat_called = true;
+                    Some((100, 2048))
+                },
+            )
+            .unwrap()
+        );
+        assert!(!stat_called, "already canceled work must not start a stat");
+
+        cancel.store(false, Ordering::Relaxed);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let saved = std::thread::scope(|scope| {
+            let db_ref = &db;
+            let cancel_ref = &cancel;
+            let worker = scope.spawn(move || {
+                db_ref.set_video_meta_with_source_check(
+                    "movie.mp4",
+                    100,
+                    2048,
+                    &VideoMeta::Unreadable,
+                    cancel_ref,
+                    || {
+                        entered_tx.send(()).unwrap();
+                        resume_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                        Some((100, 2048))
+                    },
+                )
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            cancel.store(true, Ordering::Relaxed);
+            resume_tx.send(()).unwrap();
+            worker.join().unwrap()
+        });
+        assert!(!saved.unwrap());
+        assert_eq!(db.get_video_meta("movie.mp4", 100, 2048).unwrap(), None);
+    }
+
+    #[test]
+    fn video_meta_source_change_after_stat_makes_delayed_row_a_current_identity_miss() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("movie.mp4");
+        let cache = temp.path().join("cache");
+        let old_worker = CatalogDb::open(&cache, temp.path()).unwrap();
+        let new_worker = CatalogDb::open(&cache, temp.path()).unwrap();
+        write_video_meta_source(&source, 100, 2048);
+        let cancel = AtomicBool::new(false);
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let current = VideoMeta::Read {
+            duration_secs: Some(42.0),
+            dims: Some((1280, 720)),
+            codec: Some("h264".into()),
+        };
+        let (new_saved, old_saved) = std::thread::scope(|scope| {
+            let old_ref = &old_worker;
+            let source_ref = &source;
+            let cancel_ref = &cancel;
+            let worker = scope.spawn(move || {
+                old_ref.set_video_meta_with_source_check(
+                    "movie.mp4",
+                    100,
+                    2048,
+                    &VideoMeta::Unreadable,
+                    cancel_ref,
+                    || {
+                        let identity = media_source_identity(source_ref);
+                        checked_tx.send(()).unwrap();
+                        resume_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                        identity
+                    },
+                )
+            });
+            checked_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            write_video_meta_source(&source, 50, 4096);
+            let new_saved =
+                new_worker.set_video_meta(&source, "movie.mp4", 50, 4096, &current, &cancel);
+            resume_tx.send(()).unwrap();
+            (new_saved, worker.join().unwrap())
+        });
+        assert!(new_saved.unwrap());
+        assert!(old_saved.unwrap());
+        assert_eq!(media_source_identity(&source), Some((50, 4096)));
+        assert_eq!(
+            new_worker.get_video_meta("movie.mp4", 50, 4096).unwrap(),
+            None
+        );
+        assert_eq!(
+            old_worker.get_video_meta("movie.mp4", 100, 2048).unwrap(),
+            Some(VideoMeta::Unreadable)
+        );
+    }
+
+    #[test]
+    fn video_meta_changed_source_is_rejected_in_both_completion_orders() {
         // A file identity is not ordered by mtime: replacements can be backdated
         // or keep the same timestamp while changing size.
         for new_identity in [(200, 4096), (50, 4096), (100, 4096)] {
@@ -2501,7 +2700,14 @@ mod tests {
                 if old_finishes_first {
                     assert!(
                         !old_worker
-                            .set_video_meta(&source, "movie.mp4", 100, 2048, &VideoMeta::Unreadable)
+                            .set_video_meta(
+                                &source,
+                                "movie.mp4",
+                                100,
+                                2048,
+                                &VideoMeta::Unreadable,
+                                &AtomicBool::new(false)
+                            )
                             .unwrap()
                     );
                 }
@@ -2517,14 +2723,22 @@ mod tests {
                             "movie.mp4",
                             new_identity.0,
                             new_identity.1,
-                            &current
+                            &current,
+                            &AtomicBool::new(false),
                         )
                         .unwrap()
                 );
                 if !old_finishes_first {
                     assert!(
                         !old_worker
-                            .set_video_meta(&source, "movie.mp4", 100, 2048, &VideoMeta::Unreadable)
+                            .set_video_meta(
+                                &source,
+                                "movie.mp4",
+                                100,
+                                2048,
+                                &VideoMeta::Unreadable,
+                                &AtomicBool::new(false)
+                            )
                             .unwrap()
                     );
                 }
@@ -2548,13 +2762,27 @@ mod tests {
         let source = temp.path().join("empty.mp4");
         let db = open_in_memory();
         assert!(
-            !db.set_video_meta(&source, "empty.mp4", 0, 0, &VideoMeta::Unreadable)
-                .unwrap()
+            !db.set_video_meta(
+                &source,
+                "empty.mp4",
+                0,
+                0,
+                &VideoMeta::Unreadable,
+                &AtomicBool::new(false)
+            )
+            .unwrap()
         );
         write_video_meta_source(&source, 0, 0);
         assert!(
-            db.set_video_meta(&source, "empty.mp4", 0, 0, &VideoMeta::Unreadable)
-                .unwrap()
+            db.set_video_meta(
+                &source,
+                "empty.mp4",
+                0,
+                0,
+                &VideoMeta::Unreadable,
+                &AtomicBool::new(false)
+            )
+            .unwrap()
         );
         assert_eq!(
             db.get_video_meta("empty.mp4", 0, 0).unwrap(),
@@ -2574,8 +2802,15 @@ mod tests {
             codec: Some("h264".into()),
         };
         assert!(
-            db.set_video_meta(&source, "movie.mp4", 100, 2048, &value)
-                .unwrap()
+            db.set_video_meta(
+                &source,
+                "movie.mp4",
+                100,
+                2048,
+                &value,
+                &AtomicBool::new(false)
+            )
+            .unwrap()
         );
         assert_eq!(
             db.get_video_meta("movie.mp4", 100, 2048).unwrap(),
@@ -2585,8 +2820,15 @@ mod tests {
         assert_eq!(db.get_video_meta("movie.mp4", 100, 4096).unwrap(), None);
         write_video_meta_source(&source, 101, 4096);
         assert!(
-            db.set_video_meta(&source, "movie.mp4", 101, 4096, &VideoMeta::Unreadable)
-                .unwrap()
+            db.set_video_meta(
+                &source,
+                "movie.mp4",
+                101,
+                4096,
+                &VideoMeta::Unreadable,
+                &AtomicBool::new(false)
+            )
+            .unwrap()
         );
         assert_eq!(
             db.get_video_meta("movie.mp4", 101, 4096).unwrap(),
@@ -2614,7 +2856,10 @@ mod tests {
             };
             let source = temp.path().join(name);
             write_video_meta_source(&source, 100, 1024);
-            assert!(db.set_video_meta(&source, name, 100, 1024, &value).unwrap());
+            assert!(
+                db.set_video_meta(&source, name, 100, 1024, &value, &AtomicBool::new(false))
+                    .unwrap()
+            );
             assert_eq!(db.get_video_meta(name, 100, 1024).unwrap(), Some(value));
             let dims: (Option<u32>, Option<u32>) = db
                 .conn

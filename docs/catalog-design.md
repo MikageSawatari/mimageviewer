@@ -150,10 +150,14 @@ FFmpeg の内容不正・利用可能な stream 不在・非対応 codec / conta
 保存しない。メモリ内の `RetryLater` は試行時の `items_generation` だけで終端として扱い、
 同じ一覧で連続再試行しない。次回フォルダを開くと世代が変わり、DB miss として再取得できる。
 
-書込は `BEGIN IMMEDIATE` で SQLite の書込を直列化してから、実ファイルの mtime / size を
-再確認し、要求時と完全一致するときだけ UPSERT する。mtime の大小で新旧を推測しない。
-別接続の新しい結果が先に保存されても、変更前の遅い worker は上書きできない。cache hit / probe
-の結果も worker が公開前に source identity を確認し、古い結果を `Interrupted` として捨てる。
+実ファイルの mtime / size は catalog の mutex・SQLite 書込ロックを取る前に再確認し、
+要求時と完全一致するときだけ保存へ進む。OS の属性取得自体は中断できないため、その前後で
+取消を確認し、取消後は保存しない。`BEGIN IMMEDIATE` の中は SQL 書込だけとし、ネットワーク
+共有の属性取得が停滞しても既存 UI 書込を妨げない。mtime の大小で新旧を推測しない。
+属性確認から commit までにファイルが変わり、新しい worker が先に保存した場合、遅い旧結果が
+その行を置き換える余地は残る。この行は現在の mtime / size と一致せず lookup が miss になるため、
+代償は次回の probe 1 回である。cache hit / probe の結果も worker が公開前に source identity を
+確認し、古い結果を `Interrupted` として捨てる。
 
 既存 details-meta worker が有界 catalog LRU と I/O semaphore を使って lookup → miss 時だけ probe →
 確定結果の書込を行う。UI は `DetailsLazyMeta` だけを読む。詳細列・ツールチップ・選択情報も

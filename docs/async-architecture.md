@@ -143,7 +143,11 @@ EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定
 差し替え、`invalidate_details_meta_requirements` で旧 worker / revision を無効化する。
 Thumbnail / Details の切替も同じ取消・revision 更新を通す。Thumbnail の範囲限定ジョブの
 完了通知が、Details の全件取得を完了させることはない。
-選択変更は画面外・画像等でも待たずに同じ stage へ反映する。AI ファセットの全件取得は維持し、
+専用選択情報バー・ツールチップの要求は一覧の列とは独立して同じ計画に合流し、モード切替後も
+選択項目を取得する。選択変更は画面外・画像等でも待たずに同じ stage へ反映する。
+全件計画中は既存 target の要求項目を合流し、worker 実行中は既存優先キューへ追加する。
+完了後の不足分は選択項目を含む bounded stage とし、全件走査の cursor を巻き戻さない。
+AI ファセットの全件取得は維持し、
 メディア取得だけ可視近傍に絞る。AI 全件取得後も新しい範囲を同じ staged reconciliation で取得する。
 既存 pending request の `DetailsMetaScanScope::{AllRequirements, VisibleStage}` が走査範囲を所有し、
 完了済み AI scan の後続は可視近傍だけを計画する。初回 AI 要求は進行中の長さ stage を取り消して
