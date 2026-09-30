@@ -2721,14 +2721,18 @@ protocol v62 の `RawPrefetchSkipped` を HTTP 204、`X-mIV-Page-Skip: raw-prefe
 cancel / release し、計画に残る場合は新しい有界の先読み job に戻す。混雑は job ごとに
 `page_congestion` 1 件へ集約して記録する。
 
-ZIP の代表は中央ディレクトリの情報 (名前順、画像拡張子、非暗号化、対応する圧縮方式) だけで
-特定する。外側の候補が先なら後続の入れ子 ZIP は展開しない。代表が入れ子 ZIP にあり得る
+ZIP の代表は中央ディレクトリの情報 (候補順、画像拡張子、非暗号化、対応する圧縮方式) だけで
+特定する。書庫 root の `File` は既存 loader と同じ中央ディレクトリの index 順、
+`ZipDirectory` 等は従来の sort 順を保つ。外側の候補が先なら後続の入れ子 ZIP は展開しない。
+代表が入れ子 ZIP にあり得る
 ときは既存の上限付き cache へ取消可能な器の展開を行い、JPEG 等なら先読みを続け、RAW で
 現像済み cache が無ければ `RawPrefetchSkipped` とする。変換済み書庫の ZIP backing も同じ。
 RAW entry の payload は先読みの skip 判定前も AI の現像枠確保前も読まない。前景 flight 内、
 または AI 枠確保後の payload 読み込みが破損等で失敗した場合は、同じ要求で次候補へ進み、
-RAW 候補には同じ規則を繰り返す。選んだ代表と要求内の raster / payload pin は共有する。
-AI は metadata で代表を先に特定し、RAW のときだけ最新要求優先の owner 別 capacity slot で待つ。
+RAW 候補には同じ規則を繰り返す。候補は入れ子 ZIP の chain を含む entry index の安定 cursor
+で一方向へ進め、正規化名で再検索しない。選んだ代表と要求内の raster / payload pin は共有する。
+AI は `ZipDirectory` 等の非 page を source 準備前に拒否する。その後 metadata で代表を先に特定し、
+RAW のときだけ最新要求優先の owner 別 capacity slot で待つ。
 同一 owner の旧 AI job は新規 job で supersede / cancel されるため、枠確保前の入れ子 ZIP の
 器の展開は owner あたり 1 個の live job に限定される。JPEG だけの書庫 AI は RAW 枠で待たない。
 

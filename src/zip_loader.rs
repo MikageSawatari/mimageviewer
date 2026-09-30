@@ -729,9 +729,19 @@ struct NestedZipCacheInner {
 
 struct NestedCacheEntry {
     zip_path: PathBuf,
-    nested_path: String,
+    nested_path: NestedCachePath,
     bytes: Arc<Vec<u8>>,
     last_used: Instant,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum NestedCachePath {
+    Named(String),
+    RemoteIndices {
+        archive_key: ArchiveCacheKey,
+        indices: Vec<usize>,
+        display_name: String,
+    },
 }
 
 impl NestedZipCache {
@@ -746,9 +756,29 @@ impl NestedZipCache {
     }
 
     fn get(&self, zip_path: &Path, nested_path: &str) -> Option<Arc<Vec<u8>>> {
+        self.get_key(zip_path, &NestedCachePath::Named(nested_path.to_owned()))
+    }
+
+    fn get_remote(
+        &self,
+        archive_key: &ArchiveCacheKey,
+        indices: &[usize],
+        display_name: &str,
+    ) -> Option<Arc<Vec<u8>>> {
+        self.get_key(
+            &archive_key.path,
+            &NestedCachePath::RemoteIndices {
+                archive_key: archive_key.clone(),
+                indices: indices.to_vec(),
+                display_name: display_name.to_owned(),
+            },
+        )
+    }
+
+    fn get_key(&self, zip_path: &Path, nested_path: &NestedCachePath) -> Option<Arc<Vec<u8>>> {
         let mut inner = self.inner.lock().ok()?;
         for e in inner.entries.iter_mut() {
-            if e.zip_path == zip_path && e.nested_path == nested_path {
+            if e.zip_path == zip_path && &e.nested_path == nested_path {
                 e.last_used = Instant::now();
                 return Some(e.bytes.clone());
             }
@@ -757,6 +787,28 @@ impl NestedZipCache {
     }
 
     fn insert(&self, zip_path: PathBuf, nested_path: String, bytes: Arc<Vec<u8>>) {
+        self.insert_key(zip_path, NestedCachePath::Named(nested_path), bytes);
+    }
+
+    fn insert_remote(
+        &self,
+        archive_key: ArchiveCacheKey,
+        indices: Vec<usize>,
+        display_name: String,
+        bytes: Arc<Vec<u8>>,
+    ) {
+        self.insert_key(
+            archive_key.path.clone(),
+            NestedCachePath::RemoteIndices {
+                archive_key,
+                indices,
+                display_name,
+            },
+            bytes,
+        );
+    }
+
+    fn insert_key(&self, zip_path: PathBuf, nested_path: NestedCachePath, bytes: Arc<Vec<u8>>) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -1068,7 +1120,16 @@ pub fn enumerate_image_entries_detailed_with_cancels(
 
 #[cfg(test)]
 pub(crate) fn nested_cache_contains(zip_path: &Path, nested_name: &str) -> bool {
-    NESTED_CACHE.get(zip_path, nested_name).is_some()
+    if NESTED_CACHE.get(zip_path, nested_name).is_some() {
+        return true;
+    }
+    let Ok(inner) = NESTED_CACHE.inner.lock() else {
+        return false;
+    };
+    inner.entries.iter().any(|entry| {
+        entry.zip_path == zip_path
+            && matches!(&entry.nested_path, NestedCachePath::RemoteIndices { display_name, .. } if display_name == nested_name)
+    })
 }
 
 #[cfg(test)]
@@ -1093,6 +1154,36 @@ fn note_raw_payload_read(zip_path: &Path, entry_name: &str) {
     }
 }
 
+/// Physical location of one archive entry. ZIP indices include each nested
+/// container followed by the leaf index, so duplicate decoded names stay distinct.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RemoteArchiveCandidateCursor {
+    Zip(Vec<usize>),
+    Rar(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteImageCandidate {
+    pub entry_name: String,
+    pub cursor: RemoteArchiveCandidateCursor,
+}
+
+#[cfg(test)]
+static REMOTE_CANDIDATE_PAYLOAD_READS: LazyLock<
+    Mutex<std::collections::HashMap<(PathBuf, RemoteArchiveCandidateCursor), usize>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn candidate_payload_read_count(
+    zip_path: &Path,
+    cursor: &RemoteArchiveCandidateCursor,
+) -> usize {
+    lock_unpoisoned(&REMOTE_CANDIDATE_PAYLOAD_READS)
+        .get(&(zip_path.to_path_buf(), cursor.clone()))
+        .copied()
+        .unwrap_or(0)
+}
+
 fn remote_readable_zip_metadata(entry: &zip::read::ZipFile<'_>) -> bool {
     !entry.encrypted()
         && matches!(
@@ -1104,14 +1195,15 @@ fn remote_readable_zip_metadata(entry: &zip::read::ZipFile<'_>) -> bool {
 /// Return the next Remote archive image in reading order using directory metadata.
 /// Image payloads are never read here. A nested ZIP container may be expanded via
 /// the bounded cache, and is visited only when it precedes the requested candidate.
-/// Pass the last unreadable candidate as `after` to continue in the same request.
+/// Pass the last unreadable candidate's cursor as `after` to continue in the
+/// same request. Decoded names are display labels and are never used as cursors.
 pub fn next_remote_image_candidate(
     zip_path: &Path,
     directory_prefix: Option<&str>,
-    after: Option<&str>,
+    after: Option<&RemoteArchiveCandidateCursor>,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<Option<RemoteImageCandidate>> {
     if cancelled_by(Some(cancel), stop) {
         return Err(interrupted_error());
     }
@@ -1121,24 +1213,21 @@ pub fn next_remote_image_candidate(
             Some(cancel),
         )?
         .entries;
+        let candidates: Vec<_> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| RemoteImageCandidate {
+                entry_name: entry.entry_name,
+                cursor: RemoteArchiveCandidateCursor::Rar(index),
+            })
+            .collect();
         if let Some(prefix) = directory_prefix {
-            let tree = crate::zip_tree::ZipTree::build(zip_path.to_path_buf(), entries);
-            let segments: Vec<_> = prefix
-                .split('/')
-                .filter(|segment| !segment.is_empty())
-                .map(str::to_owned)
-                .collect();
-            let Some(node) = tree.node_at(&segments) else {
-                return Ok(None);
-            };
-            let mut names = Vec::new();
-            collect_remote_tree_order(node, &mut names);
-            return Ok(next_after(names, after));
+            return Ok(next_after_cursor(
+                ordered_remote_directory_candidates(candidates, prefix),
+                after,
+            ));
         }
-        return Ok(next_after(
-            entries.into_iter().map(|entry| entry.entry_name),
-            after,
-        ));
+        return Ok(next_after_cursor(candidates, after));
     }
     let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
     if let Some(prefix) = directory_prefix {
@@ -1156,6 +1245,7 @@ pub fn next_remote_image_candidate(
         &mut archive,
         zip_path,
         "",
+        &[],
         after,
         &mut passed_after,
         cancel,
@@ -1166,16 +1256,18 @@ pub fn next_remote_image_candidate(
 fn remote_name_compare(a: &str, b: &str) -> std::cmp::Ordering {
     let sort = crate::app::BOOK_READING_PAGE_ORDER;
     sort.compare_name_keys(&sort.name_key(a), 0, &sort.name_key(b), 0)
-        .then_with(|| a.cmp(b))
 }
 
-fn next_after(names: impl IntoIterator<Item = String>, after: Option<&str>) -> Option<String> {
+fn next_after_cursor(
+    candidates: impl IntoIterator<Item = RemoteImageCandidate>,
+    after: Option<&RemoteArchiveCandidateCursor>,
+) -> Option<RemoteImageCandidate> {
     let mut passed_after = after.is_none();
-    for name in names {
+    for candidate in candidates {
         if passed_after {
-            return Some(name);
+            return Some(candidate);
         }
-        if Some(name.as_str()) == after {
+        if Some(&candidate.cursor) == after {
             passed_after = true;
         }
     }
@@ -1210,7 +1302,6 @@ fn remote_metadata_indices<R: Read + Seek>(
             entries.push((index, name, image));
         }
     }
-    entries.sort_by(|a, b| remote_name_compare(&a.1, &b.1));
     Ok(entries)
 }
 
@@ -1219,10 +1310,12 @@ fn remote_nested_bytes<R: Read + Seek>(
     index: usize,
     outer_zip_path: &Path,
     full_name: &str,
+    index_chain: &[usize],
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
 ) -> std::io::Result<Option<Arc<Vec<u8>>>> {
-    if let Some(bytes) = NESTED_CACHE.get(outer_zip_path, full_name) {
+    let archive_key = ArchiveCacheKey::from_path(outer_zip_path)?;
+    if let Some(bytes) = NESTED_CACHE.get_remote(&archive_key, index_chain, full_name) {
         return Ok(Some(bytes));
     }
     let Ok(mut entry) = archive.by_index(index) else {
@@ -1239,8 +1332,9 @@ fn remote_nested_bytes<R: Read + Seek>(
         return Err(interrupted_error());
     }
     let bytes = Arc::new(bytes);
-    NESTED_CACHE.insert(
-        outer_zip_path.to_path_buf(),
+    NESTED_CACHE.insert_remote(
+        archive_key,
+        index_chain.to_vec(),
         full_name.to_owned(),
         bytes.clone(),
     );
@@ -1252,27 +1346,41 @@ fn find_next_remote_file_candidate<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     outer_zip_path: &Path,
     prefix: &str,
-    after: Option<&str>,
+    parent_indices: &[usize],
+    after: Option<&RemoteArchiveCandidateCursor>,
     passed_after: &mut bool,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<Option<RemoteImageCandidate>> {
     for (index, name, is_image) in remote_metadata_indices(archive, cancel, stop)? {
         if cancelled_by(Some(cancel), stop) {
             return Err(interrupted_error());
         }
         let full_name = format!("{prefix}{name}");
+        let mut indices = parent_indices.to_vec();
+        indices.push(index);
         if is_image {
+            let candidate = RemoteImageCandidate {
+                entry_name: full_name,
+                cursor: RemoteArchiveCandidateCursor::Zip(indices),
+            };
             if *passed_after {
-                return Ok(Some(full_name));
+                return Ok(Some(candidate));
             }
-            if Some(full_name.as_str()) == after {
+            if Some(&candidate.cursor) == after {
                 *passed_after = true;
             }
             continue;
         }
-        let Some(bytes) =
-            remote_nested_bytes(archive, index, outer_zip_path, &full_name, cancel, stop)?
+        let Some(bytes) = remote_nested_bytes(
+            archive,
+            index,
+            outer_zip_path,
+            &full_name,
+            &indices,
+            cancel,
+            stop,
+        )?
         else {
             continue;
         };
@@ -1283,6 +1391,7 @@ fn find_next_remote_file_candidate<R: Read + Seek>(
             &mut inner,
             outer_zip_path,
             &format!("{full_name}/"),
+            &indices,
             after,
             passed_after,
             cancel,
@@ -1298,47 +1407,44 @@ fn next_remote_directory_candidate<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     zip_path: &Path,
     prefix: &str,
-    after: Option<&str>,
+    after: Option<&RemoteArchiveCandidateCursor>,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<Option<RemoteImageCandidate>> {
     let directory = prefix.trim_end_matches('/');
     let mut direct: Vec<_> = remote_metadata_indices(archive, cancel, stop)?
         .into_iter()
-        .filter_map(|(_, name, image)| {
+        .filter_map(|(index, name, image)| {
             (image && name.rsplit_once('/').map_or("", |(parent, _)| parent) == directory)
-                .then_some(name)
+                .then_some(RemoteImageCandidate {
+                    entry_name: name,
+                    cursor: RemoteArchiveCandidateCursor::Zip(vec![index]),
+                })
         })
         .collect();
-    direct.sort_by(|a, b| remote_name_compare(entry_basename(a), entry_basename(b)));
-    if (after.is_none() || after.is_some_and(|name| direct.iter().any(|entry| entry == name)))
-        && let Some(candidate) = next_after(direct, after)
+    sort_remote_direct_images(&mut direct);
+    if (after.is_none()
+        || after.is_some_and(|cursor| direct.iter().any(|entry| &entry.cursor == cursor)))
+        && let Some(candidate) = next_after_cursor(direct, after)
     {
         return Ok(Some(candidate));
     }
     // No direct image remains. Collect only eligible central-directory entries,
     // expanding nested ZIP containers without preparing an image decompressor.
     let mut entries = Vec::new();
-    collect_remote_metadata_candidates(archive, zip_path, "", &mut entries, cancel, stop)?;
-    let tree = crate::zip_tree::ZipTree::build(zip_path.to_path_buf(), entries);
-    let segments: Vec<_> = prefix
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_owned)
-        .collect();
-    let Some(node) = tree.node_at(&segments) else {
-        return Ok(None);
-    };
-    let mut names = Vec::new();
-    collect_remote_tree_order(node, &mut names);
-    Ok(next_after(names, after))
+    collect_remote_metadata_candidates(archive, zip_path, "", &[], &mut entries, cancel, stop)?;
+    Ok(next_after_cursor(
+        ordered_remote_directory_candidates(entries, prefix),
+        after,
+    ))
 }
 
 fn collect_remote_metadata_candidates<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     outer_zip_path: &Path,
     prefix: &str,
-    out: &mut Vec<ZipImageEntry>,
+    parent_indices: &[usize],
+    out: &mut Vec<RemoteImageCandidate>,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
 ) -> std::io::Result<()> {
@@ -1347,16 +1453,24 @@ fn collect_remote_metadata_candidates<R: Read + Seek>(
             return Err(interrupted_error());
         }
         let full_name = format!("{prefix}{name}");
+        let mut indices = parent_indices.to_vec();
+        indices.push(index);
         if is_image {
-            out.push(ZipImageEntry {
+            out.push(RemoteImageCandidate {
                 entry_name: full_name,
-                uncompressed_size: 0,
-                mtime: 0,
+                cursor: RemoteArchiveCandidateCursor::Zip(indices),
             });
             continue;
         }
-        let Some(bytes) =
-            remote_nested_bytes(archive, index, outer_zip_path, &full_name, cancel, stop)?
+        let Some(bytes) = remote_nested_bytes(
+            archive,
+            index,
+            outer_zip_path,
+            &full_name,
+            &indices,
+            cancel,
+            stop,
+        )?
         else {
             continue;
         };
@@ -1367,6 +1481,7 @@ fn collect_remote_metadata_candidates<R: Read + Seek>(
             &mut inner,
             outer_zip_path,
             &format!("{full_name}/"),
+            &indices,
             out,
             cancel,
             stop,
@@ -1375,17 +1490,273 @@ fn collect_remote_metadata_candidates<R: Read + Seek>(
     Ok(())
 }
 
-fn collect_remote_tree_order(node: &crate::zip_tree::ZipTreeNode, names: &mut Vec<String>) {
-    let mut images: Vec<_> = node.images.iter().collect();
+#[derive(Default)]
+struct RemoteCandidateNode {
+    images: Vec<RemoteImageCandidate>,
+    dirs: std::collections::BTreeMap<String, RemoteCandidateNode>,
+}
+
+fn sort_remote_direct_images(images: &mut [RemoteImageCandidate]) {
     images.sort_by(|a, b| {
         remote_name_compare(entry_basename(&a.entry_name), entry_basename(&b.entry_name))
     });
-    names.extend(images.into_iter().map(|entry| entry.entry_name.clone()));
+}
+
+fn ordered_remote_directory_candidates(
+    entries: Vec<RemoteImageCandidate>,
+    directory_prefix: &str,
+) -> Vec<RemoteImageCandidate> {
+    let mut root = RemoteCandidateNode::default();
+    for entry in entries {
+        let directory = entry_dir(&entry.entry_name).to_owned();
+        let mut node = &mut root;
+        for segment in directory.split('/').filter(|segment| !segment.is_empty()) {
+            node = node.dirs.entry(segment.to_owned()).or_default();
+        }
+        node.images.push(entry);
+    }
+    let mut node = &root;
+    for segment in directory_prefix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        let Some(child) = node.dirs.get(segment) else {
+            return Vec::new();
+        };
+        node = child;
+    }
+    let mut ordered = Vec::new();
+    collect_remote_tree_order(node, &mut ordered);
+    ordered
+}
+
+fn collect_remote_tree_order(node: &RemoteCandidateNode, out: &mut Vec<RemoteImageCandidate>) {
+    let mut images = node.images.clone();
+    sort_remote_direct_images(&mut images);
+    out.extend(images);
     let mut dirs: Vec<_> = node.dirs.iter().collect();
     dirs.sort_by(|a, b| remote_name_compare(a.0, b.0));
     for (_, child) in dirs {
-        collect_remote_tree_order(child, names);
+        collect_remote_tree_order(child, out);
     }
+}
+
+/// Resolve an explicit ZIP entry through the normal exact/legacy/decoded-name
+/// lookup, retaining each physical index for later payload reads and RAW identity.
+pub fn resolve_remote_image_candidate(
+    zip_path: &Path,
+    entry_name: &str,
+    cancel: &Arc<AtomicBool>,
+) -> std::io::Result<RemoteImageCandidate> {
+    if is_cancelled(Some(cancel)) {
+        return Err(interrupted_error());
+    }
+    if crate::rar_loader::is_rar_path(zip_path) {
+        let entries = crate::rar_loader::enumerate_image_entries_detailed_with_cancel(
+            zip_path,
+            Some(cancel),
+        )?
+        .entries;
+        return entries
+            .into_iter()
+            .enumerate()
+            .find(|(_, entry)| entry.entry_name == entry_name)
+            .map(|(index, entry)| RemoteImageCandidate {
+                entry_name: entry.entry_name,
+                cursor: RemoteArchiveCandidateCursor::Rar(index),
+            })
+            .ok_or_else(|| entry_not_found(entry_name));
+    }
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
+    match resolve_entry_index(
+        &mut archive,
+        entry_name,
+        decoded_name_cache_key(zip_path),
+        Some(cancel),
+    ) {
+        Ok(index) => {
+            let entry = archive
+                .by_index_raw(index)
+                .map_err(|error| zip_error_to_io(error, Some(cancel)))?;
+            if !entry.is_file() || !remote_readable_zip_metadata(&entry) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ZIP entry is not readable",
+                ));
+            }
+            return Ok(RemoteImageCandidate {
+                entry_name: normalized_zip_entry_name(&entry),
+                cursor: RemoteArchiveCandidateCursor::Zip(vec![index]),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parts = split_nested_zip_path(entry_name);
+    if parts.len() < 2 {
+        return Err(entry_not_found(entry_name));
+    }
+    let mut indices = Vec::new();
+    resolve_remote_nested_candidate(&mut archive, zip_path, &parts, "", &mut indices, cancel)
+}
+
+fn resolve_remote_nested_candidate<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    outer_zip_path: &Path,
+    parts: &[&str],
+    prefix: &str,
+    indices: &mut Vec<usize>,
+    cancel: &Arc<AtomicBool>,
+) -> std::io::Result<RemoteImageCandidate> {
+    if is_cancelled(Some(cancel)) {
+        return Err(interrupted_error());
+    }
+    let index = resolve_entry_index(archive, parts[0], None, Some(cancel))?;
+    let entry = archive
+        .by_index_raw(index)
+        .map_err(|error| zip_error_to_io(error, Some(cancel)))?;
+    if !entry.is_file() || !remote_readable_zip_metadata(&entry) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ZIP entry is not readable",
+        ));
+    }
+    let full_name = format!("{prefix}{}", normalized_zip_entry_name(&entry));
+    indices.push(index);
+    drop(entry);
+    if parts.len() == 1 {
+        return Ok(RemoteImageCandidate {
+            entry_name: full_name,
+            cursor: RemoteArchiveCandidateCursor::Zip(indices.clone()),
+        });
+    }
+    let bytes = remote_nested_bytes(
+        archive,
+        index,
+        outer_zip_path,
+        &full_name,
+        indices,
+        cancel,
+        None,
+    )?
+    .ok_or_else(|| std::io::Error::other("nested ZIP entry is unreadable"))?;
+    let reader = CancellableReader::new(Cursor::new(bytes.as_slice()), Some(cancel.clone()));
+    let mut inner =
+        zip::ZipArchive::new(reader).map_err(|error| zip_error_to_io(error, Some(cancel)))?;
+    resolve_remote_nested_candidate(
+        &mut inner,
+        outer_zip_path,
+        &parts[1..],
+        &format!("{full_name}/"),
+        indices,
+        cancel,
+    )
+}
+
+/// Read exactly the physical leaf selected by the metadata cursor. Nested ZIP
+/// cache lookups use the index chain, so equal decoded names never alias.
+pub fn read_remote_image_candidate_bytes_cancellable(
+    zip_path: &Path,
+    candidate: &RemoteImageCandidate,
+    cancel: &Arc<AtomicBool>,
+) -> std::io::Result<Vec<u8>> {
+    if is_cancelled(Some(cancel)) {
+        return Err(interrupted_error());
+    }
+    match &candidate.cursor {
+        RemoteArchiveCandidateCursor::Rar(_) => {
+            #[cfg(test)]
+            note_remote_candidate_payload_read(zip_path, candidate);
+            crate::rar_loader::read_entry_bytes(zip_path, &candidate.entry_name)
+        }
+        RemoteArchiveCandidateCursor::Zip(indices) if !indices.is_empty() => {
+            let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
+            read_remote_zip_candidate_recursive(
+                &mut archive,
+                zip_path,
+                &candidate.entry_name,
+                indices,
+                &[],
+                "",
+                cancel,
+            )
+        }
+        RemoteArchiveCandidateCursor::Zip(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty ZIP entry cursor",
+        )),
+    }
+}
+
+#[cfg(test)]
+fn note_remote_candidate_payload_read(zip_path: &Path, candidate: &RemoteImageCandidate) {
+    *lock_unpoisoned(&REMOTE_CANDIDATE_PAYLOAD_READS)
+        .entry((zip_path.to_path_buf(), candidate.cursor.clone()))
+        .or_default() += 1;
+    note_raw_payload_read(zip_path, &candidate.entry_name);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_remote_zip_candidate_recursive<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    outer_zip_path: &Path,
+    candidate_name: &str,
+    indices: &[usize],
+    parent_indices: &[usize],
+    prefix: &str,
+    cancel: &Arc<AtomicBool>,
+) -> std::io::Result<Vec<u8>> {
+    if is_cancelled(Some(cancel)) {
+        return Err(interrupted_error());
+    }
+    let index = indices[0];
+    if indices.len() == 1 {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| zip_error_to_io(error, Some(cancel)))?;
+        #[cfg(test)]
+        note_remote_candidate_payload_read(
+            outer_zip_path,
+            &RemoteImageCandidate {
+                entry_name: candidate_name.to_owned(),
+                cursor: RemoteArchiveCandidateCursor::Zip(
+                    parent_indices.iter().copied().chain([index]).collect(),
+                ),
+            },
+        );
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        read_to_end_with_cancel(&mut entry, &mut bytes, Some(cancel), None)?;
+        return Ok(bytes);
+    }
+    let entry = archive
+        .by_index_raw(index)
+        .map_err(|error| zip_error_to_io(error, Some(cancel)))?;
+    let full_name = format!("{prefix}{}", normalized_zip_entry_name(&entry));
+    drop(entry);
+    let mut chain = parent_indices.to_vec();
+    chain.push(index);
+    let bytes = remote_nested_bytes(
+        archive,
+        index,
+        outer_zip_path,
+        &full_name,
+        &chain,
+        cancel,
+        None,
+    )?
+    .ok_or_else(|| std::io::Error::other("nested ZIP entry is unreadable"))?;
+    let reader = CancellableReader::new(Cursor::new(bytes.as_slice()), Some(cancel.clone()));
+    let mut inner =
+        zip::ZipArchive::new(reader).map_err(|error| zip_error_to_io(error, Some(cancel)))?;
+    read_remote_zip_candidate_recursive(
+        &mut inner,
+        outer_zip_path,
+        candidate_name,
+        &indices[1..],
+        &chain,
+        &format!("{full_name}/"),
+        cancel,
+    )
 }
 
 /// Conservative RAW possibility check for early cache lookups that precede
@@ -3133,14 +3504,14 @@ mod tests {
     }
 
     #[test]
-    fn remote_file_candidates_use_name_order_without_reading_raw_payloads() {
+    fn remote_file_candidates_follow_central_index_order_without_reading_raw_payloads() {
         let dir = tempfile::tempdir().unwrap();
         let inner = dir.path().join("inner-source.zip");
         write_test_zip(&inner, &[("page.jpg", b"INNER")]);
         let inner_bytes = std::fs::read(&inner).unwrap();
         let outer = dir.path().join("outer.zip");
-        // Insertion order differs from reading order. The nested container is
-        // only expanded after the preceding direct candidates are exhausted.
+        // The root File loader uses central-directory index order. A later
+        // nested ZIP is not expanded while the first outer image is selected.
         write_test_zip(
             &outer,
             &[
@@ -3151,28 +3522,37 @@ mod tests {
             ],
         );
         let cancel = Arc::new(AtomicBool::new(false));
+        let first = next_remote_image_candidate(&outer, None, None, &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.entry_name, "z.jpg");
+        assert_eq!(first.cursor, RemoteArchiveCandidateCursor::Zip(vec![0]));
         assert_eq!(
-            next_remote_image_candidate(&outer, None, None, &cancel, None).unwrap(),
-            Some("a.dng".to_owned())
+            read_remote_image_candidate_bytes_cancellable(&outer, &first, &cancel).unwrap(),
+            b"LAST"
         );
         assert_eq!(raw_payload_read_count(&outer, "a.dng"), 0);
         assert!(!nested_cache_contains(&outer, "later.zip"));
-        assert_eq!(
-            next_remote_image_candidate(&outer, None, Some("a.dng"), &cancel, None).unwrap(),
-            Some("b.jpg".to_owned())
-        );
-        assert!(!nested_cache_contains(&outer, "later.zip"));
-        assert_eq!(
-            next_remote_image_candidate(&outer, None, Some("b.jpg"), &cancel, None).unwrap(),
-            Some("later.zip/page.jpg".to_owned())
-        );
+        let nested = next_remote_image_candidate(&outer, None, Some(&first.cursor), &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(nested.entry_name, "later.zip/page.jpg");
+        assert_eq!(nested.cursor, RemoteArchiveCandidateCursor::Zip(vec![1, 0]));
         assert!(nested_cache_contains(&outer, "later.zip"));
-        assert_eq!(
-            next_remote_image_candidate(&outer, None, Some("later.zip/page.jpg"), &cancel, None,)
-                .unwrap(),
-            Some("z.jpg".to_owned())
-        );
+        let raw = next_remote_image_candidate(&outer, None, Some(&nested.cursor), &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw.entry_name, "a.dng");
+        assert_eq!(raw.cursor, RemoteArchiveCandidateCursor::Zip(vec![2]));
         assert_eq!(raw_payload_read_count(&outer, "a.dng"), 0);
+        let last = next_remote_image_candidate(&outer, None, Some(&raw.cursor), &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.entry_name, "b.jpg");
+        assert_eq!(
+            next_remote_image_candidate(&outer, None, Some(&last.cursor), &cancel, None).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -3191,23 +3571,193 @@ mod tests {
             ],
         );
         let cancel = Arc::new(AtomicBool::new(false));
-        assert_eq!(
-            next_remote_image_candidate(&outer, Some("book/"), None, &cancel, None).unwrap(),
-            Some("book/a.jpg".to_owned())
-        );
+        let first = next_remote_image_candidate(&outer, Some("book/"), None, &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.entry_name, "book/a.jpg");
         assert!(!nested_cache_contains(&outer, "book/inner.zip"));
-        assert_eq!(
-            next_remote_image_candidate(&outer, Some("book/"), Some("book/a.jpg"), &cancel, None)
-                .unwrap(),
-            Some("book/b.jpg".to_owned())
-        );
+        let second =
+            next_remote_image_candidate(&outer, Some("book/"), Some(&first.cursor), &cancel, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(second.entry_name, "book/b.jpg");
         assert!(!nested_cache_contains(&outer, "book/inner.zip"));
-        assert_eq!(
-            next_remote_image_candidate(&outer, Some("book/"), Some("book/b.jpg"), &cancel, None)
-                .unwrap(),
-            Some("book/inner.zip/page.cr2".to_owned())
-        );
+        let nested =
+            next_remote_image_candidate(&outer, Some("book/"), Some(&second.cursor), &cancel, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(nested.entry_name, "book/inner.zip/page.cr2");
         assert_eq!(raw_payload_read_count(&outer, "book/inner.zip/page.cr2"), 0);
+    }
+
+    #[test]
+    fn remote_candidate_cursor_advances_across_duplicate_normalized_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("duplicate-names.zip");
+        write_test_zip(
+            &outer,
+            &[
+                ("a\\p.jpg", b"BADPAYLOAD"),
+                ("a/p.jpg", b"GOODPAYLOAD"),
+                ("z.jpg", b"LASTPAYLOAD"),
+            ],
+        );
+        let mut bytes = std::fs::read(&outer).unwrap();
+        let offset = bytes
+            .windows(b"BADPAYLOAD".len())
+            .position(|window| window == b"BADPAYLOAD")
+            .unwrap();
+        bytes[offset] ^= 1; // keep the central CRC, so only the payload read fails
+        std::fs::write(&outer, bytes).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let first = next_remote_image_candidate(&outer, None, None, &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.entry_name, "a/p.jpg");
+        assert_eq!(first.cursor, RemoteArchiveCandidateCursor::Zip(vec![0]));
+        assert!(read_remote_image_candidate_bytes_cancellable(&outer, &first, &cancel).is_err());
+        let second = next_remote_image_candidate(&outer, None, Some(&first.cursor), &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.entry_name, "a/p.jpg");
+        assert_eq!(second.cursor, RemoteArchiveCandidateCursor::Zip(vec![1]));
+        assert_eq!(
+            read_remote_image_candidate_bytes_cancellable(&outer, &second, &cancel).unwrap(),
+            b"GOODPAYLOAD"
+        );
+        let third = next_remote_image_candidate(&outer, None, Some(&second.cursor), &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.entry_name, "z.jpg");
+        assert_eq!(third.cursor, RemoteArchiveCandidateCursor::Zip(vec![2]));
+        assert_eq!(candidate_payload_read_count(&outer, &first.cursor), 1);
+        assert_eq!(candidate_payload_read_count(&outer, &second.cursor), 1);
+        assert_eq!(candidate_payload_read_count(&outer, &third.cursor), 0);
+    }
+
+    #[test]
+    fn remote_nested_cache_distinguishes_duplicate_normalized_container_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_inner = dir.path().join("first.zip");
+        let second_inner = dir.path().join("second.zip");
+        write_test_zip(&first_inner, &[("page.jpg", b"FIRST")]);
+        write_test_zip(&second_inner, &[("page.jpg", b"OTHER")]);
+        let first_bytes = std::fs::read(&first_inner).unwrap();
+        let second_bytes = std::fs::read(&second_inner).unwrap();
+        let outer = dir.path().join("outer.zip");
+        write_test_zip(
+            &outer,
+            &[
+                ("a\\inner.zip", &first_bytes),
+                ("a/inner.zip", &second_bytes),
+            ],
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let first = next_remote_image_candidate(&outer, None, None, &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.entry_name, "a/inner.zip/page.jpg");
+        assert_eq!(first.cursor, RemoteArchiveCandidateCursor::Zip(vec![0, 0]));
+        assert_eq!(
+            read_remote_image_candidate_bytes_cancellable(&outer, &first, &cancel).unwrap(),
+            b"FIRST"
+        );
+        let second = next_remote_image_candidate(&outer, None, Some(&first.cursor), &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.entry_name, first.entry_name);
+        assert_eq!(second.cursor, RemoteArchiveCandidateCursor::Zip(vec![1, 0]));
+        assert_eq!(
+            read_remote_image_candidate_bytes_cancellable(&outer, &second, &cancel).unwrap(),
+            b"OTHER"
+        );
+        assert_eq!(candidate_payload_read_count(&outer, &first.cursor), 1);
+        assert_eq!(candidate_payload_read_count(&outer, &second.cursor), 1);
+    }
+
+    #[test]
+    fn remote_nested_cache_revalidates_precise_outer_mtime_at_same_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner.zip");
+        let outer = dir.path().join("outer.zip");
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let write_version = |contents: &[u8], modified: std::time::SystemTime| {
+            write_test_zip(&inner, &[("page.jpg", contents)]);
+            let inner_bytes = std::fs::read(&inner).unwrap();
+            write_test_zip(&outer, &[("nested.zip", &inner_bytes)]);
+            File::options()
+                .write(true)
+                .open(&outer)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        };
+        write_version(b"FIRST", base);
+        let first_meta = std::fs::metadata(&outer).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let first = next_remote_image_candidate(&outer, None, None, &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_remote_image_candidate_bytes_cancellable(&outer, &first, &cancel).unwrap(),
+            b"FIRST"
+        );
+        write_version(b"OTHER", base + std::time::Duration::from_millis(1));
+        let second_meta = std::fs::metadata(&outer).unwrap();
+        assert_eq!(first_meta.len(), second_meta.len());
+        assert_ne!(
+            first_meta.modified().unwrap(),
+            second_meta.modified().unwrap()
+        );
+        assert_eq!(
+            crate::ui_helpers::mtime_secs(&first_meta),
+            crate::ui_helpers::mtime_secs(&second_meta)
+        );
+        let second = next_remote_image_candidate(&outer, None, None, &cancel, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.cursor, first.cursor);
+        assert_eq!(
+            read_remote_image_candidate_bytes_cancellable(&outer, &second, &cancel).unwrap(),
+            b"OTHER"
+        );
+    }
+
+    #[test]
+    fn remote_explicit_candidate_keeps_literal_and_nested_entry_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner.zip");
+        write_test_zip(&inner, &[("page.jpg", b"NESTED")]);
+        let inner_bytes = std::fs::read(&inner).unwrap();
+        let literal = dir.path().join("literal.zip");
+        write_test_zip(
+            &literal,
+            &[
+                ("inner.zip/page.jpg", b"LITERAL"),
+                ("inner.zip", &inner_bytes),
+            ],
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let selected =
+            resolve_remote_image_candidate(&literal, "inner.zip/page.jpg", &cancel).unwrap();
+        assert_eq!(selected.cursor, RemoteArchiveCandidateCursor::Zip(vec![0]));
+        assert_eq!(
+            read_remote_image_candidate_bytes_cancellable(&literal, &selected, &cancel).unwrap(),
+            b"LITERAL"
+        );
+        let nested_only = dir.path().join("nested-only.zip");
+        write_test_zip(&nested_only, &[("inner.zip", &inner_bytes)]);
+        let selected =
+            resolve_remote_image_candidate(&nested_only, "inner.zip/page.jpg", &cancel).unwrap();
+        assert_eq!(
+            selected.cursor,
+            RemoteArchiveCandidateCursor::Zip(vec![0, 0])
+        );
+        assert_eq!(
+            read_remote_image_candidate_bytes_cancellable(&nested_only, &selected, &cancel)
+                .unwrap(),
+            b"NESTED"
+        );
     }
 
     #[test]
@@ -3256,8 +3806,11 @@ mod tests {
         std::fs::write(&outer, bytes).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         assert_eq!(
-            next_remote_image_candidate(&outer, None, None, &cancel, None).unwrap(),
-            Some("c.jpg".to_owned())
+            next_remote_image_candidate(&outer, None, None, &cancel, None)
+                .unwrap()
+                .unwrap()
+                .entry_name,
+            "c.jpg"
         );
         assert_eq!(raw_payload_read_count(&outer, "a.cr2"), 0);
         assert_eq!(raw_payload_read_count(&outer, "b.cr2"), 0);

@@ -1212,7 +1212,7 @@ struct RemoteSourceRaster {
 struct RawDepSpec {
     identity: RemoteRawIdentity,
     readable_path: PathBuf,
-    zip_entry: Option<String>,
+    candidate: Option<crate::zip_loader::RemoteImageCandidate>,
 }
 
 impl RawDepSpec {
@@ -1220,12 +1220,14 @@ impl RawDepSpec {
         &self,
         cancel: &Arc<AtomicBool>,
     ) -> Result<crate::raw::RawOwnedSource, crate::raw::RawError> {
-        match &self.zip_entry {
-            Some(entry) => {
-                crate::zip_loader::read_entry_bytes_cancellable(&self.readable_path, entry, cancel)
-                    .map(|bytes| crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)))
-                    .map_err(|error| crate::raw::RawError::Io(error.to_string()))
-            }
+        match &self.candidate {
+            Some(candidate) => crate::zip_loader::read_remote_image_candidate_bytes_cancellable(
+                &self.readable_path,
+                candidate,
+                cancel,
+            )
+            .map(|bytes| crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)))
+            .map_err(|error| crate::raw::RawError::Io(error.to_string())),
             None => Ok(crate::raw::RawOwnedSource::Path(self.readable_path.clone())),
         }
     }
@@ -1235,7 +1237,7 @@ struct RawDepPins {
     brightness: crate::raw::RawBrightness,
     settings: crate::settings_db::AdjustmentRenderSettings,
     developed: HashMap<RemoteRawIdentity, Arc<crate::raw::RawDevelopOutput>>,
-    selections: HashMap<RemoteAddress, Option<String>>,
+    selections: HashMap<RemoteAddress, Option<crate::zip_loader::RemoteImageCandidate>>,
     archive_payloads: HashMap<RemoteAddress, Arc<Vec<u8>>>,
 }
 
@@ -1250,10 +1252,18 @@ impl RawDepPins {
         self.developed.get(key)
     }
 
-    fn selected_entry(&self, address: &RemoteAddress) -> Option<&str> {
+    fn selected_candidate(
+        &self,
+        address: &RemoteAddress,
+    ) -> Option<&crate::zip_loader::RemoteImageCandidate> {
         self.selections
             .get(address)
-            .and_then(|entry| entry.as_deref())
+            .and_then(|candidate| candidate.as_ref())
+    }
+
+    fn selected_entry(&self, address: &RemoteAddress) -> Option<&str> {
+        self.selected_candidate(address)
+            .map(|candidate| candidate.entry_name.as_str())
     }
 }
 
@@ -4044,20 +4054,11 @@ impl ContainerEngine {
             priority = effective_priority();
             let mut specs = Vec::new();
             for ((address, resolved), metadata) in dependencies.iter().zip(&metadata_by_address) {
-                let selection = if is_archive_container(resolved)
-                    && matches!(
-                        address.subresource,
-                        RemoteSubresource::File | RemoteSubresource::ZipDirectory { .. }
-                    ) {
+                let selection =
                     match remote_archive_representative(address, resolved, &cancel, None) {
                         Ok(selection) => selection,
                         Err(error) => return PageResponse::Error(error),
-                    }
-                } else if let RemoteSubresource::ZipEntry { entry_name } = &address.subresource {
-                    Some(entry_name.clone())
-                } else {
-                    None
-                };
+                    };
                 pins.selections
                     .insert((*address).clone(), selection.clone());
                 let spec = match remote_raw_dep_spec_with_selection(
@@ -4065,7 +4066,7 @@ impl ContainerEngine {
                     resolved,
                     metadata,
                     pins.brightness,
-                    selection.as_deref(),
+                    selection.as_ref(),
                 ) {
                     Ok(spec) => spec,
                     Err(error) => return PageResponse::Error(error),
@@ -4347,7 +4348,7 @@ impl ContainerEngine {
                 resolved,
                 metadata,
                 pins.brightness,
-                selection.as_deref(),
+                selection.as_ref(),
             )?;
             if let Some(spec) = spec {
                 if pins.developed.contains_key(&spec.identity) {
@@ -4393,15 +4394,15 @@ impl ContainerEngine {
                 if pins.archive_payloads.contains_key(address) {
                     return Ok(None);
                 }
-                let Some(entry) = selection.as_deref() else {
+                let Some(candidate) = selection.as_ref() else {
                     return Err(media_error(
                         MediaErrorCode::RenderFailed,
                         "ZIP 内に読み取れる画像がありません",
                     ));
                 };
-                match crate::zip_loader::read_entry_bytes_cancellable(
+                match crate::zip_loader::read_remote_image_candidate_bytes_cancellable(
                     resolved.readable_canonical(),
-                    entry,
+                    candidate,
                     cancel,
                 ) {
                     Ok(bytes) => {
@@ -4423,7 +4424,7 @@ impl ContainerEngine {
             selection = remote_archive_next_representative(
                 address,
                 resolved,
-                selection.as_deref(),
+                selection.as_ref().map(|candidate| &candidate.cursor),
                 cancel,
                 None,
             )?;
@@ -4527,7 +4528,7 @@ impl ContainerEngine {
 
         for (page_index, page) in request.pages.iter().enumerate() {
             let page_result = (|| -> Result<
-                (PagePayload, (RemoteAddress, u32, RemoteAiResultIdentity, Option<String>)),
+                (PagePayload, (RemoteAddress, u32, RemoteAiResultIdentity, Option<crate::zip_loader::RemoteImageCandidate>)),
                 RemoteAiRunError,
             > {
             check_remote_ai_cancel(cancel)?;
@@ -4547,6 +4548,11 @@ impl ContainerEngine {
             if !metadata.is_file() {
                 return Err(RemoteAiRunError::Failed(
                     "AI source is not a file".to_owned(),
+                ));
+            }
+            if remote_adjustment_identity(&page.address, &resolved.logical).is_none() {
+                return Err(RemoteAiRunError::Failed(
+                    "address does not identify an image page".to_owned(),
                 ));
             }
             let mut raw_pins = RawDepPins {
@@ -4589,7 +4595,7 @@ impl ContainerEngine {
             } else if let Some(bytes) = raw_pins.archive_payloads.get(&page.address) {
                 decode_remote_ai_canonical(
                     crate::canonical_image_loader::CanonicalImageSource::File {
-                        path: Path::new(selection.as_deref().expect("archive payload has an entry")),
+                        path: Path::new(&selection.as_ref().expect("archive payload has an entry").entry_name),
                         verified_bytes: Some(bytes),
                     }, page_index, cancel, &self.raw_develop_executor, operation_settings.raw_brightness,
                 )?
@@ -4896,7 +4902,7 @@ impl ContainerEngine {
                 &resolved,
                 &metadata,
                 current_settings.raw_brightness,
-                selection.as_deref(),
+                selection.as_ref(),
             )
             .map_err(|_| RemoteAiRunError::Superseded("RAW source changed".to_owned()))?;
             let rotation = validation_context
@@ -5903,7 +5909,7 @@ impl ContainerEngine {
                     resolved,
                     &metadata,
                     brightness,
-                    pins.selected_entry(address),
+                    pins.selected_candidate(address),
                 )?
             } else if is_archive_container(resolved)
                 && matches!(
@@ -6259,7 +6265,7 @@ impl ContainerEngine {
                     resolved,
                     &metadata,
                     pins.brightness,
-                    pins.selected_entry(address),
+                    pins.selected_candidate(address),
                 )?,
                 None => None,
             }
@@ -7830,17 +7836,17 @@ fn remote_archive_representative(
     resolved: &ResolvedPath,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
-) -> Result<Option<String>, MediaError> {
+) -> Result<Option<crate::zip_loader::RemoteImageCandidate>, MediaError> {
     remote_archive_next_representative(address, resolved, None, cancel, stop)
 }
 
 fn remote_archive_next_representative(
     address: &RemoteAddress,
     resolved: &ResolvedPath,
-    after: Option<&str>,
+    after: Option<&crate::zip_loader::RemoteArchiveCandidateCursor>,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
-) -> Result<Option<String>, MediaError> {
+) -> Result<Option<crate::zip_loader::RemoteImageCandidate>, MediaError> {
     let archive = resolved.readable_canonical();
     let prefix = match &address.subresource {
         RemoteSubresource::File if is_archive_container(resolved) => None,
@@ -7848,7 +7854,18 @@ fn remote_archive_next_representative(
             Some(prefix.as_str())
         }
         RemoteSubresource::ZipEntry { entry_name } if is_archive_container(resolved) => {
-            return Ok(Some(entry_name.clone()));
+            return crate::zip_loader::resolve_remote_image_candidate(archive, entry_name, cancel)
+                .map(Some)
+                .map_err(|error| {
+                    media_error(
+                        if cancel.load(Ordering::Acquire) {
+                            MediaErrorCode::Cancelled
+                        } else {
+                            MediaErrorCode::RenderFailed
+                        },
+                        format!("ZIP entry: {error}"),
+                    )
+                });
         }
         _ => return Ok(None),
     };
@@ -7912,21 +7929,27 @@ fn remote_raw_dep_spec_with_selection(
     resolved: &ResolvedPath,
     metadata: &std::fs::Metadata,
     brightness: crate::raw::RawBrightness,
-    selected_entry: Option<&str>,
+    selection: Option<&crate::zip_loader::RemoteImageCandidate>,
 ) -> Result<Option<RawDepSpec>, MediaError> {
     let (entry, prefix) = match &address.subresource {
         RemoteSubresource::File if crate::raw_format::is_raw_path(&resolved.logical) => {
             (None, None)
         }
-        RemoteSubresource::File if is_archive_container(resolved) => {
-            (selected_entry.map(str::to_owned), None)
-        }
-        RemoteSubresource::ZipEntry { entry_name } if is_archive_container(resolved) => {
-            (Some(entry_name.clone()), None)
-        }
-        RemoteSubresource::ZipDirectory { prefix } if is_archive_container(resolved) => {
-            (selected_entry.map(str::to_owned), Some(prefix.as_str()))
-        }
+        RemoteSubresource::File if is_archive_container(resolved) => (
+            selection.map(|candidate| candidate.entry_name.clone()),
+            None,
+        ),
+        RemoteSubresource::ZipEntry { entry_name } if is_archive_container(resolved) => (
+            Some(selection.map_or_else(
+                || entry_name.clone(),
+                |candidate| candidate.entry_name.clone(),
+            )),
+            None,
+        ),
+        RemoteSubresource::ZipDirectory { prefix } if is_archive_container(resolved) => (
+            selection.map(|candidate| candidate.entry_name.clone()),
+            Some(prefix.as_str()),
+        ),
         _ => return Ok(None),
     };
     let is_raw = entry.as_deref().map_or_else(
@@ -7941,16 +7964,18 @@ fn remote_raw_dep_spec_with_selection(
     } else {
         resolved.canonical.clone()
     };
+    let mut identity = RemoteRawIdentity::new(
+        &resolved.logical,
+        metadata,
+        entry.as_deref(),
+        prefix,
+        brightness,
+    );
+    identity.archive_cursor = selection.map(|candidate| candidate.cursor.clone());
     Ok(Some(RawDepSpec {
-        identity: RemoteRawIdentity::new(
-            &resolved.logical,
-            metadata,
-            entry.as_deref(),
-            prefix,
-            brightness,
-        ),
+        identity,
         readable_path,
-        zip_entry: entry,
+        candidate: selection.cloned(),
     }))
 }
 
@@ -7962,7 +7987,7 @@ fn remote_raw_dep_spec(
 ) -> Result<Option<RawDepSpec>, MediaError> {
     let cancel = Arc::new(AtomicBool::new(false));
     let selected = remote_archive_representative(address, resolved, &cancel, None)?;
-    remote_raw_dep_spec_with_selection(address, resolved, metadata, brightness, selected.as_deref())
+    remote_raw_dep_spec_with_selection(address, resolved, metadata, brightness, selected.as_ref())
 }
 
 fn is_pdf_path(path: &Path) -> bool {
@@ -8407,6 +8432,108 @@ mod tests {
     }
 
     #[test]
+    fn archive_file_page_preserves_central_directory_representative_order() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        initialize_remote_page_edit_databases();
+        let folder = data_dir.path().join("index-order-representative");
+        std::fs::create_dir_all(&folder).unwrap();
+        let archive = folder.join("book.zip");
+        write_remote_ai_test_zip(
+            &archive,
+            &[
+                ("z.jpg", &remote_ai_test_jpeg(8, 6)),
+                ("a.jpg", &remote_ai_test_jpeg(6, 8)),
+            ],
+        );
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("ZIP".to_owned(), folder)],
+            ..Default::default()
+        });
+        for priority in [PagePriority::Foreground, PagePriority::Prefetch] {
+            let response = engine.page_with_job_cancel_and_priority(
+                PageRequest {
+                    job_id: "index-order".to_owned(),
+                    display_request_id: None,
+                    address: RemoteAddress::file(archive.to_string_lossy().into_owned()),
+                    target_px: 256,
+                    priority,
+                    render_context: None,
+                    adjustment_preview: None,
+                },
+                &WorkerContext::open(),
+                Arc::new(AtomicBool::new(false)),
+                &|| priority,
+            );
+            let PageResponse::Success(payload) = response else {
+                panic!("{response:?}")
+            };
+            assert_eq!((payload.width, payload.height), (8, 6));
+        }
+    }
+
+    #[test]
+    fn archive_page_fallthrough_reads_duplicate_normalized_names_once_by_index() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        initialize_remote_page_edit_databases();
+        let folder = data_dir.path().join("cursor-fallthrough");
+        std::fs::create_dir_all(&folder).unwrap();
+        let archive = folder.join("book.zip");
+        let corrupt = b"CORRUPT_JPEG_PAYLOAD_FOR_CURSOR";
+        write_remote_ai_test_zip(
+            &archive,
+            &[
+                (r"a\p.jpg", corrupt),
+                ("a/p.jpg", corrupt),
+                ("z.jpg", &remote_ai_test_jpeg(8, 6)),
+            ],
+        );
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let offsets = bytes
+            .windows(corrupt.len())
+            .enumerate()
+            .filter_map(|(index, window)| (window == corrupt).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(offsets.len(), 2);
+        for offset in offsets {
+            bytes[offset] ^= 1;
+        }
+        std::fs::write(&archive, bytes).unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("ZIP".to_owned(), folder)],
+            ..Default::default()
+        });
+        let response = engine.page_with_job_cancel_and_priority(
+            PageRequest {
+                job_id: "cursor-fallthrough".to_owned(),
+                display_request_id: None,
+                address: RemoteAddress::file(archive.to_string_lossy().into_owned()),
+                target_px: 256,
+                priority: PagePriority::Foreground,
+                render_context: None,
+                adjustment_preview: None,
+            },
+            &WorkerContext::open(),
+            Arc::new(AtomicBool::new(false)),
+            &|| PagePriority::Foreground,
+        );
+        let PageResponse::Success(payload) = response else {
+            panic!("{response:?}")
+        };
+        assert_eq!((payload.width, payload.height), (8, 6));
+        let canonical = std::fs::canonicalize(&archive).unwrap();
+        for index in 0..3 {
+            assert_eq!(
+                crate::zip_loader::candidate_payload_read_count(
+                    &canonical,
+                    &crate::zip_loader::RemoteArchiveCandidateCursor::Zip(vec![index]),
+                ),
+                1,
+                "candidate {index} must be read exactly once"
+            );
+        }
+    }
+
+    #[test]
     fn zip_page_skips_raw_without_payload_reads_then_falls_back_after_admitted_payload_failure() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         initialize_remote_page_edit_databases();
@@ -8614,7 +8741,8 @@ mod tests {
                 None,
             )
             .unwrap()
-            .as_deref(),
+            .as_ref()
+            .map(|candidate| candidate.entry_name.as_str()),
             Some("book/inner.zip/leaf.cr2")
         );
         write_remote_ai_test_zip(&inner, &[("leaf.jpg", &jpeg)]);
@@ -8659,7 +8787,8 @@ mod tests {
                 None,
             )
             .unwrap()
-            .as_deref(),
+            .as_ref()
+            .map(|candidate| candidate.entry_name.as_str()),
             Some("book/inner.zip/leaf.jpg")
         );
     }
@@ -8719,7 +8848,12 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(selected.as_deref(), Some("book/cover.jpg"));
+        assert_eq!(
+            selected
+                .as_ref()
+                .map(|candidate| candidate.entry_name.as_str()),
+            Some("book/cover.jpg")
+        );
         assert!(!crate::zip_loader::nested_cache_contains(
             &std::fs::canonicalize(&directory_archive).unwrap(),
             "book/later.zip"
@@ -8744,7 +8878,12 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(selected.as_deref(), Some("inner.zip/page.jpg"));
+        assert_eq!(
+            selected
+                .as_ref()
+                .map(|candidate| candidate.entry_name.as_str()),
+            Some("inner.zip/page.jpg")
+        );
         assert!(crate::zip_loader::nested_cache_contains(
             &std::fs::canonicalize(&backing).unwrap(),
             "inner.zip"
@@ -11371,6 +11510,62 @@ mod tests {
             super::super::ai_job::RemoteAiExecutionOutcome::SettingsRecoveryInProgress(message)
                 if message.contains("もう一度")
         ));
+    }
+
+    #[test]
+    fn remote_ai_rejects_zip_directory_before_selection_or_raw_capacity() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        initialize_remote_page_edit_databases();
+        let folder = data_dir.path().join("ai-directory-eligibility");
+        std::fs::create_dir_all(&folder).unwrap();
+        let archive = folder.join("book.zip");
+        let nested = remote_ai_test_zip_bytes(&[("page.dng", b"must not develop")]);
+        write_remote_ai_test_zip(&archive, &[("book/inner.zip", &nested)]);
+        let canonical = std::fs::canonicalize(&archive).unwrap();
+        let engine = Arc::new(ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("ZIP".to_owned(), folder)],
+            ..Default::default()
+        }));
+        let _reservations = (0..super::super::raw_flights::REMOTE_RAW_FLIGHT_LIMIT)
+            .map(|_| engine.raw_flights.hold_capacity_slot_for_test())
+            .collect::<Vec<_>>();
+        let request = remote_ai_test_request(RemoteAddress {
+            path: archive.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipDirectory {
+                prefix: "book/".to_owned(),
+            },
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = {
+            let engine = Arc::clone(&engine);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                let outcome = engine.execute_remote_ai_inner(
+                    "invalid-directory",
+                    &request,
+                    &NoRemoteAiProgress,
+                    &cancel,
+                );
+                done.send(outcome).unwrap();
+            })
+        };
+        let outcome = result.recv_timeout(Duration::from_secs(10));
+        cancel.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert!(
+            matches!(outcome.unwrap(), Err(RemoteAiRunError::Failed(message))
+            if message == "address does not identify an image page")
+        );
+        assert!(!crate::zip_loader::nested_cache_contains(
+            &canonical,
+            "book/inner.zip"
+        ));
+        assert_eq!(
+            crate::zip_loader::raw_payload_read_count(&canonical, "book/inner.zip/page.dng"),
+            0
+        );
+        assert_eq!(engine.raw_flights.work_counts_for_test(), (0, 6, 0, 0));
     }
 
     #[test]

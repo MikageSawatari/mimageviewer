@@ -32,6 +32,7 @@ pub(super) struct RemoteRawIdentity {
     pub(super) mtime_100ns: i64,
     pub(super) file_size: u64,
     pub(super) zip_entry: Option<String>,
+    pub(super) archive_cursor: Option<crate::zip_loader::RemoteArchiveCandidateCursor>,
     pub(super) zip_dir_prefix: Option<String>,
     pub(super) brightness: RawBrightness,
 }
@@ -49,6 +50,7 @@ impl RemoteRawIdentity {
             mtime_100ns: remote_raw_mtime_100ns(metadata),
             file_size: metadata.len(),
             zip_entry: zip_entry.map(str::to_owned),
+            archive_cursor: None,
             zip_dir_prefix: zip_dir_prefix.map(str::to_owned),
             brightness,
         }
@@ -402,6 +404,17 @@ impl RemoteRawFlights {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .cache_lookup(identity)
+    }
+
+    #[cfg(test)]
+    pub(super) fn work_counts_for_test(&self) -> (usize, usize, usize, usize) {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        (
+            state.entries.len(),
+            state.outstanding.len(),
+            state.ai_capacity_waiters.len(),
+            state.ai_latest_request.len(),
+        )
     }
 
     pub(super) fn clear_cache(&self) {
@@ -1019,6 +1032,7 @@ mod tests {
             mtime_100ns: 1,
             file_size: 10,
             zip_entry: None,
+            archive_cursor: None,
             zip_dir_prefix: None,
             brightness: RawBrightness::None,
         }
@@ -1184,6 +1198,17 @@ mod tests {
         changed = original.clone();
         changed.zip_entry = Some("one.raw".into());
         assert_ne!(original, changed);
+        changed = original.clone();
+        changed.archive_cursor = Some(crate::zip_loader::RemoteArchiveCandidateCursor::Zip(vec![
+            1, 2,
+        ]));
+        assert_ne!(original, changed);
+        let mut other_entry = changed.clone();
+        other_entry.archive_cursor =
+            Some(crate::zip_loader::RemoteArchiveCandidateCursor::Zip(vec![
+                1, 3,
+            ]));
+        assert_ne!(changed, other_entry);
         changed = original.clone();
         changed.zip_dir_prefix = Some("nested/".into());
         assert_ne!(original, changed);
